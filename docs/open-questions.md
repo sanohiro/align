@@ -95,3 +95,87 @@ incremental compilation
 self-host
 ```
 Keeping MIR backend-agnostic does not impede future additions (`impl/00-overview.md`).
+
+### Transparent zero-copy I/O (std.io)
+
+CLI use (pipes, redirects) is a primary target (`draft.md` §2). The aim: a uniform
+`std.io` surface — `reader` / `writer` and a `copy(reader, writer)` — where the user
+writes ordinary code and the implementation picks the fastest transfer path **without
+the caller knowing**, while staying memory-bounded. This is the proven `io.Copy`-style
+capability-dispatch pattern (Go selects splice/sendfile via `ReaderFrom`/`WriterTo`,
+else a fixed-buffer fallback).
+
+Deterministic dispatch on file-descriptor kind:
+
+```text
+file → socket/pipe   sendfile / splice   (Linux)
+pipe ↔ pipe/fd       splice              (Linux)
+scan a file          mmap + madvise, returning bytes/str views
+otherwise / other OS fixed-buffer streaming copy (portable default)
+```
+
+Why this is allowed under the core invariants: "Nothing hidden" governs allocation /
+errors / effects / parallelism / unsafe — **not which syscall is used**, so hiding the
+*mechanism* is fine. The line to hold is "Predictable performance": the abstraction
+must not silently change cost class.
+
+Guardrails (a build is only "problem-free" if these hold):
+```text
+- The portable fixed-buffer copy is the reference; fast paths must match it exactly
+  and are validated against it. Streaming keeps memory O(buffer), never full-file read.
+- Fast paths add edge cases: handle partial transfer, EINTR/EAGAIN, EPIPE/SIGPIPE,
+  short writes. mmap: gate to regular files via fstat; handle SIGBUS (truncation);
+  avoid zero-length / /proc / character-device files.
+- "Predictable" is per-platform: Linux uses splice/sendfile, mac/Windows fall back —
+  the result is identical, only performance differs (acceptable, unavoidable).
+- Zero-copy views keep their backing alive; bound that lifetime with region/arena
+  (`draft.md` §6.4/§15) so a small view cannot pin a huge mapping unnoticed.
+- This is a std-layer optimization (not core, not the walking skeleton). Add it after
+  measurement; do not let it leak into core or block earlier milestones.
+```
+Placement: `std.io` (OS boundary, `draft.md` §18.2), implemented in the Rust runtime
+with a portable fallback; cross-platform mmap via a crate (e.g. `memmap2`). Revisit
+around the string/JSON milestone (M5) and std build-out.
+
+### Fast startup (non-functional goal)
+
+CLI tools are invoked repeatedly (in scripts/pipes), so startup latency is a primary
+quality. Rough scale: Python ~30ms, Go ~1–2ms, static C ~0.2ms; sub-millisecond is the
+target. Most of this is structural — Align wins by *not having* things rather than by
+optimizing them:
+```text
+- Static link + thin runtime: no dynamic-loader resolution; output carries no LLVM, no GC.
+- No hidden global init: "nothing hidden" means no startup-time global constructors /
+  lazy statics to run.
+- Thread pool is created on demand at block scope, not at process start (06-runtime §5);
+  a CLI that uses no parallelism stays single-threaded and exits immediately.
+- Small binary + hot-code locality (DCE / strip / LTO / section ordering or PGO) to cut
+  page faults on cold start.
+- Lazy resource touch: argv / env / locale / timezone DB only when used.
+```
+Promote to `draft.md` §2/§3 as a non-functional goal once committed. Per-platform and
+opt-in only: `-march=native`, PGO, non-PIE (a few µs, security tradeoff) must not be the
+default — they break "predictable performance".
+
+### Performance levers (data / build-time)
+
+Forward-looking levers beyond what the spec already bakes in (fusion §9, SIMD/mask §9,
+arena §6.4, cold error path §10, scan-once / const string pool / JSON field table §12/§14,
+SoA §05-backend §2):
+```text
+- Limited const-eval: precompute lookup tables at build time instead of at startup
+  (also feeds "fast startup"). Distinct from reflection (which stays "none").
+- SIMD numeric parse/format (fast atoi/itoa): CLIs convert numbers <-> text constantly.
+  Lives in core.str / core.math.
+- Perfect hashing for static keys: compile-time perfect hash for JSON fields / keyword
+  lookup (an extension of the field table).
+- Embedding read-only data in the binary as const (no startup load).
+- Niche / opt-in: huge pages (madvise), prefetch, io_uring batched I/O (Linux; same
+  "hidden fast path + portable fallback" rule as zero-copy I/O above).
+- Out of core/std: zero-parse formats (capnproto/flatbuffers-style mmap-and-access)
+  belong in pkg (`draft.md` §18.3).
+```
+Line-drawing (to preserve the core invariants): default-on only when predictable
+(fusion / arena / SIMD / cold path / small static binary); mechanism-hidden-but-cost-
+predictable fast paths go in std with a portable fallback; environment-dependent or
+footgun techniques stay opt-in / isolated.
