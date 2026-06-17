@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-This is **not a codebase**. It contains no source code, build system, tests, or git history. It is the **design specification for "Align"**, an AOT-compiled, data-oriented programming language that does not yet have an implementation. All work here is reading, editing, and extending Markdown documents.
+This is the **design specification + early implementation of "Align"**, an AOT-compiled, data-oriented programming language. The authoritative design lives in Markdown (`draft.md` + `docs/`); the compiler implementation has begun under `crates/` (Rust workspace, milestone M0).
 
-There are no build, lint, or test commands. "Correctness" means internal consistency of the design across documents — not compilation.
+Two kinds of work coexist:
+- **Docs** (`draft.md`, `docs/`): design spec. "Correctness" = internal consistency across documents. Editing rules below still apply.
+- **Code** (`crates/`): the `alignc` compiler. `cargo build` / `cargo test` apply. Code must stay consistent with the spec, not redefine it.
 
 ## Document layout and roles
 
@@ -47,9 +49,11 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 
 ## Current status & next step (handoff)
 
-- **Phase: design complete → implementation (M0) not yet started.** This repo is still docs-only; no code, no build/test yet.
+- **Phase: M0 walking skeleton COMPLETE.** The Rust workspace under `crates/` (all 8 crates per `docs/impl/00-overview.md`: `align_span` `align_diag` `align_ast` `align_lexer` `align_parser` `align_sema` `align_mir` `align_codegen_llvm` `align_runtime` `align_driver`) flows end-to-end: `lexer → parser → sema → MIR → LLVM → executable`. `cargo build` / `cargo test` are green.
+- **What works today:** `alignc run examples/min.align` compiles `fn main() -> i32 { x := 1; return x }` to a native executable and returns exit code 1. Subcommands: `check` / `emit-mir` / `emit-llvm` / `build` / `run`. Integer literals infer width from context (`x := 1; return x` in an `-> i32` fn → `x: i32`); unconstrained ints default to `i64`. Arithmetic `+ - * / %` with correct precedence. An integration test compiles+runs and asserts the exit code (`crates/align_driver/tests/m0.rs`).
+- **Toolchain:** Rust 1.96, LLVM 19 via `inkwell` (`llvm19-1`). The Debian llvm-19 is shared-only (no `libPolly.a`), so `llvm-sys` is forced to dynamic linking via the `prefer-dynamic` feature + `.cargo/config.toml` (`LLVM_SYS_191_PREFER_DYNAMIC=1`). For M0 the generated `main` is the C entry (crt0 calls it); `align_runtime` is a stub, wired for real at M2 (Result-returning `main` via `align_rt_start`).
 - **Where things are:** spec = `draft.md` (authoritative). Design rationale = `docs/*.md`. Implementation plan = `docs/impl/00–07`. Decisions = `docs/open-questions.md` 決着済み (and "Settled decisions" above).
-- **Next action: M0 walking skeleton** (`docs/impl/07-roadmap.md`). Stand up the Rust workspace (`align_span` → `align_lexer` → `align_parser` → `align_sema` → `align_mir` → `align_codegen_llvm` → `align_runtime` → `align_driver`, per `docs/impl/00-overview.md`) and make a trivial program (`fn main() -> i32 { x := 1; return x }` / `x := 1`) flow end-to-end: lexer → parser → sema → MIR → LLVM → executable. Widen feature-by-feature only after the skeleton runs.
+- **Next action: M1** (`docs/impl/07-roadmap.md`) — `if`/比較/`bool`, `mut`+再代入, multi-arg fns + calls, struct定義+リテラル+field access, full primitives, a `print` hooked to runtime. Each feature threads through all stages; do not build one stage out ahead of the skeleton.
 - **No design item is blocking.** Open items wait on their milestone (error type → M2, explicit-allocator arena → M3, generics → M4, etc.).
 - **Note on continuity:** prior decisions also lived in this machine's Claude memory (`~/.claude/.../memory/`), which does NOT transfer between machines — but everything durable is already captured in `draft.md` + `docs/open-questions.md`, so this repo is self-sufficient.
 

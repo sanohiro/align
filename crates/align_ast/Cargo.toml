@@ -1,0 +1,8 @@
+[package]
+name = "align_ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+align_span = { path = "../align_span" }

@@ -180,8 +180,15 @@ task_group spawn/wait         → align_rt_task_spawn / align_rt_task_wait
 
 ## 10. 未決事項 (要決着)
 
+### 決着 (M0): inkwell / LLVM バージョンとリンク方式
+LLVM 19 を `inkwell 0.9` (feature `llvm19-1`) 経由で使う。Debian の llvm-19 は shared モード
+(`llvm-config --shared-mode` = shared、静的コンポーネント `libPolly.a` 等を同梱しない) のため、
+`llvm-sys` は **動的リンク** に固定する: `llvm-sys` の `prefer-dynamic` feature +
+`.cargo/config.toml` の `LLVM_SYS_191_PREFER_DYNAMIC=1`。M0 では生成した `main` を C エントリ
+(crt0 が呼ぶ) とし、driver が `cc` で object をリンクする。アップグレード戦略 (将来の LLVM 版追従)
+は引き続き要検討。
+
 ```text
-- inkwell / LLVM バージョン固定とアップグレード戦略
 - Option/Result の LLVM 表現確定 (null化 vs タグ付き、ニッチ最適化)
 - SoA 変換のトリガ (自動 vs 注釈) と array<T> ABI への影響
 - ベクトル幅 W の決定と複数 ISA 対応の範囲 (04 §9 と共通)

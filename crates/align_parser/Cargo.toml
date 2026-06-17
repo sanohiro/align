@@ -1,0 +1,11 @@
+[package]
+name = "align_parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+align_span = { path = "../align_span" }
+align_diag = { path = "../align_diag" }
+align_ast = { path = "../align_ast" }
+align_lexer = { path = "../align_lexer" }

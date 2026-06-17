@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Align コンパイラ (alignc) のワークスペース。
+# IR 境界 = クレート境界 (docs/impl/00-overview.md)。
+# パイプライン: align_lexer -> align_parser -> align_sema -> align_mir
+#             -> align_codegen_llvm -> (align_runtime とリンク)
+# 横断: align_span / align_diag
