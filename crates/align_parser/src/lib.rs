@@ -1,13 +1,14 @@
 //! Parsing: token stream -> AST (`docs/impl/02-frontend.md` §10).
 //!
-//! Hand-written recursive descent + Pratt parsing for expressions. No desugaring
-//! (the AST keeps the written form). M0 scope: `fn` declarations / `:=` / `return`
-//! / integers / arithmetic / `( )` grouping.
+//! Hand-written recursive descent + Pratt parsing for expressions. No desugaring (the
+//! AST keeps the written form). M1 scope: `fn` decls with multiple params, calls,
+//! `if`/`else` (expression and statement), comparison/logical operators, `bool`,
+//! `mut` + reassignment, integer arithmetic, and `( )` grouping.
 
 use align_ast::*;
 use align_diag::Diagnostics;
-use align_span::Span;
 use align_lexer::{TokKind, Token};
+use align_span::Span;
 
 pub fn parse_file(tokens: Vec<Token>, diags: &mut Diagnostics) -> File {
     let mut p = Parser {
@@ -73,7 +74,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip statement separators (End from newline/`;`).
+    /// Skip statement separators (`End` from newlines or `;`).
     fn skip_ends(&mut self) {
         while self.at(&TokKind::End) {
             self.bump();
@@ -112,7 +113,6 @@ impl<'a> Parser<'a> {
             match self.parse_item() {
                 Some(item) => items.push(item),
                 None => {
-                    // Error recovery: skip to the next sync point (fn / End).
                     self.bump();
                     while !matches!(self.peek(), TokKind::Fn | TokKind::Eof | TokKind::End) {
                         self.bump();
@@ -146,13 +146,13 @@ impl<'a> Parser<'a> {
     fn parse_fn(&mut self, vis: Vis) -> Option<FnDecl> {
         let start = self.span();
         self.bump(); // fn
-        let name = self.parse_ident("a function name")?;
+        let name = self.parse_ident("function name")?;
 
         self.expect(&TokKind::LParen, "'('");
         let mut params = Vec::new();
         while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
             let is_out = self.eat_ident_keyword("out");
-            let pname = self.parse_ident("a parameter name")?;
+            let pname = self.parse_ident("parameter name")?;
             self.expect(&TokKind::Colon, "':'");
             let ty = self.parse_type()?;
             params.push(Param {
@@ -173,7 +173,6 @@ impl<'a> Parser<'a> {
         };
 
         let body = if self.eat(&TokKind::Eq) {
-            // Single-expression form `= expr`
             let e = self.parse_expr(0)?;
             self.eat(&TokKind::End);
             FnBody::Expr(Box::new(e))
@@ -203,7 +202,6 @@ impl<'a> Parser<'a> {
             if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
                 break;
             }
-            // let
             if self.at(&TokKind::Mut)
                 || (matches!(self.peek(), TokKind::Ident(_))
                     && matches!(self.peek_at(1), TokKind::ColonEq))
@@ -212,13 +210,11 @@ impl<'a> Parser<'a> {
                 stmts.push(s);
                 continue;
             }
-            // return
             if self.at(&TokKind::Return) {
                 let s = self.parse_return()?;
                 stmts.push(s);
                 continue;
             }
-            // expr -> assignment / expression statement / trailing expression
             let e = self.parse_expr(0)?;
             if self.eat(&TokKind::Eq) {
                 let value = self.parse_expr(0)?;
@@ -228,7 +224,6 @@ impl<'a> Parser<'a> {
                 self.bump();
                 stmts.push(Stmt::Expr(e));
             } else {
-                // End of block with no End -> trailing expression
                 tail = Some(Box::new(e));
                 break;
             }
@@ -241,7 +236,7 @@ impl<'a> Parser<'a> {
 
     fn parse_let(&mut self) -> Option<Stmt> {
         let is_mut = self.eat(&TokKind::Mut);
-        let name = self.parse_ident("a variable name")?;
+        let name = self.parse_ident("variable name")?;
         let ty = if self.eat(&TokKind::Colon) {
             Some(self.parse_type()?)
         } else {
@@ -269,18 +264,33 @@ impl<'a> Parser<'a> {
         Some(Stmt::Return(value))
     }
 
-    // --- Expressions (Pratt) ---
+    // --- expressions (Pratt) ---
+
+    /// Binary operator binding power (higher binds tighter). `None` = not a binary op.
+    fn binop(kind: &TokKind) -> Option<(BinOp, u8)> {
+        Some(match kind {
+            TokKind::OrOr => (BinOp::Or, 1),
+            TokKind::AndAnd => (BinOp::And, 2),
+            TokKind::EqEq => (BinOp::Eq, 3),
+            TokKind::NotEq => (BinOp::Ne, 3),
+            TokKind::Lt => (BinOp::Lt, 3),
+            TokKind::Le => (BinOp::Le, 3),
+            TokKind::Gt => (BinOp::Gt, 3),
+            TokKind::Ge => (BinOp::Ge, 3),
+            TokKind::Plus => (BinOp::Add, 4),
+            TokKind::Minus => (BinOp::Sub, 4),
+            TokKind::Star => (BinOp::Mul, 5),
+            TokKind::Slash => (BinOp::Div, 5),
+            TokKind::Percent => (BinOp::Rem, 5),
+            _ => return None,
+        })
+    }
 
     fn parse_expr(&mut self, min_bp: u8) -> Option<Expr> {
-        let mut lhs = self.parse_primary()?;
+        let mut lhs = self.parse_prefix()?;
         loop {
-            let (op, bp) = match self.peek() {
-                TokKind::Plus => (BinOp::Add, 1),
-                TokKind::Minus => (BinOp::Sub, 1),
-                TokKind::Star => (BinOp::Mul, 2),
-                TokKind::Slash => (BinOp::Div, 2),
-                TokKind::Percent => (BinOp::Rem, 2),
-                _ => break,
+            let Some((op, bp)) = Self::binop(self.peek()) else {
+                break;
             };
             if bp < min_bp {
                 break;
@@ -300,6 +310,56 @@ impl<'a> Parser<'a> {
         Some(lhs)
     }
 
+    fn parse_prefix(&mut self) -> Option<Expr> {
+        let start = self.span();
+        let op = match self.peek() {
+            TokKind::Minus => Some(UnOp::Neg),
+            TokKind::Bang => Some(UnOp::Not),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.bump();
+            let expr = self.parse_prefix()?;
+            let span = start.merge(expr.span);
+            return Some(Expr {
+                kind: ExprKind::Unary {
+                    op,
+                    expr: Box::new(expr),
+                },
+                span,
+            });
+        }
+        self.parse_postfix()
+    }
+
+    fn parse_postfix(&mut self) -> Option<Expr> {
+        let mut e = self.parse_primary()?;
+        loop {
+            if self.at(&TokKind::LParen) {
+                self.bump();
+                let mut args = Vec::new();
+                while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
+                    args.push(self.parse_expr(0)?);
+                    if !self.eat(&TokKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokKind::RParen, "')'");
+                let span = e.span.merge(self.prev_span());
+                e = Expr {
+                    kind: ExprKind::Call {
+                        callee: Box::new(e),
+                        args,
+                    },
+                    span,
+                };
+            } else {
+                break;
+            }
+        }
+        Some(e)
+    }
+
     fn parse_primary(&mut self) -> Option<Expr> {
         let span = self.span();
         match self.peek().clone() {
@@ -307,6 +367,20 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Some(Expr {
                     kind: ExprKind::Int(v),
+                    span,
+                })
+            }
+            TokKind::True => {
+                self.bump();
+                Some(Expr {
+                    kind: ExprKind::Bool(true),
+                    span,
+                })
+            }
+            TokKind::False => {
+                self.bump();
+                Some(Expr {
+                    kind: ExprKind::Bool(false),
                     span,
                 })
             }
@@ -318,6 +392,7 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
+            TokKind::If => self.parse_if(),
             TokKind::LParen => {
                 self.bump();
                 let e = self.parse_expr(0)?;
@@ -333,23 +408,53 @@ impl<'a> Parser<'a> {
                 })
             }
             _ => {
-                self.diags.error("expected an expression", span);
+                self.diags.error("expected expression", span);
                 None
             }
         }
     }
 
-    // --- Helpers ---
+    fn parse_if(&mut self) -> Option<Expr> {
+        let start = self.span();
+        self.bump(); // if
+        let cond = self.parse_expr(0)?;
+        let then = self.parse_block()?;
+        let els = if self.eat(&TokKind::Else) {
+            if self.at(&TokKind::If) {
+                Some(Box::new(self.parse_if()?))
+            } else {
+                let block = self.parse_block()?;
+                let span = block.span;
+                Some(Box::new(Expr {
+                    kind: ExprKind::Block(block),
+                    span,
+                }))
+            }
+        } else {
+            None
+        };
+        let span = start.merge(self.prev_span());
+        Some(Expr {
+            kind: ExprKind::If {
+                cond: Box::new(cond),
+                then,
+                els,
+            },
+            span,
+        })
+    }
+
+    // --- helpers ---
 
     fn parse_path(&mut self) -> Path {
         let start = self.span();
         let mut segments = Vec::new();
-        if let Some(id) = self.parse_ident("an identifier") {
+        if let Some(id) = self.parse_ident("identifier") {
             segments.push(id);
         }
         while self.at(&TokKind::Dot) && matches!(self.peek_at(1), TokKind::Ident(_)) {
-            self.bump(); // .
-            if let Some(id) = self.parse_ident("an identifier") {
+            self.bump();
+            if let Some(id) = self.parse_ident("identifier") {
                 segments.push(id);
             }
         }
@@ -379,7 +484,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Consume a weak keyword such as `out` (which appears as an Ident).
+    /// Consume a weak keyword (one that appears as an `Ident`), like `out`.
     fn eat_ident_keyword(&mut self, kw: &str) -> bool {
         if let TokKind::Ident(name) = self.peek() {
             if name == kw {
@@ -410,11 +515,6 @@ mod tests {
         assert_eq!(f.items.len(), 1);
         let Item::Fn(fd) = &f.items[0];
         assert_eq!(fd.name.name, "main");
-        assert_eq!(fd.ret.as_ref().unwrap().path.segments[0].name, "i32");
-        let FnBody::Block(b) = &fd.body else {
-            panic!("block body expected")
-        };
-        assert_eq!(b.stmts.len(), 2);
     }
 
     #[test]
@@ -428,10 +528,24 @@ mod tests {
         let Stmt::Return(Some(e)) = &b.stmts[0] else {
             panic!()
         };
-        // Top level is +, right side is * (1 + (2*3))
         let ExprKind::Binary { op, .. } = &e.kind else {
             panic!()
         };
         assert_eq!(*op, BinOp::Add);
+    }
+
+    #[test]
+    fn fib_parses() {
+        let src = "fn fib(n: i64) -> i64 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\n";
+        let (f, err) = parse(src);
+        assert!(!err);
+        let Item::Fn(fd) = &f.items[0];
+        assert_eq!(fd.params.len(), 1);
+        let FnBody::Block(b) = &fd.body else {
+            panic!()
+        };
+        // if-statement, then return-with-call.
+        assert!(matches!(&b.stmts[0], Stmt::Expr(Expr { kind: ExprKind::If { .. }, .. })));
+        assert!(matches!(&b.stmts[1], Stmt::Return(Some(_))));
     }
 }

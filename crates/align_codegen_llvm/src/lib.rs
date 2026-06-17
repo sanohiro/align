@@ -1,32 +1,32 @@
 //! Backend: MIR -> LLVM IR -> object (`docs/impl/05-backend-llvm.md`).
 //!
-//! A stage devoted to pure lowering. Align's semantic decisions (desugaring, fusion,
-//! SIMD-ization, regions) are already done in MIR; here we just mechanically lower
-//! MIR to LLVM IR (anti-rewrite).
+//! A pure-lowering stage. Align's semantic decisions (desugaring, fusion, SIMD-ization,
+//! regions) are already done in MIR; this just maps MIR to LLVM IR mechanically and
+//! does not recompute types (anti-rewrite, `00-overview.md`).
 //!
-//! M0 scope: integers only. Emit `fn main() -> iN` as LLVM's `main` function and
-//! lower arithmetic and constant returns. The C runtime (crt0) calls `main` as the
-//! entry point, so M0 can return an exit code without going through align_runtime
-//! (the Result-returning main is wired in M2).
+//! M1 model: named locals are allocas (LLVM's mem2reg promotes them to SSA); reads are
+//! loads, writes are stores; `if` is conditional branches; comparisons are `icmp`;
+//! calls are `call`. The generated `main` is the C entry (crt0 calls it).
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use align_ast::BinOp;
-use align_mir::{Function, Operand, Program, Rvalue, Stmt, Term, ValueId};
+use align_ast::{BinOp, UnOp};
+use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{IntTy, Ty};
 
+use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::types::IntType;
-use inkwell::values::IntValue;
+use inkwell::types::{BasicMetadataTypeEnum, IntType};
+use inkwell::values::{FunctionValue, IntValue};
 
-/// Whether the LLVM backend is available in this build. true because inkwell is linked.
 pub fn is_available() -> bool {
     true
 }
@@ -46,41 +46,61 @@ impl std::fmt::Display for CodegenError {
     }
 }
 
-/// Write MIR out to an object file.
+/// Write the program as an object file.
 pub fn emit_object(program: &Program, out: &Path) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    let builder = ctx.create_builder();
-
-    for f in &program.fns {
-        lower_fn(&ctx, &module, &builder, f)?;
-    }
-
+    build_module(&ctx, &module, program)?;
     write_object(&module, out)
 }
 
-/// Return LLVM IR as text for debugging (`alignc emit-llvm`).
+/// Render the program as textual LLVM IR (`alignc emit-llvm`).
 pub fn emit_llvm_ir(program: &Program) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    let builder = ctx.create_builder();
-    for f in &program.fns {
-        lower_fn(&ctx, &module, &builder, f)?;
-    }
+    build_module(&ctx, &module, program)?;
     Ok(module.print_to_string().to_string())
+}
+
+fn build_module<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    program: &Program,
+) -> Result<(), CodegenError> {
+    // Pass 1: declare all functions so calls resolve regardless of order.
+    let mut funcs: HashMap<String, FunctionValue<'c>> = HashMap::new();
+    for f in &program.fns {
+        let fv = declare_fn(ctx, module, f);
+        funcs.insert(f.name.clone(), fv);
+    }
+    // Pass 2: define bodies.
+    for f in &program.fns {
+        let builder = ctx.create_builder();
+        FnGen {
+            ctx,
+            builder: &builder,
+            funcs: &funcs,
+            f,
+            func: funcs[&f.name],
+            slots: HashMap::new(),
+            values: HashMap::new(),
+            blocks: Vec::new(),
+        }
+        .emit_fn()?;
+    }
+    Ok(())
 }
 
 fn int_type<'c>(ctx: &'c Context, ty: Ty) -> IntType<'c> {
     match ty {
-        // The width is already fixed to 8/16/32/64 by sema. custom_width_int_type
-        // returns a Result, but for these widths it is always Ok (inkwell 0.9).
         Ty::Int(IntTy { bits, .. }) => match bits {
             8 => ctx.i8_type(),
             16 => ctx.i16_type(),
             32 => ctx.i32_type(),
             _ => ctx.i64_type(),
         },
-        // Nothing but integers arrives in M0. Default to i32 on the safe side.
+        Ty::Bool => ctx.bool_type(),
+        // Unit/Error don't reach value positions in M1; use i32 as a harmless filler.
         _ => ctx.i32_type(),
     }
 }
@@ -89,103 +109,211 @@ fn is_signed(ty: Ty) -> bool {
     matches!(ty, Ty::Int(IntTy { signed: true, .. }))
 }
 
-fn lower_fn<'c>(
+fn declare_fn<'c>(ctx: &'c Context, module: &Module<'c>, f: &Function) -> FunctionValue<'c> {
+    let param_types: Vec<BasicMetadataTypeEnum> = f
+        .params
+        .iter()
+        .map(|s| int_type(ctx, f.slots[*s as usize]).into())
+        .collect();
+    let fn_ty = if f.ret == Ty::Unit {
+        ctx.void_type().fn_type(&param_types, false)
+    } else {
+        int_type(ctx, f.ret).fn_type(&param_types, false)
+    };
+    module.add_function(&f.name, fn_ty, None)
+}
+
+struct FnGen<'c, 'a> {
     ctx: &'c Context,
-    module: &Module<'c>,
-    builder: &Builder<'c>,
-    f: &Function,
-) -> Result<(), CodegenError> {
-    let ret_ty = int_type(ctx, f.ret);
-    let fn_ty = ret_ty.fn_type(&[], false);
-    let func = module.add_function(&f.name, fn_ty, None);
+    builder: &'a Builder<'c>,
+    funcs: &'a HashMap<String, FunctionValue<'c>>,
+    f: &'a Function,
+    func: FunctionValue<'c>,
+    slots: HashMap<Slot, inkwell::values::PointerValue<'c>>,
+    values: HashMap<ValueId, IntValue<'c>>,
+    blocks: Vec<BasicBlock<'c>>,
+}
 
-    let mut vals: HashMap<ValueId, IntValue<'c>> = HashMap::new();
-    let mut types: HashMap<ValueId, Ty> = HashMap::new();
+impl<'c, 'a> FnGen<'c, 'a> {
+    fn err(&self, e: impl std::fmt::Display) -> CodegenError {
+        CodegenError::Lowering(e.to_string())
+    }
 
-    // M0 is single-block. Multiple blocks (control flow) are added in M1.
-    let block = &f.blocks[0];
-    let bb = ctx.append_basic_block(func, "bb0");
-    builder.position_at_end(bb);
+    fn emit_fn(&mut self) -> Result<(), CodegenError> {
+        // Create an LLVM block per MIR block.
+        for b in &self.f.blocks {
+            let bb = self.ctx.append_basic_block(self.func, &format!("bb{}", b.id));
+            self.blocks.push(bb);
+        }
 
-    for stmt in &block.stmts {
-        match stmt {
-            Stmt::Let(v, rv) => {
-                let (val, ty) = lower_rvalue(ctx, builder, &vals, &types, rv)?;
-                vals.insert(*v, val);
-                types.insert(*v, ty);
+        // Allocate slots at the start of the entry block.
+        let entry = self.blocks[self.f.entry as usize];
+        self.builder.position_at_end(entry);
+        for (i, ty) in self.f.slots.iter().enumerate() {
+            let ptr = self
+                .builder
+                .build_alloca(int_type(self.ctx, *ty), &format!("_{i}"))
+                .map_err(|e| self.err(e))?;
+            self.slots.insert(i as Slot, ptr);
+        }
+
+        // Emit each block.
+        for b in &self.f.blocks {
+            let bb = self.blocks[b.id as usize];
+            self.builder.position_at_end(bb);
+            self.gen_block(b)?;
+        }
+        Ok(())
+    }
+
+    fn gen_block(&mut self, b: &Block) -> Result<(), CodegenError> {
+        for s in &b.stmts {
+            match s {
+                Stmt::Let(v, rv) => {
+                    if let Some(val) = self.gen_rvalue(rv)? {
+                        self.values.insert(*v, val);
+                    }
+                }
+                Stmt::Store(slot, op) => {
+                    let val = self.operand(op);
+                    let ptr = self.slots[slot];
+                    self.builder.build_store(ptr, val).map_err(|e| self.err(e))?;
+                }
             }
         }
+        self.gen_term(&b.term)
     }
 
-    match &block.term {
-        Term::Return(Some(op)) => {
-            let v = lower_operand(ctx, &vals, op);
-            builder
-                .build_return(Some(&v))
-                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+    fn gen_term(&mut self, t: &Term) -> Result<(), CodegenError> {
+        match t {
+            Term::Goto(target) => {
+                self.builder
+                    .build_unconditional_branch(self.blocks[*target as usize])
+                    .map_err(|e| self.err(e))?;
+            }
+            Term::Branch(cond, then_bb, else_bb) => {
+                let c = self.operand(cond);
+                self.builder
+                    .build_conditional_branch(
+                        c,
+                        self.blocks[*then_bb as usize],
+                        self.blocks[*else_bb as usize],
+                    )
+                    .map_err(|e| self.err(e))?;
+            }
+            Term::Return(Some(op)) => {
+                let v = self.operand(op);
+                self.builder.build_return(Some(&v)).map_err(|e| self.err(e))?;
+            }
+            Term::Return(None) => {
+                self.builder.build_return(None).map_err(|e| self.err(e))?;
+            }
+            Term::Unreachable => {
+                self.builder.build_unreachable().map_err(|e| self.err(e))?;
+            }
         }
-        Term::Return(None) => {
-            builder
-                .build_return(None)
-                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Lower an rvalue. Returns `None` for a value-less result (a void call).
+    fn gen_rvalue(&mut self, rv: &Rvalue) -> Result<Option<IntValue<'c>>, CodegenError> {
+        let v = match rv {
+            Rvalue::Use(op) => self.operand(op),
+            Rvalue::Load(slot) => {
+                let ty = int_type(self.ctx, self.f.slots[*slot as usize]);
+                self.builder
+                    .build_load(ty, self.slots[slot], "load")
+                    .map_err(|e| self.err(e))?
+                    .into_int_value()
+            }
+            Rvalue::Un(op, a) => {
+                let a = self.operand(a);
+                match op {
+                    UnOp::Neg => self.builder.build_int_neg(a, "neg").map_err(|e| self.err(e))?,
+                    UnOp::Not => self.builder.build_not(a, "not").map_err(|e| self.err(e))?,
+                }
+            }
+            Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
+            Rvalue::Call(name, args) => {
+                let callee = self.funcs[name];
+                let argv: Vec<_> = args.iter().map(|o| self.operand(o).into()).collect();
+                let cs = self
+                    .builder
+                    .build_call(callee, &argv, "call")
+                    .map_err(|e| self.err(e))?;
+                return Ok(cs.try_as_basic_value().basic().map(|b| b.into_int_value()));
+            }
+        };
+        Ok(Some(v))
+    }
+
+    fn gen_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<IntValue<'c>, CodegenError> {
+        let signed = is_signed(self.f.operand_ty(a));
+        let l = self.operand(a);
+        let r = self.operand(b);
+        let bld = self.builder;
+        let v = match op {
+            BinOp::Add => bld.build_int_add(l, r, "add"),
+            BinOp::Sub => bld.build_int_sub(l, r, "sub"),
+            BinOp::Mul => bld.build_int_mul(l, r, "mul"),
+            BinOp::Div if signed => bld.build_int_signed_div(l, r, "sdiv"),
+            BinOp::Div => bld.build_int_unsigned_div(l, r, "udiv"),
+            BinOp::Rem if signed => bld.build_int_signed_rem(l, r, "srem"),
+            BinOp::Rem => bld.build_int_unsigned_rem(l, r, "urem"),
+            BinOp::And => bld.build_and(l, r, "and"),
+            BinOp::Or => bld.build_or(l, r, "or"),
+            BinOp::Eq => bld.build_int_compare(IntPredicate::EQ, l, r, "eq"),
+            BinOp::Ne => bld.build_int_compare(IntPredicate::NE, l, r, "ne"),
+            BinOp::Lt => bld.build_int_compare(pred(signed, Cmp::Lt), l, r, "lt"),
+            BinOp::Le => bld.build_int_compare(pred(signed, Cmp::Le), l, r, "le"),
+            BinOp::Gt => bld.build_int_compare(pred(signed, Cmp::Gt), l, r, "gt"),
+            BinOp::Ge => bld.build_int_compare(pred(signed, Cmp::Ge), l, r, "ge"),
+        };
+        v.map_err(|e| self.err(e))
+    }
+
+    fn operand(&self, op: &Operand) -> IntValue<'c> {
+        match op {
+            Operand::Const(Const::Int(v, ty)) => {
+                int_type(self.ctx, *ty).const_int(*v as u64, is_signed(*ty))
+            }
+            Operand::Const(Const::Bool(v)) => {
+                self.ctx.bool_type().const_int(*v as u64, false)
+            }
+            Operand::Value(id) => self.values[id],
+            Operand::Arg(i) => self
+                .func
+                .get_nth_param(*i)
+                .expect("param index in range")
+                .into_int_value(),
         }
     }
-    Ok(())
 }
 
-fn lower_rvalue<'c>(
-    ctx: &'c Context,
-    builder: &Builder<'c>,
-    vals: &HashMap<ValueId, IntValue<'c>>,
-    types: &HashMap<ValueId, Ty>,
-    rv: &Rvalue,
-) -> Result<(IntValue<'c>, Ty), CodegenError> {
-    match rv {
-        Rvalue::Use(op) => Ok((lower_operand(ctx, vals, op), operand_ty(types, op))),
-        Rvalue::Bin(op, a, b) => {
-            let l = lower_operand(ctx, vals, a);
-            let r = lower_operand(ctx, vals, b);
-            let ty = operand_ty(types, a);
-            let signed = is_signed(ty);
-            let e = |r: Result<IntValue<'c>, _>| {
-                r.map_err(|e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string()))
-            };
-            // Integer overflow is two's-complement wrap (draft.md §5). Emit plain add/mul.
-            let v = match op {
-                BinOp::Add => e(builder.build_int_add(l, r, "add"))?,
-                BinOp::Sub => e(builder.build_int_sub(l, r, "sub"))?,
-                BinOp::Mul => e(builder.build_int_mul(l, r, "mul"))?,
-                BinOp::Div if signed => e(builder.build_int_signed_div(l, r, "sdiv"))?,
-                BinOp::Div => e(builder.build_int_unsigned_div(l, r, "udiv"))?,
-                BinOp::Rem if signed => e(builder.build_int_signed_rem(l, r, "srem"))?,
-                BinOp::Rem => e(builder.build_int_unsigned_rem(l, r, "urem"))?,
-            };
-            Ok((v, ty))
-        }
-    }
+enum Cmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
-fn lower_operand<'c>(
-    ctx: &'c Context,
-    vals: &HashMap<ValueId, IntValue<'c>>,
-    op: &Operand,
-) -> IntValue<'c> {
-    match op {
-        Operand::Const(v, ty) => int_type(ctx, *ty).const_int(*v as u64, is_signed(*ty)),
-        Operand::Value(id) => vals[id],
-    }
-}
-
-fn operand_ty(types: &HashMap<ValueId, Ty>, op: &Operand) -> Ty {
-    match op {
-        Operand::Const(_, ty) => *ty,
-        Operand::Value(id) => types.get(id).copied().unwrap_or(Ty::Error),
+fn pred(signed: bool, c: Cmp) -> IntPredicate {
+    use IntPredicate::*;
+    match (signed, c) {
+        (true, Cmp::Lt) => SLT,
+        (true, Cmp::Le) => SLE,
+        (true, Cmp::Gt) => SGT,
+        (true, Cmp::Ge) => SGE,
+        (false, Cmp::Lt) => ULT,
+        (false, Cmp::Le) => ULE,
+        (false, Cmp::Gt) => UGT,
+        (false, Cmp::Ge) => UGE,
     }
 }
 
 fn write_object(module: &Module, out: &Path) -> Result<(), CodegenError> {
     Target::initialize_native(&InitializationConfig::default())
-        .map_err(|e| CodegenError::Target(format!("native target initialization: {e}")))?;
+        .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
 
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple)
@@ -227,13 +355,14 @@ mod tests {
     fn m0_emits_main_returning_i32() {
         let text = ir("fn main() -> i32 {\n  x := 1\n  return x\n}\n");
         assert!(text.contains("define i32 @main()"), "got:\n{text}");
-        assert!(text.contains("ret i32 1"), "got:\n{text}");
     }
 
     #[test]
-    fn arithmetic_lowers() {
-        let text = ir("fn main() -> i32 {\n  return 2 + 3 * 4\n}\n");
-        // Constant folding is left to LLVM. Either add/mul instructions or a folded result appears.
-        assert!(text.contains("@main"), "got:\n{text}");
+    fn fib_emits_calls_and_branch() {
+        let src = "fn fib(n: i64) -> i64 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\n";
+        let text = ir(src);
+        assert!(text.contains("define i64 @fib(i64"), "got:\n{text}");
+        assert!(text.contains("call i64 @fib"), "expected recursive calls:\n{text}");
+        assert!(text.contains("icmp slt"), "expected signed comparison:\n{text}");
     }
 }

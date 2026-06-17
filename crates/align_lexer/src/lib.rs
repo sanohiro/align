@@ -1,12 +1,12 @@
 //! Lexing: input bytes -> token stream (`docs/impl/02-frontend.md` §1).
 //!
 //! Statement termination is **Go style** (`draft.md` §4): a newline is an implicit
-//! terminator ([`TokKind::End`]). Blocks are `{}` and indentation is insignificant
-//! (not Python). If a line starts with `.`/a binary operator, it is treated as a
-//! continuation of the previous line and no `End` is inserted (multi-line method
-//! chains).
+//! terminator ([`TokKind::End`]). Blocks use `{}`; indentation is insignificant (not
+//! Python). A line starting with `.`/a binary operator continues the previous line
+//! (multi-line method chains), so no `End` is inserted there.
 //!
-//! M0 scope: `fn` / `return` / identifiers / integers / `:=` `=` `->` separators / arithmetic.
+//! M1 scope: keywords `fn`/`return`/`mut`/`if`/`else`/`true`/`false`, identifiers,
+//! integers, `:=` `=` `->`, separators, arithmetic, comparison and logical operators.
 
 use align_diag::Diagnostics;
 use align_span::{FileId, Span};
@@ -16,13 +16,17 @@ pub enum TokKind {
     // Literals / identifiers
     Int(i128),
     Ident(String),
-    // Keywords (M0 scope)
+    // Keywords
     Fn,
     Return,
     Mut,
     Pub,
     Module,
     Import,
+    If,
+    Else,
+    True,
+    False,
     // Symbols / operators
     ColonEq, // :=
     Eq,      // =
@@ -39,19 +43,30 @@ pub enum TokKind {
     Star,
     Slash,
     Percent,
-    /// Statement terminator (implicit `;` from a newline, or an explicit `;`).
+    EqEq,    // ==
+    NotEq,   // !=
+    Lt,      // <
+    Le,      // <=
+    Gt,      // >
+    Ge,      // >=
+    AndAnd,  // &&
+    OrOr,    // ||
+    Bang,    // !
+    /// Statement terminator (implicit `;` from a newline, or explicit `;`).
     End,
     Eof,
 }
 
 impl TokKind {
-    /// Whether this token, at end of line, can terminate a statement (implicit End insertion).
+    /// Whether this token, at end of line, can terminate a statement (implicit `End`).
     fn can_end_stmt(&self) -> bool {
         matches!(
             self,
             TokKind::Int(_)
                 | TokKind::Ident(_)
                 | TokKind::Return
+                | TokKind::True
+                | TokKind::False
                 | TokKind::RParen
                 | TokKind::RBrace
         )
@@ -71,7 +86,7 @@ struct Lexer<'a> {
     tokens: Vec<Token>,
 }
 
-/// Convert `source` into a token stream. Always ends with [`TokKind::Eof`].
+/// Tokenize `source`. The stream always ends with [`TokKind::Eof`].
 pub fn tokenize(file: FileId, source: &str, diags: &mut Diagnostics) -> Vec<Token> {
     let mut lx = Lexer {
         file,
@@ -104,7 +119,6 @@ impl<'a> Lexer<'a> {
                 Some(_) => self.lex_token(diags),
             }
         }
-        // Append End to the last statement and place Eof.
         self.maybe_insert_end();
         let at = self.pos;
         self.tokens.push(Token {
@@ -113,9 +127,8 @@ impl<'a> Lexer<'a> {
         });
     }
 
-    /// On reaching a newline, insert an implicit End if the previous token can end
-    /// a statement. Skip insertion if the next significant byte is a line
-    /// continuation (`.` or a binary operator).
+    /// On a newline, insert an implicit `End` if the previous token can terminate a
+    /// statement, unless the next significant byte continues the line (`.`/binary op).
     fn maybe_insert_end(&mut self) {
         let prev_ends = self
             .tokens
@@ -135,15 +148,16 @@ impl<'a> Lexer<'a> {
         });
     }
 
-    /// Whether the next significant byte (after skipping whitespace/comments/newlines)
-    /// starts with a `.` or binary operator indicating a continuation of the previous line.
+    /// Whether the next significant byte (after whitespace/comments/newlines) starts a
+    /// line continuation: `.` or a binary operator.
     fn next_significant_continues_line(&self) -> bool {
         let mut i = self.pos;
         loop {
             match self.src.get(i).copied() {
                 Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') => i += 1,
                 Some(b'.') | Some(b'+') | Some(b'*') | Some(b'/') | Some(b'%') => return true,
-                // '-' can be unary, but at line start it is treated as binary (continuation).
+                Some(b'<') | Some(b'>') | Some(b'=') | Some(b'&') | Some(b'|') => return true,
+                // '-' is also unary, but at line start treat it as a binary continuation.
                 Some(b'-') => return self.src.get(i + 1).copied() != Some(b'>'),
                 _ => return false,
             }
@@ -208,6 +222,10 @@ impl<'a> Lexer<'a> {
             "pub" => TokKind::Pub,
             "module" => TokKind::Module,
             "import" => TokKind::Import,
+            "if" => TokKind::If,
+            "else" => TokKind::Else,
+            "true" => TokKind::True,
+            "false" => TokKind::False,
             _ => TokKind::Ident(text.to_string()),
         };
         self.push(kind, start);
@@ -219,7 +237,16 @@ impl<'a> Lexer<'a> {
         let (kind, len) = match (c, two) {
             (b':', Some(b'=')) => (TokKind::ColonEq, 2),
             (b'-', Some(b'>')) => (TokKind::Arrow, 2),
+            (b'=', Some(b'=')) => (TokKind::EqEq, 2),
+            (b'!', Some(b'=')) => (TokKind::NotEq, 2),
+            (b'<', Some(b'=')) => (TokKind::Le, 2),
+            (b'>', Some(b'=')) => (TokKind::Ge, 2),
+            (b'&', Some(b'&')) => (TokKind::AndAnd, 2),
+            (b'|', Some(b'|')) => (TokKind::OrOr, 2),
             (b'=', _) => (TokKind::Eq, 1),
+            (b'<', _) => (TokKind::Lt, 1),
+            (b'>', _) => (TokKind::Gt, 1),
+            (b'!', _) => (TokKind::Bang, 1),
             (b'(', _) => (TokKind::LParen, 1),
             (b')', _) => (TokKind::RParen, 1),
             (b'{', _) => (TokKind::LBrace, 1),
@@ -301,8 +328,26 @@ mod tests {
     }
 
     #[test]
+    fn comparison_and_bool() {
+        let ks = kinds("if n <= 2 { true }\n");
+        assert_eq!(
+            ks,
+            vec![
+                TokKind::If,
+                TokKind::Ident("n".into()),
+                TokKind::Le,
+                TokKind::Int(2),
+                TokKind::LBrace,
+                TokKind::True,
+                TokKind::RBrace,
+                TokKind::End,
+                TokKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
     fn line_continuation_suppresses_end() {
-        // If a line starts with '.', it's a continuation. No End is inserted.
         let ks = kinds("a\n  .b\n");
         assert_eq!(
             ks,

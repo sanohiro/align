@@ -1,12 +1,15 @@
 //! Semantic analysis: name resolution + type inference/checking -> typed HIR
 //! (`docs/impl/03-types.md`).
 //!
-//! M0 scope: integer types only. Minimal local inference + bidirectional typing.
-//! Integer literals are treated as unconstrained inference variables and fixed to a
-//! concrete width by context (e.g. a return type). If still unconstrained at the
-//! end, default to `i64` (`03-types.md` §2). Move/arena/effect checking is M3+.
+//! M1 scope: integer types, `bool`, functions with parameters + calls, `if`,
+//! comparison/logical operators, and `mut` reassignment. Local inference +
+//! bidirectional typing. Integer literals are unconstrained inference variables fixed
+//! to a concrete width by context; if still unconstrained at the end, default to `i64`
+//! (`03-types.md` §2). Move/arena/effect checking is M3+.
 
-use align_ast as ast;
+use std::collections::HashMap;
+
+use align_ast::{self as ast, BinOp, UnOp};
 use align_diag::Diagnostics;
 use align_span::Span;
 
@@ -26,45 +29,74 @@ impl IntTy {
     }
 }
 
-/// sema-internal type representation (the M0 subset of `03-types.md` §1).
+/// sema-internal type representation (the M1 subset of `03-types.md` §1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
     Int(IntTy),
     /// Unresolved integer (inference variable). Eventually fixed to a concrete [`IntTy`].
     IntVar(u32),
+    Bool,
     Unit,
     Error,
 }
 
-/// Return the analyzed program. Errors are pushed to `diags`.
+impl Ty {
+    fn is_int_like(self) -> bool {
+        matches!(self, Ty::Int(_) | Ty::IntVar(_))
+    }
+}
+
+struct FnSig {
+    params: Vec<Ty>,
+    ret: Ty,
+}
+
+/// Analyze a file into a typed program. Errors are pushed to `diags`.
 pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
-    let mut cx = Checker {
-        diags,
-        int_vars: Vec::new(),
-    };
+    // Pass 1: collect function signatures so calls can resolve regardless of order.
+    let mut sigs: HashMap<String, FnSig> = HashMap::new();
+    for ast::Item::Fn(f) in &file.items {
+        let params = f
+            .params
+            .iter()
+            .map(|p| resolve_type(&p.ty, diags))
+            .collect();
+        let ret = match &f.ret {
+            Some(t) => resolve_type(t, diags),
+            None => Ty::Unit,
+        };
+        sigs.insert(f.name.name.clone(), FnSig { params, ret });
+    }
+
+    // Pass 2: check each function body.
     let fns = file
         .items
         .iter()
-        .map(|ast::Item::Fn(f)| cx.check_fn(f))
+        .map(|ast::Item::Fn(f)| {
+            let mut cx = Checker {
+                diags,
+                sigs: &sigs,
+                int_vars: Vec::new(),
+                locals: Vec::new(),
+                scope: Vec::new(),
+                ret_hint: Ty::Unit,
+            };
+            cx.check_fn(f)
+        })
         .collect();
     Program { fns }
 }
 
 struct Checker<'a> {
     diags: &'a mut Diagnostics,
-    /// Resolution state of integer inference variables. `None` = undetermined.
+    sigs: &'a HashMap<String, FnSig>,
     int_vars: Vec<Option<IntTy>>,
-}
-
-/// Scope of a function body. M0 uses a simple linear scope (shadowing comes later).
-struct Scope {
-    locals: Vec<LocalInfo>,
-}
-
-struct LocalInfo {
-    name: String,
-    id: LocalId,
-    ty: Ty,
+    /// All locals of the current function (slots), never shrinks.
+    locals: Vec<Local>,
+    /// Visibility stack: (name, id). Truncated on block exit.
+    scope: Vec<(String, LocalId)>,
+    /// Enclosing function's return type, so `return` checks against it.
+    ret_hint: Ty,
 }
 
 impl<'a> Checker<'a> {
@@ -74,7 +106,6 @@ impl<'a> Checker<'a> {
         Ty::IntVar(id)
     }
 
-    /// Resolve an inference variable to a concrete type as far as possible.
     fn resolve(&self, ty: Ty) -> Ty {
         match ty {
             Ty::IntVar(v) => match self.int_vars[v as usize] {
@@ -85,7 +116,6 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Fall back unresolved integer variables to the default `i64`.
     fn finalize(&self, ty: Ty) -> Ty {
         match self.resolve(ty) {
             Ty::IntVar(_) => Ty::Int(IntTy {
@@ -96,53 +126,90 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Unify `ty` with the concrete integer `target`. `Err` on conflict.
-    fn unify_int(&mut self, ty: Ty, target: IntTy) -> Result<(), Ty> {
-        match self.resolve(ty) {
-            Ty::IntVar(v) => {
-                self.int_vars[v as usize] = Some(target);
-                Ok(())
+    /// Unify two types, returning the resolved type. Pushes a diagnostic on mismatch.
+    fn unify(&mut self, a: Ty, b: Ty, span: Span) -> Ty {
+        let (a, b) = (self.resolve(a), self.resolve(b));
+        match (a, b) {
+            (Ty::Error, _) | (_, Ty::Error) => Ty::Error,
+            (Ty::IntVar(v), Ty::Int(it)) | (Ty::Int(it), Ty::IntVar(v)) => {
+                self.int_vars[v as usize] = Some(it);
+                Ty::Int(it)
             }
-            Ty::Int(it) if it == target => Ok(()),
-            Ty::Error => Ok(()),
-            other => Err(other),
+            (Ty::IntVar(_), Ty::IntVar(_)) => a, // both unconstrained; resolve later
+            _ if a == b => a,
+            _ => {
+                self.diags.error(
+                    format!("type mismatch: {} vs {}", ty_name(a), ty_name(b)),
+                    span,
+                );
+                Ty::Error
+            }
         }
     }
 
+    /// Constrain `ty` to an expected type if one is given.
+    fn constrain(&mut self, ty: Ty, expected: Option<Ty>, span: Span) {
+        if let Some(exp) = expected {
+            self.unify(ty, exp, span);
+        }
+    }
+
+    // --- locals / scopes ---
+
+    fn declare(&mut self, name: &str, ty: Ty, is_mut: bool) -> LocalId {
+        let id = self.locals.len() as LocalId;
+        self.locals.push(Local {
+            id,
+            name: name.to_string(),
+            ty,
+            is_mut,
+        });
+        self.scope.push((name.to_string(), id));
+        id
+    }
+
+    fn lookup(&self, name: &str) -> Option<LocalId> {
+        self.scope
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+    }
+
     fn check_fn(&mut self, f: &ast::FnDecl) -> Fn {
-        let ret = match &f.ret {
-            Some(t) => self.resolve_type(t),
-            None => Ty::Unit,
-        };
-        let mut scope = Scope { locals: Vec::new() };
-        let mut next_local: u32 = 0;
+        let sig = &self.sigs[&f.name.name];
+        let ret = sig.ret;
+        let param_tys = sig.params.clone();
+        self.ret_hint = ret;
+
+        let mut params = Vec::new();
+        for (p, ty) in f.params.iter().zip(param_tys) {
+            let id = self.declare(&p.name.name, ty, false);
+            params.push(id);
+        }
 
         let body = match &f.body {
-            ast::FnBody::Block(b) => self.check_block(b, ret, &mut scope, &mut next_local),
+            ast::FnBody::Block(b) => self.check_block(b, Some(ret)),
             ast::FnBody::Expr(e) => {
-                // `= expr` form: check the body expression against the return type and make it an implicit return.
-                let te = self.check_expr(e, Some(ret), &mut scope, &mut next_local);
-                vec![Stmt::Return(Some(te))]
+                let value = self.check_expr(e, Some(ret));
+                Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(value)),
+                }
             }
         };
 
-        // Finalize all HIR types (inference variables -> concrete or default).
+        // Finalize all inferred types to concrete (or default i64).
         let mut body = body;
-        for s in &mut body {
-            self.finalize_stmt(s);
+        self.finalize_block(&mut body);
+        let mut locals = std::mem::take(&mut self.locals);
+        for l in &mut locals {
+            l.ty = self.finalize(l.ty);
         }
-        let locals = scope
-            .locals
-            .iter()
-            .map(|l| Local {
-                id: l.id,
-                name: l.name.clone(),
-                ty: self.finalize(l.ty),
-            })
-            .collect();
 
         Fn {
             name: f.name.name.clone(),
+            params,
             ret: self.finalize(ret),
             locals,
             body,
@@ -150,202 +217,294 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_block(
-        &mut self,
-        b: &ast::Block,
-        ret: Ty,
-        scope: &mut Scope,
-        next_local: &mut u32,
-    ) -> Vec<Stmt> {
-        let mut out = Vec::new();
+    /// Check a block. `expected` is the expected type of its trailing value (if any).
+    fn check_block(&mut self, b: &ast::Block, expected: Option<Ty>) -> Block {
+        let scope_mark = self.scope.len();
+        let mut stmts = Vec::new();
+
         for s in &b.stmts {
             match s {
-                ast::Stmt::Let { name, ty, init, .. } => {
-                    let expected = ty.as_ref().map(|t| self.resolve_type(t));
-                    let te = self.check_expr(init, expected, scope, next_local);
-                    let local_ty = expected.unwrap_or(te.ty);
-                    let id = *next_local;
-                    *next_local += 1;
-                    scope.locals.push(LocalInfo {
-                        name: name.name.clone(),
-                        id,
-                        ty: local_ty,
-                    });
-                    out.push(Stmt::Let {
-                        local: id,
-                        ty: local_ty,
-                        init: te,
-                    });
+                ast::Stmt::Let { is_mut, name, ty, init } => {
+                    let ann = ty.as_ref().map(|t| resolve_type(t, self.diags));
+                    let init = self.check_expr(init, ann);
+                    let local_ty = ann.unwrap_or(init.ty);
+                    let local = self.declare(&name.name, local_ty, *is_mut);
+                    stmts.push(Stmt::Let { local, init });
                 }
                 ast::Stmt::Return(value) => {
-                    let te = value
-                        .as_ref()
-                        .map(|e| self.check_expr(e, Some(ret), scope, next_local));
-                    out.push(Stmt::Return(te));
+                    // The enclosing function's return type is the expected one. We
+                    // thread it via `expected` of the body block (M1: one level).
+                    let v = value.as_ref().map(|e| self.check_expr(e, Some(self.ret_hint)));
+                    stmts.push(Stmt::Return(v));
                 }
                 ast::Stmt::Expr(e) => {
-                    let te = self.check_expr(e, None, scope, next_local);
-                    out.push(Stmt::Expr(te));
+                    let te = self.check_expr(e, None);
+                    stmts.push(Stmt::Expr(te));
                 }
                 ast::Stmt::Assign { place, value } => {
-                    // Unused in M0, but run a minimal check anyway.
-                    let pe = self.check_expr(place, None, scope, next_local);
-                    let ve = self.check_expr(value, Some(pe.ty), scope, next_local);
-                    out.push(Stmt::Expr(ve));
+                    let (local, target_ty) = self.check_place(place);
+                    let v = self.check_expr(value, Some(target_ty));
+                    match local {
+                        Some(id) => stmts.push(Stmt::Assign { local: id, value: v }),
+                        None => stmts.push(Stmt::Expr(v)),
+                    }
                 }
             }
         }
-        if let Some(tail) = &b.tail {
-            // Block trailing expression = block value. In M0, treat it as the return value at function end.
-            let te = self.check_expr(tail, Some(ret), scope, next_local);
-            out.push(Stmt::Return(Some(te)));
-        }
-        out
+
+        let value = b
+            .tail
+            .as_ref()
+            .map(|e| Box::new(self.check_expr(e, expected)));
+        self.scope.truncate(scope_mark);
+        Block { stmts, value }
     }
 
-    fn check_expr(
-        &mut self,
-        e: &ast::Expr,
-        expected: Option<Ty>,
-        scope: &mut Scope,
-        next_local: &mut u32,
-    ) -> Expr {
+    /// Resolve an assignable place. M1 only supports a `mut` local name.
+    fn check_place(&mut self, place: &ast::Expr) -> (Option<LocalId>, Ty) {
+        if let ast::ExprKind::Path(p) = &place.kind {
+            if let Some(name) = single_name(p) {
+                if let Some(id) = self.lookup(name) {
+                    let local = &self.locals[id as usize];
+                    if !local.is_mut {
+                        self.diags.error(
+                            format!("cannot assign to immutable '{name}' (declare with `mut`)"),
+                            place.span,
+                        );
+                    }
+                    return (Some(id), local.ty);
+                }
+                self.diags
+                    .error(format!("undefined name: '{name}'"), place.span);
+                return (None, Ty::Error);
+            }
+        }
+        self.diags
+            .error("invalid assignment target", place.span);
+        (None, Ty::Error)
+    }
+
+    fn check_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
         match &e.kind {
             ast::ExprKind::Int(v) => {
                 let ty = self.fresh_int_var();
-                if let Some(exp) = expected {
-                    self.expect_int(ty, exp, e.span);
-                }
-                Expr {
-                    kind: ExprKind::Int(*v),
-                    ty,
-                    span: e.span,
-                }
+                self.constrain(ty, expected, e.span);
+                Expr { kind: ExprKind::Int(*v), ty, span: e.span }
             }
-            ast::ExprKind::Path(p) => {
-                let name = p
-                    .segments
-                    .last()
-                    .map(|s| s.name.as_str())
-                    .unwrap_or("");
-                match scope.locals.iter().rev().find(|l| l.name == name) {
-                    Some(l) => {
-                        let ty = l.ty;
-                        if let Some(exp) = expected {
-                            self.expect_int(ty, exp, e.span);
+            ast::ExprKind::Bool(b) => {
+                self.constrain(Ty::Bool, expected, e.span);
+                Expr { kind: ExprKind::Bool(*b), ty: Ty::Bool, span: e.span }
+            }
+            ast::ExprKind::Path(p) => self.check_path(p, expected, e.span),
+            ast::ExprKind::Unary { op, expr } => {
+                let inner = self.check_expr(expr, expected);
+                let ty = match op {
+                    UnOp::Neg => {
+                        if !inner.ty.is_int_like() && inner.ty != Ty::Error {
+                            self.diags.error("unary '-' expects an integer", e.span);
                         }
-                        Expr {
-                            kind: ExprKind::Local(l.id),
-                            ty,
-                            span: e.span,
-                        }
+                        inner.ty
                     }
-                    None => {
-                        self.diags
-                            .error(format!("undefined name: '{name}'"), e.span);
-                        Expr {
-                            kind: ExprKind::Int(0),
-                            ty: Ty::Error,
-                            span: e.span,
-                        }
+                    UnOp::Not => {
+                        self.unify(inner.ty, Ty::Bool, e.span);
+                        Ty::Bool
                     }
-                }
+                };
+                Expr { kind: ExprKind::Unary { op: *op, expr: Box::new(inner) }, ty, span: e.span }
             }
-            ast::ExprKind::Binary { op, lhs, rhs } => {
-                let l = self.check_expr(lhs, expected, scope, next_local);
-                let r = self.check_expr(rhs, Some(l.ty), scope, next_local);
-                let ty = l.ty;
-                Expr {
-                    kind: ExprKind::Binary {
-                        op: *op,
-                        lhs: Box::new(l),
-                        rhs: Box::new(r),
-                    },
-                    ty,
-                    span: e.span,
-                }
-            }
+            ast::ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expected, e.span),
+            ast::ExprKind::Call { callee, args } => self.check_call(callee, args, e.span),
+            ast::ExprKind::If { cond, then, els } => self.check_if(cond, then, els.as_deref(), expected, e.span),
             ast::ExprKind::Block(b) => {
-                // Rare in M0. Minimal impl: check the contents and treat as Unit.
-                let _ = self.check_block(b, Ty::Unit, scope, next_local);
-                Expr {
-                    kind: ExprKind::Int(0),
-                    ty: Ty::Unit,
-                    span: e.span,
+                let block = self.check_block(b, expected);
+                let ty = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
+                // A bare block expression isn't lowered separately in M1; inline as an if-less value.
+                // Represent as an `if true { block } else {}` would over-complicate; instead keep the
+                // block's value expression directly when present.
+                match block.value {
+                    Some(v) => *v,
+                    None => Expr { kind: ExprKind::Bool(false), ty: Ty::Unit, span: e.span },
                 }
+                .with_ty(ty)
             }
         }
     }
 
-    /// Match `ty` against the expected type `exp`. Unify only integer-vs-integer; otherwise type mismatch.
-    fn expect_int(&mut self, ty: Ty, exp: Ty, span: Span) {
-        match self.resolve(exp) {
-            Ty::Int(it) => {
-                if self.unify_int(ty, it).is_err() {
-                    let got = self.resolve(ty);
-                    self.diags.error(
-                        format!("type mismatch: expected {} but found {}", it.name(), ty_name(got)),
-                        span,
-                    );
-                }
+    fn check_path(&mut self, p: &ast::Path, expected: Option<Ty>, span: Span) -> Expr {
+        match single_name(p).and_then(|n| self.lookup(n)) {
+            Some(id) => {
+                let ty = self.locals[id as usize].ty;
+                self.constrain(ty, expected, span);
+                Expr { kind: ExprKind::Local(id), ty, span }
             }
-            Ty::IntVar(_) => {
-                // Expected side is also undetermined. In M0 there's no need to unify one to the other.
-            }
-            Ty::Unit => {
-                self.diags
-                    .error("type mismatch: expected () but found an integer", span);
-            }
-            Ty::Error => {}
-        }
-    }
-
-    fn resolve_type(&mut self, t: &ast::Type) -> Ty {
-        let name = t
-            .path
-            .segments
-            .last()
-            .map(|s| s.name.as_str())
-            .unwrap_or("");
-        match parse_int_name(name) {
-            Some(it) => Ty::Int(it),
-            None if name == "()" => Ty::Unit,
             None => {
-                self.diags
-                    .error(format!("type not supported in M0: '{name}'"), t.span);
-                Ty::Error
+                let name = single_name(p).unwrap_or("");
+                self.diags.error(format!("undefined name: '{name}'"), span);
+                Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span }
             }
         }
     }
 
-    // --- finalize: make HIR types concrete ---
-
-    fn finalize_stmt(&self, s: &mut Stmt) {
-        match s {
-            Stmt::Let { ty, init, .. } => {
-                *ty = self.finalize(*ty);
-                self.finalize_expr(init);
+    fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
+        let ty;
+        let (l, r);
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                l = self.check_expr(lhs, expected);
+                r = self.check_expr(rhs, Some(l.ty));
+                let t = self.unify(l.ty, r.ty, span);
+                if !t.is_int_like() && t != Ty::Error {
+                    self.diags.error("arithmetic expects integers", span);
+                }
+                ty = t;
             }
-            Stmt::Return(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
-            Stmt::Return(None) => {}
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                l = self.check_expr(lhs, None);
+                r = self.check_expr(rhs, Some(l.ty));
+                self.unify(l.ty, r.ty, span);
+                ty = Ty::Bool;
+            }
+            BinOp::And | BinOp::Or => {
+                l = self.check_expr(lhs, Some(Ty::Bool));
+                r = self.check_expr(rhs, Some(Ty::Bool));
+                ty = Ty::Bool;
+            }
+        }
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::Binary { op, lhs: Box::new(l), rhs: Box::new(r) }, ty, span }
+    }
+
+    fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let name = match &callee.kind {
+            ast::ExprKind::Path(p) => single_name(p).map(|s| s.to_string()),
+            _ => None,
+        };
+        let Some(name) = name else {
+            self.diags.error("only direct function calls are supported", span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        };
+        let Some(sig) = self.sigs.get(&name) else {
+            self.diags.error(format!("undefined function: '{name}'"), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        };
+        let (param_tys, ret) = (sig.params.clone(), sig.ret);
+        if args.len() != param_tys.len() {
+            self.diags.error(
+                format!("'{name}' expects {} argument(s), got {}", param_tys.len(), args.len()),
+                span,
+            );
+        }
+        let checked = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| self.check_expr(a, param_tys.get(i).copied()))
+            .collect();
+        Expr { kind: ExprKind::Call { func: name, args: checked }, ty: ret, span }
+    }
+
+    fn check_if(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Expr>, expected: Option<Ty>, span: Span) -> Expr {
+        let c = self.check_expr(cond, Some(Ty::Bool));
+        let then_b = self.check_block(then, expected);
+        let els_b = match els {
+            Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block(b, expected),
+            Some(e) => {
+                // `else if` chain: check as an expression and wrap as a block value.
+                let v = self.check_expr(e, expected);
+                Block { stmts: Vec::new(), value: Some(Box::new(v)) }
+            }
+            None => Block { stmts: Vec::new(), value: None },
+        };
+
+        // If both branches produce a value, the if has that (unified) type; else Unit.
+        let ty = match (&then_b.value, &els_b.value) {
+            (Some(t), Some(e)) => self.unify(t.ty, e.ty, span),
+            _ => Ty::Unit,
+        };
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::If { cond: Box::new(c), then: then_b, els: els_b }, ty, span }
+    }
+
+    // --- finalize ---
+
+    fn finalize_block(&self, b: &mut Block) {
+        for s in &mut b.stmts {
+            match s {
+                Stmt::Let { init, .. } => self.finalize_expr(init),
+                Stmt::Assign { value, .. } => self.finalize_expr(value),
+                Stmt::Return(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
+                Stmt::Return(None) => {}
+            }
+        }
+        if let Some(v) = &mut b.value {
+            self.finalize_expr(v);
         }
     }
 
     fn finalize_expr(&self, e: &mut Expr) {
         e.ty = self.finalize(e.ty);
-        if let ExprKind::Binary { lhs, rhs, .. } = &mut e.kind {
-            self.finalize_expr(lhs);
-            self.finalize_expr(rhs);
+        match &mut e.kind {
+            ExprKind::Unary { expr, .. } => self.finalize_expr(expr),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.finalize_expr(lhs);
+                self.finalize_expr(rhs);
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.finalize_expr(a);
+                }
+            }
+            ExprKind::If { cond, then, els } => {
+                self.finalize_expr(cond);
+                self.finalize_block(then);
+                self.finalize_block(els);
+            }
+            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Local(_) => {}
         }
+    }
+}
+
+impl Expr {
+    fn with_ty(mut self, ty: Ty) -> Expr {
+        self.ty = ty;
+        self
+    }
+}
+
+fn single_name(p: &ast::Path) -> Option<&str> {
+    if p.segments.len() == 1 {
+        Some(p.segments[0].name.as_str())
+    } else {
+        None
     }
 }
 
 fn ty_name(ty: Ty) -> String {
     match ty {
         Ty::Int(it) => it.name(),
-        Ty::IntVar(_) => "integer (undetermined)".to_string(),
+        Ty::IntVar(_) => "int(undetermined)".to_string(),
+        Ty::Bool => "bool".to_string(),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
+    }
+}
+
+fn resolve_type(t: &ast::Type, diags: &mut Diagnostics) -> Ty {
+    let name = t
+        .path
+        .segments
+        .last()
+        .map(|s| s.name.as_str())
+        .unwrap_or("");
+    match name {
+        "bool" => Ty::Bool,
+        "()" => Ty::Unit,
+        _ => match parse_int_name(name) {
+            Some(it) => Ty::Int(it),
+            None => {
+                diags.error(format!("unsupported type in M1: '{name}'"), t.span);
+                Ty::Error
+            }
+        },
     }
 }
 
@@ -374,25 +533,21 @@ mod tests {
     }
 
     #[test]
-    fn int_literal_infers_return_type() {
-        // x := 1 is unconstrained -> return x requires i32 -> x: i32 is fixed.
-        let (p, d) = check("fn main() -> i32 {\n  x := 1\n  return x\n}\n");
-        assert!(!d.has_errors(), "unexpected error");
-        let f = &p.fns[0];
-        assert_eq!(f.ret, Ty::Int(IntTy { bits: 32, signed: true }));
-        assert_eq!(f.locals[0].ty, Ty::Int(IntTy { bits: 32, signed: true }));
+    fn fib_checks() {
+        let src = "fn fib(n: i64) -> i64 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\n";
+        let (_p, d) = check(src);
+        assert!(!d.has_errors(), "fib should type-check");
     }
 
     #[test]
-    fn unconstrained_int_defaults_to_i64() {
-        let (p, d) = check("fn f() -> i64 {\n  y := 5\n  return y\n}\n");
-        assert!(!d.has_errors());
-        assert_eq!(p.fns[0].locals[0].ty, Ty::Int(IntTy { bits: 64, signed: true }));
+    fn bool_condition_required() {
+        let (_p, d) = check("fn f(n: i32) -> i32 {\n  if n { return 1 }\n  return 0\n}\n");
+        assert!(d.has_errors(), "if condition must be bool");
     }
 
     #[test]
-    fn undefined_name_errors() {
-        let (_p, d) = check("fn f() -> i32 {\n  return z\n}\n");
+    fn assign_to_immutable_errors() {
+        let (_p, d) = check("fn f() -> i32 {\n  x := 1\n  x = 2\n  return x\n}\n");
         assert!(d.has_errors());
     }
 }

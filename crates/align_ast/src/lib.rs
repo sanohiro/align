@@ -1,9 +1,9 @@
 //! AST definitions (`docs/impl/02-frontend.md` §9).
 //!
-//! No desugaring: keeps the written form, used by formatter / lint / sema. Every
-//! node carries a [`Span`]. M0 represents only the minimal language subset
-//! (`fn` / `:=` / `return` / integers / arithmetic). Later milestones extend the
-//! variants.
+//! No desugaring: the written form is preserved for the formatter / lint / sema.
+//! Every node carries a [`Span`]. M1 covers `fn` (multi-arg) + calls, `if`/`else`
+//! as expression and statement, comparison/logical operators, `bool`, `mut` +
+//! reassignment, and integer arithmetic. Structs, floats, chars come in later steps.
 
 use align_span::Span;
 
@@ -13,7 +13,7 @@ pub struct Ident {
     pub span: Span,
 }
 
-/// Dot-separated path like `a.b.c` (module / reference).
+/// A dotted path like `a.b.c` (module / reference).
 #[derive(Clone, Debug)]
 pub struct Path {
     pub segments: Vec<Ident>,
@@ -55,14 +55,14 @@ pub struct Param {
     pub ty: Type,
 }
 
-/// Function body: a block, or single-expression `= expr` form (`02-frontend.md` §3).
+/// Function body: a block, or a single-expression `= expr` form (`02-frontend.md` §3).
 #[derive(Clone, Debug)]
 pub enum FnBody {
     Block(Block),
     Expr(Box<Expr>),
 }
 
-/// Type annotation. M0 supports only simple paths like `i32`.
+/// Type annotation. M1 supports simple paths only (`i32`, `bool`, ...).
 #[derive(Clone, Debug)]
 pub struct Type {
     pub path: Path,
@@ -72,7 +72,7 @@ pub struct Type {
 #[derive(Clone, Debug)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
-    /// A trailing expression (without `;`/newline END) becomes the block's value (`02-frontend.md` §5).
+    /// A trailing expression (with no `;`/newline END) becomes the block value (`02-frontend.md` §5).
     pub tail: Option<Box<Expr>>,
     pub span: Span,
 }
@@ -100,6 +100,20 @@ pub enum BinOp {
     Mul,
     Div,
     Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Neg,
+    Not,
 }
 
 #[derive(Clone, Debug)]
@@ -110,13 +124,29 @@ pub struct Expr {
 
 #[derive(Clone, Debug)]
 pub enum ExprKind {
-    /// Integer literal. Its type is decided by context (`03-types.md` §2).
+    /// Integer literal. Its type is fixed by context (`03-types.md` §2).
     Int(i128),
+    Bool(bool),
     Path(Path),
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+    },
     Binary {
         op: BinOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+    },
+    Call {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    /// `if cond { .. } else { .. }`. `els` is the optional else branch (a block, or
+    /// another `if` for `else if`).
+    If {
+        cond: Box<Expr>,
+        then: Block,
+        els: Option<Box<Expr>>,
     },
     Block(Block),
 }

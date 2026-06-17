@@ -1,9 +1,8 @@
 //! Textual output of MIR (`alignc emit-mir`, `docs/impl/04-mir.md` §8).
-//! Used to compare before/after fusion and to check "whether optimizations took
-//! effect" (ensuring predictability).
+//! Used to inspect the CFG and confirm lowering / optimizations (predictability).
 
-use crate::{ty_name, Block, Function, Operand, Program, Rvalue, Stmt, Term};
-use align_ast::BinOp;
+use crate::{ty_name, Block, Const, Function, Operand, Program, Rvalue, Stmt, Term};
+use align_ast::{BinOp, UnOp};
 use std::fmt::Write;
 
 pub fn program_to_string(p: &Program) -> String {
@@ -16,7 +15,12 @@ pub fn program_to_string(p: &Program) -> String {
 }
 
 fn fn_to_string(out: &mut String, f: &Function) {
-    let _ = writeln!(out, "fn {}() -> {} {{", f.name, ty_name(f.ret));
+    let params: Vec<String> = f
+        .params
+        .iter()
+        .map(|s| format!("_{s}: {}", ty_name(f.slots[*s as usize])))
+        .collect();
+    let _ = writeln!(out, "fn {}({}) -> {} {{", f.name, params.join(", "), ty_name(f.ret));
     for b in &f.blocks {
         block_to_string(out, b);
     }
@@ -30,14 +34,26 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::Let(v, rv) => {
                 let _ = writeln!(out, "    %{v} = {}", rvalue_str(rv));
             }
+            Stmt::Store(slot, op) => {
+                let _ = writeln!(out, "    _{slot} <- {}", operand_str(op));
+            }
         }
     }
     match &b.term {
+        Term::Goto(t) => {
+            let _ = writeln!(out, "    goto bb{t}");
+        }
+        Term::Branch(c, t, e) => {
+            let _ = writeln!(out, "    branch {} ? bb{t} : bb{e}", operand_str(c));
+        }
         Term::Return(Some(op)) => {
             let _ = writeln!(out, "    return {}", operand_str(op));
         }
         Term::Return(None) => {
             let _ = writeln!(out, "    return");
+        }
+        Term::Unreachable => {
+            let _ = writeln!(out, "    unreachable");
         }
     }
 }
@@ -45,16 +61,31 @@ fn block_to_string(out: &mut String, b: &Block) {
 fn rvalue_str(rv: &Rvalue) -> String {
     match rv {
         Rvalue::Use(op) => operand_str(op),
+        Rvalue::Load(slot) => format!("load _{slot}"),
+        Rvalue::Un(op, a) => format!("{}{}", unop_str(*op), operand_str(a)),
         Rvalue::Bin(op, a, b) => {
             format!("{} {} {}", operand_str(a), binop_str(*op), operand_str(b))
+        }
+        Rvalue::Call(name, args) => {
+            let a: Vec<String> = args.iter().map(operand_str).collect();
+            format!("call {name}({})", a.join(", "))
         }
     }
 }
 
 fn operand_str(op: &Operand) -> String {
     match op {
-        Operand::Const(v, ty) => format!("{v}_{}", ty_name(*ty)),
+        Operand::Const(Const::Int(v, ty)) => format!("{v}_{}", ty_name(*ty)),
+        Operand::Const(Const::Bool(v)) => v.to_string(),
         Operand::Value(v) => format!("%{v}"),
+        Operand::Arg(i) => format!("arg{i}"),
+    }
+}
+
+fn unop_str(op: UnOp) -> &'static str {
+    match op {
+        UnOp::Neg => "-",
+        UnOp::Not => "!",
     }
 }
 
@@ -65,5 +96,13 @@ fn binop_str(op: BinOp) -> &'static str {
         BinOp::Mul => "*",
         BinOp::Div => "/",
         BinOp::Rem => "%",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::And => "&&",
+        BinOp::Or => "||",
     }
 }
