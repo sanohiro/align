@@ -1,12 +1,12 @@
-# Align の歴史
+# History of Align
 
-## 最初の発想
+## The first idea
 
-プロジェクトは単純な観察から始まった。
+The project began with a simple observation.
 
-> 同じことが何通りもの書き方を持つべきではない。
+> The same thing should not have many ways to be written.
 
-これが次へとつながった。
+This led to the following.
 
 ```text
 one error model
@@ -16,9 +16,9 @@ one optional model
 
 ---
 
-## 性能の議論
+## The performance discussion
 
-焦点は次へ移っていった。
+The focus shifted to the following.
 
 ```text
 cache locality
@@ -26,19 +26,19 @@ allocation cost
 memory layout
 ```
 
-生の命令性能よりも、こちらへ。
+over raw instruction performance.
 
-観察:
+Observation:
 
-キャッシュはしばしば SIMD より重要である。
+The cache is often more important than SIMD.
 
 ---
 
-## データ指向への方向
+## The turn toward data orientation
 
-議論は OOP から離れていった。
+The discussion moved away from OOP.
 
-向かった先:
+Where it headed:
 
 ```text
 array processing
@@ -49,19 +49,19 @@ chunk processing
 
 ---
 
-## AI 時代の議論
+## The AI-era discussion
 
-大きな気づき:
+The big realization:
 
-プログラミングは今やこうである。
+Programming is now this.
 
 ```text
 Human -> AI -> Compiler
 ```
 
-これが優先順位を変えた。
+This changed the priorities.
 
-言語が最適化すべきは次である。
+What the language should optimize for:
 
 ```text
 convergence
@@ -69,17 +69,17 @@ predictability
 consistency
 ```
 
-最大の自由ではなく、こちらを。
+over maximal freedom.
 
 ---
 
-## エラー処理
+## Error handling
 
-例外ベースの方式は却下された。
+The exception-based approach was rejected.
 
-Go 風の明示的エラー処理は冗長すぎると判断された。
+Go-style explicit error handling was judged too verbose.
 
-選んだ方向:
+The direction chosen:
 
 ```text
 Result<T,E>
@@ -88,13 +88,13 @@ Result<T,E>
 
 ---
 
-## メモリモデル
+## Memory model
 
-GC ファーストの方式は却下された。
+The GC-first approach was rejected.
 
-Rust 風の可視ライフタイムは重すぎると判断された。
+Rust-style visible lifetimes were judged too heavy.
 
-選んだ方向:
+The direction chosen:
 
 ```text
 value types
@@ -105,15 +105,15 @@ unsafe isolation
 
 ---
 
-## SIMD の方向
+## The SIMD direction
 
-目標:
+The goal:
 
-SIMD を書かせることではない。
+Not to make developers write SIMD.
 
-自然と SIMD になるコードを書かせること。
+But to make them write code that naturally becomes SIMD.
 
-これが次を導いた。
+This led to the following.
 
 ```text
 map
@@ -123,15 +123,15 @@ mask
 vec
 ```
 
-これらがコア概念になった。
+These became core concepts.
 
 ---
 
-## 文字列と JSON の方向
+## The string and JSON direction
 
-繰り返しの scan が主要なコストとして特定された。
+Repeated scanning was identified as a major cost.
 
-選んだ方向:
+The direction chosen:
 
 ```text
 scan once
@@ -143,21 +143,21 @@ field tables
 
 ---
 
-## コンパイラ親和の方向
+## The compiler-friendly direction
 
-制限は意図的に加えられた。
+Restrictions were added intentionally.
 
-目標:
+The goal:
 
-コンパイラの推論を可能にすること。
+To enable compiler inference.
 
-プログラマの注釈を要求するのではなく。
+Rather than requiring programmer annotations.
 
 ---
 
-## ライブラリ構成
+## Library structure
 
-最終的な方向:
+The final direction:
 
 ```text
 core
@@ -165,19 +165,19 @@ std
 pkg
 ```
 
-core はデータ処理のプリミティブを含む。
+core contains data-processing primitives.
 
-std は OS 統合を含む。
+std contains OS integration.
 
-pkg はフレームワークとエコシステムを含む。
+pkg contains frameworks and the ecosystem.
 
 ---
 
-## 命名
+## Naming
 
-いくつかの名前が検討された。
+Several names were considered.
 
-例:
+For example:
 
 ```text
 Opt
@@ -187,13 +187,13 @@ Fuse
 Grain
 ```
 
-最終的な本命:
+The final front-runner:
 
 ```text
 Align
 ```
 
-理由は、次の一致(alignment)を表すから。
+The reason is that it expresses the alignment of the following.
 
 ```text
 Human
@@ -202,7 +202,7 @@ Compiler
 Hardware
 ```
 
-同時に次も指している。
+while also pointing to the following.
 
 ```text
 memory alignment

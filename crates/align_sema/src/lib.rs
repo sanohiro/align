@@ -1,8 +1,10 @@
-//! 意味解析: 名前解決 + 型推論/検査 → typed HIR (`docs/impl/03-types.md`)。
+//! Semantic analysis: name resolution + type inference/checking -> typed HIR
+//! (`docs/impl/03-types.md`).
 //!
-//! M0 範囲: 整数型のみ。局所推論 + 双方向型付けの最小版。整数リテラルは未制約の
-//! 推論変数として扱い、文脈 (return の戻り型など) で具象幅に確定する。最後まで
-//! 未制約なら既定 `i64` (`03-types.md` §2)。move 検査・arena 検査・効果検査は M3 以降。
+//! M0 scope: integer types only. Minimal local inference + bidirectional typing.
+//! Integer literals are treated as unconstrained inference variables and fixed to a
+//! concrete width by context (e.g. a return type). If still unconstrained at the
+//! end, default to `i64` (`03-types.md` §2). Move/arena/effect checking is M3+.
 
 use align_ast as ast;
 use align_diag::Diagnostics;
@@ -11,7 +13,7 @@ use align_span::Span;
 pub mod hir;
 pub use hir::*;
 
-/// 整数の幅と符号。`i32` = `IntTy { bits: 32, signed: true }`。
+/// Integer width and sign. `i32` = `IntTy { bits: 32, signed: true }`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntTy {
     pub bits: u8,
@@ -24,17 +26,17 @@ impl IntTy {
     }
 }
 
-/// sema 内部の型表現 (`03-types.md` §1 の M0 部分集合)。
+/// sema-internal type representation (the M0 subset of `03-types.md` §1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
     Int(IntTy),
-    /// 未解決の整数 (推論変数)。最終的に具象 [`IntTy`] へ確定する。
+    /// Unresolved integer (inference variable). Eventually fixed to a concrete [`IntTy`].
     IntVar(u32),
     Unit,
     Error,
 }
 
-/// 解析済みプログラムを返す。エラーは `diags` に積む。
+/// Return the analyzed program. Errors are pushed to `diags`.
 pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut cx = Checker {
         diags,
@@ -50,11 +52,11 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
 
 struct Checker<'a> {
     diags: &'a mut Diagnostics,
-    /// 整数推論変数の解決状態。`None` = 未確定。
+    /// Resolution state of integer inference variables. `None` = undetermined.
     int_vars: Vec<Option<IntTy>>,
 }
 
-/// 関数本体のスコープ。M0 は単純な線形スコープ (シャドーイングは後続)。
+/// Scope of a function body. M0 uses a simple linear scope (shadowing comes later).
 struct Scope {
     locals: Vec<LocalInfo>,
 }
@@ -72,7 +74,7 @@ impl<'a> Checker<'a> {
         Ty::IntVar(id)
     }
 
-    /// 推論変数を可能な限り具象型へ解決する。
+    /// Resolve an inference variable to a concrete type as far as possible.
     fn resolve(&self, ty: Ty) -> Ty {
         match ty {
             Ty::IntVar(v) => match self.int_vars[v as usize] {
@@ -83,7 +85,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// 最終的に未解決の整数変数は既定 `i64` に落とす。
+    /// Fall back unresolved integer variables to the default `i64`.
     fn finalize(&self, ty: Ty) -> Ty {
         match self.resolve(ty) {
             Ty::IntVar(_) => Ty::Int(IntTy {
@@ -94,7 +96,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// `ty` を具象整数 `target` に一致させる。矛盾があれば `Err`。
+    /// Unify `ty` with the concrete integer `target`. `Err` on conflict.
     fn unify_int(&mut self, ty: Ty, target: IntTy) -> Result<(), Ty> {
         match self.resolve(ty) {
             Ty::IntVar(v) => {
@@ -118,13 +120,13 @@ impl<'a> Checker<'a> {
         let body = match &f.body {
             ast::FnBody::Block(b) => self.check_block(b, ret, &mut scope, &mut next_local),
             ast::FnBody::Expr(e) => {
-                // `= expr` 形: 本体式を戻り型で check し、暗黙 return とする。
+                // `= expr` form: check the body expression against the return type and make it an implicit return.
                 let te = self.check_expr(e, Some(ret), &mut scope, &mut next_local);
                 vec![Stmt::Return(Some(te))]
             }
         };
 
-        // 全 HIR の型を確定 (推論変数 → 具象 or 既定)。
+        // Finalize all HIR types (inference variables -> concrete or default).
         let mut body = body;
         for s in &mut body {
             self.finalize_stmt(s);
@@ -186,7 +188,7 @@ impl<'a> Checker<'a> {
                     out.push(Stmt::Expr(te));
                 }
                 ast::Stmt::Assign { place, value } => {
-                    // M0 では未使用だが、最低限の検査を通す。
+                    // Unused in M0, but run a minimal check anyway.
                     let pe = self.check_expr(place, None, scope, next_local);
                     let ve = self.check_expr(value, Some(pe.ty), scope, next_local);
                     out.push(Stmt::Expr(ve));
@@ -194,7 +196,7 @@ impl<'a> Checker<'a> {
             }
         }
         if let Some(tail) = &b.tail {
-            // ブロック末尾式 = ブロック値。M0 では関数末尾なら戻り値扱い。
+            // Block trailing expression = block value. In M0, treat it as the return value at function end.
             let te = self.check_expr(tail, Some(ret), scope, next_local);
             out.push(Stmt::Return(Some(te)));
         }
@@ -240,7 +242,7 @@ impl<'a> Checker<'a> {
                     }
                     None => {
                         self.diags
-                            .error(format!("未定義の名前: '{name}'"), e.span);
+                            .error(format!("undefined name: '{name}'"), e.span);
                         Expr {
                             kind: ExprKind::Int(0),
                             ty: Ty::Error,
@@ -264,7 +266,7 @@ impl<'a> Checker<'a> {
                 }
             }
             ast::ExprKind::Block(b) => {
-                // M0 では稀。中身を検査し、Unit とみなす最小実装。
+                // Rare in M0. Minimal impl: check the contents and treat as Unit.
                 let _ = self.check_block(b, Ty::Unit, scope, next_local);
                 Expr {
                     kind: ExprKind::Int(0),
@@ -275,24 +277,24 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// `ty` を期待型 `exp` に一致させる。整数同士のみ unify、他は型不一致。
+    /// Match `ty` against the expected type `exp`. Unify only integer-vs-integer; otherwise type mismatch.
     fn expect_int(&mut self, ty: Ty, exp: Ty, span: Span) {
         match self.resolve(exp) {
             Ty::Int(it) => {
                 if self.unify_int(ty, it).is_err() {
                     let got = self.resolve(ty);
                     self.diags.error(
-                        format!("型不一致: {} が必要ですが {} です", it.name(), ty_name(got)),
+                        format!("type mismatch: expected {} but found {}", it.name(), ty_name(got)),
                         span,
                     );
                 }
             }
             Ty::IntVar(_) => {
-                // 期待側も未確定。M0 では一方を他方に合わせる必要はない。
+                // Expected side is also undetermined. In M0 there's no need to unify one to the other.
             }
             Ty::Unit => {
                 self.diags
-                    .error("型不一致: () が必要ですが整数です", span);
+                    .error("type mismatch: expected () but found an integer", span);
             }
             Ty::Error => {}
         }
@@ -310,13 +312,13 @@ impl<'a> Checker<'a> {
             None if name == "()" => Ty::Unit,
             None => {
                 self.diags
-                    .error(format!("M0 では未対応の型: '{name}'"), t.span);
+                    .error(format!("type not supported in M0: '{name}'"), t.span);
                 Ty::Error
             }
         }
     }
 
-    // --- finalize: HIR 内の型を具象化 ---
+    // --- finalize: make HIR types concrete ---
 
     fn finalize_stmt(&self, s: &mut Stmt) {
         match s {
@@ -341,7 +343,7 @@ impl<'a> Checker<'a> {
 fn ty_name(ty: Ty) -> String {
     match ty {
         Ty::Int(it) => it.name(),
-        Ty::IntVar(_) => "整数(未確定)".to_string(),
+        Ty::IntVar(_) => "integer (undetermined)".to_string(),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }
@@ -373,9 +375,9 @@ mod tests {
 
     #[test]
     fn int_literal_infers_return_type() {
-        // x := 1 は未制約 → return x が i32 を要求 → x: i32 に確定。
+        // x := 1 is unconstrained -> return x requires i32 -> x: i32 is fixed.
         let (p, d) = check("fn main() -> i32 {\n  x := 1\n  return x\n}\n");
-        assert!(!d.has_errors(), "想定外のエラー");
+        assert!(!d.has_errors(), "unexpected error");
         let f = &p.fns[0];
         assert_eq!(f.ret, Ty::Int(IntTy { bits: 32, signed: true }));
         assert_eq!(f.locals[0].ty, Ty::Int(IntTy { bits: 32, signed: true }));

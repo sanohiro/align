@@ -1,16 +1,17 @@
-//! MIR: バックエンド非依存の中間表現 (`docs/impl/04-mir.md`)。
+//! MIR: backend-agnostic intermediate representation (`docs/impl/04-mir.md`).
 //!
-//! Align の意味論 (脱糖・fusion・SIMD化・arena) はここで確定し、`MIR → LLVM` は
-//! 純粋 lowering に限定する。allocation / error path / 並列単位は明示ノードとして
-//! 残す (「隠さない」)。M0 では関数を CFG (基本ブロック列) に落とし、`Let`/`Return`
-//! と四則演算 `Bin` のみを扱う。fusion/SIMD/arena は対象機能の導入時に追加する。
+//! Align's semantics (desugaring, fusion, SIMD-ization, arena) are settled here, and
+//! `MIR -> LLVM` is restricted to pure lowering. Allocation / error paths / parallel
+//! units remain explicit nodes ("nothing hidden"). In M0, functions lower to a CFG
+//! (sequence of basic blocks), handling only `Let`/`Return` and the arithmetic `Bin`.
+//! fusion/SIMD/arena are added when their features land.
 
 use align_ast::BinOp;
 use align_sema::{hir, IntTy, Ty};
 
 pub mod print;
 
-/// MIR の局所値 (SSA 風: 一度だけ定義)。HIR の [`hir::LocalId`] とは別の連番。
+/// MIR local value (SSA-like: defined once). A separate numbering from HIR's [`hir::LocalId`].
 pub type ValueId = u32;
 
 #[derive(Clone, Debug)]
@@ -36,7 +37,7 @@ pub type BlockId = u32;
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    /// `v = rvalue` (純粋計算)。
+    /// `v = rvalue` (pure computation).
     Let(ValueId, Rvalue),
 }
 
@@ -57,7 +58,7 @@ pub enum Term {
     Return(Option<Operand>),
 }
 
-/// typed HIR → MIR。M0 の脱糖は最小 (糖衣がまだ無い)。
+/// typed HIR -> MIR. Desugaring is minimal in M0 (no sugar yet).
 pub fn lower_program(program: &hir::Program) -> Program {
     Program {
         fns: program.fns.iter().map(lower_fn).collect(),
@@ -67,7 +68,7 @@ pub fn lower_program(program: &hir::Program) -> Program {
 struct Builder {
     next_value: ValueId,
     stmts: Vec<Stmt>,
-    /// HIR ローカル → 現在の値 (M0 は再代入が無いので単純な写像)。
+    /// HIR local -> current value (a simple map since M0 has no reassignment).
     local_values: Vec<(hir::LocalId, ValueId)>,
 }
 
@@ -127,7 +128,7 @@ fn lower_fn(f: &hir::Fn) -> Function {
     }
 }
 
-/// 式を operand に落とす (定数や既存値はそのまま、複合式は新しい値へ)。
+/// Lower an expression to an operand (constants/existing values as-is, compound exprs to a new value).
 fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     match &e.kind {
         hir::ExprKind::Int(v) => Operand::Const(*v, e.ty),
@@ -139,7 +140,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     }
 }
 
-/// 式を必ず1つの値へ束縛して返す (`Let` を発行)。
+/// Always bind an expression to a single value and return it (emits a `Let`).
 fn lower_expr_to_value(b: &mut Builder, e: &hir::Expr) -> ValueId {
     match &e.kind {
         hir::ExprKind::Binary { op, lhs, rhs } => {
@@ -158,7 +159,7 @@ fn lower_expr_to_value(b: &mut Builder, e: &hir::Expr) -> ValueId {
     }
 }
 
-/// 型を MIR テキスト/診断で使う短い名前へ。
+/// Convert a type to a short name used in MIR text/diagnostics.
 pub fn ty_name(ty: Ty) -> String {
     match ty {
         Ty::Int(IntTy { bits, signed }) => format!("{}{}", if signed { 'i' } else { 'u' }, bits),
@@ -190,7 +191,7 @@ mod tests {
         let p = lower("fn main() -> i32 {\n  x := 1\n  return x\n}\n");
         let f = &p.fns[0];
         assert_eq!(f.blocks.len(), 1);
-        // x := 1 が1つの値に束縛され、return がその値を返す。
+        // x := 1 is bound to a single value, and return returns that value.
         assert!(matches!(f.blocks[0].term, Term::Return(Some(Operand::Value(_)))));
     }
 }

@@ -1,92 +1,92 @@
-# 実装方針（概要）
+# Implementation Strategy (Overview)
 
-`draft.md` を実装するための最上位ドキュメント。以降の `docs/impl/*.md` はすべてこの方針に従う。
+The top-level document for implementing `draft.md`. All subsequent `docs/impl/*.md` follow this strategy.
 
-## 決定事項
-
-```text
-実装言語     Rust
-バックエンド  LLVM (唯一の本命) ただし MIR を必ず挟む
-進め方       設計は全体を先に固める / 実装は縦に貫く骨格を先に通す
-```
-
-## なぜこの3つなのか
-
-### 実装言語: Rust
-
-コンパイラ実装の定番。lexer/parser の生成器、LLVM バインディング (`inkwell`)、強い型と所有権による自己検証が揃う。将来 Align で Align を書く(セルフホスト)際の足場にもなる。
-
-### バックエンド: LLVM 直行、ただし MIR を挟む
-
-「C バックエンド先行 → 後で LLVM」という段階戦略は**採らない**。理由:
-
-- Align の核心は `vec<N,T>` / `mask` / loop fusion を**決定論的にベクトル命令へ落とす**こと。C 経由はホスト C コンパイラの自動ベクトル化頼みになり、「予測可能に速い」というアイデンティティが崩れる。
-- 後から LLVM に移行すると大改修になる。
-
-代わりに **バックエンド非依存の中間表現 MIR を必ず挟む**。Align の意味論(arena / move / fusion / SIMD 化判断)はすべて MIR 側に置き、`MIR → LLVM` は最終段の純粋な lowering に限定する。これにより:
-
-- 将来 C バックエンドやデバッグ用テキスト出力を足したくなっても「lowering を1個追加」で済み、書き直しにならない。
-- バックエンド都合の判断が型チェッカーまで漏れない。
-
-詳細は `04-mir.md` / `05-backend-llvm.md`。
-
-### 進め方: 全体設計 → 縦切り骨格 → 肉付け
-
-コンパイラ開発で最も危険なのは「一つの段を、パイプライン全体が繋がる前に作り込む」こと。完全な型システムを codegen 前に作り込むと、codegen 段階で型情報の形が合わず型チェッカーを書き直す——これが大改修の正体。
-
-対策は2軸を分けること。
+## Decisions
 
 ```text
-軸A 機能カバレッジ   少ない機能 → 機能を足す
-軸B パイプライン貫通 source → 実行ファイル が端から端まで繋がっているか
+Implementation language   Rust
+Backend                   LLVM (the one real target), but always through MIR
+Approach                  Fix the whole design first / drive a vertical skeleton through first
 ```
 
-危険は軸Bにある。よって:
+## Why these three
 
-> 設計(本 impl docs)は全体を先に固める。
-> 実装は最小の縦切り骨格(walking skeleton)を端から端まで先に通し、そこへ機能を差し込む。
+### Implementation language: Rust
 
-`x := 1` レベルのプログラムが lexer → parser → typecheck → MIR → LLVM → 実行ファイル まで通る骨格を最初に完成させる。骨格が通れば `map` / `where` / arena / JSON は同じパイプラインへ**差し込む**だけになり、各段の書き直しが起きない。
+The standard choice for compiler implementation. Lexer/parser generators, LLVM bindings (`inkwell`), and strong types + ownership for self-checking are all available. It also serves as the foundation for later writing Align in Align (self-hosting).
 
-## クレート構成 (案)
+### Backend: straight to LLVM, but through MIR
 
-Rust workspace。段ごとにクレートを分け、IR の境界をクレート境界に一致させる。
+A staged strategy of "C backend first → LLVM later" is **not** adopted. Reasons:
+
+- The core of Align is **deterministically lowering** `vec<N,T>` / `mask` / loop fusion **to vector instructions**. Going via C would depend on the host C compiler's auto-vectorization, which breaks the "predictably fast" identity.
+- Migrating to LLVM later would be a major rewrite.
+
+Instead, **a backend-agnostic intermediate representation, MIR, is always interposed**. All of Align's semantics (arena / move / fusion / SIMD-ization decisions) live on the MIR side, and `MIR → LLVM` is limited to a pure final-stage lowering. This means:
+
+- If we later want to add a C backend or text output for debugging, it is just "add one lowering" and not a rewrite.
+- Backend-driven decisions do not leak as far as the type checker.
+
+Details in `04-mir.md` / `05-backend-llvm.md`.
+
+### Approach: whole-design → vertical-slice skeleton → fleshing out
+
+The most dangerous thing in compiler development is "building out one stage before the whole pipeline is connected." Building out a complete type system before codegen, then finding at the codegen stage that the shape of the type information does not fit and rewriting the type checker — this is the real nature of a major rewrite.
+
+The countermeasure is to separate two axes.
+
+```text
+Axis A  Feature coverage     few features → add features
+Axis B  Pipeline traversal   does source → executable connect end to end
+```
+
+The danger is in axis B. Therefore:
+
+> The design (these impl docs) fixes the whole picture first.
+> The implementation drives the smallest vertical-slice skeleton (walking skeleton) through end to end first, then plugs features into it.
+
+First complete a skeleton in which an `x := 1`-level program flows through lexer → parser → typecheck → MIR → LLVM → executable. Once the skeleton is through, `map` / `where` / arena / JSON become a matter of just **plugging** into the same pipeline, and no stage gets rewritten.
+
+## Crate Structure (proposal)
+
+A Rust workspace. Split crates per stage, matching IR boundaries to crate boundaries.
 
 ```text
 alignc/                  workspace root
   crates/
-    align_span/          ソース位置・ファイル管理 (全段が依存)
-    align_diag/          診断(エラー/警告)の共通基盤
+    align_span/          source positions / file management (depended on by all stages)
+    align_diag/          shared foundation for diagnostics (errors/warnings)
     align_lexer/         source → tokens
     align_parser/        tokens → AST
-    align_ast/           AST 定義
-    align_sema/          名前解決 + 型推論/検査 + move/arena 検査 → typed HIR
-    align_mir/           HIR → MIR 変換 + MIR 最適化(fusion 等)
+    align_ast/           AST definitions
+    align_sema/          name resolution + type inference/checking + move/arena checking → typed HIR
+    align_mir/           HIR → MIR conversion + MIR optimization (fusion etc.)
     align_codegen_llvm/  MIR → LLVM IR → object
-    align_runtime/       最小ランタイム(arena allocator 等)。出力にリンク
-    align_driver/        CLI: alignc build / run。各段を繋ぐ
-  tests/                 端から端まで(.align → 実行 → 出力比較)
+    align_runtime/       minimal runtime (arena allocator etc.). Linked into output
+    align_driver/        CLI: alignc build / run. Connects the stages
+  tests/                 end to end (.align → run → output comparison)
 ```
 
-段の責務とIR境界の詳細は `01-pipeline.md`。
+Stage responsibilities and IR-boundary details in `01-pipeline.md`.
 
-## ドキュメント一覧
+## Document Index
 
 ```text
-00-overview.md        本書。全体方針
-01-pipeline.md        パイプライン各段とIR境界
+00-overview.md        this document. Overall strategy
+01-pipeline.md        pipeline stages and IR boundaries
 02-frontend.md        lexer / parser / AST
-03-types.md           型システム / 推論 / move・arena 検査
-04-mir.md             MIR 設計(バックエンド非依存の核)
+03-types.md           type system / inference / move & arena checking
+04-mir.md             MIR design (backend-agnostic core)
 05-backend-llvm.md    MIR → LLVM lowering / SIMD / arena codegen
-06-runtime-std.md     最小ランタイムと core/std のブートストラップ
-07-roadmap.md         マイルストーン M0..Mn
+06-runtime-std.md     minimal runtime and core/std bootstrap
+07-roadmap.md         milestones M0..Mn
 ```
 
-## 不変条件 (実装でも守る)
+## Invariants (upheld in the implementation too)
 
-`draft.md` / `docs/design-notes.md` の設計不変条件は実装段階でも拘束力を持つ。特に:
+The design invariants in `draft.md` / `docs/design-notes.md` remain binding at the implementation stage. In particular:
 
-- allocation / error / 副作用 / 並列 / unsafe は**生成コードでも追跡可能**にする(隠さない)。
-- 制約はコンパイラ推論のための情報源。lifetime を表に出さずに no-alias / non-null / arena 寿命 / cold error path を推論する(`03-types.md`)。
-- `map` / `reduce` / `scan` / `filter` / `mask` が自然にベクトル化される lowering を MIR で実現する(`04-mir.md`)。
+- allocation / error / side effects / parallelism / unsafe must be **traceable even in generated code** (nothing hidden).
+- Restrictions are an information source for compiler inference. Infer no-alias / non-null / arena lifetime / cold error path without exposing lifetimes in source (`03-types.md`).
+- Achieve, in MIR, the lowering by which `map` / `reduce` / `scan` / `filter` / `mask` vectorize naturally (`04-mir.md`).

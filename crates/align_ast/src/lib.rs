@@ -1,8 +1,9 @@
-//! AST 定義 (`docs/impl/02-frontend.md` §9)。
+//! AST definitions (`docs/impl/02-frontend.md` §9).
 //!
-//! 脱糖はしない: 書かれた形を保持し、formatter / lint / sema が使う。全ノードは
-//! [`Span`] を持つ。M0 では言語の最小部分集合 (`fn` / `:=` / `return` / 整数 / 四則演算)
-//! のみを表現する。後続マイルストーンで列を拡張していく。
+//! No desugaring: keeps the written form, used by formatter / lint / sema. Every
+//! node carries a [`Span`]. M0 represents only the minimal language subset
+//! (`fn` / `:=` / `return` / integers / arithmetic). Later milestones extend the
+//! variants.
 
 use align_span::Span;
 
@@ -12,7 +13,7 @@ pub struct Ident {
     pub span: Span,
 }
 
-/// `a.b.c` のようなドット区切りパス (module / 参照)。
+/// Dot-separated path like `a.b.c` (module / reference).
 #[derive(Clone, Debug)]
 pub struct Path {
     pub segments: Vec<Ident>,
@@ -54,14 +55,14 @@ pub struct Param {
     pub ty: Type,
 }
 
-/// 関数本体: ブロック、または単一式 `= expr` 形 (`02-frontend.md` §3)。
+/// Function body: a block, or single-expression `= expr` form (`02-frontend.md` §3).
 #[derive(Clone, Debug)]
 pub enum FnBody {
     Block(Block),
     Expr(Box<Expr>),
 }
 
-/// 型表記。M0 は `i32` 等の単純パスのみ。
+/// Type annotation. M0 supports only simple paths like `i32`.
 #[derive(Clone, Debug)]
 pub struct Type {
     pub path: Path,
@@ -71,7 +72,7 @@ pub struct Type {
 #[derive(Clone, Debug)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
-    /// 末尾の式 (`;`/改行 END を伴わない) はブロックの値になる (`02-frontend.md` §5)。
+    /// A trailing expression (without `;`/newline END) becomes the block's value (`02-frontend.md` §5).
     pub tail: Option<Box<Expr>>,
     pub span: Span,
 }
@@ -109,7 +110,7 @@ pub struct Expr {
 
 #[derive(Clone, Debug)]
 pub enum ExprKind {
-    /// 整数リテラル。型は文脈で決まる (`03-types.md` §2)。
+    /// Integer literal. Its type is decided by context (`03-types.md` §2).
     Int(i128),
     Path(Path),
     Binary {

@@ -1,6 +1,6 @@
-# llvm-sys を libLLVM-19.so への動的リンクに固定する。
-# Debian の llvm-19 は shared モード (libPolly.a 等の静的コンポーネントを同梱しない)
-# ため、デフォルトの静的リンクは "could not find native static library `Polly`" で失敗する。
-# llvm-config も --shared-mode = shared を報告する。
+# Pin llvm-sys to dynamic linking against libLLVM-19.so.
+# Debian's llvm-19 is shared-mode (does not ship static components like libPolly.a),
+# so the default static linking fails with "could not find native static library `Polly`".
+# llvm-config also reports --shared-mode = shared.
 [env]
 LLVM_SYS_191_PREFER_DYNAMIC = "1"

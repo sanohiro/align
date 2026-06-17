@@ -1,17 +1,17 @@
-# Align 言語仕様 v0.1（要約）
+# Align Language Specification v0.1 (Summary)
 
-`draft.md`（権威ある詳細仕様）の要約。詳細・最新はつねに `draft.md` を参照する。
+A summary of `draft.md` (the authoritative detailed spec). For detail and the latest version, always refer to `draft.md`.
 
-## 目的
+## Purpose
 
-Align は次を一致(align)させるために設計された AOT コンパイル言語である。
+Align is an AOT-compiled language designed to align the following.
 
-* 人間の意図
-* AI が生成するコード
-* コンパイラ最適化
-* 現代ハードウェア
+* Human intent
+* AI-generated code
+* Compiler optimization
+* Modern hardware
 
-Align が優先するもの:
+What Align prioritizes:
 
 ```text
 Less code
@@ -20,20 +20,20 @@ Compiler-friendly design
 Data-oriented programming
 ```
 
-## 中核原則
+## Core principles
 
-* 同じことはひとつの書き方
-* 隠れた allocation はない
-* 隠れた error はない
-* 隠れた parallelism はない
-* 既定でデータ指向
-* 既定でキャッシュ親和的
-* 既定で SIMD 親和的
-* 既定で AI 親和的
+* One way to do the same thing
+* No hidden allocation
+* No hidden error
+* No hidden parallelism
+* Data-oriented by default
+* Cache-friendly by default
+* SIMD-friendly by default
+* AI-friendly by default
 
-## 含むもの
+## What it includes
 
-### 型
+### Types
 
 ```text
 bool
@@ -62,7 +62,7 @@ mask<T>
 bitset
 ```
 
-### メモリ
+### Memory
 
 ```text
 value types
@@ -71,16 +71,16 @@ explicit heap
 unsafe
 ```
 
-### エラー処理
+### Error handling
 
 ```text
 Result<T,E>
 ?
 ```
 
-例外はない。
+No exceptions.
 
-### データ処理
+### Data processing
 
 ```text
 map
@@ -95,7 +95,7 @@ sort
 chunks
 ```
 
-### 縮約
+### Reduction
 
 ```text
 sum
@@ -107,7 +107,7 @@ all
 dot
 ```
 
-### 文字列
+### Strings
 
 ```text
 str
@@ -126,7 +126,7 @@ json.encode<T>
 json.validate<T>
 ```
 
-### テンプレート
+### Templates
 
 ```text
 template
@@ -135,7 +135,7 @@ json
 raw
 ```
 
-### 並列
+### Parallelism
 
 ```text
 par_map
@@ -144,25 +144,25 @@ chunks
 task_group
 ```
 
-v1 に async/await はない。
+No async/await in v1.
 
-### 安全性
+### Safety
 
-通常コード:
+Normal code:
 
 ```text
 safe
 ```
 
-危険な操作:
+Dangerous operations:
 
 ```text
 unsafe
 ```
 
-unsafe ブロックの内側でのみ。
+Only inside an unsafe block.
 
-## コアライブラリ
+## Core library
 
 ```text
 core.option
@@ -186,7 +186,7 @@ core.math
 core.arena
 ```
 
-## 標準ライブラリ
+## Standard library
 
 ```text
 std.io
@@ -204,7 +204,7 @@ std.crypto
 std.http
 ```
 
-## パッケージ
+## Packages
 
 ```text
 pkg.db.*
@@ -214,4 +214,4 @@ pkg.cloud.*
 pkg.ai.*
 ```
 
-言語コアの一部ではない。
+Not part of the language core.

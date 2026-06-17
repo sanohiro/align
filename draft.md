@@ -2,21 +2,19 @@
 
 ## 1. Vision
 
-Align は、人間・AI・コンパイラ・ハードウェアが同じ方向を向ける AOT コンパイル言語である。
+Align is an AOT-compiled language where humans, AI, the compiler, and hardware can all face the same direction.
 
-目的は、
+Its goal is:
 
-> 少なく書く。予測可能に速い。
+> Write less. Predictably fast.
 
-である。
-
-Align は「高速化テクニックを書く言語」ではなく、「普通に書くとコンパイラとハードウェアが最適化しやすい形になる言語」を目指す。
+Align does not aim to be "a language for writing optimization tricks"; it aims to be "a language where ordinary code naturally takes a form the compiler and hardware can optimize."
 
 ---
 
 ## 2. Target Use Cases
 
-主対象。
+Primary targets.
 
 ```text
 CLI tools
@@ -28,7 +26,7 @@ compiler / parser / tooling
 systems-adjacent applications
 ```
 
-非主対象。
+Non-primary targets.
 
 ```text
 OS kernel
@@ -44,7 +42,7 @@ heavy GUI framework
 
 ### 3.1 One Way
 
-同じことは基本的に一つの書き方にする。
+The same thing is, in principle, written one way.
 
 ```text
 error      = Result + ?
@@ -56,9 +54,9 @@ string     = str / string / buffer / builder
 
 ### 3.2 Less Code, Fewer Bugs
 
-書く量が減ればバグは減る。
+Less code means fewer bugs.
 
-ただし、以下は隠さない。
+However, the following are never hidden.
 
 ```text
 allocation
@@ -70,7 +68,7 @@ unsafe
 
 ### 3.3 Compiler Friendly
 
-コンパイラが次を推論しやすい設計にする。
+The design makes the following easy for the compiler to infer.
 
 ```text
 contiguous memory
@@ -85,7 +83,7 @@ alignment
 
 ### 3.4 Hardware Friendly
 
-現代 CPU / GPU / Cache / SIMD / Branch Predictor に素直なコードを生成しやすくする。
+Make it easy to generate code that maps cleanly to modern CPU / GPU / Cache / SIMD / Branch Predictor.
 
 ---
 
@@ -101,7 +99,7 @@ mut count := 0
 count = count + 1
 ```
 
-デフォルトは immutable。
+The default is immutable.
 
 ### Type Annotation
 
@@ -117,7 +115,7 @@ fn add(a: i32, b: i32) -> i32 {
 }
 ```
 
-単一式の関数は `= expr` 形で書く。
+A single-expression function is written in `= expr` form.
 
 ```align
 fn add(a: i32, b: i32) -> i32 = a + b
@@ -125,7 +123,7 @@ fn add(a: i32, b: i32) -> i32 = a + b
 
 ### Statement Terminator (Go style)
 
-文は改行で終端する（Go スタイル）。普段 `;` は書かない。インデントは意味を持たず（ブロックは `{}`）、Python のようなレイアウト強制はない。
+A statement is terminated by a newline (Go style). Normally `;` is not written. Indentation is insignificant (blocks use `{}`); there is no Python-like layout enforcement.
 
 ```align
 fn classify(u: User) -> str {
@@ -134,7 +132,7 @@ fn classify(u: User) -> str {
 }
 ```
 
-`;` は**任意のセパレータ**で、1行に複数文を詰めたいときだけ使う。`{}` があるのでどんなブロックも1行に inline できる（ワンライナーの自由）。
+`;` is an **optional separator**, used only to cram multiple statements onto one line. Because of `{}`, any block can be inlined onto one line (freedom of one-liners).
 
 ```align
 fn classify(u: User) -> str { s := score(u); if s > 80 { "high" } else { "low" } }
@@ -142,7 +140,7 @@ fn classify(u: User) -> str { s := score(u); if s > 80 { "high" } else { "low" }
 point := { mut a := x; a = a * 2; a }
 ```
 
-行頭が `.` や二項演算子なら前の行の継続。チェーンを `;` なしで複数行に書ける。
+If a line begins with `.` or a binary operator, it continues the previous line. A chain can be written across multiple lines without `;`.
 
 ```align
 total := users
@@ -153,7 +151,7 @@ total := users
 
 ### Block Value
 
-ブロックの末尾に置いた式（後ろに文が続かないもの）は、そのブロックの値になる。値にしたくない式文はそのまま並べる。
+An expression placed at the end of a block (with no statement following it) becomes that block's value. Expression statements not intended to be the value are simply listed as-is.
 
 ```align
 fn abs(x: i32) -> i32 = if x < 0 { -x } else { x }
@@ -161,18 +159,18 @@ fn abs(x: i32) -> i32 = if x < 0 { -x } else { x }
 user := find_user(id) else return Error.NotFound
 ```
 
-`if` / `else` 取り出し / `match` は式であり、単一式なら自然に一行になる。
+`if` / `else`-unwrap / `match` are expressions, and a single expression naturally fits on one line.
 
 ### Style and Convergence
 
-公式 formatter（§16）は**意味のないブレだけ**を正規化する。
+The official formatter (§16) normalizes **only meaningless variation**.
 
 ```text
-正規化する     空白 / ; の置き方 / 末尾カンマ / 整列
-正規化しない   一行 ↔ 複数行 の選択（作者の自由を残す。Python 的強制をしない）
+normalized       spacing / placement of ; / trailing comma / alignment
+not normalized   one-line ↔ multi-line choice (the author's freedom is kept; no Python-like enforcement)
 ```
 
-「書き方は単一」とは「許されるレイアウトが1つ」ではなく「**あるレイアウトに対する正しい整形が1つ**」の意味（gofmt / rustfmt と同じ）。単一式の本体は `= expr`、複数文の本体は `{}` ブロック、という形ごとの正規形は保ちつつ、行の詰め方は強制しない。
+"One way to write" does not mean "one allowed layout" but "**one correct formatting for a given layout**" (same as gofmt / rustfmt). The per-form canonical shape — `= expr` for a single-expression body, a `{}` block for a multi-statement body — is preserved, while line packing is not enforced.
 
 ### Struct
 
@@ -185,7 +183,7 @@ User {
 }
 ```
 
-class / inheritance は持たない。
+There is no class / inheritance.
 
 ---
 
@@ -206,17 +204,17 @@ char
 
 ### Integer Overflow
 
-整数演算は溢れても**未定義動作にしない**。既定は2の補数の wrap（全ビルドで同一・分岐なし）。
+Integer arithmetic does **not** produce undefined behavior on overflow. The default is two's-complement wrap (identical across all builds, no branching).
 
 ```text
-既定        wrap (定義済み、ゼロコスト、SIMD を妨げない)
-明示 op     checked_*(-> Option) / saturating_* / wrapping_*
-開発時      overflow チェック付きビルド + lint でバグ検出 (意味論は変えない)
+default      wrap (defined, zero-cost, does not block SIMD)
+explicit op  checked_*(-> Option) / saturating_* / wrapping_*
+development  overflow-checked build + lint for bug detection (semantics unchanged)
 ```
 
-理由は「予測可能に速い」の徹底。全ビルドで挙動が同じで、ホットループのベクトル化を壊さない。安全が要る箇所は明示 op を使う。
+The reason is to commit fully to "predictably fast." Behavior is the same across all builds and does not break vectorization of hot loops. Where safety is needed, use the explicit ops.
 
-ゼロ除算など溢れ以外の算術エラーはこれと別扱いで、silent にせず必ずエラーにする。
+Arithmetic errors other than overflow, such as division by zero, are handled separately; they are never silent and always produce an error.
 
 ### Optional
 
@@ -224,7 +222,7 @@ char
 Option<User>
 ```
 
-null はない。
+There is no null.
 
 ```align
 user := find_user(id) else {
@@ -243,7 +241,7 @@ data := fs.read_file(path)?
 user := json.decode<User>(data)?
 ```
 
-`?` は Result 専用。
+`?` is Result-only.
 
 ---
 
@@ -252,11 +250,11 @@ user := json.decode<User>(data)?
 ### 6.1 Default
 
 ```text
-GCなし
-値型中心
-heapは明示
-arena標準
-unsafeは隔離
+no GC
+value-type centric
+heap is explicit
+arena is standard
+unsafe is isolated
 ```
 
 ### 6.2 Value
@@ -265,13 +263,13 @@ unsafeは隔離
 p := Point{x: 1, y: 2}
 ```
 
-小さい struct は値として扱う。
+Small structs are treated as values.
 
-大きい値のコピーは lint 対象。
+Copying large values is a lint target.
 
 ### 6.3 Move
 
-所有型は基本 move。
+Owning types are move by default.
 
 ```align
 data := fs.read_file(path)?
@@ -280,7 +278,7 @@ other := data
 print(data) // compile error
 ```
 
-明示 clone。
+Explicit clone.
 
 ```align
 other := data.clone()
@@ -296,9 +294,9 @@ arena {
 }
 ```
 
-arena 内の allocation はブロック終了時にまとめて解放。
+Allocations inside an arena are freed all at once when the block ends.
 
-arena 内の view は arena 外へ出せない。
+A view inside an arena cannot escape the arena.
 
 ### 6.5 Heap
 
@@ -306,9 +304,9 @@ arena 内の view は arena 外へ出せない。
 p := heap.new(User{id: 1})
 ```
 
-通常コードでは manual free しない。
+In ordinary code there is no manual free.
 
-raw allocation は unsafe のみ。
+Raw allocation is only in unsafe.
 
 ```align
 unsafe {
@@ -327,7 +325,7 @@ unsafe {
 users: array<User>
 ```
 
-`array<T>` は所有する連続メモリ。
+`array<T>` is owned contiguous memory.
 
 ### Slice
 
@@ -335,7 +333,7 @@ users: array<User>
 items: slice<User>
 ```
 
-`slice<T>` は view。
+`slice<T>` is a view.
 
 ### Out Parameter
 
@@ -345,13 +343,13 @@ fn add(out dst: slice<f32>, a: slice<f32>, b: slice<f32>) {
 }
 ```
 
-`out` は no-alias の最適化ヒントであり、安全制約でもある。
+`out` is a no-alias optimization hint and also a safety constraint.
 
 ---
 
 ## 8. Data Processing Core
 
-Align の中核は配列処理である。
+The core of Align is array processing.
 
 ### Basic Operations
 
@@ -396,7 +394,7 @@ users
   .par_map(process_chunk)
 ```
 
-並列化の単位は基本的に chunk。
+The unit of parallelism is basically the chunk.
 
 ---
 
@@ -427,7 +425,7 @@ a = b + c
 a = (b + c) * d - e
 ```
 
-一時配列を作らず loop fusion する。
+Loop-fused without creating temporary arrays.
 
 ### Mask
 
@@ -436,22 +434,22 @@ m := scores > 80
 total := scores.sum_where(m)
 ```
 
-mask は SIMD / branchless / GPU のための第一級概念。
+A mask is a first-class concept for SIMD / branchless / GPU.
 
 ---
 
 ## 10. Branch and Hot Path
 
-`if` は持つ。
+`if` exists.
 
-ただし大量データ処理では branch を中心にしない。
+But in bulk data processing, branches are not the center.
 
 ```align
 active := users.where(.active)
 total := active.score.sum()
 ```
 
-Result の失敗経路は cold path として扱いやすくする。
+The failure path of Result is made easy to treat as a cold path.
 
 ```align
 data := fs.read_file(path)?
@@ -464,9 +462,9 @@ json := json.parse(data)?
 
 ### Philosophy
 
-thread / mutex を普通にしない。
+thread / mutex are not the normal way.
 
-基本は data parallel。
+The basis is data parallelism.
 
 ```align
 scores := users.par_map(calc_score)
@@ -474,9 +472,9 @@ scores := users.par_map(calc_score)
 
 ### Side Effect Rule
 
-`par_map` に渡す関数は外部 mutable state を変更できない。
+A function passed to `par_map` cannot modify external mutable state.
 
-禁止例。
+Forbidden example.
 
 ```align
 mut total := 0
@@ -486,7 +484,7 @@ users.par_map(fn u {
 })
 ```
 
-代わりに reduce。
+Use reduce instead.
 
 ```align
 total := users.reduce(0, fn acc, u {
@@ -496,7 +494,7 @@ total := users.reduce(0, fn acc, u {
 
 ### Task Group
 
-I/O 並行は task_group。
+I/O concurrency uses task_group.
 
 ```align
 tasks := task_group()
@@ -507,7 +505,7 @@ b := tasks.spawn(fs.read_file("b.txt"))
 tasks.wait()?
 ```
 
-async/await は初期仕様には入れない。
+async/await is not in the initial specification.
 
 ---
 
@@ -526,10 +524,10 @@ builder  // append-oriented writer
 ### No Implicit Concatenation Allocation
 
 ```align
-msg := a + b // string allocation は禁止または lint
+msg := a + b // string allocation is forbidden or linted
 ```
 
-推奨。
+Recommended.
 
 ```align
 b := builder()
@@ -540,7 +538,7 @@ msg := b.to_string()
 
 ### Static String Meta
 
-文字列リテラルはコンパイル時に meta を持つ。
+String literals carry meta at compile time.
 
 ```text
 len
@@ -551,11 +549,11 @@ json_escape_needed
 html_escape_needed
 ```
 
-表面上は `str` として扱う。
+On the surface they are treated as `str`.
 
 ### Const String Pool
 
-以下は const string pool に置ける。
+The following can be placed in a const string pool.
 
 ```text
 literal strings
@@ -566,21 +564,21 @@ HTTP header names
 
 ### Scan Once
 
-同じ byte列を何度も scan しない。
+Do not scan the same byte sequence repeatedly.
 
-標準 parser は scan 結果を再利用する。
+The standard parser reuses scan results.
 
 ---
 
 ## 13. Template
 
-テンプレートは実行時 format parse ではなく、コンパイル時解析する。
+Templates are analyzed at compile time, not parsed at runtime format time.
 
 ```align
 msg := template "Hello {name}, score={score}"
 ```
 
-内部的には、
+Internally it expands to:
 
 ```text
 write_static("Hello ")
@@ -589,8 +587,6 @@ write_static(", score=")
 write_value(score)
 ```
 
-へ展開される。
-
 ### Escaping Context
 
 ```align
@@ -598,7 +594,7 @@ html "<p>{name}</p>"
 json "{name}"
 ```
 
-raw 出力は明示。
+Raw output is explicit.
 
 ```align
 raw(name)
@@ -608,9 +604,9 @@ raw(name)
 
 ## 14. JSON
 
-JSON は Align の core に近い機能とする。
+JSON is treated as a near-core feature of Align.
 
-理由は、Align の強みである以下がすべて活きるため。
+The reason is that all of Align's strengths come into play.
 
 ```text
 SIMD scan
@@ -630,9 +626,9 @@ user := json.decode<User>(data)?
 
 ### Zero Copy
 
-escape がなければ入力 buffer への `str` view を返す。
+If there is no escape, return a `str` view into the input buffer.
 
-escape がある場合のみ decode buffer を使う。
+Only when there is an escape is a decode buffer used.
 
 ### Struct as Schema
 
@@ -644,7 +640,7 @@ User {
 }
 ```
 
-struct 定義から以下を生成可能にする。
+From a struct definition, the following can be generated.
 
 ```text
 decode
@@ -655,7 +651,7 @@ field table
 
 ### Field Table
 
-コンパイル時に field 情報を持つ。
+Field information is held at compile time.
 
 ```text
 name
@@ -668,7 +664,7 @@ escape info
 
 ### SIMD Scan
 
-JSON scanner は structural chars を SIMD で探す。
+The JSON scanner finds structural chars with SIMD.
 
 ```text
 { } [ ] : , " \ whitespace
@@ -678,7 +674,7 @@ JSON scanner は structural chars を SIMD で探す。
 
 ## 15. Safety
 
-通常コードでは以下を禁止または制限する。
+In ordinary code the following are forbidden or restricted.
 
 ```text
 use-after-free
@@ -689,7 +685,7 @@ raw pointer
 unchecked cast
 ```
 
-危険な処理は `unsafe` ブロックのみ。
+Dangerous operations are only in an `unsafe` block.
 
 ```align
 unsafe {
@@ -697,8 +693,8 @@ unsafe {
 }
 ```
 
-Rust の lifetime を表には出さない。
-ただし arena 外への view 流出など、明らかな寿命違反はコンパイルエラー。
+Rust-style lifetimes are not exposed on the surface.
+However, an obvious lifetime violation, such as a view escaping an arena, is a compile error.
 
 ---
 
@@ -706,28 +702,28 @@ Rust の lifetime を表には出さない。
 
 ### Formatter
 
-公式 formatter を必須とする。空白 / `;` の置き方 / 末尾カンマ / 整列など**意味のないブレ**だけを正規化し、一行 ↔ 複数行の選択は強制しない（§4 Style and Convergence）。
+The official formatter is mandatory. It normalizes **only meaningless variation** such as spacing / placement of `;` / trailing comma / alignment, and does not enforce the one-line ↔ multi-line choice (§4 Style and Convergence).
 
 ### Lint
 
-標準 lint で検出する。
+The standard lint detects:
 
 ```text
-loop内allocation
-巨大struct copy
-不要clone
-不要heap
-未処理Result
-hot loop内branch
-string再scan
-暗黙copy
+allocation in loop
+huge struct copy
+unnecessary clone
+unnecessary heap
+unhandled Result
+branch in hot loop
+string re-scan
+implicit copy
 ```
 
 ### Convergence Over Expression
 
-表現力より収束性を重視する。
+Convergence is valued over expressiveness.
 
-AI が迷う自由度は減らす。
+Degrees of freedom that make AI hesitate are reduced.
 
 ---
 
@@ -740,7 +736,7 @@ import core.json
 import std.fs
 ```
 
-公開は明示。
+Exports are explicit.
 
 ```align
 pub fn main(args: array<str>) -> Result<(), Error> {
@@ -753,7 +749,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 ## 18.1 core
 
-`core` は言語思想そのものに近い基盤。
+`core` is the foundation, close to the language philosophy itself.
 
 ```text
 core.option
@@ -832,7 +828,7 @@ starts_with
 ends_with
 ```
 
-SIMD fast path を標準実装に持つ。
+Has a SIMD fast path in the standard implementation.
 
 ### core.json
 
@@ -856,20 +852,20 @@ raw
 
 ### core.hash
 
-非暗号用途の hash。
+Hash for non-cryptographic use.
 
 ```text
 hash64
 hash128
 ```
 
-暗号 hash は std.crypto。
+Cryptographic hashes are in std.crypto.
 
 ---
 
 ## 18.2 std
 
-`std` は OS との境界。
+`std` is the boundary with the OS.
 
 ```text
 std.io
@@ -947,7 +943,7 @@ sleep
 
 ### std.net
 
-低レベル中心。
+Low-level focused.
 
 ```text
 tcp
@@ -983,7 +979,7 @@ zstd
 
 ### std.rand
 
-非暗号用途。
+Non-cryptographic use.
 
 ```text
 seed
@@ -994,7 +990,7 @@ sample
 
 ### std.crypto
 
-暗号用途。
+Cryptographic use.
 
 ```text
 crypto.random
@@ -1011,7 +1007,7 @@ constant_time_equal
 
 ### std.http
 
-フレームワークではなく primitive。
+A primitive, not a framework.
 
 ```text
 request
@@ -1027,7 +1023,7 @@ server primitive
 
 ## 18.3 pkg
 
-`pkg` は外部パッケージ領域。
+`pkg` is the area for external packages.
 
 ```text
 pkg.web
@@ -1041,9 +1037,9 @@ pkg.aws
 pkg.openai
 ```
 
-DB driver や Web framework は core/std に入れない。
+DB drivers and Web frameworks are not in core/std.
 
-ただし、それらを作りやすくする部品は core/std に置く。
+However, the building blocks that make them easy to build are placed in core/std.
 
 ```text
 bytes
@@ -1102,11 +1098,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 # 20. Positioning
 
 ```text
-Goより allocation と error が見える
-Zigより普通の道が安全
-Rustより lifetime を書かない
-Cより alias と寿命が明確
-Pythonより速く、AIが書いても性能が崩れにくい
+Allocation and errors are more visible than in Go
+The normal path is safer than in Zig
+Lifetimes are not written, unlike Rust
+Alias and lifetime are clearer than in C
+Faster than Python, and performance is less likely to degrade even when written by AI
 ```
 
 ---

@@ -1,4 +1,4 @@
-// M0 walking skeleton の最小プログラム (docs/impl/07-roadmap.md)。
+// Minimal program for the M0 walking skeleton (docs/impl/07-roadmap.md).
 // alignc check examples/min.align
 // alignc emit-mir examples/min.align
 fn main() -> i32 {

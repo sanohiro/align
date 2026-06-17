@@ -12,13 +12,12 @@ Two kinds of work coexist:
 
 ## Document layout and roles
 
-- `draft.md` — the **authoritative, most complete** spec (Language Specification Draft v0.1, sections 1–21). When the design needs detail, this is the source of truth. Written largely in Japanese prose with `align` code blocks.
-- `docs/language-spec.md` — a condensed (Japanese) summary of `draft.md`. Keep it consistent with `draft.md`; it is a digest, not an independent spec.
+- `draft.md` — the **authoritative, most complete** spec (Language Specification Draft v0.1, sections 1–21). When the design needs detail, this is the source of truth. Written in English prose with `align` code blocks.
+- `docs/language-spec.md` — a condensed (English) summary of `draft.md`. Keep it consistent with `draft.md`; it is a digest, not an independent spec.
 - `docs/design-notes.md` — the **rationale** ("why") behind each decision. Consult before changing any design choice; a change that contradicts a stated principle here needs justification.
 - `docs/history.md` — chronology of decisions and rejected alternatives (e.g. exceptions, GC, visible lifetimes were all rejected). Use to avoid re-proposing already-discarded ideas.
 - `docs/non-goals.md` — explicit out-of-scope items. Check before adding any feature; many "obvious" additions (OOP, async-everywhere, trait/template complexity, GC, framework-in-core) are deliberately excluded.
-- `docs/open-questions.md` — design-decision tracker, split into **決着済み (settled)** / **未解決 (open)** / **将来 (future)**. Read the settled section before proposing anything — those decisions are locked (see "Settled decisions" below). Genuinely open items are tied to milestones; new design discussion belongs here until resolved.
-- All `docs/` files (incl. `docs/impl/`) are Japanese documents (Japanese headings + prose, English kept for code/technical identifiers). `draft.md` uses English headings + Japanese prose.
+- `docs/open-questions.md` — design-decision tracker, split into **Settled** / **Open** / **Future**. Read the Settled section before proposing anything — those decisions are locked (see "Settled decisions" below). Genuinely open items are tied to milestones; new design discussion belongs here until resolved.
 - `docs/impl/` — **implementation plan** for an actual compiler (does not exist yet). `00-overview.md` (strategy: Rust + LLVM-via-MIR + walking-skeleton-then-widen) → `01-pipeline.md` (stages/IR boundaries) → `02..06` (per-stage design) → `07-roadmap.md` (milestones M0–M8). These describe how `draft.md` will be built; they must stay consistent with the spec, not redefine it.
 
 The two language layers — `draft.md` (detailed) and `docs/language-spec.md` (summary) — can drift. When editing one, check the other.
@@ -36,7 +35,7 @@ These are the load-bearing principles. Any proposed syntax or feature must respe
 
 ## Settled decisions (do not re-litigate)
 
-These are locked. Full rationale + record locations in `docs/open-questions.md` 決着済み.
+These are locked. Full rationale + record locations in `docs/open-questions.md` Settled.
 
 - **Compiler implemented in Rust.** Backend = **LLVM, but always lower through a backend-agnostic MIR** (never "C-backend-first"). Semantics live in MIR; `MIR → LLVM` is pure lowering.
 - **Syntax = Go style.** Newline terminates a statement; `;` is an optional separator only for cramming multiple statements on one line. Braces `{}` delimit blocks → indentation is insignificant (NOT Python). A line starting with `.`/binary-operator continues the previous line (multi-line chains).
@@ -52,13 +51,14 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 - **Phase: M0 walking skeleton COMPLETE.** The Rust workspace under `crates/` (all 8 crates per `docs/impl/00-overview.md`: `align_span` `align_diag` `align_ast` `align_lexer` `align_parser` `align_sema` `align_mir` `align_codegen_llvm` `align_runtime` `align_driver`) flows end-to-end: `lexer → parser → sema → MIR → LLVM → executable`. `cargo build` / `cargo test` are green.
 - **What works today:** `alignc run examples/min.align` compiles `fn main() -> i32 { x := 1; return x }` to a native executable and returns exit code 1. Subcommands: `check` / `emit-mir` / `emit-llvm` / `build` / `run`. Integer literals infer width from context (`x := 1; return x` in an `-> i32` fn → `x: i32`); unconstrained ints default to `i64`. Arithmetic `+ - * / %` with correct precedence. An integration test compiles+runs and asserts the exit code (`crates/align_driver/tests/m0.rs`).
 - **Toolchain:** Rust 1.96, LLVM 19 via `inkwell` (`llvm19-1`). The Debian llvm-19 is shared-only (no `libPolly.a`), so `llvm-sys` is forced to dynamic linking via the `prefer-dynamic` feature + `.cargo/config.toml` (`LLVM_SYS_191_PREFER_DYNAMIC=1`). For M0 the generated `main` is the C entry (crt0 calls it); `align_runtime` is a stub, wired for real at M2 (Result-returning `main` via `align_rt_start`).
-- **Where things are:** spec = `draft.md` (authoritative). Design rationale = `docs/*.md`. Implementation plan = `docs/impl/00–07`. Decisions = `docs/open-questions.md` 決着済み (and "Settled decisions" above).
-- **Next action: M1** (`docs/impl/07-roadmap.md`) — `if`/比較/`bool`, `mut`+再代入, multi-arg fns + calls, struct定義+リテラル+field access, full primitives, a `print` hooked to runtime. Each feature threads through all stages; do not build one stage out ahead of the skeleton.
+- **Where things are:** spec = `draft.md` (authoritative). Design rationale = `docs/*.md`. Implementation plan = `docs/impl/00–07`. Decisions = `docs/open-questions.md` Settled (and "Settled decisions" above).
+- **Next action: M1** (`docs/impl/07-roadmap.md`) — `if`/comparison/`bool`, `mut` + reassignment, multi-arg fns + calls, struct definition + literal + field access, full primitives, a `print` hooked to runtime. Each feature threads through all stages; do not build one stage out ahead of the skeleton.
 - **No design item is blocking.** Open items wait on their milestone (error type → M2, explicit-allocator arena → M3, generics → M4, etc.).
 - **Note on continuity:** prior decisions also lived in this machine's Claude memory (`~/.claude/.../memory/`), which does NOT transfer between machines — but everything durable is already captured in `draft.md` + `docs/open-questions.md`, so this repo is self-sufficient.
 
 ## Conventions when editing
 
-- Match the existing house style: terse declarative sentences, Japanese prose in `draft.md`, fenced code blocks tagged `align` for language examples and `text` for bullet-like lists of concepts.
+- **Language: English only.** Everything in this project is written in English — code comments, identifiers, CLI output, diagnostic messages, commit messages, and all documentation (`draft.md`, `docs/`, `docs/impl/`). Align is a personal project intended to become globally adopted, so do not introduce Japanese. (The repo was originally written with Japanese docs; it was converted to English on 2026-06-17.)
+- Match the existing house style: terse declarative sentences, fenced code blocks tagged `align` for language examples and `text` for bullet-like lists of concepts.
 - Library is layered `core` (language-intrinsic primitives) → `std` (OS boundary) → `pkg` (frameworks/ecosystem, kept out of core/std). Place any new library surface in the correct layer; `draft.md` §18 defines the boundaries.
-- When changing a design decision, update *all* of: `draft.md`, the `docs/language-spec.md` digest, the rationale in `docs/design-notes.md`, the relevant `docs/impl/*.md`, and the **決着済み** section of `docs/open-questions.md` (move items out of 未解決 as they settle).
+- When changing a design decision, update *all* of: `draft.md`, the `docs/language-spec.md` digest, the rationale in `docs/design-notes.md`, the relevant `docs/impl/*.md`, and the **Settled** section of `docs/open-questions.md` (move items out of **Open** as they settle).

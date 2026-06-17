@@ -4,5 +4,5 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# 生成コードにリンクする薄いネイティブランタイム (docs/impl/06-runtime-std.md)。
-# M0 では ABI のスケッチのみ。codegen 結線時に staticlib として出力する。
+# Thin native runtime linked into generated code (docs/impl/06-runtime-std.md).
+# M0 has only an ABI sketch. Emitted as a staticlib once codegen is wired up.

@@ -1,7 +1,8 @@
-//! 構文解析: トークン列 → AST (`docs/impl/02-frontend.md` §10)。
+//! Parsing: token stream -> AST (`docs/impl/02-frontend.md` §10).
 //!
-//! 手書き再帰下降 + 式は Pratt parsing。脱糖はしない (AST は書かれた形を保つ)。
-//! M0 範囲: `fn` 宣言 / `:=` / `return` / 整数 / 四則演算 / `( )` グループ化。
+//! Hand-written recursive descent + Pratt parsing for expressions. No desugaring
+//! (the AST keeps the written form). M0 scope: `fn` declarations / `:=` / `return`
+//! / integers / arithmetic / `( )` grouping.
 
 use align_ast::*;
 use align_diag::Diagnostics;
@@ -67,12 +68,12 @@ impl<'a> Parser<'a> {
             true
         } else {
             self.diags
-                .error(format!("{what} を期待しました"), self.span());
+                .error(format!("expected {what}"), self.span());
             false
         }
     }
 
-    /// 文の区切り (改行/`;` 由来の End) を読み飛ばす。
+    /// Skip statement separators (End from newline/`;`).
     fn skip_ends(&mut self) {
         while self.at(&TokKind::End) {
             self.bump();
@@ -111,7 +112,7 @@ impl<'a> Parser<'a> {
             match self.parse_item() {
                 Some(item) => items.push(item),
                 None => {
-                    // エラー回復: 次の同期点 (fn / End) まで読み飛ばす。
+                    // Error recovery: skip to the next sync point (fn / End).
                     self.bump();
                     while !matches!(self.peek(), TokKind::Fn | TokKind::Eof | TokKind::End) {
                         self.bump();
@@ -137,7 +138,7 @@ impl<'a> Parser<'a> {
             self.parse_fn(vis).map(Item::Fn)
         } else {
             self.diags
-                .error("トップレベルでは fn を期待しました", self.span());
+                .error("expected fn at top level", self.span());
             None
         }
     }
@@ -145,13 +146,13 @@ impl<'a> Parser<'a> {
     fn parse_fn(&mut self, vis: Vis) -> Option<FnDecl> {
         let start = self.span();
         self.bump(); // fn
-        let name = self.parse_ident("関数名")?;
+        let name = self.parse_ident("a function name")?;
 
         self.expect(&TokKind::LParen, "'('");
         let mut params = Vec::new();
         while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
             let is_out = self.eat_ident_keyword("out");
-            let pname = self.parse_ident("引数名")?;
+            let pname = self.parse_ident("a parameter name")?;
             self.expect(&TokKind::Colon, "':'");
             let ty = self.parse_type()?;
             params.push(Param {
@@ -172,7 +173,7 @@ impl<'a> Parser<'a> {
         };
 
         let body = if self.eat(&TokKind::Eq) {
-            // 単一式形 `= expr`
+            // Single-expression form `= expr`
             let e = self.parse_expr(0)?;
             self.eat(&TokKind::End);
             FnBody::Expr(Box::new(e))
@@ -217,7 +218,7 @@ impl<'a> Parser<'a> {
                 stmts.push(s);
                 continue;
             }
-            // expr → 代入 / 式文 / 末尾式
+            // expr -> assignment / expression statement / trailing expression
             let e = self.parse_expr(0)?;
             if self.eat(&TokKind::Eq) {
                 let value = self.parse_expr(0)?;
@@ -227,7 +228,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 stmts.push(Stmt::Expr(e));
             } else {
-                // End なしでブロック末 → 末尾式
+                // End of block with no End -> trailing expression
                 tail = Some(Box::new(e));
                 break;
             }
@@ -240,7 +241,7 @@ impl<'a> Parser<'a> {
 
     fn parse_let(&mut self) -> Option<Stmt> {
         let is_mut = self.eat(&TokKind::Mut);
-        let name = self.parse_ident("変数名")?;
+        let name = self.parse_ident("a variable name")?;
         let ty = if self.eat(&TokKind::Colon) {
             Some(self.parse_type()?)
         } else {
@@ -268,7 +269,7 @@ impl<'a> Parser<'a> {
         Some(Stmt::Return(value))
     }
 
-    // --- 式 (Pratt) ---
+    // --- Expressions (Pratt) ---
 
     fn parse_expr(&mut self, min_bp: u8) -> Option<Expr> {
         let mut lhs = self.parse_primary()?;
@@ -332,23 +333,23 @@ impl<'a> Parser<'a> {
                 })
             }
             _ => {
-                self.diags.error("式を期待しました", span);
+                self.diags.error("expected an expression", span);
                 None
             }
         }
     }
 
-    // --- 補助 ---
+    // --- Helpers ---
 
     fn parse_path(&mut self) -> Path {
         let start = self.span();
         let mut segments = Vec::new();
-        if let Some(id) = self.parse_ident("識別子") {
+        if let Some(id) = self.parse_ident("an identifier") {
             segments.push(id);
         }
         while self.at(&TokKind::Dot) && matches!(self.peek_at(1), TokKind::Ident(_)) {
             self.bump(); // .
-            if let Some(id) = self.parse_ident("識別子") {
+            if let Some(id) = self.parse_ident("an identifier") {
                 segments.push(id);
             }
         }
@@ -373,12 +374,12 @@ impl<'a> Parser<'a> {
             self.bump();
             Some(Ident { name, span })
         } else {
-            self.diags.error(format!("{what} を期待しました"), span);
+            self.diags.error(format!("expected {what}"), span);
             None
         }
     }
 
-    /// `out` のような弱いキーワード (Ident として現れる) を消費する。
+    /// Consume a weak keyword such as `out` (which appears as an Ident).
     fn eat_ident_keyword(&mut self, kw: &str) -> bool {
         if let TokKind::Ident(name) = self.peek() {
             if name == kw {
@@ -427,7 +428,7 @@ mod tests {
         let Stmt::Return(Some(e)) = &b.stmts[0] else {
             panic!()
         };
-        // 最上位は + で、右が * (1 + (2*3))
+        // Top level is +, right side is * (1 + (2*3))
         let ExprKind::Binary { op, .. } = &e.kind else {
             panic!()
         };

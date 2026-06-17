@@ -1,16 +1,16 @@
-# Align の非目標
+# Align Non-Goals
 
-以下は意図的に目標としない。
+The following are intentionally not goals.
 
-## C++ の代替ではない
+## Not a replacement for C++
 
-Align はあらゆるプログラミングスタイルを支えようとはしない。
+Align does not try to support every programming style.
 
 ---
 
-## 最大の表現力を目指さない
+## Does not aim for maximum expressiveness
 
-Align は次に最適化しない。
+Align does not optimize for the following.
 
 ```text
 metaprogramming
@@ -20,11 +20,11 @@ advanced type wizardry
 
 ---
 
-## OOP ファーストではない
+## Not OOP-first
 
-Align はオブジェクト指向ではない。
+Align is not object-oriented.
 
-次を支える目標はない。
+There is no goal to support the following.
 
 ```text
 class hierarchies
@@ -34,9 +34,9 @@ deep object graphs
 
 ---
 
-## ランタイムの魔法を持たない
+## No runtime magic
 
-避けるもの:
+What it avoids:
 
 ```text
 hidden allocation
@@ -47,11 +47,11 @@ hidden copying
 
 ---
 
-## どこでも async にしない
+## Not async everywhere
 
-Align は言語を async/await 中心に組み立てない。
+Align does not build the language around async/await.
 
-主たるモデル:
+Primary model:
 
 ```text
 map
@@ -62,40 +62,40 @@ task_group
 
 ---
 
-## トレイトの複雑さを持たない
+## No trait complexity
 
-Rust 風の複雑さを避ける。
-
----
-
-## テンプレートの複雑さを持たない
-
-C++ 風のテンプレート複雑性を避ける。
+Avoids Rust-style complexity.
 
 ---
 
-## GC ファーストではない
+## No template complexity
 
-Align はガベージコレクション中心の設計ではない。
-
----
-
-## フレームワーク駆動ではない
-
-Web フレームワーク、ORM、クラウド SDK、AI SDK はパッケージに属する。
-
-core ではない。
+Avoids C++-style template complexity.
 
 ---
 
-## GPU 専用ではない
+## Not GC-first
 
-Align は GPU 互換である。
-
-GPU 中心ではない。
+Align is not a garbage-collection-centric design.
 
 ---
 
-## 学術的純粋さを追わない
+## Not framework-driven
 
-理論的な美しさよりも、実用的な性能を優先する。
+Web frameworks, ORMs, cloud SDKs, and AI SDKs belong to packages.
+
+Not in core.
+
+---
+
+## Not GPU-only
+
+Align is GPU-compatible.
+
+Not GPU-centric.
+
+---
+
+## Does not pursue academic purity
+
+Prioritizes practical performance over theoretical elegance.

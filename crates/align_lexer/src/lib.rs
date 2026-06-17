@@ -1,27 +1,29 @@
-//! 字句解析: 入力バイト列 → トークン列 (`docs/impl/02-frontend.md` §1)。
+//! Lexing: input bytes -> token stream (`docs/impl/02-frontend.md` §1).
 //!
-//! 文の終端は **Go スタイル** (`draft.md` §4): 改行が暗黙の終端 ([`TokKind::End`])。
-//! ブロックは `{}` でインデントは意味を持たない (非 Python)。行頭が `.`/二項演算子
-//! なら前行の継続とみなし `End` を挿入しない (複数行メソッドチェーン)。
+//! Statement termination is **Go style** (`draft.md` §4): a newline is an implicit
+//! terminator ([`TokKind::End`]). Blocks are `{}` and indentation is insignificant
+//! (not Python). If a line starts with `.`/a binary operator, it is treated as a
+//! continuation of the previous line and no `End` is inserted (multi-line method
+//! chains).
 //!
-//! M0 の範囲: `fn` / `return` / 識別子 / 整数 / `:=` `=` `->` 区切り / 四則演算。
+//! M0 scope: `fn` / `return` / identifiers / integers / `:=` `=` `->` separators / arithmetic.
 
 use align_diag::Diagnostics;
 use align_span::{FileId, Span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokKind {
-    // リテラル・識別子
+    // Literals / identifiers
     Int(i128),
     Ident(String),
-    // キーワード (M0 範囲)
+    // Keywords (M0 scope)
     Fn,
     Return,
     Mut,
     Pub,
     Module,
     Import,
-    // 記号・演算子
+    // Symbols / operators
     ColonEq, // :=
     Eq,      // =
     Arrow,   // ->
@@ -37,13 +39,13 @@ pub enum TokKind {
     Star,
     Slash,
     Percent,
-    /// 文の終端 (改行による暗黙の `;`、または明示 `;`)。
+    /// Statement terminator (implicit `;` from a newline, or an explicit `;`).
     End,
     Eof,
 }
 
 impl TokKind {
-    /// このトークンが行末にあるとき、文を終え得るか (暗黙 End 挿入の判定)。
+    /// Whether this token, at end of line, can terminate a statement (implicit End insertion).
     fn can_end_stmt(&self) -> bool {
         matches!(
             self,
@@ -69,7 +71,7 @@ struct Lexer<'a> {
     tokens: Vec<Token>,
 }
 
-/// `source` をトークン列に変換する。末尾は必ず [`TokKind::Eof`]。
+/// Convert `source` into a token stream. Always ends with [`TokKind::Eof`].
 pub fn tokenize(file: FileId, source: &str, diags: &mut Diagnostics) -> Vec<Token> {
     let mut lx = Lexer {
         file,
@@ -102,7 +104,7 @@ impl<'a> Lexer<'a> {
                 Some(_) => self.lex_token(diags),
             }
         }
-        // 最後の文に End を補い、Eof を置く。
+        // Append End to the last statement and place Eof.
         self.maybe_insert_end();
         let at = self.pos;
         self.tokens.push(Token {
@@ -111,8 +113,9 @@ impl<'a> Lexer<'a> {
         });
     }
 
-    /// 改行に達したとき、直前トークンが文を終え得るなら暗黙 End を挿入する。
-    /// ただし次の意味のあるバイトが行継続 (`.` または二項演算子) なら挿入しない。
+    /// On reaching a newline, insert an implicit End if the previous token can end
+    /// a statement. Skip insertion if the next significant byte is a line
+    /// continuation (`.` or a binary operator).
     fn maybe_insert_end(&mut self) {
         let prev_ends = self
             .tokens
@@ -132,15 +135,15 @@ impl<'a> Lexer<'a> {
         });
     }
 
-    /// 次の意味のあるバイト (空白・コメント・改行を飛ばした先) が、前行の継続を
-    /// 示す `.` または二項演算子で始まるか。
+    /// Whether the next significant byte (after skipping whitespace/comments/newlines)
+    /// starts with a `.` or binary operator indicating a continuation of the previous line.
     fn next_significant_continues_line(&self) -> bool {
         let mut i = self.pos;
         loop {
             match self.src.get(i).copied() {
                 Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') => i += 1,
                 Some(b'.') | Some(b'+') | Some(b'*') | Some(b'/') | Some(b'%') => return true,
-                // '-' は単項にもなり得るが、行頭継続では二項とみなす。
+                // '-' can be unary, but at line start it is treated as binary (continuation).
                 Some(b'-') => return self.src.get(i + 1).copied() != Some(b'>'),
                 _ => return false,
             }
@@ -182,7 +185,7 @@ impl<'a> Lexer<'a> {
                     value = value * 10 + (c - b'0') as i128;
                     self.pos += 1;
                 }
-                b'_' => self.pos += 1, // 桁区切り
+                b'_' => self.pos += 1, // digit separator
                 _ => break,
             }
         }
@@ -233,7 +236,7 @@ impl<'a> Lexer<'a> {
             _ => {
                 self.pos += 1;
                 diags.error(
-                    format!("予期しない文字: '{}'", c as char),
+                    format!("unexpected character: '{}'", c as char),
                     self.span(start, self.pos),
                 );
                 return;
@@ -299,7 +302,7 @@ mod tests {
 
     #[test]
     fn line_continuation_suppresses_end() {
-        // 行頭が '.' なら継続。End を挟まない。
+        // If a line starts with '.', it's a continuation. No End is inserted.
         let ks = kinds("a\n  .b\n");
         assert_eq!(
             ks,

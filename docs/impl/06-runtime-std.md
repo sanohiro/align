@@ -1,78 +1,78 @@
-# ランタイムと core/std ブートストラップ (draft)
+# Runtime and core/std Bootstrap (draft)
 
-`align_runtime` の ABI と、core/std をどう立ち上げるかのたたき台。`05-backend-llvm.md` が呼ぶ `align_rt_*` の実体をここで定義し、source→実行ファイルの設計を閉じる。
+Design sketch for the ABI of `align_runtime` and for how to bring up core/std. Here we define the implementation of the `align_rt_*` that `05-backend-llvm.md` calls, closing the source→executable design.
 
-方針:
+Policy:
 
 ```text
-ランタイムは薄く     GC なし。arena / 並列 / panic / 可変バッファ など「言語が要求する最小」だけ
-所有はコンパイラ側    寿命・解放点は MIR で確定済み(03/04)。runtime は与えられた通り確保/解放する
-core は言語に近い     可能な限り Align 自身で書く。runtime(C ABI)に降りるのは最小の下層だけ
-std は OS 境界        std は OS シスコールの薄いラッパ。core を土台にする
+keep the runtime thin       no GC. only the "minimum the language requires"—arena / parallel / panic / mutable buffer, etc.
+ownership is on the compiler lifetimes & release points are settled in MIR (03/04). the runtime allocates/frees exactly as told
+core is close to the language  write it in Align itself as much as possible. drop to the runtime (C ABI) only for the minimal lowest layer
+std is the OS boundary       std is a thin wrapper over OS syscalls. built on core
 ```
 
-この文書は **draft**。未決は末尾 + 本文 `// OPEN:`。
+This document is a **draft**. Open items are at the end + inline `// OPEN:`.
 
 ---
 
-## 1. ランタイムの構成
+## 1. Runtime structure
 
-`align_runtime` は薄いネイティブライブラリ(実装言語は Rust、`no_std` 寄りで C ABI を公開)。driver が object とリンクする(`01`/`05`)。
+`align_runtime` is a thin native library (implemented in Rust, leaning toward `no_std`, exposing a C ABI). The driver links it with the object (`01`/`05`).
 
 ```text
 align_runtime
-  start          エントリ(_start / main 相当)。main を呼び終了コードを返す
-  arena          bump allocator + 一括 reset
-  heap           明示 heap (malloc 系の薄い包み)
-  par            データ並列ランタイム (work-stealing or chunk 分割)
-  task           I/O 並行 (task_group)
-  buffer/builder 可変バイトバッファ
-  panic          アボート + メッセージ
-  intrinsics     memcpy/memset 等、SIMD 補助 (端数処理など)
+  start          entry (_start / main equivalent). calls main and returns the exit code
+  arena          bump allocator + bulk reset
+  heap           explicit heap (thin wrapper over the malloc family)
+  par            data-parallel runtime (work-stealing or chunk splitting)
+  task           I/O concurrency (task_group)
+  buffer/builder mutable byte buffer
+  panic          abort + message
+  intrinsics     memcpy/memset etc., SIMD helpers (remainder handling, etc.)
 ```
 
-`// OPEN:` 静的リンク固定か、libc にどこまで依存するか(`05 §10`)。OS 直叩き(syscall)か libc 経由かは std と共通の判断。
+`// OPEN:` whether to pin static linking, and how far to depend on libc (`05 §10`). Whether to hit the OS directly (syscalls) or go through libc is a decision shared with std.
 
 ---
 
-## 2. 値の ABI (コンパイラと runtime の契約)
+## 2. Value ABI (the contract between compiler and runtime)
 
-MIR/codegen のレイアウト(`05 §1`)と一致させる。runtime はこの形を前提に受け取る。
+Match the MIR/codegen layout (`05 §1`). The runtime receives these shapes by assumption.
 
 ```text
 slice<T>     { T* ptr, i64 len }
 array<T>     { T* ptr, i64 len, i64 cap }
 str          { u8* ptr, i64 len }
-builder      { u8* ptr, i64 len, i64 cap, Arena* arena? }   // 後述
-arena ハンドル  Arena*   (不透明ポインタ。中身は runtime 専有)
+builder      { u8* ptr, i64 len, i64 cap, Arena* arena? }   // described below
+arena handle  Arena*   (opaque pointer. its contents are runtime-private)
 ```
 
-すべて値渡し可能な小さなヘッダ。実体メモリは ptr の先(arena/heap/static)。
+All small headers passable by value. The actual memory is past the ptr (arena/heap/static).
 
 ---
 
 ## 3. arena allocator
 
-Align のメモリモデルの中心(`draft.md` §6.4)。bump allocator + ブロック出口で一括 reset。
+The center of Align's memory model (`draft.md` §6.4). bump allocator + bulk reset at the block exit.
 
 ```text
 Arena* align_rt_arena_begin(void)
 void*  align_rt_arena_alloc(Arena*, i64 size, i64 align)
-void   align_rt_arena_reset(Arena*)        // 全確保を一括解放。個別 free なし
-void   align_rt_arena_end(Arena*)          // arena 自体を返却
+void   align_rt_arena_reset(Arena*)        // bulk-release all allocations. no individual free
+void   align_rt_arena_end(Arena*)          // return the arena itself
 ```
 
-実装: 大きなブロックをチャンク単位で OS から取り、ポインタを前進させるだけ(O(1) 確保)。`reset` はポインタを先頭へ戻す(必要なら chunk を解放/プール)。`alloc` は要求 align に切り上げる(SIMD アライン, `draft.md` §3.4)。
+Implementation: take a large block from the OS in chunk units and just advance the pointer (O(1) allocation). `reset` returns the pointer to the start (freeing/pooling chunks if needed). `alloc` rounds up to the requested align (SIMD alignment, `draft.md` §3.4).
 
-codegen の対応(`05 §4`):
+codegen correspondence (`05 §4`):
 
 ```text
-arena { .. }  →  a = arena_begin(); ...本体(alloc は arena_alloc(a,..))...; arena_reset(a)/end(a)
+arena { .. }  →  a = arena_begin(); ...body (alloc is arena_alloc(a,..))...; arena_reset(a)/end(a)
 ```
 
-arena 内 view が外へ出ないことは型検査済み(`03 §7`)なので、runtime は寿命を一切追わない。
+Because typecheck has verified that a view inside the arena does not escape (`03 §7`), the runtime tracks no lifetimes at all.
 
-`// OPEN:` ネスト arena の chunk 共有/再利用、明示 allocator(`arena a {}`, open-questions)時の API。
+`// OPEN:` chunk sharing/reuse for nested arenas, and the API when an explicit allocator (`arena a {}`, open-questions) is used.
 
 ---
 
@@ -83,130 +83,130 @@ void* align_rt_heap_alloc(i64 size, i64 align)
 void  align_rt_heap_free(void* ptr)
 ```
 
-通常コードでは manual free しない(`draft.md` §6.5)。解放点は MIR の `Drop`(move 検査由来, `04 §1`)から codegen が `heap_free` を出す。raw alloc は `unsafe` のみ(`draft.md` §6.5)で、別の薄い API にする。
+Normal code does not manually free (`draft.md` §6.5). The release point comes from MIR's `Drop` (derived from the move check, `04 §1`), and codegen emits `heap_free`. raw alloc is `unsafe` only (`draft.md` §6.5) and goes through a separate thin API.
 
 ---
 
-## 5. データ並列 (par)
+## 5. Data parallelism (par)
 
-MIR の `ParLoop`(`04 §6`)が降りる先(`05 §7`)。
+The target that MIR's `ParLoop` (`04 §6`) lowers to (`05 §7`).
 
 ```text
 void align_rt_par_for(
   void* items, i64 len, i64 elem_size,
-  i64 chunk,                       // 0 なら runtime 既定
+  i64 chunk,                       // 0 means the runtime default
   void (*body)(void* chunk_ptr, i64 chunk_len, void* ctx),
   void* ctx)
 ```
 
-- 入力を chunk に分割し、ワーカスレッドへ。並列単位は chunk(`draft.md` §11)。
-- `body` は MIR で fusion 済みの本体を切り出した関数(`05 §7`)。`Effect=Pure` 保証済み(`03 §8`)なので競合は起きない。
+- Split the input into chunks and hand them to worker threads. The parallel unit is the chunk (`draft.md` §11).
+- `body` is the function carved out of the body fused in MIR (`05 §7`). `Effect=Pure` is guaranteed (`03 §8`), so no races occur.
 
-並列 reduce:
+Parallel reduce:
 
 ```text
 void align_rt_par_reduce(
-  ..., void (*body)(.., void* partial),     // chunk ごとの部分結果を partial に
-  void (*combine)(void* acc, void* partial),// 部分結果を結合 (結合的)
+  ..., void (*body)(.., void* partial),     // the per-chunk partial result into partial
+  void (*combine)(void* acc, void* partial),// combine partial results (associative)
   void* acc)
 ```
 
-部分結果を木状/直列に combine する。`// OPEN:` 結合の順序保証(浮動小数の再現性)、スレッドプールの寿命(プロセス常駐 vs ブロック単位)。
+Combine partial results tree-wise/serially. `// OPEN:` ordering guarantee of the combine (floating-point reproducibility), thread pool lifetime (process-resident vs. per-block).
 
 ---
 
-## 6. I/O 並行 (task_group)
+## 6. I/O concurrency (task_group)
 
 ```text
 Task*  align_rt_task_spawn(Result (*fn)(void* ctx), void* ctx)
 Result align_rt_task_wait_all(TaskGroup*)
 ```
 
-I/O 待ちの並行(`draft.md` §11)。`?` は各 spawn 結果に適用され、`wait` 合流点で最初の失敗を伝播。async/await は持たない(`non-goals.md`)ので、runtime 側でブロッキング I/O をスレッド/プールに載せる素朴な実装から始める。
+I/O-wait concurrency (`draft.md` §11). `?` applies to each spawn result, and the first failure propagates at the `wait` join point. There is no async/await (`non-goals.md`), so start from a naive implementation that puts blocking I/O on threads/a pool in the runtime.
 
 ---
 
 ## 7. buffer / builder
 
-文字列出力・template 脱糖(`04 §2.5`)の土台。
+The foundation for string output and template desugaring (`04 §2.5`).
 
 ```text
-Builder align_rt_builder_new(Arena* a?)        // arena 紐付け可
-void    align_rt_builder_write(Builder*, u8* ptr, i64 len)   // 静的部 (memcpy)
+Builder align_rt_builder_new(Arena* a?)        // can be tied to an arena
+void    align_rt_builder_write(Builder*, u8* ptr, i64 len)   // static part (memcpy)
 void    align_rt_builder_write_int(Builder*, i64)
 void    align_rt_builder_write_f64(Builder*, f64)
 str     align_rt_builder_finish(Builder*)
 ```
 
-`template "Hello {name}"` は静的部 → `builder_write`(長さは文字列 meta で既知, `03`/`05 §6`)、値部 → 型別 `write_*`。静的部長さの合計が既知なら `builder_new` 時に容量事前確保(`Alloc` 1回, `04 §2.5`)。`html`/`json` 用にエスケープ付き write を別に持つ。
+`template "Hello {name}"` is static part → `builder_write` (length known from string meta, `03`/`05 §6`), value part → per-type `write_*`. If the total static-part length is known, preallocate capacity at `builder_new` time (1 `Alloc`, `04 §2.5`). Keep separate escaping `write`s for `html`/`json`.
 
 ---
 
-## 8. panic / トラップ
+## 8. panic / traps
 
 ```text
 noreturn void align_rt_panic(str msg, SrcLoc loc)
 ```
 
-ゼロ除算など溢れ以外の算術エラー(`draft.md` §5)、未回復の不変条件違反で呼ぶ。位置は Span 由来(`05 §9`)。overflow は既定 wrap なので通常呼ばない(開発ビルドの任意チェック時のみ)。`panic` はメッセージ + 位置を stderr に出してアボート。`// OPEN:` panic を Result に変換する捕捉境界を設けるか(現状: 設けない=即アボート)。
+Called for arithmetic errors other than overflow such as divide-by-zero (`draft.md` §5), and for unrecovered invariant violations. The location comes from Span (`05 §9`). overflow defaults to wrap, so it is not normally called (only on optional checks in dev builds). `panic` prints the message + location to stderr and aborts. `// OPEN:` whether to provide a catch boundary that converts panic into a Result (current: none = immediate abort).
 
 ---
 
-## 9. エントリポイント
+## 9. Entry point
 
 ```text
 i32 align_rt_start(i32 argc, char** argv):
-  args = argv を array<str> に変換 (arena/static)
+  args = convert argv into an array<str> (arena/static)
   r = user_main(args)               // pub fn main(args) -> Result<(), Error>
   match r:
     Ok      => return 0
-    Err(e)  => report(e); return 非0
+    Err(e)  => report(e); return non-zero
 ```
 
-`main` の戻り(`draft.md` §17)を終了コードへ。`Error` の表示形式は error 型設計(`03`/M2)で確定。M0 では `fn main() -> i32` 直結の最小形から始め、Result 版は M2 で繋ぐ(`07-roadmap.md`)。
+Maps `main`'s return (`draft.md` §17) to the exit code. The display format of `Error` is settled in the error type design (`03`/M2). In M0, start from the minimal form wired directly to `fn main() -> i32`, and connect the Result version in M2 (`07-roadmap.md`).
 
 ---
 
-## 10. core / std のブートストラップ
+## 10. core / std bootstrap
 
 ```text
-core  言語思想に近い基盤 (draft.md §18.1)
+core  foundation close to the language philosophy (draft.md §18.1)
       option/result, array/slice/chunks, vec/mask/bitset,
       map/reduce/scan/partition/sort, str/string/bytes/buffer/builder,
       arena, json, template, hash, math
-std   OS 境界 (draft.md §18.2)
+std   the OS boundary (draft.md §18.2)
       io/fs/path/process/env/time/net/cli/encoding/compress/rand/crypto/http
 ```
 
-### 書く言語の方針
-- **core はできる限り Align 自身で書く**。`map`/`where`/`reduce` は MIR の fusion(`04 §3`)が効くよう、特別扱いの組込みではなく**通常の Align ジェネリック関数 + intrinsic フック**として定義する方向。下層(SIMD scan、hash の核)は runtime intrinsic に降りる。
-- **std は runtime + OS シスコールの薄いラッパ**を Align で書く。`fs.read_file` 等は runtime の I/O プリミティブを呼ぶ。
+### Policy on the implementation language
+- **Write core in Align itself as much as possible**. To make MIR's fusion (`04 §3`) work for `map`/`where`/`reduce`, the direction is to define them not as specially-handled builtins but as **normal Align generic functions + intrinsic hooks**. The lowest layer (SIMD scan, the core of hash) drops to runtime intrinsics.
+- **Write std as a thin wrapper** over the runtime + OS syscalls, in Align. `fs.read_file` etc. call the runtime's I/O primitives.
 
-### ブートストラップ順 (M と整合, 07)
+### Bootstrap order (consistent with M, 07)
 ```text
-M0-M1  最小 runtime(start/arena/panic) + 組込み print のみ。core/std はほぼ無し
-M2     core.option / core.result。std.fs.read_file (? の実例)
-M3     core.arena を言語機能と結線
-M4     core.array / slice / reduce 群 (fusion の検証対象)
+M0-M1  minimal runtime (start/arena/panic) + builtin print only. almost no core/std
+M2     core.option / core.result. std.fs.read_file (a concrete example of ?)
+M3     wire core.arena to the language feature
+M4     core.array / slice / reduce family (the verification target for fusion)
 M5     core.str/string/builder, core.json, core.template
 M6     core.vec / mask
-M7     並列 (core 側 par_map / std task)
-M8+    std 拡充 (path/env/time/net/...), pkg は対象外(draft.md §18.3)
+M7     parallel (par_map on the core side / task on std)
+M8+    std expansion (path/env/time/net/...). pkg is out of scope (draft.md §18.3)
 ```
 
-`// OPEN:` core を Align で書くために必要な最小ジェネリクス(`03 §9`, M4)が解決するまでは、暫定で組込み実装にしておくものの線引き。
+`// OPEN:` until the minimal generics needed to write core in Align (`03 §9`, M4) are resolved, where to draw the line on what stays a provisional builtin implementation.
 
 ---
 
-## 11. 未決事項 (要決着)
+## 11. Open items (to be settled)
 
 ```text
-- 静的リンク / libc 依存範囲 / syscall 直叩きの可否 (05 §10 と共通)
-- スレッドプールの寿命 (常駐 vs ブロック単位) と par reduce の浮動小数再現性
-- panic 捕捉境界を設けるか (現状: 即アボート)
-- Error 型の表示・終了コード対応 (M2 error 型設計)
-- core を Align で書く境界 (どこまで intrinsic に降ろすか)
-- arena ネスト / 明示 allocator の API (03/04 と連動)
+- static linking / scope of libc dependence / whether direct syscalls are allowed (common with 05 §10)
+- thread pool lifetime (resident vs. per-block) and floating-point reproducibility of par reduce
+- whether to provide a panic catch boundary (current: immediate abort)
+- Error type display and exit-code correspondence (M2 error type design)
+- the boundary for writing core in Align (how far to drop to intrinsics)
+- API for arena nesting / explicit allocator (linked with 03/04)
 ```
 
-決着次第 `draft.md`(該当機能)と本書へ反映する。
+Once settled, reflect into `draft.md` (the relevant feature) and this document.

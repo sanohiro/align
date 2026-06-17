@@ -1,99 +1,99 @@
-# コンパイラパイプライン
+# Compiler Pipeline
 
-`source.align` から実行ファイルまでの段と、段の間を流れる IR の境界を定義する。**IR 境界 = クレート境界**(`00-overview.md`)。各段は前段の出力だけに依存し、後段を知らない。
+Defines the stages from `source.align` to executable, and the boundaries of the IR flowing between stages. **IR boundary = crate boundary** (`00-overview.md`). Each stage depends only on the previous stage's output and knows nothing of later stages.
 
-## 全体図
+## Overall Diagram
 
 ```text
 source (.align)
   │  align_lexer
   ▼
-Tokens                      位置付きトークン列
+Tokens                      positioned token stream
   │  align_parser
   ▼
-AST                         構文木。意味解析前。span 付き
-  │  align_sema (1) 名前解決 / モジュール解決
+AST                         syntax tree. Before semantic analysis. With spans
+  │  align_sema (1) name resolution / module resolution
   ▼
-Resolved AST                参照が定義に結びついた状態
-  │  align_sema (2) 型推論 / 型検査
+Resolved AST                references bound to definitions
+  │  align_sema (2) type inference / type checking
   ▼
-Typed HIR                   全式に型が付いた高レベルIR
-  │  align_sema (3) move 検査 / arena escape 検査
+Typed HIR                   high-level IR with types on every expression
+  │  align_sema (3) move checking / arena escape checking
   ▼
-Checked HIR                 安全性検証済み。ここで通れば安全
-  │  align_mir  lowering(脱糖) + 解析
+Checked HIR                 safety-verified. If it passes here it is safe
+  │  align_mir  lowering (desugaring) + analysis
   ▼
-MIR                         バックエンド非依存の核。SIMD/fusion/arena 確定
-  │  align_mir  最適化パス
+MIR                         backend-agnostic core. SIMD/fusion/arena fixed
+  │  align_mir  optimization passes
   ▼
 MIR (optimized)
   │  align_codegen_llvm
   ▼
 LLVM IR → object
-  │  align_driver  リンク(+ align_runtime)
+  │  align_driver  link (+ align_runtime)
   ▼
-実行ファイル
+executable
 ```
 
-## 各段の責務
+## Stage Responsibilities
 
 ### Lexer (`align_lexer`)
-- 入力バイト列 → トークン列。
-- 文字列リテラルの **コンパイル時 meta** (`draft.md` §12: len / hash / ascii / utf8_valid / escape 要否) はここで一次計算し、トークンに添える。
-- ブロックは `{}`、インデントは意味を持たない(非 Python)。文の終端は **Go スタイル**: 改行が暗黙の終端、`;` は1行に詰めるときの任意セパレータ。lexer が「行末トークンが文を終え得るなら改行で暗黙 `;` を挿入、ただし行頭が `.`/二項演算子なら前行の継続」を判定する。
+- Input byte stream → token stream.
+- The **compile-time meta** of string literals (`draft.md` §12: len / hash / ascii / utf8_valid / whether escaping is needed) is computed once here and attached to the token.
+- Blocks are `{}`; indentation is not significant (non-Python). Statement termination is **Go style**: a newline is an implicit terminator, and `;` is an optional separator for cramming onto one line. The lexer decides "if the end-of-line token can end a statement, insert an implicit `;` at the newline; but if the next line starts with `.`/a binary operator, it is a continuation of the previous line."
 
 ### Parser (`align_parser`)
-- トークン列 → AST。エラー回復付き(1ファイル内で複数エラーを報告)。
-- `:=` / `mut` / `fn ... = expr` 短縮形 / struct リテラル / `?` / `else` / `arena {}` / `template`・`html`・`json` 文字列 などの構文をここで吸収。
-- **脱糖はしない**。`?` や `template` の展開は MIR 段。AST は書かれたまま保つ(formatter/lint が AST を使うため)。
+- Token stream → AST. With error recovery (reports multiple errors within one file).
+- Absorbs syntax such as `:=` / `mut` / the `fn ... = expr` short form / struct literals / `?` / `else` / `arena {}` / `template` / `html` / `json` strings here.
+- **No desugaring.** Expansion of `?` and `template` is the MIR stage. The AST is kept as written (because the formatter/lint use the AST).
 
-### Sema (1) 名前解決 (`align_sema`)
-- `module` / `import` の解決、シンボルテーブル構築、参照→定義の結合。
-- 可視性(`pub`)の検査。
+### Sema (1) Name Resolution (`align_sema`)
+- Resolution of `module` / `import`, symbol table construction, binding references → definitions.
+- Visibility (`pub`) checking.
 
-### Sema (2) 型推論・型検査 (`align_sema`)
-- 局所型推論(`x := 10` の型決定)と注釈との突合。
-- `Option<T>` / `Result<T,E>` / `array<T>` / `slice<T>` / `vec<N,T>` / `mask<T>` の型付け。
-- `?` 演算子が `Result` にのみ適用されることの検査。
-- 配列操作チェーン(`map`/`where`/`sum` ...)の型付け。詳細 `03-types.md`。
+### Sema (2) Type Inference / Type Checking (`align_sema`)
+- Local type inference (deciding the type of `x := 10`) and reconciliation with annotations.
+- Typing of `Option<T>` / `Result<T,E>` / `array<T>` / `slice<T>` / `vec<N,T>` / `mask<T>`.
+- Checking that the `?` operator applies only to `Result`.
+- Typing of array-operation chains (`map`/`where`/`sum` ...). Details in `03-types.md`.
 
-### Sema (3) move 検査 / arena escape 検査 (`align_sema`)
-- 所有型の move 後使用を**コンパイルエラー**にする(`draft.md` §6.3)。
-- `arena {}` 内で確保した view が arena 外へ漏れることを検査(§6.4, §15)。
-- `par_map` に渡す関数が外部 mutable state を変更しないことを検査(§11)。
-- `out` 引数の no-alias 制約検査(§7)。
-- **lifetime 注釈は要求しない**。フロー解析で寿命違反を検出する(`03-types.md`)。
+### Sema (3) Move Checking / Arena Escape Checking (`align_sema`)
+- Make use-after-move of owning types a **compile error** (`draft.md` §6.3).
+- Check that a view allocated inside `arena {}` does not leak outside the arena (§6.4, §15).
+- Check that a function passed to `par_map` does not mutate external mutable state (§11).
+- Check the no-alias constraint on `out` arguments (§7).
+- **No lifetime annotations are required.** Lifetime violations are detected by flow analysis (`03-types.md`).
 
-### MIR 生成 (`align_mir`)
-- ここで初めて**脱糖**する。詳細 `04-mir.md`。
-  - `?` → 早期 return + cold error path 分岐。
-  - `template` / `html` / `json` 文字列 → `write_static` / `write_value` 列(§13)。
-  - 配列式 `a = (b+c)*d` → 一時配列を作らない fused loop(§9)。
-  - `map`/`where`/`sum` チェーン → 単一ループへ fusion。
-  - `arena {}` → arena allocator の確保/一括解放呼び出し。
-  - struct → SoA/AoS レイアウト決定、field table 生成(§14)。
-- allocation / error path / 並列単位(chunk)を MIR 上で**明示ノード**として持つ(隠さない)。
+### MIR Generation (`align_mir`)
+- This is where **desugaring** first happens. Details in `04-mir.md`.
+  - `?` → early return + cold error path branch.
+  - `template` / `html` / `json` strings → `write_static` / `write_value` sequences (§13).
+  - Array expression `a = (b+c)*d` → a fused loop that creates no temporary array (§9).
+  - `map`/`where`/`sum` chains → fusion into a single loop.
+  - `arena {}` → arena allocator allocate / bulk-free calls.
+  - struct → SoA/AoS layout decision, field table generation (§14).
+- allocation / error path / parallel unit (chunk) are held as **explicit nodes** in MIR (nothing hidden).
 
-### MIR 最適化 (`align_mir`)
-- loop fusion、mask の branchless 化、不要 clone/heap の除去、const string pool 化。
-- lint(`draft.md` §16)の多くはこの解析結果を流用して診断する。
+### MIR Optimization (`align_mir`)
+- loop fusion, branchless lowering of `mask`, elimination of unnecessary clone/heap, const string pooling.
+- Many lints (`draft.md` §16) reuse the results of this analysis for diagnostics.
 
 ### Codegen (`align_codegen_llvm`)
-- MIR → LLVM IR。`vec<N,T>`/`mask` を LLVM の vector type / select に対応付け、決定論的にベクトル命令を出す。
-- arena 確保は runtime 呼び出しへ。詳細 `05-backend-llvm.md`。
+- MIR → LLVM IR. Maps `vec<N,T>`/`mask` to LLVM's vector type / select and emits vector instructions deterministically.
+- Arena allocation becomes runtime calls. Details in `05-backend-llvm.md`.
 
 ### Driver (`align_driver`)
-- CLI。各段を順に呼び、object を `align_runtime` とリンクして実行ファイルを出す。
-- サブコマンド(予定): `alignc build` / `alignc run` / `alignc check`(sema まで) / `alignc emit-mir` / `alignc emit-llvm`。
+- CLI. Calls the stages in order, links the object with `align_runtime`, and produces an executable.
+- Subcommands (planned): `alignc build` / `alignc run` / `alignc check` (up to sema) / `alignc emit-mir` / `alignc emit-llvm`.
 
-## 横断クレート
+## Cross-cutting Crates
 
-- `align_span`: ファイル ID + バイトオフセット範囲。全 IR ノードが span を持ち、診断で元ソースを指す。
-- `align_diag`: エラー/警告の型、表示、複数エラー集約。各段は失敗しても可能な限り続行し診断を貯める。
+- `align_span`: file ID + byte offset range. Every IR node carries a span, and diagnostics point back into the original source.
+- `align_diag`: types, display, and aggregation of multiple errors/warnings. Each stage continues as far as possible even on failure, accumulating diagnostics.
 
-## 骨格(walking skeleton)で最初に通す経路
+## The Path Driven First by the Skeleton (walking skeleton)
 
-M0(`07-roadmap.md`)で通す最小経路。各段の「自明な実装」だけを繋ぐ。
+The minimal path driven in M0 (`07-roadmap.md`). Connects only the "trivial implementation" of each stage.
 
 ```align
 fn main() -> i32 {
@@ -102,4 +102,4 @@ fn main() -> i32 {
 }
 ```
 
-この1本が lexer → parser → sema(型のみ) → MIR → LLVM → 実行ファイル(終了コード1)まで通れば骨格完成。以降の機能は全段へ少しずつ差し込む。
+If this one program flows through lexer → parser → sema (types only) → MIR → LLVM → executable (exit code 1), the skeleton is complete. Subsequent features are plugged into all stages little by little.

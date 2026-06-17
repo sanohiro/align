@@ -1,109 +1,109 @@
-# バックエンド: MIR → LLVM (draft)
+# Backend: MIR → LLVM (draft)
 
-`align_codegen_llvm` の設計たたき台。**純粋な lowering** に徹する——Align の意味論判断(脱糖・fusion・SIMD化・region)は MIR で済んでおり(`04-mir.md`)、ここは MIR を機械的に LLVM IR へ落とすだけ。型・Region・並列単位は MIR に載っているので**再計算しない**(anti-rewrite, `00-overview.md`)。
+Design sketch for `align_codegen_llvm`. It commits to **pure lowering**—Align's semantic decisions (desugaring, fusion, SIMD-ization, region) are already done in MIR (`04-mir.md`), and here we just mechanically lower MIR to LLVM IR. Types, Region, and parallel units are carried in MIR, so we **do not recompute** them (anti-rewrite, `00-overview.md`).
 
 ```text
-MIR (optimized)  →  LLVM IR  →  object (.o)  →  [driver がリンク] → 実行ファイル
+MIR (optimized)  →  LLVM IR  →  object (.o)  →  [driver links] → executable
                                                   + align_runtime (06)
 ```
 
-実装は Rust の LLVM バインディング(`inkwell`)を基本線とする。`// OPEN:` 版固定戦略(LLVM のバージョン依存をどう吸収するか)。
+The implementation takes Rust's LLVM bindings (`inkwell`) as the baseline. `// OPEN:` version-pinning strategy (how to absorb LLVM version dependence).
 
-この文書は **draft**。未決は末尾 + 本文 `// OPEN:`。
+This document is a **draft**. Open items are at the end + inline `// OPEN:`.
 
 ---
 
-## 1. 型の対応 (Ty → LLVM type)
+## 1. Type correspondence (Ty → LLVM type)
 
-MIR の `Ty`(`03 §1`)を LLVM 型へ一対一で写す。
+Map MIR's `Ty` (`03 §1`) one-to-one to LLVM types.
 
 ```text
-Bool              i1 (格納時は i8)
-Int(w, signed)    iW            (符号は演算側で区別)
+Bool              i1 (i8 when stored)
+Int(w, signed)    iW            (sign distinguished by the operation)
 Float(32|64)      float | double
 Char              i32 (Unicode scalar)
-Unit              {} (空) / void (戻り)
-Vec(n, T)         <n x T'>      ← LLVM vector type に直結
+Unit              {} (empty) / void (return)
+Vec(n, T)         <n x T'>      ← maps directly to LLVM vector type
 Mask(T)           <n x i1>
 Bitset            iN / [iW]
-Array(T)          { T* ptr, i64 len, i64 cap }   所有・連続
-Slice(T, _)       { T* ptr, i64 len }            view (Region は型に出さない)
-Str               { i8* ptr, i64 len }           (+ meta は別途, §6)
-String/Buffer/Builder  所有ヘッダ構造体
-Named(struct)     %struct.S = type { 各フィールド }   (レイアウトは §2)
-Named(sum)        { iT tag, [payload bytes] }    タグ付き共用体
-Option(T)         非null化できる型は null 表現、他は { i1, T }   // OPEN: 表現確定
+Array(T)          { T* ptr, i64 len, i64 cap }   owned, contiguous
+Slice(T, _)       { T* ptr, i64 len }            view (Region does not surface in the type)
+Str               { i8* ptr, i64 len }           (+ meta is separate, §6)
+String/Buffer/Builder  owned header struct
+Named(struct)     %struct.S = type { each field }   (layout is §2)
+Named(sum)        { iT tag, [payload bytes] }    tagged union
+Option(T)         null representation for types that can be made non-null, otherwise { i1, T }   // OPEN: representation TBD
 Result(T,E)       { i1 is_ok, union{T,E} }
-Fn(..)            関数ポインタ (+ キャプチャがあれば環境ポインタ)
+Fn(..)            function pointer (+ environment pointer if there is a capture)
 ```
 
-`Region` は **LLVM に出ない**。安全性は HIR で検証済み(`03 §7`)で、codegen には実体(arena ポインタ等)だけ渡る。これが「lifetime を表に出さない」の最終地点。
+`Region` **does not appear in LLVM**. Safety is already verified in HIR (`03 §7`); codegen receives only the concrete value (an arena pointer, etc.). This is the final destination of "do not surface lifetimes".
 
 ---
 
-## 2. struct レイアウト
+## 2. struct layout
 
-既定は **AoS**(宣言順、自然アライン、`draft.md` の値型中心)。データ並列で効く **SoA** は配列に対する変換として扱う。
+The default is **AoS** (declaration order, natural alignment, the value-type-centric `draft.md`). **SoA**, which helps for data parallelism, is treated as a transform over arrays.
 
 ```text
-AoS   array<User> = User の連続 → { User* , len, cap }
-SoA   ホット処理向けに array<User> を {id[], name[], active[], score[]} へ
+AoS   array<User> = contiguous User → { User* , len, cap }
+SoA   for hot processing, array<User> → {id[], name[], active[], score[]}
 ```
 
-`// OPEN:` SoA 変換のトリガ(自動判定 vs 注釈)。MIR の射影/fusion 解析(`04 §3`)が SoA の方が有利と判断した配列を SoA に置けるようにする方向。フィールドは SIMD のため自然アラインし、必要なら明示アライン属性を付ける(`draft.md` §3.4 alignment)。
+`// OPEN:` trigger for the SoA transform (automatic decision vs. annotation). The direction is to allow placing arrays that MIR's projection/fusion analysis (`04 §3`) judges to be more advantageous as SoA. Fields are naturally aligned for SIMD, and an explicit alignment attribute is added when needed (`draft.md` §3.4 alignment).
 
 ---
 
-## 3. 関数・CFG・cold path
+## 3. Functions, CFG, cold path
 
-- MIR の `Function` → LLVM function。`Block` → LLVM basic block(ほぼ一対一)。
-- ターミネータ対応:
+- MIR `Function` → LLVM function. `Block` → LLVM basic block (nearly one-to-one).
+- Terminator correspondence:
 
 ```text
 Goto         br
-Branch       条件 br
+Branch       conditional br
 Switch       switch
 Return       ret
-TryEdge      条件 br。err_bb に cold メタ付与
-Loop         ヘッダ/ボディ/エグジットの br 構造 (§5 でベクトル化)
-ParLoop      runtime の並列 API 呼び出しへ (§7)
+TryEdge      conditional br. attach cold metadata to err_bb
+Loop         br structure of header/body/exit (vectorized in §5)
+ParLoop      to a call of the runtime's parallel API (§7)
 ```
 
 ### cold path (error)
-`?` の失敗辺(`04 §2.1`)は cold。LLVM では:
+The failure edge of `?` (`04 §2.1`) is cold. In LLVM:
 
 ```text
-- err_bb に分岐する br へ llvm.expect / branch weights を付け、正常側を fall-through に
-- err_bb の中身を関数末尾(またはコールド section)へ配置
-- 失敗パスの関数呼び出しは noinline 寄りに
+- attach llvm.expect / branch weights to the br branching to err_bb, making the ok side fall-through
+- place the body of err_bb at the function tail (or a cold section)
+- lean toward noinline for calls on the failure path
 ```
 
-これで正常パスの I-cache を汚さない(`draft.md` §10)。
+This keeps the normal path's I-cache clean (`draft.md` §10).
 
 ---
 
-## 4. allocation の lowering
+## 4. allocation lowering
 
-MIR の明示 `Alloc`(`04 §5`)を実体化する。
+Materialize MIR's explicit `Alloc` (`04 §5`).
 
 ```text
-Alloc(Arena(id), layout)   → align_rt_arena_alloc(arena_ptr, size, align) を返すポインタ
-arena ブロック出口          → align_rt_arena_reset(arena_ptr)   (一括, 個別 free なし)
-Alloc(Heap, layout)        → align_rt_heap_alloc(...)  / Drop 点で align_rt_heap_free
+Alloc(Arena(id), layout)   → pointer returned by align_rt_arena_alloc(arena_ptr, size, align)
+arena block exit            → align_rt_arena_reset(arena_ptr)   (bulk, no individual free)
+Alloc(Heap, layout)        → align_rt_heap_alloc(...)  / align_rt_heap_free at the Drop point
 Alloc(Stack, layout)       → alloca
 ```
 
-arena ポインタは arena ブロック入口で `align_rt_arena_begin()` 相当を確保し、ブロックスコープの値として持ち回る(関数引数/ローカル)。詳細な runtime ABI は `06-runtime-std.md`。
+The arena pointer is acquired via the `align_rt_arena_begin()` equivalent at the arena block entry, and carried around as a block-scoped value (function argument/local). The detailed runtime ABI is in `06-runtime-std.md`.
 
 ---
 
-## 5. ループとベクトル化 (Align の性能の要)
+## 5. Loops and vectorization (the crux of Align's performance)
 
-MIR は fusion 済みで、要素独立ループを「vector幅 W + remainder」に整形済み(`04 §4`)。codegen はこれを**決定論的に** vector 命令へ落とす——LLVM の自動ベクトル化に「期待する」のではなく、こちらが vector 型で IR を組む。
+MIR is already fused and has shaped element-independent loops into "vector width W + remainder" (`04 §4`). codegen lowers this **deterministically** to vector instructions—rather than "hoping" for LLVM's auto-vectorization, we build the IR with vector types ourselves.
 
 ```text
-vector body   <W x T> の load → VecOp/Mask → store。ポインタは W ずつ進む
-remainder     端数をスカラで処理
+vector body   load <W x T> → VecOp/Mask → store. pointer advances by W
+remainder     handle the leftover scalarly
 ```
 
 ```text
@@ -118,83 +118,83 @@ loop:
 ; reduce: llvm.vector.reduce.fadd(acc) + remainder
 ```
 
-- **mask** → LLVM `<W x i1>` と `select`(branchless, `04 §4`)。
-- **dot / sum / min / max** → `llvm.vector.reduce.*`。
-- **no-alias**(`out`, `03 §6`)→ ポインタ引数に `noalias` 属性。依存なしでベクトル化が成立する根拠を LLVM に明示。
-- アライン済みなら aligned load/store。
+- **mask** → LLVM `<W x i1>` and `select` (branchless, `04 §4`).
+- **dot / sum / min / max** → `llvm.vector.reduce.*`.
+- **no-alias** (`out`, `03 §6`) → `noalias` attribute on the pointer argument. Make explicit to LLVM the basis for dependence-free vectorization.
+- aligned load/store when already aligned.
 
-### ターゲット幅 W
+### Target width W
 ```text
-vec<N,T> 由来   N をそのまま LLVM vector 幅に
-推論ループ      ターゲット ISA のネイティブ幅 (例 AVX2: 256bit) を既定に
+from vec<N,T>   N becomes the LLVM vector width directly
+inferred loops  the target ISA's native width (e.g. AVX2: 256bit) as default
 ```
-`// OPEN:` W の最終決定方針(`04 §9` と同一論点)。複数 ISA 対応(feature 別 codegen / 実行時ディスパッチ)は v1 範囲外候補。
+`// OPEN:` final policy for deciding W (same point as `04 §9`). Multi-ISA support (per-feature codegen / runtime dispatch) is a candidate outside the v1 scope.
 
 ---
 
-## 6. 文字列・builder・const pool
+## 6. Strings, builder, const pool
 
-- **文字列リテラル**: バイト列を LLVM global constant に。`str` 値は `{ptr,len}`。コンパイル時 meta(len/hash/ascii, `draft.md` §12, `03`)は定数として埋め込み、`write_static` の長さや hash 比較に使う。
-- **const string pool**(`draft.md` §12): 同一リテラル/JSON フィールド名/HTTP ヘッダ名は単一の global に集約(重複排除)。
-- **builder**: runtime の可変バッファ。`template` 脱糖(`04 §2.5`)の `write_static` は memcpy + 既知長、`write_value` は型別の書式化呼び出しに。
+- **string literals**: bytes as an LLVM global constant. A `str` value is `{ptr,len}`. Compile-time meta (len/hash/ascii, `draft.md` §12, `03`) is embedded as constants and used for `write_static` lengths and hash comparisons.
+- **const string pool** (`draft.md` §12): identical literals/JSON field names/HTTP header names are coalesced into a single global (deduplication).
+- **builder**: the runtime's mutable buffer. In the `template` desugaring (`04 §2.5`), `write_static` becomes memcpy + known length, and `write_value` becomes a per-type formatting call.
 
 ---
 
-## 7. 並列 (ParLoop → runtime)
+## 7. Parallelism (ParLoop → runtime)
 
-MIR の `ParLoop`(`04 §6`)を runtime の並列 API へ。
+MIR's `ParLoop` (`04 §6`) goes to the runtime's parallel API.
 
 ```text
 ParLoop(chunk, body)          → align_rt_par_for(items, chunk, body_fn, ctx)
-ParLoop(.., reduce)           → 部分結果配列を確保 → 並列実行 → 結合 reduce を直列/木状に
+ParLoop(.., reduce)           → allocate a partial-result array → run in parallel → combine reduce serially/tree-wise
 task_group spawn/wait         → align_rt_task_spawn / align_rt_task_wait
 ```
 
-`body` は MIR で fusion 済みの本体を**別関数として切り出し**、関数ポインタ + キャプチャ環境(`ctx`)を runtime に渡す。並列単位が MIR から渡るので codegen に並列判断は無い。ABI は `06`。
+The `body` is the fused body from MIR, **carved out as a separate function**, and a function pointer + capture environment (`ctx`) is passed to the runtime. Because the parallel unit comes from MIR, codegen makes no parallelism decisions. The ABI is in `06`.
 
 ---
 
-## 8. ターゲット・最適化・出力
+## 8. Target, optimization, output
 
 ```text
-- TargetMachine をホスト(または指定トリプル)で構築。data layout を取得し §2 のレイアウトに反映
-- LLVM 最適化: Align 側で fusion/vectorize 済みなので、LLVM には
-  下位最適化(instcombine, regalloc, ピープホール等)を任せる。高位変換は二重にしない
-- 出力: object (.o)。driver が align_runtime とリンクして実行ファイルへ (01/06)
-- alignc emit-llvm で IR をテキスト出力 (検証/デバッグ用, 01)
+- build the TargetMachine for the host (or a specified triple). obtain the data layout and reflect it in the §2 layout
+- LLVM optimization: since fusion/vectorization is done on the Align side, leave the
+  lower-level optimizations (instcombine, regalloc, peephole, etc.) to LLVM. don't duplicate high-level transforms
+- output: object (.o). the driver links it with align_runtime into an executable (01/06)
+- alignc emit-llvm outputs the IR as text (for verification/debug, 01)
 ```
 
-`// OPEN:` LLVM パスパイプラインをどこまで使うか(O2 相当一括 vs 必要パス選別)。Align の最適化と衝突しない範囲を実測で決める。
+`// OPEN:` how far to use the LLVM pass pipeline (a single O2-equivalent pass vs. selecting the necessary passes). Decide empirically within the range that does not conflict with Align's optimizations.
 
 ---
 
-## 9. デバッグ情報・パニック
+## 9. Debug info, panic
 
 ```text
-- DWARF/CodeView 行情報を Span(align_span) から生成。最低限ステップ実行できる水準を M で段階導入
-- ゼロ除算等のトラップ(03/draft §5): runtime のアボート(align_rt_panic)へ。メッセージ + 位置
-- overflow は既定 wrap なのでチェックを出さない (開発ビルドのみ任意でチェック挿入)
+- generate DWARF/CodeView line info from Span (align_span). introduce at least step-debug-capable level in stages across M
+- traps such as divide-by-zero (03/draft §5): to a runtime abort (align_rt_panic). message + location
+- overflow defaults to wrap, so no check is emitted (optionally insert a check in dev builds only)
 ```
 
 ---
 
-## 10. 未決事項 (要決着)
+## 10. Open items (to be settled)
 
-### 決着 (M0): inkwell / LLVM バージョンとリンク方式
-LLVM 19 を `inkwell 0.9` (feature `llvm19-1`) 経由で使う。Debian の llvm-19 は shared モード
-(`llvm-config --shared-mode` = shared、静的コンポーネント `libPolly.a` 等を同梱しない) のため、
-`llvm-sys` は **動的リンク** に固定する: `llvm-sys` の `prefer-dynamic` feature +
-`.cargo/config.toml` の `LLVM_SYS_191_PREFER_DYNAMIC=1`。M0 では生成した `main` を C エントリ
-(crt0 が呼ぶ) とし、driver が `cc` で object をリンクする。アップグレード戦略 (将来の LLVM 版追従)
-は引き続き要検討。
+### Settled (M0): inkwell / LLVM version and linking method
+Use LLVM 19 via `inkwell 0.9` (feature `llvm19-1`). Debian's llvm-19 is in shared mode
+(`llvm-config --shared-mode` = shared, not bundling static components such as `libPolly.a`), so
+`llvm-sys` is pinned to **dynamic linking**: `llvm-sys`'s `prefer-dynamic` feature +
+`LLVM_SYS_191_PREFER_DYNAMIC=1` in `.cargo/config.toml`. In M0 the generated `main` is the C entry
+(called by crt0), and the driver links the object with `cc`. The upgrade strategy (tracking future LLVM versions)
+remains to be examined.
 
 ```text
-- Option/Result の LLVM 表現確定 (null化 vs タグ付き、ニッチ最適化)
-- SoA 変換のトリガ (自動 vs 注釈) と array<T> ABI への影響
-- ベクトル幅 W の決定と複数 ISA 対応の範囲 (04 §9 と共通)
-- LLVM 最適化パイプラインの採用範囲 (Align 最適化との非重複)
-- デバッグ情報の精度をどの M でどこまで上げるか
-- リンク: 静的 runtime か、libc 依存をどこまで持つか (06 と連動)
+- finalize the LLVM representation of Option/Result (null-ization vs. tagged, niche optimization)
+- trigger for the SoA transform (automatic vs. annotation) and its impact on the array<T> ABI
+- deciding the vector width W and the scope of multi-ISA support (common with 04 §9)
+- the scope of adopting the LLVM optimization pipeline (non-overlap with Align's optimizations)
+- by which M and how far to raise the precision of debug info
+- linking: static runtime, and how far to depend on libc (linked with 06)
 ```
 
-決着次第 `draft.md`(該当機能)と本書へ反映する。
+Once settled, reflect into `draft.md` (the relevant feature) and this document.

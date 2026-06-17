@@ -1,5 +1,6 @@
-//! MIR のテキスト出力 (`alignc emit-mir`, `docs/impl/04-mir.md` §8)。
-//! fusion 前後の比較や「最適化が効いているか」の確認に使う (予測可能性の担保)。
+//! Textual output of MIR (`alignc emit-mir`, `docs/impl/04-mir.md` §8).
+//! Used to compare before/after fusion and to check "whether optimizations took
+//! effect" (ensuring predictability).
 
 use crate::{ty_name, Block, Function, Operand, Program, Rvalue, Stmt, Term};
 use align_ast::BinOp;

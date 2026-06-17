@@ -1,14 +1,15 @@
-//! typed HIR: 型検査を通った木 (`docs/impl/03-types.md` §10)。
+//! typed HIR: the tree after type checking (`docs/impl/03-types.md` §10).
 //!
-//! AST とほぼ同形だが、全式に解決済みの [`Ty`] が付き、参照は [`LocalId`] に解決済み。
-//! 後段 (MIR/codegen) が型を再計算しないための anti-rewrite 出力 (`00-overview.md`)。
-//! M0 では `?` / `else` / `template` / arena といった糖衣はまだ無い。
+//! Nearly isomorphic to the AST, but every expression carries a resolved [`Ty`] and
+//! references are resolved to [`LocalId`]. An anti-rewrite output so later stages
+//! (MIR/codegen) don't recompute types (`00-overview.md`). M0 has no sugar yet such
+//! as `?` / `else` / `template` / arena.
 
 use crate::Ty;
 use align_ast::BinOp;
 use align_span::Span;
 
-/// 関数本体内のローカル変数の識別子。
+/// Identifier of a local variable within a function body.
 pub type LocalId = u32;
 
 #[derive(Clone, Debug)]

@@ -1,30 +1,30 @@
-# Align 設計ノート
+# Align Design Notes
 
-## なぜ Align が存在するのか
+## Why Align exists
 
-Align は新しい構文を発明する試みではない。
+Align is not an attempt to invent new syntax.
 
-Align が存在するのは、現代のソフトウェア開発が変わったからである。
+Align exists because modern software development has changed.
 
-旧来のモデル:
+The old model:
 
 ```text
 Human -> Code -> Compiler
 ```
 
-新しいモデル:
+The new model:
 
 ```text
 Human -> AI -> Code -> Compiler
 ```
 
-言語設計はこの現実を反映しなければならない。
+Language design must reflect this reality.
 
 ---
 
-## 4つの一致
+## The four-way alignment
 
-Align は次の4者を一致(align)させようとする。
+Align seeks to align the following four parties.
 
 ```text
 Human
@@ -33,21 +33,21 @@ Compiler
 Hardware
 ```
 
-ほとんどの言語は人間だけに最適化している。
+Most languages optimize for humans alone.
 
-Align はこの4者すべてを第一級の市民として扱う。
+Align treats all four as first-class citizens.
 
 ---
 
-## 中心的な観察
+## The central observation
 
-現代の CPU は極めて速い。
+Modern CPUs are extremely fast.
 
-現代のコンパイラは極めて高度である。
+Modern compilers are extremely sophisticated.
 
-現代の AI はコードを書ける。
+Modern AI can write code.
 
-それでも開発者は依然として次を手で最適化している。
+Yet developers still hand-optimize the following.
 
 ```text
 allocation
@@ -57,19 +57,19 @@ branch prediction
 parallelism
 ```
 
-Align は、最適な道をそのまま既定の道にしようとする。
+Align seeks to make the optimal path the default path.
 
 ---
 
-## より少ないコード
+## Less code
 
-設立の信念のひとつ。
+One of the founding beliefs.
 
-> コードが少なければバグも少ない。
+> Less code means fewer bugs.
 
-言語は可能な限りボイラープレートを取り除くべきである。
+A language should remove boilerplate wherever possible.
 
-ただし、次は隠さない。
+But it does not hide the following.
 
 ```text
 allocation
@@ -78,52 +78,52 @@ parallelism
 unsafe operations
 ```
 
-これらは見えたままにする。
+These stay visible.
 
 ---
 
-## 表現力より収束性
+## Convergence over expressiveness
 
-多くの現代言語は表現力を最大化する。
+Many modern languages maximize expressiveness.
 
-Align は収束性を最大化する。
+Align maximizes convergence.
 
-目標:
+The goal:
 
 ```text
-異なる開発者
-異なる AI モデル
-異なるコードベース
+different developers
+different AI models
+different codebases
 ```
 
-が、自然と似た解にたどり着くこと。
+naturally arrive at similar solutions.
 
 ---
 
-## ひとつの道
+## One way
 
-Align は次を強く好む。
+Align strongly prefers the following.
 
 ```text
-ひとつのエラーモデル
-ひとつの optional モデル
-ひとつの所有モデル
-ひとつの並列モデル
+one error model
+one optional model
+one ownership model
+one parallel model
 ```
 
-複数の競合する方式よりも、ひとつに収束させる。
+Converge on one rather than several competing approaches.
 
 ---
 
-## まずコンパイラ親和
+## Compiler-friendly first
 
-Align は意図的に制限的である。
+Align is intentionally restrictive.
 
-制限は弱点ではない。
+Restriction is not a weakness.
 
-制限はコンパイラへの情報になる。
+Restriction becomes information for the compiler.
 
-コンパイラは次を推論できるべきである。
+The compiler should be able to infer the following.
 
 ```text
 contiguous memory
@@ -133,21 +133,21 @@ arena lifetime
 non-null values
 ```
 
-複雑な注釈を要求せずに、である。
+without requiring complex annotations.
 
 ---
 
-## まずハードウェア親和
+## Hardware-friendly first
 
-性能はまずキャッシュから始まる。
+Performance begins with the cache.
 
-SIMD より前に。
+Before SIMD.
 
-GPU より前に。
+Before GPU.
 
-並列化より前に。
+Before parallelization.
 
-重要な概念:
+Key concepts:
 
 ```text
 contiguous memory
@@ -159,13 +159,13 @@ chunk processing
 
 ---
 
-## SIMD の考え方
+## The SIMD philosophy
 
-Align は開発者に SIMD を書かせようとはしない。
+Align does not try to make developers write SIMD.
 
-Align は普通のコードが自然と SIMD 向きになるようにする。
+Align makes ordinary code naturally SIMD-friendly.
 
-例:
+Examples:
 
 ```text
 map
@@ -175,17 +175,17 @@ filter
 mask
 ```
 
-これらが自然にベクトル化コードへ落ちるべきである。
+These should lower naturally to vectorized code.
 
 ---
 
-## GPU の考え方
+## The GPU philosophy
 
-Align は GPU 言語ではない。
+Align is not a GPU language.
 
-Align は将来の GPU 実行を可能なまま保とうとするだけである。
+Align only seeks to keep future GPU execution possible.
 
-データ指向の操作を好むのは、それらが次へ自然に対応づくからである。
+It prefers data-oriented operations because they map naturally to the following.
 
 ```text
 CPU
@@ -195,13 +195,13 @@ GPU
 
 ---
 
-## 文字列の考え方
+## The string philosophy
 
-文字列は魔法のオブジェクトではない。
+Strings are not magic objects.
 
-文字列はデータである。
+Strings are data.
 
-目標:
+The goal:
 
 ```text
 scan once
@@ -210,17 +210,17 @@ builder based output
 string pools
 ```
 
-繰り返しの scan は避けるべきである。
+Repeated scanning should be avoided.
 
 ---
 
-## JSON の考え方
+## The JSON philosophy
 
-JSON は現代 API における事実上のアセンブリ言語である。
+JSON is the de facto assembly language of modern APIs.
 
-Align は JSON を第一級の関心事として扱う。
+Align treats JSON as a first-class concern.
 
-目標:
+The goal:
 
 ```text
 SIMD scanning
@@ -232,35 +232,35 @@ arena allocation
 
 ---
 
-## 安全性の立ち位置
+## The safety stance
 
-Align は意図的に次の中間に位置する。
+Align is intentionally positioned between the following.
 
 ```text
 Rust
 Zig
 ```
 
-立ち位置:
+The position:
 
 ```text
 safer than Zig
 simpler than Rust
 ```
 
-通常コードは安全であるべきである。
+Normal code should be safe.
 
-危険なコードは隔離されるべきである。
+Dangerous code should be isolated.
 
 ---
 
-## AI の考え方
+## The AI philosophy
 
-AI フレンドリーさは機能ではない。
+AI-friendliness is not a feature.
 
-それは設計上の制約である。
+It is a design constraint.
 
-避けるもの:
+What it avoids:
 
 ```text
 complex lifetime systems
@@ -269,7 +269,7 @@ multiple paradigms
 excessive abstraction
 ```
 
-好むもの:
+What it prefers:
 
 ```text
 predictability
@@ -279,6 +279,6 @@ consistency
 
 ---
 
-## ひとことで
+## In one sentence
 
-Align は、人間の意図・AI の生成・コンパイラ最適化・現代ハードウェアを一致させる、データ指向の言語である。
+Align is a data-oriented language that aligns human intent, AI generation, compiler optimization, and modern hardware.

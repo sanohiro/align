@@ -1,23 +1,23 @@
-# 型システム・推論・安全性検査 (draft)
+# Type System, Inference, Safety Checks (draft)
 
-`align_sema` の設計たたき台。担当は3パス: (2) 型推論・型検査、(3) move 検査・arena escape 検査・効果検査。((1) 名前解決は `01-pipeline.md` 参照、ここでは解決済みを前提)。
+Working draft for `align_sema`. It handles 3 passes: (2) type inference / type checking, (3) move checking / arena escape checking / effect checking. ((1) name resolution: see `01-pipeline.md`; here it is assumed already resolved.)
 
-設計原則(`draft.md` §3.3 / `design-notes.md`):
+Design principles (`draft.md` §3.3 / `design-notes.md`):
 
 ```text
-lifetime を表に出さない    move も arena 寿命もフロー解析で推論し、誤りだけをエラーにする
-推論前提                  局所推論 + 双方向型付け。global HM のような複雑さは持たない
-予測可能                  同じコードは常に同じ型に決まる。曖昧なら明示を要求
-コンパイラに情報を渡す      no-alias / non-null / region / cold path を HIR に載せ MIR/codegen が再計算しない
+Don't surface lifetimes      both move and arena lifetime are inferred by flow analysis; only mistakes become errors
+Inference-first              local inference + bidirectional typing. No global-HM-style complexity
+Predictable                 the same code always resolves to the same type. If ambiguous, demand an annotation
+Hand info to the compiler    put no-alias / non-null / region / cold path on the HIR so MIR/codegen don't recompute
 ```
 
-この文書は **draft**。未決は末尾「未決事項」+ 本文 `// OPEN:`。
+This document is a **draft**. Open items are at the end under "Open items" + `// OPEN:` in the body.
 
 ---
 
-## 1. 型の表現 (Ty)
+## 1. Type representation (Ty)
 
-`align_sema` 内部の型表現。
+The internal type representation inside `align_sema`.
 
 ```text
 Ty =
@@ -27,107 +27,107 @@ Ty =
   Char
   Unit                      // ()
   Str | String | Bytes | Buffer | Builder
-  Array(Ty)                 // 所有・連続メモリ
-  Slice(Ty, Region)         // view。Region を持つ
+  Array(Ty)                 // owning, contiguous memory
+  Slice(Ty, Region)         // view. Carries a Region
   Vec(n, Ty) | Mask(Ty) | Bitset
   Option(Ty)
   Result(Ty, Ty)
-  Named(DefId, [Ty])        // struct / sum type。ジェネリック実引数
-  Fn([Ty], Ty, Effect)     // ラムダ・関数値
-  Var(id)                   // 推論変数 (推論中のみ)
+  Named(DefId, [Ty])        // struct / sum type. Generic actual arguments
+  Fn([Ty], Ty, Effect)     // lambda / function value
+  Var(id)                   // inference variable (during inference only)
 ```
 
-`Named` は **nominal**(名前で同一性が決まる)。struct も sum type も `Named` で表し、`DefId` 経由で定義(フィールド/variant)を引く。
+`Named` is **nominal** (identity determined by name). Both struct and sum type are represented as `Named`, and the definition (fields/variants) is looked up via `DefId`.
 
-### Region (寿命タグ)
-view 系(`Slice` / `Str` 等の参照的な型)だけが持つ。ユーザは書かない。エラーメッセージにのみ現れる。
+### Region (lifetime tag)
+Only view-like types (reference-like types such as `Slice` / `Str`) carry it. Users never write it. It appears only in error messages.
 
 ```text
 Region =
-  Static        // 文字列リテラル / const pool
-  Heap          // 明示 heap 由来
-  Value         // 所有値の内部 (その値と寿命を共有)
-  Arena(id)     // 特定の arena ブロック由来
+  Static        // string literal / const pool
+  Heap          // from explicit heap
+  Value         // inside an owned value (shares the value's lifetime)
+  Arena(id)     // from a specific arena block
 ```
 
 ---
 
-## 2. 数値リテラルの既定型
+## 2. Default type of numeric literals
 
-文脈(注釈・推論)で型が決まる。**最後まで未制約のときだけ**既定型を適用する。
+The type is determined by context (annotation / inference). The default type is applied **only when left unconstrained to the end**.
 
 ```text
-整数リテラル 既定 = i64    (modern/64bit 既定。id 等の溢れに安全)
-浮動リテラル 既定 = f64
+integer literal default = i64    (modern/64bit default. Safe against id overflow etc.)
+float literal default   = f64
 ```
 
-接尾辞で明示可: `10i32` / `2.0f32`。`// OPEN:` 大配列で i64 既定が無駄な場合の lint(i32 で足りる旨)。
+Can be made explicit with a suffix: `10i32` / `2.0f32`. `// OPEN:` lint for when the i64 default is wasteful in large arrays (noting that i32 suffices).
 
-### 整数オーバーフロー (確定, draft.md §5)
+### Integer overflow (settled, draft.md §5)
 
-整数演算は **UB にしない**。既定は2の補数 wrap(全ビルド同一・分岐なし・ベクトル化を妨げない)。codegen は通常の `add`/`mul` 等をそのまま出す。`checked_*`(→Option) / `saturating_*` / `wrapping_*` を明示 op としてライブラリで提供。開発時のみ overflow チェック付きビルドと lint でバグ検出するが意味論は変えない。ゼロ除算等は溢れと別で、silent にせず必ずエラー(trap か Result)。
+Integer arithmetic is **not UB**. The default is two's-complement wrap (identical across all builds, branch-free, doesn't impede vectorization). codegen emits ordinary `add`/`mul` etc. as-is. `checked_*`(→Option) / `saturating_*` / `wrapping_*` are provided by the library as explicit ops. During development only, an overflow-checked build and lint catch bugs, but the semantics are unchanged. Division by zero etc. is separate from overflow: never silent, always an error (trap or Result).
 
 ```align
-x := 10;            // 未制約 → i64
-y: i32 := 10;       // 注釈 → i32
-z := 10i32;         // 接尾辞 → i32
-s := xs.sum();      // xs: array<i32> → i32 (文脈で決まる)
+x := 10;            // unconstrained → i64
+y: i32 := 10;       // annotation → i32
+z := 10i32;         // suffix → i32
+s := xs.sum();      // xs: array<i32> → i32 (determined by context)
 ```
 
 ---
 
-## 3. 推論と検査 (双方向)
+## 3. Inference and checking (bidirectional)
 
-局所推論 + 双方向型付け。2モードを使い分ける。
+Local inference + bidirectional typing. Two modes are used as appropriate.
 
 ```text
-check(expr, expected)   期待型がある場合 (注釈 / 引数位置 / return / if 両腕の統一)
-infer(expr) -> Ty       期待型がない場合 (:= の右辺など)
+check(expr, expected)   when an expected type exists (annotation / argument position / return / unifying both if arms)
+infer(expr) -> Ty       when there is no expected type (the RHS of := etc.)
 ```
 
-- `x := e` → `infer(e)` の結果を `x` の型に。
-- `x: T := e` → `check(e, T)`。
-- 関数本体は `check(body, ret)`。`= expr;` 形も同様。
-- 引数は宣言型で `check`。
+- `x := e` → result of `infer(e)` becomes the type of `x`.
+- `x: T := e` → `check(e, T)`.
+- A function body is `check(body, ret)`. The `= expr;` form is the same.
+- Arguments are `check`ed against their declared types.
 
-統一(unify)は推論変数 `Var` の解決のみに使い、nominal 型は構造で勝手に同一化しない。曖昧(`Var` が残る)なら型注釈を要求するエラー。
+Unification (unify) is used only to resolve inference variables `Var`; nominal types are not arbitrarily unified by structure. If ambiguous (a `Var` remains), it is an error demanding a type annotation.
 
-### if / match は式 → 両腕を統一
-フロントエンドの宿題を回収。
+### if / match are expressions → unify the arms
+Picking up the homework from the frontend.
 
 ```text
-if c { a } else { b }   : check(c, Bool); T = unify(type(a), type(b)); 結果 T
-match s { p1 => e1, ... }: 各 ei を unify。結果は共通型
-else 無しの if          : 値を持たない (Unit 文としてのみ可)
-match は網羅でなければエラー (// OPEN: 網羅性判定の詳細)
+if c { a } else { b }   : check(c, Bool); T = unify(type(a), type(b)); result T
+match s { p1 => e1, ... }: unify each ei. The result is the common type
+if with no else          : has no value (allowed only as a Unit statement)
+match must be exhaustive or it is an error (// OPEN: details of exhaustiveness checking)
 ```
 
 ```align
-label := if s > 80 { "high" } else { "low" };   // 両腕 str → label: str
+label := if s > 80 { "high" } else { "low" };   // both arms str → label: str
 ```
 
 ---
 
-## 4. フィールドアクセスと射影 (`.field` の二義を解決)
+## 4. Field access and projection (resolving the two meanings of `.field`)
 
-`recv.field` の型は **受け手の型で決まる**。
+The type of `recv.field` is **determined by the receiver's type**.
 
 ```text
-recv: Named(struct S)        → S.field の型 (通常アクセス)
-recv: Array(Named S) / Slice → Array(field の型) (射影)
+recv: Named(struct S)        → the type of S.field (ordinary access)
+recv: Array(Named S) / Slice → Array(type of field) (projection)
 ```
 
 ```align
 u.score              // u: User        → i32
-users.score          // users: array<User> → array<i32> (射影)
+users.score          // users: array<User> → array<i32> (projection)
 users.where(.active).score.sum()
 //    ^ Slice<User>   ^ Array<i32>   ^ i32
 ```
 
-射影は HIR 上で `Project(field)` ノードに確定し、MIR で fusion 対象になる(`04-mir.md`)。通常アクセスは `FieldAccess`。
+A projection is fixed as a `Project(field)` node on the HIR and becomes a fusion target in MIR (`04-mir.md`). Ordinary access is `FieldAccess`.
 
-### フィールドセレクタ `.ident`
-引数位置の `.ident` は受け手要素型 `E` から関数値 `Fn([E], type_of(E.ident), Pure)` として型付け。
+### Field selector `.ident`
+A `.ident` at argument position is typed, from the receiver element type `E`, as a function value `Fn([E], type_of(E.ident), Pure)`.
 
 ```align
 users.where(.active)   // .active : Fn([User], bool, Pure)
@@ -138,158 +138,158 @@ users.where(.active)   // .active : Fn([User], bool, Pure)
 ## 5. Option / Result / ? / else
 
 ```text
-?         expr: Result(T, E) で、囲む関数の戻りが Result(_, E') かつ E が E' に変換可能 → 値は T
-          Result 以外に ? はエラー (draft.md §5)
-else      lhs: Option(T) または Result(T, _)。
-          rhs は (a) 発散する (return 等) か (b) T を与える。結果は T
+?         for expr: Result(T, E), where the enclosing function returns Result(_, E') and E is convertible to E' → the value is T
+          ? on anything but Result is an error (draft.md §5)
+else      lhs: Option(T) or Result(T, _).
+          rhs either (a) diverges (return etc.) or (b) supplies a T. The result is T
 ```
 
 ```align
-data := fs.read_file(path)?;             // Result(String,E) → String, 失敗は伝播
+data := fs.read_file(path)?;             // Result(String,E) → String, failure propagates
 user := find_user(id) else return ...;   // Option(User) → User
-port := get_env("PORT") else { 8080 };   // else 腕が i64 を供給
+port := get_env("PORT") else { 8080 };   // the else arm supplies an i64
 ```
 
-`?` / `else` は HIR では専用ノードのまま保持し、MIR で early-return + cold path に脱糖(`04-mir.md`)。`E → E'` 変換規則は `// OPEN:`(error type 設計, M2)。
+`?` / `else` are kept as dedicated nodes in HIR, and desugared in MIR to early return + cold path (`04-mir.md`). The `E → E'` conversion rule is `// OPEN:` (error type design, M2).
 
 ---
 
-## 6. 所有権と move 検査 (パス3, lifetime なし)
+## 6. Ownership and move checking (pass 3, no lifetimes)
 
-### Copy 型と Move 型
+### Copy types and Move types
 ```text
-Copy (値, ビット複製で安全)
-  bool / 整数 / 浮動 / char / Unit
+Copy (value, safe to bit-copy)
+  bool / integer / float / char / Unit
   Vec / Mask / Bitset
-  全フィールドが Copy かつ小さい struct
-  Slice (view の複製。指す先は複製しない。Region 制約は別途)
+  structs that are all-Copy and small
+  Slice (copying the view; the pointed-to data is not copied. Region constraints handled separately)
 
-Move (所有, 線形)
+Move (owning, linear)
   Array / String / Buffer / Builder
   Heap box
-  Move 型を含む struct / 大きい struct
+  structs containing a Move type / large structs
 ```
 
-`// OPEN:` 「小さい」の閾値(レイアウトサイズ)。大 struct の値渡しは **lint**(エラーではない, `draft.md` §6.2)。
+`// OPEN:` the threshold for "small" (layout size). Passing a large struct by value is a **lint** (not an error, `draft.md` §6.2).
 
-### 検査
-CFG 上のフロー解析。Move 型の値が consume(値として代入/値引数に渡す/値で返す)されると、元の束縛は dead。dead な束縛の使用は **コンパイルエラー**。
+### Checking
+Flow analysis over the CFG. When a Move-type value is consumed (assigned as a value / passed as a value argument / returned by value), the original binding becomes dead. Using a dead binding is a **compile error**.
 
 ```align
 data := fs.read_file(path)?;
-other := data;        // data を move
-print(data);          // error: data は move 済み
+other := data;        // moves data
+print(data);          // error: data has already been moved
 ```
 
-複製は明示 `clone()`。`Copy` 型にはこの制約はかからない。
+Copying is explicit via `clone()`. This constraint does not apply to `Copy` types.
 
-### out 引数と no-alias
-`out dst: slice<T>` は「`dst` は他の入力と別領域」を意味する。検査(呼出側で `dst` が他引数と alias しないこと)+ 最適化情報(no-alias)として HIR に記録し MIR/codegen へ渡す(`draft.md` §7)。
+### out arguments and no-alias
+`out dst: slice<T>` means "`dst` is a region distinct from the other inputs". Recorded on the HIR as both a check (that `dst` does not alias other arguments at the call site) and optimization info (no-alias), then passed to MIR/codegen (`draft.md` §7).
 
 ---
 
-## 7. arena escape 検査 (パス3, region でlifetimeを隠す)
+## 7. arena escape checking (pass 3, hide lifetimes with regions)
 
-`arena {}` はブロックに `Arena(id)` region を導入する。ブロック内の allocation 由来の view はこの region を帯びる。
+`arena {}` introduces an `Arena(id)` region into the block. Views derived from allocations inside the block bear this region.
 
-**escape 規則**: `Arena(id)` を帯びた値は、その arena ブロックより長く生きてはならない。具体的に次を**コンパイルエラー**にする。
+**Escape rule**: a value bearing `Arena(id)` must not outlive its arena block. Concretely, the following are made **compile errors**.
 
 ```text
-- arena ブロックの外で宣言された束縛への代入
-- arena ブロックからの return / ブロック値として外へ返す
-- 非 arena コンテナ(外の array 等)への格納
-- arena 外へ脱出するクロージャへのキャプチャ
+- assignment to a binding declared outside the arena block
+- return from the arena block / returning outward as the block's value
+- storing into a non-arena container (an outer array etc.)
+- capture by a closure that escapes outside the arena
 ```
 
 ```align
 mut saved: slice<User> := empty;
 arena {
   data := fs.read_file(path)?;
-  users := json.decode<array<User>>(data)?;   // users は Arena(a) region
-  total := users.where(.active).score.sum();  // OK: 値(i64)は region を持たない
-  saved = users;                              // error: arena view が外へ escape
+  users := json.decode<array<User>>(data)?;   // users has the Arena(a) region
+  total := users.where(.active).score.sum();  // OK: a value (i64) carries no region
+  saved = users;                              // error: an arena view escapes outward
 }
 ```
 
-region の伝播はフロー解析で推論し、ユーザは一切書かない。違反時のみエラーメッセージに region を出す(例: 「この view は arena ブロックに束縛されている」)。`// OPEN:` arena のネスト時の region 順序、明示 allocator (`arena a {}`, open-questions) との統合。
+Region propagation is inferred by flow analysis; users write nothing. Only on violation does the error message surface a region (e.g. "this view is bound to an arena block"). `// OPEN:` region ordering for nested arenas, and integration with explicit allocators (`arena a {}`, open-questions).
 
 ---
 
-## 8. 効果検査 (par_map の純粋性, パス3)
+## 8. Effect checking (purity of par_map, pass 3)
 
-並列・データ処理に渡す関数は副作用を持てない(`draft.md` §11)。効果は**推論**する(注釈しない, open-questions の purity は推論方針で決着)。
+Functions passed to parallel / data processing cannot have side effects (`draft.md` §11). Effects are **inferred** (not annotated; the purity in open-questions is settled to be an inference policy).
 
 ```text
-Effect = Pure | Impure(理由)
-関数/ラムダは本体から効果を推論:
-  外部 mut 束縛の変更        → Impure
-  I/O など副作用 std 呼出し  → Impure
-  上記が無ければ             → Pure
+Effect = Pure | Impure(reason)
+A function/lambda has its effect inferred from its body:
+  modifying an outer mut binding   → Impure
+  calling a side-effecting std fn (I/O etc.)  → Impure
+  if none of the above             → Pure
 ```
 
-`par_map` / `map` / `where` / `reduce` のクロージャ引数は `Pure` を要求。違反はエラーで、`reduce` への誘導を示す。
+The closure arguments to `par_map` / `map` / `where` / `reduce` require `Pure`. A violation is an error, with guidance toward `reduce`.
 
 ```align
 mut total := 0;
-users.par_map(fn u { total = total + u.score });  // error: 外部 mut を変更 (Impure)
+users.par_map(fn u { total = total + u.score });  // error: modifies an outer mut (Impure)
 total := users.reduce(0, fn acc, u { acc + u.score });  // OK: Pure
 ```
 
-`Fn` 型は効果を持つ(`Fn([Ty], Ty, Effect)`)ので、関数値経由でも検査できる。
+The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked even through a function value.
 
 ---
 
-## 9. ジェネリクス (最小, M4 前に確定)
+## 9. Generics (minimal, settle before M4)
 
-monomorphization(使用箇所ごとに具象化)。Rust/C++ のトレイト/テンプレート複雑性は持たない(`non-goals.md`)。
+monomorphization (specialize per use site). No Rust/C++ trait/template complexity (`non-goals.md`).
 
 ```text
-- 型パラメータは Named / Fn / array<T> 等に持てる
-- 制約は当面「使われた演算から推論」する構造的方針を基本線とする
-- 明示的な境界(trait 風)を入れるかは M4 着手前に決定
+- type parameters can appear on Named / Fn / array<T> etc.
+- for now the baseline policy for constraints is structural "inferred from the operations used"
+- whether to introduce explicit bounds (trait-like) is decided before starting M4
 ```
 
-`// OPEN:` 制約の表現(構造的 vs 明示境界)、`vec<N,T>` の N(値ジェネリクス)の扱い、単相化の実装単位。これは `04-mir.md`(単相化を MIR 生成前に行うか後か)と連動。
+`// OPEN:` representation of constraints (structural vs explicit bounds), handling of the N in `vec<N,T>` (value generics), and the unit of monomorphization. This is tied to `04-mir.md` (whether monomorphization happens before or after MIR generation).
 
 ---
 
-## 10. typed HIR (パス出力)
+## 10. typed HIR (pass output)
 
-検査を通った AST は **typed HIR** になる。AST とほぼ同形だが、後段が型情報を再計算しないよう次を確定済みで載せる(anti-rewrite, `00-overview.md`)。
+AST that passes the checks becomes the **typed HIR**. Almost the same shape as the AST, but the following are placed on it as already-settled so later stages don't recompute type info (anti-rewrite, `00-overview.md`).
 
 ```text
-- 全 Expr に解決済み Ty
-- Path は DefId に解決済み
-- .field は FieldAccess / Project(field) のどちらかに確定
-- フィールドセレクタは具体化したクロージャに
-- view 型の Region
-- move 点(consume 位置)と dead 束縛のマーキング
-- out 引数の no-alias フラグ
-- 各関数/クロージャの Effect
+- a resolved Ty on every Expr
+- Path resolved to a DefId
+- .field fixed to either FieldAccess or Project(field)
+- field selectors made into concretized closures
+- Region of view types
+- marking of move points (consume positions) and dead bindings
+- the no-alias flag of out arguments
+- the Effect of each function/closure
 ```
 
-`?` / `else` / `template` / arena は**まだ脱糖しない**(HIR では専用ノード)。脱糖は MIR(`04-mir.md`)。
+`?` / `else` / `template` / arena are **not yet desugared** (dedicated nodes in HIR). Desugaring happens in MIR (`04-mir.md`).
 
 ---
 
-## 11. エラー報告
+## 11. Error reporting
 
-- 双方向検査で「期待 vs 実際」を持つので、型不一致は期待型の出所(注釈/引数/return/if 腕)を併記する。
-- move エラーは move した位置を指す。
-- arena escape はエラー本文に region(どの arena に束縛されているか)を出す。lifetime 構文は出さない。
-- 1関数内で複数の型エラーを集約(`align_diag`)。推論変数が残った箇所は「型注釈が必要」で停止。
+- Since bidirectional checking holds "expected vs actual", a type mismatch also cites the source of the expected type (annotation / argument / return / if arm).
+- A move error points to the position where the move happened.
+- An arena escape surfaces the region in the error body (which arena it is bound to). No lifetime syntax is shown.
+- Multiple type errors within one function are aggregated (`align_diag`). Where an inference variable remains, it stops with "type annotation required".
 
 ---
 
-## 12. 未決事項 (要決着)
+## 12. Open items (to be settled)
 
 ```text
-- E → E' (error 型変換) の規則           → M2 (error type 設計)
-- match 網羅性判定の正確なアルゴリズム
-- Copy/Move を分ける struct サイズ閾値
-- arena ネスト時の region 順序 / 明示 allocator との統合  → M3
-- ジェネリクス制約: 構造的推論 vs 明示境界 / 単相化単位  → M4
-- 数値既定型の lint (大配列で i64 が過剰な場合)
+- the rule for E → E' (error type conversion)      → M2 (error type design)
+- the exact algorithm for match exhaustiveness checking
+- the struct size threshold dividing Copy/Move
+- region ordering for nested arenas / integration with explicit allocators  → M3
+- generics constraints: structural inference vs explicit bounds / monomorphization unit  → M4
+- lint for the numeric default type (when i64 is excessive in large arrays)
 ```
 
-決着次第 `draft.md` と本書へ反映する。
+Reflected into `draft.md` and this document as they are settled.

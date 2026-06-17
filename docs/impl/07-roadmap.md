@@ -1,10 +1,10 @@
-# 実装ロードマップ
+# Implementation Roadmap
 
-マイルストーン。原則は `00-overview.md` の通り——**設計は全体を先に、実装は縦に貫く骨格を先に通し、各機能は全段へ差し込む**。各 M は「端から端まで動く(`.align` → 実行 → 出力検証)」ことを完了条件とする。段を縦に貫かないタスク(例: 型システムだけ先に全部)は作らない。
+Milestones. The principle is as in `00-overview.md` — **fix the whole design first, drive a vertical skeleton through the implementation first, and plug each feature into all stages**. Each M has the completion condition of "works end to end (`.align` → run → output verification)." Do not create tasks that do not run vertically through the stages (e.g. doing the whole type system first).
 
-## M0 — 骨格貫通 (walking skeleton)
+## M0 — Skeleton Traversal (walking skeleton)
 
-目的: パイプライン全段がクレート境界含めて繋がること。機能は最小。
+Goal: the whole pipeline connects, including crate boundaries. Features minimal.
 
 ```align
 fn main() -> i32 {
@@ -13,96 +13,96 @@ fn main() -> i32 {
 }
 ```
 
-完了条件:
-- lexer / parser / sema(整数型のみ) / MIR / LLVM codegen / driver の6クレートが存在し連結。
-- `alignc run` で実行ファイルが出て終了コードが返る。
-- 端から端までの統合テストが1本緑。
+Completion conditions:
+- The six crates lexer / parser / sema (integer types only) / MIR / LLVM codegen / driver exist and are linked.
+- `alignc run` produces an executable and returns an exit code.
+- One end-to-end integration test is green.
 
-この時点で `i64`/`i32` 整数、`:=`、`fn`、`return`、四則演算だけ。型推論も move 検査も最小。
+At this point only `i64`/`i32` integers, `:=`, `fn`, `return`, and the four arithmetic operations. Type inference and move checking are minimal.
 
-## M1 — 言語の骨(関数・制御・struct・bool)
+## M1 — The Bones of the Language (functions, control, struct, bool)
 
-- `fn`(通常形 + `= expr` 短縮形)、複数引数、関数呼び出し。
-- `if` / 比較演算 / `bool`。
-- `mut` と再代入。
-- `struct` 定義と値リテラル、フィールドアクセス(まず AoS)。
-- プリミティブ型一式(`i8..u64` / `f32` `f64` / `char`)。
-- `std.io` の `print` 相当を runtime 直結で1つ(出力検証のため)。
+- `fn` (normal form + `= expr` short form), multiple arguments, function calls.
+- `if` / comparison operations / `bool`.
+- `mut` and reassignment.
+- `struct` definitions and value literals, field access (AoS first).
+- The full set of primitive types (`i8..u64` / `f32` `f64` / `char`).
+- One `print` equivalent of `std.io`, wired directly to the runtime (for output verification).
 
-完了条件: フィボナッチ等、制御フロー + struct を使う小プログラムが動く。
+Completion condition: a small program using control flow + struct, such as Fibonacci, runs.
 
-## M2 — エラーと存在(Result / Option / ?)
+## M2 — Errors and Existence (Result / Option / ?)
 
-- `Option<T>`(null 無し)、`else` による取り出し。
-- `Result<T,E>` と `?` 演算子 → MIR で早期 return + cold path に脱糖。
-- `pub fn main(...) -> Result<(), Error>` 形を通す。
-- 単一 `Error` 型から開始(`open-questions.md` の error type 設計は M2 内で確定させる)。
+- `Option<T>` (no null), extraction via `else`.
+- `Result<T,E>` and the `?` operator → desugared in MIR to early return + cold path.
+- Make the `pub fn main(...) -> Result<(), Error>` form work.
+- Start from a single `Error` type (the error type design in `open-questions.md` is finalized within M2).
 
-完了条件: ファイル読み込み失敗を `?` で伝播する例が動く。
+Completion condition: an example that propagates a file-read failure via `?` runs.
 
-## M3 — メモリモデル(move / value / arena)
+## M3 — Memory Model (move / value / arena)
 
-- 所有型の move と move 後使用エラー、明示 `clone()`。
-- 小 struct の値渡し、大 struct copy の lint。
-- `arena {}` ブロック → `align_runtime` の arena allocator 呼び出しと一括解放。
-- arena view の escape 検査。
+- move of owning types and use-after-move errors, explicit `clone()`.
+- Pass-by-value of small structs, lint for large-struct copies.
+- `arena {}` block → calls to `align_runtime`'s arena allocator and bulk free.
+- Arena view escape checking.
 
-完了条件: `arena {}` 内で確保したデータが正しくブロック終了時に解放され、escape がエラーになる。
+Completion condition: data allocated inside `arena {}` is correctly freed at block exit, and escapes become errors.
 
-## M4 — 配列処理コア(Align の主役)
+## M4 — Array Processing Core (Align's protagonist)
 
-- `array<T>` / `slice<T>`、`out` 引数。
-- `map` / `filter` / `where` / `reduce` / `sum` 等のチェーン。
-- MIR での **loop fusion**(`map().where().sum()` を単一ループへ)。
-- `.score` のようなフィールド射影。
+- `array<T>` / `slice<T>`, `out` arguments.
+- chains such as `map` / `filter` / `where` / `reduce` / `sum`.
+- **loop fusion** in MIR (`map().where().sum()` into a single loop).
+- field projection such as `.score`.
 
-完了条件: `draft.md` §19 の example(JSON 抜きの配列集計部分)が fusion されたコードで動く。
+Completion condition: the example in `draft.md` §19 (the array-aggregation part, excluding JSON) runs as fused code.
 
-## M5 — 文字列と JSON
+## M5 — Strings and JSON
 
-- `str` / `string` / `bytes` / `buffer` / `builder`。
-- 文字列リテラル meta と const string pool。
-- `template` / `html` / `json` 文字列の脱糖(`write_static`/`write_value`)。
-- `json.decode<T>` / `encode<T>`、struct からの field table 生成、zero-copy view、SIMD structural scan。
+- `str` / `string` / `bytes` / `buffer` / `builder`.
+- string literal meta and const string pool.
+- desugaring of `template` / `html` / `json` strings (`write_static`/`write_value`).
+- `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy view, SIMD structural scan.
 
-完了条件: `draft.md` §19 の example が**丸ごと**動く(JSON 読み込み → 集計 → builder 出力)。
+Completion condition: the example in `draft.md` §19 runs **in full** (JSON read → aggregate → builder output).
 
 ## M6 — SIMD / vec / mask
 
-- `vec2/4/8/16<T>`、`mask<T>`、`bitset`。
-- 配列式 `a = (b+c)*d - e` の一時配列なし fusion。
-- MIR の mask を LLVM vector select へ決定論的に lowering。
-- `sum_where` / `dot` / `select`。
+- `vec2/4/8/16<T>`, `mask<T>`, `bitset`.
+- temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
+- deterministic lowering of MIR mask to LLVM vector select.
+- `sum_where` / `dot` / `select`.
 
-完了条件: ベクトル化されたコードが LLVM IR レベルで vector 命令を含むことを確認。
+Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 
-## M7 — 並列
+## M7 — Parallelism
 
-- `par_map`(並列単位 = chunk)、`chunks`。
-- `par_map` の副作用検査(M3 の解析を流用)。
-- `task_group` / `spawn` / `wait`(I/O 並行)。
-- async/await は入れない(`non-goals.md`)。
+- `par_map` (parallel unit = chunk), `chunks`.
+- side-effect checking for `par_map` (reusing the M3 analysis).
+- `task_group` / `spawn` / `wait` (I/O concurrency).
+- async/await is not included (`non-goals.md`).
 
-## M8 — ツールと品質
+## M8 — Tooling and Quality
 
-- 公式 formatter(必須、`draft.md` §16)。
-- 標準 lint 一式(loop 内 allocation / 巨大 struct copy / 不要 clone / 不要 heap / 未処理 Result / hot loop 内 branch / string 再 scan / 暗黙 copy)。
-- `unsafe` ブロックと `raw.*`。
+- the official formatter (mandatory, `draft.md` §16).
+- the full set of standard lints (allocation in loop / huge struct copy / unnecessary clone / unnecessary heap / unhandled Result / branch in hot loop / string re-scan / implicit copy).
+- `unsafe` blocks and `raw.*`.
 
-## 並行して詰める設計課題
+## Design Issues to Settle in Parallel
 
-`open-questions.md` の各項目を、関連 M に紐付けて決着させる(後回しにしない)。
+Settle each item in `open-questions.md`, tied to its related M (do not defer).
 
 ```text
-error type 設計        → M2 で確定
-ownership 構文          → M3 で確定
-arena API(明示 allocator) → M3 で確定
-generics 最小システム    → M4 着手前に確定(配列操作が generic を要求するため)
-purity 推論             → M7 で確定(par_map 検査と一体)
-SIMD intrinsics の有無   → M6 で確定
-reflection / FFI        → v1 範囲外。M8 後に再検討
+error type design          → finalized in M2
+ownership syntax           → finalized in M3
+arena API (explicit allocator) → finalized in M3
+minimal generics system    → finalized before starting M4 (array operations require generics)
+purity inference           → finalized in M7 (integral with par_map checking)
+presence of SIMD intrinsics → finalized in M6
+reflection / FFI           → out of v1 scope. Reconsider after M8
 ```
 
-## v1 範囲外(意図的)
+## Out of v1 Scope (intentional)
 
-`non-goals.md` / `open-questions.md` の通り。GPU バックエンド、分散実行、インクリメンタルコンパイル、セルフホストは v1 の外。ただし MIR をバックエンド非依存に保つことで将来の追加を阻害しない(`00-overview.md`)。
+As in `non-goals.md` / `open-questions.md`. GPU backend, distributed execution, incremental compilation, and self-hosting are outside v1. However, keeping MIR backend-agnostic does not obstruct future additions (`00-overview.md`).

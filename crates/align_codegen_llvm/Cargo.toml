@@ -9,8 +9,8 @@ align_mir = { path = "../align_mir" }
 align_sema = { path = "../align_sema" }
 align_ast = { path = "../align_ast" }
 inkwell = { version = "0.9", features = ["llvm19-1"] }
-# inkwell が使う llvm-sys (191.x) に prefer-dynamic を付け、libLLVM-19.so への
-# 動的リンクを強制する (Debian llvm-19 は静的コンポーネント libPolly.a 等を持たない)。
+# Add prefer-dynamic to the llvm-sys (191.x) that inkwell uses, forcing dynamic
+# linking against libLLVM-19.so (Debian llvm-19 lacks static components like libPolly.a).
 llvm-sys = { version = "191", features = ["prefer-dynamic"] }
 
 [dev-dependencies]

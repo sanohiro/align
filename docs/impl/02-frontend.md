@@ -1,124 +1,124 @@
-# フロントエンド: 字句・構文・AST (draft)
+# Frontend: Lexing, Parsing, AST (draft)
 
-`align_lexer` / `align_parser` / `align_ast` の設計たたき台。`draft.md` の構文と、これまでに確定した方針を反映する。
+Working draft for `align_lexer` / `align_parser` / `align_ast`. Reflects the syntax in `draft.md` and the decisions settled so far.
 
-確定済みの前提:
+Settled premises:
 
 ```text
-文の終端       Go スタイル (改行が暗黙の終端、; は1行に詰めるとき用の任意セパレータ)
-ブロック値     末尾の ; なし式 = ブロックの値
-式指向         if / match / else取り出し / arena は式
-型宣言         キーワードなし (内容で struct / sum type を判別)
-区切り         , (フィールド・引数・variant)。改行が無意味なので , が必要
-正規化         公式 formatter が単一正規形へ (One Way)
+Statement termination   Go style (newline is an implicit terminator; ; is an optional separator for cramming onto one line)
+Block value             trailing expression with no ; = the block's value
+Expression-oriented     if / match / else-unwrap / arena are expressions
+Type declarations       keyword-less (struct / sum type disambiguated by content)
+Separators              , (fields, args, variants). Since newlines are meaningless, , is required
+Normalization           the official formatter converges to a single normal form (One Way)
 ```
 
-この文書は **draft(たたき台)**。未決箇所は本文末尾「未決事項」に集約し、本文中は `// OPEN:` で印を付ける。
+This document is a **draft**. Open items are collected under "Open items" at the end of the document; in the body they are flagged with `// OPEN:`.
 
 ---
 
-## 1. 字句 (Lexical)
+## 1. Lexical
 
-### エンコーディング
-ソースは UTF-8。識別子は ASCII を基本とし、非 ASCII は文字列・コメント・char リテラル内のみ。
+### Encoding
+Source is UTF-8. Identifiers are basically ASCII; non-ASCII appears only inside strings, comments, and char literals.
 
-### コメント
-C/Rust 風。
+### Comments
+C/Rust style.
 
 ```align
-// 行コメント
-/* ブロックコメント /* ネスト可 */ */
-/// doc コメント (宣言の直前。ツール/将来のドキュメント生成用)
+// line comment
+/* block comment /* nesting allowed */ */
+/// doc comment (immediately before a declaration; for tooling / future doc generation)
 ```
 
-### 識別子
+### Identifiers
 ```text
 ident   = (letter | "_") (letter | digit | "_")*
 ```
 
-### キーワード (予約語)
+### Keywords (reserved words)
 ```text
 fn  mut  return  if  else  match  arena  unsafe
 module  import  pub
 true  false
 ```
 
-型名 (`i32` 等)・組込み (`array` `slice` `vec` `mask` `Option` `Result` 等) は**予約語にしない**。標準ライブラリが定義する通常の識別子として扱い、言語コアを小さく保つ。`template` / `html` / `json` / `raw` は文字列前置子(後述)で、文脈限定の弱いキーワード。
+Type names (`i32` etc.) and built-ins (`array` `slice` `vec` `mask` `Option` `Result` etc.) are **not reserved words**. They are treated as ordinary identifiers defined by the standard library, keeping the language core small. `template` / `html` / `json` / `raw` are string prefixes (see below): weak, context-limited keywords.
 
-### リテラル
+### Literals
 
-整数:
+Integers:
 ```align
-42        // 10進
-1_000_000 // _ は桁区切り (無視)
-0xFF      // 16進
-0o755     // 8進
-0b1010    // 2進
+42        // decimal
+1_000_000 // _ is a digit separator (ignored)
+0xFF      // hex
+0o755     // octal
+0b1010    // binary
 ```
 
-浮動小数:
+Floats:
 ```align
 3.14
 1.5e-10
 ```
 
-文字・文字列・bool:
+Char / string / bool:
 ```align
 'a'   '\n'   '\u{1F600}'
 "hello\tworld"
 true   false
 ```
 
-数値リテラルは原則**型を持たず**、文脈(注釈・推論)で確定する(`03-types.md`)。曖昧な場合のみ接尾辞で明示する。
+Numeric literals in principle **have no type**; the type is fixed by context (annotation / inference) (`03-types.md`). A suffix makes it explicit only when ambiguous.
 
 ```align
-x := 10        // 文脈から型が決まる
-y := 10i64     // 明示
+x := 10        // type determined by context
+y := 10i64     // explicit
 ```
 
-`// OPEN:` 接尾辞の正確な集合(`i8..u64`/`f32`/`f64`)。
+`// OPEN:` the exact set of suffixes (`i8..u64`/`f32`/`f64`).
 
-文字列リテラルは lexer 段で**コンパイル時 meta**(len / hash / ascii / utf8_valid / escape 要否, `draft.md` §12)を一次計算してトークンに添える。
+String literals get their **compile-time meta** (len / hash / ascii / utf8_valid / whether escaping is needed, `draft.md` §12) precomputed at the lexer stage and attached to the token.
 
-### 演算子・記号
+### Operators and symbols
 ```text
 +  -  *  /  %
 ==  !=  <  <=  >  >=
 &&  ||  !
-=        代入
-:=       宣言 (immutable)
-->       戻り型
-?        Result 伝播 (後置)
-.        メンバ / メソッド / フィールド射影
+=        assignment
+:=       declaration (immutable)
+->       return type
+?        Result propagation (postfix)
+.        member / method / field projection
 ,  ;  :  ::
 ( )  { }  [ ]  < >
 ```
 
-`< >` は比較とジェネリクスの両用(§9 で曖昧性解決)。
+`< >` serves both comparison and generics (ambiguity resolved in §9).
 
-### 文終端 (Go スタイルの暗黙セミコロン)
-lexer が文の終端トークン `END` を生成する。規則:
+### Statement termination (Go-style implicit semicolons)
+The lexer generates a statement-terminator token `END`. Rules:
 
 ```text
-- 行末のトークンが「文を終え得る」種別(ident / literal / ) / ] / } / ? など)なら、
-  改行で暗黙の END を挿入する。
-- ただし行頭が . または二項演算子で始まる場合は継続とみなし END を挿入しない
-  (複数行メソッドチェーン)。
-- 明示 ; は常に END。1行に複数文を詰めるときに使う。
-- 行末が二項演算子 / , / ( / { / -> などで終わる場合も継続(END を挿入しない)。
+- If the last token on a line is of a kind that "can end a statement" (ident / literal / ) / ] / } / ? etc.),
+  an implicit END is inserted at the newline.
+- However, if the next line starts with . or a binary operator, it is treated as a continuation and no END
+  is inserted (multi-line method chains).
+- An explicit ; is always an END. Used to cram multiple statements onto one line.
+- If a line ends with a binary operator / , / ( / { / -> etc., it is also a continuation (no END inserted).
 ```
 
-これにより普段は `;` なしで書け、1行に詰めたいときだけ `;` を置ける(`draft.md` §4)。`{}` でブロックを区切るためインデントは無意味(非 Python)。`// OPEN:` `return` 直後改行など Go 流の細則の確定。
+This lets you normally write without `;`, placing `;` only when you want to cram onto one line (`draft.md` §4). Since `{}` delimits blocks, indentation is meaningless (not Python). `// OPEN:` settling Go-style fine points such as newline right after `return`.
 
 ---
 
-## 2. 文法表記
+## 2. Grammar notation
 
-EBNF。`A*` 0回以上、`A+` 1回以上、`A?` 省略可、`A | B` 選択、`( )` グループ、`","` リテラル。末尾カンマは原則許可(formatter が付与)。
+EBNF. `A*` zero or more, `A+` one or more, `A?` optional, `A | B` choice, `( )` grouping, `","` literal. Trailing commas are allowed in principle (the formatter adds them).
 
 ---
 
-## 3. トップレベル (Items)
+## 3. Top level (Items)
 
 ```ebnf
 file        = module_decl? import_decl* item*
@@ -126,20 +126,20 @@ file        = module_decl? import_decl* item*
 module_decl = "module" path END
 import_decl = "import" path END
 path        = ident ("." ident)*
-END         = newline-inserted ";" | explicit ";"   // lexer 生成 (演算子・記号 §)
+END         = newline-inserted ";" | explicit ";"   // lexer-generated (operators & symbols §)
 
 item        = vis? ( fn_decl | type_decl | const_decl )
 vis         = "pub"
 ```
 
-### 関数
+### Functions
 
 ```ebnf
 fn_decl   = "fn" ident generics? "(" params? ")" ret? fn_body
 params    = param ("," param)* ","?
 param     = "out"? ident ":" type
 ret       = "->" type
-fn_body   = block | "=" expr END          // 単一式は = expr 形 (唯一の形)
+fn_body   = block | "=" expr END          // single expression uses the = expr form (the only form)
 generics  = "<" generic_param ("," generic_param)* ">"
 ```
 
@@ -148,15 +148,15 @@ fn add(a: i32, b: i32) -> i32 = a + b
 
 fn classify(u: User) -> str {
   s := score(u)
-  if s > 80 { "high" } else { "low" }     // 末尾式 = 戻り値
+  if s > 80 { "high" } else { "low" }     // trailing expression = return value
 }
 
 fn fill(out dst: slice<f32>, v: f32) { dst = v }
 ```
 
-### 型宣言 (キーワードなし)
+### Type declarations (keyword-less)
 
-struct と sum type を**同じ構文の場**で書き、中身で判別する。
+struct and sum type are written in the **same syntactic position** and disambiguated by content.
 
 ```ebnf
 type_decl  = ident generics? "{" type_body? "}"
@@ -167,7 +167,7 @@ enum_body  = variant ("," variant)* ","?
 variant    = ident ( "(" type ("," type)* ")" )?
 ```
 
-判別規則(パーサ): ブロック内の最初の要素が `ident ":" type` なら **struct**、`ident` または `ident "(" ... ")"` なら **sum type**。両者の混在は不可(エラー)。空ブロック `Name {}` は空 struct。
+Disambiguation rule (parser): if the first element inside the block is `ident ":" type` it is a **struct**; if it is `ident` or `ident "(" ... ")"` it is a **sum type**. Mixing the two is not allowed (error). An empty block `Name {}` is an empty struct.
 
 ```align
 User {
@@ -184,28 +184,28 @@ Shape {
 }
 ```
 
-`// OPEN:` variant に名前付きフィールド(`Rect { w: f32, h: f32 }`)を許すか。許すなら variant 本体も struct_body を取れるよう拡張。
+`// OPEN:` whether to allow named fields in a variant (`Rect { w: f32, h: f32 }`). If allowed, extend the variant body to also accept struct_body.
 
-### グローバル定数
+### Global constants
 
 ```ebnf
 const_decl = ident (":" type)? ":=" expr END
 ```
 
-トップレベルの `:=` はコンパイル時定数(immutable)。`mut` は不可。const string pool(`draft.md` §12)の供給源の一つ。
+A top-level `:=` is a compile-time constant (immutable). `mut` is not allowed. One of the sources feeding the const string pool (`draft.md` §12).
 
 ---
 
-## 4. 型 (Type)
+## 4. Types (Type)
 
 ```ebnf
 type      = path generic_args?
           | "(" ")"                       // unit
 generic_args = "<" type_arg ("," type_arg)* ">"
-type_arg  = type | int_literal            // vec<4, f32> の N
+type_arg  = type | int_literal            // the N in vec<4, f32>
 ```
 
-組込みは型名も通常の path として扱う:
+Built-in type names are also treated as ordinary paths:
 
 ```align
 i64   bool   str
@@ -215,28 +215,28 @@ array<User>   slice<f32>
 vec<4, f32>   mask<f32>
 ```
 
-`// OPEN:` 関数型(クロージャを変数に持つ場合の型表記)。当面はジェネリクス境界での扱いに依存。
+`// OPEN:` function types (type notation when holding a closure in a variable). For now this depends on how it is handled at generics bounds.
 
 ---
 
-## 5. 文 (Statement)
+## 5. Statements (Statement)
 
-ブロックは文の並び + 省略可能な末尾式。
+A block is a sequence of statements plus an optional trailing expression.
 
 ```ebnf
 block     = "{" stmt* tail_expr? "}"
-tail_expr = expr                          // END なし。ブロックの値
+tail_expr = expr                          // no END. The block's value
 stmt      = let_stmt
           | assign_stmt
           | return_stmt
-          | expr END                      // 式文
+          | expr END                      // expression statement
 let_stmt  = "mut"? ident (":" type)? ":=" expr END
 assign_stmt = place "=" expr END
 return_stmt = "return" expr? END
-place     = expr                          // 代入可能な左辺 (ident / field / index)
+place     = expr                          // an assignable lvalue (ident / field / index)
 ```
 
-`END` は改行で挿入される暗黙の終端、または明示 `;`(§1 文終端)。普段は改行のみで書く。
+`END` is the implicit terminator inserted at a newline, or an explicit `;` (§1 statement termination). Normally you write with newlines only.
 
 ```align
 x := 10
@@ -244,32 +244,32 @@ mut count := 0
 count = count + 1
 return x
 
-a := 1; b := 2          // 1行に詰めるときだけ ; を使う
+a := 1; b := 2          // use ; only when cramming onto one line
 ```
 
-代入 `=` は宣言済み `mut` 変数(または可変な place)のみ。未宣言名への `=` はエラー(宣言は `:=`)。
+Assignment `=` applies only to a declared `mut` variable (or a mutable place). `=` to an undeclared name is an error (declaration is `:=`).
 
 ---
 
-## 6. 式 (Expression)
+## 6. Expressions (Expression)
 
-式指向。`if` / `match` / `block` / `arena` / `unsafe` はすべて式。
+Expression-oriented. `if` / `match` / `block` / `arena` / `unsafe` are all expressions.
 
-### 優先順位 (低 → 高)
+### Precedence (low → high)
 
 ```text
-1  else 取り出し        expr else <block|stmt>
+1  else unwrap          expr else <block|stmt>
 2  ||
 3  &&
-4  比較  == != < <= > >=
+4  comparison  == != < <= > >=
 5  + -
 6  * / %
-7  単項  - !
-8  後置  f(args)  .method(args)  .field  [index]  ?
-9  一次  literal / path / (expr) / struct_lit / block / if / match / arena / unsafe / lambda
+7  unary  - !
+8  postfix  f(args)  .method(args)  .field  [index]  ?
+9  primary  literal / path / (expr) / struct_lit / block / if / match / arena / unsafe / lambda
 ```
 
-### 一次式
+### Primary expressions
 
 ```ebnf
 primary   = literal
@@ -283,26 +283,26 @@ primary   = literal
           | unsafe_expr
           | lambda
           | str_prefixed                  // template/html/json/raw
-          | field_selector                // .ident (引数位置の射影ショートカット)
+          | field_selector                // .ident (projection shortcut at argument position)
 ```
 
-### struct リテラル
+### struct literals
 ```ebnf
 struct_lit = path "{" (field_init ("," field_init)* ","?)? "}"
-field_init = ident ":" expr | ident       // ident 単独は ident: ident の短縮
+field_init = ident ":" expr | ident       // a bare ident is shorthand for ident: ident
 ```
 ```align
 p := Point{ x: 1, y: 2 }
-u := User{ id, name, active: true }       // id, name は同名短縮
+u := User{ id, name, active: true }       // id, name use same-name shorthand
 ```
 
-### if / match (式)
+### if / match (expressions)
 ```ebnf
 if_expr   = "if" expr block ("else" (if_expr | block))?
 match_expr= "match" expr "{" arm+ "}"
 arm       = pattern "=>" (expr "," | block) 
 ```
-`if` を式に使う場合、両腕の型は一致する(`03-types.md`)。`else` 無しの `if` は値を持たない文として使う。
+When `if` is used as an expression, both arms must have the same type (`03-types.md`). An `if` with no `else` is used as a statement that has no value.
 
 ```align
 label := if s > 80 { "high" } else { "low" }
@@ -313,61 +313,61 @@ kind := match shape {
 }
 ```
 
-### else 取り出し (Option/Result の unwrap-or-else)
+### else unwrap (unwrap-or-else for Option/Result)
 ```ebnf
 else_expr = expr "else" (block | stmt)
 ```
-右辺の block/stmt は脱出(`return` 等)するか、同型の値を与える。
+The right-hand block/stmt either diverges (`return` etc.) or supplies a value of the same type.
 
 ```align
 user := find_user(id) else return Error.NotFound
 port := get_env("PORT") else { 8080 }
 ```
 
-### ? 伝播
+### ? propagation
 ```ebnf
 try_expr  = expr "?"
 ```
-`?` は `Result` のみ(型検査で強制, `draft.md` §5)。MIR で早期 return + cold path に脱糖(`04-mir.md`)。
+`?` applies to `Result` only (enforced by type checking, `draft.md` §5). Desugared to early return + cold path in MIR (`04-mir.md`).
 
 ```align
 data := fs.read_file(path)?
 user := json.decode<User>(data)?
 ```
 
-### メソッドチェーン・フィールド射影
+### Method chains, field projection
 ```align
 total := users
-  .where(.active)     // .active = フィールドセレクタ
-  .score              // array<User> に対する .score = フィールド射影
+  .where(.active)     // .active = field selector
+  .score              // .score over array<User> = field projection
   .sum()
 ```
-`.field` は文脈で2つの意味を持つ(型で決まる、`03-types.md`):
-- 単一値 `u.score` → 通常のフィールドアクセス
-- コレクション `users.score` → 各要素の射影(`array<i32>`)
+`.field` has two meanings depending on context (determined by type, `03-types.md`):
+- single value `u.score` → ordinary field access
+- collection `users.score` → projection over each element (`array<i32>`)
 
-### フィールドセレクタ短縮
-引数位置の `.ident` は `fn x { x.ident }` の糖衣。
+### Field selector shorthand
+A `.ident` at argument position is sugar for `fn x { x.ident }`.
 
 ```align
 active := users.where(.active)   // == users.where(fn u { u.active })
 ```
 
-### ラムダ
-`draft.md` の記法に合わせ、引数は括弧なし。
+### Lambdas
+Matching the notation in `draft.md`, arguments have no parentheses.
 
 ```ebnf
 lambda    = "fn" lambda_params? block
-lambda_params = ident ("," ident)*        // 型は推論
+lambda_params = ident ("," ident)*        // types are inferred
 ```
 ```align
 total := users.reduce(0, fn acc, u { acc + u.score })
 ys := xs.map(fn x { x * 2 })
-zero := fn { 0 }                           // 引数なし
+zero := fn { 0 }                           // no arguments
 ```
-名前付き関数(`fn ident (`)とは「名前＋括弧の有無」で区別する。
+Distinguished from named functions (`fn ident (`) by "name + presence/absence of parentheses".
 
-### arena / unsafe (式)
+### arena / unsafe (expressions)
 ```ebnf
 arena_expr  = "arena" block
 unsafe_expr = "unsafe" block
@@ -380,12 +380,12 @@ arena {
 }
 ```
 
-### 前置文字列 (template / html / json / raw)
+### String prefixes (template / html / json / raw)
 ```ebnf
 str_prefixed = ("template" | "html" | "json") string_lit
              | "raw" "(" expr ")"
 ```
-`{ident}` 補間を含む文字列リテラルを取り、MIR で `write_static` / `write_value` 列に脱糖(`draft.md` §13, `04-mir.md`)。
+Takes a string literal containing `{ident}` interpolation, and desugars in MIR into a `write_static` / `write_value` sequence (`draft.md` §13, `04-mir.md`).
 
 ```align
 msg := template "Hello {name}, score={score}"
@@ -394,13 +394,13 @@ body := html "<p>{name}</p>"
 
 ---
 
-## 7. パターン (match)
+## 7. Patterns (match)
 
 ```ebnf
-pattern   = "_"                           // ワイルドカード
+pattern   = "_"                           // wildcard
           | literal
-          | ident                         // 束縛
-          | path ( "(" pattern ("," pattern)* ")" )?   // variant 分解
+          | ident                         // binding
+          | path ( "(" pattern ("," pattern)* ")" )?   // variant destructuring
 ```
 ```align
 match shape {
@@ -408,35 +408,35 @@ match shape {
   Rect(w, h)    => w * h,
 }
 ```
-`// OPEN:` ガード(`if`)、`|` による複数パターン、網羅性検査の詳細。
+`// OPEN:` guards (`if`), multiple patterns via `|`, and exhaustiveness-checking details.
 
 ---
 
-## 8. 曖昧性と解決
+## 8. Ambiguities and resolution
 
-### struct リテラル vs ブロック
-`if cond { ... }` の `cond` 位置に裸の struct リテラルを許すと `Foo { ... }` がブロックと衝突する(Rust と同じ問題)。**解決**: `if` / `match` / `while` のスクルチニ位置では裸の struct リテラルを禁止し、必要なら括弧で囲む。
+### struct literal vs block
+Allowing a bare struct literal at the `cond` position of `if cond { ... }` makes `Foo { ... }` collide with a block (the same problem as Rust). **Resolution**: at the scrutinee position of `if` / `match` / `while`, bare struct literals are forbidden; wrap in parentheses if needed.
 
 ```align
 if (Point{x:1,y:2}) == p { ... }
 ```
 
-### ジェネリクスの `<` vs 比較
-式位置の `a < b` と `f<T>(x)` の曖昧性。**解決方針**: 型位置(`: type`、`fn ret`、`type_decl` 等)では `<>` は常にジェネリクス。式位置では原則ジェネリック実引数を**書かせない**(推論で確定)。どうしても必要な箇所のみ明示構文を用意する。
+### generics `<` vs comparison
+Ambiguity between `a < b` at expression position and `f<T>(x)`. **Resolution policy**: at type positions (`: type`, `fn ret`, `type_decl`, etc.) `<>` is always generics. At expression positions, generic actual arguments are in principle **not written** (fixed by inference). An explicit syntax is provided only where it is unavoidable.
 
 ```align
-// OPEN: 式位置で型引数を明示する構文 (turbofish 風 `f::<T>()` を採るか)
+// OPEN: explicit-type-argument syntax at expression position (adopt a turbofish-style `f::<T>()` or not)
 ```
-Align は推論前提(`design-notes.md`)なので、式位置の明示型引数は最小化する。
+Align assumes inference (`design-notes.md`), so explicit type arguments at expression positions are minimized.
 
-### 型宣言 vs struct リテラル
-型宣言(`User { id: i64 }`)はトップレベル item 位置のみ。struct リテラル(`User{ id: 1 }`)は式位置のみ。出現位置で一意に分かれる。
+### type declaration vs struct literal
+A type declaration (`User { id: i64 }`) appears only at top-level item position. A struct literal (`User{ id: 1 }`) appears only at expression position. They are uniquely distinguished by where they occur.
 
 ---
 
 ## 9. AST (align_ast, Rust)
 
-全ノードは `Span`(`align_span`)を持つ。脱糖はしない(書かれた形を保持し、formatter / lint が使う)。抜粋:
+Every node carries a `Span` (`align_span`). No desugaring (the written form is preserved, for use by formatter / lint). Excerpt:
 
 ```rust
 struct File { module: Option<Path>, imports: Vec<Path>, items: Vec<Item> }
@@ -467,7 +467,7 @@ enum Stmt {
     Let { is_mut: bool, name: Ident, ty: Option<Type>, init: Expr },
     Assign { place: Expr, value: Expr },
     Return(Option<Expr>),
-    Expr(Expr),              // 末尾式は Block.tail に保持し Stmt にはしない
+    Expr(Expr),              // the trailing expression is held in Block.tail, not made a Stmt
 }
 struct Block { stmts: Vec<Stmt>, tail: Option<Box<Expr>> }
 
@@ -478,8 +478,8 @@ enum Expr {
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Method { recv: Box<Expr>, name: Ident, args: Vec<Expr> },
-    Field { recv: Box<Expr>, name: Ident },     // 単一/射影は型検査で決定
-    FieldSelector(Ident),                       // 引数位置の .ident
+    Field { recv: Box<Expr>, name: Ident },     // single vs projection decided by type checking
+    FieldSelector(Ident),                       // .ident at argument position
     Index { recv: Box<Expr>, index: Box<Expr> },
     Try(Box<Expr>),                             // expr?
     StructLit { path: Path, fields: Vec<(Ident, Option<Expr>)> },
@@ -495,29 +495,29 @@ enum Expr {
 }
 ```
 
-`// OPEN:` 演算子の結合性詳細、`Path` のジェネリック実引数保持、エラーノード(回復用)の表現。
+`// OPEN:` operator associativity details, holding generic actual arguments in `Path`, representing error nodes (for recovery).
 
 ---
 
-## 10. パーサ実装方針
+## 10. Parser implementation policy
 
-- 手書き再帰下降 + 式は Pratt parsing(優先順位は §6 の表)。LALR 生成器より診断とエラー回復を作り込みやすく、Align の弱キーワードや文脈依存(struct リテラル抑制等)を扱いやすい。
-- **エラー回復**: 1ファイルで複数エラーを報告。文境界(`;`)とブロック境界(`}`)を同期点にする。
-- 文終端は lexer が `END` トークンに正規化する(Go スタイルの暗黙セミコロン + 行頭継続、§1)。パーサは `END` だけを見て文境界を決め、生改行を意識しない。
-- 脱糖しない。`?` / `template` / フィールドセレクタ / `else`取り出し は AST にそのまま保持し、MIR 段で展開(`04-mir.md`)。
+- Hand-written recursive descent + Pratt parsing for expressions (precedence per the table in §6). Easier to build out diagnostics and error recovery than an LALR generator, and easier to handle Align's weak keywords and context dependence (e.g. struct-literal suppression).
+- **Error recovery**: report multiple errors in one file. Use statement boundaries (`;`) and block boundaries (`}`) as synchronization points.
+- Statement termination is normalized by the lexer into the `END` token (Go-style implicit semicolons + line-head continuation, §1). The parser decides statement boundaries by looking only at `END`, without being aware of raw newlines.
+- No desugaring. `?` / `template` / field selectors / `else`-unwrap are kept in the AST as-is and expanded at the MIR stage (`04-mir.md`).
 
 ---
 
-## 11. 未決事項 (要決着)
+## 11. Open items (to be settled)
 
 ```text
-- 数値接尾辞の正確な集合と既定型 (i32? i64?)
-- variant に名前付きフィールドを許すか (Rect { w, h })
-- match のガード / | 複数パターン / 網羅性検査
-- 式位置でのジェネリック型引数明示構文 (turbofish の要否)
-- 関数型(クロージャ)の型表記
-- 文字列補間の文法詳細 ({expr} を許すか、{ident} のみか)
-- doc コメント(///)の収集対象と形式
+- The exact set of numeric suffixes and the default type (i32? i64?)
+- Whether to allow named fields in a variant (Rect { w, h })
+- match guards / | multiple patterns / exhaustiveness checking
+- Explicit generic-type-argument syntax at expression position (need turbofish or not)
+- Type notation for function types (closures)
+- String-interpolation grammar details (allow {expr}, or {ident} only)
+- The collection target and form for doc comments (///)
 ```
 
-これらは関連マイルストーン(`07-roadmap.md`)で決着させ、決まり次第 `draft.md` と本書へ反映する。
+These will be settled at the related milestones (`07-roadmap.md`), and reflected into `draft.md` and this document as they are decided.

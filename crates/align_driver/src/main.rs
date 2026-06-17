@@ -1,11 +1,11 @@
-//! `alignc` CLI (`docs/impl/01-pipeline.md`)。
+//! `alignc` CLI (`docs/impl/01-pipeline.md`).
 //!
-//! サブコマンド:
-//!   alignc check     <file>   lexer → parser → sema まで。診断を表示
-//!   alignc emit-mir  <file>   MIR をテキスト表示
-//!   alignc emit-llvm <file>   LLVM IR をテキスト表示
-//!   alignc build     <file>   実行ファイルを生成 (カレントに <stem>)
-//!   alignc run       <file>   build して実行し、その終了コードを返す
+//! Subcommands:
+//!   alignc check     <file>   lexer -> parser -> sema. Print diagnostics
+//!   alignc emit-mir  <file>   Print MIR as text
+//!   alignc emit-llvm <file>   Print LLVM IR as text
+//!   alignc build     <file>   Build an executable (<stem> in cwd)
+//!   alignc run       <file>   Build, run, and return its exit code
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -38,11 +38,11 @@ fn usage() {
         "usage: alignc <command> <file.align>\n\
          \n\
          commands:\n  \
-           check      lexer/parser/sema まで検査\n  \
-           emit-mir   MIR をテキスト出力\n  \
-           emit-llvm  LLVM IR をテキスト出力\n  \
-           build      実行ファイルを生成\n  \
-           run        build して実行 (終了コードを返す)"
+           check      check through lexer/parser/sema\n  \
+           emit-mir   print MIR as text\n  \
+           emit-llvm  print LLVM IR as text\n  \
+           build      build an executable\n  \
+           run        build and run (returns the exit code)"
     );
 }
 
@@ -50,13 +50,13 @@ fn read(path: &str) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("alignc: '{path}' を読めません: {e}");
+            eprintln!("alignc: cannot read '{path}': {e}");
             None
         }
     }
 }
 
-/// check → MIR まで。エラーがあれば診断を出して `None`。
+/// check -> MIR. On error, print diagnostics and return `None`.
 fn front_to_mir(path: &str) -> Option<align_mir::Program> {
     let src = read(path)?;
     let mut sm = SourceMap::new();
@@ -83,7 +83,7 @@ fn run_check(path: &str) -> ExitCode {
     if checked.diags.has_errors() {
         ExitCode::FAILURE
     } else {
-        println!("ok: {} 個の関数を検査しました", checked.hir.fns.len());
+        println!("ok: checked {} function(s)", checked.hir.fns.len());
         ExitCode::SUCCESS
     }
 }
@@ -114,7 +114,7 @@ fn run_emit_llvm(path: &str) -> ExitCode {
     }
 }
 
-/// ソースのファイル名 (拡張子なし) を出力名にする。
+/// Use the source file name (without extension) as the output name.
 fn stem(path: &str) -> String {
     PathBuf::from(path)
         .file_stem()
@@ -122,11 +122,11 @@ fn stem(path: &str) -> String {
         .unwrap_or_else(|| "a".to_string())
 }
 
-/// MIR を object にして実行ファイルへリンクする。`exe` のパスを返す。
+/// Turn MIR into an object and link it into an executable. Returns the `exe` path.
 fn build_to(path: &str, mir: &align_mir::Program, exe: &PathBuf) -> Result<(), ExitCode> {
     let obj = std::env::temp_dir().join(format!("align-{}.o", stem(path)));
     if let Err(e) = emit_object_file(mir, &obj) {
-        eprintln!("alignc: codegen 失敗: {e}");
+        eprintln!("alignc: codegen failed: {e}");
         return Err(ExitCode::FAILURE);
     }
     if let Err(e) = link_executable(&obj, exe) {
@@ -143,7 +143,7 @@ fn run_build(path: &str) -> ExitCode {
     let exe = PathBuf::from(stem(path));
     match build_to(path, &mir, &exe) {
         Ok(()) => {
-            println!("alignc: 実行ファイルを生成しました: {}", exe.display());
+            println!("alignc: built executable: {}", exe.display());
             ExitCode::SUCCESS
         }
         Err(code) => code,
@@ -162,12 +162,12 @@ fn run_run(path: &str) -> ExitCode {
         Ok(status) => match status.code() {
             Some(code) => ExitCode::from(code as u8),
             None => {
-                eprintln!("alignc: プロセスがシグナルで終了しました");
+                eprintln!("alignc: process terminated by a signal");
                 ExitCode::FAILURE
             }
         },
         Err(e) => {
-            eprintln!("alignc: 実行できません: {e}");
+            eprintln!("alignc: cannot run: {e}");
             ExitCode::FAILURE
         }
     }

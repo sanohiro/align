@@ -1,11 +1,13 @@
-//! バックエンド: MIR → LLVM IR → object (`docs/impl/05-backend-llvm.md`)。
+//! Backend: MIR -> LLVM IR -> object (`docs/impl/05-backend-llvm.md`).
 //!
-//! 純粋 lowering に徹する段。Align の意味論判断 (脱糖・fusion・SIMD化・region) は
-//! MIR で済んでおり、ここは MIR を機械的に LLVM IR へ落とすだけ (anti-rewrite)。
+//! A stage devoted to pure lowering. Align's semantic decisions (desugaring, fusion,
+//! SIMD-ization, regions) are already done in MIR; here we just mechanically lower
+//! MIR to LLVM IR (anti-rewrite).
 //!
-//! M0 範囲: 整数のみ。`fn main() -> iN` を LLVM の `main` 関数として出し、四則演算と
-//! 定数 return を lowering する。C ランタイム (crt0) が `main` をエントリとして呼ぶため、
-//! M0 では align_runtime を介さず終了コードを返せる (Result 版 main は M2 で結線)。
+//! M0 scope: integers only. Emit `fn main() -> iN` as LLVM's `main` function and
+//! lower arithmetic and constant returns. The C runtime (crt0) calls `main` as the
+//! entry point, so M0 can return an exit code without going through align_runtime
+//! (the Result-returning main is wired in M2).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,7 +26,7 @@ use inkwell::targets::{
 use inkwell::types::IntType;
 use inkwell::values::IntValue;
 
-/// このビルドで LLVM バックエンドが利用可能か。inkwell をリンクしているので true。
+/// Whether the LLVM backend is available in this build. true because inkwell is linked.
 pub fn is_available() -> bool {
     true
 }
@@ -38,13 +40,13 @@ pub enum CodegenError {
 impl std::fmt::Display for CodegenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CodegenError::Lowering(m) => write!(f, "lowering 失敗: {m}"),
-            CodegenError::Target(m) => write!(f, "ターゲット/出力失敗: {m}"),
+            CodegenError::Lowering(m) => write!(f, "lowering failed: {m}"),
+            CodegenError::Target(m) => write!(f, "target/output failed: {m}"),
         }
     }
 }
 
-/// MIR を object ファイルへ書き出す。
+/// Write MIR out to an object file.
 pub fn emit_object(program: &Program, out: &Path) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
@@ -57,7 +59,7 @@ pub fn emit_object(program: &Program, out: &Path) -> Result<(), CodegenError> {
     write_object(&module, out)
 }
 
-/// デバッグ用に LLVM IR をテキストで返す (`alignc emit-llvm`)。
+/// Return LLVM IR as text for debugging (`alignc emit-llvm`).
 pub fn emit_llvm_ir(program: &Program) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
@@ -70,15 +72,15 @@ pub fn emit_llvm_ir(program: &Program) -> Result<String, CodegenError> {
 
 fn int_type<'c>(ctx: &'c Context, ty: Ty) -> IntType<'c> {
     match ty {
-        // 幅は sema が 8/16/32/64 に確定済み。custom_width_int_type は Result を返すが
-        // これらの幅では必ず Ok (inkwell 0.9)。
+        // The width is already fixed to 8/16/32/64 by sema. custom_width_int_type
+        // returns a Result, but for these widths it is always Ok (inkwell 0.9).
         Ty::Int(IntTy { bits, .. }) => match bits {
             8 => ctx.i8_type(),
             16 => ctx.i16_type(),
             32 => ctx.i32_type(),
             _ => ctx.i64_type(),
         },
-        // M0 では整数以外は来ない。安全側で i32。
+        // Nothing but integers arrives in M0. Default to i32 on the safe side.
         _ => ctx.i32_type(),
     }
 }
@@ -100,7 +102,7 @@ fn lower_fn<'c>(
     let mut vals: HashMap<ValueId, IntValue<'c>> = HashMap::new();
     let mut types: HashMap<ValueId, Ty> = HashMap::new();
 
-    // M0 は単一ブロック。複数ブロック (制御フロー) は M1 で追加。
+    // M0 is single-block. Multiple blocks (control flow) are added in M1.
     let block = &f.blocks[0];
     let bb = ctx.append_basic_block(func, "bb0");
     builder.position_at_end(bb);
@@ -148,7 +150,7 @@ fn lower_rvalue<'c>(
             let e = |r: Result<IntValue<'c>, _>| {
                 r.map_err(|e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string()))
             };
-            // 整数オーバーフローは2の補数 wrap (draft.md §5)。通常の add/mul を出す。
+            // Integer overflow is two's-complement wrap (draft.md §5). Emit plain add/mul.
             let v = match op {
                 BinOp::Add => e(builder.build_int_add(l, r, "add"))?,
                 BinOp::Sub => e(builder.build_int_sub(l, r, "sub"))?,
@@ -183,11 +185,11 @@ fn operand_ty(types: &HashMap<ValueId, Ty>, op: &Operand) -> Ty {
 
 fn write_object(module: &Module, out: &Path) -> Result<(), CodegenError> {
     Target::initialize_native(&InitializationConfig::default())
-        .map_err(|e| CodegenError::Target(format!("ネイティブターゲット初期化: {e}")))?;
+        .map_err(|e| CodegenError::Target(format!("native target initialization: {e}")))?;
 
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple)
-        .map_err(|e| CodegenError::Target(format!("triple 解決: {e}")))?;
+        .map_err(|e| CodegenError::Target(format!("triple resolution: {e}")))?;
     let tm = target
         .create_target_machine(
             &triple,
@@ -197,7 +199,7 @@ fn write_object(module: &Module, out: &Path) -> Result<(), CodegenError> {
             RelocMode::PIC,
             CodeModel::Default,
         )
-        .ok_or_else(|| CodegenError::Target("TargetMachine 生成に失敗".to_string()))?;
+        .ok_or_else(|| CodegenError::Target("failed to create TargetMachine".to_string()))?;
 
     tm.write_to_file(module, FileType::Object, out)
         .map_err(|e| CodegenError::Target(e.to_string()))
@@ -231,7 +233,7 @@ mod tests {
     #[test]
     fn arithmetic_lowers() {
         let text = ir("fn main() -> i32 {\n  return 2 + 3 * 4\n}\n");
-        // 定数畳み込みは LLVM 任せ。add/mul 命令か畳み込み結果のいずれかが出る。
+        // Constant folding is left to LLVM. Either add/mul instructions or a folded result appears.
         assert!(text.contains("@main"), "got:\n{text}");
     }
 }

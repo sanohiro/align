@@ -1,10 +1,11 @@
-//! ソース位置とファイル管理。全 IR ノードが [`Span`] を持ち、診断で元ソースを指す
-//! (`docs/impl/01-pipeline.md` 横断クレート)。
+//! Source locations and file management. Every IR node carries a [`Span`] so
+//! diagnostics can point back to the original source
+//! (`docs/impl/01-pipeline.md`, cross-cutting crate).
 
-/// ソースファイルの識別子。[`SourceMap`] が払い出す。
+/// Identifier of a source file. Handed out by [`SourceMap`].
 pub type FileId = u32;
 
-/// ファイル内のバイトオフセット範囲 `[lo, hi)`。
+/// Byte-offset range `[lo, hi)` within a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     pub file: FileId,
@@ -17,7 +18,7 @@ impl Span {
         Span { file, lo, hi }
     }
 
-    /// 2つの span を内包する最小の span。同一ファイル前提。
+    /// Smallest span containing both spans. Assumes the same file.
     pub fn merge(self, other: Span) -> Span {
         debug_assert_eq!(self.file, other.file);
         Span {
@@ -28,7 +29,7 @@ impl Span {
     }
 }
 
-/// 1ファイルの名前と中身。
+/// Name and contents of a single file.
 pub struct SourceFile {
     pub id: FileId,
     pub name: String,
@@ -36,7 +37,7 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    /// バイトオフセットを 1 始まりの (行, 列) に変換する (診断表示用)。
+    /// Convert a byte offset to a 1-based (line, column) (for diagnostics).
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
         let off = (offset as usize).min(self.src.len());
         let mut line = 1u32;
@@ -53,7 +54,7 @@ impl SourceFile {
     }
 }
 
-/// 全ソースファイルを保持する。
+/// Holds all source files.
 #[derive(Default)]
 pub struct SourceMap {
     files: Vec<SourceFile>,
