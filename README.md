@@ -10,13 +10,18 @@ compiler (`alignc`) is being implemented in Rust under `crates/`.
 
 ## Status
 
-Milestone **M0 (walking skeleton)** is complete: a minimal program flows end to
-end through `lexer → parser → sema → MIR → LLVM → executable`.
+Milestones **M0 (walking skeleton)** and **M1 (the bones of the language)** are
+complete: programs flow end to end through
+`lexer → parser → sema → MIR → LLVM → executable`. M1 adds functions and calls,
+`if`/comparisons/`bool`, `mut` reassignment, structs (declaration, literal,
+field access), the full primitive set (`i8..u64`, `f32`/`f64`, `char`), and a
+builtin `print` wired to the runtime.
 
 ```sh
 cargo build
 cargo test
-cargo run --bin alignc -- run examples/min.align   # exits with code 1
+cargo run --bin alignc -- run examples/point.align    # prints 3, 10; exits 13
+cargo run --bin alignc -- run examples/circle.align   # float arithmetic; exits 1
 ```
 
 `alignc` subcommands: `check`, `emit-mir`, `emit-llvm`, `build`, `run`.

@@ -46,7 +46,53 @@ Completion condition (met): control-flow + struct/float/char programs compile an
 - Make the `pub fn main(...) -> Result<(), Error>` form work.
 - Start from a single `Error` type (the error type design in `open-questions.md` is finalized within M2).
 
-Completion condition: an example that propagates a file-read failure via `?` runs.
+Completion condition: an example that propagates a failure via `?` runs (using a
+thin M2 fixture builtin, **not** full `std.fs` — see scope below).
+
+### M2 implementation decisions (locked, to avoid rework)
+
+Keep M2 a vertical slice. Do **not** start `std`/`string`/`array`/`import` here
+(that is M5); a missing-resource failure is modeled by a thin builtin fixture so
+`Result` + `?` get a real end-to-end path.
+
+```text
+Scope
+- Option<T> / Result<T,E> with payloads restricted to *scalars* (i8..u64, f32,
+  f64, bool, char, Error, ()). No struct/string/nested-composite payloads yet.
+- Constructors: Some(x) / None / Ok(x) / Err(e). `else`-unwrap for Option.
+  `?` for Result (and Option in a Result/Option context is deferred — Result only).
+- A fixture builtin `try_*` that returns Err to exercise propagation (no real I/O).
+
+Error (M2 minimal)
+- `Error` is an opaque i32 error code (placeholder; the full message/category
+  design in open-questions stays Open). `report(e)` prints "error: code <n>" to
+  stderr; the process exit code is <n> clamped to a nonzero u8.
+
+Type representation in the compiler (keeps `Ty: Copy`)
+- Add a Copy `Scalar` enum (the var-free scalar subset) and
+  `Ty::Option(Scalar)` / `Ty::Result(Scalar, Scalar)` / `Ty::Error`.
+- Payloads must resolve to a concrete scalar at the constructor (an unconstrained
+  int/float literal defaults there, exactly like a bare literal). This sidesteps
+  inference variables living inside a composite type — acceptable for M2.
+
+Runtime ABI for Result-returning main (locked)
+- `fn main() -> i32` stays the C entry unchanged (M0/M1 behavior preserved).
+- `fn main() -> Result<(), Error>` is lowered under the symbol `align_main`;
+  codegen emits a C `main` wrapper that calls it, and on `Err(code)` calls the
+  runtime `align_rt_report_error(i32)` and returns the code, else returns 0.
+  (Matches `06-runtime-std.md` §9's align_rt_start intent, minimal form.)
+
+Lowering
+- Option<T> = { i8 tag, T value }; Result<T,E> = { i8 tag, T ok, E err }
+  (both payload slots present — a plain struct, not a packed union — for M2).
+  tag: 0 = None/Ok, 1 = Some/Err.
+- `?` desugars in MIR to: branch on tag; Err → early-return the propagated
+  Result (cold edge); Ok → continue with the unwrapped value.
+```
+
+Build order: generic type syntax → `Ty::Option`/`Ty::Result`/`Scalar` → AST/HIR
+`Some`/`None`/`Ok`/`Err`/`Try`/`else`-unwrap → MIR cold error edge → LLVM aggregate
+lowering + the `main` wrapper. `std.fs.read_file` stays a thin fixture until M5.
 
 ## M3 — Memory Model (move / value / arena)
 
