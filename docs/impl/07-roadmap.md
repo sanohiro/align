@@ -111,12 +111,41 @@ lowering + the `main` wrapper. `std.fs.read_file` stays a thin fixture until M5.
 
 ## M3 — Memory Model (move / value / arena)
 
-- move of owning types and use-after-move errors, explicit `clone()`.
-- Pass-by-value of small structs, lint for large-struct copies.
-- `arena {}` block → calls to `align_runtime`'s arena allocator and bulk free.
-- Arena view escape checking.
+- [done] move of owning types and use-after-move errors, explicit `clone()`.
+- [done] `arena {}` block → calls to `align_runtime`'s arena allocator and bulk free.
+- [done] Arena view escape checking.
+- [deferred] Pass-by-value of small structs / large-struct-copy lint — structs are
+  still slot-only (M1 cut); whole-struct move/copy + the size threshold are revisited
+  when arrays/large aggregates arrive (M4).
 
-Completion condition: data allocated inside `arena {}` is correctly freed at block exit, and escapes become errors.
+Status: **M3 vertical slice COMPLETE.** Anchor owning type = the **heap box**
+(`heap.new(x) -> box<T>`, allocated in an arena; `.get()` copies the scalar out,
+`.clone()` deep-copies). Move checking (use-after-move) and arena escape checking are
+HIR flow analyses (`align_sema`: MoveCheck / EscapeCheck). `examples/arena.align` runs
+(exit 42); the arena is freed in bulk at block end and on every early exit (`return`/`?`).
+
+### M3 implementation decisions (locked)
+
+```text
+- Anchor owning type: heap box `box<T>` (T a scalar), the only Move type so far.
+  heap.new is REQUIRED inside an arena (M3) — free-standing heap with per-binding
+  drop insertion is deferred. The box lives in the arena and is bulk-freed.
+- Arena form: anonymous `arena {}` (no explicit-allocator `arena a {}` yet). Nested
+  arenas are handled by region = arena nesting depth; a box's region is the depth at
+  which it was allocated. (Resolves the open-questions "explicit-allocator arena" item
+  for M3: anonymous now; named allocator deferred.)
+- Region/escape inference: a box escapes if it reaches a shallower depth than its
+  region — via `return`, assignment to an outer binding, or the arena block's value.
+  Regions are inferred (flow analysis); never written.
+- Runtime: chunked bump allocator (align_rt_arena_begin/alloc/reset/end); pointers are
+  chunk-stable. Cleanup is emitted in MIR before every exit out of the arena scopes.
+- Method syntax: `recv.method(args)` is supported only for the M3 builtins
+  (`heap.new`, `box.get`, `box.clone`) via 2-segment-path call dispatch; general
+  method resolution is later.
+```
+
+Completion condition (met): data allocated inside `arena {}` is freed at block exit
+(and on early exits), and escapes are compile errors.
 
 ## M4 — Array Processing Core (Align's protagonist)
 

@@ -215,11 +215,152 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         })
         .collect();
     let program = Program { fns, structs };
-    // Pass 3 (partial): move / use-after-move checking (`03-types.md` §6).
+    // Pass 3 (partial): move / use-after-move checking + arena escape checking
+    // (`03-types.md` §6–§7).
     for f in &program.fns {
         MoveCheck { f, diags }.check();
+        EscapeCheck {
+            f,
+            diags,
+            region: std::collections::HashMap::new(),
+            decl_depth: std::collections::HashMap::new(),
+        }
+        .check();
     }
     program
+}
+
+/// Arena escape checking (`03-types.md` §7): a `box<T>` allocated in an arena must not
+/// outlive its block. The "region" of a box is the arena depth at which it was
+/// allocated; escaping to a shallower depth (return, assignment to an outer binding, or
+/// the arena block's own value) is an error. Regions are inferred — never written.
+struct EscapeCheck<'a> {
+    f: &'a Fn,
+    diags: &'a mut Diagnostics,
+    /// For each box local, the arena depth at which its current box was allocated.
+    region: std::collections::HashMap<LocalId, u32>,
+    /// For each local, the arena depth at which it was declared.
+    decl_depth: std::collections::HashMap<LocalId, u32>,
+}
+
+impl<'a> EscapeCheck<'a> {
+    fn check(&mut self) {
+        self.block(&self.f.body, 0);
+    }
+
+    fn is_box(ty: Ty) -> bool {
+        matches!(ty, Ty::Box(_))
+    }
+
+    /// The arena depth of the box a (box-typed) expression yields; 0 = no arena region.
+    fn region_of(&self, e: &Expr, depth: u32) -> u32 {
+        match &e.kind {
+            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => depth,
+            ExprKind::Local(p) => *self.region.get(p).unwrap_or(&0),
+            _ => 0,
+        }
+    }
+
+    fn block(&mut self, b: &Block, depth: u32) {
+        for s in &b.stmts {
+            self.stmt(s, depth);
+        }
+        if let Some(v) = &b.value {
+            self.walk(v, depth);
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt, depth: u32) {
+        match s {
+            Stmt::Let { local, init } => {
+                self.walk(init, depth);
+                self.decl_depth.insert(*local, depth);
+                if Self::is_box(init.ty) {
+                    let r = self.region_of(init, depth);
+                    self.region.insert(*local, r);
+                }
+            }
+            Stmt::Assign { local, value } => {
+                self.walk(value, depth);
+                if Self::is_box(value.ty) {
+                    let r = self.region_of(value, depth);
+                    let d = *self.decl_depth.get(local).unwrap_or(&0);
+                    if d < r {
+                        self.diags.error(
+                            "this value is bound to an arena block and cannot escape it".to_string(),
+                            value.span,
+                        );
+                    }
+                }
+            }
+            Stmt::AssignField { value, .. } => self.walk(value, depth),
+            Stmt::Return(Some(e)) => {
+                self.walk(e, depth);
+                if Self::is_box(e.ty) && self.region_of(e, depth) >= 1 {
+                    self.diags.error(
+                        "cannot return a value allocated in an arena (it is freed at block end)".to_string(),
+                        e.span,
+                    );
+                }
+            }
+            Stmt::Return(None) => {}
+            Stmt::Expr(e) => self.walk(e, depth),
+        }
+    }
+
+    /// Recurse to find nested arenas and value positions that let a box escape.
+    fn walk(&mut self, e: &Expr, depth: u32) {
+        match &e.kind {
+            ExprKind::Arena(b) => {
+                let inner = depth + 1;
+                self.block(b, inner);
+                if let Some(v) = &b.value {
+                    if Self::is_box(v.ty) && self.region_of(v, inner) >= inner {
+                        self.diags.error(
+                            "a value allocated in this arena cannot escape as the block's value".to_string(),
+                            v.span,
+                        );
+                    }
+                }
+            }
+            ExprKind::Block(b) => self.block(b, depth),
+            ExprKind::If { cond, then, els } => {
+                self.walk(cond, depth);
+                self.block(then, depth);
+                self.block(els, depth);
+            }
+            ExprKind::Unary { expr, .. } => self.walk(expr, depth),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.walk(lhs, depth);
+                self.walk(rhs, depth);
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.walk(a, depth);
+                }
+            }
+            ExprKind::StructLit { fields, .. } => {
+                for f in fields {
+                    self.walk(f, depth);
+                }
+            }
+            ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
+            | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
+            | ExprKind::BoxClone(i) => self.walk(i, depth),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.walk(opt, depth);
+                self.walk(fallback, depth);
+            }
+            ExprKind::Unit
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Local(_)
+            | ExprKind::OptionNone
+            | ExprKind::Field { .. } => {}
+        }
+    }
 }
 
 /// Flow analysis that flags use-after-move. A Move-typed value (M3: `box<T>`) is
@@ -1464,6 +1605,29 @@ mod tests {
             "fn main() -> i32 {\n  arena {\n    p: box<i32> := heap.new(7)\n    q: box<i32> := p.clone()\n    p.get() + q.get()\n  }\n}\n",
         );
         assert!(!d.has_errors(), "clone borrows; the original stays usable");
+    }
+
+    #[test]
+    fn arena_box_value_escape_errors() {
+        // Yielding a freshly-allocated box as the arena's value escapes the arena.
+        let (_p, d) = check("fn main() -> i32 {\n  b := arena {\n    heap.new(7)\n  }\n  return 0\n}\n");
+        assert!(d.has_errors(), "a box must not escape as the arena block's value");
+    }
+
+    #[test]
+    fn return_box_escape_errors() {
+        let (_p, d) = check(
+            "fn make() -> box<i32> {\n  arena {\n    p: box<i32> := heap.new(7)\n    return p\n  }\n}\n",
+        );
+        assert!(d.has_errors(), "returning an arena box must error");
+    }
+
+    #[test]
+    fn assign_box_to_outer_binding_escapes() {
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  arena {\n    mut saved: box<i32> := heap.new(0)\n    arena {\n      p: box<i32> := heap.new(7)\n      saved = p\n    }\n    saved.get()\n  }\n}\n",
+        );
+        assert!(d.has_errors(), "binding an inner-arena box to an outer binding must error");
     }
 
     #[test]

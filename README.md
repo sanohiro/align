@@ -10,18 +10,21 @@ compiler (`alignc`) is being implemented in Rust under `crates/`.
 
 ## Status
 
-Milestones **M0–M2** are complete: programs flow end to end through
+Milestones **M0–M3** are complete: programs flow end to end through
 `lexer → parser → sema → MIR → LLVM → executable`. M1 adds functions and calls,
 `if`/comparisons/`bool`, `mut` reassignment, structs (declaration, literal,
 field access), the full primitive set (`i8..u64`, `f32`/`f64`, `char`), and a
 builtin `print` wired to the runtime. M2 adds `Option<T>` with `else`-unwrap,
 `Result<T, E>` with `?`, and a `Result`-returning `main` (mapped to an exit code).
+M3 adds the memory model: `arena {}` regions with bulk free, the heap box
+`box<T>` (`heap.new`/`.get()`/`.clone()`), move / use-after-move checking, and
+arena escape checking.
 
 ```sh
 cargo build
 cargo test
-cargo run --bin alignc -- run examples/point.align    # prints 3, 10; exits 13
 cargo run --bin alignc -- run examples/result.align   # propagates Err; exits 7
+cargo run --bin alignc -- run examples/arena.align     # arena + heap box; exits 42
 ```
 
 `alignc` subcommands: `check`, `emit-mir`, `emit-llvm`, `build`, `run`.

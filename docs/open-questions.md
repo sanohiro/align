@@ -56,8 +56,11 @@ Structural-constraint inference vs explicit bounds (trait-style). Unit of monomo
 ### Error type design — M2
 single `Error` / typed errors / error categories. Includes the `E → E'` conversion rule for `?` and the exit-code mapping (`impl/03-types.md` §5, `impl/06-runtime-std.md` §9).
 
-### Arena with explicit allocator — M3
-Whether to introduce a form like `arena a {}`. Region ordering and chunk sharing for nested arenas (`impl/03-types.md` §7, `impl/06-runtime-std.md` §3).
+### Arena with explicit allocator — partially settled (M3)
+**M3 decision: anonymous `arena {}` only.** Nested arenas use region = arena nesting
+depth; a box's region is the depth at which it was allocated, and escape = reaching a
+shallower depth (`impl/03-types.md` §7, `impl/07-roadmap.md` M3). Still **open**: a
+named/explicit-allocator form like `arena a {}` and cross-arena chunk sharing.
 
 ### Exposing SIMD intrinsics in std
 In addition to auto-vectorization, whether to place explicit intrinsics in std (`impl/04-mir.md` §9).
