@@ -27,7 +27,7 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, StructType};
-use inkwell::values::{BasicValueEnum, FunctionValue};
+use inkwell::values::{BasicValueEnum, FunctionValue, IntValue};
 
 pub fn is_available() -> bool {
     true
@@ -133,6 +133,36 @@ fn build_module<'c>(
                 &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
                 false,
             ),
+            None,
+        ),
+    );
+    // String builder (M5: `template` desugaring).
+    let i64t2 = ctx.i64_type();
+    funcs.insert(
+        "builder_new".to_string(),
+        module.add_function("align_rt_builder_new", ptr.fn_type(&[], false), None),
+    );
+    funcs.insert(
+        "builder_write".to_string(),
+        module.add_function(
+            "align_rt_builder_write",
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_write_int".to_string(),
+        module.add_function(
+            "align_rt_builder_write_int",
+            ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_finish".to_string(),
+        module.add_function(
+            "align_rt_builder_finish",
+            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
             None,
         ),
     );
@@ -654,24 +684,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::StrLit(s) => {
-                // Intern the bytes as a private constant; str = { &bytes, len }.
-                let arr = self.ctx.const_string(s.as_bytes(), false);
-                let g = self.module.add_global(arr.get_type(), None, "str");
-                g.set_initializer(&arr);
-                g.set_constant(true);
+                let (ptr, len) = self.str_global(s);
                 let sty = slice_struct_type(self.ctx);
                 let agg = self
                     .builder
-                    .build_insert_value(sty.get_undef(), g.as_pointer_value(), 0, "strptr")
+                    .build_insert_value(sty.get_undef(), ptr, 0, "strptr")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
-                let len = self.ctx.i64_type().const_int(s.len() as u64, false);
                 self.builder
                     .build_insert_value(agg, len, 1, "strlen")
                     .map_err(|e| self.err(e))?
                     .into_struct_value()
                     .into()
             }
+            Rvalue::Template(pieces) => self.gen_template(pieces)?,
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -849,6 +875,68 @@ impl<'c, 'a> FnGen<'c, 'a> {
             BinOp::Ge => bld.build_int_compare(pred(signed, Cmp::Ge), l, r, "ge"),
         };
         Ok(v.map_err(|e| self.err(e))?.into())
+    }
+
+    /// Intern a string's bytes as a private constant; return `(&bytes, len)`.
+    fn str_global(&self, s: &str) -> (inkwell::values::PointerValue<'c>, IntValue<'c>) {
+        let arr = self.ctx.const_string(s.as_bytes(), false);
+        let g = self.module.add_global(arr.get_type(), None, "str");
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        (g.as_pointer_value(), self.ctx.i64_type().const_int(s.len() as u64, false))
+    }
+
+    /// `template "..."` → builder_new, a write per piece, then builder_finish → str.
+    fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece]) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let bptr = self
+            .builder
+            .build_call(self.funcs["builder_new"], &[], "b")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .expect("builder_new returns a pointer");
+        let i64t = self.ctx.i64_type();
+        for piece in pieces {
+            match piece {
+                align_mir::TemplatePiece::Static(s) => {
+                    let (ptr, len) = self.str_global(s);
+                    self.builder
+                        .build_call(self.funcs["builder_write"], &[bptr.into(), ptr.into(), len.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                align_mir::TemplatePiece::StrHole(op) => {
+                    let agg = self.operand(op).into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "p").map_err(|e| self.err(e))?;
+                    let len = self.builder.build_extract_value(agg, 1, "l").map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_call(self.funcs["builder_write"], &[bptr.into(), ptr.into(), len.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                align_mir::TemplatePiece::IntHole(op) => {
+                    let ty = self.f.operand_ty(op);
+                    let v = self.operand(op).into_int_value();
+                    let wide = if int_bits(ty) < 64 {
+                        if is_signed(ty) {
+                            self.builder.build_int_s_extend(v, i64t, "sext").map_err(|e| self.err(e))?
+                        } else {
+                            self.builder.build_int_z_extend(v, i64t, "zext").map_err(|e| self.err(e))?
+                        }
+                    } else {
+                        v
+                    };
+                    self.builder
+                        .build_call(self.funcs["builder_write_int"], &[bptr.into(), wide.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+            }
+        }
+        Ok(self
+            .builder
+            .build_call(self.funcs["builder_finish"], &[bptr.into()], "s")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .expect("builder_finish returns a str"))
     }
 
     /// `str == str` / `str != str` via the runtime `align_rt_str_eq`.

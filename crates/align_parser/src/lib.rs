@@ -10,6 +10,35 @@ use align_diag::Diagnostics;
 use align_lexer::{TokKind, Token};
 use align_span::Span;
 
+/// Split a template literal's decoded content into static text and `{ident}` holes.
+/// M5: only `{ident}` (no `{expr}`); the hole name is trimmed.
+fn split_template(content: &str, span: Span) -> Vec<TemplatePart> {
+    let mut parts = Vec::new();
+    let mut text = String::new();
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut name = String::new();
+            for d in chars.by_ref() {
+                if d == '}' {
+                    break;
+                }
+                name.push(d);
+            }
+            if !text.is_empty() {
+                parts.push(TemplatePart::Text(std::mem::take(&mut text)));
+            }
+            parts.push(TemplatePart::Hole(Ident { name: name.trim().to_string(), span }));
+        } else {
+            text.push(c);
+        }
+    }
+    if !text.is_empty() {
+        parts.push(TemplatePart::Text(text));
+    }
+    parts
+}
+
 pub fn parse_file(tokens: Vec<Token>, diags: &mut Diagnostics) -> File {
     let mut p = Parser {
         tokens,
@@ -500,6 +529,18 @@ impl<'a> Parser<'a> {
                 let field = self.parse_ident("field name")?;
                 let span = span.merge(self.prev_span());
                 Some(Expr { kind: ExprKind::FieldShorthand(field), span })
+            }
+            TokKind::Template => {
+                self.bump();
+                let str_span = self.span();
+                let TokKind::Str(content) = self.peek().clone() else {
+                    self.diags.error("expected a string literal after `template`", str_span);
+                    return None;
+                };
+                self.bump();
+                let parts = split_template(&content, str_span);
+                let span = span.merge(self.prev_span());
+                Some(Expr { kind: ExprKind::Template(parts), span })
             }
             TokKind::If => self.parse_if(),
             TokKind::Arena => {

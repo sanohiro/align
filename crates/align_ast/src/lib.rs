@@ -206,6 +206,17 @@ pub enum ExprKind {
     /// `.field` — element-field shorthand, valid only as a pipeline stage argument
     /// (e.g. `where(.active)`); refers to a field of the current pipeline element.
     FieldShorthand(Ident),
+    /// `template "text {hole} ..."` — a string built from static parts and `{ident}`
+    /// holes (interpolation). Produces a `str`.
+    Template(Vec<TemplatePart>),
+}
+
+#[derive(Clone, Debug)]
+pub enum TemplatePart {
+    /// Literal text between holes.
+    Text(String),
+    /// `{ident}` — interpolate the named binding.
+    Hole(Ident),
 }
 
 #[derive(Clone, Debug)]
