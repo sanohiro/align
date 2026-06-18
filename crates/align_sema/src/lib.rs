@@ -1038,7 +1038,12 @@ impl<'a> Checker<'a> {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 l = self.check_expr(lhs, None);
                 r = self.check_expr(rhs, Some(l.ty));
-                self.unify(l.ty, r.ty, span);
+                let t = self.unify(l.ty, r.ty, span);
+                // `str` supports only equality (no ordering yet).
+                if t == Ty::Str && !matches!(op, BinOp::Eq | BinOp::Ne) {
+                    self.diags
+                        .error("str supports only == and != (ordering is not available)".to_string(), span);
+                }
                 ty = Ty::Bool;
             }
             BinOp::And | BinOp::Or => {
@@ -2076,6 +2081,14 @@ mod tests {
     fn string_program_checks() {
         let (_p, d) = check("fn g() -> str = \"hi\"\nfn main() -> i32 {\n  print(g())\n  print(\"x\")\n  return 0\n}\n");
         assert!(!d.has_errors(), "string literals + print(str) should check");
+    }
+
+    #[test]
+    fn str_equality_checks_but_ordering_errors() {
+        let (_p, ok) = check("fn f(s: str) -> bool = s == \"x\"\n");
+        assert!(!ok.has_errors(), "str == str should check");
+        let (_q, bad) = check("fn f(s: str) -> bool = s < \"x\"\n");
+        assert!(bad.has_errors(), "str ordering must error");
     }
 
     #[test]

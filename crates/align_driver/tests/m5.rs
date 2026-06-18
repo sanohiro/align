@@ -35,6 +35,17 @@ fn print_string_literal_and_returned_str() {
 }
 
 #[test]
+fn string_equality() {
+    if !backend_available() {
+        return;
+    }
+    // check("yes")=1, check("maybe")=2 → 1 + 2*10 = 21.
+    let src = "fn check(s: str) -> i32 {\n  if s == \"yes\" { return 1 }\n  if s != \"no\" { return 2 }\n  return 0\n}\nfn main() -> i32 {\n  return check(\"yes\") + check(\"maybe\") * 10\n}\n";
+    let out = build_and_run("str-eq", src);
+    assert_eq!(out.status.code(), Some(21));
+}
+
+#[test]
 fn string_escapes() {
     if !backend_available() {
         return;
