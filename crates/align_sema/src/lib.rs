@@ -416,6 +416,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Str(_)
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
+            | ExprKind::Template(_)
             | ExprKind::OptionNone
             | ExprKind::Field { .. } => {}
         }
@@ -532,6 +533,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Char(_)
             | ExprKind::Str(_)
             | ExprKind::Bool(_)
+            | ExprKind::Template(_)
             | ExprKind::OptionNone => {}
         }
     }
@@ -863,6 +865,7 @@ impl<'a> Checker<'a> {
                 self.check_field_access(recv, field, expected, e.span)
             }
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, None, e.span),
+            ast::ExprKind::Template(parts) => self.check_template(parts, expected, e.span),
             ast::ExprKind::FieldShorthand(_) => {
                 self.diags.error(
                     "`.field` is only valid as a pipeline stage argument (e.g. `where(.active)`)".to_string(),
@@ -1227,6 +1230,34 @@ impl<'a> Checker<'a> {
     /// `[e1, e2, ...]` — a fixed-length array literal. Elements share one scalar type
     /// (resolved here; an unconstrained literal defaults). Empty literals need a type
     /// annotation, which is not supported yet.
+    /// `template "...{hole}..."` — each hole is a local of int or str type; the result
+    /// is a `str`.
+    fn check_template(&mut self, parts: &[ast::TemplatePart], expected: Option<Ty>, span: Span) -> Expr {
+        let mut hparts = Vec::new();
+        for p in parts {
+            match p {
+                ast::TemplatePart::Text(s) => hparts.push(TemplatePart::Text(s.clone())),
+                ast::TemplatePart::Hole(ident) => match self.lookup(&ident.name) {
+                    Some(id) => {
+                        let ty = self.locals[id as usize].ty;
+                        if !ty.is_int_like() && ty != Ty::Str && ty != Ty::Error {
+                            self.diags.error(
+                                format!("template hole '{}' must be an int or str, got {}", ident.name, ty_name(ty)),
+                                ident.span,
+                            );
+                        }
+                        hparts.push(TemplatePart::Hole(id));
+                    }
+                    None => {
+                        self.diags.error(format!("undefined name in template: '{}'", ident.name), ident.span);
+                    }
+                },
+            }
+        }
+        self.constrain(Ty::Str, expected, span);
+        Expr { kind: ExprKind::Template(hparts), ty: Ty::Str, span }
+    }
+
     fn check_array_lit(&mut self, elems: &[ast::Expr], elem_expected: Option<Ty>, span: Span) -> Expr {
         if elems.is_empty() {
             self.diags
@@ -1739,6 +1770,7 @@ impl<'a> Checker<'a> {
             | ExprKind::Str(_)
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
+            | ExprKind::Template(_)
             | ExprKind::OptionNone
             | ExprKind::Field { .. } => {}
         }
@@ -2089,6 +2121,18 @@ mod tests {
         assert!(!ok.has_errors(), "str == str should check");
         let (_q, bad) = check("fn f(s: str) -> bool = s < \"x\"\n");
         assert!(bad.has_errors(), "str ordering must error");
+    }
+
+    #[test]
+    fn template_checks() {
+        let (_p, d) = check("fn main() -> i32 {\n  n := \"x\"\n  k := 1\n  m := template \"{n}={k}\"\n  print(m)\n  return 0\n}\n");
+        assert!(!d.has_errors(), "a template with str/int holes should check");
+    }
+
+    #[test]
+    fn template_undefined_hole_errors() {
+        let (_p, d) = check("fn main() -> i32 {\n  m := template \"hi {who}\"\n  return 0\n}\n");
+        assert!(d.has_errors(), "an undefined template hole must error");
     }
 
     #[test]

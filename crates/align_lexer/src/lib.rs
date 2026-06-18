@@ -34,6 +34,7 @@ pub enum TokKind {
     True,
     False,
     Arena,
+    Template,
     // Symbols / operators
     ColonEq, // :=
     Eq,      // =
@@ -372,6 +373,7 @@ impl<'a> Lexer<'a> {
             "true" => TokKind::True,
             "false" => TokKind::False,
             "arena" => TokKind::Arena,
+            "template" => TokKind::Template,
             _ => TokKind::Ident(text.to_string()),
         };
         self.push(kind, start);

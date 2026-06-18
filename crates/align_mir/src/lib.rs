@@ -130,6 +130,16 @@ pub enum Rvalue {
     SliceIndex(Operand, Operand),
     /// A string literal — a `str` view `{ &bytes, len }` over a constant.
     StrLit(String),
+    /// `template "..."` — build a `str` from static parts and interpolated holes.
+    Template(Vec<TemplatePiece>),
+}
+
+/// One piece of a lowered `template`: a static run, or an interpolated value.
+#[derive(Clone, Debug)]
+pub enum TemplatePiece {
+    Static(String),
+    IntHole(Operand),
+    StrHole(Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -343,6 +353,27 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::StrLit(s.clone())));
             Operand::Value(v)
+        }
+        hir::ExprKind::Template(parts) => {
+            let mut pieces = Vec::new();
+            for p in parts {
+                match p {
+                    hir::TemplatePart::Text(s) => pieces.push(TemplatePiece::Static(s.clone())),
+                    hir::TemplatePart::Hole(local) => {
+                        let ty = b.slots[*local as usize];
+                        let v = b.fresh_value(ty);
+                        b.push(Stmt::Let(v, Rvalue::Load(*local)));
+                        if ty == Ty::Str {
+                            pieces.push(TemplatePiece::StrHole(Operand::Value(v)));
+                        } else {
+                            pieces.push(TemplatePiece::IntHole(Operand::Value(v)));
+                        }
+                    }
+                }
+            }
+            let r = b.fresh_value(e.ty);
+            b.push(Stmt::Let(r, Rvalue::Template(pieces)));
+            Operand::Value(r)
         }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {

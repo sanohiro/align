@@ -35,6 +35,56 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     let _ = out.write_all(b"\n");
 }
 
+/// A `str` view passed/returned across the ABI: `{ ptr, len }` (`06-runtime-std.md` §2).
+#[repr(C)]
+pub struct AlignStr {
+    pub ptr: *const u8,
+    pub len: i64,
+}
+
+/// An append-oriented string builder (`06-runtime-std.md` §7), backing `template`
+/// desugaring. M5: heap-backed; the finished buffer is leaked (no ownership/free yet —
+/// arena-tied builders come later).
+pub struct Builder {
+    buf: Vec<u8>,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_builder_new() -> *mut Builder {
+    Box::into_raw(Box::new(Builder { buf: Vec::new() }))
+}
+
+/// Append raw bytes (a static template part or a `str` value).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_write(b: *mut Builder, ptr: *const u8, len: i64) {
+    let b = unsafe { &mut *b };
+    if len > 0 {
+        b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
+    }
+}
+
+/// Append a decimal integer.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
+    use std::io::Write;
+    let b = unsafe { &mut *b };
+    let _ = write!(b.buf, "{v}");
+}
+
+/// Finish the builder, returning a `str` view over the (leaked) contents and freeing
+/// the builder object.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
+    let b = unsafe { Box::from_raw(b) };
+    let bytes = b.buf.into_boxed_slice();
+    let len = bytes.len() as i64;
+    let ptr = Box::leak(bytes).as_ptr();
+    AlignStr { ptr, len }
+}
+
 /// Byte-equality of two `str` views (M5). Returns 1 if equal, else 0.
 ///
 /// # Safety

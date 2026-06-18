@@ -57,6 +57,17 @@ fn empty_string_equality() {
 }
 
 #[test]
+fn template_interpolation() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> i32 {\n  name := \"align\"\n  score := 42\n  print(template \"Hello {name}, score={score}!\")\n  return 0\n}\n";
+    let out = build_and_run("template", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello align, score=42!\n");
+}
+
+#[test]
 fn string_escapes() {
     if !backend_available() {
         return;

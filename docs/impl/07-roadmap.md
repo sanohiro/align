@@ -210,8 +210,11 @@ later slices (struct arrays, M5 strings/JSON).
 
 - [done] `str` view (`{ u8* ptr, i64 len }`), string literals (interned constants),
   `print(str)` via `align_rt_print_str` (M5-A).
-- [todo] `string` / `bytes` / `buffer` / `builder`; const string pool/meta.
-- [todo] desugaring of `template` / `html` / `json` strings (`write_static`/`write_value`).
+- [done] `str` equality (`==`/`!=`); the runtime string `builder`
+  (`align_rt_builder_*`); `template "...{ident}..."` desugaring (static parts +
+  int/str holes → builder writes → `str`).
+- [todo] `string` / `bytes` (owned), const string pool/meta, `{expr}` holes,
+  `html`/`json` template variants.
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
   view, SIMD structural scan.
 

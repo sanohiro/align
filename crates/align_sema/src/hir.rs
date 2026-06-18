@@ -165,6 +165,15 @@ pub enum ExprKind {
     /// Borrow an array (a local stack array) as a `slice<T>` view — `{ &arr[0], len }`.
     /// Allocation-free, so it is an implicit coercion at call sites.
     ArrayToSlice(Box<Expr>),
+    /// `template "..."` — build a `str` from static parts and interpolated holes. Each
+    /// hole is a local (int or str); lowering picks the right builder write by its type.
+    Template(Vec<TemplatePart>),
+}
+
+#[derive(Clone, Debug)]
+pub enum TemplatePart {
+    Text(String),
+    Hole(LocalId),
 }
 
 #[derive(Clone, Debug)]

@@ -1,0 +1,8 @@
+// Template strings (M5). `template "...{hole}..."` interpolates named bindings
+// (int or str) and builds a `str` via the runtime string builder.
+fn main() -> i32 {
+  name := "align"
+  score := 42
+  print(template "Hello {name}, score={score}!")
+  return 0
+}
