@@ -53,7 +53,9 @@ const CHUNK: usize = 64 * 1024;
 
 impl Arena {
     fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
-        let align = align.max(1);
+        // The bit-trick below requires a power-of-two alignment; normalize so a future
+        // ABI passing odd alignments stays correct.
+        let align = align.max(1).next_power_of_two();
         let need = size.max(1);
         let aligned = (self.off + align - 1) & !(align - 1);
         let fits = self

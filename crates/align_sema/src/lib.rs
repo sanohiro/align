@@ -181,13 +181,33 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for item in &file.items {
         let ast::Item::Fn(f) = item else { continue };
-        let params = f
+        let params: Vec<Ty> = f
             .params
             .iter()
             .map(|p| resolve_type(&p.ty, &struct_ids, diags))
             .collect();
+        // A box across a call boundary would escape its arena, so M3 forbids box
+        // parameters and returns (boxes are arena-local). This also closes escape
+        // holes via call results.
+        for (p, ty) in f.params.iter().zip(&params) {
+            if matches!(ty, Ty::Box(_)) {
+                diags.error(
+                    "a box cannot be a function parameter (boxes are arena-local in M3)".to_string(),
+                    p.ty.span,
+                );
+            }
+        }
         let ret = match &f.ret {
-            Some(t) => resolve_type(t, &struct_ids, diags),
+            Some(t) => {
+                let r = resolve_type(t, &struct_ids, diags);
+                if matches!(r, Ty::Box(_)) {
+                    diags.error(
+                        "a box cannot be a function return type (it would escape its arena)".to_string(),
+                        t.span,
+                    );
+                }
+                r
+            }
             None => Ty::Unit,
         };
         sigs.insert(f.name.name.clone(), FnSig { params, ret });
@@ -253,12 +273,22 @@ impl<'a> EscapeCheck<'a> {
     }
 
     /// The arena depth of the box a (box-typed) expression yields; 0 = no arena region.
+    /// Recurses through value-producing forms so a box can't slip out via an `if`/block
+    /// value. (Calls cannot yield a box — box params/returns are forbidden.)
     fn region_of(&self, e: &Expr, depth: u32) -> u32 {
         match &e.kind {
             ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => depth,
             ExprKind::Local(p) => *self.region.get(p).unwrap_or(&0),
+            ExprKind::Block(b) => self.region_of_block(b, depth),
+            ExprKind::If { then, els, .. } => {
+                self.region_of_block(then, depth).max(self.region_of_block(els, depth))
+            }
             _ => 0,
         }
+    }
+
+    fn region_of_block(&self, b: &Block, depth: u32) -> u32 {
+        b.value.as_ref().map(|v| self.region_of(v, depth)).unwrap_or(0)
     }
 
     fn block(&mut self, b: &Block, depth: u32) {
@@ -291,6 +321,8 @@ impl<'a> EscapeCheck<'a> {
                             value.span,
                         );
                     }
+                    // Track the reassigned binding's region for later uses.
+                    self.region.insert(*local, r);
                 }
             }
             Stmt::AssignField { value, .. } => self.walk(value, depth),
@@ -374,14 +406,16 @@ struct MoveCheck<'a> {
 impl<'a> MoveCheck<'a> {
     fn check(&mut self) {
         let mut moved = std::collections::HashSet::new();
-        self.block(&self.f.body, &mut moved);
+        // A function never returns a box (forbidden), so the body value is not consumed.
+        self.block(&self.f.body, &mut moved, false);
     }
 
     fn is_move(&self, id: LocalId) -> bool {
         matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_)))
     }
 
-    fn block(&mut self, b: &Block, moved: &mut std::collections::HashSet<LocalId>) {
+    /// `tail_consuming` = whether the block's trailing value is consumed by its context.
+    fn block(&mut self, b: &Block, moved: &mut std::collections::HashSet<LocalId>, tail_consuming: bool) {
         for s in &b.stmts {
             match s {
                 Stmt::Let { local, init } => {
@@ -399,7 +433,7 @@ impl<'a> MoveCheck<'a> {
             }
         }
         if let Some(v) = &b.value {
-            self.expr(v, moved, false);
+            self.expr(v, moved, tail_consuming);
         }
     }
 
@@ -444,13 +478,13 @@ impl<'a> MoveCheck<'a> {
                 self.expr(opt, moved, true);
                 self.expr(fallback, moved, false);
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) => self.block(b, moved),
+            ExprKind::Block(b) | ExprKind::Arena(b) => self.block(b, moved, consuming),
             ExprKind::If { cond, then, els } => {
                 self.expr(cond, moved, false);
                 let mut m1 = moved.clone();
-                self.block(then, &mut m1);
+                self.block(then, &mut m1, consuming);
                 let mut m2 = moved.clone();
-                self.block(els, &mut m2);
+                self.block(els, &mut m2, consuming);
                 // Conservative join: moved if moved on either path.
                 *moved = &m1 | &m2;
             }
@@ -1628,6 +1662,30 @@ mod tests {
             "fn main() -> i32 {\n  arena {\n    mut saved: box<i32> := heap.new(0)\n    arena {\n      p: box<i32> := heap.new(7)\n      saved = p\n    }\n    saved.get()\n  }\n}\n",
         );
         assert!(d.has_errors(), "binding an inner-arena box to an outer binding must error");
+    }
+
+    #[test]
+    fn box_escape_via_if_branches_errors() {
+        // A box reaching the arena value through `if` branches must still be caught.
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  b := arena {\n    if true { heap.new(1) } else { heap.new(2) }\n  }\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "a box escaping via if-branch values must error");
+    }
+
+    #[test]
+    fn box_parameter_and_return_forbidden() {
+        let (_p, d) = check("fn id(b: box<i32>) -> box<i32> {\n  return b\n}\nfn main() -> i32 {\n  return 0\n}\n");
+        assert!(d.has_errors(), "box params/returns are forbidden in M3");
+    }
+
+    #[test]
+    fn move_through_block_value_is_tracked() {
+        // The block's tail value consumes p, so reusing p afterwards is a move error.
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  arena {\n    p: box<i32> := heap.new(1)\n    q: box<i32> := {\n      p\n    }\n    return p.get()\n  }\n}\n",
+        );
+        assert!(d.has_errors(), "a box moved through a block value must be tracked");
     }
 
     #[test]

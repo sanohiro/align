@@ -54,6 +54,29 @@ fn clone_keeps_original_usable() {
 }
 
 #[test]
+fn nested_arenas_run_correctly() {
+    if !backend_available() {
+        return;
+    }
+    // Inner arena's box value is copied out (scalar) before its arena ends; both
+    // arenas are freed. 10 + 5 = 15.
+    let src = "fn main() -> i32 {\n  arena {\n    a: box<i32> := heap.new(10)\n    inner: i32 := arena {\n      b: box<i32> := heap.new(5)\n      b.get()\n    }\n    a.get() + inner\n  }\n}\n";
+    let out = build_and_run("nested-arena", src);
+    assert_eq!(out.status.code(), Some(15));
+}
+
+#[test]
+fn early_return_from_nested_arena() {
+    if !backend_available() {
+        return;
+    }
+    // `return` inside a nested arena frees both arenas first. f(1) = 1 + 2 = 3.
+    let src = "fn f(x: i32) -> i32 {\n  arena {\n    a: box<i32> := heap.new(1)\n    arena {\n      b: box<i32> := heap.new(2)\n      if x > 0 { return a.get() + b.get() }\n      b.get()\n    }\n  }\n}\nfn main() -> i32 {\n  return f(1)\n}\n";
+    let out = build_and_run("nested-early", src);
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
 fn arena_emits_begin_and_end() {
     let mut sm = SourceMap::new();
     let src = "fn main() -> i32 {\n  r: i32 := arena {\n    p: box<i32> := heap.new(1)\n    p.get()\n  }\n  return r\n}\n";
