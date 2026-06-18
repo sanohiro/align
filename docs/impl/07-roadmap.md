@@ -215,8 +215,12 @@ later slices (struct arrays, M5 strings/JSON).
   int/str holes → builder writes → `str`); `str + str` concatenation.
 - [done] arena-backed builder: when a `template`/concat runs inside an `arena {}`,
   the result is allocated in the arena (bulk-freed, no leak); outside, it is leaked
-  (process-lifetime). [todo] str escape checking (returning an arena-backed str is
-  not yet rejected — same gap as slices).
+  (process-lifetime).
+- [done] `str` escape checking: an arena-backed `str` cannot escape its arena (return /
+  arena-block value / assign-to-outer) — `EscapeCheck` now tracks `str` regions like
+  `box`. A non-arena `str` (literal / leaked concat) is region-0 and freely returnable.
+  [todo] `slice<T>` escape checking (slices borrow function-local arrays — different
+  lifetime model; still a gap).
 - [todo] owned `string` / `bytes`, const string pool/meta, `{expr}` holes,
   `html`/`json` template variants.
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
