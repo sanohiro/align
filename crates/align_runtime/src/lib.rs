@@ -84,7 +84,10 @@ pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
 pub extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
     let b = unsafe { Box::from_raw(b) };
     let len = b.buf.len() as i64;
-    if b.arena.is_null() {
+    if len == 0 {
+        // Empty: no allocation needed; a dangling non-null ptr is valid for a 0-len view.
+        AlignStr { ptr: std::ptr::NonNull::dangling().as_ptr(), len: 0 }
+    } else if b.arena.is_null() {
         // No arena: leak the buffer so the view stays valid (process-lifetime).
         let ptr = Box::leak(b.buf.into_boxed_slice()).as_ptr();
         AlignStr { ptr, len }

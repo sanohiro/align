@@ -140,7 +140,7 @@ fn build_module<'c>(
     let i64t2 = ctx.i64_type();
     funcs.insert(
         "builder_new".to_string(),
-        module.add_function("align_rt_builder_new", ptr.fn_type(&[], false), None),
+        module.add_function("align_rt_builder_new", ptr.fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
         "builder_write".to_string(),

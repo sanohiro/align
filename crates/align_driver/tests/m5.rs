@@ -80,6 +80,18 @@ fn string_concatenation() {
 }
 
 #[test]
+fn empty_string_build() {
+    if !backend_available() {
+        return;
+    }
+    // Empty concat/template (exercises the zero-length dangling-pointer path).
+    let src = "fn main() -> i32 {\n  e := \"\"\n  arena {\n    print(e + e)\n    print(template \"{e}\")\n  }\n  return 0\n}\n";
+    let out = build_and_run("empty-build", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n\n");
+}
+
+#[test]
 fn string_escapes() {
     if !backend_available() {
         return;
