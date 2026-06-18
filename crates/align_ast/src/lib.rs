@@ -199,6 +199,8 @@ pub enum ExprKind {
     Try(Box<Expr>),
     /// `arena { ... }` — a region whose allocations are freed in bulk at block end.
     Arena(Block),
+    /// `[e1, e2, ...]` — a fixed-length array literal.
+    ArrayLit(Vec<Expr>),
 }
 
 #[derive(Clone, Debug)]

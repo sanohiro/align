@@ -40,6 +40,8 @@ pub enum TokKind {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Comma,
     Colon,
     Dot,
@@ -77,6 +79,7 @@ impl TokKind {
                 | TokKind::False
                 | TokKind::RParen
                 | TokKind::RBrace
+                | TokKind::RBracket
                 | TokKind::Question
         )
     }
@@ -346,6 +349,8 @@ impl<'a> Lexer<'a> {
             (b')', _) => (TokKind::RParen, 1),
             (b'{', _) => (TokKind::LBrace, 1),
             (b'}', _) => (TokKind::RBrace, 1),
+            (b'[', _) => (TokKind::LBracket, 1),
+            (b']', _) => (TokKind::RBracket, 1),
             (b',', _) => (TokKind::Comma, 1),
             (b':', _) => (TokKind::Colon, 1),
             (b'.', _) => (TokKind::Dot, 1),

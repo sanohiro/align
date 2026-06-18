@@ -515,6 +515,26 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
+            TokKind::LBracket => {
+                let start = self.span();
+                self.bump();
+                let mut elems = Vec::new();
+                loop {
+                    self.skip_ends();
+                    if self.at(&TokKind::RBracket) || self.at(&TokKind::Eof) {
+                        break;
+                    }
+                    elems.push(self.parse_expr(0)?);
+                    self.skip_ends();
+                    if !self.eat(&TokKind::Comma) {
+                        break;
+                    }
+                }
+                self.skip_ends();
+                self.expect(&TokKind::RBracket, "']'");
+                let span = start.merge(self.prev_span());
+                Some(Expr { kind: ExprKind::ArrayLit(elems), span })
+            }
             _ => {
                 self.diags.error("expected expression", span);
                 None

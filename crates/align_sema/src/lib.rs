@@ -73,6 +73,9 @@ pub enum Ty {
     Result(Scalar, Scalar),
     /// `box<T>` — an owning heap pointer to a scalar (a Move type). M3.
     Box(Scalar),
+    /// `array<T>` of a fixed length — contiguous scalars. M4 (length known from the
+    /// literal; dynamic-length arrays/slices come later).
+    Array(Scalar, u32),
     /// An arena handle (internal; produced by `arena {}`, never written by the user).
     ArenaHandle,
     /// The `Error` type (M2: an i32 code).
@@ -378,7 +381,12 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) => self.walk(i, depth),
+            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i } => self.walk(i, depth),
+            ExprKind::ArrayLit { elems, .. } => {
+                for e in elems {
+                    self.walk(e, depth);
+                }
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
                 self.walk(fallback, depth);
@@ -473,7 +481,14 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) => self.expr(i, moved, false),
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i } => {
+                self.expr(i, moved, false)
+            }
+            ExprKind::ArrayLit { elems, .. } => {
+                for e in elems {
+                    self.expr(e, moved, true);
+                }
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true);
                 self.expr(fallback, moved, false);
@@ -819,6 +834,7 @@ impl<'a> Checker<'a> {
             ast::ExprKind::FieldAccess { recv, field } => {
                 self.check_field_access(recv, field, expected, e.span)
             }
+            ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, None, e.span),
             ast::ExprKind::ElseUnwrap { opt, fallback } => {
                 self.check_else_unwrap(opt, fallback, expected, e.span)
             }
@@ -1116,6 +1132,16 @@ impl<'a> Checker<'a> {
                 return self.check_heap_new(args, expected, span);
             }
         }
+        // `sum` is a reduction: its result is the element type, so push the expected
+        // type into an inline array literal source.
+        if method == "sum" {
+            let recv_expr = match &recv.kind {
+                ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, expected, span),
+                _ => self.check_expr(recv, None),
+            };
+            let recv_ty = recv_expr.ty;
+            return self.check_array_sum(recv_expr, recv_ty, args, expected, span);
+        }
         let recv_expr = self.check_expr(recv, None);
         let recv_ty = recv_expr.ty;
         match method {
@@ -1127,6 +1153,51 @@ impl<'a> Checker<'a> {
                         .error(format!("unknown method '.{method}()' on {}", ty_name(recv_ty)), span);
                 }
                 err
+            }
+        }
+    }
+
+    /// `[e1, e2, ...]` — a fixed-length array literal. Elements share one scalar type
+    /// (resolved here; an unconstrained literal defaults). Empty literals need a type
+    /// annotation, which is not supported yet.
+    fn check_array_lit(&mut self, elems: &[ast::Expr], elem_expected: Option<Ty>, span: Span) -> Expr {
+        if elems.is_empty() {
+            self.diags
+                .error("an empty array literal needs a type annotation (not supported yet)".to_string(), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let first = self.check_expr(&elems[0], elem_expected);
+        let elem_ty = first.ty;
+        let mut checked = vec![first];
+        for e in &elems[1..] {
+            checked.push(self.check_expr(e, Some(elem_ty)));
+        }
+        let scalar = self.payload_scalar(elem_ty, span);
+        let n = elems.len() as u32;
+        Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar }, ty: Ty::Array(scalar, n), span }
+    }
+
+    /// `arr.sum()` — sum the elements into one scalar. The element type must be numeric.
+    fn check_array_sum(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        if !args.is_empty() {
+            self.diags.error("'sum' takes no arguments".to_string(), span);
+        }
+        match recv_ty {
+            Ty::Array(s, _) if scalar_to_ty(s).is_numeric() => {
+                let ty = scalar_to_ty(s);
+                self.constrain(ty, expected, span);
+                Expr { kind: ExprKind::ArraySum { source: Box::new(recv) }, ty, span }
+            }
+            Ty::Array(s, _) => {
+                self.diags
+                    .error(format!("'sum' needs a numeric element type, got array<{}>", scalar_name(s)), span);
+                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
+            }
+            Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
+            other => {
+                self.diags
+                    .error(format!("'.sum()' is only available on an array, got {}", ty_name(other)), span);
+                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
             }
         }
     }
@@ -1361,7 +1432,14 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) => self.finalize_expr(inner),
+            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner } => {
+                self.finalize_expr(inner)
+            }
+            ExprKind::ArrayLit { elems, .. } => {
+                for e in elems {
+                    self.finalize_expr(e);
+                }
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);
@@ -1412,6 +1490,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Option(s) => format!("Option<{}>", scalar_name(s)),
         Ty::Result(o, e) => format!("Result<{}, {}>", scalar_name(o), scalar_name(e)),
         Ty::Box(s) => format!("box<{}>", scalar_name(s)),
+        Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
@@ -1636,6 +1715,24 @@ mod tests {
             "fn main() -> i32 {\n  r: i32 := arena {\n    p: box<i32> := heap.new(5)\n    p.get()\n  }\n  return r\n}\n",
         );
         assert!(!d.has_errors(), "a well-formed arena/box program should check");
+    }
+
+    #[test]
+    fn array_sum_checks() {
+        let (_p, d) = check("fn main() -> i32 {\n  return [10, 20, 12].sum()\n}\n");
+        assert!(!d.has_errors(), "a well-formed array sum should check");
+    }
+
+    #[test]
+    fn empty_array_literal_errors() {
+        let (_p, d) = check("fn main() -> i32 {\n  return [].sum()\n}\n");
+        assert!(d.has_errors(), "an empty array literal needs a type");
+    }
+
+    #[test]
+    fn sum_on_non_array_errors() {
+        let (_p, d) = check("fn main() -> i32 {\n  x := 1\n  return x.sum()\n}\n");
+        assert!(d.has_errors(), "`.sum()` on a non-array must error");
     }
 
     #[test]

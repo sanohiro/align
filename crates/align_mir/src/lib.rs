@@ -73,6 +73,8 @@ pub enum Stmt {
     Store(Slot, Operand),
     /// `slot.field <- operand` (struct field store; `slot` holds a struct).
     StoreField(Slot, u32, Operand),
+    /// `slot[index] <- value` (array element store).
+    StoreIndex(Slot, Operand, Operand),
     /// End an arena, freeing all its allocations (the operand is the arena handle).
     ArenaEnd(Operand),
 }
@@ -114,6 +116,8 @@ pub enum Rvalue {
     /// Deep-copy a `box` into a fresh allocation. First operand is the arena handle,
     /// second is the source box.
     BoxClone(Operand, Operand),
+    /// `slot[index]` — load an array element.
+    Index(Slot, Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +292,13 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     b.push(Stmt::StoreField(*local, i as u32, op));
                 }
             }
+            // An array literal stores its elements into the slot by index.
+            hir::ExprKind::ArrayLit { elems, .. } => {
+                for (i, e) in elems.iter().enumerate() {
+                    let v = lower_expr(b, e);
+                    b.push(Stmt::StoreIndex(*local, index_const(i), v));
+                }
+            }
             _ => {
                 let op = lower_expr(b, init);
                 b.push(Stmt::Store(*local, op));
@@ -414,11 +425,105 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::BoxClone(Operand::Value(handle), src)));
             Operand::Value(v)
         }
+        hir::ExprKind::ArraySum { source } => lower_array_sum(b, source, e.ty),
+        hir::ExprKind::ArrayLit { .. } => {
+            unreachable!("array literal only appears as a let initializer or pipeline source")
+        }
         // sema only admits a struct literal as a `let` initializer (handled in lower_stmt).
         hir::ExprKind::StructLit { .. } => {
             unreachable!("struct literal outside a let initializer reached MIR lowering")
         }
     }
+}
+
+/// The i64 type used for array indices / loop counters.
+fn i64_ty() -> Ty {
+    Ty::Int(IntTy { bits: 64, signed: true })
+}
+
+fn index_const(i: usize) -> Operand {
+    Operand::Const(Const::Int(i as i128, i64_ty()))
+}
+
+/// Zero of a numeric scalar type (the identity for `sum`).
+fn zero_of(ty: Ty) -> Operand {
+    match ty {
+        Ty::Float(_) => Operand::Const(Const::Float(0.0, ty)),
+        _ => Operand::Const(Const::Int(0, ty)),
+    }
+}
+
+/// Resolve an array-typed source expression to a slot holding it (materializing a
+/// literal), returning `(slot, length)`.
+fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
+    match &source.kind {
+        hir::ExprKind::ArrayLit { elems, .. } => {
+            let slot = b.new_slot(source.ty);
+            for (i, e) in elems.iter().enumerate() {
+                let v = lower_expr(b, e);
+                b.push(Stmt::StoreIndex(slot, index_const(i), v));
+            }
+            (slot, elems.len() as i128)
+        }
+        hir::ExprKind::Local(id) => {
+            let n = match source.ty {
+                Ty::Array(_, n) => n as i128,
+                _ => 0,
+            };
+            (*id, n)
+        }
+        _ => unreachable!("array source must be a literal or a local in M4"),
+    }
+}
+
+/// `arr.sum()` → a single loop folding the elements with `+` (the fused-pipeline
+/// terminal). No intermediate array is built.
+fn lower_array_sum(b: &mut Builder, source: &hir::Expr, elem_ty: Ty) -> Operand {
+    let (slot, n) = array_source_slot(b, source);
+
+    let acc = b.new_slot(elem_ty);
+    b.push(Stmt::Store(acc, zero_of(elem_ty)));
+    let iv = b.new_slot(i64_ty());
+    b.push(Stmt::Store(iv, Operand::Const(Const::Int(0, i64_ty()))));
+
+    let header = b.new_block();
+    let body = b.new_block();
+    let exit = b.new_block();
+    b.terminate(Term::Goto(header));
+
+    // header: while i < n
+    b.cur = header;
+    let i_val = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
+    let cond = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        cond,
+        Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), Operand::Const(Const::Int(n, i64_ty()))),
+    ));
+    b.terminate(Term::Branch(Operand::Value(cond), body, exit));
+
+    // body: acc += arr[i]; i += 1
+    b.cur = body;
+    let idx = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(idx, Rvalue::Load(iv)));
+    let x = b.fresh_value(elem_ty);
+    b.push(Stmt::Let(x, Rvalue::Index(slot, Operand::Value(idx))));
+    let a = b.fresh_value(elem_ty);
+    b.push(Stmt::Let(a, Rvalue::Load(acc)));
+    let sum = b.fresh_value(elem_ty);
+    b.push(Stmt::Let(sum, Rvalue::Bin(BinOp::Add, Operand::Value(a), Operand::Value(x))));
+    b.push(Stmt::Store(acc, Operand::Value(sum)));
+    let i2 = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i2, Rvalue::Load(iv)));
+    let inc = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1))));
+    b.push(Stmt::Store(iv, Operand::Value(inc)));
+    b.terminate(Term::Goto(header));
+
+    b.cur = exit;
+    let r = b.fresh_value(elem_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(acc)));
+    Operand::Value(r)
 }
 
 /// `expr?` → branch on the Result tag. `Err` propagates (early-return an `Err` of the
@@ -543,6 +648,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Option(_) => "Option".to_string(),
         Ty::Result(..) => "Result".to_string(),
         Ty::Box(_) => "box".to_string(),
+        Ty::Array(_, n) => format!("array[{n}]"),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),

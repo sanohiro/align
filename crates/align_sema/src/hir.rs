@@ -152,4 +152,9 @@ pub enum ExprKind {
     BoxGet(Box<Expr>),
     /// `b.clone()` — deep-copy a `box<T>` into a fresh allocation in the enclosing arena.
     BoxClone(Box<Expr>),
+    /// `[e1, e2, ...]` — a fixed-length array literal of `elem` scalars.
+    ArrayLit { elems: Vec<Expr>, elem: crate::Scalar },
+    /// `arr.sum()` — fold the array's elements with `+` into a single scalar. M4: the
+    /// terminal of a (future) fused map/where/sum pipeline.
+    ArraySum { source: Box<Expr> },
 }

@@ -1,0 +1,6 @@
+// Array literal + a fused reduction (M4). `[...].sum()` lowers to a single loop
+// that folds the elements — no intermediate array. (map/where stages fuse into the
+// same loop in the next slice.)
+fn main() -> i32 {
+  return [10, 20, 12].sum()
+}

@@ -370,6 +370,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let val = self.operand(op);
                     self.builder.build_store(field_ptr, val).map_err(|e| self.err(e))?;
                 }
+                Stmt::StoreIndex(slot, idx, op) => {
+                    let ep = self.elem_ptr(*slot, idx)?;
+                    let val = self.operand(op);
+                    self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                }
                 Stmt::ArenaEnd(op) => {
                     let handle = self.operand(op).into();
                     self.builder
@@ -584,6 +589,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_load(ty, ptr, "boxget")
                     .map_err(|e| self.err(e))?
             }
+            Rvalue::Index(slot, idx) => {
+                let ep = self.elem_ptr(*slot, idx)?;
+                let ty = scalar_type(self.ctx, result_ty);
+                self.builder.build_load(ty, ep, "idx").map_err(|e| self.err(e))?
+            }
             Rvalue::BoxClone(handle, src) => {
                 let Ty::Box(s) = result_ty else {
                     return Err(self.err("clone result is not a box"));
@@ -632,7 +642,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Option(s) => option_struct_type(self.ctx, s).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e).into(),
             Ty::Box(_) | Ty::ArenaHandle => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s)).array_type(n).into(),
             _ => scalar_type(self.ctx, ty),
+        }
+    }
+
+    /// `&slot[index]` via an array GEP (indices `[0, index]` into the `[N x T]` alloca).
+    fn elem_ptr(&self, slot: Slot, idx: &Operand) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let arr_ty = self.llvm_type(self.f.slots[slot as usize]);
+        let zero = self.ctx.i64_type().const_zero();
+        let index = self.operand(idx).into_int_value();
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(arr_ty, self.slots[&slot], &[zero, index], "elemptr")
+                .map_err(|e| self.err(e))
         }
     }
 
