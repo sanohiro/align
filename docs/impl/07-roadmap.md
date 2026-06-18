@@ -155,10 +155,27 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
 - [done] struct arrays (AoS) + field projection (`.field`) and field predicates
   (`where(.active)`) — the draft.md §8 shape `[...].where(.active).pay.sum()` runs as
   one fused loop.
-- [todo] dynamic-length `array<T>`/`slice<T>` + array type annotations, `out` args,
+- [in progress] `slice<T>` views (function parameters, pipelines over slices).
+- [todo] heap-owned dynamic `array<T>`, array type annotations, `out` args,
   more terminals/stages (`reduce`/`scan`/`filter`/`partition`/`sort`/`chunks`),
   array-valued results (materialization), and named-function `map` over struct elements
   (needs struct-by-value params, deferred since M1).
+
+### Dynamic arrays / slices — decisions (from review)
+
+```text
+- slice<T> is a borrowed view { T* ptr, i64 len } and is Copy. Forming a slice from
+  an array is a *borrow* (no allocation), so an array → slice<T> coercion is allowed
+  implicitly without violating "Nothing hidden" (only heap *allocation* must be
+  explicit). A slice carries a region; escape checking must keep it from outliving its
+  backing — M4 first cut simply forbids returning a slice.
+- A heap-owned, growable array<T> (allocation) is separate and must be explicit
+  (`.to_array()`-style, or arena-allocated like box) — deferred to a later sub-slice;
+  it is a Move type (use-after-move via MoveCheck) and, if arena-allocated, bulk-freed.
+- The fused loop gains a pointer/operand-based element path for slices (length from the
+  slice's `len`, elements via `ptr[i]`), alongside the existing slot-based path for
+  stack array literals.
+```
 
 Status: **M4 core slice COMPLETE.** Scalar arrays via literals; `map`/`where` take
 named functions; `sum` is the reduction terminal. The whole chain lowers to one

@@ -158,6 +158,9 @@ pub enum ExprKind {
     /// A fused array pipeline ending in `sum`: `source.map(f).where(p)….sum()`. The
     /// stages and the reduction lower to a single loop (no intermediate arrays).
     ArraySum { source: Box<Expr>, stages: Vec<Stage> },
+    /// Borrow an array (a local stack array) as a `slice<T>` view — `{ &arr[0], len }`.
+    /// Allocation-free, so it is an implicit coercion at call sites.
+    ArrayToSlice(Box<Expr>),
 }
 
 #[derive(Clone, Debug)]

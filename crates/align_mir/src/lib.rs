@@ -122,6 +122,12 @@ pub enum Rvalue {
     Index(Slot, Operand),
     /// `slot[index].field` — load a field of a struct-array element.
     IndexField(Slot, Operand, u32),
+    /// Borrow array `slot` (length `n`) as a slice value `{ &slot[0], n }`.
+    MakeSlice(Slot, i128),
+    /// The `len` of a slice operand.
+    SliceLen(Operand),
+    /// `slice[index]` — load a slice element (scalar).
+    SliceIndex(Operand, Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -425,6 +431,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::ArraySum { source, stages } => lower_array_sum(b, source, stages, e.ty),
+        hir::ExprKind::ArrayToSlice(inner) => {
+            let (slot, n) = array_source_slot(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
+            Operand::Value(v)
+        }
         hir::ExprKind::ArrayLit { .. } => {
             unreachable!("array literal only appears as a let initializer or pipeline source")
         }
@@ -496,10 +508,21 @@ fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty)
 /// stages run inline per element (fusion); a failing `where` skips to the increment, so
 /// no intermediate array is built. `elem_ty` is the final (summed) element type.
 fn lower_array_sum(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem_ty: Ty) -> Operand {
-    let (slot, n) = array_source_slot(b, source);
-    // A scalar array loads each element up front; a struct array stays addressed by
-    // index until a `.field` projection loads a scalar.
-    let scalar_src = matches!(source.ty, Ty::Array(..));
+    // Source kinds: a stack array (slot, const length), a struct array (slot, no
+    // up-front load — projected later), or a slice value (operand, runtime length).
+    let (slot, slice_val, bound) = match source.ty {
+        Ty::Slice(_) => {
+            let sv = lower_expr(b, source);
+            let len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+            (0u32, Some(sv), Operand::Value(len))
+        }
+        _ => {
+            let (slot, n) = array_source_slot(b, source);
+            (slot, None, Operand::Const(Const::Int(n, i64_ty())))
+        }
+    };
+    let scalar_slot_src = matches!(source.ty, Ty::Array(..));
 
     let acc = b.new_slot(elem_ty);
     b.push(Stmt::Store(acc, zero_of(elem_ty)));
@@ -512,26 +535,31 @@ fn lower_array_sum(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], e
     let exit = b.new_block();
     b.terminate(Term::Goto(header));
 
-    // header: while i < n
+    // header: while i < len
     b.cur = header;
     let i_val = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
     let cond = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(
-        cond,
-        Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), Operand::Const(Const::Int(n, i64_ty()))),
-    ));
+    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound)));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
-    // body: address arr[i], run the stages, accumulate.
+    // body: address element i, run the stages, accumulate.
     b.cur = body;
     let idx = b.fresh_value(i64_ty());
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
     let index = Operand::Value(idx);
 
-    // For a scalar source the element is the loaded value; for a struct source the
-    // current value is undefined until a projection loads a field.
-    let mut cur: Option<Operand> = if scalar_src {
+    // A scalar array or a slice loads the element up front; a struct array stays
+    // addressed by index until a `.field` projection loads a scalar.
+    let mut cur: Option<Operand> = if let Some(sv) = &slice_val {
+        let src_elem = match source.ty {
+            Ty::Slice(s) => align_sema::scalar_to_ty(s),
+            _ => elem_ty,
+        };
+        let x = b.fresh_value(src_elem);
+        b.push(Stmt::Let(x, Rvalue::SliceIndex(sv.clone(), index.clone())));
+        Some(Operand::Value(x))
+    } else if scalar_slot_src {
         let src_elem = match source.ty {
             Ty::Array(s, _) => align_sema::scalar_to_ty(s),
             _ => elem_ty,
@@ -721,6 +749,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Result(..) => "Result".to_string(),
         Ty::Box(_) => "box".to_string(),
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
+        Ty::Slice(_) => "slice".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),

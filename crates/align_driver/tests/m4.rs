@@ -90,6 +90,28 @@ fn struct_array_where_field_projection_sum() {
 }
 
 #[test]
+fn slice_param_sum() {
+    if !backend_available() {
+        return;
+    }
+    // An array is borrowed as a slice<i32> argument; summed in the callee. = 42.
+    let src = "fn total(xs: slice<i32>) -> i32 = xs.sum()\nfn main() -> i32 {\n  return total([10, 20, 12])\n}\n";
+    let out = build_and_run("slice-sum", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn slice_pipeline_runtime_length() {
+    if !backend_available() {
+        return;
+    }
+    // Fused map/where/sum over a slice (runtime length). = 24.
+    let src = "fn dbl(x: i32) -> i32 = x * 2\nfn big(x: i32) -> bool = x > 4\nfn proc(xs: slice<i32>) -> i32 = xs.map(dbl).where(big).sum()\nfn main() -> i32 {\n  return proc([1, 2, 3, 4, 5])\n}\n";
+    let out = build_and_run("slice-pipe", src);
+    assert_eq!(out.status.code(), Some(24));
+}
+
+#[test]
 fn array_sum_emits_single_loop() {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "a.align", "fn main() -> i32 {\n  return [1, 2, 3].sum()\n}\n");

@@ -78,6 +78,8 @@ pub enum Ty {
     Array(Scalar, u32),
     /// A fixed-length array of structs (AoS); `(struct_id, length)`. M4.
     StructArray(u32, u32),
+    /// `slice<T>` — a borrowed view `{ T* ptr, i64 len }` of scalar elements. Copy. M4.
+    Slice(Scalar),
     /// An arena handle (internal; produced by `arena {}`, never written by the user).
     ArenaHandle,
     /// The `Error` type (M2: an i32 code).
@@ -391,7 +393,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } => self.walk(i, depth),
+            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayToSlice(i) => self.walk(i, depth),
             ExprKind::ArrayLit { elems, .. } => {
                 for e in elems {
                     self.walk(e, depth);
@@ -491,7 +493,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } => {
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayToSlice(i) => {
                 self.expr(i, moved, false)
             }
             ExprKind::ArrayLit { elems, .. } => {
@@ -1073,9 +1075,31 @@ impl<'a> Checker<'a> {
         let checked = args
             .iter()
             .enumerate()
-            .map(|(i, a)| self.check_expr(a, param_tys.get(i).copied()))
+            .map(|(i, a)| self.check_arg(a, param_tys.get(i).copied()))
             .collect();
         Expr { kind: ExprKind::Call { func: name, args: checked }, ty: ret, span }
+    }
+
+    /// Check a call argument against a parameter type, applying an array → slice borrow
+    /// when the parameter is a `slice<T>` and the argument is a matching array.
+    fn check_arg(&mut self, a: &ast::Expr, param: Option<Ty>) -> Expr {
+        if let Some(Ty::Slice(ps)) = param {
+            // An inline array literal takes the slice's element type.
+            let e = match &a.kind {
+                ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, Some(scalar_to_ty(ps)), a.span),
+                _ => self.check_expr(a, None),
+            };
+            if let Ty::Array(es, _) = e.ty {
+                if es == ps {
+                    let span = e.span;
+                    return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
+                }
+            }
+            // Not an array of the right element type: let unification report the error.
+            self.constrain(e.ty, param, e.span);
+            return e;
+        }
+        self.check_expr(a, param)
     }
 
     /// Builtin `print`. M1: exactly one integer argument; prints decimal + newline,
@@ -1320,7 +1344,7 @@ impl<'a> Checker<'a> {
             _ => self.check_expr(source_ast, None),
         };
         let mut elem = match source.ty {
-            Ty::Array(s, _) => scalar_to_ty(s),
+            Ty::Array(s, _) | Ty::Slice(s) => scalar_to_ty(s),
             Ty::StructArray(id, _) => Ty::Struct(id),
             Ty::Error => return err,
             other => {
@@ -1621,7 +1645,7 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } => {
+            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayToSlice(inner) => {
                 self.finalize_expr(inner)
             }
             ExprKind::ArrayLit { elems, .. } => {
@@ -1681,6 +1705,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Box(s) => format!("box<{}>", scalar_name(s)),
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
+        Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
@@ -1739,6 +1764,19 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
             };
             match scalar_arg(inner, "Option payload", t.span, diags) {
                 Some(s) => Ty::Option(s),
+                None => Ty::Error,
+            }
+        }
+        "slice" => {
+            let inner = match t.args.as_slice() {
+                [a] => resolve_type(a, struct_ids, diags),
+                _ => {
+                    diags.error("slice takes exactly one type argument".to_string(), t.span);
+                    return Ty::Error;
+                }
+            };
+            match scalar_arg(inner, "slice element", t.span, diags) {
+                Some(s) => Ty::Slice(s),
                 None => Ty::Error,
             }
         }
@@ -1959,6 +1997,14 @@ mod tests {
             "fn dbl(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  xs := [1, 2, 3].map(dbl)\n  return 0\n}\n",
         );
         assert!(d.has_errors(), "map without a terminal reduction must error in M4");
+    }
+
+    #[test]
+    fn slice_param_pipeline_checks() {
+        let (_p, d) = check(
+            "fn total(xs: slice<i32>) -> i32 = xs.sum()\nfn main() -> i32 {\n  return total([1, 2, 3])\n}\n",
+        );
+        assert!(!d.has_errors(), "array → slice<i32> + sum over a slice should check");
     }
 
     #[test]

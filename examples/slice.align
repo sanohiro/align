@@ -1,0 +1,10 @@
+// slice<T> views (M4). A function takes a borrowed view of a collection; an array
+// passed to it is borrowed (no allocation). The fused pipeline runs over the slice
+// with its runtime length. map *2 → [2,4,6,8,10]; where >4 → [6,8,10]; sum = 24.
+fn dbl(x: i32) -> i32 = x * 2
+fn big(x: i32) -> bool = x > 4
+fn process(xs: slice<i32>) -> i32 = xs.map(dbl).where(big).sum()
+
+fn main() -> i32 {
+  return process([1, 2, 3, 4, 5])
+}

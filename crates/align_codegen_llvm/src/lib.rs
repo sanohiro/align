@@ -256,13 +256,19 @@ fn result_struct_type<'c>(ctx: &'c Context, ok: Scalar, err: Scalar) -> StructTy
     )
 }
 
-/// LLVM type for a function parameter/return (scalars + `Option`/`Result`; structs are
-/// not passed by value in M1/M2).
+/// `slice<T>` lowers to `{ T* ptr, i64 len }`.
+fn slice_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
+    ctx.struct_type(&[ctx.ptr_type(AddressSpace::default()).into(), ctx.i64_type().into()], false)
+}
+
+/// LLVM type for a function parameter/return (scalars + `Option`/`Result`/`slice`;
+/// structs/arrays are not passed by value in M1–M4).
 fn abi_type<'c>(ctx: &'c Context, ty: Ty) -> BasicTypeEnum<'c> {
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e).into(),
         Ty::Box(_) | Ty::ArenaHandle => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Slice(_) => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty),
     }
 }
@@ -604,6 +610,44 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ty = scalar_type(self.ctx, result_ty);
                 self.builder.build_load(ty, ep, "idxfld").map_err(|e| self.err(e))?
             }
+            Rvalue::MakeSlice(slot, n) => {
+                // ptr = &slot[0]; build { ptr, len } from the array alloca.
+                let arr_ty = self.llvm_type(self.f.slots[*slot as usize]);
+                let zero = self.ctx.i64_type().const_zero();
+                let ptr0 = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(arr_ty, self.slots[slot], &[zero, zero], "slcbase")
+                        .map_err(|e| self.err(e))?
+                };
+                let sty = slice_struct_type(self.ctx);
+                let agg = self
+                    .builder
+                    .build_insert_value(sty.get_undef(), ptr0, 0, "slcptr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let len = self.ctx.i64_type().const_int(*n as u64, false);
+                self.builder
+                    .build_insert_value(agg, len, 1, "slclen")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
+            Rvalue::SliceLen(op) => {
+                let agg = self.operand(op).into_struct_value();
+                self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
+            }
+            Rvalue::SliceIndex(s, idx) => {
+                let agg = self.operand(s).into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?.into_pointer_value();
+                let ty = scalar_type(self.ctx, result_ty);
+                let index = self.operand(idx).into_int_value();
+                let ep = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(ty, ptr, &[index], "slcidx")
+                        .map_err(|e| self.err(e))?
+                };
+                self.builder.build_load(ty, ep, "slcload").map_err(|e| self.err(e))?
+            }
             Rvalue::BoxClone(handle, src) => {
                 let Ty::Box(s) = result_ty else {
                     return Err(self.err("clone result is not a box"));
@@ -654,6 +698,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Box(_) | Ty::ArenaHandle => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s)).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
+            Ty::Slice(_) => slice_struct_type(self.ctx).into(),
             _ => scalar_type(self.ctx, ty),
         }
     }

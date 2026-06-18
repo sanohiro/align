@@ -98,6 +98,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BoxClone(h, src) => format!("box_clone({}, {})", operand_str(h), operand_str(src)),
         Rvalue::Index(slot, idx) => format!("_{slot}[{}]", operand_str(idx)),
         Rvalue::IndexField(slot, idx, field) => format!("_{slot}[{}].{field}", operand_str(idx)),
+        Rvalue::MakeSlice(slot, n) => format!("slice(_{slot}, {n})"),
+        Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
+        Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
     }
 }
 
