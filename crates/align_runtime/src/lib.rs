@@ -47,11 +47,15 @@ pub struct AlignStr {
 /// arena-tied builders come later).
 pub struct Builder {
     buf: Vec<u8>,
+    /// Where the finished bytes live: an arena (bulk-freed) or null (leaked).
+    arena: *mut Arena,
 }
 
+/// Open a builder. If `arena` is non-null, the finished string is allocated in that
+/// arena (freed in bulk at the block's end); otherwise it is leaked (no owner yet).
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_new() -> *mut Builder {
-    Box::into_raw(Box::new(Builder { buf: Vec::new() }))
+pub extern "C" fn align_rt_builder_new(arena: *mut Arena) -> *mut Builder {
+    Box::into_raw(Box::new(Builder { buf: Vec::new(), arena }))
 }
 
 /// Append raw bytes (a static template part or a `str` value).
@@ -79,10 +83,21 @@ pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
     let b = unsafe { Box::from_raw(b) };
-    let bytes = b.buf.into_boxed_slice();
-    let len = bytes.len() as i64;
-    let ptr = Box::leak(bytes).as_ptr();
-    AlignStr { ptr, len }
+    let len = b.buf.len() as i64;
+    if len == 0 {
+        // Empty: no allocation needed; a dangling non-null ptr is valid for a 0-len view.
+        AlignStr { ptr: std::ptr::NonNull::dangling().as_ptr(), len: 0 }
+    } else if b.arena.is_null() {
+        // No arena: leak the buffer so the view stays valid (process-lifetime).
+        let ptr = Box::leak(b.buf.into_boxed_slice()).as_ptr();
+        AlignStr { ptr, len }
+    } else {
+        // Copy into the arena so the view is freed with it (no leak).
+        let arena = unsafe { &mut *b.arena };
+        let dst = arena.alloc(b.buf.len(), 1);
+        unsafe { std::ptr::copy_nonoverlapping(b.buf.as_ptr(), dst, b.buf.len()) };
+        AlignStr { ptr: dst, len }
+    }
 }
 
 /// Byte-equality of two `str` views (M5). Returns 1 if equal, else 0.

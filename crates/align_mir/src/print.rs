@@ -102,7 +102,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
         Rvalue::StrLit(s) => format!("{s:?}"),
-        Rvalue::Template(pieces) => {
+        Rvalue::Template(pieces, _arena) => {
             let ps: Vec<String> = pieces
                 .iter()
                 .map(|p| match p {

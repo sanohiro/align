@@ -130,8 +130,9 @@ pub enum Rvalue {
     SliceIndex(Operand, Operand),
     /// A string literal — a `str` view `{ &bytes, len }` over a constant.
     StrLit(String),
-    /// `template "..."` — build a `str` from static parts and interpolated holes.
-    Template(Vec<TemplatePiece>),
+    /// `template "..."` / `str + str` — build a `str` from pieces. The optional operand
+    /// is the enclosing arena handle (the result lives there; `None` = leaked).
+    Template(Vec<TemplatePiece>, Option<Operand>),
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -371,8 +372,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     }
                 }
             }
+            let arena = b.arenas.last().map(|h| Operand::Value(*h));
             let r = b.fresh_value(e.ty);
-            b.push(Stmt::Let(r, Rvalue::Template(pieces)));
+            b.push(Stmt::Let(r, Rvalue::Template(pieces, arena)));
             Operand::Value(r)
         }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
@@ -390,6 +392,16 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Binary { op, lhs, rhs } => {
             let l = lower_expr(b, lhs);
             let r = lower_expr(b, rhs);
+            // `str + str` is concatenation, built like a two-piece template.
+            if *op == BinOp::Add && lhs.ty == Ty::Str {
+                let arena = b.arenas.last().map(|h| Operand::Value(*h));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::Template(vec![TemplatePiece::StrHole(l), TemplatePiece::StrHole(r)], arena),
+                ));
+                return Operand::Value(v);
+            }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Bin(*op, l, r)));
             Operand::Value(v)

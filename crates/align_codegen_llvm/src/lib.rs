@@ -140,7 +140,7 @@ fn build_module<'c>(
     let i64t2 = ctx.i64_type();
     funcs.insert(
         "builder_new".to_string(),
-        module.add_function("align_rt_builder_new", ptr.fn_type(&[], false), None),
+        module.add_function("align_rt_builder_new", ptr.fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
         "builder_write".to_string(),
@@ -697,7 +697,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
-            Rvalue::Template(pieces) => self.gen_template(pieces)?,
+            Rvalue::Template(pieces, arena) => self.gen_template(pieces, arena.as_ref())?,
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -887,10 +887,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// `template "..."` → builder_new, a write per piece, then builder_finish → str.
-    fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece]) -> Result<BasicValueEnum<'c>, CodegenError> {
+    fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece], arena: Option<&Operand>) -> Result<BasicValueEnum<'c>, CodegenError> {
+        // Pass the enclosing arena handle (or a null pointer = leak) to builder_new.
+        let arena_ptr = match arena {
+            Some(op) => self.operand(op),
+            None => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
+        };
         let bptr = self
             .builder
-            .build_call(self.funcs["builder_new"], &[], "b")
+            .build_call(self.funcs["builder_new"], &[arena_ptr.into()], "b")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
