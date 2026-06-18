@@ -36,6 +36,24 @@ pub enum Vis {
 #[derive(Clone, Debug)]
 pub enum Item {
     Fn(FnDecl),
+    Struct(StructDecl),
+}
+
+/// A keyword-less type declaration whose body is all `name: Type` fields → a struct
+/// (`Name { Variant, ... }` sum types are disambiguated by content, deferred past M1).
+#[derive(Clone, Debug)]
+pub struct StructDecl {
+    pub vis: Vis,
+    pub name: Ident,
+    pub fields: Vec<FieldDef>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldDef {
+    pub name: Ident,
+    pub ty: Type,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -149,4 +167,17 @@ pub enum ExprKind {
         els: Option<Box<Expr>>,
     },
     Block(Block),
+    /// `Name { field: value, ... }` — a struct value literal. Field access (`base.field`)
+    /// is parsed as a [`Path`] and resolved in sema.
+    StructLit {
+        name: Ident,
+        fields: Vec<FieldInit>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldInit {
+    pub name: Ident,
+    pub value: Expr,
+    pub span: Span,
 }

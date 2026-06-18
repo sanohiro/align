@@ -28,7 +28,9 @@ At this point only `i64`/`i32` integers, `:=`, `fn`, `return`, and the four arit
 - [done] One `print` equivalent of `std.io`, wired directly to the runtime (for output
   verification). M1 form: integers only, decimal + newline, via `align_rt_print_i64`;
   `bool`/string and a no-newline variant wait for `std.io` (M5).
-- [todo] `struct` definitions and value literals, field access (AoS first).
+- [done] `struct` definitions and value literals, field access (AoS first). M1 cut:
+  primitive fields only; structs live in slots (construct via `:=`, read/write fields);
+  passing/returning/copying a whole struct waits for the move model (M3).
 - [todo] The full set of primitive types (`i8..u64` / `f32` `f64` / `char`).
 
 Completion condition: a small program using control flow + struct, such as Fibonacci, runs.

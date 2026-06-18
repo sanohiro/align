@@ -36,6 +36,8 @@ pub enum Ty {
     /// Unresolved integer (inference variable). Eventually fixed to a concrete [`IntTy`].
     IntVar(u32),
     Bool,
+    /// A struct type; the id indexes `Program::structs`.
+    Struct(u32),
     Unit,
     Error,
 }
@@ -51,18 +53,62 @@ struct FnSig {
     ret: Ty,
 }
 
+/// An assignable location resolved by [`Checker::check_place`].
+enum Place {
+    Local { id: LocalId, ty: Ty },
+    Field { base: LocalId, index: u32, ty: Ty },
+    Err,
+}
+
 /// Analyze a file into a typed program. Errors are pushed to `diags`.
 pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
+    // Pass 0a: assign an id to every struct name (so field/sig types can refer to them
+    // regardless of order).
+    let mut struct_ids: HashMap<String, u32> = HashMap::new();
+    let mut struct_decls: Vec<&ast::StructDecl> = Vec::new();
+    for item in &file.items {
+        if let ast::Item::Struct(s) = item {
+            if struct_ids.insert(s.name.name.clone(), struct_decls.len() as u32).is_some() {
+                diags.error(format!("duplicate type declaration: '{}'", s.name.name), s.span);
+            }
+            struct_decls.push(s);
+        }
+    }
+
+    // Pass 0b: resolve field types. M1 restricts struct fields to primitives.
+    let structs: Vec<StructDef> = struct_decls
+        .iter()
+        .map(|s| {
+            let fields = s
+                .fields
+                .iter()
+                .map(|f| {
+                    let ty = resolve_type(&f.ty, &struct_ids, diags);
+                    if matches!(ty, Ty::Struct(_)) {
+                        diags.error(
+                            "struct fields must be primitive types in M1 (nested structs come later)"
+                                .to_string(),
+                            f.span,
+                        );
+                    }
+                    FieldDef { name: f.name.name.clone(), ty }
+                })
+                .collect();
+            StructDef { name: s.name.name.clone(), fields }
+        })
+        .collect();
+
     // Pass 1: collect function signatures so calls can resolve regardless of order.
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
-    for ast::Item::Fn(f) in &file.items {
+    for item in &file.items {
+        let ast::Item::Fn(f) = item else { continue };
         let params = f
             .params
             .iter()
-            .map(|p| resolve_type(&p.ty, diags))
+            .map(|p| resolve_type(&p.ty, &struct_ids, diags))
             .collect();
         let ret = match &f.ret {
-            Some(t) => resolve_type(t, diags),
+            Some(t) => resolve_type(t, &struct_ids, diags),
             None => Ty::Unit,
         };
         sigs.insert(f.name.name.clone(), FnSig { params, ret });
@@ -72,24 +118,29 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let fns = file
         .items
         .iter()
-        .map(|ast::Item::Fn(f)| {
+        .filter_map(|item| {
+            let ast::Item::Fn(f) = item else { return None };
             let mut cx = Checker {
                 diags,
                 sigs: &sigs,
+                struct_ids: &struct_ids,
+                structs: &structs,
                 int_vars: Vec::new(),
                 locals: Vec::new(),
                 scope: Vec::new(),
                 ret_hint: Ty::Unit,
             };
-            cx.check_fn(f)
+            Some(cx.check_fn(f))
         })
         .collect();
-    Program { fns }
+    Program { fns, structs }
 }
 
 struct Checker<'a> {
     diags: &'a mut Diagnostics,
     sigs: &'a HashMap<String, FnSig>,
+    struct_ids: &'a HashMap<String, u32>,
+    structs: &'a [StructDef],
     int_vars: Vec<Option<IntTy>>,
     /// All locals of the current function (slots), never shrinks.
     locals: Vec<Local>,
@@ -225,8 +276,14 @@ impl<'a> Checker<'a> {
         for s in &b.stmts {
             match s {
                 ast::Stmt::Let { is_mut, name, ty, init } => {
-                    let ann = ty.as_ref().map(|t| resolve_type(t, self.diags));
-                    let init = self.check_expr(init, ann);
+                    let ann = ty.as_ref().map(|t| self.resolve_type(t));
+                    // A struct literal is only legal here, as a `let` initializer.
+                    let init = match &init.kind {
+                        ast::ExprKind::StructLit { name: sname, fields } => {
+                            self.check_struct_lit(sname, fields, init.span)
+                        }
+                        _ => self.check_expr(init, ann),
+                    };
                     let local_ty = ann.unwrap_or(init.ty);
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     stmts.push(Stmt::Let { local, init });
@@ -241,14 +298,20 @@ impl<'a> Checker<'a> {
                     let te = self.check_expr(e, None);
                     stmts.push(Stmt::Expr(te));
                 }
-                ast::Stmt::Assign { place, value } => {
-                    let (local, target_ty) = self.check_place(place);
-                    let v = self.check_expr(value, Some(target_ty));
-                    match local {
-                        Some(id) => stmts.push(Stmt::Assign { local: id, value: v }),
-                        None => stmts.push(Stmt::Expr(v)),
+                ast::Stmt::Assign { place, value } => match self.check_place(place) {
+                    Place::Local { id, ty } => {
+                        let v = self.check_expr(value, Some(ty));
+                        stmts.push(Stmt::Assign { local: id, value: v });
                     }
-                }
+                    Place::Field { base, index, ty } => {
+                        let v = self.check_expr(value, Some(ty));
+                        stmts.push(Stmt::AssignField { base, index, value: v });
+                    }
+                    Place::Err => {
+                        let v = self.check_expr(value, None);
+                        stmts.push(Stmt::Expr(v));
+                    }
+                },
             }
         }
 
@@ -260,28 +323,74 @@ impl<'a> Checker<'a> {
         Block { stmts, value }
     }
 
-    /// Resolve an assignable place. M1 only supports a `mut` local name.
-    fn check_place(&mut self, place: &ast::Expr) -> (Option<LocalId>, Ty) {
-        if let ast::ExprKind::Path(p) = &place.kind {
-            if let Some(name) = single_name(p) {
-                if let Some(id) = self.lookup(name) {
-                    let local = &self.locals[id as usize];
-                    if !local.is_mut {
-                        self.diags.error(
-                            format!("cannot assign to immutable '{name}' (declare with `mut`)"),
-                            place.span,
-                        );
-                    }
-                    return (Some(id), local.ty);
+    fn resolve_type(&mut self, t: &ast::Type) -> Ty {
+        resolve_type(t, self.struct_ids, self.diags)
+    }
+
+    /// Resolve an assignable place: a `mut` local, or `mut_local.field`.
+    fn check_place(&mut self, place: &ast::Expr) -> Place {
+        let ast::ExprKind::Path(p) = &place.kind else {
+            self.diags.error("invalid assignment target", place.span);
+            return Place::Err;
+        };
+        let base_name = p.segments.first().map(|s| s.name.as_str()).unwrap_or("");
+        let Some(id) = self.lookup(base_name) else {
+            self.diags
+                .error(format!("undefined name: '{base_name}'"), place.span);
+            return Place::Err;
+        };
+        let local = &self.locals[id as usize];
+        let (is_mut, local_ty) = (local.is_mut, local.ty);
+        if !is_mut {
+            self.diags.error(
+                format!("cannot assign to immutable '{base_name}' (declare with `mut`)"),
+                place.span,
+            );
+        }
+        match p.segments.len() {
+            1 => {
+                if matches!(local_ty, Ty::Struct(_)) {
+                    self.diags.error(
+                        "cannot assign a whole struct in M1; assign individual fields".to_string(),
+                        place.span,
+                    );
+                    return Place::Err;
                 }
+                Place::Local { id, ty: local_ty }
+            }
+            2 => {
+                let field = &p.segments[1];
+                match self.field_of(local_ty, &field.name, place.span) {
+                    Some((index, ty)) => Place::Field { base: id, index, ty },
+                    None => Place::Err,
+                }
+            }
+            _ => {
                 self.diags
-                    .error(format!("undefined name: '{name}'"), place.span);
-                return (None, Ty::Error);
+                    .error("nested field access is not supported in M1".to_string(), place.span);
+                Place::Err
             }
         }
-        self.diags
-            .error("invalid assignment target", place.span);
-        (None, Ty::Error)
+    }
+
+    /// Resolve `(field_index, field_type)` for `ty.name`, reporting errors against `span`.
+    fn field_of(&mut self, ty: Ty, name: &str, span: Span) -> Option<(u32, Ty)> {
+        let Ty::Struct(id) = ty else {
+            if ty != Ty::Error {
+                self.diags
+                    .error(format!("type {} has no fields", ty_name(ty)), span);
+            }
+            return None;
+        };
+        let def = &self.structs[id as usize];
+        match def.field_index(name) {
+            Some(idx) => Some((idx, def.fields[idx as usize].ty)),
+            None => {
+                self.diags
+                    .error(format!("no field '{name}' on '{}'", def.name), span);
+                None
+            }
+        }
     }
 
     fn check_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
@@ -314,6 +423,13 @@ impl<'a> Checker<'a> {
             }
             ast::ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expected, e.span),
             ast::ExprKind::Call { callee, args } => self.check_call(callee, args, e.span),
+            ast::ExprKind::StructLit { .. } => {
+                self.diags.error(
+                    "struct literals are only allowed as `name := Type { ... }` in M1".to_string(),
+                    e.span,
+                );
+                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span }
+            }
             ast::ExprKind::If { cond, then, els } => self.check_if(cond, then, els.as_deref(), expected, e.span),
             ast::ExprKind::Block(b) => {
                 let block = self.check_block(b, expected);
@@ -331,18 +447,85 @@ impl<'a> Checker<'a> {
     }
 
     fn check_path(&mut self, p: &ast::Path, expected: Option<Ty>, span: Span) -> Expr {
-        match single_name(p).and_then(|n| self.lookup(n)) {
-            Some(id) => {
-                let ty = self.locals[id as usize].ty;
-                self.constrain(ty, expected, span);
-                Expr { kind: ExprKind::Local(id), ty, span }
+        let err = |s: Span| Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span: s };
+        let base = p.segments.first().map(|s| s.name.as_str()).unwrap_or("");
+        let Some(id) = self.lookup(base) else {
+            self.diags.error(format!("undefined name: '{base}'"), span);
+            return err(span);
+        };
+        let local_ty = self.locals[id as usize].ty;
+        match p.segments.len() {
+            1 => {
+                if matches!(local_ty, Ty::Struct(_)) {
+                    self.diags.error(
+                        "cannot use a struct value directly in M1 (access its fields)".to_string(),
+                        span,
+                    );
+                    return err(span);
+                }
+                self.constrain(local_ty, expected, span);
+                Expr { kind: ExprKind::Local(id), ty: local_ty, span }
             }
-            None => {
-                let name = single_name(p).unwrap_or("");
-                self.diags.error(format!("undefined name: '{name}'"), span);
-                Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span }
+            2 => match self.field_of(local_ty, &p.segments[1].name, span) {
+                Some((index, ty)) => {
+                    self.constrain(ty, expected, span);
+                    Expr { kind: ExprKind::Field { base: id, index }, ty, span }
+                }
+                None => err(span),
+            },
+            _ => {
+                self.diags
+                    .error("nested field access is not supported in M1".to_string(), span);
+                err(span)
             }
         }
+    }
+
+    /// `Name { field: value, ... }`. Reorders inits into declaration order and requires
+    /// every field exactly once. Only reached from a `let` initializer (M1).
+    fn check_struct_lit(&mut self, name: &ast::Ident, fields: &[ast::FieldInit], span: Span) -> Expr {
+        let Some(&id) = self.struct_ids.get(&name.name) else {
+            self.diags
+                .error(format!("undefined type: '{}'", name.name), name.span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        };
+        let layout: Vec<(String, Ty)> = self.structs[id as usize]
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty))
+            .collect();
+        let sname = self.structs[id as usize].name.clone();
+
+        let mut values: Vec<Option<Expr>> = (0..layout.len()).map(|_| None).collect();
+        for fi in fields {
+            match layout.iter().position(|(n, _)| *n == fi.name.name) {
+                Some(idx) => {
+                    if values[idx].is_some() {
+                        self.diags
+                            .error(format!("duplicate field '{}'", fi.name.name), fi.span);
+                    }
+                    values[idx] = Some(self.check_expr(&fi.value, Some(layout[idx].1)));
+                }
+                None => {
+                    self.diags
+                        .error(format!("no field '{}' on '{sname}'", fi.name.name), fi.span);
+                    let _ = self.check_expr(&fi.value, None);
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(layout.len());
+        for (idx, v) in values.into_iter().enumerate() {
+            match v {
+                Some(e) => out.push(e),
+                None => {
+                    self.diags
+                        .error(format!("missing field '{}' in '{sname}'", layout[idx].0), span);
+                    out.push(Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span });
+                }
+            }
+        }
+        Expr { kind: ExprKind::StructLit { struct_id: id, fields: out }, ty: Ty::Struct(id), span }
     }
 
     fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
@@ -459,6 +642,7 @@ impl<'a> Checker<'a> {
             match s {
                 Stmt::Let { init, .. } => self.finalize_expr(init),
                 Stmt::Assign { value, .. } => self.finalize_expr(value),
+                Stmt::AssignField { value, .. } => self.finalize_expr(value),
                 Stmt::Return(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
                 Stmt::Return(None) => {}
             }
@@ -486,7 +670,12 @@ impl<'a> Checker<'a> {
                 self.finalize_block(then);
                 self.finalize_block(els);
             }
-            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Local(_) => {}
+            ExprKind::StructLit { fields, .. } => {
+                for f in fields {
+                    self.finalize_expr(f);
+                }
+            }
+            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::Field { .. } => {}
         }
     }
 }
@@ -511,12 +700,13 @@ fn ty_name(ty: Ty) -> String {
         Ty::Int(it) => it.name(),
         Ty::IntVar(_) => "int(undetermined)".to_string(),
         Ty::Bool => "bool".to_string(),
+        Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }
 }
 
-fn resolve_type(t: &ast::Type, diags: &mut Diagnostics) -> Ty {
+fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Diagnostics) -> Ty {
     let name = t
         .path
         .segments
@@ -528,10 +718,13 @@ fn resolve_type(t: &ast::Type, diags: &mut Diagnostics) -> Ty {
         "()" => Ty::Unit,
         _ => match parse_int_name(name) {
             Some(it) => Ty::Int(it),
-            None => {
-                diags.error(format!("unsupported type in M1: '{name}'"), t.span);
-                Ty::Error
-            }
+            None => match struct_ids.get(name) {
+                Some(&id) => Ty::Struct(id),
+                None => {
+                    diags.error(format!("unsupported type in M1: '{name}'"), t.span);
+                    Ty::Error
+                }
+            },
         },
     }
 }
@@ -577,5 +770,39 @@ mod tests {
     fn assign_to_immutable_errors() {
         let (_p, d) = check("fn f() -> i32 {\n  x := 1\n  x = 2\n  return x\n}\n");
         assert!(d.has_errors());
+    }
+
+    const POINT: &str = "Point {\n  x: i32,\n  y: i32,\n}\n";
+
+    #[test]
+    fn struct_construct_and_read_checks() {
+        let src = format!(
+            "{POINT}fn main() -> i32 {{\n  p := Point {{ x: 1, y: 2 }}\n  return p.x + p.y\n}}\n"
+        );
+        let (_p, d) = check(&src);
+        assert!(!d.has_errors(), "a well-formed struct program should check");
+    }
+
+    #[test]
+    fn missing_field_errors() {
+        let src = format!("{POINT}fn main() -> i32 {{\n  p := Point {{ x: 1 }}\n  return p.x\n}}\n");
+        let (_p, d) = check(&src);
+        assert!(d.has_errors(), "omitting field y must error");
+    }
+
+    #[test]
+    fn unknown_field_access_errors() {
+        let src = format!("{POINT}fn main() -> i32 {{\n  p := Point {{ x: 1, y: 2 }}\n  return p.z\n}}\n");
+        let (_p, d) = check(&src);
+        assert!(d.has_errors(), "reading field z must error");
+    }
+
+    #[test]
+    fn field_assign_requires_mut() {
+        let src = format!(
+            "{POINT}fn main() -> i32 {{\n  p := Point {{ x: 1, y: 2 }}\n  p.x = 5\n  return p.x\n}}\n"
+        );
+        let (_p, d) = check(&src);
+        assert!(d.has_errors(), "assigning a field of an immutable struct must error");
     }
 }

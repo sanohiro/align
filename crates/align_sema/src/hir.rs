@@ -16,6 +16,28 @@ pub type LocalId = u32;
 #[derive(Clone, Debug)]
 pub struct Program {
     pub fns: Vec<Fn>,
+    /// Struct definitions, indexed by the id carried in [`crate::Ty::Struct`].
+    pub structs: Vec<StructDef>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StructDef {
+    pub name: String,
+    /// Fields in declaration order; the position is the field index used by MIR/codegen.
+    pub fields: Vec<FieldDef>,
+}
+
+impl StructDef {
+    /// Index of a field by name, if present.
+    pub fn field_index(&self, name: &str) -> Option<u32> {
+        self.fields.iter().position(|f| f.name == name).map(|i| i as u32)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldDef {
+    pub name: String,
+    pub ty: Ty,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +72,8 @@ pub struct Block {
 pub enum Stmt {
     Let { local: LocalId, init: Expr },
     Assign { local: LocalId, value: Expr },
+    /// `base.field = value` where `base` is a struct local.
+    AssignField { base: LocalId, index: u32, value: Expr },
     Return(Option<Expr>),
     Expr(Expr),
 }
@@ -85,5 +109,17 @@ pub enum ExprKind {
         cond: Box<Expr>,
         then: Block,
         els: Block,
+    },
+    /// `Name { ... }`. `fields` are in declaration order and fully populated; `struct_id`
+    /// indexes [`Program::structs`]. M1: only valid as a `let` initializer.
+    StructLit {
+        struct_id: u32,
+        fields: Vec<Expr>,
+    },
+    /// `base.field` read, where `base` is a struct local. The expression `ty` is the
+    /// field type.
+    Field {
+        base: LocalId,
+        index: u32,
     },
 }

@@ -37,6 +37,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::Store(slot, op) => {
                 let _ = writeln!(out, "    _{slot} <- {}", operand_str(op));
             }
+            Stmt::StoreField(slot, idx, op) => {
+                let _ = writeln!(out, "    _{slot}.{idx} <- {}", operand_str(op));
+            }
         }
     }
     match &b.term {
@@ -70,6 +73,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             let a: Vec<String> = args.iter().map(operand_str).collect();
             format!("call {name}({})", a.join(", "))
         }
+        Rvalue::Field(slot, idx) => format!("_{slot}.{idx}"),
     }
 }
 

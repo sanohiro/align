@@ -24,6 +24,9 @@ pub type BlockId = u32;
 #[derive(Clone, Debug)]
 pub struct Program {
     pub fns: Vec<Function>,
+    /// Struct layouts, indexed by the id in [`Ty::Struct`]; codegen builds LLVM struct
+    /// types from these.
+    pub structs: Vec<hir::StructDef>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +68,8 @@ pub enum Stmt {
     Let(ValueId, Rvalue),
     /// `slot <- operand`.
     Store(Slot, Operand),
+    /// `slot.field <- operand` (struct field store; `slot` holds a struct).
+    StoreField(Slot, u32, Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +79,8 @@ pub enum Rvalue {
     Un(UnOp, Operand),
     Bin(BinOp, Operand, Operand),
     Call(String, Vec<Operand>),
+    /// Load field `index` from the struct in `slot`.
+    Field(Slot, u32),
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +109,7 @@ pub enum Term {
 pub fn lower_program(program: &hir::Program) -> Program {
     Program {
         fns: program.fns.iter().map(lower_fn).collect(),
+        structs: program.structs.clone(),
     }
 }
 
@@ -211,13 +219,27 @@ fn lower_block(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
 
 fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
     match s {
-        hir::Stmt::Let { local, init } => {
-            let op = lower_expr(b, init);
-            b.push(Stmt::Store(*local, op));
-        }
+        hir::Stmt::Let { local, init } => match &init.kind {
+            // A struct literal initializes its slot field by field; there is no scalar
+            // value to bind.
+            hir::ExprKind::StructLit { fields, .. } => {
+                for (i, fe) in fields.iter().enumerate() {
+                    let op = lower_expr(b, fe);
+                    b.push(Stmt::StoreField(*local, i as u32, op));
+                }
+            }
+            _ => {
+                let op = lower_expr(b, init);
+                b.push(Stmt::Store(*local, op));
+            }
+        },
         hir::Stmt::Assign { local, value } => {
             let op = lower_expr(b, value);
             b.push(Stmt::Store(*local, op));
+        }
+        hir::Stmt::AssignField { base, index, value } => {
+            let op = lower_expr(b, value);
+            b.push(Stmt::StoreField(*base, *index, op));
         }
         hir::Stmt::Return(value) => {
             let op = value.as_ref().map(|e| lower_expr(b, e));
@@ -261,6 +283,15 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty),
+        hir::ExprKind::Field { base, index } => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Field(*base, *index)));
+            Operand::Value(v)
+        }
+        // sema only admits a struct literal as a `let` initializer (handled in lower_stmt).
+        hir::ExprKind::StructLit { .. } => {
+            unreachable!("struct literal outside a let initializer reached MIR lowering")
+        }
     }
 }
 
@@ -311,6 +342,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Int(IntTy { bits, signed }) => format!("{}{}", if signed { 'i' } else { 'u' }, bits),
         Ty::IntVar(_) => "int?".to_string(),
         Ty::Bool => "bool".to_string(),
+        Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }
@@ -346,5 +378,23 @@ mod tests {
         let p = lower("fn f(n: i64) -> i64 {\n  if n < 2 { return n }\n  return n\n}\n");
         let f = &p.fns[0];
         assert!(f.blocks.iter().any(|b| matches!(b.term, Term::Branch(..))));
+    }
+
+    #[test]
+    fn struct_lowers_to_field_stores_and_loads() {
+        let src = "Point { x: i32, y: i32 }\nfn main() -> i32 {\n  p := Point { x: 3, y: 4 }\n  return p.x + p.y\n}\n";
+        let p = lower(src);
+        assert_eq!(p.structs.len(), 1);
+        let f = &p.fns[0];
+        let stmts: Vec<&Stmt> = f.blocks.iter().flat_map(|b| &b.stmts).collect();
+        // Two field stores for the literal, two field loads for the reads.
+        assert_eq!(stmts.iter().filter(|s| matches!(s, Stmt::StoreField(..))).count(), 2);
+        assert_eq!(
+            stmts
+                .iter()
+                .filter(|s| matches!(s, Stmt::Let(_, Rvalue::Field(..))))
+                .count(),
+            2
+        );
     }
 }

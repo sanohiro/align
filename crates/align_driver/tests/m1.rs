@@ -53,3 +53,15 @@ fn print_widens_a_narrow_integer() {
     let out = build_and_run("print-i32", src);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
 }
+
+#[test]
+fn struct_construct_read_and_field_assign() {
+    if !backend_available() {
+        return;
+    }
+    // Construct, mutate a field, read fields, and combine them.
+    let src = "Point {\n  x: i32,\n  y: i32,\n}\nfn main() -> i32 {\n  mut p := Point { x: 3, y: 4 }\n  p.y = 10\n  print(p.x)\n  print(p.y)\n  return p.x + p.y\n}\n";
+    let out = build_and_run("point", src);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n10\n");
+    assert_eq!(out.status.code(), Some(13), "3 + 10 = 13");
+}

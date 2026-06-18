@@ -136,11 +136,46 @@ impl<'a> Parser<'a> {
         };
         if self.at(&TokKind::Fn) {
             self.parse_fn(vis).map(Item::Fn)
+        } else if matches!(self.peek(), TokKind::Ident(_)) && matches!(self.peek_at(1), TokKind::LBrace) {
+            self.parse_struct(vis).map(Item::Struct)
         } else {
             self.diags
-                .error("expected fn at top level", self.span());
+                .error("expected `fn` or a type declaration at top level", self.span());
             None
         }
+    }
+
+    /// `Name { field: Type, ... }` (keyword-less struct declaration). Fields are
+    /// separated by commas and/or newlines. Sum types are deferred past M1.
+    fn parse_struct(&mut self, vis: Vis) -> Option<StructDecl> {
+        let start = self.span();
+        let name = self.parse_ident("type name")?;
+        self.expect(&TokKind::LBrace, "'{'");
+        let mut fields = Vec::new();
+        loop {
+            self.skip_ends();
+            if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
+                break;
+            }
+            let fstart = self.span();
+            let fname = self.parse_ident("field name")?;
+            if !self.eat(&TokKind::Colon) {
+                self.diags
+                    .error("expected ':' (M1 type declarations are struct-only)", self.span());
+                return None;
+            }
+            let ty = self.parse_type()?;
+            fields.push(FieldDef {
+                name: fname,
+                ty,
+                span: fstart.merge(self.prev_span()),
+            });
+            // Separator: a comma and/or a newline (`End`); both are accepted.
+            self.eat(&TokKind::Comma);
+        }
+        self.expect(&TokKind::RBrace, "'}'");
+        let span = start.merge(self.prev_span());
+        Some(StructDecl { vis, name, fields, span })
     }
 
     fn parse_fn(&mut self, vis: Vis) -> Option<FnDecl> {
@@ -385,6 +420,15 @@ impl<'a> Parser<'a> {
                 })
             }
             TokKind::Ident(_) => {
+                // `Name { field: ... }` is a struct literal. Distinguish from a block
+                // following a bare name (e.g. an `if` condition) by the `{ ident :`
+                // shape — no valid statement-block starts that way.
+                if matches!(self.peek_at(1), TokKind::LBrace)
+                    && matches!(self.peek_at(2), TokKind::Ident(_))
+                    && matches!(self.peek_at(3), TokKind::Colon)
+                {
+                    return self.parse_struct_lit();
+                }
                 let path = self.parse_path();
                 let span = path.span;
                 Some(Expr {
@@ -412,6 +456,36 @@ impl<'a> Parser<'a> {
                 None
             }
         }
+    }
+
+    /// `Name { field: value, ... }`. Assumes the `Ident {` lookahead already matched.
+    fn parse_struct_lit(&mut self) -> Option<Expr> {
+        let start = self.span();
+        let name = self.parse_ident("type name")?;
+        self.expect(&TokKind::LBrace, "'{'");
+        let mut fields = Vec::new();
+        loop {
+            self.skip_ends();
+            if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
+                break;
+            }
+            let fstart = self.span();
+            let fname = self.parse_ident("field name")?;
+            self.expect(&TokKind::Colon, "':'");
+            let value = self.parse_expr(0)?;
+            fields.push(FieldInit {
+                name: fname,
+                value,
+                span: fstart.merge(self.prev_span()),
+            });
+            self.eat(&TokKind::Comma);
+        }
+        self.expect(&TokKind::RBrace, "'}'");
+        let span = start.merge(self.prev_span());
+        Some(Expr {
+            kind: ExprKind::StructLit { name, fields },
+            span,
+        })
     }
 
     fn parse_if(&mut self) -> Option<Expr> {
@@ -513,7 +587,7 @@ mod tests {
         let (f, err) = parse("fn main() -> i32 {\n  x := 1\n  return x\n}\n");
         assert!(!err);
         assert_eq!(f.items.len(), 1);
-        let Item::Fn(fd) = &f.items[0];
+        let Item::Fn(fd) = &f.items[0] else { panic!() };
         assert_eq!(fd.name.name, "main");
     }
 
@@ -521,7 +595,7 @@ mod tests {
     fn arithmetic_precedence() {
         let (f, err) = parse("fn f() -> i64 { return 1 + 2 * 3 }\n");
         assert!(!err);
-        let Item::Fn(fd) = &f.items[0];
+        let Item::Fn(fd) = &f.items[0] else { panic!() };
         let FnBody::Block(b) = &fd.body else {
             panic!()
         };
@@ -539,7 +613,7 @@ mod tests {
         let src = "fn fib(n: i64) -> i64 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\n";
         let (f, err) = parse(src);
         assert!(!err);
-        let Item::Fn(fd) = &f.items[0];
+        let Item::Fn(fd) = &f.items[0] else { panic!() };
         assert_eq!(fd.params.len(), 1);
         let FnBody::Block(b) = &fd.body else {
             panic!()
@@ -547,5 +621,26 @@ mod tests {
         // if-statement, then return-with-call.
         assert!(matches!(&b.stmts[0], Stmt::Expr(Expr { kind: ExprKind::If { .. }, .. })));
         assert!(matches!(&b.stmts[1], Stmt::Return(Some(_))));
+    }
+
+    #[test]
+    fn struct_decl_and_literal_parse() {
+        let src = "Point { x: i32, y: i32 }\nfn main() -> i32 {\n  p := Point { x: 1, y: 2 }\n  return p.x\n}\n";
+        let (f, err) = parse(src);
+        assert!(!err);
+        let Item::Struct(sd) = &f.items[0] else { panic!("expected struct decl") };
+        assert_eq!(sd.name.name, "Point");
+        assert_eq!(sd.fields.len(), 2);
+        let Item::Fn(fd) = &f.items[1] else { panic!() };
+        let FnBody::Block(b) = &fd.body else { panic!() };
+        let Stmt::Let { init, .. } = &b.stmts[0] else { panic!() };
+        assert!(matches!(init.kind, ExprKind::StructLit { .. }), "init should be a struct literal");
+    }
+
+    #[test]
+    fn name_block_in_if_condition_is_not_a_struct_literal() {
+        // `if p { ... }` must parse `p` as the condition, not `p { ... }` as a literal.
+        let (_f, err) = parse("fn f(p: bool) -> i32 {\n  if p { return 1 }\n  return 0\n}\n");
+        assert!(!err);
     }
 }

@@ -13,7 +13,7 @@ use std::path::Path;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{IntTy, Ty};
+use align_sema::{IntTy, StructDef, Ty};
 
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -24,7 +24,7 @@ use inkwell::module::Module;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::types::{BasicMetadataTypeEnum, IntType};
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, IntType, StructType};
 use inkwell::values::{FunctionValue, IntValue};
 
 pub fn is_available() -> bool {
@@ -67,6 +67,17 @@ fn build_module<'c>(
     module: &Module<'c>,
     program: &Program,
 ) -> Result<(), CodegenError> {
+    // Struct layouts → LLVM struct types, indexed by struct id.
+    let struct_types: Vec<StructType<'c>> = program
+        .structs
+        .iter()
+        .map(|s| {
+            let fields: Vec<BasicTypeEnum> =
+                s.fields.iter().map(|f| int_type(ctx, f.ty).into()).collect();
+            ctx.struct_type(&fields, false)
+        })
+        .collect();
+
     // Pass 1: declare all functions so calls resolve regardless of order.
     let mut funcs: HashMap<String, FunctionValue<'c>> = HashMap::new();
     for f in &program.fns {
@@ -86,6 +97,8 @@ fn build_module<'c>(
             ctx,
             builder: &builder,
             funcs: &funcs,
+            structs: &program.structs,
+            struct_types: &struct_types,
             f,
             func: funcs[&f.name],
             slots: HashMap::new(),
@@ -106,7 +119,7 @@ fn int_type<'c>(ctx: &'c Context, ty: Ty) -> IntType<'c> {
             _ => ctx.i64_type(),
         },
         Ty::Bool => ctx.bool_type(),
-        // Unit/Error don't reach value positions in M1; use i32 as a harmless filler.
+        // Unit/Error/Struct don't reach scalar value positions in M1; i32 is a harmless filler.
         _ => ctx.i32_type(),
     }
 }
@@ -141,6 +154,8 @@ struct FnGen<'c, 'a> {
     ctx: &'c Context,
     builder: &'a Builder<'c>,
     funcs: &'a HashMap<String, FunctionValue<'c>>,
+    structs: &'a [StructDef],
+    struct_types: &'a [StructType<'c>],
     f: &'a Function,
     func: FunctionValue<'c>,
     slots: HashMap<Slot, inkwell::values::PointerValue<'c>>,
@@ -164,9 +179,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let entry = self.blocks[self.f.entry as usize];
         self.builder.position_at_end(entry);
         for (i, ty) in self.f.slots.iter().enumerate() {
+            let llty: BasicTypeEnum = match ty {
+                Ty::Struct(id) => self.struct_types[*id as usize].into(),
+                _ => int_type(self.ctx, *ty).into(),
+            };
             let ptr = self
                 .builder
-                .build_alloca(int_type(self.ctx, *ty), &format!("_{i}"))
+                .build_alloca(llty, &format!("_{i}"))
                 .map_err(|e| self.err(e))?;
             self.slots.insert(i as Slot, ptr);
         }
@@ -192,6 +211,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let val = self.operand(op);
                     let ptr = self.slots[slot];
                     self.builder.build_store(ptr, val).map_err(|e| self.err(e))?;
+                }
+                Stmt::StoreField(slot, idx, op) => {
+                    let field_ptr = self.field_ptr(*slot, *idx)?;
+                    let val = self.operand(op);
+                    self.builder.build_store(field_ptr, val).map_err(|e| self.err(e))?;
                 }
             }
         }
@@ -248,6 +272,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
+            Rvalue::Field(slot, idx) => {
+                let field_ptr = self.field_ptr(*slot, *idx)?;
+                let fty = int_type(self.ctx, self.field_ty(*slot, *idx));
+                self.builder
+                    .build_load(fty, field_ptr, "fld")
+                    .map_err(|e| self.err(e))?
+                    .into_int_value()
+            }
             Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
             Rvalue::Call(name, args) => {
                 let callee = self.funcs[name];
@@ -260,6 +292,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
         };
         Ok(Some(v))
+    }
+
+    /// The struct id held by a slot (assumes a struct-typed slot).
+    fn slot_struct_id(&self, slot: Slot) -> u32 {
+        match self.f.slots[slot as usize] {
+            Ty::Struct(id) => id,
+            other => unreachable!("field access on non-struct slot of type {other:?}"),
+        }
+    }
+
+    /// `&slot.field` via a struct GEP (LLVM 19 opaque pointers need the pointee type).
+    fn field_ptr(&self, slot: Slot, idx: u32) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let st = self.struct_types[self.slot_struct_id(slot) as usize];
+        self.builder
+            .build_struct_gep(st, self.slots[&slot], idx, "fldptr")
+            .map_err(|e| self.err(e))
+    }
+
+    fn field_ty(&self, slot: Slot, idx: u32) -> Ty {
+        self.structs[self.slot_struct_id(slot) as usize].fields[idx as usize].ty
     }
 
     /// Builtin `print`: widen the integer argument to i64 and call the runtime.
