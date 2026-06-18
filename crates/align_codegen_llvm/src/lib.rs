@@ -125,6 +125,17 @@ fn build_module<'c>(
             None,
         ),
     );
+    funcs.insert(
+        "str_eq".to_string(),
+        module.add_function(
+            "align_rt_str_eq",
+            ctx.i32_type().fn_type(
+                &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
+                false,
+            ),
+            None,
+        ),
+    );
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
@@ -810,6 +821,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     fn gen_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        if self.f.operand_ty(a) == Ty::Str {
+            return self.gen_str_eq(op, a, b);
+        }
         if matches!(self.f.operand_ty(a), Ty::Float(_)) {
             return self.gen_float_bin(op, a, b);
         }
@@ -835,6 +849,39 @@ impl<'c, 'a> FnGen<'c, 'a> {
             BinOp::Ge => bld.build_int_compare(pred(signed, Cmp::Ge), l, r, "ge"),
         };
         Ok(v.map_err(|e| self.err(e))?.into())
+    }
+
+    /// `str == str` / `str != str` via the runtime `align_rt_str_eq`.
+    fn gen_str_eq(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let sa = self.operand(a).into_struct_value();
+        let sb = self.operand(b).into_struct_value();
+        let ext = |b: &Builder<'c>, v: inkwell::values::StructValue<'c>, i, n| {
+            b.build_extract_value(v, i, n)
+        };
+        let pa = ext(self.builder, sa, 0, "pa").map_err(|e| self.err(e))?;
+        let la = ext(self.builder, sa, 1, "la").map_err(|e| self.err(e))?;
+        let pb = ext(self.builder, sb, 0, "pb").map_err(|e| self.err(e))?;
+        let lb = ext(self.builder, sb, 1, "lb").map_err(|e| self.err(e))?;
+        let r = self
+            .builder
+            .build_call(self.funcs["str_eq"], &[pa.into(), la.into(), pb.into(), lb.into()], "streq")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .expect("str_eq returns i32")
+            .into_int_value();
+        let zero = self.ctx.i32_type().const_zero();
+        // r != 0  ⇒  equal.
+        let eq = self
+            .builder
+            .build_int_compare(IntPredicate::NE, r, zero, "eq")
+            .map_err(|e| self.err(e))?;
+        let v = match op {
+            BinOp::Eq => eq,
+            BinOp::Ne => self.builder.build_not(eq, "ne").map_err(|e| self.err(e))?,
+            _ => return Err(self.err("str supports only == / !=")),
+        };
+        Ok(v.into())
     }
 
     fn gen_float_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {

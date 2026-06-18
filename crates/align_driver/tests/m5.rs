@@ -35,6 +35,28 @@ fn print_string_literal_and_returned_str() {
 }
 
 #[test]
+fn string_equality() {
+    if !backend_available() {
+        return;
+    }
+    // check("yes")=1, check("maybe")=2 → 1 + 2*10 = 21.
+    let src = "fn check(s: str) -> i32 {\n  if s == \"yes\" { return 1 }\n  if s != \"no\" { return 2 }\n  return 0\n}\nfn main() -> i32 {\n  return check(\"yes\") + check(\"maybe\") * 10\n}\n";
+    let out = build_and_run("str-eq", src);
+    assert_eq!(out.status.code(), Some(21));
+}
+
+#[test]
+fn empty_string_equality() {
+    if !backend_available() {
+        return;
+    }
+    // "" == "" is true (1); "" == "x" is false. 1 + 0 = 1.
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn main() -> i32 {\n  return b2i(\"\" == \"\") + b2i(\"\" == \"x\")\n}\n";
+    let out = build_and_run("str-empty-eq", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn string_escapes() {
     if !backend_available() {
         return;

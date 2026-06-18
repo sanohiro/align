@@ -35,6 +35,29 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     let _ = out.write_all(b"\n");
 }
 
+/// Byte-equality of two `str` views (M5). Returns 1 if equal, else 0.
+///
+/// # Safety
+/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_eq(a: *const u8, alen: i64, b: *const u8, blen: i64) -> i32 {
+    if alen != blen {
+        return 0;
+    }
+    // Same view, or both empty: equal without touching memory. This also avoids
+    // `from_raw_parts` on a (possibly null) pointer of a zero-length view, which is UB.
+    if a == b || alen == 0 {
+        return 1;
+    }
+    let (x, y) = unsafe {
+        (
+            std::slice::from_raw_parts(a, alen as usize),
+            std::slice::from_raw_parts(b, blen as usize),
+        )
+    };
+    (x == y) as i32
+}
+
 /// Report an `Err` returned from `main` (`docs/impl/06-runtime-std.md` §9). M2's `Error`
 /// is an i32 code; the original code is reported, and the returned value is the process
 /// exit code — clamped to a nonzero `u8` so a failure never looks like success (exit 0)
