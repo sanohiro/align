@@ -237,9 +237,11 @@ impl<'a> Parser<'a> {
             if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
                 break;
             }
+            // A `let`: `mut ...`, `name := ...`, or a type-annotated `name: T := ...`.
+            // `name :` unambiguously starts a typed binding (no other statement does).
             if self.at(&TokKind::Mut)
                 || (matches!(self.peek(), TokKind::Ident(_))
-                    && matches!(self.peek_at(1), TokKind::ColonEq))
+                    && matches!(self.peek_at(1), TokKind::ColonEq | TokKind::Colon))
             {
                 let s = self.parse_let()?;
                 stmts.push(s);
@@ -402,6 +404,20 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Some(Expr {
                     kind: ExprKind::Int(v),
+                    span,
+                })
+            }
+            TokKind::Float(v) => {
+                self.bump();
+                Some(Expr {
+                    kind: ExprKind::Float(v),
+                    span,
+                })
+            }
+            TokKind::Char(v) => {
+                self.bump();
+                Some(Expr {
+                    kind: ExprKind::Char(v),
                     span,
                 })
             }

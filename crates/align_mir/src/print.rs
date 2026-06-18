@@ -80,6 +80,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
 fn operand_str(op: &Operand) -> String {
     match op {
         Operand::Const(Const::Int(v, ty)) => format!("{v}_{}", ty_name(*ty)),
+        Operand::Const(Const::Float(v, ty)) => format!("{v}_{}", ty_name(*ty)),
+        Operand::Const(Const::Char(v)) => format!("'\\u{{{v:x}}}'"),
         Operand::Const(Const::Bool(v)) => v.to_string(),
         Operand::Value(v) => format!("%{v}"),
         Operand::Arg(i) => format!("arg{i}"),

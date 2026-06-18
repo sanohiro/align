@@ -29,13 +29,30 @@ impl IntTy {
     }
 }
 
+/// Floating-point width. `f64` = `FloatTy { bits: 64 }`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FloatTy {
+    pub bits: u8,
+}
+
+impl FloatTy {
+    pub fn name(&self) -> String {
+        format!("f{}", self.bits)
+    }
+}
+
 /// sema-internal type representation (the M1 subset of `03-types.md` §1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
     Int(IntTy),
     /// Unresolved integer (inference variable). Eventually fixed to a concrete [`IntTy`].
     IntVar(u32),
+    Float(FloatTy),
+    /// Unresolved float (inference variable). Eventually fixed to a concrete [`FloatTy`].
+    FloatVar(u32),
     Bool,
+    /// A Unicode scalar value (32-bit).
+    Char,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     Unit,
@@ -45,6 +62,14 @@ pub enum Ty {
 impl Ty {
     fn is_int_like(self) -> bool {
         matches!(self, Ty::Int(_) | Ty::IntVar(_))
+    }
+
+    fn is_float_like(self) -> bool {
+        matches!(self, Ty::Float(_) | Ty::FloatVar(_))
+    }
+
+    fn is_numeric(self) -> bool {
+        self.is_int_like() || self.is_float_like()
     }
 }
 
@@ -126,6 +151,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 struct_ids: &struct_ids,
                 structs: &structs,
                 int_vars: Vec::new(),
+                float_vars: Vec::new(),
                 locals: Vec::new(),
                 scope: Vec::new(),
                 ret_hint: Ty::Unit,
@@ -142,6 +168,7 @@ struct Checker<'a> {
     struct_ids: &'a HashMap<String, u32>,
     structs: &'a [StructDef],
     int_vars: Vec<Option<IntTy>>,
+    float_vars: Vec<Option<FloatTy>>,
     /// All locals of the current function (slots), never shrinks.
     locals: Vec<Local>,
     /// Visibility stack: (name, id). Truncated on block exit.
@@ -157,10 +184,20 @@ impl<'a> Checker<'a> {
         Ty::IntVar(id)
     }
 
+    fn fresh_float_var(&mut self) -> Ty {
+        let id = self.float_vars.len() as u32;
+        self.float_vars.push(None);
+        Ty::FloatVar(id)
+    }
+
     fn resolve(&self, ty: Ty) -> Ty {
         match ty {
             Ty::IntVar(v) => match self.int_vars[v as usize] {
                 Some(it) => Ty::Int(it),
+                None => ty,
+            },
+            Ty::FloatVar(v) => match self.float_vars[v as usize] {
+                Some(ft) => Ty::Float(ft),
                 None => ty,
             },
             other => other,
@@ -173,6 +210,7 @@ impl<'a> Checker<'a> {
                 bits: 64,
                 signed: true,
             }),
+            Ty::FloatVar(_) => Ty::Float(FloatTy { bits: 64 }),
             other => other,
         }
     }
@@ -187,6 +225,11 @@ impl<'a> Checker<'a> {
                 Ty::Int(it)
             }
             (Ty::IntVar(_), Ty::IntVar(_)) => a, // both unconstrained; resolve later
+            (Ty::FloatVar(v), Ty::Float(ft)) | (Ty::Float(ft), Ty::FloatVar(v)) => {
+                self.float_vars[v as usize] = Some(ft);
+                Ty::Float(ft)
+            }
+            (Ty::FloatVar(_), Ty::FloatVar(_)) => a,
             _ if a == b => a,
             _ => {
                 self.diags.error(
@@ -400,6 +443,15 @@ impl<'a> Checker<'a> {
                 self.constrain(ty, expected, e.span);
                 Expr { kind: ExprKind::Int(*v), ty, span: e.span }
             }
+            ast::ExprKind::Float(v) => {
+                let ty = self.fresh_float_var();
+                self.constrain(ty, expected, e.span);
+                Expr { kind: ExprKind::Float(*v), ty, span: e.span }
+            }
+            ast::ExprKind::Char(v) => {
+                self.constrain(Ty::Char, expected, e.span);
+                Expr { kind: ExprKind::Char(*v), ty: Ty::Char, span: e.span }
+            }
             ast::ExprKind::Bool(b) => {
                 self.constrain(Ty::Bool, expected, e.span);
                 Expr { kind: ExprKind::Bool(*b), ty: Ty::Bool, span: e.span }
@@ -409,8 +461,8 @@ impl<'a> Checker<'a> {
                 let inner = self.check_expr(expr, expected);
                 let ty = match op {
                     UnOp::Neg => {
-                        if !inner.ty.is_int_like() && inner.ty != Ty::Error {
-                            self.diags.error("unary '-' expects an integer", e.span);
+                        if !inner.ty.is_numeric() && inner.ty != Ty::Error {
+                            self.diags.error("unary '-' expects a number", e.span);
                         }
                         inner.ty
                     }
@@ -536,8 +588,8 @@ impl<'a> Checker<'a> {
                 l = self.check_expr(lhs, expected);
                 r = self.check_expr(rhs, Some(l.ty));
                 let t = self.unify(l.ty, r.ty, span);
-                if !t.is_int_like() && t != Ty::Error {
-                    self.diags.error("arithmetic expects integers", span);
+                if !t.is_numeric() && t != Ty::Error {
+                    self.diags.error("arithmetic expects numbers (int or float)", span);
                 }
                 ty = t;
             }
@@ -675,7 +727,12 @@ impl<'a> Checker<'a> {
                     self.finalize_expr(f);
                 }
             }
-            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::Field { .. } => {}
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Local(_)
+            | ExprKind::Field { .. } => {}
         }
     }
 }
@@ -699,7 +756,10 @@ fn ty_name(ty: Ty) -> String {
     match ty {
         Ty::Int(it) => it.name(),
         Ty::IntVar(_) => "int(undetermined)".to_string(),
+        Ty::Float(ft) => ft.name(),
+        Ty::FloatVar(_) => "float(undetermined)".to_string(),
         Ty::Bool => "bool".to_string(),
+        Ty::Char => "char".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
@@ -715,6 +775,9 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
         .unwrap_or("");
     match name {
         "bool" => Ty::Bool,
+        "char" => Ty::Char,
+        "f32" => Ty::Float(FloatTy { bits: 32 }),
+        "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
         _ => match parse_int_name(name) {
             Some(it) => Ty::Int(it),
@@ -795,6 +858,25 @@ mod tests {
         let src = format!("{POINT}fn main() -> i32 {{\n  p := Point {{ x: 1, y: 2 }}\n  return p.z\n}}\n");
         let (_p, d) = check(&src);
         assert!(d.has_errors(), "reading field z must error");
+    }
+
+    #[test]
+    fn float_program_checks() {
+        let (_p, d) = check("fn f(r: f64) -> f64 {\n  return r * r\n}\n");
+        assert!(!d.has_errors(), "float arithmetic should check");
+    }
+
+    #[test]
+    fn no_implicit_int_float_mix() {
+        // An integer literal must not silently satisfy a float context.
+        let (_p, d) = check("fn f() -> f64 {\n  return 1\n}\n");
+        assert!(d.has_errors(), "returning int where f64 is expected must error");
+    }
+
+    #[test]
+    fn char_is_not_arithmetic() {
+        let (_p, d) = check("fn f() -> char {\n  return 'a' + 'b'\n}\n");
+        assert!(d.has_errors(), "char does not support arithmetic");
     }
 
     #[test]

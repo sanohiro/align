@@ -55,6 +55,38 @@ fn print_widens_a_narrow_integer() {
 }
 
 #[test]
+fn float_arithmetic_and_comparison() {
+    if !backend_available() {
+        return;
+    }
+    // area(2.0) = 12.56636, which is in (12, 13): exit 1.
+    let src = "fn area(r: f64) -> f64 = r * r * 3.14159\nfn main() -> i32 {\n  a := area(2.0)\n  if a > 12.0 { if a < 13.0 { return 1 } }\n  return 0\n}\n";
+    let out = build_and_run("circle", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn char_literals_and_comparison() {
+    if !backend_available() {
+        return;
+    }
+    // '5' is a digit → 2.
+    let src = "fn classify(c: char) -> i32 {\n  if c == 'a' { return 1 }\n  if c >= '0' { if c <= '9' { return 2 } }\n  return 0\n}\nfn main() -> i32 {\n  return classify('5')\n}\n";
+    let out = build_and_run("classify", src);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn float_unary_neg_with_f32_typed_let() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> i32 {\n  x: f32 := 7.5\n  y := -x\n  if y < 0.0 { return 1 }\n  return 0\n}\n";
+    let out = build_and_run("f32neg", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn struct_construct_read_and_field_assign() {
     if !backend_available() {
         return;

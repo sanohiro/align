@@ -11,10 +11,14 @@
 use align_diag::Diagnostics;
 use align_span::{FileId, Span};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TokKind {
     // Literals / identifiers
     Int(i128),
+    /// Floating-point literal (e.g. `3.14`, `1e9`); the width is fixed by context.
+    Float(f64),
+    /// Character literal (a Unicode scalar value), e.g. `'a'`, `'\n'`.
+    Char(u32),
     Ident(String),
     // Keywords
     Fn,
@@ -63,6 +67,8 @@ impl TokKind {
         matches!(
             self,
             TokKind::Int(_)
+                | TokKind::Float(_)
+                | TokKind::Char(_)
                 | TokKind::Ident(_)
                 | TokKind::Return
                 | TokKind::True
@@ -185,25 +191,110 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         let c = self.peek().unwrap();
         match c {
-            b'0'..=b'9' => self.lex_number(start),
+            b'0'..=b'9' => self.lex_number(start, diags),
+            b'\'' => self.lex_char(start, diags),
             c if is_ident_start(c) => self.lex_ident(start),
             _ => self.lex_symbol(start, diags),
         }
     }
 
-    fn lex_number(&mut self, start: usize) {
-        let mut value: i128 = 0;
-        while let Some(c) = self.peek() {
-            match c {
-                b'0'..=b'9' => {
-                    value = value * 10 + (c - b'0') as i128;
-                    self.pos += 1;
+    /// Lex an integer or a floating-point literal. A `.` is only consumed as a decimal
+    /// point when a digit follows (so `p.x` and `1.method` keep the `.` as a separate
+    /// token); an `e`/`E` exponent also makes the literal a float.
+    fn lex_number(&mut self, start: usize, diags: &mut Diagnostics) {
+        self.eat_digits();
+        let mut is_float = false;
+        if self.peek() == Some(b'.') && self.src.get(self.pos + 1).is_some_and(|c| c.is_ascii_digit()) {
+            is_float = true;
+            self.pos += 1; // '.'
+            self.eat_digits();
+        }
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                self.pos += 1;
+            }
+            self.eat_digits();
+        }
+
+        let text: String = std::str::from_utf8(&self.src[start..self.pos])
+            .unwrap()
+            .chars()
+            .filter(|c| *c != '_')
+            .collect();
+        if is_float {
+            match text.parse::<f64>() {
+                Ok(v) => self.push(TokKind::Float(v), start),
+                Err(_) => {
+                    diags.error(format!("invalid float literal: '{text}'"), self.span(start, self.pos));
                 }
-                b'_' => self.pos += 1, // digit separator
-                _ => break,
+            }
+        } else {
+            match text.parse::<i128>() {
+                Ok(v) => self.push(TokKind::Int(v), start),
+                Err(_) => {
+                    diags.error(format!("integer literal out of range: '{text}'"), self.span(start, self.pos));
+                }
             }
         }
-        self.push(TokKind::Int(value), start);
+    }
+
+    fn eat_digits(&mut self) {
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() || c == b'_' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Lex a `'c'` character literal (one Unicode scalar; supports the common escapes).
+    fn lex_char(&mut self, start: usize, diags: &mut Diagnostics) {
+        self.pos += 1; // opening quote
+        let ch = match self.peek() {
+            Some(b'\\') => {
+                self.pos += 1;
+                let e = self.peek();
+                self.pos += 1;
+                match e {
+                    Some(b'n') => '\n',
+                    Some(b't') => '\t',
+                    Some(b'r') => '\r',
+                    Some(b'0') => '\0',
+                    Some(b'\\') => '\\',
+                    Some(b'\'') => '\'',
+                    other => {
+                        diags.error(
+                            format!("unknown character escape: '\\{}'", other.map(|b| b as char).unwrap_or('?')),
+                            self.span(start, self.pos),
+                        );
+                        '\u{FFFD}'
+                    }
+                }
+            }
+            Some(_) => {
+                // Decode one UTF-8 scalar from the remaining bytes.
+                let rest = std::str::from_utf8(&self.src[self.pos..]).unwrap_or("\u{FFFD}");
+                let c = rest.chars().next().unwrap_or('\u{FFFD}');
+                self.pos += c.len_utf8();
+                c
+            }
+            None => {
+                diags.error("unterminated character literal".to_string(), self.span(start, self.pos));
+                return;
+            }
+        };
+        if self.peek() == Some(b'\'') {
+            self.pos += 1;
+        } else {
+            diags.error(
+                "character literal must contain exactly one character".to_string(),
+                self.span(start, self.pos),
+            );
+        }
+        self.push(TokKind::Char(ch as u32), start);
     }
 
     fn lex_ident(&mut self, start: usize) {
@@ -343,6 +434,37 @@ mod tests {
                 TokKind::End,
                 TokKind::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn float_and_char_literals() {
+        // `1.5`, exponent, and a char with an escape; `p.x` keeps `.` as a separate token.
+        assert_eq!(
+            kinds("3.14\n"),
+            vec![TokKind::Float(3.14), TokKind::End, TokKind::Eof]
+        );
+        assert_eq!(
+            kinds("1e3\n"),
+            vec![TokKind::Float(1000.0), TokKind::End, TokKind::Eof]
+        );
+        assert_eq!(
+            kinds("p.x"),
+            vec![
+                TokKind::Ident("p".into()),
+                TokKind::Dot,
+                TokKind::Ident("x".into()),
+                TokKind::End,
+                TokKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("'a'\n"),
+            vec![TokKind::Char('a' as u32), TokKind::End, TokKind::Eof]
+        );
+        assert_eq!(
+            kinds("'\\n'\n"),
+            vec![TokKind::Char('\n' as u32), TokKind::End, TokKind::Eof]
         );
     }
 

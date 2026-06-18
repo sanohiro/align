@@ -144,6 +144,10 @@ pub struct Expr {
 pub enum ExprKind {
     /// Integer literal. Its type is fixed by context (`03-types.md` §2).
     Int(i128),
+    /// Floating-point literal; its width (`f32`/`f64`) is fixed by context.
+    Float(f64),
+    /// Character literal (a Unicode scalar value).
+    Char(u32),
     Bool(bool),
     Path(Path),
     Unary {

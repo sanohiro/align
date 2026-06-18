@@ -88,6 +88,8 @@ pub struct Expr {
 #[derive(Clone, Debug)]
 pub enum ExprKind {
     Int(i128),
+    Float(f64),
+    Char(u32),
     Bool(bool),
     Local(LocalId),
     Unary {

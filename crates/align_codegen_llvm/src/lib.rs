@@ -13,8 +13,9 @@ use std::path::Path;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{IntTy, StructDef, Ty};
+use align_sema::{FloatTy, IntTy, StructDef, Ty};
 
+use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock;
@@ -24,8 +25,8 @@ use inkwell::module::Module;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, IntType, StructType};
-use inkwell::values::{FunctionValue, IntValue};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, StructType};
+use inkwell::values::{BasicValueEnum, FunctionValue};
 
 pub fn is_available() -> bool {
     true
@@ -119,8 +120,24 @@ fn int_type<'c>(ctx: &'c Context, ty: Ty) -> IntType<'c> {
             _ => ctx.i64_type(),
         },
         Ty::Bool => ctx.bool_type(),
-        // Unit/Error/Struct don't reach scalar value positions in M1; i32 is a harmless filler.
+        // char is a 32-bit scalar; Unit/Error/Struct don't reach scalar int positions.
         _ => ctx.i32_type(),
+    }
+}
+
+fn float_type<'c>(ctx: &'c Context, ty: Ty) -> FloatType<'c> {
+    match ty {
+        Ty::Float(FloatTy { bits: 32 }) => ctx.f32_type(),
+        _ => ctx.f64_type(),
+    }
+}
+
+/// LLVM type for a scalar value (int / bool / char / float); structs go through
+/// `struct_types`.
+fn scalar_type<'c>(ctx: &'c Context, ty: Ty) -> BasicTypeEnum<'c> {
+    match ty {
+        Ty::Float(_) => float_type(ctx, ty).into(),
+        _ => int_type(ctx, ty).into(),
     }
 }
 
@@ -132,6 +149,7 @@ fn int_bits(ty: Ty) -> u32 {
     match ty {
         Ty::Int(IntTy { bits, .. }) => bits as u32,
         Ty::Bool => 1,
+        Ty::Char => 32,
         _ => 64,
     }
 }
@@ -140,12 +158,12 @@ fn declare_fn<'c>(ctx: &'c Context, module: &Module<'c>, f: &Function) -> Functi
     let param_types: Vec<BasicMetadataTypeEnum> = f
         .params
         .iter()
-        .map(|s| int_type(ctx, f.slots[*s as usize]).into())
+        .map(|s| scalar_type(ctx, f.slots[*s as usize]).into())
         .collect();
     let fn_ty = if f.ret == Ty::Unit {
         ctx.void_type().fn_type(&param_types, false)
     } else {
-        int_type(ctx, f.ret).fn_type(&param_types, false)
+        scalar_type(ctx, f.ret).fn_type(&param_types, false)
     };
     module.add_function(&f.name, fn_ty, None)
 }
@@ -159,7 +177,7 @@ struct FnGen<'c, 'a> {
     f: &'a Function,
     func: FunctionValue<'c>,
     slots: HashMap<Slot, inkwell::values::PointerValue<'c>>,
-    values: HashMap<ValueId, IntValue<'c>>,
+    values: HashMap<ValueId, BasicValueEnum<'c>>,
     blocks: Vec<BasicBlock<'c>>,
 }
 
@@ -181,7 +199,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         for (i, ty) in self.f.slots.iter().enumerate() {
             let llty: BasicTypeEnum = match ty {
                 Ty::Struct(id) => self.struct_types[*id as usize].into(),
-                _ => int_type(self.ctx, *ty).into(),
+                _ => scalar_type(self.ctx, *ty),
             };
             let ptr = self
                 .builder
@@ -230,7 +248,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
             }
             Term::Branch(cond, then_bb, else_bb) => {
-                let c = self.operand(cond);
+                let c = self.operand(cond).into_int_value();
                 self.builder
                     .build_conditional_branch(
                         c,
@@ -254,31 +272,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Lower an rvalue. Returns `None` for a value-less result (a void call).
-    fn gen_rvalue(&mut self, rv: &Rvalue) -> Result<Option<IntValue<'c>>, CodegenError> {
-        let v = match rv {
+    fn gen_rvalue(&mut self, rv: &Rvalue) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        let v: BasicValueEnum<'c> = match rv {
             Rvalue::Use(op) => self.operand(op),
             Rvalue::Load(slot) => {
-                let ty = int_type(self.ctx, self.f.slots[*slot as usize]);
+                let ty = scalar_type(self.ctx, self.f.slots[*slot as usize]);
                 self.builder
                     .build_load(ty, self.slots[slot], "load")
                     .map_err(|e| self.err(e))?
-                    .into_int_value()
             }
-            Rvalue::Un(op, a) => {
-                let a = self.operand(a);
-                match op {
-                    UnOp::Neg => self.builder.build_int_neg(a, "neg").map_err(|e| self.err(e))?,
-                    UnOp::Not => self.builder.build_not(a, "not").map_err(|e| self.err(e))?,
+            Rvalue::Un(op, a) => match op {
+                UnOp::Neg if matches!(self.f.operand_ty(a), Ty::Float(_)) => {
+                    let a = self.operand(a).into_float_value();
+                    self.builder.build_float_neg(a, "fneg").map_err(|e| self.err(e))?.into()
                 }
-            }
+                UnOp::Neg => {
+                    let a = self.operand(a).into_int_value();
+                    self.builder.build_int_neg(a, "neg").map_err(|e| self.err(e))?.into()
+                }
+                UnOp::Not => {
+                    let a = self.operand(a).into_int_value();
+                    self.builder.build_not(a, "not").map_err(|e| self.err(e))?.into()
+                }
+            },
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
             Rvalue::Field(slot, idx) => {
+                let fty = scalar_type(self.ctx, self.field_ty(*slot, *idx));
                 let field_ptr = self.field_ptr(*slot, *idx)?;
-                let fty = int_type(self.ctx, self.field_ty(*slot, *idx));
                 self.builder
                     .build_load(fty, field_ptr, "fld")
                     .map_err(|e| self.err(e))?
-                    .into_int_value()
             }
             Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
             Rvalue::Call(name, args) => {
@@ -288,7 +311,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(callee, &argv, "call")
                     .map_err(|e| self.err(e))?;
-                return Ok(cs.try_as_basic_value().basic().map(|b| b.into_int_value()));
+                return Ok(cs.try_as_basic_value().basic());
             }
         };
         Ok(Some(v))
@@ -315,10 +338,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Builtin `print`: widen the integer argument to i64 and call the runtime.
-    fn gen_print(&mut self, args: &[Operand]) -> Result<Option<IntValue<'c>>, CodegenError> {
+    fn gen_print(&mut self, args: &[Operand]) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let arg = &args[0];
         let ty = self.f.operand_ty(arg);
-        let v = self.operand(arg);
+        let v = self.operand(arg).into_int_value();
         let i64t = self.ctx.i64_type();
         let wide = if int_bits(ty) < 64 {
             if is_signed(ty) {
@@ -336,10 +359,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(None)
     }
 
-    fn gen_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<IntValue<'c>, CodegenError> {
+    fn gen_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        if matches!(self.f.operand_ty(a), Ty::Float(_)) {
+            return self.gen_float_bin(op, a, b);
+        }
         let signed = is_signed(self.f.operand_ty(a));
-        let l = self.operand(a);
-        let r = self.operand(b);
+        let l = self.operand(a).into_int_value();
+        let r = self.operand(b).into_int_value();
         let bld = self.builder;
         let v = match op {
             BinOp::Add => bld.build_int_add(l, r, "add"),
@@ -358,23 +384,40 @@ impl<'c, 'a> FnGen<'c, 'a> {
             BinOp::Gt => bld.build_int_compare(pred(signed, Cmp::Gt), l, r, "gt"),
             BinOp::Ge => bld.build_int_compare(pred(signed, Cmp::Ge), l, r, "ge"),
         };
-        v.map_err(|e| self.err(e))
+        Ok(v.map_err(|e| self.err(e))?.into())
     }
 
-    fn operand(&self, op: &Operand) -> IntValue<'c> {
+    fn gen_float_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let l = self.operand(a).into_float_value();
+        let r = self.operand(b).into_float_value();
+        let bld = self.builder;
+        let v: BasicValueEnum<'c> = match op {
+            BinOp::Add => bld.build_float_add(l, r, "fadd").map_err(|e| self.err(e))?.into(),
+            BinOp::Sub => bld.build_float_sub(l, r, "fsub").map_err(|e| self.err(e))?.into(),
+            BinOp::Mul => bld.build_float_mul(l, r, "fmul").map_err(|e| self.err(e))?.into(),
+            BinOp::Div => bld.build_float_div(l, r, "fdiv").map_err(|e| self.err(e))?.into(),
+            BinOp::Rem => bld.build_float_rem(l, r, "frem").map_err(|e| self.err(e))?.into(),
+            BinOp::Eq => bld.build_float_compare(FloatPredicate::OEQ, l, r, "feq").map_err(|e| self.err(e))?.into(),
+            BinOp::Ne => bld.build_float_compare(FloatPredicate::ONE, l, r, "fne").map_err(|e| self.err(e))?.into(),
+            BinOp::Lt => bld.build_float_compare(FloatPredicate::OLT, l, r, "flt").map_err(|e| self.err(e))?.into(),
+            BinOp::Le => bld.build_float_compare(FloatPredicate::OLE, l, r, "fle").map_err(|e| self.err(e))?.into(),
+            BinOp::Gt => bld.build_float_compare(FloatPredicate::OGT, l, r, "fgt").map_err(|e| self.err(e))?.into(),
+            BinOp::Ge => bld.build_float_compare(FloatPredicate::OGE, l, r, "fge").map_err(|e| self.err(e))?.into(),
+            BinOp::And | BinOp::Or => unreachable!("logical operators are not valid on floats (sema-checked)"),
+        };
+        Ok(v)
+    }
+
+    fn operand(&self, op: &Operand) -> BasicValueEnum<'c> {
         match op {
             Operand::Const(Const::Int(v, ty)) => {
-                int_type(self.ctx, *ty).const_int(*v as u64, is_signed(*ty))
+                int_type(self.ctx, *ty).const_int(*v as u64, is_signed(*ty)).into()
             }
-            Operand::Const(Const::Bool(v)) => {
-                self.ctx.bool_type().const_int(*v as u64, false)
-            }
+            Operand::Const(Const::Float(v, ty)) => float_type(self.ctx, *ty).const_float(*v).into(),
+            Operand::Const(Const::Char(v)) => self.ctx.i32_type().const_int(*v as u64, false).into(),
+            Operand::Const(Const::Bool(v)) => self.ctx.bool_type().const_int(*v as u64, false).into(),
             Operand::Value(id) => self.values[id],
-            Operand::Arg(i) => self
-                .func
-                .get_nth_param(*i)
-                .expect("param index in range")
-                .into_int_value(),
+            Operand::Arg(i) => self.func.get_nth_param(*i).expect("param index in range"),
         }
     }
 }

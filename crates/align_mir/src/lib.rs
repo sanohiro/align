@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, IntTy, Ty};
+use align_sema::{hir, FloatTy, IntTy, Ty};
 
 pub mod print;
 
@@ -48,6 +48,8 @@ impl Function {
     pub fn operand_ty(&self, op: &Operand) -> Ty {
         match op {
             Operand::Const(Const::Int(_, ty)) => *ty,
+            Operand::Const(Const::Float(_, ty)) => *ty,
+            Operand::Const(Const::Char(_)) => Ty::Char,
             Operand::Const(Const::Bool(_)) => Ty::Bool,
             Operand::Value(v) => self.value_tys[*v as usize],
             Operand::Arg(i) => self.slots[self.params[*i as usize] as usize],
@@ -94,6 +96,8 @@ pub enum Operand {
 #[derive(Clone, Copy, Debug)]
 pub enum Const {
     Int(i128, Ty),
+    Float(f64, Ty),
+    Char(u32),
     Bool(bool),
 }
 
@@ -257,6 +261,8 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
 fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     match &e.kind {
         hir::ExprKind::Int(v) => Operand::Const(Const::Int(*v, e.ty)),
+        hir::ExprKind::Float(v) => Operand::Const(Const::Float(*v, e.ty)),
+        hir::ExprKind::Char(v) => Operand::Const(Const::Char(*v)),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -341,7 +347,10 @@ pub fn ty_name(ty: Ty) -> String {
     match ty {
         Ty::Int(IntTy { bits, signed }) => format!("{}{}", if signed { 'i' } else { 'u' }, bits),
         Ty::IntVar(_) => "int?".to_string(),
+        Ty::Float(FloatTy { bits }) => format!("f{bits}"),
+        Ty::FloatVar(_) => "float?".to_string(),
         Ty::Bool => "bool".to_string(),
+        Ty::Char => "char".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),

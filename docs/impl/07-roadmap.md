@@ -31,9 +31,13 @@ At this point only `i64`/`i32` integers, `:=`, `fn`, `return`, and the four arit
 - [done] `struct` definitions and value literals, field access (AoS first). M1 cut:
   primitive fields only; structs live in slots (construct via `:=`, read/write fields);
   passing/returning/copying a whole struct waits for the move model (M3).
-- [todo] The full set of primitive types (`i8..u64` / `f32` `f64` / `char`).
+- [done] The full set of primitive types: `i8..u64`, `f32`/`f64` (float literals incl.
+  exponents, `fadd`/`fmul`/`fcmp`, no implicit int↔float mixing), and `char` (Unicode
+  scalar literals with escapes, equality/ordering; arithmetic on `char` is rejected).
+  `print` stays integer-only until `std.io` (M5).
 
-Completion condition: a small program using control flow + struct, such as Fibonacci, runs.
+Completion condition (met): control-flow + struct/float/char programs compile and run
+(`examples/point.align`, `examples/circle.align`, `examples/hello.align`).
 
 ## M2 — Errors and Existence (Result / Option / ?)
 
