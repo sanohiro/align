@@ -73,6 +73,12 @@ fn build_module<'c>(
         let fv = declare_fn(ctx, module, f);
         funcs.insert(f.name.clone(), fv);
     }
+    // Declare runtime builtins, keyed by the MIR call name they back.
+    let print_ty = ctx.void_type().fn_type(&[ctx.i64_type().into()], false);
+    funcs.insert(
+        "print".to_string(),
+        module.add_function("align_rt_print_i64", print_ty, None),
+    );
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
@@ -107,6 +113,14 @@ fn int_type<'c>(ctx: &'c Context, ty: Ty) -> IntType<'c> {
 
 fn is_signed(ty: Ty) -> bool {
     matches!(ty, Ty::Int(IntTy { signed: true, .. }))
+}
+
+fn int_bits(ty: Ty) -> u32 {
+    match ty {
+        Ty::Int(IntTy { bits, .. }) => bits as u32,
+        Ty::Bool => 1,
+        _ => 64,
+    }
 }
 
 fn declare_fn<'c>(ctx: &'c Context, module: &Module<'c>, f: &Function) -> FunctionValue<'c> {
@@ -234,6 +248,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
+            Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
             Rvalue::Call(name, args) => {
                 let callee = self.funcs[name];
                 let argv: Vec<_> = args.iter().map(|o| self.operand(o).into()).collect();
@@ -245,6 +260,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
         };
         Ok(Some(v))
+    }
+
+    /// Builtin `print`: widen the integer argument to i64 and call the runtime.
+    fn gen_print(&mut self, args: &[Operand]) -> Result<Option<IntValue<'c>>, CodegenError> {
+        let arg = &args[0];
+        let ty = self.f.operand_ty(arg);
+        let v = self.operand(arg);
+        let i64t = self.ctx.i64_type();
+        let wide = if int_bits(ty) < 64 {
+            if is_signed(ty) {
+                self.builder.build_int_s_extend(v, i64t, "sext").map_err(|e| self.err(e))?
+            } else {
+                self.builder.build_int_z_extend(v, i64t, "zext").map_err(|e| self.err(e))?
+            }
+        } else {
+            v
+        };
+        let callee = self.funcs["print"];
+        self.builder
+            .build_call(callee, &[wide.into()], "")
+            .map_err(|e| self.err(e))?;
+        Ok(None)
     }
 
     fn gen_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<IntValue<'c>, CodegenError> {

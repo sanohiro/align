@@ -22,12 +22,14 @@ At this point only `i64`/`i32` integers, `:=`, `fn`, `return`, and the four arit
 
 ## M1 — The Bones of the Language (functions, control, struct, bool)
 
-- `fn` (normal form + `= expr` short form), multiple arguments, function calls.
-- `if` / comparison operations / `bool`.
-- `mut` and reassignment.
-- `struct` definitions and value literals, field access (AoS first).
-- The full set of primitive types (`i8..u64` / `f32` `f64` / `char`).
-- One `print` equivalent of `std.io`, wired directly to the runtime (for output verification).
+- [done] `fn` (normal form + `= expr` short form), multiple arguments, function calls.
+- [done] `if` / comparison operations / `bool`.
+- [done] `mut` and reassignment.
+- [done] One `print` equivalent of `std.io`, wired directly to the runtime (for output
+  verification). M1 form: integers only, decimal + newline, via `align_rt_print_i64`;
+  `bool`/string and a no-newline variant wait for `std.io` (M5).
+- [todo] `struct` definitions and value literals, field access (AoS first).
+- [todo] The full set of primitive types (`i8..u64` / `f32` `f64` / `char`).
 
 Completion condition: a small program using control flow + struct, such as Fibonacci, runs.
 

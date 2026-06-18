@@ -4,8 +4,22 @@
 //! / panic / mutable buffers. Lifetimes and free points are already settled by the
 //! compiler (MIR); the runtime allocates/frees exactly as told.
 //!
-//! Since codegen does not yet emit objects in M0, this stays a template to pin down
-//! the ABI shape (`#[no_mangle]` exposure is enabled once codegen is wired up).
+//! M1 wires the first real entry point: the builtin `print` lowers to a call to
+//! [`align_rt_print_i64`]. Formatting lives here (not in codegen) so it can later be
+//! swapped for a SIMD itoa without touching the compiler (`open-questions.md` Future).
+
+/// Builtin `print` for integers: write the decimal value + newline to stdout.
+///
+/// M1 widens every integer argument to `i64` in codegen and routes it here. `bool`,
+/// strings, and a no-newline variant arrive with `std.io` (M5). The C ABI (`extern "C"`
+/// + no mangling) is what the generated `call` targets.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_print_i64(x: i64) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    // A failed write to a closed pipe is ignored here (EPIPE handling is a std.io concern).
+    let _ = writeln!(out, "{x}");
+}
 
 /// Immediate abort called on arithmetic traps / invariant violations (`draft.md` §5).
 /// Normally not called since overflow defaults to wrap.

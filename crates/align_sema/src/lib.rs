@@ -383,6 +383,9 @@ impl<'a> Checker<'a> {
             self.diags.error("only direct function calls are supported", span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         };
+        if name == "print" {
+            return self.check_print(args, span);
+        }
         let Some(sig) = self.sigs.get(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -400,6 +403,31 @@ impl<'a> Checker<'a> {
             .map(|(i, a)| self.check_expr(a, param_tys.get(i).copied()))
             .collect();
         Expr { kind: ExprKind::Call { func: name, args: checked }, ty: ret, span }
+    }
+
+    /// Builtin `print`. M1: exactly one integer argument; prints decimal + newline,
+    /// returns `()`. `bool`/string and a no-newline form arrive with `std.io` (M5).
+    fn check_print(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'print' expects 1 argument, got {}", args.len()), span);
+        }
+        let checked = args
+            .iter()
+            .map(|a| {
+                let e = self.check_expr(a, None);
+                if !e.ty.is_int_like() && e.ty != Ty::Error {
+                    self.diags
+                        .error("'print' expects an integer (M1)".to_string(), e.span);
+                }
+                e
+            })
+            .collect();
+        Expr {
+            kind: ExprKind::Call { func: "print".to_string(), args: checked },
+            ty: Ty::Unit,
+            span,
+        }
     }
 
     fn check_if(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Expr>, expected: Option<Ty>, span: Span) -> Expr {

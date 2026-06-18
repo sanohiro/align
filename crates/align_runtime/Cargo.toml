@@ -5,4 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 # Thin native runtime linked into generated code (docs/impl/06-runtime-std.md).
-# M0 has only an ABI sketch. Emitted as a staticlib once codegen is wired up.
+# `lib` keeps the in-tree unit tests; `staticlib` produces libalign_runtime.a, which
+# the driver links into every generated executable (M1: the builtin `print`).
+[lib]
+crate-type = ["lib", "staticlib"]
