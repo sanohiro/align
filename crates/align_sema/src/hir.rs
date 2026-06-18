@@ -91,6 +91,7 @@ pub enum ExprKind {
     Int(i128),
     Float(f64),
     Char(u32),
+    Str(String),
     Bool(bool),
     Local(LocalId),
     Unary {

@@ -1,0 +1,9 @@
+// Strings (M5). `str` is an immutable view `{ ptr, len }`; string literals are
+// interned constants. `print` now accepts strings as well as integers.
+fn greeting() -> str = "hello, align"
+
+fn main() -> i32 {
+  print(greeting())
+  print("strings work!")
+  return 0
+}

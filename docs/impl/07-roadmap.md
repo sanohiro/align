@@ -208,10 +208,15 @@ later slices (struct arrays, M5 strings/JSON).
 
 ## M5 — Strings and JSON
 
-- `str` / `string` / `bytes` / `buffer` / `builder`.
-- string literal meta and const string pool.
-- desugaring of `template` / `html` / `json` strings (`write_static`/`write_value`).
-- `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy view, SIMD structural scan.
+- [done] `str` view (`{ u8* ptr, i64 len }`), string literals (interned constants),
+  `print(str)` via `align_rt_print_str` (M5-A).
+- [todo] `string` / `bytes` / `buffer` / `builder`; const string pool/meta.
+- [todo] desugaring of `template` / `html` / `json` strings (`write_static`/`write_value`).
+- [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
+  view, SIMD structural scan.
+
+Status (M5-A): `str` is a Copy view, lexed with the common escapes; literals lower to a
+private constant + `{ ptr, len }`. `print` accepts `str` or an integer. `examples/strings.align` runs.
 
 Completion condition: the example in `draft.md` §19 runs **in full** (JSON read → aggregate → builder output).
 

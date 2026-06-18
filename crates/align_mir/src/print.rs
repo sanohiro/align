@@ -101,6 +101,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::MakeSlice(slot, n) => format!("slice(_{slot}, {n})"),
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
+        Rvalue::StrLit(s) => format!("{s:?}"),
     }
 }
 

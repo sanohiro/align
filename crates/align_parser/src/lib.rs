@@ -454,6 +454,13 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
+            TokKind::Str(s) => {
+                self.bump();
+                Some(Expr {
+                    kind: ExprKind::Str(s),
+                    span,
+                })
+            }
             TokKind::True => {
                 self.bump();
                 Some(Expr {

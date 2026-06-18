@@ -117,11 +117,20 @@ fn build_module<'c>(
             None,
         ),
     );
+    funcs.insert(
+        "print_str".to_string(),
+        module.add_function(
+            "align_rt_print_str",
+            ctx.void_type().fn_type(&[ptr.into(), ctx.i64_type().into()], false),
+            None,
+        ),
+    );
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
         FnGen {
             ctx,
+            module,
             builder: &builder,
             funcs: &funcs,
             structs: &program.structs,
@@ -268,7 +277,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty) -> BasicTypeEnum<'c> {
         Ty::Option(s) => option_struct_type(ctx, s).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e).into(),
         Ty::Box(_) | Ty::ArenaHandle => ctx.ptr_type(AddressSpace::default()).into(),
-        Ty::Slice(_) => slice_struct_type(ctx).into(),
+        Ty::Slice(_) | Ty::Str => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty),
     }
 }
@@ -313,6 +322,7 @@ fn declare_fn<'c>(ctx: &'c Context, module: &Module<'c>, f: &Function, symbol: &
 
 struct FnGen<'c, 'a> {
     ctx: &'c Context,
+    module: &'a Module<'c>,
     builder: &'a Builder<'c>,
     funcs: &'a HashMap<String, FunctionValue<'c>>,
     structs: &'a [StructDef],
@@ -632,6 +642,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
+            Rvalue::StrLit(s) => {
+                // Intern the bytes as a private constant; str = { &bytes, len }.
+                let arr = self.ctx.const_string(s.as_bytes(), false);
+                let g = self.module.add_global(arr.get_type(), None, "str");
+                g.set_initializer(&arr);
+                g.set_constant(true);
+                let sty = slice_struct_type(self.ctx);
+                let agg = self
+                    .builder
+                    .build_insert_value(sty.get_undef(), g.as_pointer_value(), 0, "strptr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let len = self.ctx.i64_type().const_int(s.len() as u64, false);
+                self.builder
+                    .build_insert_value(agg, len, 1, "strlen")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -698,7 +727,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Box(_) | Ty::ArenaHandle => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s)).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
-            Ty::Slice(_) => slice_struct_type(self.ctx).into(),
+            Ty::Slice(_) | Ty::Str => slice_struct_type(self.ctx).into(),
             _ => scalar_type(self.ctx, ty),
         }
     }
@@ -752,6 +781,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn gen_print(&mut self, args: &[Operand]) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let arg = &args[0];
         let ty = self.f.operand_ty(arg);
+        // print(str): pass { ptr, len } to the runtime.
+        if ty == Ty::Str {
+            let agg = self.operand(arg).into_struct_value();
+            let ptr = self.builder.build_extract_value(agg, 0, "sptr").map_err(|e| self.err(e))?;
+            let len = self.builder.build_extract_value(agg, 1, "slen").map_err(|e| self.err(e))?;
+            self.builder
+                .build_call(self.funcs["print_str"], &[ptr.into(), len.into()], "")
+                .map_err(|e| self.err(e))?;
+            return Ok(None);
+        }
         let v = self.operand(arg).into_int_value();
         let i64t = self.ctx.i64_type();
         let wide = if int_bits(ty) < 64 {

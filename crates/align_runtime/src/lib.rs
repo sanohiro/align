@@ -21,6 +21,20 @@ pub extern "C" fn align_rt_print_i64(x: i64) {
     let _ = writeln!(out, "{x}");
 }
 
+/// Builtin `print` for strings: write the bytes + a newline to stdout. `str` is a
+/// `{ ptr, len }` view (`docs/impl/06-runtime-std.md` §2).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
+    use std::io::Write;
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(bytes);
+    let _ = out.write_all(b"\n");
+}
+
 /// Report an `Err` returned from `main` (`docs/impl/06-runtime-std.md` §9). M2's `Error`
 /// is an i32 code; the original code is reported, and the returned value is the process
 /// exit code — clamped to a nonzero `u8` so a failure never looks like success (exit 0)

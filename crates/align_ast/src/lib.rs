@@ -152,6 +152,8 @@ pub enum ExprKind {
     Float(f64),
     /// Character literal (a Unicode scalar value).
     Char(u32),
+    /// String literal (decoded contents).
+    Str(String),
     Bool(bool),
     Path(Path),
     Unary {

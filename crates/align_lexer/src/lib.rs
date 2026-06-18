@@ -19,6 +19,8 @@ pub enum TokKind {
     Float(f64),
     /// Character literal (a Unicode scalar value), e.g. `'a'`, `'\n'`.
     Char(u32),
+    /// String literal (its decoded contents), e.g. `"hi\n"`.
+    Str(String),
     Ident(String),
     // Keywords
     Fn,
@@ -73,6 +75,7 @@ impl TokKind {
             TokKind::Int(_)
                 | TokKind::Float(_)
                 | TokKind::Char(_)
+                | TokKind::Str(_)
                 | TokKind::Ident(_)
                 | TokKind::Return
                 | TokKind::True
@@ -199,6 +202,7 @@ impl<'a> Lexer<'a> {
         match c {
             b'0'..=b'9' => self.lex_number(start, diags),
             b'\'' => self.lex_char(start, diags),
+            b'"' => self.lex_string(start, diags),
             c if is_ident_start(c) => self.lex_ident(start),
             _ => self.lex_symbol(start, diags),
         }
@@ -254,6 +258,50 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
+    }
+
+    /// Lex a `"..."` string literal (same escapes as char literals).
+    fn lex_string(&mut self, start: usize, diags: &mut Diagnostics) {
+        self.pos += 1; // opening quote
+        let mut s = String::new();
+        loop {
+            match self.peek() {
+                None | Some(b'\n') => {
+                    diags.error("unterminated string literal".to_string(), self.span(start, self.pos));
+                    break;
+                }
+                Some(b'"') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(b'\\') => {
+                    self.pos += 1;
+                    let e = self.peek();
+                    self.pos += 1;
+                    match e {
+                        Some(b'n') => s.push('\n'),
+                        Some(b't') => s.push('\t'),
+                        Some(b'r') => s.push('\r'),
+                        Some(b'0') => s.push('\0'),
+                        Some(b'\\') => s.push('\\'),
+                        Some(b'"') => s.push('"'),
+                        other => {
+                            diags.error(
+                                format!("unknown string escape: '\\{}'", other.map(|b| b as char).unwrap_or('?')),
+                                self.span(start, self.pos),
+                            );
+                        }
+                    }
+                }
+                Some(_) => {
+                    let rest = std::str::from_utf8(&self.src[self.pos..]).unwrap_or("\u{FFFD}");
+                    let c = rest.chars().next().unwrap_or('\u{FFFD}');
+                    self.pos += c.len_utf8();
+                    s.push(c);
+                }
+            }
+        }
+        self.push(TokKind::Str(s), start);
     }
 
     /// Lex a `'c'` character literal (one Unicode scalar; supports the common escapes).

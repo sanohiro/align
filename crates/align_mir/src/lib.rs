@@ -128,6 +128,8 @@ pub enum Rvalue {
     SliceLen(Operand),
     /// `slice[index]` — load a slice element (scalar).
     SliceIndex(Operand, Operand),
+    /// A string literal — a `str` view `{ &bytes, len }` over a constant.
+    StrLit(String),
 }
 
 #[derive(Clone, Debug)]
@@ -337,6 +339,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Int(v) => Operand::Const(Const::Int(*v, e.ty)),
         hir::ExprKind::Float(v) => Operand::Const(Const::Float(*v, e.ty)),
         hir::ExprKind::Char(v) => Operand::Const(Const::Char(*v)),
+        hir::ExprKind::Str(s) => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::StrLit(s.clone())));
+            Operand::Value(v)
+        }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -771,6 +778,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Box(_) => "box".to_string(),
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
+        Ty::Str => "str".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),

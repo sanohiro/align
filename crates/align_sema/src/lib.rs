@@ -80,6 +80,8 @@ pub enum Ty {
     StructArray(u32, u32),
     /// `slice<T>` — a borrowed view `{ T* ptr, i64 len }` of scalar elements. Copy. M4.
     Slice(Scalar),
+    /// `str` — an immutable string view `{ u8* ptr, i64 len }`. Copy. M5.
+    Str,
     /// An arena handle (internal; produced by `arena {}`, never written by the user).
     ArenaHandle,
     /// The `Error` type (M2: an i32 code).
@@ -411,6 +413,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
+            | ExprKind::Str(_)
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
@@ -527,6 +530,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
+            | ExprKind::Str(_)
             | ExprKind::Bool(_)
             | ExprKind::OptionNone => {}
         }
@@ -828,6 +832,10 @@ impl<'a> Checker<'a> {
                 self.constrain(Ty::Char, expected, e.span);
                 Expr { kind: ExprKind::Char(*v), ty: Ty::Char, span: e.span }
             }
+            ast::ExprKind::Str(s) => {
+                self.constrain(Ty::Str, expected, e.span);
+                Expr { kind: ExprKind::Str(s.clone()), ty: Ty::Str, span: e.span }
+            }
             ast::ExprKind::Bool(b) => {
                 self.constrain(Ty::Bool, expected, e.span);
                 Expr { kind: ExprKind::Bool(*b), ty: Ty::Bool, span: e.span }
@@ -1121,9 +1129,9 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|a| {
                 let e = self.check_expr(a, None);
-                if !e.ty.is_int_like() && e.ty != Ty::Error {
+                if !e.ty.is_int_like() && e.ty != Ty::Str && e.ty != Ty::Error {
                     self.diags
-                        .error("'print' expects an integer".to_string(), e.span);
+                        .error("'print' expects an integer or a string".to_string(), e.span);
                 }
                 e
             })
@@ -1723,6 +1731,7 @@ impl<'a> Checker<'a> {
             | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
+            | ExprKind::Str(_)
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
@@ -1768,6 +1777,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
+        Ty::Str => "str".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
@@ -1799,6 +1809,7 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
     match name {
         "bool" => Ty::Bool,
         "char" => Ty::Char,
+        "str" => Ty::Str,
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
@@ -2059,6 +2070,18 @@ mod tests {
             "fn dbl(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  xs := [1, 2, 3].map(dbl)\n  return 0\n}\n",
         );
         assert!(d.has_errors(), "map without a terminal reduction must error in M4");
+    }
+
+    #[test]
+    fn string_program_checks() {
+        let (_p, d) = check("fn g() -> str = \"hi\"\nfn main() -> i32 {\n  print(g())\n  print(\"x\")\n  return 0\n}\n");
+        assert!(!d.has_errors(), "string literals + print(str) should check");
+    }
+
+    #[test]
+    fn print_rejects_bool() {
+        let (_p, d) = check("fn main() -> i32 {\n  print(true)\n  return 0\n}\n");
+        assert!(d.has_errors(), "print accepts int/str only");
     }
 
     #[test]
