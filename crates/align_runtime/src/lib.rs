@@ -44,6 +44,11 @@ pub unsafe extern "C" fn align_rt_str_eq(a: *const u8, alen: i64, b: *const u8, 
     if alen != blen {
         return 0;
     }
+    // Same view, or both empty: equal without touching memory. This also avoids
+    // `from_raw_parts` on a (possibly null) pointer of a zero-length view, which is UB.
+    if a == b || alen == 0 {
+        return 1;
+    }
     let (x, y) = unsafe {
         (
             std::slice::from_raw_parts(a, alen as usize),

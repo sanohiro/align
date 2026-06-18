@@ -46,6 +46,17 @@ fn string_equality() {
 }
 
 #[test]
+fn empty_string_equality() {
+    if !backend_available() {
+        return;
+    }
+    // "" == "" is true (1); "" == "x" is false. 1 + 0 = 1.
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn main() -> i32 {\n  return b2i(\"\" == \"\") + b2i(\"\" == \"x\")\n}\n";
+    let out = build_and_run("str-empty-eq", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn string_escapes() {
     if !backend_available() {
         return;
