@@ -1,0 +1,11 @@
+// reduce(f, init) generalizes sum: fold the elements with a binary function from an
+// initial accumulator. Here a product (1*2*3*4 = 24) plus a sum (42) = 66 — both fold
+// in a single loop, reusing the same fusion machinery.
+fn mul(acc: i32, x: i32) -> i32 = acc * x
+fn add(acc: i32, x: i32) -> i32 = acc + x
+
+fn main() -> i32 {
+  product := [1, 2, 3, 4].reduce(mul, 1)
+  total := [10, 20, 12].reduce(add, 0)
+  return product + total
+}

@@ -155,11 +155,13 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
 - [done] struct arrays (AoS) + field projection (`.field`) and field predicates
   (`where(.active)`) — the draft.md §8 shape `[...].where(.active).pay.sum()` runs as
   one fused loop.
-- [in progress] `slice<T>` views (function parameters, pipelines over slices).
+- [done] `slice<T>` views (function parameters, array→slice borrow, pipelines over
+  slices with runtime length).
+- [done] `reduce(f, init)` terminal (generalizes `sum`; shares the fused loop).
 - [todo] heap-owned dynamic `array<T>`, array type annotations, `out` args,
-  more terminals/stages (`reduce`/`scan`/`filter`/`partition`/`sort`/`chunks`),
-  array-valued results (materialization), and named-function `map` over struct elements
-  (needs struct-by-value params, deferred since M1).
+  more stages/terminals (`scan`/`filter`/`partition`/`sort`/`chunks`),
+  array-valued results (materialization), slice escape checking, and named-function
+  `map` over struct elements (needs struct-by-value params, deferred since M1).
 
 ### Dynamic arrays / slices — decisions (from review)
 

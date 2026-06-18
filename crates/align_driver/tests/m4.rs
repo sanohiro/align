@@ -90,6 +90,27 @@ fn struct_array_where_field_projection_sum() {
 }
 
 #[test]
+fn reduce_with_custom_fold() {
+    if !backend_available() {
+        return;
+    }
+    // product 1*2*3*4 = 24, plus sum 42 = 66.
+    let src = "fn mul(acc: i32, x: i32) -> i32 = acc * x\nfn add(acc: i32, x: i32) -> i32 = acc + x\nfn main() -> i32 {\n  p := [1, 2, 3, 4].reduce(mul, 1)\n  s := [10, 20, 12].reduce(add, 0)\n  return p + s\n}\n";
+    let out = build_and_run("reduce", src);
+    assert_eq!(out.status.code(), Some(66));
+}
+
+#[test]
+fn reduce_after_map_where() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn dbl(x: i32) -> i32 = x * 2\nfn big(x: i32) -> bool = x > 4\nfn add(acc: i32, x: i32) -> i32 = acc + x\nfn main() -> i32 {\n  return [1, 2, 3, 4, 5].map(dbl).where(big).reduce(add, 0)\n}\n";
+    let out = build_and_run("reduce-pipe", src);
+    assert_eq!(out.status.code(), Some(24));
+}
+
+#[test]
 fn slice_param_sum() {
     if !backend_available() {
         return;

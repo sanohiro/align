@@ -430,7 +430,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::BoxClone(Operand::Value(handle), src)));
             Operand::Value(v)
         }
-        hir::ExprKind::ArraySum { source, stages } => lower_array_sum(b, source, stages, e.ty),
+        hir::ExprKind::ArraySum { source, stages } => {
+            let init = zero_of(e.ty);
+            lower_array_reduce(b, source, stages, e.ty, init, None)
+        }
+        hir::ExprKind::ArrayReduce { source, stages, func, init } => {
+            let init_op = lower_expr(b, init);
+            lower_array_reduce(b, source, stages, e.ty, init_op, Some(func.clone()))
+        }
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
             let v = b.fresh_value(e.ty);
@@ -504,10 +511,19 @@ fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty)
     }
 }
 
-/// `src.map(f).where(p)….sum()` → one loop folding the elements with `+`. The map/where
-/// stages run inline per element (fusion); a failing `where` skips to the increment, so
-/// no intermediate array is built. `elem_ty` is the final (summed) element type.
-fn lower_array_sum(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem_ty: Ty) -> Operand {
+/// `src.map(f).where(p)….{sum,reduce}` → one loop folding the post-stage elements into
+/// an accumulator. `fold` is the binary reducer (`None` = `+`), `init` seeds the
+/// accumulator (type `acc_ty`). Stages run inline (fusion); a failing `where` skips to
+/// the increment, so no intermediate array is built.
+fn lower_array_reduce(
+    b: &mut Builder,
+    source: &hir::Expr,
+    stages: &[hir::Stage],
+    acc_ty: Ty,
+    init: Operand,
+    fold: Option<String>,
+) -> Operand {
+    let elem_ty = acc_ty;
     // Source kinds: a stack array (slot, const length), a struct array (slot, no
     // up-front load — projected later), or a slice value (operand, runtime length).
     let (slot, slice_val, bound) = match source.ty {
@@ -524,8 +540,8 @@ fn lower_array_sum(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], e
     };
     let scalar_slot_src = matches!(source.ty, Ty::Array(..));
 
-    let acc = b.new_slot(elem_ty);
-    b.push(Stmt::Store(acc, zero_of(elem_ty)));
+    let acc = b.new_slot(acc_ty);
+    b.push(Stmt::Store(acc, init));
     let iv = b.new_slot(i64_ty());
     b.push(Stmt::Store(iv, Operand::Const(Const::Int(0, i64_ty()))));
 
@@ -603,12 +619,17 @@ fn lower_array_sum(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], e
             }
         }
     }
-    let cur = cur.expect("pipeline must reduce to a scalar before sum");
-    let a = b.fresh_value(elem_ty);
+    let cur = cur.expect("pipeline must reduce to a scalar before the reduction");
+    let a = b.fresh_value(acc_ty);
     b.push(Stmt::Let(a, Rvalue::Load(acc)));
-    let sum = b.fresh_value(elem_ty);
-    b.push(Stmt::Let(sum, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
-    b.push(Stmt::Store(acc, Operand::Value(sum)));
+    let next = b.fresh_value(acc_ty);
+    match &fold {
+        // `reduce`: acc = f(acc, cur).
+        Some(func) => b.push(Stmt::Let(next, Rvalue::Call(func.clone(), vec![Operand::Value(a), cur]))),
+        // `sum`: acc = acc + cur.
+        None => b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur))),
+    }
+    b.push(Stmt::Store(acc, Operand::Value(next)));
     b.terminate(Term::Goto(cont));
 
     // cont: i += 1; loop.
