@@ -1033,7 +1033,10 @@ impl<'a> Checker<'a> {
                 l = self.check_expr(lhs, expected);
                 r = self.check_expr(rhs, Some(l.ty));
                 let t = self.unify(l.ty, r.ty, span);
-                if !t.is_numeric() && t != Ty::Error {
+                // `str + str` is concatenation; other ops on str are errors.
+                if t == Ty::Str && op != BinOp::Add {
+                    self.diags.error("str supports only `+` (concatenation)", span);
+                } else if t != Ty::Str && !t.is_numeric() && t != Ty::Error {
                     self.diags.error("arithmetic expects numbers (int or float)", span);
                 }
                 ty = t;
@@ -2121,6 +2124,14 @@ mod tests {
         assert!(!ok.has_errors(), "str == str should check");
         let (_q, bad) = check("fn f(s: str) -> bool = s < \"x\"\n");
         assert!(bad.has_errors(), "str ordering must error");
+    }
+
+    #[test]
+    fn str_concat_checks_but_other_ops_error() {
+        let (_p, ok) = check("fn f(a: str, b: str) -> str = a + b\n");
+        assert!(!ok.has_errors(), "str + str should check");
+        let (_q, bad) = check("fn f(a: str, b: str) -> str = a - b\n");
+        assert!(bad.has_errors(), "str only supports +");
     }
 
     #[test]

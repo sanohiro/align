@@ -68,6 +68,18 @@ fn template_interpolation() {
 }
 
 #[test]
+fn string_concatenation() {
+    if !backend_available() {
+        return;
+    }
+    // a + b + "!" inside an arena (arena-backed, no leak); also outside (leaked).
+    let src = "fn main() -> i32 {\n  a := \"foo\"\n  b := \"bar\"\n  arena {\n    print(a + b + \"!\")\n  }\n  print(a + b)\n  return 0\n}\n";
+    let out = build_and_run("concat", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "foobar!\nfoobar\n");
+}
+
+#[test]
 fn string_escapes() {
     if !backend_available() {
         return;

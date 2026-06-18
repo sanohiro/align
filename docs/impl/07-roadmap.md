@@ -212,8 +212,12 @@ later slices (struct arrays, M5 strings/JSON).
   `print(str)` via `align_rt_print_str` (M5-A).
 - [done] `str` equality (`==`/`!=`); the runtime string `builder`
   (`align_rt_builder_*`); `template "...{ident}..."` desugaring (static parts +
-  int/str holes → builder writes → `str`).
-- [todo] `string` / `bytes` (owned), const string pool/meta, `{expr}` holes,
+  int/str holes → builder writes → `str`); `str + str` concatenation.
+- [done] arena-backed builder: when a `template`/concat runs inside an `arena {}`,
+  the result is allocated in the arena (bulk-freed, no leak); outside, it is leaked
+  (process-lifetime). [todo] str escape checking (returning an arena-backed str is
+  not yet rejected — same gap as slices).
+- [todo] owned `string` / `bytes`, const string pool/meta, `{expr}` holes,
   `html`/`json` template variants.
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
   view, SIMD structural scan.
