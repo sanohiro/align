@@ -73,6 +73,8 @@ pub enum Stmt {
     Store(Slot, Operand),
     /// `slot.field <- operand` (struct field store; `slot` holds a struct).
     StoreField(Slot, u32, Operand),
+    /// End an arena, freeing all its allocations (the operand is the arena handle).
+    ArenaEnd(Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +104,13 @@ pub enum Rvalue {
     ResultUnwrapOk(Operand),
     /// The err payload of a `Result` operand (valid only when `Err`).
     ResultUnwrapErr(Operand),
+    /// Open a new arena; the value is its handle.
+    ArenaBegin,
+    /// `heap.new(init)` in an arena: bump-allocate, store `init`, yield the `box` pointer.
+    /// First operand is the arena handle, second is the initial value.
+    HeapAlloc(Operand, Operand),
+    /// Read (copy) the value out of a `box` operand.
+    BoxGet(Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +159,20 @@ struct Builder {
     cur: BlockId,
     /// The enclosing function's return type (so `?` can build the propagated Result).
     ret: Ty,
+    /// Handles of the arenas currently open (innermost last); any exit out of them
+    /// (`return`, `?`) must free them first.
+    arenas: Vec<ValueId>,
+}
+
+impl Builder {
+    /// Free every open arena (innermost first) — emitted before any exit that leaves
+    /// the arena scopes.
+    fn emit_arena_cleanup(&mut self) {
+        let handles = self.arenas.clone();
+        for h in handles.into_iter().rev() {
+            self.push(Stmt::ArenaEnd(Operand::Value(h)));
+        }
+    }
 }
 
 impl Builder {
@@ -197,6 +220,7 @@ fn lower_fn(f: &hir::Fn) -> Function {
         blocks: Vec::new(),
         cur: 0,
         ret: f.ret,
+        arenas: Vec::new(),
     };
     let entry = b.new_block();
     b.cur = entry;
@@ -276,6 +300,8 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         }
         hir::Stmt::Return(value) => {
             let op = value.as_ref().map(|e| lower_expr(b, e));
+            // Free any arenas this return exits before leaving the function.
+            b.emit_arena_cleanup();
             b.terminate(Term::Return(op));
             // The current block is now terminated; `lower_block` stops here, so no dead
             // block is created and callers can see the divergence via `is_terminated`.
@@ -351,6 +377,33 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::Try(inner) => lower_try(b, inner, e.ty),
+        hir::ExprKind::Arena(blk) => {
+            let handle = b.fresh_value(Ty::ArenaHandle);
+            b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+            b.arenas.push(handle);
+            let tail = lower_block(b, blk);
+            b.arenas.pop();
+            if b.is_terminated() {
+                // The body diverged (return/?): cleanup already ran on that path.
+                Operand::Const(Const::Unit)
+            } else {
+                b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+                tail.unwrap_or(Operand::Const(Const::Unit))
+            }
+        }
+        hir::ExprKind::HeapNew(inner) => {
+            let init = lower_expr(b, inner);
+            let handle = *b.arenas.last().expect("heap.new outside an arena (sema-checked)");
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::HeapAlloc(Operand::Value(handle), init)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::BoxGet(inner) => {
+            let bx = lower_expr(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
+            Operand::Value(v)
+        }
         // sema only admits a struct literal as a `let` initializer (handled in lower_stmt).
         hir::ExprKind::StructLit { .. } => {
             unreachable!("struct literal outside a let initializer reached MIR lowering")
@@ -381,6 +434,8 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.push(Stmt::Let(err, Rvalue::ResultUnwrapErr(r.clone())));
     let propagated = b.fresh_value(b.ret);
     b.push(Stmt::Let(propagated, Rvalue::ResultErr(Operand::Value(err))));
+    // `?` exits the function: free any open arenas first.
+    b.emit_arena_cleanup();
     b.terminate(Term::Return(Some(Operand::Value(propagated))));
 
     // Ok: continue with the unwrapped value.
@@ -477,6 +532,8 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Char => "char".to_string(),
         Ty::Option(_) => "Option".to_string(),
         Ty::Result(..) => "Result".to_string(),
+        Ty::Box(_) => "box".to_string(),
+        Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),

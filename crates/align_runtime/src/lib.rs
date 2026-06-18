@@ -39,15 +39,64 @@ pub fn panic_abort(msg: &str) -> ! {
     std::process::abort();
 }
 
-/// Sketch of a bump allocator. Unused in M0 (arena is M3).
+/// A bump allocator (`docs/impl/06-runtime-std.md` §3). Memory is carved from a list of
+/// fixed-size chunks; individual allocations are never freed — the whole arena is
+/// released at once by [`align_rt_arena_end`]. Chunk buffers are heap-stable (the outer
+/// `Vec` growing never moves an inner buffer), so returned pointers stay valid until end.
 pub struct Arena {
-    _private: (),
+    chunks: Vec<Vec<u8>>,
+    /// Byte offset into the last chunk.
+    off: usize,
 }
 
+const CHUNK: usize = 64 * 1024;
+
 impl Arena {
-    pub fn begin() -> Arena {
-        Arena { _private: () }
+    fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+        let align = align.max(1);
+        let need = size.max(1);
+        let aligned = (self.off + align - 1) & !(align - 1);
+        let fits = self
+            .chunks
+            .last()
+            .is_some_and(|c| aligned + need <= c.len());
+        if !fits {
+            self.chunks.push(vec![0u8; CHUNK.max(need + align)]);
+            self.off = 0;
+        }
+        let off = (self.off + align - 1) & !(align - 1);
+        let chunk = self.chunks.last_mut().unwrap();
+        let ptr = unsafe { chunk.as_mut_ptr().add(off) };
+        self.off = off + need;
+        ptr
     }
+}
+
+/// Open a new arena. The returned handle is freed by [`align_rt_arena_end`].
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_arena_begin() -> *mut Arena {
+    Box::into_raw(Box::new(Arena { chunks: Vec::new(), off: 0 }))
+}
+
+/// Bump-allocate `size` bytes (with `align`) from the arena.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, align: i64) -> *mut u8 {
+    let arena = unsafe { &mut *arena };
+    arena.alloc(size as usize, align as usize)
+}
+
+/// Bulk-release every allocation, keeping the arena for reuse.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_arena_reset(arena: *mut Arena) {
+    let arena = unsafe { &mut *arena };
+    arena.chunks.clear();
+    arena.off = 0;
+}
+
+/// Release every allocation and the arena itself.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_arena_end(arena: *mut Arena) {
+    drop(unsafe { Box::from_raw(arena) });
 }
 
 #[cfg(test)]
@@ -55,7 +104,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arena_begin_smoke() {
-        let _a = Arena::begin();
+    fn arena_alloc_is_stable_across_chunks() {
+        let a = align_rt_arena_begin();
+        // Many allocations spanning multiple chunks; earlier pointers stay writable.
+        let first = align_rt_arena_alloc(a, 8, 8) as *mut i64;
+        unsafe { *first = 42 };
+        for _ in 0..50_000 {
+            let p = align_rt_arena_alloc(a, 8, 8) as *mut i64;
+            unsafe { *p = 1 };
+        }
+        assert_eq!(unsafe { *first }, 42, "earlier allocation must remain valid");
+        align_rt_arena_end(a);
     }
 }

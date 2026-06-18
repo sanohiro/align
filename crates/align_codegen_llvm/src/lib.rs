@@ -15,6 +15,7 @@ use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{FloatTy, IntTy, Scalar, StructDef, Ty, scalar_to_ty};
 
+use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -92,6 +93,29 @@ fn build_module<'c>(
     funcs.insert(
         "print".to_string(),
         module.add_function("align_rt_print_i64", print_ty, None),
+    );
+    // Arena allocator (M3).
+    let ptr = ctx.ptr_type(AddressSpace::default());
+    let i64t = ctx.i64_type();
+    funcs.insert(
+        "arena_begin".to_string(),
+        module.add_function("align_rt_arena_begin", ptr.fn_type(&[], false), None),
+    );
+    funcs.insert(
+        "arena_alloc".to_string(),
+        module.add_function(
+            "align_rt_arena_alloc",
+            ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "arena_end".to_string(),
+        module.add_function(
+            "align_rt_arena_end",
+            ctx.void_type().fn_type(&[ptr.into()], false),
+            None,
+        ),
     );
     // Pass 2: define bodies.
     for f in &program.fns {
@@ -238,7 +262,19 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty) -> BasicTypeEnum<'c> {
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e).into(),
+        Ty::Box(_) | Ty::ArenaHandle => ctx.ptr_type(AddressSpace::default()).into(),
         _ => scalar_type(ctx, ty),
+    }
+}
+
+/// Size/alignment (bytes) of a scalar's in-memory representation.
+fn scalar_bytes(s: Scalar) -> u64 {
+    match s {
+        Scalar::Int(it) => (it.bits / 8).max(1) as u64,
+        Scalar::Float(ft) => (ft.bits / 8) as u64,
+        Scalar::Bool => 1,
+        Scalar::Char | Scalar::ErrCode => 4,
+        Scalar::Unit => 1,
     }
 }
 
@@ -333,6 +369,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let field_ptr = self.field_ptr(*slot, *idx)?;
                     let val = self.operand(op);
                     self.builder.build_store(field_ptr, val).map_err(|e| self.err(e))?;
+                }
+                Stmt::ArenaEnd(op) => {
+                    let handle = self.operand(op).into();
+                    self.builder
+                        .build_call(self.funcs["arena_end"], &[handle], "")
+                        .map_err(|e| self.err(e))?;
                 }
             }
         }
@@ -504,6 +546,44 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_extract_value(agg, 2, "err")
                     .map_err(|e| self.err(e))?
             }
+            Rvalue::ArenaBegin => {
+                let cs = self
+                    .builder
+                    .build_call(self.funcs["arena_begin"], &[], "arena")
+                    .map_err(|e| self.err(e))?;
+                cs.try_as_basic_value().basic().expect("arena_begin returns a pointer")
+            }
+            Rvalue::HeapAlloc(handle, init) => {
+                let Ty::Box(s) = result_ty else {
+                    return Err(self.err("heap.new result is not a box"));
+                };
+                let i64t = self.ctx.i64_type();
+                let bytes = scalar_bytes(s);
+                let argv = [
+                    self.operand(handle).into(),
+                    i64t.const_int(bytes, false).into(),
+                    i64t.const_int(bytes, false).into(),
+                ];
+                let ptr = self
+                    .builder
+                    .build_call(self.funcs["arena_alloc"], &argv, "box")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("arena_alloc returns a pointer")
+                    .into_pointer_value();
+                self.builder
+                    .build_store(ptr, self.operand(init))
+                    .map_err(|e| self.err(e))?;
+                ptr.into()
+            }
+            Rvalue::BoxGet(op) => {
+                let ty = scalar_type(self.ctx, result_ty);
+                let ptr = self.operand(op).into_pointer_value();
+                self.builder
+                    .build_load(ty, ptr, "boxget")
+                    .map_err(|e| self.err(e))?
+            }
             // `error(code)` is identity on the i32 code (the M2 Error repr).
             Rvalue::Call(name, args) if name == "error" => self.operand(&args[0]),
             Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
@@ -526,6 +606,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Struct(id) => self.struct_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e).into(),
+            Ty::Box(_) | Ty::ArenaHandle => self.ctx.ptr_type(AddressSpace::default()).into(),
             _ => scalar_type(self.ctx, ty),
         }
     }

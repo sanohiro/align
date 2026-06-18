@@ -1,0 +1,11 @@
+// Arena + heap box (M3). `heap.new` allocates inside the `arena {}` region; the
+// whole arena is freed in bulk when the block ends. Scalars read out with `.get()`
+// are copied, so they outlive the arena.
+fn main() -> i32 {
+  r: i32 := arena {
+    p: box<i32> := heap.new(7)
+    q: box<i32> := heap.new(35)
+    p.get() + q.get()
+  }
+  return r
+}

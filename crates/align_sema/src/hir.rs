@@ -144,4 +144,10 @@ pub enum ExprKind {
     /// `expr?` — Result propagation; `ty` is the unwrapped ok payload type. Lowered
     /// against the enclosing function's return type (carried by MIR).
     Try(Box<Expr>),
+    /// `arena { ... }` — a region; allocations inside are bulk-freed at block end.
+    Arena(Block),
+    /// `heap.new(x)` — allocate a `box<T>` in the enclosing arena.
+    HeapNew(Box<Expr>),
+    /// `b.get()` — read (copy) the value out of a `box<T>`.
+    BoxGet(Box<Expr>),
 }

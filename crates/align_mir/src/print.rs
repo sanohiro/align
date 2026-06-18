@@ -40,6 +40,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::StoreField(slot, idx, op) => {
                 let _ = writeln!(out, "    _{slot}.{idx} <- {}", operand_str(op));
             }
+            Stmt::ArenaEnd(op) => {
+                let _ = writeln!(out, "    arena_end {}", operand_str(op));
+            }
         }
     }
     match &b.term {
@@ -83,6 +86,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::ResultIsOk(op) => format!("is_ok({})", operand_str(op)),
         Rvalue::ResultUnwrapOk(op) => format!("unwrap_ok({})", operand_str(op)),
         Rvalue::ResultUnwrapErr(op) => format!("unwrap_err({})", operand_str(op)),
+        Rvalue::ArenaBegin => "arena_begin".to_string(),
+        Rvalue::HeapAlloc(h, init) => format!("heap_alloc({}, {})", operand_str(h), operand_str(init)),
+        Rvalue::BoxGet(op) => format!("box_get({})", operand_str(op)),
     }
 }
 

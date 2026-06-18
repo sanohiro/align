@@ -190,6 +190,8 @@ pub enum ExprKind {
     /// `expr?` — Result propagation. `Ok(v)` yields `v`; `Err(e)` early-returns
     /// `Err(e)` from the enclosing function.
     Try(Box<Expr>),
+    /// `arena { ... }` — a region whose allocations are freed in bulk at block end.
+    Arena(Block),
 }
 
 #[derive(Clone, Debug)]

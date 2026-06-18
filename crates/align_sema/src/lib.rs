@@ -71,6 +71,10 @@ pub enum Ty {
     Option(Scalar),
     /// `Result<T, E>`; both payloads are concrete scalars (M2 restriction).
     Result(Scalar, Scalar),
+    /// `box<T>` — an owning heap pointer to a scalar (a Move type). M3.
+    Box(Scalar),
+    /// An arena handle (internal; produced by `arena {}`, never written by the user).
+    ArenaHandle,
     /// The `Error` type (M2: an i32 code).
     ErrCode,
     /// A struct type; the id indexes `Program::structs`.
@@ -205,6 +209,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 locals: Vec::new(),
                 scope: Vec::new(),
                 ret_hint: Ty::Unit,
+                arena_depth: 0,
             };
             Some(cx.check_fn(f))
         })
@@ -225,6 +230,8 @@ struct Checker<'a> {
     scope: Vec<(String, LocalId)>,
     /// Enclosing function's return type, so `return` checks against it.
     ret_hint: Ty,
+    /// Nesting depth of `arena {}` blocks (0 = not in an arena).
+    arena_depth: u32,
 }
 
 impl<'a> Checker<'a> {
@@ -538,6 +545,14 @@ impl<'a> Checker<'a> {
                 self.check_else_unwrap(opt, fallback, expected, e.span)
             }
             ast::ExprKind::Try(inner) => self.check_try(inner, e.span),
+            ast::ExprKind::Arena(b) => {
+                self.arena_depth += 1;
+                let block = self.check_block(b, expected);
+                self.arena_depth -= 1;
+                let ty = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
+                self.constrain(ty, expected, e.span);
+                Expr { kind: ExprKind::Arena(block), ty, span: e.span }
+            }
             ast::ExprKind::StructLit { .. } => {
                 self.diags.error(
                     "struct literals are only allowed as `name := Type { ... }`".to_string(),
@@ -677,6 +692,14 @@ impl<'a> Checker<'a> {
     }
 
     fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        // Dotted callee `a.b(...)`: a module builtin (`heap.new`) or a method on a local.
+        if let ast::ExprKind::Path(p) = &callee.kind {
+            if p.segments.len() == 2 {
+                let recv = p.segments[0].name.clone();
+                let method = p.segments[1].name.clone();
+                return self.check_dotted_call(&recv, &method, args, expected, span);
+            }
+        }
         let name = match &callee.kind {
             ast::ExprKind::Path(p) => single_name(p).map(|s| s.to_string()),
             _ => None,
@@ -773,6 +796,65 @@ impl<'a> Checker<'a> {
                         .error(format!("Option payload must be a scalar (composite payloads are not supported yet), got {}", ty_name(f)), span);
                 }
                 Scalar::Int(IntTy { bits: 64, signed: true })
+            }
+        }
+    }
+
+    /// A dotted call `recv.method(args)`: the `heap.new` builtin or a method on a local
+    /// (M3: `box.get()`).
+    fn check_dotted_call(&mut self, recv: &str, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = |span| Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if recv == "heap" && method == "new" {
+            return self.check_heap_new(args, expected, span);
+        }
+        let Some(id) = self.lookup(recv) else {
+            self.diags.error(format!("undefined name: '{recv}'"), span);
+            return err(span);
+        };
+        let recv_ty = self.locals[id as usize].ty;
+        let recv_expr = Expr { kind: ExprKind::Local(id), ty: recv_ty, span };
+        match method {
+            "get" => self.check_box_get(recv_expr, recv_ty, args, span),
+            _ => {
+                self.diags
+                    .error(format!("unknown method '.{method}()' on {}", ty_name(recv_ty)), span);
+                err(span)
+            }
+        }
+    }
+
+    /// `heap.new(x)` — allocate `box<T>` in the enclosing arena. M3 requires an arena.
+    fn check_heap_new(&mut self, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        if self.arena_depth == 0 {
+            self.diags
+                .error("heap.new must be used inside an `arena {}` block".to_string(), span);
+        }
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'heap.new' takes 1 argument, got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let inner_expected = match expected {
+            Some(Ty::Box(s)) => Some(scalar_to_ty(s)),
+            _ => None,
+        };
+        let arg = self.check_expr(&args[0], inner_expected);
+        let scalar = self.payload_scalar(arg.ty, args[0].span);
+        Expr { kind: ExprKind::HeapNew(Box::new(arg)), ty: Ty::Box(scalar), span }
+    }
+
+    /// `b.get()` — copy the value out of a `box<T>`.
+    fn check_box_get(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], span: Span) -> Expr {
+        if !args.is_empty() {
+            self.diags.error("'get' takes no arguments".to_string(), span);
+        }
+        match recv_ty {
+            Ty::Box(s) => Expr { kind: ExprKind::BoxGet(Box::new(recv)), ty: scalar_to_ty(s), span },
+            Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
+            other => {
+                self.diags
+                    .error(format!("'.get()' is only available on box<T>, got {}", ty_name(other)), span);
+                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
             }
         }
     }
@@ -946,9 +1028,11 @@ impl<'a> Checker<'a> {
                     self.finalize_expr(f);
                 }
             }
-            ExprKind::Block(b) => self.finalize_block(b),
+            ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner) => self.finalize_expr(inner),
+            | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner) => {
+                self.finalize_expr(inner)
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);
@@ -992,6 +1076,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::Char => "char".to_string(),
         Ty::Option(s) => format!("Option<{}>", scalar_name(s)),
         Ty::Result(o, e) => format!("Result<{}, {}>", scalar_name(o), scalar_name(e)),
+        Ty::Box(s) => format!("box<{}>", scalar_name(s)),
+        Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
@@ -1026,6 +1112,19 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
         "Error" => Ty::ErrCode,
+        "box" => {
+            let inner = match t.args.as_slice() {
+                [a] => resolve_type(a, struct_ids, diags),
+                _ => {
+                    diags.error("box takes exactly one type argument".to_string(), t.span);
+                    return Ty::Error;
+                }
+            };
+            match scalar_arg(inner, "box payload", t.span, diags) {
+                Some(s) => Ty::Box(s),
+                None => Ty::Error,
+            }
+        }
         "Option" => {
             let inner = match t.args.as_slice() {
                 [a] => resolve_type(a, struct_ids, diags),
@@ -1194,6 +1293,26 @@ mod tests {
             "fn g() -> Result<i32, Error> {\n  return Ok(1)\n}\nfn f() -> i32 {\n  x := g()?\n  return x\n}\n",
         );
         assert!(d.has_errors(), "`?` in a non-Result function must error");
+    }
+
+    #[test]
+    fn arena_box_program_checks() {
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  r: i32 := arena {\n    p: box<i32> := heap.new(5)\n    p.get()\n  }\n  return r\n}\n",
+        );
+        assert!(!d.has_errors(), "a well-formed arena/box program should check");
+    }
+
+    #[test]
+    fn heap_new_outside_arena_errors() {
+        let (_p, d) = check("fn main() -> i32 {\n  p: box<i32> := heap.new(5)\n  return p.get()\n}\n");
+        assert!(d.has_errors(), "heap.new outside an arena must error");
+    }
+
+    #[test]
+    fn get_on_non_box_errors() {
+        let (_p, d) = check("fn main() -> i32 {\n  x := 1\n  return x.get()\n}\n");
+        assert!(d.has_errors(), "`.get()` on a non-box must error");
     }
 
     #[test]

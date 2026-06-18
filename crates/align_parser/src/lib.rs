@@ -259,6 +259,13 @@ impl<'a> Parser<'a> {
                 stmts.push(Stmt::Assign { place: e, value });
             } else if self.at(&TokKind::End) {
                 self.bump();
+                // A trailing expression (last thing before `}`) is the block's value,
+                // even on its own line (newline inserts `End`).
+                self.skip_ends();
+                if self.at(&TokKind::RBrace) {
+                    tail = Some(Box::new(e));
+                    break;
+                }
                 stmts.push(Stmt::Expr(e));
             } else {
                 tail = Some(Box::new(e));
@@ -474,6 +481,13 @@ impl<'a> Parser<'a> {
                 })
             }
             TokKind::If => self.parse_if(),
+            TokKind::Arena => {
+                let start = self.span();
+                self.bump();
+                let block = self.parse_block()?;
+                let span = start.merge(self.prev_span());
+                Some(Expr { kind: ExprKind::Arena(block), span })
+            }
             TokKind::LParen => {
                 self.bump();
                 // `()` is the unit value; otherwise a parenthesized expression.
