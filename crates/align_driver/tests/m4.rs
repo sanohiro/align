@@ -43,6 +43,31 @@ fn array_sum_bound_local() {
 }
 
 #[test]
+fn fused_map_where_sum_pipeline() {
+    if !backend_available() {
+        return;
+    }
+    // map *2 → [2,4,6,8,10]; where >4 → [6,8,10]; sum = 24.
+    let src = "fn double(x: i32) -> i32 = x * 2\nfn big(x: i32) -> bool = x > 4\nfn main() -> i32 {\n  return [1, 2, 3, 4, 5].map(double).where(big).sum()\n}\n";
+    let out = build_and_run("pipeline", src);
+    assert_eq!(out.status.code(), Some(24));
+}
+
+#[test]
+fn pipeline_fuses_into_one_loop() {
+    let mut sm = SourceMap::new();
+    let src = "fn double(x: i32) -> i32 = x * 2\nfn big(x: i32) -> bool = x > 4\nfn main() -> i32 {\n  return [1, 2, 3].map(double).where(big).sum()\n}\n";
+    let checked = check(&mut sm, "p.align", src);
+    assert!(!checked.diags.has_errors());
+    let text = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
+    // Fusion: the map and where calls appear inside the loop body, and there is no
+    // intermediate array store of mapped results (only the source literal is stored).
+    assert!(text.contains("call double") && text.contains("call big"), "stages not inlined:\n{text}");
+    // Exactly one loop back-edge target reused (single loop): the source is stored once.
+    assert_eq!(text.matches("<- 1_i32").count(), 1, "source stored once:\n{text}");
+}
+
+#[test]
 fn array_sum_emits_single_loop() {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "a.align", "fn main() -> i32 {\n  return [1, 2, 3].sum()\n}\n");

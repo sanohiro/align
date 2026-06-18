@@ -425,7 +425,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::BoxClone(Operand::Value(handle), src)));
             Operand::Value(v)
         }
-        hir::ExprKind::ArraySum { source } => lower_array_sum(b, source, e.ty),
+        hir::ExprKind::ArraySum { source, stages } => lower_array_sum(b, source, stages, e.ty),
         hir::ExprKind::ArrayLit { .. } => {
             unreachable!("array literal only appears as a let initializer or pipeline source")
         }
@@ -476,10 +476,15 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
     }
 }
 
-/// `arr.sum()` → a single loop folding the elements with `+` (the fused-pipeline
-/// terminal). No intermediate array is built.
-fn lower_array_sum(b: &mut Builder, source: &hir::Expr, elem_ty: Ty) -> Operand {
+/// `src.map(f).where(p)….sum()` → one loop folding the elements with `+`. The map/where
+/// stages run inline per element (fusion); a failing `where` skips to the increment, so
+/// no intermediate array is built. `elem_ty` is the final (summed) element type.
+fn lower_array_sum(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem_ty: Ty) -> Operand {
     let (slot, n) = array_source_slot(b, source);
+    let src_elem = match source.ty {
+        Ty::Array(s, _) => align_sema::scalar_to_ty(s),
+        _ => elem_ty,
+    };
 
     let acc = b.new_slot(elem_ty);
     b.push(Stmt::Store(acc, zero_of(elem_ty)));
@@ -488,6 +493,7 @@ fn lower_array_sum(b: &mut Builder, source: &hir::Expr, elem_ty: Ty) -> Operand 
 
     let header = b.new_block();
     let body = b.new_block();
+    let cont = b.new_block();
     let exit = b.new_block();
     b.terminate(Term::Goto(header));
 
@@ -502,17 +508,40 @@ fn lower_array_sum(b: &mut Builder, source: &hir::Expr, elem_ty: Ty) -> Operand 
     ));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
-    // body: acc += arr[i]; i += 1
+    // body: load arr[i], run the stages, accumulate.
     b.cur = body;
     let idx = b.fresh_value(i64_ty());
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
-    let x = b.fresh_value(elem_ty);
+    let x = b.fresh_value(src_elem);
     b.push(Stmt::Let(x, Rvalue::Index(slot, Operand::Value(idx))));
+
+    let mut cur = Operand::Value(x);
+    for stage in stages {
+        match stage.kind {
+            hir::StageKind::Map => {
+                let v = b.fresh_value(stage.out_ty);
+                b.push(Stmt::Let(v, Rvalue::Call(stage.func.clone(), vec![cur])));
+                cur = Operand::Value(v);
+            }
+            hir::StageKind::Where => {
+                let pred = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(pred, Rvalue::Call(stage.func.clone(), vec![cur.clone()])));
+                let keep = b.new_block();
+                // false → skip this element (go to the increment).
+                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
+                b.cur = keep;
+            }
+        }
+    }
     let a = b.fresh_value(elem_ty);
     b.push(Stmt::Let(a, Rvalue::Load(acc)));
     let sum = b.fresh_value(elem_ty);
-    b.push(Stmt::Let(sum, Rvalue::Bin(BinOp::Add, Operand::Value(a), Operand::Value(x))));
+    b.push(Stmt::Let(sum, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
     b.push(Stmt::Store(acc, Operand::Value(sum)));
+    b.terminate(Term::Goto(cont));
+
+    // cont: i += 1; loop.
+    b.cur = cont;
     let i2 = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i2, Rvalue::Load(iv)));
     let inc = b.fresh_value(i64_ty());

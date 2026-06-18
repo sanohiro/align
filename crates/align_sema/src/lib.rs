@@ -381,7 +381,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i } => self.walk(i, depth),
+            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } => self.walk(i, depth),
             ExprKind::ArrayLit { elems, .. } => {
                 for e in elems {
                     self.walk(e, depth);
@@ -481,7 +481,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i } => {
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } => {
                 self.expr(i, moved, false)
             }
             ExprKind::ArrayLit { elems, .. } => {
@@ -1132,15 +1132,17 @@ impl<'a> Checker<'a> {
                 return self.check_heap_new(args, expected, span);
             }
         }
-        // `sum` is a reduction: its result is the element type, so push the expected
-        // type into an inline array literal source.
+        // `sum` is the terminal of a fused pipeline `src.map(f).where(p)….sum()`.
         if method == "sum" {
-            let recv_expr = match &recv.kind {
-                ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, expected, span),
-                _ => self.check_expr(recv, None),
-            };
-            let recv_ty = recv_expr.ty;
-            return self.check_array_sum(recv_expr, recv_ty, args, expected, span);
+            return self.check_array_sum(recv, args, expected, span);
+        }
+        // `map`/`where` are only valid as pipeline stages under a terminal reduction.
+        if method == "map" || method == "where" {
+            self.diags.error(
+                format!("'.{method}()' must be part of a pipeline ending in a reduction like `.sum()`"),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
         let recv_expr = self.check_expr(recv, None);
         let recv_ty = recv_expr.ty;
@@ -1177,29 +1179,103 @@ impl<'a> Checker<'a> {
         Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar }, ty: Ty::Array(scalar, n), span }
     }
 
-    /// `arr.sum()` — sum the elements into one scalar. The element type must be numeric.
-    fn check_array_sum(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+    /// Collect a pipeline `src.map(f).where(p)…` from the AST: the innermost receiver is
+    /// the source array; `.map`/`.where` calls become ordered stages (source-first).
+    fn collect_pipeline<'e>(&mut self, e: &'e ast::Expr) -> (&'e ast::Expr, Vec<(ast::Ident, bool)>) {
+        if let ast::ExprKind::Call { callee, args } = &e.kind {
+            if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
+                let is_map = field.name == "map";
+                let is_where = field.name == "where";
+                if is_map || is_where {
+                    let fname = match args.as_slice() {
+                        [a] => self.pipeline_fn_name(a),
+                        _ => None,
+                    };
+                    let (src, mut stages) = self.collect_pipeline(recv);
+                    if let Some(fname) = fname {
+                        stages.push((fname, is_map));
+                    } else {
+                        self.diags.error(
+                            format!("'.{}()' needs a single named function", field.name),
+                            e.span,
+                        );
+                    }
+                    return (src, stages);
+                }
+            }
+        }
+        (e, Vec::new())
+    }
+
+    fn pipeline_fn_name(&self, a: &ast::Expr) -> Option<ast::Ident> {
+        if let ast::ExprKind::Path(p) = &a.kind {
+            if p.segments.len() == 1 {
+                return Some(p.segments[0].clone());
+            }
+        }
+        None
+    }
+
+    /// `src.map(f).where(p)….sum()` — a fused reduction. Threads the element type
+    /// through each stage and folds the final (numeric) element type with `+`.
+    fn check_array_sum(&mut self, recv: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         if !args.is_empty() {
             self.diags.error("'sum' takes no arguments".to_string(), span);
         }
-        match recv_ty {
-            Ty::Array(s, _) if scalar_to_ty(s).is_numeric() => {
-                let ty = scalar_to_ty(s);
-                self.constrain(ty, expected, span);
-                Expr { kind: ExprKind::ArraySum { source: Box::new(recv) }, ty, span }
-            }
-            Ty::Array(s, _) => {
-                self.diags
-                    .error(format!("'sum' needs a numeric element type, got array<{}>", scalar_name(s)), span);
-                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
-            }
-            Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let (source_ast, raw_stages) = self.collect_pipeline(recv);
+        // Choose the expected element type for an inline literal source: the first
+        // stage's parameter type, or (with no stages) the sum's result type.
+        let elem_expected = match raw_stages.first() {
+            Some((fname, _)) => self.sigs.get(&fname.name).and_then(|s| s.params.first().copied()),
+            None => expected,
+        };
+        let source = match &source_ast.kind {
+            ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, elem_expected, span),
+            _ => self.check_expr(source_ast, None),
+        };
+        let mut elem = match source.ty {
+            Ty::Array(s, _) => scalar_to_ty(s),
+            Ty::Error => return err,
             other => {
                 self.diags
-                    .error(format!("'.sum()' is only available on an array, got {}", ty_name(other)), span);
-                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
+                    .error(format!("a pipeline source must be an array, got {}", ty_name(other)), span);
+                return err;
+            }
+        };
+
+        let mut stages = Vec::new();
+        for (fname, is_map) in raw_stages {
+            let Some(sig) = self.sigs.get(&fname.name) else {
+                self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
+                return err;
+            };
+            let (params, ret) = (sig.params.clone(), sig.ret);
+            if params.len() != 1 || params[0] != elem {
+                self.diags.error(
+                    format!("'{}' must take one {} argument here", fname.name, ty_name(elem)),
+                    fname.span,
+                );
+            }
+            if is_map {
+                stages.push(Stage { kind: StageKind::Map, func: fname.name.clone(), out_ty: ret });
+                elem = ret;
+            } else {
+                if ret != Ty::Bool {
+                    self.diags
+                        .error(format!("'where' predicate '{}' must return bool", fname.name), fname.span);
+                }
+                stages.push(Stage { kind: StageKind::Where, func: fname.name.clone(), out_ty: elem });
             }
         }
+
+        if !elem.is_numeric() {
+            self.diags
+                .error(format!("'sum' needs a numeric element type, got {}", ty_name(elem)), span);
+            return err;
+        }
+        self.constrain(elem, expected, span);
+        Expr { kind: ExprKind::ArraySum { source: Box::new(source), stages }, ty: elem, span }
     }
 
     /// `b.clone()` — deep-copy a `box<T>`. Allocates a fresh box, so it needs an arena.
@@ -1432,7 +1508,7 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner } => {
+            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } => {
                 self.finalize_expr(inner)
             }
             ExprKind::ArrayLit { elems, .. } => {
@@ -1721,6 +1797,30 @@ mod tests {
     fn array_sum_checks() {
         let (_p, d) = check("fn main() -> i32 {\n  return [10, 20, 12].sum()\n}\n");
         assert!(!d.has_errors(), "a well-formed array sum should check");
+    }
+
+    #[test]
+    fn fused_pipeline_checks() {
+        let (_p, d) = check(
+            "fn dbl(x: i32) -> i32 = x * 2\nfn big(x: i32) -> bool = x > 4\nfn main() -> i32 {\n  return [1, 2, 3].map(dbl).where(big).sum()\n}\n",
+        );
+        assert!(!d.has_errors(), "a well-formed map/where/sum pipeline should check");
+    }
+
+    #[test]
+    fn where_predicate_must_return_bool() {
+        let (_p, d) = check(
+            "fn dbl(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  return [1, 2, 3].where(dbl).sum()\n}\n",
+        );
+        assert!(d.has_errors(), "a where predicate returning non-bool must error");
+    }
+
+    #[test]
+    fn map_without_terminal_errors() {
+        let (_p, d) = check(
+            "fn dbl(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  xs := [1, 2, 3].map(dbl)\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "map without a terminal reduction must error in M4");
     }
 
     #[test]

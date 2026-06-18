@@ -154,7 +154,24 @@ pub enum ExprKind {
     BoxClone(Box<Expr>),
     /// `[e1, e2, ...]` — a fixed-length array literal of `elem` scalars.
     ArrayLit { elems: Vec<Expr>, elem: crate::Scalar },
-    /// `arr.sum()` — fold the array's elements with `+` into a single scalar. M4: the
-    /// terminal of a (future) fused map/where/sum pipeline.
-    ArraySum { source: Box<Expr> },
+    /// A fused array pipeline ending in `sum`: `source.map(f).where(p)….sum()`. The
+    /// stages and the reduction lower to a single loop (no intermediate arrays).
+    ArraySum { source: Box<Expr>, stages: Vec<Stage> },
+}
+
+#[derive(Clone, Debug)]
+pub enum StageKind {
+    /// `.map(f)` — transform each element with `f`.
+    Map,
+    /// `.where(p)` — keep only elements for which `p` is true.
+    Where,
+}
+
+#[derive(Clone, Debug)]
+pub struct Stage {
+    pub kind: StageKind,
+    /// Name of the (named) function applied at this stage.
+    pub func: String,
+    /// The element type after this stage (for `Where`, unchanged from its input).
+    pub out_ty: crate::Ty,
 }

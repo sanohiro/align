@@ -149,12 +149,39 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
 
 ## M4 — Array Processing Core (Align's protagonist)
 
-- `array<T>` / `slice<T>`, `out` arguments.
-- chains such as `map` / `filter` / `where` / `reduce` / `sum`.
-- **loop fusion** in MIR (`map().where().sum()` into a single loop).
-- field projection such as `.score`.
+- [done] `array<T>` (fixed-length, from literals) + chains `map` / `where` / `sum`.
+- [done] **loop fusion** in MIR (`[...].map(f).where(p).sum()` → a single loop, no
+  intermediate arrays).
+- [todo] dynamic-length `array<T>`/`slice<T>` + array type annotations, `out` args,
+  more terminals/stages (`reduce`/`scan`/`filter`/`partition`/`sort`/`chunks`), and
+  struct-array field projection (`.score`, `where(.active)`).
 
-Completion condition: the example in `draft.md` §19 (the array-aggregation part, excluding JSON) runs as fused code.
+Status: **M4 core slice COMPLETE.** Scalar arrays via literals; `map`/`where` take
+named functions; `sum` is the reduction terminal. The whole chain lowers to one
+counted loop in MIR (map = inline call, where = a branch skipping to the increment,
+sum = the accumulator) — verified fused (`examples/arraysum.align`,
+`examples/pipeline.align`). General generics are still deferred — `map`/`where`/`sum`
+are compiler-known builtins, monomorphic per element type.
+
+### M4 implementation decisions (locked)
+
+```text
+- Scalar element arrays only, created by literals `[...]` (Ty::Array(Scalar, N), the
+  length is part of the type). Dynamic arrays / slices / array type annotations and
+  array-valued results (materialization) are deferred.
+- Pipelines must end in a reduction (sum) so no output array is allocated; map/where
+  fuse into that loop. `map`/`where` outside a terminal is an error.
+- map/where take a *named function* argument (closures/lambdas deferred). The source
+  element type is inferred from the first stage's parameter (or the sum result type).
+- Method chains rely on the slice-0 postfix `.` (FieldAccess); the pipeline is
+  collected from the AST at the `sum` terminal and lowered as one loop.
+- Arrays are not yet Move-checked (literals are consumed only by the reduction);
+  whole-array move/ownership arrives with dynamic arrays.
+```
+
+Completion condition (met): an array-aggregation pipeline (`map`/`where`/`sum`) runs
+as fused code (one loop). The full `draft.md` §19 example (JSON, struct fields) needs
+later slices (struct arrays, M5 strings/JSON).
 
 ## M5 — Strings and JSON
 

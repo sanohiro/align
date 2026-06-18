@@ -1,0 +1,9 @@
+// A fused array pipeline (M4). `map → where → sum` lowers to a single loop: each
+// element is doubled, filtered (>4), and accumulated — no intermediate arrays.
+// map *2 → [2,4,6,8,10]; where >4 → [6,8,10]; sum = 24.
+fn double(x: i32) -> i32 = x * 2
+fn big(x: i32) -> bool = x > 4
+
+fn main() -> i32 {
+  return [1, 2, 3, 4, 5].map(double).where(big).sum()
+}
