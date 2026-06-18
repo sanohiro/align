@@ -344,6 +344,23 @@ impl<'a> Parser<'a> {
                 span,
             };
         }
+        // `opt else fallback` — Option unwrap, lowest precedence (top-level only, so it
+        // never competes with `if … else`, whose else is consumed by `parse_if`).
+        if min_bp == 0 && self.at(&TokKind::Else) {
+            self.bump();
+            let fallback = if self.at(&TokKind::LBrace) {
+                let b = self.parse_block()?;
+                let span = b.span;
+                Expr { kind: ExprKind::Block(b), span }
+            } else {
+                self.parse_expr(0)?
+            };
+            let span = lhs.span.merge(fallback.span);
+            lhs = Expr {
+                kind: ExprKind::ElseUnwrap { opt: Box::new(lhs), fallback: Box::new(fallback) },
+                span,
+            };
+        }
         Some(lhs)
     }
 
@@ -559,8 +576,19 @@ impl<'a> Parser<'a> {
         if path.segments.is_empty() {
             return None;
         }
-        let span = path.span;
-        Some(Type { path, span })
+        // Optional generic arguments: `Name<T, U>`. (`>>` lexes as two `>` tokens.)
+        let mut args = Vec::new();
+        if self.eat(&TokKind::Lt) {
+            while !self.at(&TokKind::Gt) && !self.at(&TokKind::Eof) {
+                args.push(self.parse_type()?);
+                if !self.eat(&TokKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokKind::Gt, "'>'");
+        }
+        let span = path.span.merge(self.prev_span());
+        Some(Type { path, args, span })
     }
 
     fn parse_ident(&mut self, what: &str) -> Option<Ident> {

@@ -41,7 +41,18 @@ impl FloatTy {
     }
 }
 
-/// sema-internal type representation (the M1 subset of `03-types.md` §1).
+/// A variable-free scalar type — the only payloads M2 allows inside `Option`/`Result`.
+/// Keeping it `Copy` and non-recursive lets [`Ty`] stay `Copy` (no boxing/interning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scalar {
+    Int(IntTy),
+    Float(FloatTy),
+    Bool,
+    Char,
+    Unit,
+}
+
+/// sema-internal type representation (`03-types.md` §1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
     Int(IntTy),
@@ -53,10 +64,38 @@ pub enum Ty {
     Bool,
     /// A Unicode scalar value (32-bit).
     Char,
+    /// `Option<T>`; the payload is a concrete scalar (M2 restriction).
+    Option(Scalar),
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     Unit,
     Error,
+}
+
+/// Convert a concrete scalar [`Ty`] to a [`Scalar`]; `None` for vars/composites/structs.
+fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
+    match ty {
+        Ty::Int(it) => Some(Scalar::Int(it)),
+        Ty::Float(ft) => Some(Scalar::Float(ft)),
+        Ty::Bool => Some(Scalar::Bool),
+        Ty::Char => Some(Scalar::Char),
+        Ty::Unit => Some(Scalar::Unit),
+        _ => None,
+    }
+}
+
+pub fn scalar_to_ty(s: Scalar) -> Ty {
+    match s {
+        Scalar::Int(it) => Ty::Int(it),
+        Scalar::Float(ft) => Ty::Float(ft),
+        Scalar::Bool => Ty::Bool,
+        Scalar::Char => Ty::Char,
+        Scalar::Unit => Ty::Unit,
+    }
+}
+
+fn scalar_name(s: Scalar) -> String {
+    ty_name(scalar_to_ty(s))
 }
 
 impl Ty {
@@ -474,7 +513,10 @@ impl<'a> Checker<'a> {
                 Expr { kind: ExprKind::Unary { op: *op, expr: Box::new(inner) }, ty, span: e.span }
             }
             ast::ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expected, e.span),
-            ast::ExprKind::Call { callee, args } => self.check_call(callee, args, e.span),
+            ast::ExprKind::Call { callee, args } => self.check_call(callee, args, expected, e.span),
+            ast::ExprKind::ElseUnwrap { opt, fallback } => {
+                self.check_else_unwrap(opt, fallback, expected, e.span)
+            }
             ast::ExprKind::StructLit { .. } => {
                 self.diags.error(
                     "struct literals are only allowed as `name := Type { ... }` in M1".to_string(),
@@ -486,20 +528,24 @@ impl<'a> Checker<'a> {
             ast::ExprKind::Block(b) => {
                 let block = self.check_block(b, expected);
                 let ty = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
-                // A bare block expression isn't lowered separately in M1; inline as an if-less value.
-                // Represent as an `if true { block } else {}` would over-complicate; instead keep the
-                // block's value expression directly when present.
-                match block.value {
-                    Some(v) => *v,
-                    None => Expr { kind: ExprKind::Bool(false), ty: Ty::Unit, span: e.span },
-                }
-                .with_ty(ty)
+                Expr { kind: ExprKind::Block(block), ty, span: e.span }
             }
         }
     }
 
     fn check_path(&mut self, p: &ast::Path, expected: Option<Ty>, span: Span) -> Expr {
         let err = |s: Span| Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span: s };
+        // `None` builtin: its Option type comes from context.
+        if single_name(p) == Some("None") {
+            return match expected {
+                Some(Ty::Option(s)) => Expr { kind: ExprKind::OptionNone, ty: Ty::Option(s), span },
+                _ => {
+                    self.diags
+                        .error("cannot infer the Option type of `None` here (add an annotation)".to_string(), span);
+                    Expr { kind: ExprKind::OptionNone, ty: Ty::Error, span }
+                }
+            };
+        }
         let base = p.segments.first().map(|s| s.name.as_str()).unwrap_or("");
         let Some(id) = self.lookup(base) else {
             self.diags.error(format!("undefined name: '{base}'"), span);
@@ -609,7 +655,7 @@ impl<'a> Checker<'a> {
         Expr { kind: ExprKind::Binary { op, lhs: Box::new(l), rhs: Box::new(r) }, ty, span }
     }
 
-    fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+    fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let name = match &callee.kind {
             ast::ExprKind::Path(p) => single_name(p).map(|s| s.to_string()),
             _ => None,
@@ -620,6 +666,9 @@ impl<'a> Checker<'a> {
         };
         if name == "print" {
             return self.check_print(args, span);
+        }
+        if name == "Some" {
+            return self.check_some(args, expected, span);
         }
         let Some(sig) = self.sigs.get(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
@@ -663,6 +712,65 @@ impl<'a> Checker<'a> {
             ty: Ty::Unit,
             span,
         }
+    }
+
+    /// Builtin `Some(x)`. The payload resolves to a concrete scalar here (an
+    /// unconstrained literal defaults), so the resulting `Option<T>` carries no
+    /// inference variable.
+    fn check_some(&mut self, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'Some' takes 1 argument, got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let inner_expected = match expected {
+            Some(Ty::Option(s)) => Some(scalar_to_ty(s)),
+            _ => None,
+        };
+        let arg = self.check_expr(&args[0], inner_expected);
+        let scalar = self.payload_scalar(arg.ty, args[0].span);
+        let ty = Ty::Option(scalar);
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::OptionSome(Box::new(arg)), ty, span }
+    }
+
+    /// Resolve a type to a concrete payload [`Scalar`], defaulting inference vars and
+    /// reporting non-scalar payloads (M2 restriction).
+    fn payload_scalar(&mut self, ty: Ty, span: Span) -> Scalar {
+        let f = self.finalize(ty);
+        match ty_to_scalar(f) {
+            Some(s) => s,
+            None => {
+                if f != Ty::Error {
+                    self.diags
+                        .error(format!("Option payload must be a scalar in M2, got {}", ty_name(f)), span);
+                }
+                Scalar::Int(IntTy { bits: 64, signed: true })
+            }
+        }
+    }
+
+    /// `opt else fallback`. The fallback either yields the payload type or diverges via
+    /// `return` (only the braced `else { … }` form is supported in M2).
+    fn check_else_unwrap(&mut self, opt: &ast::Expr, fallback: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
+        let o = self.check_expr(opt, None);
+        let payload = match self.resolve(o.ty) {
+            Ty::Option(s) => scalar_to_ty(s),
+            Ty::Error => Ty::Error,
+            other => {
+                self.diags
+                    .error(format!("`else` unwrap expects an Option, got {}", ty_name(other)), span);
+                Ty::Error
+            }
+        };
+        // A diverging `{ … return … }` block has no value; don't constrain it to payload.
+        let fb = if block_diverges(fallback) {
+            self.check_expr(fallback, None)
+        } else {
+            self.check_expr(fallback, Some(payload))
+        };
+        self.constrain(payload, expected, span);
+        Expr { kind: ExprKind::ElseUnwrap { opt: Box::new(o), fallback: Box::new(fb) }, ty: payload, span }
     }
 
     fn check_if(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Expr>, expected: Option<Ty>, span: Span) -> Expr {
@@ -727,20 +835,29 @@ impl<'a> Checker<'a> {
                     self.finalize_expr(f);
                 }
             }
+            ExprKind::Block(b) => self.finalize_block(b),
+            ExprKind::OptionSome(inner) => self.finalize_expr(inner),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.finalize_expr(opt);
+                self.finalize_expr(fallback);
+            }
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
+            | ExprKind::OptionNone
             | ExprKind::Field { .. } => {}
         }
     }
 }
 
-impl Expr {
-    fn with_ty(mut self, ty: Ty) -> Expr {
-        self.ty = ty;
-        self
+/// Whether a braced `else { … }` fallback diverges (its last statement is `return`),
+/// in which case it produces no value and need not match the payload type.
+fn block_diverges(e: &ast::Expr) -> bool {
+    match &e.kind {
+        ast::ExprKind::Block(b) => b.tail.is_none() && matches!(b.stmts.last(), Some(ast::Stmt::Return(_))),
+        _ => false,
     }
 }
 
@@ -760,6 +877,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::FloatVar(_) => "float(undetermined)".to_string(),
         Ty::Bool => "bool".to_string(),
         Ty::Char => "char".to_string(),
+        Ty::Option(s) => format!("Option<{}>", scalar_name(s)),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
@@ -779,6 +897,26 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
+        "Option" => {
+            let inner = match t.args.as_slice() {
+                [a] => resolve_type(a, struct_ids, diags),
+                _ => {
+                    diags.error("Option takes exactly one type argument".to_string(), t.span);
+                    return Ty::Error;
+                }
+            };
+            match ty_to_scalar(inner) {
+                Some(s) => Ty::Option(s),
+                None if inner == Ty::Error => Ty::Error,
+                None => {
+                    diags.error(
+                        format!("Option payload must be a scalar in M2, got {}", ty_name(inner)),
+                        t.span,
+                    );
+                    Ty::Error
+                }
+            }
+        }
         _ => match parse_int_name(name) {
             Some(it) => Ty::Int(it),
             None => match struct_ids.get(name) {
@@ -877,6 +1015,27 @@ mod tests {
     fn char_is_not_arithmetic() {
         let (_p, d) = check("fn f() -> char {\n  return 'a' + 'b'\n}\n");
         assert!(d.has_errors(), "char does not support arithmetic");
+    }
+
+    #[test]
+    fn option_program_checks() {
+        let (_p, d) = check(
+            "fn choose(b: bool) -> Option<i32> {\n  if b { return Some(1) }\n  return None\n}\nfn main() -> i32 {\n  return choose(true) else 0\n}\n",
+        );
+        assert!(!d.has_errors(), "a well-formed Option program should check");
+    }
+
+    #[test]
+    fn else_unwrap_requires_option() {
+        // `else`-unwrap on a non-Option is an error.
+        let (_p, d) = check("fn f() -> i32 {\n  return 1 else 0\n}\n");
+        assert!(d.has_errors(), "else-unwrap on a plain int must error");
+    }
+
+    #[test]
+    fn bare_none_without_context_errors() {
+        let (_p, d) = check("fn f() -> i32 {\n  x := None\n  return 0\n}\n");
+        assert!(d.has_errors(), "None with no inferable Option type must error");
     }
 
     #[test]

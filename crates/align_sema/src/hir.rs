@@ -124,4 +124,16 @@ pub enum ExprKind {
         base: LocalId,
         index: u32,
     },
+    /// A block used in expression position; its value is the trailing expression (or
+    /// `Unit`). Preserves statements (e.g. a diverging `{ return … }`).
+    Block(Block),
+    /// `Some(x)` — the expression `ty` is the resulting `Option<T>`.
+    OptionSome(Box<Expr>),
+    /// `None` — the expression `ty` is the `Option<T>` fixed by context.
+    OptionNone,
+    /// `opt else fallback` — Option unwrap. `ty` is the unwrapped payload type.
+    ElseUnwrap {
+        opt: Box<Expr>,
+        fallback: Box<Expr>,
+    },
 }

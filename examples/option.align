@@ -1,0 +1,14 @@
+// Option<T> and `else`-unwrap (M2). There is no null; absence is Option/None,
+// and `else` supplies a value or diverges.
+fn choose(b: bool) -> Option<i32> {
+  if b {
+    return Some(7)
+  }
+  return None
+}
+
+fn main() -> i32 {
+  x := choose(true) else 99
+  y := choose(false) else 99
+  return x + y
+}

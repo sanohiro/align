@@ -80,10 +80,12 @@ pub enum FnBody {
     Expr(Box<Expr>),
 }
 
-/// Type annotation. M1 supports simple paths only (`i32`, `bool`, ...).
+/// Type annotation. A path optionally followed by generic arguments
+/// (`Option<i32>`, `Result<i32, Error>`).
 #[derive(Clone, Debug)]
 pub struct Type {
     pub path: Path,
+    pub args: Vec<Type>,
     pub span: Span,
 }
 
@@ -176,6 +178,12 @@ pub enum ExprKind {
     StructLit {
         name: Ident,
         fields: Vec<FieldInit>,
+    },
+    /// `opt else fallback` — Option unwrap. `Some(x)` yields `x`; `None` evaluates
+    /// `fallback` (which produces the value, or diverges via `return`).
+    ElseUnwrap {
+        opt: Box<Expr>,
+        fallback: Box<Expr>,
     },
 }
 

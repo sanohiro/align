@@ -83,6 +83,14 @@ pub enum Rvalue {
     Call(String, Vec<Operand>),
     /// Load field `index` from the struct in `slot`.
     Field(Slot, u32),
+    /// `Some(operand)` — build an `Option` aggregate (tag = Some).
+    OptionSome(Operand),
+    /// `None` — build an `Option` aggregate (tag = None); the type is the value's.
+    OptionNone,
+    /// Whether an `Option` operand is `Some` (its tag).
+    OptionIsSome(Operand),
+    /// The payload of an `Option` operand (valid only when it is `Some`).
+    OptionUnwrap(Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -294,11 +302,61 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::Field(*base, *index)));
             Operand::Value(v)
         }
+        hir::ExprKind::Block(blk) => {
+            lower_block(b, blk).unwrap_or(Operand::Const(Const::Bool(false)))
+        }
+        hir::ExprKind::OptionSome(inner) => {
+            let op = lower_expr(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::OptionSome(op)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::OptionNone => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::OptionNone));
+            Operand::Value(v)
+        }
+        hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty),
         // sema only admits a struct literal as a `let` initializer (handled in lower_stmt).
         hir::ExprKind::StructLit { .. } => {
             unreachable!("struct literal outside a let initializer reached MIR lowering")
         }
     }
+}
+
+/// `opt else fallback` → branch on the Option tag; `Some` unwraps the payload into the
+/// result slot, `None` evaluates the fallback (which writes the slot or diverges).
+fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty: Ty) -> Operand {
+    let result_slot = b.new_slot(ty);
+    let opt_op = lower_expr(b, opt);
+
+    let is_some = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(is_some, Rvalue::OptionIsSome(opt_op.clone())));
+    let some_bb = b.new_block();
+    let none_bb = b.new_block();
+    let join_bb = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(is_some), some_bb, none_bb));
+
+    // Some: unwrap the payload into the result slot.
+    b.cur = some_bb;
+    let val = b.fresh_value(ty);
+    b.push(Stmt::Let(val, Rvalue::OptionUnwrap(opt_op)));
+    b.push(Stmt::Store(result_slot, Operand::Value(val)));
+    b.terminate(Term::Goto(join_bb));
+
+    // None: the fallback yields the value, or diverges (then the block is already
+    // terminated and the store/goto are skipped).
+    b.cur = none_bb;
+    let fb = lower_expr(b, fallback);
+    if !b.is_terminated() {
+        b.push(Stmt::Store(result_slot, fb));
+        b.terminate(Term::Goto(join_bb));
+    }
+
+    b.cur = join_bb;
+    let r = b.fresh_value(ty);
+    b.push(Stmt::Let(r, Rvalue::Load(result_slot)));
+    Operand::Value(r)
 }
 
 fn lower_if(
@@ -351,6 +409,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::FloatVar(_) => "float?".to_string(),
         Ty::Bool => "bool".to_string(),
         Ty::Char => "char".to_string(),
+        Ty::Option(_) => "Option".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),

@@ -13,7 +13,7 @@ use std::path::Path;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{FloatTy, IntTy, StructDef, Ty};
+use align_sema::{FloatTy, IntTy, Scalar, StructDef, Ty, scalar_to_ty};
 
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
@@ -141,6 +141,20 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty) -> BasicTypeEnum<'c> {
     }
 }
 
+/// `Option<T>` lowers to `{ i8 tag, T value }` (tag 1 = Some, 0 = None).
+fn option_struct_type<'c>(ctx: &'c Context, s: Scalar) -> StructType<'c> {
+    ctx.struct_type(&[ctx.i8_type().into(), scalar_type(ctx, scalar_to_ty(s))], false)
+}
+
+/// LLVM type for a function parameter/return (scalars + `Option`; structs are not
+/// passed by value in M1/M2).
+fn abi_type<'c>(ctx: &'c Context, ty: Ty) -> BasicTypeEnum<'c> {
+    match ty {
+        Ty::Option(s) => option_struct_type(ctx, s).into(),
+        _ => scalar_type(ctx, ty),
+    }
+}
+
 fn is_signed(ty: Ty) -> bool {
     matches!(ty, Ty::Int(IntTy { signed: true, .. }))
 }
@@ -158,12 +172,12 @@ fn declare_fn<'c>(ctx: &'c Context, module: &Module<'c>, f: &Function) -> Functi
     let param_types: Vec<BasicMetadataTypeEnum> = f
         .params
         .iter()
-        .map(|s| scalar_type(ctx, f.slots[*s as usize]).into())
+        .map(|s| abi_type(ctx, f.slots[*s as usize]).into())
         .collect();
     let fn_ty = if f.ret == Ty::Unit {
         ctx.void_type().fn_type(&param_types, false)
     } else {
-        scalar_type(ctx, f.ret).fn_type(&param_types, false)
+        abi_type(ctx, f.ret).fn_type(&param_types, false)
     };
     module.add_function(&f.name, fn_ty, None)
 }
@@ -197,10 +211,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let entry = self.blocks[self.f.entry as usize];
         self.builder.position_at_end(entry);
         for (i, ty) in self.f.slots.iter().enumerate() {
-            let llty: BasicTypeEnum = match ty {
-                Ty::Struct(id) => self.struct_types[*id as usize].into(),
-                _ => scalar_type(self.ctx, *ty),
-            };
+            let llty = self.llvm_type(*ty);
             let ptr = self
                 .builder
                 .build_alloca(llty, &format!("_{i}"))
@@ -221,7 +232,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         for s in &b.stmts {
             match s {
                 Stmt::Let(v, rv) => {
-                    if let Some(val) = self.gen_rvalue(rv)? {
+                    let result_ty = self.f.value_tys[*v as usize];
+                    if let Some(val) = self.gen_rvalue(rv, result_ty)? {
                         self.values.insert(*v, val);
                     }
                 }
@@ -272,11 +284,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Lower an rvalue. Returns `None` for a value-less result (a void call).
-    fn gen_rvalue(&mut self, rv: &Rvalue) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+    /// `result_ty` is the type of the value being defined (needed to build a bare `None`).
+    fn gen_rvalue(&mut self, rv: &Rvalue, result_ty: Ty) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let v: BasicValueEnum<'c> = match rv {
             Rvalue::Use(op) => self.operand(op),
             Rvalue::Load(slot) => {
-                let ty = scalar_type(self.ctx, self.f.slots[*slot as usize]);
+                let ty = self.llvm_type(self.f.slots[*slot as usize]);
                 self.builder
                     .build_load(ty, self.slots[slot], "load")
                     .map_err(|e| self.err(e))?
@@ -303,6 +316,49 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_load(fty, field_ptr, "fld")
                     .map_err(|e| self.err(e))?
             }
+            Rvalue::OptionSome(op) => {
+                let Ty::Option(s) = result_ty else {
+                    return Err(self.err("Some result is not an Option"));
+                };
+                let oty = option_struct_type(self.ctx, s);
+                let payload = self.operand(op);
+                let tag = self.ctx.i8_type().const_int(1, false);
+                let agg = self
+                    .builder
+                    .build_insert_value(oty.get_undef(), tag, 0, "tag")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(agg, payload, 1, "some")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
+            Rvalue::OptionNone => {
+                let Ty::Option(s) = result_ty else {
+                    return Err(self.err("None result is not an Option"));
+                };
+                // All-zero aggregate → tag 0 (None).
+                option_struct_type(self.ctx, s).const_zero().into()
+            }
+            Rvalue::OptionIsSome(op) => {
+                let agg = self.operand(op).into_struct_value();
+                let tag = self
+                    .builder
+                    .build_extract_value(agg, 0, "tag")
+                    .map_err(|e| self.err(e))?
+                    .into_int_value();
+                self.builder
+                    .build_int_compare(IntPredicate::EQ, tag, self.ctx.i8_type().const_int(1, false), "issome")
+                    .map_err(|e| self.err(e))?
+                    .into()
+            }
+            Rvalue::OptionUnwrap(op) => {
+                let agg = self.operand(op).into_struct_value();
+                self.builder
+                    .build_extract_value(agg, 1, "some")
+                    .map_err(|e| self.err(e))?
+            }
             Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
             Rvalue::Call(name, args) => {
                 let callee = self.funcs[name];
@@ -315,6 +371,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
         };
         Ok(Some(v))
+    }
+
+    /// LLVM type for a value/slot of any type (scalars, `Option`, structs).
+    fn llvm_type(&self, ty: Ty) -> BasicTypeEnum<'c> {
+        match ty {
+            Ty::Struct(id) => self.struct_types[id as usize].into(),
+            Ty::Option(s) => option_struct_type(self.ctx, s).into(),
+            _ => scalar_type(self.ctx, ty),
+        }
     }
 
     /// The struct id held by a slot (assumes a struct-typed slot).

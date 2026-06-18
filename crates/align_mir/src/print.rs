@@ -74,6 +74,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("call {name}({})", a.join(", "))
         }
         Rvalue::Field(slot, idx) => format!("_{slot}.{idx}"),
+        Rvalue::OptionSome(op) => format!("Some({})", operand_str(op)),
+        Rvalue::OptionNone => "None".to_string(),
+        Rvalue::OptionIsSome(op) => format!("is_some({})", operand_str(op)),
+        Rvalue::OptionUnwrap(op) => format!("unwrap({})", operand_str(op)),
     }
 }
 
