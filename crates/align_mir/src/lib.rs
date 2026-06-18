@@ -51,6 +51,7 @@ impl Function {
             Operand::Const(Const::Float(_, ty)) => *ty,
             Operand::Const(Const::Char(_)) => Ty::Char,
             Operand::Const(Const::Bool(_)) => Ty::Bool,
+            Operand::Const(Const::Unit) => Ty::Unit,
             Operand::Value(v) => self.value_tys[*v as usize],
             Operand::Arg(i) => self.slots[self.params[*i as usize] as usize],
         }
@@ -91,6 +92,16 @@ pub enum Rvalue {
     OptionIsSome(Operand),
     /// The payload of an `Option` operand (valid only when it is `Some`).
     OptionUnwrap(Operand),
+    /// `Ok(operand)` — build a `Result` aggregate (tag = Ok); the type is the value's.
+    ResultOk(Operand),
+    /// `Err(operand)` — build a `Result` aggregate (tag = Err); the type is the value's.
+    ResultErr(Operand),
+    /// Whether a `Result` operand is `Ok` (its tag).
+    ResultIsOk(Operand),
+    /// The ok payload of a `Result` operand (valid only when `Ok`).
+    ResultUnwrapOk(Operand),
+    /// The err payload of a `Result` operand (valid only when `Err`).
+    ResultUnwrapErr(Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +118,8 @@ pub enum Const {
     Float(f64, Ty),
     Char(u32),
     Bool(bool),
+    /// The unit value `()`.
+    Unit,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +148,8 @@ struct Builder {
     value_tys: Vec<Ty>,
     blocks: Vec<BBuild>,
     cur: BlockId,
+    /// The enclosing function's return type (so `?` can build the propagated Result).
+    ret: Ty,
 }
 
 impl Builder {
@@ -181,6 +196,7 @@ fn lower_fn(f: &hir::Fn) -> Function {
         value_tys: Vec::new(),
         blocks: Vec::new(),
         cur: 0,
+        ret: f.ret,
     };
     let entry = b.new_block();
     b.cur = entry;
@@ -268,6 +284,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
 
 fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     match &e.kind {
+        hir::ExprKind::Unit => Operand::Const(Const::Unit),
         hir::ExprKind::Int(v) => Operand::Const(Const::Int(*v, e.ty)),
         hir::ExprKind::Float(v) => Operand::Const(Const::Float(*v, e.ty)),
         hir::ExprKind::Char(v) => Operand::Const(Const::Char(*v)),
@@ -317,11 +334,54 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty),
+        hir::ExprKind::ResultOk(inner) => {
+            let op = lower_expr(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::ResultOk(op)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::ResultErr(inner) => {
+            let op = lower_expr(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::ResultErr(op)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::Try(inner) => lower_try(b, inner, e.ty),
         // sema only admits a struct literal as a `let` initializer (handled in lower_stmt).
         hir::ExprKind::StructLit { .. } => {
             unreachable!("struct literal outside a let initializer reached MIR lowering")
         }
     }
+}
+
+/// `expr?` → branch on the Result tag. `Err` propagates (early-return an `Err` of the
+/// function's own return type — the cold edge); `Ok` continues with the unwrapped value.
+fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
+    let ret_err_ty = match b.ret {
+        Ty::Result(_, e) => align_sema::scalar_to_ty(e),
+        _ => Ty::Error,
+    };
+    let r = lower_expr(b, inner);
+
+    let is_ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(r.clone())));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(is_ok), ok_bb, err_bb));
+
+    // Err: extract the error and early-return Err(err) of the function's return type.
+    b.cur = err_bb;
+    let err = b.fresh_value(ret_err_ty);
+    b.push(Stmt::Let(err, Rvalue::ResultUnwrapErr(r.clone())));
+    let propagated = b.fresh_value(b.ret);
+    b.push(Stmt::Let(propagated, Rvalue::ResultErr(Operand::Value(err))));
+    b.terminate(Term::Return(Some(Operand::Value(propagated))));
+
+    // Ok: continue with the unwrapped value.
+    b.cur = ok_bb;
+    let v = b.fresh_value(ok_ty);
+    b.push(Stmt::Let(v, Rvalue::ResultUnwrapOk(r)));
+    Operand::Value(v)
 }
 
 /// `opt else fallback` → branch on the Option tag; `Some` unwraps the payload into the
@@ -410,6 +470,8 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Bool => "bool".to_string(),
         Ty::Char => "char".to_string(),
         Ty::Option(_) => "Option".to_string(),
+        Ty::Result(..) => "Result".to_string(),
+        Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),

@@ -56,6 +56,7 @@ pub enum TokKind {
     AndAnd,  // &&
     OrOr,    // ||
     Bang,    // !
+    Question, // ?
     /// Statement terminator (implicit `;` from a newline, or explicit `;`).
     End,
     Eof,
@@ -75,6 +76,7 @@ impl TokKind {
                 | TokKind::False
                 | TokKind::RParen
                 | TokKind::RBrace
+                | TokKind::Question
         )
     }
 }
@@ -350,6 +352,7 @@ impl<'a> Lexer<'a> {
             (b'*', _) => (TokKind::Star, 1),
             (b'/', _) => (TokKind::Slash, 1),
             (b'%', _) => (TokKind::Percent, 1),
+            (b'?', _) => (TokKind::Question, 1),
             (b';', _) => (TokKind::End, 1),
             _ => {
                 self.pos += 1;

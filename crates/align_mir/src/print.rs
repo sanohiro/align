@@ -78,6 +78,11 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::OptionNone => "None".to_string(),
         Rvalue::OptionIsSome(op) => format!("is_some({})", operand_str(op)),
         Rvalue::OptionUnwrap(op) => format!("unwrap({})", operand_str(op)),
+        Rvalue::ResultOk(op) => format!("Ok({})", operand_str(op)),
+        Rvalue::ResultErr(op) => format!("Err({})", operand_str(op)),
+        Rvalue::ResultIsOk(op) => format!("is_ok({})", operand_str(op)),
+        Rvalue::ResultUnwrapOk(op) => format!("unwrap_ok({})", operand_str(op)),
+        Rvalue::ResultUnwrapErr(op) => format!("unwrap_err({})", operand_str(op)),
     }
 }
 
@@ -87,6 +92,7 @@ fn operand_str(op: &Operand) -> String {
         Operand::Const(Const::Float(v, ty)) => format!("{v}_{}", ty_name(*ty)),
         Operand::Const(Const::Char(v)) => format!("'\\u{{{v:x}}}'"),
         Operand::Const(Const::Bool(v)) => v.to_string(),
+        Operand::Const(Const::Unit) => "()".to_string(),
         Operand::Value(v) => format!("%{v}"),
         Operand::Arg(i) => format!("arg{i}"),
     }

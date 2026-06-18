@@ -1,0 +1,14 @@
+// Result<T, E> and `?` (M2). A failure propagates with `?`; `main` returning
+// Result maps Ok → exit 0 and Err(code) → reported + exit code. (M2's Error is a
+// placeholder i32 code; the Error sum type comes later.)
+fn try_get(n: i32) -> Result<i32, Error> {
+  if n < 0 {
+    return Err(error(7))
+  }
+  return Ok(n)
+}
+
+pub fn main() -> Result<(), Error> {
+  x := try_get(-1)?
+  return Ok(())
+}

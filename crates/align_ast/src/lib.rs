@@ -144,6 +144,8 @@ pub struct Expr {
 
 #[derive(Clone, Debug)]
 pub enum ExprKind {
+    /// The unit value `()`.
+    Unit,
     /// Integer literal. Its type is fixed by context (`03-types.md` §2).
     Int(i128),
     /// Floating-point literal; its width (`f32`/`f64`) is fixed by context.
@@ -185,6 +187,9 @@ pub enum ExprKind {
         opt: Box<Expr>,
         fallback: Box<Expr>,
     },
+    /// `expr?` — Result propagation. `Ok(v)` yields `v`; `Err(e)` early-returns
+    /// `Err(e)` from the enclosing function.
+    Try(Box<Expr>),
 }
 
 #[derive(Clone, Debug)]

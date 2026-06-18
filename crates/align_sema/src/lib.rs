@@ -50,6 +50,9 @@ pub enum Scalar {
     Bool,
     Char,
     Unit,
+    /// The M2 `Error` type — an opaque i32 error code (placeholder for the eventual
+    /// Error sum type; see `open-questions.md`).
+    ErrCode,
 }
 
 /// sema-internal type representation (`03-types.md` §1).
@@ -66,9 +69,15 @@ pub enum Ty {
     Char,
     /// `Option<T>`; the payload is a concrete scalar (M2 restriction).
     Option(Scalar),
+    /// `Result<T, E>`; both payloads are concrete scalars (M2 restriction).
+    Result(Scalar, Scalar),
+    /// The `Error` type (M2: an i32 code).
+    ErrCode,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     Unit,
+    /// Type-checking error sentinel (bottom). Distinct from the `Error` *type*
+    /// ([`Ty::ErrCode`]).
     Error,
 }
 
@@ -80,6 +89,7 @@ fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Bool => Some(Scalar::Bool),
         Ty::Char => Some(Scalar::Char),
         Ty::Unit => Some(Scalar::Unit),
+        Ty::ErrCode => Some(Scalar::ErrCode),
         _ => None,
     }
 }
@@ -91,6 +101,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Bool => Ty::Bool,
         Scalar::Char => Ty::Char,
         Scalar::Unit => Ty::Unit,
+        Scalar::ErrCode => Ty::ErrCode,
     }
 }
 
@@ -477,6 +488,10 @@ impl<'a> Checker<'a> {
 
     fn check_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
         match &e.kind {
+            ast::ExprKind::Unit => {
+                self.constrain(Ty::Unit, expected, e.span);
+                Expr { kind: ExprKind::Unit, ty: Ty::Unit, span: e.span }
+            }
             ast::ExprKind::Int(v) => {
                 let ty = self.fresh_int_var();
                 self.constrain(ty, expected, e.span);
@@ -517,6 +532,7 @@ impl<'a> Checker<'a> {
             ast::ExprKind::ElseUnwrap { opt, fallback } => {
                 self.check_else_unwrap(opt, fallback, expected, e.span)
             }
+            ast::ExprKind::Try(inner) => self.check_try(inner, e.span),
             ast::ExprKind::StructLit { .. } => {
                 self.diags.error(
                     "struct literals are only allowed as `name := Type { ... }` in M1".to_string(),
@@ -670,6 +686,12 @@ impl<'a> Checker<'a> {
         if name == "Some" {
             return self.check_some(args, expected, span);
         }
+        if name == "Ok" || name == "Err" {
+            return self.check_result_ctor(&name, args, expected, span);
+        }
+        if name == "error" {
+            return self.check_error_ctor(args, span);
+        }
         let Some(sig) = self.sigs.get(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -748,6 +770,90 @@ impl<'a> Checker<'a> {
                 Scalar::Int(IntTy { bits: 64, signed: true })
             }
         }
+    }
+
+    /// Builtin `error(code)` → an `Error` value (M2: an i32 code).
+    fn check_error_ctor(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'error' takes 1 argument, got {}", args.len()), span);
+        }
+        let arg = args
+            .first()
+            .map(|a| self.check_expr(a, Some(Ty::Int(IntTy { bits: 32, signed: true }))));
+        let args_hir = arg.into_iter().collect();
+        // Lower as a plain call to the runtime-less builtin; codegen treats `error` as
+        // identity on the i32 code, but the Align type is `Error`.
+        Expr { kind: ExprKind::Call { func: "error".to_string(), args: args_hir }, ty: Ty::ErrCode, span }
+    }
+
+    /// Builtins `Ok(x)` / `Err(e)`. Both payload types come from the expected
+    /// `Result<T, E>` (so both arms are typed even though only one is supplied).
+    fn check_result_ctor(&mut self, name: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'{name}' takes 1 argument, got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let (ok_exp, err_exp) = match expected {
+            Some(Ty::Result(o, e)) => (Some(scalar_to_ty(o)), Some(scalar_to_ty(e))),
+            _ => (None, None),
+        };
+        let is_ok = name == "Ok";
+        let arg = self.check_expr(&args[0], if is_ok { ok_exp } else { err_exp });
+        let arg_scalar = self.payload_scalar(arg.ty, args[0].span);
+
+        // The other arm's scalar must be known from context; otherwise we cannot form
+        // a complete Result type (M2 limitation).
+        let other = if is_ok { err_exp } else { ok_exp };
+        let other_scalar = match other.and_then(ty_to_scalar) {
+            Some(s) => s,
+            None => {
+                self.diags.error(
+                    format!("cannot infer the full Result type of `{name}` here (annotate the return type)"),
+                    span,
+                );
+                return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+            }
+        };
+        let (ty, kind) = if is_ok {
+            (Ty::Result(arg_scalar, other_scalar), ExprKind::ResultOk(Box::new(arg)))
+        } else {
+            (Ty::Result(other_scalar, arg_scalar), ExprKind::ResultErr(Box::new(arg)))
+        };
+        self.constrain(ty, expected, span);
+        Expr { kind, ty, span }
+    }
+
+    /// `expr?` — propagate. The operand must be `Result<T, E>` and the enclosing
+    /// function must return `Result<_, E>` (same `E`). Yields `T`.
+    fn check_try(&mut self, inner: &ast::Expr, span: Span) -> Expr {
+        let v = self.check_expr(inner, None);
+        let (ok, err) = match self.resolve(v.ty) {
+            Ty::Result(o, e) => (o, e),
+            Ty::Error => return Expr { kind: ExprKind::Try(Box::new(v)), ty: Ty::Error, span },
+            other => {
+                self.diags
+                    .error(format!("`?` expects a Result, got {}", ty_name(other)), span);
+                return Expr { kind: ExprKind::Try(Box::new(v)), ty: Ty::Error, span };
+            }
+        };
+        match self.resolve(self.ret_hint) {
+            Ty::Result(_, ret_err) if ret_err == err => {}
+            Ty::Result(_, ret_err) => self.diags.error(
+                format!(
+                    "`?` error type {} does not match the function's error type {}",
+                    scalar_name(err),
+                    scalar_name(ret_err)
+                ),
+                span,
+            ),
+            _ => self.diags.error(
+                "`?` can only be used in a function that returns a Result".to_string(),
+                span,
+            ),
+        }
+        Expr { kind: ExprKind::Try(Box::new(v)), ty: scalar_to_ty(ok), span }
     }
 
     /// `opt else fallback`. The fallback either yields the payload type or diverges via
@@ -836,12 +942,14 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Block(b) => self.finalize_block(b),
-            ExprKind::OptionSome(inner) => self.finalize_expr(inner),
+            ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
+            | ExprKind::Try(inner) => self.finalize_expr(inner),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);
             }
-            ExprKind::Int(_)
+            ExprKind::Unit
+            | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Bool(_)
@@ -878,9 +986,24 @@ fn ty_name(ty: Ty) -> String {
         Ty::Bool => "bool".to_string(),
         Ty::Char => "char".to_string(),
         Ty::Option(s) => format!("Option<{}>", scalar_name(s)),
+        Ty::Result(o, e) => format!("Result<{}, {}>", scalar_name(o), scalar_name(e)),
+        Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
+    }
+}
+
+/// A composite type argument must resolve to a concrete scalar in M2.
+fn scalar_arg(ty: Ty, what: &str, span: Span, diags: &mut Diagnostics) -> Option<Scalar> {
+    match ty_to_scalar(ty) {
+        Some(s) => Some(s),
+        None => {
+            if ty != Ty::Error {
+                diags.error(format!("{what} must be a scalar in M2, got {}", ty_name(ty)), span);
+            }
+            None
+        }
     }
 }
 
@@ -897,6 +1020,7 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
+        "Error" => Ty::ErrCode,
         "Option" => {
             let inner = match t.args.as_slice() {
                 [a] => resolve_type(a, struct_ids, diags),
@@ -905,16 +1029,28 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
                     return Ty::Error;
                 }
             };
-            match ty_to_scalar(inner) {
+            match scalar_arg(inner, "Option payload", t.span, diags) {
                 Some(s) => Ty::Option(s),
-                None if inner == Ty::Error => Ty::Error,
-                None => {
-                    diags.error(
-                        format!("Option payload must be a scalar in M2, got {}", ty_name(inner)),
-                        t.span,
-                    );
-                    Ty::Error
+                None => Ty::Error,
+            }
+        }
+        "Result" => {
+            let (ok, err) = match t.args.as_slice() {
+                [a, b] => (
+                    resolve_type(a, struct_ids, diags),
+                    resolve_type(b, struct_ids, diags),
+                ),
+                _ => {
+                    diags.error("Result takes two type arguments".to_string(), t.span);
+                    return Ty::Error;
                 }
+            };
+            match (
+                scalar_arg(ok, "Result ok payload", t.span, diags),
+                scalar_arg(err, "Result err payload", t.span, diags),
+            ) {
+                (Some(o), Some(e)) => Ty::Result(o, e),
+                _ => Ty::Error,
             }
         }
         _ => match parse_int_name(name) {
@@ -1036,6 +1172,29 @@ mod tests {
     fn bare_none_without_context_errors() {
         let (_p, d) = check("fn f() -> i32 {\n  x := None\n  return 0\n}\n");
         assert!(d.has_errors(), "None with no inferable Option type must error");
+    }
+
+    #[test]
+    fn result_program_checks() {
+        let (_p, d) = check(
+            "fn g(n: i32) -> Result<i32, Error> {\n  if n < 0 { return Err(error(1)) }\n  return Ok(n)\n}\nfn f() -> Result<i32, Error> {\n  x := g(2)?\n  return Ok(x)\n}\n",
+        );
+        assert!(!d.has_errors(), "a well-formed Result program should check");
+    }
+
+    #[test]
+    fn question_requires_result_returning_fn() {
+        // `?` in a function that doesn't return Result is an error.
+        let (_p, d) = check(
+            "fn g() -> Result<i32, Error> {\n  return Ok(1)\n}\nfn f() -> i32 {\n  x := g()?\n  return x\n}\n",
+        );
+        assert!(d.has_errors(), "`?` in a non-Result function must error");
+    }
+
+    #[test]
+    fn question_on_non_result_errors() {
+        let (_p, d) = check("fn f() -> Result<i32, Error> {\n  x := 1?\n  return Ok(x)\n}\n");
+        assert!(d.has_errors(), "`?` on a plain int must error");
     }
 
     #[test]

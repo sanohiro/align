@@ -79,10 +79,12 @@ fn build_module<'c>(
         })
         .collect();
 
-    // Pass 1: declare all functions so calls resolve regardless of order.
+    // Pass 1: declare all functions so calls resolve regardless of order. A
+    // `Result`-returning `main` is emitted under `align_main`; a C `main` wrapper is
+    // generated after the bodies (see below).
     let mut funcs: HashMap<String, FunctionValue<'c>> = HashMap::new();
     for f in &program.fns {
-        let fv = declare_fn(ctx, module, f);
+        let fv = declare_fn(ctx, module, f, symbol_name(f));
         funcs.insert(f.name.clone(), fv);
     }
     // Declare runtime builtins, keyed by the MIR call name they back.
@@ -108,6 +110,71 @@ fn build_module<'c>(
         }
         .emit_fn()?;
     }
+    // A Result-returning main needs a C `main` wrapper that maps Ok/Err to an exit code.
+    if let Some(f) = program.fns.iter().find(|f| f.name == "main" && matches!(f.ret, Ty::Result(..))) {
+        emit_main_wrapper(ctx, module, funcs["main"], f.ret)?;
+    }
+    Ok(())
+}
+
+/// The LLVM symbol for a function: a `Result`-returning `main` is emitted as
+/// `align_main` (the C `main` is a generated wrapper); everything else keeps its name.
+fn symbol_name(f: &Function) -> &str {
+    if f.name == "main" && matches!(f.ret, Ty::Result(..)) {
+        "align_main"
+    } else {
+        &f.name
+    }
+}
+
+/// Emit the C `main` for a `Result<(), Error>`-returning Align `main`: call it, and on
+/// `Err(code)` report the error and exit with `code`, else exit 0.
+fn emit_main_wrapper<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    align_main: FunctionValue<'c>,
+    ret: Ty,
+) -> Result<(), CodegenError> {
+    let (ok, err) = match ret {
+        Ty::Result(o, e) => (o, e),
+        _ => return Err(CodegenError::Lowering("main wrapper on a non-Result".into())),
+    };
+    let lower = |e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string());
+    let i32t = ctx.i32_type();
+    let report = module.add_function(
+        "align_rt_report_error",
+        ctx.void_type().fn_type(&[i32t.into()], false),
+        None,
+    );
+    let main = module.add_function("main", i32t.fn_type(&[], false), None);
+    let builder = ctx.create_builder();
+    let entry = ctx.append_basic_block(main, "entry");
+    builder.position_at_end(entry);
+
+    let res = builder
+        .build_call(align_main, &[], "r")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("main returned void".into()))?
+        .into_struct_value();
+    let rty = result_struct_type(ctx, ok, err);
+    let _ = rty; // res already has this type
+    let tag = builder.build_extract_value(res, 0, "tag").map_err(lower)?.into_int_value();
+    let is_err = builder
+        .build_int_compare(IntPredicate::NE, tag, ctx.i8_type().const_int(0, false), "iserr")
+        .map_err(lower)?;
+    let err_bb = ctx.append_basic_block(main, "err");
+    let ok_bb = ctx.append_basic_block(main, "ok");
+    builder.build_conditional_branch(is_err, err_bb, ok_bb).map_err(lower)?;
+
+    builder.position_at_end(err_bb);
+    let code = builder.build_extract_value(res, 2, "err").map_err(lower)?.into_int_value();
+    builder.build_call(report, &[code.into()], "").map_err(lower)?;
+    builder.build_return(Some(&code)).map_err(lower)?;
+
+    builder.position_at_end(ok_bb);
+    builder.build_return(Some(&i32t.const_int(0, false))).map_err(lower)?;
     Ok(())
 }
 
@@ -146,11 +213,24 @@ fn option_struct_type<'c>(ctx: &'c Context, s: Scalar) -> StructType<'c> {
     ctx.struct_type(&[ctx.i8_type().into(), scalar_type(ctx, scalar_to_ty(s))], false)
 }
 
-/// LLVM type for a function parameter/return (scalars + `Option`; structs are not
-/// passed by value in M1/M2).
+/// `Result<T, E>` lowers to `{ i8 tag, T ok, E err }` (tag 0 = Ok, 1 = Err).
+fn result_struct_type<'c>(ctx: &'c Context, ok: Scalar, err: Scalar) -> StructType<'c> {
+    ctx.struct_type(
+        &[
+            ctx.i8_type().into(),
+            scalar_type(ctx, scalar_to_ty(ok)),
+            scalar_type(ctx, scalar_to_ty(err)),
+        ],
+        false,
+    )
+}
+
+/// LLVM type for a function parameter/return (scalars + `Option`/`Result`; structs are
+/// not passed by value in M1/M2).
 fn abi_type<'c>(ctx: &'c Context, ty: Ty) -> BasicTypeEnum<'c> {
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s).into(),
+        Ty::Result(o, e) => result_struct_type(ctx, o, e).into(),
         _ => scalar_type(ctx, ty),
     }
 }
@@ -168,7 +248,7 @@ fn int_bits(ty: Ty) -> u32 {
     }
 }
 
-fn declare_fn<'c>(ctx: &'c Context, module: &Module<'c>, f: &Function) -> FunctionValue<'c> {
+fn declare_fn<'c>(ctx: &'c Context, module: &Module<'c>, f: &Function, symbol: &str) -> FunctionValue<'c> {
     let param_types: Vec<BasicMetadataTypeEnum> = f
         .params
         .iter()
@@ -179,7 +259,7 @@ fn declare_fn<'c>(ctx: &'c Context, module: &Module<'c>, f: &Function) -> Functi
     } else {
         abi_type(ctx, f.ret).fn_type(&param_types, false)
     };
-    module.add_function(&f.name, fn_ty, None)
+    module.add_function(symbol, fn_ty, None)
 }
 
 struct FnGen<'c, 'a> {
@@ -359,6 +439,66 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_extract_value(agg, 1, "some")
                     .map_err(|e| self.err(e))?
             }
+            Rvalue::ResultOk(op) => {
+                let Ty::Result(o, e) = result_ty else {
+                    return Err(self.err("Ok result is not a Result"));
+                };
+                let rty = result_struct_type(self.ctx, o, e);
+                let tag = self.ctx.i8_type().const_int(0, false);
+                let agg = self
+                    .builder
+                    .build_insert_value(rty.get_undef(), tag, 0, "tag")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(agg, self.operand(op), 1, "ok")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
+            Rvalue::ResultErr(op) => {
+                let Ty::Result(o, e) = result_ty else {
+                    return Err(self.err("Err result is not a Result"));
+                };
+                let rty = result_struct_type(self.ctx, o, e);
+                let tag = self.ctx.i8_type().const_int(1, false);
+                let agg = self
+                    .builder
+                    .build_insert_value(rty.get_undef(), tag, 0, "tag")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(agg, self.operand(op), 2, "err")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
+            Rvalue::ResultIsOk(op) => {
+                let agg = self.operand(op).into_struct_value();
+                let tag = self
+                    .builder
+                    .build_extract_value(agg, 0, "tag")
+                    .map_err(|e| self.err(e))?
+                    .into_int_value();
+                self.builder
+                    .build_int_compare(IntPredicate::EQ, tag, self.ctx.i8_type().const_int(0, false), "isok")
+                    .map_err(|e| self.err(e))?
+                    .into()
+            }
+            Rvalue::ResultUnwrapOk(op) => {
+                let agg = self.operand(op).into_struct_value();
+                self.builder
+                    .build_extract_value(agg, 1, "ok")
+                    .map_err(|e| self.err(e))?
+            }
+            Rvalue::ResultUnwrapErr(op) => {
+                let agg = self.operand(op).into_struct_value();
+                self.builder
+                    .build_extract_value(agg, 2, "err")
+                    .map_err(|e| self.err(e))?
+            }
+            // `error(code)` is identity on the i32 code (the M2 Error repr).
+            Rvalue::Call(name, args) if name == "error" => self.operand(&args[0]),
             Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
             Rvalue::Call(name, args) => {
                 let callee = self.funcs[name];
@@ -378,6 +518,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         match ty {
             Ty::Struct(id) => self.struct_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s).into(),
+            Ty::Result(o, e) => result_struct_type(self.ctx, o, e).into(),
             _ => scalar_type(self.ctx, ty),
         }
     }
@@ -481,6 +622,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Operand::Const(Const::Float(v, ty)) => float_type(self.ctx, *ty).const_float(*v).into(),
             Operand::Const(Const::Char(v)) => self.ctx.i32_type().const_int(*v as u64, false).into(),
             Operand::Const(Const::Bool(v)) => self.ctx.bool_type().const_int(*v as u64, false).into(),
+            Operand::Const(Const::Unit) => self.ctx.i32_type().const_int(0, false).into(),
             Operand::Value(id) => self.values[id],
             Operand::Arg(i) => self.func.get_nth_param(*i).expect("param index in range"),
         }

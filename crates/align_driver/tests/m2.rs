@@ -45,3 +45,32 @@ fn option_else_unwrap_diverging_fallback() {
     let out = build_and_run("opt-diverge", &src);
     assert_eq!(out.status.code(), Some(42));
 }
+
+const TRY_GET: &str =
+    "fn try_get(n: i32) -> Result<i32, Error> {\n  if n < 0 { return Err(error(7)) }\n  return Ok(n)\n}\n";
+
+#[test]
+fn result_question_propagates_err_from_main() {
+    if !backend_available() {
+        return;
+    }
+    // try_get(-1) → Err(7); `?` propagates it out of main → reported, exit 7.
+    let src = format!("{TRY_GET}pub fn main() -> Result<(), Error> {{\n  x := try_get(-1)?\n  return Ok(())\n}}\n");
+    let out = build_and_run("res-err", &src);
+    assert_eq!(out.status.code(), Some(7));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("code 7"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn result_question_ok_path_exits_zero() {
+    if !backend_available() {
+        return;
+    }
+    let src = format!("{TRY_GET}pub fn main() -> Result<(), Error> {{\n  x := try_get(5)?\n  return Ok(())\n}}\n");
+    let out = build_and_run("res-ok", &src);
+    assert_eq!(out.status.code(), Some(0));
+}

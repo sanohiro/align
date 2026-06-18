@@ -407,6 +407,10 @@ impl<'a> Parser<'a> {
                     },
                     span,
                 };
+            } else if self.at(&TokKind::Question) {
+                self.bump();
+                let span = e.span.merge(self.prev_span());
+                e = Expr { kind: ExprKind::Try(Box::new(e)), span };
             } else {
                 break;
             }
@@ -472,6 +476,12 @@ impl<'a> Parser<'a> {
             TokKind::If => self.parse_if(),
             TokKind::LParen => {
                 self.bump();
+                // `()` is the unit value; otherwise a parenthesized expression.
+                if self.at(&TokKind::RParen) {
+                    self.bump();
+                    let span = span.merge(self.prev_span());
+                    return Some(Expr { kind: ExprKind::Unit, span });
+                }
                 let e = self.parse_expr(0)?;
                 self.expect(&TokKind::RParen, "')'");
                 Some(e)
@@ -572,6 +582,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> Option<Type> {
+        // The unit type `()`.
+        if self.at(&TokKind::LParen) {
+            let start = self.span();
+            self.bump();
+            self.expect(&TokKind::RParen, "')'");
+            let span = start.merge(self.prev_span());
+            let seg = Ident { name: "()".to_string(), span };
+            return Some(Type { path: Path { segments: vec![seg], span }, args: Vec::new(), span });
+        }
         let path = self.parse_path();
         if path.segments.is_empty() {
             return None;

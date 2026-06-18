@@ -87,6 +87,7 @@ pub struct Expr {
 
 #[derive(Clone, Debug)]
 pub enum ExprKind {
+    Unit,
     Int(i128),
     Float(f64),
     Char(u32),
@@ -136,4 +137,11 @@ pub enum ExprKind {
         opt: Box<Expr>,
         fallback: Box<Expr>,
     },
+    /// `Ok(x)` — the expression `ty` is the resulting `Result<T, E>`.
+    ResultOk(Box<Expr>),
+    /// `Err(e)` — the expression `ty` is the resulting `Result<T, E>`.
+    ResultErr(Box<Expr>),
+    /// `expr?` — Result propagation; `ty` is the unwrapped ok payload type. Lowered
+    /// against the enclosing function's return type (carried by MIR).
+    Try(Box<Expr>),
 }

@@ -21,6 +21,14 @@ pub extern "C" fn align_rt_print_i64(x: i64) {
     let _ = writeln!(out, "{x}");
 }
 
+/// Report an `Err` returned from `main` (`docs/impl/06-runtime-std.md` §9). M2's `Error`
+/// is an i32 code; the process then exits with that code. The eventual Error sum type
+/// will carry a message/category here.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_report_error(code: i32) {
+    eprintln!("error: code {code}");
+}
+
 /// Immediate abort called on arithmetic traps / invariant violations (`draft.md` §5).
 /// Normally not called since overflow defaults to wrap.
 pub fn panic_abort(msg: &str) -> ! {

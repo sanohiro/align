@@ -41,13 +41,23 @@ Completion condition (met): control-flow + struct/float/char programs compile an
 
 ## M2 — Errors and Existence (Result / Option / ?)
 
-- `Option<T>` (no null), extraction via `else`.
-- `Result<T,E>` and the `?` operator → desugared in MIR to early return + cold path.
-- Make the `pub fn main(...) -> Result<(), Error>` form work.
-- Start from a single `Error` type (the error type design in `open-questions.md` is finalized within M2).
+- [done] `Option<T>` (no null), extraction via `else` (braced diverging form or a
+  value fallback).
+- [done] `Result<T,E>` and the `?` operator → desugared in MIR to early return + cold
+  path (the `Err` edge).
+- [done] The `pub fn main(...) -> Result<(), Error>` form (lowered to `align_main`
+  with a generated C `main` wrapper → `align_rt_report_error` + exit code).
+- [done, minimal] A single `Error` type — **M2 placeholder: an i32 code**. The full
+  error-type design (messages, categories, `Error.Variant`) stays Open in
+  `open-questions.md` and is not yet built.
 
-Completion condition: an example that propagates a failure via `?` runs (using a
-thin M2 fixture builtin, **not** full `std.fs` — see scope below).
+Status: **M2 vertical slice COMPLETE.** `examples/option.align` and
+`examples/result.align` run (`result.align` propagates `Err(7)` out of `main` →
+`error: code 7`, exit 7). Constructors `Some`/`None`/`Ok`/`Err`/`error` are sema
+builtins; payloads are scalar-only (the documented M2 cut).
+
+Completion condition (met): an example propagates a failure via `?` (using the
+`error(code)` builtin fixture, **not** full `std.fs` — see scope below).
 
 ### M2 implementation decisions (locked, to avoid rework)
 
