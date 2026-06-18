@@ -1,4 +1,4 @@
-//! M2 end-to-end: Option / `else`-unwrap (and, later, Result / `?`).
+//! M2 end-to-end: Option / `else`-unwrap and Result / `?` (incl. Result-returning main).
 //! Requires LLVM/cc, so skip where they are absent.
 
 use align_driver::{backend_available, check, emit_object_file, link_executable, lower_to_mir};
@@ -73,4 +73,15 @@ fn result_question_ok_path_exits_zero() {
     let src = format!("{TRY_GET}pub fn main() -> Result<(), Error> {{\n  x := try_get(5)?\n  return Ok(())\n}}\n");
     let out = build_and_run("res-ok", &src);
     assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn err_code_zero_still_exits_nonzero() {
+    if !backend_available() {
+        return;
+    }
+    // Err(0) must not be mistaken for success: the exit code is clamped to nonzero.
+    let src = "fn f() -> Result<i32, Error> {\n  return Err(error(0))\n}\npub fn main() -> Result<(), Error> {\n  x := f()?\n  return Ok(())\n}\n";
+    let out = build_and_run("res-zero", src);
+    assert_eq!(out.status.code(), Some(1), "Err(0) clamps to exit 1");
 }

@@ -141,9 +141,10 @@ fn emit_main_wrapper<'c>(
     };
     let lower = |e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string());
     let i32t = ctx.i32_type();
+    // Returns the clamped (nonzero u8) exit code; reporting/clamping live in the runtime.
     let report = module.add_function(
         "align_rt_report_error",
-        ctx.void_type().fn_type(&[i32t.into()], false),
+        i32t.fn_type(&[i32t.into()], false),
         None,
     );
     let main = module.add_function("main", i32t.fn_type(&[], false), None);
@@ -170,8 +171,14 @@ fn emit_main_wrapper<'c>(
 
     builder.position_at_end(err_bb);
     let code = builder.build_extract_value(res, 2, "err").map_err(lower)?.into_int_value();
-    builder.build_call(report, &[code.into()], "").map_err(lower)?;
-    builder.build_return(Some(&code)).map_err(lower)?;
+    let exit = builder
+        .build_call(report, &[code.into()], "exit")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("report returned void".into()))?
+        .into_int_value();
+    builder.build_return(Some(&exit)).map_err(lower)?;
 
     builder.position_at_end(ok_bb);
     builder.build_return(Some(&i32t.const_int(0, false))).map_err(lower)?;

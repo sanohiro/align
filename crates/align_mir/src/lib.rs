@@ -237,10 +237,15 @@ fn lower_fn(f: &hir::Fn) -> Function {
     }
 }
 
-/// Lower a block; returns its trailing value operand if any.
+/// Lower a block; returns its trailing value operand if any. If a statement diverges
+/// (e.g. `return`), the current block becomes terminated and the rest of the block —
+/// including its trailing value — is dead code and is not lowered.
 fn lower_block(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
     for s in &block.stmts {
         lower_stmt(b, s);
+        if b.is_terminated() {
+            return None;
+        }
     }
     block.value.as_ref().map(|e| lower_expr(b, e))
 }
@@ -272,9 +277,8 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         hir::Stmt::Return(value) => {
             let op = value.as_ref().map(|e| lower_expr(b, e));
             b.terminate(Term::Return(op));
-            // Start a fresh (unreachable) block so later statements stay well-formed.
-            let dead = b.new_block();
-            b.cur = dead;
+            // The current block is now terminated; `lower_block` stops here, so no dead
+            // block is created and callers can see the divergence via `is_terminated`.
         }
         hir::Stmt::Expr(e) => {
             let _ = lower_expr(b, e);
@@ -367,6 +371,8 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(r.clone())));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
+    // NOTE: the Err edge is the designed "cold" path, but this is a plain branch — LLVM
+    // branch-weight / cold metadata is not emitted yet (a later codegen optimization).
     b.terminate(Term::Branch(Operand::Value(is_ok), ok_bb, err_bb));
 
     // Err: extract the error and early-return Err(err) of the function's return type.

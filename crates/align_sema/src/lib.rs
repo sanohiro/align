@@ -161,7 +161,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                     let ty = resolve_type(&f.ty, &struct_ids, diags);
                     if matches!(ty, Ty::Struct(_)) {
                         diags.error(
-                            "struct fields must be primitive types in M1 (nested structs come later)"
+                            "struct fields must be primitive types (nested structs are not supported yet)"
                                 .to_string(),
                             f.span,
                         );
@@ -321,6 +321,11 @@ impl<'a> Checker<'a> {
     }
 
     fn check_fn(&mut self, f: &ast::FnDecl) -> Fn {
+        // M2 `main` takes no arguments; `main(args: array<str>)` (draft.md §17) is future.
+        if f.name.name == "main" && !f.params.is_empty() {
+            self.diags
+                .error("main takes no arguments (argv support comes later)".to_string(), f.span);
+        }
         let sig = &self.sigs[&f.name.name];
         let ret = sig.ret;
         let param_tys = sig.params.clone();
@@ -444,7 +449,7 @@ impl<'a> Checker<'a> {
             1 => {
                 if matches!(local_ty, Ty::Struct(_)) {
                     self.diags.error(
-                        "cannot assign a whole struct in M1; assign individual fields".to_string(),
+                        "cannot assign a whole struct; assign individual fields".to_string(),
                         place.span,
                     );
                     return Place::Err;
@@ -460,7 +465,7 @@ impl<'a> Checker<'a> {
             }
             _ => {
                 self.diags
-                    .error("nested field access is not supported in M1".to_string(), place.span);
+                    .error("nested field access is not supported yet".to_string(), place.span);
                 Place::Err
             }
         }
@@ -535,7 +540,7 @@ impl<'a> Checker<'a> {
             ast::ExprKind::Try(inner) => self.check_try(inner, e.span),
             ast::ExprKind::StructLit { .. } => {
                 self.diags.error(
-                    "struct literals are only allowed as `name := Type { ... }` in M1".to_string(),
+                    "struct literals are only allowed as `name := Type { ... }`".to_string(),
                     e.span,
                 );
                 Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span }
@@ -572,7 +577,7 @@ impl<'a> Checker<'a> {
             1 => {
                 if matches!(local_ty, Ty::Struct(_)) {
                     self.diags.error(
-                        "cannot use a struct value directly in M1 (access its fields)".to_string(),
+                        "cannot use a struct value directly (access its fields)".to_string(),
                         span,
                     );
                     return err(span);
@@ -589,7 +594,7 @@ impl<'a> Checker<'a> {
             },
             _ => {
                 self.diags
-                    .error("nested field access is not supported in M1".to_string(), span);
+                    .error("nested field access is not supported yet".to_string(), span);
                 err(span)
             }
         }
@@ -724,7 +729,7 @@ impl<'a> Checker<'a> {
                 let e = self.check_expr(a, None);
                 if !e.ty.is_int_like() && e.ty != Ty::Error {
                     self.diags
-                        .error("'print' expects an integer (M1)".to_string(), e.span);
+                        .error("'print' expects an integer".to_string(), e.span);
                 }
                 e
             })
@@ -765,7 +770,7 @@ impl<'a> Checker<'a> {
             None => {
                 if f != Ty::Error {
                     self.diags
-                        .error(format!("Option payload must be a scalar in M2, got {}", ty_name(f)), span);
+                        .error(format!("Option payload must be a scalar (composite payloads are not supported yet), got {}", ty_name(f)), span);
                 }
                 Scalar::Int(IntTy { bits: 64, signed: true })
             }
@@ -1000,7 +1005,7 @@ fn scalar_arg(ty: Ty, what: &str, span: Span, diags: &mut Diagnostics) -> Option
         Some(s) => Some(s),
         None => {
             if ty != Ty::Error {
-                diags.error(format!("{what} must be a scalar in M2, got {}", ty_name(ty)), span);
+                diags.error(format!("{what} must be a scalar (composite payloads are not supported yet), got {}", ty_name(ty)), span);
             }
             None
         }
@@ -1058,7 +1063,7 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
             None => match struct_ids.get(name) {
                 Some(&id) => Ty::Struct(id),
                 None => {
-                    diags.error(format!("unsupported type in M1: '{name}'"), t.span);
+                    diags.error(format!("unknown type: '{name}'"), t.span);
                     Ty::Error
                 }
             },
@@ -1189,6 +1194,12 @@ mod tests {
             "fn g() -> Result<i32, Error> {\n  return Ok(1)\n}\nfn f() -> i32 {\n  x := g()?\n  return x\n}\n",
         );
         assert!(d.has_errors(), "`?` in a non-Result function must error");
+    }
+
+    #[test]
+    fn main_with_arguments_errors() {
+        let (_p, d) = check("fn main(n: i32) -> i32 {\n  return n\n}\n");
+        assert!(d.has_errors(), "main with arguments must error in M2");
     }
 
     #[test]

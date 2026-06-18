@@ -75,8 +75,10 @@ Scope
 
 Error (M2 minimal)
 - `Error` is an opaque i32 error code (placeholder; the full message/category
-  design in open-questions stays Open). `report(e)` prints "error: code <n>" to
-  stderr; the process exit code is <n> clamped to a nonzero u8.
+  design in open-questions stays Open). The `error(code)` builtin makes one.
+  `align_rt_report_error` prints "error: code <n>" to stderr and returns the exit
+  code: the original code clamped to a nonzero u8 (`code.clamp(1, 255)`), so a
+  failure never reads as success (exit 0) and never wraps past the 8-bit range.
 
 Type representation in the compiler (keeps `Ty: Copy`)
 - Add a Copy `Scalar` enum (the var-free scalar subset) and
@@ -86,10 +88,13 @@ Type representation in the compiler (keeps `Ty: Copy`)
   inference variables living inside a composite type — acceptable for M2.
 
 Runtime ABI for Result-returning main (locked)
+- M2 `main` takes no arguments (sema rejects params); `main(args: array<str>)`
+  (`draft.md` §17) is future. Both `-> i32` and `-> Result<(), Error>` are allowed.
 - `fn main() -> i32` stays the C entry unchanged (M0/M1 behavior preserved).
 - `fn main() -> Result<(), Error>` is lowered under the symbol `align_main`;
   codegen emits a C `main` wrapper that calls it, and on `Err(code)` calls the
-  runtime `align_rt_report_error(i32)` and returns the code, else returns 0.
+  runtime `align_rt_report_error(i32) -> i32` (reports + returns the clamped exit
+  code) and returns that, else returns 0.
   (Matches `06-runtime-std.md` §9's align_rt_start intent, minimal form.)
 
 Lowering

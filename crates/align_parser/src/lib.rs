@@ -161,7 +161,7 @@ impl<'a> Parser<'a> {
             let fname = self.parse_ident("field name")?;
             if !self.eat(&TokKind::Colon) {
                 self.diags
-                    .error("expected ':' (M1 type declarations are struct-only)", self.span());
+                    .error("expected ':' (only struct type declarations are supported)", self.span());
                 return None;
             }
             let ty = self.parse_type()?;

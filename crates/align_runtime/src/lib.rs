@@ -22,11 +22,14 @@ pub extern "C" fn align_rt_print_i64(x: i64) {
 }
 
 /// Report an `Err` returned from `main` (`docs/impl/06-runtime-std.md` §9). M2's `Error`
-/// is an i32 code; the process then exits with that code. The eventual Error sum type
-/// will carry a message/category here.
+/// is an i32 code; the original code is reported, and the returned value is the process
+/// exit code — clamped to a nonzero `u8` so a failure never looks like success (exit 0)
+/// and never wraps past the 8-bit Unix exit range. The eventual Error sum type will
+/// carry a message/category here.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_report_error(code: i32) {
+pub extern "C" fn align_rt_report_error(code: i32) -> i32 {
     eprintln!("error: code {code}");
+    code.clamp(1, 255)
 }
 
 /// Immediate abort called on arithmetic traps / invariant violations (`draft.md` §5).
