@@ -43,6 +43,17 @@ fn arena_freed_on_early_return() {
 }
 
 #[test]
+fn clone_keeps_original_usable() {
+    if !backend_available() {
+        return;
+    }
+    // p.clone() deep-copies; both p and q stay valid. 7 + 7 = 14.
+    let src = "fn main() -> i32 {\n  arena {\n    p: box<i32> := heap.new(7)\n    q: box<i32> := p.clone()\n    p.get() + q.get()\n  }\n}\n";
+    let out = build_and_run("clone", src);
+    assert_eq!(out.status.code(), Some(14));
+}
+
+#[test]
 fn arena_emits_begin_and_end() {
     let mut sm = SourceMap::new();
     let src = "fn main() -> i32 {\n  r: i32 := arena {\n    p: box<i32> := heap.new(1)\n    p.get()\n  }\n  return r\n}\n";

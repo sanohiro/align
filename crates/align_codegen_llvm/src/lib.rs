@@ -584,6 +584,31 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_load(ty, ptr, "boxget")
                     .map_err(|e| self.err(e))?
             }
+            Rvalue::BoxClone(handle, src) => {
+                let Ty::Box(s) = result_ty else {
+                    return Err(self.err("clone result is not a box"));
+                };
+                let ty = scalar_type(self.ctx, scalar_to_ty(s));
+                let i64t = self.ctx.i64_type();
+                let bytes = scalar_bytes(s);
+                // Allocate a fresh box, then copy the value over.
+                let new_ptr = self
+                    .builder
+                    .build_call(
+                        self.funcs["arena_alloc"],
+                        &[self.operand(handle).into(), i64t.const_int(bytes, false).into(), i64t.const_int(bytes, false).into()],
+                        "clone",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("arena_alloc returns a pointer")
+                    .into_pointer_value();
+                let src_ptr = self.operand(src).into_pointer_value();
+                let val = self.builder.build_load(ty, src_ptr, "cloneval").map_err(|e| self.err(e))?;
+                self.builder.build_store(new_ptr, val).map_err(|e| self.err(e))?;
+                new_ptr.into()
+            }
             // `error(code)` is identity on the i32 code (the M2 Error repr).
             Rvalue::Call(name, args) if name == "error" => self.operand(&args[0]),
             Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),

@@ -214,7 +214,113 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             Some(cx.check_fn(f))
         })
         .collect();
-    Program { fns, structs }
+    let program = Program { fns, structs };
+    // Pass 3 (partial): move / use-after-move checking (`03-types.md` §6).
+    for f in &program.fns {
+        MoveCheck { f, diags }.check();
+    }
+    program
+}
+
+/// Flow analysis that flags use-after-move. A Move-typed value (M3: `box<T>`) is
+/// consumed when bound/assigned/passed/returned by value; using it afterwards is an
+/// error. Borrowing positions (`.get()`/`.clone()` receiver, operands) do not consume.
+struct MoveCheck<'a> {
+    f: &'a Fn,
+    diags: &'a mut Diagnostics,
+}
+
+impl<'a> MoveCheck<'a> {
+    fn check(&mut self) {
+        let mut moved = std::collections::HashSet::new();
+        self.block(&self.f.body, &mut moved);
+    }
+
+    fn is_move(&self, id: LocalId) -> bool {
+        matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_)))
+    }
+
+    fn block(&mut self, b: &Block, moved: &mut std::collections::HashSet<LocalId>) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Let { local, init } => {
+                    self.expr(init, moved, true);
+                    moved.remove(local);
+                }
+                Stmt::Assign { local, value } => {
+                    self.expr(value, moved, true);
+                    moved.remove(local);
+                }
+                Stmt::AssignField { value, .. } => self.expr(value, moved, true),
+                Stmt::Return(Some(e)) => self.expr(e, moved, true),
+                Stmt::Return(None) => {}
+                Stmt::Expr(e) => self.expr(e, moved, false),
+            }
+        }
+        if let Some(v) = &b.value {
+            self.expr(v, moved, false);
+        }
+    }
+
+    /// `consuming` = this position takes a Move value by value (so it moves it).
+    fn expr(&mut self, e: &Expr, moved: &mut std::collections::HashSet<LocalId>, consuming: bool) {
+        match &e.kind {
+            ExprKind::Local(id) => {
+                if moved.contains(id) {
+                    let name = &self.f.locals[*id as usize].name;
+                    self.diags.error(format!("use of moved value '{name}'"), e.span);
+                } else if consuming && self.is_move(*id) {
+                    moved.insert(*id);
+                }
+            }
+            ExprKind::Field { base, .. } => {
+                if moved.contains(base) {
+                    let name = &self.f.locals[*base as usize].name;
+                    self.diags.error(format!("use of moved value '{name}'"), e.span);
+                }
+            }
+            ExprKind::Unary { expr, .. } => self.expr(expr, moved, false),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.expr(lhs, moved, false);
+                self.expr(rhs, moved, false);
+            }
+            // Value arguments / wrapped payloads are consumed.
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.expr(a, moved, true);
+                }
+            }
+            ExprKind::StructLit { fields, .. } => {
+                for f in fields {
+                    self.expr(f, moved, true);
+                }
+            }
+            ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
+            | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true),
+            // The receiver is borrowed, not consumed.
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) => self.expr(i, moved, false),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.expr(opt, moved, true);
+                self.expr(fallback, moved, false);
+            }
+            ExprKind::Block(b) | ExprKind::Arena(b) => self.block(b, moved),
+            ExprKind::If { cond, then, els } => {
+                self.expr(cond, moved, false);
+                let mut m1 = moved.clone();
+                self.block(then, &mut m1);
+                let mut m2 = moved.clone();
+                self.block(els, &mut m2);
+                // Conservative join: moved if moved on either path.
+                *moved = &m1 | &m2;
+            }
+            ExprKind::Unit
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_)
+            | ExprKind::OptionNone => {}
+        }
+    }
 }
 
 struct Checker<'a> {
@@ -546,11 +652,17 @@ impl<'a> Checker<'a> {
             }
             ast::ExprKind::Try(inner) => self.check_try(inner, e.span),
             ast::ExprKind::Arena(b) => {
+                let diverges = ast_block_diverges(b);
                 self.arena_depth += 1;
-                let block = self.check_block(b, expected);
+                let block = self.check_block(b, if diverges { None } else { expected });
                 self.arena_depth -= 1;
-                let ty = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
-                self.constrain(ty, expected, e.span);
+                let ty = if diverges {
+                    expected.unwrap_or(Ty::Unit)
+                } else {
+                    let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
+                    self.constrain(t, expected, e.span);
+                    t
+                };
                 Expr { kind: ExprKind::Arena(block), ty, span: e.span }
             }
             ast::ExprKind::StructLit { .. } => {
@@ -562,6 +674,13 @@ impl<'a> Checker<'a> {
             }
             ast::ExprKind::If { cond, then, els } => self.check_if(cond, then, els.as_deref(), expected, e.span),
             ast::ExprKind::Block(b) => {
+                // A block that always returns never yields a value; let it take the
+                // expected type so it fits any value position.
+                if ast_block_diverges(b) {
+                    let block = self.check_block(b, None);
+                    let ty = expected.unwrap_or(Ty::Unit);
+                    return Expr { kind: ExprKind::Block(block), ty, span: e.span };
+                }
                 let block = self.check_block(b, expected);
                 let ty = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                 Expr { kind: ExprKind::Block(block), ty, span: e.span }
@@ -815,10 +934,33 @@ impl<'a> Checker<'a> {
         let recv_expr = Expr { kind: ExprKind::Local(id), ty: recv_ty, span };
         match method {
             "get" => self.check_box_get(recv_expr, recv_ty, args, span),
+            "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
             _ => {
                 self.diags
                     .error(format!("unknown method '.{method}()' on {}", ty_name(recv_ty)), span);
                 err(span)
+            }
+        }
+    }
+
+    /// `b.clone()` — deep-copy a `box<T>`. Allocates a fresh box, so it needs an arena.
+    fn check_box_clone(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], span: Span) -> Expr {
+        if !args.is_empty() {
+            self.diags.error("'clone' takes no arguments".to_string(), span);
+        }
+        match recv_ty {
+            Ty::Box(s) => {
+                if self.arena_depth == 0 {
+                    self.diags
+                        .error("clone allocates; it must be used inside an `arena {}` block".to_string(), span);
+                }
+                Expr { kind: ExprKind::BoxClone(Box::new(recv)), ty: Ty::Box(s), span }
+            }
+            Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
+            other => {
+                self.diags
+                    .error(format!("'.clone()' is only available on box<T> in M3, got {}", ty_name(other)), span);
+                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
             }
         }
     }
@@ -1030,9 +1172,8 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner) => {
-                self.finalize_expr(inner)
-            }
+            | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
+            | ExprKind::BoxClone(inner) => self.finalize_expr(inner),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);
@@ -1049,11 +1190,17 @@ impl<'a> Checker<'a> {
     }
 }
 
+/// Whether a block always diverges (no tail value and its last statement is `return`),
+/// so it never yields a value and need not match an expected value type.
+fn ast_block_diverges(b: &ast::Block) -> bool {
+    b.tail.is_none() && matches!(b.stmts.last(), Some(ast::Stmt::Return(_)))
+}
+
 /// Whether a braced `else { … }` fallback diverges (its last statement is `return`),
 /// in which case it produces no value and need not match the payload type.
 fn block_diverges(e: &ast::Expr) -> bool {
     match &e.kind {
-        ast::ExprKind::Block(b) => b.tail.is_none() && matches!(b.stmts.last(), Some(ast::Stmt::Return(_))),
+        ast::ExprKind::Block(b) => ast_block_diverges(b),
         _ => false,
     }
 }
@@ -1301,6 +1448,22 @@ mod tests {
             "fn main() -> i32 {\n  r: i32 := arena {\n    p: box<i32> := heap.new(5)\n    p.get()\n  }\n  return r\n}\n",
         );
         assert!(!d.has_errors(), "a well-formed arena/box program should check");
+    }
+
+    #[test]
+    fn use_after_move_errors() {
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  arena {\n    p: box<i32> := heap.new(7)\n    q: box<i32> := p\n    return p.get()\n  }\n}\n",
+        );
+        assert!(d.has_errors(), "using a box after it is moved must error");
+    }
+
+    #[test]
+    fn clone_does_not_move() {
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  arena {\n    p: box<i32> := heap.new(7)\n    q: box<i32> := p.clone()\n    p.get() + q.get()\n  }\n}\n",
+        );
+        assert!(!d.has_errors(), "clone borrows; the original stays usable");
     }
 
     #[test]

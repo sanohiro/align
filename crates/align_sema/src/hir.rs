@@ -150,4 +150,6 @@ pub enum ExprKind {
     HeapNew(Box<Expr>),
     /// `b.get()` — read (copy) the value out of a `box<T>`.
     BoxGet(Box<Expr>),
+    /// `b.clone()` — deep-copy a `box<T>` into a fresh allocation in the enclosing arena.
+    BoxClone(Box<Expr>),
 }

@@ -111,6 +111,9 @@ pub enum Rvalue {
     HeapAlloc(Operand, Operand),
     /// Read (copy) the value out of a `box` operand.
     BoxGet(Operand),
+    /// Deep-copy a `box` into a fresh allocation. First operand is the arena handle,
+    /// second is the source box.
+    BoxClone(Operand, Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -402,6 +405,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let bx = lower_expr(b, inner);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::BoxClone(inner) => {
+            let src = lower_expr(b, inner);
+            let handle = *b.arenas.last().expect("clone outside an arena (sema-checked)");
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::BoxClone(Operand::Value(handle), src)));
             Operand::Value(v)
         }
         // sema only admits a struct literal as a `let` initializer (handled in lower_stmt).
