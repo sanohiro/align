@@ -180,10 +180,13 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 .iter()
                 .map(|f| {
                     let ty = resolve_type(&f.ty, &struct_ids, diags);
-                    if matches!(ty, Ty::Struct(_)) {
+                    // M1/M5 cut: fields are scalars only. This also keeps region-bearing
+                    // types (str/box) out of structs — so they can't escape an arena via
+                    // a field — and avoids non-scalar fields the struct layout can't hold
+                    // yet (str/slice/array/option/result/nested struct).
+                    if ty_to_scalar(ty).is_none() && ty != Ty::Error {
                         diags.error(
-                            "struct fields must be primitive types (nested structs are not supported yet)"
-                                .to_string(),
+                            format!("struct fields must be a primitive scalar for now, got {}", ty_name(ty)),
                             f.span,
                         );
                     }
@@ -285,16 +288,22 @@ impl<'a> EscapeCheck<'a> {
         self.block(&self.f.body, 0);
     }
 
-    fn is_box(ty: Ty) -> bool {
-        matches!(ty, Ty::Box(_))
+    /// Types whose values carry an arena region and so must be escape-checked: `box<T>`
+    /// (M3) and arena-backed `str` (M5 — `template`/concat allocate in the arena).
+    fn tracks_region(ty: Ty) -> bool {
+        matches!(ty, Ty::Box(_) | Ty::Str)
     }
 
-    /// The arena depth of the box a (box-typed) expression yields; 0 = no arena region.
-    /// Recurses through value-producing forms so a box can't slip out via an `if`/block
-    /// value. (Calls cannot yield a box — box params/returns are forbidden.)
+    /// The arena depth a region-bearing expression's value is bound to; 0 = no region
+    /// (a leaked/static str, a box param — none exist — etc.). Recurses through value
+    /// forms so it can't slip out via an `if`/block value.
     fn region_of(&self, e: &Expr, depth: u32) -> u32 {
         match &e.kind {
-            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => depth,
+            // Allocating producers are bound to the enclosing arena (0 outside any arena,
+            // where the result is leaked / process-lifetime and safe to return).
+            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => depth,
+            // `str + str` concatenation is also built in the enclosing arena.
+            ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => depth,
             ExprKind::Local(p) => *self.region.get(p).unwrap_or(&0),
             ExprKind::Block(b) => self.region_of_block(b, depth),
             ExprKind::If { then, els, .. } => {
@@ -322,14 +331,14 @@ impl<'a> EscapeCheck<'a> {
             Stmt::Let { local, init } => {
                 self.walk(init, depth);
                 self.decl_depth.insert(*local, depth);
-                if Self::is_box(init.ty) {
+                if Self::tracks_region(init.ty) {
                     let r = self.region_of(init, depth);
                     self.region.insert(*local, r);
                 }
             }
             Stmt::Assign { local, value } => {
                 self.walk(value, depth);
-                if Self::is_box(value.ty) {
+                if Self::tracks_region(value.ty) {
                     let r = self.region_of(value, depth);
                     let d = *self.decl_depth.get(local).unwrap_or(&0);
                     if d < r {
@@ -345,7 +354,7 @@ impl<'a> EscapeCheck<'a> {
             Stmt::AssignField { value, .. } => self.walk(value, depth),
             Stmt::Return(Some(e)) => {
                 self.walk(e, depth);
-                if Self::is_box(e.ty) && self.region_of(e, depth) >= 1 {
+                if Self::tracks_region(e.ty) && self.region_of(e, depth) >= 1 {
                     self.diags.error(
                         "cannot return a value allocated in an arena (it is freed at block end)".to_string(),
                         e.span,
@@ -364,7 +373,7 @@ impl<'a> EscapeCheck<'a> {
                 let inner = depth + 1;
                 self.block(b, inner);
                 if let Some(v) = &b.value {
-                    if Self::is_box(v.ty) && self.region_of(v, inner) >= inner {
+                    if Self::tracks_region(v.ty) && self.region_of(v, inner) >= inner {
                         self.diags.error(
                             "a value allocated in this arena cannot escape as the block's value".to_string(),
                             v.span,
@@ -2124,6 +2133,32 @@ mod tests {
         assert!(!ok.has_errors(), "str == str should check");
         let (_q, bad) = check("fn f(s: str) -> bool = s < \"x\"\n");
         assert!(bad.has_errors(), "str ordering must error");
+    }
+
+    #[test]
+    fn struct_str_field_rejected() {
+        // A region-bearing (str) field would let an arena str escape via the field, and
+        // isn't supported by the struct layout yet — reject it.
+        let (_p, d) = check("User { name: str }\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "str struct fields are not allowed yet");
+    }
+
+    #[test]
+    fn struct_float_field_ok() {
+        let (_p, d) = check("P { x: f64, y: f64 }\nfn main() -> i32 {\n  p := P{x: 1.5, y: 2.5}\n  if p.x + p.y > 3.0 { return 1 }\n  return 0\n}\n");
+        assert!(!d.has_errors(), "float struct fields should check");
+    }
+
+    #[test]
+    fn arena_backed_str_cannot_escape() {
+        let (_p, d) = check("fn f() -> str {\n  arena {\n    \"x\" + \"y\"\n  }\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "an arena-backed str must not escape its arena");
+    }
+
+    #[test]
+    fn non_arena_str_returns_ok() {
+        let (_p, d) = check("fn g(a: str, b: str) -> str = a + b\nfn h() -> str = \"lit\"\n");
+        assert!(!d.has_errors(), "a non-arena str is returnable (leaked / process-lifetime)");
     }
 
     #[test]
