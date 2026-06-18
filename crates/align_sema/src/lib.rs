@@ -180,10 +180,13 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 .iter()
                 .map(|f| {
                     let ty = resolve_type(&f.ty, &struct_ids, diags);
-                    if matches!(ty, Ty::Struct(_)) {
+                    // M1/M5 cut: fields are scalars only. This also keeps region-bearing
+                    // types (str/box) out of structs — so they can't escape an arena via
+                    // a field — and avoids non-scalar fields the struct layout can't hold
+                    // yet (str/slice/array/option/result/nested struct).
+                    if ty_to_scalar(ty).is_none() && ty != Ty::Error {
                         diags.error(
-                            "struct fields must be primitive types (nested structs are not supported yet)"
-                                .to_string(),
+                            format!("struct fields must be a primitive scalar for now, got {}", ty_name(ty)),
                             f.span,
                         );
                     }
@@ -2130,6 +2133,20 @@ mod tests {
         assert!(!ok.has_errors(), "str == str should check");
         let (_q, bad) = check("fn f(s: str) -> bool = s < \"x\"\n");
         assert!(bad.has_errors(), "str ordering must error");
+    }
+
+    #[test]
+    fn struct_str_field_rejected() {
+        // A region-bearing (str) field would let an arena str escape via the field, and
+        // isn't supported by the struct layout yet — reject it.
+        let (_p, d) = check("User { name: str }\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "str struct fields are not allowed yet");
+    }
+
+    #[test]
+    fn struct_float_field_ok() {
+        let (_p, d) = check("P { x: f64, y: f64 }\nfn main() -> i32 {\n  p := P{x: 1.5, y: 2.5}\n  if p.x + p.y > 3.0 { return 1 }\n  return 0\n}\n");
+        assert!(!d.has_errors(), "float struct fields should check");
     }
 
     #[test]

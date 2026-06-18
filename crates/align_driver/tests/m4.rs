@@ -68,6 +68,17 @@ fn pipeline_fuses_into_one_loop() {
 }
 
 #[test]
+fn struct_float_field_roundtrips() {
+    if !backend_available() {
+        return;
+    }
+    // Regression: float struct fields must use the float LLVM type (not i32). 1.5+2.5>3.
+    let src = "P { x: f64, y: f64 }\nfn main() -> i32 {\n  p := P{x: 1.5, y: 2.5}\n  if p.x + p.y > 3.0 { return 1 }\n  return 0\n}\n";
+    let out = build_and_run("struct-float", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn struct_array_projection_sum() {
     if !backend_available() {
         return;

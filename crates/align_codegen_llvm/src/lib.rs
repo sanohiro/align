@@ -74,8 +74,10 @@ fn build_module<'c>(
         .structs
         .iter()
         .map(|s| {
+            // Fields are scalars (sema-restricted); `scalar_type` is correct for floats
+            // (`int_type` would wrongly map them to i32).
             let fields: Vec<BasicTypeEnum> =
-                s.fields.iter().map(|f| int_type(ctx, f.ty).into()).collect();
+                s.fields.iter().map(|f| scalar_type(ctx, f.ty)).collect();
             ctx.struct_type(&fields, false)
         })
         .collect();
