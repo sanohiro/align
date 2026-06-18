@@ -76,6 +76,8 @@ pub enum Ty {
     /// `array<T>` of a fixed length — contiguous scalars. M4 (length known from the
     /// literal; dynamic-length arrays/slices come later).
     Array(Scalar, u32),
+    /// A fixed-length array of structs (AoS); `(struct_id, length)`. M4.
+    StructArray(u32, u32),
     /// An arena handle (internal; produced by `arena {}`, never written by the user).
     ArenaHandle,
     /// The `Error` type (M2: an i32 code).
@@ -133,6 +135,14 @@ impl Ty {
 struct FnSig {
     params: Vec<Ty>,
     ret: Ty,
+}
+
+/// A pipeline stage as collected from the AST (before type checking).
+enum RawStage {
+    Map(ast::Ident),
+    Where(ast::Ident),
+    WhereField(ast::Ident),
+    Project(ast::Ident),
 }
 
 /// An assignable location resolved by [`Checker::check_place`].
@@ -835,6 +845,13 @@ impl<'a> Checker<'a> {
                 self.check_field_access(recv, field, expected, e.span)
             }
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, None, e.span),
+            ast::ExprKind::FieldShorthand(_) => {
+                self.diags.error(
+                    "`.field` is only valid as a pipeline stage argument (e.g. `where(.active)`)".to_string(),
+                    e.span,
+                );
+                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span }
+            }
             ast::ExprKind::ElseUnwrap { opt, fallback } => {
                 self.check_else_unwrap(opt, fallback, expected, e.span)
             }
@@ -1168,6 +1185,38 @@ impl<'a> Checker<'a> {
                 .error("an empty array literal needs a type annotation (not supported yet)".to_string(), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
+        let n = elems.len() as u32;
+        // An array of struct literals → a struct array (AoS).
+        if let ast::ExprKind::StructLit { .. } = &elems[0].kind {
+            let mut checked = Vec::new();
+            let mut sid = None;
+            for e in elems {
+                let ast::ExprKind::StructLit { name, fields } = &e.kind else {
+                    self.diags.error("array elements must all be struct literals here".to_string(), e.span);
+                    continue;
+                };
+                let lit = self.check_struct_lit(name, fields, e.span);
+                if let Ty::Struct(id) = lit.ty {
+                    match sid {
+                        None => sid = Some(id),
+                        Some(prev) if prev != id => {
+                            self.diags.error("array elements must be the same struct type".to_string(), e.span);
+                        }
+                        _ => {}
+                    }
+                }
+                checked.push(lit);
+            }
+            return match sid {
+                Some(id) => Expr {
+                    kind: ExprKind::ArrayLit { elems: checked, elem: Ty::Struct(id) },
+                    ty: Ty::StructArray(id, n),
+                    span,
+                },
+                None => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
+            };
+        }
+        // Otherwise a scalar array.
         let first = self.check_expr(&elems[0], elem_expected);
         let elem_ty = first.ty;
         let mut checked = vec![first];
@@ -1175,36 +1224,70 @@ impl<'a> Checker<'a> {
             checked.push(self.check_expr(e, Some(elem_ty)));
         }
         let scalar = self.payload_scalar(elem_ty, span);
-        let n = elems.len() as u32;
-        Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar }, ty: Ty::Array(scalar, n), span }
+        Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar_to_ty(scalar) }, ty: Ty::Array(scalar, n), span }
     }
 
     /// Collect a pipeline `src.map(f).where(p)…` from the AST: the innermost receiver is
     /// the source array; `.map`/`.where` calls become ordered stages (source-first).
-    fn collect_pipeline<'e>(&mut self, e: &'e ast::Expr) -> (&'e ast::Expr, Vec<(ast::Ident, bool)>) {
-        if let ast::ExprKind::Call { callee, args } = &e.kind {
-            if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
-                let is_map = field.name == "map";
-                let is_where = field.name == "where";
-                if is_map || is_where {
-                    let fname = match args.as_slice() {
-                        [a] => self.pipeline_fn_name(a),
-                        _ => None,
-                    };
-                    let (src, mut stages) = self.collect_pipeline(recv);
-                    if let Some(fname) = fname {
-                        stages.push((fname, is_map));
-                    } else {
-                        self.diags.error(
-                            format!("'.{}()' needs a single named function", field.name),
-                            e.span,
-                        );
-                    }
-                    return (src, stages);
-                }
-            }
+    /// Check a `map`/`where` stage function against the current element type, returning
+    /// its return type. `is_pred` requires a `bool` result.
+    fn check_stage_fn(&mut self, fname: &ast::Ident, elem: Ty, is_pred: bool) -> Ty {
+        let Some(sig) = self.sigs.get(&fname.name) else {
+            self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
+            return Ty::Error;
+        };
+        let (params, ret) = (sig.params.clone(), sig.ret);
+        if params.len() != 1 || params[0] != elem {
+            self.diags.error(
+                format!("'{}' must take one {} argument here", fname.name, ty_name(elem)),
+                fname.span,
+            );
         }
-        (e, Vec::new())
+        if is_pred && ret != Ty::Bool {
+            self.diags
+                .error(format!("'where' predicate '{}' must return bool", fname.name), fname.span);
+        }
+        ret
+    }
+
+    fn collect_pipeline<'e>(&mut self, e: &'e ast::Expr) -> (&'e ast::Expr, Vec<RawStage>) {
+        match &e.kind {
+            // `.map(f)` / `.where(p)`
+            ast::ExprKind::Call { callee, args } => {
+                if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
+                    let is_map = field.name == "map";
+                    let is_where = field.name == "where";
+                    if is_map || is_where {
+                        let arg = if args.len() == 1 { Some(&args[0]) } else { None };
+                        let (src, mut stages) = self.collect_pipeline(recv);
+                        // `where(.field)` — a field predicate.
+                        if is_where {
+                            if let Some(ast::Expr { kind: ast::ExprKind::FieldShorthand(f), .. }) = arg {
+                                stages.push(RawStage::WhereField(f.clone()));
+                                return (src, stages);
+                            }
+                        }
+                        match arg.and_then(|a| self.pipeline_fn_name(a)) {
+                            Some(f) if is_map => stages.push(RawStage::Map(f)),
+                            Some(f) => stages.push(RawStage::Where(f)),
+                            None => self.diags.error(
+                                format!("'.{}()' needs a single named function or `.field`", field.name),
+                                e.span,
+                            ),
+                        }
+                        return (src, stages);
+                    }
+                }
+                (e, Vec::new())
+            }
+            // `.field` projection on an array.
+            ast::ExprKind::FieldAccess { recv, field } => {
+                let (src, mut stages) = self.collect_pipeline(recv);
+                stages.push(RawStage::Project(field.clone()));
+                (src, stages)
+            }
+            _ => (e, Vec::new()),
+        }
     }
 
     fn pipeline_fn_name(&self, a: &ast::Expr) -> Option<ast::Ident> {
@@ -1216,19 +1299,21 @@ impl<'a> Checker<'a> {
         None
     }
 
-    /// `src.map(f).where(p)….sum()` — a fused reduction. Threads the element type
-    /// through each stage and folds the final (numeric) element type with `+`.
+    /// `src.map(f).where(p).field….sum()` — a fused reduction. Threads the element type
+    /// through each stage (a struct array is projected to a scalar) and folds the final
+    /// numeric element type with `+`.
     fn check_array_sum(&mut self, recv: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         if !args.is_empty() {
             self.diags.error("'sum' takes no arguments".to_string(), span);
         }
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let (source_ast, raw_stages) = self.collect_pipeline(recv);
-        // Choose the expected element type for an inline literal source: the first
-        // stage's parameter type, or (with no stages) the sum's result type.
+        // Choose the expected element type for an inline scalar literal source: the
+        // first Map stage's parameter, or (with no stages) the sum's result type.
         let elem_expected = match raw_stages.first() {
-            Some((fname, _)) => self.sigs.get(&fname.name).and_then(|s| s.params.first().copied()),
+            Some(RawStage::Map(fname)) => self.sigs.get(&fname.name).and_then(|s| s.params.first().copied()),
             None => expected,
+            _ => None,
         };
         let source = match &source_ast.kind {
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, elem_expected, span),
@@ -1236,6 +1321,7 @@ impl<'a> Checker<'a> {
         };
         let mut elem = match source.ty {
             Ty::Array(s, _) => scalar_to_ty(s),
+            Ty::StructArray(id, _) => Ty::Struct(id),
             Ty::Error => return err,
             other => {
                 self.diags
@@ -1245,27 +1331,54 @@ impl<'a> Checker<'a> {
         };
 
         let mut stages = Vec::new();
-        for (fname, is_map) in raw_stages {
-            let Some(sig) = self.sigs.get(&fname.name) else {
-                self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
-                return err;
-            };
-            let (params, ret) = (sig.params.clone(), sig.ret);
-            if params.len() != 1 || params[0] != elem {
-                self.diags.error(
-                    format!("'{}' must take one {} argument here", fname.name, ty_name(elem)),
-                    fname.span,
-                );
-            }
-            if is_map {
-                stages.push(Stage { kind: StageKind::Map, func: fname.name.clone(), out_ty: ret });
-                elem = ret;
-            } else {
-                if ret != Ty::Bool {
-                    self.diags
-                        .error(format!("'where' predicate '{}' must return bool", fname.name), fname.span);
+        for raw in raw_stages {
+            match raw {
+                RawStage::Project(field) => {
+                    if !matches!(elem, Ty::Struct(_)) {
+                        self.diags.error(
+                            format!("'.{}' projection needs a struct element, got {}", field.name, ty_name(elem)),
+                            field.span,
+                        );
+                        return err;
+                    }
+                    match self.field_of(elem, &field.name, field.span) {
+                        Some((index, ty)) => {
+                            stages.push(Stage { kind: StageKind::Project { field: index }, out_ty: ty });
+                            elem = ty;
+                        }
+                        None => return err,
+                    }
                 }
-                stages.push(Stage { kind: StageKind::Where, func: fname.name.clone(), out_ty: elem });
+                RawStage::Map(fname) => {
+                    let ret = self.check_stage_fn(&fname, elem, false);
+                    stages.push(Stage { kind: StageKind::Map { func: fname.name }, out_ty: ret });
+                    elem = ret;
+                }
+                RawStage::Where(fname) => {
+                    self.check_stage_fn(&fname, elem, true);
+                    stages.push(Stage { kind: StageKind::Where { func: fname.name }, out_ty: elem });
+                }
+                RawStage::WhereField(field) => {
+                    if !matches!(elem, Ty::Struct(_)) {
+                        self.diags.error(
+                            format!("'where(.{})' needs a struct element, got {}", field.name, ty_name(elem)),
+                            field.span,
+                        );
+                        return err;
+                    }
+                    match self.field_of(elem, &field.name, field.span) {
+                        Some((index, fty)) => {
+                            if fty != Ty::Bool {
+                                self.diags.error(
+                                    format!("'where(.{})' field must be bool, got {}", field.name, ty_name(fty)),
+                                    field.span,
+                                );
+                            }
+                            stages.push(Stage { kind: StageKind::WhereField { field: index }, out_ty: elem });
+                        }
+                        None => return err,
+                    }
+                }
             }
         }
 
@@ -1567,6 +1680,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Result(o, e) => format!("Result<{}, {}>", scalar_name(o), scalar_name(e)),
         Ty::Box(s) => format!("box<{}>", scalar_name(s)),
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
+        Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
@@ -1805,6 +1919,30 @@ mod tests {
             "fn dbl(x: i32) -> i32 = x * 2\nfn big(x: i32) -> bool = x > 4\nfn main() -> i32 {\n  return [1, 2, 3].map(dbl).where(big).sum()\n}\n",
         );
         assert!(!d.has_errors(), "a well-formed map/where/sum pipeline should check");
+    }
+
+    #[test]
+    fn struct_array_projection_checks() {
+        let (_p, d) = check(
+            "Pt { x: i32, y: i32 }\nfn main() -> i32 {\n  return [Pt{x: 1, y: 2}, Pt{x: 3, y: 4}].x.sum()\n}\n",
+        );
+        assert!(!d.has_errors(), "struct array projection + sum should check");
+    }
+
+    #[test]
+    fn where_field_predicate_checks() {
+        let (_p, d) = check(
+            "Emp { pay: i32, active: bool }\nfn main() -> i32 {\n  return [Emp{pay: 1, active: true}].where(.active).pay.sum()\n}\n",
+        );
+        assert!(!d.has_errors(), "where(.field) + projection should check");
+    }
+
+    #[test]
+    fn where_field_must_be_bool() {
+        let (_p, d) = check(
+            "Pt { x: i32, y: i32 }\nfn main() -> i32 {\n  return [Pt{x: 1, y: 2}].where(.x).x.sum()\n}\n",
+        );
+        assert!(d.has_errors(), "where(.field) on a non-bool field must error");
     }
 
     #[test]

@@ -375,6 +375,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let val = self.operand(op);
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
+                Stmt::StoreElemField(slot, idx, field, op) => {
+                    let ep = self.elem_field_ptr(*slot, idx, *field)?;
+                    let val = self.operand(op);
+                    self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                }
                 Stmt::ArenaEnd(op) => {
                     let handle = self.operand(op).into();
                     self.builder
@@ -594,6 +599,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ty = scalar_type(self.ctx, result_ty);
                 self.builder.build_load(ty, ep, "idx").map_err(|e| self.err(e))?
             }
+            Rvalue::IndexField(slot, idx, field) => {
+                let ep = self.elem_field_ptr(*slot, idx, *field)?;
+                let ty = scalar_type(self.ctx, result_ty);
+                self.builder.build_load(ty, ep, "idxfld").map_err(|e| self.err(e))?
+            }
             Rvalue::BoxClone(handle, src) => {
                 let Ty::Box(s) = result_ty else {
                     return Err(self.err("clone result is not a box"));
@@ -643,6 +653,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e).into(),
             Ty::Box(_) | Ty::ArenaHandle => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s)).array_type(n).into(),
+            Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             _ => scalar_type(self.ctx, ty),
         }
     }
@@ -655,6 +666,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
         unsafe {
             self.builder
                 .build_in_bounds_gep(arr_ty, self.slots[&slot], &[zero, index], "elemptr")
+                .map_err(|e| self.err(e))
+        }
+    }
+
+    /// `&slot[index].field` — GEP `[0, index, field]` into a `[N x %Struct]` alloca.
+    fn elem_field_ptr(&self, slot: Slot, idx: &Operand, field: u32) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let arr_ty = self.llvm_type(self.f.slots[slot as usize]);
+        let zero = self.ctx.i64_type().const_zero();
+        let index = self.operand(idx).into_int_value();
+        let f = self.ctx.i32_type().const_int(field as u64, false);
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(arr_ty, self.slots[&slot], &[zero, index, f], "elemfield")
                 .map_err(|e| self.err(e))
         }
     }

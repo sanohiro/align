@@ -75,6 +75,8 @@ pub enum Stmt {
     StoreField(Slot, u32, Operand),
     /// `slot[index] <- value` (array element store).
     StoreIndex(Slot, Operand, Operand),
+    /// `slot[index].field <- value` (struct-array element field store).
+    StoreElemField(Slot, Operand, u32, Operand),
     /// End an arena, freeing all its allocations (the operand is the arena handle).
     ArenaEnd(Operand),
 }
@@ -118,6 +120,8 @@ pub enum Rvalue {
     BoxClone(Operand, Operand),
     /// `slot[index]` — load an array element.
     Index(Slot, Operand),
+    /// `slot[index].field` — load a field of a struct-array element.
+    IndexField(Slot, Operand, u32),
 }
 
 #[derive(Clone, Debug)]
@@ -292,13 +296,8 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     b.push(Stmt::StoreField(*local, i as u32, op));
                 }
             }
-            // An array literal stores its elements into the slot by index.
-            hir::ExprKind::ArrayLit { elems, .. } => {
-                for (i, e) in elems.iter().enumerate() {
-                    let v = lower_expr(b, e);
-                    b.push(Stmt::StoreIndex(*local, index_const(i), v));
-                }
-            }
+            // An array literal stores its elements into the slot.
+            hir::ExprKind::ArrayLit { elems, elem } => store_array_elems(b, *local, elems, *elem),
             _ => {
                 let op = lower_expr(b, init);
                 b.push(Stmt::Store(*local, op));
@@ -457,17 +456,14 @@ fn zero_of(ty: Ty) -> Operand {
 /// literal), returning `(slot, length)`.
 fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
     match &source.kind {
-        hir::ExprKind::ArrayLit { elems, .. } => {
+        hir::ExprKind::ArrayLit { elems, elem } => {
             let slot = b.new_slot(source.ty);
-            for (i, e) in elems.iter().enumerate() {
-                let v = lower_expr(b, e);
-                b.push(Stmt::StoreIndex(slot, index_const(i), v));
-            }
+            store_array_elems(b, slot, elems, *elem);
             (slot, elems.len() as i128)
         }
         hir::ExprKind::Local(id) => {
             let n = match source.ty {
-                Ty::Array(_, n) => n as i128,
+                Ty::Array(_, n) | Ty::StructArray(_, n) => n as i128,
                 _ => 0,
             };
             (*id, n)
@@ -476,15 +472,34 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
     }
 }
 
+/// Store an array literal's elements into `slot`: scalar arrays write each element by
+/// index; struct arrays write each element's fields (the elements are struct literals).
+fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty) {
+    if matches!(elem, Ty::Struct(_)) {
+        for (i, e) in elems.iter().enumerate() {
+            if let hir::ExprKind::StructLit { fields, .. } = &e.kind {
+                for (j, fe) in fields.iter().enumerate() {
+                    let v = lower_expr(b, fe);
+                    b.push(Stmt::StoreElemField(slot, index_const(i), j as u32, v));
+                }
+            }
+        }
+    } else {
+        for (i, e) in elems.iter().enumerate() {
+            let v = lower_expr(b, e);
+            b.push(Stmt::StoreIndex(slot, index_const(i), v));
+        }
+    }
+}
+
 /// `src.map(f).where(p)….sum()` → one loop folding the elements with `+`. The map/where
 /// stages run inline per element (fusion); a failing `where` skips to the increment, so
 /// no intermediate array is built. `elem_ty` is the final (summed) element type.
 fn lower_array_sum(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem_ty: Ty) -> Operand {
     let (slot, n) = array_source_slot(b, source);
-    let src_elem = match source.ty {
-        Ty::Array(s, _) => align_sema::scalar_to_ty(s),
-        _ => elem_ty,
-    };
+    // A scalar array loads each element up front; a struct array stays addressed by
+    // index until a `.field` projection loads a scalar.
+    let scalar_src = matches!(source.ty, Ty::Array(..));
 
     let acc = b.new_slot(elem_ty);
     b.push(Stmt::Store(acc, zero_of(elem_ty)));
@@ -508,31 +523,59 @@ fn lower_array_sum(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], e
     ));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
-    // body: load arr[i], run the stages, accumulate.
+    // body: address arr[i], run the stages, accumulate.
     b.cur = body;
     let idx = b.fresh_value(i64_ty());
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
-    let x = b.fresh_value(src_elem);
-    b.push(Stmt::Let(x, Rvalue::Index(slot, Operand::Value(idx))));
+    let index = Operand::Value(idx);
 
-    let mut cur = Operand::Value(x);
+    // For a scalar source the element is the loaded value; for a struct source the
+    // current value is undefined until a projection loads a field.
+    let mut cur: Option<Operand> = if scalar_src {
+        let src_elem = match source.ty {
+            Ty::Array(s, _) => align_sema::scalar_to_ty(s),
+            _ => elem_ty,
+        };
+        let x = b.fresh_value(src_elem);
+        b.push(Stmt::Let(x, Rvalue::Index(slot, index.clone())));
+        Some(Operand::Value(x))
+    } else {
+        None
+    };
+
     for stage in stages {
-        match stage.kind {
-            hir::StageKind::Map => {
+        match &stage.kind {
+            hir::StageKind::Project { field } => {
                 let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::Call(stage.func.clone(), vec![cur])));
-                cur = Operand::Value(v);
+                b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), *field)));
+                cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Where => {
+            hir::StageKind::Map { func } => {
+                let arg = cur.take().expect("map before projection");
+                let v = b.fresh_value(stage.out_ty);
+                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), vec![arg])));
+                cur = Some(Operand::Value(v));
+            }
+            hir::StageKind::Where { func } => {
+                let arg = cur.clone().expect("where before projection");
                 let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::Call(stage.func.clone(), vec![cur.clone()])));
+                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), vec![arg])));
                 let keep = b.new_block();
                 // false → skip this element (go to the increment).
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
             }
+            hir::StageKind::WhereField { field } => {
+                // Predicate on a struct element's (bool) field; the element is unchanged.
+                let pred = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(pred, Rvalue::IndexField(slot, index.clone(), *field)));
+                let keep = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
+                b.cur = keep;
+            }
         }
     }
+    let cur = cur.expect("pipeline must reduce to a scalar before sum");
     let a = b.fresh_value(elem_ty);
     b.push(Stmt::Let(a, Rvalue::Load(acc)));
     let sum = b.fresh_value(elem_ty);
@@ -677,7 +720,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Option(_) => "Option".to_string(),
         Ty::Result(..) => "Result".to_string(),
         Ty::Box(_) => "box".to_string(),
-        Ty::Array(_, n) => format!("array[{n}]"),
+        Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),

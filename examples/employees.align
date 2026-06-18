@@ -1,0 +1,14 @@
+// Struct arrays + projection + field predicate (M4), the shape of draft.md §8:
+// keep the active employees, project their pay, and sum — all in one fused loop.
+// active pays 10 + 32 = 42.
+Emp {
+  pay: i32,
+  active: bool,
+}
+
+fn main() -> i32 {
+  return [Emp{pay: 10, active: true}, Emp{pay: 50, active: false}, Emp{pay: 32, active: true}]
+    .where(.active)
+    .pay
+    .sum()
+}

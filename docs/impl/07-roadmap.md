@@ -152,9 +152,13 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
 - [done] `array<T>` (fixed-length, from literals) + chains `map` / `where` / `sum`.
 - [done] **loop fusion** in MIR (`[...].map(f).where(p).sum()` → a single loop, no
   intermediate arrays).
+- [done] struct arrays (AoS) + field projection (`.field`) and field predicates
+  (`where(.active)`) — the draft.md §8 shape `[...].where(.active).pay.sum()` runs as
+  one fused loop.
 - [todo] dynamic-length `array<T>`/`slice<T>` + array type annotations, `out` args,
-  more terminals/stages (`reduce`/`scan`/`filter`/`partition`/`sort`/`chunks`), and
-  struct-array field projection (`.score`, `where(.active)`).
+  more terminals/stages (`reduce`/`scan`/`filter`/`partition`/`sort`/`chunks`),
+  array-valued results (materialization), and named-function `map` over struct elements
+  (needs struct-by-value params, deferred since M1).
 
 Status: **M4 core slice COMPLETE.** Scalar arrays via literals; `map`/`where` take
 named functions; `sum` is the reduction terminal. The whole chain lowers to one

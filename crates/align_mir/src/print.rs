@@ -43,6 +43,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::StoreIndex(slot, idx, val) => {
                 let _ = writeln!(out, "    _{slot}[{}] <- {}", operand_str(idx), operand_str(val));
             }
+            Stmt::StoreElemField(slot, idx, field, val) => {
+                let _ = writeln!(out, "    _{slot}[{}].{field} <- {}", operand_str(idx), operand_str(val));
+            }
             Stmt::ArenaEnd(op) => {
                 let _ = writeln!(out, "    arena_end {}", operand_str(op));
             }
@@ -94,6 +97,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BoxGet(op) => format!("box_get({})", operand_str(op)),
         Rvalue::BoxClone(h, src) => format!("box_clone({}, {})", operand_str(h), operand_str(src)),
         Rvalue::Index(slot, idx) => format!("_{slot}[{}]", operand_str(idx)),
+        Rvalue::IndexField(slot, idx, field) => format!("_{slot}[{}].{field}", operand_str(idx)),
     }
 }
 

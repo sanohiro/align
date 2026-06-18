@@ -152,8 +152,9 @@ pub enum ExprKind {
     BoxGet(Box<Expr>),
     /// `b.clone()` — deep-copy a `box<T>` into a fresh allocation in the enclosing arena.
     BoxClone(Box<Expr>),
-    /// `[e1, e2, ...]` — a fixed-length array literal of `elem` scalars.
-    ArrayLit { elems: Vec<Expr>, elem: crate::Scalar },
+    /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
+    /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
+    ArrayLit { elems: Vec<Expr>, elem: crate::Ty },
     /// A fused array pipeline ending in `sum`: `source.map(f).where(p)….sum()`. The
     /// stages and the reduction lower to a single loop (no intermediate arrays).
     ArraySum { source: Box<Expr>, stages: Vec<Stage> },
@@ -161,17 +162,19 @@ pub enum ExprKind {
 
 #[derive(Clone, Debug)]
 pub enum StageKind {
-    /// `.map(f)` — transform each element with `f`.
-    Map,
-    /// `.where(p)` — keep only elements for which `p` is true.
-    Where,
+    /// `.map(f)` — transform each element with the named function `func`.
+    Map { func: String },
+    /// `.where(p)` — keep only elements for which the named predicate `func` is true.
+    Where { func: String },
+    /// `.where(.field)` — keep only elements whose (bool) `field` is true.
+    WhereField { field: u32 },
+    /// `.field` — project a struct field out of each element (struct array → scalar).
+    Project { field: u32 },
 }
 
 #[derive(Clone, Debug)]
 pub struct Stage {
     pub kind: StageKind,
-    /// Name of the (named) function applied at this stage.
-    pub func: String,
     /// The element type after this stage (for `Where`, unchanged from its input).
     pub out_ty: crate::Ty,
 }

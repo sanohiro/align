@@ -68,6 +68,28 @@ fn pipeline_fuses_into_one_loop() {
 }
 
 #[test]
+fn struct_array_projection_sum() {
+    if !backend_available() {
+        return;
+    }
+    // Project field x and sum: 10 + 30 + 2 = 42.
+    let src = "Pt { x: i32, y: i32 }\nfn main() -> i32 {\n  return [Pt{x: 10, y: 1}, Pt{x: 30, y: 2}, Pt{x: 2, y: 3}].x.sum()\n}\n";
+    let out = build_and_run("proj", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn struct_array_where_field_projection_sum() {
+    if !backend_available() {
+        return;
+    }
+    // where(.active) keeps pay 10 and 32; project pay; sum = 42.
+    let src = "Emp { pay: i32, active: bool }\nfn main() -> i32 {\n  return [Emp{pay: 10, active: true}, Emp{pay: 50, active: false}, Emp{pay: 32, active: true}].where(.active).pay.sum()\n}\n";
+    let out = build_and_run("emp", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
 fn array_sum_emits_single_loop() {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "a.align", "fn main() -> i32 {\n  return [1, 2, 3].sum()\n}\n");

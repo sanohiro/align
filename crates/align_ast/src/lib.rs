@@ -201,6 +201,9 @@ pub enum ExprKind {
     Arena(Block),
     /// `[e1, e2, ...]` — a fixed-length array literal.
     ArrayLit(Vec<Expr>),
+    /// `.field` — element-field shorthand, valid only as a pipeline stage argument
+    /// (e.g. `where(.active)`); refers to a field of the current pipeline element.
+    FieldShorthand(Ident),
 }
 
 #[derive(Clone, Debug)]

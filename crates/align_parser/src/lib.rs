@@ -487,6 +487,13 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
+            TokKind::Dot if matches!(self.peek_at(1), TokKind::Ident(_)) => {
+                // `.field` element-field shorthand (pipeline stage argument).
+                self.bump();
+                let field = self.parse_ident("field name")?;
+                let span = span.merge(self.prev_span());
+                Some(Expr { kind: ExprKind::FieldShorthand(field), span })
+            }
             TokKind::If => self.parse_if(),
             TokKind::Arena => {
                 let start = self.span();
