@@ -715,48 +715,42 @@ impl<'a> Checker<'a> {
 
     /// Resolve an assignable place: a `mut` local, or `mut_local.field`.
     fn check_place(&mut self, place: &ast::Expr) -> Place {
-        let ast::ExprKind::Path(p) = &place.kind else {
+        // `local.field = v`
+        if let ast::ExprKind::FieldAccess { recv, field } = &place.kind {
+            let Some((id, local_ty)) = self.place_local(recv) else {
+                self.diags.error("invalid assignment target", place.span);
+                return Place::Err;
+            };
+            if !self.locals[id as usize].is_mut {
+                let name = self.locals[id as usize].name.clone();
+                self.diags.error(
+                    format!("cannot assign to a field of immutable '{name}' (declare with `mut`)"),
+                    place.span,
+                );
+            }
+            return match self.field_of(local_ty, &field.name, place.span) {
+                Some((index, ty)) => Place::Field { base: id, index, ty },
+                None => Place::Err,
+            };
+        }
+        // `local = v`
+        let Some((id, local_ty)) = self.place_local(place) else {
             self.diags.error("invalid assignment target", place.span);
             return Place::Err;
         };
-        let base_name = p.segments.first().map(|s| s.name.as_str()).unwrap_or("");
-        let Some(id) = self.lookup(base_name) else {
+        if !self.locals[id as usize].is_mut {
+            let name = self.locals[id as usize].name.clone();
             self.diags
-                .error(format!("undefined name: '{base_name}'"), place.span);
-            return Place::Err;
-        };
-        let local = &self.locals[id as usize];
-        let (is_mut, local_ty) = (local.is_mut, local.ty);
-        if !is_mut {
+                .error(format!("cannot assign to immutable '{name}' (declare with `mut`)"), place.span);
+        }
+        if matches!(local_ty, Ty::Struct(_)) {
             self.diags.error(
-                format!("cannot assign to immutable '{base_name}' (declare with `mut`)"),
+                "cannot assign a whole struct; assign individual fields".to_string(),
                 place.span,
             );
+            return Place::Err;
         }
-        match p.segments.len() {
-            1 => {
-                if matches!(local_ty, Ty::Struct(_)) {
-                    self.diags.error(
-                        "cannot assign a whole struct; assign individual fields".to_string(),
-                        place.span,
-                    );
-                    return Place::Err;
-                }
-                Place::Local { id, ty: local_ty }
-            }
-            2 => {
-                let field = &p.segments[1];
-                match self.field_of(local_ty, &field.name, place.span) {
-                    Some((index, ty)) => Place::Field { base: id, index, ty },
-                    None => Place::Err,
-                }
-            }
-            _ => {
-                self.diags
-                    .error("nested field access is not supported yet".to_string(), place.span);
-                Place::Err
-            }
-        }
+        Place::Local { id, ty: local_ty }
     }
 
     /// Resolve `(field_index, field_type)` for `ty.name`, reporting errors against `span`.
@@ -822,6 +816,9 @@ impl<'a> Checker<'a> {
             }
             ast::ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expected, e.span),
             ast::ExprKind::Call { callee, args } => self.check_call(callee, args, expected, e.span),
+            ast::ExprKind::FieldAccess { recv, field } => {
+                self.check_field_access(recv, field, expected, e.span)
+            }
             ast::ExprKind::ElseUnwrap { opt, fallback } => {
                 self.check_else_unwrap(opt, fallback, expected, e.span)
             }
@@ -882,31 +879,49 @@ impl<'a> Checker<'a> {
             return err(span);
         };
         let local_ty = self.locals[id as usize].ty;
-        match p.segments.len() {
-            1 => {
-                if matches!(local_ty, Ty::Struct(_)) {
-                    self.diags.error(
-                        "cannot use a struct value directly (access its fields)".to_string(),
-                        span,
-                    );
-                    return err(span);
-                }
-                self.constrain(local_ty, expected, span);
-                Expr { kind: ExprKind::Local(id), ty: local_ty, span }
-            }
-            2 => match self.field_of(local_ty, &p.segments[1].name, span) {
-                Some((index, ty)) => {
-                    self.constrain(ty, expected, span);
-                    Expr { kind: ExprKind::Field { base: id, index }, ty, span }
-                }
-                None => err(span),
-            },
-            _ => {
+        if matches!(local_ty, Ty::Struct(_)) {
+            self.diags.error(
+                "cannot use a struct value directly (access its fields)".to_string(),
+                span,
+            );
+            return err(span);
+        }
+        self.constrain(local_ty, expected, span);
+        Expr { kind: ExprKind::Local(id), ty: local_ty, span }
+    }
+
+    /// `recv.field` (not a method call) — a struct field read. M4: the receiver must be
+    /// a local (chained field access on a value comes later).
+    fn check_field_access(&mut self, recv: &ast::Expr, field: &ast::Ident, expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
+        let base = match self.place_local(recv) {
+            Some((id, _)) => id,
+            None => {
                 self.diags
-                    .error("nested field access is not supported yet".to_string(), span);
-                err(span)
+                    .error("field access is only supported on a local binding".to_string(), span);
+                return err;
+            }
+        };
+        let base_ty = self.locals[base as usize].ty;
+        match self.field_of(base_ty, &field.name, span) {
+            Some((index, ty)) => {
+                self.constrain(ty, expected, span);
+                Expr { kind: ExprKind::Field { base, index }, ty, span }
+            }
+            None => err,
+        }
+    }
+
+    /// If `e` is a bare local name, return its id and type.
+    fn place_local(&self, e: &ast::Expr) -> Option<(LocalId, Ty)> {
+        if let ast::ExprKind::Path(p) = &e.kind {
+            if let Some(name) = single_name(p) {
+                if let Some(id) = self.lookup(name) {
+                    return Some((id, self.locals[id as usize].ty));
+                }
             }
         }
+        None
     }
 
     /// `Name { field: value, ... }`. Reorders inits into declaration order and requires
@@ -986,13 +1001,10 @@ impl<'a> Checker<'a> {
     }
 
     fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
-        // Dotted callee `a.b(...)`: a module builtin (`heap.new`) or a method on a local.
-        if let ast::ExprKind::Path(p) = &callee.kind {
-            if p.segments.len() == 2 {
-                let recv = p.segments[0].name.clone();
-                let method = p.segments[1].name.clone();
-                return self.check_dotted_call(&recv, &method, args, expected, span);
-            }
+        // Method call `recv.method(...)`: a module builtin (`heap.new`) or a method on a
+        // value (`box.get()`, `box.clone()`).
+        if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
+            return self.check_method_call(recv, &field.name, args, expected, span);
         }
         let name = match &callee.kind {
             ast::ExprKind::Path(p) => single_name(p).map(|s| s.to_string()),
@@ -1094,26 +1106,27 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A dotted call `recv.method(args)`: the `heap.new` builtin or a method on a local
-    /// (M3: `box.get()`).
-    fn check_dotted_call(&mut self, recv: &str, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
-        let err = |span| Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        if recv == "heap" && method == "new" {
-            return self.check_heap_new(args, expected, span);
+    /// A method call `recv.method(args)`: the `heap.new` builtin, or a method on a value
+    /// (`box.get()`, `box.clone()`).
+    fn check_method_call(&mut self, recv: &ast::Expr, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // `heap.new(...)` — `heap` is a module name, not a value.
+        if let ast::ExprKind::Path(p) = &recv.kind {
+            if single_name(p) == Some("heap") && method == "new" {
+                return self.check_heap_new(args, expected, span);
+            }
         }
-        let Some(id) = self.lookup(recv) else {
-            self.diags.error(format!("undefined name: '{recv}'"), span);
-            return err(span);
-        };
-        let recv_ty = self.locals[id as usize].ty;
-        let recv_expr = Expr { kind: ExprKind::Local(id), ty: recv_ty, span };
+        let recv_expr = self.check_expr(recv, None);
+        let recv_ty = recv_expr.ty;
         match method {
             "get" => self.check_box_get(recv_expr, recv_ty, args, span),
             "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
             _ => {
-                self.diags
-                    .error(format!("unknown method '.{method}()' on {}", ty_name(recv_ty)), span);
-                err(span)
+                if recv_ty != Ty::Error {
+                    self.diags
+                        .error(format!("unknown method '.{method}()' on {}", ty_name(recv_ty)), span);
+                }
+                err
             }
         }
     }

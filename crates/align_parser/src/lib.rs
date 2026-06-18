@@ -418,6 +418,11 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let span = e.span.merge(self.prev_span());
                 e = Expr { kind: ExprKind::Try(Box::new(e)), span };
+            } else if self.at(&TokKind::Dot) && matches!(self.peek_at(1), TokKind::Ident(_)) {
+                self.bump(); // '.'
+                let field = self.parse_ident("field or method name")?;
+                let span = e.span.merge(field.span);
+                e = Expr { kind: ExprKind::FieldAccess { recv: Box::new(e), field }, span };
             } else {
                 break;
             }
@@ -473,10 +478,12 @@ impl<'a> Parser<'a> {
                 {
                     return self.parse_struct_lit();
                 }
-                let path = self.parse_path();
-                let span = path.span;
+                // A single name; dotted access (`a.b`, method chains) is handled as a
+                // postfix in `parse_postfix`.
+                let id = self.parse_ident("identifier")?;
+                let span = id.span;
                 Some(Expr {
-                    kind: ExprKind::Path(path),
+                    kind: ExprKind::Path(Path { segments: vec![id], span }),
                     span,
                 })
             }
@@ -712,6 +719,20 @@ mod tests {
         let FnBody::Block(b) = &fd.body else { panic!() };
         let Stmt::Let { init, .. } = &b.stmts[0] else { panic!() };
         assert!(matches!(init.kind, ExprKind::StructLit { .. }), "init should be a struct literal");
+    }
+
+    #[test]
+    fn method_chain_parses_as_nested_field_access_calls() {
+        // `a.f(x).g()` → Call(FieldAccess(Call(FieldAccess(a, f), [x]), g), [])
+        let (f, err) = parse("fn main() -> i32 {\n  return a.f(1).g()\n}\n");
+        assert!(!err);
+        let Item::Fn(fd) = &f.items[0] else { panic!() };
+        let FnBody::Block(b) = &fd.body else { panic!() };
+        let Stmt::Return(Some(e)) = &b.stmts[0] else { panic!() };
+        let ExprKind::Call { callee, .. } = &e.kind else { panic!("outer call") };
+        let ExprKind::FieldAccess { recv, field } = &callee.kind else { panic!("outer .g") };
+        assert_eq!(field.name, "g");
+        assert!(matches!(recv.kind, ExprKind::Call { .. }), "receiver is the inner call");
     }
 
     #[test]

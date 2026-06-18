@@ -167,6 +167,13 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `recv.field` — field access (struct field) or, when followed by `(...)`, the
+    /// callee of a method call. Method chains (`a.map(f).where(p)`) parse as nested
+    /// `FieldAccess` + `Call`.
+    FieldAccess {
+        recv: Box<Expr>,
+        field: Ident,
+    },
     /// `if cond { .. } else { .. }`. `els` is the optional else branch (a block, or
     /// another `if` for `else if`).
     If {
