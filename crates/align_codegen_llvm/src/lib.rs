@@ -915,7 +915,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 align_mir::TemplatePiece::IntHole(op) => {
                     let ty = self.f.operand_ty(op);
                     let v = self.operand(op).into_int_value();
-                    let wide = if int_bits(ty) < 64 {
+                    // Use the actual LLVM width (robust even if `ty` is the error type).
+                    let wide = if v.get_type().get_bit_width() < 64 {
                         if is_signed(ty) {
                             self.builder.build_int_s_extend(v, i64t, "sext").map_err(|e| self.err(e))?
                         } else {

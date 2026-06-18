@@ -10,6 +10,16 @@ use align_diag::Diagnostics;
 use align_lexer::{TokKind, Token};
 use align_span::Span;
 
+/// Whether `s` is a valid identifier (so `{ and {` or `{}` stay literal text).
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
 /// Split a template literal's decoded content into static text and `{ident}` holes.
 /// M5: only `{ident}` (no `{expr}`); the hole name is trimmed.
 fn split_template(content: &str, span: Span) -> Vec<TemplatePart> {
@@ -19,16 +29,28 @@ fn split_template(content: &str, span: Span) -> Vec<TemplatePart> {
     while let Some(c) = chars.next() {
         if c == '{' {
             let mut name = String::new();
+            let mut found_close = false;
             for d in chars.by_ref() {
                 if d == '}' {
+                    found_close = true;
                     break;
                 }
                 name.push(d);
             }
-            if !text.is_empty() {
-                parts.push(TemplatePart::Text(std::mem::take(&mut text)));
+            let trimmed = name.trim();
+            if found_close && is_ident(trimmed) {
+                if !text.is_empty() {
+                    parts.push(TemplatePart::Text(std::mem::take(&mut text)));
+                }
+                parts.push(TemplatePart::Hole(Ident { name: trimmed.to_string(), span }));
+            } else {
+                // Unmatched `{` or an empty `{}`: keep it as literal text.
+                text.push('{');
+                text.push_str(&name);
+                if found_close {
+                    text.push('}');
+                }
             }
-            parts.push(TemplatePart::Hole(Ident { name: name.trim().to_string(), span }));
         } else {
             text.push(c);
         }
@@ -794,6 +816,23 @@ mod tests {
         let FnBody::Block(b) = &fd.body else { panic!() };
         let Stmt::Let { init, .. } = &b.stmts[0] else { panic!() };
         assert!(matches!(init.kind, ExprKind::StructLit { .. }), "init should be a struct literal");
+    }
+
+    #[test]
+    fn template_splits_holes_and_keeps_bad_braces_literal() {
+        use crate::TemplatePart;
+        let span = Span::new(0, 0, 0);
+        // Valid hole.
+        let p = split_template("a {x} b", span);
+        assert!(matches!(p.as_slice(), [TemplatePart::Text(_), TemplatePart::Hole(_), TemplatePart::Text(_)]));
+        // Unmatched `{`, empty `{}`, and non-ident `{ x y }` all stay literal text.
+        for s in ["unmatched {", "empty {}", "{ x y } two words"] {
+            let parts = split_template(s, span);
+            assert!(
+                parts.iter().all(|p| matches!(p, TemplatePart::Text(_))),
+                "expected all-literal for {s:?}, got {parts:?}"
+            );
+        }
     }
 
     #[test]
