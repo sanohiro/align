@@ -255,18 +255,24 @@ pub unsafe extern "C" fn align_rt_json_decode(
                         let kind = (d.tag >> 8) & 0xff;
                         let width = (d.tag & 0xff) as i64;
                         // Defense in depth: never write outside the out struct, even if a
-                        // descriptor offset/width were wrong.
-                        if d.offset < 0 || d.offset + width > out_size {
+                        // descriptor offset/width were wrong (checked_add avoids i64 overflow).
+                        if d.offset < 0 || d.offset.checked_add(width).map_or(true, |end| end > out_size) {
                             return None;
                         }
                         let off = d.offset as usize;
                         let w = width as usize;
                         match kind {
                             1 => {
+                                if w != 1 {
+                                    return None;
+                                }
                                 let v = p.boolean()?;
                                 unsafe { *out.add(off) = v as u8 };
                             }
                             2 => {
+                                if w != 4 && w != 8 {
+                                    return None;
+                                }
                                 let v = p.number()?;
                                 // Write the float repr at the field width (f32 / f64).
                                 if w == 4 {
@@ -282,6 +288,9 @@ pub unsafe extern "C" fn align_rt_json_decode(
                                 }
                             }
                             _ => {
+                                if w != 1 && w != 2 && w != 4 && w != 8 {
+                                    return None;
+                                }
                                 let v = p.integer()?;
                                 let bytes = v.to_le_bytes();
                                 for k in 0..w {
