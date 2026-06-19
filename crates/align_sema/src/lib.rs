@@ -185,14 +185,14 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 .iter()
                 .map(|f| {
                     let ty = resolve_type(&f.ty, &struct_ids, diags);
-                    // M5 cut: fields are scalars or `str`. A `str` field is allowed but must
-                    // only ever hold a region-0 str (a literal / non-arena str) — storing an
-                    // arena-backed str into a field is rejected by `EscapeCheck`, so a struct
-                    // never carries an arena region and stays freely returnable. Other
-                    // composite/region-bearing fields (box/slice/array/option/result/nested
-                    // struct) the layout can't hold yet remain rejected. NOTE: `ty_to_scalar`
-                    // now also accepts `Ty::Struct` (a valid Option/Result payload), so a
-                    // nested struct field is rejected explicitly here.
+                    // Fields are scalars or `str`. A `str` field may now hold an arena-backed
+                    // str: the struct *carries* that field's region (MMv2 slice 2), so
+                    // `EscapeCheck` lets it live inside the arena and only rejects the whole
+                    // struct escaping. A scalar/literal-only struct stays `Static` (returnable).
+                    // Other composite/region-bearing fields (box/slice/array/option/result/
+                    // nested struct) the layout can't hold yet remain rejected. NOTE:
+                    // `ty_to_scalar` now also accepts `Ty::Struct` (a valid Option/Result
+                    // payload), so a nested struct field is rejected explicitly here.
                     let is_field_ok =
                         (ty_to_scalar(ty).is_some() && !matches!(ty, Ty::Struct(_))) || ty == Ty::Str || ty == Ty::Error;
                     if !is_field_ok {
@@ -359,6 +359,12 @@ impl<'a> EscapeCheck<'a> {
         // The body's trailing value is the function's return value (single-expression
         // bodies and fall-through blocks), so apply the same slice-escape check there.
         if let Some(v) = &self.f.body.value {
+            if Self::tracks_region(v.ty) && !self.region_of(v, 0).outlives(Region::Static) {
+                self.diags.error(
+                    "cannot return a value allocated in an arena (it is freed at block end)".to_string(),
+                    v.span,
+                );
+            }
             if matches!(v.ty, Ty::Slice(_)) && self.slice_is_local(v) {
                 self.diags.error(
                     "cannot return a slice that views a local array (it is freed when the function returns)".to_string(),
@@ -368,10 +374,12 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    /// Types whose values carry an arena region and so must be escape-checked: `box<T>`
-    /// (M3) and arena-backed `str` (M5 — `template`/concat allocate in the arena).
+    /// Types whose values carry an inferred region and so must be escape-checked: `box<T>`
+    /// (M3), arena-backed `str` (M5 — `template`/concat allocate in the arena), and a struct
+    /// (MMv2 slice 2 — a struct's region is the max of its fields, so a struct holding an
+    /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(ty: Ty) -> bool {
-        matches!(ty, Ty::Box(_) | Ty::Str)
+        matches!(ty, Ty::Box(_) | Ty::Str | Ty::Struct(_))
     }
 
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
@@ -385,7 +393,20 @@ impl<'a> EscapeCheck<'a> {
             // `str + str` concatenation is also built in the enclosing arena.
             ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => Region::arena(depth),
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
+            // A struct's region is the shortest-lived of its fields (a view over it lives only
+            // as long as the shortest source); a scalar/literal-only struct stays `Static`.
+            ExprKind::StructLit { fields, .. } => fields
+                .iter()
+                .fold(Region::Static, |acc, f| acc.shorter(self.region_of(f, depth))),
+            // A field read inherits its base struct's region (the field may be a view into it).
+            ExprKind::Field { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
+            // An `arena {}` *expression* yields its block value, evaluated one level deeper.
+            // Without this, a binding that captures an arena's value (`p := arena { … }`) would
+            // be inferred `Static` and could then escape undetected (a use-after-free across
+            // nested arenas); the per-block walk only checks the immediate boundary, not a
+            // later escape of the binding.
+            ExprKind::Arena(b) => self.region_of_block(b, depth + 1),
             ExprKind::If { then, els, .. } => {
                 self.region_of_block(then, depth).shorter(self.region_of_block(els, depth))
             }
@@ -458,15 +479,18 @@ impl<'a> EscapeCheck<'a> {
                     self.region.insert(*local, r);
                 }
             }
-            Stmt::AssignField { value, .. } => {
+            Stmt::AssignField { base, value, .. } => {
                 self.walk(value, depth);
-                // A struct carries no arena region (today), so an arena-backed str must not be
-                // stored into a str field (it would outlive the arena via the struct).
-                if value.ty == Ty::Str && !self.region_of(value, depth).outlives(Region::Static) {
-                    self.diags.error(
-                        "cannot store an arena-allocated str into a struct field (it would outlive the arena)".to_string(),
-                        value.span,
-                    );
+                // The base struct lives at its own (fixed) region; a stored value must outlive
+                // it, else the value would escape its region via the longer-lived struct.
+                if Self::tracks_region(value.ty) {
+                    let target = self.region.get(base).copied().unwrap_or(Region::Static);
+                    if !self.region_of(value, depth).outlives(target) {
+                        self.diags.error(
+                            "this value cannot be stored into a longer-lived struct field (it would escape its region)".to_string(),
+                            value.span,
+                        );
+                    }
                 }
             }
             Stmt::Return(Some(e)) => {
@@ -525,16 +549,11 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::StructLit { fields, .. } => {
+                // No per-field rejection: the struct *carries* the region of its fields
+                // (`region_of`), and escape is checked when the whole struct is returned /
+                // stored / used as an arena block value. Just recurse for nested escapes.
                 for f in fields {
                     self.walk(f, depth);
-                    // A struct carries no arena region: an arena-backed str field initializer
-                    // would let the str outlive its arena via the struct.
-                    if f.ty == Ty::Str && !self.region_of(f, depth).outlives(Region::Static) {
-                        self.diags.error(
-                            "cannot store an arena-allocated str into a struct field (it would outlive the arena)".to_string(),
-                            f.span,
-                        );
-                    }
                 }
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
@@ -2704,10 +2723,42 @@ mod tests {
     }
 
     #[test]
-    fn struct_arena_str_field_rejected() {
-        // Storing an arena-backed str into a struct field would let it outlive the arena.
+    fn struct_arena_str_field_ok_when_not_escaping() {
+        // MMv2 slice 2: a struct may now hold an arena-backed str. As long as the struct does
+        // not escape the arena (here it is only used inside it), this is safe and allowed.
         let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  a := \"x\"\n  b := \"y\"\n  arena {\n    p := P{tag: a + b}\n    print(p.tag)\n  }\n  return 0\n}\n");
-        assert!(d.has_errors(), "an arena str must not be stored into a struct field");
+        assert!(!d.has_errors(), "a struct holding an arena str is fine if it does not escape");
+    }
+
+    #[test]
+    fn struct_with_arena_str_field_cannot_escape() {
+        // The struct carries its field's arena region, so returning it out of the arena (as the
+        // arena block's value, which becomes the function result) must be rejected.
+        let (_p, d) = check("P { tag: str }\nfn mk(a: str, b: str) -> P {\n  arena {\n    P{tag: a + b}\n  }\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "a struct holding an arena str must not escape its arena");
+    }
+
+    #[test]
+    fn struct_nested_arena_escape_rejected() {
+        // A binding that captures an inner arena's value must keep that arena's region, so it
+        // cannot be assigned to an outer-arena binding (which would outlive it → use-after-free).
+        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  arena {\n    mut out := P{tag: \"init\"}\n    arena {\n      x := \"a\" + \"b\"\n      p := arena {\n        P{tag: x}\n      }\n      out = p\n    }\n  }\n  return 0\n}\n");
+        assert!(d.has_errors(), "a value captured from an inner arena must not escape to an outer one");
+    }
+
+    #[test]
+    fn struct_with_literal_str_field_returns_ok() {
+        // A struct whose str field is a literal (region-0 / Static) stays freely returnable.
+        let (_p, d) = check("P { tag: str }\nfn mk() -> P {\n  return P{tag: \"lit\"}\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(!d.has_errors(), "a struct with a literal str field is Static and returnable");
+    }
+
+    #[test]
+    fn arena_str_into_outer_struct_field_rejected() {
+        // Assigning an arena str into a field of a struct declared in an outer (longer-lived)
+        // scope would let it outlive the arena via that struct.
+        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  a := \"x\"\n  b := \"y\"\n  mut p := P{tag: \"init\"}\n  arena {\n    p.tag = a + b\n  }\n  print(p.tag)\n  return 0\n}\n");
+        assert!(d.has_errors(), "storing an arena str into an outer struct's field must be rejected");
     }
 
     #[test]
