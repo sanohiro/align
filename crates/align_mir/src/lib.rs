@@ -609,6 +609,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let init_op = lower_expr(b, init);
             lower_array_collect(b, source, stages, *elem, CollectKind::Scan { func: func.clone(), init: init_op })
         }
+        hir::ExprKind::ArrayDot { a, b: bex, elem } => lower_array_dot(b, a, bex, *elem),
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
             let v = b.fresh_value(e.ty);
@@ -1108,6 +1109,66 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
         b.push(Stmt::DropValue(tmp));
     }
     Operand::Value(arr)
+}
+
+/// `a.dot(b)` — the inner product `Σ a[i]*b[i]` of two fixed-length scalar arrays of equal
+/// (sema-checked) length, folded in one counted loop. Both sources materialize to a slot
+/// (`array_source_slot`); `mul`/`add` lower per element type (int or float).
+fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) -> Operand {
+    let (a_slot, n) = array_source_slot(b, a);
+    let (b_slot, _nb) = array_source_slot(b, bex);
+
+    let acc = b.new_slot(elem);
+    b.push(Stmt::Store(acc, zero_of(elem)));
+    let iv = b.new_slot(i64_ty());
+    b.push(Stmt::Store(iv, Operand::Const(Const::Int(0, i64_ty()))));
+    let bound = Operand::Const(Const::Int(n, i64_ty()));
+
+    let header = b.new_block();
+    let body = b.new_block();
+    let cont = b.new_block();
+    let exit = b.new_block();
+    b.terminate(Term::Goto(header));
+
+    // header: while i < n
+    b.cur = header;
+    let i_val = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
+    let cond = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound)));
+    b.terminate(Term::Branch(Operand::Value(cond), body, exit));
+
+    // body: acc += a[i] * b[i].
+    b.cur = body;
+    let idx = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(idx, Rvalue::Load(iv)));
+    let index = Operand::Value(idx);
+    let xa = b.fresh_value(elem);
+    b.push(Stmt::Let(xa, Rvalue::Index(a_slot, index.clone())));
+    let xb = b.fresh_value(elem);
+    b.push(Stmt::Let(xb, Rvalue::Index(b_slot, index)));
+    let prod = b.fresh_value(elem);
+    b.push(Stmt::Let(prod, Rvalue::Bin(BinOp::Mul, Operand::Value(xa), Operand::Value(xb))));
+    let a_acc = b.fresh_value(elem);
+    b.push(Stmt::Let(a_acc, Rvalue::Load(acc)));
+    let next = b.fresh_value(elem);
+    b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a_acc), Operand::Value(prod))));
+    b.push(Stmt::Store(acc, Operand::Value(next)));
+    b.terminate(Term::Goto(cont));
+
+    // cont: i += 1; loop.
+    b.cur = cont;
+    let i2 = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i2, Rvalue::Load(iv)));
+    let inc = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1))));
+    b.push(Stmt::Store(iv, Operand::Value(inc)));
+    b.terminate(Term::Goto(header));
+
+    b.cur = exit;
+    let r = b.fresh_value(elem);
+    b.push(Stmt::Let(r, Rvalue::Load(acc)));
+    Operand::Value(r)
 }
 
 /// The scalar of a known-scalar element `Ty` (panics on a non-scalar — `to_array` is

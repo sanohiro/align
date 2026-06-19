@@ -222,6 +222,28 @@ fn array_max_float() {
 }
 
 #[test]
+fn array_dot_int() {
+    if !backend_available() {
+        return;
+    }
+    // dot([1,2,3], [4,5,6]) = 4 + 10 + 18 = 32 (i64 by default); exit 1 when it matches.
+    let src = "fn main() -> i32 {\n  xs := [1, 2, 3]\n  ys := [4, 5, 6]\n  d := xs.dot(ys)\n  if d == 32 { return 1 }\n  return 0\n}\n";
+    let out = build_and_run("dot-int", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn array_dot_float() {
+    if !backend_available() {
+        return;
+    }
+    // dot([1.0,2.0,3.0], [4.0,5.0,0.5]) = 4 + 10 + 1.5 = 15.5 (> 15); exit 1.
+    let src = "fn main() -> i32 {\n  xs := [1.0, 2.0, 3.0]\n  ys := [4.0, 5.0, 0.5]\n  d := xs.dot(ys)\n  if d > 15.0 { return 1 }\n  return 0\n}\n";
+    let out = build_and_run("dot-float", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn array_sum_emits_single_loop() {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "a.align", "fn main() -> i32 {\n  return [1, 2, 3].sum()\n}\n");

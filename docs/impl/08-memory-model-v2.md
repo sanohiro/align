@@ -335,9 +335,13 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    a *materializing prefix fold* on the `to_array` collect loop (`CollectKind::Scan`): threads an
    accumulator seeded with `init` and appends the running `acc = f(acc, element)` per survivor,
    yielding an owned `array<A>` (freed as a free-standing temporary / arena-bulk-freed like
-   `to_array`; `temp_free` now also recognizes a `scan` source). **Remaining:** `dot` (two
-   sources) and the array-producing `sort`/`partition`/`chunks` (new algorithms / nested types)
-   — each its own follow-up on the slice-3/4 foundation.
+   `to_array`; `temp_free` now also recognizes a `scan` source). `dot` **[done]** — `a.dot(b)`,
+   the inner product `Σ a[i]*b[i]`, folded in one counted loop over two slot-backed sources
+   (`lower_array_dot`). First cut restricted to two fixed-length arrays of the same numeric
+   scalar element and the same statically known length (sema-checked) — the SIMD/vector case;
+   `slice`/`array<T>` dot with runtime lengths (and a runtime length-equality check) is a
+   follow-up. **Remaining:** the array-producing `sort`/`partition`/`chunks` (new algorithms /
+   nested types) — each its own follow-up on the slice-3/4 foundation.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
    `.clone()` to escape; **draft.md §19 runs in full** → M5 truly complete.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same

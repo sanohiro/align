@@ -589,6 +589,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(source, depth);
                 self.walk(init, depth);
             }
+            ExprKind::ArrayDot { a, b, .. } => {
+                self.walk(a, depth);
+                self.walk(b, depth);
+            }
             ExprKind::ArrayLit { elems, .. } => {
                 for e in elems {
                     self.walk(e, depth);
@@ -736,6 +740,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.expr(source, moved, false, false);
                 self.expr(init, moved, false, false);
+            }
+            ExprKind::ArrayDot { a, b, .. } => {
+                self.expr(a, moved, false, false);
+                self.expr(b, moved, false, false);
             }
             ExprKind::ArrayLit { elems, .. } => {
                 for e in elems {
@@ -1512,6 +1520,9 @@ impl<'a> Checker<'a> {
         if method == "scan" {
             return self.check_array_scan(recv, args, span);
         }
+        if method == "dot" {
+            return self.check_array_dot(recv, args, expected, span);
+        }
         if method == "count" {
             return self.check_array_count(recv, args, span);
         }
@@ -2067,6 +2078,82 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `a.dot(b)` — the inner product `Σ a[i]*b[i]`. First cut: both operands must be
+    /// fixed-length arrays of the same numeric scalar element and the same statically known
+    /// length (the SIMD/vector case; `slice`/`array<T>` dot with runtime lengths is a follow-up).
+    fn check_array_dot(&mut self, recv: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [b_arg] = args else {
+            self.diags.error(format!("'dot' takes 1 argument (another array), got {}", args.len()), span);
+            return err;
+        };
+        // The receiver must be a bare fixed array — no pipeline stages on the left yet.
+        let Some((a_src, stages, elem)) = self.check_pipeline(recv, expected, span) else {
+            return err;
+        };
+        if !stages.is_empty() {
+            self.diags.error("'dot' does not support map/where stages yet".to_string(), span);
+            return err;
+        }
+        let na = match a_src.ty {
+            Ty::Array(_, n) => n,
+            Ty::Error => return err,
+            other => {
+                self.diags.error(
+                    format!("'dot' needs a fixed-length array on the left, got {} (slice/array<T> dot is not supported yet)", ty_name(other)),
+                    span,
+                );
+                return err;
+            }
+        };
+        if !elem.is_numeric() {
+            self.diags.error(format!("'dot' needs a numeric element type, got {}", ty_name(elem)), span);
+            return err;
+        }
+        // No type hint for `b`: passing `a`'s full array type would make a length mismatch
+        // produce a duplicate "array[m] vs array[n]" error on top of the clearer one below.
+        // The element-type and length checks here cover correctness.
+        let b = self.check_expr(b_arg, None);
+        // MIR materializes both operands via `array_source_slot`, which only handles a literal
+        // or a local (the M4 restriction). Reject an arbitrary array expression (an `if`, a
+        // call, a block, …) here so it cannot reach lowering and panic — mirrors `check_pipeline`'s
+        // restriction on the left operand.
+        if !matches!(b.ty, Ty::Error) && !matches!(b.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+            self.diags.error(
+                "the right operand of 'dot' must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                b.span,
+            );
+            return err;
+        }
+        let (nb, b_elem) = match b.ty {
+            Ty::Array(s, n) => (n, scalar_to_ty(s)),
+            Ty::Error => return err,
+            other => {
+                self.diags.error(
+                    format!("'dot' needs a fixed-length array on the right, got {}", ty_name(other)),
+                    b.span,
+                );
+                return err;
+            }
+        };
+        if b_elem != elem {
+            self.diags.error(
+                format!("'dot' operands must have the same element type, got {} and {}", ty_name(elem), ty_name(b_elem)),
+                b.span,
+            );
+            return err;
+        }
+        if na != nb {
+            self.diags.error(
+                format!("'dot' operands must have the same length, got {na} and {nb}"),
+                b.span,
+            );
+            return err;
+        }
+        self.constrain(elem, expected, span);
+        Expr { kind: ExprKind::ArrayDot { a: Box::new(a_src), b: Box::new(b), elem }, ty: elem, span }
+    }
+
     /// `b.clone()` — deep-copy a `box<T>`. Allocates a fresh box, so it needs an arena.
     fn check_box_clone(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], span: Span) -> Expr {
         if !args.is_empty() {
@@ -2478,6 +2565,10 @@ impl<'a> Checker<'a> {
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.finalize_expr(source);
                 self.finalize_expr(init);
+            }
+            ExprKind::ArrayDot { a, b, .. } => {
+                self.finalize_expr(a);
+                self.finalize_expr(b);
             }
             ExprKind::ArrayLit { elems, .. } => {
                 for e in elems {
@@ -3259,6 +3350,33 @@ mod tests {
         // scan needs a 2-arg fold; a 1-arg function must error.
         let (_p, d) = check("fn bad(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].scan(bad, 0).sum()\n}\n");
         assert!(d.has_errors(), "scan with a non-binary function must error");
+    }
+
+    #[test]
+    fn dot_length_mismatch_errors() {
+        let (_p, d) = check("fn main() -> i32 {\n  xs := [1, 2, 3]\n  ys := [4, 5]\n  return xs.dot(ys)\n}\n");
+        assert!(d.has_errors(), "dot of unequal-length arrays must error");
+    }
+
+    #[test]
+    fn dot_element_type_mismatch_errors() {
+        // An int array dotted with a float array must error (no implicit numeric coercion).
+        let (_p, d) = check("fn main() -> i32 {\n  xs := [1, 2, 3]\n  ys := [1.0, 2.0, 3.0]\n  if xs.dot(ys) == 0 { return 1 }\n  return 0\n}\n");
+        assert!(d.has_errors(), "dot of mismatched element types must error");
+    }
+
+    #[test]
+    fn dot_arbitrary_right_operand_rejected_not_panicked() {
+        // An `if` expression as the right operand is an arbitrary array expr; it must be
+        // rejected in sema, not reach `array_source_slot` and panic in MIR.
+        let (_p, d) = check("fn main() -> i32 {\n  xs := [1, 2, 3]\n  ys := [4, 5, 6]\n  zs := [7, 8, 9]\n  c := true\n  if xs.dot(if c { ys } else { zs }) == 32 { return 1 }\n  return 0\n}\n");
+        assert!(d.has_errors(), "an arbitrary array expr as dot's right operand must error");
+    }
+
+    #[test]
+    fn dot_inline_checks() {
+        let (_p, d) = check("fn main() -> i32 {\n  xs := [2, 3, 4]\n  ys := [5, 6, 7]\n  if xs.dot(ys) == 56 { return 1 }\n  return 0\n}\n");
+        assert!(!d.has_errors(), "dot of two equal-length i64 arrays should check");
     }
 
     #[test]
