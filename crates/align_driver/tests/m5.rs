@@ -116,6 +116,18 @@ fn json_decode_errors_on_missing_or_malformed() {
 }
 
 #[test]
+fn json_decode_skips_unknown_string_value() {
+    if !backend_available() {
+        return;
+    }
+    // An unknown key with a string value is skipped, not a parse error.
+    let src = "P { a: i32 }\nfn parse(s: str) -> Result<P, Error> {\n  p: P := json.decode(s)?\n  return Ok(p)\n}\nfn main() -> Result<(), Error> {\n  p := parse(\"{\\\"note\\\": \\\"hi\\\", \\\"a\\\": 42}\")?\n  print(p.a)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-skipstr", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+#[test]
 fn json_decode_then_encode_roundtrips() {
     if !backend_available() {
         return;

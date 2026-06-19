@@ -219,7 +219,7 @@ pub unsafe extern "C" fn align_rt_json_decode(
     fields: *const JsonField,
     n_fields: i64,
     out: *mut u8,
-    _out_size: i64,
+    out_size: i64,
 ) -> i32 {
     let src = unsafe { std::slice::from_raw_parts(input, input_len.max(0) as usize) };
     let descs = unsafe { std::slice::from_raw_parts(fields, n_fields.max(0) as usize) };
@@ -242,7 +242,7 @@ pub unsafe extern "C" fn align_rt_json_decode(
                 // Find the matching field descriptor (unknown keys are skipped).
                 let idx = descs.iter().position(|d| {
                     let name = unsafe { std::slice::from_raw_parts(d.name_ptr, d.name_len.max(0) as usize) };
-                    name == key.as_slice()
+                    name == key
                 });
                 match idx {
                     Some(i) => {
@@ -251,6 +251,12 @@ pub unsafe extern "C" fn align_rt_json_decode(
                         }
                         seen[i] = true;
                         let d = &descs[i];
+                        // Defense in depth: never write outside the out struct, even if a
+                        // descriptor offset/width were wrong.
+                        let width = if d.tag == 0 { 1 } else { d.tag as i64 };
+                        if d.offset < 0 || d.offset + width > out_size {
+                            return None;
+                        }
                         if d.tag == 0 {
                             let v = p.boolean()?;
                             unsafe { *out.add(d.offset as usize) = v as u8 };
@@ -298,7 +304,7 @@ struct JsonParser<'a> {
     pos: usize,
 }
 
-impl JsonParser<'_> {
+impl<'a> JsonParser<'a> {
     fn peek(&self) -> Option<u8> {
         self.src.get(self.pos).copied()
     }
@@ -315,14 +321,14 @@ impl JsonParser<'_> {
             None
         }
     }
-    /// Read a `"..."` string key (no escapes in keys for the M5 cut). Returns an owned copy
-    /// so the parser can keep advancing while the key is compared.
-    fn string(&mut self) -> Option<Vec<u8>> {
+    /// Read a `"..."` string key (no escapes for the M5 cut). Borrows the input (`&'a`), so
+    /// it does not hold `self`, and the parser can keep advancing after.
+    fn string(&mut self) -> Option<&'a [u8]> {
         self.expect(b'"')?;
         let start = self.pos;
         while let Some(c) = self.peek() {
             if c == b'"' {
-                let s = self.src[start..self.pos].to_vec();
+                let s = &self.src[start..self.pos];
                 self.pos += 1;
                 return Some(s);
             }
@@ -358,11 +364,12 @@ impl JsonParser<'_> {
             None
         }
     }
-    /// Skip a value of an unknown key (int / bool only for the M5 cut).
+    /// Skip a value of an unknown key (int / bool / string for the M5 cut).
     fn skip_value(&mut self) -> Option<()> {
         match self.peek() {
             Some(b't' | b'f') => self.boolean().map(|_| ()),
             Some(b'-' | b'0'..=b'9') => self.integer().map(|_| ()),
+            Some(b'"') => self.string().map(|_| ()),
             _ => None,
         }
     }

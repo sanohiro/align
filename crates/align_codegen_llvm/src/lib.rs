@@ -1063,38 +1063,32 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let i32t = self.ctx.i32_type();
         let desc_ty = self.ctx.struct_type(&[ptr_ty.into(), i64t.into(), i32t.into(), i64t.into()], false);
         let fields = self.structs[struct_id as usize].fields.clone();
-        let arr_ty = desc_ty.array_type(fields.len() as u32);
-        let table = self.builder.build_alloca(arr_ty, "jfields").map_err(|e| self.err(e))?;
-        let zero = i64t.const_zero();
-        for (i, f) in fields.iter().enumerate() {
-            let (name_ptr, name_len) = self.str_global(&f.name);
-            let tag = match f.ty {
-                Ty::Bool => 0,
-                Ty::Int(it) => (it.bits / 8) as u64,
-                _ => unreachable!("json.decode field is int/bool (sema-checked)"),
-            };
-            let offset = self.target_data.offset_of_element(&sty, i as u32).unwrap_or(0);
-            let idx = i64t.const_int(i as u64, false);
-            let parts: [BasicValueEnum; 4] = [
-                name_ptr.into(),
-                name_len.into(),
-                i32t.const_int(tag, false).into(),
-                i64t.const_int(offset, false).into(),
-            ];
-            for (fi, val) in parts.iter().enumerate() {
-                let ep = unsafe {
-                    self.builder
-                        .build_in_bounds_gep(arr_ty, table, &[zero, idx, i32t.const_int(fi as u64, false)], "jf")
-                        .map_err(|e| self.err(e))?
+        // The table is constant (names, type tags, layout offsets are all known here), so
+        // emit it as a private global — no per-call stack alloca (safe inside loops).
+        let descs: Vec<inkwell::values::StructValue> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let (name_ptr, name_len) = self.str_global(&f.name);
+                let tag = match f.ty {
+                    Ty::Bool => 0,
+                    Ty::Int(it) => (it.bits / 8) as u64,
+                    _ => unreachable!("json.decode field is int/bool (sema-checked)"),
                 };
-                self.builder.build_store(ep, *val).map_err(|e| self.err(e))?;
-            }
-        }
-        let base = unsafe {
-            self.builder
-                .build_in_bounds_gep(arr_ty, table, &[zero, zero], "jbase")
-                .map_err(|e| self.err(e))?
-        };
+                let offset = self.target_data.offset_of_element(&sty, i as u32).unwrap_or(0);
+                desc_ty.const_named_struct(&[
+                    name_ptr.into(),
+                    name_len.into(),
+                    i32t.const_int(tag, false).into(),
+                    i64t.const_int(offset, false).into(),
+                ])
+            })
+            .collect();
+        let table_val = desc_ty.const_array(&descs);
+        let table = self.module.add_global(table_val.get_type(), None, "jfields");
+        table.set_initializer(&table_val);
+        table.set_constant(true);
+        let base = table.as_pointer_value();
         let n = i64t.const_int(fields.len() as u64, false);
         let size = i64t.const_int(self.target_data.get_store_size(&sty), false);
         let cs = self
