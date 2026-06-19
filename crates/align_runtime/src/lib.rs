@@ -585,13 +585,19 @@ unsafe extern "C" {
     fn free(ptr: *mut core::ffi::c_void);
 }
 
-/// Allocate `size` bytes on the heap (C `malloc`). Returns null on size 0 / OOM.
+/// Allocate `size` bytes on the heap (C `malloc`). Returns null for `size <= 0` (an empty
+/// buffer). On OOM (`malloc` returns null for a positive request) we fail fast and abort,
+/// rather than hand back a null the generated code would dereference on the first store.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
     if size <= 0 {
         return core::ptr::null_mut();
     }
-    unsafe { malloc(size as usize) as *mut u8 }
+    let ptr = unsafe { malloc(size as usize) as *mut u8 };
+    if ptr.is_null() {
+        panic_abort("out of memory");
+    }
+    ptr
 }
 
 /// Free a heap buffer from [`align_rt_alloc`]. Null-safe (a no-op), so dropping an owned

@@ -290,6 +290,12 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         // A free-standing owned `array<T>` (region `Static`) that is never moved out must be
         // dropped at every function exit. Arena-allocated ones (region `Arena(k)`) are
         // bulk-freed, and moved-out ones transfer ownership, so both are excluded.
+        //
+        // KNOWN LIMITATION (deferred to a "complete drop coverage" slice): a local moved on
+        // *some* but not all paths is excluded outright, so it leaks on the path where it is
+        // not moved. The robust fix is null-on-move drop flags (keep it in `drop_locals`, null
+        // its slot at each move site so the exit `Drop` is a no-op `free(null)` when moved).
+        // The leak is sound (no double-free / UAF) and bounded (no loops in the language yet).
         let drops: Vec<LocalId> = f
             .locals
             .iter()
@@ -633,7 +639,12 @@ struct MoveCheck<'a> {
 impl<'a> MoveCheck<'a> {
     fn check(mut self) -> std::collections::HashSet<LocalId> {
         let mut moved = std::collections::HashSet::new();
-        self.block(&self.f.body, &mut moved, false);
+        // If the function returns a Move type, its body's trailing expression is consumed by
+        // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
+        // moved out to the caller. Without this, such a local would stay in `drop_locals` and be
+        // freed at exit while the caller also frees it — a double-free / use-after-free.
+        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_));
+        self.block(&self.f.body, &mut moved, ret_is_move);
         self.ever_moved
     }
 

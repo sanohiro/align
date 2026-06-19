@@ -838,6 +838,11 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     let out_ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
     let alloc = match arena {
         Some(h) => Rvalue::ArenaAlloc { handle: Operand::Value(h), count: bound.clone(), elem },
+        // KNOWN LIMITATION (deferred): a free-standing `.to_array()` that is consumed as an
+        // unbound temporary (`[..].to_array().sum()`) is never bound to a `drop_local`, so its
+        // buffer is leaked. Sound (no UAF) and bounded; the "complete drop coverage" slice will
+        // either bind such temporaries to synthetic drop slots or fuse the terminal so no
+        // materialization happens. Arena mode is unaffected (bulk-freed).
         None => Rvalue::HeapAllocBuf { count: bound.clone(), elem },
     };
     b.push(Stmt::Let(out_ptr, alloc));

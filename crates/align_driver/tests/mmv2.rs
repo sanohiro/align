@@ -74,6 +74,19 @@ fn return_owned_array_across_functions() {
 }
 
 #[test]
+fn return_owned_array_via_trailing_block_expr() {
+    if !backend_available() {
+        return;
+    }
+    // `make` binds the owned array to a local and returns it as the trailing block expression
+    // (not the `= expr` form). The local is moved out to the caller, so `make` must NOT drop it
+    // (else double-free / use-after-free); `main` owns and drops it. sum = 12.
+    let src = "fn double(x: i32) -> i32 = x * 2\nfn make() -> array<i32> {\n  ys := [1, 2, 3].map(double).to_array()\n  ys\n}\nfn main() -> i32 {\n  zs := make()\n  return zs.sum()\n}\n";
+    let out = build_and_run("return-trailing", src);
+    assert_eq!(out.status.code(), Some(12));
+}
+
+#[test]
 fn to_array_map_only_keeps_all() {
     if !backend_available() {
         return;
