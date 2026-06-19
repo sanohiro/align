@@ -177,6 +177,10 @@ pub enum ExprKind {
     /// `source.….any(p)` / `.all(p)` — whether the predicate `func` holds for any / all
     /// surviving (scalar) elements. Always `bool`; `all` selects an `&&`-fold over `||`.
     ArrayAnyAll { source: Box<Expr>, stages: Vec<Stage>, func: String, all: bool },
+    /// `source.….min()` / `.max()` — the smallest / largest surviving (scalar, numeric)
+    /// element. `is_max` selects max over min. Seeded with the element type's extreme, so an
+    /// empty pipeline yields that extreme (the fold identity, as `sum` yields 0).
+    ArrayMinMax { source: Box<Expr>, stages: Vec<Stage>, is_max: bool },
     /// `source.…​.reduce(f, init)` — fold the (post-stage) elements with the binary
     /// function `func` starting from `init`. `ty` is the accumulator type.
     ArrayReduce { source: Box<Expr>, stages: Vec<Stage>, func: String, init: Box<Expr> },
