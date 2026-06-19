@@ -49,6 +49,12 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::PtrStore(ptr, idx, val) => {
                 let _ = writeln!(out, "    {}[{}] <- {}", operand_str(ptr), operand_str(idx), operand_str(val));
             }
+            Stmt::DropFlagInit(slot) => {
+                let _ = writeln!(out, "    drop_init _{slot}");
+            }
+            Stmt::Drop(slot) => {
+                let _ = writeln!(out, "    drop _{slot}");
+            }
             Stmt::ArenaEnd(op) => {
                 let _ = writeln!(out, "    arena_end {}", operand_str(op));
             }
@@ -104,6 +110,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::MakeSlice(slot, n) => format!("slice(_{slot}, {n})"),
         Rvalue::ArenaAlloc { handle, count, elem } => {
             format!("arena_alloc({}, {} x {})", operand_str(handle), operand_str(count), crate::ty_name(*elem))
+        }
+        Rvalue::HeapAllocBuf { count, elem } => {
+            format!("heap_alloc({} x {})", operand_str(count), crate::ty_name(*elem))
         }
         Rvalue::MakeDynArray { ptr, len } => {
             format!("array({}, {})", operand_str(ptr), operand_str(len))

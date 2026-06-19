@@ -576,6 +576,40 @@ pub extern "C" fn align_rt_arena_end(arena: *mut Arena) {
     drop(unsafe { Box::from_raw(arena) });
 }
 
+// Free-standing heap allocation for owned collections (`array<T>` produced by `.to_array()`
+// outside an arena). Backed by the C allocator so `free` needs no size/layout — the buffer
+// may be over-allocated (map/where never grow) and is freed whole. `free(null)` is a no-op,
+// so a never-initialised (null) owned slot drops harmlessly (MMv2 slice 4).
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+/// Allocate `size` bytes on the heap (C `malloc`). Returns null for `size <= 0` (an empty
+/// buffer). On OOM (`malloc` returns null for a positive request) we fail fast and abort,
+/// rather than hand back a null the generated code would dereference on the first store.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
+    if size <= 0 {
+        return core::ptr::null_mut();
+    }
+    let ptr = unsafe { malloc(size as usize) as *mut u8 };
+    if ptr.is_null() {
+        panic_abort("out of memory");
+    }
+    ptr
+}
+
+/// Free a heap buffer from [`align_rt_alloc`]. Null-safe (a no-op), so dropping an owned
+/// value whose slot was never initialised is harmless.
+///
+/// # Safety
+/// `ptr` must be null or a pointer previously returned by [`align_rt_alloc`] and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
+    unsafe { free(ptr as *mut core::ffi::c_void) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

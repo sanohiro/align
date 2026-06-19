@@ -50,6 +50,11 @@ pub struct Fn {
     pub locals: Vec<Local>,
     pub body: Block,
     pub span: Span,
+    /// Free-standing **owned** locals (heap `array<T>`, region `Static`) that are *not*
+    /// moved out — MIR must drop (free) each at every function exit. Arena-allocated owned
+    /// values are excluded (the arena bulk-frees them). Populated after move/escape analysis
+    /// (MMv2 slice 4).
+    pub drop_locals: Vec<LocalId>,
 }
 
 #[derive(Clone, Debug)]

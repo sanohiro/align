@@ -301,11 +301,28 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    like a slice (`.len()`, `.sum()`, pipeline source) via the shared `{ptr,len}` path; region
    = `Arena(k)`, so it cannot escape its arena. (`where`-first inline-literal element
    inference still defaults to i64 — a separate, pre-existing limitation.)
-4. **Free-standing drop.** Per-binding MIR `Drop` + runtime free; move-out skips drop; allow
-   owned arrays outside arenas and **returning** them. Now materializing terminals work
-   anywhere.
+4. **[done]** **Free-standing drop.** Per-binding MIR `Drop` + runtime `free`; move-out skips
+   drop (a returned/moved array is owned by the callee, so the source frame does not free it);
+   owned arrays now allowed outside arenas and **returnable** across functions. `.to_array()`
+   with no enclosing arena heap-allocates via libc `malloc` and is freed at every function exit.
+   Drop slots are null-initialized (`DropFlagInit`) so an unreached/never-allocated path is a
+   no-op `free(null)`. New MIR `HeapAllocBuf` / `Drop` / `DropFlagInit` + `emit_exit_cleanup`
+   (drops then arena-ends at each `return`/`?`/fall-through); `MoveCheck` tracks `ever_moved`,
+   and `check_file` derives each fn's `drop_locals` (owned arrays neither moved-out nor
+   arena-regioned). Now materializing terminals work anywhere. A bare owned local returned as
+   the function's trailing expression (`fn make() -> array<i32> { ys := …; ys }`) is correctly
+   treated as moved-out (return type is a Move type) so it is not double-freed.
+   - **Deferred to slice 4.5 (complete drop coverage)** — two *sound, bounded* leaks remain
+     (no double-free / UAF; no loops in the language yet, so leaks are process-lifetime):
+     (a) a local moved on some-but-not-all paths is excluded from `drop_locals` outright, so it
+     leaks on the not-moved path; (b) an unbound temporary owned array consumed in place
+     (`[..].to_array().sum()` with no arena) is never tracked, so its buffer leaks. The fix is
+     **null-on-move drop flags** (keep moved locals in `drop_locals`, null the slot at each move
+     site → exit `Drop` is a no-op `free(null)` when moved) plus binding consumed temporaries to
+     synthetic drop slots (or fusing the terminal so no materialization happens). Both surfaced
+     by the slice-4 Gemini review (#42).
 5. **Remaining materializing terminals.** `sort`/`partition`/`chunks`/`scan` + array-valued
-   results, each on the slice-3/4 foundation.
+   results, each on the slice-3/4 foundation. (Fold slice 4.5 drop coverage in here or before.)
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
    `.clone()` to escape; **draft.md §19 runs in full** → M5 truly complete.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same
