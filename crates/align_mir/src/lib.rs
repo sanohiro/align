@@ -1187,12 +1187,12 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.push(Stmt::Store(jv, Operand::Value(jdec)));
     b.terminate(Term::Goto(inner));
 
-    // place: arr[j+1] = key; i += 1.
+    // place: arr[j+1] = key; i += 1. `jv` is unchanged between `inner` (which dominates `place`)
+    // and here — only `shift` writes it, and `shift` loops back to `inner` — so `j_val` from
+    // `inner` is still current; reuse it instead of re-loading.
     b.cur = place;
-    let j_final = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(j_final, Rvalue::Load(jv)));
     let jf1 = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(jf1, Rvalue::Bin(BinOp::Add, Operand::Value(j_final), index_const(1))));
+    b.push(Stmt::Let(jf1, Rvalue::Bin(BinOp::Add, Operand::Value(j_val), index_const(1))));
     b.push(Stmt::PtrStore(Operand::Value(ptr), Operand::Value(jf1), Operand::Value(key)));
     let i_inc = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i_inc, Rvalue::Bin(BinOp::Add, Operand::Value(i_cur), index_const(1))));
