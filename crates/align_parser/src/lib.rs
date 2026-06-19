@@ -6,7 +6,7 @@
 //! `mut` + reassignment, integer arithmetic, and `( )` grouping.
 
 use align_ast::*;
-use align_diag::Diagnostics;
+use align_diag::{Diagnostic, Diagnostics};
 use align_lexer::{TokKind, Token};
 use align_span::Span;
 
@@ -390,13 +390,21 @@ impl<'a> Parser<'a> {
     /// yields a `Unit` placeholder so the surrounding template still produces an AST node.
     fn parse_hole_expr(&mut self, src: &str, str_span: Span, off: usize) -> Expr {
         let base = str_span.lo + 1 + off as u32;
-        let tokens: Vec<Token> = align_lexer::tokenize(str_span.file, src, self.diags)
+        let remap = |s: Span| Span::new(s.file, s.lo + base, s.hi + base);
+        // Lex into a private buffer so lexer-error spans (relative to the hole source) can be
+        // offset into the template literal before merging into the real diagnostics.
+        let mut hole_diags = Diagnostics::new();
+        let tokens: Vec<Token> = align_lexer::tokenize(str_span.file, src, &mut hole_diags)
             .into_iter()
-            .map(|t| Token {
-                kind: t.kind,
-                span: Span::new(str_span.file, t.span.lo + base, t.span.hi + base),
-            })
+            .map(|t| Token { kind: t.kind, span: remap(t.span) })
             .collect();
+        for d in hole_diags.iter() {
+            self.diags.push(Diagnostic {
+                severity: d.severity,
+                message: d.message.clone(),
+                span: d.span.map(remap),
+            });
+        }
         let mut sub = Parser { tokens, pos: 0, diags: self.diags };
         let expr = sub.parse_expr(0);
         // The lexer appends an implicit `End` before `Eof`; skip it, then reject any
@@ -407,7 +415,9 @@ impl<'a> Parser<'a> {
         if expr.is_some() && !matches!(sub.peek(), TokKind::Eof) {
             sub.diags.error("a template hole must be a single expression".to_string(), sub.span());
         }
-        expr.unwrap_or(Expr { kind: ExprKind::Unit, span: str_span })
+        // On parse failure, point the placeholder at just the hole's contents.
+        let hole_span = Span::new(str_span.file, base, base + src.len() as u32);
+        expr.unwrap_or(Expr { kind: ExprKind::Unit, span: hole_span })
     }
 
     fn parse_expr(&mut self, min_bp: u8) -> Option<Expr> {
