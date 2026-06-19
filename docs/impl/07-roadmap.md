@@ -234,10 +234,14 @@ later slices (struct arrays, M5 strings/JSON).
   performs the array→slice borrow (fixes a latent array-into-slice-slot codegen mismatch).
 - [done] `{expr}` template holes: a hole is any non-empty `{...}`, whose contents are
   re-lexed and parsed as a sub-expression (arithmetic, calls, inline `str` concat — not
-  just a bare name). The hole expression must be int-like or `str`. An unmatched `{` or
+  just a bare name). The hole expression must be printable. An unmatched `{` or
   empty `{}` stays literal. Hole token spans are offset to point into the template literal.
-- [todo] owned `string` / `bytes`, const string pool/meta,
-  `html`/`json` template variants.
+- [done] `print` and template holes render `bool` (`true`/`false`) and `char` (its UTF-8,
+  incl. multibyte) in addition to integers and `str` (runtime `align_rt_print_bool`/
+  `print_char` + `builder_write_bool`/`write_char`; MIR `BoolHole`/`CharHole`). Floats
+  still wait for a dtoa.
+- [todo] float formatting (`print`/template holes for `f32`/`f64` — needs a dtoa),
+  owned `string` / `bytes`, const string pool/meta, `html`/`json` template variants.
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
   view, SIMD structural scan.
 

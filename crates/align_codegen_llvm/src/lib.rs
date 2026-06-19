@@ -128,6 +128,22 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        "print_bool".to_string(),
+        module.add_function(
+            "align_rt_print_bool",
+            ctx.void_type().fn_type(&[ctx.i32_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "print_char".to_string(),
+        module.add_function(
+            "align_rt_print_char",
+            ctx.void_type().fn_type(&[ctx.i32_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         "str_eq".to_string(),
         module.add_function(
             "align_rt_str_eq",
@@ -157,6 +173,22 @@ fn build_module<'c>(
         module.add_function(
             "align_rt_builder_write_int",
             ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_write_bool".to_string(),
+        module.add_function(
+            "align_rt_builder_write_bool",
+            ctx.void_type().fn_type(&[ptr.into(), ctx.i32_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_write_char".to_string(),
+        module.add_function(
+            "align_rt_builder_write_char",
+            ctx.void_type().fn_type(&[ptr.into(), ctx.i32_type().into()], false),
             None,
         ),
     );
@@ -830,6 +862,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .map_err(|e| self.err(e))?;
             return Ok(None);
         }
+        // print(bool): widen i1 to i32 and emit `true`/`false`.
+        if ty == Ty::Bool {
+            let v = self.operand(arg).into_int_value();
+            let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
+            self.builder
+                .build_call(self.funcs["print_bool"], &[wide.into()], "")
+                .map_err(|e| self.err(e))?;
+            return Ok(None);
+        }
+        // print(char): pass the u32 scalar; the runtime emits its UTF-8.
+        if ty == Ty::Char {
+            let v = self.operand(arg).into_int_value();
+            self.builder
+                .build_call(self.funcs["print_char"], &[v.into()], "")
+                .map_err(|e| self.err(e))?;
+            return Ok(None);
+        }
         let v = self.operand(arg).into_int_value();
         let i64t = self.ctx.i64_type();
         let wide = if int_bits(ty) < 64 {
@@ -934,6 +983,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     };
                     self.builder
                         .build_call(self.funcs["builder_write_int"], &[bptr.into(), wide.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                align_mir::TemplatePiece::BoolHole(op) => {
+                    let v = self.operand(op).into_int_value();
+                    let wide = self.builder.build_int_z_extend(v, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_call(self.funcs["builder_write_bool"], &[bptr.into(), wide.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                align_mir::TemplatePiece::CharHole(op) => {
+                    let v = self.operand(op).into_int_value();
+                    self.builder
+                        .build_call(self.funcs["builder_write_char"], &[bptr.into(), v.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
             }
