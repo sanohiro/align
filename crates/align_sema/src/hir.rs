@@ -126,6 +126,13 @@ pub enum ExprKind {
         base: LocalId,
         index: u32,
     },
+    /// `base[index].field` — read `field` of element `index` of a struct-array local. Used
+    /// by `json.encode` over a fixed struct array (unrolled; `index` is a constant).
+    IndexField {
+        base: LocalId,
+        index: u32,
+        field: u32,
+    },
     /// A block used in expression position; its value is the trailing expression (or
     /// `Unit`). Preserves statements (e.g. a diverging `{ return … }`).
     Block(Block),

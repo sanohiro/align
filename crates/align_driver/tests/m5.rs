@@ -105,6 +105,21 @@ fn json_encode_flat_struct() {
 }
 
 #[test]
+fn json_encode_struct_array() {
+    if !backend_available() {
+        return;
+    }
+    // A fixed struct array encodes to a JSON array of objects (str fields escaped).
+    let src = "User { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\", active: true}, User{id: 2, name: \"b\\n\", active: false}]\n  print(json.encode(us))\n  return 0\n}\n";
+    let out = build_and_run("json-encode-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[{\"id\":1,\"name\":\"a\",\"active\":true},{\"id\":2,\"name\":\"b\\n\",\"active\":false}]\n"
+    );
+}
+
+#[test]
 fn struct_str_field_roundtrips() {
     if !backend_available() {
         return;

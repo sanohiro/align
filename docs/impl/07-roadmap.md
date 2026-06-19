@@ -248,11 +248,13 @@ later slices (struct arrays, M5 strings/JSON).
   non-arena str); storing an arena-backed str into a field is an `EscapeCheck` error, so a
   struct never carries an arena region and stays freely returnable. box/slice/array/option
   fields remain unsupported.
-- [done] `json.encode(s)` — encode a flat struct (int/float/bool/str fields) into a JSON
-  object `str`. Desugars in sema to the `template`/builder machinery (static JSON syntax +
-  per-field value holes); `str` fields are emitted as JSON string literals (quoted + escaped
-  per RFC 8259) by the runtime `align_rt_builder_write_json_str`. Nested structs/arrays/
-  options and `json.decode` are not implemented yet.
+- [done] `json.encode(s)` — encode a flat struct **or a fixed struct array** into a JSON
+  object / array of objects (`str`). Desugars in sema to the `template`/builder machinery
+  (static JSON syntax + per-field value holes; the array case is unrolled since the length
+  is static, reading each element field via the new HIR `IndexField`). `str` fields are
+  emitted as JSON string literals (quoted + escaped per RFC 8259) by the runtime
+  `align_rt_builder_write_json_str`. Nested structs, dynamic arrays/options, and
+  `json.decode` are not implemented yet.
 - [done] `.len()` on `str`/`slice<T>` (the `len` field of the `{ ptr, len }` view; for
   `str` this is the **byte** length) and on a fixed array/struct-array (the static element
   count). Returns `i64`. Reuses the MIR `SliceLen` rvalue.
