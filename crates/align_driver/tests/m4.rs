@@ -189,6 +189,39 @@ fn struct_by_value_pass_return_copy() {
 }
 
 #[test]
+fn array_min_max_int() {
+    if !backend_available() {
+        return;
+    }
+    // min = 1, max = 8 over [5,3,8,1,4]; `map(id)` pins the element type to i32.
+    let src = "fn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  lo := [5, 3, 8, 1, 4].map(id).min()\n  hi := [5, 3, 8, 1, 4].map(id).max()\n  return lo * 100 + hi\n}\n";
+    let out = build_and_run("minmax-int", src);
+    assert_eq!(out.status.code(), Some(108));
+}
+
+#[test]
+fn array_min_after_where() {
+    if !backend_available() {
+        return;
+    }
+    // where >2 over [5,3,8,1,4] keeps [5,3,8,4]; min = 3.
+    let src = "fn id(x: i32) -> i32 = x\nfn big(x: i32) -> bool = x > 2\nfn main() -> i32 {\n  return [5, 3, 8, 1, 4].map(id).where(big).min()\n}\n";
+    let out = build_and_run("min-where", src);
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn array_max_float() {
+    if !backend_available() {
+        return;
+    }
+    // max of [1.5, 9.5, 4.5] is 9.5 (> 9.0); exit 1.
+    let src = "fn idf(x: f64) -> f64 = x\nfn main() -> i32 {\n  hi := [1.5, 9.5, 4.5].map(idf).max()\n  if hi > 9.0 { return 1 }\n  return 0\n}\n";
+    let out = build_and_run("max-float", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn array_sum_emits_single_loop() {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "a.align", "fn main() -> i32 {\n  return [1, 2, 3].sum()\n}\n");

@@ -596,6 +596,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let init = Operand::Const(Const::Bool(*all));
             lower_array_reduce(b, source, stages, Ty::Bool, init, Reducer::AnyAll { func: func.clone(), all: *all })
         }
+        hir::ExprKind::ArrayMinMax { source, stages, is_max } => {
+            // Seed with the element type's extreme so the running `min`/`max` is replaced by the
+            // first element and an empty pipeline yields that extreme (the fold identity).
+            let init = extreme_of(e.ty, *is_max);
+            lower_array_reduce(b, source, stages, e.ty, init, Reducer::MinMax { is_max: *is_max })
+        }
         hir::ExprKind::ArrayToArray { source, stages, elem } => {
             lower_array_collect(b, source, stages, *elem)
         }
@@ -644,6 +650,29 @@ fn index_const(i: usize) -> Operand {
 fn zero_of(ty: Ty) -> Operand {
     match ty {
         Ty::Float(_) => Operand::Const(Const::Float(0.0, ty)),
+        _ => Operand::Const(Const::Int(0, ty)),
+    }
+}
+
+/// The seed for a `min` (`is_max = false`) / `max` (`is_max = true`) fold: the element type's
+/// largest / smallest value, so the first element always replaces it. Floats use ±infinity.
+fn extreme_of(ty: Ty, is_max: bool) -> Operand {
+    match ty {
+        Ty::Float(_) => {
+            let v = if is_max { f64::NEG_INFINITY } else { f64::INFINITY };
+            Operand::Const(Const::Float(v, ty))
+        }
+        Ty::Int(IntTy { bits, signed }) => {
+            // `min` seeds with the type max; `max` seeds with the type min.
+            let v: i128 = if is_max {
+                // type minimum
+                if signed { -(1i128 << (bits - 1)) } else { 0 }
+            } else {
+                // type maximum
+                if signed { (1i128 << (bits - 1)) - 1 } else { (1i128 << bits) - 1 }
+            };
+            Operand::Const(Const::Int(v, ty))
+        }
         _ => Operand::Const(Const::Int(0, ty)),
     }
 }
@@ -702,6 +731,8 @@ enum Reducer {
     Fold(String),
     /// `any(p)` / `all(p)`: `acc || p(element)` / `acc && p(element)`.
     AnyAll { func: String, all: bool },
+    /// `min` / `max`: keep `element` when it is smaller / larger than `acc`.
+    MinMax { is_max: bool },
 }
 
 /// The set-up of a pipeline source: a stack array (slot + const length), a struct array
@@ -844,31 +875,47 @@ fn lower_array_reduce(
     }
     let a = b.fresh_value(acc_ty);
     b.push(Stmt::Let(a, Rvalue::Load(acc)));
-    let next = b.fresh_value(acc_ty);
-    match &reducer {
-        // `count`: acc = acc + 1 (the element value is irrelevant).
-        Reducer::Count => b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), index_const(1)))),
-        // `sum`: acc = acc + cur.
-        Reducer::Sum => {
-            let cur = cur.expect("sum needs a scalar element");
-            b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
+    // `min`/`max` update the accumulator conditionally (keep the element only when it beats the
+    // current best), branching straight to `cont`; the other reducers compute a `next` value
+    // unconditionally and fall through to the shared store-and-loop below.
+    if let Reducer::MinMax { is_max } = &reducer {
+        let cur = cur.expect("min/max needs a scalar element");
+        let op = if *is_max { BinOp::Gt } else { BinOp::Lt };
+        let cmp = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(cmp, Rvalue::Bin(op, cur.clone(), Operand::Value(a))));
+        let upd = b.new_block();
+        b.terminate(Term::Branch(Operand::Value(cmp), upd, cont));
+        b.cur = upd;
+        b.push(Stmt::Store(acc, cur));
+        b.terminate(Term::Goto(cont));
+    } else {
+        let next = b.fresh_value(acc_ty);
+        match &reducer {
+            // `count`: acc = acc + 1 (the element value is irrelevant).
+            Reducer::Count => b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), index_const(1)))),
+            // `sum`: acc = acc + cur.
+            Reducer::Sum => {
+                let cur = cur.expect("sum needs a scalar element");
+                b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
+            }
+            // `reduce`: acc = f(acc, cur).
+            Reducer::Fold(func) => {
+                let cur = cur.expect("reduce needs a scalar element");
+                b.push(Stmt::Let(next, Rvalue::Call(func.clone(), vec![Operand::Value(a), cur])));
+            }
+            // `any`/`all`: t = p(cur); acc = acc || t  /  acc && t.
+            Reducer::AnyAll { func, all } => {
+                let cur = cur.expect("any/all needs a scalar element");
+                let t = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(t, Rvalue::Call(func.clone(), vec![cur])));
+                let op = if *all { BinOp::And } else { BinOp::Or };
+                b.push(Stmt::Let(next, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
+            }
+            Reducer::MinMax { .. } => unreachable!("min/max handled above"),
         }
-        // `reduce`: acc = f(acc, cur).
-        Reducer::Fold(func) => {
-            let cur = cur.expect("reduce needs a scalar element");
-            b.push(Stmt::Let(next, Rvalue::Call(func.clone(), vec![Operand::Value(a), cur])));
-        }
-        // `any`/`all`: t = p(cur); acc = acc || t  /  acc && t.
-        Reducer::AnyAll { func, all } => {
-            let cur = cur.expect("any/all needs a scalar element");
-            let t = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(t, Rvalue::Call(func.clone(), vec![cur])));
-            let op = if *all { BinOp::And } else { BinOp::Or };
-            b.push(Stmt::Let(next, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
-        }
+        b.push(Stmt::Store(acc, Operand::Value(next)));
+        b.terminate(Term::Goto(cont));
     }
-    b.push(Stmt::Store(acc, Operand::Value(next)));
-    b.terminate(Term::Goto(cont));
 
     // cont: i += 1; loop.
     b.cur = cont;

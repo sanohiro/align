@@ -583,7 +583,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::ArrayReduce { source, init, .. } => {
                 self.walk(source, depth);
@@ -729,7 +729,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
@@ -1515,6 +1515,9 @@ impl<'a> Checker<'a> {
         if method == "any" || method == "all" {
             return self.check_array_any_all(recv, args, method == "all", span);
         }
+        if method == "min" || method == "max" {
+            return self.check_array_min_max(recv, args, expected, method == "max", span);
+        }
         if method == "to_array" {
             return self.check_array_to_array(recv, args, span);
         }
@@ -1840,6 +1843,27 @@ impl<'a> Checker<'a> {
         }
         self.constrain(elem, expected, span);
         Expr { kind: ExprKind::ArraySum { source: Box::new(source), stages }, ty: elem, span }
+    }
+
+    /// `source.….min()` / `.max()` — the smallest / largest surviving (numeric scalar)
+    /// element, as the element type. Like `sum`, it takes no arguments and an empty pipeline
+    /// yields the fold identity (the type's extreme value).
+    fn check_array_min_max(&mut self, recv: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, is_max: bool, span: Span) -> Expr {
+        let name = if is_max { "max" } else { "min" };
+        if !args.is_empty() {
+            self.diags.error(format!("'{name}' takes no arguments"), span);
+        }
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some((source, stages, elem)) = self.check_pipeline(recv, expected, span) else {
+            return err;
+        };
+        if !elem.is_numeric() {
+            self.diags
+                .error(format!("'{name}' needs a numeric element type, got {}", ty_name(elem)), span);
+            return err;
+        }
+        self.constrain(elem, expected, span);
+        Expr { kind: ExprKind::ArrayMinMax { source: Box::new(source), stages, is_max }, ty: elem, span }
     }
 
     /// `source.….count()` — the count of elements surviving the stages, as an `i64`. The
@@ -2381,7 +2405,7 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
@@ -3142,6 +3166,19 @@ mod tests {
         // MIR nulls the slot at the move site so the not-moved path is still freed at exit.
         let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn run(c: bool) -> i32 {\n  ys := [1, 2, 3].map(double).to_array()\n  mut total := 0\n  if c {\n    zs := ys\n    total = zs.sum()\n  }\n  return total\n}\nfn main() -> i32 = run(true)\n");
         assert!(!d.has_errors(), "a one-path move with no later use of the source should check");
+    }
+
+    #[test]
+    fn min_over_non_numeric_errors() {
+        // `min`/`max` need a numeric element, like `sum`. A bool-producing map is rejected.
+        let (_p, d) = check("fn isbig(x: i32) -> bool = x > 1\nfn main() -> i32 {\n  if [1, 2, 3].map(isbig).min() { return 1 }\n  return 0\n}\n");
+        assert!(d.has_errors(), "min over a non-numeric element must error");
+    }
+
+    #[test]
+    fn min_max_inline_checks() {
+        let (_p, d) = check("fn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [3, 1, 2].map(id).min() + [3, 1, 2].map(id).max()\n}\n");
+        assert!(!d.has_errors(), "min + max over an i32 pipeline should check");
     }
 
     #[test]

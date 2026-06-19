@@ -327,8 +327,13 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    would double-free, so those stay a sound bounded leak). Moving a *bound* owned local out
    through an `if`/`else` arm (or `else`-unwrap fallback) is rejected for now (sema deferral
    diagnostic) — codegen only nulls at direct sites; bind the branch result to a local first.
-5. **Remaining materializing terminals.** `sort`/`partition`/`chunks`/`scan` + array-valued
-   results, each on the slice-3/4 foundation.
+5. **More terminals (in progress).** `min`/`max` reductions **[done]** — fused-loop reducers
+   (`Reducer::MinMax`) that keep an element only when it beats the running best (a conditional
+   update branching to the loop `cont`), seeded with the element type's extreme so an empty
+   pipeline yields that extreme (the fold identity, like `sum → 0`). Completes the common
+   reduction set (`sum`/`count`/`min`/`max`/`any`/`all`/`reduce`). **Remaining:** `dot` (two
+   sources), `scan` (materializing prefix fold) and the array-producing `sort`/`partition`/
+   `chunks` (new algorithms / nested types) — each its own follow-up on the slice-3/4 foundation.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
    `.clone()` to escape; **draft.md §19 runs in full** → M5 truly complete.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same
