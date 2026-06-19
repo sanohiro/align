@@ -374,12 +374,11 @@ impl<'a> EscapeCheck<'a> {
             }
             Stmt::Assign { local, value } => {
                 self.walk(value, depth);
-                if matches!(value.ty, Ty::Slice(_)) {
-                    if self.slice_is_local(value) {
-                        self.local_backed_slice.insert(*local);
-                    } else {
-                        self.local_backed_slice.remove(local);
-                    }
+                // Conservative without a dataflow join: a binding that is *ever* assigned a
+                // local-backed slice stays local-backed (a later branch could reach `return`
+                // while the binding still holds the local array). We never clear the flag.
+                if matches!(value.ty, Ty::Slice(_)) && self.slice_is_local(value) {
+                    self.local_backed_slice.insert(*local);
                 }
                 if Self::tracks_region(value.ty) {
                     let r = self.region_of(value, depth);
@@ -789,7 +788,11 @@ impl<'a> Checker<'a> {
                 }
                 ast::Stmt::Assign { place, value } => match self.check_place(place) {
                     Place::Local { id, ty } => {
-                        let v = self.check_expr(value, Some(ty));
+                        // Mirror the `let` path: a slice place borrows its array source.
+                        let v = match ty {
+                            Ty::Slice(ps) => self.check_slice_init(value, ps),
+                            _ => self.check_expr(value, Some(ty)),
+                        };
                         stmts.push(Stmt::Assign { local: id, value: v });
                     }
                     Place::Field { base, index, ty } => {
@@ -2229,6 +2232,22 @@ mod tests {
         // first() re-borrows its arg; returning it leaks a view into bad()'s temp array.
         let (_p, d) = check("fn first(xs: slice<i64>) -> slice<i64> = xs\nfn bad() -> slice<i64> {\n  return first([1, 2, 3])\n}\nfn main() -> i32 { return 0 }\n");
         assert!(d.has_errors(), "a slice re-borrowed from a local array must not escape");
+    }
+
+    #[test]
+    fn slice_local_backed_via_conditional_assign_cannot_escape() {
+        // Without a dataflow join we must stay conservative: a binding ever holding a
+        // local-backed slice cannot be returned, even if a branch reassigns a param slice.
+        let (_p, d) = check("fn pick(p: slice<i32>) -> slice<i32> {\n  mut s: slice<i32> := [1, 2, 3]\n  if true { s = p }\n  return s\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "a conditionally-reassigned local-backed slice must not escape");
+    }
+
+    #[test]
+    fn slice_array_literal_reassign_cannot_escape() {
+        // Reassigning an array literal to a slice local borrows frame-local storage (and is
+        // coerced like a `let`), so the binding becomes local-backed and cannot be returned.
+        let (_p, d) = check("fn bad(p: slice<i32>) -> slice<i32> {\n  mut s: slice<i32> := p\n  s = [1, 2, 3]\n  return s\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "a slice reassigned from a local array must not escape");
     }
 
     #[test]
