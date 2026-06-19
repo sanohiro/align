@@ -884,13 +884,6 @@ impl<'a> Checker<'a> {
             self.diags
                 .error(format!("cannot assign to immutable '{name}' (declare with `mut`)"), place.span);
         }
-        if matches!(local_ty, Ty::Struct(_)) {
-            self.diags.error(
-                "cannot assign a whole struct; assign individual fields".to_string(),
-                place.span,
-            );
-            return Place::Err;
-        }
         Place::Local { id, ty: local_ty }
     }
 
@@ -991,12 +984,10 @@ impl<'a> Checker<'a> {
                 };
                 Expr { kind: ExprKind::Arena(block), ty, span: e.span }
             }
-            ast::ExprKind::StructLit { .. } => {
-                self.diags.error(
-                    "struct literals are only allowed as `name := Type { ... }`".to_string(),
-                    e.span,
-                );
-                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span }
+            ast::ExprKind::StructLit { name, fields } => {
+                // A struct literal is a value expression (constructed, then passed/returned/
+                // stored). The `let` path checks it directly to store fields in place.
+                self.check_struct_lit(name, fields, e.span)
             }
             ast::ExprKind::If { cond, then, els } => self.check_if(cond, then, els.as_deref(), expected, e.span),
             ast::ExprKind::Block(b) => {
@@ -1033,13 +1024,7 @@ impl<'a> Checker<'a> {
             return err(span);
         };
         let local_ty = self.locals[id as usize].ty;
-        if matches!(local_ty, Ty::Struct(_)) {
-            self.diags.error(
-                "cannot use a struct value directly (access its fields)".to_string(),
-                span,
-            );
-            return err(span);
-        }
+        // A struct is a value: it may be read whole (copied), passed, and returned.
         self.constrain(local_ty, expected, span);
         Expr { kind: ExprKind::Local(id), ty: local_ty, span }
     }
@@ -2350,6 +2335,19 @@ mod tests {
     fn struct_float_field_ok() {
         let (_p, d) = check("P { x: f64, y: f64 }\nfn main() -> i32 {\n  p := P{x: 1.5, y: 2.5}\n  if p.x + p.y > 3.0 { return 1 }\n  return 0\n}\n");
         assert!(!d.has_errors(), "float struct fields should check");
+    }
+
+    #[test]
+    fn struct_by_value_param_return_copy() {
+        // Pass a struct by value, copy it, and return it; construct via a struct-literal body.
+        let (_p, d) = check("P { x: i32, y: i32 }\nfn sum(p: P) -> i32 = p.x + p.y\nfn dup(p: P) -> P {\n  q := p\n  return q\n}\nfn mk(v: i32) -> P = P{x: v, y: v}\nfn main() -> i32 {\n  a := mk(21)\n  b := dup(a)\n  return sum(b)\n}\n");
+        assert!(!d.has_errors(), "struct pass/return/copy + struct-literal expressions should check");
+    }
+
+    #[test]
+    fn whole_struct_reassign_ok() {
+        let (_p, d) = check("P { x: i32 }\nfn mk(v: i32) -> P = P{x: v}\nfn main() -> i32 {\n  mut p := P{x: 1}\n  p = mk(7)\n  return p.x\n}\n");
+        assert!(!d.has_errors(), "whole-struct reassignment should check");
     }
 
     #[test]

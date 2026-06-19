@@ -515,9 +515,18 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayLit { .. } => {
             unreachable!("array literal only appears as a let initializer or pipeline source")
         }
-        // sema only admits a struct literal as a `let` initializer (handled in lower_stmt).
-        hir::ExprKind::StructLit { .. } => {
-            unreachable!("struct literal outside a let initializer reached MIR lowering")
+        // A struct literal in value position (return/arg/assign): materialize it into a
+        // temp slot field by field, then load the whole struct. (A `let` initializer stores
+        // straight into its own slot — see `lower_stmt` — avoiding this copy.)
+        hir::ExprKind::StructLit { fields, .. } => {
+            let slot = b.new_slot(e.ty);
+            for (i, fe) in fields.iter().enumerate() {
+                let op = lower_expr(b, fe);
+                b.push(Stmt::StoreField(slot, i as u32, op));
+            }
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Load(slot)));
+            Operand::Value(v)
         }
     }
 }

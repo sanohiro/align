@@ -256,8 +256,12 @@ later slices (struct arrays, M5 strings/JSON).
 - [done] `.len()` on `str`/`slice<T>` (the `len` field of the `{ ptr, len }` view; for
   `str` this is the **byte** length) and on a fixed array/struct-array (the static element
   count). Returns `i64`. Reuses the MIR `SliceLen` rvalue.
-- [todo] whole-struct by-value (pass/return/copy) — the gateway to `json.decode<T>`
-  (which returns a decoded struct); structs are currently slot-only.
+- [done] whole-struct by-value (pass/return/copy) and struct literals in value position.
+  A struct is a Copy aggregate (its fields are scalars + region-0 `str`, all Copy): it can
+  be a function parameter, a return type, a call argument, copied via `let y := x`, and
+  reassigned whole. Codegen passes/returns the LLVM aggregate by value (`declare_fn` maps
+  `Ty::Struct`); params are already stored into their slots, and a struct-literal expression
+  materializes into a temp slot then loads. The gateway to `json.decode<T>`.
 - [todo] owned `string` / `bytes`, const string pool/meta, `html`/`json` template variants,
   `json.decode<T>` (SIMD scan, zero-copy views, field tables).
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
