@@ -158,6 +158,9 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
 - [done] `slice<T>` views (function parameters, array→slice borrow, pipelines over
   slices with runtime length).
 - [done] `reduce(f, init)` terminal (generalizes `sum`; shares the fused loop).
+- [done] `count()` terminal — counts the elements surviving the stages (`i64`). Shares the
+  fused loop (`acc + 1` per kept element); needs no scalar element, so it works on a struct
+  array with only a `where(.field)` filter (`[...].where(.active).count()`).
 - [done] `slice<T>` escape checking: a slice that borrows function-local array storage (an
   array literal / local array, including via a slice-annotated `let` or a re-borrowing
   call) cannot be returned — it would dangle when the frame is freed. A slice *parameter*
