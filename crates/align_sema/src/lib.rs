@@ -256,7 +256,9 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 struct_ids: &struct_ids,
                 structs: &structs,
                 int_vars: Vec::new(),
+                int_parent: Vec::new(),
                 float_vars: Vec::new(),
+                float_parent: Vec::new(),
                 locals: Vec::new(),
                 scope: Vec::new(),
                 ret_hint: Ty::Unit,
@@ -648,8 +650,14 @@ struct Checker<'a> {
     sigs: &'a HashMap<String, FnSig>,
     struct_ids: &'a HashMap<String, u32>,
     structs: &'a [StructDef],
+    // Integer/float inference variables. `*_vars[i]` is the binding for the *root* of var
+    // `i`; `*_parent[i]` is its union-find parent (self when `i` is a root). Linking two
+    // unconstrained vars (rather than dropping one) means a later constraint on either
+    // reaches both — without it they would diverge and resolve to different concrete types.
     int_vars: Vec<Option<IntTy>>,
+    int_parent: Vec<u32>,
     float_vars: Vec<Option<FloatTy>>,
+    float_parent: Vec<u32>,
     /// All locals of the current function (slots), never shrinks.
     locals: Vec<Local>,
     /// Visibility stack: (name, id). Truncated on block exit.
@@ -664,25 +672,47 @@ impl<'a> Checker<'a> {
     fn fresh_int_var(&mut self) -> Ty {
         let id = self.int_vars.len() as u32;
         self.int_vars.push(None);
+        self.int_parent.push(id);
         Ty::IntVar(id)
     }
 
     fn fresh_float_var(&mut self) -> Ty {
         let id = self.float_vars.len() as u32;
         self.float_vars.push(None);
+        self.float_parent.push(id);
         Ty::FloatVar(id)
+    }
+
+    /// Union-find root of an int/float var (no path compression — callers only read).
+    fn root_int(&self, mut v: u32) -> u32 {
+        while self.int_parent[v as usize] != v {
+            v = self.int_parent[v as usize];
+        }
+        v
+    }
+    fn root_float(&self, mut v: u32) -> u32 {
+        while self.float_parent[v as usize] != v {
+            v = self.float_parent[v as usize];
+        }
+        v
     }
 
     fn resolve(&self, ty: Ty) -> Ty {
         match ty {
-            Ty::IntVar(v) => match self.int_vars[v as usize] {
-                Some(it) => Ty::Int(it),
-                None => ty,
-            },
-            Ty::FloatVar(v) => match self.float_vars[v as usize] {
-                Some(ft) => Ty::Float(ft),
-                None => ty,
-            },
+            Ty::IntVar(v) => {
+                let r = self.root_int(v);
+                match self.int_vars[r as usize] {
+                    Some(it) => Ty::Int(it),
+                    None => Ty::IntVar(r),
+                }
+            }
+            Ty::FloatVar(v) => {
+                let r = self.root_float(v);
+                match self.float_vars[r as usize] {
+                    Some(ft) => Ty::Float(ft),
+                    None => Ty::FloatVar(r),
+                }
+            }
             other => other,
         }
     }
@@ -704,15 +734,27 @@ impl<'a> Checker<'a> {
         match (a, b) {
             (Ty::Error, _) | (_, Ty::Error) => Ty::Error,
             (Ty::IntVar(v), Ty::Int(it)) | (Ty::Int(it), Ty::IntVar(v)) => {
+                // `v` is a resolved root (see `resolve`); bind it.
                 self.int_vars[v as usize] = Some(it);
                 Ty::Int(it)
             }
-            (Ty::IntVar(_), Ty::IntVar(_)) => a, // both unconstrained; resolve later
+            (Ty::IntVar(v1), Ty::IntVar(v2)) => {
+                // Both unconstrained: link their roots so a later binding reaches both.
+                if v1 != v2 {
+                    self.int_parent[v2 as usize] = v1;
+                }
+                Ty::IntVar(v1)
+            }
             (Ty::FloatVar(v), Ty::Float(ft)) | (Ty::Float(ft), Ty::FloatVar(v)) => {
                 self.float_vars[v as usize] = Some(ft);
                 Ty::Float(ft)
             }
-            (Ty::FloatVar(_), Ty::FloatVar(_)) => a,
+            (Ty::FloatVar(v1), Ty::FloatVar(v2)) => {
+                if v1 != v2 {
+                    self.float_parent[v2 as usize] = v1;
+                }
+                Ty::FloatVar(v1)
+            }
             _ if a == b => a,
             _ => {
                 self.diags.error(
@@ -1224,6 +1266,15 @@ impl<'a> Checker<'a> {
         };
         if let Ty::Array(es, _) = e.ty {
             if es == ps {
+                // The borrow lowers via the same slot-materialization as a pipeline source,
+                // so the same restriction applies: only a literal or a named local.
+                if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+                    self.diags.error(
+                        "an array coerced to a slice must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                        e.span,
+                    );
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
+                }
                 let span = e.span;
                 return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
             }
@@ -1527,6 +1578,19 @@ impl<'a> Checker<'a> {
                 return None;
             }
         };
+        // MIR materializes an array source only when it is an array literal or a named
+        // local (slot-addressable); an arbitrary array-valued expression (e.g. an `if` or
+        // block) would otherwise crash lowering. A slice source is fine — it lowers as a
+        // value. Reject the unsupported array shape cleanly here.
+        if matches!(source.ty, Ty::Array(..) | Ty::StructArray(..))
+            && !matches!(source.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_))
+        {
+            self.diags.error(
+                "a pipeline over an array must start from an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                span,
+            );
+            return None;
+        }
 
         let mut stages = Vec::new();
         for raw in raw_stages {
@@ -1548,11 +1612,28 @@ impl<'a> Checker<'a> {
                     }
                 }
                 RawStage::Map(fname) => {
+                    // A struct element must be projected to a scalar first: MIR keeps a
+                    // struct array addressed by index until a `.field`, so a `map`/`where`
+                    // over the whole struct has nothing loaded and would crash lowering.
+                    if matches!(elem, Ty::Struct(_)) {
+                        self.diags.error(
+                            format!("'map' over a struct element is not supported yet (project a field first), got {}", ty_name(elem)),
+                            fname.span,
+                        );
+                        return None;
+                    }
                     let ret = self.check_stage_fn(&fname, elem, false);
                     stages.push(Stage { kind: StageKind::Map { func: fname.name }, out_ty: ret });
                     elem = ret;
                 }
                 RawStage::Where(fname) => {
+                    if matches!(elem, Ty::Struct(_)) {
+                        self.diags.error(
+                            format!("'where' over a struct element is not supported yet (use 'where(.field)' or project first), got {}", ty_name(elem)),
+                            fname.span,
+                        );
+                        return None;
+                    }
                     self.check_stage_fn(&fname, elem, true);
                     stages.push(Stage { kind: StageKind::Where { func: fname.name }, out_ty: elem });
                 }

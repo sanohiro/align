@@ -18,7 +18,10 @@ pub extern "C" fn align_rt_print_i64(x: i64) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
     // A failed write to a closed pipe is ignored here (EPIPE handling is a std.io concern).
-    let _ = writeln!(out, "{x}");
+    // The generated `main` returns straight to crt0, so std's atexit flush never runs;
+    // an explicit flush keeps output from being lost when stdout is block-buffered (a
+    // file/pipe redirect). Same for every other `print` variant below.
+    let _ = writeln!(out, "{x}").and_then(|()| out.flush());
 }
 
 /// Builtin `print` for strings: write the bytes + a newline to stdout. `str` is a
@@ -32,7 +35,7 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(bytes);
-    let _ = out.write_all(b"\n");
+    let _ = out.write_all(b"\n").and_then(|()| out.flush());
 }
 
 /// Builtin `print` for booleans: write `true`/`false` + a newline.
@@ -41,7 +44,9 @@ pub extern "C" fn align_rt_print_bool(v: i32) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
     // Write the constant bytes directly (no formatting machinery).
-    let _ = out.write_all(if v != 0 { &b"true\n"[..] } else { &b"false\n"[..] });
+    let _ = out
+        .write_all(if v != 0 { &b"true\n"[..] } else { &b"false\n"[..] })
+        .and_then(|()| out.flush());
 }
 
 /// Builtin `print` for a `char` (a Unicode scalar value): write its UTF-8 + a newline.
@@ -52,7 +57,7 @@ pub extern "C" fn align_rt_print_char(c: u32) {
     let mut tmp = [0u8; 4];
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(ch.encode_utf8(&mut tmp).as_bytes());
-    let _ = out.write_all(b"\n");
+    let _ = out.write_all(b"\n").and_then(|()| out.flush());
 }
 
 /// Append a float's shortest round-trip decimal (Rust's `Display`), ensuring it reads as a
@@ -75,7 +80,8 @@ pub extern "C" fn align_rt_print_f64(x: f64) {
     let mut line = Vec::with_capacity(32);
     push_float(&mut line, x);
     line.push(b'\n');
-    let _ = std::io::stdout().lock().write_all(&line);
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(&line).and_then(|()| out.flush());
 }
 
 /// Builtin `print` for `f32`: shortest round-trip decimal + a newline.
@@ -85,7 +91,8 @@ pub extern "C" fn align_rt_print_f32(x: f32) {
     let mut line = Vec::with_capacity(32);
     push_float(&mut line, x);
     line.push(b'\n');
-    let _ = std::io::stdout().lock().write_all(&line);
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(&line).and_then(|()| out.flush());
 }
 
 /// A `str` view passed/returned across the ABI: `{ ptr, len }` (`06-runtime-std.md` §2).
@@ -516,17 +523,27 @@ impl Arena {
         // ABI passing odd alignments stays correct.
         let align = align.max(1).next_power_of_two();
         let need = size.max(1);
-        let aligned = (self.off + align - 1) & !(align - 1);
-        let fits = self
-            .chunks
-            .last()
-            .is_some_and(|c| aligned + need <= c.len());
-        if !fits {
-            self.chunks.push(vec![0u8; CHUNK.max(need + align)]);
-            self.off = 0;
+        // Align against the chunk's *absolute* base address, not the chunk-relative
+        // offset: a `Vec<u8>` buffer is only guaranteed 1-byte aligned, so a multiple of
+        // `align` measured from the chunk start need not be an aligned address. Returning
+        // an unaligned pointer is UB for the typed loads/stores codegen emits.
+        let aligned_off = |base: usize, off: usize| -> usize {
+            let addr = (base + off + align - 1) & !(align - 1);
+            addr - base
+        };
+        if let Some(chunk) = self.chunks.last() {
+            let off = aligned_off(chunk.as_ptr() as usize, self.off);
+            if off + need <= chunk.len() {
+                let chunk = self.chunks.last_mut().unwrap();
+                let ptr = unsafe { chunk.as_mut_ptr().add(off) };
+                self.off = off + need;
+                return ptr;
+            }
         }
-        let off = (self.off + align - 1) & !(align - 1);
+        // A fresh chunk: size it so an aligned `need` always fits (+align worst case).
+        self.chunks.push(vec![0u8; CHUNK.max(need + align)]);
         let chunk = self.chunks.last_mut().unwrap();
+        let off = aligned_off(chunk.as_ptr() as usize, 0);
         let ptr = unsafe { chunk.as_mut_ptr().add(off) };
         self.off = off + need;
         ptr

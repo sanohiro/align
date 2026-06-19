@@ -441,7 +441,10 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Float(ft) => (ft.bits / 8) as u64,
         Scalar::Bool => 1,
         Scalar::Char | Scalar::ErrCode => 4,
-        Scalar::Unit => 1,
+        // `()` is lowered as `i32` (the `int_type` fallback), so it must be sized as 4
+        // bytes: a `box<()>` allocates `scalar_bytes` and then stores/loads an `i32`, so a
+        // 1-byte size would overflow the allocation on the store and read OOB on the load.
+        Scalar::Unit => 4,
         // Only used to size a `box<T>` payload, which is always a true scalar.
         Scalar::Struct(_) => unreachable!("a struct is not a box payload"),
     }
@@ -1235,7 +1238,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             BinOp::Div => bld.build_float_div(l, r, "fdiv").map_err(|e| self.err(e))?.into(),
             BinOp::Rem => bld.build_float_rem(l, r, "frem").map_err(|e| self.err(e))?.into(),
             BinOp::Eq => bld.build_float_compare(FloatPredicate::OEQ, l, r, "feq").map_err(|e| self.err(e))?.into(),
-            BinOp::Ne => bld.build_float_compare(FloatPredicate::ONE, l, r, "fne").map_err(|e| self.err(e))?.into(),
+            // UNE (unordered-or-not-equal), not ONE: IEEE 754 requires `NaN != x` to be
+            // true, and ONE (ordered-and-not-equal) returns false when either side is NaN.
+            BinOp::Ne => bld.build_float_compare(FloatPredicate::UNE, l, r, "fne").map_err(|e| self.err(e))?.into(),
             BinOp::Lt => bld.build_float_compare(FloatPredicate::OLT, l, r, "flt").map_err(|e| self.err(e))?.into(),
             BinOp::Le => bld.build_float_compare(FloatPredicate::OLE, l, r, "fle").map_err(|e| self.err(e))?.into(),
             BinOp::Gt => bld.build_float_compare(FloatPredicate::OGT, l, r, "fgt").map_err(|e| self.err(e))?.into(),
