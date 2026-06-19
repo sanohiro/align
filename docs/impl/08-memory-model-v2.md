@@ -284,12 +284,15 @@ lifetimes). `MoveCheck` and `EscapeCheck` consume it; codegen/`Ty` do not carry 
 
 Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
 
-1. **Region lattice + unified `EscapeCheck`.** Introduce `Region` and the single `outlives`
-   rule; re-express the three existing point solutions on top of it with **no behavior
+1. **[done]** **Region lattice + unified `EscapeCheck`.** Introduce `Region` and the single
+   `outlives` rule; re-express the existing point solutions on top of it with **no behavior
    change** (pure refactor, all current tests green). This is the safety net for everything
    after.
-2. **Structs carry a region.** Lift the region-0 `str`-field restriction; struct region =
-   max(fields); allow `str`/`slice` view fields. Escape-checked by slice 1's rule.
+2. **[done]** **Structs carry a region.** Lift the region-0 `str`-field restriction; struct
+   region = max(fields); `region_of` handles `StructLit`/`Field`; `AssignField` uses the
+   single `outlives` rule against the base struct's region. A struct holding an arena `str`
+   is now constructible and usable inside its arena, and escape-checked as a whole. (Adding
+   `slice`/`box` view *fields* — needs the matching field-layout/codegen — is a follow-on.)
 3. **Owned dynamic `array<T>` (arena mode first).** The Move type, arena-bump-allocated,
    bulk-freed. `.to_array()` / a first materializing terminal (`filter`) **restricted to
    arena context**. No drop yet.
