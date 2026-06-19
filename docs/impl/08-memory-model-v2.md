@@ -56,8 +56,13 @@ longest-lived                                         shortest-lived
 
 - **Static** — process / program lifetime. String literals, leaked allocations, values built
   from only owned + scalar data. Freely returnable from any function.
-- **Frame** — the current function's stack frame. A `slice` that views a frame-local array, a
-  view into a by-value parameter. Lives until the function returns; **cannot** be returned.
+- **Frame** — the current function's stack frame. A view *created inside this function* over
+  frame-local storage: a `slice` of a frame-local array literal, or a view into the interior
+  of a by-value (owned) parameter. Lives until the function returns; **cannot** be returned.
+  Note this is **not** a view *parameter*: a `slice`/`str` *parameter* borrows the **caller**
+  (which outlives this call), so within this function's analysis it is treated as returnable —
+  region `Static` (see §3). This matches today's `slice_is_local`, which never marks a slice
+  parameter local-backed.
 - **Arena(k)** — the `k`-th enclosing `arena {}` block (1 = outermost arena, larger = more
   nested = shorter-lived). Freed at that block's `}`.
 
@@ -85,20 +90,27 @@ its sources** — a borrow can never outlive what it borrows.
 
 ```text
 literal / leaked / owned-from-scalars     → Static
-heap.new / clone / template / str-concat  → region of the enclosing arena (Frame if none*)
-slice of a frame-local array              → Frame
+view parameter (slice/str/… param)        → Static within this fn  (borrows the caller; returnable)
+heap.new / clone / template / str-concat  → region of the enclosing arena (Static if none*)
+slice of a frame-local array literal      → Frame
+slice/view into a by-value param interior → Frame
 slice of an arena-allocated array         → that Arena(k)
 x.field   (field is a view)               → region(x)
 view[i] / project(.field) on a view       → region(view)
+array literal of views [v0, v1, …]        → max region over the elements
+index/project an array-of-views  arr[i]   → region of the array's elements
 f(args)  returning a view                 → max region over the view-typed args it reborrows
 if/block/match yielding a view            → max region over the yielded branches
 struct literal { … }                      → max region over its fields  (Static if all owned/scalar)
 decoded str/array field                   → region of the decode input  (§9)
 ```
 
-\* An allocation outside any arena: see §6 — an **owned** value there is heap-owned with a
-drop (Static-lived until dropped), not "Frame". Only **borrows** with no arena source are
-Frame.
+\* `heap.new`/`clone`/`template`/concat outside any arena: the result is leaked /
+process-lifetime today, so `Static`. The owned-collection case is different — see §6: a
+free-standing **owned** `array`/`string` is heap-owned and `Static`-lived *until its `Drop`*
+(not `Frame`). `Frame` is only for **borrows** of frame-local storage (a slice of a
+frame-local array literal, or a view into a by-value parameter's interior), never for a
+view *parameter* (which borrows the caller → `Static`, returnable).
 
 Regions are never written by the user and never appear in a type. They live only in the
 checker (an inferred property of each binding), exactly like today's `region` map — just
@@ -161,9 +173,16 @@ Per draft.md §7 (`array<T>` = owned contiguous memory) and §12 (`string` = own
   no drop at the producing scope because it was moved), so materializing terminals are fully
   usable, not arena-confined.
 
-A returned/ moved-out owned value transfers ownership to the caller (region `Static` from the
-callee's view — it outlives the callee). `.clone()` deep-copies (allocating in the arena if in
-one, else heap-owned with its own drop).
+**Move-out is allowed only for free-standing owned values.** A *free-standing* owned value is
+`Static` (it owns its heap buffer, which it carries with it), so returning it / moving it to
+an outer binding transfers ownership to the destination and no drop fires at the producing
+scope. An *arena-allocated* owned value is `Arena(k)` — its buffer lives in the arena and is
+bulk-freed at the block's `}`. The single escape rule (§4) therefore **forbids moving or
+returning an arena-allocated owned value to a longer-lived region**: doing so would leave a
+dangling pointer after the bulk-free. To produce an owned `array`/`string` that must outlive
+the arena, allocate it free-standing (the default outside an arena) or `.clone()` it out.
+`.clone()` deep-copies: in an arena it allocates in that arena (`Arena(k)`); outside, it is
+heap-owned with its own `Drop`.
 
 ---
 
@@ -176,6 +195,13 @@ Free-standing owned values (§6) need their backing freed exactly once, on every
   early exit already handled for arenas (`return`, `?`, and later `break`/`continue`). This
   extends the existing `Builder.arenas` cleanup stack / `emit_arena_cleanup` to a parallel
   per-binding drop stack.
+- **How MIR knows arena vs free-standing:** regions are an analysis result, not part of `Ty`,
+  so the owned type alone does not say where it was allocated. `align_sema` therefore
+  **records, per owning binding, its allocation mode** (`Arena(k)` vs free-standing `Static`)
+  as part of the HIR/region result it already hands to `align_mir`. MIR drops only
+  free-standing bindings; `Arena(k)` bindings are skipped (the arena bulk-frees them). A
+  minimal carrier — e.g. a per-`Let` "owns a free-standing heap value" flag derived from the
+  region analysis — is enough; MIR does not re-run region inference.
 - **Skip when moved:** if `MoveCheck` marks the binding moved (returned, passed by value,
   reassigned), no drop is emitted — ownership left the scope.
 - **Skip when arena-allocated:** arena values are bulk-freed; they are not on the drop stack.

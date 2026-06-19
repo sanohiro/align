@@ -632,12 +632,13 @@ region-tied to that input (see the memory model, §6, and `docs/impl/08-memory-m
 To make a decoded value outlive its input, the user clones it explicitly:
 
 ```align
-arena {
+first_name := arena {
   data := fs.read_file(path)?
   users := json.decode<array<User>>(data)?   // views into `data`
   process(users)?                             // zero copy, cache-local
-  first_name := users[0].name.clone()         // explicit copy only when it must escape
+  users[0].name.clone()                       // explicit copy to escape the arena
 }
+// `first_name` outlives the arena; the views in `users` do not.
 ```
 
 The compiler never silently inserts a copy on escape — allocation stays visible in source
