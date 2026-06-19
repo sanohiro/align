@@ -57,9 +57,12 @@ pub extern "C" fn align_rt_print_char(c: u32) {
 
 /// Append a float's shortest round-trip decimal (Rust's `Display`), ensuring it reads as a
 /// float: if the rendering has no `.`/exponent and isn't `inf`/`NaN`, a `.0` is appended.
-fn push_float(buf: &mut Vec<u8>, s: &str) {
-    buf.extend_from_slice(s.as_bytes());
-    let looks_float = s.bytes().any(|b| matches!(b, b'.' | b'e' | b'E') || b.is_ascii_alphabetic());
+/// Generic over `Display` so the value is written straight into `buf` (no temporary `String`).
+fn push_float<T: std::fmt::Display>(buf: &mut Vec<u8>, x: T) {
+    use std::io::Write;
+    let start = buf.len();
+    let _ = write!(buf, "{x}");
+    let looks_float = buf[start..].iter().any(|&b| matches!(b, b'.' | b'e' | b'E') || b.is_ascii_alphabetic());
     if !looks_float {
         buf.extend_from_slice(b".0");
     }
@@ -69,8 +72,8 @@ fn push_float(buf: &mut Vec<u8>, s: &str) {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_print_f64(x: f64) {
     use std::io::Write;
-    let mut line = Vec::new();
-    push_float(&mut line, &x.to_string());
+    let mut line = Vec::with_capacity(32);
+    push_float(&mut line, x);
     line.push(b'\n');
     let _ = std::io::stdout().lock().write_all(&line);
 }
@@ -79,8 +82,8 @@ pub extern "C" fn align_rt_print_f64(x: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_print_f32(x: f32) {
     use std::io::Write;
-    let mut line = Vec::new();
-    push_float(&mut line, &x.to_string());
+    let mut line = Vec::with_capacity(32);
+    push_float(&mut line, x);
     line.push(b'\n');
     let _ = std::io::stdout().lock().write_all(&line);
 }
@@ -148,14 +151,14 @@ pub extern "C" fn align_rt_builder_write_char(b: *mut Builder, c: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_builder_write_f64(b: *mut Builder, x: f64) {
     let b = unsafe { &mut *b };
-    push_float(&mut b.buf, &x.to_string());
+    push_float(&mut b.buf, x);
 }
 
 /// Append an `f32`'s shortest round-trip decimal.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_builder_write_f32(b: *mut Builder, x: f32) {
     let b = unsafe { &mut *b };
-    push_float(&mut b.buf, &x.to_string());
+    push_float(&mut b.buf, x);
 }
 
 /// Finish the builder, returning a `str` view over the (leaked) contents and freeing
