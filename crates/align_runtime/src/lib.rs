@@ -35,6 +35,25 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     let _ = out.write_all(b"\n");
 }
 
+/// Builtin `print` for booleans: write `true`/`false` + a newline.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_print_bool(v: i32) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{}", if v != 0 { "true" } else { "false" });
+}
+
+/// Builtin `print` for a `char` (a Unicode scalar value): write its UTF-8 + a newline.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_print_char(c: u32) {
+    use std::io::Write;
+    let ch = char::from_u32(c).unwrap_or('\u{FFFD}');
+    let mut tmp = [0u8; 4];
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(ch.encode_utf8(&mut tmp).as_bytes());
+    let _ = out.write_all(b"\n");
+}
+
 /// A `str` view passed/returned across the ABI: `{ ptr, len }` (`06-runtime-std.md` §2).
 #[repr(C)]
 pub struct AlignStr {
@@ -76,6 +95,22 @@ pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
     use std::io::Write;
     let b = unsafe { &mut *b };
     let _ = write!(b.buf, "{v}");
+}
+
+/// Append `true`/`false`.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_builder_write_bool(b: *mut Builder, v: i32) {
+    let b = unsafe { &mut *b };
+    b.buf.extend_from_slice(if v != 0 { &b"true"[..] } else { &b"false"[..] });
+}
+
+/// Append a `char`'s UTF-8 encoding.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_builder_write_char(b: *mut Builder, c: u32) {
+    let b = unsafe { &mut *b };
+    let ch = char::from_u32(c).unwrap_or('\u{FFFD}');
+    let mut tmp = [0u8; 4];
+    b.buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
 }
 
 /// Finish the builder, returning a `str` view over the (leaked) contents and freeing

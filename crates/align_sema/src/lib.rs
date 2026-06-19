@@ -1227,9 +1227,9 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|a| {
                 let e = self.check_expr(a, None);
-                if !e.ty.is_int_like() && e.ty != Ty::Str && e.ty != Ty::Error {
+                if !is_printable(e.ty) {
                     self.diags
-                        .error("'print' expects an integer or a string".to_string(), e.span);
+                        .error("'print' expects an int, str, bool, or char".to_string(), e.span);
                 }
                 e
             })
@@ -1329,9 +1329,9 @@ impl<'a> Checker<'a> {
                 ast::TemplatePart::Text(s) => hparts.push(TemplatePart::Text(s.clone())),
                 ast::TemplatePart::Hole(expr) => {
                     let e = self.check_expr(expr, None);
-                    if !e.ty.is_int_like() && e.ty != Ty::Str && e.ty != Ty::Error {
+                    if !is_printable(e.ty) {
                         self.diags.error(
-                            format!("a template hole must be an int or str, got {}", ty_name(e.ty)),
+                            format!("a template hole must be an int, str, bool, or char, got {}", ty_name(e.ty)),
                             e.span,
                         );
                     }
@@ -1891,6 +1891,12 @@ fn single_name(p: &ast::Path) -> Option<&str> {
     }
 }
 
+/// Types `print` and a `template` hole can render today: integers, `str`, `bool`, `char`
+/// (and the error sentinel, to avoid cascading diagnostics). Floats wait for a dtoa.
+fn is_printable(ty: Ty) -> bool {
+    ty.is_int_like() || matches!(ty, Ty::Str | Ty::Bool | Ty::Char | Ty::Error)
+}
+
 fn ty_name(ty: Ty) -> String {
     match ty {
         Ty::Int(it) => it.name(),
@@ -2312,16 +2318,29 @@ mod tests {
     }
 
     #[test]
-    fn template_non_int_str_hole_errors() {
-        // A hole evaluating to bool is rejected (only int/str are interpolatable).
-        let (_p, d) = check("fn main() -> i32 {\n  print(template \"{1 > 2}\")\n  return 0\n}\n");
-        assert!(d.has_errors(), "a bool template hole must error");
+    fn template_bool_and_char_holes_check() {
+        // bool and char holes are interpolatable.
+        let (_p, d) = check("fn main() -> i32 {\n  c := 'x'\n  print(template \"{1 > 2} {c}\")\n  return 0\n}\n");
+        assert!(!d.has_errors(), "bool and char template holes should check");
     }
 
     #[test]
-    fn print_rejects_bool() {
-        let (_p, d) = check("fn main() -> i32 {\n  print(true)\n  return 0\n}\n");
-        assert!(d.has_errors(), "print accepts int/str only");
+    fn template_float_hole_errors() {
+        // A float hole is rejected for now (no dtoa yet).
+        let (_p, d) = check("fn main() -> i32 {\n  print(template \"{1.5}\")\n  return 0\n}\n");
+        assert!(d.has_errors(), "a float template hole must error (no float formatting yet)");
+    }
+
+    #[test]
+    fn print_accepts_bool_and_char() {
+        let (_p, d) = check("fn main() -> i32 {\n  print(true)\n  print('a')\n  return 0\n}\n");
+        assert!(!d.has_errors(), "print accepts bool and char");
+    }
+
+    #[test]
+    fn print_rejects_float() {
+        let (_p, d) = check("fn main() -> i32 {\n  print(1.5)\n  return 0\n}\n");
+        assert!(d.has_errors(), "print rejects floats for now (no dtoa)");
     }
 
     #[test]

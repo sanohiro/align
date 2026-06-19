@@ -141,6 +141,8 @@ pub enum TemplatePiece {
     Static(String),
     IntHole(Operand),
     StrHole(Operand),
+    BoolHole(Operand),
+    CharHole(Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -363,11 +365,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     hir::TemplatePart::Hole(h) => {
                         let ty = h.ty;
                         let op = lower_expr(b, h);
-                        if ty == Ty::Str {
-                            pieces.push(TemplatePiece::StrHole(op));
-                        } else {
-                            pieces.push(TemplatePiece::IntHole(op));
-                        }
+                        pieces.push(match ty {
+                            Ty::Str => TemplatePiece::StrHole(op),
+                            Ty::Bool => TemplatePiece::BoolHole(op),
+                            Ty::Char => TemplatePiece::CharHole(op),
+                            _ => TemplatePiece::IntHole(op),
+                        });
                     }
                 }
             }

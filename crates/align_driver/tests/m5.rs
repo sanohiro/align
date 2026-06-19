@@ -80,6 +80,18 @@ fn template_expression_holes() {
 }
 
 #[test]
+fn print_and_template_bool_char() {
+    if !backend_available() {
+        return;
+    }
+    // print/templates render bool as true/false and char as its UTF-8 (incl. multibyte).
+    let src = "fn main() -> i32 {\n  flag := 3 > 2\n  c := 'A'\n  m := 'あ'\n  print(flag)\n  print(c)\n  print(template \"flag={flag} ch={c} uc={m} cmp={1 > 5}\")\n  return 0\n}\n";
+    let out = build_and_run("bool-char", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\nA\nflag=true ch=A uc=あ cmp=false\n");
+}
+
+#[test]
 fn string_concatenation() {
     if !backend_available() {
         return;
