@@ -80,6 +80,31 @@ fn template_expression_holes() {
 }
 
 #[test]
+fn json_encode_flat_struct() {
+    if !backend_available() {
+        return;
+    }
+    // A struct of i64/str/bool encodes to a JSON object; the str field's embedded quote
+    // is JSON-escaped.
+    let src = "User { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 7, name: \"a\\\"b\", active: true}\n  print(json.encode(u))\n  return 0\n}\n";
+    let out = build_and_run("json-encode", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"id\":7,\"name\":\"a\\\"b\",\"active\":true}\n");
+}
+
+#[test]
+fn struct_str_field_roundtrips() {
+    if !backend_available() {
+        return;
+    }
+    // A str struct field can be stored and read back.
+    let src = "P { tag: str, n: i32 }\nfn main() -> i32 {\n  p := P{tag: \"hi\", n: 5}\n  print(p.tag)\n  return p.n\n}\n";
+    let out = build_and_run("struct-str-field", src);
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+}
+
+#[test]
 fn print_and_template_float() {
     if !backend_available() {
         return;

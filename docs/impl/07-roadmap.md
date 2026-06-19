@@ -242,7 +242,19 @@ later slices (struct arrays, M5 strings/JSON).
   rendering would otherwise look like an integer (runtime `align_rt_print_{bool,char,f32,f64}`
   + matching `builder_write_*`; MIR `BoolHole`/`CharHole`/`FloatHole`). `is_printable`
   (numeric | `str` | `bool` | `char`) gates both `print` and template holes.
-- [todo] owned `string` / `bytes`, const string pool/meta, `html`/`json` template variants.
+- [done] `str` struct fields. A struct may hold `str` fields (codegen lays them out as the
+  `{ ptr, len }` view via `abi_type`). To avoid reopening the arena-escape gap without
+  per-struct region tracking, a `str` field may only hold a **region-0** str (a literal /
+  non-arena str); storing an arena-backed str into a field is an `EscapeCheck` error, so a
+  struct never carries an arena region and stays freely returnable. box/slice/array/option
+  fields remain unsupported.
+- [done] `json.encode(s)` — encode a flat struct (int/float/bool/str fields) into a JSON
+  object `str`. Desugars in sema to the `template`/builder machinery (static JSON syntax +
+  per-field value holes); `str` fields are emitted as JSON string literals (quoted + escaped
+  per RFC 8259) by the runtime `align_rt_builder_write_json_str`. Nested structs/arrays/
+  options and `json.decode` are not implemented yet.
+- [todo] owned `string` / `bytes`, const string pool/meta, `html`/`json` template variants,
+  `json.decode<T>` (SIMD scan, zero-copy views, field tables).
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
   view, SIMD structural scan.
 

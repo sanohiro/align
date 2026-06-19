@@ -161,6 +161,40 @@ pub extern "C" fn align_rt_builder_write_f32(b: *mut Builder, x: f32) {
     push_float(&mut b.buf, x);
 }
 
+/// Append a `str` as a JSON string literal: a leading/trailing `"` with the content
+/// escaped per RFC 8259 (`"`, `\`, and the C0 control set; the rest passes through as
+/// UTF-8). Backs `json.encode` for `str` fields.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_write_json_str(b: *mut Builder, ptr: *const u8, len: i64) {
+    let b = unsafe { &mut *b };
+    b.buf.push(b'"');
+    if len > 0 {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        for &c in bytes {
+            match c {
+                b'"' => b.buf.extend_from_slice(b"\\\""),
+                b'\\' => b.buf.extend_from_slice(b"\\\\"),
+                0x08 => b.buf.extend_from_slice(b"\\b"),
+                0x0c => b.buf.extend_from_slice(b"\\f"),
+                b'\n' => b.buf.extend_from_slice(b"\\n"),
+                b'\r' => b.buf.extend_from_slice(b"\\r"),
+                b'\t' => b.buf.extend_from_slice(b"\\t"),
+                c if c < 0x20 => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    b.buf.extend_from_slice(b"\\u00");
+                    b.buf.push(HEX[(c >> 4) as usize]);
+                    b.buf.push(HEX[(c & 0xf) as usize]);
+                }
+                c => b.buf.push(c),
+            }
+        }
+    }
+    b.buf.push(b'"');
+}
+
 /// Finish the builder, returning a `str` view over the (leaked) contents and freeing
 /// the builder object.
 #[unsafe(no_mangle)]

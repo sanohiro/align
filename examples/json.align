@@ -1,0 +1,9 @@
+// JSON encode (M5). `json.encode(s)` turns a flat struct into a JSON object `str`,
+// built with the runtime string builder. A struct may now hold `str` fields (which must
+// hold region-0 strings — literals / non-arena strings); str fields are JSON-escaped.
+User { id: i64, name: str, active: bool }
+fn main() -> i32 {
+  u := User{id: 7, name: "a\"b", active: true}
+  print(json.encode(u))   // {"id":7,"name":"a\"b","active":true}
+  return 0
+}

@@ -180,13 +180,15 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 .iter()
                 .map(|f| {
                     let ty = resolve_type(&f.ty, &struct_ids, diags);
-                    // M1/M5 cut: fields are scalars only. This also keeps region-bearing
-                    // types (str/box) out of structs — so they can't escape an arena via
-                    // a field — and avoids non-scalar fields the struct layout can't hold
-                    // yet (str/slice/array/option/result/nested struct).
-                    if ty_to_scalar(ty).is_none() && ty != Ty::Error {
+                    // M5 cut: fields are scalars or `str`. A `str` field is allowed but must
+                    // only ever hold a region-0 str (a literal / non-arena str) — storing an
+                    // arena-backed str into a field is rejected by `EscapeCheck`, so a struct
+                    // never carries an arena region and stays freely returnable. Other
+                    // composite/region-bearing fields (box/slice/array/option/result/nested
+                    // struct) the layout can't hold yet remain rejected.
+                    if ty_to_scalar(ty).is_none() && ty != Ty::Str && ty != Ty::Error {
                         diags.error(
-                            format!("struct fields must be a primitive scalar for now, got {}", ty_name(ty)),
+                            format!("struct fields must be a primitive scalar or str for now, got {}", ty_name(ty)),
                             f.span,
                         );
                     }
@@ -393,7 +395,17 @@ impl<'a> EscapeCheck<'a> {
                     self.region.insert(*local, r);
                 }
             }
-            Stmt::AssignField { value, .. } => self.walk(value, depth),
+            Stmt::AssignField { value, .. } => {
+                self.walk(value, depth);
+                // A struct carries no arena region, so an arena-backed str must not be
+                // stored into a str field (it would outlive the arena via the struct).
+                if value.ty == Ty::Str && self.region_of(value, depth) >= 1 {
+                    self.diags.error(
+                        "cannot store an arena-allocated str into a struct field (it would outlive the arena)".to_string(),
+                        value.span,
+                    );
+                }
+            }
             Stmt::Return(Some(e)) => {
                 self.walk(e, depth);
                 if Self::tracks_region(e.ty) && self.region_of(e, depth) >= 1 {
@@ -448,6 +460,14 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
                     self.walk(f, depth);
+                    // A struct carries no arena region: an arena-backed str field initializer
+                    // would let the str outlive its arena via the struct.
+                    if f.ty == Ty::Str && self.region_of(f, depth) >= 1 {
+                        self.diags.error(
+                            "cannot store an arena-allocated str into a struct field (it would outlive the arena)".to_string(),
+                            f.span,
+                        );
+                    }
                 }
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
@@ -468,7 +488,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::Template(parts) => {
                 for p in parts {
-                    if let TemplatePart::Hole(h) = p {
+                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
                         self.walk(h, depth);
                     }
                 }
@@ -592,7 +612,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::Template(parts) => {
                 for p in parts {
-                    if let TemplatePart::Hole(h) = p {
+                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
                         // A hole value is read (copied) into the builder, not moved out.
                         self.expr(h, moved, false);
                     }
@@ -1286,6 +1306,9 @@ impl<'a> Checker<'a> {
             if single_name(p) == Some("heap") && method == "new" {
                 return self.check_heap_new(args, expected, span);
             }
+            if single_name(p) == Some("json") && method == "encode" {
+                return self.check_json_encode(args, span);
+            }
         }
         // `sum` / `reduce` are the terminals of a fused pipeline.
         if method == "sum" {
@@ -1644,6 +1667,53 @@ impl<'a> Checker<'a> {
         Expr { kind: ExprKind::HeapNew(Box::new(arg)), ty: Ty::Box(scalar), span }
     }
 
+    /// `json.encode(s)` — encode a flat struct into a JSON object `str`. Desugars to the
+    /// string-builder `template` machinery: static JSON syntax interleaved with per-field
+    /// value holes (`str` fields are emitted as JSON-escaped string literals). M5: fields
+    /// must be int/float/bool/str; nested structs/arrays/options are not supported yet. The
+    /// result is arena-backed when inside an `arena {}` (else leaked), like any built string.
+    fn check_json_encode(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'json.encode' expects 1 argument, got {}", args.len()), span);
+            return err;
+        }
+        let Some((base, ty)) = self.place_local(&args[0]) else {
+            self.diags
+                .error("'json.encode' expects a struct value (a local binding)".to_string(), args[0].span);
+            return err;
+        };
+        let Ty::Struct(sid) = ty else {
+            self.diags
+                .error(format!("'json.encode' expects a struct, got {}", ty_name(ty)), args[0].span);
+            return err;
+        };
+        let fields = self.structs[sid as usize].fields.clone();
+        let mut parts = vec![TemplatePart::Text("{".to_string())];
+        for (i, f) in fields.iter().enumerate() {
+            let sep = if i == 0 { "" } else { "," };
+            parts.push(TemplatePart::Text(format!("{sep}\"{}\":", f.name)));
+            let field_expr = Expr { kind: ExprKind::Field { base, index: i as u32 }, ty: f.ty, span };
+            match f.ty {
+                Ty::Str => parts.push(TemplatePart::JsonStr(field_expr)),
+                t if t.is_numeric() || t == Ty::Bool => parts.push(TemplatePart::Hole(field_expr)),
+                _ => {
+                    self.diags.error(
+                        format!(
+                            "'json.encode' field '{}' has unsupported type {} (int/float/bool/str only for now)",
+                            f.name,
+                            ty_name(f.ty)
+                        ),
+                        args[0].span,
+                    );
+                }
+            }
+        }
+        parts.push(TemplatePart::Text("}".to_string()));
+        Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
+    }
+
     /// `b.get()` — copy the value out of a `box<T>`.
     fn check_box_get(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], span: Span) -> Expr {
         if !args.is_empty() {
@@ -1850,7 +1920,7 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Template(parts) => {
                 for p in parts {
-                    if let TemplatePart::Hole(h) = p {
+                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
                         self.finalize_expr(h);
                     }
                 }
@@ -2221,11 +2291,24 @@ mod tests {
     }
 
     #[test]
-    fn struct_str_field_rejected() {
-        // A region-bearing (str) field would let an arena str escape via the field, and
-        // isn't supported by the struct layout yet — reject it.
-        let (_p, d) = check("User { name: str }\nfn main() -> i32 { return 0 }\n");
-        assert!(d.has_errors(), "str struct fields are not allowed yet");
+    fn struct_str_field_ok() {
+        // A `str` struct field is allowed; reading it back is fine.
+        let (_p, d) = check("User { name: str }\nfn main() -> i32 {\n  u := User{name: \"ada\"}\n  print(u.name)\n  return 0\n}\n");
+        assert!(!d.has_errors(), "str struct fields are allowed (region-0 strs)");
+    }
+
+    #[test]
+    fn struct_arena_str_field_rejected() {
+        // Storing an arena-backed str into a struct field would let it outlive the arena.
+        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  a := \"x\"\n  b := \"y\"\n  arena {\n    p := P{tag: a + b}\n    print(p.tag)\n  }\n  return 0\n}\n");
+        assert!(d.has_errors(), "an arena str must not be stored into a struct field");
+    }
+
+    #[test]
+    fn struct_box_field_still_rejected() {
+        // box fields remain unsupported (only scalars and str for now).
+        let (_p, d) = check("B { b: box<i32> }\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "box struct fields are still rejected");
     }
 
     #[test]
@@ -2335,6 +2418,18 @@ mod tests {
     fn print_accepts_bool_char_float() {
         let (_p, d) = check("fn main() -> i32 {\n  print(true)\n  print('a')\n  print(3.14)\n  return 0\n}\n");
         assert!(!d.has_errors(), "print accepts bool, char, and float");
+    }
+
+    #[test]
+    fn json_encode_struct_checks() {
+        let (_p, d) = check("User { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 1, name: \"a\", active: true}\n  print(json.encode(u))\n  return 0\n}\n");
+        assert!(!d.has_errors(), "json.encode of a flat struct should check");
+    }
+
+    #[test]
+    fn json_encode_rejects_non_struct() {
+        let (_p, d) = check("fn main() -> i32 {\n  x := 5\n  print(json.encode(x))\n  return 0\n}\n");
+        assert!(d.has_errors(), "json.encode requires a struct");
     }
 
     #[test]

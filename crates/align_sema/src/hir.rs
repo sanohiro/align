@@ -173,8 +173,11 @@ pub enum ExprKind {
 #[derive(Clone, Debug)]
 pub enum TemplatePart {
     Text(String),
-    /// `{expr}` — interpolate the value of an expression (int-like or `str`).
+    /// `{expr}` — interpolate the value of an expression (a printable scalar).
     Hole(Expr),
+    /// A `str` expression to be emitted as a JSON string literal (quoted + escaped).
+    /// Produced by `json.encode` desugaring, not by surface `template` syntax.
+    JsonStr(Expr),
 }
 
 #[derive(Clone, Debug)]
