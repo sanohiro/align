@@ -146,6 +146,9 @@ pub enum Rvalue {
     MakeDynArray { ptr: Operand, len: Operand },
     /// The `len` of a slice operand.
     SliceLen(Operand),
+    /// The buffer `ptr` (field 0) of a slice / owned-array `{ptr,len}` operand — the raw element
+    /// pointer, used to store back into the buffer (e.g. an in-place `sort`).
+    SlicePtr(Operand),
     /// `slice[index]` — load a slice element (scalar).
     SliceIndex(Operand, Operand),
     /// A string literal — a `str` view `{ &bytes, len }` over a constant.
@@ -610,6 +613,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             lower_array_collect(b, source, stages, *elem, CollectKind::Scan { func: func.clone(), init: init_op })
         }
         hir::ExprKind::ArrayDot { a, b: bex, elem } => lower_array_dot(b, a, bex, *elem),
+        hir::ExprKind::ArraySort { source, stages, elem } => lower_array_sort(b, source, stages, *elem),
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
             let v = b.fresh_value(e.ty);
@@ -1109,6 +1113,94 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
         b.push(Stmt::DropValue(tmp));
     }
     Operand::Value(arr)
+}
+
+/// `source.….sort()` — materialize the surviving elements into an owned `array<T>` (the
+/// `to_array` collect loop), then sort that buffer ascending in place with insertion sort.
+/// Reads use `SliceIndex` over the `{ptr,len}` value; writes use `PtrStore` through its buffer
+/// pointer (`SlicePtr`). Returns the same owned array. O(n²) — fine for the small arrays this
+/// first cut targets; a faster sort is a follow-up.
+fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty) -> Operand {
+    let arr = lower_array_collect(b, source, stages, elem, CollectKind::Collect);
+    let ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
+    b.push(Stmt::Let(ptr, Rvalue::SlicePtr(arr.clone())));
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::SliceLen(arr.clone())));
+
+    // i = 1; while i < len { key = arr[i]; j = i-1; while j >= 0 && arr[j] > key { arr[j+1] =
+    // arr[j]; j-- }; arr[j+1] = key; i++ }.
+    let iv = b.new_slot(i64_ty());
+    b.push(Stmt::Store(iv, Operand::Const(Const::Int(1, i64_ty()))));
+    let jv = b.new_slot(i64_ty());
+
+    let outer = b.new_block();
+    let outer_body = b.new_block();
+    let inner = b.new_block();
+    let cmp_bb = b.new_block();
+    let shift = b.new_block();
+    let place = b.new_block();
+    let exit = b.new_block();
+    b.terminate(Term::Goto(outer));
+
+    // outer: while i < len
+    b.cur = outer;
+    let i_val = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
+    let ocond = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(ocond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), Operand::Value(len))));
+    b.terminate(Term::Branch(Operand::Value(ocond), outer_body, exit));
+
+    // outer_body: key = arr[i]; j = i - 1.
+    b.cur = outer_body;
+    let i_cur = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i_cur, Rvalue::Load(iv)));
+    let key = b.fresh_value(elem);
+    b.push(Stmt::Let(key, Rvalue::SliceIndex(arr.clone(), Operand::Value(i_cur))));
+    let j0 = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(j0, Rvalue::Bin(BinOp::Sub, Operand::Value(i_cur), index_const(1))));
+    b.push(Stmt::Store(jv, Operand::Value(j0)));
+    b.terminate(Term::Goto(inner));
+
+    // inner: while j >= 0 (then test arr[j] > key in cmp_bb).
+    b.cur = inner;
+    let j_val = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(j_val, Rvalue::Load(jv)));
+    let jge0 = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(jge0, Rvalue::Bin(BinOp::Ge, Operand::Value(j_val), index_const(0))));
+    b.terminate(Term::Branch(Operand::Value(jge0), cmp_bb, place));
+
+    // cmp_bb: if arr[j] > key, shift; else place.
+    b.cur = cmp_bb;
+    let aj = b.fresh_value(elem);
+    b.push(Stmt::Let(aj, Rvalue::SliceIndex(arr.clone(), Operand::Value(j_val))));
+    let gt = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(gt, Rvalue::Bin(BinOp::Gt, Operand::Value(aj), Operand::Value(key))));
+    b.terminate(Term::Branch(Operand::Value(gt), shift, place));
+
+    // shift: arr[j+1] = arr[j]; j -= 1.
+    b.cur = shift;
+    let jp1 = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(jp1, Rvalue::Bin(BinOp::Add, Operand::Value(j_val), index_const(1))));
+    b.push(Stmt::PtrStore(Operand::Value(ptr), Operand::Value(jp1), Operand::Value(aj)));
+    let jdec = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(jdec, Rvalue::Bin(BinOp::Sub, Operand::Value(j_val), index_const(1))));
+    b.push(Stmt::Store(jv, Operand::Value(jdec)));
+    b.terminate(Term::Goto(inner));
+
+    // place: arr[j+1] = key; i += 1.
+    b.cur = place;
+    let j_final = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(j_final, Rvalue::Load(jv)));
+    let jf1 = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(jf1, Rvalue::Bin(BinOp::Add, Operand::Value(j_final), index_const(1))));
+    b.push(Stmt::PtrStore(Operand::Value(ptr), Operand::Value(jf1), Operand::Value(key)));
+    let i_inc = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i_inc, Rvalue::Bin(BinOp::Add, Operand::Value(i_cur), index_const(1))));
+    b.push(Stmt::Store(iv, Operand::Value(i_inc)));
+    b.terminate(Term::Goto(outer));
+
+    b.cur = exit;
+    arr
 }
 
 /// `a.dot(b)` — the inner product `Σ a[i]*b[i]` of two fixed-length scalar arrays of equal

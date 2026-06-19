@@ -414,7 +414,9 @@ impl<'a> EscapeCheck<'a> {
             // where the result is leaked / process-lifetime and safe to return).
             ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => Region::arena(depth),
             // `.to_array()` bump-allocates the owned array in the enclosing arena.
-            ExprKind::ArrayToArray { .. } | ExprKind::ArrayScan { .. } => Region::arena(depth),
+            ExprKind::ArrayToArray { .. } | ExprKind::ArrayScan { .. } | ExprKind::ArraySort { .. } => {
+                Region::arena(depth)
+            }
             // `str + str` concatenation is also built in the enclosing arena.
             ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => Region::arena(depth),
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
@@ -583,7 +585,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.walk(source, depth);
@@ -733,7 +735,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
@@ -1523,6 +1525,9 @@ impl<'a> Checker<'a> {
         if method == "dot" {
             return self.check_array_dot(recv, args, expected, span);
         }
+        if method == "sort" {
+            return self.check_array_sort(recv, args, span);
+        }
         if method == "count" {
             return self.check_array_count(recv, args, span);
         }
@@ -2078,6 +2083,36 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `source.….sort()` — materialize the surviving elements into an owned `array<T>` and sort
+    /// them ascending. First cut: numeric scalar elements only (an ordering exists), no
+    /// comparator argument (a `sort(cmp)` overload is a follow-up).
+    fn check_array_sort(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        if !args.is_empty() {
+            self.diags.error("'sort' takes no arguments yet (a comparator overload is a follow-up)".to_string(), span);
+        }
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
+            return err;
+        };
+        if matches!(elem, Ty::Struct(_)) {
+            self.diags.error("'sort' over struct elements is not supported yet (project a field first)".to_string(), span);
+            return err;
+        }
+        if !elem.is_numeric() {
+            self.diags.error(format!("'sort' needs a numeric element type, got {}", ty_name(elem)), span);
+            return err;
+        }
+        let Some(scalar) = ty_to_scalar(elem) else {
+            self.diags.error(format!("'sort' needs a scalar element, got {}", ty_name(elem)), span);
+            return err;
+        };
+        Expr {
+            kind: ExprKind::ArraySort { source: Box::new(source), stages, elem },
+            ty: Ty::DynArray(scalar),
+            span,
+        }
+    }
+
     /// `a.dot(b)` — the inner product `Σ a[i]*b[i]`. First cut: both operands must be
     /// fixed-length arrays of the same numeric scalar element and the same statically known
     /// length (the SIMD/vector case; `slice`/`array<T>` dot with runtime lengths is a follow-up).
@@ -2558,7 +2593,7 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
@@ -3350,6 +3385,18 @@ mod tests {
         // scan needs a 2-arg fold; a 1-arg function must error.
         let (_p, d) = check("fn bad(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].scan(bad, 0).sum()\n}\n");
         assert!(d.has_errors(), "scan with a non-binary function must error");
+    }
+
+    #[test]
+    fn sort_inline_checks() {
+        let (_p, d) = check("fn id(x: i32) -> i32 = x\nfn h(acc: i32, x: i32) -> i32 = acc + x\nfn main() -> i32 {\n  return [3, 1, 2].map(id).sort().reduce(h, 0)\n}\n");
+        assert!(!d.has_errors(), "sort of a numeric pipeline should check");
+    }
+
+    #[test]
+    fn sort_over_struct_element_rejected() {
+        let (_p, d) = check("Point { x: i32, y: i32 }\nfn main() -> i32 {\n  s := [Point { x: 1, y: 2 }].sort()\n  return 0\n}\n");
+        assert!(d.has_errors(), "sort over struct elements must error (project a field first)");
     }
 
     #[test]

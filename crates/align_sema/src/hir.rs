@@ -193,6 +193,10 @@ pub enum ExprKind {
     /// numeric scalar element and the same (statically known) length. `elem` is that scalar;
     /// the result has type `elem`.
     ArrayDot { a: Box<Expr>, b: Box<Expr>, elem: crate::Ty },
+    /// `source.….sort()` — materialize the surviving (numeric scalar) elements into an owned
+    /// `array<T>` and sort them ascending in place. `elem` is the element scalar; the result
+    /// type is `DynArray(elem)`.
+    ArraySort { source: Box<Expr>, stages: Vec<Stage>, elem: crate::Ty },
     /// `source.….to_array()` — materialize the surviving (post-stage) elements into an
     /// *owned* `array<T>` (MMv2 slice 3: arena-bump-allocated). `elem` is the element
     /// scalar type; the expression `ty` is `DynArray(elem)`.

@@ -340,8 +340,13 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    (`lower_array_dot`). First cut restricted to two fixed-length arrays of the same numeric
    scalar element and the same statically known length (sema-checked) — the SIMD/vector case;
    `slice`/`array<T>` dot with runtime lengths (and a runtime length-equality check) is a
-   follow-up. **Remaining:** the array-producing `sort`/`partition`/`chunks` (new algorithms /
-   nested types) — each its own follow-up on the slice-3/4 foundation.
+   follow-up. `sort` **[done]** — `source.….sort()` materializes survivors into an owned
+   `array<T>` (the `to_array` collect loop) then sorts that buffer ascending in place with
+   insertion sort (`lower_array_sort`): reads via `SliceIndex`, writes via `PtrStore` through the
+   buffer pointer (new `SlicePtr` rvalue). First cut: numeric scalar elements, no comparator
+   argument (a `sort(cmp)` overload and a faster-than-O(n²) sort are follow-ups). **Remaining:**
+   `partition` (needs a 2-array product/tuple result — no tuple type yet) and `chunks` (needs a
+   nested `array<slice<T>>` type) — each its own follow-up, gated on new type machinery.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
    `.clone()` to escape; **draft.md §19 runs in full** → M5 truly complete.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same

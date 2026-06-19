@@ -121,6 +121,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("array({}, {})", operand_str(ptr), operand_str(len))
         }
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
+        Rvalue::SlicePtr(op) => format!("slice_ptr({})", operand_str(op)),
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
         Rvalue::StrLit(s) => format!("{s:?}"),
         Rvalue::Template(pieces, _arena) => {

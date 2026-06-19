@@ -927,6 +927,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
             }
+            Rvalue::SlicePtr(op) => {
+                let agg = self.operand(op).into_struct_value();
+                self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?
+            }
             Rvalue::SliceIndex(s, idx) => {
                 let agg = self.operand(s).into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?.into_pointer_value();
