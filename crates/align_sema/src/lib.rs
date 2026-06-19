@@ -1691,6 +1691,7 @@ impl<'a> Checker<'a> {
         };
         let fields = self.structs[sid as usize].fields.clone();
         let mut parts = vec![TemplatePart::Text("{".to_string())];
+        let mut ok = true;
         for (i, f) in fields.iter().enumerate() {
             let sep = if i == 0 { "" } else { "," };
             parts.push(TemplatePart::Text(format!("{sep}\"{}\":", f.name)));
@@ -1707,8 +1708,14 @@ impl<'a> Checker<'a> {
                         ),
                         args[0].span,
                     );
+                    ok = false;
                 }
             }
+        }
+        // An unsupported field left a `"name":` with no value part: return the error
+        // sentinel rather than a malformed template (matches the other checks' convention).
+        if !ok {
+            return err;
         }
         parts.push(TemplatePart::Text("}".to_string()));
         Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
@@ -2430,6 +2437,14 @@ mod tests {
     fn json_encode_rejects_non_struct() {
         let (_p, d) = check("fn main() -> i32 {\n  x := 5\n  print(json.encode(x))\n  return 0\n}\n");
         assert!(d.has_errors(), "json.encode requires a struct");
+    }
+
+    #[test]
+    fn json_encode_rejects_unsupported_field() {
+        // A char field is a valid struct field but not encodable yet; json.encode must error
+        // (and not return a malformed template).
+        let (_p, d) = check("C { ch: char, n: i32 }\nfn main() -> i32 {\n  c := C{ch: 'x', n: 1}\n  print(json.encode(c))\n  return 0\n}\n");
+        assert!(d.has_errors(), "json.encode rejects a struct with an unsupported field type");
     }
 
     #[test]
