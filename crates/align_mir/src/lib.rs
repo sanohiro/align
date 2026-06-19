@@ -603,7 +603,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             lower_array_reduce(b, source, stages, e.ty, init, Reducer::MinMax { is_max: *is_max })
         }
         hir::ExprKind::ArrayToArray { source, stages, elem } => {
-            lower_array_collect(b, source, stages, *elem)
+            lower_array_collect(b, source, stages, *elem, CollectKind::Collect)
+        }
+        hir::ExprKind::ArrayScan { source, stages, func, init, elem } => {
+            let init_op = lower_expr(b, init);
+            lower_array_collect(b, source, stages, *elem, CollectKind::Scan { func: func.clone(), init: init_op })
         }
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
@@ -758,14 +762,17 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             // A source that *owns* a fresh free-standing buffer nothing else holds must be freed
-            // by the consuming loop: a `.to_array()` materialization, or a call returning an
-            // owned `array<T>` (`make().sum()` — ownership transferred to us). A bound `Local`
+            // by the consuming loop: a `.to_array()` / `.scan()` materialization, or a call
+            // returning an owned `array<T>` (`make().sum()` — ownership transferred to us). A
+            // bound `Local`
             // and a struct `Field` are borrows (freed by the owner's exit `Drop`), and arena
             // temporaries are bulk-freed, so none of those are freed here. `Block`/`If` sources
             // may *borrow* a bound local in a branch (e.g. `(if c { ys } else { zs }).sum()`), so
             // blanket-freeing them would double-free — they are left as a sound, bounded leak.
-            let owns_fresh =
-                matches!(source.kind, hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::Call { .. });
+            let owns_fresh = matches!(
+                source.kind,
+                hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. } | hir::ExprKind::Call { .. }
+            );
             let temp_free =
                 (owns_fresh && b.arenas.is_empty()).then(|| sv.clone());
             SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, temp_free }
@@ -937,10 +944,20 @@ fn lower_array_reduce(
     Operand::Value(r)
 }
 
-/// `source.….to_array()` — the fused loop, but each surviving element is appended to a
-/// freshly bump-allocated arena buffer instead of folded. Yields an owned `array<T>` value
-/// `{ ptr, len }` where `len` is the survivor count. (MMv2 slice 3; arena-only.)
-fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty) -> Operand {
+/// What a materializing collect loop appends per surviving element.
+enum CollectKind {
+    /// `to_array`: append the element itself.
+    Collect,
+    /// `scan(f, init)`: thread an accumulator (`acc = f(acc, element)`, seeded with `init`) and
+    /// append the running accumulator.
+    Scan { func: String, init: Operand },
+}
+
+/// `source.….to_array()` / `.scan(f, init)` — the fused loop, but each surviving element is
+/// appended to a freshly allocated buffer (arena-bump inside an arena, else heap) instead of
+/// folded into a scalar. Yields an owned `array<T>` value `{ ptr, len }` where `len` is the
+/// survivor count. (MMv2 slice 3 `to_array`; slice 5 adds `scan`.)
+fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty, kind: CollectKind) -> Operand {
     // Inside an arena → bump-allocate (bulk-freed); otherwise → free-standing heap (dropped).
     let arena = b.arenas.last().copied();
     // A collect source can itself be a fresh unbound owned temporary (`make().map(f).to_array()`
@@ -968,6 +985,15 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     b.push(Stmt::Store(acc, Operand::Const(Const::Int(0, i64_ty()))));
     let iv = b.new_slot(i64_ty());
     b.push(Stmt::Store(iv, Operand::Const(Const::Int(0, i64_ty()))));
+    // `scan` threads an accumulator (output element type) seeded with `init`.
+    let scan_acc = match &kind {
+        CollectKind::Scan { init, .. } => {
+            let s = b.new_slot(elem);
+            b.push(Stmt::Store(s, init.clone()));
+            Some(s)
+        }
+        CollectKind::Collect => None,
+    };
 
     let header = b.new_block();
     let body = b.new_block();
@@ -1040,11 +1066,23 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
         }
     }
 
-    // append: out_ptr[out_idx] = cur; out_idx += 1.
-    let cur = cur.expect("to_array needs a scalar element");
+    // append: out_ptr[out_idx] = <value>; out_idx += 1. For `to_array` the value is the
+    // element; for `scan` it is the updated accumulator `acc = f(acc, element)`.
+    let cur = cur.expect("to_array/scan needs a scalar element");
+    let value = match (&kind, scan_acc) {
+        (CollectKind::Scan { func, .. }, Some(acc_slot)) => {
+            let prev = b.fresh_value(elem);
+            b.push(Stmt::Let(prev, Rvalue::Load(acc_slot)));
+            let folded = b.fresh_value(elem);
+            b.push(Stmt::Let(folded, Rvalue::Call(func.clone(), vec![Operand::Value(prev), cur])));
+            b.push(Stmt::Store(acc_slot, Operand::Value(folded)));
+            Operand::Value(folded)
+        }
+        _ => cur,
+    };
     let out_idx = b.fresh_value(i64_ty());
     b.push(Stmt::Let(out_idx, Rvalue::Load(acc)));
-    b.push(Stmt::PtrStore(Operand::Value(out_ptr), Operand::Value(out_idx), cur));
+    b.push(Stmt::PtrStore(Operand::Value(out_ptr), Operand::Value(out_idx), value));
     let next = b.fresh_value(i64_ty());
     b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(out_idx), index_const(1))));
     b.push(Stmt::Store(acc, Operand::Value(next)));
