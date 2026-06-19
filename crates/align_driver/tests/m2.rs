@@ -76,6 +76,33 @@ fn result_question_ok_path_exits_zero() {
 }
 
 #[test]
+fn result_struct_payload_ok_and_err() {
+    if !backend_available() {
+        return;
+    }
+    // Result<Pt, Error>: `?` unwraps a struct on Ok; an Err propagates the code.
+    let ok_src = "Pt { x: i32, y: i32 }\nfn make() -> Result<Pt, Error> {\n  p := Pt{x: 40, y: 2}\n  return Ok(p)\n}\nfn main() -> Result<(), Error> {\n  q := make()?\n  print(q.x + q.y)\n  return Ok(())\n}\n";
+    let ok = build_and_run("res-struct-ok", ok_src);
+    assert_eq!(ok.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&ok.stdout), "42\n");
+
+    let err_src = "Pt { x: i32, y: i32 }\nfn make() -> Result<Pt, Error> = Err(error(5))\nfn main() -> Result<(), Error> {\n  q := make()?\n  print(q.x)\n  return Ok(())\n}\n";
+    let err = build_and_run("res-struct-err", err_src);
+    assert_eq!(err.status.code(), Some(5), "Err propagates through a struct-payload Result");
+}
+
+#[test]
+fn option_struct_payload_else_unwrap() {
+    if !backend_available() {
+        return;
+    }
+    // Option<Pt>: `else` unwraps the struct (Some) or runs the diverging fallback (None).
+    let src = "Pt { x: i32, y: i32 }\nfn pick(b: bool) -> Option<Pt> {\n  if b {\n    p := Pt{x: 30, y: 12}\n    return Some(p)\n  }\n  return None\n}\nfn main() -> i32 {\n  q := pick(true) else { return 99 }\n  return q.x + q.y\n}\n";
+    let out = build_and_run("opt-struct", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
 fn err_code_zero_still_exits_nonzero() {
     if !backend_available() {
         return;

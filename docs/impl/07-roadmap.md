@@ -270,8 +270,15 @@ later slices (struct arrays, M5 strings/JSON).
   reassigned whole. Codegen passes/returns the LLVM aggregate by value (`declare_fn` maps
   `Ty::Struct`); params are already stored into their slots, and a struct-literal expression
   materializes into a temp slot then loads. The gateway to `json.decode<T>`.
+- [done] composite (struct) payloads in `Option`/`Result` — lifts the M2 scalar-only cut.
+  `Scalar` gains `Struct(u32)`, so `Option<Pt>` / `Result<User, Error>` are representable;
+  `Some`/`Ok`/`Err` accept a struct, `?` unwraps to a struct, `else` unwraps `Option<Struct>`.
+  Codegen threads the struct-type table through the `Option`/`Result` aggregate builders so a
+  struct payload lowers to a nested aggregate. The second `json.decode<T>` prerequisite
+  (decode returns `Result<T, Error>`).
 - [todo] owned `string` / `bytes`, const string pool/meta, `html`/`json` template variants,
-  `json.decode<T>` (SIMD scan, zero-copy views, field tables).
+  `json.decode<T>` (generic-call syntax, runtime JSON parser, field tables; SIMD scan,
+  zero-copy views).
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
   view, SIMD structural scan.
 

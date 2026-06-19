@@ -50,6 +50,9 @@ pub enum Scalar {
     Bool,
     Char,
     Unit,
+    /// A struct payload (the struct's id). Lets `Option`/`Result` carry a whole struct
+    /// (e.g. `Result<User, Error>` from `json.decode`). No recursion — just the id.
+    Struct(u32),
     /// The M2 `Error` type — an opaque i32 error code (placeholder for the eventual
     /// Error sum type; see `open-questions.md`).
     ErrCode,
@@ -102,6 +105,7 @@ fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Bool => Some(Scalar::Bool),
         Ty::Char => Some(Scalar::Char),
         Ty::Unit => Some(Scalar::Unit),
+        Ty::Struct(id) => Some(Scalar::Struct(id)),
         Ty::ErrCode => Some(Scalar::ErrCode),
         _ => None,
     }
@@ -114,6 +118,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Bool => Ty::Bool,
         Scalar::Char => Ty::Char,
         Scalar::Unit => Ty::Unit,
+        Scalar::Struct(id) => Ty::Struct(id),
         Scalar::ErrCode => Ty::ErrCode,
     }
 }
@@ -185,8 +190,12 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                     // arena-backed str into a field is rejected by `EscapeCheck`, so a struct
                     // never carries an arena region and stays freely returnable. Other
                     // composite/region-bearing fields (box/slice/array/option/result/nested
-                    // struct) the layout can't hold yet remain rejected.
-                    if ty_to_scalar(ty).is_none() && ty != Ty::Str && ty != Ty::Error {
+                    // struct) the layout can't hold yet remain rejected. NOTE: `ty_to_scalar`
+                    // now also accepts `Ty::Struct` (a valid Option/Result payload), so a
+                    // nested struct field is rejected explicitly here.
+                    let is_field_ok =
+                        (ty_to_scalar(ty).is_some() && !matches!(ty, Ty::Struct(_))) || ty == Ty::Str || ty == Ty::Error;
+                    if !is_field_ok {
                         diags.error(
                             format!("struct fields must be a primitive scalar or str for now, got {}", ty_name(ty)),
                             f.span,
@@ -1728,6 +1737,13 @@ impl<'a> Checker<'a> {
             _ => None,
         };
         let arg = self.check_expr(&args[0], inner_expected);
+        // A box payload must be a true scalar — `ty_to_scalar` now also accepts structs (a
+        // valid Option/Result payload), so reject a struct box explicitly (codegen can't size it).
+        if matches!(arg.ty, Ty::Struct(_)) {
+            self.diags
+                .error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), args[0].span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
         let scalar = self.payload_scalar(arg.ty, args[0].span);
         Expr { kind: ExprKind::HeapNew(Box::new(arg)), ty: Ty::Box(scalar), span }
     }
@@ -2159,7 +2175,13 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
                     return Ty::Error;
                 }
             };
+            // `scalar_arg` now also accepts a struct (a valid Option/Result payload), but a
+            // box payload must be a true scalar (codegen can't size a struct box) — reject it.
             match scalar_arg(inner, "box payload", t.span, diags) {
+                Some(Scalar::Struct(_)) => {
+                    diags.error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), t.span);
+                    Ty::Error
+                }
                 Some(s) => Ty::Box(s),
                 None => Ty::Error,
             }
@@ -2421,6 +2443,27 @@ mod tests {
         assert!(!ok.has_errors(), "str == str should check");
         let (_q, bad) = check("fn f(s: str) -> bool = s < \"x\"\n");
         assert!(bad.has_errors(), "str ordering must error");
+    }
+
+    #[test]
+    fn struct_payload_does_not_leak_into_fields_or_box() {
+        // Allowing struct Option/Result payloads must NOT accidentally allow nested struct
+        // fields or struct boxes (both would panic in codegen).
+        let (_p, nested) = check("A { v: i32 }\nB { a: A }\nfn main() -> i32 { return 0 }\n");
+        assert!(nested.has_errors(), "a nested struct field must still be rejected");
+        let (_q, boxed) = check("P { x: i32 }\nfn main() -> i32 {\n  arena {\n    b := heap.new(P{x: 1})\n  }\n  return 0\n}\n");
+        assert!(boxed.has_errors(), "a struct box payload must still be rejected");
+        let (_r, boxann) = check("P { x: i32 }\nfn f(b: box<P>) -> i32 = 0\nfn main() -> i32 { return 0 }\n");
+        assert!(boxann.has_errors(), "a box<Struct> annotation must still be rejected");
+    }
+
+    #[test]
+    fn result_option_struct_payload_checks() {
+        // A struct can be an Ok/Some payload; `?` unwraps to the struct, `else` to it too.
+        let (_p, r) = check("Pt { x: i32 }\nfn mk() -> Result<Pt, Error> {\n  p := Pt{x: 1}\n  return Ok(p)\n}\nfn main() -> Result<(), Error> {\n  q := mk()?\n  print(q.x)\n  return Ok(())\n}\n");
+        assert!(!r.has_errors(), "Result<Struct, Error> should check");
+        let (_q, o) = check("Pt { x: i32 }\nfn pick() -> Option<Pt> {\n  p := Pt{x: 1}\n  return Some(p)\n}\nfn main() -> i32 {\n  q := pick() else { return 9 }\n  return q.x\n}\n");
+        assert!(!o.has_errors(), "Option<Struct> should check");
     }
 
     #[test]
