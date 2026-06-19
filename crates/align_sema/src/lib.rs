@@ -1740,7 +1740,9 @@ impl<'a> Checker<'a> {
         span: Span,
         ok: &mut bool,
     ) {
-        let fields = self.structs[sid as usize].fields.clone();
+        // `self.structs` is a `&'a [StructDef]`, so this borrow is tied to `'a`, not `self`
+        // — `self.diags` stays mutably borrowable in the loop (no clone needed).
+        let fields = &self.structs[sid as usize].fields;
         parts.push(TemplatePart::Text("{".to_string()));
         for (i, f) in fields.iter().enumerate() {
             let sep = if i == 0 { "" } else { "," };
