@@ -11,42 +11,44 @@ use align_lexer::{TokKind, Token};
 use align_span::Span;
 
 /// Whether `s` is a valid identifier (so `{ and {` or `{}` stay literal text).
-fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+/// A raw template piece, before holes are parsed: either literal text or the (untrimmed)
+/// source of a `{...}` hole plus its byte offset within the decoded content (for span
+/// remapping). Splitting is kept pure (no parsing) so it can be unit-tested on its own.
+#[derive(Debug)]
+enum RawPart {
+    Text(String),
+    Hole { src: String, off: usize },
 }
 
-/// Split a template literal's decoded content into static text and `{ident}` holes.
-/// M5: only `{ident}` (no `{expr}`); the hole name is trimmed.
-fn split_template(content: &str, span: Span) -> Vec<TemplatePart> {
+/// Split a template literal's decoded content into static text and `{...}` holes. A hole is
+/// any non-empty `{...}` (its contents are parsed as an expression later). An unmatched `{`
+/// or an empty `{}` stays literal text. The hole body runs to the first `}` (nested braces,
+/// e.g. struct literals, are out of scope for M5).
+fn split_template(content: &str) -> Vec<RawPart> {
     let mut parts = Vec::new();
     let mut text = String::new();
-    let mut chars = content.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut chars = content.char_indices().peekable();
+    while let Some((idx, c)) = chars.next() {
         if c == '{' {
-            let mut name = String::new();
+            let off = idx + 1; // byte offset of the hole's first char within `content`
+            let mut src = String::new();
             let mut found_close = false;
-            for d in chars.by_ref() {
+            for (_, d) in chars.by_ref() {
                 if d == '}' {
                     found_close = true;
                     break;
                 }
-                name.push(d);
+                src.push(d);
             }
-            let trimmed = name.trim();
-            if found_close && is_ident(trimmed) {
+            if found_close && !src.trim().is_empty() {
                 if !text.is_empty() {
-                    parts.push(TemplatePart::Text(std::mem::take(&mut text)));
+                    parts.push(RawPart::Text(std::mem::take(&mut text)));
                 }
-                parts.push(TemplatePart::Hole(Ident { name: trimmed.to_string(), span }));
+                parts.push(RawPart::Hole { src, off });
             } else {
                 // Unmatched `{` or an empty `{}`: keep it as literal text.
                 text.push('{');
-                text.push_str(&name);
+                text.push_str(&src);
                 if found_close {
                     text.push('}');
                 }
@@ -56,7 +58,7 @@ fn split_template(content: &str, span: Span) -> Vec<TemplatePart> {
         }
     }
     if !text.is_empty() {
-        parts.push(TemplatePart::Text(text));
+        parts.push(RawPart::Text(text));
     }
     parts
 }
@@ -381,6 +383,33 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a `{...}` template hole's contents as a sub-expression. The hole source is
+    /// re-lexed and parsed; token spans are offset to point into the template literal
+    /// (`base = after the opening quote + the hole's offset in the content`). The mapping is
+    /// exact when no escapes precede the hole (good enough for diagnostics). A parse failure
+    /// yields a `Unit` placeholder so the surrounding template still produces an AST node.
+    fn parse_hole_expr(&mut self, src: &str, str_span: Span, off: usize) -> Expr {
+        let base = str_span.lo + 1 + off as u32;
+        let tokens: Vec<Token> = align_lexer::tokenize(str_span.file, src, self.diags)
+            .into_iter()
+            .map(|t| Token {
+                kind: t.kind,
+                span: Span::new(str_span.file, t.span.lo + base, t.span.hi + base),
+            })
+            .collect();
+        let mut sub = Parser { tokens, pos: 0, diags: self.diags };
+        let expr = sub.parse_expr(0);
+        // The lexer appends an implicit `End` before `Eof`; skip it, then reject any
+        // remaining tokens (e.g. `{x y}`): a hole must be exactly one expression.
+        while matches!(sub.peek(), TokKind::End) {
+            sub.bump();
+        }
+        if expr.is_some() && !matches!(sub.peek(), TokKind::Eof) {
+            sub.diags.error("a template hole must be a single expression".to_string(), sub.span());
+        }
+        expr.unwrap_or(Expr { kind: ExprKind::Unit, span: str_span })
+    }
+
     fn parse_expr(&mut self, min_bp: u8) -> Option<Expr> {
         let mut lhs = self.parse_prefix()?;
         loop {
@@ -560,7 +589,15 @@ impl<'a> Parser<'a> {
                     return None;
                 };
                 self.bump();
-                let parts = split_template(&content, str_span);
+                let parts = split_template(&content)
+                    .into_iter()
+                    .map(|rp| match rp {
+                        RawPart::Text(s) => TemplatePart::Text(s),
+                        RawPart::Hole { src, off } => {
+                            TemplatePart::Hole(self.parse_hole_expr(&src, str_span, off))
+                        }
+                    })
+                    .collect();
                 let span = span.merge(self.prev_span());
                 Some(Expr { kind: ExprKind::Template(parts), span })
             }
@@ -820,19 +857,33 @@ mod tests {
 
     #[test]
     fn template_splits_holes_and_keeps_bad_braces_literal() {
-        use crate::TemplatePart;
-        let span = Span::new(0, 0, 0);
-        // Valid hole.
-        let p = split_template("a {x} b", span);
-        assert!(matches!(p.as_slice(), [TemplatePart::Text(_), TemplatePart::Hole(_), TemplatePart::Text(_)]));
-        // Unmatched `{`, empty `{}`, and non-ident `{ x y }` all stay literal text.
-        for s in ["unmatched {", "empty {}", "{ x y } two words"] {
-            let parts = split_template(s, span);
+        use crate::RawPart;
+        // A non-empty `{...}` is a hole (its contents are parsed as an expression later).
+        let p = split_template("a {x + 1} b");
+        assert!(matches!(p.as_slice(), [RawPart::Text(_), RawPart::Hole { .. }, RawPart::Text(_)]));
+        // An unmatched `{` and an empty `{}` stay literal text.
+        for s in ["unmatched {", "empty {}"] {
+            let parts = split_template(s);
             assert!(
-                parts.iter().all(|p| matches!(p, TemplatePart::Text(_))),
+                parts.iter().all(|p| matches!(p, RawPart::Text(_))),
                 "expected all-literal for {s:?}, got {parts:?}"
             );
         }
+    }
+
+    #[test]
+    fn template_hole_parses_expression() {
+        // `{a + b}` parses as a Binary expression hole, not just a bare name.
+        let (f, err) = parse("fn main() -> i32 {\n  m := template \"{a + b}\"\n  return 0\n}\n");
+        assert!(!err, "expression hole should parse");
+        let Item::Fn(fd) = &f.items[0] else { panic!() };
+        let FnBody::Block(b) = &fd.body else { panic!() };
+        let Stmt::Let { init, .. } = &b.stmts[0] else { panic!() };
+        let ExprKind::Template(parts) = &init.kind else { panic!("expected template") };
+        assert!(
+            matches!(parts.as_slice(), [TemplatePart::Hole(e)] if matches!(e.kind, ExprKind::Binary { .. })),
+            "hole should be a binary expression, got {parts:?}"
+        );
     }
 
     #[test]

@@ -360,14 +360,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             for p in parts {
                 match p {
                     hir::TemplatePart::Text(s) => pieces.push(TemplatePiece::Static(s.clone())),
-                    hir::TemplatePart::Hole(local) => {
-                        let ty = b.slots[*local as usize];
-                        let v = b.fresh_value(ty);
-                        b.push(Stmt::Let(v, Rvalue::Load(*local)));
+                    hir::TemplatePart::Hole(h) => {
+                        let ty = h.ty;
+                        let op = lower_expr(b, h);
                         if ty == Ty::Str {
-                            pieces.push(TemplatePiece::StrHole(Operand::Value(v)));
+                            pieces.push(TemplatePiece::StrHole(op));
                         } else {
-                            pieces.push(TemplatePiece::IntHole(Operand::Value(v)));
+                            pieces.push(TemplatePiece::IntHole(op));
                         }
                     }
                 }

@@ -466,6 +466,13 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(opt, depth);
                 self.walk(fallback, depth);
             }
+            ExprKind::Template(parts) => {
+                for p in parts {
+                    if let TemplatePart::Hole(h) = p {
+                        self.walk(h, depth);
+                    }
+                }
+            }
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -473,7 +480,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Str(_)
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
-            | ExprKind::Template(_)
             | ExprKind::OptionNone
             | ExprKind::Field { .. } => {}
         }
@@ -584,13 +590,20 @@ impl<'a> MoveCheck<'a> {
                 // Conservative join: moved if moved on either path.
                 *moved = &m1 | &m2;
             }
+            ExprKind::Template(parts) => {
+                for p in parts {
+                    if let TemplatePart::Hole(h) = p {
+                        // A hole value is read (copied) into the builder, not moved out.
+                        self.expr(h, moved, false);
+                    }
+                }
+            }
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Str(_)
             | ExprKind::Bool(_)
-            | ExprKind::Template(_)
             | ExprKind::OptionNone => {}
         }
     }
@@ -1314,21 +1327,16 @@ impl<'a> Checker<'a> {
         for p in parts {
             match p {
                 ast::TemplatePart::Text(s) => hparts.push(TemplatePart::Text(s.clone())),
-                ast::TemplatePart::Hole(ident) => match self.lookup(&ident.name) {
-                    Some(id) => {
-                        let ty = self.locals[id as usize].ty;
-                        if !ty.is_int_like() && ty != Ty::Str && ty != Ty::Error {
-                            self.diags.error(
-                                format!("template hole '{}' must be an int or str, got {}", ident.name, ty_name(ty)),
-                                ident.span,
-                            );
-                        }
-                        hparts.push(TemplatePart::Hole(id));
+                ast::TemplatePart::Hole(expr) => {
+                    let e = self.check_expr(expr, None);
+                    if !e.ty.is_int_like() && e.ty != Ty::Str && e.ty != Ty::Error {
+                        self.diags.error(
+                            format!("a template hole must be an int or str, got {}", ty_name(e.ty)),
+                            e.span,
+                        );
                     }
-                    None => {
-                        self.diags.error(format!("undefined name in template: '{}'", ident.name), ident.span);
-                    }
-                },
+                    hparts.push(TemplatePart::Hole(e));
+                }
             }
         }
         self.constrain(Ty::Str, expected, span);
@@ -1840,6 +1848,13 @@ impl<'a> Checker<'a> {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);
             }
+            ExprKind::Template(parts) => {
+                for p in parts {
+                    if let TemplatePart::Hole(h) = p {
+                        self.finalize_expr(h);
+                    }
+                }
+            }
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -1847,7 +1862,6 @@ impl<'a> Checker<'a> {
             | ExprKind::Str(_)
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
-            | ExprKind::Template(_)
             | ExprKind::OptionNone
             | ExprKind::Field { .. } => {}
         }
@@ -2288,6 +2302,20 @@ mod tests {
     fn template_undefined_hole_errors() {
         let (_p, d) = check("fn main() -> i32 {\n  m := template \"hi {who}\"\n  return 0\n}\n");
         assert!(d.has_errors(), "an undefined template hole must error");
+    }
+
+    #[test]
+    fn template_expression_holes_check() {
+        // `{expr}` holes: arithmetic and str concatenation are both valid.
+        let (_p, d) = check("fn main() -> i32 {\n  a := 20\n  b := 22\n  n := \"x\"\n  m := template \"{a + b} {a * 2} {n + \\\"!\\\"}\"\n  print(m)\n  return 0\n}\n");
+        assert!(!d.has_errors(), "arithmetic and str-concat holes should check");
+    }
+
+    #[test]
+    fn template_non_int_str_hole_errors() {
+        // A hole evaluating to bool is rejected (only int/str are interpolatable).
+        let (_p, d) = check("fn main() -> i32 {\n  print(template \"{1 > 2}\")\n  return 0\n}\n");
+        assert!(d.has_errors(), "a bool template hole must error");
     }
 
     #[test]

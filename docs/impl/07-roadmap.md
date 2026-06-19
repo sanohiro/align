@@ -232,7 +232,11 @@ later slices (struct arrays, M5 strings/JSON).
   `let`, or via a re-borrowing call — cannot be returned (it would dangle); a slice
   *parameter* borrows the caller and is returnable. Slice-annotated `let` now also
   performs the array→slice borrow (fixes a latent array-into-slice-slot codegen mismatch).
-- [todo] owned `string` / `bytes`, const string pool/meta, `{expr}` holes,
+- [done] `{expr}` template holes: a hole is any non-empty `{...}`, whose contents are
+  re-lexed and parsed as a sub-expression (arithmetic, calls, inline `str` concat — not
+  just a bare name). The hole expression must be int-like or `str`. An unmatched `{` or
+  empty `{}` stays literal. Hole token spans are offset to point into the template literal.
+- [todo] owned `string` / `bytes`, const string pool/meta,
   `html`/`json` template variants.
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
   view, SIMD structural scan.

@@ -173,7 +173,8 @@ pub enum ExprKind {
 #[derive(Clone, Debug)]
 pub enum TemplatePart {
     Text(String),
-    Hole(LocalId),
+    /// `{expr}` — interpolate the value of an expression (int-like or `str`).
+    Hole(Expr),
 }
 
 #[derive(Clone, Debug)]
