@@ -2026,6 +2026,15 @@ impl<'a> Checker<'a> {
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
+        // A struct element must be projected to a scalar first (the fused loop has no scalar
+        // value loaded for a struct array, like `map`/`to_array`).
+        if matches!(elem, Ty::Struct(_)) {
+            self.diags.error(
+                "'scan' over struct elements is not supported yet (project a field first)".to_string(),
+                span,
+            );
+            return err;
+        }
         if params.len() != 2 || params[0] != acc_ty || params[1] != elem {
             self.diags.error(
                 format!("'scan' function '{}' must have type ({}, {}) -> {}", fname.name, ty_name(acc_ty), ty_name(elem), ty_name(acc_ty)),
@@ -2033,7 +2042,16 @@ impl<'a> Checker<'a> {
             );
             return err;
         }
-        // The accumulator (output element) must be a scalar to materialize into `array<A>`.
+        // The accumulator (output element) must be a *primitive* scalar to materialize into
+        // `array<A>`. `ty_to_scalar` accepts `Ty::Struct` (a valid Option/Result payload), but
+        // the buffer/PtrStore path has no struct-element support, so reject structs explicitly.
+        if matches!(acc_ty, Ty::Struct(_)) {
+            self.diags.error(
+                "'scan' accumulator must be a primitive scalar (struct accumulators are not supported yet)".to_string(),
+                span,
+            );
+            return err;
+        }
         let Some(scalar) = ty_to_scalar(acc_ty) else {
             self.diags.error(
                 format!("'scan' accumulator must be a scalar to materialize, got {}", ty_name(acc_ty)),
@@ -3241,6 +3259,20 @@ mod tests {
         // scan needs a 2-arg fold; a 1-arg function must error.
         let (_p, d) = check("fn bad(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].scan(bad, 0).sum()\n}\n");
         assert!(d.has_errors(), "scan with a non-binary function must error");
+    }
+
+    #[test]
+    fn scan_over_struct_element_rejected_not_panicked() {
+        // A struct element (no field projection) must be rejected in sema, not panic in MIR.
+        let (_p, d) = check("Point { x: i32, y: i32 }\nfn addx(acc: i32, p: Point) -> i32 = acc + p.x\nfn main() -> i32 {\n  return [Point { x: 1, y: 2 }].scan(addx, 0).sum()\n}\n");
+        assert!(d.has_errors(), "scan over struct elements must error (project a field first)");
+    }
+
+    #[test]
+    fn scan_struct_accumulator_rejected() {
+        // A struct accumulator (ty_to_scalar succeeds for structs) must be rejected explicitly.
+        let (_p, d) = check("Acc { s: i32 }\nfn step(a: Acc, x: i32) -> Acc = Acc { s: a.s + x }\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(step, Acc { s: 0 }).len()\n}\n");
+        assert!(d.has_errors(), "scan with a struct accumulator must error");
     }
 
     #[test]
