@@ -184,6 +184,9 @@ pub enum ExprKind {
     /// `template "..."` — build a `str` from static parts and interpolated holes. Each
     /// hole is a local (int or str); lowering picks the right builder write by its type.
     Template(Vec<TemplatePart>),
+    /// `json.decode(input)` for struct `struct_id` — parse the `str` `input` into that
+    /// struct at runtime. The expression `ty` is `Result<Struct, Error>`.
+    JsonDecode { struct_id: u32, input: Box<Expr> },
 }
 
 #[derive(Clone, Debug)]

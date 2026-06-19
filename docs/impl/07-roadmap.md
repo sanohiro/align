@@ -276,9 +276,17 @@ later slices (struct arrays, M5 strings/JSON).
   Codegen threads the struct-type table through the `Option`/`Result` aggregate builders so a
   struct payload lowers to a nested aggregate. The second `json.decode<T>` prerequisite
   (decode returns `Result<T, Error>`).
-- [todo] owned `string` / `bytes`, const string pool/meta, `html`/`json` template variants,
-  `json.decode<T>` (generic-call syntax, runtime JSON parser, field tables; SIMD scan,
-  zero-copy views).
+- [done] `json.decode` (first cut) — parse a `str` into a struct, yielding `Result<T, Error>`.
+  The target `T` is inferred from the binding annotation threaded through `?`
+  (`let u: T := json.decode(s)?`); `check_try` now passes the expected type inward. `<T>`
+  call syntax is future. MIR fills a zeroed out-struct via the runtime parser (status `i32`)
+  then branches into `Ok(<struct>)` / `Err(<code>)`. Codegen builds a field-descriptor table
+  (name / type-tag / byte offset via the target layout) and calls `align_rt_json_decode`, a
+  minimal object parser (field order irrelevant, unknown keys ignored, missing/malformed →
+  error). M5 cut: a flat struct of `i64`/`i32`/`bool` fields.
+- [todo] `json.decode` for `str`/`float` fields, arrays/nested; SIMD scan, zero-copy views,
+  compile-time field tables; owned `string` / `bytes`, const string pool, `html`/`json`
+  template variants; `<T>` generic-call syntax.
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
   view, SIMD structural scan.
 

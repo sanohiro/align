@@ -69,6 +69,26 @@ fn build_module<'c>(
     module: &Module<'c>,
     program: &Program,
 ) -> Result<(), CodegenError> {
+    // Target layout (for struct field offsets in `json.decode`); also pin the module's data
+    // layout so offsets match the emitted object.
+    Target::initialize_native(&InitializationConfig::default())
+        .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple)
+        .map_err(|e| CodegenError::Target(format!("triple resolution: {e}")))?;
+    let tm = target
+        .create_target_machine(
+            &triple,
+            "generic",
+            "",
+            OptimizationLevel::Default,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .ok_or_else(|| CodegenError::Target("failed to create TargetMachine".to_string()))?;
+    let target_data = tm.get_target_data();
+    module.set_data_layout(&target_data.get_data_layout());
+
     // Struct layouts → LLVM struct types, indexed by struct id.
     let struct_types: Vec<StructType<'c>> = program
         .structs
@@ -235,6 +255,18 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // json.decode(input, fields, n, out, out_size) -> i32 status (0 = ok).
+        "json_decode".to_string(),
+        module.add_function(
+            "align_rt_json_decode",
+            ctx.i32_type().fn_type(
+                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()],
+                false,
+            ),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_finish".to_string(),
         module.add_function(
             "align_rt_builder_finish",
@@ -252,6 +284,7 @@ fn build_module<'c>(
             funcs: &funcs,
             structs: &program.structs,
             struct_types: &struct_types,
+            target_data: &target_data,
             f,
             func: funcs[&f.name],
             slots: HashMap::new(),
@@ -463,6 +496,8 @@ struct FnGen<'c, 'a> {
     funcs: &'a HashMap<String, FunctionValue<'c>>,
     structs: &'a [StructDef],
     struct_types: &'a [StructType<'c>],
+    /// Target layout — used to compute struct field byte offsets for `json.decode`.
+    target_data: &'a inkwell::targets::TargetData,
     f: &'a Function,
     func: FunctionValue<'c>,
     slots: HashMap<Slot, inkwell::values::PointerValue<'c>>,
@@ -793,6 +828,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::Template(pieces, arena) => self.gen_template(pieces, arena.as_ref())?,
+            Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -1008,6 +1044,70 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// `template "..."` → builder_new, a write per piece, then builder_finish → str.
+    /// `json.decode` into struct `struct_id`: zero the out slot, build a field-descriptor
+    /// table `[{ name_ptr, name_len: i64, tag: i32, offset: i64 }]` (tag = byte width for
+    /// ints, 0 for bool; offset from the target layout), and call the runtime parser. Returns
+    /// the i32 status.
+    fn gen_json_decode(&mut self, struct_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let sty = self.struct_types[struct_id as usize];
+        let out_ptr = self.slots[&out];
+        // Zero the struct so missing fields read as 0/false.
+        self.builder.build_store(out_ptr, sty.const_zero()).map_err(|e| self.err(e))?;
+
+        let agg = self.operand(input).into_struct_value();
+        let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
+        let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
+
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let desc_ty = self.ctx.struct_type(&[ptr_ty.into(), i64t.into(), i32t.into(), i64t.into()], false);
+        let fields = self.structs[struct_id as usize].fields.clone();
+        let arr_ty = desc_ty.array_type(fields.len() as u32);
+        let table = self.builder.build_alloca(arr_ty, "jfields").map_err(|e| self.err(e))?;
+        let zero = i64t.const_zero();
+        for (i, f) in fields.iter().enumerate() {
+            let (name_ptr, name_len) = self.str_global(&f.name);
+            let tag = match f.ty {
+                Ty::Bool => 0,
+                Ty::Int(it) => (it.bits / 8) as u64,
+                _ => unreachable!("json.decode field is int/bool (sema-checked)"),
+            };
+            let offset = self.target_data.offset_of_element(&sty, i as u32).unwrap_or(0);
+            let idx = i64t.const_int(i as u64, false);
+            let parts: [BasicValueEnum; 4] = [
+                name_ptr.into(),
+                name_len.into(),
+                i32t.const_int(tag, false).into(),
+                i64t.const_int(offset, false).into(),
+            ];
+            for (fi, val) in parts.iter().enumerate() {
+                let ep = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(arr_ty, table, &[zero, idx, i32t.const_int(fi as u64, false)], "jf")
+                        .map_err(|e| self.err(e))?
+                };
+                self.builder.build_store(ep, *val).map_err(|e| self.err(e))?;
+            }
+        }
+        let base = unsafe {
+            self.builder
+                .build_in_bounds_gep(arr_ty, table, &[zero, zero], "jbase")
+                .map_err(|e| self.err(e))?
+        };
+        let n = i64t.const_int(fields.len() as u64, false);
+        let size = i64t.const_int(self.target_data.get_store_size(&sty), false);
+        let cs = self
+            .builder
+            .build_call(
+                self.funcs["json_decode"],
+                &[in_ptr.into(), in_len.into(), base.into(), n.into(), out_ptr.into(), size.into()],
+                "jdec",
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("json_decode returns i32"))
+    }
+
     fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece], arena: Option<&Operand>) -> Result<BasicValueEnum<'c>, CodegenError> {
         // Pass the enclosing arena handle (or a null pointer = leak) to builder_new.
         let arena_ptr = match arena {

@@ -92,6 +92,42 @@ fn len_of_str_slice_array() {
 }
 
 #[test]
+fn json_decode_flat_struct() {
+    if !backend_available() {
+        return;
+    }
+    // Decode {"id":40,"active":true} into User; `?` unwraps the struct. Unknown keys are
+    // ignored and field order is irrelevant.
+    let src = "User { id: i64, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"active\\\": true, \\\"x\\\": 9, \\\"id\\\": 40}\")?\n  print(u.id)\n  if u.active { print(2) }\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "40\n2\n");
+}
+
+#[test]
+fn json_decode_errors_on_missing_or_malformed() {
+    if !backend_available() {
+        return;
+    }
+    // A missing field (`active`) makes decode fail; `?` propagates → nonzero exit.
+    let src = "User { id: i64, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"id\\\": 40}\")?\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-missing", src);
+    assert_eq!(out.status.code(), Some(1), "a missing field propagates an Err");
+}
+
+#[test]
+fn json_decode_then_encode_roundtrips() {
+    if !backend_available() {
+        return;
+    }
+    // §19 spirit: decode → (re-)encode. {"id":7,"active":false} round-trips.
+    let src = "User { id: i64, active: bool }\nfn run(s: str) -> Result<(), Error> {\n  u: User := json.decode(s)?\n  print(json.encode(u))\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  run(\"{\\\"id\\\": 7, \\\"active\\\": false}\")?\n  return Ok(())\n}\n";
+    let out = build_and_run("json-roundtrip", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"id\":7,\"active\":false}\n");
+}
+
+#[test]
 fn json_encode_flat_struct() {
     if !backend_available() {
         return;
