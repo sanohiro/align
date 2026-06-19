@@ -1,0 +1,17 @@
+// JSON decode (M5). `json.decode(input)` parses a `str` into a struct, returning
+// Result<T, Error>. The target type T is inferred from the binding annotation through `?`
+// (`<T>` call syntax is future). M5 cut: a flat struct of int / bool fields.
+User { id: i64, active: bool }
+
+fn parse(s: str) -> Result<User, Error> {
+  u: User := json.decode(s)?
+  return Ok(u)
+}
+
+fn main() -> Result<(), Error> {
+  // Field order is irrelevant and unknown keys ("x") are ignored.
+  u := parse("{\"active\": true, \"x\": 9, \"id\": 42}")?
+  print(u.id)            // 42
+  print(json.encode(u))  // {"id":42,"active":true}
+  return Ok(())
+}

@@ -133,6 +133,10 @@ pub enum Rvalue {
     /// `template "..."` / `str + str` — build a `str` from pieces. The optional operand
     /// is the enclosing arena handle (the result lives there; `None` = leaked).
     Template(Vec<TemplatePiece>, Option<Operand>),
+    /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
+    /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
+    /// type tags, byte offsets) and calls the runtime parser.
+    JsonDecode { struct_id: u32, input: Operand, out: Slot },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -388,6 +392,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(r, Rvalue::Template(pieces, arena)));
             Operand::Value(r)
         }
+        hir::ExprKind::JsonDecode { struct_id, input } => lower_json_decode(b, *struct_id, input, e.ty),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -763,6 +768,45 @@ fn lower_array_reduce(
     b.cur = exit;
     let r = b.fresh_value(elem_ty);
     b.push(Stmt::Let(r, Rvalue::Load(acc)));
+    Operand::Value(r)
+}
+
+/// `json.decode(input)` → fill an out struct via the runtime parser (status `i32`), then
+/// branch into `Ok(<struct>)` on status 0 or `Err(<code>)` otherwise, yielding the Result.
+fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
+    let sty = Ty::Struct(struct_id);
+    let out = b.new_slot(sty);
+    let inp = lower_expr(b, input);
+    let code = b.fresh_value(Ty::ErrCode);
+    b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, input: inp, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the filled struct and wrap it.
+    b.cur = ok_bb;
+    let s = b.fresh_value(sty);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: wrap the status code as the Error.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
     Operand::Value(r)
 }
 

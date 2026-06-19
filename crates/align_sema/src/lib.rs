@@ -503,6 +503,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
+            ExprKind::JsonDecode { input, .. } => self.walk(input, depth),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -630,6 +631,7 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
+            ExprKind::JsonDecode { input, .. } => self.expr(input, moved, false),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -979,7 +981,7 @@ impl<'a> Checker<'a> {
             ast::ExprKind::ElseUnwrap { opt, fallback } => {
                 self.check_else_unwrap(opt, fallback, expected, e.span)
             }
-            ast::ExprKind::Try(inner) => self.check_try(inner, e.span),
+            ast::ExprKind::Try(inner) => self.check_try(inner, expected, e.span),
             ast::ExprKind::Arena(b) => {
                 let diverges = ast_block_diverges(b);
                 self.arena_depth += 1;
@@ -1305,6 +1307,9 @@ impl<'a> Checker<'a> {
             }
             if single_name(p) == Some("json") && method == "encode" {
                 return self.check_json_encode(args, span);
+            }
+            if single_name(p) == Some("json") && method == "decode" {
+                return self.check_json_decode(args, expected, span);
             }
         }
         // `sum` / `reduce` are the terminals of a fused pipeline.
@@ -1797,6 +1802,51 @@ impl<'a> Checker<'a> {
         Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
     }
 
+    /// `json.decode(input)` — parse a `str` into a struct at runtime, yielding
+    /// `Result<Struct, Error>`. The target struct `T` is taken from the expected type
+    /// (a `Result<T, _>`, e.g. from `let u: T := json.decode(d)?`); `<T>` call syntax is
+    /// future. M5 cut: a flat struct of `i64`/`i32`/`bool` fields (str/float/nested later).
+    fn check_json_decode(&mut self, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'json.decode' expects 1 argument, got {}", args.len()), span);
+            return err;
+        }
+        // The decode target is the Ok type of the expected `Result<T, _>`.
+        let sid = match expected.map(|e| self.resolve(e)) {
+            Some(Ty::Result(Scalar::Struct(id), _)) => id,
+            _ => {
+                self.diags.error(
+                    "cannot infer the decode target type; annotate the binding, e.g. `u: T := json.decode(d)?`".to_string(),
+                    span,
+                );
+                return err;
+            }
+        };
+        // Every field must be decodable (M5 cut: int / bool).
+        let fields = self.structs[sid as usize].fields.clone();
+        for f in &fields {
+            if !matches!(f.ty, Ty::Int(_) | Ty::Bool) {
+                self.diags.error(
+                    format!("'json.decode' field '{}' has type {} (only int/bool decode for now)", f.name, ty_name(f.ty)),
+                    span,
+                );
+                return err;
+            }
+        }
+        let input = self.check_expr(&args[0], Some(Ty::Str));
+        if input.ty != Ty::Str && input.ty != Ty::Error {
+            self.diags
+                .error(format!("'json.decode' input must be a str, got {}", ty_name(input.ty)), args[0].span);
+        }
+        Expr {
+            kind: ExprKind::JsonDecode { struct_id: sid, input: Box::new(input) },
+            ty: Ty::Result(Scalar::Struct(sid), Scalar::ErrCode),
+            span,
+        }
+    }
+
     /// Emit the `{"field":value,...}` template parts for one struct value: either the struct
     /// local `base` itself (`elem` = None) or element `elem` of the struct-array local `base`.
     /// Sets `*ok = false` (and reports) on a field type `json.encode` can't render yet.
@@ -1932,8 +1982,16 @@ impl<'a> Checker<'a> {
 
     /// `expr?` — propagate. The operand must be `Result<T, E>` and the enclosing
     /// function must return `Result<_, E>` (same `E`). Yields `T`.
-    fn check_try(&mut self, inner: &ast::Expr, span: Span) -> Expr {
-        let v = self.check_expr(inner, None);
+    fn check_try(&mut self, inner: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
+        // Thread the expected unwrapped (Ok) type inward as a `Result<expected, ret_err>`, so
+        // a context type can drive inference inside the `?` operand (e.g. `json.decode`'s T
+        // from `let u: User := json.decode(d)?`). The err type comes from the function's
+        // return Result, matching the `?` propagation rule below.
+        let inner_expected = match (expected, self.resolve(self.ret_hint)) {
+            (Some(ok), Ty::Result(_, err)) => ty_to_scalar(ok).map(|o| Ty::Result(o, err)),
+            _ => None,
+        };
+        let v = self.check_expr(inner, inner_expected);
         let (ok, err) = match self.resolve(v.ty) {
             Ty::Result(o, e) => (o, e),
             Ty::Error => return Expr { kind: ExprKind::Try(Box::new(v)), ty: Ty::Error, span },
@@ -2073,6 +2131,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            ExprKind::JsonDecode { input, .. } => self.finalize_expr(input),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -2455,6 +2514,19 @@ mod tests {
         assert!(boxed.has_errors(), "a struct box payload must still be rejected");
         let (_r, boxann) = check("P { x: i32 }\nfn f(b: box<P>) -> i32 = 0\nfn main() -> i32 { return 0 }\n");
         assert!(boxann.has_errors(), "a box<Struct> annotation must still be rejected");
+    }
+
+    #[test]
+    fn json_decode_checks_and_infers_target() {
+        // T is inferred from the binding annotation through `?`.
+        let (_p, ok) = check("User { id: i64, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(!ok.has_errors(), "json.decode into an annotated struct should check");
+        // Without an inferable target type, decode errors.
+        let (_q, noty) = check("fn main() -> i32 {\n  x := json.decode(\"{}\")\n  return 0\n}\n");
+        assert!(noty.has_errors(), "json.decode needs an inferable target type");
+        // A non-int/bool field is rejected for now.
+        let (_r, badf) = check("U { name: str }\nfn parse(s: str) -> Result<U, Error> {\n  u: U := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(badf.has_errors(), "a str field is not decodable yet");
     }
 
     #[test]

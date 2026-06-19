@@ -195,6 +195,186 @@ pub unsafe extern "C" fn align_rt_builder_write_json_str(b: *mut Builder, ptr: *
     b.buf.push(b'"');
 }
 
+/// One field descriptor for `json.decode` (matches the codegen layout):
+/// `{ name_ptr, name_len, tag, offset }`. `tag`: byte width for ints (1/2/4/8), 0 for bool.
+#[repr(C)]
+pub struct JsonField {
+    pub name_ptr: *const u8,
+    pub name_len: i64,
+    pub tag: i32,
+    pub offset: i64,
+}
+
+/// Parse the JSON object in `input` into the zeroed struct at `out` (size `out_size`),
+/// writing each known field per its descriptor. Returns 0 on success, nonzero on a parse
+/// error or a missing/duplicate field. M5 cut: a flat object of integer / boolean values.
+///
+/// # Safety
+/// `input`/`fields`/`out` must describe valid ranges for the call; `out` must have room for
+/// the largest `offset + width`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_decode(
+    input: *const u8,
+    input_len: i64,
+    fields: *const JsonField,
+    n_fields: i64,
+    out: *mut u8,
+    out_size: i64,
+) -> i32 {
+    let src = unsafe { std::slice::from_raw_parts(input, input_len.max(0) as usize) };
+    let descs = unsafe { std::slice::from_raw_parts(fields, n_fields.max(0) as usize) };
+    let mut seen = vec![false; descs.len()];
+
+    let mut p = JsonParser { src, pos: 0 };
+    let ok = (|| -> Option<()> {
+        p.ws();
+        p.expect(b'{')?;
+        p.ws();
+        if p.peek() == Some(b'}') {
+            p.pos += 1;
+        } else {
+            loop {
+                p.ws();
+                let key = p.string()?;
+                p.ws();
+                p.expect(b':')?;
+                p.ws();
+                // Find the matching field descriptor (unknown keys are skipped).
+                let idx = descs.iter().position(|d| {
+                    let name = unsafe { std::slice::from_raw_parts(d.name_ptr, d.name_len.max(0) as usize) };
+                    name == key
+                });
+                match idx {
+                    Some(i) => {
+                        if seen[i] {
+                            return None; // duplicate field
+                        }
+                        seen[i] = true;
+                        let d = &descs[i];
+                        // Defense in depth: never write outside the out struct, even if a
+                        // descriptor offset/width were wrong.
+                        let width = if d.tag == 0 { 1 } else { d.tag as i64 };
+                        if d.offset < 0 || d.offset + width > out_size {
+                            return None;
+                        }
+                        if d.tag == 0 {
+                            let v = p.boolean()?;
+                            unsafe { *out.add(d.offset as usize) = v as u8 };
+                        } else {
+                            let v = p.integer()?;
+                            let bytes = v.to_le_bytes();
+                            for k in 0..(d.tag as usize) {
+                                unsafe { *out.add(d.offset as usize + k) = bytes[k] };
+                            }
+                        }
+                    }
+                    None => p.skip_value()?,
+                }
+                p.ws();
+                match p.peek() {
+                    Some(b',') => {
+                        p.pos += 1;
+                        continue;
+                    }
+                    Some(b'}') => {
+                        p.pos += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        p.ws();
+        // Trailing garbage after the object is an error.
+        if p.pos != src.len() { return None; }
+        Some(())
+    })();
+    // All declared fields must be present.
+    if ok.is_some() && seen.iter().all(|&s| s) {
+        0
+    } else {
+        1
+    }
+}
+
+/// A minimal JSON scanner over a byte slice (just what `json.decode` needs: objects with
+/// integer / boolean values; strings only as keys).
+struct JsonParser<'a> {
+    src: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.src.get(self.pos).copied()
+    }
+    fn ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+    fn expect(&mut self, c: u8) -> Option<()> {
+        if self.peek() == Some(c) {
+            self.pos += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+    /// Read a `"..."` string key (no escapes for the M5 cut). Borrows the input (`&'a`), so
+    /// it does not hold `self`, and the parser can keep advancing after.
+    fn string(&mut self) -> Option<&'a [u8]> {
+        self.expect(b'"')?;
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c == b'"' {
+                let s = &self.src[start..self.pos];
+                self.pos += 1;
+                return Some(s);
+            }
+            if c == b'\\' {
+                return None; // escapes in keys unsupported (M5 cut)
+            }
+            self.pos += 1;
+        }
+        None
+    }
+    fn integer(&mut self) -> Option<i64> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        let digits = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.pos == digits {
+            return None;
+        }
+        std::str::from_utf8(&self.src[start..self.pos]).ok()?.parse::<i64>().ok()
+    }
+    fn boolean(&mut self) -> Option<bool> {
+        if self.src[self.pos..].starts_with(b"true") {
+            self.pos += 4;
+            Some(true)
+        } else if self.src[self.pos..].starts_with(b"false") {
+            self.pos += 5;
+            Some(false)
+        } else {
+            None
+        }
+    }
+    /// Skip a value of an unknown key (int / bool / string for the M5 cut).
+    fn skip_value(&mut self) -> Option<()> {
+        match self.peek() {
+            Some(b't' | b'f') => self.boolean().map(|_| ()),
+            Some(b'-' | b'0'..=b'9') => self.integer().map(|_| ()),
+            Some(b'"') => self.string().map(|_| ()),
+            _ => None,
+        }
+    }
+}
+
 /// Finish the builder, returning a `str` view over the (leaked) contents and freeing
 /// the builder object.
 #[unsafe(no_mangle)]
