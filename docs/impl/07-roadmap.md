@@ -236,12 +236,13 @@ later slices (struct arrays, M5 strings/JSON).
   re-lexed and parsed as a sub-expression (arithmetic, calls, inline `str` concat — not
   just a bare name). The hole expression must be printable. An unmatched `{` or
   empty `{}` stays literal. Hole token spans are offset to point into the template literal.
-- [done] `print` and template holes render `bool` (`true`/`false`) and `char` (its UTF-8,
-  incl. multibyte) in addition to integers and `str` (runtime `align_rt_print_bool`/
-  `print_char` + `builder_write_bool`/`write_char`; MIR `BoolHole`/`CharHole`). Floats
-  still wait for a dtoa.
-- [todo] float formatting (`print`/template holes for `f32`/`f64` — needs a dtoa),
-  owned `string` / `bytes`, const string pool/meta, `html`/`json` template variants.
+- [done] `print` and template holes render `bool` (`true`/`false`), `char` (its UTF-8,
+  incl. multibyte), and floats (`f32`/`f64`) in addition to integers and `str`. Floats use
+  the runtime's shortest round-trip decimal (Rust `Display`), with a `.0` appended when the
+  rendering would otherwise look like an integer (runtime `align_rt_print_{bool,char,f32,f64}`
+  + matching `builder_write_*`; MIR `BoolHole`/`CharHole`/`FloatHole`). `is_printable`
+  (numeric | `str` | `bool` | `char`) gates both `print` and template holes.
+- [todo] owned `string` / `bytes`, const string pool/meta, `html`/`json` template variants.
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
   view, SIMD structural scan.
 

@@ -80,6 +80,18 @@ fn template_expression_holes() {
 }
 
 #[test]
+fn print_and_template_float() {
+    if !backend_available() {
+        return;
+    }
+    // f64 and f32 render as shortest round-trip decimals; whole values get a `.0`.
+    let src = "fn main() -> i32 {\n  x := 3.14\n  y := 1.0\n  z: f32 := 0.5\n  print(x)\n  print(y)\n  print(template \"x={x} half={z}\")\n  return 0\n}\n";
+    let out = build_and_run("float-print", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3.14\n1.0\nx=3.14 half=0.5\n");
+}
+
+#[test]
 fn print_and_template_bool_char() {
     if !backend_available() {
         return;

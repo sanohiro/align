@@ -144,6 +144,22 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        "print_f32".to_string(),
+        module.add_function(
+            "align_rt_print_f32",
+            ctx.void_type().fn_type(&[ctx.f32_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "print_f64".to_string(),
+        module.add_function(
+            "align_rt_print_f64",
+            ctx.void_type().fn_type(&[ctx.f64_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         "str_eq".to_string(),
         module.add_function(
             "align_rt_str_eq",
@@ -189,6 +205,22 @@ fn build_module<'c>(
         module.add_function(
             "align_rt_builder_write_char",
             ctx.void_type().fn_type(&[ptr.into(), ctx.i32_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_write_f32".to_string(),
+        module.add_function(
+            "align_rt_builder_write_f32",
+            ctx.void_type().fn_type(&[ptr.into(), ctx.f32_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_write_f64".to_string(),
+        module.add_function(
+            "align_rt_builder_write_f64",
+            ctx.void_type().fn_type(&[ptr.into(), ctx.f64_type().into()], false),
             None,
         ),
     );
@@ -879,6 +911,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .map_err(|e| self.err(e))?;
             return Ok(None);
         }
+        // print(float): the runtime renders the shortest round-trip decimal.
+        if matches!(ty, Ty::Float(_)) {
+            let v = self.operand(arg).into_float_value();
+            let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "print_f32" } else { "print_f64" };
+            self.builder
+                .build_call(self.funcs[callee], &[v.into()], "")
+                .map_err(|e| self.err(e))?;
+            return Ok(None);
+        }
         let v = self.operand(arg).into_int_value();
         let i64t = self.ctx.i64_type();
         let wide = if int_bits(ty) < 64 {
@@ -996,6 +1037,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let v = self.operand(op).into_int_value();
                     self.builder
                         .build_call(self.funcs["builder_write_char"], &[bptr.into(), v.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                align_mir::TemplatePiece::FloatHole(op) => {
+                    let ty = self.f.operand_ty(op);
+                    let v = self.operand(op).into_float_value();
+                    let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
+                    self.builder
+                        .build_call(self.funcs[callee], &[bptr.into(), v.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
             }

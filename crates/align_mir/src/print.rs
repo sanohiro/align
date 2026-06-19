@@ -111,6 +111,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     crate::TemplatePiece::StrHole(o) => format!("str({})", operand_str(o)),
                     crate::TemplatePiece::BoolHole(o) => format!("bool({})", operand_str(o)),
                     crate::TemplatePiece::CharHole(o) => format!("char({})", operand_str(o)),
+                    crate::TemplatePiece::FloatHole(o) => format!("float({})", operand_str(o)),
                 })
                 .collect();
             format!("template[{}]", ps.join(", "))
