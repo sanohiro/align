@@ -51,6 +51,15 @@ Record: `draft.md` §18.3
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
 ### Memory model v2 (borrow-region propagation + owned heap/drop) — dedicated phase before M6
+**Design locked — see `impl/08-memory-model-v2.md` (the full model + ordered implementation
+slices). Implementation pending (slice 1 = behavior-preserving region-lattice refactor).**
+Two decisions are now settled (recorded there): (1) owned `array<T>` uses **both** allocation
+modes — arena bump + bulk-free inside an `arena {}`, free-standing heap + per-binding MIR
+`Drop` outside (so owned arrays can be returned); (2) a zero-copy decoded view that must
+outlive its input is **cloned explicitly** — the compiler never inserts a copy on escape
+(Nothing hidden + Predictable performance; supersedes the old draft.md §12 auto-buffer
+wording). The rest of this entry is the original framing, kept for context:
+
 The single load-bearing foundation that **both** of the deferred "ideal forms" depend on:
 - **Borrow-region propagation**: a value that *views* another (a `slice` into an array, a
   `str` view into a buffer, a **`json.decode`-d struct borrowing its input**) must carry a
