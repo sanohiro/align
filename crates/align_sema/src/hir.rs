@@ -166,6 +166,9 @@ pub enum ExprKind {
     /// A fused array pipeline ending in `sum`: `source.map(f).where(p)….sum()`. The
     /// stages and the reduction lower to a single loop (no intermediate arrays).
     ArraySum { source: Box<Expr>, stages: Vec<Stage> },
+    /// `source.….count()` — count the elements that survive the stages. Always `i64`;
+    /// the element value is irrelevant, so no scalar projection is required.
+    ArrayCount { source: Box<Expr>, stages: Vec<Stage> },
     /// `source.…​.reduce(f, init)` — fold the (post-stage) elements with the binary
     /// function `func` starting from `init`. `ty` is the accumulator type.
     ArrayReduce { source: Box<Expr>, stages: Vec<Stage>, func: String, init: Box<Expr> },

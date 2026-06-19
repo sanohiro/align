@@ -498,11 +498,16 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::ArraySum { source, stages } => {
             let init = zero_of(e.ty);
-            lower_array_reduce(b, source, stages, e.ty, init, None)
+            lower_array_reduce(b, source, stages, e.ty, init, Reducer::Sum)
+        }
+        hir::ExprKind::ArrayCount { source, stages } => {
+            // i64 accumulator seeded at 0; each surviving element adds 1.
+            let init = Operand::Const(Const::Int(0, i64_ty()));
+            lower_array_reduce(b, source, stages, i64_ty(), init, Reducer::Count)
         }
         hir::ExprKind::ArrayReduce { source, stages, func, init } => {
             let init_op = lower_expr(b, init);
-            lower_array_reduce(b, source, stages, e.ty, init_op, Some(func.clone()))
+            lower_array_reduce(b, source, stages, e.ty, init_op, Reducer::Fold(func.clone()))
         }
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
@@ -597,13 +602,23 @@ fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty)
 /// an accumulator. `fold` is the binary reducer (`None` = `+`), `init` seeds the
 /// accumulator (type `acc_ty`). Stages run inline (fusion); a failing `where` skips to
 /// the increment, so no intermediate array is built.
+/// How a fused pipeline's surviving elements combine into the result.
+enum Reducer {
+    /// `sum`: `acc + element`.
+    Sum,
+    /// `count`: `acc + 1` (element value ignored).
+    Count,
+    /// `reduce(f, init)`: `f(acc, element)`.
+    Fold(String),
+}
+
 fn lower_array_reduce(
     b: &mut Builder,
     source: &hir::Expr,
     stages: &[hir::Stage],
     acc_ty: Ty,
     init: Operand,
-    fold: Option<String>,
+    reducer: Reducer,
 ) -> Operand {
     let elem_ty = acc_ty;
     // Source kinds: a stack array (slot, const length), a struct array (slot, no
@@ -701,15 +716,22 @@ fn lower_array_reduce(
             }
         }
     }
-    let cur = cur.expect("pipeline must reduce to a scalar before the reduction");
     let a = b.fresh_value(acc_ty);
     b.push(Stmt::Let(a, Rvalue::Load(acc)));
     let next = b.fresh_value(acc_ty);
-    match &fold {
-        // `reduce`: acc = f(acc, cur).
-        Some(func) => b.push(Stmt::Let(next, Rvalue::Call(func.clone(), vec![Operand::Value(a), cur]))),
+    match &reducer {
+        // `count`: acc = acc + 1 (the element value is irrelevant).
+        Reducer::Count => b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), index_const(1)))),
         // `sum`: acc = acc + cur.
-        None => b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur))),
+        Reducer::Sum => {
+            let cur = cur.expect("sum needs a scalar element");
+            b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
+        }
+        // `reduce`: acc = f(acc, cur).
+        Reducer::Fold(func) => {
+            let cur = cur.expect("reduce needs a scalar element");
+            b.push(Stmt::Let(next, Rvalue::Call(func.clone(), vec![Operand::Value(a), cur])));
+        }
     }
     b.push(Stmt::Store(acc, Operand::Value(next)));
     b.terminate(Term::Goto(cont));

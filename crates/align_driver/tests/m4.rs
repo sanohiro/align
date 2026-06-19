@@ -101,6 +101,18 @@ fn struct_array_where_field_projection_sum() {
 }
 
 #[test]
+fn count_terminal_scalar_struct_and_plain() {
+    if !backend_available() {
+        return;
+    }
+    // count after where on a scalar array (3), after where(.active) on a struct array (2),
+    // and with no stages (3): 3 + 2 + 3 = 8.
+    let src = "fn big(x: i64) -> bool = x > 2\nEmp { pay: i32, active: bool }\nfn total() -> i64 {\n  c1 := [1, 2, 3, 4, 5].where(big).count()\n  c2 := [Emp{pay: 10, active: true}, Emp{pay: 5, active: false}, Emp{pay: 8, active: true}].where(.active).count()\n  c3 := [10, 20, 30].count()\n  return c1 + c2 + c3\n}\nfn main() -> i32 {\n  if total() == 8 { return 1 }\n  return 0\n}\n";
+    let out = build_and_run("count", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn reduce_with_custom_fold() {
     if !backend_available() {
         return;

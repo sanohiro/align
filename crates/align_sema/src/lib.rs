@@ -472,7 +472,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::ArrayReduce { source, init, .. } => {
                 self.walk(source, depth);
@@ -586,7 +586,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false)
             }
@@ -1305,6 +1305,9 @@ impl<'a> Checker<'a> {
         if method == "reduce" {
             return self.check_array_reduce(recv, args, expected, span);
         }
+        if method == "count" {
+            return self.check_array_count(recv, args, span);
+        }
         // `.len()` of a `str`/`slice`/array — the element count (an `i64`).
         if method == "len" {
             return self.check_len(recv, args, span);
@@ -1578,6 +1581,23 @@ impl<'a> Checker<'a> {
         }
         self.constrain(elem, expected, span);
         Expr { kind: ExprKind::ArraySum { source: Box::new(source), stages }, ty: elem, span }
+    }
+
+    /// `source.….count()` — the count of elements surviving the stages, as an `i64`. The
+    /// element type is unconstrained (a struct element needs no projection), unlike `sum`.
+    fn check_array_count(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        if !args.is_empty() {
+            self.diags.error("'count' takes no arguments".to_string(), span);
+        }
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some((source, stages, _elem)) = self.check_pipeline(recv, None, span) else {
+            return err;
+        };
+        Expr {
+            kind: ExprKind::ArrayCount { source: Box::new(source), stages },
+            ty: Ty::Int(IntTy { bits: 64, signed: true }),
+            span,
+        }
     }
 
     /// `src.…​.reduce(f, init)` — fold the post-stage elements with `f: (A, E) -> A`,
@@ -1958,7 +1978,7 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
@@ -2542,6 +2562,13 @@ mod tests {
             "fn add(acc: i32, x: i32) -> i32 = acc + x\nfn main() -> i32 {\n  return [1, 2, 3].reduce(add, 0)\n}\n",
         );
         assert!(!d.has_errors(), "reduce with a matching fold should check");
+    }
+
+    #[test]
+    fn count_checks_on_scalar_and_struct_arrays() {
+        // count returns i64 and needs no scalar element (a struct element is fine).
+        let (_p, d) = check("fn big(x: i64) -> bool = x > 2\nE { active: bool }\nfn main() -> i32 {\n  a := [1, 2, 3].where(big).count()\n  b := [E{active: true}, E{active: false}].where(.active).count()\n  if a + b == 3 { return 1 }\n  return 0\n}\n");
+        assert!(!d.has_errors(), "count should check on scalar and struct array pipelines");
     }
 
     #[test]
