@@ -626,9 +626,23 @@ user := json.decode<User>(data)?
 
 ### Zero Copy
 
-If there is no escape, return a `str` view into the input buffer.
+A decoded `str` / `array` / nested field is a view into the input buffer (no allocation),
+region-tied to that input (see the memory model, §6, and `docs/impl/08-memory-model-v2.md`).
 
-Only when there is an escape is a decode buffer used.
+To make a decoded value outlive its input, the user clones it explicitly:
+
+```align
+arena {
+  data := fs.read_file(path)?
+  users := json.decode<array<User>>(data)?   // views into `data`
+  process(users)?                             // zero copy, cache-local
+  first_name := users[0].name.clone()         // explicit copy only when it must escape
+}
+```
+
+The compiler never silently inserts a copy on escape — allocation stays visible in source
+("Nothing hidden") and the cost class stays predictable. A `.clone()` inside an arena is a
+bump allocation (bulk-freed), so escaping is not a sudden heap cost.
 
 ### Struct as Schema
 

@@ -306,8 +306,10 @@ which needs zero-copy borrow-region decode. M5 is otherwise complete (strings, t
 ## Memory Model v2 — borrow-region + owned heap/drop (foundation; before M6)
 
 A dedicated phase for the one foundation that the deferred "ideal forms" of M4 and M5 both
-need (see `open-questions.md` "Memory model v2"). **Design the whole model first**
-(`00-overview.md`), then the dependent features fall out:
+need (see `open-questions.md` "Memory model v2"). **The whole model is designed in
+`08-memory-model-v2.md`** (region lattice, owned heap + drop, zero-copy decode, and the
+ordered implementation slices 1–7); implement from there. In outline the dependent features
+fall out of:
 - **Borrow-region propagation**: generalize the point solutions (arena depth, slice
   "local-backed", struct `str` region-0) so a *view* (`slice`, `str` view, a
   `json.decode`-d struct) carries a region tied to its source and escape checking forbids it

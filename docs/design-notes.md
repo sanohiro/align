@@ -159,6 +159,33 @@ chunk processing
 
 ---
 
+## Memory model v2: one region lattice, explicit copies
+
+(Design: `impl/08-memory-model-v2.md`. Decided as a whole before M6.)
+
+Two principles drove the load-bearing choices.
+
+**One region lattice, not three point solutions.** Escape safety started as three unrelated
+mechanisms (arena depth for `box`/`str`, a "local-backed" flag for slices, a region-0
+restriction for struct `str` fields). They are unified into a single total order
+`Static ⊐ Frame ⊐ Arena(1) ⊐ … ⊐ Arena(d)` with one rule — a value may only be stored or
+returned where it outlives the destination. Regions stay **inferred** (no lifetime syntax,
+ever); they are an analysis result, not a surface type. Restriction-as-information: one
+lattice keeps the checker simple and preserves the optimizer's no-alias / contiguous /
+arena-lifetime facts.
+
+**Explicit `.clone()` over a hidden copy-on-escape.** A zero-copy decoded view that needs to
+outlive its input is cloned *explicitly*; the compiler never inserts the copy silently. The
+cache-friendly fast path — borrow the input bytes, process, discard — is identical either
+way; the difference is only the rare escape, where a copy is physically unavoidable. Making
+it explicit honors **Nothing hidden** (allocation is visible) and **Predictable performance**
+(a small edit that starts escaping a value does not silently jump its cost class). This is the
+hardware-aligned choice: predictable allocation beats convenience, and an in-arena clone is a
+bump allocation, not a malloc cliff. (Convenience-first auto-copy was rejected for the same
+reason exceptions and GC were — it hides cost.)
+
+---
+
 ## The SIMD philosophy
 
 Align does not try to make developers write SIMD.
