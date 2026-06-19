@@ -509,6 +509,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let init_op = lower_expr(b, init);
             lower_array_reduce(b, source, stages, e.ty, init_op, Reducer::Fold(func.clone()))
         }
+        hir::ExprKind::ArrayAnyAll { source, stages, func, all } => {
+            // bool accumulator: `all` seeds true (&&-fold), `any` seeds false (||-fold).
+            let init = Operand::Const(Const::Bool(*all));
+            lower_array_reduce(b, source, stages, Ty::Bool, init, Reducer::AnyAll { func: func.clone(), all: *all })
+        }
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
             let v = b.fresh_value(e.ty);
@@ -610,6 +615,8 @@ enum Reducer {
     Count,
     /// `reduce(f, init)`: `f(acc, element)`.
     Fold(String),
+    /// `any(p)` / `all(p)`: `acc || p(element)` / `acc && p(element)`.
+    AnyAll { func: String, all: bool },
 }
 
 fn lower_array_reduce(
@@ -731,6 +738,14 @@ fn lower_array_reduce(
         Reducer::Fold(func) => {
             let cur = cur.expect("reduce needs a scalar element");
             b.push(Stmt::Let(next, Rvalue::Call(func.clone(), vec![Operand::Value(a), cur])));
+        }
+        // `any`/`all`: t = p(cur); acc = acc || t  /  acc && t.
+        Reducer::AnyAll { func, all } => {
+            let cur = cur.expect("any/all needs a scalar element");
+            let t = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(t, Rvalue::Call(func.clone(), vec![cur])));
+            let op = if *all { BinOp::And } else { BinOp::Or };
+            b.push(Stmt::Let(next, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
         }
     }
     b.push(Stmt::Store(acc, Operand::Value(next)));
