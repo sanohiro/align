@@ -1,0 +1,19 @@
+// MMv2 slice 3: a materializing pipeline terminal. `.to_array()` collects the surviving
+// elements of a fused map/where pipeline into an *owned* `array<T>`, bump-allocated in the
+// enclosing arena (bulk-freed at the block's end — no per-binding drop yet). The owned array
+// is then consumed like a slice (`.len()`, `.sum()`).
+
+fn double(x: i32) -> i32 = x * 2
+fn big(x: i32) -> bool = x > 4
+
+fn main() -> i32 {
+  arena {
+    // map *2 → [2,4,6,8,10]; where >4 → [6,8,10]; materialize into an owned array.
+    ys := [1, 2, 3, 4, 5].map(double).where(big).to_array()
+    // Read the owned array back (a borrow, not a move): len 3, sum 24.
+    if ys.len() == 3 {
+      return ys.sum()
+    }
+    return 0
+  }
+}

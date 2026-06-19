@@ -293,9 +293,14 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    single `outlives` rule against the base struct's region. A struct holding an arena `str`
    is now constructible and usable inside its arena, and escape-checked as a whole. (Adding
    `slice`/`box` view *fields* — needs the matching field-layout/codegen — is a follow-on.)
-3. **Owned dynamic `array<T>` (arena mode first).** The Move type, arena-bump-allocated,
-   bulk-freed. `.to_array()` / a first materializing terminal (`filter`) **restricted to
-   arena context**. No drop yet.
+3. **[done]** **Owned dynamic `array<T>` (arena mode first).** New `Ty::DynArray(Scalar)`
+   (owned, Move, `{ptr,len}` layout). `.to_array()` materializes a fused map/where pipeline
+   into an arena-bump-allocated owned array (bulk-freed), **restricted to arena context** (no
+   drop yet). New MIR `ArenaAlloc` / `PtrStore` / `MakeDynArray` + a `lower_array_collect`
+   loop (over-allocates to the source length — map/where never grow). The result is consumed
+   like a slice (`.len()`, `.sum()`, pipeline source) via the shared `{ptr,len}` path; region
+   = `Arena(k)`, so it cannot escape its arena. (`where`-first inline-literal element
+   inference still defaults to i64 — a separate, pre-existing limitation.)
 4. **Free-standing drop.** Per-binding MIR `Drop` + runtime free; move-out skips drop; allow
    owned arrays outside arenas and **returning** them. Now materializing terminals work
    anywhere.

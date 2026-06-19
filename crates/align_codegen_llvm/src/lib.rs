@@ -429,7 +429,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
         Ty::Option(s) => option_struct_type(ctx, s, sx).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx).into(),
         Ty::Box(_) | Ty::ArenaHandle => ctx.ptr_type(AddressSpace::default()).into(),
-        Ty::Slice(_) | Ty::Str => slice_struct_type(ctx).into(),
+        Ty::Slice(_) | Ty::Str | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty, sx),
     }
 }
@@ -568,6 +568,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 Stmt::StoreElemField(slot, idx, field, op) => {
                     let ep = self.elem_field_ptr(*slot, idx, *field)?;
                     let val = self.operand(op);
+                    self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                }
+                Stmt::PtrStore(ptr, idx, op) => {
+                    // `ptr[idx] <- val` into a raw element buffer; the element LLVM type is
+                    // the stored value's type (opaque pointers, so the ptr carries none).
+                    let p = self.operand(ptr).into_pointer_value();
+                    let index = self.operand(idx).into_int_value();
+                    let val = self.operand(op);
+                    let ep = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(val.get_type(), p, &[index], "ptrstore")
+                            .map_err(|e| self.err(e))?
+                    };
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
                 Stmt::ArenaEnd(op) => {
@@ -816,6 +829,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
+            Rvalue::ArenaAlloc { handle, count, elem } => {
+                // bytes = count * sizeof(elem); align = sizeof(elem). Bump-allocate in the arena.
+                let scalar = align_sema::ty_to_scalar(*elem).expect("ArenaAlloc elem must be a scalar");
+                let i64t = self.ctx.i64_type();
+                let elem_bytes = i64t.const_int(scalar_bytes(scalar), false);
+                let count_v = self.operand(count).into_int_value();
+                let bytes = self.builder.build_int_mul(count_v, elem_bytes, "bytes").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle).into(), bytes.into(), elem_bytes.into()], "buf")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("arena_alloc returns a pointer")
+            }
+            Rvalue::MakeDynArray { ptr, len } => {
+                // Build the owned array value `{ ptr, len }` (same layout as a slice).
+                let p = self.operand(ptr);
+                let l = self.operand(len);
+                let sty = slice_struct_type(self.ctx);
+                let agg = self
+                    .builder
+                    .build_insert_value(sty.get_undef(), p, 0, "arrptr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(agg, l, 1, "arrlen")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
             Rvalue::StrLit(s) => {
                 let (ptr, len) = self.str_global(s);
                 let sty = slice_struct_type(self.ctx);
@@ -898,7 +941,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Box(_) | Ty::ArenaHandle => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
-            Ty::Slice(_) | Ty::Str => slice_struct_type(self.ctx).into(),
+            Ty::Slice(_) | Ty::Str | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
             _ => scalar_type(self.ctx, ty, self.struct_types),
         }
     }

@@ -46,6 +46,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::StoreElemField(slot, idx, field, val) => {
                 let _ = writeln!(out, "    _{slot}[{}].{field} <- {}", operand_str(idx), operand_str(val));
             }
+            Stmt::PtrStore(ptr, idx, val) => {
+                let _ = writeln!(out, "    {}[{}] <- {}", operand_str(ptr), operand_str(idx), operand_str(val));
+            }
             Stmt::ArenaEnd(op) => {
                 let _ = writeln!(out, "    arena_end {}", operand_str(op));
             }
@@ -99,6 +102,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::Index(slot, idx) => format!("_{slot}[{}]", operand_str(idx)),
         Rvalue::IndexField(slot, idx, field) => format!("_{slot}[{}].{field}", operand_str(idx)),
         Rvalue::MakeSlice(slot, n) => format!("slice(_{slot}, {n})"),
+        Rvalue::ArenaAlloc { handle, count, elem } => {
+            format!("arena_alloc({}, {} x {})", operand_str(handle), operand_str(count), crate::ty_name(*elem))
+        }
+        Rvalue::MakeDynArray { ptr, len } => {
+            format!("array({}, {})", operand_str(ptr), operand_str(len))
+        }
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
         Rvalue::StrLit(s) => format!("{s:?}"),
