@@ -184,6 +184,11 @@ pub enum ExprKind {
     /// `source.…​.reduce(f, init)` — fold the (post-stage) elements with the binary
     /// function `func` starting from `init`. `ty` is the accumulator type.
     ArrayReduce { source: Box<Expr>, stages: Vec<Stage>, func: String, init: Box<Expr> },
+    /// `source.….scan(f, init)` — a *materializing* prefix fold: emit the running accumulator
+    /// after each surviving element (`out[k] = acc` after `acc = f(acc, elem)`), starting from
+    /// `init`. Yields an owned `array<A>` of survivor length. `elem` is the accumulator scalar
+    /// (the output element type, `A`); `func` has type `(A, E) -> A`.
+    ArrayScan { source: Box<Expr>, stages: Vec<Stage>, func: String, init: Box<Expr>, elem: crate::Ty },
     /// `source.….to_array()` — materialize the surviving (post-stage) elements into an
     /// *owned* `array<T>` (MMv2 slice 3: arena-bump-allocated). `elem` is the element
     /// scalar type; the expression `ty` is `DynArray(elem)`.

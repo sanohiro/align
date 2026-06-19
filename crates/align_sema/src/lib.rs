@@ -414,7 +414,7 @@ impl<'a> EscapeCheck<'a> {
             // where the result is leaked / process-lifetime and safe to return).
             ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => Region::arena(depth),
             // `.to_array()` bump-allocates the owned array in the enclosing arena.
-            ExprKind::ArrayToArray { .. } => Region::arena(depth),
+            ExprKind::ArrayToArray { .. } | ExprKind::ArrayScan { .. } => Region::arena(depth),
             // `str + str` concatenation is also built in the enclosing arena.
             ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => Region::arena(depth),
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
@@ -585,7 +585,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
             | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
-            ExprKind::ArrayReduce { source, init, .. } => {
+            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.walk(source, depth);
                 self.walk(init, depth);
             }
@@ -733,7 +733,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
-            ExprKind::ArrayReduce { source, init, .. } => {
+            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.expr(source, moved, false, false);
                 self.expr(init, moved, false, false);
             }
@@ -1509,6 +1509,9 @@ impl<'a> Checker<'a> {
         if method == "reduce" {
             return self.check_array_reduce(recv, args, expected, span);
         }
+        if method == "scan" {
+            return self.check_array_scan(recv, args, span);
+        }
         if method == "count" {
             return self.check_array_count(recv, args, span);
         }
@@ -2001,6 +2004,51 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `source.….scan(f, init)` — a materializing prefix fold: emit the running accumulator
+    /// after each surviving element, yielding an owned `array<A>`. `f: (A, E) -> A`, `init: A`.
+    fn check_array_scan(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [fn_arg, init_arg] = args else {
+            self.diags.error(format!("'scan' takes 2 arguments (a function and an initial value), got {}", args.len()), span);
+            return err;
+        };
+        let Some(fname) = self.pipeline_fn_name(fn_arg) else {
+            self.diags.error("'scan' needs a named function as its first argument".to_string(), span);
+            return err;
+        };
+        let Some(sig) = self.sigs.get(&fname.name) else {
+            self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
+            return err;
+        };
+        let (params, acc_ty) = (sig.params.clone(), sig.ret);
+        // The element type the fold expects (its 2nd parameter) guides an inline source.
+        let elem_hint = params.get(1).copied();
+        let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
+            return err;
+        };
+        if params.len() != 2 || params[0] != acc_ty || params[1] != elem {
+            self.diags.error(
+                format!("'scan' function '{}' must have type ({}, {}) -> {}", fname.name, ty_name(acc_ty), ty_name(elem), ty_name(acc_ty)),
+                fname.span,
+            );
+            return err;
+        }
+        // The accumulator (output element) must be a scalar to materialize into `array<A>`.
+        let Some(scalar) = ty_to_scalar(acc_ty) else {
+            self.diags.error(
+                format!("'scan' accumulator must be a scalar to materialize, got {}", ty_name(acc_ty)),
+                span,
+            );
+            return err;
+        };
+        let init = self.check_expr(init_arg, Some(acc_ty));
+        Expr {
+            kind: ExprKind::ArrayScan { source: Box::new(source), stages, func: fname.name, init: Box::new(init), elem: acc_ty },
+            ty: Ty::DynArray(scalar),
+            span,
+        }
+    }
+
     /// `b.clone()` — deep-copy a `box<T>`. Allocates a fresh box, so it needs an arena.
     fn check_box_clone(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], span: Span) -> Expr {
         if !args.is_empty() {
@@ -2409,7 +2457,7 @@ impl<'a> Checker<'a> {
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
-            ExprKind::ArrayReduce { source, init, .. } => {
+            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.finalize_expr(source);
                 self.finalize_expr(init);
             }
@@ -3179,6 +3227,20 @@ mod tests {
     fn min_max_inline_checks() {
         let (_p, d) = check("fn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [3, 1, 2].map(id).min() + [3, 1, 2].map(id).max()\n}\n");
         assert!(!d.has_errors(), "min + max over an i32 pipeline should check");
+    }
+
+    #[test]
+    fn scan_inline_checks() {
+        // scan(f, init) with f: (i32, i32) -> i32 yields array<i32>; summing it checks.
+        let (_p, d) = check("fn add(acc: i32, x: i32) -> i32 = acc + x\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(add, 0).sum()\n}\n");
+        assert!(!d.has_errors(), "scan(add, 0) over an i32 pipeline should check");
+    }
+
+    #[test]
+    fn scan_fn_arity_mismatch_errors() {
+        // scan needs a 2-arg fold; a 1-arg function must error.
+        let (_p, d) = check("fn bad(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].scan(bad, 0).sum()\n}\n");
+        assert!(d.has_errors(), "scan with a non-binary function must error");
     }
 
     #[test]

@@ -331,9 +331,13 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    (`Reducer::MinMax`) that keep an element only when it beats the running best (a conditional
    update branching to the loop `cont`), seeded with the element type's extreme so an empty
    pipeline yields that extreme (the fold identity, like `sum → 0`). Completes the common
-   reduction set (`sum`/`count`/`min`/`max`/`any`/`all`/`reduce`). **Remaining:** `dot` (two
-   sources), `scan` (materializing prefix fold) and the array-producing `sort`/`partition`/
-   `chunks` (new algorithms / nested types) — each its own follow-up on the slice-3/4 foundation.
+   reduction set (`sum`/`count`/`min`/`max`/`any`/`all`/`reduce`). `scan(f, init)` **[done]** —
+   a *materializing prefix fold* on the `to_array` collect loop (`CollectKind::Scan`): threads an
+   accumulator seeded with `init` and appends the running `acc = f(acc, element)` per survivor,
+   yielding an owned `array<A>` (freed as a free-standing temporary / arena-bulk-freed like
+   `to_array`; `temp_free` now also recognizes a `scan` source). **Remaining:** `dot` (two
+   sources) and the array-producing `sort`/`partition`/`chunks` (new algorithms / nested types)
+   — each its own follow-up on the slice-3/4 foundation.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
    `.clone()` to escape; **draft.md §19 runs in full** → M5 truly complete.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same
