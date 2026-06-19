@@ -169,6 +169,9 @@ pub enum ExprKind {
     /// `source.….count()` — count the elements that survive the stages. Always `i64`;
     /// the element value is irrelevant, so no scalar projection is required.
     ArrayCount { source: Box<Expr>, stages: Vec<Stage> },
+    /// `source.….any(p)` / `.all(p)` — whether the predicate `func` holds for any / all
+    /// surviving (scalar) elements. Always `bool`; `all` selects an `&&`-fold over `||`.
+    ArrayAnyAll { source: Box<Expr>, stages: Vec<Stage>, func: String, all: bool },
     /// `source.…​.reduce(f, init)` — fold the (post-stage) elements with the binary
     /// function `func` starting from `init`. `ty` is the accumulator type.
     ArrayReduce { source: Box<Expr>, stages: Vec<Stage>, func: String, init: Box<Expr> },

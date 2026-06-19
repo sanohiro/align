@@ -161,6 +161,9 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
 - [done] `count()` terminal — counts the elements surviving the stages (`i64`). Shares the
   fused loop (`acc + 1` per kept element); needs no scalar element, so it works on a struct
   array with only a `where(.field)` filter (`[...].where(.active).count()`).
+- [done] `any(p)` / `all(p)` terminals — whether a predicate holds for any / all surviving
+  elements (`bool`). Shares the fused loop with a bool accumulator (`||`-fold seeded false /
+  `&&`-fold seeded true). The element must be a scalar (project a struct field first).
 - [done] `slice<T>` escape checking: a slice that borrows function-local array storage (an
   array literal / local array, including via a slice-annotated `let` or a re-borrowing
   call) cannot be returned — it would dangle when the frame is freed. A slice *parameter*

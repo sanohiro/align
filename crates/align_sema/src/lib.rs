@@ -472,7 +472,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::ArrayReduce { source, init, .. } => {
                 self.walk(source, depth);
@@ -586,7 +586,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false)
             }
@@ -1308,6 +1308,9 @@ impl<'a> Checker<'a> {
         if method == "count" {
             return self.check_array_count(recv, args, span);
         }
+        if method == "any" || method == "all" {
+            return self.check_array_any_all(recv, args, method == "all", span);
+        }
         // `.len()` of a `str`/`slice`/array — the element count (an `i64`).
         if method == "len" {
             return self.check_len(recv, args, span);
@@ -1596,6 +1599,56 @@ impl<'a> Checker<'a> {
         Expr {
             kind: ExprKind::ArrayCount { source: Box::new(source), stages },
             ty: Ty::Int(IntTy { bits: 64, signed: true }),
+            span,
+        }
+    }
+
+    /// `src.….any(p)` / `.all(p)` — whether predicate `p: E -> bool` holds for any / all
+    /// surviving elements. The element must be a scalar (project a struct field first), so
+    /// the fused loop has a concrete value to test. Always returns `bool`.
+    fn check_array_any_all(&mut self, recv: &ast::Expr, args: &[ast::Expr], all: bool, span: Span) -> Expr {
+        let name = if all { "all" } else { "any" };
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [fn_arg] = args else {
+            self.diags
+                .error(format!("'{name}' takes 1 argument (a predicate function), got {}", args.len()), span);
+            return err;
+        };
+        let Some(fname) = self.pipeline_fn_name(fn_arg) else {
+            self.diags.error(format!("'{name}' needs a named predicate function"), span);
+            return err;
+        };
+        // The predicate's parameter type guides an inline source's element type.
+        let elem_hint = self.sigs.get(&fname.name).and_then(|s| s.params.first().copied());
+        let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
+            return err;
+        };
+        if ty_to_scalar(elem).is_none() {
+            self.diags.error(
+                format!("'{name}' needs a scalar element, got {} (project a field first)", ty_name(elem)),
+                span,
+            );
+            return err;
+        }
+        // Predicate must be `(elem) -> bool`. On a bad/undefined predicate, return the error
+        // sentinel — a Call to a missing/mistyped function must not reach MIR/codegen.
+        match self.sigs.get(&fname.name) {
+            Some(sig) if sig.params.len() == 1 && sig.params[0] == elem && sig.ret == Ty::Bool => {}
+            Some(_) => {
+                self.diags.error(
+                    format!("'{name}' predicate '{}' must have type ({}) -> bool", fname.name, ty_name(elem)),
+                    fname.span,
+                );
+                return err;
+            }
+            None => {
+                self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
+                return err;
+            }
+        }
+        Expr {
+            kind: ExprKind::ArrayAnyAll { source: Box::new(source), stages, func: fname.name, all },
+            ty: Ty::Bool,
             span,
         }
     }
@@ -1980,7 +2033,7 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
@@ -2564,6 +2617,18 @@ mod tests {
             "fn add(acc: i32, x: i32) -> i32 = acc + x\nfn main() -> i32 {\n  return [1, 2, 3].reduce(add, 0)\n}\n",
         );
         assert!(!d.has_errors(), "reduce with a matching fold should check");
+    }
+
+    #[test]
+    fn any_all_check_and_require_scalar_element() {
+        let (_p, ok) = check("fn big(x: i64) -> bool = x > 4\nfn pos(x: i64) -> bool = x > 0\nfn main() -> i32 {\n  if [1, 2, 3].any(big) { return 1 }\n  if [1, 2, 3].all(pos) { return 2 }\n  return 0\n}\n");
+        assert!(!ok.has_errors(), "any/all over a scalar array should check");
+        // A struct element (no projection) is rejected — project a field first.
+        let (_q, bad) = check("fn f(e: i32) -> bool = e > 0\nE { pay: i32 }\nfn main() -> i32 {\n  if [E{pay: 1}].any(f) { return 1 }\n  return 0\n}\n");
+        assert!(bad.has_errors(), "any on a struct element must error");
+        // An undefined predicate errors (and returns Ty::Error, not a valid bool node).
+        let (_r, undef) = check("fn main() -> i32 {\n  if [1, 2, 3].any(nope) { return 1 }\n  return 0\n}\n");
+        assert!(undef.has_errors(), "any with an undefined predicate must error");
     }
 
     #[test]

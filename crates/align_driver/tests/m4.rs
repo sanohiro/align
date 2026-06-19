@@ -113,6 +113,17 @@ fn count_terminal_scalar_struct_and_plain() {
 }
 
 #[test]
+fn any_all_terminals() {
+    if !backend_available() {
+        return;
+    }
+    // any(>4) over [1..5] = true; all(>0) = true; projected struct .pay.any(>40) = true.
+    let src = "fn big(x: i64) -> bool = x > 4\nfn pos(x: i64) -> bool = x > 0\nfn rich(p: i32) -> bool = p > 40\nEmp { pay: i32, active: bool }\nfn main() -> i32 {\n  if [1, 2, 3].any(big) { return 91 }\n  if [1, 2, 3, 4, 5].any(big) { } else { return 92 }\n  if [1, 2, 3, 4, 5].all(pos) { } else { return 93 }\n  if [Emp{pay: 10, active: true}, Emp{pay: 50, active: false}].pay.any(rich) { } else { return 94 }\n  return 42\n}\n";
+    let out = build_and_run("any-all", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
 fn reduce_with_custom_fold() {
     if !backend_available() {
         return;
