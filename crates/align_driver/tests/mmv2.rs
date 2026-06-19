@@ -150,6 +150,41 @@ fn scan_after_where_free_standing() {
 }
 
 #[test]
+fn sort_orders_ascending_in_arena() {
+    if !backend_available() {
+        return;
+    }
+    // sort([3,1,2]) → [1,2,3]; an order-sensitive base-4 Horner fold (acc*4 + x) = 27 proves
+    // the elements are actually ordered (min/max/sum would not). Within a byte exit range.
+    let src = "fn id(x: i32) -> i32 = x\nfn horner(acc: i32, x: i32) -> i32 = acc * 4 + x\nfn main() -> i32 {\n  arena {\n    return [3, 1, 2].map(id).sort().reduce(horner, 0)\n  }\n}\n";
+    let out = build_and_run("sort-arena", src);
+    assert_eq!(out.status.code(), Some(27));
+}
+
+#[test]
+fn sort_reverse_input_free_standing() {
+    if !backend_available() {
+        return;
+    }
+    // Worst case for insertion sort: [4,3,2,1] → [1,2,3,4]; base-5 Horner = 194. No arena, so
+    // the sorted buffer is a free-standing temporary freed after `reduce` consumes it.
+    let src = "fn id(x: i32) -> i32 = x\nfn h(acc: i32, x: i32) -> i32 = acc * 5 + x\nfn main() -> i32 {\n  return [4, 3, 2, 1].map(id).sort().reduce(h, 0)\n}\n";
+    let out = build_and_run("sort-rev", src);
+    assert_eq!(out.status.code(), Some(194));
+}
+
+#[test]
+fn sort_after_where() {
+    if !backend_available() {
+        return;
+    }
+    // where >2 over [5,3,1,4] keeps [5,3,4]; sort → [3,4,5]; base-8 Horner = 229.
+    let src = "fn id(x: i32) -> i32 = x\nfn big(x: i32) -> bool = x > 2\nfn h8(acc: i32, x: i32) -> i32 = acc * 8 + x\nfn main() -> i32 {\n  return [5, 3, 1, 4].map(id).where(big).sort().reduce(h8, 0)\n}\n";
+    let out = build_and_run("sort-where", src);
+    assert_eq!(out.status.code(), Some(229));
+}
+
+#[test]
 fn to_array_map_only_keeps_all() {
     if !backend_available() {
         return;
