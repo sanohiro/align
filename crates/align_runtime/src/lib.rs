@@ -40,7 +40,8 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
 pub extern "C" fn align_rt_print_bool(v: i32) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{}", if v != 0 { "true" } else { "false" });
+    // Write the constant bytes directly (no formatting machinery).
+    let _ = out.write_all(if v != 0 { &b"true\n"[..] } else { &b"false\n"[..] });
 }
 
 /// Builtin `print` for a `char` (a Unicode scalar value): write its UTF-8 + a newline.
