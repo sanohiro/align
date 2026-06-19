@@ -1679,10 +1679,22 @@ impl<'a> Checker<'a> {
             return None;
         }
 
+        // Field projection / field-predicate stages index the source by element
+        // (`IndexField(slot, …)` in MIR), which needs a slot-backed source — a stack array
+        // or struct array. A `{ptr,len}` view (`slice`/owned `array`) has no such slot, so
+        // projecting a field out of one is not supported (it would miscompile).
+        let slot_backed = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..));
         let mut stages = Vec::new();
         for raw in raw_stages {
             match raw {
                 RawStage::Project(field) => {
+                    if !slot_backed {
+                        self.diags.error(
+                            format!("'.{}' field projection needs an array source, not a slice/array view", field.name),
+                            field.span,
+                        );
+                        return None;
+                    }
                     if !matches!(elem, Ty::Struct(_)) {
                         self.diags.error(
                             format!("'.{}' projection needs a struct element, got {}", field.name, ty_name(elem)),
@@ -1725,6 +1737,13 @@ impl<'a> Checker<'a> {
                     stages.push(Stage { kind: StageKind::Where { func: fname.name }, out_ty: elem });
                 }
                 RawStage::WhereField(field) => {
+                    if !slot_backed {
+                        self.diags.error(
+                            format!("'where(.{})' needs an array source, not a slice/array view", field.name),
+                            field.span,
+                        );
+                        return None;
+                    }
                     if !matches!(elem, Ty::Struct(_)) {
                         self.diags.error(
                             format!("'where(.{})' needs a struct element, got {}", field.name, ty_name(elem)),
@@ -3009,6 +3028,15 @@ mod tests {
         // count returns i64 and needs no scalar element (a struct element is fine).
         let (_p, d) = check("fn big(x: i64) -> bool = x > 2\nE { active: bool }\nfn main() -> i32 {\n  a := [1, 2, 3].where(big).count()\n  b := [E{active: true}, E{active: false}].where(.active).count()\n  if a + b == 3 { return 1 }\n  return 0\n}\n");
         assert!(!d.has_errors(), "count should check on scalar and struct array pipelines");
+    }
+
+    #[test]
+    fn field_projection_from_slice_source_rejected() {
+        // A `slice<Struct>` parameter is constructible, but a `.field` projection needs a
+        // slot-backed source (MIR `IndexField`); projecting from a `{ptr,len}` view would
+        // miscompile, so reject it cleanly.
+        let (_p, d) = check("P { pay: i32, active: bool }\nfn total(xs: slice<P>) -> i32 = xs.pay.sum()\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "field projection from a slice source must be rejected");
     }
 
     #[test]
