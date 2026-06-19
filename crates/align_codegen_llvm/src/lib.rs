@@ -87,7 +87,7 @@ fn build_module<'c>(
     // generated after the bodies (see below).
     let mut funcs: HashMap<String, FunctionValue<'c>> = HashMap::new();
     for f in &program.fns {
-        let fv = declare_fn(ctx, module, f, symbol_name(f));
+        let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types);
         funcs.insert(f.name.clone(), fv);
     }
     // Declare runtime builtins, keyed by the MIR call name they back.
@@ -421,16 +421,28 @@ fn int_bits(ty: Ty) -> u32 {
     }
 }
 
-fn declare_fn<'c>(ctx: &'c Context, module: &Module<'c>, f: &Function, symbol: &str) -> FunctionValue<'c> {
-    let param_types: Vec<BasicMetadataTypeEnum> = f
-        .params
-        .iter()
-        .map(|s| abi_type(ctx, f.slots[*s as usize]).into())
-        .collect();
+fn declare_fn<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    f: &Function,
+    symbol: &str,
+    struct_types: &[StructType<'c>],
+) -> FunctionValue<'c> {
+    // Structs / struct-arrays pass and return by value as their aggregate LLVM type
+    // (`abi_type` covers scalars + Option/Result/slice/str).
+    let map = |ty: Ty| -> BasicTypeEnum<'c> {
+        match ty {
+            Ty::Struct(id) => struct_types[id as usize].into(),
+            Ty::StructArray(id, n) => struct_types[id as usize].array_type(n).into(),
+            _ => abi_type(ctx, ty),
+        }
+    };
+    let param_types: Vec<BasicMetadataTypeEnum> =
+        f.params.iter().map(|s| map(f.slots[*s as usize]).into()).collect();
     let fn_ty = if f.ret == Ty::Unit {
         ctx.void_type().fn_type(&param_types, false)
     } else {
-        abi_type(ctx, f.ret).fn_type(&param_types, false)
+        map(f.ret).fn_type(&param_types, false)
     };
     module.add_function(symbol, fn_ty, None)
 }

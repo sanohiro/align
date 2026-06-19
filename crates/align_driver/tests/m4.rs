@@ -155,6 +155,17 @@ fn slice_annotated_local_sum() {
 }
 
 #[test]
+fn struct_by_value_pass_return_copy() {
+    if !backend_available() {
+        return;
+    }
+    // Construct via a struct-literal body, pass by value, copy, and return by value. = 42.
+    let src = "P { x: i32, y: i32 }\nfn sum(p: P) -> i32 = p.x + p.y\nfn dup(p: P) -> P {\n  q := p\n  return q\n}\nfn mk(v: i32) -> P = P{x: v, y: v}\nfn main() -> i32 {\n  a := mk(21)\n  b := dup(a)\n  return sum(b)\n}\n";
+    let out = build_and_run("struct-by-value", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
 fn array_sum_emits_single_loop() {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "a.align", "fn main() -> i32 {\n  return [1, 2, 3].sum()\n}\n");
