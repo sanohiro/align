@@ -434,6 +434,9 @@ fn declare_fn<'c>(
         match ty {
             Ty::Struct(id) => struct_types[id as usize].into(),
             Ty::StructArray(id, n) => struct_types[id as usize].array_type(n).into(),
+            // No array-typed params/returns arise yet (arrays coerce to slices at calls),
+            // but mirror `llvm_type` so it stays correct once array annotations land.
+            Ty::Array(s, n) => scalar_type(ctx, scalar_to_ty(s)).array_type(n).into(),
             _ => abi_type(ctx, ty),
         }
     };
