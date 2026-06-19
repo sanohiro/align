@@ -1630,14 +1630,21 @@ impl<'a> Checker<'a> {
             );
             return err;
         }
-        // Predicate must be `(elem) -> bool`.
+        // Predicate must be `(elem) -> bool`. On a bad/undefined predicate, return the error
+        // sentinel — a Call to a missing/mistyped function must not reach MIR/codegen.
         match self.sigs.get(&fname.name) {
             Some(sig) if sig.params.len() == 1 && sig.params[0] == elem && sig.ret == Ty::Bool => {}
-            Some(_) => self.diags.error(
-                format!("'{name}' predicate '{}' must have type ({}) -> bool", fname.name, ty_name(elem)),
-                fname.span,
-            ),
-            None => self.diags.error(format!("undefined function: '{}'", fname.name), fname.span),
+            Some(_) => {
+                self.diags.error(
+                    format!("'{name}' predicate '{}' must have type ({}) -> bool", fname.name, ty_name(elem)),
+                    fname.span,
+                );
+                return err;
+            }
+            None => {
+                self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
+                return err;
+            }
         }
         Expr {
             kind: ExprKind::ArrayAnyAll { source: Box::new(source), stages, func: fname.name, all },
@@ -2619,6 +2626,9 @@ mod tests {
         // A struct element (no projection) is rejected — project a field first.
         let (_q, bad) = check("fn f(e: i32) -> bool = e > 0\nE { pay: i32 }\nfn main() -> i32 {\n  if [E{pay: 1}].any(f) { return 1 }\n  return 0\n}\n");
         assert!(bad.has_errors(), "any on a struct element must error");
+        // An undefined predicate errors (and returns Ty::Error, not a valid bool node).
+        let (_r, undef) = check("fn main() -> i32 {\n  if [1, 2, 3].any(nope) { return 1 }\n  return 0\n}\n");
+        assert!(undef.has_errors(), "any with an undefined predicate must error");
     }
 
     #[test]
