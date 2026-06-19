@@ -143,6 +143,8 @@ pub enum TemplatePiece {
     StrHole(Operand),
     BoolHole(Operand),
     CharHole(Operand),
+    /// A float hole; codegen picks f32/f64 from the operand's type.
+    FloatHole(Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -369,6 +371,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                             Ty::Str => TemplatePiece::StrHole(op),
                             Ty::Bool => TemplatePiece::BoolHole(op),
                             Ty::Char => TemplatePiece::CharHole(op),
+                            Ty::Float(_) => TemplatePiece::FloatHole(op),
                             _ => TemplatePiece::IntHole(op),
                         });
                     }

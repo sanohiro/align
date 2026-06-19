@@ -1229,7 +1229,7 @@ impl<'a> Checker<'a> {
                 let e = self.check_expr(a, None);
                 if !is_printable(e.ty) {
                     self.diags
-                        .error("'print' expects an int, str, bool, or char".to_string(), e.span);
+                        .error("'print' expects an int, float, str, bool, or char".to_string(), e.span);
                 }
                 e
             })
@@ -1331,7 +1331,7 @@ impl<'a> Checker<'a> {
                     let e = self.check_expr(expr, None);
                     if !is_printable(e.ty) {
                         self.diags.error(
-                            format!("a template hole must be an int, str, bool, or char, got {}", ty_name(e.ty)),
+                            format!("a template hole must be an int, float, str, bool, or char, got {}", ty_name(e.ty)),
                             e.span,
                         );
                     }
@@ -1891,10 +1891,10 @@ fn single_name(p: &ast::Path) -> Option<&str> {
     }
 }
 
-/// Types `print` and a `template` hole can render today: integers, `str`, `bool`, `char`
-/// (and the error sentinel, to avoid cascading diagnostics). Floats wait for a dtoa.
+/// Types `print` and a `template` hole can render: integers, floats, `str`, `bool`, `char`
+/// (and the error sentinel, to avoid cascading diagnostics).
 fn is_printable(ty: Ty) -> bool {
-    ty.is_int_like() || matches!(ty, Ty::Str | Ty::Bool | Ty::Char | Ty::Error)
+    ty.is_numeric() || matches!(ty, Ty::Str | Ty::Bool | Ty::Char | Ty::Error)
 }
 
 fn ty_name(ty: Ty) -> String {
@@ -2325,22 +2325,23 @@ mod tests {
     }
 
     #[test]
-    fn template_float_hole_errors() {
-        // A float hole is rejected for now (no dtoa yet).
-        let (_p, d) = check("fn main() -> i32 {\n  print(template \"{1.5}\")\n  return 0\n}\n");
-        assert!(d.has_errors(), "a float template hole must error (no float formatting yet)");
+    fn template_float_hole_checks() {
+        // A float hole is interpolatable (rendered via the runtime's shortest round-trip).
+        let (_p, d) = check("fn main() -> i32 {\n  print(template \"{1.5} {2.0 + 0.5}\")\n  return 0\n}\n");
+        assert!(!d.has_errors(), "a float template hole should check");
     }
 
     #[test]
-    fn print_accepts_bool_and_char() {
-        let (_p, d) = check("fn main() -> i32 {\n  print(true)\n  print('a')\n  return 0\n}\n");
-        assert!(!d.has_errors(), "print accepts bool and char");
+    fn print_accepts_bool_char_float() {
+        let (_p, d) = check("fn main() -> i32 {\n  print(true)\n  print('a')\n  print(3.14)\n  return 0\n}\n");
+        assert!(!d.has_errors(), "print accepts bool, char, and float");
     }
 
     #[test]
-    fn print_rejects_float() {
-        let (_p, d) = check("fn main() -> i32 {\n  print(1.5)\n  return 0\n}\n");
-        assert!(d.has_errors(), "print rejects floats for now (no dtoa)");
+    fn print_rejects_non_scalar() {
+        // An Option is not a printable scalar.
+        let (_p, d) = check("fn main() -> i32 {\n  print(Some(1))\n  return 0\n}\n");
+        assert!(d.has_errors(), "print rejects non-scalar values like Option");
     }
 
     #[test]
