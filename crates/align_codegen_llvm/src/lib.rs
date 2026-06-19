@@ -141,6 +141,15 @@ fn build_module<'c>(
             None,
         ),
     );
+    // Free-standing heap allocation for owned arrays (MMv2 slice 4).
+    funcs.insert(
+        "alloc".to_string(),
+        module.add_function("align_rt_alloc", ptr.fn_type(&[i64t.into()], false), None),
+    );
+    funcs.insert(
+        "free".to_string(),
+        module.add_function("align_rt_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     funcs.insert(
         "print_str".to_string(),
         module.add_function(
@@ -589,6 +598,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_call(self.funcs["arena_end"], &[handle], "")
                         .map_err(|e| self.err(e))?;
                 }
+                Stmt::DropFlagInit(slot) => {
+                    // Store `{null, 0}` so a drop on a never-allocated path frees null.
+                    let z = slice_struct_type(self.ctx).const_zero();
+                    self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
+                }
+                Stmt::Drop(slot) => {
+                    // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
+                    let agg = self
+                        .builder
+                        .build_load(slice_struct_type(self.ctx), self.slots[slot], "drop")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "dropptr").map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_call(self.funcs["free"], &[ptr.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
             }
         }
         self.gen_term(&b.term)
@@ -842,6 +868,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .expect("arena_alloc returns a pointer")
+            }
+            Rvalue::HeapAllocBuf { count, elem } => {
+                // bytes = count * sizeof(elem); heap-allocate (freed by a later Drop).
+                let scalar = align_sema::ty_to_scalar(*elem).expect("HeapAllocBuf elem must be a scalar");
+                let i64t = self.ctx.i64_type();
+                let elem_bytes = i64t.const_int(scalar_bytes(scalar), false);
+                let count_v = self.operand(count).into_int_value();
+                let bytes = self.builder.build_int_mul(count_v, elem_bytes, "bytes").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["alloc"], &[bytes.into()], "buf")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("alloc returns a pointer")
             }
             Rvalue::MakeDynArray { ptr, len } => {
                 // Build the owned array value `{ ptr, len }` (same layout as a slice).

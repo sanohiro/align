@@ -50,6 +50,30 @@ fn to_array_bound_then_len_and_sum() {
 }
 
 #[test]
+fn free_standing_to_array_sum() {
+    if !backend_available() {
+        return;
+    }
+    // No arena: `.to_array()` heap-allocates a free-standing owned array (dropped at exit).
+    // [1,2,3].map(*2) = [2,4,6]; sum = 12.
+    let src = "fn double(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  return [1, 2, 3].map(double).to_array().sum()\n}\n";
+    let out = build_and_run("free-to-array", src);
+    assert_eq!(out.status.code(), Some(12));
+}
+
+#[test]
+fn return_owned_array_across_functions() {
+    if !backend_available() {
+        return;
+    }
+    // `make` returns a free-standing owned array (ownership moves to the caller, so `make`
+    // does not drop it); `main` binds it and drops it at exit after summing. sum = 12.
+    let src = "fn double(x: i32) -> i32 = x * 2\nfn make() -> array<i32> = [1, 2, 3].map(double).to_array()\nfn main() -> i32 {\n  ys := make()\n  return ys.sum()\n}\n";
+    let out = build_and_run("return-owned", src);
+    assert_eq!(out.status.code(), Some(12));
+}
+
+#[test]
 fn to_array_map_only_keeps_all() {
     if !backend_available() {
         return;

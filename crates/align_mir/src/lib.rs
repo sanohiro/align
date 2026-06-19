@@ -82,6 +82,11 @@ pub enum Stmt {
     StoreElemField(Slot, Operand, u32, Operand),
     /// End an arena, freeing all its allocations (the operand is the arena handle).
     ArenaEnd(Operand),
+    /// Null-initialise an owned-array slot (`{null, 0}`) so a later [`Stmt::Drop`] on a path
+    /// that never allocated is a no-op (MMv2 slice 4 drop-flag-via-null-slot).
+    DropFlagInit(Slot),
+    /// Drop a free-standing owned `array<T>` slot: free its buffer (null-safe).
+    Drop(Slot),
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +135,9 @@ pub enum Rvalue {
     /// Bump-allocate `count` elements of type `elem` in the arena `handle`; yields the
     /// element pointer (used to build an owned `array<T>` via [`Rvalue::MakeDynArray`]).
     ArenaAlloc { handle: Operand, count: Operand, elem: Ty },
+    /// Heap-allocate `count` elements of type `elem` (free-standing owned array, outside any
+    /// arena). Yields the element pointer; freed by a later [`Stmt::Drop`].
+    HeapAllocBuf { count: Operand, elem: Ty },
     /// Build an owned `array<T>` value `{ ptr, len }` from a buffer pointer and a length.
     MakeDynArray { ptr: Operand, len: Operand },
     /// The `len` of a slice operand.
@@ -210,12 +218,19 @@ struct Builder {
     /// Handles of the arenas currently open (innermost last); any exit out of them
     /// (`return`, `?`) must free them first.
     arenas: Vec<ValueId>,
+    /// Free-standing owned locals (heap `array<T>`) that must be freed at every function
+    /// exit (MMv2 slice 4; `hir::Fn::drop_locals`). Their slots are null-initialised at
+    /// entry, so a drop on a path that never allocated frees null (a no-op).
+    drop_locals: Vec<Slot>,
 }
 
 impl Builder {
-    /// Free every open arena (innermost first) — emitted before any exit that leaves
-    /// the arena scopes.
-    fn emit_arena_cleanup(&mut self) {
+    /// Free every open arena (innermost first) and drop every owned free-standing local —
+    /// emitted before any exit that leaves the function / arena scopes.
+    fn emit_exit_cleanup(&mut self) {
+        for s in self.drop_locals.clone() {
+            self.push(Stmt::Drop(s));
+        }
         let handles = self.arenas.clone();
         for h in handles.into_iter().rev() {
             self.push(Stmt::ArenaEnd(Operand::Value(h)));
@@ -269,6 +284,7 @@ fn lower_fn(f: &hir::Fn) -> Function {
         cur: 0,
         ret: f.ret,
         arenas: Vec::new(),
+        drop_locals: f.drop_locals.clone(),
     };
     let entry = b.new_block();
     b.cur = entry;
@@ -278,12 +294,21 @@ fn lower_fn(f: &hir::Fn) -> Function {
     for (i, &slot) in params.iter().enumerate() {
         b.push(Stmt::Store(slot, Operand::Arg(i as u32)));
     }
+    // Null-initialise each owned-drop slot so a drop on a path that never allocated frees
+    // null (a no-op) instead of an uninitialised pointer.
+    for s in b.drop_locals.clone() {
+        b.push(Stmt::DropFlagInit(s));
+    }
 
     let tail = lower_block(&mut b, &f.body);
     if !b.is_terminated() {
+        // Fall-through end of the body: drop owned locals (the returned value, if any owned
+        // local, was moved out and is excluded from `drop_locals`) before returning.
+        let tail = tail.filter(|_| f.ret != Ty::Unit);
+        b.emit_exit_cleanup();
         match tail {
-            Some(op) if f.ret != Ty::Unit => b.terminate(Term::Return(Some(op))),
-            _ => b.terminate(Term::Return(None)),
+            Some(op) => b.terminate(Term::Return(Some(op))),
+            None => b.terminate(Term::Return(None)),
         }
     }
 
@@ -350,8 +375,9 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         }
         hir::Stmt::Return(value) => {
             let op = value.as_ref().map(|e| lower_expr(b, e));
-            // Free any arenas this return exits before leaving the function.
-            b.emit_arena_cleanup();
+            // Free open arenas and drop owned locals before leaving the function. A returned
+            // owned array was moved out (excluded from `drop_locals`), so it is not freed here.
+            b.emit_exit_cleanup();
             b.terminate(Term::Return(op));
             // The current block is now terminated; `lower_block` stops here, so no dead
             // block is created and callers can see the divergence via `is_terminated`.
@@ -803,13 +829,18 @@ fn lower_array_reduce(
 /// freshly bump-allocated arena buffer instead of folded. Yields an owned `array<T>` value
 /// `{ ptr, len }` where `len` is the survivor count. (MMv2 slice 3; arena-only.)
 fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty) -> Operand {
-    let handle = Operand::Value(*b.arenas.last().expect("to_array outside an arena (sema-checked)"));
+    // Inside an arena → bump-allocate (bulk-freed); otherwise → free-standing heap (dropped).
+    let arena = b.arenas.last().copied();
     let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src } = setup_source(b, source);
 
-    // Output buffer: `bound` (upper-bound = source length) elements in the arena. map/where
-    // never grow the count, so the buffer never needs to be resized.
+    // Output buffer: `bound` (upper-bound = source length) elements. map/where never grow
+    // the count, so the buffer never needs to be resized.
     let out_ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
-    b.push(Stmt::Let(out_ptr, Rvalue::ArenaAlloc { handle, count: bound.clone(), elem }));
+    let alloc = match arena {
+        Some(h) => Rvalue::ArenaAlloc { handle: Operand::Value(h), count: bound.clone(), elem },
+        None => Rvalue::HeapAllocBuf { count: bound.clone(), elem },
+    };
+    b.push(Stmt::Let(out_ptr, alloc));
 
     // `acc` is the running output index (= final length); `iv` is the source index.
     let acc = b.new_slot(i64_ty());
@@ -984,8 +1015,8 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.push(Stmt::Let(err, Rvalue::ResultUnwrapErr(r.clone())));
     let propagated = b.fresh_value(b.ret);
     b.push(Stmt::Let(propagated, Rvalue::ResultErr(Operand::Value(err))));
-    // `?` exits the function: free any open arenas first.
-    b.emit_arena_cleanup();
+    // `?` exits the function: free open arenas and drop owned locals first.
+    b.emit_exit_cleanup();
     b.terminate(Term::Return(Some(Operand::Value(propagated))));
 
     // Ok: continue with the unwrapped value.

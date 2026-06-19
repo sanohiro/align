@@ -271,19 +271,34 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             Some(cx.check_fn(f))
         })
         .collect();
-    let program = Program { fns, structs };
+    let mut program = Program { fns, structs };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
-    // (`03-types.md` §6–§7).
-    for f in &program.fns {
-        MoveCheck { f, diags }.check();
-        EscapeCheck {
-            f,
-            diags,
-            region: std::collections::HashMap::new(),
-            decl_depth: std::collections::HashMap::new(),
-            local_backed_slice: std::collections::HashSet::new(),
-        }
-        .check();
+    // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
+    for f in &mut program.fns {
+        let ever_moved = MoveCheck { f, diags, ever_moved: std::collections::HashSet::new() }.check();
+        let region = {
+            let mut ec = EscapeCheck {
+                f,
+                diags,
+                region: std::collections::HashMap::new(),
+                decl_depth: std::collections::HashMap::new(),
+                local_backed_slice: std::collections::HashSet::new(),
+            };
+            ec.check();
+            ec.region
+        };
+        // A free-standing owned `array<T>` (region `Static`) that is never moved out must be
+        // dropped at every function exit. Arena-allocated ones (region `Arena(k)`) are
+        // bulk-freed, and moved-out ones transfer ownership, so both are excluded.
+        let drops: Vec<LocalId> = f
+            .locals
+            .iter()
+            .filter(|l| matches!(l.ty, Ty::DynArray(_)))
+            .map(|l| l.id)
+            .filter(|id| !ever_moved.contains(id))
+            .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
+            .collect();
+        f.drop_locals = drops;
     }
     program
 }
@@ -610,13 +625,16 @@ impl<'a> EscapeCheck<'a> {
 struct MoveCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
+    /// Every local moved out anywhere in the body (the union over all paths). Used to decide
+    /// which owned locals still need a drop (MMv2 slice 4): a moved-out local does not.
+    ever_moved: std::collections::HashSet<LocalId>,
 }
 
 impl<'a> MoveCheck<'a> {
-    fn check(&mut self) {
+    fn check(mut self) -> std::collections::HashSet<LocalId> {
         let mut moved = std::collections::HashSet::new();
-        // A function never returns a box (forbidden), so the body value is not consumed.
         self.block(&self.f.body, &mut moved, false);
+        self.ever_moved
     }
 
     fn is_move(&self, id: LocalId) -> bool {
@@ -655,6 +673,7 @@ impl<'a> MoveCheck<'a> {
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
                 } else if consuming && self.is_move(*id) {
                     moved.insert(*id);
+                    self.ever_moved.insert(*id);
                 }
             }
             ExprKind::Field { base, .. } | ExprKind::IndexField { base, .. } => {
@@ -922,6 +941,7 @@ impl<'a> Checker<'a> {
             locals,
             body,
             span: f.span,
+            drop_locals: Vec::new(),
         }
     }
 
@@ -1812,13 +1832,8 @@ impl<'a> Checker<'a> {
             self.diags.error("'to_array' takes no arguments".to_string(), span);
         }
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        if self.arena_depth == 0 {
-            self.diags.error(
-                "'to_array' must be used inside an 'arena {}' (a free-standing owned array needs drop, which is not available yet)".to_string(),
-                span,
-            );
-            return err;
-        }
+        // Inside an arena → bump-allocated (bulk-freed). Outside → free-standing heap with a
+        // per-binding drop (MMv2 slice 4). Both are fine now.
         let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
             return err;
         };
@@ -2496,6 +2511,21 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
                 None => Ty::Error,
             }
         }
+        // `array<T>` — an owned, dynamic-length array (MMv2). Currently usable as a return
+        // type so a function can hand back a free-standing owned array.
+        "array" => {
+            let inner = match t.args.as_slice() {
+                [a] => resolve_type(a, struct_ids, diags),
+                _ => {
+                    diags.error("array takes exactly one type argument".to_string(), t.span);
+                    return Ty::Error;
+                }
+            };
+            match scalar_arg(inner, "array element", t.span, diags) {
+                Some(s) => Ty::DynArray(s),
+                None => Ty::Error,
+            }
+        }
         "Result" => {
             let (ok, err) = match t.args.as_slice() {
                 [a, b] => (
@@ -3047,10 +3077,11 @@ mod tests {
     }
 
     #[test]
-    fn to_array_outside_arena_rejected() {
-        // Without an arena there is no bulk-free and drop is not available yet, so reject.
+    fn to_array_outside_arena_now_allowed() {
+        // MMv2 slice 4: `.to_array()` outside an arena is free-standing (heap + drop), so it
+        // checks (the owned array is dropped at function exit).
         let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  return [1, 2, 3].map(double).to_array().sum()\n}\n");
-        assert!(d.has_errors(), "to_array outside an arena must be rejected (no drop yet)");
+        assert!(!d.has_errors(), "to_array outside an arena is now free-standing (heap + drop)");
     }
 
     #[test]

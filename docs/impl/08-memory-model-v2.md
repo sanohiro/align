@@ -301,9 +301,15 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    like a slice (`.len()`, `.sum()`, pipeline source) via the shared `{ptr,len}` path; region
    = `Arena(k)`, so it cannot escape its arena. (`where`-first inline-literal element
    inference still defaults to i64 — a separate, pre-existing limitation.)
-4. **Free-standing drop.** Per-binding MIR `Drop` + runtime free; move-out skips drop; allow
-   owned arrays outside arenas and **returning** them. Now materializing terminals work
-   anywhere.
+4. **[done]** **Free-standing drop.** Per-binding MIR `Drop` + runtime `free`; move-out skips
+   drop (a returned/moved array is owned by the callee, so the source frame does not free it);
+   owned arrays now allowed outside arenas and **returnable** across functions. `.to_array()`
+   with no enclosing arena heap-allocates via libc `malloc` and is freed at every function exit.
+   Drop slots are null-initialized (`DropFlagInit`) so an unreached/never-allocated path is a
+   no-op `free(null)`. New MIR `HeapAllocBuf` / `Drop` / `DropFlagInit` + `emit_exit_cleanup`
+   (drops then arena-ends at each `return`/`?`/fall-through); `MoveCheck` tracks `ever_moved`,
+   and `check_file` derives each fn's `drop_locals` (owned arrays neither moved-out nor
+   arena-regioned). Now materializing terminals work anywhere.
 5. **Remaining materializing terminals.** `sort`/`partition`/`chunks`/`scan` + array-valued
    results, each on the slice-3/4 foundation.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
