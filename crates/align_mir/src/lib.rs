@@ -429,6 +429,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::Field(*base, *index)));
             Operand::Value(v)
         }
+        hir::ExprKind::IndexField { base, index, field } => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::IndexField(*base, index_const(*index as usize), *field)));
+            Operand::Value(v)
+        }
         hir::ExprKind::Block(blk) => {
             lower_block(b, blk).unwrap_or(Operand::Const(Const::Bool(false)))
         }

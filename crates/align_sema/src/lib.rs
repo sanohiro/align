@@ -502,7 +502,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
-            | ExprKind::Field { .. } => {}
+            | ExprKind::Field { .. }
+            | ExprKind::IndexField { .. } => {}
         }
     }
 }
@@ -560,7 +561,7 @@ impl<'a> MoveCheck<'a> {
                     moved.insert(*id);
                 }
             }
-            ExprKind::Field { base, .. } => {
+            ExprKind::Field { base, .. } | ExprKind::IndexField { base, .. } => {
                 if moved.contains(base) {
                     let name = &self.f.locals[*base as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
@@ -1672,21 +1673,63 @@ impl<'a> Checker<'a> {
         }
         let Some((base, ty)) = self.place_local(&args[0]) else {
             self.diags
-                .error("'json.encode' expects a struct value (a local binding)".to_string(), args[0].span);
+                .error("'json.encode' expects a struct or struct-array value (a local binding)".to_string(), args[0].span);
             return err;
         };
-        let Ty::Struct(sid) = ty else {
-            self.diags
-                .error(format!("'json.encode' expects a struct, got {}", ty_name(ty)), args[0].span);
-            return err;
-        };
-        let fields = self.structs[sid as usize].fields.clone();
-        let mut parts = vec![TemplatePart::Text("{".to_string())];
+        let mut parts = vec![];
         let mut ok = true;
+        match ty {
+            // A single struct → a JSON object.
+            Ty::Struct(sid) => {
+                self.json_object_parts(base, sid, None, &mut parts, args[0].span, &mut ok);
+            }
+            // A fixed struct-array → a JSON array of objects (unrolled; length is static).
+            Ty::StructArray(sid, n) => {
+                parts.push(TemplatePart::Text("[".to_string()));
+                for i in 0..n {
+                    if i > 0 {
+                        parts.push(TemplatePart::Text(",".to_string()));
+                    }
+                    self.json_object_parts(base, sid, Some(i), &mut parts, args[0].span, &mut ok);
+                }
+                parts.push(TemplatePart::Text("]".to_string()));
+            }
+            _ => {
+                self.diags
+                    .error(format!("'json.encode' expects a struct or struct-array, got {}", ty_name(ty)), args[0].span);
+                return err;
+            }
+        }
+        // An unsupported field left a `"name":` with no value part: return the error
+        // sentinel rather than a malformed template (matches the other checks' convention).
+        if !ok {
+            return err;
+        }
+        Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
+    }
+
+    /// Emit the `{"field":value,...}` template parts for one struct value: either the struct
+    /// local `base` itself (`elem` = None) or element `elem` of the struct-array local `base`.
+    /// Sets `*ok = false` (and reports) on a field type `json.encode` can't render yet.
+    fn json_object_parts(
+        &mut self,
+        base: LocalId,
+        sid: u32,
+        elem: Option<u32>,
+        parts: &mut Vec<TemplatePart>,
+        span: Span,
+        ok: &mut bool,
+    ) {
+        let fields = self.structs[sid as usize].fields.clone();
+        parts.push(TemplatePart::Text("{".to_string()));
         for (i, f) in fields.iter().enumerate() {
             let sep = if i == 0 { "" } else { "," };
             parts.push(TemplatePart::Text(format!("{sep}\"{}\":", f.name)));
-            let field_expr = Expr { kind: ExprKind::Field { base, index: i as u32 }, ty: f.ty, span };
+            let kind = match elem {
+                None => ExprKind::Field { base, index: i as u32 },
+                Some(e) => ExprKind::IndexField { base, index: e, field: i as u32 },
+            };
+            let field_expr = Expr { kind, ty: f.ty, span };
             match f.ty {
                 Ty::Str => parts.push(TemplatePart::JsonStr(field_expr)),
                 t if t.is_numeric() || t == Ty::Bool => parts.push(TemplatePart::Hole(field_expr)),
@@ -1697,19 +1740,13 @@ impl<'a> Checker<'a> {
                             f.name,
                             ty_name(f.ty)
                         ),
-                        args[0].span,
+                        span,
                     );
-                    ok = false;
+                    *ok = false;
                 }
             }
         }
-        // An unsupported field left a `"name":` with no value part: return the error
-        // sentinel rather than a malformed template (matches the other checks' convention).
-        if !ok {
-            return err;
-        }
         parts.push(TemplatePart::Text("}".to_string()));
-        Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
     }
 
     /// `.len()` — the element count of a `str`, `slice<T>`, or fixed array, as an `i64`.
@@ -1953,7 +1990,8 @@ impl<'a> Checker<'a> {
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
-            | ExprKind::Field { .. } => {}
+            | ExprKind::Field { .. }
+            | ExprKind::IndexField { .. } => {}
         }
     }
 }
@@ -2469,6 +2507,12 @@ mod tests {
     fn json_encode_struct_checks() {
         let (_p, d) = check("User { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 1, name: \"a\", active: true}\n  print(json.encode(u))\n  return 0\n}\n");
         assert!(!d.has_errors(), "json.encode of a flat struct should check");
+    }
+
+    #[test]
+    fn json_encode_struct_array_checks() {
+        let (_p, d) = check("User { id: i64, name: str }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\"}, User{id: 2, name: \"b\"}]\n  print(json.encode(us))\n  return 0\n}\n");
+        assert!(!d.has_errors(), "json.encode of a struct array should check");
     }
 
     #[test]
