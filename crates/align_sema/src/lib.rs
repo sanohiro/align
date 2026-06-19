@@ -2114,6 +2114,17 @@ impl<'a> Checker<'a> {
         // produce a duplicate "array[m] vs array[n]" error on top of the clearer one below.
         // The element-type and length checks here cover correctness.
         let b = self.check_expr(b_arg, None);
+        // MIR materializes both operands via `array_source_slot`, which only handles a literal
+        // or a local (the M4 restriction). Reject an arbitrary array expression (an `if`, a
+        // call, a block, …) here so it cannot reach lowering and panic — mirrors `check_pipeline`'s
+        // restriction on the left operand.
+        if !matches!(b.ty, Ty::Error) && !matches!(b.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+            self.diags.error(
+                "the right operand of 'dot' must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                b.span,
+            );
+            return err;
+        }
         let (nb, b_elem) = match b.ty {
             Ty::Array(s, n) => (n, scalar_to_ty(s)),
             Ty::Error => return err,
@@ -3352,6 +3363,14 @@ mod tests {
         // An int array dotted with a float array must error (no implicit numeric coercion).
         let (_p, d) = check("fn main() -> i32 {\n  xs := [1, 2, 3]\n  ys := [1.0, 2.0, 3.0]\n  if xs.dot(ys) == 0 { return 1 }\n  return 0\n}\n");
         assert!(d.has_errors(), "dot of mismatched element types must error");
+    }
+
+    #[test]
+    fn dot_arbitrary_right_operand_rejected_not_panicked() {
+        // An `if` expression as the right operand is an arbitrary array expr; it must be
+        // rejected in sema, not reach `array_source_slot` and panic in MIR.
+        let (_p, d) = check("fn main() -> i32 {\n  xs := [1, 2, 3]\n  ys := [4, 5, 6]\n  zs := [7, 8, 9]\n  c := true\n  if xs.dot(if c { ys } else { zs }) == 32 { return 1 }\n  return 0\n}\n");
+        assert!(d.has_errors(), "an arbitrary array expr as dot's right operand must error");
     }
 
     #[test]
