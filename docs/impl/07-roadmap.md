@@ -170,10 +170,13 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   borrows the caller and is returnable. (Landed in M5; replaces the M4 "simply forbid
   returning a slice" first cut.) Slice-annotated `let` now also applies the array→slice
   borrow, fixing a latent codegen mismatch (a bare array stored into a slice slot).
-- [todo] heap-owned dynamic `array<T>`, array type annotations, `out` args,
-  more stages/terminals (`scan`/`filter`/`partition`/`sort`/`chunks`),
-  array-valued results (materialization), and named-function
-  `map` over struct elements (needs struct-by-value params, deferred since M1).
+- [todo — blocked on Memory Model v2] heap-owned dynamic `array<T>`, array type annotations,
+  `out` args, more stages/terminals (`scan`/`filter`/`partition`/`sort`/`chunks`), and
+  array-valued results — all need **owned/dynamic heap arrays + drop** (materialization).
+  Done without it = building on a faked array model. Non-materializing terminals
+  (`sum`/`reduce`/`count`/`any`/`all`) are complete and need no materialization.
+- [todo] named-function `map` over struct elements (struct-by-value params now exist; this
+  one is not gated on Memory Model v2 — it only needs loading a whole struct element).
 
 ### Dynamic arrays / slices — decisions (from review)
 
@@ -284,16 +287,39 @@ later slices (struct arrays, M5 strings/JSON).
   (name / type-tag / byte offset via the target layout) and calls `align_rt_json_decode`, a
   minimal object parser (field order irrelevant, unknown keys ignored, missing/malformed →
   error). M5 cut: a flat struct of `i64`/`i32`/`bool` fields.
-- [todo] `json.decode` for `str`/`float` fields, arrays/nested; SIMD scan, zero-copy views,
-  compile-time field tables; owned `string` / `bytes`, const string pool, `html`/`json`
-  template variants; `<T>` generic-call syntax.
-- [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
-  view, SIMD structural scan.
+- [done] `json.decode` for `float` fields (scalars are copied into the struct — no borrow
+  concern). Combined with int/bool, `json.decode` now covers **all scalar fields**.
+- [todo — blocked on Memory Model v2] `json.decode` for `str`/`array<T>`/nested fields
+  (zero-copy views region-tied to the input; decode buffer only on escapes); SIMD scan,
+  compile-time field tables; `<T>` generic-call syntax. `str`/array decode is what
+  draft.md §19 needs, so the §19 completion condition is gated on Memory Model v2.
+- [todo] owned `string` / `bytes`, const string pool, `html`/`json` template variants.
 
 Status (M5-A): `str` is a Copy view, lexed with the common escapes; literals lower to a
 private constant + `{ ptr, len }`. `print` accepts `str` or an integer. `examples/strings.align` runs.
 
-Completion condition: the example in `draft.md` §19 runs **in full** (JSON read → aggregate → builder output).
+Completion condition: the example in `draft.md` §19 runs **in full** (JSON read → aggregate →
+builder output). **Gated on Memory Model v2** — §19 decodes `array<User>` with a `str` field,
+which needs zero-copy borrow-region decode. M5 is otherwise complete (strings, templates,
+`json.encode` for struct/array, `json.decode` for all-scalar structs).
+
+## Memory Model v2 — borrow-region + owned heap/drop (foundation; before M6)
+
+A dedicated phase for the one foundation that the deferred "ideal forms" of M4 and M5 both
+need (see `open-questions.md` "Memory model v2"). **Design the whole model first**
+(`00-overview.md`), then the dependent features fall out:
+- **Borrow-region propagation**: generalize the point solutions (arena depth, slice
+  "local-backed", struct `str` region-0) so a *view* (`slice`, `str` view, a
+  `json.decode`-d struct) carries a region tied to its source and escape checking forbids it
+  outliving that source.
+- **Owned / dynamic heap collections + drop**: free-standing heap `array<T>`/`string` with
+  per-binding drop insertion (deferred from M3), enabling array materialization.
+
+Unblocks: M5 zero-copy `str`/`array` decode → **draft.md §19 in full**; M4 carryover
+`filter`/`scan`/`partition`/`sort`/`chunks` + array-valued results. **Do not** ship corner-cut
+versions of these before the model lands (a leaked / borrow-unchecked decode, or a
+materializing terminal on a faked array) — either bakes in a wrong lifetime/ownership
+assumption that becomes a breaking change. M6/M7 build on top of this, not before it.
 
 ## M6 — SIMD / vec / mask
 

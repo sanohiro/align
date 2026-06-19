@@ -1824,12 +1824,13 @@ impl<'a> Checker<'a> {
                 return err;
             }
         };
-        // Every field must be decodable (M5 cut: int / bool).
+        // Every field must be a decodable scalar (int / float / bool). `str`/array fields
+        // need zero-copy borrow-region decode → deferred to Memory Model v2.
         let fields = self.structs[sid as usize].fields.clone();
         for f in &fields {
-            if !matches!(f.ty, Ty::Int(_) | Ty::Bool) {
+            if !matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool) {
                 self.diags.error(
-                    format!("'json.decode' field '{}' has type {} (only int/bool decode for now)", f.name, ty_name(f.ty)),
+                    format!("'json.decode' field '{}' has type {} (only int/float/bool decode for now)", f.name, ty_name(f.ty)),
                     span,
                 );
                 return err;

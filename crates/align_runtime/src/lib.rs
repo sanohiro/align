@@ -251,20 +251,51 @@ pub unsafe extern "C" fn align_rt_json_decode(
                         }
                         seen[i] = true;
                         let d = &descs[i];
+                        // tag = (kind << 8) | byte-width. kind: 0 = int, 1 = bool, 2 = float.
+                        let kind = (d.tag >> 8) & 0xff;
+                        let width = (d.tag & 0xff) as i64;
                         // Defense in depth: never write outside the out struct, even if a
-                        // descriptor offset/width were wrong.
-                        let width = if d.tag == 0 { 1 } else { d.tag as i64 };
-                        if d.offset < 0 || d.offset + width > out_size {
+                        // descriptor offset/width were wrong (checked_add avoids i64 overflow).
+                        if d.offset < 0 || d.offset.checked_add(width).map_or(true, |end| end > out_size) {
                             return None;
                         }
-                        if d.tag == 0 {
-                            let v = p.boolean()?;
-                            unsafe { *out.add(d.offset as usize) = v as u8 };
-                        } else {
-                            let v = p.integer()?;
-                            let bytes = v.to_le_bytes();
-                            for k in 0..(d.tag as usize) {
-                                unsafe { *out.add(d.offset as usize + k) = bytes[k] };
+                        let off = d.offset as usize;
+                        let w = width as usize;
+                        match kind {
+                            1 => {
+                                if w != 1 {
+                                    return None;
+                                }
+                                let v = p.boolean()?;
+                                unsafe { *out.add(off) = v as u8 };
+                            }
+                            2 => {
+                                if w != 4 && w != 8 {
+                                    return None;
+                                }
+                                let v = p.number()?;
+                                // Write the float repr at the field width (f32 / f64).
+                                if w == 4 {
+                                    let bytes = (v as f32).to_le_bytes();
+                                    for k in 0..4 {
+                                        unsafe { *out.add(off + k) = bytes[k] };
+                                    }
+                                } else {
+                                    let bytes = v.to_le_bytes();
+                                    for k in 0..8 {
+                                        unsafe { *out.add(off + k) = bytes[k] };
+                                    }
+                                }
+                            }
+                            _ => {
+                                if w != 1 && w != 2 && w != 4 && w != 8 {
+                                    return None;
+                                }
+                                let v = p.integer()?;
+                                let bytes = v.to_le_bytes();
+                                for k in 0..w {
+                                    unsafe { *out.add(off + k) = bytes[k] };
+                                }
                             }
                         }
                     }
@@ -353,6 +384,35 @@ impl<'a> JsonParser<'a> {
         }
         std::str::from_utf8(&self.src[start..self.pos]).ok()?.parse::<i64>().ok()
     }
+    /// Read a JSON number (`-?digits(.digits)?([eE][+-]?digits)?`) as `f64`.
+    fn number(&mut self) -> Option<f64> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if self.pos == start {
+            return None;
+        }
+        std::str::from_utf8(&self.src[start..self.pos]).ok()?.parse::<f64>().ok()
+    }
     fn boolean(&mut self) -> Option<bool> {
         if self.src[self.pos..].starts_with(b"true") {
             self.pos += 4;
@@ -364,11 +424,11 @@ impl<'a> JsonParser<'a> {
             None
         }
     }
-    /// Skip a value of an unknown key (int / bool / string for the M5 cut).
+    /// Skip a value of an unknown key (number / bool / string for the M5 cut).
     fn skip_value(&mut self) -> Option<()> {
         match self.peek() {
             Some(b't' | b'f') => self.boolean().map(|_| ()),
-            Some(b'-' | b'0'..=b'9') => self.integer().map(|_| ()),
+            Some(b'-' | b'0'..=b'9') => self.number().map(|_| ()),
             Some(b'"') => self.string().map(|_| ()),
             _ => None,
         }
