@@ -472,7 +472,8 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayToSlice(i) => self.walk(i, depth),
+            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::ArrayReduce { source, init, .. } => {
                 self.walk(source, depth);
                 self.walk(init, depth);
@@ -584,7 +585,8 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayToSlice(i) => {
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::Len(i) => {
                 self.expr(i, moved, false)
             }
             ExprKind::ArrayReduce { source, init, .. } => {
@@ -1317,6 +1319,10 @@ impl<'a> Checker<'a> {
         if method == "reduce" {
             return self.check_array_reduce(recv, args, expected, span);
         }
+        // `.len()` of a `str`/`slice`/array — the element count (an `i64`).
+        if method == "len" {
+            return self.check_len(recv, args, span);
+        }
         // `map`/`where` are only valid as pipeline stages under a terminal reduction.
         if method == "map" || method == "where" {
             self.diags.error(
@@ -1721,6 +1727,27 @@ impl<'a> Checker<'a> {
         Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
     }
 
+    /// `.len()` — the element count of a `str`, `slice<T>`, or fixed array, as an `i64`.
+    fn check_len(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        if !args.is_empty() {
+            self.diags.error(format!("'.len()' takes no arguments, got {}", args.len()), span);
+        }
+        let r = self.check_expr(recv, None);
+        match r.ty {
+            // `str`/`slice` carry a runtime length in their `{ ptr, len }` view.
+            Ty::Str | Ty::Slice(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            // A fixed array's length is known at compile time.
+            Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
+            Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
+            other => {
+                self.diags
+                    .error(format!("'.len()' is not defined on {}", ty_name(other)), span);
+                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
+            }
+        }
+    }
+
     /// `b.get()` — copy the value out of a `box<T>`.
     fn check_box_get(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], span: Span) -> Expr {
         if !args.is_empty() {
@@ -1909,7 +1936,8 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayToSlice(inner) => {
+            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
             ExprKind::ArrayReduce { source, init, .. } => {
@@ -2425,6 +2453,18 @@ mod tests {
     fn print_accepts_bool_char_float() {
         let (_p, d) = check("fn main() -> i32 {\n  print(true)\n  print('a')\n  print(3.14)\n  return 0\n}\n");
         assert!(!d.has_errors(), "print accepts bool, char, and float");
+    }
+
+    #[test]
+    fn len_checks_on_str_slice_array() {
+        let (_p, d) = check("fn slen(xs: slice<i32>) -> i64 = xs.len()\nfn main() -> i32 {\n  s := \"hi\"\n  a := [1, 2, 3]\n  print(s.len())\n  print(a.len())\n  print(slen([4, 5]))\n  return 0\n}\n");
+        assert!(!d.has_errors(), ".len() should check on str, array, and slice");
+    }
+
+    #[test]
+    fn len_rejects_non_sequence() {
+        let (_p, d) = check("fn main() -> i32 {\n  x := 5\n  print(x.len())\n  return 0\n}\n");
+        assert!(d.has_errors(), ".len() is not defined on an integer");
     }
 
     #[test]

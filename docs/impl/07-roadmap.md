@@ -253,6 +253,11 @@ later slices (struct arrays, M5 strings/JSON).
   per-field value holes); `str` fields are emitted as JSON string literals (quoted + escaped
   per RFC 8259) by the runtime `align_rt_builder_write_json_str`. Nested structs/arrays/
   options and `json.decode` are not implemented yet.
+- [done] `.len()` on `str`/`slice<T>` (the `len` field of the `{ ptr, len }` view; for
+  `str` this is the **byte** length) and on a fixed array/struct-array (the static element
+  count). Returns `i64`. Reuses the MIR `SliceLen` rvalue.
+- [todo] whole-struct by-value (pass/return/copy) — the gateway to `json.decode<T>`
+  (which returns a decoded struct); structs are currently slot-only.
 - [todo] owned `string` / `bytes`, const string pool/meta, `html`/`json` template variants,
   `json.decode<T>` (SIMD scan, zero-copy views, field tables).
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
