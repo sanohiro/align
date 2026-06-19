@@ -284,15 +284,67 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     program
 }
 
-/// Arena escape checking (`03-types.md` §7): a `box<T>` allocated in an arena must not
-/// outlive its block. The "region" of a box is the arena depth at which it was
-/// allocated; escaping to a shallower depth (return, assignment to an outer binding, or
-/// the arena block's own value) is an error. Regions are inferred — never written.
+/// A value's inferred lifetime region (Memory Model v2, `impl/08-memory-model-v2.md`).
+/// Total order, longest-lived first: `Static ⊐ Frame ⊐ Arena(1) ⊐ … ⊐ Arena(d)`. Regions are
+/// inferred, never written, and live only in this analysis — they are not part of `Ty`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Region {
+    /// Process / program lifetime: literals, leaked allocations, owned-from-scalar values.
+    Static,
+    /// The current function's frame: a view created in-frame over frame-local storage. Cannot
+    /// be returned. (A view *parameter* borrows the caller and is `Static` here — returnable.)
+    Frame,
+    /// The k-th enclosing `arena {}` (1 = outermost). Freed at that block's end.
+    Arena(u32),
+}
+
+impl Region {
+    /// Ordinal in the lattice; smaller = longer-lived.
+    fn ord(self) -> u32 {
+        match self {
+            Region::Static => 0,
+            Region::Frame => 1,
+            Region::Arena(k) => 1 + k,
+        }
+    }
+
+    /// Whether a value of `self` may be stored into / returned to a location of region `dst`
+    /// — i.e. `self` lives at least as long as `dst`. This is the single escape rule.
+    fn outlives(self, dst: Region) -> bool {
+        self.ord() <= dst.ord()
+    }
+
+    /// The region of a value allocated at arena nesting `depth` (0 = outside any arena, where
+    /// the result is leaked / process-lifetime → `Static`).
+    fn arena(depth: u32) -> Region {
+        if depth == 0 {
+            Region::Static
+        } else {
+            Region::Arena(depth)
+        }
+    }
+
+    /// The shorter-lived (higher-ordinal) of two regions — a view over both lives only as
+    /// long as the shorter source.
+    fn shorter(self, other: Region) -> Region {
+        if self.ord() >= other.ord() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+/// Arena escape checking (`03-types.md` §7, generalized per `impl/08-memory-model-v2.md`):
+/// every view / arena-allocated value carries an inferred [`Region`], and the one escape rule
+/// ([`Region::outlives`]) forbids it being returned to / stored into a longer-lived location.
+/// A `box<T>` / arena-backed `str` is `Arena(k)`; a frame-local-backed `slice` is `Frame`.
+/// Regions are inferred — never written.
 struct EscapeCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
-    /// For each box local, the arena depth at which its current box was allocated.
-    region: std::collections::HashMap<LocalId, u32>,
+    /// For each box/str local, the region at which its current value was allocated.
+    region: std::collections::HashMap<LocalId, Region>,
     /// For each local, the arena depth at which it was declared.
     decl_depth: std::collections::HashMap<LocalId, u32>,
     /// Slice locals bound to a view of *function-local* array storage (an array literal or
@@ -322,27 +374,27 @@ impl<'a> EscapeCheck<'a> {
         matches!(ty, Ty::Box(_) | Ty::Str)
     }
 
-    /// The arena depth a region-bearing expression's value is bound to; 0 = no region
-    /// (a leaked/static str, a box param — none exist — etc.). Recurses through value
-    /// forms so it can't slip out via an `if`/block value.
-    fn region_of(&self, e: &Expr, depth: u32) -> u32 {
+    /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
+    /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
+    /// it can't slip out via an `if`/block value.
+    fn region_of(&self, e: &Expr, depth: u32) -> Region {
         match &e.kind {
-            // Allocating producers are bound to the enclosing arena (0 outside any arena,
+            // Allocating producers are bound to the enclosing arena (Static outside any arena,
             // where the result is leaked / process-lifetime and safe to return).
-            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => depth,
+            ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => Region::arena(depth),
             // `str + str` concatenation is also built in the enclosing arena.
-            ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => depth,
-            ExprKind::Local(p) => *self.region.get(p).unwrap_or(&0),
+            ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => Region::arena(depth),
+            ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
             ExprKind::If { then, els, .. } => {
-                self.region_of_block(then, depth).max(self.region_of_block(els, depth))
+                self.region_of_block(then, depth).shorter(self.region_of_block(els, depth))
             }
-            _ => 0,
+            _ => Region::Static,
         }
     }
 
-    fn region_of_block(&self, b: &Block, depth: u32) -> u32 {
-        b.value.as_ref().map(|v| self.region_of(v, depth)).unwrap_or(0)
+    fn region_of_block(&self, b: &Block, depth: u32) -> Region {
+        b.value.as_ref().map(|v| self.region_of(v, depth)).unwrap_or(Region::Static)
     }
 
     /// Whether a `slice<T>`-typed expression borrows *function-local* array storage (and so
@@ -395,8 +447,8 @@ impl<'a> EscapeCheck<'a> {
                 }
                 if Self::tracks_region(value.ty) {
                     let r = self.region_of(value, depth);
-                    let d = *self.decl_depth.get(local).unwrap_or(&0);
-                    if d < r {
+                    let target = Region::arena(*self.decl_depth.get(local).unwrap_or(&0));
+                    if !r.outlives(target) {
                         self.diags.error(
                             "this value is bound to an arena block and cannot escape it".to_string(),
                             value.span,
@@ -408,9 +460,9 @@ impl<'a> EscapeCheck<'a> {
             }
             Stmt::AssignField { value, .. } => {
                 self.walk(value, depth);
-                // A struct carries no arena region, so an arena-backed str must not be
+                // A struct carries no arena region (today), so an arena-backed str must not be
                 // stored into a str field (it would outlive the arena via the struct).
-                if value.ty == Ty::Str && self.region_of(value, depth) >= 1 {
+                if value.ty == Ty::Str && !self.region_of(value, depth).outlives(Region::Static) {
                     self.diags.error(
                         "cannot store an arena-allocated str into a struct field (it would outlive the arena)".to_string(),
                         value.span,
@@ -419,7 +471,9 @@ impl<'a> EscapeCheck<'a> {
             }
             Stmt::Return(Some(e)) => {
                 self.walk(e, depth);
-                if Self::tracks_region(e.ty) && self.region_of(e, depth) >= 1 {
+                // A returned value escapes to the caller (`Static`): only a `Static`-region
+                // value may be returned (an arena/frame view cannot).
+                if Self::tracks_region(e.ty) && !self.region_of(e, depth).outlives(Region::Static) {
                     self.diags.error(
                         "cannot return a value allocated in an arena (it is freed at block end)".to_string(),
                         e.span,
@@ -444,7 +498,9 @@ impl<'a> EscapeCheck<'a> {
                 let inner = depth + 1;
                 self.block(b, inner);
                 if let Some(v) = &b.value {
-                    if Self::tracks_region(v.ty) && self.region_of(v, inner) >= inner {
+                    // The block's value escapes to the enclosing region (`Region::arena(depth)`);
+                    // a value bound to this inner arena cannot outlive it.
+                    if Self::tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
                         self.diags.error(
                             "a value allocated in this arena cannot escape as the block's value".to_string(),
                             v.span,
@@ -473,7 +529,7 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(f, depth);
                     // A struct carries no arena region: an arena-backed str field initializer
                     // would let the str outlive its arena via the struct.
-                    if f.ty == Ty::Str && self.region_of(f, depth) >= 1 {
+                    if f.ty == Ty::Str && !self.region_of(f, depth).outlives(Region::Static) {
                         self.diags.error(
                             "cannot store an arena-allocated str into a struct field (it would outlive the arena)".to_string(),
                             f.span,
@@ -2407,6 +2463,26 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn region_lattice_outlives() {
+        // Static ⊐ Frame ⊐ Arena(1) ⊐ Arena(2): longer-lived outlives shorter-lived.
+        assert!(Region::Static.outlives(Region::Frame));
+        assert!(Region::Static.outlives(Region::Arena(1)));
+        assert!(Region::Frame.outlives(Region::Arena(1)));
+        assert!(Region::Arena(1).outlives(Region::Arena(2)));
+        assert!(Region::Static.outlives(Region::Static));
+        // …and not the reverse.
+        assert!(!Region::Frame.outlives(Region::Static));
+        assert!(!Region::Arena(1).outlives(Region::Frame));
+        assert!(!Region::Arena(2).outlives(Region::Arena(1)));
+        // `arena(0)` is the leaked / process-lifetime case → Static; deeper = shorter-lived.
+        assert_eq!(Region::arena(0), Region::Static);
+        assert!(!Region::arena(2).outlives(Region::arena(1)));
+        // `shorter` picks the shorter-lived (the one that bounds a view over both).
+        assert_eq!(Region::Static.shorter(Region::Arena(1)), Region::Arena(1));
+        assert_eq!(Region::Arena(2).shorter(Region::Frame), Region::Arena(2));
     }
 
     #[test]
