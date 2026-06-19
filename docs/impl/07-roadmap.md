@@ -158,9 +158,15 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
 - [done] `slice<T>` views (function parameters, array→slice borrow, pipelines over
   slices with runtime length).
 - [done] `reduce(f, init)` terminal (generalizes `sum`; shares the fused loop).
+- [done] `slice<T>` escape checking: a slice that borrows function-local array storage (an
+  array literal / local array, including via a slice-annotated `let` or a re-borrowing
+  call) cannot be returned — it would dangle when the frame is freed. A slice *parameter*
+  borrows the caller and is returnable. (Landed in M5; replaces the M4 "simply forbid
+  returning a slice" first cut.) Slice-annotated `let` now also applies the array→slice
+  borrow, fixing a latent codegen mismatch (a bare array stored into a slice slot).
 - [todo] heap-owned dynamic `array<T>`, array type annotations, `out` args,
   more stages/terminals (`scan`/`filter`/`partition`/`sort`/`chunks`),
-  array-valued results (materialization), slice escape checking, and named-function
+  array-valued results (materialization), and named-function
   `map` over struct elements (needs struct-by-value params, deferred since M1).
 
 ### Dynamic arrays / slices — decisions (from review)
@@ -219,8 +225,13 @@ later slices (struct arrays, M5 strings/JSON).
 - [done] `str` escape checking: an arena-backed `str` cannot escape its arena (return /
   arena-block value / assign-to-outer) — `EscapeCheck` now tracks `str` regions like
   `box`. A non-arena `str` (literal / leaked concat) is region-0 and freely returnable.
-  [todo] `slice<T>` escape checking (slices borrow function-local arrays — different
-  lifetime model; still a gap).
+- [done] `slice<T>` escape checking. Slices borrow function-local array storage (a
+  different lifetime model from arena regions: the backing array lives in the *frame*,
+  not an arena), so `EscapeCheck` tracks a separate set of "local-backed" slice locals.
+  A slice that borrows an array literal / local array — directly, via a slice-annotated
+  `let`, or via a re-borrowing call — cannot be returned (it would dangle); a slice
+  *parameter* borrows the caller and is returnable. Slice-annotated `let` now also
+  performs the array→slice borrow (fixes a latent array-into-slice-slot codegen mismatch).
 - [todo] owned `string` / `bytes`, const string pool/meta, `{expr}` holes,
   `html`/`json` template variants.
 - [todo] `json.decode<T>` / `encode<T>`, field table generation from structs, zero-copy
