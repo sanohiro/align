@@ -68,6 +68,18 @@ fn template_interpolation() {
 }
 
 #[test]
+fn template_expression_holes() {
+    if !backend_available() {
+        return;
+    }
+    // `{expr}` holes: arithmetic and an inline str concat, not just bare names.
+    let src = "fn main() -> i32 {\n  a := 20\n  b := 22\n  name := \"world\"\n  print(template \"sum={a + b} dbl={a * 2} hi={name + \\\"!\\\"}\")\n  return 0\n}\n";
+    let out = build_and_run("template-expr", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sum=42 dbl=40 hi=world!\n");
+}
+
+#[test]
 fn string_concatenation() {
     if !backend_available() {
         return;

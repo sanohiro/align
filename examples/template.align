@@ -1,8 +1,9 @@
-// Template strings (M5). `template "...{hole}..."` interpolates named bindings
+// Template strings (M5). `template "...{expr}..."` interpolates expressions
 // (int or str) and builds a `str` via the runtime string builder.
 fn main() -> i32 {
   name := "align"
-  score := 42
-  print(template "Hello {name}, score={score}!")
+  score := 40
+  // Holes are full expressions: a bare name, arithmetic, or an inline str concat.
+  print(template "Hello {name}, score={score + 2}, tag={name + \"!\"}")
   return 0
 }
