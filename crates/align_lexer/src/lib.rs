@@ -171,6 +171,16 @@ impl<'a> Lexer<'a> {
         loop {
             match self.src.get(i).copied() {
                 Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') => i += 1,
+                // A line comment is not significant: skip it (and the newline ending it)
+                // and keep scanning. Without this, the leading `/` of `//` is mistaken for
+                // a division continuation, which suppresses the statement terminator and
+                // glues the following line onto this one.
+                Some(b'/') if self.src.get(i + 1) == Some(&b'/') => {
+                    i += 2;
+                    while !matches!(self.src.get(i), Some(b'\n') | None) {
+                        i += 1;
+                    }
+                }
                 Some(b'.') | Some(b'+') | Some(b'*') | Some(b'/') | Some(b'%') => return true,
                 Some(b'<') | Some(b'>') | Some(b'=') | Some(b'&') | Some(b'|') => return true,
                 // '-' is also unary, but at line start treat it as a binary continuation.
