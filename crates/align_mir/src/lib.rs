@@ -505,6 +505,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
             Operand::Value(v)
         }
+        hir::ExprKind::Len(inner) => {
+            // `str`/`slice` carry the length in their `{ ptr, len }` view.
+            let sv = lower_expr(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::SliceLen(sv)));
+            Operand::Value(v)
+        }
         hir::ExprKind::ArrayLit { .. } => {
             unreachable!("array literal only appears as a let initializer or pipeline source")
         }

@@ -80,6 +80,18 @@ fn template_expression_holes() {
 }
 
 #[test]
+fn len_of_str_slice_array() {
+    if !backend_available() {
+        return;
+    }
+    // str.len() is the byte length (UTF-8: 'あ' = 3 bytes); slice/array lengths too.
+    let src = "fn slen(xs: slice<i32>) -> i64 = xs.len()\nfn main() -> i32 {\n  s := \"hello\"\n  a := [10, 20, 30, 40]\n  print(s.len())\n  print(a.len())\n  print(slen([1, 2, 3]))\n  print(\"あ\".len())\n  return 0\n}\n";
+    let out = build_and_run("len", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n4\n3\n3\n");
+}
+
+#[test]
 fn json_encode_flat_struct() {
     if !backend_available() {
         return;

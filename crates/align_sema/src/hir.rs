@@ -165,6 +165,9 @@ pub enum ExprKind {
     /// Borrow an array (a local stack array) as a `slice<T>` view — `{ &arr[0], len }`.
     /// Allocation-free, so it is an implicit coercion at call sites.
     ArrayToSlice(Box<Expr>),
+    /// `.len()` of a `str` or `slice<T>` (the `len` field of the `{ ptr, len }` view); the
+    /// result is `i64`. A fixed array's length is a constant and lowers without this node.
+    Len(Box<Expr>),
     /// `template "..."` — build a `str` from static parts and interpolated holes. Each
     /// hole is a local (int or str); lowering picks the right builder write by its type.
     Template(Vec<TemplatePart>),
