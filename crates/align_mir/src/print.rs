@@ -55,6 +55,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::Drop(slot) => {
                 let _ = writeln!(out, "    drop _{slot}");
             }
+            Stmt::DropValue(op) => {
+                let _ = writeln!(out, "    drop_value {}", operand_str(op));
+            }
             Stmt::ArenaEnd(op) => {
                 let _ = writeln!(out, "    arena_end {}", operand_str(op));
             }

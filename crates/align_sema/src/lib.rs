@@ -275,7 +275,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     for f in &mut program.fns {
-        let ever_moved = MoveCheck { f, diags, ever_moved: std::collections::HashSet::new() }.check();
+        MoveCheck { f, diags }.check();
         let region = {
             let mut ec = EscapeCheck {
                 f,
@@ -287,21 +287,16 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             ec.check();
             ec.region
         };
-        // A free-standing owned `array<T>` (region `Static`) that is never moved out must be
-        // dropped at every function exit. Arena-allocated ones (region `Arena(k)`) are
-        // bulk-freed, and moved-out ones transfer ownership, so both are excluded.
-        //
-        // KNOWN LIMITATION (deferred to a "complete drop coverage" slice): a local moved on
-        // *some* but not all paths is excluded outright, so it leaks on the path where it is
-        // not moved. The robust fix is null-on-move drop flags (keep it in `drop_locals`, null
-        // its slot at each move site so the exit `Drop` is a no-op `free(null)` when moved).
-        // The leak is sound (no double-free / UAF) and bounded (no loops in the language yet).
+        // Every free-standing owned `array<T>` (region `Static`) is dropped at every function
+        // exit. Arena-allocated ones (region `Arena(k)`) are bulk-freed by the arena, so they
+        // are excluded. A moved-out local stays in this set, but MIR nulls its slot at the move
+        // site (null-on-move drop flag), so its exit `Drop` is a no-op `free(null)` — no
+        // double-free, and the path where it is *not* moved is still freed (no leak).
         let drops: Vec<LocalId> = f
             .locals
             .iter()
             .filter(|l| matches!(l.ty, Ty::DynArray(_)))
             .map(|l| l.id)
-            .filter(|id| !ever_moved.contains(id))
             .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
             .collect();
         f.drop_locals = drops;
@@ -631,60 +626,82 @@ impl<'a> EscapeCheck<'a> {
 struct MoveCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
-    /// Every local moved out anywhere in the body (the union over all paths). Used to decide
-    /// which owned locals still need a drop (MMv2 slice 4): a moved-out local does not.
-    ever_moved: std::collections::HashSet<LocalId>,
 }
 
 impl<'a> MoveCheck<'a> {
-    fn check(mut self) -> std::collections::HashSet<LocalId> {
+    fn check(mut self) {
         let mut moved = std::collections::HashSet::new();
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
-        // moved out to the caller. Without this, such a local would stay in `drop_locals` and be
-        // freed at exit while the caller also frees it — a double-free / use-after-free.
+        // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
         let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_));
-        self.block(&self.f.body, &mut moved, ret_is_move);
-        self.ever_moved
+        self.block(&self.f.body, &mut moved, ret_is_move, true);
     }
 
     fn is_move(&self, id: LocalId) -> bool {
         matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_) | Ty::DynArray(_)))
     }
 
-    /// `tail_consuming` = whether the block's trailing value is consumed by its context.
-    fn block(&mut self, b: &Block, moved: &mut std::collections::HashSet<LocalId>, tail_consuming: bool) {
+    /// `tail_consuming` = whether the block's trailing value is consumed by its context;
+    /// `tail_direct` = whether that consuming position is a "direct" move site (a statement /
+    /// return / the function tail) rather than nested inside a branching expression (`if`).
+    /// MIR nulls a moved owned local's slot only at direct sites, so a move of a *bound* owned
+    /// local through an `if`/`else` arm is rejected here (deferred — bind it to a local first).
+    fn block(
+        &mut self,
+        b: &Block,
+        moved: &mut std::collections::HashSet<LocalId>,
+        tail_consuming: bool,
+        tail_direct: bool,
+    ) {
         for s in &b.stmts {
             match s {
                 Stmt::Let { local, init } => {
-                    self.expr(init, moved, true);
+                    self.expr(init, moved, true, true);
                     moved.remove(local);
                 }
                 Stmt::Assign { local, value } => {
-                    self.expr(value, moved, true);
+                    self.expr(value, moved, true, true);
                     moved.remove(local);
                 }
-                Stmt::AssignField { value, .. } => self.expr(value, moved, true),
-                Stmt::Return(Some(e)) => self.expr(e, moved, true),
+                Stmt::AssignField { value, .. } => self.expr(value, moved, true, true),
+                Stmt::Return(Some(e)) => self.expr(e, moved, true, true),
                 Stmt::Return(None) => {}
-                Stmt::Expr(e) => self.expr(e, moved, false),
+                Stmt::Expr(e) => self.expr(e, moved, false, false),
             }
         }
         if let Some(v) = &b.value {
-            self.expr(v, moved, tail_consuming);
+            self.expr(v, moved, tail_consuming, tail_direct);
         }
     }
 
-    /// `consuming` = this position takes a Move value by value (so it moves it).
-    fn expr(&mut self, e: &Expr, moved: &mut std::collections::HashSet<LocalId>, consuming: bool) {
+    /// `consuming` = this position takes a Move value by value (so it moves it). `direct` = the
+    /// consuming position is a direct move site (see [`block`]); a non-direct owned-local move
+    /// is a deferred-feature error.
+    fn expr(
+        &mut self,
+        e: &Expr,
+        moved: &mut std::collections::HashSet<LocalId>,
+        consuming: bool,
+        direct: bool,
+    ) {
         match &e.kind {
             ExprKind::Local(id) => {
                 if moved.contains(id) {
                     let name = &self.f.locals[*id as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
                 } else if consuming && self.is_move(*id) {
+                    if !direct {
+                        let name = &self.f.locals[*id as usize].name;
+                        self.diags.error(
+                            format!(
+                                "cannot move owned value '{name}' out through a conditional \
+                                 expression yet; bind the `if`/`else` result to a local first"
+                            ),
+                            e.span,
+                        );
+                    }
                     moved.insert(*id);
-                    self.ever_moved.insert(*id);
                 }
             }
             ExprKind::Field { base, .. } | ExprKind::IndexField { base, .. } => {
@@ -693,49 +710,56 @@ impl<'a> MoveCheck<'a> {
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
                 }
             }
-            ExprKind::Unary { expr, .. } => self.expr(expr, moved, false),
+            ExprKind::Unary { expr, .. } => self.expr(expr, moved, false, false),
             ExprKind::Binary { lhs, rhs, .. } => {
-                self.expr(lhs, moved, false);
-                self.expr(rhs, moved, false);
+                self.expr(lhs, moved, false, false);
+                self.expr(rhs, moved, false, false);
             }
-            // Value arguments / wrapped payloads are consumed.
+            // Value arguments / wrapped payloads are consumed (a direct move site).
             ExprKind::Call { args, .. } => {
                 for a in args {
-                    self.expr(a, moved, true);
+                    self.expr(a, moved, true, true);
                 }
             }
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
-                    self.expr(f, moved, true);
+                    self.expr(f, moved, true, true);
                 }
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
-            | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true),
+            | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
             // The receiver is borrowed, not consumed.
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
-                self.expr(i, moved, false)
+                self.expr(i, moved, false, false)
             }
             ExprKind::ArrayReduce { source, init, .. } => {
-                self.expr(source, moved, false);
-                self.expr(init, moved, false);
+                self.expr(source, moved, false, false);
+                self.expr(init, moved, false, false);
             }
             ExprKind::ArrayLit { elems, .. } => {
                 for e in elems {
-                    self.expr(e, moved, true);
+                    self.expr(e, moved, true, true);
                 }
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
-                self.expr(opt, moved, true);
-                self.expr(fallback, moved, false);
+                self.expr(opt, moved, true, true);
+                // The fallback is an arm value: it inherits this position's `consuming` but is
+                // not a direct move site (like an `if`/`else` arm). Today Option payloads are
+                // scalar-only, so a Move-typed unwrap result is not constructible — but treating
+                // the fallback consistently keeps the analysis sound if that ever changes.
+                self.expr(fallback, moved, consuming, false);
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) => self.block(b, moved, consuming),
+            // A plain block is transparent: its tail inherits this position's consuming/direct.
+            ExprKind::Block(b) | ExprKind::Arena(b) => self.block(b, moved, consuming, direct),
             ExprKind::If { cond, then, els } => {
-                self.expr(cond, moved, false);
+                self.expr(cond, moved, false, false);
+                // An `if`/`else` arm value is a consuming-but-NOT-direct position: moving a
+                // bound owned local out through it is rejected (the `direct = false`).
                 let mut m1 = moved.clone();
-                self.block(then, &mut m1, consuming);
+                self.block(then, &mut m1, consuming, false);
                 let mut m2 = moved.clone();
-                self.block(els, &mut m2, consuming);
+                self.block(els, &mut m2, consuming, false);
                 // Conservative join: moved if moved on either path.
                 *moved = &m1 | &m2;
             }
@@ -743,11 +767,11 @@ impl<'a> MoveCheck<'a> {
                 for p in parts {
                     if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
                         // A hole value is read (copied) into the builder, not moved out.
-                        self.expr(h, moved, false);
+                        self.expr(h, moved, false, false);
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } => self.expr(input, moved, false),
+            ExprKind::JsonDecode { input, .. } => self.expr(input, moved, false, false),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -3101,6 +3125,23 @@ mod tests {
         // block's value (bound outside the arena) must be rejected.
         let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  bad := arena {\n    [1, 2, 3].map(double).to_array()\n  }\n  return 0\n}\n");
         assert!(d.has_errors(), "an arena-allocated owned array must not escape its arena");
+    }
+
+    #[test]
+    fn move_owned_local_through_if_arm_rejected() {
+        // MMv2 slice 4.5: moving a *bound* owned array out through an `if`/`else` arm is a
+        // deferred-feature error (codegen only nulls slots at direct move sites). A fresh
+        // temporary through an `if` is fine — there is no bound slot to double-free.
+        let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn pick(c: bool) -> array<i32> {\n  ys := [1, 2, 3].map(double).to_array()\n  zs := [4, 5, 6].map(double).to_array()\n  return if c { ys } else { zs }\n}\nfn main() -> i32 = 0\n");
+        assert!(d.has_errors(), "moving a bound owned local out through an if/else arm must error");
+    }
+
+    #[test]
+    fn conditional_move_then_no_later_use_checks() {
+        // Moving an owned local on only one path (with no later use of the source) is allowed:
+        // MIR nulls the slot at the move site so the not-moved path is still freed at exit.
+        let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn run(c: bool) -> i32 {\n  ys := [1, 2, 3].map(double).to_array()\n  mut total := 0\n  if c {\n    zs := ys\n    total = zs.sum()\n  }\n  return total\n}\nfn main() -> i32 = run(true)\n");
+        assert!(!d.has_errors(), "a one-path move with no later use of the source should check");
     }
 
     #[test]

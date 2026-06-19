@@ -615,6 +615,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_call(self.funcs["free"], &[ptr.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
+                Stmt::DropValue(op) => {
+                    // Free the buffer of an owned `{ptr, len}` value (an unbound temporary).
+                    let agg = self.operand(op).into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "dropvalptr").map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_call(self.funcs["free"], &[ptr.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
             }
         }
         self.gen_term(&b.term)
