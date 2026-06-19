@@ -401,6 +401,12 @@ impl<'a> EscapeCheck<'a> {
             // A field read inherits its base struct's region (the field may be a view into it).
             ExprKind::Field { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
+            // An `arena {}` *expression* yields its block value, evaluated one level deeper.
+            // Without this, a binding that captures an arena's value (`p := arena { … }`) would
+            // be inferred `Static` and could then escape undetected (a use-after-free across
+            // nested arenas); the per-block walk only checks the immediate boundary, not a
+            // later escape of the binding.
+            ExprKind::Arena(b) => self.region_of_block(b, depth + 1),
             ExprKind::If { then, els, .. } => {
                 self.region_of_block(then, depth).shorter(self.region_of_block(els, depth))
             }
@@ -2730,6 +2736,14 @@ mod tests {
         // arena block's value, which becomes the function result) must be rejected.
         let (_p, d) = check("P { tag: str }\nfn mk(a: str, b: str) -> P {\n  arena {\n    P{tag: a + b}\n  }\n}\nfn main() -> i32 { return 0 }\n");
         assert!(d.has_errors(), "a struct holding an arena str must not escape its arena");
+    }
+
+    #[test]
+    fn struct_nested_arena_escape_rejected() {
+        // A binding that captures an inner arena's value must keep that arena's region, so it
+        // cannot be assigned to an outer-arena binding (which would outlive it → use-after-free).
+        let (_p, d) = check("P { tag: str }\nfn main() -> i32 {\n  arena {\n    mut out := P{tag: \"init\"}\n    arena {\n      x := \"a\" + \"b\"\n      p := arena {\n        P{tag: x}\n      }\n      out = p\n    }\n  }\n  return 0\n}\n");
+        assert!(d.has_errors(), "a value captured from an inner arena must not escape to an outer one");
     }
 
     #[test]
