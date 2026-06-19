@@ -75,6 +75,9 @@ pub enum Stmt {
     StoreField(Slot, u32, Operand),
     /// `slot[index] <- value` (array element store).
     StoreIndex(Slot, Operand, Operand),
+    /// `ptr[index] <- value` — store into a raw element pointer (the buffer of an owned
+    /// `array<T>` being filled). The element type comes from `value`.
+    PtrStore(Operand, Operand, Operand),
     /// `slot[index].field <- value` (struct-array element field store).
     StoreElemField(Slot, Operand, u32, Operand),
     /// End an arena, freeing all its allocations (the operand is the arena handle).
@@ -124,6 +127,11 @@ pub enum Rvalue {
     IndexField(Slot, Operand, u32),
     /// Borrow array `slot` (length `n`) as a slice value `{ &slot[0], n }`.
     MakeSlice(Slot, i128),
+    /// Bump-allocate `count` elements of type `elem` in the arena `handle`; yields the
+    /// element pointer (used to build an owned `array<T>` via [`Rvalue::MakeDynArray`]).
+    ArenaAlloc { handle: Operand, count: Operand, elem: Ty },
+    /// Build an owned `array<T>` value `{ ptr, len }` from a buffer pointer and a length.
+    MakeDynArray { ptr: Operand, len: Operand },
     /// The `len` of a slice operand.
     SliceLen(Operand),
     /// `slice[index]` — load a slice element (scalar).
@@ -519,6 +527,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let init = Operand::Const(Const::Bool(*all));
             lower_array_reduce(b, source, stages, Ty::Bool, init, Reducer::AnyAll { func: func.clone(), all: *all })
         }
+        hir::ExprKind::ArrayToArray { source, stages, elem } => {
+            lower_array_collect(b, source, stages, *elem)
+        }
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
             let v = b.fresh_value(e.ty);
@@ -624,6 +635,37 @@ enum Reducer {
     AnyAll { func: String, all: bool },
 }
 
+/// The set-up of a pipeline source: a stack array (slot + const length), a struct array
+/// (slot), or a `{ptr,len}`-shaped value — a `slice` or an owned `array` (operand + runtime
+/// length). Shared by the reducing and collecting loops.
+struct SrcSetup {
+    slot: Slot,
+    slice_val: Option<Operand>,
+    bound: Operand,
+    scalar_slot: bool,
+}
+
+fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
+    match source.ty {
+        // `slice<T>` and owned `array<T>` share the `{ptr,len}` layout and runtime length.
+        Ty::Slice(_) | Ty::DynArray(_) => {
+            let sv = lower_expr(b, source);
+            let len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false }
+        }
+        _ => {
+            let (slot, n) = array_source_slot(b, source);
+            SrcSetup {
+                slot,
+                slice_val: None,
+                bound: Operand::Const(Const::Int(n, i64_ty())),
+                scalar_slot: matches!(source.ty, Ty::Array(..)),
+            }
+        }
+    }
+}
+
 fn lower_array_reduce(
     b: &mut Builder,
     source: &hir::Expr,
@@ -633,21 +675,7 @@ fn lower_array_reduce(
     reducer: Reducer,
 ) -> Operand {
     let elem_ty = acc_ty;
-    // Source kinds: a stack array (slot, const length), a struct array (slot, no
-    // up-front load — projected later), or a slice value (operand, runtime length).
-    let (slot, slice_val, bound) = match source.ty {
-        Ty::Slice(_) => {
-            let sv = lower_expr(b, source);
-            let len = b.fresh_value(i64_ty());
-            b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            (0u32, Some(sv), Operand::Value(len))
-        }
-        _ => {
-            let (slot, n) = array_source_slot(b, source);
-            (slot, None, Operand::Const(Const::Int(n, i64_ty())))
-        }
-    };
-    let scalar_slot_src = matches!(source.ty, Ty::Array(..));
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src } = setup_source(b, source);
 
     let acc = b.new_slot(acc_ty);
     b.push(Stmt::Store(acc, init));
@@ -678,7 +706,7 @@ fn lower_array_reduce(
     // addressed by index until a `.field` projection loads a scalar.
     let mut cur: Option<Operand> = if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
-            Ty::Slice(s) => align_sema::scalar_to_ty(s),
+            Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
             _ => elem_ty,
         };
         let x = b.fresh_value(src_elem);
@@ -769,6 +797,129 @@ fn lower_array_reduce(
     let r = b.fresh_value(elem_ty);
     b.push(Stmt::Let(r, Rvalue::Load(acc)));
     Operand::Value(r)
+}
+
+/// `source.….to_array()` — the fused loop, but each surviving element is appended to a
+/// freshly bump-allocated arena buffer instead of folded. Yields an owned `array<T>` value
+/// `{ ptr, len }` where `len` is the survivor count. (MMv2 slice 3; arena-only.)
+fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty) -> Operand {
+    let handle = Operand::Value(*b.arenas.last().expect("to_array outside an arena (sema-checked)"));
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src } = setup_source(b, source);
+
+    // Output buffer: `bound` (upper-bound = source length) elements in the arena. map/where
+    // never grow the count, so the buffer never needs to be resized.
+    let out_ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
+    b.push(Stmt::Let(out_ptr, Rvalue::ArenaAlloc { handle, count: bound.clone(), elem }));
+
+    // `acc` is the running output index (= final length); `iv` is the source index.
+    let acc = b.new_slot(i64_ty());
+    b.push(Stmt::Store(acc, Operand::Const(Const::Int(0, i64_ty()))));
+    let iv = b.new_slot(i64_ty());
+    b.push(Stmt::Store(iv, Operand::Const(Const::Int(0, i64_ty()))));
+
+    let header = b.new_block();
+    let body = b.new_block();
+    let cont = b.new_block();
+    let exit = b.new_block();
+    b.terminate(Term::Goto(header));
+
+    // header: while i < len
+    b.cur = header;
+    let i_val = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
+    let cond = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound)));
+    b.terminate(Term::Branch(Operand::Value(cond), body, exit));
+
+    // body: address element i, run the stages, append survivors.
+    b.cur = body;
+    let idx = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(idx, Rvalue::Load(iv)));
+    let index = Operand::Value(idx);
+
+    let mut cur: Option<Operand> = if let Some(sv) = &slice_val {
+        let src_elem = match source.ty {
+            Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+            _ => elem,
+        };
+        let x = b.fresh_value(src_elem);
+        b.push(Stmt::Let(x, Rvalue::SliceIndex(sv.clone(), index.clone())));
+        Some(Operand::Value(x))
+    } else if scalar_slot_src {
+        let src_elem = match source.ty {
+            Ty::Array(s, _) => align_sema::scalar_to_ty(s),
+            _ => elem,
+        };
+        let x = b.fresh_value(src_elem);
+        b.push(Stmt::Let(x, Rvalue::Index(slot, index.clone())));
+        Some(Operand::Value(x))
+    } else {
+        None
+    };
+
+    for stage in stages {
+        match &stage.kind {
+            hir::StageKind::Project { field } => {
+                let v = b.fresh_value(stage.out_ty);
+                b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), *field)));
+                cur = Some(Operand::Value(v));
+            }
+            hir::StageKind::Map { func } => {
+                let arg = cur.take().expect("map before projection");
+                let v = b.fresh_value(stage.out_ty);
+                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), vec![arg])));
+                cur = Some(Operand::Value(v));
+            }
+            hir::StageKind::Where { func } => {
+                let arg = cur.clone().expect("where before projection");
+                let pred = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), vec![arg])));
+                let keep = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
+                b.cur = keep;
+            }
+            hir::StageKind::WhereField { field } => {
+                let pred = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(pred, Rvalue::IndexField(slot, index.clone(), *field)));
+                let keep = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
+                b.cur = keep;
+            }
+        }
+    }
+
+    // append: out_ptr[out_idx] = cur; out_idx += 1.
+    let cur = cur.expect("to_array needs a scalar element");
+    let out_idx = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(out_idx, Rvalue::Load(acc)));
+    b.push(Stmt::PtrStore(Operand::Value(out_ptr), Operand::Value(out_idx), cur));
+    let next = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(out_idx), index_const(1))));
+    b.push(Stmt::Store(acc, Operand::Value(next)));
+    b.terminate(Term::Goto(cont));
+
+    // cont: i += 1; loop.
+    b.cur = cont;
+    let i2 = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i2, Rvalue::Load(iv)));
+    let inc = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1))));
+    b.push(Stmt::Store(iv, Operand::Value(inc)));
+    b.terminate(Term::Goto(header));
+
+    // exit: build the owned array { out_ptr, out_idx }.
+    b.cur = exit;
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::Load(acc)));
+    let arr = b.fresh_value(Ty::DynArray(scalar_of(elem)));
+    b.push(Stmt::Let(arr, Rvalue::MakeDynArray { ptr: Operand::Value(out_ptr), len: Operand::Value(len) }));
+    Operand::Value(arr)
+}
+
+/// The scalar of a known-scalar element `Ty` (panics on a non-scalar — `to_array` is
+/// sema-restricted to scalar elements).
+fn scalar_of(ty: Ty) -> align_sema::Scalar {
+    align_sema::ty_to_scalar(ty).expect("to_array element must be a scalar (sema-checked)")
 }
 
 /// `json.decode(input)` → fill an out struct via the runtime parser (status `i32`), then
@@ -934,6 +1085,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Box(_) => "box".to_string(),
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
+        Ty::DynArray(_) => "array".to_string(),
         Ty::Str => "str".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),

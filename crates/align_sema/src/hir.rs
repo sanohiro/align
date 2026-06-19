@@ -175,6 +175,10 @@ pub enum ExprKind {
     /// `source.…​.reduce(f, init)` — fold the (post-stage) elements with the binary
     /// function `func` starting from `init`. `ty` is the accumulator type.
     ArrayReduce { source: Box<Expr>, stages: Vec<Stage>, func: String, init: Box<Expr> },
+    /// `source.….to_array()` — materialize the surviving (post-stage) elements into an
+    /// *owned* `array<T>` (MMv2 slice 3: arena-bump-allocated). `elem` is the element
+    /// scalar type; the expression `ty` is `DynArray(elem)`.
+    ArrayToArray { source: Box<Expr>, stages: Vec<Stage>, elem: crate::Ty },
     /// Borrow an array (a local stack array) as a `slice<T>` view — `{ &arr[0], len }`.
     /// Allocation-free, so it is an implicit coercion at call sites.
     ArrayToSlice(Box<Expr>),

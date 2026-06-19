@@ -83,6 +83,10 @@ pub enum Ty {
     StructArray(u32, u32),
     /// `slice<T>` — a borrowed view `{ T* ptr, i64 len }` of scalar elements. Copy. M4.
     Slice(Scalar),
+    /// `array<T>` — an *owned*, dynamic-length array of scalars, laid out like a slice
+    /// (`{ T* ptr, i64 len }`) but Move and region-tracked. MMv2 slice 3: produced by a
+    /// materializing terminal (`.to_array()`) and (this slice) arena-bump-allocated.
+    DynArray(Scalar),
     /// `str` — an immutable string view `{ u8* ptr, i64 len }`. Copy. M5.
     Str,
     /// An arena handle (internal; produced by `arena {}`, never written by the user).
@@ -98,7 +102,7 @@ pub enum Ty {
 }
 
 /// Convert a concrete scalar [`Ty`] to a [`Scalar`]; `None` for vars/composites/structs.
-fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
+pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
     match ty {
         Ty::Int(it) => Some(Scalar::Int(it)),
         Ty::Float(ft) => Some(Scalar::Float(ft)),
@@ -293,6 +297,9 @@ enum Region {
     Static,
     /// The current function's frame: a view created in-frame over frame-local storage. Cannot
     /// be returned. (A view *parameter* borrows the caller and is `Static` here — returnable.)
+    /// Not yet produced — frame-local slices still use the `local_backed_slice` set; folding
+    /// them onto this variant is a later MMv2 slice.
+    #[allow(dead_code)]
     Frame,
     /// The k-th enclosing `arena {}` (1 = outermost). Freed at that block's end.
     Arena(u32),
@@ -379,7 +386,7 @@ impl<'a> EscapeCheck<'a> {
     /// (MMv2 slice 2 — a struct's region is the max of its fields, so a struct holding an
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(ty: Ty) -> bool {
-        matches!(ty, Ty::Box(_) | Ty::Str | Ty::Struct(_))
+        matches!(ty, Ty::Box(_) | Ty::Str | Ty::Struct(_) | Ty::DynArray(_))
     }
 
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
@@ -390,6 +397,8 @@ impl<'a> EscapeCheck<'a> {
             // Allocating producers are bound to the enclosing arena (Static outside any arena,
             // where the result is leaked / process-lifetime and safe to return).
             ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => Region::arena(depth),
+            // `.to_array()` bump-allocates the owned array in the enclosing arena.
+            ExprKind::ArrayToArray { .. } => Region::arena(depth),
             // `str + str` concatenation is also built in the enclosing arena.
             ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => Region::arena(depth),
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
@@ -558,7 +567,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::ArrayReduce { source, init, .. } => {
                 self.walk(source, depth);
@@ -611,7 +620,7 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn is_move(&self, id: LocalId) -> bool {
-        matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_)))
+        matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_) | Ty::DynArray(_)))
     }
 
     /// `tail_consuming` = whether the block's trailing value is consumed by its context.
@@ -673,7 +682,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false)
             }
@@ -1451,6 +1460,9 @@ impl<'a> Checker<'a> {
         if method == "any" || method == "all" {
             return self.check_array_any_all(recv, args, method == "all", span);
         }
+        if method == "to_array" {
+            return self.check_array_to_array(recv, args, span);
+        }
         // `.len()` of a `str`/`slice`/array — the element count (an `i64`).
         if method == "len" {
             return self.check_len(recv, args, span);
@@ -1644,7 +1656,7 @@ impl<'a> Checker<'a> {
             _ => self.check_expr(source_ast, None),
         };
         let mut elem = match source.ty {
-            Ty::Array(s, _) | Ty::Slice(s) => scalar_to_ty(s),
+            Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             Ty::StructArray(id, _) => Ty::Struct(id),
             Ty::Error => return None,
             other => {
@@ -1667,10 +1679,22 @@ impl<'a> Checker<'a> {
             return None;
         }
 
+        // Field projection / field-predicate stages index the source by element
+        // (`IndexField(slot, …)` in MIR), which needs a slot-backed source — a stack array
+        // or struct array. A `{ptr,len}` view (`slice`/owned `array`) has no such slot, so
+        // projecting a field out of one is not supported (it would miscompile).
+        let slot_backed = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..));
         let mut stages = Vec::new();
         for raw in raw_stages {
             match raw {
                 RawStage::Project(field) => {
+                    if !slot_backed {
+                        self.diags.error(
+                            format!("'.{}' field projection needs an array source, not a slice/array view", field.name),
+                            field.span,
+                        );
+                        return None;
+                    }
                     if !matches!(elem, Ty::Struct(_)) {
                         self.diags.error(
                             format!("'.{}' projection needs a struct element, got {}", field.name, ty_name(elem)),
@@ -1713,6 +1737,13 @@ impl<'a> Checker<'a> {
                     stages.push(Stage { kind: StageKind::Where { func: fname.name }, out_ty: elem });
                 }
                 RawStage::WhereField(field) => {
+                    if !slot_backed {
+                        self.diags.error(
+                            format!("'where(.{})' needs an array source, not a slice/array view", field.name),
+                            field.span,
+                        );
+                        return None;
+                    }
                     if !matches!(elem, Ty::Struct(_)) {
                         self.diags.error(
                             format!("'where(.{})' needs a struct element, got {}", field.name, ty_name(elem)),
@@ -1769,6 +1800,42 @@ impl<'a> Checker<'a> {
         Expr {
             kind: ExprKind::ArrayCount { source: Box::new(source), stages },
             ty: Ty::Int(IntTy { bits: 64, signed: true }),
+            span,
+        }
+    }
+
+    /// `src.….to_array()` — materialize the surviving (scalar) elements into an *owned*
+    /// `array<T>`. MMv2 slice 3: the result is arena-bump-allocated (bulk-freed), so it is
+    /// only allowed inside an `arena {}`; free-standing (heap + drop) arrives in slice 4.
+    fn check_array_to_array(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        if !args.is_empty() {
+            self.diags.error("'to_array' takes no arguments".to_string(), span);
+        }
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if self.arena_depth == 0 {
+            self.diags.error(
+                "'to_array' must be used inside an 'arena {}' (a free-standing owned array needs drop, which is not available yet)".to_string(),
+                span,
+            );
+            return err;
+        }
+        let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
+            return err;
+        };
+        let Some(scalar) = ty_to_scalar(elem) else {
+            self.diags.error(
+                format!("'to_array' needs a scalar element, got {} (project a field first)", ty_name(elem)),
+                span,
+            );
+            return err;
+        };
+        if matches!(elem, Ty::Struct(_)) {
+            self.diags.error("'to_array' over struct elements is not supported yet (project a field first)".to_string(), span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ArrayToArray { source: Box::new(source), stages, elem },
+            ty: Ty::DynArray(scalar),
             span,
         }
     }
@@ -2056,7 +2123,7 @@ impl<'a> Checker<'a> {
         let r = self.check_expr(recv, None);
         match r.ty {
             // `str`/`slice` carry a runtime length in their `{ ptr, len }` view.
-            Ty::Str | Ty::Slice(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            Ty::Str | Ty::Slice(_) | Ty::DynArray(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
@@ -2264,7 +2331,7 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
@@ -2346,6 +2413,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
+        Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
         Ty::Str => "str".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
@@ -2960,6 +3028,37 @@ mod tests {
         // count returns i64 and needs no scalar element (a struct element is fine).
         let (_p, d) = check("fn big(x: i64) -> bool = x > 2\nE { active: bool }\nfn main() -> i32 {\n  a := [1, 2, 3].where(big).count()\n  b := [E{active: true}, E{active: false}].where(.active).count()\n  if a + b == 3 { return 1 }\n  return 0\n}\n");
         assert!(!d.has_errors(), "count should check on scalar and struct array pipelines");
+    }
+
+    #[test]
+    fn field_projection_from_slice_source_rejected() {
+        // A `slice<Struct>` parameter is constructible, but a `.field` projection needs a
+        // slot-backed source (MIR `IndexField`); projecting from a `{ptr,len}` view would
+        // miscompile, so reject it cleanly.
+        let (_p, d) = check("P { pay: i32, active: bool }\nfn total(xs: slice<P>) -> i32 = xs.pay.sum()\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "field projection from a slice source must be rejected");
+    }
+
+    #[test]
+    fn to_array_inside_arena_checks() {
+        // MMv2 slice 3: `.to_array()` inside an arena yields an owned array (consumed here).
+        let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  arena {\n    return [1, 2, 3].map(double).to_array().sum()\n  }\n}\n");
+        assert!(!d.has_errors(), "to_array inside an arena should check");
+    }
+
+    #[test]
+    fn to_array_outside_arena_rejected() {
+        // Without an arena there is no bulk-free and drop is not available yet, so reject.
+        let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  return [1, 2, 3].map(double).to_array().sum()\n}\n");
+        assert!(d.has_errors(), "to_array outside an arena must be rejected (no drop yet)");
+    }
+
+    #[test]
+    fn to_array_owned_cannot_escape_arena() {
+        // The owned array is arena-allocated (region Arena(k)); letting it escape as the arena
+        // block's value (bound outside the arena) must be rejected.
+        let (_p, d) = check("fn double(x: i32) -> i32 = x * 2\nfn main() -> i32 {\n  bad := arena {\n    [1, 2, 3].map(double).to_array()\n  }\n  return 0\n}\n");
+        assert!(d.has_errors(), "an arena-allocated owned array must not escape its arena");
     }
 
     #[test]
