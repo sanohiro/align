@@ -87,6 +87,20 @@ fn return_owned_array_via_trailing_block_expr() {
 }
 
 #[test]
+fn conditional_move_is_freed_on_both_paths() {
+    if !backend_available() {
+        return;
+    }
+    // `ys` is moved into `zs` only on the `c` branch. null-on-move means: on the moved path
+    // `ys`'s slot is nulled (its exit Drop is a no-op) and `zs` is freed once; on the not-moved
+    // path `ys` is still freed at exit. Neither path double-frees nor leaks. With `c = true`
+    // the sum flows through `zs` (== 12); the program must run cleanly to exit.
+    let src = "fn double(x: i32) -> i32 = x * 2\nfn run(c: bool) -> i32 {\n  ys := [1, 2, 3].map(double).to_array()\n  mut total := 0\n  if c {\n    zs := ys\n    total = zs.sum()\n  }\n  return total\n}\nfn main() -> i32 {\n  return run(true)\n}\n";
+    let out = build_and_run("cond-move", src);
+    assert_eq!(out.status.code(), Some(12));
+}
+
+#[test]
 fn to_array_map_only_keeps_all() {
     if !backend_available() {
         return;

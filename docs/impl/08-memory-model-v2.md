@@ -312,17 +312,18 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    arena-regioned). Now materializing terminals work anywhere. A bare owned local returned as
    the function's trailing expression (`fn make() -> array<i32> { ys := …; ys }`) is correctly
    treated as moved-out (return type is a Move type) so it is not double-freed.
-   - **Deferred to slice 4.5 (complete drop coverage)** — two *sound, bounded* leaks remain
-     (no double-free / UAF; no loops in the language yet, so leaks are process-lifetime):
-     (a) a local moved on some-but-not-all paths is excluded from `drop_locals` outright, so it
-     leaks on the not-moved path; (b) an unbound temporary owned array consumed in place
-     (`[..].to_array().sum()` with no arena) is never tracked, so its buffer leaks. The fix is
-     **null-on-move drop flags** (keep moved locals in `drop_locals`, null the slot at each move
-     site → exit `Drop` is a no-op `free(null)` when moved) plus binding consumed temporaries to
-     synthetic drop slots (or fusing the terminal so no materialization happens). Both surfaced
-     by the slice-4 Gemini review (#42).
+4.5 **[done]** **Complete drop coverage (null-on-move).** Closes the two sound-but-leaky gaps
+   the slice-4 Gemini review (#42) flagged. `drop_locals` now keeps **every** free-standing
+   owned local (the `ever_moved` exclusion is gone); MIR nulls a moved local's slot at each
+   *direct* move site (`null_moved_source` at return / let / assign / call-arg / function tail,
+   recursing through block & arena tails) so its exit `Drop` is a no-op `free(null)` when moved
+   and a real free on the path where it is not — no double-free, no leak on conditional moves.
+   Unbound `.to_array()` temporaries consumed in place (`[..].to_array().sum()` with no arena)
+   are freed right after the fold via a new MIR `DropValue` (`SrcSetup.temp_free`). Moving a
+   *bound* owned local out through an `if`/`else` arm is rejected for now (sema deferral
+   diagnostic) — codegen only nulls at direct sites; bind the `if` result to a local first.
 5. **Remaining materializing terminals.** `sort`/`partition`/`chunks`/`scan` + array-valued
-   results, each on the slice-3/4 foundation. (Fold slice 4.5 drop coverage in here or before.)
+   results, each on the slice-3/4 foundation.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
    `.clone()` to escape; **draft.md §19 runs in full** → M5 truly complete.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same

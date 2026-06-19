@@ -87,6 +87,10 @@ pub enum Stmt {
     DropFlagInit(Slot),
     /// Drop a free-standing owned `array<T>` slot: free its buffer (null-safe).
     Drop(Slot),
+    /// Free the buffer of a free-standing owned `array<T>` *value* (a `{ptr,len}` operand that
+    /// is not backed by a slot — an unbound `.to_array()` temporary consumed in place). Used to
+    /// free the materialized buffer right after the loop that consumes it (null-safe).
+    DropValue(Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -302,8 +306,14 @@ fn lower_fn(f: &hir::Fn) -> Function {
 
     let tail = lower_block(&mut b, &f.body);
     if !b.is_terminated() {
-        // Fall-through end of the body: drop owned locals (the returned value, if any owned
-        // local, was moved out and is excluded from `drop_locals`) before returning.
+        // Fall-through end of the body: if the trailing value moves an owned local out (the
+        // function returns it), null that local's slot so the exit cleanup frees null — the
+        // caller now owns the buffer — then drop the remaining owned locals.
+        if f.ret != Ty::Unit {
+            if let Some(v) = &f.body.value {
+                null_moved_source(&mut b, v);
+            }
+        }
         let tail = tail.filter(|_| f.ret != Ty::Unit);
         b.emit_exit_cleanup();
         match tail {
@@ -331,6 +341,29 @@ fn lower_fn(f: &hir::Fn) -> Function {
         value_tys: b.value_tys,
         blocks,
         entry,
+    }
+}
+
+/// Null the slot of an owned `array<T>` local moved out at a (just-lowered) consuming site,
+/// so its exit [`Stmt::Drop`] becomes a no-op `free(null)` and the buffer is freed once — by
+/// the new owner. The moved expression is a bare `Local` (null its slot) or a block/arena whose
+/// trailing value is the move (recurse into the tail). Other shapes (fresh temporaries like
+/// `make()` / `.to_array()`) own no slot, and sema rejects moving a bound owned local out
+/// through an `if`/`else` arm, so no other case reaches here. Restricted to `DynArray` slots —
+/// `box<T>` is arena-regioned and never free-standing-dropped.
+fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
+    match &e.kind {
+        hir::ExprKind::Local(id) => {
+            if matches!(b.slots.get(*id as usize), Some(Ty::DynArray(_))) {
+                b.push(Stmt::DropFlagInit(*id));
+            }
+        }
+        hir::ExprKind::Block(blk) | hir::ExprKind::Arena(blk) => {
+            if let Some(v) = &blk.value {
+                null_moved_source(b, v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -363,11 +396,14 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             _ => {
                 let op = lower_expr(b, init);
                 b.push(Stmt::Store(*local, op));
+                // If the initializer moved an owned local, null its slot (drop-flag).
+                null_moved_source(b, init);
             }
         },
         hir::Stmt::Assign { local, value } => {
             let op = lower_expr(b, value);
             b.push(Stmt::Store(*local, op));
+            null_moved_source(b, value);
         }
         hir::Stmt::AssignField { base, index, value } => {
             let op = lower_expr(b, value);
@@ -375,8 +411,11 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         }
         hir::Stmt::Return(value) => {
             let op = value.as_ref().map(|e| lower_expr(b, e));
-            // Free open arenas and drop owned locals before leaving the function. A returned
-            // owned array was moved out (excluded from `drop_locals`), so it is not freed here.
+            // A returned owned array is moved out: null its slot so the exit cleanup below frees
+            // null (the caller now owns the buffer), then free open arenas / drop owned locals.
+            if let Some(e) = value {
+                null_moved_source(b, e);
+            }
             b.emit_exit_cleanup();
             b.terminate(Term::Return(op));
             // The current block is now terminated; `lower_block` stops here, so no dead
@@ -458,6 +497,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::Call { func, args } => {
             let ops = args.iter().map(|a| lower_expr(b, a)).collect();
+            // A by-value owned-array argument is moved into the callee: null the caller's slot.
+            for a in args {
+                null_moved_source(b, a);
+            }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Call(func.clone(), ops)));
             Operand::Value(v)
@@ -669,6 +712,11 @@ struct SrcSetup {
     slice_val: Option<Operand>,
     bound: Operand,
     scalar_slot: bool,
+    /// An unbound free-standing owned-array temporary that this source materialized in place
+    /// (`[..].to_array().sum()` with no arena): its `{ptr,len}` value, to be freed by the
+    /// consuming loop once done. `None` for slots, slices, bound locals, and arena temporaries
+    /// (the latter are bulk-freed by the arena).
+    temp_free: Option<Operand>,
 }
 
 fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
@@ -678,7 +726,13 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             let sv = lower_expr(b, source);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false }
+            // A fresh `.to_array()` source with no enclosing arena heap-allocated a buffer that
+            // nothing else owns; the consuming loop must free it. (Arena temporaries and bound
+            // locals are freed elsewhere — arena bulk-free / the local's exit `Drop`.)
+            let temp_free = matches!(source.kind, hir::ExprKind::ArrayToArray { .. })
+                .then(|| b.arenas.is_empty().then(|| sv.clone()))
+                .flatten();
+            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, temp_free }
         }
         _ => {
             let (slot, n) = array_source_slot(b, source);
@@ -687,6 +741,7 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
                 slice_val: None,
                 bound: Operand::Const(Const::Int(n, i64_ty())),
                 scalar_slot: matches!(source.ty, Ty::Array(..)),
+                temp_free: None,
             }
         }
     }
@@ -701,7 +756,7 @@ fn lower_array_reduce(
     reducer: Reducer,
 ) -> Operand {
     let elem_ty = acc_ty;
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src } = setup_source(b, source);
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, temp_free } = setup_source(b, source);
 
     let acc = b.new_slot(acc_ty);
     b.push(Stmt::Store(acc, init));
@@ -822,6 +877,11 @@ fn lower_array_reduce(
     b.cur = exit;
     let r = b.fresh_value(elem_ty);
     b.push(Stmt::Let(r, Rvalue::Load(acc)));
+    // Free a free-standing `.to_array()` temporary now that the fold has consumed it. The
+    // result `r` is a scalar accumulator independent of the buffer, so this is safe.
+    if let Some(tmp) = temp_free {
+        b.push(Stmt::DropValue(tmp));
+    }
     Operand::Value(r)
 }
 
@@ -831,7 +891,9 @@ fn lower_array_reduce(
 fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty) -> Operand {
     // Inside an arena → bump-allocate (bulk-freed); otherwise → free-standing heap (dropped).
     let arena = b.arenas.last().copied();
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src } = setup_source(b, source);
+    // A collect source is an array literal / slot or a bound owned array; a nested unbound
+    // `.to_array()` source is not produced by the front end, so `temp_free` is unused here.
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, temp_free: _ } = setup_source(b, source);
 
     // Output buffer: `bound` (upper-bound = source length) elements. map/where never grow
     // the count, so the buffer never needs to be resized.
