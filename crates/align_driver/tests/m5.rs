@@ -116,6 +116,18 @@ fn json_decode_errors_on_missing_or_malformed() {
 }
 
 #[test]
+fn json_decode_float_and_mixed_scalars() {
+    if !backend_available() {
+        return;
+    }
+    // Decode f64 / f32 / i32 / bool fields together.
+    let src = "Pt { x: f64, y: f32, n: i32, on: bool }\nfn parse(s: str) -> Result<Pt, Error> {\n  p: Pt := json.decode(s)?\n  return Ok(p)\n}\nfn main() -> Result<(), Error> {\n  p := parse(\"{\\\"x\\\": 1.5, \\\"y\\\": 0.25, \\\"n\\\": 40, \\\"on\\\": true}\")?\n  print(p.x)\n  print(p.y)\n  print(p.n)\n  if p.on { print(1) }\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-float", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.5\n0.25\n40\n1\n");
+}
+
+#[test]
 fn json_decode_skips_unknown_string_value() {
     if !backend_available() {
         return;
