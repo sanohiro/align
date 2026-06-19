@@ -531,10 +531,9 @@ impl Arena {
             let addr = (base + off + align - 1) & !(align - 1);
             addr - base
         };
-        if let Some(chunk) = self.chunks.last() {
+        if let Some(chunk) = self.chunks.last_mut() {
             let off = aligned_off(chunk.as_ptr() as usize, self.off);
             if off + need <= chunk.len() {
-                let chunk = self.chunks.last_mut().unwrap();
                 let ptr = unsafe { chunk.as_mut_ptr().add(off) };
                 self.off = off + need;
                 return ptr;
