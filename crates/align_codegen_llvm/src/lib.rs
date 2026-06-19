@@ -74,10 +74,10 @@ fn build_module<'c>(
         .structs
         .iter()
         .map(|s| {
-            // Fields are scalars (sema-restricted); `scalar_type` is correct for floats
-            // (`int_type` would wrongly map them to i32).
+            // Fields are scalars or `str` (sema-restricted); `abi_type` maps each correctly
+            // (floats to their float type, `str` to the `{ ptr, len }` view).
             let fields: Vec<BasicTypeEnum> =
-                s.fields.iter().map(|f| scalar_type(ctx, f.ty)).collect();
+                s.fields.iter().map(|f| abi_type(ctx, f.ty)).collect();
             ctx.struct_type(&fields, false)
         })
         .collect();
@@ -221,6 +221,14 @@ fn build_module<'c>(
         module.add_function(
             "align_rt_builder_write_f64",
             ctx.void_type().fn_type(&[ptr.into(), ctx.f64_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_write_json_str".to_string(),
+        module.add_function(
+            "align_rt_builder_write_json_str",
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ctx.i64_type().into()], false),
             None,
         ),
     );
@@ -572,7 +580,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             },
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
             Rvalue::Field(slot, idx) => {
-                let fty = scalar_type(self.ctx, self.field_ty(*slot, *idx));
+                let fty = abi_type(self.ctx, self.field_ty(*slot, *idx));
                 let field_ptr = self.field_ptr(*slot, *idx)?;
                 self.builder
                     .build_load(fty, field_ptr, "fld")
@@ -724,7 +732,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::IndexField(slot, idx, field) => {
                 let ep = self.elem_field_ptr(*slot, idx, *field)?;
-                let ty = scalar_type(self.ctx, result_ty);
+                let ty = abi_type(self.ctx, result_ty);
                 self.builder.build_load(ty, ep, "idxfld").map_err(|e| self.err(e))?
             }
             Rvalue::MakeSlice(slot, n) => {
@@ -1045,6 +1053,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
                     self.builder
                         .build_call(self.funcs[callee], &[bptr.into(), v.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                align_mir::TemplatePiece::JsonStrHole(op) => {
+                    let agg = self.operand(op).into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "jp").map_err(|e| self.err(e))?;
+                    let len = self.builder.build_extract_value(agg, 1, "jl").map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_call(self.funcs["builder_write_json_str"], &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
             }

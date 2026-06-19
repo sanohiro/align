@@ -145,6 +145,8 @@ pub enum TemplatePiece {
     CharHole(Operand),
     /// A float hole; codegen picks f32/f64 from the operand's type.
     FloatHole(Operand),
+    /// A `str` operand emitted as a JSON string literal (quoted + escaped). From `json.encode`.
+    JsonStrHole(Operand),
 }
 
 #[derive(Clone, Debug)]
@@ -374,6 +376,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                             Ty::Float(_) => TemplatePiece::FloatHole(op),
                             _ => TemplatePiece::IntHole(op),
                         });
+                    }
+                    hir::TemplatePart::JsonStr(h) => {
+                        let op = lower_expr(b, h);
+                        pieces.push(TemplatePiece::JsonStrHole(op));
                     }
                 }
             }
