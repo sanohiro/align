@@ -144,6 +144,17 @@ fn slice_pipeline_runtime_length() {
 }
 
 #[test]
+fn slice_annotated_local_sum() {
+    if !backend_available() {
+        return;
+    }
+    // A slice-annotated local borrows the array literal (ArrayToSlice), then is summed. = 42.
+    let src = "fn main() -> i32 {\n  s: slice<i32> := [10, 20, 12]\n  return s.sum()\n}\n";
+    let out = build_and_run("slice-local-sum", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
 fn array_sum_emits_single_loop() {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "a.align", "fn main() -> i32 {\n  return [1, 2, 3].sum()\n}\n");

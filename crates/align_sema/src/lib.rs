@@ -264,6 +264,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             diags,
             region: std::collections::HashMap::new(),
             decl_depth: std::collections::HashMap::new(),
+            local_backed_slice: std::collections::HashSet::new(),
         }
         .check();
     }
@@ -281,11 +282,25 @@ struct EscapeCheck<'a> {
     region: std::collections::HashMap<LocalId, u32>,
     /// For each local, the arena depth at which it was declared.
     decl_depth: std::collections::HashMap<LocalId, u32>,
+    /// Slice locals bound to a view of *function-local* array storage (an array literal or
+    /// local array materialized in this frame). Such a slice borrows the stack frame and so
+    /// must not be returned. A slice *parameter* borrows the caller and is never in this set.
+    local_backed_slice: std::collections::HashSet<LocalId>,
 }
 
 impl<'a> EscapeCheck<'a> {
     fn check(&mut self) {
         self.block(&self.f.body, 0);
+        // The body's trailing value is the function's return value (single-expression
+        // bodies and fall-through blocks), so apply the same slice-escape check there.
+        if let Some(v) = &self.f.body.value {
+            if matches!(v.ty, Ty::Slice(_)) && self.slice_is_local(v) {
+                self.diags.error(
+                    "cannot return a slice that views a local array (it is freed when the function returns)".to_string(),
+                    v.span,
+                );
+            }
+        }
     }
 
     /// Types whose values carry an arena region and so must be escape-checked: `box<T>`
@@ -317,6 +332,24 @@ impl<'a> EscapeCheck<'a> {
         b.value.as_ref().map(|v| self.region_of(v, depth)).unwrap_or(0)
     }
 
+    /// Whether a `slice<T>`-typed expression borrows *function-local* array storage (and so
+    /// cannot be returned). An array literal / local array materializes in this frame; a
+    /// slice parameter borrows the caller (safe). A call returns a local-backed slice iff any
+    /// argument it borrows is itself local-backed (the callee can only re-borrow its args).
+    fn slice_is_local(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } => true,
+            ExprKind::Local(p) => self.local_backed_slice.contains(p),
+            ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
+            ExprKind::Block(b) => b.value.as_ref().map_or(false, |v| self.slice_is_local(v)),
+            ExprKind::If { then, els, .. } => {
+                then.value.as_ref().map_or(false, |v| self.slice_is_local(v))
+                    || els.value.as_ref().map_or(false, |v| self.slice_is_local(v))
+            }
+            _ => false,
+        }
+    }
+
     fn block(&mut self, b: &Block, depth: u32) {
         for s in &b.stmts {
             self.stmt(s, depth);
@@ -335,9 +368,19 @@ impl<'a> EscapeCheck<'a> {
                     let r = self.region_of(init, depth);
                     self.region.insert(*local, r);
                 }
+                if matches!(init.ty, Ty::Slice(_)) && self.slice_is_local(init) {
+                    self.local_backed_slice.insert(*local);
+                }
             }
             Stmt::Assign { local, value } => {
                 self.walk(value, depth);
+                if matches!(value.ty, Ty::Slice(_)) {
+                    if self.slice_is_local(value) {
+                        self.local_backed_slice.insert(*local);
+                    } else {
+                        self.local_backed_slice.remove(local);
+                    }
+                }
                 if Self::tracks_region(value.ty) {
                     let r = self.region_of(value, depth);
                     let d = *self.decl_depth.get(local).unwrap_or(&0);
@@ -357,6 +400,12 @@ impl<'a> EscapeCheck<'a> {
                 if Self::tracks_region(e.ty) && self.region_of(e, depth) >= 1 {
                     self.diags.error(
                         "cannot return a value allocated in an arena (it is freed at block end)".to_string(),
+                        e.span,
+                    );
+                }
+                if matches!(e.ty, Ty::Slice(_)) && self.slice_is_local(e) {
+                    self.diags.error(
+                        "cannot return a slice that views a local array (it is freed when the function returns)".to_string(),
                         e.span,
                     );
                 }
@@ -718,7 +767,11 @@ impl<'a> Checker<'a> {
                         ast::ExprKind::StructLit { name: sname, fields } => {
                             self.check_struct_lit(sname, fields, init.span)
                         }
-                        _ => self.check_expr(init, ann),
+                        // A slice-annotated binding borrows its array source (mirrors a call arg).
+                        _ => match ann {
+                            Some(Ty::Slice(ps)) => self.check_slice_init(init, ps),
+                            _ => self.check_expr(init, ann),
+                        },
                     };
                     let local_ty = ann.unwrap_or(init.ty);
                     let local = self.declare(&name.name, local_ty, *is_mut);
@@ -1120,22 +1173,31 @@ impl<'a> Checker<'a> {
     /// when the parameter is a `slice<T>` and the argument is a matching array.
     fn check_arg(&mut self, a: &ast::Expr, param: Option<Ty>) -> Expr {
         if let Some(Ty::Slice(ps)) = param {
-            // An inline array literal takes the slice's element type.
-            let e = match &a.kind {
-                ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, Some(scalar_to_ty(ps)), a.span),
-                _ => self.check_expr(a, None),
-            };
-            if let Ty::Array(es, _) = e.ty {
-                if es == ps {
-                    let span = e.span;
-                    return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
-                }
-            }
-            // Not an array of the right element type: let unification report the error.
-            self.constrain(e.ty, param, e.span);
-            return e;
+            return self.check_slice_init(a, ps);
         }
         self.check_expr(a, param)
+    }
+
+    /// Check an expression expected to be a `slice<T>`, applying the array → slice borrow
+    /// (`ArrayToSlice`) when the source is a matching array. Shared by call arguments and
+    /// slice-annotated `let` bindings so both produce a real slice value (not a bare array).
+    fn check_slice_init(&mut self, a: &ast::Expr, ps: Scalar) -> Expr {
+        // An inline array literal takes the slice's element type.
+        let e = match &a.kind {
+            ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, Some(scalar_to_ty(ps)), a.span),
+            _ => self.check_expr(a, None),
+        };
+        if let Ty::Array(es, _) = e.ty {
+            if es == ps {
+                let span = e.span;
+                return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
+            }
+        }
+        // Already a slice, or a mismatch: let unification report any error.
+        if e.ty != Ty::Slice(ps) {
+            self.constrain(e.ty, Some(Ty::Slice(ps)), e.span);
+        }
+        e
     }
 
     /// Builtin `print`. M1: exactly one integer argument; prints decimal + newline,
@@ -2153,6 +2215,34 @@ mod tests {
     fn arena_backed_str_cannot_escape() {
         let (_p, d) = check("fn f() -> str {\n  arena {\n    \"x\" + \"y\"\n  }\n}\nfn main() -> i32 { return 0 }\n");
         assert!(d.has_errors(), "an arena-backed str must not escape its arena");
+    }
+
+    #[test]
+    fn slice_of_local_array_cannot_be_returned() {
+        // A slice that views a stack-local array literal dies when the function returns.
+        let (_p, d) = check("fn bad() -> slice<i64> {\n  s: slice<i64> := [1, 2, 3]\n  return s\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "a slice into a local array must not escape via return");
+    }
+
+    #[test]
+    fn slice_borrowing_local_array_via_call_cannot_be_returned() {
+        // first() re-borrows its arg; returning it leaks a view into bad()'s temp array.
+        let (_p, d) = check("fn first(xs: slice<i64>) -> slice<i64> = xs\nfn bad() -> slice<i64> {\n  return first([1, 2, 3])\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(d.has_errors(), "a slice re-borrowed from a local array must not escape");
+    }
+
+    #[test]
+    fn slice_param_passthrough_returns_ok() {
+        // A slice parameter borrows the caller, so returning it (directly or re-borrowed) is fine.
+        let (_p, d) = check("fn id(xs: slice<i64>) -> slice<i64> = xs\nfn g(ys: slice<i64>) -> slice<i64> = id(ys)\n");
+        assert!(!d.has_errors(), "returning a slice parameter is safe (it borrows the caller)");
+    }
+
+    #[test]
+    fn slice_local_used_in_function_is_ok() {
+        // A slice into a local array is fine as long as it does not outlive the frame.
+        let (_p, d) = check("fn main() -> i32 {\n  s: slice<i32> := [10, 20, 12]\n  return s.sum()\n}\n");
+        assert!(!d.has_errors(), "a non-escaping slice local should check");
     }
 
     #[test]
