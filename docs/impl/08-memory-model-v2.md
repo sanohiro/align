@@ -318,10 +318,15 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    *direct* move site (`null_moved_source` at return / let / assign / call-arg / function tail,
    recursing through block & arena tails) so its exit `Drop` is a no-op `free(null)` when moved
    and a real free on the path where it is not — no double-free, no leak on conditional moves.
-   Unbound `.to_array()` temporaries consumed in place (`[..].to_array().sum()` with no arena)
-   are freed right after the fold via a new MIR `DropValue` (`SrcSetup.temp_free`). Moving a
-   *bound* owned local out through an `if`/`else` arm is rejected for now (sema deferral
-   diagnostic) — codegen only nulls at direct sites; bind the `if` result to a local first.
+   Unbound owned-array temporaries consumed in place are freed via a new MIR `DropValue`
+   (`SrcSetup.temp_free`), both after a fold (`make().sum()`) and after a collect copy
+   (`make().map(f).to_array()`). `temp_free` is set for sources that unambiguously own a fresh
+   buffer — a `.to_array()` materialization or a call returning `array<T>` — but **not** for a
+   bound `Local`/`Field` (a borrow, freed by its owner) nor for `Block`/`If` sources (which may
+   borrow a bound local in a branch, e.g. `(if c { ys } else { zs }).sum()`; blanket-freeing
+   would double-free, so those stay a sound bounded leak). Moving a *bound* owned local out
+   through an `if`/`else` arm (or `else`-unwrap fallback) is rejected for now (sema deferral
+   diagnostic) — codegen only nulls at direct sites; bind the branch result to a local first.
 5. **Remaining materializing terminals.** `sort`/`partition`/`chunks`/`scan` + array-valued
    results, each on the slice-3/4 foundation.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit

@@ -726,12 +726,17 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             let sv = lower_expr(b, source);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            // A fresh `.to_array()` source with no enclosing arena heap-allocated a buffer that
-            // nothing else owns; the consuming loop must free it. (Arena temporaries and bound
-            // locals are freed elsewhere — arena bulk-free / the local's exit `Drop`.)
-            let temp_free = matches!(source.kind, hir::ExprKind::ArrayToArray { .. })
-                .then(|| b.arenas.is_empty().then(|| sv.clone()))
-                .flatten();
+            // A source that *owns* a fresh free-standing buffer nothing else holds must be freed
+            // by the consuming loop: a `.to_array()` materialization, or a call returning an
+            // owned `array<T>` (`make().sum()` — ownership transferred to us). A bound `Local`
+            // and a struct `Field` are borrows (freed by the owner's exit `Drop`), and arena
+            // temporaries are bulk-freed, so none of those are freed here. `Block`/`If` sources
+            // may *borrow* a bound local in a branch (e.g. `(if c { ys } else { zs }).sum()`), so
+            // blanket-freeing them would double-free — they are left as a sound, bounded leak.
+            let owns_fresh =
+                matches!(source.kind, hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::Call { .. });
+            let temp_free =
+                (owns_fresh && b.arenas.is_empty()).then(|| sv.clone());
             SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, temp_free }
         }
         _ => {
@@ -891,9 +896,11 @@ fn lower_array_reduce(
 fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty) -> Operand {
     // Inside an arena → bump-allocate (bulk-freed); otherwise → free-standing heap (dropped).
     let arena = b.arenas.last().copied();
-    // A collect source is an array literal / slot or a bound owned array; a nested unbound
-    // `.to_array()` source is not produced by the front end, so `temp_free` is unused here.
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, temp_free: _ } = setup_source(b, source);
+    // A collect source can itself be a fresh unbound owned temporary (`make().map(f).to_array()`
+    // — `make()` returns an owned array nothing else holds). The copy loop consumes it into the
+    // new output buffer, so free that source temporary at the exit (the result is a separate
+    // buffer). `temp_free` is None for slots / bound locals / arena temporaries.
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, temp_free } = setup_source(b, source);
 
     // Output buffer: `bound` (upper-bound = source length) elements. map/where never grow
     // the count, so the buffer never needs to be resized.
@@ -1011,6 +1018,10 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     b.push(Stmt::Let(len, Rvalue::Load(acc)));
     let arr = b.fresh_value(Ty::DynArray(scalar_of(elem)));
     b.push(Stmt::Let(arr, Rvalue::MakeDynArray { ptr: Operand::Value(out_ptr), len: Operand::Value(len) }));
+    // Free the source temporary now its elements have been copied into the new buffer.
+    if let Some(tmp) = temp_free {
+        b.push(Stmt::DropValue(tmp));
+    }
     Operand::Value(arr)
 }
 

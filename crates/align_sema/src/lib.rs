@@ -744,7 +744,11 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
-                self.expr(fallback, moved, false, false);
+                // The fallback is an arm value: it inherits this position's `consuming` but is
+                // not a direct move site (like an `if`/`else` arm). Today Option payloads are
+                // scalar-only, so a Move-typed unwrap result is not constructible — but treating
+                // the fallback consistently keeps the analysis sound if that ever changes.
+                self.expr(fallback, moved, consuming, false);
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
             ExprKind::Block(b) | ExprKind::Arena(b) => self.block(b, moved, consuming, direct),

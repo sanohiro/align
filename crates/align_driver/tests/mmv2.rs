@@ -101,6 +101,32 @@ fn conditional_move_is_freed_on_both_paths() {
 }
 
 #[test]
+fn call_returned_owned_array_consumed_in_place() {
+    if !backend_available() {
+        return;
+    }
+    // `make()` returns a fresh owned array; consuming it in place (`make().sum()`) without
+    // binding it must free the returned buffer after the fold (no leak, no double-free).
+    // [1,2,3].map(*2) = [2,4,6]; sum = 12.
+    let src = "fn double(x: i32) -> i32 = x * 2\nfn make() -> array<i32> = [1, 2, 3].map(double).to_array()\nfn main() -> i32 {\n  return make().sum()\n}\n";
+    let out = build_and_run("call-temp-sum", src);
+    assert_eq!(out.status.code(), Some(12));
+}
+
+#[test]
+fn call_returned_owned_array_as_collect_source() {
+    if !backend_available() {
+        return;
+    }
+    // A fresh owned array (from `make()`) used as a `.to_array()` source: the collect loop
+    // copies it into a new buffer and frees the source temporary at its exit. [2,4,6].map(+1)
+    // = [3,5,7]; sum = 15.
+    let src = "fn double(x: i32) -> i32 = x * 2\nfn inc(x: i32) -> i32 = x + 1\nfn make() -> array<i32> = [1, 2, 3].map(double).to_array()\nfn main() -> i32 {\n  return make().map(inc).to_array().sum()\n}\n";
+    let out = build_and_run("call-temp-collect", src);
+    assert_eq!(out.status.code(), Some(15));
+}
+
+#[test]
 fn to_array_map_only_keeps_all() {
     if !backend_available() {
         return;
