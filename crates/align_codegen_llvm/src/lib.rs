@@ -76,8 +76,10 @@ fn build_module<'c>(
         .map(|s| {
             // Fields are scalars or `str` (sema-restricted); `abi_type` maps each correctly
             // (floats to their float type, `str` to the `{ ptr, len }` view).
+            // Fields are scalars/str only (sema-restricted), so the struct-type table is
+            // never consulted here — and it isn't built yet — so an empty table is safe.
             let fields: Vec<BasicTypeEnum> =
-                s.fields.iter().map(|f| abi_type(ctx, f.ty)).collect();
+                s.fields.iter().map(|f| abi_type(ctx, f.ty, &[])).collect();
             ctx.struct_type(&fields, false)
         })
         .collect();
@@ -283,10 +285,9 @@ fn emit_main_wrapper<'c>(
     align_main: FunctionValue<'c>,
     ret: Ty,
 ) -> Result<(), CodegenError> {
-    let (ok, err) = match ret {
-        Ty::Result(o, e) => (o, e),
-        _ => return Err(CodegenError::Lowering("main wrapper on a non-Result".into())),
-    };
+    if !matches!(ret, Ty::Result(_, _)) {
+        return Err(CodegenError::Lowering("main wrapper on a non-Result".into()));
+    }
     let lower = |e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string());
     let i32t = ctx.i32_type();
     // Returns the clamped (nonzero u8) exit code; reporting/clamping live in the runtime.
@@ -307,8 +308,7 @@ fn emit_main_wrapper<'c>(
         .basic()
         .ok_or_else(|| CodegenError::Lowering("main returned void".into()))?
         .into_struct_value();
-    let rty = result_struct_type(ctx, ok, err);
-    let _ = rty; // res already has this type
+    // `res` already has the Result aggregate type (main's payloads are () / Error).
     let tag = builder.build_extract_value(res, 0, "tag").map_err(lower)?.into_int_value();
     let is_err = builder
         .build_int_compare(IntPredicate::NE, tag, ctx.i8_type().const_int(0, false), "iserr")
@@ -356,25 +356,29 @@ fn float_type<'c>(ctx: &'c Context, ty: Ty) -> FloatType<'c> {
 
 /// LLVM type for a scalar value (int / bool / char / float); structs go through
 /// `struct_types`.
-fn scalar_type<'c>(ctx: &'c Context, ty: Ty) -> BasicTypeEnum<'c> {
+/// A scalar's LLVM type. `sx` is the struct-type table (needed when the scalar is a
+/// struct payload — `Option`/`Result` can carry a struct).
+fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnum<'c> {
     match ty {
         Ty::Float(_) => float_type(ctx, ty).into(),
+        Ty::Struct(id) => sx[id as usize].into(),
+        Ty::StructArray(id, n) => sx[id as usize].array_type(n).into(),
         _ => int_type(ctx, ty).into(),
     }
 }
 
 /// `Option<T>` lowers to `{ i8 tag, T value }` (tag 1 = Some, 0 = None).
-fn option_struct_type<'c>(ctx: &'c Context, s: Scalar) -> StructType<'c> {
-    ctx.struct_type(&[ctx.i8_type().into(), scalar_type(ctx, scalar_to_ty(s))], false)
+fn option_struct_type<'c>(ctx: &'c Context, s: Scalar, sx: &[StructType<'c>]) -> StructType<'c> {
+    ctx.struct_type(&[ctx.i8_type().into(), scalar_type(ctx, scalar_to_ty(s), sx)], false)
 }
 
 /// `Result<T, E>` lowers to `{ i8 tag, T ok, E err }` (tag 0 = Ok, 1 = Err).
-fn result_struct_type<'c>(ctx: &'c Context, ok: Scalar, err: Scalar) -> StructType<'c> {
+fn result_struct_type<'c>(ctx: &'c Context, ok: Scalar, err: Scalar, sx: &[StructType<'c>]) -> StructType<'c> {
     ctx.struct_type(
         &[
             ctx.i8_type().into(),
-            scalar_type(ctx, scalar_to_ty(ok)),
-            scalar_type(ctx, scalar_to_ty(err)),
+            scalar_type(ctx, scalar_to_ty(ok), sx),
+            scalar_type(ctx, scalar_to_ty(err), sx),
         ],
         false,
     )
@@ -385,15 +389,15 @@ fn slice_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
     ctx.struct_type(&[ctx.ptr_type(AddressSpace::default()).into(), ctx.i64_type().into()], false)
 }
 
-/// LLVM type for a function parameter/return (scalars + `Option`/`Result`/`slice`;
-/// structs/arrays are not passed by value in M1–M4).
-fn abi_type<'c>(ctx: &'c Context, ty: Ty) -> BasicTypeEnum<'c> {
+/// LLVM type for a function parameter/return (scalars + `Option`/`Result`/`slice`/`str`,
+/// and structs/struct-arrays by value).
+fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnum<'c> {
     match ty {
-        Ty::Option(s) => option_struct_type(ctx, s).into(),
-        Ty::Result(o, e) => result_struct_type(ctx, o, e).into(),
+        Ty::Option(s) => option_struct_type(ctx, s, sx).into(),
+        Ty::Result(o, e) => result_struct_type(ctx, o, e, sx).into(),
         Ty::Box(_) | Ty::ArenaHandle => ctx.ptr_type(AddressSpace::default()).into(),
         Ty::Slice(_) | Ty::Str => slice_struct_type(ctx).into(),
-        _ => scalar_type(ctx, ty),
+        _ => scalar_type(ctx, ty, sx),
     }
 }
 
@@ -405,6 +409,8 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Bool => 1,
         Scalar::Char | Scalar::ErrCode => 4,
         Scalar::Unit => 1,
+        // Only used to size a `box<T>` payload, which is always a true scalar.
+        Scalar::Struct(_) => unreachable!("a struct is not a box payload"),
     }
 }
 
@@ -436,8 +442,8 @@ fn declare_fn<'c>(
             Ty::StructArray(id, n) => struct_types[id as usize].array_type(n).into(),
             // No array-typed params/returns arise yet (arrays coerce to slices at calls),
             // but mirror `llvm_type` so it stays correct once array annotations land.
-            Ty::Array(s, n) => scalar_type(ctx, scalar_to_ty(s)).array_type(n).into(),
-            _ => abi_type(ctx, ty),
+            Ty::Array(s, n) => scalar_type(ctx, scalar_to_ty(s), struct_types).array_type(n).into(),
+            _ => abi_type(ctx, ty, struct_types),
         }
     };
     let param_types: Vec<BasicMetadataTypeEnum> =
@@ -595,7 +601,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             },
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
             Rvalue::Field(slot, idx) => {
-                let fty = abi_type(self.ctx, self.field_ty(*slot, *idx));
+                let fty = abi_type(self.ctx, self.field_ty(*slot, *idx), self.struct_types);
                 let field_ptr = self.field_ptr(*slot, *idx)?;
                 self.builder
                     .build_load(fty, field_ptr, "fld")
@@ -605,7 +611,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Option(s) = result_ty else {
                     return Err(self.err("Some result is not an Option"));
                 };
-                let oty = option_struct_type(self.ctx, s);
+                let oty = option_struct_type(self.ctx, s, self.struct_types);
                 let payload = self.operand(op);
                 let tag = self.ctx.i8_type().const_int(1, false);
                 let agg = self
@@ -624,7 +630,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     return Err(self.err("None result is not an Option"));
                 };
                 // All-zero aggregate → tag 0 (None).
-                option_struct_type(self.ctx, s).const_zero().into()
+                option_struct_type(self.ctx, s, self.struct_types).const_zero().into()
             }
             Rvalue::OptionIsSome(op) => {
                 let agg = self.operand(op).into_struct_value();
@@ -648,7 +654,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Result(o, e) = result_ty else {
                     return Err(self.err("Ok result is not a Result"));
                 };
-                let rty = result_struct_type(self.ctx, o, e);
+                let rty = result_struct_type(self.ctx, o, e, self.struct_types);
                 let tag = self.ctx.i8_type().const_int(0, false);
                 let agg = self
                     .builder
@@ -665,7 +671,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Result(o, e) = result_ty else {
                     return Err(self.err("Err result is not a Result"));
                 };
-                let rty = result_struct_type(self.ctx, o, e);
+                let rty = result_struct_type(self.ctx, o, e, self.struct_types);
                 let tag = self.ctx.i8_type().const_int(1, false);
                 let agg = self
                     .builder
@@ -734,7 +740,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 ptr.into()
             }
             Rvalue::BoxGet(op) => {
-                let ty = scalar_type(self.ctx, result_ty);
+                let ty = scalar_type(self.ctx, result_ty, self.struct_types);
                 let ptr = self.operand(op).into_pointer_value();
                 self.builder
                     .build_load(ty, ptr, "boxget")
@@ -742,12 +748,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::Index(slot, idx) => {
                 let ep = self.elem_ptr(*slot, idx)?;
-                let ty = scalar_type(self.ctx, result_ty);
+                let ty = scalar_type(self.ctx, result_ty, self.struct_types);
                 self.builder.build_load(ty, ep, "idx").map_err(|e| self.err(e))?
             }
             Rvalue::IndexField(slot, idx, field) => {
                 let ep = self.elem_field_ptr(*slot, idx, *field)?;
-                let ty = abi_type(self.ctx, result_ty);
+                let ty = abi_type(self.ctx, result_ty, self.struct_types);
                 self.builder.build_load(ty, ep, "idxfld").map_err(|e| self.err(e))?
             }
             Rvalue::MakeSlice(slot, n) => {
@@ -794,7 +800,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::SliceIndex(s, idx) => {
                 let agg = self.operand(s).into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?.into_pointer_value();
-                let ty = scalar_type(self.ctx, result_ty);
+                let ty = scalar_type(self.ctx, result_ty, self.struct_types);
                 let index = self.operand(idx).into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -807,7 +813,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Box(s) = result_ty else {
                     return Err(self.err("clone result is not a box"));
                 };
-                let ty = scalar_type(self.ctx, scalar_to_ty(s));
+                let ty = scalar_type(self.ctx, scalar_to_ty(s), self.struct_types);
                 let i64t = self.ctx.i64_type();
                 let bytes = scalar_bytes(s);
                 // Allocate a fresh box, then copy the value over.
@@ -848,13 +854,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn llvm_type(&self, ty: Ty) -> BasicTypeEnum<'c> {
         match ty {
             Ty::Struct(id) => self.struct_types[id as usize].into(),
-            Ty::Option(s) => option_struct_type(self.ctx, s).into(),
-            Ty::Result(o, e) => result_struct_type(self.ctx, o, e).into(),
+            Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types).into(),
+            Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types).into(),
             Ty::Box(_) | Ty::ArenaHandle => self.ctx.ptr_type(AddressSpace::default()).into(),
-            Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s)).array_type(n).into(),
+            Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Str => slice_struct_type(self.ctx).into(),
-            _ => scalar_type(self.ctx, ty),
+            _ => scalar_type(self.ctx, ty, self.struct_types),
         }
     }
 

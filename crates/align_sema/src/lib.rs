@@ -50,6 +50,9 @@ pub enum Scalar {
     Bool,
     Char,
     Unit,
+    /// A struct payload (the struct's id). Lets `Option`/`Result` carry a whole struct
+    /// (e.g. `Result<User, Error>` from `json.decode`). No recursion — just the id.
+    Struct(u32),
     /// The M2 `Error` type — an opaque i32 error code (placeholder for the eventual
     /// Error sum type; see `open-questions.md`).
     ErrCode,
@@ -102,6 +105,7 @@ fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Bool => Some(Scalar::Bool),
         Ty::Char => Some(Scalar::Char),
         Ty::Unit => Some(Scalar::Unit),
+        Ty::Struct(id) => Some(Scalar::Struct(id)),
         Ty::ErrCode => Some(Scalar::ErrCode),
         _ => None,
     }
@@ -114,6 +118,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Bool => Ty::Bool,
         Scalar::Char => Ty::Char,
         Scalar::Unit => Ty::Unit,
+        Scalar::Struct(id) => Ty::Struct(id),
         Scalar::ErrCode => Ty::ErrCode,
     }
 }
@@ -2421,6 +2426,15 @@ mod tests {
         assert!(!ok.has_errors(), "str == str should check");
         let (_q, bad) = check("fn f(s: str) -> bool = s < \"x\"\n");
         assert!(bad.has_errors(), "str ordering must error");
+    }
+
+    #[test]
+    fn result_option_struct_payload_checks() {
+        // A struct can be an Ok/Some payload; `?` unwraps to the struct, `else` to it too.
+        let (_p, r) = check("Pt { x: i32 }\nfn mk() -> Result<Pt, Error> {\n  p := Pt{x: 1}\n  return Ok(p)\n}\nfn main() -> Result<(), Error> {\n  q := mk()?\n  print(q.x)\n  return Ok(())\n}\n");
+        assert!(!r.has_errors(), "Result<Struct, Error> should check");
+        let (_q, o) = check("Pt { x: i32 }\nfn pick() -> Option<Pt> {\n  p := Pt{x: 1}\n  return Some(p)\n}\nfn main() -> i32 {\n  q := pick() else { return 9 }\n  return q.x\n}\n");
+        assert!(!o.has_errors(), "Option<Struct> should check");
     }
 
     #[test]
