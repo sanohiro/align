@@ -419,6 +419,12 @@ impl<'a> EscapeCheck<'a> {
             }
             // `str + str` concatenation is also built in the enclosing arena.
             ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => Region::arena(depth),
+            // A decoded struct's `str`/array fields are zero-copy views into the input buffer
+            // (MMv2 slice 6), so the struct is region-tied to that input — it cannot outlive it.
+            // Conservative: even a scalar-only decoded struct is bound to the input region (no
+            // struct-field lookup here); use `.clone()` to escape. `?` preserves the region.
+            ExprKind::JsonDecode { input, .. } => self.region_of(input, depth),
+            ExprKind::Try(inner) => self.region_of(inner, depth),
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
@@ -437,6 +443,11 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::If { then, els, .. } => {
                 self.region_of_block(then, depth).shorter(self.region_of_block(els, depth))
             }
+            // KNOWN LIMITATION: a `Call` returning a region-tracked value (a `str`/struct view
+            // that borrows an argument) is treated as `Static`, so `r := parse(arena_str)` loses
+            // the tie to the arena at the call boundary. Pre-existing (already affects any
+            // view-returning fn); closing it means propagating the shortest tracked-arg region
+            // through a `Call` (cf. `slice_is_local`). Deferred to its own slice.
             _ => Region::Static,
         }
     }
@@ -2309,13 +2320,15 @@ impl<'a> Checker<'a> {
                 return err;
             }
         };
-        // Every field must be a decodable scalar (int / float / bool). `str`/array fields
-        // need zero-copy borrow-region decode → deferred to Memory Model v2.
+        // Each field must be an int / float / bool scalar, or a `str` — a `str` decodes as a
+        // zero-copy view into the input buffer (MMv2 slice 6), so the decoded struct is
+        // region-tied to that input (see `region_of`). Array / nested-struct fields are still
+        // deferred.
         let fields = self.structs[sid as usize].fields.clone();
         for f in &fields {
-            if !matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool) {
+            if !matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str) {
                 self.diags.error(
-                    format!("'json.decode' field '{}' has type {} (only int/float/bool decode for now)", f.name, ty_name(f.ty)),
+                    format!("'json.decode' field '{}' has type {} (only int/float/bool/str decode for now)", f.name, ty_name(f.ty)),
                     span,
                 );
                 return err;
@@ -3050,9 +3063,18 @@ mod tests {
         // Without an inferable target type, decode errors.
         let (_q, noty) = check("fn main() -> i32 {\n  x := json.decode(\"{}\")\n  return 0\n}\n");
         assert!(noty.has_errors(), "json.decode needs an inferable target type");
-        // A non-int/bool field is rejected for now.
-        let (_r, badf) = check("U { name: str }\nfn parse(s: str) -> Result<U, Error> {\n  u: U := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> i32 { return 0 }\n");
-        assert!(badf.has_errors(), "a str field is not decodable yet");
+        // A `str` field now decodes as a zero-copy view (MMv2 slice 6); decoding from a param
+        // (region Static, the caller owns the buffer) and returning the struct is allowed.
+        let (_r, strf) = check("U { name: str }\nfn parse(s: str) -> Result<U, Error> {\n  u: U := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> i32 { return 0 }\n");
+        assert!(!strf.has_errors(), "a str field decodes zero-copy and is returnable from a param");
+    }
+
+    #[test]
+    fn json_decoded_str_view_cannot_escape_arena() {
+        // A `str` field decoded from an arena-allocated input is a view into that input; the
+        // decoded struct is region-tied to it, so the view cannot escape the arena.
+        let (_p, d) = check("U { id: i64, name: str }\nfn bad(key: str) -> Result<i32, Error> {\n  mut outer := \"\"\n  arena {\n    d := key + key\n    u: U := json.decode(d)?\n    outer = u.name\n  }\n  return Ok(0)\n}\nfn main() -> i32 = 0\n");
+        assert!(d.has_errors(), "a decoded str view from arena input must not escape the arena");
     }
 
     #[test]

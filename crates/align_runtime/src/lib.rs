@@ -294,6 +294,21 @@ pub unsafe extern "C" fn align_rt_json_decode(
                                     }
                                 }
                             }
+                            3 => {
+                                // str: a zero-copy `{ptr,len}` view into the input buffer.
+                                // `string()` borrows the input and rejects escapes, so its
+                                // pointer is the absolute address of the content within `src`.
+                                if w != 16 {
+                                    return None;
+                                }
+                                let s = p.string()?;
+                                let ptr_bytes = (s.as_ptr() as usize as u64).to_le_bytes();
+                                let len_bytes = (s.len() as i64).to_le_bytes();
+                                for k in 0..8 {
+                                    unsafe { *out.add(off + k) = ptr_bytes[k] };
+                                    unsafe { *out.add(off + 8 + k) = len_bytes[k] };
+                                }
+                            }
                             _ => {
                                 if w != 1 && w != 2 && w != 4 && w != 8 {
                                     return None;

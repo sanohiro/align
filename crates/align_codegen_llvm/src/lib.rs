@@ -1168,12 +1168,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .enumerate()
             .map(|(i, f)| {
                 let (name_ptr, name_len) = self.str_global(&f.name);
-                // tag = (kind << 8) | byte-width. kind: 0 = int, 1 = bool, 2 = float.
+                // tag = (kind << 8) | byte-width. kind: 0 = int, 1 = bool, 2 = float, 3 = str.
+                // A `str` field is a `{ptr,len}` view (16 bytes) written zero-copy into the input.
                 let tag: u64 = match f.ty {
                     Ty::Int(it) => (it.bits / 8) as u64,
                     Ty::Bool => (1 << 8) | 1,
                     Ty::Float(ft) => (2 << 8) | (ft.bits / 8) as u64,
-                    _ => unreachable!("json.decode field is int/float/bool (sema-checked)"),
+                    Ty::Str => (3 << 8) | 16,
+                    _ => unreachable!("json.decode field is int/float/bool/str (sema-checked)"),
                 };
                 let offset = self.target_data.offset_of_element(&sty, i as u32).unwrap_or(0);
                 desc_ty.const_named_struct(&[
