@@ -189,6 +189,10 @@ pub enum ExprKind {
     /// `init`. Yields an owned `array<A>` of survivor length. `elem` is the accumulator scalar
     /// (the output element type, `A`); `func` has type `(A, E) -> A`.
     ArrayScan { source: Box<Expr>, stages: Vec<Stage>, func: String, init: Box<Expr>, elem: crate::Ty },
+    /// `a.dot(b)` — the inner product `Σ a[i]*b[i]` of two fixed-length arrays of the same
+    /// numeric scalar element and the same (statically known) length. `elem` is that scalar;
+    /// the result has type `elem`.
+    ArrayDot { a: Box<Expr>, b: Box<Expr>, elem: crate::Ty },
     /// `source.….to_array()` — materialize the surviving (post-stage) elements into an
     /// *owned* `array<T>` (MMv2 slice 3: arena-bump-allocated). `elem` is the element
     /// scalar type; the expression `ty` is `DynArray(elem)`.
