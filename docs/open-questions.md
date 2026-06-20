@@ -279,10 +279,10 @@ Runtime / std internals (API unchanged, fast path swapped in):
 Library architecture principle (record before std is built, applies to all of std):
 - Read-oriented std APIs take/return views (str / slice / bytes), not owned copies
   (fs.read_file_view, path.base, env.get). Output APIs write into a caller-provided
-  `mut builder` sink (write_json(out: mut builder, …)) rather than returning a fresh
+  "mut builder" sink (write_json(out: mut builder, …)) rather than returning a fresh
   string. This makes zero-allocation pipelines the default and is painful to retrofit, so
-  it is a design rule for std, not an afterthought. (Digested from `library-foundations.md`,
-  `api-server-db.md`; consistent with design-notes "string philosophy".)
+  it is a design rule for std, not an afterthought. (Digested from library-foundations.md,
+  api-server-db.md; consistent with design-notes "string philosophy".)
 ```
 
 ### Domain libraries belong to `std`/`pkg`, not core (placement note)
