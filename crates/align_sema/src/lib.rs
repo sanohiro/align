@@ -2259,7 +2259,7 @@ impl<'a> Checker<'a> {
             Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
             other => {
                 self.diags
-                    .error(format!("'.clone()' is available on box<T> and str, got {}", ty_name(other)), span);
+                    .error(format!("'.clone()' is available on box<T>, str, and string, got {}", ty_name(other)), span);
                 Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
             }
         }

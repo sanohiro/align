@@ -133,6 +133,19 @@ fn str_clone_of_decoded_field_is_owned() {
 }
 
 #[test]
+fn owned_string_moved_into_callee_is_freed_once() {
+    if !backend_available() {
+        return;
+    }
+    // A `string` passed by value is *moved* into the callee, which owns and drops it (the caller
+    // nulls its slot on the move, so no double-free). Exercises that an owned-`string` *parameter*
+    // is NOT entry-null-initialised (which would clobber the incoming argument). len("hello") = 5.
+    let src = "fn consume(s: string) -> i64 = s.len()\nfn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  x := mk(\"hello\")\n  n := consume(x)\n  if n == 5 { return 0 }\n  return 1\n}\n";
+    let out = build_and_run("string-move-param", src);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
 fn json_decode_flat_struct() {
     if !backend_available() {
         return;

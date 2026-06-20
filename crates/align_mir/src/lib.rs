@@ -305,9 +305,13 @@ fn lower_fn(f: &hir::Fn) -> Function {
         b.push(Stmt::Store(slot, Operand::Arg(i as u32)));
     }
     // Null-initialise each owned-drop slot so a drop on a path that never allocated frees
-    // null (a no-op) instead of an uninitialised pointer.
+    // null (a no-op) instead of an uninitialised pointer. Parameters are excluded: they arrive
+    // already initialised (owning a valid buffer), so zeroing them would clobber the argument
+    // and leak the caller-transferred buffer.
     for s in b.drop_locals.clone() {
-        b.push(Stmt::DropFlagInit(s));
+        if !params.contains(&s) {
+            b.push(Stmt::DropFlagInit(s));
+        }
     }
 
     let tail = lower_block(&mut b, &f.body);

@@ -395,10 +395,14 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      (read `{ptr,len}` as a `str`), so a printed string stays usable; both sema's `MoveCheck` and
      MIR's null-on-move special-case `print` as non-consuming. Tested: clone escapes an arena;
      clone of a decoded field; non-cloned arena `str` still rejected; use-after-move rejected.
+     A `string` passed by value to a callee is **moved** (the callee owns and `Drop`-frees it;
+     the caller's slot is nulled on the move). An owned-`string` *parameter* is therefore NOT
+     entry-null-initialised — it arrives owning a valid buffer, and zeroing it would clobber the
+     argument (a bug fixed here; the entry `DropFlagInit` now skips parameter slots).
    - **Deferred (7b+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
-     for now — sound, just not arena-bump); passing a `string` by-value *into* a callee (today a
-     `string` arg is read as a borrow); `builder()`/`.to_string()` as the canonical constructor;
-     and `bytes`/`buffer`.
+     for now — sound, just not arena-bump); coercing a `string` to a `str` view when calling a
+     `str`-parameter callee (today the types must match — a `string` arg needs a `string` param);
+     `builder()`/`.to_string()` as the canonical constructor; and `bytes`/`buffer`.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).

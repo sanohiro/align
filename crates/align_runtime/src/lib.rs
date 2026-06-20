@@ -114,8 +114,16 @@ pub unsafe extern "C" fn align_rt_str_clone(ptr: *const u8, len: i64) -> AlignSt
     if len <= 0 {
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
+    // Validate `len` fits a `usize` before allocating/copying. On a 32-bit target an unchecked
+    // `len as usize` would truncate, so `align_rt_alloc` would size a tiny buffer while we return
+    // the full `len` — a heap out-of-bounds. After this check, both the alloc and the copy are
+    // exact (on 64-bit the check never fires).
+    let n = match usize::try_from(len) {
+        Ok(n) => n,
+        Err(_) => panic_abort("string length exceeds addressable memory"),
+    };
     let dst = align_rt_alloc(len);
-    unsafe { core::ptr::copy_nonoverlapping(ptr, dst, len as usize) };
+    unsafe { core::ptr::copy_nonoverlapping(ptr, dst, n) };
     AlignStr { ptr: dst, len }
 }
 
