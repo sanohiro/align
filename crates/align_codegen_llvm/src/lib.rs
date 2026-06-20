@@ -1021,6 +1021,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
+            Rvalue::BuilderWriteBool(bld, v) => {
+                // Widen the i1 to i32 (the runtime arg width), like `print(bool)`.
+                let b = self.operand(bld).into();
+                let val = self.operand(v).into_int_value();
+                let wide = self.builder.build_int_z_extend(val, self.ctx.i32_type(), "bext").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["builder_write_bool"], &[b, wide.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::BuilderWriteChar(bld, c) => {
+                // A `char` is a u32 scalar; the runtime emits its UTF-8.
+                let b = self.operand(bld).into();
+                let val = self.operand(c);
+                self.builder
+                    .build_call(self.funcs["builder_write_char"], &[b, val.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::BuilderWriteFloat(bld, x) => {
+                // Pick the runtime fn by float width, like `print(float)`.
+                let b = self.operand(bld).into();
+                let ty = self.f.operand_ty(x);
+                let val = self.operand(x);
+                let callee = if ty == Ty::Float(FloatTy { bits: 32 }) { "builder_write_f32" } else { "builder_write_f64" };
+                self.builder
+                    .build_call(self.funcs[callee], &[b, val.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
             Rvalue::BuilderToString(bld) => {
                 // Finish into an owned `string` `{ptr,len}` (a fresh heap buffer); the builder
                 // object is freed by the runtime.

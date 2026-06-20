@@ -428,10 +428,17 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      + buffer `free`). `b.write(owned_string)` reuses the slice-7b borrow, so the source `string`
      stays usable. Tested: build a greeting + length (e2e), borrow a `string` into `write` and an
      unfinished builder (e2e), and sema move/`to_string`-consume/wrong-arg/non-builder-receiver.
-   - **Deferred (7c+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
-     for now — sound, just not arena-bump); a `let`-position `string` → `str` borrow; the remaining
-     builder writes (`write_bool`/`write_char`/`write_float` — the runtime already has them, just
-     not surfaced); and `bytes`/`buffer`.
+   - **[done] 7d — builder scalar writers.** Surfaced `write_bool` / `write_char` / `write_float`
+     on `builder` (the runtime fns already existed for `template`), so the builder's write set
+     matches `print`/`template` scalar coverage. `BuilderWriteKind` gains `Bool`/`Char`/`Float`;
+     `check_builder_write` dispatches by method name (`builder_write_kind`) and validates the arg's
+     scalar (no implicit int→float — `write_float(3)` is rejected). codegen mirrors `print`'s
+     widening: `write_bool` zexts i1→i32, `write_char` passes the u32, `write_float` picks
+     `f32`/`f64` by operand width. Tested e2e (all kinds in one builder) + sema (each accepts its
+     scalar, rejects a mismatch).
+   - **Deferred (7d+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
+     for now — sound, just not arena-bump); a `let`-position `string` → `str` borrow; and
+     `bytes`/`buffer`.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).
