@@ -390,20 +390,31 @@ impl<'a> EscapeCheck<'a> {
     fn check(&mut self) {
         self.block(&self.f.body, 0);
         // The body's trailing value is the function's return value (single-expression
-        // bodies and fall-through blocks), so apply the same slice-escape check there.
+        // bodies and fall-through blocks), so apply the same escape check there.
         if let Some(v) = &self.f.body.value {
-            if Self::tracks_region(v.ty) && !self.region_of(v, 0).outlives(Region::Static) {
-                self.diags.error(
-                    "cannot return a value allocated in an arena (it is freed at block end)".to_string(),
-                    v.span,
-                );
-            }
-            if matches!(v.ty, Ty::Slice(_)) && self.slice_is_local(v) {
-                self.diags.error(
-                    "cannot return a slice that views a local array (it is freed when the function returns)".to_string(),
-                    v.span,
-                );
-            }
+            self.check_return_escape(v, 0);
+        }
+    }
+
+    /// Escape check for a returned value `e` (an explicit `return` or a body's trailing value):
+    /// a region-tracked value must be `Static` (returnable), and a `slice` must not view a local
+    /// array. The region-tracked diagnostic distinguishes a `Frame` borrow of local storage (use
+    /// `.clone()`) from an arena allocation.
+    fn check_return_escape(&mut self, e: &Expr, depth: u32) {
+        let r = self.region_of(e, depth);
+        if Self::tracks_region(e.ty) && !r.outlives(Region::Static) {
+            let msg = if r == Region::Frame {
+                "cannot return a view that borrows local storage (it is freed when the function returns); use `.clone()` to return an owned value"
+            } else {
+                "cannot return a value allocated in an arena (it is freed at block end)"
+            };
+            self.diags.error(msg.to_string(), e.span);
+        }
+        if matches!(e.ty, Ty::Slice(_)) && self.slice_is_local(e) {
+            self.diags.error(
+                "cannot return a slice that views a local array (it is freed when the function returns)".to_string(),
+                e.span,
+            );
         }
     }
 
@@ -590,23 +601,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(e, depth);
                 // A returned value escapes to the caller (`Static`): only a `Static`-region
                 // value may be returned (an arena/frame view cannot).
-                let r = self.region_of(e, depth);
-                if Self::tracks_region(e.ty) && !r.outlives(Region::Static) {
-                    let msg = if r == Region::Frame {
-                        // A borrow of this frame's storage (e.g. a `str` view of a local `string`):
-                        // its buffer is freed when the function returns. `.clone()` to escape.
-                        "cannot return a view that borrows local storage (it is freed when the function returns); use `.clone()` to return an owned value"
-                    } else {
-                        "cannot return a value allocated in an arena (it is freed at block end)"
-                    };
-                    self.diags.error(msg.to_string(), e.span);
-                }
-                if matches!(e.ty, Ty::Slice(_)) && self.slice_is_local(e) {
-                    self.diags.error(
-                        "cannot return a slice that views a local array (it is freed when the function returns)".to_string(),
-                        e.span,
-                    );
-                }
+                self.check_return_escape(e, depth);
             }
             Stmt::Return(None) => {}
             Stmt::Expr(e) => self.walk(e, depth),
@@ -3511,9 +3506,13 @@ mod tests {
     #[test]
     fn str_let_borrow_returned_escapes() {
         // The let-bound borrow is `Frame`-regioned: returning it (the buffer is freed at exit) is
-        // rejected with the borrow-specific diagnostic.
+        // rejected with the borrow-specific diagnostic — both via explicit `return` and as a
+        // block's trailing (fall-through) value.
         let (_p, d) = check("fn mk(a: str) -> string = a.clone()\nfn leak() -> str {\n  owned := mk(\"x\")\n  view: str := owned\n  return view\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "returning a str that borrows a local string must be rejected");
+        // Fall-through (trailing-value) return path — same rejection.
+        let (_q, d2) = check("fn mk(a: str) -> string = a.clone()\nfn leak() -> str {\n  owned := mk(\"x\")\n  view: str := owned\n  view\n}\nfn main() -> i32 = 0\n");
+        assert!(d2.has_errors(), "a trailing-value str borrow of a local string must also be rejected");
     }
 
     #[test]
