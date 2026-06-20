@@ -422,10 +422,16 @@ impl<'a> EscapeCheck<'a> {
             // Allocating producers are bound to the enclosing arena (Static outside any arena,
             // where the result is leaked / process-lifetime and safe to return).
             ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => Region::arena(depth),
-            // `.to_array()` bump-allocates the owned array in the enclosing arena.
-            ExprKind::ArrayToArray { .. } | ExprKind::ArrayScan { .. } | ExprKind::ArraySort { .. } => {
-                Region::arena(depth)
-            }
+            // `.to_array()` bump-allocates the owned array in the enclosing arena. `reduce` folds
+            // its accumulator there too — when that accumulator is region-tracked (a `str` built by
+            // concatenation, a struct), the result lives in the enclosing arena and must not escape
+            // it. `arena(depth)` is the shortest-lived (most restrictive) region anything allocated
+            // at this depth can have, so it conservatively covers an accumulator that instead just
+            // forwards `init` or borrows a source element (both outlive `arena(depth)`).
+            ExprKind::ArrayToArray { .. }
+            | ExprKind::ArrayScan { .. }
+            | ExprKind::ArraySort { .. }
+            | ExprKind::ArrayReduce { .. } => Region::arena(depth),
             // `str + str` concatenation is also built in the enclosing arena.
             ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => Region::arena(depth),
             // A decoded struct's `str`/array fields are zero-copy views into the input buffer
@@ -3243,6 +3249,23 @@ mod tests {
         // are literals (Static) yields a Static result, so it stays returnable — no false reject.
         let (_p, d) = check("fn dup(s: str) -> str = s\nfn ok() -> str = dup(\"hi\")\nfn main() -> i32 = 0\n");
         assert!(!d.has_errors(), "a call on a static-region arg should stay returnable");
+    }
+
+    #[test]
+    fn reduce_str_accumulator_cannot_escape_arena() {
+        // `reduce`'s accumulator is folded in the enclosing arena; when it is region-tracked (a
+        // `str` built by concatenation), returning it out of the arena must be rejected (the
+        // accumulator buffer is freed at arena end → use-after-free).
+        let (_p, d) = check("fn build(a: str, e: i64) -> str = a + \"?\"\nfn leak() -> str {\n  arena {\n    ns := [1, 2, 3]\n    return ns.reduce(build, \"\")\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(d.has_errors(), "a str reduce accumulator built in an arena must not escape it");
+    }
+
+    #[test]
+    fn reduce_scalar_accumulator_returns_ok() {
+        // A scalar reduce result carries no region (it is Copy), so folding inside an arena and
+        // returning the scalar is fine — the arena region must not leak onto plain scalars.
+        let (_p, d) = check("fn add(a: i64, e: i64) -> i64 = a + e\nfn total() -> i64 {\n  arena {\n    ns := [1, 2, 3]\n    return ns.reduce(add, 0)\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(!d.has_errors(), "a scalar reduce accumulator carries no region and may be returned");
     }
 
     #[test]

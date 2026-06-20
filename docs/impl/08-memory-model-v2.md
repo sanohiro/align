@@ -373,6 +373,13 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      function that does *not* return a borrow of its args is over-restricted (precise per-fn
      "returns a borrow of arg i" inference is a later slice) — but sound. Non-tracked args
      (ints/literals) are `Static` and don't shorten, so `dup("hi")` stays returnable.
+     - **`reduce` accumulator region (same fix).** A sibling gap: `region_of(ArrayReduce)` was
+       `Static`, so a `reduce` whose accumulator is region-tracked (a `str` built by concatenation
+       in the fold) could escape the arena it was folded in → use-after-free. `reduce` now joins
+       `to_array`/`scan`/`sort` at `Region::arena(depth)` (the accumulator is folded in the
+       enclosing arena). Scalar accumulators are unaffected (no region). (Note: the precise region
+       is `arena(depth)`, not `shorter(init, source)` — an empty/all-`Static`-arg reduce still
+       allocates its fresh accumulator at `depth`.)
    - **Deferred:** `str.clone()` to escape; array / nested-struct field decode; and precise
      per-fn borrow inference (which arg, if any, a call result actually borrows) to lift the
      conservatism of 6b.
