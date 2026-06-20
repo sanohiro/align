@@ -436,9 +436,20 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      widening: `write_bool` zexts i1→i32, `write_char` passes the u32, `write_float` picks
      `f32`/`f64` by operand width. Tested e2e (all kinds in one builder) + sema (each accepts its
      scalar, rejects a mismatch).
-   - **Deferred (7d+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
-     for now — sound, just not arena-bump); a `let`-position `string` → `str` borrow; and
-     `bytes`/`buffer`.
+   - **[done] 7e — `let`/assign-position `string` → `str` borrow.** Extended the slice-7b borrow
+     coercion (call arguments only) to `str`-annotated `let` bindings (`view: str := owned`) and
+     `str`-place assignments (`view = owned`), via a shared `check_str_init` helper (mirrors how
+     `check_slice_init` serves both call args and slice-annotated lets). The borrow is `Frame`-
+     regioned, so returning a `let`-bound `str` view of a local `string` is rejected — now with a
+     borrow-specific diagnostic ("…borrows local storage…; use `.clone()`…") split from the arena
+     message. Also fixed a latent bug this surfaced: the `Stmt::Assign` escape check used
+     `target = arena(decl_depth)` (= `Static` at depth 0), wrongly rejecting a `Frame` borrow
+     assigned to a frame-local binding; the target is now `Frame.shorter(arena(decl_depth))`
+     (escape past the frame is still caught by the return / struct-field-store checks; a deeper
+     arena value into a shallower binding stays rejected).
+   - **Deferred (7e+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
+     for now — sound, just not arena-bump); and `bytes`/`buffer` (the spec defines only the type
+     names + one-line roles so far — surface API to be fleshed out in the spec first).
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).

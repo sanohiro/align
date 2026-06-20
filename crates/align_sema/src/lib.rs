@@ -555,7 +555,13 @@ impl<'a> EscapeCheck<'a> {
                 }
                 if Self::tracks_region(value.ty) {
                     let r = self.region_of(value, depth);
-                    let target = Region::arena(*self.decl_depth.get(local).unwrap_or(&0));
+                    // The binding's scope: at least the frame (a depth-0 binding lives the whole
+                    // frame, region `Frame`), or the enclosing arena if declared inside one. Using
+                    // `Frame` rather than `Static` here lets a `Frame`-region borrow (a `str` view
+                    // of a local `string`, slice 7e) be held by a frame binding — escape past the
+                    // frame is still caught by the return / struct-field-store checks. A deeper
+                    // arena value assigned to a shallower binding stays rejected.
+                    let target = Region::Frame.shorter(Region::arena(*self.decl_depth.get(local).unwrap_or(&0)));
                     if !r.outlives(target) {
                         self.diags.error(
                             "this value is bound to an arena block and cannot escape it".to_string(),
@@ -584,11 +590,16 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(e, depth);
                 // A returned value escapes to the caller (`Static`): only a `Static`-region
                 // value may be returned (an arena/frame view cannot).
-                if Self::tracks_region(e.ty) && !self.region_of(e, depth).outlives(Region::Static) {
-                    self.diags.error(
-                        "cannot return a value allocated in an arena (it is freed at block end)".to_string(),
-                        e.span,
-                    );
+                let r = self.region_of(e, depth);
+                if Self::tracks_region(e.ty) && !r.outlives(Region::Static) {
+                    let msg = if r == Region::Frame {
+                        // A borrow of this frame's storage (e.g. a `str` view of a local `string`):
+                        // its buffer is freed when the function returns. `.clone()` to escape.
+                        "cannot return a view that borrows local storage (it is freed when the function returns); use `.clone()` to return an owned value"
+                    } else {
+                        "cannot return a value allocated in an arena (it is freed at block end)"
+                    };
+                    self.diags.error(msg.to_string(), e.span);
                 }
                 if matches!(e.ty, Ty::Slice(_)) && self.slice_is_local(e) {
                     self.diags.error(
@@ -1080,9 +1091,11 @@ impl<'a> Checker<'a> {
                         ast::ExprKind::StructLit { name: sname, fields } => {
                             self.check_struct_lit(sname, fields, init.span)
                         }
-                        // A slice-annotated binding borrows its array source (mirrors a call arg).
+                        // A slice/str-annotated binding borrows its source (mirrors a call arg):
+                        // `slice<T>` borrows an array, `str` borrows an owned `string`.
                         _ => match ann {
                             Some(Ty::Slice(ps)) => self.check_slice_init(init, ps),
+                            Some(Ty::Str) => self.check_str_init(init),
                             _ => self.check_expr(init, ann),
                         },
                     };
@@ -1102,9 +1115,10 @@ impl<'a> Checker<'a> {
                 }
                 ast::Stmt::Assign { place, value } => match self.check_place(place) {
                     Place::Local { id, ty } => {
-                        // Mirror the `let` path: a slice place borrows its array source.
+                        // Mirror the `let` path: a slice/str place borrows its source.
                         let v = match ty {
                             Ty::Slice(ps) => self.check_slice_init(value, ps),
+                            Ty::Str => self.check_str_init(value),
                             _ => self.check_expr(value, Some(ty)),
                         };
                         stmts.push(Stmt::Assign { local: id, value: v });
@@ -1480,19 +1494,27 @@ impl<'a> Checker<'a> {
         if let Some(Ty::Slice(ps)) = param {
             return self.check_slice_init(a, ps);
         }
-        // A `str` parameter accepts an owned `string` by borrowing it as a `{ptr,len}` view
-        // (MMv2 slice 7b): zero-cost (same layout), non-consuming (the `string` stays owned by
-        // its slot). Pass `None` first so the argument types as `string`, then wrap the borrow.
         if let Some(Ty::Str) = param {
-            let e = self.check_expr(a, None);
-            if e.ty == Ty::String {
-                let span = e.span;
-                return Expr { kind: ExprKind::StrBorrow(Box::new(e)), ty: Ty::Str, span };
-            }
-            self.constrain(e.ty, param, e.span);
-            return e;
+            return self.check_str_init(a);
         }
         self.check_expr(a, param)
+    }
+
+    /// Check an expression expected to be a `str`, applying the `string` → `str` borrow
+    /// (`StrBorrow`) when the source is an owned `string` (MMv2 slice 7b/7e): zero-cost (same
+    /// `{ptr,len}` layout), non-consuming (the `string` stays owned by its slot). Shared by call
+    /// arguments, `str`-annotated `let` bindings, and `str`-place assignments. Pass `None` first so
+    /// the source types as `string`, then wrap the borrow.
+    fn check_str_init(&mut self, a: &ast::Expr) -> Expr {
+        let e = self.check_expr(a, None);
+        if e.ty == Ty::String {
+            let span = e.span;
+            return Expr { kind: ExprKind::StrBorrow(Box::new(e)), ty: Ty::Str, span };
+        }
+        if e.ty != Ty::Str {
+            self.constrain(e.ty, Some(Ty::Str), e.span);
+        }
+        e
     }
 
     /// Check an expression expected to be a `slice<T>`, applying the array → slice borrow
@@ -3473,6 +3495,25 @@ mod tests {
         // fine — unlike passing it to a `string` parameter (which moves).
         let (_p, d) = check("fn show(s: str) -> i64 = s.len()\nfn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  a := show(s)\n  b := show(s)\n  return 0\n}\n");
         assert!(!d.has_errors(), "borrowing a string as a str arg must not move it");
+    }
+
+    #[test]
+    fn string_borrows_into_str_let_and_assign() {
+        // MMv2 slice 7e: a `str`-annotated let borrows an owned `string` (non-consuming), so the
+        // source stays usable.
+        let (_p, d) = check("fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  owned := mk(\"x\")\n  view: str := owned\n  print(view)\n  print(owned.len())\n  return 0\n}\n");
+        assert!(!d.has_errors(), "borrowing a string into a str let must check and not move it");
+        // A `str` place assignment borrows the same way.
+        let (_q, d2) = check("fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  owned := mk(\"x\")\n  mut view: str := \"\"\n  view = owned\n  print(view)\n  print(owned.len())\n  return 0\n}\n");
+        assert!(!d2.has_errors(), "borrowing a string into a str place assignment must check");
+    }
+
+    #[test]
+    fn str_let_borrow_returned_escapes() {
+        // The let-bound borrow is `Frame`-regioned: returning it (the buffer is freed at exit) is
+        // rejected with the borrow-specific diagnostic.
+        let (_p, d) = check("fn mk(a: str) -> string = a.clone()\nfn leak() -> str {\n  owned := mk(\"x\")\n  view: str := owned\n  return view\n}\nfn main() -> i32 = 0\n");
+        assert!(d.has_errors(), "returning a str that borrows a local string must be rejected");
     }
 
     #[test]
