@@ -441,21 +441,14 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicType
 
 /// Field indices of an `Option`/`Result` aggregate whose payload is an owned (Move) type and
 /// must be freed when the aggregate is dropped (MMv2 slice 8a). Some/Ok = field 1, Err = field 2.
-fn move_payload_fields(ty: Ty) -> Vec<u32> {
-    match ty {
-        Ty::Option(s) if s.is_move() => vec![1],
-        Ty::Result(o, e) => {
-            let mut v = Vec::new();
-            if o.is_move() {
-                v.push(1);
-            }
-            if e.is_move() {
-                v.push(2);
-            }
-            v
-        }
-        _ => Vec::new(),
-    }
+/// Allocation-free (≤ 2 indices).
+fn move_payload_fields(ty: Ty) -> impl Iterator<Item = u32> {
+    let (ok, err) = match ty {
+        Ty::Option(s) => (s.is_move().then_some(1), None),
+        Ty::Result(o, e) => (o.is_move().then_some(1), e.is_move().then_some(2)),
+        _ => (None, None),
+    };
+    ok.into_iter().chain(err)
 }
 
 /// `Option<T>` lowers to `{ i8 tag, T value }` (tag 1 = Some, 0 = None).

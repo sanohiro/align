@@ -2986,11 +2986,17 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
                     return Ty::Error;
                 }
             };
-            // `scalar_arg` now also accepts a struct (a valid Option/Result payload), but a
-            // box payload must be a true scalar (codegen can't size a struct box) — reject it.
+            // `scalar_arg` accepts structs and owned `string` (valid Option/Result payloads), but
+            // a box payload must be a true primitive scalar: codegen can't size a struct box, and
+            // a Move payload (`string`) has no `box` drop story. Reject both with a clean
+            // diagnostic (else `box<string>`/`box<Struct>` would type-check then panic in codegen).
             match scalar_arg(inner, "box payload", t.span, diags) {
                 Some(Scalar::Struct(_)) => {
                     diags.error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), t.span);
+                    Ty::Error
+                }
+                Some(s) if s.is_move() => {
+                    diags.error(format!("a box payload must be a primitive scalar (an owned `{}` cannot be boxed)", scalar_name(s)), t.span);
                     Ty::Error
                 }
                 Some(s) => Ty::Box(s),
@@ -3557,6 +3563,15 @@ mod tests {
     fn option_string_payload_checks() {
         let (_p, d) = check("fn first() -> Option<string> = Some(\"x\".clone())\nfn main() -> i32 {\n  s := first() else { return 9 }\n  print(s)\n  return 0\n}\n");
         assert!(!d.has_errors(), "Option<string> construct + else-unwrap should check");
+    }
+
+    #[test]
+    fn box_string_payload_rejected_cleanly() {
+        // `string` is now a scalar (slice 8a), so `box<string>` must be rejected in sema with a
+        // clean diagnostic — not type-check and then panic in codegen (the box payload guard must
+        // cover Move scalars, like it already covers structs).
+        let (_p, d) = check("fn main() -> i32 {\n  arena {\n    p: box<string> := heap.new(\"x\".clone())\n    return 0\n  }\n}\n");
+        assert!(d.has_errors(), "box<string> must be rejected (an owned string cannot be boxed)");
     }
 
     #[test]
