@@ -455,6 +455,11 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.region_of(opt, depth).shorter(self.region_of(fallback, depth))
             }
+            // A `str` borrow of an owned `string` (slice 7b) views storage owned by *this* frame
+            // (the `string` is `Drop`-freed at frame exit), so the view is `Frame`-regioned — it
+            // must not escape the frame. This feeds `region_of(Call)`: passing a borrowed string
+            // to a function that returns a borrow of its argument correctly blocks the escape.
+            ExprKind::StrBorrow(_) => Region::Frame,
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
@@ -631,7 +636,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.walk(source, depth);
@@ -784,7 +789,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
@@ -1449,6 +1454,18 @@ impl<'a> Checker<'a> {
     fn check_arg(&mut self, a: &ast::Expr, param: Option<Ty>) -> Expr {
         if let Some(Ty::Slice(ps)) = param {
             return self.check_slice_init(a, ps);
+        }
+        // A `str` parameter accepts an owned `string` by borrowing it as a `{ptr,len}` view
+        // (MMv2 slice 7b): zero-cost (same layout), non-consuming (the `string` stays owned by
+        // its slot). Pass `None` first so the argument types as `string`, then wrap the borrow.
+        if let Some(Ty::Str) = param {
+            let e = self.check_expr(a, None);
+            if e.ty == Ty::String {
+                let span = e.span;
+                return Expr { kind: ExprKind::StrBorrow(Box::new(e)), ty: Ty::Str, span };
+            }
+            self.constrain(e.ty, param, e.span);
+            return e;
         }
         self.check_expr(a, param)
     }
@@ -2649,7 +2666,7 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
@@ -3308,6 +3325,24 @@ mod tests {
         assert!(!d.has_errors(), "moving a string into a new binding and using the new one is fine");
         let (_q, d2) = check("fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  t := s\n  return s.len()\n}\n");
         assert!(d2.has_errors(), "using a string after it was moved must be rejected");
+    }
+
+    #[test]
+    fn string_borrows_as_str_arg_without_moving() {
+        // MMv2 slice 7b: passing an owned `string` to a `str` parameter *borrows* it (zero-cost,
+        // same `{ptr,len}` layout). The borrow does not consume the string, so a later use is
+        // fine — unlike passing it to a `string` parameter (which moves).
+        let (_p, d) = check("fn show(s: str) -> i64 = s.len()\nfn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  a := show(s)\n  b := show(s)\n  return 0\n}\n");
+        assert!(!d.has_errors(), "borrowing a string as a str arg must not move it");
+    }
+
+    #[test]
+    fn string_borrow_returned_as_str_view_escapes() {
+        // The borrow is `Frame`-regioned: a function that returns a borrow of its `str` arg, when
+        // fed a borrowed `string`, would dangle (the string is freed at frame exit). The
+        // call-result region tie (slice 6b) must catch this through the borrow.
+        let (_p, d) = check("fn id(s: str) -> str = s\nfn mk(a: str) -> string = a.clone()\nfn leak() -> str {\n  owned := mk(\"x\")\n  return id(owned)\n}\nfn main() -> i32 = 0\n");
+        assert!(d.has_errors(), "returning a str borrow of a frame-owned string must be rejected");
     }
 
     #[test]

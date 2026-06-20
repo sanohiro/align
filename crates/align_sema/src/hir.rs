@@ -169,6 +169,12 @@ pub enum ExprKind {
     /// slice 7). The result owns its buffer (`Drop`-freed), so it can escape its source's
     /// region — the explicit escape hatch out of a zero-copy view.
     StrClone(Box<Expr>),
+    /// Borrow an owned `string` as a `str` view (MMv2 slice 7b). The two share the `{ptr,len}`
+    /// layout, so this is a zero-cost, allocation-free read-only view — an implicit coercion at
+    /// a `str`-parameter call site. The `string` is **not** moved (it stays owned by its slot
+    /// and is `Drop`-freed by its owner); the view borrows it, so it is `Frame`-regioned and
+    /// must not outlive the frame holding the `string`.
+    StrBorrow(Box<Expr>),
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
     ArrayLit { elems: Vec<Expr>, elem: crate::Ty },

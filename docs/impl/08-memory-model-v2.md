@@ -399,9 +399,21 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      the caller's slot is nulled on the move). An owned-`string` *parameter* is therefore NOT
      entry-null-initialised — it arrives owning a valid buffer, and zeroing it would clobber the
      argument (a bug fixed here; the entry `DropFlagInit` now skips parameter slots).
-   - **Deferred (7b+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
-     for now — sound, just not arena-bump); coercing a `string` to a `str` view when calling a
-     `str`-parameter callee (today the types must match — a `string` arg needs a `string` param);
+   - **[done] 7b — `string` → `str` borrow coercion.** An owned `string` argument now satisfies a
+     `str` parameter by *borrowing* it (`ExprKind::StrBorrow`): the two share the `{ptr,len}`
+     layout, so the coercion is zero-cost (MIR lowers it to its inner load; no new runtime/codegen).
+     The borrow is **non-consuming** — sema's `MoveCheck` treats `StrBorrow` like the other read-only
+     receivers and MIR does not null the source slot — so the `string` stays owned by its slot and is
+     `Drop`-freed once at exit, usable across multiple borrows (`a := show(s); b := show(s)`). The
+     view is **`Frame`-regioned** (`region_of(StrBorrow) = Frame`): it borrows storage the current
+     frame `Drop`-frees, so a function returning a borrow of its `str` arg, fed a borrowed `string`,
+     is correctly rejected as an escape (via the slice-6b call-result region tie). Applied at call
+     arguments only (`check_arg`); a `let s: str := some_string` borrow is a follow-on. As with 6b,
+     the call-result tie is conservative — a `str`-param callee that returns a *fresh owned* `string`
+     is over-restricted when fed a borrowed `string` (use `.clone()`); precise per-fn borrow
+     inference is the lift.
+   - **Deferred (7c+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
+     for now — sound, just not arena-bump); a `let`-position `string` → `str` borrow;
      `builder()`/`.to_string()` as the canonical constructor; and `bytes`/`buffer`.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
