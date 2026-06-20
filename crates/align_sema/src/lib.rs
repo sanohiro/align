@@ -59,6 +59,12 @@ pub enum Scalar {
     /// `?` / `else` unwrap. Lets a fallible function return an owned string
     /// (`fn f() -> Result<string, Error>`). Kept var-free (`Scalar: Copy`) — it carries no inner.
     String,
+    /// An owned `array<T>` payload (MMv2 slice 8b), the owned-collection dual of [`Scalar::String`]
+    /// — same `{ptr,len}` layout, Move, dropped/moved as a unit. Lets a fallible function return an
+    /// owned array (`fn f() -> Result<array<i64>, Error>`). The element is a [`PrimScalar`] (not a
+    /// full [`Scalar`]) so the variant stays non-recursive and `Copy`; owned arrays only ever hold
+    /// primitive elements today (struct/dynamic-array elements are a later capability).
+    DynArray(PrimScalar),
     /// The M2 `Error` type — an opaque i32 error code (placeholder for the eventual
     /// Error sum type; see `open-questions.md`).
     ErrCode,
@@ -66,9 +72,42 @@ pub enum Scalar {
 
 impl Scalar {
     /// Whether this payload scalar is an owned **Move** type (a heap buffer that the enclosing
-    /// `Option`/`Result` owns and must drop / move out). Today: `string` (MMv2 slice 8a).
+    /// `Option`/`Result` owns and must drop / move out). Today: `string` (8a), `array<T>` (8b).
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String)
+        matches!(self, Scalar::String | Scalar::DynArray(_))
+    }
+}
+
+/// The element of an owned-`array<T>` payload ([`Scalar::DynArray`]). A primitive scalar only —
+/// a deliberately small, `Copy`, **non-recursive** subset of [`Scalar`] so an `array` can sit
+/// inside an `Option`/`Result` payload without making [`Scalar`]/[`Ty`] recursive (MMv2 slice 8b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimScalar {
+    Int(IntTy),
+    Float(FloatTy),
+    Bool,
+    Char,
+}
+
+/// A [`PrimScalar`] as a full [`Scalar`] (the array element type).
+pub fn prim_to_scalar(p: PrimScalar) -> Scalar {
+    match p {
+        PrimScalar::Int(it) => Scalar::Int(it),
+        PrimScalar::Float(ft) => Scalar::Float(ft),
+        PrimScalar::Bool => Scalar::Bool,
+        PrimScalar::Char => Scalar::Char,
+    }
+}
+
+/// A [`Scalar`] as a [`PrimScalar`] if it is a primitive (the only valid `array` element today);
+/// `None` for struct / string / array / unit / error elements.
+pub fn scalar_to_prim(s: Scalar) -> Option<PrimScalar> {
+    match s {
+        Scalar::Int(it) => Some(PrimScalar::Int(it)),
+        Scalar::Float(ft) => Some(PrimScalar::Float(ft)),
+        Scalar::Bool => Some(PrimScalar::Bool),
+        Scalar::Char => Some(PrimScalar::Char),
+        _ => None,
     }
 }
 
@@ -135,6 +174,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Unit => Some(Scalar::Unit),
         Ty::Struct(id) => Some(Scalar::Struct(id)),
         Ty::String => Some(Scalar::String),
+        // An owned `array<T>` is a payload only when its element is primitive (slice 8b).
+        Ty::DynArray(elem) => scalar_to_prim(elem).map(Scalar::DynArray),
         Ty::ErrCode => Some(Scalar::ErrCode),
         _ => None,
     }
@@ -149,6 +190,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Unit => Ty::Unit,
         Scalar::Struct(id) => Ty::Struct(id),
         Scalar::String => Ty::String,
+        Scalar::DynArray(elem) => Ty::DynArray(prim_to_scalar(elem)),
         Scalar::ErrCode => Ty::ErrCode,
     }
 }
@@ -3563,6 +3605,24 @@ mod tests {
     fn option_string_payload_checks() {
         let (_p, d) = check("fn first() -> Option<string> = Some(\"x\".clone())\nfn main() -> i32 {\n  s := first() else { return 9 }\n  print(s)\n  return 0\n}\n");
         assert!(!d.has_errors(), "Option<string> construct + else-unwrap should check");
+    }
+
+    #[test]
+    fn result_and_option_array_payload_checks() {
+        // MMv2 slice 8b: `Result<array<i64>, Error>` / `Option<array<i64>>` are representable; an
+        // owned array is returnable through them and `?`/`else` unwrap to the owned array.
+        let (_p, d) = check("fn mk() -> Result<array<i64>, Error> = Ok([1, 2, 3].to_array())\nfn use() -> Result<i64, Error> {\n  xs := mk()?\n  return Ok(xs.sum())\n}\nfn main() -> i32 = 0\n");
+        assert!(!d.has_errors(), "Result<array<i64>,Error> construct/return/unwrap should check");
+        let (_q, d2) = check("fn first() -> Option<array<i64>> = Some([1, 2].to_array())\nfn main() -> i32 {\n  xs := first() else { return 9 }\n  print(xs.sum())\n  return 0\n}\n");
+        assert!(!d2.has_errors(), "Option<array<i64>> construct + else-unwrap should check");
+    }
+
+    #[test]
+    fn box_array_payload_rejected_cleanly() {
+        // Like `box<string>`, an owned `array` is a Move scalar and cannot be boxed — rejected in
+        // sema (not a codegen panic).
+        let (_p, d) = check("fn main() -> i32 {\n  arena {\n    p: box<array<i64>> := heap.new([1].to_array())\n    return 0\n  }\n}\n");
+        assert!(d.has_errors(), "box<array<T>> must be rejected (an owned array cannot be boxed)");
     }
 
     #[test]

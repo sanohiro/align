@@ -499,6 +499,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         // Only used to size a `box<T>` payload, which is always a true scalar.
         Scalar::Struct(_) => unreachable!("a struct is not a box payload"),
         Scalar::String => unreachable!("an owned string is not a box payload"),
+        Scalar::DynArray(_) => unreachable!("an owned array is not a box payload"),
     }
 }
 

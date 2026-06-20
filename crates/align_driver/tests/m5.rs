@@ -244,6 +244,33 @@ fn result_string_err_path_frees_nothing() {
 }
 
 #[test]
+fn result_array_payload_unwrapped_and_freed() {
+    if !backend_available() {
+        return;
+    }
+    // MMv2 slice 8b: a fallible function returns an owned `array<i64>` in a `Result`; the
+    // heap-allocated buffer is moved out of `mk` into the Result, unwrapped by `?`, summed, and
+    // freed exactly once at scope exit (the source aggregate is nulled on the Ok edge). 1+2+3 = 6.
+    let src = "fn mk() -> Result<array<i64>, Error> = Ok([1, 2, 3].to_array())\nfn use() -> Result<i64, Error> {\n  xs := mk()?\n  return Ok(xs.sum())\n}\nfn main() -> Result<(), Error> {\n  n := use()?\n  print(n)\n  return Ok(())\n}\n";
+    let out = build_and_run("result-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n");
+}
+
+#[test]
+fn option_array_payload_else_unwrap() {
+    if !backend_available() {
+        return;
+    }
+    // `Option<array<i64>>` carries an owned payload; `else` moves it out on `Some`, and `None`
+    // owns no buffer (its payload is {null,0}). first(false) = Some([10,20]) → sum 30. Output "30\n".
+    let src = "fn first(empty: bool) -> Option<array<i64>> {\n  if empty { return None }\n  return Some([10, 20].to_array())\n}\nfn main() -> i32 {\n  xs := first(false) else { return 9 }\n  print(xs.sum())\n  return 0\n}\n";
+    let out = build_and_run("option-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n");
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;

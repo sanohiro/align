@@ -470,12 +470,24 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      `fn f() -> Result<string, Error>` / `Option<string>`. MIR-verified: bound `r := mk(); s := r?`
      frees the buffer exactly once (source nulled on the Ok edge), Err/None paths free null.
      Tested e2e (Result/Option unwrap + Err path) + sema (construct/return/use-after-`?`).
-   - **Deferred (8b+):** owned `array<T>` payload (same `{ptr,len}` + null-safe free machinery —
-     just add `Scalar::DynArray`), then **`json.decode<array<T>>` / `array<Struct>`** (the draft.md
-     §19 headline: materialize an owned array, str fields zero-copy region-tied to the input).
-     Tuples / multi-value returns (for `partition`) and `array<slice<T>>` (for `chunks`) are a
-     **separate** type-system track — recorded as open design items (do not fake them); they reuse
-     this same owned-aggregate + drop foundation once their surface is designed.
+   - **[done] 8b — owned `array<T>` payload.** The owned-collection dual of 8a: added
+     `Scalar::DynArray(PrimScalar)` (the array dual of `Scalar::String`), reusing the 8a machinery
+     wholesale — same `{ptr,len}` layout, `is_move`, zeroed-base construction, null-safe payload
+     free, and `?`/`else` move-out-then-null-source. The only new piece is `PrimScalar` (a small
+     `Copy`, **non-recursive** Int/Float/Bool/Char enum) carrying the element type, so an
+     `array<T>` can sit in an `Option`/`Result` payload without making `Scalar`/`Ty` recursive;
+     `ty_to_scalar`/`scalar_to_ty` round-trip through `scalar_to_prim`/`prim_to_scalar` (a
+     non-primitive element — struct/dynamic-array — is simply not payload-representable yet). The
+     box-payload guard already rejects Move scalars, so `box<array<T>>` is a clean diagnostic.
+     Enables `fn f() -> Result<array<i64>, Error>` / `Option<array<f64>>`. MIR-verified: the
+     heap buffer is moved `mk → Result → ?-unwrap → local` and freed exactly once; Err/None free
+     null. Tested e2e (Result/Option unwrap + sum) + sema (construct/return/box-rejection).
+   - **Deferred (8c+):** **`json.decode<array<scalar>>`** (parse a JSON array into an owned
+     `array<T>` — now representable as the `Result<array<T>, Error>` return), then `array<Struct>`
+     decode (needs a dynamic *struct* array + str fields zero-copy region-tied to the input) for the
+     draft.md §19 headline. Tuples / multi-value returns (for `partition`) and `array<slice<T>>`
+     (for `chunks`) remain a **separate** type-system track — open design items (do not fake them);
+     they reuse this same owned-aggregate + drop foundation once their surface is designed.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).
