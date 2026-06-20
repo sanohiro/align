@@ -462,11 +462,16 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::If { then, els, .. } => {
                 self.region_of_block(then, depth).shorter(self.region_of_block(els, depth))
             }
-            // KNOWN LIMITATION: a `Call` returning a region-tracked value (a `str`/struct view
-            // that borrows an argument) is treated as `Static`, so `r := parse(arena_str)` loses
-            // the tie to the arena at the call boundary. Pre-existing (already affects any
-            // view-returning fn); closing it means propagating the shortest tracked-arg region
-            // through a `Call` (cf. `slice_is_local`). Deferred to its own slice.
+            // A call's result may be a view borrowing one of its arguments (`fn id(s: str) -> str
+            // = s`), so conservatively it lives no longer than the shortest-lived argument — the
+            // region analogue of `slice_is_local`'s arg propagation. Without this, returning
+            // `f(arena_str)` out of the arena slips the escape check → use-after-free of the
+            // freed buffer. A function that does *not* return a borrow of its args is
+            // over-restricted here; precise per-fn "returns a borrow of arg i" inference is a
+            // later slice. Non-tracked args (ints, literals) are `Static` and don't shorten.
+            ExprKind::Call { args, .. } => args
+                .iter()
+                .fold(Region::Static, |acc, a| acc.shorter(self.region_of(a, depth))),
             _ => Region::Static,
         }
     }
@@ -3220,6 +3225,24 @@ mod tests {
         // coerced like a `let`), so the binding becomes local-backed and cannot be returned.
         let (_p, d) = check("fn bad(p: slice<i32>) -> slice<i32> {\n  mut s: slice<i32> := p\n  s = [1, 2, 3]\n  return s\n}\nfn main() -> i32 { return 0 }\n");
         assert!(d.has_errors(), "a slice reassigned from a local array must not escape");
+    }
+
+    #[test]
+    fn call_result_view_cannot_escape_arena() {
+        // A call may return a view borrowing one of its args; calling such a fn with an
+        // arena-backed str and returning the result out of the arena must be rejected (the
+        // borrowed buffer is freed at arena end → use-after-free). Conservative: the call
+        // result lives no longer than its shortest-lived argument.
+        let (_p, d) = check("fn dup(s: str) -> str = s\nfn leak() -> str {\n  arena {\n    x := \"a\" + \"b\"\n    return dup(x)\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(d.has_errors(), "a view returned from a call on an arena arg must not escape the arena");
+    }
+
+    #[test]
+    fn call_result_view_with_static_arg_returns_ok() {
+        // The arg propagation only shortens the region by *tracked* args: a call whose str args
+        // are literals (Static) yields a Static result, so it stays returnable — no false reject.
+        let (_p, d) = check("fn dup(s: str) -> str = s\nfn ok() -> str = dup(\"hi\")\nfn main() -> i32 = 0\n");
+        assert!(!d.has_errors(), "a call on a static-region arg should stay returnable");
     }
 
     #[test]
