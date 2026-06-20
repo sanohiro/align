@@ -459,7 +459,11 @@ impl<'a> EscapeCheck<'a> {
             // (the `string` is `Drop`-freed at frame exit), so the view is `Frame`-regioned — it
             // must not escape the frame. This feeds `region_of(Call)`: passing a borrowed string
             // to a function that returns a borrow of its argument correctly blocks the escape.
-            ExprKind::StrBorrow(_) => Region::Frame,
+            // We cap at the shorter of `Frame` and the borrowed value's own region: today every
+            // `string` is heap-owned (`Static`), so this is exactly `Frame`; but if a later slice
+            // arena-allocates a `string` (`Arena(k)`, shorter than `Frame`), the borrow must not
+            // outlive that arena — taking the shorter keeps it sound for free.
+            ExprKind::StrBorrow(inner) => Region::Frame.shorter(self.region_of(inner, depth)),
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
