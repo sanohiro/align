@@ -32,9 +32,13 @@ pub extern "C" fn align_rt_print_i64(x: i64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     use std::io::Write;
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(bytes);
+    // An empty owned `string` (from `str.clone()` / `builder().to_string()`) carries a *null*
+    // pointer with `len == 0`; `from_raw_parts(null, 0)` is UB, so emit just the newline.
+    if len > 0 {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let _ = out.write_all(bytes);
+    }
     let _ = out.write_all(b"\n").and_then(|()| out.flush());
 }
 

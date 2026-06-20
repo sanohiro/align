@@ -190,6 +190,20 @@ fn builder_write_borrows_owned_string() {
 }
 
 #[test]
+fn empty_builder_to_string_is_safe() {
+    if !backend_available() {
+        return;
+    }
+    // An empty `builder().to_string()` yields an owned `string` with a *null* buffer and len 0.
+    // `print` must not `from_raw_parts(null, 0)` (UB) — it emits just a newline; `.len()` is 0.
+    // Output: "\n0\n".
+    let src = "fn main() -> i32 {\n  b := builder()\n  s := b.to_string()\n  print(s)\n  print(s.len())\n  return 0\n}\n";
+    let out = build_and_run("builder-empty", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n0\n");
+}
+
+#[test]
 fn json_decode_flat_struct() {
     if !backend_available() {
         return;
