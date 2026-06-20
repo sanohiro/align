@@ -175,6 +175,15 @@ pub enum ExprKind {
     /// and is `Drop`-freed by its owner); the view borrows it, so it is `Frame`-regioned and
     /// must not outlive the frame holding the `string`.
     StrBorrow(Box<Expr>),
+    /// `builder()` — open an append-oriented string builder (MMv2 slice 7c). The `ty` is
+    /// [`crate::Ty::Builder`] (an owned, Move handle).
+    BuilderNew,
+    /// `b.write(s)` / `b.write_int(n)` — append to a builder, mutating it through its handle.
+    /// The builder is borrowed (not consumed); the `ty` is `Unit`.
+    BuilderWrite { builder: Box<Expr>, arg: Box<Expr>, kind: BuilderWriteKind },
+    /// `b.to_string()` — finish a builder into an **owned** `string`, consuming (moving) the
+    /// builder. The `ty` is [`crate::Ty::String`].
+    BuilderToString(Box<Expr>),
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
     ArrayLit { elems: Vec<Expr>, elem: crate::Ty },
@@ -223,6 +232,15 @@ pub enum ExprKind {
     /// `json.decode(input)` for struct `struct_id` — parse the `str` `input` into that
     /// struct at runtime. The expression `ty` is `Result<Struct, Error>`.
     JsonDecode { struct_id: u32, input: Box<Expr> },
+}
+
+/// Which builder append a `BuilderWrite` performs (MMv2 slice 7c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuilderWriteKind {
+    /// `b.write(s)` — append a `str`/`string` value's bytes.
+    Str,
+    /// `b.write_int(n)` — append a decimal integer.
+    Int,
 }
 
 #[derive(Clone, Debug)]

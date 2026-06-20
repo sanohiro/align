@@ -125,6 +125,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
         Rvalue::StrLit(s) => format!("{s:?}"),
         Rvalue::StrClone(op) => format!("str_clone({})", operand_str(op)),
+        Rvalue::BuilderNew => "builder_new".to_string(),
+        Rvalue::BuilderWriteStr(b, s) => format!("builder_write({}, {})", operand_str(b), operand_str(s)),
+        Rvalue::BuilderWriteInt(b, n) => format!("builder_write_int({}, {})", operand_str(b), operand_str(n)),
+        Rvalue::BuilderToString(op) => format!("builder_to_string({})", operand_str(op)),
         Rvalue::Template(pieces, _arena) => {
             let ps: Vec<String> = pieces
                 .iter()

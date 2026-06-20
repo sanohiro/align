@@ -504,6 +504,36 @@ pub extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
     }
 }
 
+/// Finish a surface `builder` (`b.to_string()`), returning an **owned** `string` `{ptr,len}`
+/// (MMv2 slice 7c) and freeing the builder object. The bytes are copied into a fresh
+/// [`align_rt_alloc`] buffer, freed by the generated code's `Drop` of the owning slot — so the
+/// finished string outlives the builder and any arena. An empty result owns no buffer (null
+/// ptr), so its `free(null)` drop is a harmless no-op.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_builder_into_string(b: *mut Builder) -> AlignStr {
+    let b = unsafe { Box::from_raw(b) };
+    let len = b.buf.len() as i64;
+    if len == 0 {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let dst = align_rt_alloc(len);
+    unsafe { core::ptr::copy_nonoverlapping(b.buf.as_ptr(), dst, b.buf.len()) };
+    AlignStr { ptr: dst, len }
+}
+
+/// Free a `builder` object that was never finished (`to_string()` not called) — the `Drop` of an
+/// owned builder slot (MMv2 slice 7c). Null-safe: a builder slot nulled on move (its value was
+/// consumed by `to_string()`) drops to a no-op.
+///
+/// # Safety
+/// `b` must be null or a pointer returned by [`align_rt_builder_new`] and not yet finished/freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_free(b: *mut Builder) {
+    if !b.is_null() {
+        drop(unsafe { Box::from_raw(b) });
+    }
+}
+
 /// Byte-equality of two `str` views (M5). Returns 1 if equal, else 0.
 ///
 /// # Safety

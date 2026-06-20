@@ -96,6 +96,11 @@ pub enum Ty {
     String,
     /// An arena handle (internal; produced by `arena {}`, never written by the user).
     ArenaHandle,
+    /// `builder` — an append-oriented string writer (draft.md §12), the canonical way to
+    /// construct a `string` (over `a + b` concat). An opaque owned handle to a heap builder
+    /// object (a Move type): `builder()` opens it, `.write(...)` appends, `.to_string()` consumes
+    /// it into an owned `string`. An unfinished builder is `Drop`-freed at scope exit (MMv2 7c).
+    Builder,
     /// The `Error` type (M2: an i32 code).
     ErrCode,
     /// A struct type; the id indexes `Program::structs`.
@@ -300,7 +305,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::String))
+            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::String | Ty::Builder))
             .map(|l| l.id)
             .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
             .collect();
@@ -640,8 +645,12 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
+            ExprKind::BuilderWrite { builder, arg, .. } => {
+                self.walk(builder, depth);
+                self.walk(arg, depth);
+            }
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.walk(source, depth);
                 self.walk(init, depth);
@@ -676,6 +685,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Local(_)
             | ExprKind::OptionNone
             | ExprKind::Field { .. }
+            | ExprKind::BuilderNew
             | ExprKind::IndexField { .. } => {}
         }
     }
@@ -695,12 +705,12 @@ impl<'a> MoveCheck<'a> {
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
-        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::String);
+        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder);
         self.block(&self.f.body, &mut moved, ret_is_move, true);
     }
 
     fn is_move(&self, id: LocalId) -> bool {
-        matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_) | Ty::DynArray(_) | Ty::String))
+        matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder))
     }
 
     /// `tail_consuming` = whether the block's trailing value is consumed by its context;
@@ -792,6 +802,14 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
+            // `b.to_string()` consumes (moves) the builder; `b.write(...)` borrows it (and its
+            // str/int arg). `builder()` is a leaf.
+            ExprKind::BuilderToString(i) => self.expr(i, moved, true, true),
+            ExprKind::BuilderWrite { builder, arg, .. } => {
+                self.expr(builder, moved, false, false);
+                self.expr(arg, moved, false, false);
+            }
+            ExprKind::BuilderNew => {}
             // The receiver is borrowed, not consumed.
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
@@ -1434,6 +1452,9 @@ impl<'a> Checker<'a> {
         if name == "error" {
             return self.check_error_ctor(args, span);
         }
+        if name == "builder" {
+            return self.check_builder_new(args, span);
+        }
         let Some(sig) = self.sigs.get(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -1609,6 +1630,13 @@ impl<'a> Checker<'a> {
         }
         if method == "to_array" {
             return self.check_array_to_array(recv, args, span);
+        }
+        // Builder methods (MMv2 slice 7c): `write`/`write_int` append, `to_string` finishes.
+        if method == "write" || method == "write_int" {
+            return self.check_builder_write(recv, args, method == "write_int", span);
+        }
+        if method == "to_string" {
+            return self.check_builder_to_string(recv, args, span);
         }
         // `.len()` of a `str`/`slice`/array — the element count (an `i64`).
         if method == "len" {
@@ -2286,6 +2314,87 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `builder()` — open an append-oriented string builder (MMv2 slice 7c, draft.md §12).
+    fn check_builder_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if !args.is_empty() {
+            self.diags
+                .error(format!("'builder' takes no arguments, got {}", args.len()), span);
+        }
+        Expr { kind: ExprKind::BuilderNew, ty: Ty::Builder, span }
+    }
+
+    /// `b.write(s)` / `b.write_int(n)` — append to a builder. The builder is borrowed (mutated
+    /// through its handle, not consumed). `write` takes a `str` (a `string` borrows as one);
+    /// `write_int` takes an integer (widened to `i64` at codegen, like `print`).
+    fn check_builder_write(&mut self, recv: &ast::Expr, args: &[ast::Expr], is_int: bool, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let recv_expr = self.check_expr(recv, None);
+        let mname = if is_int { "write_int" } else { "write" };
+        if recv_expr.ty != Ty::Builder {
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.{mname}()' is a builder method, got {}", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'.{mname}()' takes 1 argument, got {}", args.len()), span);
+            return err;
+        }
+        let arg = self.check_expr(&args[0], None);
+        let (arg, kind) = if is_int {
+            if !matches!(arg.ty, Ty::Int(_) | Ty::IntVar(_)) {
+                if arg.ty != Ty::Error {
+                    self.diags
+                        .error(format!("'.write_int()' expects an integer, got {}", ty_name(arg.ty)), arg.span);
+                }
+                return err;
+            }
+            (arg, BuilderWriteKind::Int)
+        } else {
+            // A `str` is written directly; a `string` borrows as one (zero-cost, non-consuming —
+            // reuses the slice-7b borrow), so `b.write(owned_string)` keeps `owned_string` usable.
+            let arg = match arg.ty {
+                Ty::Str => arg,
+                Ty::String => {
+                    let s = arg.span;
+                    Expr { kind: ExprKind::StrBorrow(Box::new(arg)), ty: Ty::Str, span: s }
+                }
+                Ty::Error => return err,
+                other => {
+                    self.diags
+                        .error(format!("'.write()' expects a str, got {}", ty_name(other)), arg.span);
+                    return err;
+                }
+            };
+            (arg, BuilderWriteKind::Str)
+        };
+        Expr {
+            kind: ExprKind::BuilderWrite { builder: Box::new(recv_expr), arg: Box::new(arg), kind },
+            ty: Ty::Unit,
+            span,
+        }
+    }
+
+    /// `b.to_string()` — finish a builder into an **owned** `string`, consuming (moving) it.
+    fn check_builder_to_string(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let recv_expr = self.check_expr(recv, None);
+        if recv_expr.ty != Ty::Builder {
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.to_string()' is a builder method, got {}", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        if !args.is_empty() {
+            self.diags
+                .error(format!("'.to_string()' takes no arguments, got {}", args.len()), span);
+        }
+        Expr { kind: ExprKind::BuilderToString(Box::new(recv_expr)), ty: Ty::String, span }
+    }
+
     /// `heap.new(x)` — allocate `box<T>` in the enclosing arena. M3 requires an arena.
     fn check_heap_new(&mut self, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         if self.arena_depth == 0 {
@@ -2670,9 +2779,13 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
+            }
+            ExprKind::BuilderWrite { builder, arg, .. } => {
+                self.finalize_expr(builder);
+                self.finalize_expr(arg);
             }
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.finalize_expr(source);
@@ -2708,6 +2821,7 @@ impl<'a> Checker<'a> {
             | ExprKind::Local(_)
             | ExprKind::OptionNone
             | ExprKind::Field { .. }
+            | ExprKind::BuilderNew
             | ExprKind::IndexField { .. } => {}
         }
     }
@@ -2760,6 +2874,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
+        Ty::Builder => "builder".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
@@ -3338,6 +3453,35 @@ mod tests {
         // fine — unlike passing it to a `string` parameter (which moves).
         let (_p, d) = check("fn show(s: str) -> i64 = s.len()\nfn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  a := show(s)\n  b := show(s)\n  return 0\n}\n");
         assert!(!d.has_errors(), "borrowing a string as a str arg must not move it");
+    }
+
+    #[test]
+    fn builder_constructs_string_checks() {
+        // MMv2 slice 7c: `builder()` + `write`/`write_int` + `to_string()` yields an owned
+        // `string` returnable from the function.
+        let (_p, d) = check("fn make(name: str, n: i64) -> string {\n  b := builder()\n  b.write(\"x=\")\n  b.write(name)\n  b.write_int(n)\n  return b.to_string()\n}\nfn main() -> i32 = 0\n");
+        assert!(!d.has_errors(), "builder construction should check");
+    }
+
+    #[test]
+    fn builder_to_string_consumes_use_after_move_rejected() {
+        // `to_string()` consumes (moves) the builder; using it afterwards is a use-after-move.
+        let (_p, d) = check("fn main() -> i32 {\n  b := builder()\n  b.write(\"a\")\n  s := b.to_string()\n  t := b.to_string()\n  return 0\n}\n");
+        assert!(d.has_errors(), "using a builder after to_string() must be rejected");
+    }
+
+    #[test]
+    fn builder_write_wrong_arg_type_errors() {
+        // `.write()` takes a str; an int is rejected (use `.write_int()`).
+        let (_p, d) = check("fn main() -> i32 {\n  b := builder()\n  b.write(42)\n  return 0\n}\n");
+        assert!(d.has_errors(), "builder.write of a non-str must error");
+    }
+
+    #[test]
+    fn write_on_non_builder_errors() {
+        // The builder methods are builder-only; calling `.write()` on a str is an error.
+        let (_p, d) = check("fn main() -> i32 {\n  s := \"x\"\n  s.write(\"y\")\n  return 0\n}\n");
+        assert!(d.has_errors(), "'.write()' on a non-builder must error");
     }
 
     #[test]
