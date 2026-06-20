@@ -165,6 +165,10 @@ pub enum ExprKind {
     BoxGet(Box<Expr>),
     /// `b.clone()` — deep-copy a `box<T>` into a fresh allocation in the enclosing arena.
     BoxClone(Box<Expr>),
+    /// `s.clone()` on a `str` — deep-copy the bytes into a fresh heap-owned `string` (MMv2
+    /// slice 7). The result owns its buffer (`Drop`-freed), so it can escape its source's
+    /// region — the explicit escape hatch out of a zero-copy view.
+    StrClone(Box<Expr>),
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
     ArrayLit { elems: Vec<Expr>, elem: crate::Ty },

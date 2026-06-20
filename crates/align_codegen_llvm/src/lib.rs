@@ -283,6 +283,15 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `str.clone()` → deep-copy into a heap-owned `string` `{ptr,len}` (MMv2 slice 7).
+    funcs.insert(
+        "str_clone".to_string(),
+        module.add_function(
+            "align_rt_str_clone",
+            slice_struct_type(ctx).fn_type(&[ptr.into(), ctx.i64_type().into()], false),
+            None,
+        ),
+    );
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
@@ -438,7 +447,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
         Ty::Option(s) => option_struct_type(ctx, s, sx).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx).into(),
         Ty::Box(_) | Ty::ArenaHandle => ctx.ptr_type(AddressSpace::default()).into(),
-        Ty::Slice(_) | Ty::Str | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty, sx),
     }
 }
@@ -921,6 +930,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
+            Rvalue::StrClone(op) => {
+                // Extract the source `{ptr,len}` view, deep-copy the bytes into a fresh heap
+                // buffer, and yield the owned `string` `{ptr,len}` the runtime returns.
+                let agg = self.operand(op).into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "srcptr").map_err(|e| self.err(e))?;
+                let len = self.builder.build_extract_value(agg, 1, "srclen").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["str_clone"], &[ptr.into(), len.into()], "strclone")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("str_clone returns a {ptr,len}")
+            }
             Rvalue::Template(pieces, arena) => self.gen_template(pieces, arena.as_ref())?,
             Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::SliceLen(op) => {
@@ -993,7 +1015,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Box(_) | Ty::ArenaHandle => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
-            Ty::Slice(_) | Ty::Str | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
+            Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
             _ => scalar_type(self.ctx, ty, self.struct_types),
         }
     }
@@ -1047,8 +1069,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn gen_print(&mut self, args: &[Operand]) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let arg = &args[0];
         let ty = self.f.operand_ty(arg);
-        // print(str): pass { ptr, len } to the runtime.
-        if ty == Ty::Str {
+        // print(str)/print(string): pass { ptr, len } to the runtime (a `string` reads as a `str`).
+        if ty == Ty::Str || ty == Ty::String {
             let agg = self.operand(arg).into_struct_value();
             let ptr = self.builder.build_extract_value(agg, 0, "sptr").map_err(|e| self.err(e))?;
             let len = self.builder.build_extract_value(agg, 1, "slen").map_err(|e| self.err(e))?;

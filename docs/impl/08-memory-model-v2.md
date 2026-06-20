@@ -380,11 +380,29 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
        enclosing arena). Scalar accumulators are unaffected (no region). (Note: the precise region
        is `arena(depth)`, not `shorter(init, source)` — an empty/all-`Static`-arg reduce still
        allocates its fresh accumulator at `depth`.)
-   - **Deferred:** `str.clone()` to escape; array / nested-struct field decode; and precise
-     per-fn borrow inference (which arg, if any, a call result actually borrows) to lift the
-     conservatism of 6b.
+   - **Deferred:** array / nested-struct field decode; and precise per-fn borrow inference
+     (which arg, if any, a call result actually borrows) to lift the conservatism of 6b.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same
    owned/drop machinery.
+   - **[done] 7a — owned `string` + `str.clone()`.** Added `Ty::String`, the heap-owned dual of
+     `str` (same `{ptr,len}` layout, but **Move** and region-tracked). It reuses the owned-array
+     machinery wholesale: a free-standing (`Static`) `string` is in `drop_locals` and `Drop`-freed
+     at every exit, nulled-on-move, `ret_is_move`, and `tracks_region`. `str.clone()` (`Ty::Str |
+     Ty::String → string`) is the producer and the **explicit escape hatch out of a zero-copy
+     view**: unlike `box.clone` it needs no arena — the result owns a fresh `malloc`'d buffer
+     (`align_rt_str_clone`, null buffer for the empty string so `free` is a no-op), so it can be
+     returned out of the arena its source was built in. `print`/`.len()` **borrow** a `string`
+     (read `{ptr,len}` as a `str`), so a printed string stays usable; both sema's `MoveCheck` and
+     MIR's null-on-move special-case `print` as non-consuming. Tested: clone escapes an arena;
+     clone of a decoded field; non-cloned arena `str` still rejected; use-after-move rejected.
+     A `string` passed by value to a callee is **moved** (the callee owns and `Drop`-frees it;
+     the caller's slot is nulled on the move). An owned-`string` *parameter* is therefore NOT
+     entry-null-initialised — it arrives owning a valid buffer, and zeroing it would clobber the
+     argument (a bug fixed here; the entry `DropFlagInit` now skips parameter slots).
+   - **Deferred (7b+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
+     for now — sound, just not arena-bump); coercing a `string` to a `str` view when calling a
+     `str`-parameter callee (today the types must match — a `string` arg needs a `string` param);
+     `builder()`/`.to_string()` as the canonical constructor; and `bytes`/`buffer`.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).

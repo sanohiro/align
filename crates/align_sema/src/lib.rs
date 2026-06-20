@@ -89,6 +89,11 @@ pub enum Ty {
     DynArray(Scalar),
     /// `str` — an immutable string view `{ u8* ptr, i64 len }`. Copy. M5.
     Str,
+    /// `string` — an *owned* string `{ u8* ptr, i64 len }`, laid out like `str` but Move and
+    /// region-tracked (MMv2 slice 7). Produced by `str.clone()`; free-standing values own a
+    /// heap buffer freed by `Drop` (the same machinery as owned `array<T>`). A `string` is
+    /// readable as a `str` (a borrow of itself).
+    String,
     /// An arena handle (internal; produced by `arena {}`, never written by the user).
     ArenaHandle,
     /// The `Error` type (M2: an i32 code).
@@ -295,7 +300,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| matches!(l.ty, Ty::DynArray(_)))
+            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::String))
             .map(|l| l.id)
             .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
             .collect();
@@ -403,7 +408,7 @@ impl<'a> EscapeCheck<'a> {
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(ty: Ty) -> bool {
         match ty {
-            Ty::Box(_) | Ty::Str | Ty::Struct(_) | Ty::DynArray(_) => true,
+            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) => true,
             // An `Option`/`Result` is region-tracked iff its payload is (only a `Struct` payload
             // can be — `str`/`box`/`array` aren't scalars, so they never reach a composite). A
             // `Result<Struct, _>` is exactly what `json.decode` yields, so a region-tied decoded
@@ -626,7 +631,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.walk(source, depth);
@@ -681,12 +686,12 @@ impl<'a> MoveCheck<'a> {
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
-        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_));
+        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::String);
         self.block(&self.f.body, &mut moved, ret_is_move, true);
     }
 
     fn is_move(&self, id: LocalId) -> bool {
-        matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_) | Ty::DynArray(_)))
+        matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_) | Ty::DynArray(_) | Ty::String))
     }
 
     /// `tail_consuming` = whether the block's trailing value is consumed by its context;
@@ -762,10 +767,13 @@ impl<'a> MoveCheck<'a> {
                 self.expr(lhs, moved, false, false);
                 self.expr(rhs, moved, false, false);
             }
-            // Value arguments / wrapped payloads are consumed (a direct move site).
-            ExprKind::Call { args, .. } => {
+            // Value arguments / wrapped payloads are consumed (a direct move site). `print` is a
+            // read-only builtin, so it *borrows* its argument (a `string` printed once is still
+            // usable — `print(s); s.len()`); it never takes ownership.
+            ExprKind::Call { func, args } => {
+                let consuming = func != "print";
                 for a in args {
-                    self.expr(a, moved, true, true);
+                    self.expr(a, moved, consuming, consuming);
                 }
             }
             ExprKind::StructLit { fields, .. } => {
@@ -776,7 +784,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) => self.expr(i, moved, true, true),
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
@@ -2243,10 +2251,15 @@ impl<'a> Checker<'a> {
                 }
                 Expr { kind: ExprKind::BoxClone(Box::new(recv)), ty: Ty::Box(s), span }
             }
+            // `str.clone()` deep-copies into a free-standing heap-owned `string` (MMv2 slice 7).
+            // Unlike `box.clone`, it needs no arena: the result owns its buffer and is `Drop`-freed,
+            // so it can outlive any region — this is how a zero-copy view escapes. (Arena-bump
+            // cloning, the in-arena optimization, is a later sub-slice.)
+            Ty::Str | Ty::String => Expr { kind: ExprKind::StrClone(Box::new(recv)), ty: Ty::String, span },
             Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
             other => {
                 self.diags
-                    .error(format!("'.clone()' is only available on box<T> in M3, got {}", ty_name(other)), span);
+                    .error(format!("'.clone()' is available on box<T>, str, and string, got {}", ty_name(other)), span);
                 Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
             }
         }
@@ -2428,7 +2441,7 @@ impl<'a> Checker<'a> {
         let r = self.check_expr(recv, None);
         match r.ty {
             // `str`/`slice` carry a runtime length in their `{ ptr, len }` view.
-            Ty::Str | Ty::Slice(_) | Ty::DynArray(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
@@ -2636,7 +2649,7 @@ impl<'a> Checker<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
@@ -2705,7 +2718,7 @@ fn single_name(p: &ast::Path) -> Option<&str> {
 /// Types `print` and a `template` hole can render: integers, floats, `str`, `bool`, `char`
 /// (and the error sentinel, to avoid cascading diagnostics).
 fn is_printable(ty: Ty) -> bool {
-    ty.is_numeric() || matches!(ty, Ty::Str | Ty::Bool | Ty::Char | Ty::Error)
+    ty.is_numeric() || matches!(ty, Ty::Str | Ty::String | Ty::Bool | Ty::Char | Ty::Error)
 }
 
 fn ty_name(ty: Ty) -> String {
@@ -2724,6 +2737,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
         Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
         Ty::Str => "str".to_string(),
+        Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
@@ -2756,6 +2770,7 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
         "bool" => Ty::Bool,
         "char" => Ty::Char,
         "str" => Ty::Str,
+        "string" => Ty::String,
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
@@ -3266,6 +3281,33 @@ mod tests {
         // returning the scalar is fine — the arena region must not leak onto plain scalars.
         let (_p, d) = check("fn add(a: i64, e: i64) -> i64 = a + e\nfn total() -> i64 {\n  arena {\n    ns := [1, 2, 3]\n    return ns.reduce(add, 0)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(!d.has_errors(), "a scalar reduce accumulator carries no region and may be returned");
+    }
+
+    #[test]
+    fn str_clone_produces_returnable_owned_string() {
+        // `str.clone()` yields a heap-owned `string` (region `Static`), so it can be returned out
+        // of the arena its source was built in — the explicit escape hatch (MMv2 slice 7).
+        let (_p, d) = check("fn longer(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(!d.has_errors(), "a cloned (owned) string should be returnable from an arena");
+    }
+
+    #[test]
+    fn arena_str_without_clone_still_cannot_escape() {
+        // Without the `.clone()`, the arena-backed `str` view must not escape (regression guard
+        // that adding `string` did not loosen the borrow's region check).
+        let (_p, d) = check("fn longer(a: str, b: str) -> str {\n  arena {\n    c := a + b\n    return c\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(d.has_errors(), "an arena-backed str view must not escape without an explicit clone");
+    }
+
+    #[test]
+    fn owned_string_is_move_use_after_move_rejected() {
+        // A `string` is a Move type: binding it elsewhere moves it, so a later use is rejected
+        // (whereas `print` borrows — covered by the e2e tests).
+        let (_p, d) = check("fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  t := s\n  return t.len()\n}\n");
+        // `t := s` moves; but `t.len()` is fine. Now force a use-after-move:
+        assert!(!d.has_errors(), "moving a string into a new binding and using the new one is fine");
+        let (_q, d2) = check("fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  t := s\n  return s.len()\n}\n");
+        assert!(d2.has_errors(), "using a string after it was moved must be rejected");
     }
 
     #[test]

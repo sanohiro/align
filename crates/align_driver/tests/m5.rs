@@ -105,6 +105,47 @@ fn json_decode_str_field_zero_copy() {
 }
 
 #[test]
+fn str_clone_escapes_arena_as_owned_string() {
+    if !backend_available() {
+        return;
+    }
+    // `str.clone()` deep-copies into a heap-owned `string` that outlives the arena its source
+    // was built in (MMv2 slice 7): the concat `c` lives in the arena (freed at `}`), but the
+    // returned clone owns its own buffer. `print` borrows (so `s` is still usable for `.len()`),
+    // and the owned string is freed once at function exit.
+    let src = "fn longer(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := longer(\"foo\", \"bar\")\n  print(s)\n  print(s.len())\n  return 0\n}\n";
+    let out = build_and_run("str-clone-escape", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "foobar\n6\n");
+}
+
+#[test]
+fn str_clone_of_decoded_field_is_owned() {
+    if !backend_available() {
+        return;
+    }
+    // Clone a zero-copy decoded `str` field into an owned `string` — the explicit escape hatch
+    // out of the borrow. name="alice" (len 5).
+    let src = "User { id: i64, name: str }\nfn decode(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := decode(\"{\\\"id\\\": 7, \\\"name\\\": \\\"alice\\\"}\")?\n  owned := u.name.clone()\n  print(owned)\n  print(owned.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("str-clone-decoded", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "alice\n5\n");
+}
+
+#[test]
+fn owned_string_moved_into_callee_is_freed_once() {
+    if !backend_available() {
+        return;
+    }
+    // A `string` passed by value is *moved* into the callee, which owns and drops it (the caller
+    // nulls its slot on the move, so no double-free). Exercises that an owned-`string` *parameter*
+    // is NOT entry-null-initialised (which would clobber the incoming argument). len("hello") = 5.
+    let src = "fn consume(s: string) -> i64 = s.len()\nfn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  x := mk(\"hello\")\n  n := consume(x)\n  if n == 5 { return 0 }\n  return 1\n}\n";
+    let out = build_and_run("string-move-param", src);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
 fn json_decode_flat_struct() {
     if !backend_available() {
         return;
