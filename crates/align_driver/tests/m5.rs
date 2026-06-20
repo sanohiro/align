@@ -161,6 +161,49 @@ fn owned_string_borrowed_as_str_arg() {
 }
 
 #[test]
+fn builder_constructs_owned_string() {
+    if !backend_available() {
+        return;
+    }
+    // MMv2 slice 7c: the canonical string-construction API (draft.md §12). `builder()` opens a
+    // writer, `.write(str)` / `.write_int(i64)` append, `.to_string()` finishes into an owned
+    // `string` that outlives the builder. The result is `print`ed and its byte length checked:
+    // "hello, align! score=42" is 22 bytes. Output: "hello, align! score=42\n22\n".
+    let src = "fn make(name: str, score: i64) -> string {\n  b := builder()\n  b.write(\"hello, \")\n  b.write(name)\n  b.write(\"! score=\")\n  b.write_int(score)\n  return b.to_string()\n}\nfn main() -> i32 {\n  s := make(\"align\", 42)\n  print(s)\n  print(s.len())\n  return 0\n}\n";
+    let out = build_and_run("builder", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello, align! score=42\n22\n");
+}
+
+#[test]
+fn builder_write_borrows_owned_string() {
+    if !backend_available() {
+        return;
+    }
+    // `b.write(owned)` borrows a `string` argument (slice 7b coercion), so the source stays
+    // usable afterwards (`owned.len()` below). An unfinished builder is also created and freed at
+    // exit (no leak / double-free). Output: "hi world\n5\n".
+    let src = "fn dup(s: str) -> string = s.clone()\nfn main() -> i32 {\n  owned := dup(\"world\")\n  b := builder()\n  b.write(\"hi \")\n  b.write(owned)\n  msg := b.to_string()\n  print(msg)\n  print(owned.len())\n  unfinished := builder()\n  unfinished.write(\"x\")\n  return 0\n}\n";
+    let out = build_and_run("builder-write-string", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi world\n5\n");
+}
+
+#[test]
+fn empty_builder_to_string_is_safe() {
+    if !backend_available() {
+        return;
+    }
+    // An empty `builder().to_string()` yields an owned `string` with a *null* buffer and len 0.
+    // `print` must not `from_raw_parts(null, 0)` (UB) — it emits just a newline; `.len()` is 0.
+    // Output: "\n0\n".
+    let src = "fn main() -> i32 {\n  b := builder()\n  s := b.to_string()\n  print(s)\n  print(s.len())\n  return 0\n}\n";
+    let out = build_and_run("builder-empty", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n0\n");
+}
+
+#[test]
 fn json_decode_flat_struct() {
     if !backend_available() {
         return;

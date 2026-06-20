@@ -292,6 +292,24 @@ fn build_module<'c>(
             None,
         ),
     );
+    // Surface `builder` (MMv2 slice 7c): `to_string()` finishes into an owned `string`; `free`
+    // drops an unfinished builder at scope exit.
+    funcs.insert(
+        "builder_into_string".to_string(),
+        module.add_function(
+            "align_rt_builder_into_string",
+            slice_struct_type(ctx).fn_type(&[ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "builder_free".to_string(),
+        module.add_function(
+            "align_rt_builder_free",
+            ctx.void_type().fn_type(&[ptr.into()], false),
+            None,
+        ),
+    );
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
@@ -446,7 +464,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx).into(),
-        Ty::Box(_) | Ty::ArenaHandle => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => ctx.ptr_type(AddressSpace::default()).into(),
         Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty, sx),
     }
@@ -608,21 +626,40 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::DropFlagInit(slot) => {
-                    // Store `{null, 0}` so a drop on a never-allocated path frees null.
-                    let z = slice_struct_type(self.ctx).const_zero();
-                    self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
+                    // Null-initialise the slot so a drop on a never-allocated / moved-out path is
+                    // a no-op. A `builder` slot holds a bare pointer (null); the owned `{ptr,len}`
+                    // collections store `{null, 0}`.
+                    if self.f.slots[*slot as usize] == Ty::Builder {
+                        let z = self.ctx.ptr_type(AddressSpace::default()).const_null();
+                        self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
+                    } else {
+                        let z = slice_struct_type(self.ctx).const_zero();
+                        self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
+                    }
                 }
                 Stmt::Drop(slot) => {
-                    // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
-                    let agg = self
-                        .builder
-                        .build_load(slice_struct_type(self.ctx), self.slots[slot], "drop")
-                        .map_err(|e| self.err(e))?
-                        .into_struct_value();
-                    let ptr = self.builder.build_extract_value(agg, 0, "dropptr").map_err(|e| self.err(e))?;
-                    self.builder
-                        .build_call(self.funcs["free"], &[ptr.into()], "")
-                        .map_err(|e| self.err(e))?;
+                    if self.f.slots[*slot as usize] == Ty::Builder {
+                        // An unfinished builder: free the builder object (null-safe — a moved-out
+                        // builder's slot was nulled by `to_string`).
+                        let p = self
+                            .builder
+                            .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropb")
+                            .map_err(|e| self.err(e))?;
+                        self.builder
+                            .build_call(self.funcs["builder_free"], &[p.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    } else {
+                        // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
+                        let agg = self
+                            .builder
+                            .build_load(slice_struct_type(self.ctx), self.slots[slot], "drop")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                        let ptr = self.builder.build_extract_value(agg, 0, "dropptr").map_err(|e| self.err(e))?;
+                        self.builder
+                            .build_call(self.funcs["free"], &[ptr.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    }
                 }
                 Stmt::DropValue(op) => {
                     // Free the buffer of an owned `{ptr, len}` value (an unbound temporary).
@@ -943,6 +980,58 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("str_clone returns a {ptr,len}")
             }
+            Rvalue::BuilderNew => {
+                // Open a builder with a null arena: the finished `string` is heap-owned
+                // (`into_string` copies into a fresh malloc'd buffer), not arena-tied.
+                let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
+                self.builder
+                    .build_call(self.funcs["builder_new"], &[null.into()], "builder")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("builder_new returns a pointer")
+            }
+            Rvalue::BuilderWriteStr(bld, s) => {
+                let b = self.operand(bld).into();
+                let agg = self.operand(s).into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "wptr").map_err(|e| self.err(e))?;
+                let len = self.builder.build_extract_value(agg, 1, "wlen").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["builder_write"], &[b, ptr.into(), len.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::BuilderWriteInt(bld, n) => {
+                let b = self.operand(bld).into();
+                // Widen the integer to `i64` (the runtime arg width), like `print`.
+                let ty = self.f.operand_ty(n);
+                let v = self.operand(n).into_int_value();
+                let i64t = self.ctx.i64_type();
+                let wide = if int_bits(ty) < 64 {
+                    if is_signed(ty) {
+                        self.builder.build_int_s_extend(v, i64t, "sext").map_err(|e| self.err(e))?
+                    } else {
+                        self.builder.build_int_z_extend(v, i64t, "zext").map_err(|e| self.err(e))?
+                    }
+                } else {
+                    v
+                };
+                self.builder
+                    .build_call(self.funcs["builder_write_int"], &[b, wide.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::BuilderToString(bld) => {
+                // Finish into an owned `string` `{ptr,len}` (a fresh heap buffer); the builder
+                // object is freed by the runtime.
+                let b = self.operand(bld).into();
+                self.builder
+                    .build_call(self.funcs["builder_into_string"], &[b], "tostr")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("builder_into_string returns a {ptr,len}")
+            }
             Rvalue::Template(pieces, arena) => self.gen_template(pieces, arena.as_ref())?,
             Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::SliceLen(op) => {
@@ -1012,7 +1101,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Struct(id) => self.struct_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),

@@ -412,9 +412,26 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      the call-result tie is conservative — a `str`-param callee that returns a *fresh owned* `string`
      is over-restricted when fed a borrowed `string` (use `.clone()`); precise per-fn borrow
      inference is the lift.
+   - **[done] 7c — `builder()` / `.write()` / `.to_string()`.** The canonical string-construction
+     API (draft.md §12, recommended over `a + b` concat), surfaced on the runtime `Builder` that
+     already backs `template`. New `Ty::Builder` (an opaque owned handle, a Move type) with three
+     forms: `builder()` opens it (`BuilderNew`), `b.write(str)` / `b.write_int(i64)` append
+     (`BuilderWrite`, borrowing the builder — mutate-through-handle, not consume), and
+     `b.to_string()` finishes into an **owned** `string` (`BuilderToString`), consuming the builder.
+     No parser changes — `builder()` is a builtin call and the methods are ordinary method-call
+     syntax. `to_string()` lowers to a new runtime `align_rt_builder_into_string` that copies into a
+     fresh `malloc`'d buffer (so the finished `string` outlives the builder and any arena, freed by
+     its slot's `Drop`); an unfinished builder is `Drop`-freed at exit via `align_rt_builder_free`
+     (null-safe). The builder reuses the owned-local machinery: it is in `drop_locals`, nulled on
+     the `to_string` move, and `DropFlagInit`/`Drop` are **type-aware** in codegen (a `builder` slot
+     holds a bare pointer — null-init and `builder_free` — vs the `{ptr,len}` collections' `{null,0}`
+     + buffer `free`). `b.write(owned_string)` reuses the slice-7b borrow, so the source `string`
+     stays usable. Tested: build a greeting + length (e2e), borrow a `string` into `write` and an
+     unfinished builder (e2e), and sema move/`to_string`-consume/wrong-arg/non-builder-receiver.
    - **Deferred (7c+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
-     for now — sound, just not arena-bump); a `let`-position `string` → `str` borrow;
-     `builder()`/`.to_string()` as the canonical constructor; and `bytes`/`buffer`.
+     for now — sound, just not arena-bump); a `let`-position `string` → `str` borrow; the remaining
+     builder writes (`write_bool`/`write_char`/`write_float` — the runtime already has them, just
+     not surfaced); and `bytes`/`buffer`.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).

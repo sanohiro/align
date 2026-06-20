@@ -156,6 +156,15 @@ pub enum Rvalue {
     /// `str.clone()` — deep-copy a `str` operand's bytes into a fresh heap buffer, yielding an
     /// owned `string` `{ptr,len}`. The buffer is freed by a later [`Stmt::Drop`] of its slot.
     StrClone(Operand),
+    /// `builder()` — open a builder, yielding an opaque handle (MMv2 slice 7c).
+    BuilderNew,
+    /// `b.write(s)` — append a `str` operand's bytes to the builder. Side-effecting; yields unit.
+    BuilderWriteStr(Operand, Operand),
+    /// `b.write_int(n)` — append a decimal integer (widened to `i64`) to the builder. Yields unit.
+    BuilderWriteInt(Operand, Operand),
+    /// `b.to_string()` — finish the builder into an owned `string` `{ptr,len}` (a fresh heap
+    /// buffer freed by a later [`Stmt::Drop`]), consuming the builder handle.
+    BuilderToString(Operand),
     /// `template "..."` / `str + str` — build a `str` from pieces. The optional operand
     /// is the enclosing arena handle (the result lives there; `None` = leaked).
     Template(Vec<TemplatePiece>, Option<Operand>),
@@ -364,7 +373,7 @@ fn lower_fn(f: &hir::Fn) -> Function {
 fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
     match &e.kind {
         hir::ExprKind::Local(id) => {
-            if matches!(b.slots.get(*id as usize), Some(Ty::DynArray(_) | Ty::String)) {
+            if matches!(b.slots.get(*id as usize), Some(Ty::DynArray(_) | Ty::String | Ty::Builder)) {
                 b.push(Stmt::DropFlagInit(*id));
             }
         }
@@ -605,6 +614,31 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // the `{ptr,len}` layout, so the loaded value is the view. The `string` is not moved (no
         // `null_moved_source`), so its owner still `Drop`-frees it.
         hir::ExprKind::StrBorrow(inner) => lower_expr(b, inner),
+        hir::ExprKind::BuilderNew => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::BuilderNew));
+            Operand::Value(v)
+        }
+        hir::ExprKind::BuilderWrite { builder, arg, kind } => {
+            let bop = lower_expr(b, builder);
+            let aop = lower_expr(b, arg);
+            let v = b.fresh_value(Ty::Unit);
+            let rv = match kind {
+                hir::BuilderWriteKind::Str => Rvalue::BuilderWriteStr(bop, aop),
+                hir::BuilderWriteKind::Int => Rvalue::BuilderWriteInt(bop, aop),
+            };
+            b.push(Stmt::Let(v, rv));
+            Operand::Const(Const::Unit)
+        }
+        hir::ExprKind::BuilderToString(inner) => {
+            let bop = lower_expr(b, inner);
+            // The builder is consumed: null its slot so the exit `Drop` of an unfinished builder
+            // is a no-op (`builder_free(null)`), and the finished `string` owns its own buffer.
+            null_moved_source(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::BuilderToString(bop)));
+            Operand::Value(v)
+        }
         hir::ExprKind::ArraySum { source, stages } => {
             let init = zero_of(e.ty);
             lower_array_reduce(b, source, stages, e.ty, init, Reducer::Sum)
@@ -1460,6 +1494,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
+        Ty::Builder => "builder".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Unit => "()".to_string(),
