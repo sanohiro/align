@@ -190,6 +190,20 @@ fn builder_write_borrows_owned_string() {
 }
 
 #[test]
+fn string_borrowed_into_str_let_binding() {
+    if !backend_available() {
+        return;
+    }
+    // MMv2 slice 7e: a `str`-annotated `let` borrows an owned `string` (the slice-7b coercion now
+    // also applies at let bindings). The borrow is non-consuming, so `owned` stays usable after.
+    // Output: "hello\n5\n".
+    let src = "fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  owned := mk(\"hello\")\n  view: str := owned\n  print(view)\n  print(owned.len())\n  return 0\n}\n";
+    let out = build_and_run("string-let-borrow", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n5\n");
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;
