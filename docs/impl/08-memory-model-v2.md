@@ -349,6 +349,27 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    nested `array<slice<T>>` type) — each its own follow-up, gated on new type machinery.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
    `.clone()` to escape; **draft.md §19 runs in full** → M5 truly complete.
+   - **[done] 6a — `str` field decode.** `json.decode` now accepts `str` fields: each decodes
+     as a zero-copy `{ptr,len}` view into the input buffer (the runtime's `string()` already
+     borrows the input and rejects escapes, so its pointer is the content's absolute address;
+     codegen tags `str` fields `(3<<8)|16`). The decoded struct is **region-tied to its input**:
+     `region_of(JsonDecode{input}) = region_of(input)` and `region_of(Try) = region_of(inner)`,
+     so a view decoded from arena-allocated input cannot escape the arena (conservative — even a
+     scalar-only struct is tied; decode from a `str` param/literal is Static, hence returnable,
+     which is sound because the caller owns the buffer). Tested both directions.
+     - **Region tracking through `Option`/`Result` (fix).** The region tie has to survive the
+       `Result` wrapper, since `json.decode` yields `Result<Struct, Error>`. `tracks_region` now
+       recurses into `Option`/`Result` payloads (true iff a `Struct` payload tracks a region), and
+       `region_of` propagates through `Ok`/`Some`/`Err`/`?` (= the inner region) and `else`
+       (= the shorter of the two arms). Without this, binding the raw decode to a `Result`-typed
+       local and unwrapping it later (`res: Result<U,E> := json.decode(d); u := res?; return Ok(u)`)
+       slipped the escape check (the `Result` local wasn't region-tracked) → use-after-free.
+   - **Deferred:** `str.clone()` to escape; array / nested-struct field decode; and a general
+     **call-result region tie** — `region_of(Call)` is `Static`, so a view-returning function
+     called with an arena argument (`r := parse(arena_str)`) loses the tie at the call boundary.
+     This is a *pre-existing* gap (it already affects `fn f(s: str) -> str = s`), not introduced
+     here; closing it (propagate the shortest region-tracked arg region through a `Call`, like
+     `slice_is_local` does for slices) is its own slice.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same
    owned/drop machinery.
 

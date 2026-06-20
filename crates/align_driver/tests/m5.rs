@@ -92,6 +92,19 @@ fn len_of_str_slice_array() {
 }
 
 #[test]
+fn json_decode_str_field_zero_copy() {
+    if !backend_available() {
+        return;
+    }
+    // A `str` field decodes as a zero-copy view into the input buffer (MMv2 slice 6): the
+    // printed name comes straight from the input bytes, no allocation. id=7, name="alice".
+    let src = "User { id: i64, name: str, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"id\\\": 7, \\\"name\\\": \\\"alice\\\", \\\"active\\\": true}\")?\n  print(u.id)\n  print(u.name)\n  if u.active { print(1) }\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-str", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\nalice\n1\n");
+}
+
+#[test]
 fn json_decode_flat_struct() {
     if !backend_available() {
         return;
