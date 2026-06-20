@@ -53,9 +53,23 @@ pub enum Scalar {
     /// A struct payload (the struct's id). Lets `Option`/`Result` carry a whole struct
     /// (e.g. `Result<User, Error>` from `json.decode`). No recursion — just the id.
     Struct(u32),
+    /// An owned `string` payload (MMv2 slice 8a). Unlike the other scalars this is a **Move**
+    /// type with a heap buffer, so an `Option<string>` / `Result<string, E>` that holds it owns
+    /// that buffer: it is dropped (freed) when the aggregate local is dropped, and moved out on
+    /// `?` / `else` unwrap. Lets a fallible function return an owned string
+    /// (`fn f() -> Result<string, Error>`). Kept var-free (`Scalar: Copy`) — it carries no inner.
+    String,
     /// The M2 `Error` type — an opaque i32 error code (placeholder for the eventual
     /// Error sum type; see `open-questions.md`).
     ErrCode,
+}
+
+impl Scalar {
+    /// Whether this payload scalar is an owned **Move** type (a heap buffer that the enclosing
+    /// `Option`/`Result` owns and must drop / move out). Today: `string` (MMv2 slice 8a).
+    pub fn is_move(self) -> bool {
+        matches!(self, Scalar::String)
+    }
 }
 
 /// sema-internal type representation (`03-types.md` §1).
@@ -120,6 +134,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Char => Some(Scalar::Char),
         Ty::Unit => Some(Scalar::Unit),
         Ty::Struct(id) => Some(Scalar::Struct(id)),
+        Ty::String => Some(Scalar::String),
         Ty::ErrCode => Some(Scalar::ErrCode),
         _ => None,
     }
@@ -133,12 +148,23 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Char => Ty::Char,
         Scalar::Unit => Ty::Unit,
         Scalar::Struct(id) => Ty::Struct(id),
+        Scalar::String => Ty::String,
         Scalar::ErrCode => Ty::ErrCode,
     }
 }
 
 fn scalar_name(s: Scalar) -> String {
     ty_name(scalar_to_ty(s))
+}
+
+/// Whether an `Option`/`Result` type carries an owned (Move) payload that the aggregate owns
+/// — so the aggregate is itself a Move type and its drop must free that payload (MMv2 slice 8a).
+pub fn payload_is_move(ty: Ty) -> bool {
+    match ty {
+        Ty::Option(s) => s.is_move(),
+        Ty::Result(o, e) => o.is_move() || e.is_move(),
+        _ => false,
+    }
 }
 
 impl Ty {
@@ -305,7 +331,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::String | Ty::Builder))
+            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::String | Ty::Builder) || payload_is_move(l.ty))
             .map(|l| l.id)
             .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
             .collect();
@@ -711,12 +737,16 @@ impl<'a> MoveCheck<'a> {
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
-        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder);
+        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder)
+            || payload_is_move(self.f.ret);
         self.block(&self.f.body, &mut moved, ret_is_move, true);
     }
 
     fn is_move(&self, id: LocalId) -> bool {
-        matches!(self.f.locals.get(id as usize).map(|l| l.ty), Some(Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder))
+        match self.f.locals.get(id as usize).map(|l| l.ty) {
+            Some(ty) => matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty),
+            None => false,
+        }
     }
 
     /// `tail_consuming` = whether the block's trailing value is consumed by its context;
@@ -2956,11 +2986,17 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
                     return Ty::Error;
                 }
             };
-            // `scalar_arg` now also accepts a struct (a valid Option/Result payload), but a
-            // box payload must be a true scalar (codegen can't size a struct box) — reject it.
+            // `scalar_arg` accepts structs and owned `string` (valid Option/Result payloads), but
+            // a box payload must be a true primitive scalar: codegen can't size a struct box, and
+            // a Move payload (`string`) has no `box` drop story. Reject both with a clean
+            // diagnostic (else `box<string>`/`box<Struct>` would type-check then panic in codegen).
             match scalar_arg(inner, "box payload", t.span, diags) {
                 Some(Scalar::Struct(_)) => {
                     diags.error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), t.span);
+                    Ty::Error
+                }
+                Some(s) if s.is_move() => {
+                    diags.error(format!("a box payload must be a primitive scalar (an owned `{}` cannot be boxed)", scalar_name(s)), t.span);
                     Ty::Error
                 }
                 Some(s) => Ty::Box(s),
@@ -3513,6 +3549,37 @@ mod tests {
         // Fall-through (trailing-value) return path — same rejection.
         let (_q, d2) = check("fn mk(a: str) -> string = a.clone()\nfn leak() -> str {\n  owned := mk(\"x\")\n  view: str := owned\n  view\n}\nfn main() -> i32 = 0\n");
         assert!(d2.has_errors(), "a trailing-value str borrow of a local string must also be rejected");
+    }
+
+    #[test]
+    fn result_string_payload_checks_and_returns() {
+        // MMv2 slice 8a: `Result<string, Error>` is representable; an owned `string` (Static
+        // region) is returnable through it, and `?` unwraps to an owned string.
+        let (_p, d) = check("fn mk(a: str) -> Result<string, Error> = Ok(a.clone())\nfn use(name: str) -> Result<i64, Error> {\n  s := mk(name)?\n  return Ok(s.len())\n}\nfn main() -> i32 = 0\n");
+        assert!(!d.has_errors(), "Result<string,Error> construct/return/unwrap should check");
+    }
+
+    #[test]
+    fn option_string_payload_checks() {
+        let (_p, d) = check("fn first() -> Option<string> = Some(\"x\".clone())\nfn main() -> i32 {\n  s := first() else { return 9 }\n  print(s)\n  return 0\n}\n");
+        assert!(!d.has_errors(), "Option<string> construct + else-unwrap should check");
+    }
+
+    #[test]
+    fn box_string_payload_rejected_cleanly() {
+        // `string` is now a scalar (slice 8a), so `box<string>` must be rejected in sema with a
+        // clean diagnostic — not type-check and then panic in codegen (the box payload guard must
+        // cover Move scalars, like it already covers structs).
+        let (_p, d) = check("fn main() -> i32 {\n  arena {\n    p: box<string> := heap.new(\"x\".clone())\n    return 0\n  }\n}\n");
+        assert!(d.has_errors(), "box<string> must be rejected (an owned string cannot be boxed)");
+    }
+
+    #[test]
+    fn result_string_use_after_try_rejected() {
+        // `?` consumes the Result (moves its owned payload out); using the source again is a
+        // use-after-move.
+        let (_p, d) = check("fn mk() -> Result<string, Error> = Ok(\"x\".clone())\nfn use() -> Result<i64, Error> {\n  r := mk()\n  a := r?\n  b := r?\n  return Ok(a.len())\n}\nfn main() -> i32 = 0\n");
+        assert!(d.has_errors(), "using a Result<string> after `?` consumed it must be rejected");
     }
 
     #[test]

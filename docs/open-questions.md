@@ -125,6 +125,16 @@ A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) d
 ### SoA conversion trigger
 Whether to automate the decision to lay out `array<T>` as SoA, or use annotation. Impact on the array ABI (`impl/05-backend-llvm.md` §2). (Subsumed by "SoA layout" above; kept as the open auto-vs-annotation sub-question.)
 
+### Tuples / multi-value returns — design before `partition`/`chunks` (do not fake)
+`partition` needs a two-array result and `chunks` needs `array<slice<T>>`; both want a product
+type. **Open design decision, deliberately not rushed**: anonymous tuples `(A, B)` overlap with
+keyword-less structs, so introducing them touches "one way to do things" / AI-friendliness —
+decide *tuple vs. named-struct-result vs. multiple return values* on its own merits, not as a
+by-product of `partition`. **No retrofit risk in deferring it:** a tuple/struct holding owned
+values reuses the **same** owned-aggregate + drop machinery built for owned `Option`/`Result`
+payloads (slice 8), so it lands additively on that foundation later. Until then, `partition`/
+`chunks` stay deferred rather than faked. (Surfaced by the MMv2 slice-8 inventory.)
+
 ### Arena checkpoint / rollback — std arena API, after MMv2
 A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. The runtime arena already bump-allocates; this exposes a reset-to-mark on top. (Digested from `work/proposals/library-foundations.md` §3; used by the streaming-parse story in `http-optimization.md` §5.)
 

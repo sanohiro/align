@@ -450,6 +450,32 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    - **Deferred (7e+):** the in-arena bump-clone optimization (`str.clone()` is always heap-owned
      for now — sound, just not arena-bump); and `bytes`/`buffer` (the spec defines only the type
      names + one-line roles so far — surface API to be fleshed out in the spec first).
+8. **Owned (Move) payloads in `Option`/`Result`.** The remaining "ideal form" carryover (a
+   materializing `json.decode<array<T>>`, fallible functions returning owned values) is gated on
+   one type-system gap: `Ty::Result(Scalar, Scalar)` could only carry *scalars*, so a fallible
+   function could not even return `Result<string, Error>`. This slice lets an `Option`/`Result`
+   hold an owned **Move** payload.
+   - **[done] 8a — owned `string` payload.** Added `Scalar::String` (var-free, so `Ty: Copy`
+     holds) with `Scalar::is_move()`; `payload_is_move(ty)` marks an `Option`/`Result` whose
+     payload is owned. Such an aggregate is itself Move: it joins `drop_locals` / `is_move` /
+     `ret_is_move`, and its `Drop` frees each owned payload field's buffer pointer (`Some`/`Ok` =
+     field 1, `Err` = field 2) **null-safely**. The key invariant that makes the drop branch-free:
+     constructors now build on a **zeroed** aggregate (`const_zero`, not `get_undef`), so the
+     *inactive* arm's payload reads `{null,0}` and its drop is a `free(null)` no-op — only the
+     active owned payload is real. `?` / `else` move the payload out and **null the source** slot
+     on the success edge (`null_moved_source` in `lower_try`/`lower_else_unwrap`), so the source's
+     exit `Drop` frees null (no double-free); on the failure edge the source already holds a
+     zeroed payload. Region: `tracks_region` already recurses into payloads, so `Ok(owned_string)`
+     is `Static` (returnable) while a view-backed payload stays region-tied. Enables
+     `fn f() -> Result<string, Error>` / `Option<string>`. MIR-verified: bound `r := mk(); s := r?`
+     frees the buffer exactly once (source nulled on the Ok edge), Err/None paths free null.
+     Tested e2e (Result/Option unwrap + Err path) + sema (construct/return/use-after-`?`).
+   - **Deferred (8b+):** owned `array<T>` payload (same `{ptr,len}` + null-safe free machinery —
+     just add `Scalar::DynArray`), then **`json.decode<array<T>>` / `array<Struct>`** (the draft.md
+     §19 headline: materialize an owned array, str fields zero-copy region-tied to the input).
+     Tuples / multi-value returns (for `partition`) and `array<slice<T>>` (for `chunks`) are a
+     **separate** type-system track — recorded as open design items (do not fake them); they reuse
+     this same owned-aggregate + drop foundation once their surface is designed.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).

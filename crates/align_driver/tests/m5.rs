@@ -204,6 +204,46 @@ fn string_borrowed_into_str_let_binding() {
 }
 
 #[test]
+fn result_string_payload_unwrapped_and_freed() {
+    if !backend_available() {
+        return;
+    }
+    // MMv2 slice 8a: a fallible function returns an owned `string` in a `Result`; `?` moves it
+    // out (the source Result's payload is nulled so it isn't double-freed), and the unwrapped
+    // `string` is freed once at scope exit. len("hello") = 5 → "5\n".
+    let src = "fn mk(a: str) -> Result<string, Error> = Ok(a.clone())\nfn greet(name: str) -> Result<i64, Error> {\n  r := mk(name)\n  s := r?\n  return Ok(s.len())\n}\nfn main() -> Result<(), Error> {\n  n := greet(\"hello\")?\n  print(n)\n  return Ok(())\n}\n";
+    let out = build_and_run("result-string", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+}
+
+#[test]
+fn option_string_payload_else_unwrap() {
+    if !backend_available() {
+        return;
+    }
+    // `Option<string>` carries an owned payload; `else` moves it out on `Some`, and a `None`
+    // result owns no buffer (its payload is {null,0}, so the drop is a no-op). first(false) =
+    // Some("hi") → len 2; first(true) = None → else returns 0. Output "2\n", exit 0.
+    let src = "fn first(empty: bool) -> Option<string> {\n  if empty { return None }\n  return Some(\"hi\".clone())\n}\nfn main() -> i32 {\n  s := first(false) else { return 9 }\n  print(s.len())\n  t := first(true) else { return 0 }\n  print(t.len())\n  return 1\n}\n";
+    let out = build_and_run("option-string", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+}
+
+#[test]
+fn result_string_err_path_frees_nothing() {
+    if !backend_available() {
+        return;
+    }
+    // On the `Err` arm the owned `ok` payload is zeroed at construction, so propagating the error
+    // frees no garbage and leaks nothing. mk(true) = Err(7) → `?` propagates → exit code 7.
+    let src = "fn mk(fail: bool) -> Result<string, Error> {\n  if fail { return Err(error(7)) }\n  return Ok(\"ok\".clone())\n}\nfn main() -> Result<(), Error> {\n  s := mk(true)?\n  print(s.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("result-string-err", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;
