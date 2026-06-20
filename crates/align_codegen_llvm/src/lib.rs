@@ -13,7 +13,7 @@ use std::path::Path;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{FloatTy, IntTy, Scalar, StructDef, Ty, scalar_to_ty};
+use align_sema::{payload_is_move, FloatTy, IntTy, Scalar, StructDef, Ty, scalar_to_ty};
 
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
@@ -432,7 +432,29 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicType
         Ty::Float(_) => float_type(ctx, ty).into(),
         Ty::Struct(id) => sx[id as usize].into(),
         Ty::StructArray(id, n) => sx[id as usize].array_type(n).into(),
+        // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
+        // array views) lowers to the slice struct.
+        Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         _ => int_type(ctx, ty).into(),
+    }
+}
+
+/// Field indices of an `Option`/`Result` aggregate whose payload is an owned (Move) type and
+/// must be freed when the aggregate is dropped (MMv2 slice 8a). Some/Ok = field 1, Err = field 2.
+fn move_payload_fields(ty: Ty) -> Vec<u32> {
+    match ty {
+        Ty::Option(s) if s.is_move() => vec![1],
+        Ty::Result(o, e) => {
+            let mut v = Vec::new();
+            if o.is_move() {
+                v.push(1);
+            }
+            if e.is_move() {
+                v.push(2);
+            }
+            v
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -483,6 +505,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Unit => 4,
         // Only used to size a `box<T>` payload, which is always a true scalar.
         Scalar::Struct(_) => unreachable!("a struct is not a box payload"),
+        Scalar::String => unreachable!("an owned string is not a box payload"),
     }
 }
 
@@ -627,18 +650,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 Stmt::DropFlagInit(slot) => {
                     // Null-initialise the slot so a drop on a never-allocated / moved-out path is
-                    // a no-op. A `builder` slot holds a bare pointer (null); the owned `{ptr,len}`
-                    // collections store `{null, 0}`.
-                    if self.f.slots[*slot as usize] == Ty::Builder {
-                        let z = self.ctx.ptr_type(AddressSpace::default()).const_null();
-                        self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
+                    // a no-op. A `builder` slot holds a bare pointer (null); an Option/Result with
+                    // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
+                    // the owned `{ptr,len}` collections store `{null, 0}`.
+                    let ty = self.f.slots[*slot as usize];
+                    let z: BasicValueEnum = if ty == Ty::Builder {
+                        self.ctx.ptr_type(AddressSpace::default()).const_null().into()
+                    } else if payload_is_move(ty) {
+                        self.llvm_type(ty).into_struct_type().const_zero().into()
                     } else {
-                        let z = slice_struct_type(self.ctx).const_zero();
-                        self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
-                    }
+                        slice_struct_type(self.ctx).const_zero().into()
+                    };
+                    self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
                 }
                 Stmt::Drop(slot) => {
-                    if self.f.slots[*slot as usize] == Ty::Builder {
+                    let ty = self.f.slots[*slot as usize];
+                    if ty == Ty::Builder {
                         // An unfinished builder: free the builder object (null-safe — a moved-out
                         // builder's slot was nulled by `to_string`).
                         let p = self
@@ -648,6 +675,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
+                    } else if payload_is_move(ty) {
+                        // An Option/Result owning a Move payload: free each owned payload field's
+                        // buffer pointer (null-safe — the inactive arm reads {null,0}, and a
+                        // moved-out aggregate was nulled at the move site).
+                        let aty = self.llvm_type(ty).into_struct_type();
+                        let agg = self
+                            .builder
+                            .build_load(aty, self.slots[slot], "drop")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                        for idx in move_payload_fields(ty) {
+                            let payload = self
+                                .builder
+                                .build_extract_value(agg, idx, "droppl")
+                                .map_err(|e| self.err(e))?
+                                .into_struct_value();
+                            let ptr = self.builder.build_extract_value(payload, 0, "dropplptr").map_err(|e| self.err(e))?;
+                            self.builder
+                                .build_call(self.funcs["free"], &[ptr.into()], "")
+                                .map_err(|e| self.err(e))?;
+                        }
                     } else {
                         // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
                         let agg = self
@@ -745,9 +793,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let oty = option_struct_type(self.ctx, s, self.struct_types);
                 let payload = self.operand(op);
                 let tag = self.ctx.i8_type().const_int(1, false);
+                // Start zeroed (not undef): an owned (Move) payload's drop frees the payload field
+                // null-safely, so the inactive arm must read as {null,0}, not garbage (slice 8a).
                 let agg = self
                     .builder
-                    .build_insert_value(oty.get_undef(), tag, 0, "tag")
+                    .build_insert_value(oty.const_zero(), tag, 0, "tag")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 self.builder
@@ -787,9 +837,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 let rty = result_struct_type(self.ctx, o, e, self.struct_types);
                 let tag = self.ctx.i8_type().const_int(0, false);
+                // Zeroed base (see OptionSome): the inactive `err` arm reads {null,0}, so an owned
+                // (Move) payload there drops null-safely (slice 8a).
                 let agg = self
                     .builder
-                    .build_insert_value(rty.get_undef(), tag, 0, "tag")
+                    .build_insert_value(rty.const_zero(), tag, 0, "tag")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 self.builder
@@ -804,9 +856,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 let rty = result_struct_type(self.ctx, o, e, self.struct_types);
                 let tag = self.ctx.i8_type().const_int(1, false);
+                // Zeroed base (see OptionSome): the inactive `ok` arm reads {null,0}, so an owned
+                // (Move) payload there drops null-safely (slice 8a).
                 let agg = self
                     .builder
-                    .build_insert_value(rty.get_undef(), tag, 0, "tag")
+                    .build_insert_value(rty.const_zero(), tag, 0, "tag")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 self.builder

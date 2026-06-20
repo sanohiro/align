@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, FloatTy, IntTy, Ty};
+use align_sema::{hir, payload_is_move, FloatTy, IntTy, Ty};
 
 pub mod print;
 
@@ -379,7 +379,11 @@ fn lower_fn(f: &hir::Fn) -> Function {
 fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
     match &e.kind {
         hir::ExprKind::Local(id) => {
-            if matches!(b.slots.get(*id as usize), Some(Ty::DynArray(_) | Ty::String | Ty::Builder)) {
+            let moved = match b.slots.get(*id as usize) {
+                Some(&ty) => matches!(ty, Ty::DynArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty),
+                None => false,
+            };
+            if moved {
                 b.push(Stmt::DropFlagInit(*id));
             }
         }
@@ -1402,10 +1406,15 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.emit_exit_cleanup();
     b.terminate(Term::Return(Some(Operand::Value(propagated))));
 
-    // Ok: continue with the unwrapped value.
+    // Ok: continue with the unwrapped value. If the operand was a bound local holding an owned
+    // payload (e.g. `r: Result<string,E>`), the payload is now moved into `v`, so null the source
+    // slot — its exit `Drop` then frees null, not the moved-out buffer (no double-free). On the
+    // Err edge the source's ok payload is already {null,0} (zeroed at construction), so the
+    // exit-cleanup drop there is a harmless no-op.
     b.cur = ok_bb;
     let v = b.fresh_value(ok_ty);
     b.push(Stmt::Let(v, Rvalue::ResultUnwrapOk(r)));
+    null_moved_source(b, inner);
     Operand::Value(v)
 }
 
@@ -1422,11 +1431,14 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     let join_bb = b.new_block();
     b.terminate(Term::Branch(Operand::Value(is_some), some_bb, none_bb));
 
-    // Some: unwrap the payload into the result slot.
+    // Some: unwrap the payload into the result slot. If the source was a bound local with an
+    // owned payload (`opt: Option<string>`), null it — the payload moved into the result slot, so
+    // its exit `Drop` must free null (the `None` edge already has a {null,0} payload).
     b.cur = some_bb;
     let val = b.fresh_value(ty);
     b.push(Stmt::Let(val, Rvalue::OptionUnwrap(opt_op)));
     b.push(Stmt::Store(result_slot, Operand::Value(val)));
+    null_moved_source(b, opt);
     b.terminate(Term::Goto(join_bb));
 
     // None: the fallback yields the value, or diverges (then the block is already
