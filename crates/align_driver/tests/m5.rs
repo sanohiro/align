@@ -146,6 +146,21 @@ fn owned_string_moved_into_callee_is_freed_once() {
 }
 
 #[test]
+fn owned_string_borrowed_as_str_arg() {
+    if !backend_available() {
+        return;
+    }
+    // An owned `string` is passed to a `str` parameter by *borrowing* it (MMv2 slice 7b): the
+    // view shares the `{ptr,len}` layout (zero-cost), and the `string` is NOT consumed — `s` is
+    // still usable after the call (`s.len()` below) and freed exactly once at function exit.
+    // `show` borrows the string twice across the call boundary; output: "foobar\n6\n6\n".
+    let src = "fn show(label: str) -> i64 {\n  print(label)\n  return label.len()\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"foo\", \"bar\")\n  n := show(s)\n  print(n)\n  print(s.len())\n  return 0\n}\n";
+    let out = build_and_run("string-borrow-arg", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "foobar\n6\n6\n");
+}
+
+#[test]
 fn json_decode_flat_struct() {
     if !backend_available() {
         return;

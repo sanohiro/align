@@ -601,6 +601,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::StrClone(src)));
             Operand::Value(v)
         }
+        // Borrowing an owned `string` as a `str` (slice 7b) is a no-op at runtime: the two share
+        // the `{ptr,len}` layout, so the loaded value is the view. The `string` is not moved (no
+        // `null_moved_source`), so its owner still `Drop`-frees it.
+        hir::ExprKind::StrBorrow(inner) => lower_expr(b, inner),
         hir::ExprKind::ArraySum { source, stages } => {
             let init = zero_of(e.ty);
             lower_array_reduce(b, source, stages, e.ty, init, Reducer::Sum)
