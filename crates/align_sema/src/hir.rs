@@ -234,13 +234,19 @@ pub enum ExprKind {
     JsonDecode { struct_id: u32, input: Box<Expr> },
 }
 
-/// Which builder append a `BuilderWrite` performs (MMv2 slice 7c).
+/// Which builder append a `BuilderWrite` performs (MMv2 slice 7c/7d).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuilderWriteKind {
     /// `b.write(s)` — append a `str`/`string` value's bytes.
     Str,
     /// `b.write_int(n)` — append a decimal integer.
     Int,
+    /// `b.write_bool(v)` — append `true`/`false`.
+    Bool,
+    /// `b.write_char(c)` — append a `char`'s UTF-8 encoding.
+    Char,
+    /// `b.write_float(x)` — append an `f32`/`f64`'s shortest round-trip decimal.
+    Float,
 }
 
 #[derive(Clone, Debug)]

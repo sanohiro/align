@@ -190,6 +190,20 @@ fn builder_write_borrows_owned_string() {
 }
 
 #[test]
+fn builder_writes_all_scalar_kinds() {
+    if !backend_available() {
+        return;
+    }
+    // MMv2 slice 7d: the builder's scalar writers match `print`/`template` coverage —
+    // `write_int`/`write_bool`/`write_char`/`write_float` alongside `write` (str).
+    // Output: "n=7 ok=true c=A pi=3.5\n".
+    let src = "fn render() -> string {\n  b := builder()\n  b.write(\"n=\")\n  b.write_int(7)\n  b.write(\" ok=\")\n  b.write_bool(true)\n  b.write(\" c=\")\n  b.write_char('A')\n  b.write(\" pi=\")\n  b.write_float(3.5)\n  return b.to_string()\n}\nfn main() -> i32 {\n  print(render())\n  return 0\n}\n";
+    let out = build_and_run("builder-scalars", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "n=7 ok=true c=A pi=3.5\n");
+}
+
+#[test]
 fn empty_builder_to_string_is_safe() {
     if !backend_available() {
         return;

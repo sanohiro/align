@@ -1631,9 +1631,9 @@ impl<'a> Checker<'a> {
         if method == "to_array" {
             return self.check_array_to_array(recv, args, span);
         }
-        // Builder methods (MMv2 slice 7c): `write`/`write_int` append, `to_string` finishes.
-        if method == "write" || method == "write_int" {
-            return self.check_builder_write(recv, args, method == "write_int", span);
+        // Builder methods (MMv2 slice 7c/7d): typed `write*` appends, `to_string` finishes.
+        if let Some(kind) = builder_write_kind(method) {
+            return self.check_builder_write(recv, args, kind, span);
         }
         if method == "to_string" {
             return self.check_builder_to_string(recv, args, span);
@@ -2323,13 +2323,16 @@ impl<'a> Checker<'a> {
         Expr { kind: ExprKind::BuilderNew, ty: Ty::Builder, span }
     }
 
-    /// `b.write(s)` / `b.write_int(n)` — append to a builder. The builder is borrowed (mutated
-    /// through its handle, not consumed). `write` takes a `str` (a `string` borrows as one);
-    /// `write_int` takes an integer (widened to `i64` at codegen, like `print`).
-    fn check_builder_write(&mut self, recv: &ast::Expr, args: &[ast::Expr], is_int: bool, span: Span) -> Expr {
+    /// `b.write(s)` / `b.write_int(n)` / `b.write_bool(v)` / `b.write_char(c)` /
+    /// `b.write_float(x)` — append to a builder (MMv2 slice 7c/7d). The builder is borrowed
+    /// (mutated through its handle, not consumed). Each writer takes the matching scalar; `write`
+    /// takes a `str` (a `string` borrows as one — zero-cost, non-consuming, reuses the slice-7b
+    /// borrow, so `b.write(owned_string)` keeps it usable). `write_int` widens to `i64` at codegen,
+    /// like `print`; `write_float` accepts `f32`/`f64` (codegen picks the runtime fn by width).
+    fn check_builder_write(&mut self, recv: &ast::Expr, args: &[ast::Expr], kind: BuilderWriteKind, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let mname = builder_write_method_name(kind);
         let recv_expr = self.check_expr(recv, None);
-        let mname = if is_int { "write_int" } else { "write" };
         if recv_expr.ty != Ty::Builder {
             if recv_expr.ty != Ty::Error {
                 self.diags
@@ -2342,34 +2345,28 @@ impl<'a> Checker<'a> {
                 .error(format!("'.{mname}()' takes 1 argument, got {}", args.len()), span);
             return err;
         }
-        let arg = self.check_expr(&args[0], None);
-        let (arg, kind) = if is_int {
-            if !matches!(arg.ty, Ty::Int(_) | Ty::IntVar(_)) {
-                if arg.ty != Ty::Error {
-                    self.diags
-                        .error(format!("'.write_int()' expects an integer, got {}", ty_name(arg.ty)), arg.span);
-                }
-                return err;
-            }
-            (arg, BuilderWriteKind::Int)
-        } else {
-            // A `str` is written directly; a `string` borrows as one (zero-cost, non-consuming —
-            // reuses the slice-7b borrow), so `b.write(owned_string)` keeps `owned_string` usable.
-            let arg = match arg.ty {
-                Ty::Str => arg,
-                Ty::String => {
-                    let s = arg.span;
-                    Expr { kind: ExprKind::StrBorrow(Box::new(arg)), ty: Ty::Str, span: s }
-                }
-                Ty::Error => return err,
-                other => {
-                    self.diags
-                        .error(format!("'.write()' expects a str, got {}", ty_name(other)), arg.span);
-                    return err;
-                }
-            };
-            (arg, BuilderWriteKind::Str)
+        let mut arg = self.check_expr(&args[0], None);
+        if arg.ty == Ty::Error {
+            return err;
+        }
+        // `write` accepts a `str`; a `string` borrows as one (zero-cost, non-consuming — reuses
+        // the slice-7b borrow), so `b.write(owned_string)` keeps `owned_string` usable.
+        if kind == BuilderWriteKind::Str && arg.ty == Ty::String {
+            let s = arg.span;
+            arg = Expr { kind: ExprKind::StrBorrow(Box::new(arg)), ty: Ty::Str, span: s };
+        }
+        let (ok, want) = match kind {
+            BuilderWriteKind::Str => (arg.ty == Ty::Str, "a str"),
+            BuilderWriteKind::Int => (matches!(arg.ty, Ty::Int(_) | Ty::IntVar(_)), "an integer"),
+            BuilderWriteKind::Bool => (arg.ty == Ty::Bool, "a bool"),
+            BuilderWriteKind::Char => (arg.ty == Ty::Char, "a char"),
+            BuilderWriteKind::Float => (matches!(arg.ty, Ty::Float(_) | Ty::FloatVar(_)), "a float"),
         };
+        if !ok {
+            self.diags
+                .error(format!("'.{mname}()' expects {want}, got {}", ty_name(arg.ty)), arg.span);
+            return err;
+        }
         Expr {
             kind: ExprKind::BuilderWrite { builder: Box::new(recv_expr), arg: Box::new(arg), kind },
             ty: Ty::Unit,
@@ -2854,6 +2851,29 @@ fn single_name(p: &ast::Path) -> Option<&str> {
 /// (and the error sentinel, to avoid cascading diagnostics).
 fn is_printable(ty: Ty) -> bool {
     ty.is_numeric() || matches!(ty, Ty::Str | Ty::String | Ty::Bool | Ty::Char | Ty::Error)
+}
+
+/// Map a method name to the builder writer it denotes (MMv2 slice 7c/7d), if any.
+fn builder_write_kind(method: &str) -> Option<BuilderWriteKind> {
+    Some(match method {
+        "write" => BuilderWriteKind::Str,
+        "write_int" => BuilderWriteKind::Int,
+        "write_bool" => BuilderWriteKind::Bool,
+        "write_char" => BuilderWriteKind::Char,
+        "write_float" => BuilderWriteKind::Float,
+        _ => return None,
+    })
+}
+
+/// The surface method name of a builder writer (for diagnostics).
+fn builder_write_method_name(kind: BuilderWriteKind) -> &'static str {
+    match kind {
+        BuilderWriteKind::Str => "write",
+        BuilderWriteKind::Int => "write_int",
+        BuilderWriteKind::Bool => "write_bool",
+        BuilderWriteKind::Char => "write_char",
+        BuilderWriteKind::Float => "write_float",
+    }
 }
 
 fn ty_name(ty: Ty) -> String {
@@ -3475,6 +3495,26 @@ mod tests {
         // `.write()` takes a str; an int is rejected (use `.write_int()`).
         let (_p, d) = check("fn main() -> i32 {\n  b := builder()\n  b.write(42)\n  return 0\n}\n");
         assert!(d.has_errors(), "builder.write of a non-str must error");
+    }
+
+    #[test]
+    fn builder_scalar_writers_check() {
+        // MMv2 slice 7d: bool/char/float writers accept their matching scalar.
+        let (_p, d) = check("fn main() -> i32 {\n  b := builder()\n  b.write_int(1)\n  b.write_bool(true)\n  b.write_char('z')\n  b.write_float(2.5)\n  s := b.to_string()\n  return 0\n}\n");
+        assert!(!d.has_errors(), "builder scalar writers should check");
+    }
+
+    #[test]
+    fn builder_write_bool_rejects_non_bool() {
+        // Each typed writer rejects a mismatched scalar (here `write_bool` of an int).
+        let (_p, d) = check("fn main() -> i32 {\n  b := builder()\n  b.write_bool(1)\n  return 0\n}\n");
+        assert!(d.has_errors(), "write_bool of a non-bool must error");
+    }
+
+    #[test]
+    fn builder_write_float_rejects_int() {
+        let (_p, d) = check("fn main() -> i32 {\n  b := builder()\n  b.write_float(3)\n  return 0\n}\n");
+        assert!(d.has_errors(), "write_float of an int must error (no implicit int->float)");
     }
 
     #[test]

@@ -162,6 +162,12 @@ pub enum Rvalue {
     BuilderWriteStr(Operand, Operand),
     /// `b.write_int(n)` — append a decimal integer (widened to `i64`) to the builder. Yields unit.
     BuilderWriteInt(Operand, Operand),
+    /// `b.write_bool(v)` — append `true`/`false`. Yields unit.
+    BuilderWriteBool(Operand, Operand),
+    /// `b.write_char(c)` — append a `char`'s UTF-8. Yields unit.
+    BuilderWriteChar(Operand, Operand),
+    /// `b.write_float(x)` — append an `f32`/`f64` (codegen picks the width). Yields unit.
+    BuilderWriteFloat(Operand, Operand),
     /// `b.to_string()` — finish the builder into an owned `string` `{ptr,len}` (a fresh heap
     /// buffer freed by a later [`Stmt::Drop`]), consuming the builder handle.
     BuilderToString(Operand),
@@ -626,6 +632,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let rv = match kind {
                 hir::BuilderWriteKind::Str => Rvalue::BuilderWriteStr(bop, aop),
                 hir::BuilderWriteKind::Int => Rvalue::BuilderWriteInt(bop, aop),
+                hir::BuilderWriteKind::Bool => Rvalue::BuilderWriteBool(bop, aop),
+                hir::BuilderWriteKind::Char => Rvalue::BuilderWriteChar(bop, aop),
+                hir::BuilderWriteKind::Float => Rvalue::BuilderWriteFloat(bop, aop),
             };
             b.push(Stmt::Let(v, rv));
             Operand::Const(Const::Unit)
