@@ -402,7 +402,16 @@ impl<'a> EscapeCheck<'a> {
     /// (MMv2 slice 2 — a struct's region is the max of its fields, so a struct holding an
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(ty: Ty) -> bool {
-        matches!(ty, Ty::Box(_) | Ty::Str | Ty::Struct(_) | Ty::DynArray(_))
+        match ty {
+            Ty::Box(_) | Ty::Str | Ty::Struct(_) | Ty::DynArray(_) => true,
+            // An `Option`/`Result` is region-tracked iff its payload is (only a `Struct` payload
+            // can be — `str`/`box`/`array` aren't scalars, so they never reach a composite). A
+            // `Result<Struct, _>` is exactly what `json.decode` yields, so a region-tied decoded
+            // struct stays tracked while wrapped, and can't escape via an unwrapped local.
+            Ty::Option(s) => Self::tracks_region(scalar_to_ty(s)),
+            Ty::Result(o, e) => Self::tracks_region(scalar_to_ty(o)) || Self::tracks_region(scalar_to_ty(e)),
+            _ => false,
+        }
     }
 
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
@@ -424,7 +433,17 @@ impl<'a> EscapeCheck<'a> {
             // Conservative: even a scalar-only decoded struct is bound to the input region (no
             // struct-field lookup here); use `.clone()` to escape. `?` preserves the region.
             ExprKind::JsonDecode { input, .. } => self.region_of(input, depth),
-            ExprKind::Try(inner) => self.region_of(inner, depth),
+            // Wrapping/unwrapping preserves the payload's region: `Ok(decoded)` is as short-lived
+            // as `decoded`, and `res?` re-exposes whatever region `res` carried. Without this a
+            // region-tied struct could escape through a `Result`-typed local (use-after-free).
+            ExprKind::Try(inner)
+            | ExprKind::OptionSome(inner)
+            | ExprKind::ResultOk(inner)
+            | ExprKind::ResultErr(inner) => self.region_of(inner, depth),
+            // `opt else fb` yields one of two values, so it lives only as long as the shorter.
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.region_of(opt, depth).shorter(self.region_of(fallback, depth))
+            }
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
@@ -3075,6 +3094,15 @@ mod tests {
         // decoded struct is region-tied to it, so the view cannot escape the arena.
         let (_p, d) = check("U { id: i64, name: str }\nfn bad(key: str) -> Result<i32, Error> {\n  mut outer := \"\"\n  arena {\n    d := key + key\n    u: U := json.decode(d)?\n    outer = u.name\n  }\n  return Ok(0)\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "a decoded str view from arena input must not escape the arena");
+    }
+
+    #[test]
+    fn json_decoded_struct_cannot_escape_via_result_local() {
+        // The decoded struct's region must survive while wrapped in a `Result`: binding the raw
+        // `json.decode(...)` to a `Result`-typed local, unwrapping it with `?`, then returning
+        // `Ok(u)` must still be rejected (otherwise the arena-tied str views escape → UAF).
+        let (_p, d) = check("U { id: i64, name: str }\nfn bad(key: str) -> Result<U, Error> {\n  arena {\n    d := key + key\n    res: Result<U, Error> := json.decode(d)\n    u: U := res?\n    return Ok(u)\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(d.has_errors(), "a region-tied decoded struct must not escape through a Result-typed local");
     }
 
     #[test]

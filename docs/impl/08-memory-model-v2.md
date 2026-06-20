@@ -357,6 +357,13 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      so a view decoded from arena-allocated input cannot escape the arena (conservative — even a
      scalar-only struct is tied; decode from a `str` param/literal is Static, hence returnable,
      which is sound because the caller owns the buffer). Tested both directions.
+     - **Region tracking through `Option`/`Result` (fix).** The region tie has to survive the
+       `Result` wrapper, since `json.decode` yields `Result<Struct, Error>`. `tracks_region` now
+       recurses into `Option`/`Result` payloads (true iff a `Struct` payload tracks a region), and
+       `region_of` propagates through `Ok`/`Some`/`Err`/`?` (= the inner region) and `else`
+       (= the shorter of the two arms). Without this, binding the raw decode to a `Result`-typed
+       local and unwrapping it later (`res: Result<U,E> := json.decode(d); u := res?; return Ok(u)`)
+       slipped the escape check (the `Result` local wasn't region-tracked) → use-after-free.
    - **Deferred:** `str.clone()` to escape; array / nested-struct field decode; and a general
      **call-result region tie** — `region_of(Call)` is `Static`, so a view-returning function
      called with an arena argument (`r := parse(arena_str)`) loses the tie at the call boundary.
