@@ -153,6 +153,9 @@ pub enum Rvalue {
     SliceIndex(Operand, Operand),
     /// A string literal — a `str` view `{ &bytes, len }` over a constant.
     StrLit(String),
+    /// `str.clone()` — deep-copy a `str` operand's bytes into a fresh heap buffer, yielding an
+    /// owned `string` `{ptr,len}`. The buffer is freed by a later [`Stmt::Drop`] of its slot.
+    StrClone(Operand),
     /// `template "..."` / `str + str` — build a `str` from pieces. The optional operand
     /// is the enclosing arena handle (the result lives there; `None` = leaked).
     Template(Vec<TemplatePiece>, Option<Operand>),
@@ -352,12 +355,12 @@ fn lower_fn(f: &hir::Fn) -> Function {
 /// the new owner. The moved expression is a bare `Local` (null its slot) or a block/arena whose
 /// trailing value is the move (recurse into the tail). Other shapes (fresh temporaries like
 /// `make()` / `.to_array()`) own no slot, and sema rejects moving a bound owned local out
-/// through an `if`/`else` arm, so no other case reaches here. Restricted to `DynArray` slots —
-/// `box<T>` is arena-regioned and never free-standing-dropped.
+/// through an `if`/`else` arm, so no other case reaches here. Restricted to free-standing owned
+/// slots (`DynArray`, owned `string`) — `box<T>` is arena-regioned and never free-standing-dropped.
 fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
     match &e.kind {
         hir::ExprKind::Local(id) => {
-            if matches!(b.slots.get(*id as usize), Some(Ty::DynArray(_))) {
+            if matches!(b.slots.get(*id as usize), Some(Ty::DynArray(_) | Ty::String)) {
                 b.push(Stmt::DropFlagInit(*id));
             }
         }
@@ -501,8 +504,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Call { func, args } => {
             let ops = args.iter().map(|a| lower_expr(b, a)).collect();
             // A by-value owned-array argument is moved into the callee: null the caller's slot.
-            for a in args {
-                null_moved_source(b, a);
+            // `print` only reads its argument (it borrows), so it must not null the source — it
+            // keeps living (matching the borrow in sema's MoveCheck).
+            if func != "print" {
+                for a in args {
+                    null_moved_source(b, a);
+                }
             }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Call(func.clone(), ops)));
@@ -579,6 +586,15 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let handle = *b.arenas.last().expect("clone outside an arena (sema-checked)");
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::BoxClone(Operand::Value(handle), src)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::StrClone(inner) => {
+            // Deep-copy the `str` bytes into a fresh heap buffer, yielding an owned `string`
+            // `{ptr,len}`. The slot it lands in is `Drop`-freed at scope exit (sema marks the
+            // String local for drop), so no arena is needed.
+            let src = lower_expr(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::StrClone(src)));
             Operand::Value(v)
         }
         hir::ExprKind::ArraySum { source, stages } => {
@@ -1434,6 +1450,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Slice(_) => "slice".to_string(),
         Ty::DynArray(_) => "array".to_string(),
         Ty::Str => "str".to_string(),
+        Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),

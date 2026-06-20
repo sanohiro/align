@@ -102,6 +102,23 @@ pub struct AlignStr {
     pub len: i64,
 }
 
+/// `str.clone()` — deep-copy the bytes of a `str` view into a fresh heap buffer, returning an
+/// owned `string` `{ptr,len}` (MMv2 slice 7). The buffer comes from [`align_rt_alloc`] and is
+/// freed by the generated code's `Drop` of the owning slot. An empty clone owns no buffer (null
+/// ptr), so its `free(null)` drop is a harmless no-op.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_clone(ptr: *const u8, len: i64) -> AlignStr {
+    if len <= 0 {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let dst = align_rt_alloc(len);
+    unsafe { core::ptr::copy_nonoverlapping(ptr, dst, len as usize) };
+    AlignStr { ptr: dst, len }
+}
+
 /// An append-oriented string builder (`06-runtime-std.md` §7), backing `template`
 /// desugaring. M5: heap-backed; the finished buffer is leaked (no ownership/free yet —
 /// arena-tied builders come later).
