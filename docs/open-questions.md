@@ -44,6 +44,15 @@ Record: `draft.md` §9, `impl/04-mir.md` §4, `impl/05-backend-llvm.md` §5
 **Decision: delegated to packages.** No SQL abstraction in core/std. Foundational parts (bytes/buffer/json/reader-writer etc.) are placed in core/std.
 Record: `draft.md` §18.3
 
+### String representation (SSO)
+**Decision: `string` is `{ ptr, len }` (16 bytes), heap-owned. Small-String Optimization (an inline `{ ptr, len, cap }` header with a length-tag bit) is NOT adopted.**
+Rationale: SSO adds a branch to every `ptr`/`len` access and breaks FFI pointer stability (an inline string cannot hand a stable address to C without first materializing it). Align's arena-centric model already avoids the small-`malloc` churn SSO targets, so the win is marginal while the cost lands on "predictable performance" + "nothing hidden". Revisit only if profiling on real workloads justifies it (digested from `work/proposals/string-optimization.md` §1).
+Record: `impl/08-memory-model-v2.md` (slice 7a, owned `string`), `design-notes.md`.
+
+### Panic / unwinding (CFG shape)
+**Decision: no unwinding; immediate abort.** Fatal errors (div-by-zero, OOM) abort the process; there is no catch/recover boundary. The compiler emits plain LLVM `call` (never `invoke` + landing pads), so the MIR→LLVM CFG stays exception-free. (Promotes the prior "currently: immediate abort" detail to a locked decision — committing now keeps the CFG-generation stage from ever needing landing-pad support.) The *build-level* `panic=abort` + strip-`.eh_frame` step that drops the Rust-std unwinder is a separate, opt-in binary-size/startup lever (see Future "Hardware & backend optimization backlog").
+Record: `impl/04-mir.md` (CFG), `non-goals.md`.
+
 ---
 
 ## Open (to be decided)
@@ -103,14 +112,27 @@ named/explicit-allocator form like `arena a {}` and cross-arena chunk sharing.
 ### Exposing SIMD intrinsics in std
 In addition to auto-vectorization, whether to place explicit intrinsics in std (`impl/04-mir.md` §9).
 
+### SoA (struct-of-arrays) layout — design now, implement ~M6
+**Leaning: an explicit `soa array<T>` modifier (annotation), not auto-detection.** A column-oriented array lowers `users[i].field` to an index into the matching column array instead of an AoS GEP. **Retrofit-sensitive**: this changes AST/HIR/MIR field-access resolution and the array ABI, so the array / struct-array type representation and field-access lowering should stay **layout-parametric** (treat AoS vs SoA as a property of the array type) *now*, while the array machinery is still being built — even though the `soa` surface + SoA codegen ship at M6 (its payoff is SIMD auto-vectorization of column scans). Still open: whether to also allow auto-SoA under a heuristic. (Digested from `work/proposals/next-draft.md` §1.2, `optimization-milestones.md` §1.1.)
+Record: `impl/05-backend-llvm.md` §2, `design-notes.md` (hardware-friendly).
+
+### Struct/array alignment attribute `align(N)` — design reserved, implement ~M6
+A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) data := …`) for GPU/DMA/page-aligned zero-copy interop. **Retrofit-sensitive**: it modifies struct field-offset math and the arena bump allocator's alignment, so reserve room in the layout model now; the surface + LLVM `align N` emission + arena honoring it can land at M6 alongside SoA. (Digested from `work/proposals/next-draft.md` §1.1.)
+
+### `out` parameters + `noalias` — fold into the post-MMv2 aliasing work
+`out` params (`draft.md` §7) are a no-alias optimization. The compiler's `EscapeCheck`/`MoveCheck` (Memory Model v2) already track which views may overlap; an `out` param / non-aliasing view lowers to LLVM `noalias` metadata, letting loop vectorization skip runtime overlap checks. **Schedule right after MMv2** (it is a direct extension of the analysis being written there), not in a separate far-future phase. (Digested from `work/proposals/optimization-milestones.md` §1.2, `toolchain-optimizations.md` §5; see also `08-memory-model-v2.md` §11 "out parameters".)
+
 ### SoA conversion trigger
-Whether to automate the decision to lay out `array<T>` as SoA, or use annotation. Impact on the array ABI (`impl/05-backend-llvm.md` §2).
+Whether to automate the decision to lay out `array<T>` as SoA, or use annotation. Impact on the array ABI (`impl/05-backend-llvm.md` §2). (Subsumed by "SoA layout" above; kept as the open auto-vs-annotation sub-question.)
+
+### Arena checkpoint / rollback — std arena API, after MMv2
+A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. The runtime arena already bump-allocates; this exposes a reset-to-mark on top. (Digested from `work/proposals/library-foundations.md` §3; used by the streaming-parse story in `http-optimization.md` §5.)
 
 ### Build system / package layout
 Visibility (`pub`), import, and module are decided (`impl/02-frontend.md`). What remains is the design of the build system, package layout, and dependency resolution.
 
-### FFI (foreign function interface) — after M8
-Detailed design of C / Rust / Zig interoperability.
+### FFI (foreign function interface) — after M8 (keystone for the library strategy)
+Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLVM with no GC, an external C call is a direct LLVM `call` at native speed (no pinning / stack-switch / marshaling), and an Align `slice`/`str`/`bytes` hands its raw pointer straight to C. **This gates a deliberate library strategy: "own the memory wrappers, borrow the mathematical engines"** — `std.compress` wraps `libzstd`/`zlib-ng`, `pkg` DB drivers wrap `libpq`/`sqlite`, etc., rather than re-implementing assembly-tuned algorithms in Align. So FFI's design should land before those `std`/`pkg` libraries are built, even though it stays out of the v1 *language* core. (Digested from `work/proposals/ffi-optimization.md`, `compression-strategy.md`, `rdb-optimization.md`.)
 
 ### Details (settled during implementation)
 ```text
@@ -220,3 +242,62 @@ Line-drawing (to preserve the core invariants): default-on only when predictable
 (fusion / arena / SIMD / cold path / small static binary); mechanism-hidden-but-cost-
 predictable fast paths go in std with a portable fallback; environment-dependent or
 footgun techniques stay opt-in / isolated.
+
+### Hardware & backend optimization backlog (deferrable; no front-end change)
+
+A consolidated home for the performance proposals that are **pure backend lowering,
+driver settings, or library internals** — none touch parser / type checker / IR
+*semantics*, so they are safe to add after the language core, enabled by the
+"backend-agnostic MIR" invariant (an alternate lowering, not a redesign). Digested from
+`work/proposals/` (kept there as raw drafts); listed here so the drafts can be discarded
+without losing the backlog.
+
+```text
+Backend / codegen lowering (MIR -> LLVM, source unchanged):
+- Scalable-vector (VLA) loops: emit <vscale x N x T> + predication for ARM SVE /
+  RISC-V V, eliminating the scalar remainder loop. (Baseline = fixed-width vec<N> at M6.)
+- Non-temporal stores: tag large materializing writes with !nontemporal to bypass cache.
+- Fast-math flags on float ops (opt-in): unlock float reassociation / autovectorization.
+- -march=native / host CPU feature detection (opt-in; breaks portable "predictable").
+- Cross-language LTO: build the Rust runtime to bitcode so align_rt_* helpers inline into
+  user loops across the language boundary.
+- GPU codegen for pure par_map/reduce: compile the closure to PTX / SPIR-V / MSL, embed as
+  a blob, runtime device-dispatch with a length heuristic + unified-memory zero-copy.
+  (GPU backend is already listed Future, above.)
+- panic=abort build + strip .eh_frame: drop the Rust-std unwinder (smaller binary, cleaner
+  I-cache). The no-unwind CFG itself is already Settled; this is the build-flag half.
+
+Runtime / std internals (API unchanged, fast path swapped in):
+- SIMD-accelerated runtime: JSON structural scan, str find/split/trim, UTF-8 validation,
+  zero-alloc itoa/atoi (an extension of the existing fast atoi/itoa lever).
+- Perfect hashing for static keys (already a lever above; JSON field tables / keywords).
+- core.bitset (POPCNT/TZCNT/LZCNT) and a default SIMD non-crypto hash (core.hash).
+- Buffered, optionally-unlocked stdout (ring buffer; flush on full/newline-to-TTY/exit).
+- Zero-copy I/O: mmap+madvise file views, io_uring/GCD async — see "Transparent zero-copy
+  I/O (std.io)" above; same hidden-fast-path + portable-fallback rule.
+
+Library architecture principle (record before std is built, applies to all of std):
+- Read-oriented std APIs take/return views (str / slice / bytes), not owned copies
+  (fs.read_file_view, path.base, env.get). Output APIs write into a caller-provided
+  "mut builder" sink (write_json(out: mut builder, …)) rather than returning a fresh
+  string. This makes zero-allocation pipelines the default and is painful to retrofit, so
+  it is a design rule for std, not an afterthought. (Digested from library-foundations.md,
+  api-server-db.md; consistent with design-notes "string philosophy".)
+```
+
+### Domain libraries belong to `std`/`pkg`, not core (placement note)
+
+The proposals' application domains are **not core-language work** and must not pull
+framework concerns into the core (per `non-goals.md` and `draft.md` §18 layering):
+
+```text
+- std (OS boundary): std.fs / std.net / std.io fast paths, std.regex (RE2-style linear-time
+  NFA/DFA; a compile-time `rx"…"` literal is a *language* add tracked separately if pursued),
+  std.compress (FFI wrappers over libzstd/zlib-ng — gated on FFI).
+- pkg (frameworks/ecosystem, kept out of core/std): HTTP/3 client+server, socket tuning
+  (TFO/REUSEPORT/thread-per-core), RDB drivers (Postgres/MySQL/SQLite), the API-server
+  blueprint. DB ecosystem delegation is already Settled above.
+```
+These ride on the core capabilities (arena, views, FFI, task_group, zero-copy I/O); they
+are downstream consumers, scheduled after the core + std foundations, and are recorded here
+only so the vision is not lost when `work/proposals/` is discarded.

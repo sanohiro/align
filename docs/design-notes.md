@@ -239,6 +239,19 @@ string pools
 
 Repeated scanning should be avoided.
 
+**Owned `string` stays `{ ptr, len }` — no Small-String Optimization.** SSO (inline
+`{ ptr, len, cap }` with a tag bit) was considered and rejected: it adds a branch to every
+access and breaks FFI pointer stability, while Align's arena model already avoids the
+small-`malloc` churn SSO targets — so it trades "predictable performance" + "nothing hidden"
+for a marginal win. (Settled in `open-questions.md`.)
+
+**Output writes into a `builder` sink, not a returned string.** The library convention is
+`write_json(out: mut builder, …)` over `to_json() -> string`: serialization/formatting append
+into a caller-provided buffer (often arena-backed), so complex output costs zero heap
+allocations. Paired with read-oriented `std` APIs returning views (`str`/`slice`/`bytes`)
+rather than owned copies, this makes zero-allocation pipelines the default. (A std design
+rule — `open-questions.md` Future "Library architecture principle".)
+
 ---
 
 ## The JSON philosophy

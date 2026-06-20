@@ -329,6 +329,10 @@ assumption that becomes a breaking change. M6/M7 build on top of this, not befor
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.
+- **SoA (`soa array<T>`) + `align(N)`** land here (layout features whose payoff is
+  vectorization / aligned zero-copy interop). Both are retrofit-sensitive — keep array
+  field-access lowering layout-parametric and reserve room in field-offset math *before*
+  M6 (see `open-questions.md` Open "SoA layout" / "`align(N)`").
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 
@@ -354,9 +358,20 @@ error type design          → finalized in M2
 ownership syntax           → finalized in M3
 arena API (explicit allocator) → finalized in M3
 minimal generics system    → finalized before starting M4 (array operations require generics)
+out params + noalias       → right after Memory Model v2 (extends EscapeCheck/MoveCheck)
+arena checkpoint/rollback  → std arena API, after Memory Model v2
+SoA layout + align(N)      → finalized in M6 (keep array lowering layout-parametric before then)
+string SSO                 → settled: NOT adopted (open-questions Settled)
+panic / unwinding          → settled: no unwind, plain-call CFG (open-questions Settled)
 purity inference           → finalized in M7 (integral with par_map checking)
 presence of SIMD intrinsics → finalized in M6
-reflection / FFI           → out of v1 scope. Reconsider after M8
+reflection                 → out of v1 scope
+FFI                        → out of v1 *language* core; design before std.compress / pkg DB
+                             drivers (they wrap C engines via FFI). Reconsider after M8.
+backend/runtime perf       → deferrable backlog (VLA/SVE, nontemporal, fast-math, LTO,
+                             -march=native, GPU codegen, SIMD JSON/str, perfect hash, mmap/
+                             io_uring) — open-questions Future "Hardware & backend optimization
+                             backlog". No front-end change; add after the core + std.
 ```
 
 ## Out of v1 Scope (intentional)
