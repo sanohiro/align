@@ -364,12 +364,25 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
        (= the shorter of the two arms). Without this, binding the raw decode to a `Result`-typed
        local and unwrapping it later (`res: Result<U,E> := json.decode(d); u := res?; return Ok(u)`)
        slipped the escape check (the `Result` local wasn't region-tracked) → use-after-free.
-   - **Deferred:** `str.clone()` to escape; array / nested-struct field decode; and a general
-     **call-result region tie** — `region_of(Call)` is `Static`, so a view-returning function
-     called with an arena argument (`r := parse(arena_str)`) loses the tie at the call boundary.
-     This is a *pre-existing* gap (it already affects `fn f(s: str) -> str = s`), not introduced
-     here; closing it (propagate the shortest region-tracked arg region through a `Call`, like
-     `slice_is_local` does for slices) is its own slice.
+   - **[done] 6b — call-result region tie.** Closed the (pre-existing, unsound) gap where
+     `region_of(Call)` was `Static`: a view-returning function called with an arena argument
+     (`return dup(arena_str)`, `fn dup(s: str) -> str = s`) lost the tie at the call boundary and
+     escaped the arena unchecked → use-after-free. `region_of(Call { args })` now folds the
+     **shortest-lived argument region** (the region analogue of `slice_is_local`'s arg
+     propagation): the result is assumed to borrow its shortest-lived arg. Conservative — a
+     function that does *not* return a borrow of its args is over-restricted (precise per-fn
+     "returns a borrow of arg i" inference is a later slice) — but sound. Non-tracked args
+     (ints/literals) are `Static` and don't shorten, so `dup("hi")` stays returnable.
+     - **`reduce` accumulator region (same fix).** A sibling gap: `region_of(ArrayReduce)` was
+       `Static`, so a `reduce` whose accumulator is region-tracked (a `str` built by concatenation
+       in the fold) could escape the arena it was folded in → use-after-free. `reduce` now joins
+       `to_array`/`scan`/`sort` at `Region::arena(depth)` (the accumulator is folded in the
+       enclosing arena). Scalar accumulators are unaffected (no region). (Note: the precise region
+       is `arena(depth)`, not `shorter(init, source)` — an empty/all-`Static`-arg reduce still
+       allocates its fresh accumulator at `depth`.)
+   - **Deferred:** `str.clone()` to escape; array / nested-struct field decode; and precise
+     per-fn borrow inference (which arg, if any, a call result actually borrows) to lift the
+     conservatism of 6b.
 7. **`string` (owned) + `bytes`/`buffer`.** Owned string per draft.md §12, on the same
    owned/drop machinery.
 
