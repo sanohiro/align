@@ -513,6 +513,12 @@ impl<'a> Parser<'a> {
                 let field = self.parse_ident("field or method name")?;
                 let span = e.span.merge(field.span);
                 e = Expr { kind: ExprKind::FieldAccess { recv: Box::new(e), field }, span };
+            } else if self.at(&TokKind::LBracket) {
+                self.bump(); // '['
+                let index = self.parse_expr(0)?;
+                self.expect(&TokKind::RBracket, "']'");
+                let span = e.span.merge(self.prev_span());
+                e = Expr { kind: ExprKind::Index { recv: Box::new(e), index: Box::new(index) }, span };
             } else {
                 break;
             }

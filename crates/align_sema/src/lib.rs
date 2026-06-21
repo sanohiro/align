@@ -738,6 +738,10 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
             | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
+            ExprKind::Index { recv, index } => {
+                self.walk(recv, depth);
+                self.walk(index, depth);
+            }
             ExprKind::BuilderWrite { builder, arg, .. } => {
                 self.walk(builder, depth);
                 self.walk(arg, depth);
@@ -909,6 +913,11 @@ impl<'a> MoveCheck<'a> {
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
+            }
+            // `recv[index]` borrows the receiver (reads an element) and reads the index.
+            ExprKind::Index { recv, index } => {
+                self.expr(recv, moved, false, false);
+                self.expr(index, moved, false, false);
             }
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.expr(source, moved, false, false);
@@ -1335,6 +1344,7 @@ impl<'a> Checker<'a> {
                 self.check_field_access(recv, field, expected, e.span)
             }
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, None, e.span),
+            ast::ExprKind::Index { recv, index } => self.check_index(recv, index, e.span),
             ast::ExprKind::Template(parts) => self.check_template(parts, expected, e.span),
             ast::ExprKind::FieldShorthand(_) => {
                 self.diags.error(
@@ -2731,6 +2741,61 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `recv[index]` — element access. M5/MMv2 cut: a scalar `array`/`slice`/owned `array<T>`
+    /// (the element is a scalar, copied out); the bounds check + abort is emitted in MIR. Indexing
+    /// a struct array (whole-element load) and `str` byte indexing are deferred.
+    fn check_index(&mut self, recv: &ast::Expr, index: &ast::Expr, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let r = self.check_expr(recv, None);
+        // The index is an `i64` (matching `.len()` and loop counters). A non-integer index must
+        // bail with `Ty::Error` — returning a typed `Index` node with a bad index would feed a
+        // non-int operand into the MIR bounds-check `icmp` and panic codegen.
+        let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if i.ty == Ty::Error {
+            return err;
+        }
+        if !i.ty.is_int_like() {
+            self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
+            return err;
+        }
+        let elem = match r.ty {
+            Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
+            Ty::StructArray(..) | Ty::DynStructArray(_) => {
+                self.diags.error(
+                    "indexing a struct array is not supported yet (use a pipeline, e.g. `.where(...).field.sum()`)".to_string(),
+                    span,
+                );
+                return err;
+            }
+            Ty::Error => return err,
+            other => {
+                self.diags.error(format!("cannot index {} (only array / slice / owned array)", ty_name(other)), span);
+                return err;
+            }
+        };
+        // A Move-only element (e.g. `array<string>`, `array<array<T>>`) cannot be indexed yet:
+        // the load copies the element's `{ptr,len}` without transferring ownership, so the array
+        // and the copy would both free the same buffer (double-free). Such element reads need a
+        // borrow / move-out design (a later slice) — reject cleanly until then.
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(elem) {
+            self.diags.error(
+                format!("indexing an array of the Move type {} is not supported yet (it would copy the element without transferring ownership)", ty_name(elem)),
+                span,
+            );
+            return err;
+        }
+        // A slot-backed fixed array must be a literal or a variable (same restriction as a
+        // pipeline source — MIR addresses it through a slot). A `{ptr,len}` view is fine as a value.
+        if matches!(r.ty, Ty::Array(..)) && !matches!(r.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+            self.diags.error(
+                "indexing a fixed array requires an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                span,
+            );
+            return err;
+        }
+        Expr { kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty: elem, span }
+    }
+
     /// `b.get()` — copy the value out of a `box<T>`.
     fn check_box_get(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], span: Span) -> Expr {
         if !args.is_empty() {
@@ -2930,6 +2995,10 @@ impl<'a> Checker<'a> {
             | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
+            }
+            ExprKind::Index { recv, index } => {
+                self.finalize_expr(recv);
+                self.finalize_expr(index);
             }
             ExprKind::BuilderWrite { builder, arg, .. } => {
                 self.finalize_expr(builder);
@@ -3454,6 +3523,28 @@ mod tests {
         // Returning the arena-decoded array (region-tied to the arena input) must be rejected.
         let (_r, ret) = check("User { id: i64, name: str }\nfn bad(key: str) -> Result<array<User>, Error> {\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    return Ok(users)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(ret.has_errors(), "an arena-tied decoded struct array must not escape via return");
+    }
+
+    #[test]
+    fn array_index_checks_and_rejects() {
+        // Indexing a scalar array / slice / owned array yields the element scalar.
+        let (_p, ok) = check("fn main() -> i32 {\n  xs := [10, 20, 30]\n  return xs[1]\n}\n");
+        assert!(!ok.has_errors(), "indexing a scalar array should check");
+        let (_o, owned) = check("fn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[1,2]\")?\n  print(xs[0])\n  return Ok(())\n}\n");
+        assert!(!owned.has_errors(), "indexing an owned array<i64> should check");
+        // A non-integer index is rejected.
+        let (_q, badidx) = check("fn main() -> i32 {\n  xs := [10, 20]\n  return xs[true]\n}\n");
+        assert!(badidx.has_errors(), "a non-integer index must be rejected");
+        // Indexing a non-array is rejected.
+        let (_r, nonarr) = check("fn main() -> i32 {\n  x := 5\n  return x[0]\n}\n");
+        assert!(nonarr.has_errors(), "indexing a non-array must be rejected");
+        // Indexing a struct array (whole-element load) is deferred → a clean error, not a panic.
+        let (_s, structarr) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}, P{x: 2}]\n  return ps[0].x\n}\n");
+        assert!(structarr.has_errors(), "indexing a struct array is deferred and must error cleanly");
+        // Indexing a Move-only element (here a nested owned array) is rejected — copying the
+        // element's {ptr,len} without ownership transfer would double-free.
+        let (_m, moveelem) = check("fn take(xs: array<array<i64>>) -> i64 {\n  ys := xs[0]\n  return ys.len()\n}\nfn main() -> i32 = 0\n");
+        assert!(moveelem.has_errors(), "indexing an array of a Move type must be rejected (double-free)");
     }
 
     #[test]

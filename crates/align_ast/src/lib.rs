@@ -203,6 +203,12 @@ pub enum ExprKind {
     Arena(Block),
     /// `[e1, e2, ...]` — a fixed-length array literal.
     ArrayLit(Vec<Expr>),
+    /// `recv[index]` — element access into an array / slice / owned array. Out-of-bounds is a
+    /// hard runtime error (abort), per the settled panic model.
+    Index {
+        recv: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// `.field` — element-field shorthand, valid only as a pipeline stage argument
     /// (e.g. `where(.active)`); refers to a field of the current pipeline element.
     FieldShorthand(Ident),
