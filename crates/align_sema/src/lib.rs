@@ -534,10 +534,12 @@ impl<'a> EscapeCheck<'a> {
     fn tracks_region(ty: Ty) -> bool {
         match ty {
             Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) => true,
-            // An `Option`/`Result` is region-tracked iff its payload is (only a `Struct` payload
-            // can be — `str`/`box`/`array` aren't scalars, so they never reach a composite). A
-            // `Result<Struct, _>` is exactly what `json.decode` yields, so a region-tied decoded
-            // struct stays tracked while wrapped, and can't escape via an unwrapped local.
+            // A *fixed* `array<T>` (a stack value) is region-tracked iff its element is — an
+            // `array<str>` holds `str` views (so an array of arena strs is arena-regioned and must
+            // not escape), while an `array<i64>` is plain Copy data (Static, freely returnable).
+            Ty::Array(s, _) => Self::tracks_region(scalar_to_ty(s)),
+            // An `Option`/`Result` is region-tracked iff its payload is. A `Struct` payload (e.g. a
+            // `json.decode`-d struct) and now a `str` payload (a view) both track; scalars do not.
             Ty::Option(s) => Self::tracks_region(scalar_to_ty(s)),
             Ty::Result(o, e) => Self::tracks_region(scalar_to_ty(o)) || Self::tracks_region(scalar_to_ty(e)),
             _ => false,
@@ -577,6 +579,15 @@ impl<'a> EscapeCheck<'a> {
             // scalar field is Copy → the default `Static` (handled below), but tying to the array
             // is conservatively correct for both.
             ExprKind::ElemField { recv, .. } => self.region_of(recv, depth),
+            // `arr[i]` reads an element; a `str` element is a view into the array's storage, so it
+            // inherits the array's region (it must not outlive it). A scalar element is Copy and
+            // not region-tracked, so inheriting the array's region is harmless (never checked).
+            ExprKind::Index { recv, .. } => self.region_of(recv, depth),
+            // An array literal lives as long as its shortest-lived element — a `[str]` of arena
+            // `str` views is arena-regioned (the same rule as a struct literal over its fields).
+            ExprKind::ArrayLit { elems, .. } => elems
+                .iter()
+                .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
             // Wrapping/unwrapping preserves the payload's region: `Ok(decoded)` is as short-lived
             // as `decoded`, and `res?` re-exposes whatever region `res` carried. Without this a
             // region-tied struct could escape through a `Result`-typed local (use-after-free).
@@ -3763,6 +3774,27 @@ mod tests {
         // guarded separately, so this exercises the inference path).
         let (_m, bmove) = check("fn mk() -> string = \"x\".clone()\nfn main() -> i32 {\n  arena {\n    p := heap.new(mk())\n    return 0\n  }\n}\n");
         assert!(bmove.has_errors(), "un-annotated heap.new of an owned string must be rejected");
+    }
+
+    #[test]
+    fn str_array_and_slice_checks() {
+        // PR-B: `array<str>` literal + index (→ str) + len.
+        let (_p, ok) = check("fn main() -> i32 {\n  xs := [\"a\", \"b\", \"c\"]\n  print(xs[1])\n  print(xs.len())\n  return 0\n}\n");
+        assert!(!ok.has_errors(), "array<str> literal + index + len should check");
+        // `slice<str>` param: index + len.
+        let (_q, sl) = check("fn snd(xs: slice<str>) -> str = xs[1]\nfn len(xs: slice<str>) -> i64 = xs.len()\nfn main() -> i32 = 0\n");
+        assert!(!sl.has_errors(), "slice<str> index + len should check");
+        // Region: a `slice<str>` viewing a local array must not escape.
+        let (_r, esc) = check("fn bad() -> slice<str> {\n  s: slice<str> := [\"a\", \"b\"]\n  return s\n}\nfn main() -> i32 = 0\n");
+        assert!(esc.has_errors(), "a slice<str> into a local array must not escape");
+        // Region: an `array<str>` of arena strs must not let an element escape via index+return
+        // (the fixed array is region-tracked because its `str` element is).
+        let (_s, idxesc) = check("fn bad(a: str, b: str) -> str {\n  arena {\n    xs := [a + b, a]\n    return xs[0]\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(idxesc.has_errors(), "a str element of an arena str-array must not escape via index");
+        // A literal-str array element is Static → returnable (no false reject); a scalar array
+        // stays returnable too (no regression from the new array region-tracking).
+        let (_t, lit) = check("fn ok() -> str {\n  xs := [\"lit\", \"lat\"]\n  return xs[0]\n}\nfn n() -> i64 {\n  ys := [1, 2, 3]\n  return ys[0]\n}\nfn main() -> i32 = 0\n");
+        assert!(!lit.has_errors(), "literal-str and scalar array element reads stay returnable");
     }
 
     #[test]

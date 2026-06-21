@@ -315,8 +315,12 @@ the MMv2 region model rather than a `main`-only special case), in three steps:
   construct + unwrap, region-tracked (an arena `str` in an `Option<str>` can't escape — falls out
   of the region model, no new logic); `box<str>` rejected (a view is not boxable). `str` is Copy
   (not Move), so such composites are never dropped — they borrow.
-- **[todo] PR-B** — `array<str>` / `slice<str>` types + `str`-array literals + index (→ `str`) +
-  `.len()`; a container's region follows its `str` element's.
+- **[done] PR-B** — `array<str>` / `slice<str>`: `str`-array literals, index (→ `str`), `.len()`
+  (element store/load reuses the `[N x {ptr,len}]` scalar-array machinery; `slice<str>` via the
+  existing `ArrayToSlice` coercion). A container's region follows its `str` element's: a *fixed*
+  `array<str>` is now region-tracked (`tracks_region(Array(s)) = tracks_region(s)`), so an array of
+  arena `str`s can't let an element escape via index+return — while `array<i64>` stays
+  Static/returnable.
 - **[todo] PR-C** — `main(args: array<str>)` ABI + argv marshalling → **§19 verbatim**.
 M5 language features are complete (strings, templates, `json.encode` for struct/array,
 `json.decode` for scalar / `str` / `array<scalar>` / `array<Struct>`).

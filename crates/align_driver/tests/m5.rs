@@ -678,6 +678,33 @@ fn result_str_payload_via_try() {
 }
 
 #[test]
+fn str_array_literal_index_and_len() {
+    if !backend_available() {
+        return;
+    }
+    // PR-B: `array<str>` — a fixed array of `str` views. Indexing yields a `str` (Copy view); the
+    // element store/load reuses the scalar-array machinery (`[N x {ptr,len}]`). Output:
+    // "beta\n3\nalpha\n".
+    let src = "fn main() -> i32 {\n  xs := [\"alpha\", \"beta\", \"gamma\"]\n  print(xs[1])\n  print(xs.len())\n  print(xs[0])\n  return 0\n}\n";
+    let out = build_and_run("str-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "beta\n3\nalpha\n");
+}
+
+#[test]
+fn slice_str_param_index_and_len() {
+    if !backend_available() {
+        return;
+    }
+    // `slice<str>` — an array<str> literal coerces to a slice<str> at the call (ArrayToSlice). The
+    // callee indexes it (`xs[1]`) and reads its length. `second` prints "bb"; `count` returns 2.
+    let src = "fn second(xs: slice<str>) -> str = xs[1]\nfn count(xs: slice<str>) -> i64 = xs.len()\nfn main() -> i32 {\n  print(second([\"a\", \"bb\", \"ccc\"]))\n  return count([\"x\", \"y\"])\n}\n";
+    let out = build_and_run("slice-str", src);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bb\n");
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;
