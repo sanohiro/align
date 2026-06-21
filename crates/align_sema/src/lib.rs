@@ -117,6 +117,19 @@ pub fn scalar_to_prim(s: Scalar) -> Option<PrimScalar> {
     }
 }
 
+/// Memory layout of a struct array — a property of the array *type*, so AoS-vs-SoA is decided
+/// once (at the type) and threaded into field-access lowering, not re-derived per use site
+/// (`open-questions.md` Open "SoA layout"). Only [`Layout::Aos`] exists today; `Layout::Soa`
+/// (column-oriented, `soa array<T>`) joins at M6. Keeping it in the type **now** means adding
+/// `Soa` later turns every place that must handle the new layout into a compile error — the
+/// layout decision can never be silently forgotten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// Array-of-structs: elements are contiguous whole structs (`[... %Struct ...]`). The only
+    /// layout today; field access GEPs `element, field`.
+    Aos,
+}
+
 /// sema-internal type representation (`03-types.md` §1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
@@ -140,12 +153,13 @@ pub enum Ty {
     Array(Scalar, u32),
     /// A fixed-length array of structs (AoS); `(struct_id, length)`. M4.
     StructArray(u32, u32),
-    /// An *owned*, dynamic-length array of structs (AoS), laid out like a slice
+    /// An *owned*, dynamic-length array of structs, laid out like a slice
     /// (`{ Struct* ptr, i64 len }`) but Move and region-tracked — the dynamic struct dual of
     /// [`Ty::DynArray`] (MMv2 slice 8d). Produced by `json.decode<array<Struct>>`. Its `str`
     /// fields are zero-copy views into the decode input, so the array is region-tied to that
-    /// input and dropped (buffer freed) at scope exit.
-    DynStructArray(u32),
+    /// input and dropped (buffer freed) at scope exit. Carries its [`Layout`] (AoS today; SoA at
+    /// M6) — the memory layout is a property of the type, threaded into field-access lowering.
+    DynStructArray(u32, Layout),
     /// `slice<T>` — a borrowed view `{ T* ptr, i64 len }` of scalar elements. Copy. M4.
     Slice(Scalar),
     /// `array<T>` — an *owned*, dynamic-length array of scalars, laid out like a slice
@@ -188,7 +202,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::String => Some(Scalar::String),
         // An owned `array<T>` is a payload only when its element is primitive (slice 8b).
         Ty::DynArray(elem) => scalar_to_prim(elem).map(Scalar::DynArray),
-        Ty::DynStructArray(id) => Some(Scalar::DynStructArray(id)),
+        // Only an AoS array is payload-able today; an SoA array as an Option/Result payload is a
+        // later concern (so `Scalar::DynStructArray` stays layout-free — always AoS).
+        Ty::DynStructArray(id, Layout::Aos) => Some(Scalar::DynStructArray(id)),
         Ty::ErrCode => Some(Scalar::ErrCode),
         _ => None,
     }
@@ -204,7 +220,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Struct(id) => Ty::Struct(id),
         Scalar::String => Ty::String,
         Scalar::DynArray(elem) => Ty::DynArray(prim_to_scalar(elem)),
-        Scalar::DynStructArray(id) => Ty::DynStructArray(id),
+        Scalar::DynStructArray(id) => Ty::DynStructArray(id, Layout::Aos),
         Scalar::ErrCode => Ty::ErrCode,
     }
 }
@@ -387,7 +403,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(l.ty))
+            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(l.ty))
             .map(|l| l.id)
             .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
             .collect();
@@ -506,7 +522,7 @@ impl<'a> EscapeCheck<'a> {
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(ty: Ty) -> bool {
         match ty {
-            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(_) => true,
+            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) => true,
             // An `Option`/`Result` is region-tracked iff its payload is (only a `Struct` payload
             // can be — `str`/`box`/`array` aren't scalars, so they never reach a composite). A
             // `Result<Struct, _>` is exactly what `json.decode` yields, so a region-tied decoded
@@ -805,14 +821,14 @@ impl<'a> MoveCheck<'a> {
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
-        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder)
+        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder)
             || payload_is_move(self.f.ret);
         self.block(&self.f.body, &mut moved, ret_is_move, true);
     }
 
     fn is_move(&self, id: LocalId) -> bool {
         match self.f.locals.get(id as usize).map(|l| l.ty) {
-            Some(ty) => matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty),
+            Some(ty) => matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(ty),
             None => false,
         }
     }
@@ -1959,7 +1975,7 @@ impl<'a> Checker<'a> {
         };
         let mut elem = match source.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
-            Ty::StructArray(id, _) | Ty::DynStructArray(id) => Ty::Struct(id),
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Ty::Struct(id),
             Ty::Error => return None,
             other => {
                 self.diags
@@ -1973,7 +1989,7 @@ impl<'a> Checker<'a> {
         // fine as a value, but a dynamic `array<Struct>` must be a variable: its field
         // projection indexes through the buffer pointer (`IndexFieldPtr`), and binding it first
         // keeps the owned buffer alive across the loop. Reject other array shapes cleanly here.
-        let needs_var = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(_));
+        let needs_var = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(..));
         if needs_var && !matches!(source.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
             self.diags.error(
                 "a pipeline over an array must start from an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
@@ -1986,7 +2002,7 @@ impl<'a> Checker<'a> {
         // slot-backed stack array / struct array (`IndexField`) or a dynamic `array<Struct>`
         // view addressed through its buffer pointer (`IndexFieldPtr`, slice 8d-2). A scalar
         // `{ptr,len}` view (`slice` / owned scalar `array`) has no per-element struct to project.
-        let slot_backed = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(_));
+        let slot_backed = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(..));
         let mut stages = Vec::new();
         for raw in raw_stages {
             match raw {
@@ -2740,7 +2756,7 @@ impl<'a> Checker<'a> {
         let r = self.check_expr(recv, None);
         match r.ty {
             // `str`/`slice` carry a runtime length in their `{ ptr, len }` view.
-            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
@@ -2771,7 +2787,7 @@ impl<'a> Checker<'a> {
         }
         let elem = match r.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
-            Ty::StructArray(..) | Ty::DynStructArray(_) => {
+            Ty::StructArray(..) | Ty::DynStructArray(..) => {
                 // A whole-struct element value is deferred (it needs a struct copy + region tie);
                 // `arr[i].field` is supported and handled in `check_field_access`.
                 self.diags.error(
@@ -2800,7 +2816,7 @@ impl<'a> Checker<'a> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(elem) {
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(elem) {
             self.diags.error(
                 format!("indexing an array of the Move type {} is not supported yet (it would copy the element without transferring ownership)", ty_name(elem)),
                 span,
@@ -2835,7 +2851,7 @@ impl<'a> Checker<'a> {
             return err;
         }
         let struct_id = match r.ty {
-            Ty::StructArray(id, _) | Ty::DynStructArray(id) => id,
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
             Ty::Error => return err,
             other => {
                 self.diags.error(format!("'{}[i].{}' needs a struct array, got {}", "arr", field.name, ty_name(other)), span);
@@ -2858,7 +2874,7 @@ impl<'a> Checker<'a> {
         // A field-read that is itself a Move type would copy without ownership transfer (the same
         // double-free concern as scalar indexing). Decoded structs only have scalar / `str`-view
         // fields, but guard generally.
-        if matches!(field_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(field_ty) {
+        if matches!(field_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(field_ty) {
             self.diags.error(
                 format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(field_ty)),
                 span,
@@ -3186,7 +3202,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Box(s) => format!("box<{}>", scalar_name(s)),
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
-        Ty::DynStructArray(id) => format!("array<struct#{id}>"),
+        Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
         Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
         Ty::Str => "str".to_string(),
@@ -3293,7 +3309,7 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
             // An `array<Struct>` is a dynamic AoS (its own owned type); only a primitive
             // element resolves to the scalar `array<T>` (`DynArray`).
             match inner {
-                Ty::Struct(id) => Ty::DynStructArray(id),
+                Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
                 _ => match scalar_arg(inner, "array element", t.span, diags) {
                     Some(s) => Ty::DynArray(s),
                     None => Ty::Error,
