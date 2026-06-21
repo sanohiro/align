@@ -134,6 +134,11 @@ pub enum Rvalue {
     Index(Slot, Operand),
     /// `slot[index].field` — load a field of a struct-array element.
     IndexField(Slot, Operand, u32),
+    /// `base[index].field` for a `{ptr,len}` view of struct `struct_id` (an owned, dynamic
+    /// `array<Struct>`, MMv2 slice 8d-2). Like [`IndexField`] but addressed through the loaded
+    /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
+    /// fused pipeline (`users.where(.active).score.sum()`) can run over a runtime-length AoS.
+    IndexFieldPtr { base: Operand, index: Operand, field: u32, struct_id: u32 },
     /// Borrow array `slot` (length `n`) as a slice value `{ &slot[0], n }`.
     MakeSlice(Slot, i128),
     /// Bump-allocate `count` elements of type `elem` in the arena `handle`; yields the
@@ -840,6 +845,10 @@ struct SrcSetup {
     slice_val: Option<Operand>,
     bound: Operand,
     scalar_slot: bool,
+    /// `Some(struct_id)` when the source is an owned, dynamic `array<Struct>` — a `{ptr,len}` view
+    /// (`slice_val`) addressed by pointer + index for field projection (MMv2 slice 8d-2). The loop
+    /// keeps it index-addressed (no up-front element load) and projects fields via `IndexFieldPtr`.
+    struct_view: Option<u32>,
     /// An unbound free-standing owned-array temporary that this source materialized in place
     /// (`[..].to_array().sum()` with no arena): its `{ptr,len}` value, to be freed by the
     /// consuming loop once done. `None` for slots, slices, bound locals, and arena temporaries
@@ -868,7 +877,16 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             );
             let temp_free =
                 (owns_fresh && b.arenas.is_empty()).then(|| sv.clone());
-            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, temp_free }
+            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: None, temp_free }
+        }
+        // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field
+        // projection (slice 8d-2). It is a bound local borrow (sema requires a variable source),
+        // so nothing is freed by the loop — the owner's exit `Drop` frees the buffer.
+        Ty::DynStructArray(id) => {
+            let sv = lower_expr(b, source);
+            let len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some(id), temp_free: None }
         }
         _ => {
             let (slot, n) = array_source_slot(b, source);
@@ -877,10 +895,39 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
                 slice_val: None,
                 bound: Operand::Const(Const::Int(n, i64_ty())),
                 scalar_slot: matches!(source.ty, Ty::Array(..)),
+                struct_view: None,
                 temp_free: None,
             }
         }
     }
+}
+
+/// Load `base[index].field` for a fused pipeline's struct-array source: a stack-slot AoS uses
+/// the slot-based [`Rvalue::IndexField`]; a `{ptr,len}` dynamic `array<Struct>` view
+/// (`struct_view = Some(id)`) uses the pointer-based [`Rvalue::IndexFieldPtr`]. MMv2 slice 8d-2.
+fn lower_field_access(
+    b: &mut Builder,
+    struct_view: Option<u32>,
+    slice_val: &Option<Operand>,
+    slot: Slot,
+    index: &Operand,
+    field: u32,
+    out_ty: Ty,
+) -> ValueId {
+    let v = b.fresh_value(out_ty);
+    match struct_view {
+        Some(struct_id) => b.push(Stmt::Let(
+            v,
+            Rvalue::IndexFieldPtr {
+                base: slice_val.clone().expect("a struct-view source has a {ptr,len} value"),
+                index: index.clone(),
+                field,
+                struct_id,
+            },
+        )),
+        None => b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), field))),
+    }
+    v
 }
 
 fn lower_array_reduce(
@@ -892,7 +939,7 @@ fn lower_array_reduce(
     reducer: Reducer,
 ) -> Operand {
     let elem_ty = acc_ty;
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, temp_free } = setup_source(b, source);
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free } = setup_source(b, source);
 
     let acc = b.new_slot(acc_ty);
     b.push(Stmt::Store(acc, init));
@@ -919,9 +966,11 @@ fn lower_array_reduce(
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
     let index = Operand::Value(idx);
 
-    // A scalar array or a slice loads the element up front; a struct array stays
-    // addressed by index until a `.field` projection loads a scalar.
-    let mut cur: Option<Operand> = if let Some(sv) = &slice_val {
+    // A scalar array or a slice loads the element up front; a struct array (stack slot or a
+    // `{ptr,len}` `array<Struct>` view) stays addressed by index until a `.field` projection.
+    let mut cur: Option<Operand> = if struct_view.is_some() {
+        None
+    } else if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
             Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
             _ => elem_ty,
@@ -944,8 +993,7 @@ fn lower_array_reduce(
     for stage in stages {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), *field)));
+                let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func } => {
@@ -965,8 +1013,7 @@ fn lower_array_reduce(
             }
             hir::StageKind::WhereField { field } => {
                 // Predicate on a struct element's (bool) field; the element is unchanged.
-                let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::IndexField(slot, index.clone(), *field)));
+                let pred = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -1057,7 +1104,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     // — `make()` returns an owned array nothing else holds). The copy loop consumes it into the
     // new output buffer, so free that source temporary at the exit (the result is a separate
     // buffer). `temp_free` is None for slots / bound locals / arena temporaries.
-    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, temp_free } = setup_source(b, source);
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free } = setup_source(b, source);
 
     // Output buffer: `bound` (upper-bound = source length) elements. map/where never grow
     // the count, so the buffer never needs to be resized.
@@ -1108,7 +1155,9 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
     let index = Operand::Value(idx);
 
-    let mut cur: Option<Operand> = if let Some(sv) = &slice_val {
+    let mut cur: Option<Operand> = if struct_view.is_some() {
+        None
+    } else if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
             Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
             _ => elem,
@@ -1131,8 +1180,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     for stage in stages {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), *field)));
+                let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func } => {
@@ -1150,8 +1198,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                 b.cur = keep;
             }
             hir::StageKind::WhereField { field } => {
-                let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::IndexField(slot, index.clone(), *field)));
+                let pred = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
