@@ -316,7 +316,10 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                     FieldDef { name: f.name.name.clone(), ty }
                 })
                 .collect();
-            StructDef { name: s.name.name.clone(), fields }
+            // `align`: natural alignment today — the `align(N)` surface syntax + custom value
+            // arrive at M6 (`open-questions.md`); the field is reserved so that is an additive
+            // change at the alignment seam, not a retrofit.
+            StructDef { name: s.name.name.clone(), fields, align: None }
         })
         .collect();
 
