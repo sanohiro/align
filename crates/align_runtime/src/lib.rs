@@ -84,6 +84,11 @@ pub unsafe extern "C" fn align_rt_io_stdout_write(ptr: *const u8, len: i64) -> i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_io_stdout_write_builder(b: *mut Builder) -> i32 {
     use std::io::Write;
+    // Codegen always passes a live builder handle, but guard the raw pointer at the FFI boundary
+    // (this fn returns a status, so a null is a clean error rather than a deref UB).
+    if b.is_null() {
+        return 1;
+    }
     let b = unsafe { &*b };
     let mut out = std::io::stdout().lock();
     if out.write_all(&b.buf).and_then(|()| out.flush()).is_ok() {
