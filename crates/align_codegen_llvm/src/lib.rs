@@ -568,6 +568,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::String => unreachable!("an owned string is not a box payload"),
         Scalar::DynArray(_) => unreachable!("an owned array is not a box payload"),
         Scalar::DynStructArray(_) => unreachable!("an owned struct array is not a box payload"),
+        Scalar::Str => unreachable!("a str view is not a box payload"),
     }
 }
 

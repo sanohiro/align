@@ -309,11 +309,17 @@ remaining gap is `main(args: array<str>)`: **`fs.read_file`** reads a file into 
 and **`io.stdout.write`** writes a `str`/`string`/`builder` to stdout (no newline), so the §19
 body — read file → `json.decode<array<User>>` → `where(.active).score.sum()` → format with a
 `builder` → `io.stdout.write(out)` — runs **verbatim** bar the signature. Full `§19` *verbatim*
-needs only `main(args: array<str>)` — which needs `array<str>` (an array of `str` views) as a
-type, i.e. a `Scalar::Str` (and with it the design of `str` in composites — `Option<str>` /
-`box<str>` / `slice<str>`), plus argv marshalling in the `main` wrapper. M5 language features are
-complete (strings, templates, `json.encode` for struct/array, `json.decode` for scalar / `str` /
-`array<scalar>` / `array<Struct>`).
+needs only `main(args: array<str>)`, being added as `str`-in-composites (the ideal form, extending
+the MMv2 region model rather than a `main`-only special case), in three steps:
+- **[done] PR-A** — `Scalar::Str`: `str` as a composite payload. `Option<str>` / `Result<str,E>`
+  construct + unwrap, region-tracked (an arena `str` in an `Option<str>` can't escape — falls out
+  of the region model, no new logic); `box<str>` rejected (a view is not boxable). `str` is Copy
+  (not Move), so such composites are never dropped — they borrow.
+- **[todo] PR-B** — `array<str>` / `slice<str>` types + `str`-array literals + index (→ `str`) +
+  `.len()`; a container's region follows its `str` element's.
+- **[todo] PR-C** — `main(args: array<str>)` ABI + argv marshalling → **§19 verbatim**.
+M5 language features are complete (strings, templates, `json.encode` for struct/array,
+`json.decode` for scalar / `str` / `array<scalar>` / `array<Struct>`).
 
 ## Memory Model v2 — borrow-region + owned heap/drop (foundation; before M6) — DONE
 
