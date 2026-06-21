@@ -537,7 +537,12 @@ impl<'a> EscapeCheck<'a> {
             // A *fixed* `array<T>` (a stack value) is region-tracked iff its element is — an
             // `array<str>` holds `str` views (so an array of arena strs is arena-regioned and must
             // not escape), while an `array<i64>` is plain Copy data (Static, freely returnable).
-            Ty::Array(s, _) => Self::tracks_region(scalar_to_ty(s)),
+            // A `slice<T>` likewise tracks iff its element does (its own backing is handled
+            // separately by the local-backed-slice check). A fixed `array<Struct>` (AoS) always
+            // tracks, like `Struct` itself — a struct may hold a region-tracked `str` field, so an
+            // element / element-field read must inherit the array's region.
+            Ty::Array(s, _) | Ty::Slice(s) => Self::tracks_region(scalar_to_ty(s)),
+            Ty::StructArray(..) => true,
             // An `Option`/`Result` is region-tracked iff its payload is. A `Struct` payload (e.g. a
             // `json.decode`-d struct) and now a `str` payload (a view) both track; scalars do not.
             Ty::Option(s) => Self::tracks_region(scalar_to_ty(s)),
@@ -588,6 +593,9 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayLit { elems, .. } => elems
                 .iter()
                 .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
+            // Borrowing an array as a slice preserves the array's region — a `slice<str>` coerced
+            // from an arena str-array must not outlive that arena.
+            ExprKind::ArrayToSlice(inner) => self.region_of(inner, depth),
             // Wrapping/unwrapping preserves the payload's region: `Ok(decoded)` is as short-lived
             // as `decoded`, and `res?` re-exposes whatever region `res` carried. Without this a
             // region-tied struct could escape through a `Result`-typed local (use-after-free).
@@ -3795,6 +3803,15 @@ mod tests {
         // stays returnable too (no regression from the new array region-tracking).
         let (_t, lit) = check("fn ok() -> str {\n  xs := [\"lit\", \"lat\"]\n  return xs[0]\n}\nfn n() -> i64 {\n  ys := [1, 2, 3]\n  return ys[0]\n}\nfn main() -> i32 = 0\n");
         assert!(!lit.has_errors(), "literal-str and scalar array element reads stay returnable");
+        // A `slice<str>` coerced from an arena str-array must not escape via return — the slice
+        // inherits the array's region (`region_of(ArrayToSlice)`), and `slice<str>` is now
+        // region-tracked.
+        let (_u, slesc) = check("fn bad(a: str, b: str) -> slice<str> {\n  arena {\n    s: slice<str> := [a + b, a]\n    return s\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(slesc.has_errors(), "a slice<str> over an arena str-array must not escape");
+        // A scalar `slice<i32>` parameter stays returnable (it borrows the caller) — no regression
+        // from adding `Slice` to `tracks_region`.
+        let (_v, slok) = check("fn id(xs: slice<i32>) -> slice<i32> = xs\nfn main() -> i32 = 0\n");
+        assert!(!slok.has_errors(), "a slice<i32> parameter stays returnable");
     }
 
     #[test]
