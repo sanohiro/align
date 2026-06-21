@@ -816,11 +816,11 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, field
     // `array<Struct>` is a `{ptr,len}` value addressed by pointer. Differs from the pipeline only
     // in needing an explicit bounds check (the loop's counter is in-bounds by construction).
     let (struct_view, slice_val, slot, len) = match recv.ty {
-        Ty::DynStructArray(_, _) => {
+        Ty::DynStructArray(_, layout) => {
             let sv = lower_expr(b, recv);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            (Some(struct_id), Some(sv), 0, Operand::Value(len))
+            (Some((struct_id, layout)), Some(sv), 0, Operand::Value(len))
         }
         _ => {
             // A fixed `array<Struct>` slot (sema restricted `recv` to a literal / local).
@@ -934,10 +934,12 @@ struct SrcSetup {
     slice_val: Option<Operand>,
     bound: Operand,
     scalar_slot: bool,
-    /// `Some(struct_id)` when the source is an owned, dynamic `array<Struct>` — a `{ptr,len}` view
-    /// (`slice_val`) addressed by pointer + index for field projection (MMv2 slice 8d-2). The loop
-    /// keeps it index-addressed (no up-front element load) and projects fields via `IndexFieldPtr`.
-    struct_view: Option<u32>,
+    /// `Some((struct_id, layout))` when the source is an owned, dynamic `array<Struct>` — a
+    /// `{ptr,len}` view (`slice_val`) addressed by pointer + index for field projection (MMv2
+    /// slice 8d-2). The loop keeps it index-addressed (no up-front element load) and projects
+    /// fields via the layout seam `lower_field_access`. The layout is carried (not discarded) so
+    /// it reaches that seam — adding `Layout::Soa` then forces a match there.
+    struct_view: Option<(u32, Layout)>,
     /// An unbound free-standing owned-array temporary that this source materialized in place
     /// (`[..].to_array().sum()` with no arena): its `{ptr,len}` value, to be freed by the
     /// consuming loop once done. `None` for slots, slices, bound locals, and arena temporaries
@@ -971,11 +973,11 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
         // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field
         // projection (slice 8d-2). It is a bound local borrow (sema requires a variable source),
         // so nothing is freed by the loop — the owner's exit `Drop` frees the buffer.
-        Ty::DynStructArray(id, _) => {
+        Ty::DynStructArray(id, layout) => {
             let sv = lower_expr(b, source);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some(id), temp_free: None }
+            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, layout)), temp_free: None }
         }
         _ => {
             let (slot, n) = array_source_slot(b, source);
@@ -993,15 +995,15 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
 
 /// The **single layout seam** for struct-array element-field addressing — the one place that
 /// turns `arr[i].field` into a load, shared by the fused pipeline (8d-2) and surface indexing
-/// (8f). A stack-slot AoS array uses the slot-based [`Rvalue::IndexField`]; an owned dynamic
-/// `array<Struct>` view (`struct_view = Some(id)`) uses the pointer-based
-/// [`Rvalue::IndexFieldPtr`]. Both are AoS (`element, field` GEP). When SoA (`Layout::Soa`,
-/// `soa array<T>`) lands at M6, its column-array indexing branches **here** (keyed off the
-/// source's [`Layout`]) — every field access already routes through this function, so the change
-/// is localized rather than a cross-cutting retrofit.
+/// (8f). A stack-slot (fixed) `array<Struct>` is always AoS and uses the slot-based
+/// [`Rvalue::IndexField`]; an owned dynamic `array<Struct>` view (`struct_view = Some((id,
+/// layout))`) carries its [`Layout`] here. The `match layout` below is the SoA hook: today only
+/// `Layout::Aos` (the pointer-based [`Rvalue::IndexFieldPtr`], `element, field` GEP); when
+/// `Layout::Soa` (`soa array<T>`) lands at M6, this match goes non-exhaustive — a compile error
+/// that points exactly here, the one site SoA's column-array indexing must branch in.
 fn lower_field_access(
     b: &mut Builder,
-    struct_view: Option<u32>,
+    struct_view: Option<(u32, Layout)>,
     slice_val: &Option<Operand>,
     slot: Slot,
     index: &Operand,
@@ -1010,15 +1012,17 @@ fn lower_field_access(
 ) -> ValueId {
     let v = b.fresh_value(out_ty);
     match struct_view {
-        Some(struct_id) => b.push(Stmt::Let(
-            v,
-            Rvalue::IndexFieldPtr {
-                base: slice_val.clone().expect("a struct-view source has a {ptr,len} value"),
-                index: index.clone(),
-                field,
-                struct_id,
-            },
-        )),
+        Some((struct_id, layout)) => match layout {
+            Layout::Aos => b.push(Stmt::Let(
+                v,
+                Rvalue::IndexFieldPtr {
+                    base: slice_val.clone().expect("a struct-view source has a {ptr,len} value"),
+                    index: index.clone(),
+                    field,
+                    struct_id,
+                },
+            )),
+        },
         None => b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), field))),
     }
     v
