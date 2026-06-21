@@ -2584,11 +2584,9 @@ impl<'a> Checker<'a> {
                     );
                     return err;
                 }
-                let input = self.check_expr(&args[0], Some(Ty::Str));
-                if input.ty != Ty::Str && input.ty != Ty::Error {
-                    self.diags
-                        .error(format!("'json.decode' input must be a str, got {}", ty_name(input.ty)), args[0].span);
-                }
+                // `check_str_init` accepts a `str` or auto-borrows an owned `string` (the result
+                // is copied, so the input's region does not constrain it), and reports a mismatch.
+                let input = self.check_str_init(&args[0]);
                 return Expr {
                     kind: ExprKind::JsonDecodeArray { elem, input: Box::new(input) },
                     ty: Ty::Result(Scalar::DynArray(prim), Scalar::ErrCode),
@@ -2617,11 +2615,10 @@ impl<'a> Checker<'a> {
                 return err;
             }
         }
-        let input = self.check_expr(&args[0], Some(Ty::Str));
-        if input.ty != Ty::Str && input.ty != Ty::Error {
-            self.diags
-                .error(format!("'json.decode' input must be a str, got {}", ty_name(input.ty)), args[0].span);
-        }
+        // The decoded struct's `str` fields are zero-copy views into the input, so the input's
+        // region constrains the result (see `region_of`). `check_str_init` accepts a `str` or
+        // auto-borrows an owned `string` (whose region then bounds the decoded value).
+        let input = self.check_str_init(&args[0]);
         Expr {
             kind: ExprKind::JsonDecode { struct_id: sid, input: Box::new(input) },
             ty: Ty::Result(Scalar::Struct(sid), Scalar::ErrCode),

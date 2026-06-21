@@ -257,7 +257,13 @@ pub unsafe extern "C" fn align_rt_json_decode(
     out: *mut u8,
     out_size: i64,
 ) -> i32 {
-    let src = unsafe { std::slice::from_raw_parts(input, input_len.max(0) as usize) };
+    // `from_raw_parts` is UB on a null pointer even with len 0, and an empty owned `string`
+    // (e.g. an empty `builder().to_string()` or `str.clone()`) is `{null, 0}` — guard it.
+    let src: &[u8] = if input_len <= 0 || input.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(input, input_len as usize) }
+    };
     let descs = unsafe { std::slice::from_raw_parts(fields, n_fields.max(0) as usize) };
     let mut seen = vec![false; descs.len()];
 
@@ -395,7 +401,13 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     elem_tag: i32,
     out: *mut AlignStr,
 ) -> i32 {
-    let src = unsafe { std::slice::from_raw_parts(input, input_len.max(0) as usize) };
+    // `from_raw_parts` is UB on a null pointer even with len 0, and an empty owned `string`
+    // (e.g. an empty `builder().to_string()` or `str.clone()`) is `{null, 0}` — guard it.
+    let src: &[u8] = if input_len <= 0 || input.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(input, input_len as usize) }
+    };
     let kind = (elem_tag >> 8) & 0xff;
     let width = (elem_tag & 0xff) as usize;
     let mut bytes: Vec<u8> = Vec::new();

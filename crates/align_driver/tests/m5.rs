@@ -308,6 +308,34 @@ fn json_decode_array_malformed_errors() {
 }
 
 #[test]
+fn json_decode_array_from_owned_string() {
+    if !backend_available() {
+        return;
+    }
+    // The `json.decode` input accepts an owned `string` (auto-borrowed to `str` via the same
+    // coercion as `let`/call args); the decoded `array<i64>` is copied, so it outlives the
+    // borrow. Build "[1, 2, 3]" with a builder, decode it: sum = 6, len = 3.
+    let src = "fn main() -> Result<(), Error> {\n  b := builder()\n  b.write(\"[1, 2, 3]\")\n  doc := b.to_string()\n  xs: array<i64> := json.decode(doc)?\n  print(xs.sum())\n  print(xs.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-array-owned", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n3\n");
+}
+
+#[test]
+fn json_decode_empty_array_is_safe() {
+    if !backend_available() {
+        return;
+    }
+    // An empty JSON array decodes to a `{null, 0}` owned array — `.len()` is 0, `.sum()` is 0,
+    // and the runtime must not `from_raw_parts(null, 0)` on either the empty result or, when the
+    // source itself is an empty owned `string`, the input buffer. Output: "0\n0\n".
+    let src = "fn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[]\")?\n  print(xs.sum())\n  print(xs.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-empty-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n0\n");
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;
