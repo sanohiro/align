@@ -545,6 +545,11 @@ impl<'a> EscapeCheck<'a> {
             // A decoded `array<Struct>` (slice 8d) likewise carries the input's region — its
             // elements' `str` fields are zero-copy views into the input; `.clone()` to escape.
             ExprKind::JsonDecodeStructArray { input, .. } => self.region_of(input, depth),
+            // `arr[i].field` reads a field of a struct-array element; a `str` field is a view into
+            // the array's storage, so it inherits the array's region (it must not outlive it). A
+            // scalar field is Copy → the default `Static` (handled below), but tying to the array
+            // is conservatively correct for both.
+            ExprKind::ElemField { recv, .. } => self.region_of(recv, depth),
             // Wrapping/unwrapping preserves the payload's region: `Ok(decoded)` is as short-lived
             // as `decoded`, and `res?` re-exposes whatever region `res` carried. Without this a
             // region-tied struct could escape through a `Result`-typed local (use-after-free).
@@ -738,7 +743,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
             | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
-            ExprKind::Index { recv, index } => {
+            ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.walk(recv, depth);
                 self.walk(index, depth);
             }
@@ -914,8 +919,9 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
-            // `recv[index]` borrows the receiver (reads an element) and reads the index.
-            ExprKind::Index { recv, index } => {
+            // `recv[index]` / `recv[index].field` borrow the receiver (read an element) and read
+            // the index.
+            ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.expr(recv, moved, false, false);
                 self.expr(index, moved, false, false);
             }
@@ -1420,6 +1426,11 @@ impl<'a> Checker<'a> {
     /// a local (chained field access on a value comes later).
     fn check_field_access(&mut self, recv: &ast::Expr, field: &ast::Ident, expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
+        // `arr[i].field` — field access on a struct-array element. Fused into one bounds-checked
+        // element-field load (MMv2 slice 8f); a whole-struct `arr[i]` value is not materialized.
+        if let ast::ExprKind::Index { recv: arr, index } = &recv.kind {
+            return self.check_index_field(arr, index, field, expected, span);
+        }
         let base = match self.place_local(recv) {
             Some((id, _)) => id,
             None => {
@@ -2761,8 +2772,10 @@ impl<'a> Checker<'a> {
         let elem = match r.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             Ty::StructArray(..) | Ty::DynStructArray(_) => {
+                // A whole-struct element value is deferred (it needs a struct copy + region tie);
+                // `arr[i].field` is supported and handled in `check_field_access`.
                 self.diags.error(
-                    "indexing a struct array is not supported yet (use a pipeline, e.g. `.where(...).field.sum()`)".to_string(),
+                    "indexing a struct array yields a whole struct, which is not supported yet — read a field directly (`arr[i].field`) or use a pipeline".to_string(),
                     span,
                 );
                 return err;
@@ -2794,6 +2807,60 @@ impl<'a> Checker<'a> {
             return err;
         }
         Expr { kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty: elem, span }
+    }
+
+    /// `arr[index].field` — field access on a struct-array element (MMv2 slice 8f). Fused into one
+    /// bounds-checked element-field load; only the field (a scalar or a `str` view) is read. The
+    /// result inherits the array's region (a `str` field views the array's input), so it cannot
+    /// escape that input.
+    fn check_index_field(&mut self, arr: &ast::Expr, index: &ast::Expr, field: &ast::Ident, expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
+        let r = self.check_expr(arr, None);
+        let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if i.ty == Ty::Error {
+            return err;
+        }
+        if !i.ty.is_int_like() {
+            self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
+            return err;
+        }
+        let struct_id = match r.ty {
+            Ty::StructArray(id, _) | Ty::DynStructArray(id) => id,
+            Ty::Error => return err,
+            other => {
+                self.diags.error(format!("'{}[i].{}' needs a struct array, got {}", "arr", field.name, ty_name(other)), span);
+                return err;
+            }
+        };
+        // A fixed `array<Struct>` slot must be a literal or a variable (same restriction as a
+        // pipeline source — MIR addresses it through a slot). A `{ptr,len}` view is fine as a value.
+        if matches!(r.ty, Ty::StructArray(..)) && !matches!(r.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+            self.diags.error(
+                "indexing a fixed array requires an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                span,
+            );
+            return err;
+        }
+        let (field_index, field_ty) = match self.field_of(Ty::Struct(struct_id), &field.name, field.span) {
+            Some(x) => x,
+            None => return err,
+        };
+        // A field-read that is itself a Move type would copy without ownership transfer (the same
+        // double-free concern as scalar indexing). Decoded structs only have scalar / `str`-view
+        // fields, but guard generally.
+        if matches!(field_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(field_ty) {
+            self.diags.error(
+                format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(field_ty)),
+                span,
+            );
+            return err;
+        }
+        self.constrain(field_ty, expected, span);
+        Expr {
+            kind: ExprKind::ElemField { recv: Box::new(r), index: Box::new(i), field: field_index, struct_id },
+            ty: field_ty,
+            span,
+        }
     }
 
     /// `b.get()` — copy the value out of a `box<T>`.
@@ -2996,7 +3063,7 @@ impl<'a> Checker<'a> {
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
-            ExprKind::Index { recv, index } => {
+            ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.finalize_expr(recv);
                 self.finalize_expr(index);
             }
@@ -3538,13 +3605,31 @@ mod tests {
         // Indexing a non-array is rejected.
         let (_r, nonarr) = check("fn main() -> i32 {\n  x := 5\n  return x[0]\n}\n");
         assert!(nonarr.has_errors(), "indexing a non-array must be rejected");
-        // Indexing a struct array (whole-element load) is deferred → a clean error, not a panic.
-        let (_s, structarr) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}, P{x: 2}]\n  return ps[0].x\n}\n");
-        assert!(structarr.has_errors(), "indexing a struct array is deferred and must error cleanly");
+        // A bare whole-struct `ps[0]` value is deferred → a clean error, not a panic. (Reading a
+        // field, `ps[0].x`, is supported — see `struct_array_element_field_checks`.)
+        let (_s, structarr) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}, P{x: 2}]\n  q := ps[0]\n  return q.x\n}\n");
+        assert!(structarr.has_errors(), "a whole-struct element value is deferred and must error cleanly");
         // Indexing a Move-only element (here a nested owned array) is rejected — copying the
         // element's {ptr,len} without ownership transfer would double-free.
         let (_m, moveelem) = check("fn take(xs: array<array<i64>>) -> i64 {\n  ys := xs[0]\n  return ys.len()\n}\nfn main() -> i32 = 0\n");
         assert!(moveelem.has_errors(), "indexing an array of a Move type must be rejected (double-free)");
+    }
+
+    #[test]
+    fn struct_array_element_field_checks() {
+        // MMv2 slice 8f: `arr[i].field` on a struct array reads one field (scalar or str view),
+        // bounds-checked.
+        let (_p, ok) = check("User { id: i64, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users[0].score)\n  return Ok(())\n}\n");
+        assert!(!ok.has_errors(), "arr[i].field on a struct array should check");
+        // A whole-struct `arr[i]` value (no field) is still deferred → clean error.
+        let (_q, whole) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}]\n  q := ps[0]\n  return q.x\n}\n");
+        assert!(whole.has_errors(), "a whole-struct element value is deferred and must error cleanly");
+        // An unknown field on the element is rejected.
+        let (_r, badf) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}]\n  return ps[0].nope\n}\n");
+        assert!(badf.has_errors(), "an unknown element field must be rejected");
+        // A `str` field read from an arena-decoded element must not escape the arena.
+        let (_s, esc) = check("U { id: i64, name: str }\nfn bad(key: str) -> Result<str, Error> {\n  mut out := \"\"\n  arena {\n    d := key + key\n    users: array<U> := json.decode(d)?\n    out = users[0].name\n  }\n  return Ok(out)\n}\nfn main() -> i32 = 0\n");
+        assert!(esc.has_errors(), "a str field of an arena-decoded element must not escape the arena");
     }
 
     #[test]

@@ -484,6 +484,43 @@ fn array_index_negative_aborts() {
 }
 
 #[test]
+fn struct_array_element_field_dynamic() {
+    if !backend_available() {
+        return;
+    }
+    // MMv2 slice 8f: `users[i].field` on an owned `array<Struct>` from `json.decode`. Reads a
+    // `str` field (zero-copy view), an `i32`, and a `bool` from specific elements — bounds-checked,
+    // no whole-struct copy. Output: "ann\n99\ntrue\n".
+    let src = "User { id: i64, name: str, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false,\\\"score\\\":99}]\")?\n  print(users[0].name)\n  print(users[1].score)\n  print(users[0].active)\n  return Ok(())\n}\n";
+    let out = build_and_run("struct-array-elem-field", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ann\n99\ntrue\n");
+}
+
+#[test]
+fn struct_array_element_field_fixed() {
+    if !backend_available() {
+        return;
+    }
+    // `ps[1].x` on a fixed stack `array<Struct>` (slot-addressed `IndexField`). = 30.
+    let src = "P { x: i32, y: i32 }\nfn main() -> i32 {\n  ps := [P{x: 10, y: 20}, P{x: 30, y: 40}]\n  return ps[1].x\n}\n";
+    let out = build_and_run("struct-array-elem-field-fixed", src);
+    assert_eq!(out.status.code(), Some(30));
+}
+
+#[test]
+fn struct_array_element_field_out_of_bounds_aborts() {
+    if !backend_available() {
+        return;
+    }
+    // `ps[i].field` is bounds-checked like a scalar index: an out-of-range element aborts.
+    let src = "P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}]\n  return ps[3].x\n}\n";
+    let out = build_and_run("struct-array-elem-field-oob", src);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("index out of bounds"));
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;
