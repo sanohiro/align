@@ -42,6 +42,30 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     let _ = out.write_all(b"\n").and_then(|()| out.flush());
 }
 
+/// `io.stdout.write(s)` — write the bytes of a `str` to stdout with **no** trailing newline
+/// (unlike `print`). Returns 0 on success, 1 on an I/O error. The first `std.io` surface
+/// (`06-runtime-std.md`). An empty / null `{ptr,len}` writes nothing and succeeds.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_stdout_write(ptr: *const u8, len: i64) -> i32 {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let ok = if len > 0 && !ptr.is_null() {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        out.write_all(bytes).and_then(|()| out.flush()).is_ok()
+    } else {
+        // Nothing to write; still flush so ordering with other output is stable.
+        out.flush().is_ok()
+    };
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
 /// Builtin `print` for booleans: write `true`/`false` + a newline.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_print_bool(v: i32) {

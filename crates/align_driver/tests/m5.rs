@@ -580,6 +580,42 @@ fn fs_read_file_feeds_json_decode() {
 }
 
 #[test]
+fn io_stdout_write_has_no_newline() {
+    if !backend_available() {
+        return;
+    }
+    // std.io: `io.stdout.write(s)` writes the bytes with no trailing newline (unlike `print`), so
+    // three writes concatenate: "a" + "b" + "c\n" = "abc\n".
+    let src = "fn main() -> Result<(), Error> {\n  io.stdout.write(\"a\")?\n  io.stdout.write(\"b\")?\n  io.stdout.write(\"c\\n\")?\n  return Ok(())\n}\n";
+    let out = build_and_run("io-stdout-write", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abc\n");
+}
+
+#[test]
+fn s19_full_flow_read_decode_aggregate_write() {
+    if !backend_available() {
+        return;
+    }
+    // The draft.md §19 pipeline, end-to-end bar `main(args)`: read a file → decode `array<User>`
+    // → `where(.active).score.sum()` → format with a `builder` → `io.stdout.write`. The active
+    // users score 10 + 5 = 15. Output: "active score: 15\n".
+    let path = std::env::temp_dir().join("align-s19-users.json");
+    std::fs::write(
+        &path,
+        "[{\"id\":1,\"name\":\"ann\",\"active\":true,\"score\":10},{\"id\":2,\"name\":\"bob\",\"active\":false,\"score\":99},{\"id\":3,\"name\":\"cyd\",\"active\":true,\"score\":5}]",
+    )
+    .expect("write json");
+    let src = format!(
+        "User {{ id: i64, name: str, active: bool, score: i32 }}\nfn main() -> Result<(), Error> {{\n  arena {{\n    data := fs.read_file(\"{}\")?\n    users: array<User> := json.decode(data)?\n    total := users.where(.active).score.sum()\n    out := builder()\n    out.write(\"active score: \")\n    out.write_int(total)\n    out.write(\"\\n\")\n    io.stdout.write(out.to_string())?\n  }}\n  return Ok(())\n}}\n",
+        path.display()
+    );
+    let out = build_and_run("s19-full", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "active score: 15\n");
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;

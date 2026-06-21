@@ -162,6 +162,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsReadFile { path, out } => {
             format!("fs_read_file({}, -> _{out})", operand_str(path))
         }
+        Rvalue::IoStdoutWrite { arg } => {
+            format!("io_stdout_write({})", operand_str(arg))
+        }
     }
 }
 

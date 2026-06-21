@@ -796,6 +796,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.walk(input, depth),
             ExprKind::FsReadFile { path } => self.walk(path, depth),
+            ExprKind::IoStdoutWrite { arg } => self.walk(arg, depth),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -989,6 +990,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.expr(input, moved, false, false),
             ExprKind::FsReadFile { path } => self.expr(path, moved, false, false),
+            ExprKind::IoStdoutWrite { arg } => self.expr(arg, moved, false, false),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -1752,6 +1754,17 @@ impl<'a> Checker<'a> {
             }
             if single_name(p) == Some("fs") && method == "read_file" {
                 return self.check_fs_read_file(args, span);
+            }
+        }
+        // `io.stdout.write(s)` — the receiver is the 2-segment `io.stdout`, so it parses as a
+        // `FieldAccess` (`io` . `stdout`), not a single-name path.
+        if method == "write" {
+            if let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind {
+                if let ast::ExprKind::Path(p) = &inner.kind {
+                    if single_name(p) == Some("io") && field.name == "stdout" {
+                        return self.check_io_stdout_write(args, span);
+                    }
+                }
             }
         }
         // `sum` / `reduce` are the terminals of a fused pipeline.
@@ -2862,6 +2875,24 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `io.stdout.write(s)` — write the bytes of a `str` (or owned `string`, auto-borrowed) to
+    /// stdout with **no** trailing newline (unlike `print`), yielding `Result<(), Error>` (an I/O
+    /// failure is `Err`). The first `std.io` surface; a builtin like `fs.read_file`.
+    fn check_io_stdout_write(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'io.stdout.write' expects 1 argument, got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        // The argument is written as bytes: a `str`, or an owned `string` (auto-borrowed).
+        let arg = self.check_str_init(&args[0]);
+        Expr {
+            kind: ExprKind::IoStdoutWrite { arg: Box::new(arg) },
+            ty: Ty::Result(Scalar::Unit, Scalar::ErrCode),
+            span,
+        }
+    }
+
     /// `arr[index].field` — field access on a struct-array element (MMv2 slice 8f). Fused into one
     /// bounds-checked element-field load; only the field (a scalar or a `str` view) is read. The
     /// result inherits the array's region (a `str` field views the array's input), so it cannot
@@ -3150,6 +3181,7 @@ impl<'a> Checker<'a> {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.finalize_expr(input),
             ExprKind::FsReadFile { path } => self.finalize_expr(path),
+            ExprKind::IoStdoutWrite { arg } => self.finalize_expr(arg),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -3684,6 +3716,19 @@ mod tests {
         // Wrong arity errors cleanly.
         let (_r, ar) = check("fn main() -> Result<(), Error> {\n  data := fs.read_file()?\n  return Ok(())\n}\n");
         assert!(ar.has_errors(), "fs.read_file needs exactly one argument");
+    }
+
+    #[test]
+    fn io_stdout_write_checks() {
+        // std.io: `io.stdout.write(s)` (s: str / owned string) yields `Result<(), Error>`.
+        let (_p, ok) = check("fn main() -> Result<(), Error> {\n  io.stdout.write(\"hi\")?\n  return Ok(())\n}\n");
+        assert!(!ok.has_errors(), "io.stdout.write of a str should check");
+        // An owned string is accepted (auto-borrowed to str) and stays usable afterwards.
+        let (_q, owned) = check("fn mk() -> string = \"x\".clone()\nfn main() -> Result<(), Error> {\n  s := mk()\n  io.stdout.write(s)?\n  print(s.len())\n  return Ok(())\n}\n");
+        assert!(!owned.has_errors(), "io.stdout.write borrows an owned string (does not move it)");
+        // Wrong arity errors.
+        let (_r, ar) = check("fn main() -> Result<(), Error> {\n  io.stdout.write()?\n  return Ok(())\n}\n");
+        assert!(ar.has_errors(), "io.stdout.write needs exactly one argument");
     }
 
     #[test]

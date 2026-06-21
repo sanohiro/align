@@ -306,6 +306,15 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // io.stdout.write (ptr, len) -> i32 status (std.io); writes bytes, no newline.
+        "io_stdout_write".to_string(),
+        module.add_function(
+            "align_rt_io_stdout_write",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len})
         // -> i32 status (MMv2 slice 8d).
         "json_decode_struct_array".to_string(),
@@ -1188,6 +1197,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeStructArray { struct_id, input, out } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
+            Rvalue::IoStdoutWrite { arg } => self.gen_io_stdout_write(arg)?,
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -1570,6 +1580,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_call(self.funcs["fs_read_file"], &[p_ptr.into(), p_len.into(), out_ptr.into()], "frf")
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("fs_read_file returns i32"))
+    }
+
+    /// `io.stdout.write(arg)`: pass the `str` arg's `{ptr,len}` to the runtime writer (no newline).
+    /// Returns the i32 status (0 = ok).
+    fn gen_io_stdout_write(&mut self, arg: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let agg = self.operand(arg).into_struct_value();
+        let s_ptr = self.builder.build_extract_value(agg, 0, "out_p").map_err(|e| self.err(e))?;
+        let s_len = self.builder.build_extract_value(agg, 1, "out_l").map_err(|e| self.err(e))?;
+        let cs = self
+            .builder
+            .build_call(self.funcs["io_stdout_write"], &[s_ptr.into(), s_len.into()], "sow")
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("io_stdout_write returns i32"))
     }
 
     fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece], arena: Option<&Operand>) -> Result<BasicValueEnum<'c>, CodegenError> {

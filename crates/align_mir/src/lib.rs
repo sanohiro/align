@@ -196,6 +196,9 @@ pub enum Rvalue {
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
     FsReadFile { path: Operand, out: Slot },
+    /// `io.stdout.write(arg)`: write the bytes of the `str` `arg` to stdout (no newline). Yields
+    /// an `i32` status (0 = ok). The first `std.io` surface.
+    IoStdoutWrite { arg: Operand },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -522,6 +525,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::JsonDecodeArray { elem, input } => lower_json_decode_array(b, *elem, input, e.ty),
         hir::ExprKind::JsonDecodeStructArray { struct_id, input } => lower_json_decode_struct_array(b, *struct_id, input, e.ty),
         hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
+        hir::ExprKind::IoStdoutWrite { arg } => lower_io_stdout_write(b, arg, e.ty),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -1613,6 +1617,41 @@ fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Opera
     b.terminate(Term::Goto(join));
 
     // Err: wrap the status code (the out slot was zeroed → no buffer allocated on failure).
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `io.stdout.write(arg)` → call the runtime writer (status `i32`), then branch `Ok(())` /
+/// `Err(<code>)`. No out slot — the result payload is unit.
+fn lower_io_stdout_write(b: &mut Builder, arg: &hir::Expr, result_ty: Ty) -> Operand {
+    let a = lower_expr(b, arg);
+    let code = b.fresh_value(Ty::ErrCode);
+    b.push(Stmt::Let(code, Rvalue::IoStdoutWrite { arg: a }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: wrap unit.
+    b.cur = ok_bb;
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Const(Const::Unit))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: wrap the status code.
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
     b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
