@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, payload_is_move, FloatTy, IntTy, Ty};
+use align_sema::{hir, payload_is_move, FloatTy, IntTy, Layout, Ty};
 
 pub mod print;
 
@@ -394,7 +394,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
     match &e.kind {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
-                Some(&ty) => matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty),
+                Some(&ty) => matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(ty),
                 None => false,
             };
             if moved {
@@ -811,25 +811,26 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
 /// projection). Only the one field (a scalar or a `str` view) is loaded — no whole-struct copy.
 fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, field: u32, struct_id: u32, field_ty: Ty) -> Operand {
     let idx = lower_expr(b, index);
-    match recv.ty {
-        Ty::DynStructArray(_) => {
+    // Set the element-field address up the same way the fused pipeline does (one shared seam,
+    // `lower_field_access`): a fixed `array<Struct>` is slot-addressed, an owned dynamic
+    // `array<Struct>` is a `{ptr,len}` value addressed by pointer. Differs from the pipeline only
+    // in needing an explicit bounds check (the loop's counter is in-bounds by construction).
+    let (struct_view, slice_val, slot, len) = match recv.ty {
+        Ty::DynStructArray(_, _) => {
             let sv = lower_expr(b, recv);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            emit_bounds_check(b, &idx, Operand::Value(len));
-            let v = b.fresh_value(field_ty);
-            b.push(Stmt::Let(v, Rvalue::IndexFieldPtr { base: sv, index: idx, field, struct_id }));
-            Operand::Value(v)
+            (Some(struct_id), Some(sv), 0, Operand::Value(len))
         }
         _ => {
             // A fixed `array<Struct>` slot (sema restricted `recv` to a literal / local).
             let (slot, n) = array_source_slot(b, recv);
-            emit_bounds_check(b, &idx, Operand::Const(Const::Int(n, i64_ty())));
-            let v = b.fresh_value(field_ty);
-            b.push(Stmt::Let(v, Rvalue::IndexField(slot, idx, field)));
-            Operand::Value(v)
+            (None, None, slot, Operand::Const(Const::Int(n, i64_ty())))
         }
-    }
+    };
+    emit_bounds_check(b, &idx, len);
+    let v = lower_field_access(b, struct_view, &slice_val, slot, &idx, field, field_ty);
+    Operand::Value(v)
 }
 
 fn index_const(i: usize) -> Operand {
@@ -970,7 +971,7 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
         // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field
         // projection (slice 8d-2). It is a bound local borrow (sema requires a variable source),
         // so nothing is freed by the loop — the owner's exit `Drop` frees the buffer.
-        Ty::DynStructArray(id) => {
+        Ty::DynStructArray(id, _) => {
             let sv = lower_expr(b, source);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
@@ -990,9 +991,14 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
     }
 }
 
-/// Load `base[index].field` for a fused pipeline's struct-array source: a stack-slot AoS uses
-/// the slot-based [`Rvalue::IndexField`]; a `{ptr,len}` dynamic `array<Struct>` view
-/// (`struct_view = Some(id)`) uses the pointer-based [`Rvalue::IndexFieldPtr`]. MMv2 slice 8d-2.
+/// The **single layout seam** for struct-array element-field addressing — the one place that
+/// turns `arr[i].field` into a load, shared by the fused pipeline (8d-2) and surface indexing
+/// (8f). A stack-slot AoS array uses the slot-based [`Rvalue::IndexField`]; an owned dynamic
+/// `array<Struct>` view (`struct_view = Some(id)`) uses the pointer-based
+/// [`Rvalue::IndexFieldPtr`]. Both are AoS (`element, field` GEP). When SoA (`Layout::Soa`,
+/// `soa array<T>`) lands at M6, its column-array indexing branches **here** (keyed off the
+/// source's [`Layout`]) — every field access already routes through this function, so the change
+/// is localized rather than a cross-cutting retrofit.
 fn lower_field_access(
     b: &mut Builder,
     struct_view: Option<u32>,
@@ -1576,7 +1582,7 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
 /// Mirrors [`lower_json_decode_array`]; the AoS buffer is heap-owned (the unwrapped local
 /// `Drop`-frees it), while its elements' `str` fields remain views into the input.
 fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
-    let arr_ty = Ty::DynStructArray(struct_id);
+    let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
     let out = b.new_slot(arr_ty);
     let inp = lower_expr(b, input);
     let code = b.fresh_value(Ty::ErrCode);
@@ -1745,7 +1751,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
         Ty::DynArray(_) => "array".to_string(),
-        Ty::DynStructArray(id) => format!("array<struct#{id}>"),
+        Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),

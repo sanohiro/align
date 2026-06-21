@@ -468,7 +468,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicType
         Ty::StructArray(id, n) => sx[id as usize].array_type(n).into(),
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct.
-        Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_) => {
+        Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) => {
             slice_struct_type(ctx).into()
         }
         _ => int_type(ctx, ty).into(),
@@ -516,7 +516,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
         Ty::Option(s) => option_struct_type(ctx, s, sx).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx).into(),
         Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => ctx.ptr_type(AddressSpace::default()).into(),
-        Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) | Ty::DynStructArray(_) => {
+        Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) | Ty::DynStructArray(..) => {
             slice_struct_type(ctx).into()
         }
         _ => scalar_type(ctx, ty, sx),
@@ -1238,7 +1238,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
-            Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) | Ty::DynStructArray(_) => {
+            Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) | Ty::DynStructArray(..) => {
                 slice_struct_type(self.ctx).into()
             }
             _ => scalar_type(self.ctx, ty, self.struct_types),
