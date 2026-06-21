@@ -2747,10 +2747,16 @@ impl<'a> Checker<'a> {
     fn check_index(&mut self, recv: &ast::Expr, index: &ast::Expr, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let r = self.check_expr(recv, None);
-        // The index is an `i64` (matching `.len()` and loop counters).
+        // The index is an `i64` (matching `.len()` and loop counters). A non-integer index must
+        // bail with `Ty::Error` — returning a typed `Index` node with a bad index would feed a
+        // non-int operand into the MIR bounds-check `icmp` and panic codegen.
         let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
-        if !i.ty.is_int_like() && i.ty != Ty::Error {
+        if i.ty == Ty::Error {
+            return err;
+        }
+        if !i.ty.is_int_like() {
             self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
+            return err;
         }
         let elem = match r.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
@@ -2767,6 +2773,17 @@ impl<'a> Checker<'a> {
                 return err;
             }
         };
+        // A Move-only element (e.g. `array<string>`, `array<array<T>>`) cannot be indexed yet:
+        // the load copies the element's `{ptr,len}` without transferring ownership, so the array
+        // and the copy would both free the same buffer (double-free). Such element reads need a
+        // borrow / move-out design (a later slice) — reject cleanly until then.
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(elem) {
+            self.diags.error(
+                format!("indexing an array of the Move type {} is not supported yet (it would copy the element without transferring ownership)", ty_name(elem)),
+                span,
+            );
+            return err;
+        }
         // A slot-backed fixed array must be a literal or a variable (same restriction as a
         // pipeline source — MIR addresses it through a slot). A `{ptr,len}` view is fine as a value.
         if matches!(r.ty, Ty::Array(..)) && !matches!(r.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
@@ -3524,6 +3541,10 @@ mod tests {
         // Indexing a struct array (whole-element load) is deferred → a clean error, not a panic.
         let (_s, structarr) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}, P{x: 2}]\n  return ps[0].x\n}\n");
         assert!(structarr.has_errors(), "indexing a struct array is deferred and must error cleanly");
+        // Indexing a Move-only element (here a nested owned array) is rejected — copying the
+        // element's {ptr,len} without ownership transfer would double-free.
+        let (_m, moveelem) = check("fn take(xs: array<array<i64>>) -> i64 {\n  ys := xs[0]\n  return ys.len()\n}\nfn main() -> i32 = 0\n");
+        assert!(moveelem.has_errors(), "indexing an array of a Move type must be rejected (double-free)");
     }
 
     #[test]
