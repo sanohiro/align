@@ -261,6 +261,9 @@ pub enum ExprKind {
     /// `fs.read_file(path)` — read the file at `path` (a `str`) into a freshly heap-allocated owned
     /// `string`; the expression `ty` is `Result<string, Error>`. The first `std.fs` surface.
     FsReadFile { path: Box<Expr> },
+    /// `io.stdout.write(arg)` — write the bytes of the `str` `arg` to stdout with no trailing
+    /// newline; the expression `ty` is `Result<(), Error>`. The first `std.io` surface.
+    IoStdoutWrite { arg: Box<Expr> },
 }
 
 /// Which builder append a `BuilderWrite` performs (MMv2 slice 7c/7d).

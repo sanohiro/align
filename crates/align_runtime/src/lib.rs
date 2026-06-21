@@ -34,12 +34,46 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
     // An empty owned `string` (from `str.clone()` / `builder().to_string()`) carries a *null*
-    // pointer with `len == 0`; `from_raw_parts(null, 0)` is UB, so emit just the newline.
+    // pointer with `len == 0`; `from_raw_parts(null, 0)` is UB, so emit just the newline. `try_from`
+    // avoids a truncating `len as usize` (a heap OOB) on a 32-bit target.
     if len > 0 {
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        let _ = out.write_all(bytes);
+        if let Ok(n) = usize::try_from(len) {
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
+            let _ = out.write_all(bytes);
+        }
     }
     let _ = out.write_all(b"\n").and_then(|()| out.flush());
+}
+
+/// `io.stdout.write(s)` — write the bytes of a `str` to stdout with **no** trailing newline
+/// (unlike `print`). Returns 0 on success, 1 on an I/O error. The first `std.io` surface
+/// (`06-runtime-std.md`). An empty / null `{ptr,len}` writes nothing and succeeds.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_stdout_write(ptr: *const u8, len: i64) -> i32 {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let ok = if len > 0 && !ptr.is_null() {
+        // `try_from` avoids a truncating `len as usize` (a heap OOB) on a 32-bit target; an
+        // overflow is a write failure.
+        match usize::try_from(len) {
+            Ok(n) => {
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
+                out.write_all(bytes).and_then(|()| out.flush()).is_ok()
+            }
+            Err(_) => false,
+        }
+    } else {
+        // Nothing to write; still flush so ordering with other output is stable.
+        out.flush().is_ok()
+    };
+    if ok {
+        0
+    } else {
+        1
+    }
 }
 
 /// Builtin `print` for booleans: write `true`/`false` + a newline.

@@ -305,12 +305,14 @@ Completion condition: the example in `draft.md` §19 runs (JSON decode → aggre
 output). **Met (compiler side), via Memory Model v2** — §19 decodes `array<User>` with a `str`
 field and folds `where(.active).score.sum()` into one loop, both delivered by the zero-copy
 borrow-region decode + owned `array<Struct>` + fused-pipeline work (MMv2 slices 8d-1/8d-2). The
-remaining gap is the std boundary: **`fs.read_file` now reads a file into an owned `string`**
-(read file → decode → aggregate → index runs end-to-end), leaving `io.stdout.write` (output a
-`str`/`builder` without `print`'s newline) and `main(args: array<str>)` (needs `array<str>` — an
-array of `str` views — as a type) for full `§19` *verbatim*. M5 language features are complete
-(strings, templates, `json.encode` for struct/array, `json.decode` for scalar / `str` /
-`array<scalar>` / `array<Struct>`).
+remaining gap is `main(args: array<str>)`: **`fs.read_file`** reads a file into an owned `string`
+and **`io.stdout.write`** writes a `str`/`string` to stdout (no newline), so the §19 body —
+read file → `json.decode<array<User>>` → `where(.active).score.sum()` → format with a `builder`
+→ `io.stdout.write` — runs end-to-end. Full `§19` *verbatim* needs only `main(args: array<str>)`
+(which needs `array<str>` — an array of `str` views — as a type) and `io.stdout.write` accepting
+a `builder` directly (today: `out.to_string()`). M5 language features are complete (strings,
+templates, `json.encode` for struct/array, `json.decode` for scalar / `str` / `array<scalar>` /
+`array<Struct>`).
 
 ## Memory Model v2 — borrow-region + owned heap/drop (foundation; before M6) — DONE
 
