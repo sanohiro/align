@@ -141,11 +141,21 @@ pub unsafe extern "C" fn align_rt_str_clone(ptr: *const u8, len: i64) -> AlignSt
 /// `path` must describe a valid byte range; `out` must point to a writable `{ptr,len}`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, out: *mut AlignStr) -> i32 {
-    // `from_raw_parts` is UB on a null pointer even with len 0 — guard an empty/owned path.
+    // `out` is the caller's `{ptr,len}` slot; the generated code always passes a valid one, but
+    // guard the raw pointer at the FFI boundary rather than dereferencing a null below.
+    if out.is_null() {
+        return 1;
+    }
+    // `from_raw_parts` is UB on a null pointer even with len 0 — guard an empty/owned path. Use
+    // `try_from` so a `path_len` that doesn't fit `usize` (only possible on a 32-bit target) is a
+    // clean error, not a truncating `as` cast (a heap out-of-bounds).
     let path_bytes: &[u8] = if path_len <= 0 || path.is_null() {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(path, path_len as usize) }
+        let Ok(n) = usize::try_from(path_len) else {
+            return 1;
+        };
+        unsafe { std::slice::from_raw_parts(path, n) }
     };
     let Ok(path_str) = std::str::from_utf8(path_bytes) else {
         return 1;
