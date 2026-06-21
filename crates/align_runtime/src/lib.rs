@@ -379,6 +379,102 @@ pub unsafe extern "C" fn align_rt_json_decode(
     }
 }
 
+/// Parse the JSON array in `input` into a freshly heap-allocated owned `array<T>`, writing the
+/// materialized `{ptr, len}` (len = element count) to `out` (MMv2 slice 8c). `elem_tag` is the
+/// element encoding `(kind << 8) | byte-width` (kind 0 = int, 1 = bool, 2 = float), matching the
+/// struct-field tags. Elements are *copied* into the new buffer (not borrowed), so the result is
+/// owned and freed by the generated `Drop`. Returns 0 on success, 1 on a parse error (leaving
+/// `out` as the caller-zeroed `{null,0}`). An empty array allocates nothing (null buffer).
+///
+/// # Safety
+/// `input` must describe a valid byte range; `out` must point to a writable `{ptr,len}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_decode_array(
+    input: *const u8,
+    input_len: i64,
+    elem_tag: i32,
+    out: *mut AlignStr,
+) -> i32 {
+    let src = unsafe { std::slice::from_raw_parts(input, input_len.max(0) as usize) };
+    let kind = (elem_tag >> 8) & 0xff;
+    let width = (elem_tag & 0xff) as usize;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut count: i64 = 0;
+
+    let mut p = JsonParser { src, pos: 0 };
+    let ok = (|| -> Option<()> {
+        p.ws();
+        p.expect(b'[')?;
+        p.ws();
+        if p.peek() == Some(b']') {
+            p.pos += 1;
+        } else {
+            loop {
+                p.ws();
+                match kind {
+                    1 => {
+                        // bool — always one byte.
+                        if width != 1 {
+                            return None;
+                        }
+                        bytes.push(p.boolean()? as u8);
+                    }
+                    2 => {
+                        // float — f32 (4) or f64 (8).
+                        let v = p.number()?;
+                        match width {
+                            4 => bytes.extend_from_slice(&(v as f32).to_le_bytes()),
+                            8 => bytes.extend_from_slice(&v.to_le_bytes()),
+                            _ => return None,
+                        }
+                    }
+                    _ => {
+                        // int — write the low `width` bytes of the i64 (two's-complement LE),
+                        // matching how struct int fields are written.
+                        if !matches!(width, 1 | 2 | 4 | 8) {
+                            return None;
+                        }
+                        let le = p.integer()?.to_le_bytes();
+                        bytes.extend_from_slice(&le[..width]);
+                    }
+                }
+                count += 1;
+                p.ws();
+                match p.peek() {
+                    Some(b',') => {
+                        p.pos += 1;
+                        continue;
+                    }
+                    Some(b']') => {
+                        p.pos += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        p.ws();
+        // Trailing garbage after the array is an error.
+        if p.pos != src.len() {
+            return None;
+        }
+        Some(())
+    })();
+    if ok.is_none() {
+        return 1;
+    }
+
+    // Materialize into a fresh heap buffer (owned; freed by the generated `Drop`). An empty
+    // array allocates nothing — `align_rt_alloc(0)` returns null and `free(null)` is a no-op.
+    let total = bytes.len() as i64;
+    let dst = align_rt_alloc(total);
+    if total > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+    }
+    unsafe { *out = AlignStr { ptr: dst, len: count } };
+    0
+}
+
 /// A minimal JSON scanner over a byte slice (just what `json.decode` needs: objects with
 /// integer / boolean values; strings only as keys).
 struct JsonParser<'a> {

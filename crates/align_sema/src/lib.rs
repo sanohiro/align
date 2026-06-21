@@ -749,7 +749,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } => self.walk(input, depth),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } => self.walk(input, depth),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -935,7 +935,7 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } => self.expr(input, moved, false, false),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } => self.expr(input, moved, false, false),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -2571,6 +2571,30 @@ impl<'a> Checker<'a> {
         // The decode target is the Ok type of the expected `Result<T, _>`.
         let sid = match expected.map(|e| self.resolve(e)) {
             Some(Ty::Result(Scalar::Struct(id), _)) => id,
+            // `array<T>` target (MMv2 slice 8c): parse a JSON array of scalars into an *owned*
+            // `array<T>` (elements copied → `Static`/returnable, not region-tied to the input).
+            Some(Ty::Result(Scalar::DynArray(prim), _)) => {
+                let elem = scalar_to_ty(prim_to_scalar(prim));
+                // The element must be runtime-parseable. A `str` element would be a zero-copy
+                // view region-tied to the input (deferred — needs the array to carry that region).
+                if !matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool) {
+                    self.diags.error(
+                        format!("'json.decode' into array<{}> is not supported yet (int/float/bool elements only)", ty_name(elem)),
+                        span,
+                    );
+                    return err;
+                }
+                let input = self.check_expr(&args[0], Some(Ty::Str));
+                if input.ty != Ty::Str && input.ty != Ty::Error {
+                    self.diags
+                        .error(format!("'json.decode' input must be a str, got {}", ty_name(input.ty)), args[0].span);
+                }
+                return Expr {
+                    kind: ExprKind::JsonDecodeArray { elem, input: Box::new(input) },
+                    ty: Ty::Result(Scalar::DynArray(prim), Scalar::ErrCode),
+                    span,
+                };
+            }
             _ => {
                 self.diags.error(
                     "cannot infer the decode target type; annotate the binding, e.g. `u: T := json.decode(d)?`".to_string(),
@@ -2897,7 +2921,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } => self.finalize_expr(input),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } => self.finalize_expr(input),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -3605,6 +3629,18 @@ mod tests {
     fn option_string_payload_checks() {
         let (_p, d) = check("fn first() -> Option<string> = Some(\"x\".clone())\nfn main() -> i32 {\n  s := first() else { return 9 }\n  print(s)\n  return 0\n}\n");
         assert!(!d.has_errors(), "Option<string> construct + else-unwrap should check");
+    }
+
+    #[test]
+    fn json_decode_scalar_array_checks() {
+        // MMv2 slice 8c: `json.decode` into an owned `array<scalar>` checks (target inferred from
+        // the `array<T>` annotation threaded through `?`).
+        let (_p, d) = check("fn parse(s: str) -> Result<array<i64>, Error> {\n  xs: array<i64> := json.decode(s)?\n  return Ok(xs)\n}\nfn main() -> i32 = 0\n");
+        assert!(!d.has_errors(), "json.decode into array<i64> should check");
+        // `array<char>` is a representable owned-array type, but the runtime parser only handles
+        // int/float/bool elements — `json.decode` rejects it cleanly (exercises the element check).
+        let (_q, d2) = check("fn parse(s: str) -> Result<array<char>, Error> {\n  xs: array<char> := json.decode(s)?\n  return Ok(xs)\n}\nfn main() -> i32 = 0\n");
+        assert!(d2.has_errors(), "json.decode into array<char> must be rejected for now");
     }
 
     #[test]

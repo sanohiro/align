@@ -271,6 +271,43 @@ fn option_array_payload_else_unwrap() {
 }
 
 #[test]
+fn json_decode_scalar_array() {
+    if !backend_available() {
+        return;
+    }
+    // MMv2 slice 8c: `json.decode` into an owned `array<i64>` — the JSON array is parsed and the
+    // elements copied into a fresh heap buffer (owned, returnable). sum = 100, len = 4. Also
+    // exercises `return Ok(xs)` moving a bound owned local through the `Ok` wrapper (freed once).
+    let src = "fn parse(s: str) -> Result<array<i64>, Error> {\n  xs: array<i64> := json.decode(s)?\n  return Ok(xs)\n}\nfn main() -> Result<(), Error> {\n  xs := parse(\"[10, 20, 30, 40]\")?\n  print(xs.sum())\n  print(xs.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "100\n4\n");
+}
+
+#[test]
+fn json_decode_float_array() {
+    if !backend_available() {
+        return;
+    }
+    // `array<f64>` decode: 1.5 + 2.5 + 3.0 = 7.0.
+    let src = "fn main() -> Result<(), Error> {\n  xs: array<f64> := json.decode(\"[1.5, 2.5, 3.0]\")?\n  print(xs.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-farray", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7.0\n");
+}
+
+#[test]
+fn json_decode_array_malformed_errors() {
+    if !backend_available() {
+        return;
+    }
+    // A malformed element propagates an error (exit code 1), with no allocation leaked.
+    let src = "fn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[1, 2, oops]\")?\n  print(xs.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-array-bad", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;

@@ -178,6 +178,10 @@ pub enum Rvalue {
     /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
     /// type tags, byte offsets) and calls the runtime parser.
     JsonDecode { struct_id: u32, input: Operand, out: Slot },
+    /// `json.decode` into an owned `array<elem>` (MMv2 slice 8c): parse a JSON array of scalars
+    /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
+    /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
+    JsonDecodeArray { elem: Ty, input: Operand, out: Slot },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -392,6 +396,12 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                 null_moved_source(b, v);
             }
         }
+        // A bound owned local moved into a wrapper (`return Ok(xs)` / `Some(xs)` / `Err(xs)`) is
+        // consumed by the construction — see through the wrapper to null the source slot, else the
+        // local's exit `Drop` double-frees the buffer now owned by the aggregate.
+        hir::ExprKind::ResultOk(inner) | hir::ExprKind::ResultErr(inner) | hir::ExprKind::OptionSome(inner) => {
+            null_moved_source(b, inner);
+        }
         _ => {}
     }
 }
@@ -495,6 +505,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(r)
         }
         hir::ExprKind::JsonDecode { struct_id, input } => lower_json_decode(b, *struct_id, input, e.ty),
+        hir::ExprKind::JsonDecodeArray { elem, input } => lower_json_decode_array(b, *elem, input, e.ty),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -1367,6 +1378,46 @@ fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_
     b.terminate(Term::Goto(join));
 
     // Err: wrap the status code as the Error.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `json.decode(input)` into an owned `array<elem>` → materialize the array into an out slot via
+/// the runtime parser (status `i32`), then branch into `Ok(<array>)` / `Err(<code>)`. Mirrors
+/// [`lower_json_decode`]; the array is heap-owned (the unwrapped local `Drop`-frees it).
+fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_ty: Ty) -> Operand {
+    let arr_ty = Ty::DynArray(scalar_of(elem));
+    let out = b.new_slot(arr_ty);
+    let inp = lower_expr(b, input);
+    let code = b.fresh_value(Ty::ErrCode);
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeArray { elem, input: inp, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the materialized array {ptr,len} and wrap it (it owns its buffer now).
+    b.cur = ok_bb;
+    let a = b.fresh_value(arr_ty);
+    b.push(Stmt::Let(a, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(a))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: wrap the status code (the out slot was zeroed → no buffer allocated on failure).
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
     b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));

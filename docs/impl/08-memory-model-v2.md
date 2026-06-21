@@ -482,12 +482,25 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      Enables `fn f() -> Result<array<i64>, Error>` / `Option<array<f64>>`. MIR-verified: the
      heap buffer is moved `mk → Result → ?-unwrap → local` and freed exactly once; Err/None free
      null. Tested e2e (Result/Option unwrap + sum) + sema (construct/return/box-rejection).
-   - **Deferred (8c+):** **`json.decode<array<scalar>>`** (parse a JSON array into an owned
-     `array<T>` — now representable as the `Result<array<T>, Error>` return), then `array<Struct>`
-     decode (needs a dynamic *struct* array + str fields zero-copy region-tied to the input) for the
-     draft.md §19 headline. Tuples / multi-value returns (for `partition`) and `array<slice<T>>`
-     (for `chunks`) remain a **separate** type-system track — open design items (do not fake them);
-     they reuse this same owned-aggregate + drop foundation once their surface is designed.
+   - **[done] 8c — `json.decode<array<scalar>>`.** Parse a JSON array of scalars into an **owned**
+     `array<T>` (`Result<array<T>, Error>`, now representable thanks to 8b). New
+     `ExprKind::JsonDecodeArray` + MIR `Rvalue::JsonDecodeArray` + runtime `align_rt_json_decode_array`,
+     mirroring the struct-decode pattern (materialize into an out slot, branch `Ok(<array>)` /
+     `Err(<code>)`). The elements are **copied** into a fresh `malloc`'d buffer (not borrowed), so
+     the result is `Static`/returnable — *not* region-tied to the input (`region_of` leaves it at
+     the `Static` default; only the struct decode ties to its input for zero-copy `str` fields).
+     `check_json_decode` dispatches on the expected Ok scalar (`Struct` → object, `DynArray(prim)` →
+     array); int/float/bool elements only (a `str` element would be region-tied — deferred). Same
+     `(kind<<8)|width` element tag as struct fields. M5 cut: an empty array allocates nothing
+     (`{null,0}`). **Latent-bug fix surfaced here:** `null_moved_source` now sees through
+     `Ok`/`Some`/`Err` wrappers, so `return Ok(xs)` of a *bound* owned local nulls its slot — else
+     the local's exit `Drop` double-freed the buffer now owned by the returned aggregate (a slice-8a
+     gap exposed by `return Ok(decoded_array)`; also fixes `return Ok(bound_string)`).
+   - **Deferred (8d+):** `json.decode<array<Struct>>` (the draft.md §19 headline — needs a dynamic
+     *struct* array, AoS, with `str` fields zero-copy region-tied to the input). Tuples / multi-value
+     returns (for `partition`) and `array<slice<T>>` (for `chunks`) remain a **separate** type-system
+     track — open design items (do not fake them); they reuse this same owned-aggregate + drop
+     foundation once their surface is designed.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).
