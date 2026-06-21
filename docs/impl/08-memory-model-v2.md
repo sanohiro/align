@@ -1,9 +1,13 @@
 # 08 — Memory Model v2: borrow regions + owned heap/drop
 
-Status: **design (pre-implementation).** This is the foundation phase slotted **after the
-foundation-safe scalar work and before M6 (SIMD)** (`07-roadmap.md`, `open-questions.md`
-"Memory model v2"). It is designed **as a whole here first**, then implemented in ordered
-slices (§11). Nothing in M4/M5 that depends on it ships in a corner-cut form before it lands.
+Status: **IMPLEMENTED through slice 8d** (see the §11 slice ledger for the per-slice record).
+This was the foundation phase slotted **after the foundation-safe scalar work and before M6
+(SIMD)** (`07-roadmap.md`, `open-questions.md` Settled "Memory model v2"). It was designed **as
+a whole here first**, then implemented in ordered slices (§11) — nothing it gated shipped in a
+corner-cut form before it landed. **`draft.md` §19 now runs end-to-end except the `fs`/`io` std
+boundary.** The text below is the original design narrative, kept as the authoritative model;
+the still-deferred, deliberately un-rushed tracks (tuples/`partition`, `array<slice>`/`chunks`,
+`array<Struct>.clone()`, element indexing) are called out in §11.
 
 It exists because the deferred "ideal forms" of M4 and M5 both rest on one foundation:
 - M5 `json.decode` for `str` / `array<T>` / nested fields → zero-copy views region-tied to
@@ -536,25 +540,29 @@ ownership/regions — deferred to its own slice (not gated on v2; recorded in `o
 
 ---
 
-## 12. Spec / doc updates this phase requires
+## 12. Spec / doc updates this phase requires — DONE
 
-Per `CLAUDE.md` "when changing a design decision, update all of": this phase changes the
-decode-escape semantics and lifts several deferrals, so on landing each slice update:
+Per `CLAUDE.md` "when changing a design decision, update all of": this phase changed the
+decode-escape semantics and lifted several deferrals. All of the following are now reconciled
+(the milestone-closing consolidation):
 
-- **draft.md §12 "Zero Copy"** — replace "only when there is an escape is a decode buffer
-  used" with the explicit-`.clone()`-to-escape rule (§9 here).
-- **draft.md §6/§7** — note owned `array<T>` allocation modes (arena bulk-free vs
-  free-standing drop) and that views carry inferred regions.
-- **docs/language-spec.md** — mirror the §12/§6/§7 changes in the digest.
-- **docs/design-notes.md** — record the rationale for explicit-clone-over-auto-copy
-  (Nothing hidden + Predictable performance > convenience) and for the unified region lattice
-  over point solutions.
-- **docs/impl/03-types.md §6–§7** — the region lattice, struct-carries-region, owned/drop.
-- **docs/impl/04-mir.md** — the `Drop` terminator/stmt and per-binding drop stack.
-- **docs/impl/07-roadmap.md** — move items from "[todo — blocked on Memory Model v2]" to done
-  as slices land; flip the §19 completion condition once slice 6 ships.
-- **docs/open-questions.md** — move "Memory model v2" from Open to Settled (with this doc as
-  the record); record the decode-escape decision and the owned-array allocation decision.
+- **[done] draft.md §14 "Zero Copy"** — the explicit-`.clone()`-to-escape rule (the section
+  renumbered from the original §12; JSON is now §14).
+- **[done] draft.md §6/§7** — `array<T>` owned/move + arena bulk-free + "a view cannot escape
+  the arena" are stated; the two allocation modes' implementation detail lives here (§6) and in
+  `03-types.md` rather than the high-level spec.
+- **[done] docs/language-spec.md** — the feature-surface digest (terse keyword lists) already
+  names `array<T>` / `json.decode<T>` / arena / explicit heap; no contradiction to reconcile.
+- **[done] docs/design-notes.md** — the "Memory model v2: one region lattice, explicit copies"
+  section records both rationales.
+- **[done] docs/impl/03-types.md §7** — a status note generalizing the sketch to the region
+  lattice + owned/drop, pointing here as the authoritative model.
+- **[done] docs/impl/04-mir.md §5** — a status note on per-binding `Drop` / drop flags /
+  null-on-move / Option-Result owned-payload drop.
+- **[done] docs/impl/07-roadmap.md** — Memory Model v2 marked DONE, the `[todo — blocked]`
+  items reconciled, and the §19 completion condition marked met (compiler side).
+- **[done] docs/open-questions.md** — "Memory model v2" moved from Open to **Settled** (this
+  doc as the record), with the region-lattice / owned-drop / explicit-clone decisions recorded.
 
 ---
 

@@ -53,49 +53,20 @@ Record: `impl/08-memory-model-v2.md` (slice 7a, owned `string`), `design-notes.m
 **Decision: no unwinding; immediate abort.** Fatal errors (div-by-zero, OOM) abort the process; there is no catch/recover boundary. The compiler emits plain LLVM `call` (never `invoke` + landing pads), so the MIR→LLVM CFG stays exception-free. (Promotes the prior "currently: immediate abort" detail to a locked decision — committing now keeps the CFG-generation stage from ever needing landing-pad support.) The *build-level* `panic=abort` + strip-`.eh_frame` step that drops the Rust-std unwinder is a separate, opt-in binary-size/startup lever (see Future "Hardware & backend optimization backlog").
 Record: `impl/04-mir.md` (CFG), `non-goals.md`.
 
+### Memory model v2 (borrow-region propagation + owned heap/drop) — IMPLEMENTED
+**Decision: one inferred region lattice + owned heap collections with per-binding drop; views are region-tied and escape is checked; a value that must outlive its source is cloned explicitly (the compiler never inserts a copy on escape).** The phase that unified the old point solutions and lifted the M3/M4/M5 ownership deferrals. Concretely settled and shipped:
+- **One region lattice** `Static ⊐ Frame ⊐ Arena(k)` (regions stay *inferred* — no lifetime syntax). Every view producer (`slice`, `str` borrow, struct field, a `json.decode`-d struct or `array<Struct>`, a call re-borrowing an argument) carries a region; `EscapeCheck` forbids a view outliving its source. Replaces the three unrelated mechanisms (arena depth for `box`/`str`, slice "local-backed", struct `str` region-0).
+- **Owned (Move) heap collections + drop**: free-standing owned `string` / `array<T>` / `array<Struct>` (AoS) / `builder`, freed by per-binding MIR `Drop` (null-on-move drop flags) outside an arena, or arena bulk-free inside one. Owned payloads inside `Option`/`Result` are dropped / moved-out as a unit.
+- **Explicit `.clone()` over hidden copy-on-escape**: a zero-copy decoded view that must escape its input is cloned explicitly (Nothing hidden + Predictable performance; supersedes the old `draft.md` auto-buffer wording). An in-arena clone is a bump allocation, so escaping is not a sudden heap cost.
+- **`json.decode`**: `str` and `array<Struct>` decode are zero-copy views region-tied to the input (a struct's `str` fields borrow it); `array<scalar>` is copied into a fresh buffer (owned / `Static` / returnable, not region-tied). Together → **`draft.md` §19 runs end-to-end except the `fs`/`io` std boundary**.
+SSO is **not** adopted (its own Settled entry above). Still open / separate tracks (not part of this decision): tuples / multi-value returns (for `partition`), `array<slice<T>>` (for `chunks`), `array<Struct>.clone()`, element indexing (`users[i].name`), and `out` params + `noalias` (below).
+Record: `impl/08-memory-model-v2.md` (full model + slice ledger §11), `design-notes.md` ("one region lattice, explicit copies"), `draft.md` §6/§7/§14, `impl/07-roadmap.md` (Memory Model v2 — DONE).
+
 ---
 
 ## Open (to be decided)
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
-
-### Memory model v2 (borrow-region propagation + owned heap/drop) — dedicated phase before M6
-**Design locked — see `impl/08-memory-model-v2.md` (the full model + ordered implementation
-slices). Implementation pending (slice 1 = behavior-preserving region-lattice refactor).**
-Two decisions are now settled (recorded there): (1) owned `array<T>` uses **both** allocation
-modes — arena bump + bulk-free inside an `arena {}`, free-standing heap + per-binding MIR
-`Drop` outside (so owned arrays can be returned); (2) a zero-copy decoded view that must
-outlive its input is **cloned explicitly** — the compiler never inserts a copy on escape
-(Nothing hidden + Predictable performance; supersedes the old draft.md §12 auto-buffer
-wording). The rest of this entry is the original framing, kept for context:
-
-The single load-bearing foundation that **both** of the deferred "ideal forms" depend on:
-- **Borrow-region propagation**: a value that *views* another (a `slice` into an array, a
-  `str` view into a buffer, a **`json.decode`-d struct borrowing its input**) must carry a
-  region tied to its source, and escape checking must forbid it outliving that source.
-  Today this is only handled by point solutions (arena depth for box/str, "local-backed"
-  for slices, region-0 for struct `str` fields) — they must be **generalized**.
-- **Owned / dynamic heap collections + drop**: free-standing heap `array<T>`/`string` with
-  per-binding drop insertion (the piece M3 explicitly deferred). Required for any pipeline
-  terminal that **materializes** an array.
-
-**Decision (sequencing, to avoid the "half-implementation makes it hard later" trap):** do
-NOT ship corner-cut versions of the dependent features (a leaked or borrow-unchecked
-zero-copy `json.decode` str/array; a materializing `filter`/`sort`/etc on a faked array).
-Either bakes in a wrong lifetime/ownership assumption that becomes a breaking change once the
-model lands. Instead, design this model **as a whole first** (per `impl/00-overview.md`), as a
-dedicated phase slotted **after the foundation-safe scalar work and before M6 (SIMD)** — so
-M6/M7 build on a solid array/borrow foundation rather than a provisional one.
-
-**What the dependent features become, once this lands:**
-- M5 `json.decode` for `str`/`array<T>` fields → zero-copy views into the input (decode
-  buffer only on escapes), region-tied to the input → **draft.md §19 runs in full** (true M5
-  completion). Until then, `json.decode` stays **scalar-only** (int/float/bool).
-- M4 carryover `filter`/`scan`/`partition`/`sort`/`chunks` + array-valued results → built on
-  owned dynamic arrays. Until then, only **non-materializing** terminals exist
-  (`sum`/`reduce`/`count`/`any`/`all`).
-
-(`impl/03-types.md` §6–§7, `impl/07-roadmap.md` M3/M4/M5 deferrals.)
 
 ### Generics (minimal system) — before M4
 Structural-constraint inference vs explicit bounds (trait-style). Unit of monomorphization implementation. Value generics for `vec<N,T>`. Required to write core in Align itself (`impl/03-types.md` §9, `impl/06-runtime-std.md` §10).

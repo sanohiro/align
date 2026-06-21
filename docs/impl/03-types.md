@@ -190,6 +190,13 @@ Copying is explicit via `clone()`. This constraint does not apply to `Copy` type
 
 ## 7. arena escape checking (pass 3, hide lifetimes with regions)
 
+> **Implemented (Memory Model v2).** The sketch below generalized into one inferred region
+> lattice `Static ⊐ Frame ⊐ Arena(k)`: every view producer (slice, `str` borrow, struct field,
+> a `json.decode`-d struct/array, a call re-borrowing an argument) carries a region, and
+> `EscapeCheck` forbids a view outliving its source. Owned heap values (`string`/`array<T>`/
+> `array<Struct>`/`builder`) are freed by per-binding MIR `Drop` outside an arena and bulk-freed
+> inside one. The authoritative model + per-slice ledger is `08-memory-model-v2.md`.
+
 `arena {}` introduces an `Arena(id)` region into the block. Views derived from allocations inside the block bear this region.
 
 **Escape rule**: a value bearing `Arena(id)` must not outlive its arena block. Concretely, the following are made **compile errors**.
