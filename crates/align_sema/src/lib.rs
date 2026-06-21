@@ -2583,15 +2583,24 @@ impl<'a> Checker<'a> {
             _ => None,
         };
         let arg = self.check_expr(&args[0], inner_expected);
-        // A box payload must be a true (owned) primitive scalar. `ty_to_scalar` also accepts a
-        // struct (a valid Option/Result payload) and now `str` (a view) — reject both: codegen
-        // can't size a struct box, and boxing a `str` view is meaningless (box `string` to own).
-        if matches!(arg.ty, Ty::Struct(_) | Ty::Str) {
+        // A box payload must be a true (owned) *primitive* scalar. Resolve the payload scalar
+        // first, then reject the non-primitive ones at the scalar level so every shape is caught
+        // consistently — including an *un-annotated* `heap.new(move_value)` (the `box<…>`
+        // annotation path is guarded in `resolve_type`, but inference here must reject the same
+        // set or codegen's `scalar_bytes` hits `unreachable!`): a Move scalar (`string`/`array`),
+        // a `Struct` (codegen can't size a struct box), or a `str` view (not boxable).
+        let scalar = self.payload_scalar(arg.ty, args[0].span);
+        let reject = match scalar {
+            _ if scalar.is_move() => Some(format!("an owned `{}` cannot be boxed", scalar_name(scalar))),
+            Scalar::Struct(_) => Some("struct boxes are not supported".to_string()),
+            Scalar::Str => Some("a `str` view is not boxable".to_string()),
+            _ => None,
+        };
+        if let Some(why) = reject {
             self.diags
-                .error("a box payload must be a primitive scalar (a struct / `str` view is not boxable)".to_string(), args[0].span);
+                .error(format!("a box payload must be a primitive scalar ({why})"), args[0].span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let scalar = self.payload_scalar(arg.ty, args[0].span);
         Expr { kind: ExprKind::HeapNew(Box::new(arg)), ty: Ty::Box(scalar), span }
     }
 
@@ -3749,6 +3758,11 @@ mod tests {
         assert!(bann.has_errors(), "box<str> annotation must be rejected");
         let (_s, bnew) = check("fn main() -> i32 {\n  arena {\n    p: box<str> := heap.new(\"x\")\n    return 0\n  }\n}\n");
         assert!(bnew.has_errors(), "heap.new of a str must be rejected");
+        // Un-annotated `heap.new(move_value)` must reject at the scalar level too — else inference
+        // forms `box<string>` and codegen's `scalar_bytes` panics (the `box<…>` annotation path is
+        // guarded separately, so this exercises the inference path).
+        let (_m, bmove) = check("fn mk() -> string = \"x\".clone()\nfn main() -> i32 {\n  arena {\n    p := heap.new(mk())\n    return 0\n  }\n}\n");
+        assert!(bmove.has_errors(), "un-annotated heap.new of an owned string must be rejected");
     }
 
     #[test]
