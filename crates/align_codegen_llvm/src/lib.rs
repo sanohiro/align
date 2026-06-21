@@ -315,6 +315,15 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // io.stdout.write(builder) (b: *Builder) -> i32 status; writes the builder's bytes.
+        "io_stdout_write_builder".to_string(),
+        module.add_function(
+            "align_rt_io_stdout_write_builder",
+            ctx.i32_type().fn_type(&[ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len})
         // -> i32 status (MMv2 slice 8d).
         "json_decode_struct_array".to_string(),
@@ -1198,6 +1207,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonDecodeStructArray { struct_id, input, out } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             Rvalue::IoStdoutWrite { arg } => self.gen_io_stdout_write(arg)?,
+            Rvalue::IoStdoutWriteBuilder { builder } => {
+                let b = self.operand(builder).into();
+                let cs = self
+                    .builder
+                    .build_call(self.funcs["io_stdout_write_builder"], &[b], "sowb")
+                    .map_err(|e| self.err(e))?;
+                cs.try_as_basic_value().basic().expect("io_stdout_write_builder returns i32")
+            }
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?

@@ -797,6 +797,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.walk(input, depth),
             ExprKind::FsReadFile { path } => self.walk(path, depth),
             ExprKind::IoStdoutWrite { arg } => self.walk(arg, depth),
+            ExprKind::IoStdoutWriteBuilder { builder } => self.walk(builder, depth),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -991,6 +992,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.expr(input, moved, false, false),
             ExprKind::FsReadFile { path } => self.expr(path, moved, false, false),
             ExprKind::IoStdoutWrite { arg } => self.expr(arg, moved, false, false),
+            ExprKind::IoStdoutWriteBuilder { builder } => self.expr(builder, moved, false, false),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -2884,13 +2886,26 @@ impl<'a> Checker<'a> {
                 .error(format!("'io.stdout.write' expects 1 argument, got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        // The argument is written as bytes: a `str`, or an owned `string` (auto-borrowed).
-        let arg = self.check_str_init(&args[0]);
-        Expr {
-            kind: ExprKind::IoStdoutWrite { arg: Box::new(arg) },
-            ty: Ty::Result(Scalar::Unit, Scalar::ErrCode),
-            span,
-        }
+        let result_ty = Ty::Result(Scalar::Unit, Scalar::ErrCode);
+        // The argument is written as bytes: a `builder` (its accumulated bytes, written directly —
+        // no `to_string()` materialization), or a `str` / owned `string` (auto-borrowed). The
+        // builder is *borrowed* (not consumed), so it is still usable / dropped normally after.
+        let arg0 = self.check_expr(&args[0], None);
+        let kind = match arg0.ty {
+            Ty::Builder => ExprKind::IoStdoutWriteBuilder { builder: Box::new(arg0) },
+            // Replicates `check_str_init`: borrow an owned `string` as a `str`; constrain anything
+            // else to `str`.
+            Ty::String => {
+                let span = arg0.span;
+                ExprKind::IoStdoutWrite { arg: Box::new(Expr { kind: ExprKind::StrBorrow(Box::new(arg0)), ty: Ty::Str, span }) }
+            }
+            Ty::Str | Ty::Error => ExprKind::IoStdoutWrite { arg: Box::new(arg0) },
+            other => {
+                self.constrain(other, Some(Ty::Str), args[0].span);
+                ExprKind::IoStdoutWrite { arg: Box::new(arg0) }
+            }
+        };
+        Expr { kind, ty: result_ty, span }
     }
 
     /// `arr[index].field` — field access on a struct-array element (MMv2 slice 8f). Fused into one
@@ -3182,6 +3197,7 @@ impl<'a> Checker<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.finalize_expr(input),
             ExprKind::FsReadFile { path } => self.finalize_expr(path),
             ExprKind::IoStdoutWrite { arg } => self.finalize_expr(arg),
+            ExprKind::IoStdoutWriteBuilder { builder } => self.finalize_expr(builder),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -3726,6 +3742,9 @@ mod tests {
         // An owned string is accepted (auto-borrowed to str) and stays usable afterwards.
         let (_q, owned) = check("fn mk() -> string = \"x\".clone()\nfn main() -> Result<(), Error> {\n  s := mk()\n  io.stdout.write(s)?\n  print(s.len())\n  return Ok(())\n}\n");
         assert!(!owned.has_errors(), "io.stdout.write borrows an owned string (does not move it)");
+        // A `builder` is accepted directly (written, not consumed — still usable / dropped after).
+        let (_b, bld) = check("fn main() -> Result<(), Error> {\n  b := builder()\n  b.write(\"hi\")\n  io.stdout.write(b)?\n  print(b.to_string())\n  return Ok(())\n}\n");
+        assert!(!bld.has_errors(), "io.stdout.write accepts a builder directly (borrows it)");
         // Wrong arity errors.
         let (_r, ar) = check("fn main() -> Result<(), Error> {\n  io.stdout.write()?\n  return Ok(())\n}\n");
         assert!(ar.has_errors(), "io.stdout.write needs exactly one argument");

@@ -199,6 +199,9 @@ pub enum Rvalue {
     /// `io.stdout.write(arg)`: write the bytes of the `str` `arg` to stdout (no newline). Yields
     /// an `i32` status (0 = ok). The first `std.io` surface.
     IoStdoutWrite { arg: Operand },
+    /// `io.stdout.write(b)` for a `builder` `b`: write the builder's bytes to stdout (no newline),
+    /// borrowing it. Yields an `i32` status (0 = ok).
+    IoStdoutWriteBuilder { builder: Operand },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -525,7 +528,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::JsonDecodeArray { elem, input } => lower_json_decode_array(b, *elem, input, e.ty),
         hir::ExprKind::JsonDecodeStructArray { struct_id, input } => lower_json_decode_struct_array(b, *struct_id, input, e.ty),
         hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
-        hir::ExprKind::IoStdoutWrite { arg } => lower_io_stdout_write(b, arg, e.ty),
+        hir::ExprKind::IoStdoutWrite { arg } => {
+            lower_io_stdout_write(b, arg, e.ty, |a| Rvalue::IoStdoutWrite { arg: a })
+        }
+        hir::ExprKind::IoStdoutWriteBuilder { builder } => {
+            lower_io_stdout_write(b, builder, e.ty, |a| Rvalue::IoStdoutWriteBuilder { builder: a })
+        }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -1630,11 +1638,17 @@ fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Opera
 }
 
 /// `io.stdout.write(arg)` → call the runtime writer (status `i32`), then branch `Ok(())` /
-/// `Err(<code>)`. No out slot — the result payload is unit.
-fn lower_io_stdout_write(b: &mut Builder, arg: &hir::Expr, result_ty: Ty) -> Operand {
+/// `Err(<code>)`. No out slot — the result payload is unit. `write_rv` builds the status-producing
+/// rvalue from the lowered argument (a `str` value or a `builder` handle).
+fn lower_io_stdout_write(
+    b: &mut Builder,
+    arg: &hir::Expr,
+    result_ty: Ty,
+    write_rv: impl FnOnce(Operand) -> Rvalue,
+) -> Operand {
     let a = lower_expr(b, arg);
     let code = b.fresh_value(Ty::ErrCode);
-    b.push(Stmt::Let(code, Rvalue::IoStdoutWrite { arg: a }));
+    b.push(Stmt::Let(code, write_rv(a)));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
