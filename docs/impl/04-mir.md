@@ -184,6 +184,12 @@ Loop:
 
 The region checked in `03 §7` is converted into actual allocation/release here.
 
+> **Implemented (Memory Model v2).** Free-standing owned values use a per-binding `Drop` (a
+> `DropFlagInit` null-inits the slot; a moved-out source is nulled at the move site so the exit
+> `Drop` is a no-op `free(null)`). An owned payload inside an `Option`/`Result` is dropped by
+> freeing each owned field's buffer. Inside an `arena {}` the same values are bump-allocated and
+> bulk-freed (no per-binding `Drop`). See `08-memory-model-v2.md`.
+
 ```text
 arena {}        →  group of Alloc(.., Arena(id)) + a bulk release at the block exit
                    no individual Drops emitted (arena is bump + bulk reset)
