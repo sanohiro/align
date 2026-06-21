@@ -258,6 +258,9 @@ pub enum ExprKind {
     /// fields are zero-copy views into the input, so the array is region-tied to that input; the
     /// expression `ty` is `Result<array<Struct>, Error>`.
     JsonDecodeStructArray { struct_id: u32, input: Box<Expr> },
+    /// `fs.read_file(path)` — read the file at `path` (a `str`) into a freshly heap-allocated owned
+    /// `string`; the expression `ty` is `Result<string, Error>`. The first `std.fs` surface.
+    FsReadFile { path: Box<Expr> },
 }
 
 /// Which builder append a `BuilderWrite` performs (MMv2 slice 7c/7d).

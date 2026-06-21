@@ -795,6 +795,7 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.walk(input, depth),
+            ExprKind::FsReadFile { path } => self.walk(path, depth),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -987,6 +988,7 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.expr(input, moved, false, false),
+            ExprKind::FsReadFile { path } => self.expr(path, moved, false, false),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -1747,6 +1749,9 @@ impl<'a> Checker<'a> {
             }
             if single_name(p) == Some("json") && method == "decode" {
                 return self.check_json_decode(args, expected, span);
+            }
+            if single_name(p) == Some("fs") && method == "read_file" {
+                return self.check_fs_read_file(args, span);
             }
         }
         // `sum` / `reduce` are the terminals of a fused pipeline.
@@ -2838,6 +2843,25 @@ impl<'a> Checker<'a> {
         Expr { kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty: elem, span }
     }
 
+    /// `fs.read_file(path)` — read the whole file at `path` (a `str`) into a freshly heap-allocated
+    /// owned `string`, yielding `Result<string, Error>`. The returned `string` owns its buffer
+    /// (freed by the binding's `Drop`); an I/O error is `Err`. The first `std.fs` surface (the
+    /// `std.io`/zero-copy work is later) — a builtin, dispatched like `json.decode`.
+    fn check_fs_read_file(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'fs.read_file' expects 1 argument (the path), got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        // The path is a `str` (or an owned `string`, auto-borrowed).
+        let path = self.check_str_init(&args[0]);
+        Expr {
+            kind: ExprKind::FsReadFile { path: Box::new(path) },
+            ty: Ty::Result(Scalar::String, Scalar::ErrCode),
+            span,
+        }
+    }
+
     /// `arr[index].field` — field access on a struct-array element (MMv2 slice 8f). Fused into one
     /// bounds-checked element-field load; only the field (a scalar or a `str` view) is read. The
     /// result inherits the array's region (a `str` field views the array's input), so it cannot
@@ -3125,6 +3149,7 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.finalize_expr(input),
+            ExprKind::FsReadFile { path } => self.finalize_expr(path),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -3646,6 +3671,19 @@ mod tests {
         // through the scalar-index path (its element resolves to a struct via the slice arm).
         let (_sl, slstruct) = check("P { x: i32 }\nfn first(s: slice<P>) -> i32 {\n  q := s[0]\n  return q.x\n}\nfn main() -> i32 = 0\n");
         assert!(slstruct.has_errors(), "indexing a slice<Struct> for a whole struct must be rejected");
+    }
+
+    #[test]
+    fn fs_read_file_checks() {
+        // std.fs: `fs.read_file(path)` yields `Result<string, Error>`; `?` unwraps an owned string.
+        let (_p, ok) = check("fn main() -> Result<(), Error> {\n  data := fs.read_file(\"x.txt\")?\n  print(data.len())\n  return Ok(())\n}\n");
+        assert!(!ok.has_errors(), "fs.read_file should check and yield an owned string");
+        // The owned string owns a fresh buffer (not a view), so it is returnable.
+        let (_q, ret) = check("fn load(p: str) -> Result<string, Error> {\n  return Ok(fs.read_file(p)?)\n}\nfn main() -> i32 = 0\n");
+        assert!(!ret.has_errors(), "an fs.read_file string is owned and returnable");
+        // Wrong arity errors cleanly.
+        let (_r, ar) = check("fn main() -> Result<(), Error> {\n  data := fs.read_file()?\n  return Ok(())\n}\n");
+        assert!(ar.has_errors(), "fs.read_file needs exactly one argument");
     }
 
     #[test]

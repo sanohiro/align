@@ -107,7 +107,8 @@ Lowering
 
 Build order: generic type syntax → `Ty::Option`/`Ty::Result`/`Scalar` → AST/HIR
 `Some`/`None`/`Ok`/`Err`/`Try`/`else`-unwrap → MIR cold error edge → LLVM aggregate
-lowering + the `main` wrapper. `std.fs.read_file` stays a thin fixture until M5.
+lowering + the `main` wrapper. (`std.fs.read_file` later landed as a real builtin reading a file
+into an owned `string` — see the M5 §19 note below.)
 
 ## M3 — Memory Model (move / value / arena)
 
@@ -304,10 +305,12 @@ Completion condition: the example in `draft.md` §19 runs (JSON decode → aggre
 output). **Met (compiler side), via Memory Model v2** — §19 decodes `array<User>` with a `str`
 field and folds `where(.active).score.sum()` into one loop, both delivered by the zero-copy
 borrow-region decode + owned `array<Struct>` + fused-pipeline work (MMv2 slices 8d-1/8d-2). The
-remaining gap is the `fs.read_file` / `io.stdout.write` std boundary (the `std.fs`/`std.io`
-surface), tracked separately. M5 language features are complete (strings, templates,
-`json.encode` for struct/array, `json.decode` for scalar / `str` / `array<scalar>` /
-`array<Struct>`).
+remaining gap is the std boundary: **`fs.read_file` now reads a file into an owned `string`**
+(read file → decode → aggregate → index runs end-to-end), leaving `io.stdout.write` (output a
+`str`/`builder` without `print`'s newline) and `main(args: array<str>)` (needs `array<str>` — an
+array of `str` views — as a type) for full `§19` *verbatim*. M5 language features are complete
+(strings, templates, `json.encode` for struct/array, `json.decode` for scalar / `str` /
+`array<scalar>` / `array<Struct>`).
 
 ## Memory Model v2 — borrow-region + owned heap/drop (foundation; before M6) — DONE
 
