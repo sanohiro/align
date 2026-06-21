@@ -652,6 +652,32 @@ fn s19_verbatim_output_via_builder() {
 }
 
 #[test]
+fn option_str_payload_construct_and_unwrap() {
+    if !backend_available() {
+        return;
+    }
+    // `str` is now a composite payload (`Scalar::Str`): `Option<str>` carries a `{ptr,len}` view
+    // (Copy, region-tracked, never dropped). `Some("yes")` / `None` + `else`-unwrap. Output:
+    // "yes\nno\n".
+    let src = "fn pick(b: bool) -> Option<str> {\n  if b { return Some(\"yes\") }\n  return None\n}\nfn main() -> i32 {\n  print(pick(true) else \"no\")\n  print(pick(false) else \"no\")\n  return 0\n}\n";
+    let out = build_and_run("option-str", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "yes\nno\n");
+}
+
+#[test]
+fn result_str_payload_via_try() {
+    if !backend_available() {
+        return;
+    }
+    // `Result<str, Error>`: `?` unwraps to the `str` view. "hi" → printed.
+    let src = "fn first(s: str) -> Result<str, Error> {\n  if s == \"\" { return Err(error(1)) }\n  return Ok(s)\n}\nfn main() -> Result<(), Error> {\n  v := first(\"hi\")?\n  print(v)\n  return Ok(())\n}\n";
+    let out = build_and_run("result-str", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;

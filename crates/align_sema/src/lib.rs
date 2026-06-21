@@ -71,6 +71,12 @@ pub enum Scalar {
     /// whose decoded `str` fields are zero-copy views into the input — so unlike a scalar
     /// `array<T>`, a struct array is region-tied to that input and cannot escape it.
     DynStructArray(u32),
+    /// A `str` view payload (`array<str>` / `slice<str>` element, `Option<str>` / `Result<str,E>`
+    /// payload). A `{ptr,len}` borrow — **Copy, not Move** (no heap buffer of its own), but
+    /// **region-tracked**: a composite carrying a `str` lives only as long as that `str`'s source
+    /// (`tracks_region`), exactly the struct-with-`str`-field rule extended to scalars. Unlike
+    /// `String`, it is never dropped (it borrows). A `box<str>` is rejected (a view is not boxable).
+    Str,
     /// The M2 `Error` type — an opaque i32 error code (placeholder for the eventual
     /// Error sum type; see `open-questions.md`).
     ErrCode,
@@ -205,6 +211,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // Only an AoS array is payload-able today; an SoA array as an Option/Result payload is a
         // later concern (so `Scalar::DynStructArray` stays layout-free — always AoS).
         Ty::DynStructArray(id, Layout::Aos) => Some(Scalar::DynStructArray(id)),
+        Ty::Str => Some(Scalar::Str),
         Ty::ErrCode => Some(Scalar::ErrCode),
         _ => None,
     }
@@ -221,6 +228,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::String => Ty::String,
         Scalar::DynArray(elem) => Ty::DynArray(prim_to_scalar(elem)),
         Scalar::DynStructArray(id) => Ty::DynStructArray(id, Layout::Aos),
+        Scalar::Str => Ty::Str,
         Scalar::ErrCode => Ty::ErrCode,
     }
 }
@@ -2575,14 +2583,24 @@ impl<'a> Checker<'a> {
             _ => None,
         };
         let arg = self.check_expr(&args[0], inner_expected);
-        // A box payload must be a true scalar — `ty_to_scalar` now also accepts structs (a
-        // valid Option/Result payload), so reject a struct box explicitly (codegen can't size it).
-        if matches!(arg.ty, Ty::Struct(_)) {
+        // A box payload must be a true (owned) *primitive* scalar. Resolve the payload scalar
+        // first, then reject the non-primitive ones at the scalar level so every shape is caught
+        // consistently — including an *un-annotated* `heap.new(move_value)` (the `box<…>`
+        // annotation path is guarded in `resolve_type`, but inference here must reject the same
+        // set or codegen's `scalar_bytes` hits `unreachable!`): a Move scalar (`string`/`array`),
+        // a `Struct` (codegen can't size a struct box), or a `str` view (not boxable).
+        let scalar = self.payload_scalar(arg.ty, args[0].span);
+        let reject = match scalar {
+            _ if scalar.is_move() => Some(format!("an owned `{}` cannot be boxed", scalar_name(scalar))),
+            Scalar::Struct(_) => Some("struct boxes are not supported".to_string()),
+            Scalar::Str => Some("a `str` view is not boxable".to_string()),
+            _ => None,
+        };
+        if let Some(why) = reject {
             self.diags
-                .error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), args[0].span);
+                .error(format!("a box payload must be a primitive scalar ({why})"), args[0].span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let scalar = self.payload_scalar(arg.ty, args[0].span);
         Expr { kind: ExprKind::HeapNew(Box::new(arg)), ty: Ty::Box(scalar), span }
     }
 
@@ -3342,6 +3360,10 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
                     diags.error(format!("a box payload must be a primitive scalar (an owned `{}` cannot be boxed)", scalar_name(s)), t.span);
                     Ty::Error
                 }
+                Some(Scalar::Str) => {
+                    diags.error("a box payload must be a primitive scalar (a `str` view is not boxable)".to_string(), t.span);
+                    Ty::Error
+                }
                 Some(s) => Ty::Box(s),
                 None => Ty::Error,
             }
@@ -3719,6 +3741,28 @@ mod tests {
         // through the scalar-index path (its element resolves to a struct via the slice arm).
         let (_sl, slstruct) = check("P { x: i32 }\nfn first(s: slice<P>) -> i32 {\n  q := s[0]\n  return q.x\n}\nfn main() -> i32 = 0\n");
         assert!(slstruct.has_errors(), "indexing a slice<Struct> for a whole struct must be rejected");
+    }
+
+    #[test]
+    fn str_in_composites_checks() {
+        // PR-A: `str` is a composite payload (`Scalar::Str`). `Option<str>` / `Result<str,E>`
+        // construct and unwrap; a literal-str payload is Static, so it is returnable.
+        let (_p, ok) = check("fn mk() -> Option<str> = Some(\"lit\")\nfn r() -> Result<str, Error> = Ok(\"x\")\nfn main() -> i32 {\n  s := mk() else \"no\"\n  print(s)\n  return 0\n}\n");
+        assert!(!ok.has_errors(), "Option<str> / Result<str,Error> with literal payloads should check");
+        // Region: an arena-built `str` in an `Option<str>` must not escape the arena (the view
+        // would dangle) — this falls out of the existing region model, no new logic.
+        let (_q, esc) = check("fn bad(a: str, b: str) -> Option<str> {\n  arena {\n    return Some(a + b)\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(esc.has_errors(), "an arena str inside Option<str> must not escape the arena");
+        // `box<str>` is rejected (a view is not boxable) — both the annotation and `heap.new`.
+        let (_r, bann) = check("fn f(b: box<str>) -> i32 = 0\nfn main() -> i32 = 0\n");
+        assert!(bann.has_errors(), "box<str> annotation must be rejected");
+        let (_s, bnew) = check("fn main() -> i32 {\n  arena {\n    p: box<str> := heap.new(\"x\")\n    return 0\n  }\n}\n");
+        assert!(bnew.has_errors(), "heap.new of a str must be rejected");
+        // Un-annotated `heap.new(move_value)` must reject at the scalar level too — else inference
+        // forms `box<string>` and codegen's `scalar_bytes` panics (the `box<…>` annotation path is
+        // guarded separately, so this exercises the inference path).
+        let (_m, bmove) = check("fn mk() -> string = \"x\".clone()\nfn main() -> i32 {\n  arena {\n    p := heap.new(mk())\n    return 0\n  }\n}\n");
+        assert!(bmove.has_errors(), "un-annotated heap.new of an owned string must be rejected");
     }
 
     #[test]
