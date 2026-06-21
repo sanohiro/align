@@ -192,6 +192,10 @@ pub enum Rvalue {
     /// count) into the `out` slot. Yields an `i32` status (0 = ok). codegen builds the same field
     /// table as [`JsonDecode`] plus the element stride, and calls the runtime parser.
     JsonDecodeStructArray { struct_id: u32, input: Operand, out: Slot },
+    /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
+    /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
+    /// (0 = ok). The first `std.fs` surface.
+    FsReadFile { path: Operand, out: Slot },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -517,6 +521,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::JsonDecode { struct_id, input } => lower_json_decode(b, *struct_id, input, e.ty),
         hir::ExprKind::JsonDecodeArray { elem, input } => lower_json_decode_array(b, *elem, input, e.ty),
         hir::ExprKind::JsonDecodeStructArray { struct_id, input } => lower_json_decode_struct_array(b, *struct_id, input, e.ty),
+        hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -1565,6 +1570,45 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
     b.push(Stmt::Let(a, Rvalue::Load(out)));
     let okv = b.fresh_value(result_ty);
     b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(a))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: wrap the status code (the out slot was zeroed → no buffer allocated on failure).
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `fs.read_file(path)` → read the file into an owned `string` materialized in an out slot via
+/// the runtime (status `i32`), then branch `Ok(<string>)` / `Err(<code>)`. Mirrors
+/// [`lower_json_decode_array`]; the `string` is heap-owned (the unwrapped local `Drop`-frees it).
+fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::String);
+    let p = lower_expr(b, path);
+    let code = b.fresh_value(Ty::ErrCode);
+    b.push(Stmt::Let(code, Rvalue::FsReadFile { path: p, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the materialized string {ptr,len} and wrap it (it owns its buffer now).
+    b.cur = ok_bb;
+    let s = b.fresh_value(Ty::String);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));
     b.push(Stmt::Store(rslot, Operand::Value(okv)));
     b.terminate(Term::Goto(join));
 

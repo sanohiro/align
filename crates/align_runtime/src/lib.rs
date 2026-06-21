@@ -131,6 +131,39 @@ pub unsafe extern "C" fn align_rt_str_clone(ptr: *const u8, len: i64) -> AlignSt
     AlignStr { ptr: dst, len }
 }
 
+/// `fs.read_file(path)` — read the whole file at `path` (a `str`, `ptr`/`len`) into a freshly
+/// heap-allocated owned `string`, writing its `{ptr,len}` to `out`. The buffer comes from
+/// [`align_rt_alloc`] (so the generated `Drop` frees it). Returns 0 on success, 1 on any I/O error
+/// (or a non-UTF-8 path), leaving `out` as the caller-zeroed `{null,0}`. An empty file yields a
+/// null buffer with len 0 (no allocation). The first `std.fs` surface (`06-runtime-std.md`).
+///
+/// # Safety
+/// `path` must describe a valid byte range; `out` must point to a writable `{ptr,len}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, out: *mut AlignStr) -> i32 {
+    // `from_raw_parts` is UB on a null pointer even with len 0 — guard an empty/owned path.
+    let path_bytes: &[u8] = if path_len <= 0 || path.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(path, path_len as usize) }
+    };
+    let Ok(path_str) = std::str::from_utf8(path_bytes) else {
+        return 1;
+    };
+    let data = match std::fs::read(path_str) {
+        Ok(d) => d,
+        Err(_) => return 1,
+    };
+    let len = data.len() as i64;
+    // Copy into the runtime's own allocator so the generated `Drop` (which calls `free`) owns it.
+    let dst = align_rt_alloc(len);
+    if len > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
+    }
+    unsafe { *out = AlignStr { ptr: dst, len } };
+    0
+}
+
 /// An append-oriented string builder (`06-runtime-std.md` §7), backing `template`
 /// desugaring. M5: heap-backed; the finished buffer is leaked (no ownership/free yet —
 /// arena-tied builders come later).

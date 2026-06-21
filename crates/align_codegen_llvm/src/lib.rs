@@ -297,6 +297,15 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // fs.read_file (path_ptr, path_len, out: *{ptr,len}) -> i32 status (std.fs).
+        "fs_read_file".to_string(),
+        module.add_function(
+            "align_rt_fs_read_file",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
         // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len})
         // -> i32 status (MMv2 slice 8d).
         "json_decode_struct_array".to_string(),
@@ -1178,6 +1187,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeStructArray { struct_id, input, out } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
+            Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -1542,6 +1552,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
             )
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_decode_array returns i32"))
+    }
+
+    /// `fs.read_file(path)`: zero the out `{ptr,len}` slot, then call the runtime reader with the
+    /// path `{ptr,len}`. The runtime writes the owned `string` (heap buffer freed by `Drop`) to
+    /// `out`. Returns the i32 status (0 = ok).
+    fn gen_fs_read_file(&mut self, path: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        // Zero the {ptr,len} so a failed read reads {null,0} (its Drop frees null).
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+
+        let agg = self.operand(path).into_struct_value();
+        let p_ptr = self.builder.build_extract_value(agg, 0, "path_p").map_err(|e| self.err(e))?;
+        let p_len = self.builder.build_extract_value(agg, 1, "path_l").map_err(|e| self.err(e))?;
+        let cs = self
+            .builder
+            .build_call(self.funcs["fs_read_file"], &[p_ptr.into(), p_len.into(), out_ptr.into()], "frf")
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("fs_read_file returns i32"))
     }
 
     fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece], arena: Option<&Operand>) -> Result<BasicValueEnum<'c>, CodegenError> {

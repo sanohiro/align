@@ -521,6 +521,65 @@ fn struct_array_element_field_out_of_bounds_aborts() {
 }
 
 #[test]
+fn fs_read_file_reads_owned_string() {
+    if !backend_available() {
+        return;
+    }
+    // std.fs: `fs.read_file(path)` reads the file into an owned `string` (heap buffer freed by the
+    // binding's Drop). Write a temp file, read it back, print its content + byte length.
+    let path = std::env::temp_dir().join("align-fs-read.txt");
+    std::fs::write(&path, "hello from align\n42").expect("write temp file");
+    let src = format!(
+        "fn main() -> Result<(), Error> {{\n  data := fs.read_file(\"{}\")?\n  print(data)\n  print(data.len())\n  return Ok(())\n}}\n",
+        path.display()
+    );
+    let out = build_and_run("fs-read-file", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello from align\n42\n19\n");
+}
+
+#[test]
+fn fs_read_file_missing_propagates_err() {
+    if !backend_available() {
+        return;
+    }
+    // A missing file is an I/O error → `Err`, propagated by `?` out of `main` (exit code 1).
+    let missing = std::env::temp_dir().join("align-fs-does-not-exist-xyzzy.txt");
+    let _ = std::fs::remove_file(&missing);
+    let src = format!(
+        "fn main() -> Result<(), Error> {{\n  data := fs.read_file(\"{}\")?\n  print(data.len())\n  return Ok(())\n}}\n",
+        missing.display()
+    );
+    let out = build_and_run("fs-read-missing", &src);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn fs_read_file_feeds_json_decode() {
+    if !backend_available() {
+        return;
+    }
+    // The draft.md §19 flow (minus `main(args)` / `io.stdout.write`): read a file into an owned
+    // `string`, decode it as `array<User>` (the decoded `str` fields view the owned buffer), then
+    // aggregate + index — all inside an arena. `where(.active).score.sum()` = 10 + 5 = 15; the
+    // first user's name is "ann".
+    let path = std::env::temp_dir().join("align-fs-users.json");
+    std::fs::write(
+        &path,
+        "[{\"id\":1,\"name\":\"ann\",\"active\":true,\"score\":10},{\"id\":2,\"name\":\"bob\",\"active\":false,\"score\":99},{\"id\":3,\"name\":\"cyd\",\"active\":true,\"score\":5}]",
+    )
+    .expect("write json");
+    let src = format!(
+        "User {{ id: i64, name: str, active: bool, score: i32 }}\nfn main() -> Result<(), Error> {{\n  arena {{\n    data := fs.read_file(\"{}\")?\n    users: array<User> := json.decode(data)?\n    print(users.where(.active).score.sum())\n    print(users[0].name)\n  }}\n  return Ok(())\n}}\n",
+        path.display()
+    );
+    let out = build_and_run("fs-read-json", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "15\nann\n");
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;
