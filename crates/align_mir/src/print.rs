@@ -165,6 +165,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::IoStdoutWrite { arg } => {
             format!("io_stdout_write({})", operand_str(arg))
         }
+        Rvalue::IoStdoutWriteBuilder { builder } => {
+            format!("io_stdout_write_builder({})", operand_str(builder))
+        }
     }
 }
 

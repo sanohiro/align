@@ -264,6 +264,10 @@ pub enum ExprKind {
     /// `io.stdout.write(arg)` — write the bytes of the `str` `arg` to stdout with no trailing
     /// newline; the expression `ty` is `Result<(), Error>`. The first `std.io` surface.
     IoStdoutWrite { arg: Box<Expr> },
+    /// `io.stdout.write(b)` where `b` is a `builder` — write the builder's accumulated bytes to
+    /// stdout directly (no `to_string()` materialization), borrowing it (not consumed). `ty` is
+    /// `Result<(), Error>`.
+    IoStdoutWriteBuilder { builder: Box<Expr> },
 }
 
 /// Which builder append a `BuilderWrite` performs (MMv2 slice 7c/7d).
