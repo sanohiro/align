@@ -627,9 +627,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // Today this is the natural ABI alignment (a no-op vs LLVM's default); at M6 a struct
             // declared `align(N)` returns `N` here, so its stack slot is over-aligned — the single
             // place that change lands (`open-questions.md` "`align(N)`").
-            if let Some(inst) = ptr.as_instruction() {
-                inst.set_alignment(self.type_align(*ty)).map_err(|e| self.err(e))?;
-            }
+            let inst = ptr
+                .as_instruction()
+                .ok_or_else(|| self.err("alloca did not yield an instruction"))?;
+            inst.set_alignment(self.type_align(*ty)).map_err(|e| self.err(e))?;
             self.slots.insert(i as Slot, ptr);
         }
 
