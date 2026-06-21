@@ -549,7 +549,7 @@ decode-escape semantics and lifted several deferrals. All of the following are n
 - **[done] draft.md §14 "Zero Copy"** — the explicit-`.clone()`-to-escape rule (the section
   renumbered from the original §12; JSON is now §14).
 - **[done] draft.md §6/§7** — `array<T>` owned/move + arena bulk-free + "a view cannot escape
-  the arena" are stated; the two allocation modes' implementation detail lives here (§9) and in
+  the arena" are stated; the two allocation modes' implementation detail lives here (§6) and in
   `03-types.md` rather than the high-level spec.
 - **[done] docs/language-spec.md** — the feature-surface digest (terse keyword lists) already
   names `array<T>` / `json.decode<T>` / arena / explicit heap; no contradiction to reconcile.
