@@ -336,6 +336,58 @@ fn json_decode_empty_array_is_safe() {
 }
 
 #[test]
+fn json_decode_struct_array_len() {
+    if !backend_available() {
+        return;
+    }
+    // MMv2 slice 8d (draft.md §19 headline): `json.decode` into an owned, dynamic `array<Struct>`
+    // (AoS). The two objects parse into a heap buffer of `User` structs; `.len()` reads the count
+    // (2), and the buffer is freed at scope exit (no double-free / leak crash). `str` fields are
+    // zero-copy views into the input literal (Static), so no arena is needed here.
+    let src = "User { id: i64, name: str, active: bool }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false}]\")?\n  print(users.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-struct-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+}
+
+#[test]
+fn json_decode_struct_array_scalar_only() {
+    if !backend_available() {
+        return;
+    }
+    // A scalar-only struct array (no `str` fields) decodes the same way; len = 3.
+    let src = "P { x: i64, y: i64 }\nfn main() -> Result<(), Error> {\n  ps: array<P> := json.decode(\"[{\\\"x\\\":1,\\\"y\\\":2},{\\\"x\\\":3,\\\"y\\\":4},{\\\"x\\\":5,\\\"y\\\":6}]\")?\n  print(ps.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-struct-array-scalar", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n");
+}
+
+#[test]
+fn json_decode_empty_struct_array_is_safe() {
+    if !backend_available() {
+        return;
+    }
+    // An empty `[]` decodes to a `{null, 0}` owned struct array — `.len()` is 0, and the runtime
+    // must not `from_raw_parts(null, 0)` nor `free` a non-null buffer. Output: "0\n".
+    let src = "User { id: i64, name: str }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-empty-struct-array", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+}
+
+#[test]
+fn json_decode_struct_array_malformed_errors() {
+    if !backend_available() {
+        return;
+    }
+    // A malformed element (missing the required `active` field) propagates an error (exit 1),
+    // leaving the out slot `{null,0}` (nothing allocated / leaked).
+    let src = "User { id: i64, name: str, active: bool }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\"}]\")?\n  print(users.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-struct-array-bad", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;

@@ -496,11 +496,30 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      `Ok`/`Some`/`Err` wrappers, so `return Ok(xs)` of a *bound* owned local nulls its slot — else
      the local's exit `Drop` double-freed the buffer now owned by the returned aggregate (a slice-8a
      gap exposed by `return Ok(decoded_array)`; also fixes `return Ok(bound_string)`).
-   - **Deferred (8d+):** `json.decode<array<Struct>>` (the draft.md §19 headline — needs a dynamic
-     *struct* array, AoS, with `str` fields zero-copy region-tied to the input). Tuples / multi-value
-     returns (for `partition`) and `array<slice<T>>` (for `chunks`) remain a **separate** type-system
-     track — open design items (do not fake them); they reuse this same owned-aggregate + drop
-     foundation once their surface is designed.
+   - **[done] 8d-1 — `json.decode<array<Struct>>` (decode + len + drop + region/escape).** The
+     draft.md §19 headline type: an owned, dynamic AoS of structs. New `Ty::DynStructArray(id)` +
+     `Scalar::DynStructArray(id)` (the struct dual of `DynArray`; both `{ptr,len}`, Move, freed by
+     `Drop`), so `Result<array<Struct>, Error>` is representable and threads through `?`. The
+     `array<T>` annotation resolves a struct element to `DynStructArray`. New
+     `ExprKind::JsonDecodeStructArray` + MIR `Rvalue::JsonDecodeStructArray` + runtime
+     `align_rt_json_decode_struct_array` (parses a JSON array of objects, reusing the per-object
+     `parse_object` helper factored out of the scalar struct decode, into a growing buffer then a
+     fresh `malloc`'d AoS). The buffer is owned, but each element's `str` fields are zero-copy
+     views into the input, so the array is **region-tied to the input** (`region_of` ties it like
+     the single-struct decode; `tracks_region` includes it) — a decoded array from an arena/param
+     input cannot escape that input (`.clone()` to escape — array clone is a later capability).
+     `.len()` works; the buffer is `Drop`-freed at scope exit, and the `return Ok(bound)` slot-null
+     (slice 8c) covers a bound struct array too. Empty `[]` → `{null,0}` (no alloc). Decode-side
+     only this slice — **the `.where(.active).field.sum()` pipeline over a dynamic struct array is
+     8d-2**.
+   - **Deferred (8d-2+):** the **pipeline over a dynamic `array<Struct>`** (`.where(.active).score.sum()`
+     — the rest of the draft.md §19 example; extends the fused-loop lowering from compile-time `N`
+     to the runtime length). Reading an element field (indexing) and `array<Struct>.clone()` (escape)
+     are also still deferred. The `fs.read_file` / `io.stdout.write` parts of §19 are the std
+     boundary (separate from MMv2). Tuples / multi-value returns (for `partition`) and
+     `array<slice<T>>` (for `chunks`) remain a **separate** type-system track — open design items
+     (do not fake them); they reuse this same owned-aggregate + drop foundation once their surface
+     is designed.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).

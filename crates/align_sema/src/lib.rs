@@ -65,6 +65,12 @@ pub enum Scalar {
     /// full [`Scalar`]) so the variant stays non-recursive and `Copy`; owned arrays only ever hold
     /// primitive elements today (struct/dynamic-array elements are a later capability).
     DynArray(PrimScalar),
+    /// An owned, dynamic-length array of structs (AoS), the struct dual of [`Scalar::DynArray`]
+    /// (MMv2 slice 8d). Same `{ptr,len}` layout, Move, dropped/freed as a unit. Carries the struct
+    /// id (non-recursive, so `Scalar` stays `Copy`). Produced by `json.decode<array<Struct>>`,
+    /// whose decoded `str` fields are zero-copy views into the input — so unlike a scalar
+    /// `array<T>`, a struct array is region-tied to that input and cannot escape it.
+    DynStructArray(u32),
     /// The M2 `Error` type — an opaque i32 error code (placeholder for the eventual
     /// Error sum type; see `open-questions.md`).
     ErrCode,
@@ -74,7 +80,7 @@ impl Scalar {
     /// Whether this payload scalar is an owned **Move** type (a heap buffer that the enclosing
     /// `Option`/`Result` owns and must drop / move out). Today: `string` (8a), `array<T>` (8b).
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_))
     }
 }
 
@@ -134,6 +140,12 @@ pub enum Ty {
     Array(Scalar, u32),
     /// A fixed-length array of structs (AoS); `(struct_id, length)`. M4.
     StructArray(u32, u32),
+    /// An *owned*, dynamic-length array of structs (AoS), laid out like a slice
+    /// (`{ Struct* ptr, i64 len }`) but Move and region-tracked — the dynamic struct dual of
+    /// [`Ty::DynArray`] (MMv2 slice 8d). Produced by `json.decode<array<Struct>>`. Its `str`
+    /// fields are zero-copy views into the decode input, so the array is region-tied to that
+    /// input and dropped (buffer freed) at scope exit.
+    DynStructArray(u32),
     /// `slice<T>` — a borrowed view `{ T* ptr, i64 len }` of scalar elements. Copy. M4.
     Slice(Scalar),
     /// `array<T>` — an *owned*, dynamic-length array of scalars, laid out like a slice
@@ -176,6 +188,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::String => Some(Scalar::String),
         // An owned `array<T>` is a payload only when its element is primitive (slice 8b).
         Ty::DynArray(elem) => scalar_to_prim(elem).map(Scalar::DynArray),
+        Ty::DynStructArray(id) => Some(Scalar::DynStructArray(id)),
         Ty::ErrCode => Some(Scalar::ErrCode),
         _ => None,
     }
@@ -191,6 +204,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Struct(id) => Ty::Struct(id),
         Scalar::String => Ty::String,
         Scalar::DynArray(elem) => Ty::DynArray(prim_to_scalar(elem)),
+        Scalar::DynStructArray(id) => Ty::DynStructArray(id),
         Scalar::ErrCode => Ty::ErrCode,
     }
 }
@@ -373,7 +387,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::String | Ty::Builder) || payload_is_move(l.ty))
+            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(l.ty))
             .map(|l| l.id)
             .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
             .collect();
@@ -492,7 +506,7 @@ impl<'a> EscapeCheck<'a> {
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(ty: Ty) -> bool {
         match ty {
-            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) => true,
+            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(_) => true,
             // An `Option`/`Result` is region-tracked iff its payload is (only a `Struct` payload
             // can be — `str`/`box`/`array` aren't scalars, so they never reach a composite). A
             // `Result<Struct, _>` is exactly what `json.decode` yields, so a region-tied decoded
@@ -528,6 +542,9 @@ impl<'a> EscapeCheck<'a> {
             // Conservative: even a scalar-only decoded struct is bound to the input region (no
             // struct-field lookup here); use `.clone()` to escape. `?` preserves the region.
             ExprKind::JsonDecode { input, .. } => self.region_of(input, depth),
+            // A decoded `array<Struct>` (slice 8d) likewise carries the input's region — its
+            // elements' `str` fields are zero-copy views into the input; `.clone()` to escape.
+            ExprKind::JsonDecodeStructArray { input, .. } => self.region_of(input, depth),
             // Wrapping/unwrapping preserves the payload's region: `Ok(decoded)` is as short-lived
             // as `decoded`, and `res?` re-exposes whatever region `res` carried. Without this a
             // region-tied struct could escape through a `Result`-typed local (use-after-free).
@@ -749,7 +766,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } => self.walk(input, depth),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.walk(input, depth),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -779,14 +796,14 @@ impl<'a> MoveCheck<'a> {
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
-        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder)
+        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder)
             || payload_is_move(self.f.ret);
         self.block(&self.f.body, &mut moved, ret_is_move, true);
     }
 
     fn is_move(&self, id: LocalId) -> bool {
         match self.f.locals.get(id as usize).map(|l| l.ty) {
-            Some(ty) => matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty),
+            Some(ty) => matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty),
             None => false,
         }
     }
@@ -935,7 +952,7 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } => self.expr(input, moved, false, false),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.expr(input, moved, false, false),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -2593,6 +2610,23 @@ impl<'a> Checker<'a> {
                     span,
                 };
             }
+            // `array<Struct>` target (MMv2 slice 8d, the draft.md §19 headline): parse a JSON
+            // array of objects into an owned, dynamic AoS. Each element decodes like the single
+            // struct path; `str` fields are zero-copy views into the input, so the whole array is
+            // region-tied to that input (see `region_of`) and cannot escape it.
+            Some(Ty::Result(Scalar::DynStructArray(id), _)) => {
+                if !self.decode_struct_fields_ok(id, span) {
+                    return err;
+                }
+                // The input region bounds the result (its `str` fields borrow the input), so use
+                // `check_str_init` — a borrowed owned `string`'s region then bounds the array.
+                let input = self.check_str_init(&args[0]);
+                return Expr {
+                    kind: ExprKind::JsonDecodeStructArray { struct_id: id, input: Box::new(input) },
+                    ty: Ty::Result(Scalar::DynStructArray(id), Scalar::ErrCode),
+                    span,
+                };
+            }
             _ => {
                 self.diags.error(
                     "cannot infer the decode target type; annotate the binding, e.g. `u: T := json.decode(d)?`".to_string(),
@@ -2601,19 +2635,8 @@ impl<'a> Checker<'a> {
                 return err;
             }
         };
-        // Each field must be an int / float / bool scalar, or a `str` — a `str` decodes as a
-        // zero-copy view into the input buffer (MMv2 slice 6), so the decoded struct is
-        // region-tied to that input (see `region_of`). Array / nested-struct fields are still
-        // deferred.
-        let fields = self.structs[sid as usize].fields.clone();
-        for f in &fields {
-            if !matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str) {
-                self.diags.error(
-                    format!("'json.decode' field '{}' has type {} (only int/float/bool/str decode for now)", f.name, ty_name(f.ty)),
-                    span,
-                );
-                return err;
-            }
+        if !self.decode_struct_fields_ok(sid, span) {
+            return err;
         }
         // The decoded struct's `str` fields are zero-copy views into the input, so the input's
         // region constrains the result (see `region_of`). `check_str_init` accepts a `str` or
@@ -2624,6 +2647,23 @@ impl<'a> Checker<'a> {
             ty: Ty::Result(Scalar::Struct(sid), Scalar::ErrCode),
             span,
         }
+    }
+
+    /// Validate that struct `sid`'s fields are all `json.decode`-able (int / float / bool, or a
+    /// `str` zero-copy view into the input). Reports the first offending field and returns false.
+    /// Shared by the single-struct and `array<Struct>` decode paths (MMv2 slice 8d).
+    fn decode_struct_fields_ok(&mut self, sid: u32, span: Span) -> bool {
+        let fields = self.structs[sid as usize].fields.clone();
+        for f in &fields {
+            if !matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str) {
+                self.diags.error(
+                    format!("'json.decode' field '{}' has type {} (only int/float/bool/str decode for now)", f.name, ty_name(f.ty)),
+                    span,
+                );
+                return false;
+            }
+        }
+        true
     }
 
     /// Emit the `{"field":value,...}` template parts for one struct value: either the struct
@@ -2678,7 +2718,7 @@ impl<'a> Checker<'a> {
         let r = self.check_expr(recv, None);
         match r.ty {
             // `str`/`slice` carry a runtime length in their `{ ptr, len }` view.
-            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
@@ -2918,7 +2958,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } => self.finalize_expr(input),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.finalize_expr(input),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -2999,6 +3039,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Box(s) => format!("box<{}>", scalar_name(s)),
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
+        Ty::DynStructArray(id) => format!("array<struct#{id}>"),
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
         Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
         Ty::Str => "str".to_string(),
@@ -3102,9 +3143,14 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
                     return Ty::Error;
                 }
             };
-            match scalar_arg(inner, "array element", t.span, diags) {
-                Some(s) => Ty::DynArray(s),
-                None => Ty::Error,
+            // An `array<Struct>` is a dynamic AoS (its own owned type); only a primitive
+            // element resolves to the scalar `array<T>` (`DynArray`).
+            match inner {
+                Ty::Struct(id) => Ty::DynStructArray(id),
+                _ => match scalar_arg(inner, "array element", t.span, diags) {
+                    Some(s) => Ty::DynArray(s),
+                    None => Ty::Error,
+                },
             }
         }
         "Result" => {
@@ -3392,6 +3438,21 @@ mod tests {
         // decoded struct is region-tied to it, so the view cannot escape the arena.
         let (_p, d) = check("U { id: i64, name: str }\nfn bad(key: str) -> Result<i32, Error> {\n  mut outer := \"\"\n  arena {\n    d := key + key\n    u: U := json.decode(d)?\n    outer = u.name\n  }\n  return Ok(0)\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "a decoded str view from arena input must not escape the arena");
+    }
+
+    #[test]
+    fn json_decode_struct_array_checks_and_escape() {
+        // MMv2 slice 8d: `json.decode` into `array<Struct>` infers the target through `?` and is
+        // usable as a frame-local when decoded from a param (Static input, caller owns the buffer).
+        let (_p, ok) = check("User { id: i64, name: str }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.len())\n  return Ok(())\n}\n");
+        assert!(!ok.has_errors(), "json.decode into array<Struct> should check");
+        // The decoded array's `str` fields are views into the input, so an array decoded from an
+        // arena-allocated input must not escape the arena (use-after-free of the freed buffer).
+        let (_q, esc) = check("User { id: i64, name: str }\nfn bad(key: str) -> Result<i64, Error> {\n  mut total := 0\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    total = users.len()\n  }\n  return Ok(total)\n}\nfn main() -> i32 = 0\n");
+        assert!(!esc.has_errors(), "reading .len() inside the arena is fine (no escape)");
+        // Returning the arena-decoded array (region-tied to the arena input) must be rejected.
+        let (_r, ret) = check("User { id: i64, name: str }\nfn bad(key: str) -> Result<array<User>, Error> {\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    return Ok(users)\n  }\n}\nfn main() -> i32 = 0\n");
+        assert!(ret.has_errors(), "an arena-tied decoded struct array must not escape via return");
     }
 
     #[test]

@@ -265,106 +265,200 @@ pub unsafe extern "C" fn align_rt_json_decode(
         unsafe { std::slice::from_raw_parts(input, input_len as usize) }
     };
     let descs = unsafe { std::slice::from_raw_parts(fields, n_fields.max(0) as usize) };
-    let mut seen = vec![false; descs.len()];
 
     let mut p = JsonParser { src, pos: 0 };
     let ok = (|| -> Option<()> {
+        unsafe { parse_object(&mut p, descs, out, out_size)? };
         p.ws();
-        p.expect(b'{')?;
-        p.ws();
-        if p.peek() == Some(b'}') {
-            p.pos += 1;
-        } else {
-            loop {
-                p.ws();
-                let key = p.string()?;
-                p.ws();
-                p.expect(b':')?;
-                p.ws();
-                // Find the matching field descriptor (unknown keys are skipped).
-                let idx = descs.iter().position(|d| {
-                    let name = unsafe { std::slice::from_raw_parts(d.name_ptr, d.name_len.max(0) as usize) };
-                    name == key
-                });
-                match idx {
-                    Some(i) => {
-                        if seen[i] {
-                            return None; // duplicate field
+        // Trailing garbage after the object is an error.
+        if p.pos != src.len() {
+            return None;
+        }
+        Some(())
+    })();
+    if ok.is_some() {
+        0
+    } else {
+        1
+    }
+}
+
+/// Parse one JSON object from `p` into the (caller-zeroed) struct at `out` (`out_size` bytes) per
+/// the field `descs`, leaving `p` positioned just past the closing `}`. Returns `None` on a parse
+/// error, a missing or duplicate declared field, or an out-of-range descriptor. Shared by the
+/// single-struct decode and the `array<Struct>` AoS decode (MMv2 slice 8d).
+///
+/// # Safety
+/// `out` must point to `out_size` writable, already-zeroed bytes; each descriptor's `name_ptr`
+/// must describe a valid byte range. `str` fields write a `{ptr,len}` view into `p`'s input.
+unsafe fn parse_object(p: &mut JsonParser, descs: &[JsonField], out: *mut u8, out_size: i64) -> Option<()> {
+    let mut seen = vec![false; descs.len()];
+    p.ws();
+    p.expect(b'{')?;
+    p.ws();
+    if p.peek() == Some(b'}') {
+        p.pos += 1;
+    } else {
+        loop {
+            p.ws();
+            let key = p.string()?;
+            p.ws();
+            p.expect(b':')?;
+            p.ws();
+            // Find the matching field descriptor (unknown keys are skipped).
+            let idx = descs.iter().position(|d| {
+                let name = unsafe { std::slice::from_raw_parts(d.name_ptr, d.name_len.max(0) as usize) };
+                name == key
+            });
+            match idx {
+                Some(i) => {
+                    if seen[i] {
+                        return None; // duplicate field
+                    }
+                    seen[i] = true;
+                    let d = &descs[i];
+                    // tag = (kind << 8) | byte-width. kind: 0 = int, 1 = bool, 2 = float.
+                    let kind = (d.tag >> 8) & 0xff;
+                    let width = (d.tag & 0xff) as i64;
+                    // Defense in depth: never write outside the out struct, even if a
+                    // descriptor offset/width were wrong (checked_add avoids i64 overflow).
+                    if d.offset < 0 || d.offset.checked_add(width).map_or(true, |end| end > out_size) {
+                        return None;
+                    }
+                    let off = d.offset as usize;
+                    let w = width as usize;
+                    match kind {
+                        1 => {
+                            if w != 1 {
+                                return None;
+                            }
+                            let v = p.boolean()?;
+                            unsafe { *out.add(off) = v as u8 };
                         }
-                        seen[i] = true;
-                        let d = &descs[i];
-                        // tag = (kind << 8) | byte-width. kind: 0 = int, 1 = bool, 2 = float.
-                        let kind = (d.tag >> 8) & 0xff;
-                        let width = (d.tag & 0xff) as i64;
-                        // Defense in depth: never write outside the out struct, even if a
-                        // descriptor offset/width were wrong (checked_add avoids i64 overflow).
-                        if d.offset < 0 || d.offset.checked_add(width).map_or(true, |end| end > out_size) {
-                            return None;
-                        }
-                        let off = d.offset as usize;
-                        let w = width as usize;
-                        match kind {
-                            1 => {
-                                if w != 1 {
-                                    return None;
-                                }
-                                let v = p.boolean()?;
-                                unsafe { *out.add(off) = v as u8 };
+                        2 => {
+                            if w != 4 && w != 8 {
+                                return None;
                             }
-                            2 => {
-                                if w != 4 && w != 8 {
-                                    return None;
+                            let v = p.number()?;
+                            // Write the float repr at the field width (f32 / f64).
+                            if w == 4 {
+                                let bytes = (v as f32).to_le_bytes();
+                                for k in 0..4 {
+                                    unsafe { *out.add(off + k) = bytes[k] };
                                 }
-                                let v = p.number()?;
-                                // Write the float repr at the field width (f32 / f64).
-                                if w == 4 {
-                                    let bytes = (v as f32).to_le_bytes();
-                                    for k in 0..4 {
-                                        unsafe { *out.add(off + k) = bytes[k] };
-                                    }
-                                } else {
-                                    let bytes = v.to_le_bytes();
-                                    for k in 0..8 {
-                                        unsafe { *out.add(off + k) = bytes[k] };
-                                    }
-                                }
-                            }
-                            3 => {
-                                // str: a zero-copy `{ptr,len}` view into the input buffer.
-                                // `string()` borrows the input and rejects escapes, so its
-                                // pointer is the absolute address of the content within `src`.
-                                if w != 16 {
-                                    return None;
-                                }
-                                let s = p.string()?;
-                                let ptr_bytes = (s.as_ptr() as usize as u64).to_le_bytes();
-                                let len_bytes = (s.len() as i64).to_le_bytes();
-                                for k in 0..8 {
-                                    unsafe { *out.add(off + k) = ptr_bytes[k] };
-                                    unsafe { *out.add(off + 8 + k) = len_bytes[k] };
-                                }
-                            }
-                            _ => {
-                                if w != 1 && w != 2 && w != 4 && w != 8 {
-                                    return None;
-                                }
-                                let v = p.integer()?;
+                            } else {
                                 let bytes = v.to_le_bytes();
-                                for k in 0..w {
+                                for k in 0..8 {
                                     unsafe { *out.add(off + k) = bytes[k] };
                                 }
                             }
                         }
+                        3 => {
+                            // str: a zero-copy `{ptr,len}` view into the input buffer.
+                            // `string()` borrows the input and rejects escapes, so its
+                            // pointer is the absolute address of the content within `src`.
+                            if w != 16 {
+                                return None;
+                            }
+                            let s = p.string()?;
+                            let ptr_bytes = (s.as_ptr() as usize as u64).to_le_bytes();
+                            let len_bytes = (s.len() as i64).to_le_bytes();
+                            for k in 0..8 {
+                                unsafe { *out.add(off + k) = ptr_bytes[k] };
+                                unsafe { *out.add(off + 8 + k) = len_bytes[k] };
+                            }
+                        }
+                        _ => {
+                            if w != 1 && w != 2 && w != 4 && w != 8 {
+                                return None;
+                            }
+                            let v = p.integer()?;
+                            let bytes = v.to_le_bytes();
+                            for k in 0..w {
+                                unsafe { *out.add(off + k) = bytes[k] };
+                            }
+                        }
                     }
-                    None => p.skip_value()?,
                 }
+                None => p.skip_value()?,
+            }
+            p.ws();
+            match p.peek() {
+                Some(b',') => {
+                    p.pos += 1;
+                    continue;
+                }
+                Some(b'}') => {
+                    p.pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+    // All declared fields must be present.
+    if seen.iter().all(|&s| s) {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// Parse the JSON array of objects in `input` into a freshly heap-allocated owned `array<Struct>`
+/// (AoS), writing the materialized `{ptr, len}` (len = element count) to `out` (MMv2 slice 8d,
+/// the draft.md §19 headline). Each object is decoded by [`parse_object`] per the `fields`
+/// descriptors; `str` fields are zero-copy `{ptr,len}` views into `input`, so the result is
+/// owned (the buffer is freed by the generated `Drop`) yet borrows `input` for its string content
+/// — the compiler region-ties it to `input`. Returns 0 on success, 1 on a parse error (leaving
+/// `out` as the caller-zeroed `{null,0}`). An empty array allocates nothing (null buffer).
+///
+/// # Safety
+/// `input`/`fields` must describe valid ranges; `elem_size` is the struct stride in bytes; `out`
+/// must point to a writable `{ptr,len}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_decode_struct_array(
+    input: *const u8,
+    input_len: i64,
+    fields: *const JsonField,
+    n_fields: i64,
+    elem_size: i64,
+    out: *mut AlignStr,
+) -> i32 {
+    // `from_raw_parts` is UB on a null pointer even with len 0 — guard an empty owned `string`.
+    let src: &[u8] = if input_len <= 0 || input.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(input, input_len as usize) }
+    };
+    let descs = unsafe { std::slice::from_raw_parts(fields, n_fields.max(0) as usize) };
+    let esz = elem_size.max(0) as usize;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut count: i64 = 0;
+
+    let mut p = JsonParser { src, pos: 0 };
+    let ok = (|| -> Option<()> {
+        p.ws();
+        p.expect(b'[')?;
+        p.ws();
+        if p.peek() == Some(b']') {
+            p.pos += 1;
+        } else {
+            loop {
+                p.ws();
+                // Grow the buffer by one zeroed element and decode the object into it. The decoded
+                // `str` fields hold pointers into `src` (not `buf`), so reallocating `buf` on the
+                // next `resize` keeps them valid.
+                let base = buf.len();
+                buf.resize(base + esz, 0);
+                unsafe { parse_object(&mut p, descs, buf.as_mut_ptr().add(base), esz as i64)? };
+                count += 1;
                 p.ws();
                 match p.peek() {
                     Some(b',') => {
                         p.pos += 1;
                         continue;
                     }
-                    Some(b'}') => {
+                    Some(b']') => {
                         p.pos += 1;
                         break;
                     }
@@ -373,16 +467,25 @@ pub unsafe extern "C" fn align_rt_json_decode(
             }
         }
         p.ws();
-        // Trailing garbage after the object is an error.
-        if p.pos != src.len() { return None; }
+        // Trailing garbage after the array is an error.
+        if p.pos != src.len() {
+            return None;
+        }
         Some(())
     })();
-    // All declared fields must be present.
-    if ok.is_some() && seen.iter().all(|&s| s) {
-        0
-    } else {
-        1
+    if ok.is_none() {
+        return 1;
     }
+
+    // Materialize into a fresh heap buffer (owned; freed by the generated `Drop`). An empty array
+    // allocates nothing — `align_rt_alloc(0)` returns null and `free(null)` is a no-op.
+    let total = buf.len() as i64;
+    let dst = align_rt_alloc(total);
+    if total > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
+    }
+    unsafe { *out = AlignStr { ptr: dst, len: count } };
+    0
 }
 
 /// Parse the JSON array in `input` into a freshly heap-allocated owned `array<T>`, writing the

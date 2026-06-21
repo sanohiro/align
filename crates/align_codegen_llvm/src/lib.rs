@@ -288,6 +288,19 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len})
+        // -> i32 status (MMv2 slice 8d).
+        "json_decode_struct_array".to_string(),
+        module.add_function(
+            "align_rt_json_decode_struct_array",
+            ctx.i32_type().fn_type(
+                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into()],
+                false,
+            ),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_finish".to_string(),
         module.add_function(
             "align_rt_builder_finish",
@@ -446,7 +459,9 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicType
         Ty::StructArray(id, n) => sx[id as usize].array_type(n).into(),
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct.
-        Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_) => {
+            slice_struct_type(ctx).into()
+        }
         _ => int_type(ctx, ty).into(),
     }
 }
@@ -492,7 +507,9 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
         Ty::Option(s) => option_struct_type(ctx, s, sx).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx).into(),
         Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => ctx.ptr_type(AddressSpace::default()).into(),
-        Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) | Ty::DynStructArray(_) => {
+            slice_struct_type(ctx).into()
+        }
         _ => scalar_type(ctx, ty, sx),
     }
 }
@@ -512,6 +529,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Struct(_) => unreachable!("a struct is not a box payload"),
         Scalar::String => unreachable!("an owned string is not a box payload"),
         Scalar::DynArray(_) => unreachable!("an owned array is not a box payload"),
+        Scalar::DynStructArray(_) => unreachable!("an owned struct array is not a box payload"),
     }
 }
 
@@ -1125,6 +1143,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::Template(pieces, arena) => self.gen_template(pieces, arena.as_ref())?,
             Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
+            Rvalue::JsonDecodeStructArray { struct_id, input, out } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -1195,7 +1214,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
-            Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
+            Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) | Ty::DynStructArray(_) => {
+                slice_struct_type(self.ctx).into()
+            }
             _ => scalar_type(self.ctx, ty, self.struct_types),
         }
     }
@@ -1348,23 +1369,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// table `[{ name_ptr, name_len: i64, tag: i32, offset: i64 }]` (tag = byte width for
     /// ints, 0 for bool; offset from the target layout), and call the runtime parser. Returns
     /// the i32 status.
-    fn gen_json_decode(&mut self, struct_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+    /// Emit the constant `{name_ptr, name_len, tag, offset}` field-descriptor table for decoding
+    /// struct `struct_id`, returning `(table base, n_fields, struct store size)`. The table is a
+    /// private constant global (no per-call alloca → safe inside a loop). Shared by single-struct
+    /// and `array<Struct>` decode (MMv2 slice 8d).
+    fn decode_field_table(&mut self, struct_id: u32) -> (inkwell::values::PointerValue<'c>, u64, u64) {
         let sty = self.struct_types[struct_id as usize];
-        let out_ptr = self.slots[&out];
-        // Zero the struct so missing fields read as 0/false.
-        self.builder.build_store(out_ptr, sty.const_zero()).map_err(|e| self.err(e))?;
-
-        let agg = self.operand(input).into_struct_value();
-        let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
-        let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
-
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
         let i32t = self.ctx.i32_type();
         let desc_ty = self.ctx.struct_type(&[ptr_ty.into(), i64t.into(), i32t.into(), i64t.into()], false);
         let fields = self.structs[struct_id as usize].fields.clone();
-        // The table is constant (names, type tags, layout offsets are all known here), so
-        // emit it as a private global — no per-call stack alloca (safe inside loops).
         let descs: Vec<inkwell::values::StructValue> = fields
             .iter()
             .enumerate()
@@ -1392,9 +1407,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let table = self.module.add_global(table_val.get_type(), None, "jfields");
         table.set_initializer(&table_val);
         table.set_constant(true);
-        let base = table.as_pointer_value();
-        let n = i64t.const_int(fields.len() as u64, false);
-        let size = i64t.const_int(self.target_data.get_store_size(&sty), false);
+        (table.as_pointer_value(), fields.len() as u64, self.target_data.get_store_size(&sty))
+    }
+
+    fn gen_json_decode(&mut self, struct_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let sty = self.struct_types[struct_id as usize];
+        let out_ptr = self.slots[&out];
+        // Zero the struct so missing fields read as 0/false.
+        self.builder.build_store(out_ptr, sty.const_zero()).map_err(|e| self.err(e))?;
+
+        let agg = self.operand(input).into_struct_value();
+        let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
+        let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
+
+        let i64t = self.ctx.i64_type();
+        let (base, n_fields, size) = self.decode_field_table(struct_id);
+        let n = i64t.const_int(n_fields, false);
+        let size = i64t.const_int(size, false);
         let cs = self
             .builder
             .build_call(
@@ -1404,6 +1433,34 @@ impl<'c, 'a> FnGen<'c, 'a> {
             )
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_decode returns i32"))
+    }
+
+    /// `json.decode` into an owned `array<Struct>` (MMv2 slice 8d): zero the out `{ptr,len}` slot,
+    /// then call the runtime AoS parser with the same field table as the single-struct path plus
+    /// the element stride. The returned buffer is owned (freed by `Drop`); its `str` fields point
+    /// into the input. Returns the i32 status.
+    fn gen_json_decode_struct_array(&mut self, struct_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        // Zero the {ptr,len} so a failed decode reads {null,0} (its Drop frees null).
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+
+        let agg = self.operand(input).into_struct_value();
+        let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
+        let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
+
+        let i64t = self.ctx.i64_type();
+        let (base, n_fields, size) = self.decode_field_table(struct_id);
+        let n = i64t.const_int(n_fields, false);
+        let elem_size = i64t.const_int(size, false);
+        let cs = self
+            .builder
+            .build_call(
+                self.funcs["json_decode_struct_array"],
+                &[in_ptr.into(), in_len.into(), base.into(), n.into(), elem_size.into(), out_ptr.into()],
+                "jdecsa",
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("json_decode_struct_array returns i32"))
     }
 
     /// `json.decode` into an owned `array<elem>`: zero the out `{ptr,len}` slot, then call the
