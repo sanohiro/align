@@ -388,6 +388,47 @@ fn json_decode_struct_array_malformed_errors() {
 }
 
 #[test]
+fn json_decode_struct_array_pipeline_sum() {
+    if !backend_available() {
+        return;
+    }
+    // MMv2 slice 8d-2 — the draft.md §19 headline runs end-to-end (compiler side): decode a JSON
+    // array of objects into an owned `array<User>`, then fuse `where(.active).score.sum()` into a
+    // single counted loop over the heap AoS (field access via `IndexFieldPtr`). The inactive `bob`
+    // (score 99) is filtered out → 10 + 5 = 15.
+    let src = "User { id: i64, name: str, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false,\\\"score\\\":99},{\\\"id\\\":3,\\\"name\\\":\\\"cyd\\\",\\\"active\\\":true,\\\"score\\\":5}]\")?\n  total := users.where(.active).score.sum()\n  print(total)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-struct-array-pipeline", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n");
+}
+
+#[test]
+fn json_decode_struct_array_pipeline_project_and_count() {
+    if !backend_available() {
+        return;
+    }
+    // A bare field projection + `sum` (no `where`): sum all `score`s = 10 + 99 + 5 = 114. And a
+    // `where(.active)` count of survivors = 2. Two pipelines over the same decoded array.
+    let src = "User { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"active\\\":false,\\\"score\\\":99},{\\\"id\\\":3,\\\"active\\\":true,\\\"score\\\":5}]\")?\n  print(users.score.sum())\n  print(users.where(.active).score.count())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-struct-array-project", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "114\n2\n");
+}
+
+#[test]
+fn json_decode_struct_array_pipeline_empty() {
+    if !backend_available() {
+        return;
+    }
+    // A pipeline over an empty decoded array folds to the identity (sum = 0) without touching the
+    // null buffer.
+    let src = "User { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(.active).score.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-struct-array-pipeline-empty", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;

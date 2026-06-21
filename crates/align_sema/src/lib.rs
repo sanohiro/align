@@ -1938,7 +1938,7 @@ impl<'a> Checker<'a> {
         };
         let mut elem = match source.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
-            Ty::StructArray(id, _) => Ty::Struct(id),
+            Ty::StructArray(id, _) | Ty::DynStructArray(id) => Ty::Struct(id),
             Ty::Error => return None,
             other => {
                 self.diags
@@ -1946,13 +1946,14 @@ impl<'a> Checker<'a> {
                 return None;
             }
         };
-        // MIR materializes an array source only when it is an array literal or a named
+        // MIR materializes a stack-array source only when it is an array literal or a named
         // local (slot-addressable); an arbitrary array-valued expression (e.g. an `if` or
-        // block) would otherwise crash lowering. A slice source is fine — it lowers as a
-        // value. Reject the unsupported array shape cleanly here.
-        if matches!(source.ty, Ty::Array(..) | Ty::StructArray(..))
-            && !matches!(source.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_))
-        {
+        // block) would otherwise crash lowering. A `{ptr,len}` view (`slice`/owned array) is
+        // fine as a value, but a dynamic `array<Struct>` must be a variable: its field
+        // projection indexes through the buffer pointer (`IndexFieldPtr`), and binding it first
+        // keeps the owned buffer alive across the loop. Reject other array shapes cleanly here.
+        let needs_var = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(_));
+        if needs_var && !matches!(source.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
             self.diags.error(
                 "a pipeline over an array must start from an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
                 span,
@@ -1960,11 +1961,11 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        // Field projection / field-predicate stages index the source by element
-        // (`IndexField(slot, …)` in MIR), which needs a slot-backed source — a stack array
-        // or struct array. A `{ptr,len}` view (`slice`/owned `array`) has no such slot, so
-        // projecting a field out of one is not supported (it would miscompile).
-        let slot_backed = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..));
+        // Field projection / field-predicate stages index the source by element, which needs a
+        // slot-backed stack array / struct array (`IndexField`) or a dynamic `array<Struct>`
+        // view addressed through its buffer pointer (`IndexFieldPtr`, slice 8d-2). A scalar
+        // `{ptr,len}` view (`slice` / owned scalar `array`) has no per-element struct to project.
+        let slot_backed = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(_));
         let mut stages = Vec::new();
         for raw in raw_stages {
             match raw {
@@ -3453,6 +3454,18 @@ mod tests {
         // Returning the arena-decoded array (region-tied to the arena input) must be rejected.
         let (_r, ret) = check("User { id: i64, name: str }\nfn bad(key: str) -> Result<array<User>, Error> {\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    return Ok(users)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(ret.has_errors(), "an arena-tied decoded struct array must not escape via return");
+    }
+
+    #[test]
+    fn pipeline_over_dynamic_struct_array_checks() {
+        // MMv2 slice 8d-2: a fused pipeline over a decoded `array<Struct>` variable type-checks
+        // (`where(.field)` + projection + reduction).
+        let (_p, ok) = check("User { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(.active).score.sum())\n  return Ok(())\n}\n");
+        assert!(!ok.has_errors(), "a where(.field).field.sum() pipeline over array<Struct> should check");
+        // `map`/`where` directly over the whole struct element (before a projection) is still
+        // rejected for a dynamic struct array, just as for a fixed one.
+        let (_q, bad) = check("User { id: i64, score: i32 }\nfn keep(u: User) -> bool = true\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(keep).score.sum())\n  return Ok(())\n}\n");
+        assert!(bad.has_errors(), "'where' over a whole struct element must be rejected");
     }
 
     #[test]

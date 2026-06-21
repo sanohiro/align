@@ -512,14 +512,24 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      (slice 8c) covers a bound struct array too. Empty `[]` → `{null,0}` (no alloc). Decode-side
      only this slice — **the `.where(.active).field.sum()` pipeline over a dynamic struct array is
      8d-2**.
-   - **Deferred (8d-2+):** the **pipeline over a dynamic `array<Struct>`** (`.where(.active).score.sum()`
-     — the rest of the draft.md §19 example; extends the fused-loop lowering from compile-time `N`
-     to the runtime length). Reading an element field (indexing) and `array<Struct>.clone()` (escape)
-     are also still deferred. The `fs.read_file` / `io.stdout.write` parts of §19 are the std
-     boundary (separate from MMv2). Tuples / multi-value returns (for `partition`) and
-     `array<slice<T>>` (for `chunks`) remain a **separate** type-system track — open design items
-     (do not fake them); they reuse this same owned-aggregate + drop foundation once their surface
-     is designed.
+   - **[done] 8d-2 — pipeline over a dynamic `array<Struct>`.** The rest of the draft.md §19
+     example now runs (compiler side): `users.where(.active).score.sum()` fuses into one counted
+     loop over the heap AoS. The fused-loop lowering (both the reducing and collecting loops)
+     gained a "struct view" source mode: a `DynStructArray` is set up as its `{ptr,len}` value with
+     a runtime `SliceLen` bound, and field projection / `where(.field)` index it through the buffer
+     pointer via a new `Rvalue::IndexFieldPtr` (`getelementptr %Struct, ptr, index, field`) instead
+     of the stack-slot `IndexField` — shared by both loops through a `lower_field_access` helper.
+     sema's pipeline check accepts a `DynStructArray` source (requiring a variable, since field
+     projection addresses through the owned buffer that the binding keeps alive); `map`/`where`
+     over the whole struct element is still rejected (project a field first), same as the fixed
+     AoS. The source is a borrow (the owner's exit `Drop` frees it — `setup_source` sets no
+     `temp_free`). **draft.md §19 runs end-to-end except the `fs`/`io` std boundary.**
+   - **Deferred (later):** reading an element field by index (`users[i].name`), `array<Struct>.clone()`
+     (the escape hatch), and collecting terminals' broader use over struct arrays beyond the fused
+     reduction. The `fs.read_file` / `io.stdout.write` parts of §19 are the std boundary (separate
+     from MMv2). Tuples / multi-value returns (for `partition`) and `array<slice<T>>` (for `chunks`)
+     remain a **separate** type-system track — open design items (do not fake them); they reuse
+     this same owned-aggregate + drop foundation once their surface is designed.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).
