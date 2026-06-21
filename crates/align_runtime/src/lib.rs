@@ -264,7 +264,12 @@ pub unsafe extern "C" fn align_rt_json_decode(
     } else {
         unsafe { std::slice::from_raw_parts(input, input_len as usize) }
     };
-    let descs = unsafe { std::slice::from_raw_parts(fields, n_fields.max(0) as usize) };
+    // `from_raw_parts` is UB on a null pointer even with len 0 — guard `fields` like `input`.
+    let descs: &[JsonField] = if n_fields <= 0 || fields.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(fields, n_fields as usize) }
+    };
 
     let mut p = JsonParser { src, pos: 0 };
     let ok = (|| -> Option<()> {
@@ -283,6 +288,55 @@ pub unsafe extern "C" fn align_rt_json_decode(
     }
 }
 
+/// Tracks which declared fields `parse_object` has seen, to reject duplicates and require all of
+/// them — without a per-object heap allocation in the common case. A struct of <= 64 fields uses a
+/// `u64` bitmask; a wider one falls back to a `Vec<bool>` (MMv2 slice 8d perf).
+enum SeenSet {
+    Mask(u64),
+    Big(Vec<bool>),
+}
+
+impl SeenSet {
+    fn new(n: usize) -> Self {
+        if n <= 64 {
+            SeenSet::Mask(0)
+        } else {
+            SeenSet::Big(vec![false; n])
+        }
+    }
+
+    /// Mark field `i` as seen; returns false if it was already seen (a duplicate). `i` is a valid
+    /// descriptor index (`< n`), so for `Mask` it is `< 64` and the shift never overflows.
+    fn mark(&mut self, i: usize) -> bool {
+        match self {
+            SeenSet::Mask(m) => {
+                let bit = 1u64 << i;
+                if *m & bit != 0 {
+                    return false;
+                }
+                *m |= bit;
+                true
+            }
+            SeenSet::Big(v) => {
+                if v[i] {
+                    return false;
+                }
+                v[i] = true;
+                true
+            }
+        }
+    }
+
+    /// Whether all `n` declared fields have been marked.
+    fn all_seen(&self, n: usize) -> bool {
+        match self {
+            // `Mask` is only used for `n <= 64`; `n == 64` needs `!0` (a `1 << 64` shift is UB).
+            SeenSet::Mask(m) => *m == if n >= 64 { !0u64 } else { (1u64 << n) - 1 },
+            SeenSet::Big(v) => v.iter().all(|&s| s),
+        }
+    }
+}
+
 /// Parse one JSON object from `p` into the (caller-zeroed) struct at `out` (`out_size` bytes) per
 /// the field `descs`, leaving `p` positioned just past the closing `}`. Returns `None` on a parse
 /// error, a missing or duplicate declared field, or an out-of-range descriptor. Shared by the
@@ -292,7 +346,10 @@ pub unsafe extern "C" fn align_rt_json_decode(
 /// `out` must point to `out_size` writable, already-zeroed bytes; each descriptor's `name_ptr`
 /// must describe a valid byte range. `str` fields write a `{ptr,len}` view into `p`'s input.
 unsafe fn parse_object(p: &mut JsonParser, descs: &[JsonField], out: *mut u8, out_size: i64) -> Option<()> {
-    let mut seen = vec![false; descs.len()];
+    // `parse_object` runs once per array element (slice 8d), so avoid a per-object heap allocation:
+    // a struct of <= 64 fields tracks "seen" in a `u64` bitmask, falling back to a `Vec` only for
+    // a wider struct (which essentially never occurs).
+    let mut seen = SeenSet::new(descs.len());
     p.ws();
     p.expect(b'{')?;
     p.ws();
@@ -312,10 +369,9 @@ unsafe fn parse_object(p: &mut JsonParser, descs: &[JsonField], out: *mut u8, ou
             });
             match idx {
                 Some(i) => {
-                    if seen[i] {
+                    if !seen.mark(i) {
                         return None; // duplicate field
                     }
-                    seen[i] = true;
                     let d = &descs[i];
                     // tag = (kind << 8) | byte-width. kind: 0 = int, 1 = bool, 2 = float.
                     let kind = (d.tag >> 8) & 0xff;
@@ -397,7 +453,7 @@ unsafe fn parse_object(p: &mut JsonParser, descs: &[JsonField], out: *mut u8, ou
         }
     }
     // All declared fields must be present.
-    if seen.iter().all(|&s| s) {
+    if seen.all_seen(descs.len()) {
         Some(())
     } else {
         None
@@ -430,7 +486,12 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     } else {
         unsafe { std::slice::from_raw_parts(input, input_len as usize) }
     };
-    let descs = unsafe { std::slice::from_raw_parts(fields, n_fields.max(0) as usize) };
+    // `from_raw_parts` is UB on a null pointer even with len 0 — guard `fields` like `input`.
+    let descs: &[JsonField] = if n_fields <= 0 || fields.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(fields, n_fields as usize) }
+    };
     let esz = elem_size.max(0) as usize;
     let mut buf: Vec<u8> = Vec::new();
     let mut count: i64 = 0;
