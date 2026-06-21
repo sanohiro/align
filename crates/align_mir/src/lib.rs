@@ -720,6 +720,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::SliceLen(sv)));
             Operand::Value(v)
         }
+        hir::ExprKind::Index { recv, index } => lower_index(b, recv, index, e.ty),
         hir::ExprKind::ArrayLit { .. } => {
             unreachable!("array literal only appears as a let initializer or pipeline source")
         }
@@ -742,6 +743,59 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// The i64 type used for array indices / loop counters.
 fn i64_ty() -> Ty {
     Ty::Int(IntTy { bits: 64, signed: true })
+}
+
+/// `recv[index]` → a bounds-checked element load. Emits the check explicitly in MIR (semantics
+/// live here): `if index < 0 || index >= len { bounds_fail(index, len); unreachable }`, then the
+/// element load. A scalar `array<T>` / `slice` loads through its `{ptr,len}` value; a fixed stack
+/// `array` loads through its slot.
+fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty) -> Operand {
+    let idx = lower_expr(b, index);
+    // The length, and whether the element loads from a `{ptr,len}` value or a stack slot.
+    enum Src {
+        Slice(Operand),
+        Slot(Slot),
+    }
+    let (src, len): (Src, Operand) = match recv.ty {
+        Ty::Slice(_) | Ty::DynArray(_) => {
+            let sv = lower_expr(b, recv);
+            let len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+            (Src::Slice(sv), Operand::Value(len))
+        }
+        _ => {
+            // A fixed `array<T>` (sema restricted `recv` to a literal / local).
+            let (slot, n) = array_source_slot(b, recv);
+            (Src::Slot(slot), Operand::Const(Const::Int(n, i64_ty())))
+        }
+    };
+
+    // oob = index < 0 || index >= len
+    let lo = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(lo, Rvalue::Bin(BinOp::Lt, idx.clone(), Operand::Const(Const::Int(0, i64_ty())))));
+    let hi = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(hi, Rvalue::Bin(BinOp::Ge, idx.clone(), len.clone())));
+    let oob = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(oob, Rvalue::Bin(BinOp::Or, Operand::Value(lo), Operand::Value(hi))));
+
+    let fail = b.new_block();
+    let ok = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(oob), fail, ok));
+
+    // fail: report (index, len) and abort. `bounds_fail` is `-> !`, so the block is `Unreachable`.
+    b.cur = fail;
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(t, Rvalue::Call("bounds_fail".to_string(), vec![idx.clone(), len])));
+    b.terminate(Term::Unreachable);
+
+    // ok: load the element.
+    b.cur = ok;
+    let v = b.fresh_value(elem_ty);
+    match src {
+        Src::Slice(sv) => b.push(Stmt::Let(v, Rvalue::SliceIndex(sv, idx))),
+        Src::Slot(slot) => b.push(Stmt::Let(v, Rvalue::Index(slot, idx))),
+    }
+    Operand::Value(v)
 }
 
 fn index_const(i: usize) -> Operand {

@@ -118,6 +118,15 @@ fn build_module<'c>(
         "print".to_string(),
         module.add_function("align_rt_print_i64", print_ty, None),
     );
+    // Out-of-bounds index failure: report `(index, len)` and abort (`-> !`).
+    funcs.insert(
+        "bounds_fail".to_string(),
+        module.add_function(
+            "align_rt_bounds_fail",
+            ctx.void_type().fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false),
+            None,
+        ),
+    );
     // Arena allocator (M3).
     let ptr = ctx.ptr_type(AddressSpace::default());
     let i64t = ctx.i64_type();

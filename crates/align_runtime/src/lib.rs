@@ -851,6 +851,15 @@ pub fn panic_abort(msg: &str) -> ! {
     std::process::abort();
 }
 
+/// Out-of-bounds array index: report `index`/`len` and abort. Codegen emits the bounds check
+/// (`0 <= index < len`) inline and calls this only on the failing path (the settled panic model:
+/// a memory-safety violation in ordinary code is a hard error, never silent UB).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_bounds_fail(index: i64, len: i64) -> ! {
+    eprintln!("align: panic: index out of bounds: the len is {len} but the index is {index}");
+    std::process::abort();
+}
+
 /// A bump allocator (`docs/impl/06-runtime-std.md` §3). Memory is carved from a list of
 /// fixed-size chunks; individual allocations are never freed — the whole arena is
 /// released at once by [`align_rt_arena_end`]. Chunk buffers are heap-stable (the outer

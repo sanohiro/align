@@ -429,6 +429,61 @@ fn json_decode_struct_array_pipeline_empty() {
 }
 
 #[test]
+fn array_index_fixed_and_owned() {
+    if !backend_available() {
+        return;
+    }
+    // Element access `recv[index]` on a fixed stack array and on an owned `array<i64>` (from
+    // `json.decode`). Fixed: xs[2] = 30. Owned: ys[0] + ys[3] = 5 + 35 = 40. A computed index
+    // (1 + 1) exercises a non-constant subscript.
+    let src = "fn main() -> Result<(), Error> {\n  xs := [10, 20, 30, 40]\n  print(xs[1 + 1])\n  ys: array<i64> := json.decode(\"[5, 15, 25, 35]\")?\n  print(ys[0] + ys[3])\n  return Ok(())\n}\n";
+    let out = build_and_run("array-index", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n40\n");
+}
+
+#[test]
+fn slice_index_through_param() {
+    if !backend_available() {
+        return;
+    }
+    // Indexing a `slice<i32>` (a `{ptr,len}` view borrowed from the caller's array): s[1] = 20.
+    let src = "fn second(s: slice<i32>) -> i32 = s[1]\nfn main() -> i32 {\n  return second([10, 20, 30])\n}\n";
+    let out = build_and_run("slice-index", src);
+    assert_eq!(out.status.code(), Some(20));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn array_index_out_of_bounds_aborts() {
+    if !backend_available() {
+        return;
+    }
+    // An out-of-range index is a hard error: the bounds check calls the runtime, which aborts
+    // (no silent UB / OOB read). The process dies via SIGABRT (no clean exit code).
+    let src = "fn main() -> i32 {\n  xs := [1, 2, 3]\n  return xs[5]\n}\n";
+    let out = build_and_run("array-index-oob", src);
+    assert_ne!(out.status.code(), Some(0), "out-of-bounds must not exit cleanly");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("index out of bounds"),
+        "expected an out-of-bounds panic message, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn array_index_negative_aborts() {
+    if !backend_available() {
+        return;
+    }
+    // A negative index also fails the `index < 0` half of the bounds check and aborts.
+    let src = "fn main() -> i32 {\n  xs := [1, 2, 3]\n  mut i := 0\n  i = i - 1\n  return xs[i]\n}\n";
+    let out = build_and_run("array-index-neg", src);
+    assert_ne!(out.status.code(), Some(0), "a negative index must not exit cleanly");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("index out of bounds"));
+}
+
+#[test]
 fn builder_writes_all_scalar_kinds() {
     if !backend_available() {
         return;

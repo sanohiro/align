@@ -226,6 +226,10 @@ pub enum ExprKind {
     /// `.len()` of a `str` or `slice<T>` (the `len` field of the `{ ptr, len }` view); the
     /// result is `i64`. A fixed array's length is a constant and lowers without this node.
     Len(Box<Expr>),
+    /// `recv[index]` — element access into a scalar `array`/`slice`/owned `array<T>` (the result
+    /// is the scalar element). Lowering emits a bounds check (`0 <= index < len`) that aborts on
+    /// an out-of-range index (the settled panic model). `index` is an `i64`.
+    Index { recv: Box<Expr>, index: Box<Expr> },
     /// `template "..."` — build a `str` from static parts and interpolated holes. Each
     /// hole is a local (int or str); lowering picks the right builder write by its type.
     Template(Vec<TemplatePart>),

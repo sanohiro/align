@@ -324,12 +324,13 @@ drop, zero-copy decode); slices 1–8d are **implemented**. The two foundations 
   as a unit.
 
 Delivered on top of it: zero-copy `str`/`array<T>`/`array<Struct>` decode region-tied to the
-input, with explicit `.clone()` to escape; owned-array materialization. **`draft.md` §19 now
-runs end-to-end except the `fs`/`io` std boundary** (`json.decode<array<User>>` →
-`where(.active).score.sum()` as one fused loop). Still **deferred** (separate, deliberately
-un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`),
-`array<slice<T>>` (for `chunks`), `array<Struct>.clone()`, and element indexing
-(`users[i].name`) — see `08-memory-model-v2.md` §11 and `open-questions.md`.
+input, with explicit `.clone()` to escape; owned-array materialization; and bounds-checked
+scalar element indexing `recv[index]`. **`draft.md` §19 now runs end-to-end except the `fs`/`io`
+std boundary** (`json.decode<array<User>>` → `where(.active).score.sum()` as one fused loop).
+Still **deferred** (separate, deliberately un-rushed tracks, not corner-cut): tuples /
+multi-value returns (for `partition`), `array<slice<T>>` (for `chunks`), `array<Struct>.clone()`,
+and **struct-element** indexing (`users[i]` / `users[i].name`) — see `08-memory-model-v2.md` §11
+and `open-questions.md`.
 
 ## M6 — SIMD / vec / mask
 

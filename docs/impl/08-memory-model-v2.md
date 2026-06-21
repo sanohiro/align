@@ -528,12 +528,20 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      over the whole struct element is still rejected (project a field first), same as the fixed
      AoS. The source is a borrow (the owner's exit `Drop` frees it — `setup_source` sets no
      `temp_free`). **draft.md §19 runs end-to-end except the `fs`/`io` std boundary.**
-   - **Deferred (later):** reading an element field by index (`users[i].name`), `array<Struct>.clone()`
-     (the escape hatch), and collecting terminals' broader use over struct arrays beyond the fused
-     reduction. The `fs.read_file` / `io.stdout.write` parts of §19 are the std boundary (separate
-     from MMv2). Tuples / multi-value returns (for `partition`) and `array<slice<T>>` (for `chunks`)
-     remain a **separate** type-system track — open design items (do not fake them); they reuse
-     this same owned-aggregate + drop foundation once their surface is designed.
+   - **[done] 8e — scalar element indexing `recv[index]`.** Surface `[]` subscript on a scalar
+     `array` / `slice` / owned `array<T>` (yields the element scalar). Bounds-checked: MIR emits
+     `if index < 0 || index >= len { bounds_fail(index, len); unreachable }` then the element load
+     (`Index` for a stack slot, `SliceIndex` for a `{ptr,len}` view), with the runtime
+     `align_rt_bounds_fail` aborting on the failing path (the settled panic model — a memory-safety
+     violation in ordinary code is a hard error, never silent UB). New `ExprKind::Index` (a postfix
+     `[]` operator in the parser).
+   - **Deferred (later):** **struct-element** indexing (`users[i]` whole-element load / `users[i].name`)
+     — needs a whole-struct value load + the region tie; `array<Struct>.clone()` (the escape hatch);
+     and collecting terminals' broader use over struct arrays beyond the fused reduction. The
+     `fs.read_file` / `io.stdout.write` parts of §19 are the std boundary (separate from MMv2).
+     Tuples / multi-value returns (for `partition`) and `array<slice<T>>` (for `chunks`) remain a
+     **separate** type-system track — open design items (do not fake them); they reuse this same
+     owned-aggregate + drop foundation once their surface is designed.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).
