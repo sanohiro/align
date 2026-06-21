@@ -153,6 +153,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecodeArray { elem, input, out } => {
             format!("json_decode_array({} x {}, -> _{out})", operand_str(input), crate::ty_name(*elem))
         }
+        Rvalue::JsonDecodeStructArray { struct_id, input, out } => {
+            format!("json_decode_struct_array(struct#{struct_id}, {}, -> _{out})", operand_str(input))
+        }
     }
 }
 
