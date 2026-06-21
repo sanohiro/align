@@ -230,6 +230,42 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
     0
 }
 
+/// Build the `args: array<str>` value for `main` from the C `argc`/`argv`. Returns the owned
+/// `array<str>` as an `{ptr, len}`: a freshly [`align_rt_alloc`]'d buffer of `argc` `AlignStr`
+/// (`{ptr,len}`) entries, each a zero-copy view of one argv string (length via `strlen`). The
+/// element string bytes are argv's (process-lifetime, not freed); only the `AlignStr` buffer is
+/// owned, freed by the generated `Drop` of the `args` local at `main` exit. `argc <= 0` → an empty
+/// `{null,0}` array.
+///
+/// # Safety
+/// `argv` must point to `argc` valid, NUL-terminated C strings (the platform `main` contract).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_args_build(argc: i32, argv: *const *const u8) -> AlignStr {
+    if argc <= 0 || argv.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let n = argc as usize;
+    // Buffer of `n` AlignStr entries; sized in bytes for `align_rt_alloc` (a `c_void*`-granular
+    // bump/heap allocator). The element views point into argv, so the buffer is the only owned part.
+    let bytes = (n * core::mem::size_of::<AlignStr>()) as i64;
+    let buf = align_rt_alloc(bytes) as *mut AlignStr;
+    for i in 0..n {
+        let cstr = unsafe { *argv.add(i) };
+        let len = if cstr.is_null() {
+            0
+        } else {
+            // strlen: scan to the NUL.
+            let mut l = 0usize;
+            while unsafe { *cstr.add(l) } != 0 {
+                l += 1;
+            }
+            l as i64
+        };
+        unsafe { *buf.add(i) = AlignStr { ptr: cstr, len } };
+    }
+    AlignStr { ptr: buf as *const u8, len: argc as i64 }
+}
+
 /// An append-oriented string builder (`06-runtime-std.md` §7), backing `template`
 /// desugaring. M5: heap-backed; the finished buffer is leaked (no ownership/free yet —
 /// arena-tied builders come later).
