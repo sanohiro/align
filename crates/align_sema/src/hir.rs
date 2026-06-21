@@ -232,6 +232,11 @@ pub enum ExprKind {
     /// `json.decode(input)` for struct `struct_id` — parse the `str` `input` into that
     /// struct at runtime. The expression `ty` is `Result<Struct, Error>`.
     JsonDecode { struct_id: u32, input: Box<Expr> },
+    /// `json.decode(input)` targeting an owned `array<T>` (MMv2 slice 8c) — parse a JSON array of
+    /// scalars into a freshly heap-allocated owned `array<T>` (the elements are *copied*, so the
+    /// result is `Static`/returnable, not region-tied to the input). `elem` is the (primitive)
+    /// element type; the expression `ty` is `Result<array<T>, Error>`.
+    JsonDecodeArray { elem: crate::Ty, input: Box<Expr> },
 }
 
 /// Which builder append a `BuilderWrite` performs (MMv2 slice 7c/7d).

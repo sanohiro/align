@@ -276,6 +276,18 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // json.decode into array (input, input_len, elem_tag, out: *{ptr,len}) -> i32 status.
+        "json_decode_array".to_string(),
+        module.add_function(
+            "align_rt_json_decode_array",
+            ctx.i32_type().fn_type(
+                &[ptr.into(), i64t2.into(), ctx.i32_type().into(), ptr.into()],
+                false,
+            ),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_finish".to_string(),
         module.add_function(
             "align_rt_builder_finish",
@@ -1112,6 +1124,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::Template(pieces, arena) => self.gen_template(pieces, arena.as_ref())?,
             Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
+            Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -1391,6 +1404,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
             )
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_decode returns i32"))
+    }
+
+    /// `json.decode` into an owned `array<elem>`: zero the out `{ptr,len}` slot, then call the
+    /// runtime array parser with the element tag `(kind << 8) | width`. Returns the i32 status.
+    fn gen_json_decode_array(&mut self, elem: Ty, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        // Zero the {ptr,len} so a failed decode reads {null,0} (its Drop / unused value frees null).
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+
+        let agg = self.operand(input).into_struct_value();
+        let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
+        let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
+        // Same tag encoding as struct fields: (kind << 8) | byte-width. kind 0 = int, 1 = bool,
+        // 2 = float.
+        let tag: u64 = match elem {
+            Ty::Int(it) => (it.bits / 8) as u64,
+            Ty::Bool => (1 << 8) | 1,
+            Ty::Float(ft) => (2 << 8) | (ft.bits / 8) as u64,
+            _ => unreachable!("json.decode array element is int/float/bool (sema-checked)"),
+        };
+        let tag_v = self.ctx.i32_type().const_int(tag, false);
+        let cs = self
+            .builder
+            .build_call(
+                self.funcs["json_decode_array"],
+                &[in_ptr.into(), in_len.into(), tag_v.into(), out_ptr.into()],
+                "jdeca",
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("json_decode_array returns i32"))
     }
 
     fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece], arena: Option<&Operand>) -> Result<BasicValueEnum<'c>, CodegenError> {
