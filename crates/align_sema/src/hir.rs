@@ -25,6 +25,12 @@ pub struct StructDef {
     pub name: String,
     /// Fields in declaration order; the position is the field index used by MIR/codegen.
     pub fields: Vec<FieldDef>,
+    /// A declared over-alignment in bytes (`align(N) Node { … }`, for GPU/DMA/page-aligned
+    /// zero-copy interop), or `None` for the type's natural alignment. **Reserved for M6** — there
+    /// is no surface syntax yet, so this is always `None` today (`open-questions.md` Open
+    /// "`align(N)`"). Carrying it on the type now means the M6 work is "parse `align(N)` → set this
+    /// field" + "honor it in the one alignment seam" rather than a cross-cutting retrofit.
+    pub align: Option<u32>,
 }
 
 impl StructDef {

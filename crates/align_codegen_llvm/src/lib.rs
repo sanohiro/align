@@ -623,6 +623,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .builder
                 .build_alloca(llty, &format!("_{i}"))
                 .map_err(|e| self.err(e))?;
+            // Set the slot's alignment explicitly through the one alignment seam (`type_align`).
+            // Today this is the natural ABI alignment (a no-op vs LLVM's default); at M6 a struct
+            // declared `align(N)` returns `N` here, so its stack slot is over-aligned — the single
+            // place that change lands (`open-questions.md` "`align(N)`").
+            if let Some(inst) = ptr.as_instruction() {
+                inst.set_alignment(self.type_align(*ty)).map_err(|e| self.err(e))?;
+            }
             self.slots.insert(i as Slot, ptr);
         }
 
@@ -1257,6 +1264,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .build_in_bounds_gep(arr_ty, self.slots[&slot], &[zero, index], "elemptr")
                 .map_err(|e| self.err(e))
         }
+    }
+
+    /// The **single alignment seam**: the byte alignment to use for a value/allocation of `ty`.
+    /// A struct (or struct array) declared `align(N)` returns `N`; everything else returns the
+    /// natural ABI alignment LLVM derives from the type. Reserved for M6 `align(N)` — today every
+    /// struct's `align` is `None`, so this is always the natural alignment (`open-questions.md`).
+    /// Routing all alignment through here means honoring a custom `align(N)` is a one-line change.
+    fn type_align(&self, ty: Ty) -> u32 {
+        let custom = match ty {
+            // A struct value, and a fixed AoS array of it (`[N x %Struct]`, whose alignment is the
+            // element's), take the struct's declared alignment. A `DynStructArray` slot holds a
+            // `{ptr,len}` view, not the struct — its element-buffer alignment is a heap/runtime
+            // concern (M6), so the slot itself stays naturally aligned.
+            Ty::Struct(id) | Ty::StructArray(id, _) => self.structs[id as usize].align,
+            _ => None,
+        };
+        custom.unwrap_or_else(|| self.target_data.get_abi_alignment(&self.llvm_type(ty)))
     }
 
     /// `&slot[index].field` — GEP `[0, index, field]` into a `[N x %Struct]` alloca.

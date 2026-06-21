@@ -341,10 +341,12 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
 - **SoA (`soa array<T>`) + `align(N)`** land here (layout features whose payoff is
   vectorization / aligned zero-copy interop). Both are retrofit-sensitive — keep array
   field-access lowering layout-parametric and reserve room in field-offset math *before*
-  M6 (see `open-questions.md` Open "SoA layout" / "`align(N)`"). **SoA groundwork landed:**
-  `Ty::DynStructArray` carries a `Layout` (AoS today), and all struct-array element-field
-  addressing routes through one MIR seam (`lower_field_access`) where the SoA branch hooks in.
-  `align(N)` groundwork (field-offset math + arena alignment) is still to do before M6.
+  M6 (see `open-questions.md` Open "SoA layout" / "`align(N)`"). **Groundwork landed:** SoA —
+  `Ty::DynStructArray` carries a `Layout` (AoS today) and all struct-array element-field addressing
+  routes through one MIR seam (`lower_field_access`) where the SoA branch hooks in; `align(N)` —
+  `StructDef` carries `align: Option<u32>` (None today) and codegen routes all allocation alignment
+  through one `type_align` seam. M6 then wires the `soa`/`align(N)` surface syntax + SoA codegen
+  into those seams.
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 
