@@ -2786,6 +2786,16 @@ impl<'a> Checker<'a> {
                 return err;
             }
         };
+        // A `slice<Struct>` resolves `elem` to a whole struct via the scalar arm above; that is the
+        // same deferred whole-struct value as a struct array (and its `str` fields' region tie is
+        // unhandled here), so reject it too — `arr[i].field` is the supported form.
+        if matches!(elem, Ty::Struct(_)) {
+            self.diags.error(
+                "indexing yields a whole struct, which is not supported yet — read a field directly (`arr[i].field`)".to_string(),
+                span,
+            );
+            return err;
+        }
         // A Move-only element (e.g. `array<string>`, `array<array<T>>`) cannot be indexed yet:
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
@@ -3613,6 +3623,10 @@ mod tests {
         // element's {ptr,len} without ownership transfer would double-free.
         let (_m, moveelem) = check("fn take(xs: array<array<i64>>) -> i64 {\n  ys := xs[0]\n  return ys.len()\n}\nfn main() -> i32 = 0\n");
         assert!(moveelem.has_errors(), "indexing an array of a Move type must be rejected (double-free)");
+        // A `slice<Struct>` element index also yields a whole struct (deferred) — it must not slip
+        // through the scalar-index path (its element resolves to a struct via the slice arm).
+        let (_sl, slstruct) = check("P { x: i32 }\nfn first(s: slice<P>) -> i32 {\n  q := s[0]\n  return q.x\n}\nfn main() -> i32 = 0\n");
+        assert!(slstruct.has_errors(), "indexing a slice<Struct> for a whole struct must be rejected");
     }
 
     #[test]
