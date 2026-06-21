@@ -535,13 +535,21 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      `align_rt_bounds_fail` aborting on the failing path (the settled panic model — a memory-safety
      violation in ordinary code is a hard error, never silent UB). New `ExprKind::Index` (a postfix
      `[]` operator in the parser).
-   - **Deferred (later):** **struct-element** indexing (`users[i]` whole-element load / `users[i].name`)
-     — needs a whole-struct value load + the region tie; `array<Struct>.clone()` (the escape hatch);
-     and collecting terminals' broader use over struct arrays beyond the fused reduction. The
-     `fs.read_file` / `io.stdout.write` parts of §19 are the std boundary (separate from MMv2).
-     Tuples / multi-value returns (for `partition`) and `array<slice<T>>` (for `chunks`) remain a
-     **separate** type-system track — open design items (do not fake them); they reuse this same
-     owned-aggregate + drop foundation once their surface is designed.
+   - **[done] 8f — struct-array element field access `arr[index].field`.** `users[i].name` /
+     `ps[i].x` on a fixed `array<Struct>` or an owned dynamic `array<Struct>`. Fused into one
+     bounds-checked element-field load (new HIR `ExprKind::ElemField`, lowered to the slot-based
+     `IndexField` for a stack array or the pointer-based `IndexFieldPtr` for a dynamic one — the
+     same addressing as a fused pipeline projection); no whole-struct copy. Detected in
+     `check_field_access` when the receiver is an `Index` over a struct array. A `str` field is a
+     view region-tied to the array (so it cannot escape the array's input); a Move-type field is
+     rejected (same double-free concern as 8e).
+   - **Deferred (later):** a bare whole-struct element value `users[i]` (no field) — needs a
+     whole-struct value load + region tie + the Move-field question; `array<Struct>.clone()` (the
+     escape hatch); and collecting terminals' broader use over struct arrays beyond the fused
+     reduction. The `fs.read_file` / `io.stdout.write` parts of §19 are the std boundary (separate
+     from MMv2). Tuples / multi-value returns (for `partition`) and `array<slice<T>>` (for `chunks`)
+     remain a **separate** type-system track — open design items (do not fake them); they reuse this
+     same owned-aggregate + drop foundation once their surface is designed.
 
 `out` parameters (draft.md §7) are a no-alias optimization, largely orthogonal to
 ownership/regions — deferred to its own slice (not gated on v2; recorded in `open-questions.md`).

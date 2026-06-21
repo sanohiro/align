@@ -344,6 +344,12 @@ x := xs[i]
 `xs[i]` reads element `i` of an array / slice / owned `array<T>`. The index is bounds-checked;
 an out-of-range index is a hard runtime error (abort), never a silent out-of-bounds read.
 
+A field of a struct-array element is read directly:
+
+```align
+name := users[i].name
+```
+
 ### Out Parameter
 
 ```align
