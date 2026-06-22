@@ -302,6 +302,71 @@ pub unsafe extern "C" fn align_rt_chunks(src: *const u8, src_len: i64, n: i64, e
     AlignStr { ptr: buf as *const u8, len: count }
 }
 
+/// `par_map`: allocate an output buffer of `count` elements (`out_stride` bytes each) and apply
+/// `thunk` to each of `count` input elements — reading element `i` from `in_buf + i*in_stride`,
+/// writing its result to `out + i*out_stride` — splitting the work into contiguous, **disjoint**
+/// output ranges across the available threads. No synchronization is needed: the language
+/// guarantees `thunk` (a Pure function) shares no mutable state and the ranges never overlap
+/// (`draft.md` §11). Returns the owned output buffer (freed by the generated `Drop`). `count <= 0`
+/// → null. The buffer size uses `checked_mul` (a huge `count` would otherwise under-allocate and
+/// then heap-overflow the write loop).
+///
+/// # Safety
+/// `in_buf` must point to `count` elements of `in_stride` bytes for the call; `thunk` reads one
+/// input element and writes one output element.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_par_map(
+    in_buf: *const u8,
+    count: i64,
+    in_stride: i64,
+    out_stride: i64,
+    thunk: extern "C" fn(*const u8, *mut u8),
+) -> *mut u8 {
+    if count <= 0 {
+        return core::ptr::null_mut();
+    }
+    let count = usize::try_from(count).unwrap_or_else(|_| panic_abort("par_map count overflow"));
+    let in_stride = in_stride as usize;
+    let out_stride = out_stride as usize;
+    let bytes = count
+        .checked_mul(out_stride)
+        .and_then(|b| i64::try_from(b).ok())
+        .unwrap_or_else(|| panic_abort("par_map output size overflow"));
+    let out_buf = align_rt_alloc(bytes);
+    let in_addr = in_buf as usize;
+    let out_addr = out_buf as usize;
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(count);
+    // Single-thread fast path: run on the caller, skipping the `thread::scope` overhead.
+    if nthreads <= 1 {
+        for i in 0..count {
+            let ip = (in_addr + i * in_stride) as *const u8;
+            let op = (out_addr + i * out_stride) as *mut u8;
+            thunk(ip, op);
+        }
+        return out_buf;
+    }
+    // Pass the buffers as `usize` addresses so the per-thread closures are `Send` (raw pointers
+    // are not). Each thread owns a disjoint `[start, end)` output range, so this is race-free.
+    let per = count.div_ceil(nthreads);
+    std::thread::scope(|s| {
+        for t in 0..nthreads {
+            let start = t * per;
+            if start >= count {
+                break;
+            }
+            let end = (start + per).min(count);
+            s.spawn(move || {
+                for i in start..end {
+                    let ip = (in_addr + i * in_stride) as *const u8;
+                    let op = (out_addr + i * out_stride) as *mut u8;
+                    thunk(ip, op);
+                }
+            });
+        }
+    });
+    out_buf
+}
+
 /// An append-oriented string builder (`06-runtime-std.md` §7), backing `template`
 /// desugaring. M5: heap-backed; the finished buffer is leaked (no ownership/free yet —
 /// arena-tied builders come later).

@@ -166,6 +166,11 @@ pub enum Rvalue {
     /// sub-slices, yielding an owned `array<slice<T>>` value `{ chunk_buf, count }` (via the
     /// runtime `align_rt_chunks`). The element slices borrow `src`.
     Chunks { src: Operand, n: Operand, elem: Ty },
+    /// `par_map(f)` over a `{ptr,len}` source `src` with no prior stages — apply the Pure `func`
+    /// to each element in parallel (runtime `align_rt_par_map` + a per-`func` thunk), materializing
+    /// an owned `array<elem_out>` `{ out_buf, count }`. `elem_in` is the source element type (the
+    /// `func` parameter — a scalar, or a `slice<T>` chunk); `elem_out` is `func`'s return.
+    ParMapParallel { src: Operand, func: String, elem_in: Ty, elem_out: Ty },
     /// The `len` of a slice operand.
     SliceLen(Operand),
     /// The buffer `ptr` (field 0) of a slice / owned-array `{ptr,len}` operand — the raw element
@@ -820,8 +825,43 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             lower_array_partition(b, source, stages, *elem, func, tuple_id)
         }
         hir::ExprKind::ArrayParMap { source, stages, func, elem } => {
-            // First cut: sequential — append a `map(f)` stage and materialize via the collect loop
-            // (real thread-parallel execution is a runtime follow-up).
+            // With no prior stages and a `{ptr,len}` (or fixed scalar-array) source, run in parallel
+            // via the runtime; otherwise (prior stages, struct-array source) fall back to the
+            // sequential collect loop.
+            let elem_in = match source.ty {
+                Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),
+                Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
+                _ => None,
+            };
+            if stages.is_empty() {
+                if let Some(elem_in) = elem_in {
+                    let src = match source.ty {
+                        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => lower_expr(b, source),
+                        _ => {
+                            let (slot, n) = array_source_slot(b, source);
+                            let sv = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
+                            b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, n)));
+                            Operand::Value(sv)
+                        }
+                    };
+                    // Free the source buffer if it is an owned temporary the runtime just consumed
+                    // (same rule as `setup_source`: `chunks`/call results are always heap; the
+                    // materializing terminals arena-allocate inside an arena and are bulk-freed).
+                    let free_src = matches!(source.kind, hir::ExprKind::ArrayChunks { .. } | hir::ExprKind::Call { .. })
+                        || (matches!(
+                            source.kind,
+                            hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. }
+                                | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. }
+                        ) && b.arenas.is_empty());
+                    let v = b.fresh_value(e.ty);
+                    b.push(Stmt::Let(v, Rvalue::ParMapParallel { src: src.clone(), func: func.clone(), elem_in, elem_out: *elem }));
+                    if free_src {
+                        b.push(Stmt::DropValue(src));
+                    }
+                    return Operand::Value(v);
+                }
+            }
+            // Sequential fallback: append a `map(f)` stage and materialize via the collect loop.
             let mut stages2 = stages.clone();
             stages2.push(hir::Stage { kind: hir::StageKind::Map { func: func.clone() }, out_ty: *elem });
             lower_array_collect(b, source, &stages2, *elem, CollectKind::Collect)

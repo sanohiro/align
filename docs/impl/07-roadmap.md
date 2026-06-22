@@ -462,8 +462,14 @@ Completion condition: confirm that the vectorized code contains vector instructi
   so `par_map(f)` with `f: (slice<T>) -> R` reduces each chunk; the per-chunk results materialize
   into `array<R>` (which a further reduction can fold). The Pure requirement still applies.
   Lowers via the existing collect loop (sequential). (`examples/chunk_parallel.align`.)
-- [todo] thread-parallel execution of `par_map` (a runtime work-splitting layer) — the perf
-  widening of the sequential walking skeleton.
+- [done] **thread-parallel execution of `par_map`** — the perf widening of the sequential
+  skeleton. A direct (no prior stages) `{ptr,len}` / scalar-array / `chunks` source lowers to
+  `Rvalue::ParMapParallel`: codegen emits a per-function `void(in, out)` thunk (load element → call
+  `f` → store result) and the runtime `align_rt_par_map` splits `[0, count)` into disjoint output
+  ranges across `available_parallelism()` threads (`std::thread::scope`). Race-free **by
+  construction** — `f` is Pure (no shared mutable state) and the output ranges never overlap. A
+  *staged* `par_map` (`where(p).par_map(f)`) still uses the sequential collect loop (a flat split
+  can't see through a filter). Results are identical to the sequential lowering.
 - `task_group` / `spawn` / `wait` (I/O concurrency).
 - async/await is not included (`non-goals.md`).
 
