@@ -218,6 +218,21 @@ fn bound_owned_tuple_copy_field_read() {
 }
 
 #[test]
+fn owned_tuple_use_after_move_rejected() {
+    // Consuming a Move tuple twice (destructure, then destructure again) is a use-after-move —
+    // must be a compile error, not a runtime double-free.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1].to_array()\n  b := [2].to_array()\n  return (a, b)\n}\nfn main() -> Result<(), Error> {\n  t := split()\n  (a, b) := t\n  (c, d) := t\n  print(a.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("tup-uam", src));
+}
+
+#[test]
+fn owned_tuple_use_after_pass_rejected() {
+    // Passing a Move tuple to a function consumes it; using it afterwards is a use-after-move.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1].to_array()\n  b := [2].to_array()\n  return (a, b)\n}\nfn take(t: (array<i64>, array<i64>)) -> i64 = 0\nfn main() -> Result<(), Error> {\n  t := split()\n  print(take(t))\n  (a, b) := t\n  print(a.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("tup-uap", src));
+}
+
+#[test]
 fn owned_tuple_field_index_rejected() {
     // Reading an *owned* element by index (`t.0` = array) would partially move it out — rejected;
     // destructure instead.
@@ -226,8 +241,26 @@ fn owned_tuple_field_index_rejected() {
 }
 
 #[test]
-fn owned_tuple_param_rejected() {
-    // Cut: an owned tuple may not be a function parameter (it would need callee-side drop).
-    let src = "fn f(t: (array<i64>, array<i64>)) -> i32 = 0\nfn main() -> i32 = 0\n";
-    assert!(check_errs("tup-owned-param", src));
+fn owned_tuple_param_destructured() {
+    if !backend_available() {
+        return;
+    }
+    // An owned tuple passed as a parameter and destructured in the callee; each buffer freed once.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1, 2, 3].to_array()\n  b := [10, 20].to_array()\n  return (a, b)\n}\nfn sumboth(t: (array<i64>, array<i64>)) -> i64 {\n  (a, b) := t\n  return a.sum() + b.sum()\n}\nfn main() -> Result<(), Error> {\n  print(sumboth(split()))\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-param-destr", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n");
+}
+
+#[test]
+fn owned_tuple_param_dropped_in_callee() {
+    if !backend_available() {
+        return;
+    }
+    // An owned tuple parameter that the callee never consumes is dropped (its owned elements
+    // freed) at the callee's exit — no leak, no double-free.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1].to_array()\n  b := [2].to_array()\n  return (a, b)\n}\nfn ignore(t: (array<i64>, array<i64>)) -> i64 = 7\nfn main() -> Result<(), Error> {\n  print(ignore(split()))\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-param-drop", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
 }
