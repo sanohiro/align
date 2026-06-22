@@ -2076,16 +2076,19 @@ impl<'a> Checker<'a> {
                         );
                         return None;
                     }
-                    if mapped {
+                    if !matches!(elem, Ty::Struct(_)) {
                         self.diags.error(
-                            format!("'.{}' field projection after 'map' is not supported (map produces a computed value, not a source element)", field.name),
+                            format!("'.{}' projection needs a struct element, got {}", field.name, ty_name(elem)),
                             field.span,
                         );
                         return None;
                     }
-                    if !matches!(elem, Ty::Struct(_)) {
+                    // A struct element after a `map` is the map's (struct) result, not a source
+                    // element — projection reads the source, so reject it (checked after the
+                    // struct-type check so a non-struct gets the more fundamental diagnostic).
+                    if mapped {
                         self.diags.error(
-                            format!("'.{}' projection needs a struct element, got {}", field.name, ty_name(elem)),
+                            format!("'.{}' field projection after 'map' is not supported (map produces a computed value, not a source element)", field.name),
                             field.span,
                         );
                         return None;
@@ -2127,16 +2130,18 @@ impl<'a> Checker<'a> {
                         );
                         return None;
                     }
-                    if mapped {
+                    if !matches!(elem, Ty::Struct(_)) {
                         self.diags.error(
-                            format!("'where(.{})' after 'map' is not supported (map produces a computed value, not a source element)", field.name),
+                            format!("'where(.{})' needs a struct element, got {}", field.name, ty_name(elem)),
                             field.span,
                         );
                         return None;
                     }
-                    if !matches!(elem, Ty::Struct(_)) {
+                    // Same as projection: a struct element after a `map` is the map result, not a
+                    // source element (struct-type check first so a non-struct reports that first).
+                    if mapped {
                         self.diags.error(
-                            format!("'where(.{})' needs a struct element, got {}", field.name, ty_name(elem)),
+                            format!("'where(.{})' after 'map' is not supported (map produces a computed value, not a source element)", field.name),
                             field.span,
                         );
                         return None;
