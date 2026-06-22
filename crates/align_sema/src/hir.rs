@@ -265,6 +265,10 @@ pub enum ExprKind {
     /// `to_array`), with real thread-parallel execution a runtime follow-up. `func` is required to
     /// be Pure (checked in the parallelism pass over the full call graph).
     ArrayParMap { source: Box<Expr>, stages: Vec<Stage>, func: String, elem: crate::Ty },
+    /// `arr.chunks(n)` — split `source` (an array/slice of primitive `elem`) into sub-slices of
+    /// length `n` (the last may be shorter), yielding an owned `array<slice<elem>>` whose elements
+    /// borrow `source`. The unit of chunk parallelism (`draft.md` §11). `n` is an `i64`.
+    ArrayChunks { source: Box<Expr>, n: Box<Expr>, elem: crate::Ty },
     /// Borrow an array (a local stack array) as a `slice<T>` view — `{ &arr[0], len }`.
     /// Allocation-free, so it is an implicit coercion at call sites.
     ArrayToSlice(Box<Expr>),

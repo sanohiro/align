@@ -168,6 +168,12 @@ pub enum Ty {
     DynStructArray(u32, Layout),
     /// `slice<T>` — a borrowed view `{ T* ptr, i64 len }` of scalar elements. Copy. M4.
     Slice(Scalar),
+    /// `array<slice<T>>` — an *owned*, dynamic-length array whose elements are `slice<T>` views
+    /// (each `{ T* ptr, i64 len }`). Laid out like a slice (`{ slice* ptr, i64 count }`), Move
+    /// (owns the buffer of slice headers, freed at scope exit), and region-tracked (the element
+    /// slices borrow a source array, so the whole thing cannot outlive it). Produced by
+    /// `chunks(n)` — the unit of chunk parallelism (`draft.md` §11). `T` is a primitive scalar.
+    DynSliceArray(PrimScalar),
     /// `array<T>` — an *owned*, dynamic-length array of scalars, laid out like a slice
     /// (`{ T* ptr, i64 len }`) but Move and region-tracked. MMv2 slice 3: produced by a
     /// materializing terminal (`.to_array()`) and (this slice) arena-bump-allocated.
@@ -262,7 +268,7 @@ fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
 /// region is `Static`) — the predicate the drop set is built from. A free-standing owned
 /// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
 fn is_owned_droppable(ty: Ty) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(ty)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty)
 }
 
 impl Ty {
@@ -592,6 +598,10 @@ impl EffectScan {
                 self.expr(a);
                 self.expr(b);
             }
+            ExprKind::ArrayChunks { source, n, .. } => {
+                self.expr(source);
+                self.expr(n);
+            }
             // Structural recursion (no effect of their own).
             ExprKind::Unary { expr, .. } => self.expr(expr),
             ExprKind::Binary { lhs, rhs, .. } => {
@@ -769,7 +779,7 @@ impl<'a> EscapeCheck<'a> {
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
     fn tracks_region(&self, ty: Ty) -> bool {
         match ty {
-            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) => true,
+            Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => true,
             // A tuple is region-tracked iff any element is (today: a `str` element — a view tied to
             // its source). A tuple of plain scalars is Copy / `Static`, freely returnable.
             Ty::Tuple(id) => self.tuples[id as usize].elems.iter().any(|s| self.tracks_region(scalar_to_ty(*s))),
@@ -842,6 +852,8 @@ impl<'a> EscapeCheck<'a> {
             // `t.N` reads an element; a `str` element is a view into the tuple, so it inherits the
             // tuple's region (a scalar element is Copy → harmless to inherit, never checked).
             ExprKind::TupleIndex { recv, .. } => self.region_of(recv, depth),
+            // `chunks` makes an array of slices that borrow the source array — region-tied to it.
+            ExprKind::ArrayChunks { source, .. } => self.region_of(source, depth),
             // Borrowing an array as a slice preserves the array's region — a `slice<str>` coerced
             // from an arena str-array must not outlive that arena.
             ExprKind::ArrayToSlice(inner) => self.region_of(inner, depth),
@@ -1082,6 +1094,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(a, depth);
                 self.walk(b, depth);
             }
+            ExprKind::ArrayChunks { source, n, .. } => {
+                self.walk(source, depth);
+                self.walk(n, depth);
+            }
             ExprKind::ArrayLit { elems, .. } => {
                 for e in elems {
                     self.walk(e, depth);
@@ -1140,7 +1156,7 @@ impl<'a> MoveCheck<'a> {
 
     /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple.
     fn is_move_ty(&self, ty: Ty) -> bool {
-        matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder)
+        matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
             || payload_is_move(ty)
             || ty_tuple_is_move(ty, self.tuples)
     }
@@ -1286,6 +1302,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ArrayDot { a, b, .. } => {
                 self.expr(a, moved, false, false);
                 self.expr(b, moved, false, false);
+            }
+            ExprKind::ArrayChunks { source, n, .. } => {
+                self.expr(source, moved, false, false);
+                self.expr(n, moved, false, false);
             }
             ExprKind::ArrayLit { elems, .. } => {
                 for e in elems {
@@ -2418,6 +2438,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "par_map" {
             return self.check_array_par_map(recv, args, span);
         }
+        if method == "chunks" {
+            return self.check_array_chunks(recv, args, span);
+        }
         // Builder methods (MMv2 slice 7c/7d): typed `write*` appends, `to_string` finishes.
         if let Some(kind) = builder_write_kind(method) {
             return self.check_builder_write(recv, args, kind, span);
@@ -2878,6 +2901,58 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::ArrayPartition { source: Box::new(source), stages, func: fname.name, elem },
             ty: Ty::Tuple(tuple_id),
+            span,
+        }
+    }
+
+    /// `arr.chunks(n)` — split an array/slice of a primitive scalar into length-`n` sub-slices
+    /// (the last may be shorter), yielding an owned `array<slice<T>>` whose elements borrow `arr`.
+    /// The result is region-tied to `arr` (the chunk slices view its storage).
+    fn check_array_chunks(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [n_arg] = args else {
+            self.diags.error(format!("'chunks' takes 1 argument (the chunk size), got {}", args.len()), span);
+            return err;
+        };
+        let n = self.check_expr(n_arg, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if n.ty == Ty::Error {
+            return err;
+        }
+        if !n.ty.is_int_like() {
+            self.diags.error(format!("'chunks' size must be an integer, got {}", ty_name(n.ty)), n_arg.span);
+            return err;
+        }
+        let src = self.check_expr(recv, None);
+        let elem_scalar = match src.ty {
+            Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => s,
+            Ty::Error => return err,
+            other => {
+                self.diags.error(
+                    format!("'chunks' needs an array or slice, got {}", ty_name(other)),
+                    span,
+                );
+                return err;
+            }
+        };
+        let Some(prim) = scalar_to_prim(elem_scalar) else {
+            self.diags.error(
+                format!("'chunks' element must be a primitive scalar (int/float/bool/char), got {}", ty_name(scalar_to_ty(elem_scalar))),
+                span,
+            );
+            return err;
+        };
+        // A fixed stack array source must be a literal or a named local (slot-addressable, like a
+        // pipeline source) so MIR can take its buffer address; a `{ptr,len}` view is fine as a value.
+        if matches!(src.ty, Ty::Array(..)) && !matches!(src.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+            self.diags.error(
+                "'chunks' over a stack array must start from an array literal or a variable".to_string(),
+                span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ArrayChunks { source: Box::new(src), n: Box::new(n), elem: scalar_to_ty(prim_to_scalar(prim)) },
+            ty: Ty::DynSliceArray(prim),
             span,
         }
     }
@@ -3516,7 +3591,7 @@ impl<'a, 't> Checker<'a, 't> {
         let r = self.check_expr(recv, None);
         match r.ty {
             // `str`/`slice` carry a runtime length in their `{ ptr, len }` view.
-            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
@@ -3547,6 +3622,8 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let elem = match r.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
+            // Indexing an `array<slice<T>>` (a `chunks` result) yields one chunk `slice<T>`.
+            Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
             Ty::StructArray(..) | Ty::DynStructArray(..) => {
                 // A whole-struct element value is deferred (it needs a struct copy + region tie);
                 // `arr[i].field` is supported and handled in `check_field_access`.
@@ -3920,6 +3997,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(a);
                 self.finalize_expr(b);
             }
+            ExprKind::ArrayChunks { source, n, .. } => {
+                self.finalize_expr(source);
+                self.finalize_expr(n);
+            }
             ExprKind::ArrayLit { elems, .. } => {
                 for e in elems {
                     self.finalize_expr(e);
@@ -4027,6 +4108,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
+        Ty::DynSliceArray(p) => format!("array<slice<{}>>", scalar_name(prim_to_scalar(p))),
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
         Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
         Ty::Str => "str".to_string(),
