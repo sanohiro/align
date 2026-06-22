@@ -2765,13 +2765,16 @@ impl<'a, 't> Checker<'a, 't> {
             return None;
         };
         let (params, ret) = (sig.params.clone(), sig.ret);
-        if params.as_slice() != expected_params || expected_ret.is_some_and(|er| er != ret) {
-            let want_ret = expected_ret.unwrap_or(ret);
+        // Resolve the expected types first: an unresolved inference variable (e.g. an inline
+        // literal's element type) must not false-positive against the concrete signature.
+        let expected_resolved: Vec<Ty> = expected_params.iter().map(|&t| self.resolve(t)).collect();
+        if params.as_slice() != expected_resolved.as_slice() || expected_ret.is_some_and(|er| self.resolve(er) != ret) {
+            let want_ret = self.resolve(expected_ret.unwrap_or(ret));
             self.diags.error(
                 format!(
                     "'{}' must have type ({}) -> {} here",
                     fname.name,
-                    expected_params.iter().map(|t| ty_name(*t)).collect::<Vec<_>>().join(", "),
+                    expected_resolved.iter().map(|t| ty_name(*t)).collect::<Vec<_>>().join(", "),
                     ty_name(want_ret),
                 ),
                 fname.span,
@@ -3298,6 +3301,11 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
+        // A failed initial value leaves `acc_ty == Ty::Error`; bail before resolving the function
+        // so it doesn't cascade into the lambda body / signature check (matching `scan`).
+        if acc_ty == Ty::Error {
+            return err;
+        }
         // `f: (acc, elem) -> acc` (named or lambda).
         let Some((func, _)) = self.resolve_fn(fn_arg, &[acc_ty, elem], Some(acc_ty), "reduce", span) else {
             return err;
