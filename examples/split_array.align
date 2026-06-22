@@ -1,0 +1,18 @@
+// Owned (Move) values in a tuple: a function hands back two owned arrays as `(array, array)`,
+// and the caller destructures them. Each buffer is freed exactly once — building `(a, b)` moves
+// a and b into the returned tuple (their source slots are nulled), and the destructure transfers
+// ownership to `xs`/`ys`, which are freed at scope exit.
+//
+// An owned tuple is a temporary here: it is returned and destructured, but not bound to a
+// variable (`t := split()`) or passed as a parameter — those are a later slice.
+fn split() -> (array<i64>, array<i64>) {
+  a := [1, 2, 3].to_array()
+  b := [10, 20].to_array()
+  return (a, b)
+}
+
+fn main() -> Result<(), Error> {
+  (xs, ys) := split()
+  print(xs.sum() + ys.sum())   // 6 + 30 = 36
+  return Ok(())
+}
