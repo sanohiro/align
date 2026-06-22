@@ -175,7 +175,15 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   array-valued results, and the materializing terminals `scan`/`sort`/`to_array` all landed on
   the owned/dynamic-heap-array + drop foundation. Non-materializing terminals
   (`sum`/`reduce`/`count`/`any`/`all`) were already complete. Still deferred: `chunks` (needs
-  `array<slice<T>>`, a separate type-system track) and `out` args (the post-MMv2 `noalias` work).
+  `array<slice<T>>`, a separate type-system track).
+- [done] **mutable element writes + `out` parameters (write mechanism)** — `place[i] = v` into a
+  `mut` array local or an `out slice<T>` parameter (a writable output buffer the callee fills),
+  bounds-checked (abort on out-of-range, like a read). `out` is restricted to `slice<T>` params and
+  marks the local writable; the store lowers through the slice buffer pointer (`SlicePtr` +
+  `PtrStore`) or a fixed array's slot (`StoreIndex`). First cut: primitive elements only (a `str`
+  element store needs a region check; struct/Move need ownership handling). The **no-alias check +
+  LLVM `noalias`** (the vectorization payoff — `out` declaring `dst` distinct from the inputs) is
+  the follow-up. (`examples/out_param.align`.)
 - [done] **`partition(p)`** — split a pipeline's surviving (primitive-scalar) elements into two
   owned arrays `(array<T>, array<T>)` (predicate true, then false) in one fused loop with two
   buffers + a per-element branch (`lower_array_partition`, the `to_array` collect loop doubled),

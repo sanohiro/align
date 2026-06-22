@@ -1,0 +1,18 @@
+// An `out` parameter is a writable output buffer (a `slice<T>` the callee writes back
+// through), and elements of a `mut` array or `out` slice are assignable: `dst[i] = v`
+// (bounds-checked). `scale` fills `dst` from `src`; `main` passes its array and reads it.
+//
+// `out` will also drive the no-alias / SIMD story (it declares `dst` distinct from the
+// other inputs) — that optimization is a follow-up; here it is the writable-buffer mechanism.
+fn scale(src: slice<i64>, out dst: slice<i64>) {
+  dst[0] = src[0] * 10
+  dst[1] = src[1] * 10
+}
+
+fn main() -> i32 {
+  xs := [2, 4, 0]
+  mut ys := [0, 0, 0]
+  scale(xs, ys)
+  if ys[0] + ys[1] == 60 { return 60 }   // 20 + 40 = 60
+  return 0
+}

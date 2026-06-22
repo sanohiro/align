@@ -117,8 +117,15 @@ Record: `impl/05-backend-llvm.md` §2, `design-notes.md` (hardware-friendly).
 A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) data := …`) for GPU/DMA/page-aligned zero-copy interop. **Retrofit-sensitive**: it modifies struct field-offset math and the arena bump allocator's alignment, so reserve room in the layout model now; the surface + LLVM `align N` emission + arena honoring it can land at M6 alongside SoA. (Digested from `work/proposals/next-draft.md` §1.1.)
 **Groundwork landed (pre-M6):** `StructDef` carries `align: Option<u32>` (always `None` today — no surface syntax), and codegen routes all allocation alignment through one seam, `type_align(ty)` (natural ABI alignment today; a struct's custom `align` if set). M6 work is then "parse `align(N)` → set `StructDef.align`" + the seam returns it — the stack-slot alloca already calls the seam; the arena bump allocator already takes an explicit `align` argument. (Retrofit risk was low — a custom alignment is largely *additive* at the alloca/global/alloc sites — so this groundwork is a light reservation, unlike the SoA field-access seam.)
 
-### `out` parameters + `noalias` — fold into the post-MMv2 aliasing work
-`out` params (`draft.md` §7) are a no-alias optimization. The compiler's `EscapeCheck`/`MoveCheck` (Memory Model v2) already track which views may overlap; an `out` param / non-aliasing view lowers to LLVM `noalias` metadata, letting loop vectorization skip runtime overlap checks. **Schedule right after MMv2** (it is a direct extension of the analysis being written there), not in a separate far-future phase. (Digested from `work/proposals/optimization-milestones.md` §1.2, `toolchain-optimizations.md` §5; see also `08-memory-model-v2.md` §11 "out parameters".)
+### `out` parameters + `noalias` — write mechanism DONE; no-alias check is the follow-up
+`out` params (`draft.md` §7) are a no-alias optimization. **The write mechanism is implemented**:
+`out dst: slice<T>` is a writable output buffer, and `place[i] = v` (bounds-checked) writes a `mut`
+array local or `out` slice (primitive elements; the store lowers through the slice buffer pointer
+or a fixed array's slot). **What remains is the optimization itself**: at a call site, check the
+`out` arg does not alias the other reference args (the compiler's `EscapeCheck`/`MoveCheck` already
+track which views may overlap), then lower the `out` param to LLVM `noalias` metadata so loop
+vectorization can skip runtime overlap checks. (Digested from `work/proposals/optimization-milestones.md`
+§1.2, `toolchain-optimizations.md` §5; see also `08-memory-model-v2.md` §11 "out parameters".)
 
 ### SoA conversion trigger
 Whether to automate the decision to lay out `array<T>` as SoA, or use annotation. Impact on the array ABI (`impl/05-backend-llvm.md` §2). (Subsumed by "SoA layout" above; kept as the open auto-vs-annotation sub-question.)
