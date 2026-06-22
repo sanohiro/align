@@ -435,6 +435,32 @@ fn json_decode_struct_array_pipeline_empty() {
 }
 
 #[test]
+fn json_decode_struct_array_map_sum() {
+    if !backend_available() {
+        return;
+    }
+    // `map(f)` over whole struct elements of an owned, dynamic `array<Struct>` (decoded from
+    // JSON), loaded through the buffer pointer (`IndexPtr`): dbl(u) = u.score * 2 → 20 + 22 = 42.
+    let src = "User { score: i64, active: bool }\nfn dbl(u: User) -> i64 = u.score * 2\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"score\\\":10,\\\"active\\\":true},{\\\"score\\\":11,\\\"active\\\":true}]\")?\n  print(users.map(dbl).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-struct-map", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+#[test]
+fn json_decode_struct_array_where_field_then_map() {
+    if !backend_available() {
+        return;
+    }
+    // `where(.active)` then `map(f)` over the surviving whole structs of a dynamic `array<Struct>`:
+    // dbl(u) = u.score * 2 over active rows → 10*2 + 5*2 = 30 (bob, inactive, is skipped).
+    let src = "User { active: bool, score: i64 }\nfn dbl(u: User) -> i64 = u.score * 2\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":5}]\")?\n  print(users.where(.active).map(dbl).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-struct-wheremap", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n");
+}
+
+#[test]
 fn array_index_fixed_and_owned() {
     if !backend_available() {
         return;

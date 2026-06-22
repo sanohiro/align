@@ -139,6 +139,11 @@ pub enum Rvalue {
     /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
     /// fused pipeline (`users.where(.active).score.sum()`) can run over a runtime-length AoS.
     IndexFieldPtr { base: Operand, index: Operand, field: u32, struct_id: u32 },
+    /// `base[index]` — load a **whole** struct element of `struct_id` from a `{ptr,len}` view of
+    /// an owned, dynamic `array<Struct>` (GEP `%Struct, ptr, index`, then load the aggregate). The
+    /// field-less analogue of [`Rvalue::IndexFieldPtr`]; emitted by `map(f)` whose `f` consumes a
+    /// struct element by value (a fixed stack `array<Struct>` uses [`Rvalue::Index`] instead).
+    IndexPtr { base: Operand, index: Operand, struct_id: u32 },
     /// Borrow array `slot` (length `n`) as a slice value `{ &slot[0], n }`.
     MakeSlice(Slot, i128),
     /// Bump-allocate `count` elements of type `elem` in the arena `handle`; yields the
@@ -1045,6 +1050,36 @@ fn lower_field_access(
     v
 }
 
+/// Load a **whole** struct element `src[index]` for a `map(f)` whose `f` consumes the struct by
+/// value (the whole-element companion of [`lower_field_access`]). A fixed stack `array<Struct>`
+/// (`struct_view == None`) loads the aggregate straight from its slot ([`Rvalue::Index`]); an
+/// owned dynamic `array<Struct>` view loads through the buffer pointer ([`Rvalue::IndexPtr`]). The
+/// `match layout` mirrors the field seam: `Layout::Soa` (M6) makes it non-exhaustive here too.
+fn lower_struct_elem(
+    b: &mut Builder,
+    struct_view: Option<(u32, Layout)>,
+    slice_val: &Option<Operand>,
+    slot: Slot,
+    index: &Operand,
+    struct_id: u32,
+) -> ValueId {
+    let v = b.fresh_value(Ty::Struct(struct_id));
+    match struct_view {
+        Some((sid, layout)) => match layout {
+            Layout::Aos => b.push(Stmt::Let(
+                v,
+                Rvalue::IndexPtr {
+                    base: slice_val.clone().expect("a struct-view source has a {ptr,len} value"),
+                    index: index.clone(),
+                    struct_id: sid,
+                },
+            )),
+        },
+        None => b.push(Stmt::Let(v, Rvalue::Index(slot, index.clone()))),
+    }
+    v
+}
+
 fn lower_array_reduce(
     b: &mut Builder,
     source: &hir::Expr,
@@ -1112,7 +1147,18 @@ fn lower_array_reduce(
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func } => {
-                let arg = cur.take().expect("map before projection");
+                // A scalar element is already loaded; a struct element consumed whole (a
+                // `map(f)` with no prior `.field`) is loaded here by index.
+                let arg = match cur.take() {
+                    Some(a) => a,
+                    None => {
+                        let sid = match source.ty {
+                            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
+                            _ => unreachable!("map with no loaded element must be over a struct array"),
+                        };
+                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                    }
+                };
                 let v = b.fresh_value(stage.out_ty);
                 b.push(Stmt::Let(v, Rvalue::Call(func.clone(), vec![arg])));
                 cur = Some(Operand::Value(v));
@@ -1299,7 +1345,18 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func } => {
-                let arg = cur.take().expect("map before projection");
+                // A scalar element is already loaded; a struct element consumed whole (a
+                // `map(f)` with no prior `.field`) is loaded here by index.
+                let arg = match cur.take() {
+                    Some(a) => a,
+                    None => {
+                        let sid = match source.ty {
+                            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
+                            _ => unreachable!("map with no loaded element must be over a struct array"),
+                        };
+                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                    }
+                };
                 let v = b.fresh_value(stage.out_ty);
                 b.push(Stmt::Let(v, Rvalue::Call(func.clone(), vec![arg])));
                 cur = Some(Operand::Value(v));

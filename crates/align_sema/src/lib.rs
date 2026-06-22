@@ -2062,12 +2062,23 @@ impl<'a> Checker<'a> {
         // `{ptr,len}` view (`slice` / owned scalar `array`) has no per-element struct to project.
         let slot_backed = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(..));
         let mut stages = Vec::new();
+        // `.field` / `where(.field)` read the *source* element by index; after a `map` the logical
+        // element is a computed value no longer in the source buffer, so those stages are only
+        // valid before any `map`.
+        let mut mapped = false;
         for raw in raw_stages {
             match raw {
                 RawStage::Project(field) => {
                     if !slot_backed {
                         self.diags.error(
                             format!("'.{}' field projection needs an array source, not a slice/array view", field.name),
+                            field.span,
+                        );
+                        return None;
+                    }
+                    if mapped {
+                        self.diags.error(
+                            format!("'.{}' field projection after 'map' is not supported (map produces a computed value, not a source element)", field.name),
                             field.span,
                         );
                         return None;
@@ -2088,19 +2099,14 @@ impl<'a> Checker<'a> {
                     }
                 }
                 RawStage::Map(fname) => {
-                    // A struct element must be projected to a scalar first: MIR keeps a
-                    // struct array addressed by index until a `.field`, so a `map`/`where`
-                    // over the whole struct has nothing loaded and would crash lowering.
-                    if matches!(elem, Ty::Struct(_)) {
-                        self.diags.error(
-                            format!("'map' over a struct element is not supported yet (project a field first), got {}", ty_name(elem)),
-                            fname.span,
-                        );
-                        return None;
-                    }
+                    // `map(f)` accepts a scalar element or a whole struct element: a struct array
+                    // stays index-addressed until used, and a struct-consuming `map` loads the
+                    // element by index in MIR (`lower_struct_elem`). `check_stage_fn` requires `f`'s
+                    // single parameter to match the current element type (scalar or struct).
                     let ret = self.check_stage_fn(&fname, elem, false);
                     stages.push(Stage { kind: StageKind::Map { func: fname.name }, out_ty: ret });
                     elem = ret;
+                    mapped = true;
                 }
                 RawStage::Where(fname) => {
                     if matches!(elem, Ty::Struct(_)) {
@@ -2117,6 +2123,13 @@ impl<'a> Checker<'a> {
                     if !slot_backed {
                         self.diags.error(
                             format!("'where(.{})' needs an array source, not a slice/array view", field.name),
+                            field.span,
+                        );
+                        return None;
+                    }
+                    if mapped {
+                        self.diags.error(
+                            format!("'where(.{})' after 'map' is not supported (map produces a computed value, not a source element)", field.name),
                             field.span,
                         );
                         return None;

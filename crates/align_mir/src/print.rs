@@ -113,6 +113,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
             format!("{}[{}].{field} (struct#{struct_id})", operand_str(base), operand_str(index))
         }
+        Rvalue::IndexPtr { base, index, struct_id } => {
+            format!("{}[{}] (struct#{struct_id})", operand_str(base), operand_str(index))
+        }
         Rvalue::MakeSlice(slot, n) => format!("slice(_{slot}, {n})"),
         Rvalue::ArenaAlloc { handle, count, elem } => {
             format!("arena_alloc({}, {} x {})", operand_str(handle), operand_str(count), crate::ty_name(*elem))

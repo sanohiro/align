@@ -1,0 +1,16 @@
+// `map(f)` over whole struct elements (M4). A struct array stays index-addressed until
+// used; a struct-consuming `map` loads each element by value and calls `f`. Here
+// `where(.active)` filters on a source field first, then `map(net)` maps each surviving
+// `Emp` to a number, and `sum` folds — all one fused loop, no intermediate arrays.
+// active rows: {base 30, bonus 12} and {base 18, bonus 4} → (30+12) + (18+4) = 64.
+Emp { base: i32, bonus: i32, active: bool }
+
+fn net(e: Emp) -> i32 = e.base + e.bonus
+
+fn main() -> i32 {
+  return [
+    Emp{base: 30, bonus: 12, active: true},
+    Emp{base: 99, bonus: 99, active: false},
+    Emp{base: 18, bonus: 4, active: true},
+  ].where(.active).map(net).sum()
+}

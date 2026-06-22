@@ -244,6 +244,39 @@ fn array_dot_float() {
 }
 
 #[test]
+fn struct_array_map_to_scalar_sum() {
+    if !backend_available() {
+        return;
+    }
+    // `map(f)` over whole struct elements of a fixed stack `array<Struct>` (loaded by `Index`):
+    // f(e) = e.base + e.bonus → (10+5) + (20+7) = 42.
+    let src = "Emp { base: i32, bonus: i32 }\nfn total(e: Emp) -> i32 = e.base + e.bonus\nfn main() -> i32 {\n  return [Emp{base: 10, bonus: 5}, Emp{base: 20, bonus: 7}].map(total).sum()\n}\n";
+    let out = build_and_run("struct-map-sum", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn struct_array_where_field_then_map() {
+    if !backend_available() {
+        return;
+    }
+    // `where(.active)` (reads the source element) then `map(f)` over the surviving whole structs:
+    // dbl(e) = e.base * 2 over the active rows → 10*2 + 11*2 = 42.
+    let src = "Emp { base: i32, active: bool }\nfn dbl(e: Emp) -> i32 = e.base * 2\nfn main() -> i32 {\n  return [Emp{base: 10, active: true}, Emp{base: 50, active: false}, Emp{base: 11, active: true}].where(.active).map(dbl).sum()\n}\n";
+    let out = build_and_run("struct-wheremap", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn map_then_field_projection_errors() {
+    // `.field` after `map` is rejected (map yields a computed value, not a source element).
+    let mut sm = SourceMap::new();
+    let src = "Emp { base: i32 }\nfn keep(e: Emp) -> Emp = e\nfn main() -> i32 {\n  return [Emp{base: 1}].map(keep).base.sum()\n}\n";
+    let checked = check(&mut sm, "a.align", src);
+    assert!(checked.diags.has_errors(), "expected a 'projection after map' error");
+}
+
+#[test]
 fn array_sum_emits_single_loop() {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "a.align", "fn main() -> i32 {\n  return [1, 2, 3].sum()\n}\n");

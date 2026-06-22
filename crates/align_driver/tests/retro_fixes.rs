@@ -93,11 +93,14 @@ fn if_array_coerced_to_slice_is_rejected_not_panicked() {
     assert!(check_errs("if-arr-slice", src));
 }
 
-// --- #33: `.map()` / `.where()` directly on a struct array (before projecting a field)
-//          is rejected cleanly (it used to panic `cur.take().expect("map before ...")`) ---
+// --- #33: a struct-array pipeline stage that has nothing scalar loaded is rejected cleanly
+//          (it used to panic `cur.take().expect("map before ...")`). `map(f)` over a whole
+//          struct is now *supported* (loaded by value); the cases below are the ones that stay
+//          rejected: a `.field` projection after `map` (it reads the source, not the map result),
+//          and `where(structfn)` over a whole struct (use `where(.field)` or project first). ---
 
 #[test]
-fn map_over_struct_element_is_rejected_not_panicked() {
+fn field_projection_after_map_is_rejected_not_panicked() {
     let src = "Point { x: i32, y: i32 }\nfn bump(p: Point) -> Point = p\nfn main() -> i32 {\n  return [Point { x: 1, y: 2 }].map(bump).x.sum()\n}\n";
     assert!(check_errs("map-struct", src));
 }
