@@ -243,6 +243,25 @@ user: User := json.decode(data)?
 
 `?` is Result-only.
 
+### Tuple
+
+An anonymous, positional product type `(T, U, ...)` — the companion of the keyword-less
+named struct (a named struct for a domain type, a tuple for an ad-hoc "several things"
+result). A function returns multiple values by returning a tuple; there is no separate
+multiple-return mechanism.
+
+```align
+fn divmod(a: i32, b: i32) -> (i32, i32) = (a / b, a % b)
+
+t := divmod(17, 5)        // a tuple value
+(q, r) := t               // destructure; `_` ignores an element
+first := t.0              // positional access: `t.0`, `t.1`, ...
+```
+
+`()` is unit and `(e)` is just grouping, so a tuple has arity ≥ 2. A tuple's ownership is
+derived from its elements (Move if any element is Move; a tuple of views is region-tied to
+their sources) — the same rule as a struct, no new ownership concept.
+
 ---
 
 ## 6. Memory Model

@@ -190,6 +190,10 @@ pub enum Ty {
     ErrCode,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
+    /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
+    /// are primitive scalars (Copy, `Static`) — a tuple is Copy and never dropped/region-tied
+    /// yet; owned/`str` elements are a later, additive slice.
+    Tuple(u32),
     Unit,
     /// Type-checking error sentinel (bottom). Distinct from the `Error` *type*
     /// ([`Ty::ErrCode`]).
@@ -296,50 +300,47 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         }
     }
 
+    // The shared tuple-type interner (anonymous `(T, U, …)`), built on demand as types resolve.
+    let mut tuples: Vec<hir::TupleDef> = Vec::new();
+
     // Pass 0b: resolve field types. M1 restricts struct fields to primitives.
-    let structs: Vec<StructDef> = struct_decls
-        .iter()
-        .map(|s| {
-            let fields = s
-                .fields
-                .iter()
-                .map(|f| {
-                    let ty = resolve_type(&f.ty, &struct_ids, diags);
-                    // Fields are scalars or `str`. A `str` field may now hold an arena-backed
-                    // str: the struct *carries* that field's region (MMv2 slice 2), so
-                    // `EscapeCheck` lets it live inside the arena and only rejects the whole
-                    // struct escaping. A scalar/literal-only struct stays `Static` (returnable).
-                    // Other composite/region-bearing fields (box/slice/array/option/result/
-                    // nested struct) the layout can't hold yet remain rejected. NOTE:
-                    // `ty_to_scalar` now also accepts `Ty::Struct` (a valid Option/Result
-                    // payload), so a nested struct field is rejected explicitly here.
-                    let is_field_ok =
-                        (ty_to_scalar(ty).is_some() && !matches!(ty, Ty::Struct(_))) || ty == Ty::Str || ty == Ty::Error;
-                    if !is_field_ok {
-                        diags.error(
-                            format!("struct fields must be a primitive scalar or str for now, got {}", ty_name(ty)),
-                            f.span,
-                        );
-                    }
-                    FieldDef { name: f.name.name.clone(), ty }
-                })
-                .collect();
-            // `align`: natural alignment today — the `align(N)` surface syntax + custom value
-            // arrive at M6 (`open-questions.md`); the field is reserved so that is an additive
-            // change at the alignment seam, not a retrofit.
-            StructDef { name: s.name.name.clone(), fields, align: None }
-        })
-        .collect();
+    let mut structs: Vec<StructDef> = Vec::with_capacity(struct_decls.len());
+    for s in &struct_decls {
+        let mut fields = Vec::with_capacity(s.fields.len());
+        for f in &s.fields {
+            let ty = resolve_type(&f.ty, &struct_ids, &mut tuples, diags);
+            // Fields are scalars or `str`. A `str` field may now hold an arena-backed
+            // str: the struct *carries* that field's region (MMv2 slice 2), so
+            // `EscapeCheck` lets it live inside the arena and only rejects the whole
+            // struct escaping. A scalar/literal-only struct stays `Static` (returnable).
+            // Other composite/region-bearing fields (box/slice/array/option/result/
+            // nested struct/tuple) the layout can't hold yet remain rejected. NOTE:
+            // `ty_to_scalar` now also accepts `Ty::Struct` (a valid Option/Result
+            // payload), so a nested struct field is rejected explicitly here.
+            let is_field_ok =
+                (ty_to_scalar(ty).is_some() && !matches!(ty, Ty::Struct(_))) || ty == Ty::Str || ty == Ty::Error;
+            if !is_field_ok {
+                diags.error(
+                    format!("struct fields must be a primitive scalar or str for now, got {}", ty_name(ty)),
+                    f.span,
+                );
+            }
+            fields.push(FieldDef { name: f.name.name.clone(), ty });
+        }
+        // `align`: natural alignment today — the `align(N)` surface syntax + custom value
+        // arrive at M6 (`open-questions.md`); the field is reserved so that is an additive
+        // change at the alignment seam, not a retrofit.
+        structs.push(StructDef { name: s.name.name.clone(), fields, align: None });
+    }
 
     // Pass 1: collect function signatures so calls can resolve regardless of order.
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for item in &file.items {
         let ast::Item::Fn(f) = item else { continue };
-        let params: Vec<Ty> = f
-            .params
-            .iter()
-            .map(|p| resolve_type(&p.ty, &struct_ids, diags))
-            .collect();
+        let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
+        for p in &f.params {
+            params.push(resolve_type(&p.ty, &struct_ids, &mut tuples, diags));
+        }
         // A box across a call boundary would escape its arena, so M3 forbids box
         // parameters and returns (boxes are arena-local). This also closes escape
         // holes via call results.
@@ -347,17 +348,17 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             if matches!(ty, Ty::Box(_)) {
                 diags.error(
                     "a box cannot be a function parameter (boxes are arena-local in M3)".to_string(),
-                    p.ty.span,
+                    p.ty.span(),
                 );
             }
         }
         let ret = match &f.ret {
             Some(t) => {
-                let r = resolve_type(t, &struct_ids, diags);
+                let r = resolve_type(t, &struct_ids, &mut tuples, diags);
                 if matches!(r, Ty::Box(_)) {
                     diags.error(
                         "a box cannot be a function return type (it would escape its arena)".to_string(),
-                        t.span,
+                        t.span(),
                     );
                 }
                 r
@@ -378,6 +379,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 sigs: &sigs,
                 struct_ids: &struct_ids,
                 structs: &structs,
+                tuples: &mut tuples,
                 int_vars: Vec::new(),
                 int_parent: Vec::new(),
                 float_vars: Vec::new(),
@@ -390,7 +392,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             Some(cx.check_fn(f))
         })
         .collect();
-    let mut program = Program { fns, structs };
+    let mut program = Program { fns, structs, tuples };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     for f in &mut program.fns {
@@ -741,12 +743,21 @@ impl<'a> EscapeCheck<'a> {
             }
             Stmt::Return(None) => {}
             Stmt::Expr(e) => self.walk(e, depth),
+            // A tuple destructure binds primitive (Static) elements in PR1 — no region to track,
+            // just recurse into the source for nested escapes.
+            Stmt::LetTuple { init, .. } => self.walk(init, depth),
         }
     }
 
     /// Recurse to find nested arenas and value positions that let a box escape.
     fn walk(&mut self, e: &Expr, depth: u32) {
         match &e.kind {
+            ExprKind::Tuple { elems, .. } => {
+                for el in elems {
+                    self.walk(el, depth);
+                }
+            }
+            ExprKind::TupleIndex { recv, .. } => self.walk(recv, depth),
             ExprKind::Arena(b) => {
                 let inner = depth + 1;
                 self.block(b, inner);
@@ -892,6 +903,14 @@ impl<'a> MoveCheck<'a> {
                 Stmt::Return(Some(e)) => self.expr(e, moved, true, true),
                 Stmt::Return(None) => {}
                 Stmt::Expr(e) => self.expr(e, moved, false, false),
+                // Destructure consumes its tuple source (Copy elements in PR1 — nothing to move,
+                // but recurse to flag a moved source).
+                Stmt::LetTuple { locals, init, .. } => {
+                    self.expr(init, moved, true, true);
+                    for l in locals.iter().flatten() {
+                        moved.remove(l);
+                    }
+                }
             }
         }
         if let Some(v) = &b.value {
@@ -1020,6 +1039,14 @@ impl<'a> MoveCheck<'a> {
             ExprKind::FsReadFile { path } => self.expr(path, moved, false, false),
             ExprKind::IoStdoutWrite { arg } => self.expr(arg, moved, false, false),
             ExprKind::IoStdoutWriteBuilder { builder } => self.expr(builder, moved, false, false),
+            // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
+            // borrows. Recurse to catch moves in element subexpressions.
+            ExprKind::Tuple { elems, .. } => {
+                for el in elems {
+                    self.expr(el, moved, true, true);
+                }
+            }
+            ExprKind::TupleIndex { recv, .. } => self.expr(recv, moved, false, false),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -1031,11 +1058,15 @@ impl<'a> MoveCheck<'a> {
     }
 }
 
-struct Checker<'a> {
+struct Checker<'a, 't> {
     diags: &'a mut Diagnostics,
     sigs: &'a HashMap<String, FnSig>,
     struct_ids: &'a HashMap<String, u32>,
     structs: &'a [StructDef],
+    /// The shared tuple-type interner (anonymous `(T, U, …)` types). A separate lifetime from
+    /// `'a` so each per-function `Checker` can reborrow it mutably without conflicting with the
+    /// long-lived shared `structs`/`struct_ids` borrows.
+    tuples: &'t mut Vec<hir::TupleDef>,
     // Integer/float inference variables. `*_vars[i]` is the binding for the *root* of var
     // `i`; `*_parent[i]` is its union-find parent (self when `i` is a root). Linking two
     // unconstrained vars (rather than dropping one) means a later constraint on either
@@ -1054,7 +1085,7 @@ struct Checker<'a> {
     arena_depth: u32,
 }
 
-impl<'a> Checker<'a> {
+impl<'a, 't> Checker<'a, 't> {
     fn fresh_int_var(&mut self) -> Ty {
         let id = self.int_vars.len() as u32;
         self.int_vars.push(None);
@@ -1262,6 +1293,43 @@ impl<'a> Checker<'a> {
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     stmts.push(Stmt::Let { local, init });
                 }
+                ast::Stmt::LetTuple { names, init, span } => {
+                    // `(a, b, ...) := expr` — the RHS must be a tuple; bind each name to its
+                    // element type (`_` binds nothing). Element types are inferred from the tuple.
+                    let init = self.check_expr(init, None);
+                    let (tuple_id, elem_tys) = match self.resolve(init.ty) {
+                        Ty::Tuple(id) => {
+                            let tys: Vec<Ty> =
+                                self.tuples[id as usize].elems.iter().map(|s| scalar_to_ty(*s)).collect();
+                            if tys.len() != names.len() {
+                                self.diags.error(
+                                    format!("this destructuring binds {} name(s) but the tuple has {} element(s)", names.len(), tys.len()),
+                                    *span,
+                                );
+                            }
+                            (id, tys)
+                        }
+                        Ty::Error => (u32::MAX, Vec::new()),
+                        other => {
+                            self.diags.error(
+                                format!("destructuring needs a tuple value, got {}", ty_name(other)),
+                                *span,
+                            );
+                            (u32::MAX, Vec::new())
+                        }
+                    };
+                    let mut locals = Vec::with_capacity(names.len());
+                    for (i, n) in names.iter().enumerate() {
+                        match n {
+                            Some(name) => {
+                                let ety = elem_tys.get(i).copied().unwrap_or(Ty::Error);
+                                locals.push(Some(self.declare(&name.name, ety, false)));
+                            }
+                            None => locals.push(None),
+                        }
+                    }
+                    stmts.push(Stmt::LetTuple { locals, tuple_id, init });
+                }
                 ast::Stmt::Return(value) => {
                     // The enclosing function's return type is the expected one. We
                     // thread it via `expected` of the body block (M1: one level).
@@ -1303,7 +1371,7 @@ impl<'a> Checker<'a> {
     }
 
     fn resolve_type(&mut self, t: &ast::Type) -> Ty {
-        resolve_type(t, self.struct_ids, self.diags)
+        resolve_type(t, self.struct_ids, self.tuples, self.diags)
     }
 
     /// Resolve an assignable place: a `mut` local, or `mut_local.field`.
@@ -1442,6 +1510,8 @@ impl<'a> Checker<'a> {
                 // stored). The `let` path checks it directly to store fields in place.
                 self.check_struct_lit(name, fields, e.span)
             }
+            ast::ExprKind::Tuple(elems) => self.check_tuple(elems, expected, e.span),
+            ast::ExprKind::TupleIndex { recv, index } => self.check_tuple_index(recv, *index, expected, e.span),
             ast::ExprKind::If { cond, then, els } => self.check_if(cond, then, els.as_deref(), expected, e.span),
             ast::ExprKind::Block(b) => {
                 // A block that always returns never yields a value; let it take the
@@ -1456,6 +1526,92 @@ impl<'a> Checker<'a> {
                 Expr { kind: ExprKind::Block(block), ty, span: e.span }
             }
         }
+    }
+
+    /// `(e0, e1, ...)` — a tuple literal. Element types are taken from the expected tuple type
+    /// when context fixes one (e.g. a multi-value `return`), else each element defaults like a
+    /// bare `:=` binding (int → i64, float → f64). PR1 cut: elements are primitive scalars.
+    fn check_tuple(&mut self, elems: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // If the context fixes a concrete tuple type, use its element types to drive checking.
+        let expected_elems: Option<Vec<Ty>> = match expected.map(|t| self.resolve(t)) {
+            Some(Ty::Tuple(id)) => {
+                Some(self.tuples[id as usize].elems.iter().map(|s| scalar_to_ty(*s)).collect())
+            }
+            _ => None,
+        };
+        if let Some(exp) = &expected_elems {
+            if exp.len() != elems.len() {
+                self.diags.error(
+                    format!("expected a tuple of {} element(s), got {}", exp.len(), elems.len()),
+                    span,
+                );
+                return err;
+            }
+        }
+        let mut checked = Vec::with_capacity(elems.len());
+        let mut scalars = Vec::with_capacity(elems.len());
+        let mut ok = true;
+        for (i, el) in elems.iter().enumerate() {
+            let exp_i = expected_elems.as_ref().map(|v| v[i]);
+            let ce = self.check_expr(el, exp_i);
+            // Commit the element to a concrete scalar: bind any inference var to the expected type
+            // or its default, so the interned tuple type (and later uses of the element) agree.
+            let concrete = self.finalize(ce.ty);
+            self.constrain(ce.ty, Some(concrete), ce.span);
+            match ty_to_scalar(self.resolve(ce.ty)) {
+                Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char)) => {
+                    scalars.push(s)
+                }
+                _ => {
+                    if ce.ty != Ty::Error {
+                        self.diags.error(
+                            format!("tuple elements must be a primitive scalar (int/float/bool/char) for now, got {}", ty_name(ce.ty)),
+                            ce.span,
+                        );
+                    }
+                    ok = false;
+                }
+            }
+            checked.push(ce);
+        }
+        if !ok {
+            return err;
+        }
+        let id = intern_tuple(self.tuples, scalars);
+        let ty = Ty::Tuple(id);
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::Tuple { tuple_id: id, elems: checked }, ty, span }
+    }
+
+    /// `recv.N` — positional tuple access.
+    fn check_tuple_index(&mut self, recv: &ast::Expr, index: u32, expected: Option<Ty>, span: Span) -> Expr {
+        let r = self.check_expr(recv, None);
+        let ty = match self.resolve(r.ty) {
+            Ty::Tuple(id) => {
+                let elems = &self.tuples[id as usize].elems;
+                match elems.get(index as usize) {
+                    Some(s) => scalar_to_ty(*s),
+                    None => {
+                        self.diags.error(
+                            format!("tuple index .{index} is out of range (tuple has {} element(s))", elems.len()),
+                            span,
+                        );
+                        Ty::Error
+                    }
+                }
+            }
+            Ty::Error => Ty::Error,
+            other => {
+                self.diags.error(
+                    format!("`.{index}` needs a tuple value, got {}", ty_name(other)),
+                    span,
+                );
+                Ty::Error
+            }
+        };
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::TupleIndex { recv: Box::new(r), index }, ty, span }
     }
 
     fn check_path(&mut self, p: &ast::Path, expected: Option<Ty>, span: Span) -> Expr {
@@ -3192,6 +3348,7 @@ impl<'a> Checker<'a> {
                 Stmt::AssignField { value, .. } => self.finalize_expr(value),
                 Stmt::Return(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
                 Stmt::Return(None) => {}
+                Stmt::LetTuple { init, .. } => self.finalize_expr(init),
             }
         }
         if let Some(v) = &mut b.value {
@@ -3265,6 +3422,12 @@ impl<'a> Checker<'a> {
             ExprKind::FsReadFile { path } => self.finalize_expr(path),
             ExprKind::IoStdoutWrite { arg } => self.finalize_expr(arg),
             ExprKind::IoStdoutWriteBuilder { builder } => self.finalize_expr(builder),
+            ExprKind::Tuple { elems, .. } => {
+                for el in elems {
+                    self.finalize_expr(el);
+                }
+            }
+            ExprKind::TupleIndex { recv, .. } => self.finalize_expr(recv),
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -3354,6 +3517,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Builder => "builder".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
+        Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }
@@ -3372,13 +3536,50 @@ fn scalar_arg(ty: Ty, what: &str, span: Span, diags: &mut Diagnostics) -> Option
     }
 }
 
-fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Diagnostics) -> Ty {
-    let name = t
-        .path
-        .segments
-        .last()
-        .map(|s| s.name.as_str())
-        .unwrap_or("");
+/// Intern a tuple type (dedup by element list) into `tuples`, returning its id. Tuples are
+/// few, so a linear scan is fine.
+fn intern_tuple(tuples: &mut Vec<hir::TupleDef>, elems: Vec<Scalar>) -> u32 {
+    if let Some(i) = tuples.iter().position(|t| t.elems == elems) {
+        return i as u32;
+    }
+    tuples.push(hir::TupleDef { elems });
+    (tuples.len() - 1) as u32
+}
+
+fn resolve_type(
+    t: &ast::Type,
+    struct_ids: &HashMap<String, u32>,
+    tuples: &mut Vec<hir::TupleDef>,
+    diags: &mut Diagnostics,
+) -> Ty {
+    let (path, args, span) = match t {
+        ast::Type::Named { path, args, span } => (path, args.as_slice(), *span),
+        ast::Type::Tuple { elems, span } => {
+            // PR1 cut: tuple elements are primitive scalars (int/float/bool/char) — Copy,
+            // `Static`, so the tuple needs no drop/region machinery. `str`/owned elements later.
+            let mut scalars = Vec::with_capacity(elems.len());
+            for e in elems {
+                let ety = resolve_type(e, struct_ids, tuples, diags);
+                if ety == Ty::Error {
+                    return Ty::Error;
+                }
+                match ty_to_scalar(ety) {
+                    Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char)) => {
+                        scalars.push(s)
+                    }
+                    _ => {
+                        diags.error(
+                            format!("tuple elements must be a primitive scalar (int/float/bool/char) for now, got {}", ty_name(ety)),
+                            *span,
+                        );
+                        return Ty::Error;
+                    }
+                }
+            }
+            return Ty::Tuple(intern_tuple(tuples, scalars));
+        }
+    };
+    let name = path.segments.last().map(|s| s.name.as_str()).unwrap_or("");
     match name {
         "bool" => Ty::Bool,
         "char" => Ty::Char,
@@ -3389,10 +3590,10 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
         "()" => Ty::Unit,
         "Error" => Ty::ErrCode,
         "box" => {
-            let inner = match t.args.as_slice() {
-                [a] => resolve_type(a, struct_ids, diags),
+            let inner = match args {
+                [a] => resolve_type(a, struct_ids, tuples, diags),
                 _ => {
-                    diags.error("box takes exactly one type argument".to_string(), t.span);
+                    diags.error("box takes exactly one type argument".to_string(), span);
                     return Ty::Error;
                 }
             };
@@ -3400,17 +3601,17 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
             // a box payload must be a true primitive scalar: codegen can't size a struct box, and
             // a Move payload (`string`) has no `box` drop story. Reject both with a clean
             // diagnostic (else `box<string>`/`box<Struct>` would type-check then panic in codegen).
-            match scalar_arg(inner, "box payload", t.span, diags) {
+            match scalar_arg(inner, "box payload", span, diags) {
                 Some(Scalar::Struct(_)) => {
-                    diags.error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), t.span);
+                    diags.error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), span);
                     Ty::Error
                 }
                 Some(s) if s.is_move() => {
-                    diags.error(format!("a box payload must be a primitive scalar (an owned `{}` cannot be boxed)", scalar_name(s)), t.span);
+                    diags.error(format!("a box payload must be a primitive scalar (an owned `{}` cannot be boxed)", scalar_name(s)), span);
                     Ty::Error
                 }
                 Some(Scalar::Str) => {
-                    diags.error("a box payload must be a primitive scalar (a `str` view is not boxable)".to_string(), t.span);
+                    diags.error("a box payload must be a primitive scalar (a `str` view is not boxable)".to_string(), span);
                     Ty::Error
                 }
                 Some(s) => Ty::Box(s),
@@ -3418,27 +3619,27 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
             }
         }
         "Option" => {
-            let inner = match t.args.as_slice() {
-                [a] => resolve_type(a, struct_ids, diags),
+            let inner = match args {
+                [a] => resolve_type(a, struct_ids, tuples, diags),
                 _ => {
-                    diags.error("Option takes exactly one type argument".to_string(), t.span);
+                    diags.error("Option takes exactly one type argument".to_string(), span);
                     return Ty::Error;
                 }
             };
-            match scalar_arg(inner, "Option payload", t.span, diags) {
+            match scalar_arg(inner, "Option payload", span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,
             }
         }
         "slice" => {
-            let inner = match t.args.as_slice() {
-                [a] => resolve_type(a, struct_ids, diags),
+            let inner = match args {
+                [a] => resolve_type(a, struct_ids, tuples, diags),
                 _ => {
-                    diags.error("slice takes exactly one type argument".to_string(), t.span);
+                    diags.error("slice takes exactly one type argument".to_string(), span);
                     return Ty::Error;
                 }
             };
-            match scalar_arg(inner, "slice element", t.span, diags) {
+            match scalar_arg(inner, "slice element", span, diags) {
                 Some(s) => Ty::Slice(s),
                 None => Ty::Error,
             }
@@ -3446,10 +3647,10 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
         // `array<T>` — an owned, dynamic-length array (MMv2). Currently usable as a return
         // type so a function can hand back a free-standing owned array.
         "array" => {
-            let inner = match t.args.as_slice() {
-                [a] => resolve_type(a, struct_ids, diags),
+            let inner = match args {
+                [a] => resolve_type(a, struct_ids, tuples, diags),
                 _ => {
-                    diags.error("array takes exactly one type argument".to_string(), t.span);
+                    diags.error("array takes exactly one type argument".to_string(), span);
                     return Ty::Error;
                 }
             };
@@ -3457,26 +3658,26 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
             // element resolves to the scalar `array<T>` (`DynArray`).
             match inner {
                 Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
-                _ => match scalar_arg(inner, "array element", t.span, diags) {
+                _ => match scalar_arg(inner, "array element", span, diags) {
                     Some(s) => Ty::DynArray(s),
                     None => Ty::Error,
                 },
             }
         }
         "Result" => {
-            let (ok, err) = match t.args.as_slice() {
+            let (ok, err) = match args {
                 [a, b] => (
-                    resolve_type(a, struct_ids, diags),
-                    resolve_type(b, struct_ids, diags),
+                    resolve_type(a, struct_ids, tuples, diags),
+                    resolve_type(b, struct_ids, tuples, diags),
                 ),
                 _ => {
-                    diags.error("Result takes two type arguments".to_string(), t.span);
+                    diags.error("Result takes two type arguments".to_string(), span);
                     return Ty::Error;
                 }
             };
             match (
-                scalar_arg(ok, "Result ok payload", t.span, diags),
-                scalar_arg(err, "Result err payload", t.span, diags),
+                scalar_arg(ok, "Result ok payload", span, diags),
+                scalar_arg(err, "Result err payload", span, diags),
             ) {
                 (Some(o), Some(e)) => Ty::Result(o, e),
                 _ => Ty::Error,
@@ -3487,7 +3688,7 @@ fn resolve_type(t: &ast::Type, struct_ids: &HashMap<String, u32>, diags: &mut Di
             None => match struct_ids.get(name) {
                 Some(&id) => Ty::Struct(id),
                 None => {
-                    diags.error(format!("unknown type: '{name}'"), t.span);
+                    diags.error(format!("unknown type: '{name}'"), span);
                     Ty::Error
                 }
             },

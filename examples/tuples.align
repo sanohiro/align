@@ -1,0 +1,10 @@
+// Tuples / multi-value return (the anonymous product type `(T, U, ...)`). A function
+// returns more than one value by returning a tuple; the caller destructures it with
+// `(a, b) := ...`. Elements are read positionally (`t.0`) and `_` ignores one.
+// PR1 cut: tuple elements are primitive scalars (int/float/bool/char).
+fn divmod(a: i32, b: i32) -> (i32, i32) = (a / b, a % b)
+
+fn main() -> i32 {
+  (q, r) := divmod(17, 5)   // q = 3, r = 2
+  return q * 10 + r         // 32
+}

@@ -54,6 +54,8 @@ builder
 Option<T>
 Result<T,E>
 
+(T, U, ...)   // anonymous tuple; multi-value return = returning a tuple
+
 array<T>
 slice<T>
 

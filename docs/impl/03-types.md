@@ -33,11 +33,14 @@ Ty =
   Option(Ty)
   Result(Ty, Ty)
   Named(DefId, [Ty])        // struct / sum type. Generic actual arguments
+  Tuple(TupleId)            // anonymous product `(T, U, ...)`; interned by element list
   Fn([Ty], Ty, Effect)     // lambda / function value
   Var(id)                   // inference variable (during inference only)
 ```
 
 `Named` is **nominal** (identity determined by name). Both struct and sum type are represented as `Named`, and the definition (fields/variants) is looked up via `DefId`.
+
+`Tuple` is **structural**: identity is the element-type list, so it is interned (deduplicated) into a tuple table — the anonymous dual of the struct table — and `Ty::Tuple(id)` indexes it. Multi-value return is returning a tuple (no separate mechanism). PR1 implements primitive-scalar elements (Copy / `Static`); owned and `str` elements (which make a tuple Move / region-tied, via the same rule as a struct) are an additive follow-up. Lowered to an anonymous LLVM struct (by-value construct/index, like a small struct).
 
 ### Region (lifetime tag)
 Only view-like types (reference-like types such as `Slice` / `Str`) carry it. Users never write it. It appears only in error messages.

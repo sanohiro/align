@@ -290,6 +290,14 @@ impl<'a> Parser<'a> {
             if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
                 break;
             }
+            // A tuple destructuring `let`: `(a, b, ...) := expr`. Detected by lookahead (a
+            // parenthesized name list followed by `:=`) so a parenthesized expression statement
+            // stays unambiguous.
+            if self.looks_like_destructure() {
+                let s = self.parse_let_tuple()?;
+                stmts.push(s);
+                continue;
+            }
             // A `let`: `mut ...`, `name := ...`, or a type-annotated `name: T := ...`.
             // `name :` unambiguously starts a typed binding (no other statement does).
             if self.at(&TokKind::Mut)
@@ -329,6 +337,60 @@ impl<'a> Parser<'a> {
         self.expect(&TokKind::RBrace, "'}'");
         let span = start.merge(self.prev_span());
         Some(Block { stmts, tail, span })
+    }
+
+    /// Lookahead: does the current `(` begin a tuple-destructuring pattern `(a, b, ...) :=`?
+    /// A name list (each binder an identifier or `_`), arity ≥ 2, closed by `)` then `:=`.
+    fn looks_like_destructure(&self) -> bool {
+        if !self.at(&TokKind::LParen) {
+            return false;
+        }
+        let mut i = 1;
+        let mut count = 0;
+        loop {
+            if !matches!(self.peek_at(i), TokKind::Ident(_)) {
+                return false;
+            }
+            count += 1;
+            i += 1;
+            if matches!(self.peek_at(i), TokKind::RParen) {
+                i += 1;
+                break;
+            }
+            if !matches!(self.peek_at(i), TokKind::Comma) {
+                return false;
+            }
+            i += 1;
+            // A trailing comma before `)`.
+            if matches!(self.peek_at(i), TokKind::RParen) {
+                i += 1;
+                break;
+            }
+        }
+        count >= 2 && matches!(self.peek_at(i), TokKind::ColonEq)
+    }
+
+    fn parse_let_tuple(&mut self) -> Option<Stmt> {
+        let start = self.span();
+        self.bump(); // '('
+        let mut names = Vec::new();
+        loop {
+            let id = self.parse_ident("binding name or '_'")?;
+            // `_` is the ignore binder (no local bound).
+            names.push(if id.name == "_" { None } else { Some(id) });
+            if self.eat(&TokKind::RParen) {
+                break;
+            }
+            self.expect(&TokKind::Comma, "','");
+            if self.eat(&TokKind::RParen) {
+                break;
+            }
+        }
+        self.expect(&TokKind::ColonEq, "':='");
+        let init = self.parse_expr(0)?;
+        self.eat(&TokKind::End);
+        let span = start.merge(self.prev_span());
+        Some(Stmt::LetTuple { names, init, span })
     }
 
     fn parse_let(&mut self) -> Option<Stmt> {
@@ -513,6 +575,15 @@ impl<'a> Parser<'a> {
                 let field = self.parse_ident("field or method name")?;
                 let span = e.span.merge(field.span);
                 e = Expr { kind: ExprKind::FieldAccess { recv: Box::new(e), field }, span };
+            } else if self.at(&TokKind::Dot) && matches!(self.peek_at(1), TokKind::Int(_)) {
+                // `recv.0` — positional tuple access.
+                self.bump(); // '.'
+                let ispan = self.span();
+                let TokKind::Int(v) = self.peek().clone() else { unreachable!() };
+                self.bump();
+                let index = u32::try_from(v).unwrap_or(u32::MAX);
+                let span = e.span.merge(ispan);
+                e = Expr { kind: ExprKind::TupleIndex { recv: Box::new(e), index }, span };
             } else if self.at(&TokKind::LBracket) {
                 self.bump(); // '['
                 let index = self.parse_expr(0)?;
@@ -627,15 +698,26 @@ impl<'a> Parser<'a> {
             }
             TokKind::LParen => {
                 self.bump();
-                // `()` is the unit value; otherwise a parenthesized expression.
+                // `()` is the unit value; `(e)` is grouping; `(e0, e1, ...)` is a tuple.
                 if self.at(&TokKind::RParen) {
                     self.bump();
                     let span = span.merge(self.prev_span());
                     return Some(Expr { kind: ExprKind::Unit, span });
                 }
-                let e = self.parse_expr(0)?;
+                let mut elems = vec![self.parse_expr(0)?];
+                while self.eat(&TokKind::Comma) {
+                    if self.at(&TokKind::RParen) {
+                        break;
+                    }
+                    elems.push(self.parse_expr(0)?);
+                }
                 self.expect(&TokKind::RParen, "')'");
-                Some(e)
+                let span = span.merge(self.prev_span());
+                Some(if elems.len() == 1 {
+                    elems.pop().unwrap()
+                } else {
+                    Expr { kind: ExprKind::Tuple(elems), span }
+                })
             }
             TokKind::LBrace => {
                 let block = self.parse_block()?;
@@ -753,14 +835,31 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> Option<Type> {
-        // The unit type `()`.
+        // A parenthesized type: `()` = unit, `(T)` = grouping, `(T, U, ...)` = tuple.
         if self.at(&TokKind::LParen) {
             let start = self.span();
             self.bump();
+            // The unit type `()` (a `Named` with the sentinel path "()").
+            if self.eat(&TokKind::RParen) {
+                let span = start.merge(self.prev_span());
+                let seg = Ident { name: "()".to_string(), span };
+                return Some(Type::Named { path: Path { segments: vec![seg], span }, args: Vec::new(), span });
+            }
+            let mut elems = vec![self.parse_type()?];
+            while self.eat(&TokKind::Comma) {
+                if self.at(&TokKind::RParen) {
+                    break;
+                }
+                elems.push(self.parse_type()?);
+            }
             self.expect(&TokKind::RParen, "')'");
             let span = start.merge(self.prev_span());
-            let seg = Ident { name: "()".to_string(), span };
-            return Some(Type { path: Path { segments: vec![seg], span }, args: Vec::new(), span });
+            // `(T)` is just grouping; `(T, U, ...)` is a tuple.
+            return Some(if elems.len() == 1 {
+                elems.pop().unwrap()
+            } else {
+                Type::Tuple { elems, span }
+            });
         }
         let path = self.parse_path();
         if path.segments.is_empty() {
@@ -778,7 +877,7 @@ impl<'a> Parser<'a> {
             self.expect(&TokKind::Gt, "'>'");
         }
         let span = path.span.merge(self.prev_span());
-        Some(Type { path, args, span })
+        Some(Type::Named { path, args, span })
     }
 
     fn parse_ident(&mut self, what: &str) -> Option<Ident> {

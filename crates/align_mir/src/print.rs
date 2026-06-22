@@ -116,6 +116,11 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::IndexPtr { base, index, struct_id } => {
             format!("{}[{}] (struct#{struct_id})", operand_str(base), operand_str(index))
         }
+        Rvalue::MakeTuple { tuple_id, elems } => {
+            let parts: Vec<String> = elems.iter().map(operand_str).collect();
+            format!("tuple#{tuple_id}({})", parts.join(", "))
+        }
+        Rvalue::TupleIndex { tuple, index } => format!("{}.{index}", operand_str(tuple)),
         Rvalue::MakeSlice(slot, n) => format!("slice(_{slot}, {n})"),
         Rvalue::ArenaAlloc { handle, count, elem } => {
             format!("arena_alloc({}, {} x {})", operand_str(handle), operand_str(count), crate::ty_name(*elem))

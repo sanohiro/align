@@ -104,12 +104,24 @@ fn build_module<'c>(
         })
         .collect();
 
+    // Tuple layouts → anonymous LLVM struct types, indexed by tuple id. Elements are primitive
+    // scalars (PR1), so the struct-type table is not consulted here.
+    let tuple_types: Vec<StructType<'c>> = program
+        .tuples
+        .iter()
+        .map(|t| {
+            let fields: Vec<BasicTypeEnum> =
+                t.elems.iter().map(|s| scalar_type(ctx, scalar_to_ty(*s), &struct_types)).collect();
+            ctx.struct_type(&fields, false)
+        })
+        .collect();
+
     // Pass 1: declare all functions so calls resolve regardless of order. A
     // `Result`-returning `main` is emitted under `align_main`; a C `main` wrapper is
     // generated after the bodies (see below).
     let mut funcs: HashMap<String, FunctionValue<'c>> = HashMap::new();
     for f in &program.fns {
-        let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types);
+        let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types, &tuple_types);
         funcs.insert(f.name.clone(), fv);
     }
     // Declare runtime builtins, keyed by the MIR call name they back.
@@ -381,6 +393,7 @@ fn build_module<'c>(
             funcs: &funcs,
             structs: &program.structs,
             struct_types: &struct_types,
+            tuple_types: &tuple_types,
             target_data: &target_data,
             f,
             func: funcs[&f.name],
@@ -621,13 +634,15 @@ fn declare_fn<'c>(
     f: &Function,
     symbol: &str,
     struct_types: &[StructType<'c>],
+    tuple_types: &[StructType<'c>],
 ) -> FunctionValue<'c> {
-    // Structs / struct-arrays pass and return by value as their aggregate LLVM type
+    // Structs / struct-arrays / tuples pass and return by value as their aggregate LLVM type
     // (`abi_type` covers scalars + Option/Result/slice/str).
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
         match ty {
             Ty::Struct(id) => struct_types[id as usize].into(),
             Ty::StructArray(id, n) => struct_types[id as usize].array_type(n).into(),
+            Ty::Tuple(id) => tuple_types[id as usize].into(),
             // No array-typed params/returns arise yet (arrays coerce to slices at calls),
             // but mirror `llvm_type` so it stays correct once array annotations land.
             Ty::Array(s, n) => scalar_type(ctx, scalar_to_ty(s), struct_types).array_type(n).into(),
@@ -651,6 +666,8 @@ struct FnGen<'c, 'a> {
     funcs: &'a HashMap<String, FunctionValue<'c>>,
     structs: &'a [StructDef],
     struct_types: &'a [StructType<'c>],
+    /// Anonymous tuple types, indexed by the id in [`Ty::Tuple`].
+    tuple_types: &'a [StructType<'c>],
     /// Target layout — used to compute struct field byte offsets for `json.decode`.
     target_data: &'a inkwell::targets::TargetData,
     f: &'a Function,
@@ -1071,6 +1088,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 self.builder.build_load(st, ep, "idxp").map_err(|e| self.err(e))?
             }
+            Rvalue::MakeTuple { tuple_id, elems } => {
+                // Build the tuple aggregate by inserting each element into an undef struct.
+                let st = self.tuple_types[*tuple_id as usize];
+                let mut agg = st.get_undef();
+                for (i, el) in elems.iter().enumerate() {
+                    let v = self.operand(el);
+                    agg = self
+                        .builder
+                        .build_insert_value(agg, v, i as u32, "tup")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value();
+                }
+                agg.into()
+            }
+            Rvalue::TupleIndex { tuple, index } => {
+                let agg = self.operand(tuple).into_struct_value();
+                self.builder
+                    .build_extract_value(agg, *index, "tupidx")
+                    .map_err(|e| self.err(e))?
+            }
             Rvalue::MakeSlice(slot, n) => {
                 // ptr = &slot[0]; build { ptr, len } from the array alloca.
                 let arr_ty = self.llvm_type(self.f.slots[*slot as usize]);
@@ -1325,6 +1362,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn llvm_type(&self, ty: Ty) -> BasicTypeEnum<'c> {
         match ty {
             Ty::Struct(id) => self.struct_types[id as usize].into(),
+            Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types).into(),
             Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => self.ctx.ptr_type(AddressSpace::default()).into(),

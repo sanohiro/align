@@ -201,9 +201,15 @@ A top-level `:=` is a compile-time constant (immutable). `mut` is not allowed. O
 ```ebnf
 type      = path generic_args?
           | "(" ")"                       // unit
+          | "(" type ("," type)+ ")"      // tuple (arity >= 2); "(" type ")" is grouping
 generic_args = "<" type_arg ("," type_arg)* ">"
 type_arg  = type | int_literal            // the N in vec<4, f32>
 ```
+
+Tuple values mirror the type: a literal `(a, b, ...)` (arity ≥ 2; `()` is unit, `(e)` is
+grouping), positional access `t.0` / `t.1`, and a destructuring binding `(a, b) := expr`
+(parens required, `_` ignores an element). Multi-value return is returning a tuple — there is
+no separate multiple-return form (`design-notes.md` "One way").
 
 Built-in type names are also treated as ordinary paths:
 

@@ -80,13 +80,22 @@ pub enum FnBody {
     Expr(Box<Expr>),
 }
 
-/// Type annotation. A path optionally followed by generic arguments
-/// (`Option<i32>`, `Result<i32, Error>`).
+/// Type annotation. Either a named type — a path optionally followed by generic
+/// arguments (`Option<i32>`, `Result<i32, Error>`); the unit type `()` is a `Named`
+/// with the sentinel path `"()"` — or an anonymous tuple type `(T, U, ...)`.
 #[derive(Clone, Debug)]
-pub struct Type {
-    pub path: Path,
-    pub args: Vec<Type>,
-    pub span: Span,
+pub enum Type {
+    Named { path: Path, args: Vec<Type>, span: Span },
+    /// `(T, U, ...)` — an anonymous product type (arity ≥ 2; `()` is unit, `(T)` is grouping).
+    Tuple { elems: Vec<Type>, span: Span },
+}
+
+impl Type {
+    pub fn span(&self) -> Span {
+        match self {
+            Type::Named { span, .. } | Type::Tuple { span, .. } => *span,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +113,13 @@ pub enum Stmt {
         name: Ident,
         ty: Option<Type>,
         init: Expr,
+    },
+    /// `(a, b, ...) := expr` — tuple destructuring. Each binder is a name or `_` (ignore).
+    /// The element types are inferred from the tuple on the right (no annotation in this cut).
+    LetTuple {
+        names: Vec<Option<Ident>>,
+        init: Expr,
+        span: Span,
     },
     Assign {
         place: Expr,
@@ -212,6 +228,13 @@ pub enum ExprKind {
     /// `.field` — element-field shorthand, valid only as a pipeline stage argument
     /// (e.g. `where(.active)`); refers to a field of the current pipeline element.
     FieldShorthand(Ident),
+    /// `(e0, e1, ...)` — a tuple value (arity ≥ 2; `()` is `Unit`, `(e)` is just `e`).
+    Tuple(Vec<Expr>),
+    /// `recv.0` / `recv.1` — positional access into a tuple value.
+    TupleIndex {
+        recv: Box<Expr>,
+        index: u32,
+    },
     /// `template "text {expr} ..."` — a string built from static parts and `{expr}`
     /// holes (interpolation). Produces a `str`.
     Template(Vec<TemplatePart>),
