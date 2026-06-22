@@ -332,7 +332,7 @@ try_expr  = expr "?"
 
 ```align
 data := fs.read_file(path)?
-user := json.decode<User>(data)?
+user: User := json.decode(data)?
 ```
 
 ### Method chains, field projection
@@ -375,7 +375,7 @@ unsafe_expr = "unsafe" block
 ```align
 arena {
   data := fs.read_file(path)?
-  users := json.decode<array<User>>(data)?
+  users: array<User> := json.decode(data)?
   process(users)?
 }
 ```
@@ -422,12 +422,9 @@ if (Point{x:1,y:2}) == p { ... }
 ```
 
 ### generics `<` vs comparison
-Ambiguity between `a < b` at expression position and `f<T>(x)`. **Resolution policy**: at type positions (`: type`, `fn ret`, `type_decl`, etc.) `<>` is always generics. At expression positions, generic actual arguments are in principle **not written** (fixed by inference). An explicit syntax is provided only where it is unavoidable.
+Ambiguity between `a < b` at expression position and `f<T>(x)`. **Resolution policy**: at type positions (`: type`, `fn ret`, `type_decl`, etc.) `<>` is always generics. At expression positions there is **no type-argument syntax** — so `<` at expression position is unambiguously comparison, and no lookahead/backtrack is needed.
 
-```align
-// OPEN: explicit-type-argument syntax at expression position (adopt a turbofish-style `f::<T>()` or not)
-```
-Align assumes inference (`design-notes.md`), so explicit type arguments at expression positions are minimized.
+**Settled (2026-06-22): no expression-position type-argument syntax (no turbofish).** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context (`u: User := json.decode(d)?`, flowing back through `?`). When neither supplies the type, that is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. This keeps "one way" (the binding annotation is the single place a type is written), avoids importing the `<>` parse ambiguity that pushed Go to `f[T](x)` and Rust to `::<>`, and is friendlier to generate. The one residual is a *schema-selector* builtin whose type appears in neither arguments nor result (`json.validate<T>`, `json.field_table<T>`); that narrow case stays open (and may fold into `decode`). This rule scales to general generics (before M4): a return-only type parameter is supplied by the binding annotation, never a turbofish.
 
 ### type declaration vs struct literal
 A type declaration (`User { id: i64 }`) appears only at top-level item position. A struct literal (`User{ id: 1 }`) appears only at expression position. They are uniquely distinguished by where they occur.

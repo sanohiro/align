@@ -2682,8 +2682,12 @@ impl<'a> Checker<'a> {
 
     /// `json.decode(input)` — parse a `str` into a struct at runtime, yielding
     /// `Result<Struct, Error>`. The target struct `T` is taken from the expected type
-    /// (a `Result<T, _>`, e.g. from `let u: T := json.decode(d)?`); `<T>` call syntax is
-    /// future. M5 cut: a flat struct of `i64`/`i32`/`bool` fields (str/float/nested later).
+    /// (a `Result<T, _>`, e.g. from `let u: T := json.decode(d)?` — the type flows back
+    /// through `?`). There is deliberately no `<T>` call syntax: Align has no
+    /// expression-position type-argument form (no turbofish — `open-questions.md` Settled,
+    /// `impl/02-frontend.md` §8); the annotate-the-binding error below is the fallback when
+    /// context gives no type. M5 cut: a flat struct of `i64`/`i32`/`bool`/`str` fields
+    /// (float/nested later).
     fn check_json_decode(&mut self, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if args.len() != 1 {

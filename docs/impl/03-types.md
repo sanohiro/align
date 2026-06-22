@@ -212,7 +212,7 @@ Copying is explicit via `clone()`. This constraint does not apply to `Copy` type
 mut saved: slice<User> := empty;
 arena {
   data := fs.read_file(path)?;
-  users := json.decode<array<User>>(data)?;   // users has the Arena(a) region
+  users: array<User> := json.decode(data)?;   // users has the Arena(a) region
   total := users.where(.active).score.sum();  // OK: a value (i64) carries no region
   saved = users;                              // error: an arena view escapes outward
 }

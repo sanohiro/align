@@ -62,6 +62,9 @@ Record: `impl/04-mir.md` (CFG), `non-goals.md`.
 SSO is **not** adopted (its own Settled entry above). Element indexing is implemented: `recv[index]` (array/slice/owned array → scalar) and `arr[index].field` (a struct-array element's field), both bounds-checked. Still open / separate tracks (not part of this decision): tuples / multi-value returns (for `partition`), `array<slice<T>>` (for `chunks`), `array<Struct>.clone()`, a bare whole-struct element value `users[i]` (no field), and `out` params + `noalias` (below).
 Record: `impl/08-memory-model-v2.md` (full model + slice ledger §11), `design-notes.md` ("one region lattice, explicit copies"), `draft.md` §6/§7/§14, `impl/07-roadmap.md` (Memory Model v2 — DONE).
 
+### Type-argument syntax: no turbofish (expression position)
+**Decision (2026-06-22): there is no expression-position type-argument syntax.** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context, including back through `?` (`u: User := json.decode(d)?`). When neither supplies the type it is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. Rationale: keeps "one way" (the binding annotation is the single place a type is written), removes the `<` vs comparison parse ambiguity at expression position outright (the reason Go uses `f[T](x)` and Rust `::<>`), and is friendlier to generate. The headline case — `draft.md` §19's `json.decode<array<User>>(data)` — therefore becomes `users: array<User> := json.decode(data)?`; the checker already takes `decode`'s target from the expected `Result<T,_>` and emits an annotate-the-binding error otherwise (no code change needed — only the spec/comment caught up). **Residual (still open):** a *schema-selector* builtin whose type appears in neither arguments nor result (`json.validate<T>`, `json.field_table<T>`); narrow, unimplemented, and may fold into `decode`. This rule scales to general generics (below): a return-only type parameter is supplied by the binding annotation, never a turbofish. Record: `impl/02-frontend.md` §8 (generics `<` vs comparison), `draft.md` §18 (core.json), `language-spec.md` (JSON).
+
 ---
 
 ## Open (to be decided)
@@ -69,7 +72,7 @@ Record: `impl/08-memory-model-v2.md` (full model + slice ledger §11), `design-n
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
 ### Generics (minimal system) — before M4
-Structural-constraint inference vs explicit bounds (trait-style). Unit of monomorphization implementation. Value generics for `vec<N,T>`. Required to write core in Align itself (`impl/03-types.md` §9, `impl/06-runtime-std.md` §10).
+Structural-constraint inference vs explicit bounds (trait-style). Unit of monomorphization implementation. Value generics for `vec<N,T>`. Required to write core in Align itself (`impl/03-types.md` §9, `impl/06-runtime-std.md` §10). Note: the *call-site* surface is already settled — no expression-position type arguments (see "Type-argument syntax: no turbofish" under Settled); a return-only type parameter is supplied by the binding annotation.
 
 ### Error type design — M2
 single `Error` / typed errors / error categories. Includes the `E → E'` conversion rule for `?` and the exit-code mapping (`impl/03-types.md` §5, `impl/06-runtime-std.md` §9).
