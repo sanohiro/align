@@ -264,6 +264,14 @@ fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
     matches!(ty, Ty::Tuple(id) if tuples[id as usize].elems.iter().any(|s| s.is_move()))
 }
 
+/// Whether `ty` is a Move (owned) type — used to reject capturing an owned value into a lambda
+/// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
+fn ty_capture_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_))
+        || payload_is_move(ty)
+        || ty_tuple_is_move(ty, tuples)
+}
+
 /// Whether a local of `ty` owns a heap buffer that must be freed by a per-binding `Drop` (when its
 /// region is `Static`) — the predicate the drop set is built from. A free-standing owned
 /// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
@@ -425,6 +433,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             slice_bases: std::collections::HashMap::new(),
             cur_fn: String::new(),
             lifted: Vec::new(),
+            capture: None,
         };
         let checked = cx.check_fn(f);
         let lifted = std::mem::take(&mut cx.lifted);
@@ -534,7 +543,14 @@ impl EffectScan {
     fn stage_funcs(&mut self, stages: &[Stage]) {
         for s in stages {
             match &s.kind {
-                StageKind::Map { func } | StageKind::Where { func } => self.calls.push(func.clone()),
+                StageKind::Map { func, captures } | StageKind::Where { func, captures } => {
+                    self.calls.push(func.clone());
+                    // Capture operands are reads of enclosing locals — walk them so no call edge /
+                    // effect they might contain is missed (exhaustiveness).
+                    for c in captures {
+                        self.expr(c);
+                    }
+                }
                 StageKind::Project { .. } | StageKind::WhereField { .. } => {}
             }
         }
@@ -1456,6 +1472,19 @@ struct Checker<'a, 't> {
     /// Lambdas lifted to synthetic top-level functions while checking this function's body. Pass 2
     /// appends them to `program.fns` so later passes / codegen treat them like named functions.
     lifted: Vec<hir::Fn>,
+    /// Set while checking a lambda body — lets a reference to an enclosing local become a capture
+    /// (a synthetic value parameter of the lifted function, passed at the call site).
+    capture: Option<CaptureScope>,
+}
+
+/// Captured-variable bookkeeping while lifting a lambda. A reference in the body that misses the
+/// lambda's own scope but resolves to an enclosing local is *captured*: a synthetic value parameter
+/// is appended to the lifted function and the enclosing local is passed at the call site.
+struct CaptureScope {
+    /// The enclosing function's visible names → (enclosing LocalId, type), snapshot at lambda entry.
+    enclosing: Vec<(String, LocalId, Ty)>,
+    /// Captured enclosing locals, in capture order: (name, lifted-fn param LocalId, enclosing LocalId).
+    captured: Vec<(String, LocalId, LocalId)>,
 }
 
 impl<'a, 't> Checker<'a, 't> {
@@ -1583,6 +1612,27 @@ impl<'a, 't> Checker<'a, 't> {
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, id)| *id)
+    }
+
+    /// Resolve a name to a local, capturing an enclosing local if we are in a lambda body. A miss
+    /// in the lambda's own scope that resolves to an enclosing local becomes a capture: a synthetic
+    /// value parameter of the lifted function (reused on repeat references). The captured local's
+    /// type is taken as-is here; `lift_lambda` rejects capturing a Move (owned) value afterward.
+    fn lookup_or_capture(&mut self, name: &str) -> Option<LocalId> {
+        if let Some(id) = self.lookup(name) {
+            return Some(id);
+        }
+        let cap = self.capture.as_ref()?;
+        if let Some(&(_, param_id, _)) = cap.captured.iter().find(|(n, _, _)| n == name) {
+            return Some(param_id);
+        }
+        let (enc_id, ty) = cap.enclosing.iter().rev().find(|(n, _, _)| n == name).map(|(_, id, t)| (*id, *t))?;
+        // A captured value becomes a synthetic parameter local (tracked in `captured`, *not* pushed
+        // into the visible scope so a nested-block exit can't truncate it).
+        let param_id = self.locals.len() as LocalId;
+        self.locals.push(Local { id: param_id, name: name.to_string(), ty, is_mut: false });
+        self.capture.as_mut().unwrap().captured.push((name.to_string(), param_id, enc_id));
+        Some(param_id)
     }
 
     fn check_fn(&mut self, f: &ast::FnDecl) -> Fn {
@@ -2105,7 +2155,7 @@ impl<'a, 't> Checker<'a, 't> {
             };
         }
         let base = p.segments.first().map(|s| s.name.as_str()).unwrap_or("");
-        let Some(id) = self.lookup(base) else {
+        let Some(id) = self.lookup_or_capture(base) else {
             self.diags.error(format!("undefined name: '{base}'"), span);
             return err(span);
         };
@@ -2655,9 +2705,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// Resolve a stage's function argument (named or lambda) over element type `elem`, returning
     /// the (possibly synthetic) function name to lower to and its return type. A lambda is lifted
     /// to a synthetic top-level function (`lift_lambda`); a named function is checked in place.
-    fn resolve_stage_fn(&mut self, sf: &StageFn, elem: Ty, is_pred: bool) -> Option<(String, Ty)> {
+    fn resolve_stage_fn(&mut self, sf: &StageFn, elem: Ty, is_pred: bool) -> Option<(String, Ty, Vec<Expr>)> {
         match sf {
-            StageFn::Named(fname) => Some((fname.name.clone(), self.check_stage_fn(fname, elem, is_pred))),
+            StageFn::Named(fname) => Some((fname.name.clone(), self.check_stage_fn(fname, elem, is_pred), Vec::new())),
             StageFn::Lambda { params, body, span } => {
                 let expected_ret = if is_pred { Some(Ty::Bool) } else { None };
                 self.lift_lambda(params, body, &[elem], expected_ret, *span)
@@ -2683,7 +2733,7 @@ impl<'a, 't> Checker<'a, 't> {
         expected_params: &[Ty],
         expected_ret: Option<Ty>,
         span: Span,
-    ) -> Option<(String, Ty)> {
+    ) -> Option<(String, Ty, Vec<Expr>)> {
         if params.len() != expected_params.len() {
             self.diags.error(
                 format!("this lambda must take {} parameter(s), but has {}", expected_params.len(), params.len()),
@@ -2695,6 +2745,15 @@ impl<'a, 't> Checker<'a, 't> {
         // another function's inference variable), so resolve the element type now.
         let param_tys: Vec<Ty> = expected_params.iter().map(|t| self.finalize(*t)).collect();
 
+        // Snapshot the enclosing scope (with finalized types) so a body reference to an enclosing
+        // local can be captured. Finalizing now (enclosing inference still live) keeps the capture
+        // parameter's type consistent with the enclosing local once both default the same way.
+        let enclosing: Vec<(String, LocalId, Ty)> = self
+            .scope
+            .iter()
+            .map(|(n, id)| (n.clone(), *id, self.finalize(self.locals[*id as usize].ty)))
+            .collect();
+
         // Swap in fresh per-function state; the lambda is a separate function body.
         let saved_locals = std::mem::take(&mut self.locals);
         let saved_scope = std::mem::take(&mut self.scope);
@@ -2705,10 +2764,12 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_ret = self.ret_hint;
         let saved_arena = self.arena_depth;
         let saved_bases = std::mem::take(&mut self.slice_bases);
+        let saved_capture = self.capture.take();
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
         self.arena_depth = 0;
+        self.capture = Some(CaptureScope { enclosing, captured: Vec::new() });
 
-        let param_ids: Vec<LocalId> =
+        let mut param_ids: Vec<LocalId> =
             params.iter().zip(&param_tys).map(|(p, ty)| self.declare(&p.name, *ty, false)).collect();
         let checked = self.check_block(body, expected_ret);
         let ret = match expected_ret {
@@ -2717,10 +2778,27 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let mut body_fin = checked;
         self.finalize_block(&mut body_fin);
+
+        // Collect captures: each becomes a trailing parameter of the lifted function, and the
+        // enclosing local is passed at the call site. Slice ③ supports copy-value captures only.
+        let captured = self.capture.take().unwrap().captured;
         let mut locals = std::mem::take(&mut self.locals);
         for l in &mut locals {
             l.ty = self.finalize(l.ty);
         }
+        let mut capture_ops = Vec::new();
+        for (cname, pid, enc_id) in &captured {
+            let ty = locals[*pid as usize].ty;
+            if ty_capture_is_move(ty, self.tuples) {
+                self.diags.error(
+                    format!("a lambda cannot capture the owned value '{cname}' yet (capture supports copy values like int/float/bool/char)"),
+                    span,
+                );
+            }
+            param_ids.push(*pid);
+            capture_ops.push(Expr { kind: ExprKind::Local(*enc_id), ty, span });
+        }
+
         let ret = self.finalize(ret);
         let name = format!("{}$lambda{}", self.cur_fn, self.lifted.len());
         self.lifted.push(hir::Fn {
@@ -2743,7 +2821,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.ret_hint = saved_ret;
         self.arena_depth = saved_arena;
         self.slice_bases = saved_bases;
-        Some((name, ret))
+        self.capture = saved_capture;
+        Some((name, ret, capture_ops))
     }
 
     /// Resolve a reducer/terminal function argument — a named function or an inline lambda — given
@@ -2754,7 +2833,17 @@ impl<'a, 't> Checker<'a, 't> {
     /// types are known after `check_pipeline`/the initial value).
     fn resolve_fn(&mut self, arg: &ast::Expr, expected_params: &[Ty], expected_ret: Option<Ty>, label: &str, span: Span) -> Option<(String, Ty)> {
         if let ast::ExprKind::Lambda { params, body } = &arg.kind {
-            return self.lift_lambda(params, body, expected_params, expected_ret, arg.span);
+            let (name, ret, captures) = self.lift_lambda(params, body, expected_params, expected_ret, arg.span)?;
+            if !captures.is_empty() {
+                // Capture is wired into the fused-loop stages (`map`/`where`); the reducers
+                // (`reduce`/`par_map`/`scan`/`partition`/`any`/`all`) don't pass captures yet.
+                self.diags.error(
+                    format!("a capturing lambda is not supported in '{label}' yet — use a named function or a non-capturing lambda"),
+                    span,
+                );
+                return None;
+            }
+            return Some((name, ret));
         }
         let Some(fname) = self.pipeline_fn_name(arg) else {
             self.diags.error(format!("'{label}' needs a function (named or `fn … {{ … }}`)"), span);
@@ -2963,10 +3052,10 @@ impl<'a, 't> Checker<'a, 't> {
                     // stays index-addressed until used, and a struct-consuming `map` loads the
                     // element by index in MIR (`lower_struct_elem`). The function (named or lambda)
                     // takes the current element type and returns the new one.
-                    let Some((func, ret)) = self.resolve_stage_fn(&sf, elem, false) else {
+                    let Some((func, ret, captures)) = self.resolve_stage_fn(&sf, elem, false) else {
                         return None;
                     };
-                    stages.push(Stage { kind: StageKind::Map { func }, out_ty: ret });
+                    stages.push(Stage { kind: StageKind::Map { func, captures }, out_ty: ret });
                     elem = ret;
                     mapped = true;
                 }
@@ -2976,10 +3065,10 @@ impl<'a, 't> Checker<'a, 't> {
                     // (the same `lower_struct_elem` as `map`); `where` filters, so the element is
                     // unchanged (no `mapped`, and a later `.field` / `where(.field)` still reads the
                     // source).
-                    let Some((func, _)) = self.resolve_stage_fn(&sf, elem, true) else {
+                    let Some((func, _, captures)) = self.resolve_stage_fn(&sf, elem, true) else {
                         return None;
                     };
-                    stages.push(Stage { kind: StageKind::Where { func }, out_ty: elem });
+                    stages.push(Stage { kind: StageKind::Where { func, captures }, out_ty: elem });
                 }
                 RawStage::WhereField(field) => {
                     if !slot_backed {

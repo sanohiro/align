@@ -164,10 +164,74 @@ fn bare_lambda_rejected() {
 }
 
 #[test]
-fn lambda_capture_rejected_for_now() {
-    // Slice ① is non-capturing: referencing an enclosing local is an undefined-name error.
+fn lambda_captures_local_in_map() {
+    if !backend_available() {
+        return;
+    }
+    // A lambda captures an enclosing local by value (passed as a synthetic parameter): (1+2+3)*3 = 18.
     let src = "fn main() -> Result<(), Error> {\n  factor := 3\n  print([1, 2, 3].map(fn x { x * factor }).sum())\n  return Ok(())\n}\n";
-    assert!(check_errs("lam-capture", src));
+    let out = build_and_run("lam-capture-map", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "18\n");
+}
+
+#[test]
+fn lambda_captures_in_where() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n  threshold := 2\n  print([1, 2, 3, 4].where(fn x { x > threshold }).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-capture-where", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+#[test]
+fn lambda_captures_function_parameter() {
+    if !backend_available() {
+        return;
+    }
+    // Capturing a function parameter — what named functions fundamentally cannot do.
+    let src = "fn scale(xs: slice<i64>, k: i64) -> i64 = xs.map(fn x { x * k }).sum()\nfn main() -> Result<(), Error> {\n  a := [1, 2, 3, 4]\n  print(scale(a, 10))\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-capture-param", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "100\n");
+}
+
+#[test]
+fn lambda_captures_multiple() {
+    if !backend_available() {
+        return;
+    }
+    // Two captures: (1*2+5)+(2*2+5)+(3*2+5) = 7+9+11 = 27.
+    let src = "fn main() -> Result<(), Error> {\n  a := 2\n  b := 5\n  print([1, 2, 3].map(fn x { x * a + b }).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-capture-multi", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "27\n");
+}
+
+#[test]
+fn lambda_captures_lower_to_extra_call_args() {
+    // The capture becomes a trailing parameter of the lifted function, passed at the call.
+    let src = "fn main() -> Result<(), Error> {\n  factor := 3\n  print([1, 2, 3].map(fn x { x * factor }).sum())\n  return Ok(())\n}\n";
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("fn main$lambda0(_0: i64, _1: i64)"), "lambda should take the element + the capture:\n{text}");
+}
+
+#[test]
+fn lambda_capture_in_reduce_rejected_for_now() {
+    // Capture is wired into map/where; the reducers don't pass captures yet.
+    let src = "fn main() -> Result<(), Error> {\n  k := 2\n  print([1, 2, 3].reduce(fn acc, x { acc + x * k }, 0))\n  return Ok(())\n}\n";
+    assert!(check_errs("lam-capture-reduce", src));
+}
+
+#[test]
+fn lambda_capture_owned_value_rejected_for_now() {
+    // Slice ③ captures copy values; capturing an owned (Move) value is deferred.
+    let src = "fn main() -> Result<(), Error> {\n  ys := [10, 20].to_array()\n  print([1, 2, 3].map(fn x { x + ys.sum() }).sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("lam-capture-owned", src));
 }
 
 #[test]

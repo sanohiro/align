@@ -878,7 +878,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             // Sequential fallback: append a `map(f)` stage and materialize via the collect loop.
             let mut stages2 = stages.clone();
-            stages2.push(hir::Stage { kind: hir::StageKind::Map { func: func.clone() }, out_ty: *elem });
+            stages2.push(hir::Stage { kind: hir::StageKind::Map { func: func.clone(), captures: Vec::new() }, out_ty: *elem });
             lower_array_collect(b, source, &stages2, *elem, CollectKind::Collect)
         }
         hir::ExprKind::ArrayChunks { source, n, elem } => {
@@ -1139,6 +1139,17 @@ struct SrcSetup {
     temp_free: Option<Operand>,
 }
 
+/// The arguments for a stage function call: the element, then any captured values (a lifted
+/// lambda's captured enclosing locals, passed by value). Captures are lowered each iteration —
+/// they reference loop-invariant enclosing locals, so LLVM hoists the loads out of the loop.
+fn stage_call_args(b: &mut Builder, arg: Operand, captures: &[hir::Expr]) -> Vec<Operand> {
+    let mut args = vec![arg];
+    for c in captures {
+        args.push(lower_expr(b, c));
+    }
+    args
+}
+
 fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
     match source.ty {
         // `slice<T>`, owned `array<T>`, and `array<slice<T>>` (a `chunks` result, element =
@@ -1327,7 +1338,7 @@ fn lower_array_reduce(
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Map { func } => {
+            hir::StageKind::Map { func, captures } => {
                 // A scalar element is already loaded; a struct element consumed whole (a
                 // `map(f)` with no prior `.field`) is loaded here by index.
                 let arg = match cur.take() {
@@ -1340,11 +1351,12 @@ fn lower_array_reduce(
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
+                let call_args = stage_call_args(b, arg, captures);
                 let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), vec![arg])));
+                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Where { func } => {
+            hir::StageKind::Where { func, captures } => {
                 // A scalar element is already loaded; a whole struct element (a struct-consuming
                 // predicate, no prior projection) is loaded here by index. `where` keeps the
                 // element, so `cur` is left unchanged either way.
@@ -1358,8 +1370,9 @@ fn lower_array_reduce(
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
+                let call_args = stage_call_args(b, arg, captures);
                 let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), vec![arg])));
+                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
                 let keep = b.new_block();
                 // false → skip this element (go to the increment).
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
@@ -1538,7 +1551,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Map { func } => {
+            hir::StageKind::Map { func, captures } => {
                 // A scalar element is already loaded; a struct element consumed whole (a
                 // `map(f)` with no prior `.field`) is loaded here by index.
                 let arg = match cur.take() {
@@ -1551,11 +1564,12 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
+                let call_args = stage_call_args(b, arg, captures);
                 let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), vec![arg])));
+                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Where { func } => {
+            hir::StageKind::Where { func, captures } => {
                 // A scalar element is already loaded; a whole struct element (a struct-consuming
                 // predicate, no prior projection) is loaded here by index. `where` keeps the
                 // element, so `cur` is left unchanged either way.
@@ -1569,8 +1583,9 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
+                let call_args = stage_call_args(b, arg, captures);
                 let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), vec![arg])));
+                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -1713,7 +1728,7 @@ fn lower_array_partition(
                 let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Map { func } => {
+            hir::StageKind::Map { func, captures } => {
                 let arg = match cur.take() {
                     Some(a) => a,
                     None => {
@@ -1724,11 +1739,12 @@ fn lower_array_partition(
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
+                let call_args = stage_call_args(b, arg, captures);
                 let v = b.fresh_value(stage.out_ty);
-                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), vec![arg])));
+                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
                 cur = Some(Operand::Value(v));
             }
-            hir::StageKind::Where { func } => {
+            hir::StageKind::Where { func, captures } => {
                 let arg = match &cur {
                     Some(a) => a.clone(),
                     None => {
@@ -1739,8 +1755,9 @@ fn lower_array_partition(
                         Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
                     }
                 };
+                let call_args = stage_call_args(b, arg, captures);
                 let pred = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), vec![arg])));
+                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;

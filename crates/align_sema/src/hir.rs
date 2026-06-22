@@ -340,10 +340,11 @@ pub enum TemplatePart {
 
 #[derive(Clone, Debug)]
 pub enum StageKind {
-    /// `.map(f)` — transform each element with the named function `func`.
-    Map { func: String },
-    /// `.where(p)` — keep only elements for which the named predicate `func` is true.
-    Where { func: String },
+    /// `.map(f)` — transform each element with `func`. `captures` are extra arguments passed after
+    /// the element (a lifted lambda's captured enclosing values; empty for a named function).
+    Map { func: String, captures: Vec<Expr> },
+    /// `.where(p)` — keep only elements for which the predicate `func` is true. `captures` as `Map`.
+    Where { func: String, captures: Vec<Expr> },
     /// `.where(.field)` — keep only elements whose (bool) `field` is true.
     WhereField { field: u32 },
     /// `.field` — project a struct field out of each element (struct array → scalar).
