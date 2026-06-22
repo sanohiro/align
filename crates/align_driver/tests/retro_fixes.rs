@@ -106,9 +106,16 @@ fn field_projection_after_map_is_rejected_not_panicked() {
 }
 
 #[test]
-fn where_over_struct_element_is_rejected_not_panicked() {
+fn where_over_struct_element_now_compiles() {
+    if !backend_available() {
+        return;
+    }
+    // `where(structfn)` over a whole struct element is now a supported feature (a multi-field
+    // predicate), no longer the rejected/panicking case it was at #33. `keep` is always true, so
+    // the element survives; `.x` projects (where leaves the element unchanged) → sum = 1.
     let src = "Point { x: i32, y: i32 }\nfn keep(p: Point) -> bool = true\nfn main() -> i32 {\n  return [Point { x: 1, y: 2 }].where(keep).x.sum()\n}\n";
-    assert!(check_errs("where-struct", src));
+    let out = build_and_run("where-struct", src);
+    assert_eq!(out.status.code(), Some(1));
 }
 
 // --- #19/#22: unifying two unconstrained int vars links them, so constraining one later

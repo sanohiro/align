@@ -2276,13 +2276,11 @@ impl<'a, 't> Checker<'a, 't> {
                     mapped = true;
                 }
                 RawStage::Where(fname) => {
-                    if matches!(elem, Ty::Struct(_)) {
-                        self.diags.error(
-                            format!("'where' over a struct element is not supported yet (use 'where(.field)' or project first), got {}", ty_name(elem)),
-                            fname.span,
-                        );
-                        return None;
-                    }
+                    // `where(f)` accepts a scalar element or a whole struct element (a multi-field
+                    // predicate, e.g. `fn busy(e: Emp) -> bool = e.hours > 40 && e.active`). A
+                    // struct-consuming predicate loads the element by value in MIR (the same
+                    // `lower_struct_elem` as `map`); `where` filters, so the element is unchanged
+                    // (no `mapped`, and a later `.field` / `where(.field)` still reads the source).
                     self.check_stage_fn(&fname, elem, true);
                     stages.push(Stage { kind: StageKind::Where { func: fname.name }, out_ty: elem });
                 }
@@ -4105,10 +4103,10 @@ mod tests {
         // (`where(.field)` + projection + reduction).
         let (_p, ok) = check("User { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(.active).score.sum())\n  return Ok(())\n}\n");
         assert!(!ok.has_errors(), "a where(.field).field.sum() pipeline over array<Struct> should check");
-        // `map`/`where` directly over the whole struct element (before a projection) is still
-        // rejected for a dynamic struct array, just as for a fixed one.
-        let (_q, bad) = check("User { id: i64, score: i32 }\nfn keep(u: User) -> bool = true\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(keep).score.sum())\n  return Ok(())\n}\n");
-        assert!(bad.has_errors(), "'where' over a whole struct element must be rejected");
+        // `where` with a whole-struct predicate over a dynamic struct array now checks (it loads
+        // the element by value and keeps it, so the following `.score` projection reads the source).
+        let (_q, ok2) = check("User { id: i64, active: bool, score: i32 }\nfn keep(u: User) -> bool = u.active\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(keep).score.sum())\n  return Ok(())\n}\n");
+        assert!(!ok2.has_errors(), "'where' with a whole-struct predicate should check");
     }
 
     #[test]

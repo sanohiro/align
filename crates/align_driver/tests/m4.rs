@@ -268,6 +268,30 @@ fn struct_array_where_field_then_map() {
 }
 
 #[test]
+fn struct_array_where_struct_predicate() {
+    if !backend_available() {
+        return;
+    }
+    // `where(f)` with a whole-struct predicate (multi-field: hours > 40 AND active). `where`
+    // keeps the element, so the following `.pay` projection still reads the source: 20 + 22 = 42.
+    let src = "Emp { hours: i32, active: bool, pay: i32 }\nfn busy(e: Emp) -> bool = e.hours > 40 && e.active\nfn main() -> i32 {\n  return [Emp{hours: 50, active: true, pay: 20}, Emp{hours: 60, active: false, pay: 99}, Emp{hours: 45, active: true, pay: 22}].where(busy).pay.sum()\n}\n";
+    let out = build_and_run("struct-where-pred", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn struct_array_where_struct_then_map() {
+    if !backend_available() {
+        return;
+    }
+    // A whole-struct `where` predicate, then a whole-struct `map` over the survivors:
+    // keep base > 15, then net = base + bonus → (30+12) = 42 (the base-10 row is filtered out).
+    let src = "Emp { base: i32, bonus: i32 }\nfn big(e: Emp) -> bool = e.base > 15\nfn net(e: Emp) -> i32 = e.base + e.bonus\nfn main() -> i32 {\n  return [Emp{base: 10, bonus: 99}, Emp{base: 30, bonus: 12}].where(big).map(net).sum()\n}\n";
+    let out = build_and_run("struct-where-map", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
 fn map_then_field_projection_errors() {
     // `.field` after `map` is rejected (map yields a computed value, not a source element).
     let mut sm = SourceMap::new();

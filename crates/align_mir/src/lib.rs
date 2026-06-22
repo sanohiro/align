@@ -1197,7 +1197,19 @@ fn lower_array_reduce(
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Where { func } => {
-                let arg = cur.clone().expect("where before projection");
+                // A scalar element is already loaded; a whole struct element (a struct-consuming
+                // predicate, no prior projection) is loaded here by index. `where` keeps the
+                // element, so `cur` is left unchanged either way.
+                let arg = match &cur {
+                    Some(a) => a.clone(),
+                    None => {
+                        let sid = match source.ty {
+                            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
+                            _ => unreachable!("where with no loaded element must be over a struct array"),
+                        };
+                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                    }
+                };
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), vec![arg])));
                 let keep = b.new_block();
@@ -1395,7 +1407,19 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Where { func } => {
-                let arg = cur.clone().expect("where before projection");
+                // A scalar element is already loaded; a whole struct element (a struct-consuming
+                // predicate, no prior projection) is loaded here by index. `where` keeps the
+                // element, so `cur` is left unchanged either way.
+                let arg = match &cur {
+                    Some(a) => a.clone(),
+                    None => {
+                        let sid = match source.ty {
+                            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
+                            _ => unreachable!("where with no loaded element must be over a struct array"),
+                        };
+                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                    }
+                };
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), vec![arg])));
                 let keep = b.new_block();

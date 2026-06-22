@@ -1,0 +1,15 @@
+// `where(f)` with a whole-struct predicate (M4) — a multi-field filter, the companion of
+// the single-field `where(.active)`. The predicate reads the whole element by value; `where`
+// keeps it, so the following `.pay` projection still reads the source struct.
+// busy = hours > 40 AND active → keeps rows 1 and 3; sum of their pay = 20 + 22 = 42.
+Emp { hours: i32, active: bool, pay: i32 }
+
+fn busy(e: Emp) -> bool = e.hours > 40 && e.active
+
+fn main() -> i32 {
+  return [
+    Emp{hours: 50, active: true, pay: 20},
+    Emp{hours: 60, active: false, pay: 99},
+    Emp{hours: 45, active: true, pay: 22},
+  ].where(busy).pay.sum()
+}
