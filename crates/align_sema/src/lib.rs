@@ -1606,7 +1606,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(ce.ty, Some(concrete), ce.span);
             match ty_to_scalar(self.resolve(ce.ty)) {
                 Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
-                | Scalar::Str | Scalar::String | Scalar::DynArray(_))) => scalars.push(s),
+                | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_))) => scalars.push(s),
                 _ => {
                     if ce.ty != Ty::Error {
                         self.diags.error(
@@ -3612,7 +3612,7 @@ fn resolve_type(
                 }
                 match ty_to_scalar(ety) {
                     Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
-                    | Scalar::Str | Scalar::String | Scalar::DynArray(_))) => scalars.push(s),
+                    | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_))) => scalars.push(s),
                     _ => {
                         diags.error(
                             format!("tuple elements must be a scalar, str, owned string, or owned array for now, got {}", ty_name(ety)),
