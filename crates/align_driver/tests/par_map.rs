@@ -84,6 +84,56 @@ fn par_map_chained_into_reduction_frees_intermediate() {
     assert!(text.contains("drop_value"), "the par_map intermediate must be freed:\n{text}");
 }
 
+#[test]
+fn chunks_par_map_chunk_function() {
+    if !backend_available() {
+        return;
+    }
+    // The §11 headline: `chunks(n).par_map(f)` where `f: (slice<T>) -> R` reduces each chunk.
+    // [1..5].chunks(2) → [1,2],[3,4],[5]; chunk_sum → [3, 7, 5].
+    let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  sums := [1, 2, 3, 4, 5].chunks(2).par_map(chunk_sum)\n  print(sums.len())\n  print(sums[0])\n  print(sums[2])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-chunks", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n3\n5\n");
+}
+
+#[test]
+fn chunks_par_map_then_reduce() {
+    if !backend_available() {
+        return;
+    }
+    // Chunk-parallel sums, then a final reduction over the per-chunk results: 3+7+11 = 21.
+    let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  total := [1, 2, 3, 4, 5, 6].chunks(2).par_map(chunk_sum).sum()\n  print(total)\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-chunks-reduce", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "21\n");
+}
+
+#[test]
+fn chunks_par_map_inside_arena_frees_chunk_buffer() {
+    if !backend_available() {
+        return;
+    }
+    // Inside an `arena {}`, the `chunks` header buffer is heap-allocated (not arena), so it must
+    // still be freed (`drop_value`) — the arena's bulk-free doesn't cover it. (1+2)+(3+4) = 10.
+    let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  arena {\n    total := [1, 2, 3, 4].chunks(2).par_map(chunk_sum).sum()\n    print(total)\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-chunks-arena", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n");
+    // The always-heap chunks buffer is freed even inside the arena.
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("drop_value"), "the chunks buffer must be freed inside the arena:\n{text}");
+}
+
+#[test]
+fn chunks_par_map_impure_rejected() {
+    // The Pure requirement still applies to a chunk-consuming function.
+    let src = "fn noisy(c: slice<i64>) -> i64 {\n  print(c.len())\n  return c.sum()\n}\nfn main() -> Result<(), Error> {\n  s := [1, 2].chunks(1).par_map(noisy)\n  print(s.len())\n  return Ok(())\n}\n";
+    assert!(check_errs("pm-chunks-impure", src));
+}
+
 // --- purity (Pure requirement) ---
 
 #[test]

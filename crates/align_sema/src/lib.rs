@@ -2643,6 +2643,9 @@ impl<'a, 't> Checker<'a, 't> {
         let mut elem = match source.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Ty::Struct(id),
+            // An `array<slice<T>>` (a `chunks` result): each element is a `slice<T>` chunk —
+            // the input to `chunks(n).par_map(f)`'s `f: (slice<T>) -> R`.
+            Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
             Ty::Error => return None,
             other => {
                 self.diags
