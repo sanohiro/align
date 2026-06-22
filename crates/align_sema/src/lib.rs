@@ -2763,13 +2763,16 @@ impl<'a, 't> Checker<'a, 't> {
                             }
                         }
                         // An inline lambda (`map(fn x { … })`) or a named function.
-                        let stage_fn = match arg.map(|a| &a.kind) {
-                            Some(ast::ExprKind::Lambda { params, body }) => Some(StageFn::Lambda {
-                                params: params.clone(),
-                                body: body.clone(),
-                                span: arg.unwrap().span,
-                            }),
-                            _ => arg.and_then(|a| self.pipeline_fn_name(a)).map(StageFn::Named),
+                        let stage_fn = match arg {
+                            Some(a) => match &a.kind {
+                                ast::ExprKind::Lambda { params, body } => Some(StageFn::Lambda {
+                                    params: params.clone(),
+                                    body: body.clone(),
+                                    span: a.span,
+                                }),
+                                _ => self.pipeline_fn_name(a).map(StageFn::Named),
+                            },
+                            None => None,
                         };
                         match stage_fn {
                             Some(f) if is_map => stages.push(RawStage::Map(f)),
