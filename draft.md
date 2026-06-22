@@ -874,7 +874,7 @@ json.field_table<T>
 `decode` and `encode` carry no written type argument: `decode`'s target is the
 expected type from context (`u: User := json.decode(d)?`) and `encode`'s is the
 type of its value argument — inference recovers both, so Align has no
-expression-position type-argument syntax (`§9`, no turbofish). `validate<T>` and
+expression-position type-argument syntax (no turbofish). `validate<T>` and
 `field_table<T>` are the residual schema-selector case where `T` appears in
 neither arguments nor result; their explicit-type surface is still open (they may
 fold into `decode`).
