@@ -1,0 +1,17 @@
+// `par_map(f)` applies a function to each element and materializes the results into an owned
+// `array<R>` (draft.md §11) — the data-parallel map. The function must be **Pure** (no I/O or
+// other observable side effect); an impure function is a compile error. (This first cut runs
+// sequentially; real thread-parallel execution is a runtime follow-up — the Pure rule is what
+// makes that safe.)
+Emp { base: i32, bonus: i32 }
+
+fn net(e: Emp) -> i32 = e.base + e.bonus
+
+fn main() -> Result<(), Error> {
+  pay := [
+    Emp{base: 30, bonus: 12},
+    Emp{base: 18, bonus: 4},
+  ].par_map(net)
+  print(pay.sum())   // 42 + 22 = 64
+  return Ok(())
+}

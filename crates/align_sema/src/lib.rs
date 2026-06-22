@@ -448,7 +448,213 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             .collect();
         f.drop_locals = drops;
     }
+    // Pass 4: effect/purity inference + the `par_map` Pure requirement (`draft.md` §11).
+    check_parallelism(&program, diags);
     program
+}
+
+/// Effect/purity inference + the rule that a `par_map` function must be **Pure** (`draft.md` §11,
+/// a Settled decision). A function is **Impure** iff it (transitively) performs an observable
+/// side effect — calling `print` / `io.stdout.write` / `fs.read_file`, or calling an Impure
+/// function. Everything else (arithmetic, field/array reads, builder/arena/heap use, owned-value
+/// moves) is Pure. A `par_map(f)` whose `f` is Impure is rejected. (`f` is `(T) -> R` with no `out`
+/// parameter, so reaching a side effect is the only way it can be Impure — sound for the language
+/// as it stands.)
+fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
+    use std::collections::HashMap;
+    // Per function: directly observable effect + the set of functions it calls (incl. pipeline
+    // stage/reducer functions) + the `par_map` callees to verify.
+    let mut direct: HashMap<&str, bool> = HashMap::new();
+    let mut calls: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut parmaps: Vec<(String, Span)> = Vec::new();
+    for f in &program.fns {
+        let mut scan = EffectScan { impure_direct: false, calls: Vec::new(), parmaps: Vec::new() };
+        scan.block(&f.body);
+        direct.insert(f.name.as_str(), scan.impure_direct);
+        calls.insert(f.name.as_str(), scan.calls);
+        parmaps.extend(scan.parmaps);
+    }
+    // Fixpoint: a function is impure if it has a direct effect or calls an impure function.
+    let mut impure: std::collections::HashSet<String> =
+        direct.iter().filter(|(_, d)| **d).map(|(n, _)| n.to_string()).collect();
+    loop {
+        let mut changed = false;
+        for f in &program.fns {
+            if impure.contains(&f.name) {
+                continue;
+            }
+            if calls[f.name.as_str()].iter().any(|c| impure.contains(c)) {
+                impure.insert(f.name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // The `par_map` function must be Pure.
+    for (func, span) in parmaps {
+        if impure.contains(&func) {
+            diags.error(
+                format!("'par_map' requires a Pure function, but '{func}' has a side effect (it reads/writes I/O); use `reduce` for an accumulation"),
+                span,
+            );
+        }
+    }
+}
+
+/// Walks a function body to collect its directly-observable effect, the functions it calls (incl.
+/// pipeline stage/reducer functions), and any `par_map` callees. The match is exhaustive, so no
+/// call edge or effect node can be silently missed.
+struct EffectScan {
+    impure_direct: bool,
+    calls: Vec<String>,
+    parmaps: Vec<(String, Span)>,
+}
+
+impl EffectScan {
+    fn stage_funcs(&mut self, stages: &[Stage]) {
+        for s in stages {
+            match &s.kind {
+                StageKind::Map { func } | StageKind::Where { func } => self.calls.push(func.clone()),
+                StageKind::Project { .. } | StageKind::WhereField { .. } => {}
+            }
+        }
+    }
+
+    fn block(&mut self, b: &Block) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Let { init, .. } | Stmt::Assign { value: init, .. } | Stmt::AssignField { value: init, .. } | Stmt::LetTuple { init, .. } => self.expr(init),
+                Stmt::AssignIndex { index, value, .. } => {
+                    self.expr(index);
+                    self.expr(value);
+                }
+                Stmt::Return(Some(e)) | Stmt::Expr(e) => self.expr(e),
+                Stmt::Return(None) => {}
+            }
+        }
+        if let Some(v) = &b.value {
+            self.expr(v);
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) {
+        match &e.kind {
+            // Observable side effects.
+            ExprKind::Call { func, args } => {
+                if func == "print" {
+                    self.impure_direct = true;
+                } else {
+                    self.calls.push(func.clone());
+                }
+                for a in args {
+                    self.expr(a);
+                }
+            }
+            ExprKind::IoStdoutWrite { arg } => {
+                self.impure_direct = true;
+                self.expr(arg);
+            }
+            ExprKind::IoStdoutWriteBuilder { builder } => {
+                self.impure_direct = true;
+                self.expr(builder);
+            }
+            ExprKind::FsReadFile { path } => {
+                self.impure_direct = true;
+                self.expr(path);
+            }
+            // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
+            ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
+                self.stage_funcs(stages);
+                self.expr(source);
+            }
+            ExprKind::ArrayMinMax { source, stages, .. } | ExprKind::ArraySort { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. } => {
+                self.stage_funcs(stages);
+                self.expr(source);
+            }
+            ExprKind::ArrayAnyAll { source, stages, func, .. }
+            | ExprKind::ArrayReduce { source, stages, func, .. }
+            | ExprKind::ArrayScan { source, stages, func, .. }
+            | ExprKind::ArrayPartition { source, stages, func, .. } => {
+                self.stage_funcs(stages);
+                self.calls.push(func.clone());
+                self.expr(source);
+            }
+            ExprKind::ArrayParMap { source, stages, func, .. } => {
+                self.stage_funcs(stages);
+                self.calls.push(func.clone());
+                self.parmaps.push((func.clone(), e.span));
+                self.expr(source);
+            }
+            ExprKind::ArrayDot { a, b, .. } => {
+                self.expr(a);
+                self.expr(b);
+            }
+            // Structural recursion (no effect of their own).
+            ExprKind::Unary { expr, .. } => self.expr(expr),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.expr(lhs);
+                self.expr(rhs);
+            }
+            ExprKind::If { cond, then, els } => {
+                self.expr(cond);
+                self.block(then);
+                self.block(els);
+            }
+            ExprKind::StructLit { fields, .. } => {
+                for f in fields {
+                    self.expr(f);
+                }
+            }
+            ExprKind::Tuple { elems, .. } => {
+                for el in elems {
+                    self.expr(el);
+                }
+            }
+            ExprKind::ArrayLit { elems, .. } => {
+                for el in elems {
+                    self.expr(el);
+                }
+            }
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.expr(opt);
+                self.expr(fallback);
+            }
+            ExprKind::BuilderWrite { builder, arg, .. } => {
+                self.expr(builder);
+                self.expr(arg);
+            }
+            ExprKind::Block(b) | ExprKind::Arena(b) => self.block(b),
+            ExprKind::TupleIndex { recv, .. } => self.expr(recv),
+            ExprKind::Index { recv, index } => {
+                self.expr(recv);
+                self.expr(index);
+            }
+            ExprKind::ElemField { recv, index, .. } => {
+                self.expr(recv);
+                self.expr(index);
+            }
+            ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i) | ExprKind::Try(i)
+            | ExprKind::HeapNew(i) | ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i)
+            | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::Len(i)
+            | ExprKind::ArrayToSlice(i) => self.expr(i),
+            ExprKind::Template(parts) => {
+                for p in parts {
+                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
+                        self.expr(h);
+                    }
+                }
+            }
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. }
+            | ExprKind::JsonDecodeStructArray { input, .. } => self.expr(input),
+            // Leaves.
+            ExprKind::Unit | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_)
+            | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::OptionNone
+            | ExprKind::Field { .. } | ExprKind::IndexField { .. } | ExprKind::BuilderNew => {}
+        }
+    }
 }
 
 /// A value's inferred lifetime region (Memory Model v2, `impl/08-memory-model-v2.md`).
@@ -600,6 +806,7 @@ impl<'a> EscapeCheck<'a> {
             // forwards `init` or borrows a source element (both outlive `arena(depth)`).
             ExprKind::ArrayToArray { .. }
             | ExprKind::ArrayPartition { .. }
+            | ExprKind::ArrayParMap { .. }
             | ExprKind::ArrayScan { .. }
             | ExprKind::ArraySort { .. }
             | ExprKind::ArrayReduce { .. } => Region::arena(depth),
@@ -857,7 +1064,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.walk(recv, depth);
@@ -1062,7 +1269,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::BuilderNew => {}
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
@@ -2208,6 +2415,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "partition" {
             return self.check_array_partition(recv, args, span);
         }
+        if method == "par_map" {
+            return self.check_array_par_map(recv, args, span);
+        }
         // Builder methods (MMv2 slice 7c/7d): typed `write*` appends, `to_string` finishes.
         if let Some(kind) = builder_write_kind(method) {
             return self.check_builder_write(recv, args, kind, span);
@@ -2668,6 +2878,45 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::ArrayPartition { source: Box::new(source), stages, func: fname.name, elem },
             ty: Ty::Tuple(tuple_id),
+            span,
+        }
+    }
+
+    /// `source.….par_map(f)` — apply the Pure function `f` to each surviving element and
+    /// materialize the results into an owned `array<R>`. `f` must be Pure (checked later, over the
+    /// whole call graph) and return a primitive scalar. The first cut runs sequentially.
+    fn check_array_par_map(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [fn_arg] = args else {
+            self.diags.error(
+                format!("'par_map' takes 1 argument (a function), got {}", args.len()),
+                span,
+            );
+            return err;
+        };
+        let Some(fname) = self.pipeline_fn_name(fn_arg) else {
+            self.diags.error("'par_map' needs a named function".to_string(), span);
+            return err;
+        };
+        let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
+            return err;
+        };
+        // `f: (elem) -> R`; check the parameter matches the (post-stage) element type.
+        let r = self.check_stage_fn(&fname, elem, false);
+        if r == Ty::Error {
+            return err;
+        }
+        // The result must materialize into `array<R>`, i.e. be a primitive scalar.
+        let Some(scalar) = ty_to_scalar(r).filter(|s| scalar_to_prim(*s).is_some()) else {
+            self.diags.error(
+                format!("'par_map' result must be a primitive scalar (int/float/bool/char), got {}", ty_name(r)),
+                span,
+            );
+            return err;
+        };
+        Expr {
+            kind: ExprKind::ArrayParMap { source: Box::new(source), stages, func: fname.name, elem: r },
+            ty: Ty::DynArray(scalar),
             span,
         }
     }
@@ -3651,7 +3900,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
