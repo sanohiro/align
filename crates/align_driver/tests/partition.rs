@@ -79,6 +79,24 @@ fn partition_all_one_side() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n0\n");
 }
 
+#[test]
+fn partition_ignored_owned_half_is_dropped() {
+    if !backend_available() {
+        return;
+    }
+    // `(evens, _) := …` discards the odds array. The ignored owned half must still be freed (not
+    // leaked) — it is bound to a hidden drop local. evens (2,4) sum = 6.
+    let src = "fn is_even(x: i64) -> bool = x % 2 == 0\nfn main() -> Result<(), Error> {\n  (evens, _) := [1, 2, 3, 4, 5].partition(is_even)\n  print(evens.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("part-ignore", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n");
+    // The ignored half is extracted into a drop local (not leaked).
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains(".1"), "the ignored element should still be extracted:\n{text}");
+}
+
 // --- diagnostics ---
 
 #[test]

@@ -258,6 +258,13 @@ fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
     matches!(ty, Ty::Tuple(id) if tuples[id as usize].elems.iter().any(|s| s.is_move()))
 }
 
+/// Whether a local of `ty` owns a heap buffer that must be freed by a per-binding `Drop` (when its
+/// region is `Static`) — the predicate the drop set is built from. A free-standing owned
+/// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
+fn is_owned_droppable(ty: Ty) -> bool {
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(ty)
+}
+
 impl Ty {
     fn is_int_like(self) -> bool {
         matches!(self, Ty::Int(_) | Ty::IntVar(_))
@@ -436,7 +443,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| matches!(l.ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(l.ty))
+            .filter(|l| is_owned_droppable(l.ty))
             .map(|l| l.id)
             .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
             .collect();
@@ -1364,10 +1371,17 @@ impl<'a, 't> Checker<'a, 't> {
                         }
                         let mut locals = Vec::with_capacity(names.len());
                         for (i, n) in names.iter().enumerate() {
+                            let ety = elem_tys.get(i).copied().unwrap_or(Ty::Error);
                             match n {
                                 Some(name) => {
-                                    let ety = elem_tys.get(i).copied().unwrap_or(Ty::Error);
                                     locals.push(Some(self.declare(&name.name, ety, false)));
+                                }
+                                // An *ignored* (`_`) owned element must still be dropped, not leaked:
+                                // bind it to a fresh hidden local so it joins the normal drop path
+                                // (freed once at scope exit, or bulk-freed if arena-regioned). A
+                                // Copy / `str` element needs no cleanup, so `_` binds nothing.
+                                None if is_owned_droppable(ety) => {
+                                    locals.push(Some(self.declare(&format!("_drop{i}"), ety, false)));
                                 }
                                 None => locals.push(None),
                             }
