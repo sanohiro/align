@@ -82,6 +82,14 @@ fn write_to_immutable_array_rejected() {
 }
 
 #[test]
+fn element_write_after_move_rejected() {
+    // Writing an element of an owned array that was moved away is a use-after-move (it would
+    // write through a nulled slot) — must be a compile error, not a runtime fault.
+    let src = "fn main() -> Result<(), Error> {\n  mut ys := [1, 2, 3].to_array()\n  zs := ys\n  ys[0] = 4\n  print(zs.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("w-uam", src));
+}
+
+#[test]
 fn out_on_non_slice_rejected() {
     assert!(check_errs("w-out-nonslice", "fn f(out x: i32) -> i32 = x\nfn main() -> i32 = 0\n"));
 }

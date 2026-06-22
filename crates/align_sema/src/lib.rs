@@ -963,9 +963,14 @@ impl<'a> MoveCheck<'a> {
                     moved.remove(local);
                 }
                 Stmt::AssignField { value, .. } => self.expr(value, moved, true, true),
-                // `base[index] = value` — primitive element store: index and value are read
-                // (not moved; Copy). Recurse to flag any use of a moved value within them.
-                Stmt::AssignIndex { index, value, .. } => {
+                // `base[index] = value` — writing an element is a use of `base` (an owned array
+                // could have been moved away), so flag use-after-move on it; index and value are
+                // read (not moved; Copy).
+                Stmt::AssignIndex { base, index, value } => {
+                    if moved.contains(base) {
+                        let name = &self.f.locals[*base as usize].name;
+                        self.diags.error(format!("use of moved value '{name}'"), index.span);
+                    }
                     self.expr(index, moved, false, false);
                     self.expr(value, moved, false, false);
                 }
@@ -1511,7 +1516,10 @@ impl<'a, 't> Checker<'a, 't> {
                 return Place::Err;
             }
             let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
-            if i.ty != Ty::Error && !i.ty.is_int_like() {
+            if i.ty == Ty::Error {
+                return Place::Err;
+            }
+            if !i.ty.is_int_like() {
                 self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
                 return Place::Err;
             }
