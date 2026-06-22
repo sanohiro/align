@@ -1,0 +1,12 @@
+// The chunk-parallel pattern (draft.md §11): split an array into chunks, then `par_map` a
+// Pure function over each chunk. `process` takes a whole `slice<T>` chunk and reduces it; the
+// per-chunk results are materialized into an `array<R>`, which a final reduction folds.
+// (par_map runs sequentially for now — the Pure requirement is what will make real
+// thread-parallel execution safe.)
+fn chunk_sum(c: slice<i64>) -> i64 = c.sum()
+
+fn main() -> Result<(), Error> {
+  total := [1, 2, 3, 4, 5, 6].chunks(2).par_map(chunk_sum).sum()
+  print(total)   // (1+2) + (3+4) + (5+6) = 21
+  return Ok(())
+}

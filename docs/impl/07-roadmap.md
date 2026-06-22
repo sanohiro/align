@@ -457,8 +457,13 @@ Completion condition: confirm that the vectorized code contains vector instructi
   `SliceIndex` with a slice element, 16-byte stride); `.len()` is the chunk count. Confined to a
   local binding (no annotation/payload syntax for `array<slice<T>>`, so it cannot escape its
   source's scope). (`examples/chunks.align`.)
-- [todo] thread-parallel execution of `par_map` (a runtime work-splitting layer); `chunks(n).par_map(f)`
-  — the chunk-parallel combo (`par_map` over a `slice<T>` chunk element).
+- [done] **`chunks(n).par_map(f)`** — the chunk-parallel combo (`draft.md` §11 headline). A
+  `chunks` result (`array<slice<T>>`) is now a valid pipeline source whose element is `slice<T>`,
+  so `par_map(f)` with `f: (slice<T>) -> R` reduces each chunk; the per-chunk results materialize
+  into `array<R>` (which a further reduction can fold). The Pure requirement still applies.
+  Lowers via the existing collect loop (sequential). (`examples/chunk_parallel.align`.)
+- [todo] thread-parallel execution of `par_map` (a runtime work-splitting layer) — the perf
+  widening of the sequential walking skeleton.
 - `task_group` / `spawn` / `wait` (I/O concurrency).
 - async/await is not included (`non-goals.md`).
 

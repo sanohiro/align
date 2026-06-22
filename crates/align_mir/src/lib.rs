@@ -1086,8 +1086,9 @@ struct SrcSetup {
 
 fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
     match source.ty {
-        // `slice<T>` and owned `array<T>` share the `{ptr,len}` layout and runtime length.
-        Ty::Slice(_) | Ty::DynArray(_) => {
+        // `slice<T>`, owned `array<T>`, and `array<slice<T>>` (a `chunks` result, element =
+        // `slice<T>`) all share the `{ptr,len}` layout and runtime length.
+        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => {
             let sv = lower_expr(b, source);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
@@ -1102,7 +1103,8 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             let owns_fresh = matches!(
                 source.kind,
                 hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. }
-                    | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. } | hir::ExprKind::Call { .. }
+                    | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. }
+                    | hir::ExprKind::ArrayChunks { .. } | hir::ExprKind::Call { .. }
             );
             let temp_free =
                 (owns_fresh && b.arenas.is_empty()).then(|| sv.clone());
@@ -1239,6 +1241,7 @@ fn lower_array_reduce(
     } else if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
             Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+            Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
             _ => elem_ty,
         };
         let x = b.fresh_value(src_elem);
@@ -1449,6 +1452,7 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     } else if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
             Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+            Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
             _ => elem,
         };
         let x = b.fresh_value(src_elem);
@@ -1623,6 +1627,7 @@ fn lower_array_partition(
     } else if let Some(sv) = &slice_val {
         let src_elem = match source.ty {
             Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+            Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
             _ => elem,
         };
         let x = b.fresh_value(src_elem);
