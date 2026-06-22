@@ -97,6 +97,9 @@ pub enum Stmt {
     /// ignored (`_`) element. `tuple_id` indexes [`Program::tuples`] (the `init`'s type).
     LetTuple { locals: Vec<Option<LocalId>>, tuple_id: u32, init: Expr },
     Assign { local: LocalId, value: Expr },
+    /// `base[index] = value` — element store into a `mut` array local or `out` slice parameter.
+    /// Lowering emits a bounds check (abort on out-of-range), like an element read.
+    AssignIndex { base: LocalId, index: Expr, value: Expr },
     /// `base.field = value` where `base` is a struct local.
     AssignField { base: LocalId, index: u32, value: Expr },
     Return(Option<Expr>),

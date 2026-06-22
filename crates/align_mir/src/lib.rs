@@ -490,6 +490,31 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             let op = lower_expr(b, value);
             b.push(Stmt::StoreField(*base, *index, op));
         }
+        hir::Stmt::AssignIndex { base, index, value } => {
+            // `base[index] = value` — bounds-checked element store (abort on out-of-range, like a
+            // read). A `{ptr,len}` slice/owned-array writes through its buffer pointer; a fixed
+            // stack array writes its slot directly.
+            let idx = lower_expr(b, index);
+            let val = lower_expr(b, value);
+            let base_ty = b.slots[*base as usize];
+            match base_ty {
+                Ty::Slice(s) | Ty::DynArray(s) => {
+                    let sv = b.fresh_value(base_ty);
+                    b.push(Stmt::Let(sv, Rvalue::Load(*base)));
+                    let len = b.fresh_value(i64_ty());
+                    b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(sv))));
+                    emit_bounds_check(b, &idx, Operand::Value(len));
+                    let ptr = b.fresh_value(Ty::Box(s));
+                    b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(sv))));
+                    b.push(Stmt::PtrStore(Operand::Value(ptr), idx, val));
+                }
+                Ty::Array(_, n) => {
+                    emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
+                    b.push(Stmt::StoreIndex(*base, idx, val));
+                }
+                other => unreachable!("element assignment into non-array/slice {other:?}"),
+            }
+        }
         hir::Stmt::Return(value) => {
             let op = value.as_ref().map(|e| lower_expr(b, e));
             // A returned owned array is moved out: null its slot so the exit cleanup below frees

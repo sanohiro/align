@@ -296,6 +296,9 @@ enum RawStage {
 enum Place {
     Local { id: LocalId, ty: Ty },
     Field { base: LocalId, index: u32, ty: Ty },
+    /// `base[index] = value` — an element store into a `mut` array local or an `out` slice
+    /// parameter. `index` is the checked (`i64`) subscript; `elem` is the element type.
+    Index { base: LocalId, index: Expr, elem: Ty },
     Err,
 }
 
@@ -735,6 +738,12 @@ impl<'a> EscapeCheck<'a> {
                     self.local_backed_slice.insert(*local);
                 }
             }
+            // `base[index] = value` — primitive element store (first cut), so no region to track;
+            // just recurse into the index and value for nested escapes.
+            Stmt::AssignIndex { index, value, .. } => {
+                self.walk(index, depth);
+                self.walk(value, depth);
+            }
             Stmt::Assign { local, value } => {
                 self.walk(value, depth);
                 // Conservative without a dataflow join: a binding that is *ever* assigned a
@@ -954,6 +963,17 @@ impl<'a> MoveCheck<'a> {
                     moved.remove(local);
                 }
                 Stmt::AssignField { value, .. } => self.expr(value, moved, true, true),
+                // `base[index] = value` — writing an element is a use of `base` (an owned array
+                // could have been moved away), so flag use-after-move on it; index and value are
+                // read (not moved; Copy).
+                Stmt::AssignIndex { base, index, value } => {
+                    if moved.contains(base) {
+                        let name = &self.f.locals[*base as usize].name;
+                        self.diags.error(format!("use of moved value '{name}'"), index.span);
+                    }
+                    self.expr(index, moved, false, false);
+                    self.expr(value, moved, false, false);
+                }
                 Stmt::Return(Some(e)) => self.expr(e, moved, true, true),
                 Stmt::Return(None) => {}
                 Stmt::Expr(e) => self.expr(e, moved, false, false),
@@ -1287,7 +1307,15 @@ impl<'a, 't> Checker<'a, 't> {
 
         let mut params = Vec::new();
         for (p, ty) in f.params.iter().zip(param_tys) {
-            let id = self.declare(&p.name.name, ty, false);
+            // An `out` parameter is a writable output buffer — only a `slice<T>` (a borrow the
+            // callee writes back through). Mark its local mutable so `dst[i] = v` is allowed.
+            if p.is_out && !matches!(ty, Ty::Slice(_) | Ty::Error) {
+                self.diags.error(
+                    format!("an `out` parameter must be a slice (a writable output buffer), got {}", ty_name(ty)),
+                    p.ty.span(),
+                );
+            }
+            let id = self.declare(&p.name.name, ty, p.is_out);
             params.push(id);
         }
 
@@ -1427,6 +1455,10 @@ impl<'a, 't> Checker<'a, 't> {
                         let v = self.check_expr(value, Some(ty));
                         stmts.push(Stmt::AssignField { base, index, value: v });
                     }
+                    Place::Index { base, index, elem } => {
+                        let v = self.check_expr(value, Some(elem));
+                        stmts.push(Stmt::AssignIndex { base, index, value: v });
+                    }
                     Place::Err => {
                         let v = self.check_expr(value, None);
                         stmts.push(Stmt::Expr(v));
@@ -1449,6 +1481,50 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// Resolve an assignable place: a `mut` local, or `mut_local.field`.
     fn check_place(&mut self, place: &ast::Expr) -> Place {
+        // `local[index] = v` — element store into a `mut` array local or `out` slice parameter.
+        if let ast::ExprKind::Index { recv, index } = &place.kind {
+            let Some((id, local_ty)) = self.place_local(recv) else {
+                self.diags.error("invalid assignment target".to_string(), place.span);
+                return Place::Err;
+            };
+            if !self.locals[id as usize].is_mut {
+                let name = self.locals[id as usize].name.clone();
+                self.diags.error(
+                    format!("cannot assign to an element of immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
+                    place.span,
+                );
+            }
+            let elem = match local_ty {
+                Ty::Slice(s) | Ty::Array(s, _) | Ty::DynArray(s) => scalar_to_ty(s),
+                Ty::Error => return Place::Err,
+                other => {
+                    self.diags.error(
+                        format!("cannot index-assign into {} (only an array or slice)", ty_name(other)),
+                        place.span,
+                    );
+                    return Place::Err;
+                }
+            };
+            // First cut: element stores are primitive-scalar only (int/float/bool/char). A `str`
+            // element store would need a region check (storing a borrowed view into the buffer);
+            // struct / Move elements need whole-struct / ownership handling. Both deferred.
+            if ty_to_scalar(elem).and_then(scalar_to_prim).is_none() {
+                self.diags.error(
+                    format!("element assignment of {} is not supported yet (primitive elements only for now)", ty_name(elem)),
+                    place.span,
+                );
+                return Place::Err;
+            }
+            let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+            if i.ty == Ty::Error {
+                return Place::Err;
+            }
+            if !i.ty.is_int_like() {
+                self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
+                return Place::Err;
+            }
+            return Place::Index { base: id, index: i, elem };
+        }
         // `local.field = v`
         if let ast::ExprKind::FieldAccess { recv, field } = &place.kind {
             let Some((id, local_ty)) = self.place_local(recv) else {
@@ -3471,6 +3547,10 @@ impl<'a, 't> Checker<'a, 't> {
                 Stmt::Let { init, .. } => self.finalize_expr(init),
                 Stmt::Assign { value, .. } => self.finalize_expr(value),
                 Stmt::AssignField { value, .. } => self.finalize_expr(value),
+                Stmt::AssignIndex { index, value, .. } => {
+                    self.finalize_expr(index);
+                    self.finalize_expr(value);
+                }
                 Stmt::Return(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
                 Stmt::Return(None) => {}
                 Stmt::LetTuple { init, .. } => self.finalize_expr(init),
