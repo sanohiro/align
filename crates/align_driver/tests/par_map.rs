@@ -66,6 +66,24 @@ fn par_map_over_struct_field() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
+#[test]
+fn par_map_chained_into_reduction_frees_intermediate() {
+    if !backend_available() {
+        return;
+    }
+    // `arr.par_map(f).sum()` — the par_map result is a fresh owned array consumed by `sum`; it
+    // must be freed (`drop_value`), not leaked. 2 + 4 + 6 = 12.
+    let src = "fn dbl(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  print([1, 2, 3].par_map(dbl).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-chain", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n");
+    // The consumed intermediate buffer is freed (no leak).
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("drop_value"), "the par_map intermediate must be freed:\n{text}");
+}
+
 // --- purity (Pure requirement) ---
 
 #[test]
