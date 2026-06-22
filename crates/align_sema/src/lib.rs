@@ -281,6 +281,8 @@ impl Ty {
 
 struct FnSig {
     params: Vec<Ty>,
+    /// `out[i]` — whether parameter `i` is an `out` (writable, no-alias) output buffer.
+    out: Vec<bool>,
     ret: Ty,
 }
 
@@ -390,7 +392,8 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             }
             None => Ty::Unit,
         };
-        sigs.insert(f.name.name.clone(), FnSig { params, ret });
+        let out = f.params.iter().map(|p| p.is_out).collect();
+        sigs.insert(f.name.name.clone(), FnSig { params, out, ret });
     }
 
     // Pass 2: check each function body.
@@ -1947,12 +1950,34 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         };
-        let (param_tys, ret) = (sig.params.clone(), sig.ret);
+        let (param_tys, ret, out) = (sig.params.clone(), sig.ret, sig.out.clone());
         if args.len() != param_tys.len() {
             self.diags.error(
                 format!("'{name}' expects {} argument(s), got {}", param_tys.len(), args.len()),
                 span,
             );
+        }
+        // No-alias check: an `out` argument must not name the same local as any other argument
+        // (the no-alias guarantee `out` lowers to LLVM `noalias`). A conservative base-local
+        // comparison — every slice of an array `a` goes through `a` directly today, so distinct
+        // locals are genuinely distinct buffers.
+        for (i, is_out) in out.iter().enumerate() {
+            if !is_out {
+                continue;
+            }
+            let Some(base) = args.get(i).and_then(|a| self.place_local(a)).map(|(id, _)| id) else {
+                continue;
+            };
+            for (j, a) in args.iter().enumerate() {
+                if j != i && self.place_local(a).map(|(id, _)| id) == Some(base) {
+                    let lname = self.locals[base as usize].name.clone();
+                    self.diags.error(
+                        format!("the `out` argument '{lname}' also appears as another argument to '{name}' — an `out` buffer must not alias the other arguments"),
+                        args[i].span,
+                    );
+                    break;
+                }
+            }
         }
         let checked = args
             .iter()

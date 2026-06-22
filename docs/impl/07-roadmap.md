@@ -181,9 +181,13 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   bounds-checked (abort on out-of-range, like a read). `out` is restricted to `slice<T>` params and
   marks the local writable; the store lowers through the slice buffer pointer (`SlicePtr` +
   `PtrStore`) or a fixed array's slot (`StoreIndex`). First cut: primitive elements only (a `str`
-  element store needs a region check; struct/Move need ownership handling). The **no-alias check +
-  LLVM `noalias`** (the vectorization payoff — `out` declaring `dst` distinct from the inputs) is
-  the follow-up. (`examples/out_param.align`.)
+  element store needs a region check; struct/Move need ownership handling). (`examples/out_param.align`.)
+- [done] **`out` no-alias check** — at a call site an `out` argument must not name the same local as
+  any other argument (`fill(a, a)` rejected; `fill(xs, ys)` fine), a conservative base-local
+  comparison via `FnSig.out`. The language-level no-alias guarantee. **Still follow-up:** emitting
+  LLVM `noalias` (the actual vectorization payoff) — blocked on the slice ABI (a slice is passed by
+  value as `{ptr,len}`, so its buffer pointer is not a standalone param to attribute; needs a
+  by-pointer `out`-slice ABI or scoped `!noalias` metadata on the buffer stores).
 - [done] **`partition(p)`** — split a pipeline's surviving (primitive-scalar) elements into two
   owned arrays `(array<T>, array<T>)` (predicate true, then false) in one fused loop with two
   buffers + a per-element branch (`lower_array_partition`, the `to_array` collect loop doubled),
