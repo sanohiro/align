@@ -284,9 +284,11 @@ pub unsafe extern "C" fn align_rt_chunks(src: *const u8, src_len: i64, n: i64, e
     if n <= 0 || src_len <= 0 || src.is_null() {
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
-    let count = (src_len + n - 1) / n; // ceil(src_len / n)
-    // Header buffer of `count` `AlignStr` entries. `checked_mul` guards a 32-bit `usize` overflow.
-    let bytes = (count as usize)
+    let count = (src_len - 1) / n + 1; // ceil(src_len / n), overflow-free (src_len > 0, n > 0)
+    // Header buffer of `count` `AlignStr` entries. `try_from` + `checked_mul` guard a 32-bit
+    // `usize` truncation/overflow (a huge `count` would otherwise under-allocate and heap-overflow).
+    let count_usize = usize::try_from(count).unwrap_or_else(|_| panic_abort("chunks count overflow"));
+    let bytes = count_usize
         .checked_mul(core::mem::size_of::<AlignStr>())
         .and_then(|b| i64::try_from(b).ok())
         .unwrap_or_else(|| panic_abort("chunks buffer size overflow"));

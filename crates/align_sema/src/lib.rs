@@ -2915,7 +2915,10 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         let n = self.check_expr(n_arg, Some(Ty::Int(IntTy { bits: 64, signed: true })));
-        if n.ty != Ty::Error && !n.ty.is_int_like() {
+        if n.ty == Ty::Error {
+            return err;
+        }
+        if !n.ty.is_int_like() {
             self.diags.error(format!("'chunks' size must be an integer, got {}", ty_name(n.ty)), n_arg.span);
             return err;
         }
