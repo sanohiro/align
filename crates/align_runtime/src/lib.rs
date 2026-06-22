@@ -247,7 +247,12 @@ pub unsafe extern "C" fn align_rt_args_build(argc: i32, argv: *const *const u8) 
     let n = argc as usize;
     // Buffer of `n` AlignStr entries; sized in bytes for `align_rt_alloc` (a `c_void*`-granular
     // bump/heap allocator). The element views point into argv, so the buffer is the only owned part.
-    let bytes = (n * core::mem::size_of::<AlignStr>()) as i64;
+    // `checked_mul` guards a 32-bit `usize` overflow (`n` up to `i32::MAX` × the entry size), which
+    // would otherwise under-allocate and then heap-overflow the store loop below.
+    let bytes = n
+        .checked_mul(core::mem::size_of::<AlignStr>())
+        .and_then(|b| i64::try_from(b).ok())
+        .unwrap_or_else(|| panic_abort("arguments buffer size overflow"));
     let buf = align_rt_alloc(bytes) as *mut AlignStr;
     for i in 0..n {
         let cstr = unsafe { *argv.add(i) };

@@ -1190,7 +1190,7 @@ impl<'a> Checker<'a> {
         // argv into (an `-> i32` argv `main` is a later follow-up).
         if f.name.name == "main" && !f.params.is_empty() {
             let args_ok = param_tys.as_slice() == [Ty::DynArray(Scalar::Str)]
-                && matches!(ret, Ty::Result(..));
+                && matches!(ret, Ty::Result(Scalar::Unit, Scalar::ErrCode));
             if !args_ok {
                 self.diags.error(
                     "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return".to_string(),
