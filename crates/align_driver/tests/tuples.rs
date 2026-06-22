@@ -270,6 +270,19 @@ fn owned_tuple_field_borrow_keeps_tuple() {
 }
 
 #[test]
+fn copy_field_usable_after_owned_field_moved() {
+    if !backend_available() {
+        return;
+    }
+    // Moving an owned field must NOT poison a *Copy* field read: `t` mixes an owned array and a
+    // scalar; after `x := t.0`, reading the Copy field `t.1` is still valid (per-field tracking).
+    let src = "fn main() -> Result<(), Error> {\n  t := ([1, 2, 3].to_array(), 99)\n  x := t.0\n  print(x.sum())\n  print(t.1)\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-copy-after-move", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n99\n");
+}
+
+#[test]
 fn owned_tuple_field_reuse_after_move_rejected() {
     // Moving the same owned field twice is use-after-move.
     let src = "fn main() -> Result<(), Error> {\n  t := ([1, 2, 3].to_array(), [4, 5].to_array())\n  x := t.0\n  y := t.0\n  print(x.sum())\n  return Ok(())\n}\n";

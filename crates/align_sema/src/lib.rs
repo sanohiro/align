@@ -1377,32 +1377,26 @@ impl<'a> MoveCheck<'a> {
                     self.expr(el, moved, true, true);
                 }
             }
-            // `t.N` of an *owned* element (e.g. `a := t.0`) moves that field out — like a `Local`
-            // move, but tracked per field so the other elements stay usable. A Copy element (or a
-            // non-local receiver) just reads, so recurse into the receiver as a borrow.
+            // `t.N` of a bound tuple reads field `N` independently of the other fields: it is
+            // invalid only if *that* field (or the whole tuple) was moved — NOT if some *other*
+            // field was moved (that must not poison a Copy-field read). An owned field in a
+            // consuming position (`a := t.0`) is moved out (marked per field); a Copy read, or a
+            // borrowing read, moves nothing. A non-local receiver just recurses as a borrow.
             ExprKind::TupleIndex { recv, index } => {
-                let owned_field = match &recv.kind {
-                    ExprKind::Local(t) => match self.f.locals.get(*t as usize).map(|l| l.ty) {
-                        Some(Ty::Tuple(tid)) => self
-                            .tuples
-                            .get(tid as usize)
-                            .and_then(|td| td.elems.get(*index as usize))
-                            .filter(|s| s.is_move())
-                            .map(|_| *t),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                match owned_field {
-                    Some(t) => {
-                        if field_moved(moved, t, *index) {
-                            let name = &self.f.locals[t as usize].name;
+                match &recv.kind {
+                    ExprKind::Local(t) => {
+                        if field_moved(moved, *t, *index) {
+                            let name = &self.f.locals[*t as usize].name;
                             self.diags.error(format!("use of moved field '.{index}' of '{name}'"), e.span);
-                        } else if consuming {
-                            moved.insert(MovedKey::Field(t, *index));
+                        } else {
+                            let owned = matches!(self.f.locals.get(*t as usize).map(|l| l.ty), Some(Ty::Tuple(tid))
+                                if self.tuples.get(tid as usize).and_then(|td| td.elems.get(*index as usize)).is_some_and(|s| s.is_move()));
+                            if owned && consuming {
+                                moved.insert(MovedKey::Field(*t, *index));
+                            }
                         }
                     }
-                    None => self.expr(recv, moved, false, false),
+                    _ => self.expr(recv, moved, false, false),
                 }
             }
             ExprKind::Unit
