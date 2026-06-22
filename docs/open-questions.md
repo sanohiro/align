@@ -59,7 +59,7 @@ Record: `impl/04-mir.md` (CFG), `non-goals.md`.
 - **Owned (Move) heap collections + drop**: free-standing owned `string` / `array<T>` / `array<Struct>` (AoS) / `builder`, freed by per-binding MIR `Drop` (null-on-move drop flags) outside an arena, or arena bulk-free inside one. Owned payloads inside `Option`/`Result` are dropped / moved-out as a unit.
 - **Explicit `.clone()` over hidden copy-on-escape**: a zero-copy decoded view that must escape its input is cloned explicitly (Nothing hidden + Predictable performance; supersedes the old `draft.md` auto-buffer wording). An in-arena clone is a bump allocation, so escaping is not a sudden heap cost.
 - **`json.decode`**: `str` and `array<Struct>` decode are zero-copy views region-tied to the input (a struct's `str` fields borrow it); `array<scalar>` is copied into a fresh buffer (owned / `Static` / returnable, not region-tied). Together → **`draft.md` §19 runs end-to-end except the `fs`/`io` std boundary**.
-SSO is **not** adopted (its own Settled entry above). Element indexing is implemented: `recv[index]` (array/slice/owned array → scalar) and `arr[index].field` (a struct-array element's field), both bounds-checked. Still open / separate tracks (not part of this decision): tuples / multi-value returns (for `partition`), `array<slice<T>>` (for `chunks`), `array<Struct>.clone()`, a bare whole-struct element value `users[i]` (no field), and `out` params + `noalias` (below).
+SSO is **not** adopted (its own Settled entry above). Element indexing is implemented: `recv[index]` (array/slice/owned array → scalar) and `arr[index].field` (a struct-array element's field), both bounds-checked. Since-implemented on separate tracks: tuples / multi-value returns → `partition`; `array<slice<T>>` → `chunks` (`Ty::DynSliceArray`); `out` params + the no-alias check. Still open: `array<Struct>.clone()`, a bare whole-struct element value `users[i]` (no field), and emitting LLVM `noalias` (below).
 Record: `impl/08-memory-model-v2.md` (full model + slice ledger §11), `design-notes.md` ("one region lattice, explicit copies"), `draft.md` §6/§7/§14, `impl/07-roadmap.md` (Memory Model v2 — DONE).
 
 ### Tuples / multi-value returns
@@ -82,9 +82,9 @@ destructure/return/call that moves it nulls the slot; an owned-tuple parameter t
 consumes is dropped at the callee's exit (the same drop set as an owned array param). Reading an
 *owned* element by index (`t.0` where `.0` is owned) is rejected (a partial move) — destructure
 instead; a Copy element reads fine. The first consumer **`partition`** (`(array<T>, array<T>)`) is
-implemented. What remains is the other consumers built on this: `min_with_index` (`(value, index)`),
-`chunks` (`array<slice<T>>`), and the one remaining owned-tuple loose end — **partial field moves**
-(`t.0` of an owned element, which needs per-field move tracking). Record:
+implemented. What remains is one more potential consumer — `min_with_index` (`(value, index)`) —
+and the one remaining owned-tuple loose end: **partial field moves** (`t.0` of an owned element,
+which needs per-field move tracking). Record:
 `draft.md` §5 (Types → Tuple), `impl/02-frontend.md`
 §8, `impl/03-types.md`, `impl/07-roadmap.md`.
 
@@ -148,8 +148,8 @@ see "Tuples / multi-value returns" under Settled). The **foundation is implement
 primitive scalars, `str` (region-tracked), and **owned `string`/`array<T>`** elements (a Move
 tuple — including **bound to a variable**, with per-element `Drop` in codegen), and the first
 consumer **`partition`** (`(array<T>, array<T>)`). What remains is purely additive
-*implementation*, not design: the other consumers — `chunks` (`array<slice<T>>`),
-`min_with_index`-style `(value, index)` reductions — and the one remaining owned-tuple loose end:
+*implementation*, not design: one more potential consumer — `min_with_index`-style
+`(value, index)` reductions — and the one remaining owned-tuple loose end:
 **partial field moves** (`t.0` of an owned element).
 
 ### Arena checkpoint / rollback — std arena API, after MMv2

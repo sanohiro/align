@@ -1,0 +1,11 @@
+// `chunks(n)` splits an array into length-`n` sub-slices (the last may be shorter), yielding
+// an `array<slice<T>>` — the unit of chunk parallelism (draft.md §11). Each chunk is a
+// `slice<T>` that borrows the original array, so it can be indexed and reduced.
+fn main() -> Result<(), Error> {
+  xs := [1, 2, 3, 4, 5]
+  cs := xs.chunks(2)        // 3 chunks: [1,2], [3,4], [5]
+  print(cs.len())           // 3
+  print(cs[0].sum())        // 1 + 2 = 3
+  print(cs[2].sum())        // 5
+  return Ok(())
+}

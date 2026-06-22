@@ -171,6 +171,15 @@ fn build_module<'c>(
         "free".to_string(),
         module.add_function("align_rt_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
+    // `chunks(n)`: (src_ptr, src_len, n, elem_size) -> { chunk_buf, count } (a `{ptr,len}`).
+    funcs.insert(
+        "chunks".to_string(),
+        module.add_function(
+            "align_rt_chunks",
+            slice_struct_type(ctx).fn_type(&[ptr.into(), i64t.into(), i64t.into(), i64t.into()], false),
+            None,
+        ),
+    );
     funcs.insert(
         "print_str".to_string(),
         module.add_function(
@@ -543,7 +552,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicType
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
-        Ty::DynStructArray(_, Layout::Aos) => slice_struct_type(ctx).into(),
+        Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
         _ => int_type(ctx, ty).into(),
     }
 }
@@ -591,7 +600,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
         Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => ctx.ptr_type(AddressSpace::default()).into(),
         Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
-        Ty::DynStructArray(_, Layout::Aos) => slice_struct_type(ctx).into(),
+        Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty, sx),
     }
 }
@@ -1201,6 +1210,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
+            Rvalue::Chunks { src, n, elem } => {
+                // Split the `{ptr,len}` `src` into length-`n` slices via the runtime; the result is
+                // the chunk array's `{chunk_buf, count}` (also a `{ptr,len}`).
+                let agg = self.operand(src).into_struct_value();
+                let src_ptr = self.builder.build_extract_value(agg, 0, "srcptr").map_err(|e| self.err(e))?;
+                let src_len = self.builder.build_extract_value(agg, 1, "srclen").map_err(|e| self.err(e))?;
+                let n = self.operand(n);
+                let scalar = align_sema::ty_to_scalar(*elem).expect("chunks element is a scalar");
+                let esz = self.ctx.i64_type().const_int(scalar_bytes(scalar), false);
+                self.builder
+                    .build_call(self.funcs["chunks"], &[src_ptr.into(), src_len.into(), n.into(), esz.into()], "chunks")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("align_rt_chunks returns a {ptr,len}")
+            }
             Rvalue::StrLit(s) => {
                 let (ptr, len) = self.str_global(s);
                 let sty = slice_struct_type(self.ctx);
@@ -1397,7 +1422,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
-            Ty::DynStructArray(_, Layout::Aos) => slice_struct_type(self.ctx).into(),
+            Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(self.ctx).into(),
             _ => scalar_type(self.ctx, ty, self.struct_types),
         }
     }

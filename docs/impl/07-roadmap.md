@@ -174,8 +174,7 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
 - [mostly done, via Memory Model v2] heap-owned dynamic `array<T>` + array type annotations,
   array-valued results, and the materializing terminals `scan`/`sort`/`to_array` all landed on
   the owned/dynamic-heap-array + drop foundation. Non-materializing terminals
-  (`sum`/`reduce`/`count`/`any`/`all`) were already complete. Still deferred: `chunks` (needs
-  `array<slice<T>>`, a separate type-system track).
+  (`sum`/`reduce`/`count`/`any`/`all`) were already complete.
 - [done] **mutable element writes + `out` parameters (write mechanism)** — `place[i] = v` into a
   `mut` array local or an `out slice<T>` parameter (a writable output buffer the callee fills),
   bounds-checked (abort on out-of-range, like a read). `out` is restricted to `slice<T>` params and
@@ -451,8 +450,15 @@ Completion condition: confirm that the vectorized code contains vector instructi
   stages (`where`/`map`/…) and struct-consuming functions. Lowers to the collect loop (`map(f)` +
   `to_array`); **real thread-parallel execution is the remaining piece** — the Pure rule is exactly
   what makes that safe. (`examples/par_map.align`.)
-- [todo] thread-parallel execution of `par_map` (a runtime work-splitting layer), `chunks`
-  (`array<slice<T>>`, the parallel unit).
+- [done] **`chunks(n)` → `array<slice<T>>`** — split an array/slice of a primitive scalar into
+  length-`n` sub-slices (the last may be shorter), the unit of chunk parallelism. New owned type
+  `Ty::DynSliceArray(prim)` (`{ chunk_buf, count }`, Move + region-tracked — the chunk slices borrow
+  the source); built by the runtime `align_rt_chunks`. Indexing yields a `slice<T>` (reuses
+  `SliceIndex` with a slice element, 16-byte stride); `.len()` is the chunk count. Confined to a
+  local binding (no annotation/payload syntax for `array<slice<T>>`, so it cannot escape its
+  source's scope). (`examples/chunks.align`.)
+- [todo] thread-parallel execution of `par_map` (a runtime work-splitting layer); `chunks(n).par_map(f)`
+  — the chunk-parallel combo (`par_map` over a `slice<T>` chunk element).
 - `task_group` / `spawn` / `wait` (I/O concurrency).
 - async/await is not included (`non-goals.md`).
 

@@ -162,6 +162,10 @@ pub enum Rvalue {
     HeapAllocBuf { count: Operand, elem: Ty },
     /// Build an owned `array<T>` value `{ ptr, len }` from a buffer pointer and a length.
     MakeDynArray { ptr: Operand, len: Operand },
+    /// `chunks(n)`: split the `{ptr,len}` slice `src` (element size `elem`) into length-`n`
+    /// sub-slices, yielding an owned `array<slice<T>>` value `{ chunk_buf, count }` (via the
+    /// runtime `align_rt_chunks`). The element slices borrow `src`.
+    Chunks { src: Operand, n: Operand, elem: Ty },
     /// The `len` of a slice operand.
     SliceLen(Operand),
     /// The buffer `ptr` (field 0) of a slice / owned-array `{ptr,len}` operand — the raw element
@@ -822,6 +826,22 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             stages2.push(hir::Stage { kind: hir::StageKind::Map { func: func.clone() }, out_ty: *elem });
             lower_array_collect(b, source, &stages2, *elem, CollectKind::Collect)
         }
+        hir::ExprKind::ArrayChunks { source, n, elem } => {
+            // Materialize the source as a `{ptr,len}` slice, then call the runtime chunker.
+            let src = match source.ty {
+                Ty::Slice(_) | Ty::DynArray(_) => lower_expr(b, source),
+                _ => {
+                    let (slot, len) = array_source_slot(b, source);
+                    let sv = b.fresh_value(Ty::Slice(scalar_of(*elem)));
+                    b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, len)));
+                    Operand::Value(sv)
+                }
+            };
+            let n_op = lower_expr(b, n);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Chunks { src, n: n_op, elem: *elem }));
+            Operand::Value(v)
+        }
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
             let v = b.fresh_value(e.ty);
@@ -899,7 +919,9 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         Slot(Slot),
     }
     let (src, len): (Src, Operand) = match recv.ty {
-        Ty::Slice(_) | Ty::DynArray(_) => {
+        // A `{ptr,len}` value: scalar `slice`/owned `array` loads a scalar element; an
+        // `array<slice<T>>` (`chunks` result) loads a whole `slice<T>` element (`elem_ty`).
+        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => {
             let sv = lower_expr(b, recv);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
@@ -2202,6 +2224,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Slice(_) => "slice".to_string(),
         Ty::DynArray(_) => "array".to_string(),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
+        Ty::DynSliceArray(_) => "array<slice>".to_string(),
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),

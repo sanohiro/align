@@ -271,6 +271,35 @@ pub unsafe extern "C" fn align_rt_args_build(argc: i32, argv: *const *const u8) 
     AlignStr { ptr: buf as *const u8, len: argc as i64 }
 }
 
+/// `chunks(n)`: split the `{src, src_len}` view (element size `elem_size` bytes, `src_len` =
+/// element count) into length-`n` sub-slices — the last may be shorter — returning an owned
+/// `{ chunk_buf, count }` array of slice headers (`draft.md` §11). Each header `{ ptr, len }`
+/// points into `src` (a borrow, not freed); only the header buffer is owned (freed by the
+/// generated `Drop`). `n <= 0` / empty source → `{ null, 0 }`.
+///
+/// # Safety
+/// `src` must point to `src_len` elements of `elem_size` bytes for the call's duration.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_chunks(src: *const u8, src_len: i64, n: i64, elem_size: i64) -> AlignStr {
+    if n <= 0 || src_len <= 0 || src.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let count = (src_len + n - 1) / n; // ceil(src_len / n)
+    // Header buffer of `count` `AlignStr` entries. `checked_mul` guards a 32-bit `usize` overflow.
+    let bytes = (count as usize)
+        .checked_mul(core::mem::size_of::<AlignStr>())
+        .and_then(|b| i64::try_from(b).ok())
+        .unwrap_or_else(|| panic_abort("chunks buffer size overflow"));
+    let buf = align_rt_alloc(bytes) as *mut AlignStr;
+    for i in 0..count {
+        let start = i * n; // element offset of this chunk
+        let len = core::cmp::min(n, src_len - start);
+        let ptr = unsafe { src.add((start * elem_size) as usize) };
+        unsafe { *buf.add(i as usize) = AlignStr { ptr, len } };
+    }
+    AlignStr { ptr: buf as *const u8, len: count }
+}
+
 /// An append-oriented string builder (`06-runtime-std.md` §7), backing `template`
 /// desugaring. M5: heap-backed; the finished buffer is leaked (no ownership/free yet —
 /// arena-tied builders come later).
