@@ -1297,38 +1297,41 @@ impl<'a, 't> Checker<'a, 't> {
                     // `(a, b, ...) := expr` — the RHS must be a tuple; bind each name to its
                     // element type (`_` binds nothing). Element types are inferred from the tuple.
                     let init = self.check_expr(init, None);
-                    let (tuple_id, elem_tys) = match self.resolve(init.ty) {
-                        Ty::Tuple(id) => {
-                            let tys: Vec<Ty> =
-                                self.tuples[id as usize].elems.iter().map(|s| scalar_to_ty(*s)).collect();
-                            if tys.len() != names.len() {
-                                self.diags.error(
-                                    format!("this destructuring binds {} name(s) but the tuple has {} element(s)", names.len(), tys.len()),
-                                    *span,
-                                );
-                            }
-                            (id, tys)
-                        }
-                        Ty::Error => (u32::MAX, Vec::new()),
-                        other => {
+                    if let Ty::Tuple(id) = self.resolve(init.ty) {
+                        let elem_tys: Vec<Ty> =
+                            self.tuples[id as usize].elems.iter().map(|s| scalar_to_ty(*s)).collect();
+                        if elem_tys.len() != names.len() {
                             self.diags.error(
-                                format!("destructuring needs a tuple value, got {}", ty_name(other)),
+                                format!("this destructuring binds {} name(s) but the tuple has {} element(s)", names.len(), elem_tys.len()),
                                 *span,
                             );
-                            (u32::MAX, Vec::new())
                         }
-                    };
-                    let mut locals = Vec::with_capacity(names.len());
-                    for (i, n) in names.iter().enumerate() {
-                        match n {
-                            Some(name) => {
-                                let ety = elem_tys.get(i).copied().unwrap_or(Ty::Error);
-                                locals.push(Some(self.declare(&name.name, ety, false)));
+                        let mut locals = Vec::with_capacity(names.len());
+                        for (i, n) in names.iter().enumerate() {
+                            match n {
+                                Some(name) => {
+                                    let ety = elem_tys.get(i).copied().unwrap_or(Ty::Error);
+                                    locals.push(Some(self.declare(&name.name, ety, false)));
+                                }
+                                None => locals.push(None),
                             }
-                            None => locals.push(None),
                         }
+                        stmts.push(Stmt::LetTuple { locals, tuple_id: id, init });
+                    } else {
+                        // Not a tuple: declare the names as `Ty::Error` (no cascade of "undefined
+                        // name") and keep the RHS as a plain expression statement — never emit a
+                        // `LetTuple` whose `TupleIndex` lowering would panic codegen.
+                        if self.resolve(init.ty) != Ty::Error {
+                            self.diags.error(
+                                format!("destructuring needs a tuple value, got {}", ty_name(init.ty)),
+                                *span,
+                            );
+                        }
+                        for n in names.iter().flatten() {
+                            self.declare(&n.name, Ty::Error, false);
+                        }
+                        stmts.push(Stmt::Expr(init));
                     }
-                    stmts.push(Stmt::LetTuple { locals, tuple_id, init });
                 }
                 ast::Stmt::Return(value) => {
                     // The enclosing function's return type is the expected one. We
@@ -1586,32 +1589,37 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `recv.N` — positional tuple access.
     fn check_tuple_index(&mut self, recv: &ast::Expr, index: u32, expected: Option<Ty>, span: Span) -> Expr {
+        // On any error return a dummy `Ty::Error` expr (not a `TupleIndex` node): a `TupleIndex`
+        // whose receiver is not a tuple would panic codegen's `into_struct_value()`.
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let r = self.check_expr(recv, None);
-        let ty = match self.resolve(r.ty) {
+        match self.resolve(r.ty) {
             Ty::Tuple(id) => {
                 let elems = &self.tuples[id as usize].elems;
                 match elems.get(index as usize) {
-                    Some(s) => scalar_to_ty(*s),
+                    Some(s) => {
+                        let ty = scalar_to_ty(*s);
+                        self.constrain(ty, expected, span);
+                        Expr { kind: ExprKind::TupleIndex { recv: Box::new(r), index }, ty, span }
+                    }
                     None => {
                         self.diags.error(
                             format!("tuple index .{index} is out of range (tuple has {} element(s))", elems.len()),
                             span,
                         );
-                        Ty::Error
+                        err
                     }
                 }
             }
-            Ty::Error => Ty::Error,
+            Ty::Error => err,
             other => {
                 self.diags.error(
                     format!("`.{index}` needs a tuple value, got {}", ty_name(other)),
                     span,
                 );
-                Ty::Error
+                err
             }
-        };
-        self.constrain(ty, expected, span);
-        Expr { kind: ExprKind::TupleIndex { recv: Box::new(r), index }, ty, span }
+        }
     }
 
     fn check_path(&mut self, p: &ast::Path, expected: Option<Ty>, span: Span) -> Expr {
@@ -3554,7 +3562,7 @@ fn resolve_type(
 ) -> Ty {
     let (path, args, span) = match t {
         ast::Type::Named { path, args, span } => (path, args.as_slice(), *span),
-        ast::Type::Tuple { elems, span } => {
+        ast::Type::Tuple { elems, span: _ } => {
             // PR1 cut: tuple elements are primitive scalars (int/float/bool/char) — Copy,
             // `Static`, so the tuple needs no drop/region machinery. `str`/owned elements later.
             let mut scalars = Vec::with_capacity(elems.len());
@@ -3570,7 +3578,7 @@ fn resolve_type(
                     _ => {
                         diags.error(
                             format!("tuple elements must be a primitive scalar (int/float/bool/char) for now, got {}", ty_name(ety)),
-                            *span,
+                            e.span(),
                         );
                         return Ty::Error;
                     }
