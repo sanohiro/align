@@ -121,9 +121,12 @@ A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) d
 `out` params (`draft.md` §7) are a no-alias optimization. **Implemented:** (1) the write mechanism —
 `out dst: slice<T>` is a writable output buffer and `place[i] = v` (bounds-checked) writes a `mut`
 array local or `out` slice (primitive elements); (2) the **no-alias check** — at a call site an
-`out` argument must not name the same local as another argument (a conservative base-local
-comparison; every slice of an array goes through that array directly today, so distinct locals are
-distinct buffers). **What remains is emitting the LLVM `noalias`** so loop vectorization can skip
+`out` argument must not alias another argument, compared by **root buffer**: a slice local's
+provenance is tracked back to the array it borrows (`s: slice := a`), so `fill(a, s)` and
+`fill(s1, s2)` (two slices of `a`) are both rejected, not just `fill(a, a)`. (Residual for the
+noalias-emission follow-up: a slice returned from a function has unknown provenance and is treated
+as its own root — sound for today's direct-borrow slices, but the emission gate may need to
+conservatively reject unknown-provenance `out` args.) **What remains is emitting the LLVM `noalias`** so loop vectorization can skip
 runtime overlap checks — blocked on the slice ABI: a slice is passed **by value** as a `{ptr,len}`
 aggregate, so its buffer pointer is not a standalone pointer parameter to attribute. Needs either a
 by-pointer `out`-slice ABI or scoped `!noalias` metadata on the buffer stores. The no-alias *check*
