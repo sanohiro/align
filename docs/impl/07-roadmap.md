@@ -177,8 +177,15 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   multi-value returns) and `chunks` (needs `array<slice<T>>`) — separate type-system tracks
   (`open-questions.md`); and `out` args (the post-MMv2 `noalias` work). Non-materializing
   terminals (`sum`/`reduce`/`count`/`any`/`all`) were already complete.
-- [todo] named-function `map` over struct elements (struct-by-value params now exist; this
-  one is not gated on Memory Model v2 — it only needs loading a whole struct element).
+- [done] named-function `map` over struct elements — `[Emp{…}].where(.active).map(net).sum()`
+  where `net(e: Emp) -> i32`. A struct array stays index-addressed until used; a struct-consuming
+  `map` loads the whole element by value just before the call (`lower_struct_elem`): a fixed stack
+  `array<Struct>` via the slot load `Index`, an owned dynamic `array<Struct>` via the buffer-pointer
+  load `IndexPtr` (the field-less analogue of `IndexFieldPtr`). `.field` / `where(.field)` read the
+  *source* element, so they are rejected after a `map` (which yields a computed value, not a source
+  element). Map-result struct chaining (`map(f).field` / `map(f).g()` where `f` returns a struct) is
+  not supported — projection addresses the source, so a struct map must feed a scalar map or a
+  reduction. (`examples/struct_map.align`.)
 
 ### Dynamic arrays / slices — decisions (from review)
 

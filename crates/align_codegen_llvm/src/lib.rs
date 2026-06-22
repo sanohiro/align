@@ -1057,6 +1057,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ty = abi_type(self.ctx, result_ty, self.struct_types);
                 self.builder.build_load(ty, ep, "idxfldp").map_err(|e| self.err(e))?
             }
+            Rvalue::IndexPtr { base, index, struct_id } => {
+                // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index` and load
+                // the whole element (a `map(f)` consuming the struct by value).
+                let agg = self.operand(base).into_struct_value();
+                let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
+                let st = self.struct_types[*struct_id as usize];
+                let index = self.operand(index).into_int_value();
+                let ep = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(st, buf, &[index], "aoselem")
+                        .map_err(|e| self.err(e))?
+                };
+                self.builder.build_load(st, ep, "idxp").map_err(|e| self.err(e))?
+            }
             Rvalue::MakeSlice(slot, n) => {
                 // ptr = &slot[0]; build { ptr, len } from the array alloca.
                 let arr_ty = self.llvm_type(self.f.slots[*slot as usize]);
