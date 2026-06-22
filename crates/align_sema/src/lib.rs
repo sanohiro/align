@@ -395,12 +395,17 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut program = Program { fns, structs, tuples };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
-    for f in &mut program.fns {
+    // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
+    // holds a `str` element) while iterating `&mut fns`.
+    let Program { fns, tuples, .. } = &mut program;
+    let tuples: &[hir::TupleDef] = tuples;
+    for f in fns.iter_mut() {
         MoveCheck { f, diags }.check();
         let region = {
             let mut ec = EscapeCheck {
                 f,
                 diags,
+                tuples,
                 region: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
                 local_backed_slice: std::collections::HashSet::new(),
@@ -487,6 +492,8 @@ impl Region {
 struct EscapeCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
+    /// Tuple defs (to decide whether a `Ty::Tuple` is region-tracked — true iff an element is).
+    tuples: &'a [hir::TupleDef],
     /// For each box/str local, the region at which its current value was allocated.
     region: std::collections::HashMap<LocalId, Region>,
     /// For each local, the arena depth at which it was declared.
@@ -513,7 +520,7 @@ impl<'a> EscapeCheck<'a> {
     /// `.clone()`) from an arena allocation.
     fn check_return_escape(&mut self, e: &Expr, depth: u32) {
         let r = self.region_of(e, depth);
-        if Self::tracks_region(e.ty) && !r.outlives(Region::Static) {
+        if self.tracks_region(e.ty) && !r.outlives(Region::Static) {
             let msg = if r == Region::Frame {
                 "cannot return a view that borrows local storage (it is freed when the function returns); use `.clone()` to return an owned value"
             } else {
@@ -533,9 +540,12 @@ impl<'a> EscapeCheck<'a> {
     /// (M3), arena-backed `str` (M5 — `template`/concat allocate in the arena), and a struct
     /// (MMv2 slice 2 — a struct's region is the max of its fields, so a struct holding an
     /// arena-backed `str` field carries that arena region). A scalar-only struct is `Static`.
-    fn tracks_region(ty: Ty) -> bool {
+    fn tracks_region(&self, ty: Ty) -> bool {
         match ty {
             Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) => true,
+            // A tuple is region-tracked iff any element is (today: a `str` element — a view tied to
+            // its source). A tuple of plain scalars is Copy / `Static`, freely returnable.
+            Ty::Tuple(id) => self.tuples[id as usize].elems.iter().any(|s| self.tracks_region(scalar_to_ty(*s))),
             // A *fixed* `array<T>` (a stack value) is region-tracked iff its element is — an
             // `array<str>` holds `str` views (so an array of arena strs is arena-regioned and must
             // not escape), while an `array<i64>` is plain Copy data (Static, freely returnable).
@@ -543,12 +553,12 @@ impl<'a> EscapeCheck<'a> {
             // separately by the local-backed-slice check). A fixed `array<Struct>` (AoS) always
             // tracks, like `Struct` itself — a struct may hold a region-tracked `str` field, so an
             // element / element-field read must inherit the array's region.
-            Ty::Array(s, _) | Ty::Slice(s) => Self::tracks_region(scalar_to_ty(s)),
+            Ty::Array(s, _) | Ty::Slice(s) => self.tracks_region(scalar_to_ty(s)),
             Ty::StructArray(..) => true,
             // An `Option`/`Result` is region-tracked iff its payload is. A `Struct` payload (e.g. a
             // `json.decode`-d struct) and now a `str` payload (a view) both track; scalars do not.
-            Ty::Option(s) => Self::tracks_region(scalar_to_ty(s)),
-            Ty::Result(o, e) => Self::tracks_region(scalar_to_ty(o)) || Self::tracks_region(scalar_to_ty(e)),
+            Ty::Option(s) => self.tracks_region(scalar_to_ty(s)),
+            Ty::Result(o, e) => self.tracks_region(scalar_to_ty(o)) || self.tracks_region(scalar_to_ty(e)),
             _ => false,
         }
     }
@@ -595,6 +605,14 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayLit { elems, .. } => elems
                 .iter()
                 .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
+            // A tuple lives as long as its shortest-lived element (same rule as an array literal):
+            // a tuple holding an arena `str` view is arena-regioned and cannot escape.
+            ExprKind::Tuple { elems, .. } => elems
+                .iter()
+                .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
+            // `t.N` reads an element; a `str` element is a view into the tuple, so it inherits the
+            // tuple's region (a scalar element is Copy → harmless to inherit, never checked).
+            ExprKind::TupleIndex { recv, .. } => self.region_of(recv, depth),
             // Borrowing an array as a slice preserves the array's region — a `slice<str>` coerced
             // from an arena str-array must not outlive that arena.
             ExprKind::ArrayToSlice(inner) => self.region_of(inner, depth),
@@ -686,7 +704,7 @@ impl<'a> EscapeCheck<'a> {
             Stmt::Let { local, init } => {
                 self.walk(init, depth);
                 self.decl_depth.insert(*local, depth);
-                if Self::tracks_region(init.ty) {
+                if self.tracks_region(init.ty) {
                     let r = self.region_of(init, depth);
                     self.region.insert(*local, r);
                 }
@@ -702,7 +720,7 @@ impl<'a> EscapeCheck<'a> {
                 if matches!(value.ty, Ty::Slice(_)) && self.slice_is_local(value) {
                     self.local_backed_slice.insert(*local);
                 }
-                if Self::tracks_region(value.ty) {
+                if self.tracks_region(value.ty) {
                     let r = self.region_of(value, depth);
                     // The binding's scope: at least the frame (a depth-0 binding lives the whole
                     // frame, region `Frame`), or the enclosing arena if declared inside one. Using
@@ -725,7 +743,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(value, depth);
                 // The base struct lives at its own (fixed) region; a stored value must outlive
                 // it, else the value would escape its region via the longer-lived struct.
-                if Self::tracks_region(value.ty) {
+                if self.tracks_region(value.ty) {
                     let target = self.region.get(base).copied().unwrap_or(Region::Static);
                     if !self.region_of(value, depth).outlives(target) {
                         self.diags.error(
@@ -764,7 +782,7 @@ impl<'a> EscapeCheck<'a> {
                 if let Some(v) = &b.value {
                     // The block's value escapes to the enclosing region (`Region::arena(depth)`);
                     // a value bound to this inner arena cannot outlive it.
-                    if Self::tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
+                    if self.tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
                         self.diags.error(
                             "a value allocated in this arena cannot escape as the block's value".to_string(),
                             v.span,
@@ -1563,13 +1581,13 @@ impl<'a, 't> Checker<'a, 't> {
             let concrete = self.finalize(ce.ty);
             self.constrain(ce.ty, Some(concrete), ce.span);
             match ty_to_scalar(self.resolve(ce.ty)) {
-                Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char)) => {
+                Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str)) => {
                     scalars.push(s)
                 }
                 _ => {
                     if ce.ty != Ty::Error {
                         self.diags.error(
-                            format!("tuple elements must be a primitive scalar (int/float/bool/char) for now, got {}", ty_name(ce.ty)),
+                            format!("tuple elements must be a primitive scalar or str for now (owned `string`/`array` elements come later), got {}", ty_name(ce.ty)),
                             ce.span,
                         );
                     }
@@ -3570,12 +3588,12 @@ fn resolve_type(
                     return Ty::Error;
                 }
                 match ty_to_scalar(ety) {
-                    Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char)) => {
+                    Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str)) => {
                         scalars.push(s)
                     }
                     _ => {
                         diags.error(
-                            format!("tuple elements must be a primitive scalar (int/float/bool/char) for now, got {}", ty_name(ety)),
+                            format!("tuple elements must be a primitive scalar or str for now (owned `string`/`array` elements come later), got {}", ty_name(ety)),
                             e.span(),
                         );
                         return Ty::Error;
