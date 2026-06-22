@@ -815,6 +815,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             };
             lower_array_partition(b, source, stages, *elem, func, tuple_id)
         }
+        hir::ExprKind::ArrayParMap { source, stages, func, elem } => {
+            // First cut: sequential — append a `map(f)` stage and materialize via the collect loop
+            // (real thread-parallel execution is a runtime follow-up).
+            let mut stages2 = stages.clone();
+            stages2.push(hir::Stage { kind: hir::StageKind::Map { func: func.clone() }, out_ty: *elem });
+            lower_array_collect(b, source, &stages2, *elem, CollectKind::Collect)
+        }
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
             let v = b.fresh_value(e.ty);

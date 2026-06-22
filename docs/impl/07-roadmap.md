@@ -442,8 +442,17 @@ Completion condition: confirm that the vectorized code contains vector instructi
 
 ## M7 — Parallelism
 
-- `par_map` (parallel unit = chunk), `chunks`.
-- side-effect checking for `par_map` (reusing the M3 analysis).
+- [done] **purity / effect inference** (`align_sema` Pass 4, `check_parallelism`): a function is
+  Impure iff it transitively performs an observable side effect (`print` / `io.stdout.write` /
+  `fs.read_file`, or calls an Impure function — fixpoint over the call graph); everything else is
+  Pure (`open-questions.md` "Purity model").
+- [done] **`par_map(f)` (sequential first cut)** — apply a **Pure** `f` to each (post-stage)
+  element and materialize an owned `array<R>`; an Impure `f` is rejected. Composes with prior
+  stages (`where`/`map`/…) and struct-consuming functions. Lowers to the collect loop (`map(f)` +
+  `to_array`); **real thread-parallel execution is the remaining piece** — the Pure rule is exactly
+  what makes that safe. (`examples/par_map.align`.)
+- [todo] thread-parallel execution of `par_map` (a runtime work-splitting layer), `chunks`
+  (`array<slice<T>>`, the parallel unit).
 - `task_group` / `spawn` / `wait` (I/O concurrency).
 - async/await is not included (`non-goals.md`).
 

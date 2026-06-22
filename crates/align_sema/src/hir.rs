@@ -259,6 +259,12 @@ pub enum ExprKind {
     /// `(array<T>, array<T>)` (`Ty::Tuple`); `elem` is the element scalar. One fused loop fills
     /// both buffers (no intermediate array).
     ArrayPartition { source: Box<Expr>, stages: Vec<Stage>, func: String, elem: crate::Ty },
+    /// `source.….par_map(f)` — apply the **Pure** function `func` to each (post-stage) element
+    /// and materialize the results into an owned `array<R>` (`elem` = `R`). Semantically a
+    /// data-parallel map; the first cut lowers to the sequential collect loop (`map(f)` +
+    /// `to_array`), with real thread-parallel execution a runtime follow-up. `func` is required to
+    /// be Pure (checked in the parallelism pass over the full call graph).
+    ArrayParMap { source: Box<Expr>, stages: Vec<Stage>, func: String, elem: crate::Ty },
     /// Borrow an array (a local stack array) as a `slice<T>` view — `{ &arr[0], len }`.
     /// Allocation-free, so it is an implicit coercion at call sites.
     ArrayToSlice(Box<Expr>),
