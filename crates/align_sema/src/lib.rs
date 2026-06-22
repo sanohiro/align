@@ -421,7 +421,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let Program { fns, tuples, .. } = &mut program;
     let tuples: &[hir::TupleDef] = tuples;
     for f in fns.iter_mut() {
-        MoveCheck { f, diags }.check();
+        MoveCheck { f, diags, tuples }.check();
         let region = {
             let mut ec = EscapeCheck {
                 f,
@@ -916,6 +916,9 @@ impl<'a> EscapeCheck<'a> {
 struct MoveCheck<'a> {
     f: &'a Fn,
     diags: &'a mut Diagnostics,
+    /// Tuple defs — so a Move tuple (one with an owned element) is recognised as a Move type and
+    /// its consumption (pass / destructure / return) is tracked for use-after-move.
+    tuples: &'a [hir::TupleDef],
 }
 
 impl<'a> MoveCheck<'a> {
@@ -924,14 +927,20 @@ impl<'a> MoveCheck<'a> {
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
-        let ret_is_move = matches!(self.f.ret, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder)
-            || payload_is_move(self.f.ret);
+        let ret_is_move = self.is_move_ty(self.f.ret);
         self.block(&self.f.body, &mut moved, ret_is_move, true);
+    }
+
+    /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple.
+    fn is_move_ty(&self, ty: Ty) -> bool {
+        matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder)
+            || payload_is_move(ty)
+            || ty_tuple_is_move(ty, self.tuples)
     }
 
     fn is_move(&self, id: LocalId) -> bool {
         match self.f.locals.get(id as usize).map(|l| l.ty) {
-            Some(ty) => matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(ty),
+            Some(ty) => self.is_move_ty(ty),
             None => false,
         }
     }

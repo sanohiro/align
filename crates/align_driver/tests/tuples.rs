@@ -218,6 +218,21 @@ fn bound_owned_tuple_copy_field_read() {
 }
 
 #[test]
+fn owned_tuple_use_after_move_rejected() {
+    // Consuming a Move tuple twice (destructure, then destructure again) is a use-after-move —
+    // must be a compile error, not a runtime double-free.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1].to_array()\n  b := [2].to_array()\n  return (a, b)\n}\nfn main() -> Result<(), Error> {\n  t := split()\n  (a, b) := t\n  (c, d) := t\n  print(a.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("tup-uam", src));
+}
+
+#[test]
+fn owned_tuple_use_after_pass_rejected() {
+    // Passing a Move tuple to a function consumes it; using it afterwards is a use-after-move.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1].to_array()\n  b := [2].to_array()\n  return (a, b)\n}\nfn take(t: (array<i64>, array<i64>)) -> i64 = 0\nfn main() -> Result<(), Error> {\n  t := split()\n  print(take(t))\n  (a, b) := t\n  print(a.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("tup-uap", src));
+}
+
+#[test]
 fn owned_tuple_field_index_rejected() {
     // Reading an *owned* element by index (`t.0` = array) would partially move it out — rejected;
     // destructure instead.
