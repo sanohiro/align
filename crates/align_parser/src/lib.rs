@@ -688,6 +688,25 @@ impl<'a> Parser<'a> {
                 let span = span.merge(self.prev_span());
                 Some(Expr { kind: ExprKind::Template(parts), span })
             }
+            TokKind::Fn => {
+                // A lambda: `fn p0, p1 { ... }` — bare comma-separated parameter idents (types
+                // inferred at the use site), then a block body. (Top-level `fn` is parsed at item
+                // level, so a `fn` in expression position is always a lambda.)
+                let start = self.span();
+                self.bump();
+                let mut params = Vec::new();
+                if !matches!(self.peek(), TokKind::LBrace) {
+                    loop {
+                        params.push(self.parse_ident("lambda parameter")?);
+                        if !self.eat(&TokKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                let body = self.parse_block()?;
+                let span = start.merge(self.prev_span());
+                Some(Expr { kind: ExprKind::Lambda { params, body }, span })
+            }
             TokKind::If => self.parse_if(),
             TokKind::Arena => {
                 let start = self.span();

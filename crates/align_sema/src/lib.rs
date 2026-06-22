@@ -293,9 +293,16 @@ struct FnSig {
 }
 
 /// A pipeline stage as collected from the AST (before type checking).
+/// A stage's function argument: either a reference to a named top-level function, or an inline
+/// lambda (which sema lifts to a synthetic top-level function — see [`Checker::lift_lambda`]).
+enum StageFn {
+    Named(ast::Ident),
+    Lambda { params: Vec<ast::Ident>, body: ast::Block, span: Span },
+}
+
 enum RawStage {
-    Map(ast::Ident),
-    Where(ast::Ident),
+    Map(StageFn),
+    Where(StageFn),
     WhereField(ast::Ident),
     Project(ast::Ident),
 }
@@ -394,31 +401,35 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         sigs.insert(f.name.name.clone(), FnSig { params, out, ret });
     }
 
-    // Pass 2: check each function body.
-    let fns = file
-        .items
-        .iter()
-        .filter_map(|item| {
-            let ast::Item::Fn(f) = item else { return None };
-            let mut cx = Checker {
-                diags,
-                sigs: &sigs,
-                struct_ids: &struct_ids,
-                structs: &structs,
-                tuples: &mut tuples,
-                int_vars: Vec::new(),
-                int_parent: Vec::new(),
-                float_vars: Vec::new(),
-                float_parent: Vec::new(),
-                locals: Vec::new(),
-                scope: Vec::new(),
-                ret_hint: Ty::Unit,
-                arena_depth: 0,
-                slice_bases: std::collections::HashMap::new(),
-            };
-            Some(cx.check_fn(f))
-        })
-        .collect();
+    // Pass 2: check each function body. A function's inline lambdas are lifted to synthetic
+    // top-level functions (`cx.lifted`) and appended to the program, so all later passes treat
+    // them like ordinary named functions.
+    let mut fns: Vec<hir::Fn> = Vec::new();
+    for item in &file.items {
+        let ast::Item::Fn(f) = item else { continue };
+        let mut cx = Checker {
+            diags,
+            sigs: &sigs,
+            struct_ids: &struct_ids,
+            structs: &structs,
+            tuples: &mut tuples,
+            int_vars: Vec::new(),
+            int_parent: Vec::new(),
+            float_vars: Vec::new(),
+            float_parent: Vec::new(),
+            locals: Vec::new(),
+            scope: Vec::new(),
+            ret_hint: Ty::Unit,
+            arena_depth: 0,
+            slice_bases: std::collections::HashMap::new(),
+            cur_fn: String::new(),
+            lifted: Vec::new(),
+        };
+        let checked = cx.check_fn(f);
+        let lifted = std::mem::take(&mut cx.lifted);
+        fns.push(checked);
+        fns.extend(lifted);
+    }
     let mut program = Program { fns, structs, tuples };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
@@ -1439,6 +1450,11 @@ struct Checker<'a, 't> {
     /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
     /// is caught even though `s` and `a` are different locals.
     slice_bases: std::collections::HashMap<LocalId, LocalId>,
+    /// The enclosing function's name — used to generate unique names for lifted lambdas.
+    cur_fn: String,
+    /// Lambdas lifted to synthetic top-level functions while checking this function's body. Pass 2
+    /// appends them to `program.fns` so later passes / codegen treat them like named functions.
+    lifted: Vec<hir::Fn>,
 }
 
 impl<'a, 't> Checker<'a, 't> {
@@ -1569,6 +1585,7 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn check_fn(&mut self, f: &ast::FnDecl) -> Fn {
+        self.cur_fn = f.name.name.clone();
         let sig = &self.sigs[&f.name.name];
         let ret = sig.ret;
         let param_tys = sig.params.clone();
@@ -1912,6 +1929,15 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::FieldShorthand(_) => {
                 self.diags.error(
                     "`.field` is only valid as a pipeline stage argument (e.g. `where(.active)`)".to_string(),
+                    e.span,
+                );
+                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span }
+            }
+            // A lambda is only meaningful as a stage/reducer argument, where it is lifted; a
+            // bare lambda value (first-class function values) is a later slice.
+            ast::ExprKind::Lambda { .. } => {
+                self.diags.error(
+                    "a lambda (`fn … { … }`) is only valid as a pipeline/reducer argument (e.g. `map(fn x { x * 2 })`)".to_string(),
                     e.span,
                 );
                 Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span }
@@ -2625,6 +2651,100 @@ impl<'a, 't> Checker<'a, 't> {
         ret
     }
 
+    /// Resolve a stage's function argument (named or lambda) over element type `elem`, returning
+    /// the (possibly synthetic) function name to lower to and its return type. A lambda is lifted
+    /// to a synthetic top-level function (`lift_lambda`); a named function is checked in place.
+    fn resolve_stage_fn(&mut self, sf: &StageFn, elem: Ty, is_pred: bool) -> Option<(String, Ty)> {
+        match sf {
+            StageFn::Named(fname) => Some((fname.name.clone(), self.check_stage_fn(fname, elem, is_pred))),
+            StageFn::Lambda { params, body, span } => {
+                let expected_ret = if is_pred { Some(Ty::Bool) } else { None };
+                self.lift_lambda(params, body, &[elem], expected_ret, *span)
+            }
+        }
+    }
+
+    /// Lift an inline lambda to a synthetic top-level function and return its generated name + its
+    /// return type. The lambda is checked as an isolated function body (its own locals/scope/
+    /// inference), with parameter types taken from `expected_params` (so a `slice<i32>.map(fn x …)`
+    /// gives `x: i32`); an inline-literal element type defaults like any unconstrained literal. The
+    /// lifted function joins `program.fns` (Pass 2 collects `self.lifted`), so move/escape/purity
+    /// analysis and codegen treat it exactly like a named function — including the `par_map` Pure
+    /// requirement. The fused-loop lowering is then identical to a named stage function.
+    ///
+    /// Slice ① cut: **non-capturing** only — the lambda body sees its parameters and top-level
+    /// functions, but not enclosing locals (capturing those is a follow-up; such a reference
+    /// surfaces as an undefined-variable error here).
+    fn lift_lambda(
+        &mut self,
+        params: &[ast::Ident],
+        body: &ast::Block,
+        expected_params: &[Ty],
+        expected_ret: Option<Ty>,
+        span: Span,
+    ) -> Option<(String, Ty)> {
+        if params.len() != expected_params.len() {
+            self.diags.error(
+                format!("this lambda must take {} parameter(s), but has {}", expected_params.len(), params.len()),
+                span,
+            );
+            return None;
+        }
+        // Parameter types must be concrete at the lambda boundary (a function signature can't carry
+        // another function's inference variable), so resolve the element type now.
+        let param_tys: Vec<Ty> = expected_params.iter().map(|t| self.finalize(*t)).collect();
+
+        // Swap in fresh per-function state; the lambda is a separate function body.
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_scope = std::mem::take(&mut self.scope);
+        let saved_int_vars = std::mem::take(&mut self.int_vars);
+        let saved_int_parent = std::mem::take(&mut self.int_parent);
+        let saved_float_vars = std::mem::take(&mut self.float_vars);
+        let saved_float_parent = std::mem::take(&mut self.float_parent);
+        let saved_ret = self.ret_hint;
+        let saved_arena = self.arena_depth;
+        let saved_bases = std::mem::take(&mut self.slice_bases);
+        self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
+        self.arena_depth = 0;
+
+        let param_ids: Vec<LocalId> =
+            params.iter().zip(&param_tys).map(|(p, ty)| self.declare(&p.name, *ty, false)).collect();
+        let checked = self.check_block(body, expected_ret);
+        let ret = match expected_ret {
+            Some(t) => t,
+            None => checked.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit),
+        };
+        let mut body_fin = checked;
+        self.finalize_block(&mut body_fin);
+        let mut locals = std::mem::take(&mut self.locals);
+        for l in &mut locals {
+            l.ty = self.finalize(l.ty);
+        }
+        let ret = self.finalize(ret);
+        let name = format!("{}$lambda{}", self.cur_fn, self.lifted.len());
+        self.lifted.push(hir::Fn {
+            name: name.clone(),
+            params: param_ids,
+            ret,
+            locals,
+            body: body_fin,
+            span,
+            drop_locals: Vec::new(),
+        });
+
+        // Restore the enclosing function's state.
+        self.locals = saved_locals;
+        self.scope = saved_scope;
+        self.int_vars = saved_int_vars;
+        self.int_parent = saved_int_parent;
+        self.float_vars = saved_float_vars;
+        self.float_parent = saved_float_parent;
+        self.ret_hint = saved_ret;
+        self.arena_depth = saved_arena;
+        self.slice_bases = saved_bases;
+        Some((name, ret))
+    }
+
     fn collect_pipeline<'e>(&mut self, e: &'e ast::Expr) -> (&'e ast::Expr, Vec<RawStage>) {
         match &e.kind {
             // `.map(f)` / `.where(p)`
@@ -2642,11 +2762,23 @@ impl<'a, 't> Checker<'a, 't> {
                                 return (src, stages);
                             }
                         }
-                        match arg.and_then(|a| self.pipeline_fn_name(a)) {
+                        // An inline lambda (`map(fn x { … })`) or a named function.
+                        let stage_fn = match arg {
+                            Some(a) => match &a.kind {
+                                ast::ExprKind::Lambda { params, body } => Some(StageFn::Lambda {
+                                    params: params.clone(),
+                                    body: body.clone(),
+                                    span: a.span,
+                                }),
+                                _ => self.pipeline_fn_name(a).map(StageFn::Named),
+                            },
+                            None => None,
+                        };
+                        match stage_fn {
                             Some(f) if is_map => stages.push(RawStage::Map(f)),
                             Some(f) => stages.push(RawStage::Where(f)),
                             None => self.diags.error(
-                                format!("'.{}()' needs a single named function or `.field`", field.name),
+                                format!("'.{}()' needs a function (named or `fn … {{ … }}`) or `.field`", field.name),
                                 e.span,
                             ),
                         }
@@ -2685,7 +2817,9 @@ impl<'a, 't> Checker<'a, 't> {
         // The expected element type for an inline scalar literal source: the first Map
         // stage's parameter, or (with no stages) the caller-provided hint.
         let elem_expected = match raw_stages.first() {
-            Some(RawStage::Map(fname)) => self.sigs.get(&fname.name).and_then(|s| s.params.first().copied()),
+            // A named first `map` fixes the element type from its parameter; a lambda's parameter
+            // type is inferred (the literal defaults), so there is no hint to pull.
+            Some(RawStage::Map(StageFn::Named(fname))) => self.sigs.get(&fname.name).and_then(|s| s.params.first().copied()),
             None => elem_expected_no_stages,
             _ => None,
         };
@@ -2766,24 +2900,28 @@ impl<'a, 't> Checker<'a, 't> {
                         None => return None,
                     }
                 }
-                RawStage::Map(fname) => {
+                RawStage::Map(sf) => {
                     // `map(f)` accepts a scalar element or a whole struct element: a struct array
                     // stays index-addressed until used, and a struct-consuming `map` loads the
-                    // element by index in MIR (`lower_struct_elem`). `check_stage_fn` requires `f`'s
-                    // single parameter to match the current element type (scalar or struct).
-                    let ret = self.check_stage_fn(&fname, elem, false);
-                    stages.push(Stage { kind: StageKind::Map { func: fname.name }, out_ty: ret });
+                    // element by index in MIR (`lower_struct_elem`). The function (named or lambda)
+                    // takes the current element type and returns the new one.
+                    let Some((func, ret)) = self.resolve_stage_fn(&sf, elem, false) else {
+                        return None;
+                    };
+                    stages.push(Stage { kind: StageKind::Map { func }, out_ty: ret });
                     elem = ret;
                     mapped = true;
                 }
-                RawStage::Where(fname) => {
+                RawStage::Where(sf) => {
                     // `where(f)` accepts a scalar element or a whole struct element (a multi-field
-                    // predicate, e.g. `fn busy(e: Emp) -> bool = e.hours > 40 && e.active`). A
-                    // struct-consuming predicate loads the element by value in MIR (the same
-                    // `lower_struct_elem` as `map`); `where` filters, so the element is unchanged
-                    // (no `mapped`, and a later `.field` / `where(.field)` still reads the source).
-                    self.check_stage_fn(&fname, elem, true);
-                    stages.push(Stage { kind: StageKind::Where { func: fname.name }, out_ty: elem });
+                    // predicate). A struct-consuming predicate loads the element by value in MIR
+                    // (the same `lower_struct_elem` as `map`); `where` filters, so the element is
+                    // unchanged (no `mapped`, and a later `.field` / `where(.field)` still reads the
+                    // source).
+                    let Some((func, _)) = self.resolve_stage_fn(&sf, elem, true) else {
+                        return None;
+                    };
+                    stages.push(Stage { kind: StageKind::Where { func }, out_ty: elem });
                 }
                 RawStage::WhereField(field) => {
                     if !slot_backed {
