@@ -173,10 +173,18 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   borrow, fixing a latent codegen mismatch (a bare array stored into a slice slot).
 - [mostly done, via Memory Model v2] heap-owned dynamic `array<T>` + array type annotations,
   array-valued results, and the materializing terminals `scan`/`sort`/`to_array` all landed on
-  the owned/dynamic-heap-array + drop foundation. Still deferred: `partition` (needs tuples /
-  multi-value returns) and `chunks` (needs `array<slice<T>>`) — separate type-system tracks
-  (`open-questions.md`); and `out` args (the post-MMv2 `noalias` work). Non-materializing
-  terminals (`sum`/`reduce`/`count`/`any`/`all`) were already complete.
+  the owned/dynamic-heap-array + drop foundation. Non-materializing terminals
+  (`sum`/`reduce`/`count`/`any`/`all`) were already complete. Still deferred: `chunks` (needs
+  `array<slice<T>>`, a separate type-system track) and `out` args (the post-MMv2 `noalias` work).
+- [done] **`partition(p)`** — split a pipeline's surviving (primitive-scalar) elements into two
+  owned arrays `(array<T>, array<T>)` (predicate true, then false) in one fused loop with two
+  buffers + a per-element branch (`lower_array_partition`, the `to_array` collect loop doubled),
+  returning the pair as an owned tuple — destructured by the caller `(evens, odds) := …`. Built on
+  the owned-tuple work. Each buffer is freed once: inside an arena the buffers are arena-allocated
+  and the destructured locals inherit the arena region (so they are not also dropped — the
+  EscapeCheck `LetTuple` handler now propagates the tuple's region to the bound locals, closing a
+  double-free); outside, they are heap and freed by the destructure targets' drop. Struct elements
+  and a tuple-returning chained form are deferred. (`examples/partition.align`.)
 - [done] **tuples / multi-value return (foundation)** — the anonymous product type `(T, U, ...)`:
   literals, destructuring `(a, b) := expr` (parens required, `_` ignores), positional `.N` access,
   and tuple params/returns. Multi-value return = returning a tuple (no separate mechanism; settled,

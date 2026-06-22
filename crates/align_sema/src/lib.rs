@@ -593,6 +593,7 @@ impl<'a> EscapeCheck<'a> {
             // at this depth can have, so it conservatively covers an accumulator that instead just
             // forwards `init` or borrows a source element (both outlive `arena(depth)`).
             ExprKind::ArrayToArray { .. }
+            | ExprKind::ArrayPartition { .. }
             | ExprKind::ArrayScan { .. }
             | ExprKind::ArraySort { .. }
             | ExprKind::ArrayReduce { .. } => Region::arena(depth),
@@ -776,9 +777,22 @@ impl<'a> EscapeCheck<'a> {
             }
             Stmt::Return(None) => {}
             Stmt::Expr(e) => self.walk(e, depth),
-            // A tuple destructure binds primitive (Static) elements in PR1 — no region to track,
-            // just recurse into the source for nested escapes.
-            Stmt::LetTuple { init, .. } => self.walk(init, depth),
+            // A tuple destructure binds each element to a local. If the tuple is region-tracked
+            // (holds a `str` view, or owned arrays allocated in an arena), each bound local inherits
+            // the tuple's region — else an arena-allocated destructured array would default to
+            // `Static`, land in the drop set, and be freed both here and by the arena (double-free).
+            // (The current producers — `partition`, owned-tuple returns — give all elements the same
+            // region, so the tuple's region is exact; per-element regions are a later refinement.)
+            Stmt::LetTuple { locals, init, .. } => {
+                self.walk(init, depth);
+                if self.tracks_region(init.ty) {
+                    let r = self.region_of(init, depth);
+                    for l in locals.iter().flatten() {
+                        self.decl_depth.insert(*l, depth);
+                        self.region.insert(*l, r);
+                    }
+                }
+            }
         }
     }
 
@@ -831,7 +845,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.walk(recv, depth);
@@ -1016,7 +1030,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::BuilderNew => {}
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
@@ -2037,6 +2051,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "to_array" {
             return self.check_array_to_array(recv, args, span);
         }
+        if method == "partition" {
+            return self.check_array_partition(recv, args, span);
+        }
         // Builder methods (MMv2 slice 7c/7d): typed `write*` appends, `to_string` finishes.
         if let Some(kind) = builder_write_kind(method) {
             return self.check_builder_write(recv, args, kind, span);
@@ -2450,6 +2467,53 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::ArrayToArray { source: Box::new(source), stages, elem },
             ty: Ty::DynArray(scalar),
+            span,
+        }
+    }
+
+    /// `source.….partition(p)` — split the surviving (scalar) elements into two owned arrays:
+    /// those satisfying the predicate `p`, then the rest. Yields a tuple `(array<T>, array<T>)`,
+    /// filled by one fused loop. The element must be a primitive scalar (the `array<T>` payload).
+    fn check_array_partition(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [fn_arg] = args else {
+            self.diags.error(
+                format!("'partition' takes 1 argument (a predicate function), got {}", args.len()),
+                span,
+            );
+            return err;
+        };
+        let Some(fname) = self.pipeline_fn_name(fn_arg) else {
+            self.diags.error("'partition' needs a named predicate function".to_string(), span);
+            return err;
+        };
+        let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
+            return err;
+        };
+        if matches!(elem, Ty::Struct(_)) {
+            self.diags.error(
+                "'partition' over struct elements is not supported yet (project a field first)".to_string(),
+                span,
+            );
+            return err;
+        }
+        // The predicate has type `(elem) -> bool`.
+        self.check_stage_fn(&fname, elem, true);
+        // The element must materialize into `array<T>`, i.e. be a primitive scalar.
+        let prim_ok = ty_to_scalar(elem).and_then(scalar_to_prim).is_some();
+        if !prim_ok {
+            self.diags.error(
+                format!("'partition' element must be a primitive scalar (int/float/bool/char), got {}", ty_name(elem)),
+                span,
+            );
+            return err;
+        }
+        // Result: a tuple of two owned arrays `(array<T>, array<T>)`.
+        let arr = ty_to_scalar(Ty::DynArray(ty_to_scalar(elem).unwrap())).expect("array<prim> is a payload scalar");
+        let tuple_id = intern_tuple(self.tuples, vec![arr, arr]);
+        Expr {
+            kind: ExprKind::ArrayPartition { source: Box::new(source), stages, func: fname.name, elem },
+            ty: Ty::Tuple(tuple_id),
             span,
         }
     }
@@ -3429,7 +3493,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }

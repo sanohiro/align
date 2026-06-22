@@ -251,6 +251,11 @@ pub enum ExprKind {
     /// *owned* `array<T>` (MMv2 slice 3: arena-bump-allocated). `elem` is the element
     /// scalar type; the expression `ty` is `DynArray(elem)`.
     ArrayToArray { source: Box<Expr>, stages: Vec<Stage>, elem: crate::Ty },
+    /// `source.….partition(p)` — split the surviving (scalar) elements into two owned arrays by
+    /// the predicate `func`: those satisfying it, then the rest. The expression `ty` is a tuple
+    /// `(array<T>, array<T>)` (`Ty::Tuple`); `elem` is the element scalar. One fused loop fills
+    /// both buffers (no intermediate array).
+    ArrayPartition { source: Box<Expr>, stages: Vec<Stage>, func: String, elem: crate::Ty },
     /// Borrow an array (a local stack array) as a `slice<T>` view — `{ &arr[0], len }`.
     /// Allocation-free, so it is an implicit coercion at call sites.
     ArrayToSlice(Box<Expr>),

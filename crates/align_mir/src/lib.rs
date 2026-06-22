@@ -773,6 +773,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::ArrayDot { a, b: bex, elem } => lower_array_dot(b, a, bex, *elem),
         hir::ExprKind::ArraySort { source, stages, elem } => lower_array_sort(b, source, stages, *elem),
+        hir::ExprKind::ArrayPartition { source, stages, func, elem } => {
+            let tuple_id = match e.ty {
+                Ty::Tuple(id) => id,
+                _ => unreachable!("partition result is a tuple"),
+            };
+            lower_array_partition(b, source, stages, *elem, func, tuple_id)
+        }
         hir::ExprKind::ArrayToSlice(inner) => {
             let (slot, n) = array_source_slot(b, inner);
             let v = b.fresh_value(e.ty);
@@ -1488,6 +1495,180 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
         b.push(Stmt::DropValue(tmp));
     }
     Operand::Value(arr)
+}
+
+/// `source.….partition(p)` — one fused loop that splits the surviving scalar elements into two
+/// owned arrays (predicate true, then false) and returns them as a tuple `(array<T>, array<T>)`.
+/// Mirrors [`lower_array_collect`] but with two buffers + a per-element predicate branch at the
+/// append point. Each buffer is sized at the source length (an upper bound).
+fn lower_array_partition(
+    b: &mut Builder,
+    source: &hir::Expr,
+    stages: &[hir::Stage],
+    elem: Ty,
+    pred_func: &str,
+    tuple_id: u32,
+) -> Operand {
+    let arena = b.arenas.last().copied();
+    let SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free } = setup_source(b, source);
+
+    // Two output buffers, each an upper-bound `bound` elements (a split never grows the count).
+    let alloc_buf = |b: &mut Builder| {
+        let p = b.fresh_value(Ty::Box(scalar_of(elem)));
+        let alloc = match arena {
+            Some(h) => Rvalue::ArenaAlloc { handle: Operand::Value(h), count: bound.clone(), elem },
+            // Unbound free-standing buffers leak if the result tuple is never destructured (same
+            // bounded caveat as `to_array`); destructured into owned locals, they are freed once.
+            None => Rvalue::HeapAllocBuf { count: bound.clone(), elem },
+        };
+        b.push(Stmt::Let(p, alloc));
+        p
+    };
+    let out_a = alloc_buf(b);
+    let out_b = alloc_buf(b);
+    let acc_a = b.new_slot(i64_ty());
+    b.push(Stmt::Store(acc_a, Operand::Const(Const::Int(0, i64_ty()))));
+    let acc_b = b.new_slot(i64_ty());
+    b.push(Stmt::Store(acc_b, Operand::Const(Const::Int(0, i64_ty()))));
+    let iv = b.new_slot(i64_ty());
+    b.push(Stmt::Store(iv, Operand::Const(Const::Int(0, i64_ty()))));
+
+    let header = b.new_block();
+    let body = b.new_block();
+    let cont = b.new_block();
+    let exit = b.new_block();
+    b.terminate(Term::Goto(header));
+
+    // header: while i < len
+    b.cur = header;
+    let i_val = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
+    let cond = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound.clone())));
+    b.terminate(Term::Branch(Operand::Value(cond), body, exit));
+
+    // body: address element i, run the stages.
+    b.cur = body;
+    let idx = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(idx, Rvalue::Load(iv)));
+    let index = Operand::Value(idx);
+
+    let mut cur: Option<Operand> = if struct_view.is_some() {
+        None
+    } else if let Some(sv) = &slice_val {
+        let src_elem = match source.ty {
+            Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+            _ => elem,
+        };
+        let x = b.fresh_value(src_elem);
+        b.push(Stmt::Let(x, Rvalue::SliceIndex(sv.clone(), index.clone())));
+        Some(Operand::Value(x))
+    } else if scalar_slot_src {
+        let src_elem = match source.ty {
+            Ty::Array(s, _) => align_sema::scalar_to_ty(s),
+            _ => elem,
+        };
+        let x = b.fresh_value(src_elem);
+        b.push(Stmt::Let(x, Rvalue::Index(slot, index.clone())));
+        Some(Operand::Value(x))
+    } else {
+        None
+    };
+
+    for stage in stages {
+        match &stage.kind {
+            hir::StageKind::Project { field } => {
+                let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
+                cur = Some(Operand::Value(v));
+            }
+            hir::StageKind::Map { func } => {
+                let arg = match cur.take() {
+                    Some(a) => a,
+                    None => {
+                        let sid = match source.ty {
+                            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
+                            _ => unreachable!("map with no loaded element must be over a struct array"),
+                        };
+                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                    }
+                };
+                let v = b.fresh_value(stage.out_ty);
+                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), vec![arg])));
+                cur = Some(Operand::Value(v));
+            }
+            hir::StageKind::Where { func } => {
+                let arg = match &cur {
+                    Some(a) => a.clone(),
+                    None => {
+                        let sid = match source.ty {
+                            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
+                            _ => unreachable!("where with no loaded element must be over a struct array"),
+                        };
+                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                    }
+                };
+                let pred = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), vec![arg])));
+                let keep = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
+                b.cur = keep;
+            }
+            hir::StageKind::WhereField { field } => {
+                let pred = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                let keep = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
+                b.cur = keep;
+            }
+        }
+    }
+
+    // Split: pred = p(element); true → out_a[acc_a++] = element, false → out_b[acc_b++] = element.
+    let cur = cur.expect("partition needs a scalar element");
+    let pred = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(pred, Rvalue::Call(pred_func.to_string(), vec![cur.clone()])));
+    let to_a = b.new_block();
+    let to_b = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(pred), to_a, to_b));
+
+    let append = |b: &mut Builder, buf: ValueId, acc: Slot| {
+        let oi = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(oi, Rvalue::Load(acc)));
+        b.push(Stmt::PtrStore(Operand::Value(buf), Operand::Value(oi), cur.clone()));
+        let n = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(oi), index_const(1))));
+        b.push(Stmt::Store(acc, Operand::Value(n)));
+        b.terminate(Term::Goto(cont));
+    };
+    b.cur = to_a;
+    append(b, out_a, acc_a);
+    b.cur = to_b;
+    append(b, out_b, acc_b);
+
+    // cont: i += 1; loop.
+    b.cur = cont;
+    let i2 = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i2, Rvalue::Load(iv)));
+    let inc = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1))));
+    b.push(Stmt::Store(iv, Operand::Value(inc)));
+    b.terminate(Term::Goto(header));
+
+    // exit: build the two owned arrays and the result tuple `(array<T>, array<T>)`.
+    b.cur = exit;
+    let la = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(la, Rvalue::Load(acc_a)));
+    let arr_a = b.fresh_value(Ty::DynArray(scalar_of(elem)));
+    b.push(Stmt::Let(arr_a, Rvalue::MakeDynArray { ptr: Operand::Value(out_a), len: Operand::Value(la) }));
+    let lb = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(lb, Rvalue::Load(acc_b)));
+    let arr_b = b.fresh_value(Ty::DynArray(scalar_of(elem)));
+    b.push(Stmt::Let(arr_b, Rvalue::MakeDynArray { ptr: Operand::Value(out_b), len: Operand::Value(lb) }));
+    if let Some(tmp) = temp_free {
+        b.push(Stmt::DropValue(tmp));
+    }
+    let tup = b.fresh_value(Ty::Tuple(tuple_id));
+    b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(arr_a), Operand::Value(arr_b)] }));
+    Operand::Value(tup)
 }
 
 /// `source.….sort()` — materialize the surviving elements into an owned `array<T>` (the
