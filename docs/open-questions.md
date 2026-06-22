@@ -77,9 +77,10 @@ into an interned tuple table (the dual of the struct table), lowered to an anony
 **Implemented:** the type + literal + destructure + `.N` + tuple params/returns for primitive
 scalars, `str` (region-tracked), **and owned `string`/`array<T>` elements** (a Move tuple, restricted
 to temporaries — returned or destructured, not bound to a variable or passed as a parameter — so it
-never occupies a drop slot and needs no tuple `Drop`). What remains is the consumers built on this:
-`partition` (`(array<T>, array<T>)`), `min_with_index` (`(value, index)`), `chunks`
-(`array<slice<T>>`), and lifting the temporary-only cut (bound owned-tuple locals / params, which
+never occupies a drop slot and needs no tuple `Drop`). The first consumer, **`partition`**
+(`(array<T>, array<T>)`), is implemented. What remains is the other consumers built on this:
+`min_with_index` (`(value, index)`), `chunks` (`array<slice<T>>`), and lifting the
+temporary-only cut (bound owned-tuple locals / params, which
 need element-wise drop + index-move). Record: `draft.md` §5 (Types → Tuple), `impl/02-frontend.md`
 §8, `impl/03-types.md`, `impl/07-roadmap.md`.
 
@@ -127,9 +128,9 @@ The *design* is settled (first-class anonymous tuples; multi-value return = retu
 see "Tuples / multi-value returns" under Settled). The **foundation is implemented**: the
 `(T, U, …)` type, literals, destructuring `(a, b) :=`, positional `.N`, tuple params/returns, for
 primitive scalars, `str` (region-tracked), and **owned `string`/`array<T>`** elements (a Move
-tuple, restricted to temporaries). What remains is purely additive *implementation*, not design:
-the consumers — `partition` (`(array<T>, array<T>)`), `chunks` (`array<slice<T>>`),
-`min_with_index`-style `(value, index)` reductions — and lifting the temporary-only cut on owned
+tuple, restricted to temporaries), and the first consumer **`partition`** (`(array<T>, array<T>)`).
+What remains is purely additive *implementation*, not design: the other consumers — `chunks`
+(`array<slice<T>>`), `min_with_index`-style `(value, index)` reductions — and lifting the temporary-only cut on owned
 tuples (binding to a variable / passing as a parameter, which need element-wise drop + index-move).
 
 ### Arena checkpoint / rollback — std arena API, after MMv2
