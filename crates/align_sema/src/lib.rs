@@ -281,6 +281,8 @@ impl Ty {
 
 struct FnSig {
     params: Vec<Ty>,
+    /// `out[i]` — whether parameter `i` is an `out` (writable, no-alias) output buffer.
+    out: Vec<bool>,
     ret: Ty,
 }
 
@@ -390,7 +392,8 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             }
             None => Ty::Unit,
         };
-        sigs.insert(f.name.name.clone(), FnSig { params, ret });
+        let out = f.params.iter().map(|p| p.is_out).collect();
+        sigs.insert(f.name.name.clone(), FnSig { params, out, ret });
     }
 
     // Pass 2: check each function body.
@@ -413,6 +416,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 scope: Vec::new(),
                 ret_hint: Ty::Unit,
                 arena_depth: 0,
+                slice_bases: std::collections::HashMap::new(),
             };
             Some(cx.check_fn(f))
         })
@@ -1157,6 +1161,10 @@ struct Checker<'a, 't> {
     ret_hint: Ty,
     /// Nesting depth of `arena {}` blocks (0 = not in an arena).
     arena_depth: u32,
+    /// For each slice local bound from an array/slice (`s: slice<T> := a`), the **root** buffer
+    /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
+    /// is caught even though `s` and `a` are different locals.
+    slice_bases: std::collections::HashMap<LocalId, LocalId>,
 }
 
 impl<'a, 't> Checker<'a, 't> {
@@ -1382,6 +1390,13 @@ impl<'a, 't> Checker<'a, 't> {
                         );
                     }
                     let local = self.declare(&name.name, local_ty, *is_mut);
+                    // Record slice provenance (`s: slice<T> := a` → `s` borrows `a`'s buffer) so
+                    // the `out` no-alias check can see through slice variables.
+                    if matches!(local_ty, Ty::Slice(_)) {
+                        if let Some(root) = self.expr_root_local(&init) {
+                            self.slice_bases.insert(local, root);
+                        }
+                    }
                     stmts.push(Stmt::Let { local, init });
                 }
                 ast::Stmt::LetTuple { names, init, span } => {
@@ -1819,6 +1834,31 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// If `e` is a bare local name, return its id and type.
+    /// Follow a slice local to the root buffer it borrows (an array, or a slice parameter — its
+    /// own root). A non-slice / unborrowed local is its own root.
+    fn root_local(&self, id: LocalId) -> LocalId {
+        let mut cur = id;
+        let mut guard = 0;
+        while let Some(&base) = self.slice_bases.get(&cur) {
+            if base == cur || guard > self.locals.len() {
+                break;
+            }
+            cur = base;
+            guard += 1;
+        }
+        cur
+    }
+
+    /// The root buffer local an HIR expression borrows, if it resolves to one (a local or an
+    /// array→slice borrow). Used to record slice provenance for the `out` no-alias check.
+    fn expr_root_local(&self, e: &Expr) -> Option<LocalId> {
+        match &e.kind {
+            ExprKind::Local(id) => Some(self.root_local(*id)),
+            ExprKind::ArrayToSlice(inner) => self.expr_root_local(inner),
+            _ => None,
+        }
+    }
+
     fn place_local(&self, e: &ast::Expr) -> Option<(LocalId, Ty)> {
         if let ast::ExprKind::Path(p) = &e.kind {
             if let Some(name) = single_name(p) {
@@ -1947,12 +1987,34 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         };
-        let (param_tys, ret) = (sig.params.clone(), sig.ret);
+        let (param_tys, ret, out) = (sig.params.clone(), sig.ret, sig.out.clone());
         if args.len() != param_tys.len() {
             self.diags.error(
                 format!("'{name}' expects {} argument(s), got {}", param_tys.len(), args.len()),
                 span,
             );
+        }
+        // No-alias check: an `out` argument must not name the same local as any other argument
+        // (the no-alias guarantee `out` lowers to LLVM `noalias`). A conservative base-local
+        // comparison — every slice of an array `a` goes through `a` directly today, so distinct
+        // locals are genuinely distinct buffers.
+        let arg_root = |s: &Self, a: &ast::Expr| s.place_local(a).map(|(id, _)| s.root_local(id));
+        for (i, is_out) in out.iter().enumerate() {
+            if !is_out {
+                continue;
+            }
+            let Some(arg_i) = args.get(i) else { continue };
+            let Some(base) = arg_root(self, arg_i) else { continue };
+            for (j, a) in args.iter().enumerate() {
+                if j != i && arg_root(self, a) == Some(base) {
+                    let lname = self.locals[base as usize].name.clone();
+                    self.diags.error(
+                        format!("the `out` argument also aliases '{lname}', another argument to '{name}' — an `out` buffer must not alias the other arguments"),
+                        arg_i.span,
+                    );
+                    break;
+                }
+            }
         }
         let checked = args
             .iter()

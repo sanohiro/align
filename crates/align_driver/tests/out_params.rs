@@ -82,6 +82,39 @@ fn write_to_immutable_array_rejected() {
 }
 
 #[test]
+fn out_arg_aliasing_another_arg_rejected() {
+    // The no-alias guarantee: an `out` argument must not name the same local as another argument.
+    let src = "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  mut a := [1, 2, 3]\n  fill(a, a)\n  return 0\n}\n";
+    assert!(check_errs("na-alias", src));
+}
+
+#[test]
+fn out_arg_aliasing_via_slice_variable_rejected() {
+    // Soundness: even via different locals, aliasing the same buffer must be caught — `s` views
+    // `a`, so `fill(a, s)` aliases. (Slice provenance is tracked to the root array.)
+    let src = "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  mut a := [1, 2, 3]\n  s : slice<i64> := a\n  fill(a, s)\n  return 0\n}\n";
+    assert!(check_errs("na-alias-slice", src));
+}
+
+#[test]
+fn out_arg_two_slices_of_same_array_rejected() {
+    // Two slice variables borrowing the same array alias each other.
+    let src = "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  mut a := [1, 2, 3]\n  s1 : slice<i64> := a\n  s2 : slice<i64> := a\n  fill(s1, s2)\n  return 0\n}\n";
+    assert!(check_errs("na-alias-two-slices", src));
+}
+
+#[test]
+fn out_arg_distinct_ok() {
+    if !backend_available() {
+        return;
+    }
+    // Distinct buffers satisfy the no-alias rule and run. dst[0] = src[0] = 7.
+    let src = "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  xs := [7, 2, 3]\n  mut ys := [0, 0, 0]\n  fill(xs, ys)\n  return ys[0]\n}\n";
+    let out = build_and_run("na-distinct", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn element_write_after_move_rejected() {
     // Writing an element of an owned array that was moved away is a use-after-move (it would
     // write through a nulled slot) — must be a compile error, not a runtime fault.
