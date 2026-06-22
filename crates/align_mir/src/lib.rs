@@ -260,7 +260,7 @@ pub enum Term {
 /// typed HIR -> MIR.
 pub fn lower_program(program: &hir::Program) -> Program {
     Program {
-        fns: program.fns.iter().map(lower_fn).collect(),
+        fns: program.fns.iter().map(|f| lower_fn(f, &program.tuples)).collect(),
         structs: program.structs.clone(),
         tuples: program.tuples.clone(),
     }
@@ -285,6 +285,9 @@ struct Builder {
     /// exit (MMv2 slice 4; `hir::Fn::drop_locals`). Their slots are null-initialised at
     /// entry, so a drop on a path that never allocated frees null (a no-op).
     drop_locals: Vec<Slot>,
+    /// Tuple defs — to tell whether a `Ty::Tuple` slot is a Move tuple (holds an owned element),
+    /// which `null_moved_source` must null on move so its exit `Drop` doesn't double-free.
+    tuples: Vec<hir::TupleDef>,
 }
 
 impl Builder {
@@ -339,7 +342,7 @@ impl Builder {
     }
 }
 
-fn lower_fn(f: &hir::Fn) -> Function {
+fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef]) -> Function {
     let mut b = Builder {
         slots: f.locals.iter().map(|l| l.ty).collect(),
         value_tys: Vec::new(),
@@ -348,6 +351,7 @@ fn lower_fn(f: &hir::Fn) -> Function {
         ret: f.ret,
         arenas: Vec::new(),
         drop_locals: f.drop_locals.clone(),
+        tuples: tuples.to_vec(),
     };
     let entry = b.new_block();
     b.cur = entry;
@@ -418,7 +422,13 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
     match &e.kind {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
-                Some(&ty) => matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(ty),
+                Some(&ty) => {
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder)
+                        || payload_is_move(ty)
+                        // A Move tuple (holds an owned element) moved away must be nulled so its
+                        // exit `Drop` frees nulls, not the buffers the new owner took.
+                        || matches!(ty, Ty::Tuple(tid) if b.tuples[tid as usize].elems.iter().any(|s| s.is_move()))
+                }
                 None => false,
             };
             if moved {

@@ -75,13 +75,16 @@ is derived from the elements (Move if any element is Move; region-tied if any is
 the MMv2 owned-aggregate/region machinery — no new ownership rule. Represented as `Ty::Tuple(id)`
 into an interned tuple table (the dual of the struct table), lowered to an anonymous LLVM struct.
 **Implemented:** the type + literal + destructure + `.N` + tuple params/returns for primitive
-scalars, `str` (region-tracked), **and owned `string`/`array<T>` elements** (a Move tuple, restricted
-to temporaries — returned or destructured, not bound to a variable or passed as a parameter — so it
-never occupies a drop slot and needs no tuple `Drop`). The first consumer, **`partition`**
-(`(array<T>, array<T>)`), is implemented. What remains is the other consumers built on this:
-`min_with_index` (`(value, index)`), `chunks` (`array<slice<T>>`), and lifting the
-temporary-only cut (bound owned-tuple locals / params, which
-need element-wise drop + index-move). Record: `draft.md` §5 (Types → Tuple), `impl/02-frontend.md`
+scalars, `str` (region-tracked), **and owned `string`/`array<T>` elements** (a Move tuple). An owned
+tuple may now be **bound to a variable** (`t := split()`): codegen drops each owned element at scope
+exit (`Drop`/`DropFlagInit` over the tuple aggregate), and a destructure/return that moves it nulls
+the slot. Reading an *owned* element by index (`t.0` where `.0` is owned) is rejected (a partial
+move) — destructure instead; a Copy element reads fine. The first consumer **`partition`**
+(`(array<T>, array<T>)`) is implemented. What remains is the other consumers built on this:
+`min_with_index` (`(value, index)`), `chunks` (`array<slice<T>>`), and the last owned-tuple
+loose ends — owned-tuple **parameters** (the callee would have to drop the passed buffer) and
+**partial field moves** (`t.0` of an owned element, which needs per-field move tracking). Record:
+`draft.md` §5 (Types → Tuple), `impl/02-frontend.md`
 §8, `impl/03-types.md`, `impl/07-roadmap.md`.
 
 ### Type-argument syntax: no turbofish (expression position)
@@ -142,10 +145,11 @@ The *design* is settled (first-class anonymous tuples; multi-value return = retu
 see "Tuples / multi-value returns" under Settled). The **foundation is implemented**: the
 `(T, U, …)` type, literals, destructuring `(a, b) :=`, positional `.N`, tuple params/returns, for
 primitive scalars, `str` (region-tracked), and **owned `string`/`array<T>`** elements (a Move
-tuple, restricted to temporaries), and the first consumer **`partition`** (`(array<T>, array<T>)`).
-What remains is purely additive *implementation*, not design: the other consumers — `chunks`
-(`array<slice<T>>`), `min_with_index`-style `(value, index)` reductions — and lifting the temporary-only cut on owned
-tuples (binding to a variable / passing as a parameter, which need element-wise drop + index-move).
+tuple — including **bound to a variable**, with per-element `Drop` in codegen), and the first
+consumer **`partition`** (`(array<T>, array<T>)`). What remains is purely additive
+*implementation*, not design: the other consumers — `chunks` (`array<slice<T>>`),
+`min_with_index`-style `(value, index)` reductions — and the last owned-tuple loose ends:
+owned-tuple **parameters** and **partial field moves** (`t.0` of an owned element).
 
 ### Arena checkpoint / rollback — std arena API, after MMv2
 A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. The runtime arena already bump-allocates; this exposes a reset-to-mark on top. (Digested from `work/proposals/library-foundations.md` §3; used by the streaming-parse story in `http-optimization.md` §5.)

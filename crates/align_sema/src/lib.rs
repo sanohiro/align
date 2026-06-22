@@ -450,7 +450,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| is_owned_droppable(l.ty))
+            .filter(|l| is_owned_droppable(l.ty) || ty_tuple_is_move(l.ty, tuples))
             .map(|l| l.id)
             .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
             .collect();
@@ -1380,15 +1380,6 @@ impl<'a, 't> Checker<'a, 't> {
                         },
                     };
                     let local_ty = ann.unwrap_or(init.ty);
-                    // An owned (Move) tuple is restricted to temporaries in this cut (returned or
-                    // destructured) — binding one to a variable would need element-wise drop +
-                    // index-move semantics. Destructure it directly instead.
-                    if ty_tuple_is_move(self.resolve(local_ty), self.tuples) {
-                        self.diags.error(
-                            "binding an owned tuple to a variable is not supported yet — destructure it directly, e.g. `(a, b) := …`".to_string(),
-                            name.span,
-                        );
-                    }
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     // Record slice provenance (`s: slice<T> := a` → `s` borrows `a`'s buffer) so
                     // the `out` no-alias check can see through slice variables.
@@ -1757,6 +1748,16 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::Tuple(id) => {
                 let elems = &self.tuples[id as usize].elems;
                 match elems.get(index as usize) {
+                    // Reading an *owned* element by index would move it out of the tuple (a partial
+                    // move, leaving the tuple's `Drop` to double-free) — deferred. Destructure the
+                    // tuple instead. A Copy element (scalar/`str`) reads fine, leaving the tuple intact.
+                    Some(s) if s.is_move() => {
+                        self.diags.error(
+                            format!("`.{index}` would move the owned element {} out of the tuple — destructure the tuple with `(a, b) := …` instead", scalar_name(*s)),
+                            span,
+                        );
+                        err
+                    }
                     Some(s) => {
                         let ty = scalar_to_ty(*s);
                         self.constrain(ty, expected, span);

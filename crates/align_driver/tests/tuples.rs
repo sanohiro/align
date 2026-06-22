@@ -181,10 +181,48 @@ fn owned_struct_array_tuple_element() {
 }
 
 #[test]
-fn bound_owned_tuple_rejected() {
-    // Cut: an owned tuple may not be bound to a variable — it must be destructured directly.
-    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1].to_array()\n  b := [2].to_array()\n  return (a, b)\n}\nfn main() -> i32 {\n  t := split()\n  return 0\n}\n";
-    assert!(check_errs("tup-owned-bound", src));
+fn bound_owned_tuple_then_destructure() {
+    if !backend_available() {
+        return;
+    }
+    // An owned tuple bound to a variable, then destructured: each buffer freed once. 6 + 30 = 36.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1, 2, 3].to_array()\n  b := [10, 20].to_array()\n  return (a, b)\n}\nfn main() -> Result<(), Error> {\n  t := split()\n  (a, b) := t\n  print(a.sum() + b.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-owned-bound", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n");
+}
+
+#[test]
+fn bound_owned_tuple_unused_is_dropped() {
+    if !backend_available() {
+        return;
+    }
+    // A bound owned tuple that is never used: its `Drop` frees both owned elements (no leak,
+    // no double-free) — the program runs and exits cleanly.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1, 2, 3].to_array()\n  b := [10, 20].to_array()\n  return (a, b)\n}\nfn main() -> Result<(), Error> {\n  t := split()\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-owned-unused", src);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn bound_owned_tuple_copy_field_read() {
+    if !backend_available() {
+        return;
+    }
+    // Reading a *Copy* element (`t.1` = i64) of a bound Move tuple is fine; the owned element is
+    // still dropped at scope exit.
+    let src = "fn f() -> (array<i64>, i64) {\n  a := [1, 2, 3].to_array()\n  return (a, 5)\n}\nfn main() -> Result<(), Error> {\n  t := f()\n  print(t.1)\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-owned-copyfield", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+}
+
+#[test]
+fn owned_tuple_field_index_rejected() {
+    // Reading an *owned* element by index (`t.0` = array) would partially move it out — rejected;
+    // destructure instead.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1].to_array()\n  b := [2].to_array()\n  return (a, b)\n}\nfn main() -> Result<(), Error> {\n  t := split()\n  print(t.0.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("tup-owned-index", src));
 }
 
 #[test]
