@@ -40,7 +40,7 @@ Ty =
 
 `Named` is **nominal** (identity determined by name). Both struct and sum type are represented as `Named`, and the definition (fields/variants) is looked up via `DefId`.
 
-`Tuple` is **structural**: identity is the element-type list, so it is interned (deduplicated) into a tuple table — the anonymous dual of the struct table — and `Ty::Tuple(id)` indexes it. Multi-value return is returning a tuple (no separate mechanism). PR1 implements primitive-scalar elements (Copy / `Static`); owned and `str` elements (which make a tuple Move / region-tied, via the same rule as a struct) are an additive follow-up. Lowered to an anonymous LLVM struct (by-value construct/index, like a small struct).
+`Tuple` is **structural**: identity is the element-type list, so it is interned (deduplicated) into a tuple table — the anonymous dual of the struct table — and `Ty::Tuple(id)` indexes it. Multi-value return is returning a tuple (no separate mechanism). Elements so far: primitive scalars (Copy / `Static`) and `str` (a Copy view — a tuple holding one is region-tracked, region-tied to the view's source, via the same rule as a struct with a `str` field). Owned (`string`/`array<T>`) elements — which would make a tuple Move and need element-wise drop — are the additive follow-up. Lowered to an anonymous LLVM struct (by-value construct/index, like a small struct).
 
 ### Region (lifetime tag)
 Only view-like types (reference-like types such as `Slice` / `Str`) carry it. Users never write it. It appears only in error messages.

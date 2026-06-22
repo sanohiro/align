@@ -1,0 +1,10 @@
+// `str` (a view) as a tuple element. A `(str, str)` of literals is region-0 (Static), so it
+// can be returned and destructured freely. A tuple holding an arena-backed `str` would be
+// region-tied to that arena and rejected from escaping — the same rule as a struct `str` field.
+fn labels() -> (str, str) = ("hello", "world")
+
+fn main() -> i32 {
+  (a, b) := labels()
+  if a.len() + b.len() == 10 { return 10 }   // "hello" + "world" = 5 + 5
+  return 0
+}

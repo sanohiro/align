@@ -181,11 +181,18 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   literals, destructuring `(a, b) := expr` (parens required, `_` ignores), positional `.N` access,
   and tuple params/returns. Multi-value return = returning a tuple (no separate mechanism; settled,
   `open-questions.md`). `Ty::Tuple(id)` interns into a tuple table (the struct-table dual); codegen
-  is an anonymous LLVM struct (`MakeTuple`/`TupleIndex`). PR1 cut: **primitive-scalar elements**
-  (int/float/bool/char) — Copy / `Static`, so no drop/region machinery yet. This **unblocks**
-  `partition` (`(array<T>, array<T>)`) and `min_with_index` (`(value, index)`), which need owned /
-  `str` tuple elements (the additive next slice, reusing the MMv2 owned-aggregate + drop machinery)
-  then the terminals themselves. (`examples/tuples.align`.)
+  is an anonymous LLVM struct (`MakeTuple`/`TupleIndex`). First cut: **primitive-scalar elements**
+  (int/float/bool/char) — Copy / `Static`, no drop/region machinery. (`examples/tuples.align`.)
+- [done] **`str` tuple elements** — `str` (a view) is now a valid tuple element. A `str`-bearing
+  tuple is region-tracked (region-tied to the view's source, the struct-with-`str`-field rule), so
+  an arena-`str` tuple is escape-checked and cannot be returned, while a literal-`str` tuple is
+  `Static`/returnable. Required threading the tuple table into `EscapeCheck` (`tracks_region` is now
+  a method; `region_of` folds `Tuple`/`TupleIndex`) — the infrastructure the owned-element slice
+  reuses. Still Copy (no drop). (`examples/str_pair.align`.)
+- [todo] **owned (`string`/`array<T>`) tuple elements** → then the terminals. Makes a tuple Move
+  (element-wise drop + move-out on destructure/return, reusing the MMv2 slice-8 owned-aggregate
+  machinery), which **unblocks** `partition` (`(array<T>, array<T>)`) and `min_with_index`
+  (`(value, index)`).
 - [done] named-function `map` over struct elements — `[Emp{…}].where(.active).map(net).sum()`
   where `net(e: Emp) -> i32`. A struct array stays index-addressed until used; a struct-consuming
   `map` loads the whole element by value just before the call (`lower_struct_elem`): a fixed stack

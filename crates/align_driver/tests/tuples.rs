@@ -110,7 +110,27 @@ fn destructure_non_tuple_errors() {
 }
 
 #[test]
-fn non_primitive_element_rejected() {
-    // PR1 cut: a `str` element is not allowed in a tuple yet.
-    assert!(check_errs("tup-str", "fn main() -> i32 {\n  t := (\"hi\", 1)\n  return 0\n}\n"));
+fn str_element_allowed() {
+    if !backend_available() {
+        return;
+    }
+    // `str` (a view) is a valid tuple element. A `(str, str)` of literals is region-0, returnable
+    // and destructurable; "hello"+"world" lengths = 5 + 5 = 10.
+    let src = "fn pair() -> (str, str) = (\"hello\", \"world\")\nfn main() -> i32 {\n  (a, b) := pair()\n  if a.len() + b.len() == 10 { return 10 }\n  return 0\n}\n";
+    let out = build_and_run("tup-str", src);
+    assert_eq!(out.status.code(), Some(10));
+}
+
+#[test]
+fn arena_str_element_cannot_escape() {
+    // A tuple holding an arena-backed `str` is region-tied to that arena and cannot be returned.
+    let src = "fn bad() -> (str, i32) {\n  arena {\n    s := \"x\" + \"y\"\n    return (s, 1)\n  }\n}\nfn main() -> i32 = 0\n";
+    assert!(check_errs("tup-arena-str", src));
+}
+
+#[test]
+fn owned_element_rejected() {
+    // Cut: owned (`string`/`array`) tuple elements come later; an owned `string` element errors.
+    let src = "fn main() -> i32 {\n  b := builder()\n  b.write(\"x\")\n  s := b.to_string()\n  t := (s, 1)\n  return 0\n}\n";
+    assert!(check_errs("tup-owned", src));
 }
