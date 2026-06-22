@@ -27,6 +27,9 @@ pub struct Program {
     /// Struct layouts, indexed by the id in [`Ty::Struct`]; codegen builds LLVM struct
     /// types from these.
     pub structs: Vec<hir::StructDef>,
+    /// Tuple layouts, indexed by the id in [`Ty::Tuple`]; codegen builds an anonymous LLVM
+    /// struct type from each element list.
+    pub tuples: Vec<hir::TupleDef>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +147,11 @@ pub enum Rvalue {
     /// field-less analogue of [`Rvalue::IndexFieldPtr`]; emitted by `map(f)` whose `f` consumes a
     /// struct element by value (a fixed stack `array<Struct>` uses [`Rvalue::Index`] instead).
     IndexPtr { base: Operand, index: Operand, struct_id: u32 },
+    /// `(e0, e1, ...)` — build a tuple aggregate value of `tuple_id` from its element operands
+    /// (an anonymous LLVM struct, by value). The whole-value analogue of a struct literal.
+    MakeTuple { tuple_id: u32, elems: Vec<Operand> },
+    /// `recv.N` — extract element `index` from a tuple value (by value).
+    TupleIndex { tuple: Operand, index: u32 },
     /// Borrow array `slot` (length `n`) as a slice value `{ &slot[0], n }`.
     MakeSlice(Slot, i128),
     /// Bump-allocate `count` elements of type `elem` in the arena `handle`; yields the
@@ -254,6 +262,7 @@ pub fn lower_program(program: &hir::Program) -> Program {
     Program {
         fns: program.fns.iter().map(lower_fn).collect(),
         structs: program.structs.clone(),
+        tuples: program.tuples.clone(),
     }
 }
 
@@ -485,6 +494,18 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // The current block is now terminated; `lower_block` stops here, so no dead
             // block is created and callers can see the divergence via `is_terminated`.
         }
+        hir::Stmt::LetTuple { locals, init, .. } => {
+            // Evaluate the tuple once, then extract each bound element into its slot (`_` skipped).
+            let tup = lower_expr(b, init);
+            for (i, lid) in locals.iter().enumerate() {
+                if let Some(lid) = lid {
+                    let ety = b.slots[*lid as usize];
+                    let v = b.fresh_value(ety);
+                    b.push(Stmt::Let(v, Rvalue::TupleIndex { tuple: tup.clone(), index: i as u32 }));
+                    b.push(Stmt::Store(*lid, Operand::Value(v)));
+                }
+            }
+        }
         hir::Stmt::Expr(e) => {
             let _ = lower_expr(b, e);
         }
@@ -586,6 +607,18 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Field { base, index } => {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Field(*base, *index)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::Tuple { tuple_id, elems } => {
+            let ops: Vec<Operand> = elems.iter().map(|el| lower_expr(b, el)).collect();
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::MakeTuple { tuple_id: *tuple_id, elems: ops }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::TupleIndex { recv, index } => {
+            let t = lower_expr(b, recv);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::TupleIndex { tuple: t, index: *index }));
             Operand::Value(v)
         }
         hir::ExprKind::IndexField { base, index, field } => {
@@ -1916,6 +1949,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Builder => "builder".to_string(),
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
+        Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }

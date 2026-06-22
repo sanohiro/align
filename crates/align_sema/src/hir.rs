@@ -18,6 +18,17 @@ pub struct Program {
     pub fns: Vec<Fn>,
     /// Struct definitions, indexed by the id carried in [`crate::Ty::Struct`].
     pub structs: Vec<StructDef>,
+    /// Anonymous tuple types, indexed by the id carried in [`crate::Ty::Tuple`]. Interned
+    /// (deduplicated by element list) during checking, so `(i64, i64)` is one entry.
+    pub tuples: Vec<TupleDef>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TupleDef {
+    /// Element types in positional order (`t.0`, `t.1`, …). PR1 cut: primitive scalars only
+    /// (int/float/bool/char) — all Copy / `Static`, so a tuple needs no drop or region tracking
+    /// yet; owned (`string`/`array<T>`) and `str` elements are a later, additive slice.
+    pub elems: Vec<crate::Scalar>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +93,9 @@ pub struct Block {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Let { local: LocalId, init: Expr },
+    /// `(a, b, ...) := expr` — bind each tuple element to a local. A `None` entry is an
+    /// ignored (`_`) element. `tuple_id` indexes [`Program::tuples`] (the `init`'s type).
+    LetTuple { locals: Vec<Option<LocalId>>, tuple_id: u32, init: Expr },
     Assign { local: LocalId, value: Expr },
     /// `base.field = value` where `base` is a struct local.
     AssignField { base: LocalId, index: u32, value: Expr },
@@ -135,6 +149,17 @@ pub enum ExprKind {
     /// field type.
     Field {
         base: LocalId,
+        index: u32,
+    },
+    /// `(e0, e1, ...)` — a tuple value. `tuple_id` indexes [`Program::tuples`]; the
+    /// expression `ty` is `Ty::Tuple(tuple_id)`.
+    Tuple {
+        tuple_id: u32,
+        elems: Vec<Expr>,
+    },
+    /// `recv.N` — positional read of a tuple element. The expression `ty` is the element type.
+    TupleIndex {
+        recv: Box<Expr>,
         index: u32,
     },
     /// `base[index].field` — read `field` of element `index` of a struct-array local. Used

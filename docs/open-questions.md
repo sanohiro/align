@@ -62,6 +62,23 @@ Record: `impl/04-mir.md` (CFG), `non-goals.md`.
 SSO is **not** adopted (its own Settled entry above). Element indexing is implemented: `recv[index]` (array/slice/owned array → scalar) and `arr[index].field` (a struct-array element's field), both bounds-checked. Still open / separate tracks (not part of this decision): tuples / multi-value returns (for `partition`), `array<slice<T>>` (for `chunks`), `array<Struct>.clone()`, a bare whole-struct element value `users[i]` (no field), and `out` params + `noalias` (below).
 Record: `impl/08-memory-model-v2.md` (full model + slice ledger §11), `design-notes.md` ("one region lattice, explicit copies"), `draft.md` §6/§7/§14, `impl/07-roadmap.md` (Memory Model v2 — DONE).
 
+### Tuples / multi-value returns
+**Decision (2026-06-22): first-class anonymous tuples `(T, U, …)`; multi-value return is just
+returning a tuple — no separate Go-style multi-value mechanism.** A Go-style "multiple return
+values" feature would be a second way to produce several values that is *not itself a value*
+(can't be stored, nested, or put in an array) — exactly the special-casing Align avoids. A tuple
+is the anonymous, positional companion of the keyword-less named struct: use a named struct for a
+domain type, a tuple for an ad-hoc "two things" result. Syntax: type `(T, U)`; literal `(a, b)`;
+destructure `(a, b) := expr` (parens required — mirrors the literal — with `_` to ignore an
+element); positional access `t.0` / `t.1`. Arity ≥ 2 (`()` is unit, `(e)` is grouping). Ownership
+is derived from the elements (Move if any element is Move; region-tied if any is a view), reusing
+the MMv2 owned-aggregate/region machinery — no new ownership rule. Represented as `Ty::Tuple(id)`
+into an interned tuple table (the dual of the struct table), lowered to an anonymous LLVM struct.
+**Implemented (PR1):** the type + literal + destructure + `.N` + tuple params/returns for
+primitive-scalar elements; owned/`str` elements + `partition`/`chunks`/`min_with_index` are the
+additive follow-ups (see the Open note). Record: `draft.md` §5 (Types → Tuple),
+`impl/02-frontend.md` §8, `impl/03-types.md`, `impl/07-roadmap.md`.
+
 ### Type-argument syntax: no turbofish (expression position)
 **Decision (2026-06-22): there is no expression-position type-argument syntax.** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context, including back through `?` (`u: User := json.decode(d)?`). When neither supplies the type it is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. Rationale: keeps "one way" (the binding annotation is the single place a type is written), removes the `<` vs comparison parse ambiguity at expression position outright (the reason Go uses `f[T](x)` and Rust `::<>`), and is friendlier to generate. The headline case — `draft.md` §19's `json.decode<array<User>>(data)` — therefore becomes `users: array<User> := json.decode(data)?`; the checker already takes `decode`'s target from the expected `Result<T,_>` and emits an annotate-the-binding error otherwise (no code change needed — only the spec/comment caught up). **Residual (still open):** a *schema-selector* builtin whose type appears in neither arguments nor result (`json.validate<T>`, `json.field_table<T>`); narrow, unimplemented, and may fold into `decode`. This rule scales to general generics (below): a return-only type parameter is supplied by the binding annotation, never a turbofish. Record: `impl/02-frontend.md` §8 (generics `<` vs comparison), `draft.md` §18 (core.json), `language-spec.md` (JSON).
 
@@ -101,15 +118,14 @@ A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) d
 ### SoA conversion trigger
 Whether to automate the decision to lay out `array<T>` as SoA, or use annotation. Impact on the array ABI (`impl/05-backend-llvm.md` §2). (Subsumed by "SoA layout" above; kept as the open auto-vs-annotation sub-question.)
 
-### Tuples / multi-value returns — design before `partition`/`chunks` (do not fake)
-`partition` needs a two-array result and `chunks` needs `array<slice<T>>`; both want a product
-type. **Open design decision, deliberately not rushed**: anonymous tuples `(A, B)` overlap with
-keyword-less structs, so introducing them touches "one way to do things" / AI-friendliness —
-decide *tuple vs. named-struct-result vs. multiple return values* on its own merits, not as a
-by-product of `partition`. **No retrofit risk in deferring it:** a tuple/struct holding owned
-values reuses the **same** owned-aggregate + drop machinery built for owned `Option`/`Result`
-payloads (slice 8), so it lands additively on that foundation later. Until then, `partition`/
-`chunks` stay deferred rather than faked. (Surfaced by the MMv2 slice-8 inventory.)
+### Tuples / multi-value returns — design SETTLED (see Settled); implementation in progress
+The *design* is settled (first-class anonymous tuples; multi-value return = returning a tuple —
+see "Tuples / multi-value returns" under Settled). The **foundation is implemented** (PR1: the
+`(T, U, …)` type, literals, destructuring `(a, b) :=`, positional `.N`, tuple params/returns) for
+primitive-scalar elements. What remains is purely additive *implementation*, not design: owned
+(`string`/`array<T>`) and `str`/struct tuple elements (reuse the owned-aggregate + drop machinery
+from MMv2 slice 8), then the `partition` (`(array<T>, array<T>)`) and `chunks` (`array<slice<T>>`)
+terminals that consume them, and `min_with_index`-style `(value, index)` reductions.
 
 ### Arena checkpoint / rollback — std arena API, after MMv2
 A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. The runtime arena already bump-allocates; this exposes a reset-to-mark on top. (Digested from `work/proposals/library-foundations.md` §3; used by the streaming-parse story in `http-optimization.md` §5.)

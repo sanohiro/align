@@ -113,6 +113,14 @@ one parallel model
 
 Converge on one rather than several competing approaches.
 
+This is why **multi-value return is just returning a tuple**, not a separate mechanism. A
+Go-style "multiple return values" feature produces several values that are not themselves a
+value (you can't store, nest, or array them) — a second, special-cased way to hand back more
+than one thing. Align instead has one first-class anonymous product type, the tuple `(T, U)`,
+the positional companion of the keyword-less named struct: a named struct for a domain type, a
+tuple for an ad-hoc result. A tuple's ownership falls out of its elements (the same rule as a
+struct), so it adds no new ownership concept either.
+
 ---
 
 ## Compiler-friendly first

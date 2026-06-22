@@ -177,6 +177,15 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   multi-value returns) and `chunks` (needs `array<slice<T>>`) — separate type-system tracks
   (`open-questions.md`); and `out` args (the post-MMv2 `noalias` work). Non-materializing
   terminals (`sum`/`reduce`/`count`/`any`/`all`) were already complete.
+- [done] **tuples / multi-value return (foundation)** — the anonymous product type `(T, U, ...)`:
+  literals, destructuring `(a, b) := expr` (parens required, `_` ignores), positional `.N` access,
+  and tuple params/returns. Multi-value return = returning a tuple (no separate mechanism; settled,
+  `open-questions.md`). `Ty::Tuple(id)` interns into a tuple table (the struct-table dual); codegen
+  is an anonymous LLVM struct (`MakeTuple`/`TupleIndex`). PR1 cut: **primitive-scalar elements**
+  (int/float/bool/char) — Copy / `Static`, so no drop/region machinery yet. This **unblocks**
+  `partition` (`(array<T>, array<T>)`) and `min_with_index` (`(value, index)`), which need owned /
+  `str` tuple elements (the additive next slice, reusing the MMv2 owned-aggregate + drop machinery)
+  then the terminals themselves. (`examples/tuples.align`.)
 - [done] named-function `map` over struct elements — `[Emp{…}].where(.active).map(net).sum()`
   where `net(e: Emp) -> i32`. A struct array stays index-addressed until used; a struct-consuming
   `map` loads the whole element by value just before the call (`lower_struct_elem`): a fixed stack
