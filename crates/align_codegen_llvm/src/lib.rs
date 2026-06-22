@@ -842,6 +842,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     };
                     self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
                 }
+                Stmt::NullTupleField(slot, idx) => {
+                    // Null one owned `{ptr,len}` field of a tuple slot (after a partial field move),
+                    // so the tuple's `Drop` frees null there.
+                    let Ty::Tuple(tid) = self.f.slots[*slot as usize] else {
+                        unreachable!("NullTupleField on a non-tuple slot");
+                    };
+                    let field_ptr = self
+                        .builder
+                        .build_struct_gep(self.tuple_types[tid as usize], self.slots[slot], *idx, "nulltupfld")
+                        .map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_store(field_ptr, slice_struct_type(self.ctx).const_zero())
+                        .map_err(|e| self.err(e))?;
+                }
                 Stmt::Drop(slot) => {
                     let ty = self.f.slots[*slot as usize];
                     if ty == Ty::Builder {

@@ -79,12 +79,15 @@ scalars, `str` (region-tracked), **and owned `string`/`array<T>` elements** (a M
 tuple may be **bound to a variable** (`t := split()`) and **passed as a parameter** — codegen drops
 each owned element at scope exit (`Drop`/`DropFlagInit` over the tuple aggregate), and a
 destructure/return/call that moves it nulls the slot; an owned-tuple parameter the callee never
-consumes is dropped at the callee's exit (the same drop set as an owned array param). Reading an
-*owned* element by index (`t.0` where `.0` is owned) is rejected (a partial move) — destructure
-instead; a Copy element reads fine. The first consumer **`partition`** (`(array<T>, array<T>)`) is
-implemented. What remains is one more potential consumer — `min_with_index` (`(value, index)`) —
-and the one remaining owned-tuple loose end: **partial field moves** (`t.0` of an owned element,
-which needs per-field move tracking). Record:
+consumes is dropped at the callee's exit (the same drop set as an owned array param). **Partial
+field moves** are supported: `a := t.0` (a bound tuple) moves that owned element out, leaving the
+other elements usable; MoveCheck tracks moves per field (`MovedKey::Field`), forbids re-moving a
+field or using the tuple as a whole afterwards, and a borrowing read (`t.0.sum()`) does not move.
+MIR nulls the moved field (`NullTupleField`) so the tuple's exit `Drop` frees null there. Indexing
+an owned element out of a *temporary* tuple (`f().0`) is rejected (it would orphan the other owned
+elements) — bind it first. A Copy element reads fine in any position. The first consumer
+**`partition`** (`(array<T>, array<T>)`) is implemented. The remaining potential consumer is
+`min_with_index` (`(value, index)`). Record:
 `draft.md` §5 (Types → Tuple), `impl/02-frontend.md`
 §8, `impl/03-types.md`, `impl/07-roadmap.md`.
 
@@ -147,10 +150,10 @@ see "Tuples / multi-value returns" under Settled). The **foundation is implement
 `(T, U, …)` type, literals, destructuring `(a, b) :=`, positional `.N`, tuple params/returns, for
 primitive scalars, `str` (region-tracked), and **owned `string`/`array<T>`** elements (a Move
 tuple — including **bound to a variable**, with per-element `Drop` in codegen), and the first
-consumer **`partition`** (`(array<T>, array<T>)`). What remains is purely additive
+consumer **`partition`** (`(array<T>, array<T>)`), and **partial field moves** (`a := t.0` moves
+one owned element out of a bound tuple, per-field move tracking). What remains is purely additive
 *implementation*, not design: one more potential consumer — `min_with_index`-style
-`(value, index)` reductions — and the one remaining owned-tuple loose end:
-**partial field moves** (`t.0` of an owned element).
+`(value, index)` reductions.
 
 ### Arena checkpoint / rollback — std arena API, after MMv2
 A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. The runtime arena already bump-allocates; this exposes a reset-to-mark on top. (Digested from `work/proposals/library-foundations.md` §3; used by the streaming-parse story in `http-optimization.md` §5.)

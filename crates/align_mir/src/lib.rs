@@ -88,6 +88,10 @@ pub enum Stmt {
     /// Null-initialise an owned-array slot (`{null, 0}`) so a later [`Stmt::Drop`] on a path
     /// that never allocated is a no-op (MMv2 slice 4 drop-flag-via-null-slot).
     DropFlagInit(Slot),
+    /// Null one owned field (`{null, 0}`) of a tuple slot, after a partial field move (`a := t.0`)
+    /// took its buffer — so the tuple's exit `Drop` frees null there, not the buffer now owned by
+    /// the new binding. The other fields are untouched.
+    NullTupleField(Slot, u32),
     /// Drop a free-standing owned `array<T>` slot: free its buffer (null-safe).
     Drop(Slot),
     /// Free the buffer of a free-standing owned `array<T>` *value* (a `{ptr,len}` operand that
@@ -461,6 +465,17 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Tuple { elems, .. } => {
             for el in elems {
                 null_moved_source(b, el);
+            }
+        }
+        // A partial field move (`a := t.0`) took the owned element's buffer; null that one field of
+        // the tuple slot so the tuple's exit `Drop` frees null there, not the now-aliased buffer.
+        hir::ExprKind::TupleIndex { recv, index } => {
+            if let hir::ExprKind::Local(t) = &recv.kind {
+                let owned = matches!(b.slots.get(*t as usize), Some(&Ty::Tuple(tid))
+                    if b.tuples[tid as usize].elems.get(*index as usize).is_some_and(|s| s.is_move()));
+                if owned {
+                    b.push(Stmt::NullTupleField(*t, *index));
+                }
             }
         }
         _ => {}

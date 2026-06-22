@@ -233,11 +233,75 @@ fn owned_tuple_use_after_pass_rejected() {
 }
 
 #[test]
-fn owned_tuple_field_index_rejected() {
-    // Reading an *owned* element by index (`t.0` = array) would partially move it out — rejected;
-    // destructure instead.
-    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1].to_array()\n  b := [2].to_array()\n  return (a, b)\n}\nfn main() -> Result<(), Error> {\n  t := split()\n  print(t.0.sum())\n  return Ok(())\n}\n";
-    assert!(check_errs("tup-owned-index", src));
+fn owned_tuple_field_partial_move() {
+    if !backend_available() {
+        return;
+    }
+    // `a := t.0` moves the owned element out of the bound tuple; the other element stays usable.
+    // MIR nulls the moved field so the tuple's exit `Drop` frees null there (no double-free).
+    let src = "fn main() -> Result<(), Error> {\n  a := [1, 2, 3].to_array()\n  b := [10, 20].to_array()\n  t := (a, b)\n  x := t.0\n  print(x.sum())\n  print(t.1.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-partial-move", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n30\n");
+}
+
+#[test]
+fn owned_tuple_both_fields_moved_individually() {
+    if !backend_available() {
+        return;
+    }
+    // Each owned element can be moved out independently; each buffer is freed exactly once.
+    let src = "fn main() -> Result<(), Error> {\n  t := ([1, 2, 3].to_array(), [10, 20].to_array())\n  x := t.0\n  y := t.1\n  print(x.sum() + y.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-both-moved", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n");
+}
+
+#[test]
+fn owned_tuple_field_borrow_keeps_tuple() {
+    if !backend_available() {
+        return;
+    }
+    // A *borrowing* read (`t.0.sum()`) does not move the field — the tuple stays whole afterwards.
+    let src = "fn main() -> Result<(), Error> {\n  t := ([1, 2, 3].to_array(), [10, 20].to_array())\n  print(t.0.sum())\n  print(t.1.sum())\n  (a, b) := t\n  print(a.sum() + b.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-field-borrow", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n30\n36\n");
+}
+
+#[test]
+fn copy_field_usable_after_owned_field_moved() {
+    if !backend_available() {
+        return;
+    }
+    // Moving an owned field must NOT poison a *Copy* field read: `t` mixes an owned array and a
+    // scalar; after `x := t.0`, reading the Copy field `t.1` is still valid (per-field tracking).
+    let src = "fn main() -> Result<(), Error> {\n  t := ([1, 2, 3].to_array(), 99)\n  x := t.0\n  print(x.sum())\n  print(t.1)\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-copy-after-move", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n99\n");
+}
+
+#[test]
+fn owned_tuple_field_reuse_after_move_rejected() {
+    // Moving the same owned field twice is use-after-move.
+    let src = "fn main() -> Result<(), Error> {\n  t := ([1, 2, 3].to_array(), [4, 5].to_array())\n  x := t.0\n  y := t.0\n  print(x.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("tup-field-reuse", src));
+}
+
+#[test]
+fn owned_tuple_whole_use_after_field_move_rejected() {
+    // After a field is moved out, the tuple can no longer be used as a whole (destructured).
+    let src = "fn main() -> Result<(), Error> {\n  t := ([1, 2, 3].to_array(), [4, 5].to_array())\n  x := t.0\n  (p, q) := t\n  print(x.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("tup-whole-after-field", src));
+}
+
+#[test]
+fn owned_tuple_field_index_on_temporary_rejected() {
+    // Indexing an owned element out of a *temporary* tuple would orphan the other owned elements —
+    // bind it to a variable (or destructure) first.
+    let src = "fn mk() -> (array<i64>, i64) {\n  return ([1, 2, 3].to_array(), 9)\n}\nfn main() -> Result<(), Error> {\n  x := mk().0\n  print(x.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("tup-owned-temp-index", src));
 }
 
 #[test]
