@@ -1100,14 +1100,21 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             // temporaries are bulk-freed, so none of those are freed here. `Block`/`If` sources
             // may *borrow* a bound local in a branch (e.g. `(if c { ys } else { zs }).sum()`), so
             // blanket-freeing them would double-free — they are left as a sound, bounded leak.
-            let owns_fresh = matches!(
+            // `chunks` (runtime `align_rt_chunks`) and a function's owned-array return are *always*
+            // heap-allocated, so they must be freed even inside an `arena {}` (the arena's bulk-free
+            // doesn't cover them). The materializing terminals instead arena-allocate when inside an
+            // arena (bulk-freed there), so the loop frees them only outside one.
+            let always_heap = matches!(
+                source.kind,
+                hir::ExprKind::ArrayChunks { .. } | hir::ExprKind::Call { .. }
+            );
+            let arena_if_in_arena = matches!(
                 source.kind,
                 hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. }
                     | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. }
-                    | hir::ExprKind::ArrayChunks { .. } | hir::ExprKind::Call { .. }
             );
             let temp_free =
-                (owns_fresh && b.arenas.is_empty()).then(|| sv.clone());
+                (always_heap || (arena_if_in_arena && b.arenas.is_empty())).then(|| sv.clone());
             SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: None, temp_free }
         }
         // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field

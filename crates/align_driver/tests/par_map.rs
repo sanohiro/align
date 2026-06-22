@@ -110,6 +110,24 @@ fn chunks_par_map_then_reduce() {
 }
 
 #[test]
+fn chunks_par_map_inside_arena_frees_chunk_buffer() {
+    if !backend_available() {
+        return;
+    }
+    // Inside an `arena {}`, the `chunks` header buffer is heap-allocated (not arena), so it must
+    // still be freed (`drop_value`) — the arena's bulk-free doesn't cover it. (1+2)+(3+4) = 10.
+    let src = "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> Result<(), Error> {\n  arena {\n    total := [1, 2, 3, 4].chunks(2).par_map(chunk_sum).sum()\n    print(total)\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-chunks-arena", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n");
+    // The always-heap chunks buffer is freed even inside the arena.
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("drop_value"), "the chunks buffer must be freed inside the arena:\n{text}");
+}
+
+#[test]
 fn chunks_par_map_impure_rejected() {
     // The Pure requirement still applies to a chunk-consuming function.
     let src = "fn noisy(c: slice<i64>) -> i64 {\n  print(c.len())\n  return c.sum()\n}\nfn main() -> Result<(), Error> {\n  s := [1, 2].chunks(1).par_map(noisy)\n  print(s.len())\n  return Ok(())\n}\n";
