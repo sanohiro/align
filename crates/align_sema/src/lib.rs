@@ -370,14 +370,6 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                     p.ty.span(),
                 );
             }
-            // An owned (Move) tuple parameter would need the callee to drop it — restricted to
-            // temporaries (returned / destructured) in this cut, so reject it as a parameter.
-            if ty_tuple_is_move(*ty, &tuples) {
-                diags.error(
-                    "an owned tuple cannot be a function parameter yet (owned tuples are temporaries — returned or destructured)".to_string(),
-                    p.ty.span(),
-                );
-            }
         }
         let ret = match &f.ret {
             Some(t) => {

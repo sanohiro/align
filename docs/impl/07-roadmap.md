@@ -223,8 +223,11 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   tuple aggregate and `DropFlagInit` zeroes it (so a moved-out tuple's `Drop` is a no-op). A
   destructure/return that moves the tuple nulls the slot (`null_moved_source` recognises a Move
   `Tuple` local). Reading an *owned* element by index (`t.0` where `.0` is owned) is rejected — a
-  partial move; destructure instead. A Copy element reads fine. Owned-tuple **parameters** + partial
-  field moves remain deferred (`open-questions.md`).
+  partial move; destructure instead. A Copy element reads fine.
+- [done] **owned tuple parameters** — `fn f(t: (array<i64>, array<i64>))`. Falls out of the bind +
+  drop machinery: an owned-tuple param joins the drop set (like an owned array param), so the callee
+  drops it at exit if it doesn't consume it, and a caller passing a bound owned tuple moves it (slot
+  nulled). Only **partial field moves** (`t.0` of an owned element) remain deferred.
 - [done] named-function `map` over struct elements — `[Emp{…}].where(.active).map(net).sum()`
   where `net(e: Emp) -> i32`. A struct array stays index-addressed until used; a struct-consuming
   `map` loads the whole element by value just before the call (`lower_struct_elem`): a fixed stack
