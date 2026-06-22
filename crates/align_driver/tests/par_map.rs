@@ -134,6 +134,41 @@ fn chunks_par_map_impure_rejected() {
     assert!(check_errs("pm-chunks-impure", src));
 }
 
+#[test]
+fn par_map_takes_parallel_path_and_is_correct() {
+    if !backend_available() {
+        return;
+    }
+    // A direct (no prior stages) array source runs in parallel (runtime work-split). Correctness
+    // across thread boundaries: dbl over [1..12] → sum 156, first 2, last 24.
+    let src = "fn dbl(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  xs := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].par_map(dbl)\n  print(xs.sum())\n  print(xs[0])\n  print(xs[11])\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-parallel", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "156\n2\n24\n");
+    // The direct par_map lowers to the parallel runtime path (not the sequential collect loop).
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(text.contains("par_map["), "a direct par_map should take the parallel path:\n{text}");
+}
+
+#[test]
+fn par_map_after_where_stays_sequential() {
+    if !backend_available() {
+        return;
+    }
+    // With a prior stage (`where`), par_map falls back to the sequential collect loop (a parallel
+    // split can't see through the filter). Still correct: keep >2, *10 → [30,40,50], sum 120.
+    let src = "fn big(x: i64) -> bool = x > 2\nfn dec(x: i64) -> i64 = x * 10\nfn main() -> Result<(), Error> {\n  out := [1, 2, 3, 4, 5].where(big).par_map(dec)\n  print(out.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-seq", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "120\n");
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(!text.contains("par_map["), "a staged par_map should stay sequential:\n{text}");
+}
+
 // --- purity (Pure requirement) ---
 
 #[test]

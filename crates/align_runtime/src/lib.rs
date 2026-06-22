@@ -302,6 +302,54 @@ pub unsafe extern "C" fn align_rt_chunks(src: *const u8, src_len: i64, n: i64, e
     AlignStr { ptr: buf as *const u8, len: count }
 }
 
+/// `par_map`: apply `thunk` to each of `count` elements in parallel, reading element `i` from
+/// `in_buf + i*in_stride` and writing its result to `out_buf + i*out_stride`. The work is split
+/// into contiguous, **disjoint** output ranges across the available threads, so no synchronization
+/// is needed — the language guarantees `thunk` (a Pure function) shares no mutable state and the
+/// output ranges never overlap (`draft.md` §11). `count <= 0` is a no-op.
+///
+/// # Safety
+/// `in_buf`/`out_buf` must point to `count` elements of `in_stride`/`out_stride` bytes for the
+/// duration of the call; `thunk` reads one input element and writes one output element.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_par_map(
+    in_buf: *const u8,
+    count: i64,
+    in_stride: i64,
+    out_buf: *mut u8,
+    out_stride: i64,
+    thunk: extern "C" fn(*const u8, *mut u8),
+) {
+    if count <= 0 {
+        return;
+    }
+    let count = count as usize;
+    let in_stride = in_stride as usize;
+    let out_stride = out_stride as usize;
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(count);
+    // Pass the buffers as `usize` addresses so the per-thread closures are `Send` (raw pointers
+    // are not). Each thread owns a disjoint `[start, end)` output range, so this is race-free.
+    let in_addr = in_buf as usize;
+    let out_addr = out_buf as usize;
+    let per = count.div_ceil(nthreads);
+    std::thread::scope(|s| {
+        for t in 0..nthreads {
+            let start = t * per;
+            if start >= count {
+                break;
+            }
+            let end = (start + per).min(count);
+            s.spawn(move || {
+                for i in start..end {
+                    let ip = (in_addr + i * in_stride) as *const u8;
+                    let op = (out_addr + i * out_stride) as *mut u8;
+                    thunk(ip, op);
+                }
+            });
+        }
+    });
+}
+
 /// An append-oriented string builder (`06-runtime-std.md` §7), backing `template`
 /// desugaring. M5: heap-backed; the finished buffer is leaked (no ownership/free yet —
 /// arena-tied builders come later).

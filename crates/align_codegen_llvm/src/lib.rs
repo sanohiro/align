@@ -180,6 +180,19 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `par_map`: (in_buf, count, in_stride, out_buf, out_stride, thunk) -> void. Applies the
+    // per-function thunk to each element across threads.
+    funcs.insert(
+        "par_map".to_string(),
+        module.add_function(
+            "align_rt_par_map",
+            ctx.void_type().fn_type(
+                &[ptr.into(), i64t.into(), i64t.into(), ptr.into(), i64t.into(), ptr.into()],
+                false,
+            ),
+            None,
+        ),
+    );
     funcs.insert(
         "print_str".to_string(),
         module.add_function(
@@ -692,6 +705,42 @@ struct FnGen<'c, 'a> {
 impl<'c, 'a> FnGen<'c, 'a> {
     fn err(&self, e: impl std::fmt::Display) -> CodegenError {
         CodegenError::Lowering(e.to_string())
+    }
+
+    /// Get (building it once) the `void(in_ptr, out_ptr)` thunk for `func` — load the input
+    /// element (`in_ty`), call `func`, store its result through `out_ptr` — and return its pointer.
+    /// The runtime `align_rt_par_map` calls this per element. Building it temporarily repositions
+    /// the shared builder, then restores it.
+    fn par_map_thunk(
+        &self,
+        func: &str,
+        in_ty: BasicTypeEnum<'c>,
+    ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let name = format!("{func}$parthunk");
+        if let Some(f) = self.module.get_function(&name) {
+            return Ok(f.as_global_value().as_pointer_value());
+        }
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+        let thunk = self.module.add_function(&name, self.ctx.void_type().fn_type(&[ptr_t.into(), ptr_t.into()], false), None);
+        let saved = self.builder.get_insert_block();
+        let entry = self.ctx.append_basic_block(thunk, "entry");
+        self.builder.position_at_end(entry);
+        let in_p = thunk.get_nth_param(0).unwrap().into_pointer_value();
+        let out_p = thunk.get_nth_param(1).unwrap().into_pointer_value();
+        let x = self.builder.build_load(in_ty, in_p, "x").map_err(|e| self.err(e))?;
+        let r = self
+            .builder
+            .build_call(self.funcs[func], &[x.into()], "r")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| self.err("par_map function must return a value"))?;
+        self.builder.build_store(out_p, r).map_err(|e| self.err(e))?;
+        self.builder.build_return(None).map_err(|e| self.err(e))?;
+        if let Some(s) = saved {
+            self.builder.position_at_end(s);
+        }
+        Ok(thunk.as_global_value().as_pointer_value())
     }
 
     fn emit_fn(&mut self) -> Result<(), CodegenError> {
@@ -1225,6 +1274,48 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .expect("align_rt_chunks returns a {ptr,len}")
+            }
+            Rvalue::ParMapParallel { src, func, elem_in, elem_out } => {
+                // Heap-allocate the output buffer, then run `func` over the input in parallel via
+                // a per-`func` thunk; the result is the owned `{ out_buf, count }` array.
+                let agg = self.operand(src).into_struct_value();
+                let in_ptr = self.builder.build_extract_value(agg, 0, "inptr").map_err(|e| self.err(e))?;
+                let count = self.builder.build_extract_value(agg, 1, "incnt").map_err(|e| self.err(e))?.into_int_value();
+                let in_ty = self.llvm_type(*elem_in);
+                let out_ty = self.llvm_type(*elem_out);
+                let i64t = self.ctx.i64_type();
+                let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
+                let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
+                let bytes = self.builder.build_int_mul(count, out_stride, "obytes").map_err(|e| self.err(e))?;
+                let out_buf = self
+                    .builder
+                    .build_call(self.funcs["alloc"], &[bytes.into()], "obuf")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("alloc returns a pointer")
+                    .into_pointer_value();
+                let _ = out_ty;
+                let thunk = self.par_map_thunk(func, in_ty)?;
+                self.builder
+                    .build_call(
+                        self.funcs["par_map"],
+                        &[in_ptr.into(), count.into(), in_stride.into(), out_buf.into(), out_stride.into(), thunk.into()],
+                        "",
+                    )
+                    .map_err(|e| self.err(e))?;
+                // Result owned array `{ out_buf, count }`.
+                let sty = slice_struct_type(self.ctx);
+                let r = self
+                    .builder
+                    .build_insert_value(sty.get_undef(), out_buf, 0, "pmptr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(r, count, 1, "pmlen")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
             }
             Rvalue::StrLit(s) => {
                 let (ptr, len) = self.str_global(s);
