@@ -1079,7 +1079,8 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             // blanket-freeing them would double-free — they are left as a sound, bounded leak.
             let owns_fresh = matches!(
                 source.kind,
-                hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. } | hir::ExprKind::Call { .. }
+                hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. }
+                    | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. } | hir::ExprKind::Call { .. }
             );
             let temp_free =
                 (owns_fresh && b.arenas.is_empty()).then(|| sv.clone());
