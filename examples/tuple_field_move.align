@@ -1,0 +1,13 @@
+// Partial field moves: `a := t.0` moves one owned element out of a bound tuple, leaving the
+// other elements usable. The compiler tracks moves per field — re-moving a field, or using the
+// tuple as a whole afterwards, is a compile error; a borrowing read (`t.0.sum()`) does not move.
+fn main() -> Result<(), Error> {
+  a := [1, 2, 3].to_array()
+  b := [10, 20].to_array()
+  t := (a, b)
+
+  x := t.0          // move the first owned array out of t
+  print(x.sum())    // 6
+  print(t.1.sum())  // 30 — the second element is still usable
+  return Ok(())
+}

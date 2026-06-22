@@ -1144,9 +1144,35 @@ struct MoveCheck<'a> {
     tuples: &'a [hir::TupleDef],
 }
 
+/// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
+/// partial tuple-field move (`a := t.0`, moving one owned element) coexist: each owned tuple field
+/// can be moved out independently, after which the tuple may no longer be used as a whole.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum MovedKey {
+    Whole(LocalId),
+    Field(LocalId, u32),
+}
+
+type MovedSet = std::collections::HashSet<MovedKey>;
+
+/// `id` is unusable as a whole if it was wholly moved or *any* of its fields was moved.
+fn whole_moved(moved: &MovedSet, id: LocalId) -> bool {
+    moved.contains(&MovedKey::Whole(id)) || moved.iter().any(|k| matches!(k, MovedKey::Field(l, _) if *l == id))
+}
+
+/// Field `n` of `id` is unusable if it (or the whole local) was moved.
+fn field_moved(moved: &MovedSet, id: LocalId, n: u32) -> bool {
+    moved.contains(&MovedKey::Field(id, n)) || moved.contains(&MovedKey::Whole(id))
+}
+
+/// Re-binding a local (`x := …`) clears every move record for it (whole and per-field).
+fn clear_moved(moved: &mut MovedSet, id: LocalId) {
+    moved.retain(|k| !matches!(k, MovedKey::Whole(l) | MovedKey::Field(l, _) if *l == id));
+}
+
 impl<'a> MoveCheck<'a> {
     fn check(mut self) {
-        let mut moved = std::collections::HashSet::new();
+        let mut moved: MovedSet = std::collections::HashSet::new();
         // If the function returns a Move type, its body's trailing expression is consumed by
         // the return: a bare owned local there (`fn make() -> array<i32> { ys := ...; ys }`) is
         // moved out to the caller (MIR nulls its slot so it is not also freed at exit).
@@ -1176,7 +1202,7 @@ impl<'a> MoveCheck<'a> {
     fn block(
         &mut self,
         b: &Block,
-        moved: &mut std::collections::HashSet<LocalId>,
+        moved: &mut MovedSet,
         tail_consuming: bool,
         tail_direct: bool,
     ) {
@@ -1184,18 +1210,18 @@ impl<'a> MoveCheck<'a> {
             match s {
                 Stmt::Let { local, init } => {
                     self.expr(init, moved, true, true);
-                    moved.remove(local);
+                    clear_moved(moved, *local);
                 }
                 Stmt::Assign { local, value } => {
                     self.expr(value, moved, true, true);
-                    moved.remove(local);
+                    clear_moved(moved, *local);
                 }
                 Stmt::AssignField { value, .. } => self.expr(value, moved, true, true),
                 // `base[index] = value` — writing an element is a use of `base` (an owned array
                 // could have been moved away), so flag use-after-move on it; index and value are
                 // read (not moved; Copy).
                 Stmt::AssignIndex { base, index, value } => {
-                    if moved.contains(base) {
+                    if whole_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), index.span);
                     }
@@ -1205,12 +1231,11 @@ impl<'a> MoveCheck<'a> {
                 Stmt::Return(Some(e)) => self.expr(e, moved, true, true),
                 Stmt::Return(None) => {}
                 Stmt::Expr(e) => self.expr(e, moved, false, false),
-                // Destructure consumes its tuple source (Copy elements in PR1 — nothing to move,
-                // but recurse to flag a moved source).
+                // Destructure consumes its tuple source whole (see the `Local` arm in `expr`).
                 Stmt::LetTuple { locals, init, .. } => {
                     self.expr(init, moved, true, true);
                     for l in locals.iter().flatten() {
-                        moved.remove(l);
+                        clear_moved(moved, *l);
                     }
                 }
             }
@@ -1226,13 +1251,13 @@ impl<'a> MoveCheck<'a> {
     fn expr(
         &mut self,
         e: &Expr,
-        moved: &mut std::collections::HashSet<LocalId>,
+        moved: &mut MovedSet,
         consuming: bool,
         direct: bool,
     ) {
         match &e.kind {
             ExprKind::Local(id) => {
-                if moved.contains(id) {
+                if whole_moved(moved, *id) {
                     let name = &self.f.locals[*id as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
                 } else if consuming && self.is_move(*id) {
@@ -1246,11 +1271,11 @@ impl<'a> MoveCheck<'a> {
                             e.span,
                         );
                     }
-                    moved.insert(*id);
+                    moved.insert(MovedKey::Whole(*id));
                 }
             }
             ExprKind::Field { base, .. } | ExprKind::IndexField { base, .. } => {
-                if moved.contains(base) {
+                if whole_moved(moved, *base) {
                     let name = &self.f.locals[*base as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
                 }
@@ -1352,7 +1377,34 @@ impl<'a> MoveCheck<'a> {
                     self.expr(el, moved, true, true);
                 }
             }
-            ExprKind::TupleIndex { recv, .. } => self.expr(recv, moved, false, false),
+            // `t.N` of an *owned* element (e.g. `a := t.0`) moves that field out — like a `Local`
+            // move, but tracked per field so the other elements stay usable. A Copy element (or a
+            // non-local receiver) just reads, so recurse into the receiver as a borrow.
+            ExprKind::TupleIndex { recv, index } => {
+                let owned_field = match &recv.kind {
+                    ExprKind::Local(t) => match self.f.locals.get(*t as usize).map(|l| l.ty) {
+                        Some(Ty::Tuple(tid)) => self
+                            .tuples
+                            .get(tid as usize)
+                            .and_then(|td| td.elems.get(*index as usize))
+                            .filter(|s| s.is_move())
+                            .map(|_| *t),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match owned_field {
+                    Some(t) => {
+                        if field_moved(moved, t, *index) {
+                            let name = &self.f.locals[t as usize].name;
+                            self.diags.error(format!("use of moved field '.{index}' of '{name}'"), e.span);
+                        } else if consuming {
+                            moved.insert(MovedKey::Field(t, *index));
+                        }
+                    }
+                    None => self.expr(recv, moved, false, false),
+                }
+            }
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -1976,15 +2028,22 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::Tuple(id) => {
                 let elems = &self.tuples[id as usize].elems;
                 match elems.get(index as usize) {
-                    // Reading an *owned* element by index would move it out of the tuple (a partial
-                    // move, leaving the tuple's `Drop` to double-free) — deferred. Destructure the
-                    // tuple instead. A Copy element (scalar/`str`) reads fine, leaving the tuple intact.
+                    // Reading an *owned* element by index moves it out of the tuple, leaving the
+                    // other elements usable (MoveCheck tracks the per-field move; MIR nulls the
+                    // moved field so the tuple's `Drop` frees null there). This needs a bound
+                    // tuple (a `Local`) to name the field being moved; a non-local tuple temporary
+                    // (`f().0`) would orphan its other owned elements, so destructure that instead.
                     Some(s) if s.is_move() => {
-                        self.diags.error(
-                            format!("`.{index}` would move the owned element {} out of the tuple — destructure the tuple with `(a, b) := …` instead", scalar_name(*s)),
-                            span,
-                        );
-                        err
+                        if !matches!(r.kind, ExprKind::Local(_)) {
+                            self.diags.error(
+                                format!("`.{index}` would move the owned element {} out of a temporary tuple — bind it to a variable, or destructure with `(a, b) := …`", scalar_name(*s)),
+                                span,
+                            );
+                            return err;
+                        }
+                        let ty = scalar_to_ty(*s);
+                        self.constrain(ty, expected, span);
+                        Expr { kind: ExprKind::TupleIndex { recv: Box::new(r), index }, ty, span }
                     }
                     Some(s) => {
                         let ty = scalar_to_ty(*s);
