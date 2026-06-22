@@ -180,16 +180,13 @@ fn build_module<'c>(
             None,
         ),
     );
-    // `par_map`: (in_buf, count, in_stride, out_buf, out_stride, thunk) -> void. Applies the
-    // per-function thunk to each element across threads.
+    // `par_map`: (in_buf, count, in_stride, out_stride, thunk) -> out_buf. Allocates the output,
+    // applies the per-function thunk to each element across threads, returns the owned buffer.
     funcs.insert(
         "par_map".to_string(),
         module.add_function(
             "align_rt_par_map",
-            ctx.void_type().fn_type(
-                &[ptr.into(), i64t.into(), i64t.into(), ptr.into(), i64t.into(), ptr.into()],
-                false,
-            ),
+            ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
             None,
         ),
     );
@@ -737,8 +734,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .ok_or_else(|| self.err("par_map function must return a value"))?;
         self.builder.build_store(out_p, r).map_err(|e| self.err(e))?;
         self.builder.build_return(None).map_err(|e| self.err(e))?;
-        if let Some(s) = saved {
-            self.builder.position_at_end(s);
+        match saved {
+            Some(s) => self.builder.position_at_end(s),
+            // No prior block: clear the position so later codegen doesn't append into the thunk.
+            None => self.builder.clear_insertion_position(),
         }
         Ok(thunk.as_global_value().as_pointer_value())
     }
@@ -1286,24 +1285,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let in_stride = i64t.const_int(self.target_data.get_store_size(&in_ty), false);
                 let out_stride = i64t.const_int(self.target_data.get_store_size(&out_ty), false);
-                let bytes = self.builder.build_int_mul(count, out_stride, "obytes").map_err(|e| self.err(e))?;
+                let thunk = self.par_map_thunk(func, in_ty)?;
+                // The runtime allocates the output (overflow-guarded), runs the thunk across
+                // threads, and returns the owned buffer.
                 let out_buf = self
                     .builder
-                    .build_call(self.funcs["alloc"], &[bytes.into()], "obuf")
+                    .build_call(
+                        self.funcs["par_map"],
+                        &[in_ptr.into(), count.into(), in_stride.into(), out_stride.into(), thunk.into()],
+                        "obuf",
+                    )
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("alloc returns a pointer")
+                    .expect("align_rt_par_map returns a pointer")
                     .into_pointer_value();
-                let _ = out_ty;
-                let thunk = self.par_map_thunk(func, in_ty)?;
-                self.builder
-                    .build_call(
-                        self.funcs["par_map"],
-                        &[in_ptr.into(), count.into(), in_stride.into(), out_buf.into(), out_stride.into(), thunk.into()],
-                        "",
-                    )
-                    .map_err(|e| self.err(e))?;
                 // Result owned array `{ out_buf, count }`.
                 let sty = slice_struct_type(self.ctx);
                 let r = self
