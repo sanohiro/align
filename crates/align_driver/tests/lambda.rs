@@ -91,6 +91,72 @@ fn lambda_can_call_a_named_function() {
 }
 
 #[test]
+fn reduce_lambda() {
+    if !backend_available() {
+        return;
+    }
+    // `reduce(f, init)` with a two-parameter lambda: 1+2+3+4 = 10.
+    let src = "fn main() -> Result<(), Error> {\n  print([1, 2, 3, 4].reduce(fn acc, x { acc + x }, 0))\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-reduce", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n");
+}
+
+#[test]
+fn par_map_lambda_pure() {
+    if !backend_available() {
+        return;
+    }
+    // A Pure lambda runs in parallel: (1+100)+(2+100)+(3+100) = 306.
+    let src = "fn main() -> Result<(), Error> {\n  print([1, 2, 3].par_map(fn x { x + 100 }).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-parmap", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "306\n");
+}
+
+#[test]
+fn par_map_impure_lambda_rejected() {
+    // The Pure requirement applies to a lambda too (a lifted impure lambda is rejected).
+    let src = "fn show(x: i64) -> i64 {\n  print(x)\n  return x\n}\nfn main() -> Result<(), Error> {\n  ys := [1, 2].par_map(fn x { show(x) })\n  print(ys.sum())\n  return Ok(())\n}\n";
+    assert!(check_errs("lam-parmap-impure", src));
+}
+
+#[test]
+fn any_all_lambda() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n  if [2, 4, 6].all(fn x { x % 2 == 0 }) { print(1) }\n  if [1, 2, 3].any(fn x { x > 2 }) { print(2) }\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-anyall", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n");
+}
+
+#[test]
+fn scan_lambda() {
+    if !backend_available() {
+        return;
+    }
+    // Prefix sums [1,3,6,10]; last = 10.
+    let src = "fn main() -> Result<(), Error> {\n  arena {\n    ps := [1, 2, 3, 4].scan(fn acc, x { acc + x }, 0)\n    print(ps[3])\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-scan", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n");
+}
+
+#[test]
+fn partition_lambda() {
+    if !backend_available() {
+        return;
+    }
+    // Evens [2,4] sum 6, odds [1,3,5] sum 9.
+    let src = "fn main() -> Result<(), Error> {\n  (ev, od) := [1, 2, 3, 4, 5].partition(fn x { x % 2 == 0 })\n  print(ev.sum())\n  print(od.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-partition", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n9\n");
+}
+
+#[test]
 fn bare_lambda_rejected() {
     // A lambda value outside a stage argument is not yet a first-class value.
     let src = "fn main() -> Result<(), Error> {\n  f := fn x { x * 2 }\n  return Ok(())\n}\n";
