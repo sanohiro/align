@@ -189,10 +189,15 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   `Static`/returnable. Required threading the tuple table into `EscapeCheck` (`tracks_region` is now
   a method; `region_of` folds `Tuple`/`TupleIndex`) — the infrastructure the owned-element slice
   reuses. Still Copy (no drop). (`examples/str_pair.align`.)
-- [todo] **owned (`string`/`array<T>`) tuple elements** → then the terminals. Makes a tuple Move
-  (element-wise drop + move-out on destructure/return, reusing the MMv2 slice-8 owned-aggregate
-  machinery), which **unblocks** `partition` (`(array<T>, array<T>)`) and `min_with_index`
-  (`(value, index)`).
+- [done] **owned (`string`/`array<T>`) tuple elements** — `fn split() -> (array<i64>, array<i64>)`
+  builds and returns the pair; the caller `(xs, ys) := split()` destructures it. Cut: an owned
+  tuple is a **temporary** — it may be returned or destructured, but **not** bound to a variable
+  (`t := split()` is rejected — that would need element-wise drop + index-move) or passed as a
+  parameter. Because such tuples never occupy a drop slot, no tuple `Drop`/codegen change was
+  needed: building `(a, b)` from owned locals nulls them (`null_moved_source` extended to `Tuple`,
+  in both `return` and destructure-init positions), and the destructure targets are ordinary owned
+  locals freed once by the existing drop set. **Unblocks** `partition` (`(array<T>, array<T>)`) and
+  `min_with_index` (`(value, index)`). (`examples/split_array.align`.)
 - [done] named-function `map` over struct elements — `[Emp{…}].where(.active).map(net).sum()`
   where `net(e: Emp) -> i32`. A struct array stays index-addressed until used; a struct-consuming
   `map` loads the whole element by value just before the call (`lower_struct_elem`): a fixed stack

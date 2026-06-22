@@ -251,6 +251,13 @@ pub fn payload_is_move(ty: Ty) -> bool {
     }
 }
 
+/// Whether `ty` is a tuple with at least one owned (Move) element — i.e. a Move tuple. Needs the
+/// tuple table to read the element scalars. (Such tuples are restricted to temporaries in this
+/// cut — returned or destructured — so they never occupy a drop slot; see `check`/`check_fn`.)
+fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
+    matches!(ty, Ty::Tuple(id) if tuples[id as usize].elems.iter().any(|s| s.is_move()))
+}
+
 impl Ty {
     fn is_int_like(self) -> bool {
         matches!(self, Ty::Int(_) | Ty::IntVar(_))
@@ -348,6 +355,14 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             if matches!(ty, Ty::Box(_)) {
                 diags.error(
                     "a box cannot be a function parameter (boxes are arena-local in M3)".to_string(),
+                    p.ty.span(),
+                );
+            }
+            // An owned (Move) tuple parameter would need the callee to drop it — restricted to
+            // temporaries (returned / destructured) in this cut, so reject it as a parameter.
+            if ty_tuple_is_move(*ty, &tuples) {
+                diags.error(
+                    "an owned tuple cannot be a function parameter yet (owned tuples are temporaries — returned or destructured)".to_string(),
                     p.ty.span(),
                 );
             }
@@ -1308,6 +1323,15 @@ impl<'a, 't> Checker<'a, 't> {
                         },
                     };
                     let local_ty = ann.unwrap_or(init.ty);
+                    // An owned (Move) tuple is restricted to temporaries in this cut (returned or
+                    // destructured) — binding one to a variable would need element-wise drop +
+                    // index-move semantics. Destructure it directly instead.
+                    if ty_tuple_is_move(self.resolve(local_ty), self.tuples) {
+                        self.diags.error(
+                            "binding an owned tuple to a variable is not supported yet — destructure it directly, e.g. `(a, b) := …`".to_string(),
+                            name.span,
+                        );
+                    }
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     stmts.push(Stmt::Let { local, init });
                 }
@@ -1581,13 +1605,12 @@ impl<'a, 't> Checker<'a, 't> {
             let concrete = self.finalize(ce.ty);
             self.constrain(ce.ty, Some(concrete), ce.span);
             match ty_to_scalar(self.resolve(ce.ty)) {
-                Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str)) => {
-                    scalars.push(s)
-                }
+                Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
+                | Scalar::Str | Scalar::String | Scalar::DynArray(_))) => scalars.push(s),
                 _ => {
                     if ce.ty != Ty::Error {
                         self.diags.error(
-                            format!("tuple elements must be a primitive scalar or str for now (owned `string`/`array` elements come later), got {}", ty_name(ce.ty)),
+                            format!("tuple elements must be a scalar, str, owned string, or owned array for now, got {}", ty_name(ce.ty)),
                             ce.span,
                         );
                     }
@@ -3588,12 +3611,11 @@ fn resolve_type(
                     return Ty::Error;
                 }
                 match ty_to_scalar(ety) {
-                    Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str)) => {
-                        scalars.push(s)
-                    }
+                    Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
+                    | Scalar::Str | Scalar::String | Scalar::DynArray(_))) => scalars.push(s),
                     _ => {
                         diags.error(
-                            format!("tuple elements must be a primitive scalar or str for now (owned `string`/`array` elements come later), got {}", ty_name(ety)),
+                            format!("tuple elements must be a scalar, str, owned string, or owned array for now, got {}", ty_name(ety)),
                             e.span(),
                         );
                         return Ty::Error;

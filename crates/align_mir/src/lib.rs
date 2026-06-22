@@ -436,6 +436,14 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::ResultOk(inner) | hir::ExprKind::ResultErr(inner) | hir::ExprKind::OptionSome(inner) => {
             null_moved_source(b, inner);
         }
+        // A tuple literal moves each owned-local element into the tuple (its consumer — a
+        // destructure target, or the returned tuple's caller — now owns the buffer), so null those
+        // source slots, else both the source local and the new owner would free the same buffer.
+        hir::ExprKind::Tuple { elems, .. } => {
+            for el in elems {
+                null_moved_source(b, el);
+            }
+        }
         _ => {}
     }
 }
@@ -497,6 +505,9 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         hir::Stmt::LetTuple { locals, init, .. } => {
             // Evaluate the tuple once, then extract each bound element into its slot (`_` skipped).
             let tup = lower_expr(b, init);
+            // If the tuple was built from owned source locals (`(x, y) := (a, b)`), null them: the
+            // destructure targets now own the buffers, so the source slots must not also free them.
+            null_moved_source(b, init);
             for (i, lid) in locals.iter().enumerate() {
                 if let Some(lid) = lid {
                     let ety = b.slots[*lid as usize];

@@ -75,11 +75,13 @@ is derived from the elements (Move if any element is Move; region-tied if any is
 the MMv2 owned-aggregate/region machinery — no new ownership rule. Represented as `Ty::Tuple(id)`
 into an interned tuple table (the dual of the struct table), lowered to an anonymous LLVM struct.
 **Implemented:** the type + literal + destructure + `.N` + tuple params/returns for primitive
-scalars **and `str`** (a `str`-bearing tuple is region-tracked, region-tied to the view's source,
-and arena-`str` tuples are escape-checked). Owned (`string`/`array<T>`) elements (which make a
-tuple Move + need element-wise drop) + `partition`/`chunks`/`min_with_index` are the additive
-follow-ups (see the Open note). Record: `draft.md` §5 (Types → Tuple), `impl/02-frontend.md` §8,
-`impl/03-types.md`, `impl/07-roadmap.md`.
+scalars, `str` (region-tracked), **and owned `string`/`array<T>` elements** (a Move tuple, restricted
+to temporaries — returned or destructured, not bound to a variable or passed as a parameter — so it
+never occupies a drop slot and needs no tuple `Drop`). What remains is the consumers built on this:
+`partition` (`(array<T>, array<T>)`), `min_with_index` (`(value, index)`), `chunks`
+(`array<slice<T>>`), and lifting the temporary-only cut (bound owned-tuple locals / params, which
+need element-wise drop + index-move). Record: `draft.md` §5 (Types → Tuple), `impl/02-frontend.md`
+§8, `impl/03-types.md`, `impl/07-roadmap.md`.
 
 ### Type-argument syntax: no turbofish (expression position)
 **Decision (2026-06-22): there is no expression-position type-argument syntax.** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context, including back through `?` (`u: User := json.decode(d)?`). When neither supplies the type it is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. Rationale: keeps "one way" (the binding annotation is the single place a type is written), removes the `<` vs comparison parse ambiguity at expression position outright (the reason Go uses `f[T](x)` and Rust `::<>`), and is friendlier to generate. The headline case — `draft.md` §19's `json.decode<array<User>>(data)` — therefore becomes `users: array<User> := json.decode(data)?`; the checker already takes `decode`'s target from the expected `Result<T,_>` and emits an annotate-the-binding error otherwise (no code change needed — only the spec/comment caught up). **Residual (still open):** a *schema-selector* builtin whose type appears in neither arguments nor result (`json.validate<T>`, `json.field_table<T>`); narrow, unimplemented, and may fold into `decode`. This rule scales to general generics (below): a return-only type parameter is supplied by the binding annotation, never a turbofish. Record: `impl/02-frontend.md` §8 (generics `<` vs comparison), `draft.md` §18 (core.json), `language-spec.md` (JSON).
@@ -124,11 +126,11 @@ Whether to automate the decision to lay out `array<T>` as SoA, or use annotation
 The *design* is settled (first-class anonymous tuples; multi-value return = returning a tuple —
 see "Tuples / multi-value returns" under Settled). The **foundation is implemented**: the
 `(T, U, …)` type, literals, destructuring `(a, b) :=`, positional `.N`, tuple params/returns, for
-primitive scalars **and `str`** (region-tracked). What remains is purely additive *implementation*,
-not design: **owned** (`string`/`array<T>`) tuple elements (make a tuple Move; reuse the
-owned-aggregate + drop machinery from MMv2 slice 8 for element-wise drop / move-out), then the
-`partition` (`(array<T>, array<T>)`) and `chunks` (`array<slice<T>>`) terminals that consume them,
-and `min_with_index`-style `(value, index)` reductions.
+primitive scalars, `str` (region-tracked), and **owned `string`/`array<T>`** elements (a Move
+tuple, restricted to temporaries). What remains is purely additive *implementation*, not design:
+the consumers — `partition` (`(array<T>, array<T>)`), `chunks` (`array<slice<T>>`),
+`min_with_index`-style `(value, index)` reductions — and lifting the temporary-only cut on owned
+tuples (binding to a variable / passing as a parameter, which need element-wise drop + index-move).
 
 ### Arena checkpoint / rollback — std arena API, after MMv2
 A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. The runtime arena already bump-allocates; this exposes a reset-to-mark on top. (Digested from `work/proposals/library-foundations.md` §3; used by the streaming-parse story in `http-optimization.md` §5.)

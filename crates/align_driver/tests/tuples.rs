@@ -128,9 +128,56 @@ fn arena_str_element_cannot_escape() {
     assert!(check_errs("tup-arena-str", src));
 }
 
+// --- owned (Move) elements: temporaries only (returned / destructured) ---
+
 #[test]
-fn owned_element_rejected() {
-    // Cut: owned (`string`/`array`) tuple elements come later; an owned `string` element errors.
-    let src = "fn main() -> i32 {\n  b := builder()\n  b.write(\"x\")\n  s := b.to_string()\n  t := (s, 1)\n  return 0\n}\n";
-    assert!(check_errs("tup-owned", src));
+fn owned_array_tuple_return_and_destructure() {
+    if !backend_available() {
+        return;
+    }
+    // A function returns two owned arrays as a tuple; the caller destructures them. Each buffer
+    // is freed exactly once (the returned source locals are nulled on the move). sum 6 + 30 = 36.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1, 2, 3].to_array()\n  b := [10, 20].to_array()\n  return (a, b)\n}\nfn main() -> Result<(), Error> {\n  (xs, ys) := split()\n  print(xs.sum() + ys.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-owned-split", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n");
+}
+
+#[test]
+fn owned_tuple_literal_destructure() {
+    if !backend_available() {
+        return;
+    }
+    // `(x, y) := (a, b)` over owned-array locals: the literal moves a/b into the tuple, then the
+    // destructure transfers them to x/y; a/b's slots are nulled so each buffer is freed once.
+    let src = "fn main() -> Result<(), Error> {\n  a := [1, 2, 3].to_array()\n  b := [10, 20].to_array()\n  (x, y) := (a, b)\n  print(x.sum() + y.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-owned-lit", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "36\n");
+}
+
+#[test]
+fn owned_string_tuple() {
+    if !backend_available() {
+        return;
+    }
+    // An owned `string` as a tuple element, returned and destructured (mixed with a scalar).
+    let src = "fn named() -> (string, i64) {\n  b := builder()\n  b.write(\"align\")\n  return (b.to_string(), 7)\n}\nfn main() -> Result<(), Error> {\n  (name, n) := named()\n  print(name)\n  print(n)\n  return Ok(())\n}\n";
+    let out = build_and_run("tup-owned-str", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "align\n7\n");
+}
+
+#[test]
+fn bound_owned_tuple_rejected() {
+    // Cut: an owned tuple may not be bound to a variable — it must be destructured directly.
+    let src = "fn split() -> (array<i64>, array<i64>) {\n  a := [1].to_array()\n  b := [2].to_array()\n  return (a, b)\n}\nfn main() -> i32 {\n  t := split()\n  return 0\n}\n";
+    assert!(check_errs("tup-owned-bound", src));
+}
+
+#[test]
+fn owned_tuple_param_rejected() {
+    // Cut: an owned tuple may not be a function parameter (it would need callee-side drop).
+    let src = "fn f(t: (array<i64>, array<i64>)) -> i32 = 0\nfn main() -> i32 = 0\n";
+    assert!(check_errs("tup-owned-param", src));
 }
