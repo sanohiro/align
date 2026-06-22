@@ -228,6 +228,13 @@ pub enum ExprKind {
     /// `.field` — element-field shorthand, valid only as a pipeline stage argument
     /// (e.g. `where(.active)`); refers to a field of the current pipeline element.
     FieldShorthand(Ident),
+    /// `fn p0, p1 { ... }` — an anonymous function (lambda). Parameter types are inferred
+    /// from the use site (a pipeline stage's element type); the body is a block. Valid as a
+    /// pipeline-stage / reducer argument, where sema lifts it to a synthetic top-level function.
+    Lambda {
+        params: Vec<Ident>,
+        body: Block,
+    },
     /// `(e0, e1, ...)` — a tuple value (arity ≥ 2; `()` is `Unit`, `(e)` is just `e`).
     Tuple(Vec<Expr>),
     /// `recv.0` / `recv.1` — positional access into a tuple value.

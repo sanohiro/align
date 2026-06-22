@@ -1,0 +1,10 @@
+// Inline lambdas as pipeline stages (draft.md §11). A lambda `fn x { ... }` is lifted to a
+// synthetic top-level function, so it fuses into the same single counted loop as a named
+// function — no closure environment, no allocation. Parameter types are inferred from the
+// element type.
+fn main() -> Result<(), Error> {
+  // map *10, keep the ones over 25, sum: 30 + 40 + 50 = 120
+  total := [1, 2, 3, 4, 5].map(fn x { x * 10 }).where(fn x { x > 25 }).sum()
+  print(total)
+  return Ok(())
+}

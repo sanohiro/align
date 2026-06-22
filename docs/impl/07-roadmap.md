@@ -278,8 +278,14 @@ are compiler-known builtins, monomorphic per element type.
   array-valued results (materialization) are deferred.
 - Pipelines must end in a reduction (sum) so no output array is allocated; map/where
   fuse into that loop. `map`/`where` outside a terminal is an error.
-- map/where take a *named function* argument (closures/lambdas deferred). The source
-  element type is inferred from the first stage's parameter (or the sum result type).
+- `map`/`where` take a named function **or an inline lambda** (`map(fn x { x * 2 })`). A
+  lambda is **lifted** to a synthetic top-level function (`fn$lambdaN`) in sema, so it flows
+  through the same `Rvalue::Call` + fused-loop lowering as a named function — optimized
+  identically (no closure environment). Slice ① cut: `map`/`where` only, **non-capturing**
+  (the body sees its parameters and top-level functions, not enclosing locals); the remaining
+  stages/reducers (`reduce`/`par_map`/`scan`/`partition`/`any`/`all`), capture, and first-class
+  function values are follow-up slices. The source element type is inferred from the first
+  named-stage parameter (a lambda first stage defaults the literal like any unconstrained value).
 - Method chains rely on the slice-0 postfix `.` (FieldAccess); the pipeline is
   collected from the AST at the `sum` terminal and lowered as one loop.
 - Arrays are not yet Move-checked (literals are consumed only by the reduction);
