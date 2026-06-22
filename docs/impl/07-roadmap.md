@@ -216,8 +216,15 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   parameter. Because such tuples never occupy a drop slot, no tuple `Drop`/codegen change was
   needed: building `(a, b)` from owned locals nulls them (`null_moved_source` extended to `Tuple`,
   in both `return` and destructure-init positions), and the destructure targets are ordinary owned
-  locals freed once by the existing drop set. **Unblocks** `partition` (`(array<T>, array<T>)`) and
-  `min_with_index` (`(value, index)`). (`examples/split_array.align`.)
+  locals freed once by the existing drop set. **Unblocks** `partition` (`(array<T>, array<T>)`).
+  (`examples/split_array.align`.)
+- [done] **owned tuples bound to a variable** — lifts the temporary-only cut: `t := split()` is now
+  allowed. A Move tuple local joins the drop set; codegen `Drop` frees each owned element of the
+  tuple aggregate and `DropFlagInit` zeroes it (so a moved-out tuple's `Drop` is a no-op). A
+  destructure/return that moves the tuple nulls the slot (`null_moved_source` recognises a Move
+  `Tuple` local). Reading an *owned* element by index (`t.0` where `.0` is owned) is rejected — a
+  partial move; destructure instead. A Copy element reads fine. Owned-tuple **parameters** + partial
+  field moves remain deferred (`open-questions.md`).
 - [done] named-function `map` over struct elements — `[Emp{…}].where(.active).map(net).sum()`
   where `net(e: Emp) -> i32`. A struct array stays index-addressed until used; a struct-consuming
   `map` loads the whole element by value just before the call (`lower_struct_elem`): a fixed stack

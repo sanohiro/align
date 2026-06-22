@@ -13,7 +13,7 @@ use std::path::Path;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{payload_is_move, FloatTy, IntTy, Layout, Scalar, StructDef, Ty, scalar_to_ty};
+use align_sema::{payload_is_move, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty};
 
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
@@ -394,6 +394,7 @@ fn build_module<'c>(
             structs: &program.structs,
             struct_types: &struct_types,
             tuple_types: &tuple_types,
+            tuples: &program.tuples,
             target_data: &target_data,
             f,
             func: funcs[&f.name],
@@ -668,6 +669,8 @@ struct FnGen<'c, 'a> {
     struct_types: &'a [StructType<'c>],
     /// Anonymous tuple types, indexed by the id in [`Ty::Tuple`].
     tuple_types: &'a [StructType<'c>],
+    /// Tuple defs (element scalars) — to know which tuple elements are owned (Move) when dropping.
+    tuples: &'a [TupleDef],
     /// Target layout — used to compute struct field byte offsets for `json.decode`.
     target_data: &'a inkwell::targets::TargetData,
     f: &'a Function,
@@ -774,7 +777,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ty = self.f.slots[*slot as usize];
                     let z: BasicValueEnum = if ty == Ty::Builder {
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
-                    } else if payload_is_move(ty) {
+                    } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_)) {
+                        // Zero the whole aggregate so each owned field/element reads {null,0}.
                         self.llvm_type(ty).into_struct_type().const_zero().into()
                     } else {
                         slice_struct_type(self.ctx).const_zero().into()
@@ -810,6 +814,29 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .map_err(|e| self.err(e))?
                                 .into_struct_value();
                             let ptr = self.builder.build_extract_value(payload, 0, "dropplptr").map_err(|e| self.err(e))?;
+                            self.builder
+                                .build_call(self.funcs["free"], &[ptr.into()], "")
+                                .map_err(|e| self.err(e))?;
+                        }
+                    } else if let Ty::Tuple(tid) = ty {
+                        // A Move tuple: free each owned element's buffer pointer (null-safe — a
+                        // moved-out tuple was zeroed, and Copy elements are skipped).
+                        let aty = self.tuple_types[tid as usize];
+                        let agg = self
+                            .builder
+                            .build_load(aty, self.slots[slot], "droptup")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                        for (i, s) in self.tuples[tid as usize].elems.iter().enumerate() {
+                            if !s.is_move() {
+                                continue;
+                            }
+                            let elem = self
+                                .builder
+                                .build_extract_value(agg, i as u32, "droptupel")
+                                .map_err(|e| self.err(e))?
+                                .into_struct_value();
+                            let ptr = self.builder.build_extract_value(elem, 0, "droptupptr").map_err(|e| self.err(e))?;
                             self.builder
                                 .build_call(self.funcs["free"], &[ptr.into()], "")
                                 .map_err(|e| self.err(e))?;
