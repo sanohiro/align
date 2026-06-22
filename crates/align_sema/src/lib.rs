@@ -285,6 +285,7 @@ impl Ty {
     }
 }
 
+#[derive(Clone)]
 struct FnSig {
     params: Vec<Ty>,
     /// `out[i]` — whether parameter `i` is an `out` (writable, no-alias) output buffer.
@@ -2745,6 +2746,63 @@ impl<'a, 't> Checker<'a, 't> {
         Some((name, ret))
     }
 
+    /// Resolve a reducer/terminal function argument — a named function or an inline lambda — given
+    /// its expected parameter types and (optionally) return type. Returns the (possibly synthetic
+    /// lifted) function name and its actual return type. A named function is validated against the
+    /// expected signature; a lambda is lifted (`lift_lambda`). `label` names the operation for
+    /// diagnostics. Used by `reduce`/`par_map`/`scan`/`partition`/`any`/`all` (the element/acc
+    /// types are known after `check_pipeline`/the initial value).
+    fn resolve_fn(&mut self, arg: &ast::Expr, expected_params: &[Ty], expected_ret: Option<Ty>, label: &str, span: Span) -> Option<(String, Ty)> {
+        if let ast::ExprKind::Lambda { params, body } = &arg.kind {
+            return self.lift_lambda(params, body, expected_params, expected_ret, arg.span);
+        }
+        let Some(fname) = self.pipeline_fn_name(arg) else {
+            self.diags.error(format!("'{label}' needs a function (named or `fn … {{ … }}`)"), span);
+            return None;
+        };
+        let Some(sig) = self.sigs.get(&fname.name) else {
+            self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
+            return None;
+        };
+        let (params, ret) = (sig.params.clone(), sig.ret);
+        // Resolve the expected types first: an unresolved inference variable (e.g. an inline
+        // literal's element type) must not false-positive against the concrete signature.
+        let expected_resolved: Vec<Ty> = expected_params.iter().map(|&t| self.resolve(t)).collect();
+        if params.as_slice() != expected_resolved.as_slice() || expected_ret.is_some_and(|er| self.resolve(er) != ret) {
+            let want_ret = self.resolve(expected_ret.unwrap_or(ret));
+            self.diags.error(
+                format!(
+                    "'{}' must have type ({}) -> {} here",
+                    fname.name,
+                    expected_resolved.iter().map(|t| ty_name(*t)).collect::<Vec<_>>().join(", "),
+                    ty_name(want_ret),
+                ),
+                fname.span,
+            );
+            return None;
+        }
+        Some((fname.name, ret))
+    }
+
+    /// The `idx`-th parameter type of a *named* function argument, to seed an inline-literal source's
+    /// element type. A lambda has no signature to peek (its parameters are inferred), so it yields
+    /// `None` (the literal then defaults like any unconstrained value).
+    fn named_param_hint(&self, arg: &ast::Expr, idx: usize) -> Option<Ty> {
+        if matches!(arg.kind, ast::ExprKind::Lambda { .. }) {
+            return None;
+        }
+        self.pipeline_fn_name(arg).and_then(|f| self.sigs.get(&f.name).cloned()).and_then(|s| s.params.get(idx).copied())
+    }
+
+    /// The signature of a *named* function argument (`None` for a lambda or an unresolved name) —
+    /// used by `reduce`/`scan` to take the accumulator/element types from a named fold's signature.
+    fn named_sig(&self, arg: &ast::Expr) -> Option<FnSig> {
+        if matches!(arg.kind, ast::ExprKind::Lambda { .. }) {
+            return None;
+        }
+        self.pipeline_fn_name(arg).and_then(|f| self.sigs.get(&f.name).cloned())
+    }
+
     fn collect_pipeline<'e>(&mut self, e: &'e ast::Expr) -> (&'e ast::Expr, Vec<RawStage>) {
         match &e.kind {
             // `.map(f)` / `.where(p)`
@@ -3064,11 +3122,8 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
-        let Some(fname) = self.pipeline_fn_name(fn_arg) else {
-            self.diags.error("'partition' needs a named predicate function".to_string(), span);
-            return err;
-        };
-        let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
+        let elem_hint = self.named_param_hint(fn_arg, 0);
+        let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
         if matches!(elem, Ty::Struct(_)) {
@@ -3078,8 +3133,10 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        // The predicate has type `(elem) -> bool`.
-        self.check_stage_fn(&fname, elem, true);
+        // The predicate has type `(elem) -> bool` (named or lambda).
+        let Some((func, _)) = self.resolve_fn(fn_arg, &[elem], Some(Ty::Bool), "partition", span) else {
+            return err;
+        };
         // The element must materialize into `array<T>`, i.e. be a primitive scalar.
         let prim_ok = ty_to_scalar(elem).and_then(scalar_to_prim).is_some();
         if !prim_ok {
@@ -3093,7 +3150,7 @@ impl<'a, 't> Checker<'a, 't> {
         let arr = ty_to_scalar(Ty::DynArray(ty_to_scalar(elem).unwrap())).expect("array<prim> is a payload scalar");
         let tuple_id = intern_tuple(self.tuples, vec![arr, arr]);
         Expr {
-            kind: ExprKind::ArrayPartition { source: Box::new(source), stages, func: fname.name, elem },
+            kind: ExprKind::ArrayPartition { source: Box::new(source), stages, func, elem },
             ty: Ty::Tuple(tuple_id),
             span,
         }
@@ -3163,15 +3220,14 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
-        let Some(fname) = self.pipeline_fn_name(fn_arg) else {
-            self.diags.error("'par_map' needs a named function".to_string(), span);
+        let elem_hint = self.named_param_hint(fn_arg, 0);
+        let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
-        let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
+        // `f: (elem) -> R` (named or lambda); `R` is inferred.
+        let Some((func, r)) = self.resolve_fn(fn_arg, &[elem], None, "par_map", span) else {
             return err;
         };
-        // `f: (elem) -> R`; check the parameter matches the (post-stage) element type.
-        let r = self.check_stage_fn(&fname, elem, false);
         if r == Ty::Error {
             return err;
         }
@@ -3184,7 +3240,7 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         Expr {
-            kind: ExprKind::ArrayParMap { source: Box::new(source), stages, func: fname.name, elem: r },
+            kind: ExprKind::ArrayParMap { source: Box::new(source), stages, func, elem: r },
             ty: Ty::DynArray(scalar),
             span,
         }
@@ -3201,12 +3257,8 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'{name}' takes 1 argument (a predicate function), got {}", args.len()), span);
             return err;
         };
-        let Some(fname) = self.pipeline_fn_name(fn_arg) else {
-            self.diags.error(format!("'{name}' needs a named predicate function"), span);
-            return err;
-        };
-        // The predicate's parameter type guides an inline source's element type.
-        let elem_hint = self.sigs.get(&fname.name).and_then(|s| s.params.first().copied());
+        // The predicate's parameter type guides an inline source's element type (named only).
+        let elem_hint = self.named_param_hint(fn_arg, 0);
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
@@ -3217,24 +3269,12 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        // Predicate must be `(elem) -> bool`. On a bad/undefined predicate, return the error
-        // sentinel — a Call to a missing/mistyped function must not reach MIR/codegen.
-        match self.sigs.get(&fname.name) {
-            Some(sig) if sig.params.len() == 1 && sig.params[0] == elem && sig.ret == Ty::Bool => {}
-            Some(_) => {
-                self.diags.error(
-                    format!("'{name}' predicate '{}' must have type ({}) -> bool", fname.name, ty_name(elem)),
-                    fname.span,
-                );
-                return err;
-            }
-            None => {
-                self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
-                return err;
-            }
-        }
+        // Predicate must be `(elem) -> bool` (named or lambda).
+        let Some((func, _)) = self.resolve_fn(fn_arg, &[elem], Some(Ty::Bool), name, span) else {
+            return err;
+        };
         Expr {
-            kind: ExprKind::ArrayAnyAll { source: Box::new(source), stages, func: fname.name, all },
+            kind: ExprKind::ArrayAnyAll { source: Box::new(source), stages, func, all },
             ty: Ty::Bool,
             span,
         }
@@ -3248,30 +3288,31 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'reduce' takes 2 arguments (a function and an initial value), got {}", args.len()), span);
             return err;
         };
-        let Some(fname) = self.pipeline_fn_name(fn_arg) else {
-            self.diags.error("'reduce' needs a named function as its first argument".to_string(), span);
-            return err;
+        // The accumulator type + element hint: a named fold fixes both from its signature; a
+        // lambda infers the accumulator from the initial value (and the element from the source).
+        let named_sig = self.named_sig(fn_arg);
+        let (acc_ty, elem_hint, init) = match &named_sig {
+            Some(sig) => (sig.ret, sig.params.get(1).copied(), self.check_expr(init_arg, Some(sig.ret))),
+            None => {
+                let init = self.check_expr(init_arg, expected);
+                (self.finalize(init.ty), None, init)
+            }
         };
-        let Some(sig) = self.sigs.get(&fname.name) else {
-            self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
-            return err;
-        };
-        let (params, acc_ty) = (sig.params.clone(), sig.ret);
-        // The element type the fold expects (its 2nd parameter) guides an inline source.
-        let elem_hint = params.get(1).copied();
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
-        if params.len() != 2 || params[0] != acc_ty || params[1] != elem {
-            self.diags.error(
-                format!("'reduce' function '{}' must have type ({}, {}) -> {}", fname.name, ty_name(acc_ty), ty_name(elem), ty_name(acc_ty)),
-                fname.span,
-            );
+        // A failed initial value leaves `acc_ty == Ty::Error`; bail before resolving the function
+        // so it doesn't cascade into the lambda body / signature check (matching `scan`).
+        if acc_ty == Ty::Error {
+            return err;
         }
-        let init = self.check_expr(init_arg, Some(acc_ty));
+        // `f: (acc, elem) -> acc` (named or lambda).
+        let Some((func, _)) = self.resolve_fn(fn_arg, &[acc_ty, elem], Some(acc_ty), "reduce", span) else {
+            return err;
+        };
         self.constrain(acc_ty, expected, span);
         Expr {
-            kind: ExprKind::ArrayReduce { source: Box::new(source), stages, func: fname.name, init: Box::new(init) },
+            kind: ExprKind::ArrayReduce { source: Box::new(source), stages, func, init: Box::new(init) },
             ty: acc_ty,
             span,
         }
@@ -3285,17 +3326,16 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'scan' takes 2 arguments (a function and an initial value), got {}", args.len()), span);
             return err;
         };
-        let Some(fname) = self.pipeline_fn_name(fn_arg) else {
-            self.diags.error("'scan' needs a named function as its first argument".to_string(), span);
-            return err;
+        // Accumulator type + element hint: a named fold fixes both from its signature; a lambda
+        // infers the accumulator from the initial value (and the element from the source).
+        let named_sig = self.named_sig(fn_arg);
+        let (acc_ty, elem_hint, init) = match &named_sig {
+            Some(sig) => (sig.ret, sig.params.get(1).copied(), self.check_expr(init_arg, Some(sig.ret))),
+            None => {
+                let init = self.check_expr(init_arg, None);
+                (self.finalize(init.ty), None, init)
+            }
         };
-        let Some(sig) = self.sigs.get(&fname.name) else {
-            self.diags.error(format!("undefined function: '{}'", fname.name), fname.span);
-            return err;
-        };
-        let (params, acc_ty) = (sig.params.clone(), sig.ret);
-        // The element type the fold expects (its 2nd parameter) guides an inline source.
-        let elem_hint = params.get(1).copied();
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
@@ -3305,13 +3345,6 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(
                 "'scan' over struct elements is not supported yet (project a field first)".to_string(),
                 span,
-            );
-            return err;
-        }
-        if params.len() != 2 || params[0] != acc_ty || params[1] != elem {
-            self.diags.error(
-                format!("'scan' function '{}' must have type ({}, {}) -> {}", fname.name, ty_name(acc_ty), ty_name(elem), ty_name(acc_ty)),
-                fname.span,
             );
             return err;
         }
@@ -3332,9 +3365,12 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
-        let init = self.check_expr(init_arg, Some(acc_ty));
+        // `f: (acc, elem) -> acc` (named or lambda).
+        let Some((func, _)) = self.resolve_fn(fn_arg, &[acc_ty, elem], Some(acc_ty), "scan", span) else {
+            return err;
+        };
         Expr {
-            kind: ExprKind::ArrayScan { source: Box::new(source), stages, func: fname.name, init: Box::new(init), elem: acc_ty },
+            kind: ExprKind::ArrayScan { source: Box::new(source), stages, func, init: Box::new(init), elem: acc_ty },
             ty: Ty::DynArray(scalar),
             span,
         }
