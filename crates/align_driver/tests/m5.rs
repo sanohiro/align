@@ -4,6 +4,12 @@ use align_driver::{backend_available, check, emit_object_file, link_executable, 
 use align_span::SourceMap;
 
 fn build_and_run(name: &str, src: &str) -> std::process::Output {
+    build_and_run_args(name, src, &[])
+}
+
+/// Build `src` and run it, forwarding `prog_args` to the program (its `main(args)`); argv[0] is
+/// the executable, then `prog_args`.
+fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::process::Output {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, name, src);
     assert!(
@@ -17,7 +23,7 @@ fn build_and_run(name: &str, src: &str) -> std::process::Output {
     let exe = dir.join(format!("align-test-{name}"));
     emit_object_file(&mir, &obj).expect("codegen");
     link_executable(&obj, &exe).expect("link");
-    std::process::Command::new(&exe).output().expect("run")
+    std::process::Command::new(&exe).args(prog_args).output().expect("run")
 }
 
 #[test]
@@ -702,6 +708,40 @@ fn slice_str_param_index_and_len() {
     let out = build_and_run("slice-str", src);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "bb\n");
+}
+
+#[test]
+fn main_args_argv_marshalling() {
+    if !backend_available() {
+        return;
+    }
+    // PR-C: `main(args: array<str>)` — the C `main` wrapper marshals argv into an `array<str>`.
+    // argv[0] is the executable, then the forwarded args. With ["one", "two"]: len = 3, args[1] =
+    // "one". `io.stdout.write` (no newline) on args[1], then "\n".
+    let src = "pub fn main(args: array<str>) -> Result<(), Error> {\n  print(args.len())\n  io.stdout.write(args[1])?\n  io.stdout.write(\"\\n\")?\n  return Ok(())\n}\n";
+    let out = build_and_run_args("main-args", src, &["one", "two"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\none\n");
+}
+
+#[test]
+fn s19_main_args_reads_file() {
+    if !backend_available() {
+        return;
+    }
+    // The draft.md §19 program (bar the `json.decode<…>` generic-call syntax): `main(args)` reads
+    // the file named by `args[1]`, decodes `array<User>`, aggregates, and writes via a builder.
+    // = "active score: 15\n".
+    let path = std::env::temp_dir().join("align-s19-args.json");
+    std::fs::write(
+        &path,
+        "[{\"id\":1,\"name\":\"ann\",\"active\":true,\"score\":10},{\"id\":2,\"name\":\"bob\",\"active\":false,\"score\":99},{\"id\":3,\"name\":\"cyd\",\"active\":true,\"score\":5}]",
+    )
+    .expect("write json");
+    let src = "User { id: i64, name: str, active: bool, score: i32 }\npub fn main(args: array<str>) -> Result<(), Error> {\n  arena {\n    data := fs.read_file(args[1])?\n    users: array<User> := json.decode(data)?\n    total := users.where(.active).score.sum()\n    out := builder()\n    out.write(\"active score: \")\n    out.write_int(total)\n    out.write(\"\\n\")\n    io.stdout.write(out)?\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run_args("s19-main-args", src, &[path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "active score: 15\n");
 }
 
 #[test]

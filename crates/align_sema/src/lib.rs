@@ -1182,14 +1182,22 @@ impl<'a> Checker<'a> {
     }
 
     fn check_fn(&mut self, f: &ast::FnDecl) -> Fn {
-        // M2 `main` takes no arguments; `main(args: array<str>)` (draft.md §17) is future.
-        if f.name.name == "main" && !f.params.is_empty() {
-            self.diags
-                .error("main takes no arguments (argv support comes later)".to_string(), f.span);
-        }
         let sig = &self.sigs[&f.name.name];
         let ret = sig.ret;
         let param_tys = sig.params.clone();
+        // `main` takes no arguments, or exactly `args: array<str>` (argv, draft.md §19) with a
+        // `Result<(), Error>` return — the latter is the only form the C-`main` wrapper marshals
+        // argv into (an `-> i32` argv `main` is a later follow-up).
+        if f.name.name == "main" && !f.params.is_empty() {
+            let args_ok = param_tys.as_slice() == [Ty::DynArray(Scalar::Str)]
+                && matches!(ret, Ty::Result(Scalar::Unit, Scalar::ErrCode));
+            if !args_ok {
+                self.diags.error(
+                    "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return".to_string(),
+                    f.span,
+                );
+            }
+        }
         self.ret_hint = ret;
 
         let mut params = Vec::new();
@@ -4584,9 +4592,16 @@ mod tests {
     }
 
     #[test]
-    fn main_with_arguments_errors() {
-        let (_p, d) = check("fn main(n: i32) -> i32 {\n  return n\n}\n");
-        assert!(d.has_errors(), "main with arguments must error in M2");
+    fn main_arguments_only_array_str() {
+        // `main(args: array<str>)` with a `Result<(), Error>` return is accepted (PR-C, argv).
+        let (_p, ok) = check("pub fn main(args: array<str>) -> Result<(), Error> {\n  print(args.len())\n  return Ok(())\n}\n");
+        assert!(!ok.has_errors(), "main(args: array<str>) -> Result should check");
+        // Any other main parameter is rejected.
+        let (_q, bad) = check("fn main(n: i32) -> i32 {\n  return n\n}\n");
+        assert!(bad.has_errors(), "main with a non-`array<str>` argument must error");
+        // `main(args)` must return Result (the only form the wrapper marshals argv into).
+        let (_r, noresult) = check("fn main(args: array<str>) -> i32 = 0\n");
+        assert!(noresult.has_errors(), "main(args) with a non-Result return must error");
     }
 
     #[test]

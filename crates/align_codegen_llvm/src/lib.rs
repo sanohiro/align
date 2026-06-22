@@ -390,9 +390,10 @@ fn build_module<'c>(
         }
         .emit_fn()?;
     }
-    // A Result-returning main needs a C `main` wrapper that maps Ok/Err to an exit code.
+    // A Result-returning main needs a C `main` wrapper that maps Ok/Err to an exit code (and, when
+    // `main(args: array<str>)`, marshals argv into the `array<str>` argument).
     if let Some(f) = program.fns.iter().find(|f| f.name == "main" && matches!(f.ret, Ty::Result(..))) {
-        emit_main_wrapper(ctx, module, funcs["main"], f.ret)?;
+        emit_main_wrapper(ctx, module, funcs["main"], f.ret, !f.params.is_empty())?;
     }
     Ok(())
 }
@@ -414,25 +415,54 @@ fn emit_main_wrapper<'c>(
     module: &Module<'c>,
     align_main: FunctionValue<'c>,
     ret: Ty,
+    has_args: bool,
 ) -> Result<(), CodegenError> {
     if !matches!(ret, Ty::Result(_, _)) {
         return Err(CodegenError::Lowering("main wrapper on a non-Result".into()));
     }
     let lower = |e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string());
     let i32t = ctx.i32_type();
+    let ptr_t = ctx.ptr_type(AddressSpace::default());
     // Returns the clamped (nonzero u8) exit code; reporting/clamping live in the runtime.
     let report = module.add_function(
         "align_rt_report_error",
         i32t.fn_type(&[i32t.into()], false),
         None,
     );
-    let main = module.add_function("main", i32t.fn_type(&[], false), None);
+    // `main(args: array<str>)`: the C entry takes (argc, argv) and the runtime builds the
+    // `array<str>` value; otherwise the C entry takes no args.
+    let main_ty = if has_args {
+        i32t.fn_type(&[i32t.into(), ptr_t.into()], false)
+    } else {
+        i32t.fn_type(&[], false)
+    };
+    let main = module.add_function("main", main_ty, None);
     let builder = ctx.create_builder();
     let entry = ctx.append_basic_block(main, "entry");
     builder.position_at_end(entry);
 
+    // Marshal argv into the `array<str>` argument, or call with no args.
+    let call_args: Vec<inkwell::values::BasicMetadataValueEnum> = if has_args {
+        let args_build = module.add_function(
+            "align_rt_args_build",
+            slice_struct_type(ctx).fn_type(&[i32t.into(), ptr_t.into()], false),
+            None,
+        );
+        let argc = main.get_nth_param(0).expect("argc").into_int_value();
+        let argv = main.get_nth_param(1).expect("argv").into_pointer_value();
+        let args_val = builder
+            .build_call(args_build, &[argc.into(), argv.into()], "args")
+            .map_err(lower)?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CodegenError::Lowering("args_build returned void".into()))?;
+        vec![args_val.into()]
+    } else {
+        vec![]
+    };
+
     let res = builder
-        .build_call(align_main, &[], "r")
+        .build_call(align_main, &call_args, "r")
         .map_err(lower)?
         .try_as_basic_value()
         .basic()

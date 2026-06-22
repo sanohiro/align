@@ -321,7 +321,15 @@ the MMv2 region model rather than a `main`-only special case), in three steps:
   `array<str>` is now region-tracked (`tracks_region(Array(s)) = tracks_region(s)`), so an array of
   arena `str`s can't let an element escape via index+return — while `array<i64>` stays
   Static/returnable.
-- **[todo] PR-C** — `main(args: array<str>)` ABI + argv marshalling → **§19 verbatim**.
+- **[done] PR-C** — `main(args: array<str>)` ABI + argv marshalling. `main(args: array<str>) ->
+  Result<(), Error>` is accepted; the C `main` wrapper takes `(argc, argv)` and calls
+  `align_rt_args_build` (a buffer of `str` views into argv — argv strings process-lifetime, the
+  buffer `Drop`-freed at `main` exit), then `align_main(args)`. `alignc run` forwards trailing args
+  to the program. The §19 program now runs from a file path in `args[1]`.
+- **[todo] PR-D** — the last verbatim gap: `json.decode<array<User>>(data)` generic-*call* syntax
+  (explicit `<T>` type argument). Today the target is inferred from the binding annotation
+  (`users: array<User> := json.decode(data)?`); the `<T>` call form needs the parser to read type
+  arguments after a method name (the `<` disambiguation). Then draft.md §19 runs **literally**.
 M5 language features are complete (strings, templates, `json.encode` for struct/array,
 `json.decode` for scalar / `str` / `array<scalar>` / `array<Struct>`).
 

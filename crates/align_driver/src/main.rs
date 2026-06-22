@@ -25,7 +25,8 @@ fn main() -> ExitCode {
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
         (Some("emit-llvm"), Some(p)) => run_emit_llvm(p),
         (Some("build"), Some(p)) => run_build(p),
-        (Some("run"), Some(p)) => run_run(p),
+        // `run` forwards any trailing arguments to the built program (its `main(args)`).
+        (Some("run"), Some(p)) => run_run(p, &args[3..]),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -150,7 +151,7 @@ fn run_build(path: &str) -> ExitCode {
     }
 }
 
-fn run_run(path: &str) -> ExitCode {
+fn run_run(path: &str, prog_args: &[String]) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
@@ -158,7 +159,9 @@ fn run_run(path: &str) -> ExitCode {
     if let Err(code) = build_to(path, &mir, &exe) {
         return code;
     }
-    match std::process::Command::new(&exe).status() {
+    // Forward trailing args so they reach the program's `main(args: array<str>)` (argv[0] is the
+    // executable, then `prog_args`).
+    match std::process::Command::new(&exe).args(prog_args).status() {
         Ok(status) => match status.code() {
             Some(code) => ExitCode::from(code as u8),
             None => {
