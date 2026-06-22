@@ -448,6 +448,19 @@ fn json_decode_struct_array_map_sum() {
 }
 
 #[test]
+fn json_decode_struct_array_where_struct_predicate() {
+    if !backend_available() {
+        return;
+    }
+    // A whole-struct `where` predicate over a decoded dynamic `array<Struct>` (loaded by
+    // `IndexPtr`): keep score > 8 AND active → 10 + 12 = 22 (bob inactive, dot too low).
+    let src = "User { active: bool, score: i64 }\nfn good(u: User) -> bool = u.score > 8 && u.active\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":12}]\")?\n  print(users.where(good).score.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("json-decode-struct-where-pred", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "22\n");
+}
+
+#[test]
 fn json_decode_struct_array_where_field_then_map() {
     if !backend_available() {
         return;

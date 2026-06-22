@@ -195,6 +195,11 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   element). Map-result struct chaining (`map(f).field` / `map(f).g()` where `f` returns a struct) is
   not supported — projection addresses the source, so a struct map must feed a scalar map or a
   reduction. (`examples/struct_map.align`.)
+- [done] named-function `where` over struct elements — a whole-struct predicate (`fn busy(e: Emp)
+  -> bool = e.hours > 40 && e.active`), the multi-field companion of the single-field
+  `where(.active)`. Same `lower_struct_elem` load as `map`, but `where` *filters* (keeps the
+  element unchanged), so unlike `map` it sets no "mapped" flag — a following `.field` /
+  `where(.field)` still reads the source. (`examples/struct_where.align`.)
 
 ### Dynamic arrays / slices — decisions (from review)
 
