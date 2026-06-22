@@ -238,7 +238,7 @@ Result<T, E>
 
 ```align
 data := fs.read_file(path)?
-user := json.decode<User>(data)?
+user: User := json.decode(data)?
 ```
 
 `?` is Result-only.
@@ -289,7 +289,7 @@ other := data.clone()
 ```align
 arena {
   data := fs.read_file(path)?
-  users := json.decode<array<User>>(data)?
+  users: array<User> := json.decode(data)?
   process(users)?
 }
 ```
@@ -636,7 +636,7 @@ builder encode
 ### Typed Decode
 
 ```align
-user := json.decode<User>(data)?
+user: User := json.decode(data)?
 ```
 
 ### Zero Copy
@@ -649,7 +649,7 @@ To make a decoded value outlive its input, the user clones it explicitly:
 ```align
 first_name := arena {
   data := fs.read_file(path)?
-  users := json.decode<array<User>>(data)?   // views into `data`
+  users: array<User> := json.decode(data)?   // views into `data`
   process(users)?                             // zero copy, cache-local
   users[0].name.clone()                       // explicit copy to escape the arena
 }
@@ -864,12 +864,20 @@ Has a SIMD fast path in the standard implementation.
 
 ```text
 json.scan
-json.decode<T>
-json.encode<T>
+json.decode
+json.encode
 json.validate<T>
 json.token
 json.field_table<T>
 ```
+
+`decode` and `encode` carry no written type argument: `decode`'s target is the
+expected type from context (`u: User := json.decode(d)?`) and `encode`'s is the
+type of its value argument — inference recovers both, so Align has no
+expression-position type-argument syntax (`§9`, no turbofish). `validate<T>` and
+`field_table<T>` are the residual schema-selector case where `T` appears in
+neither arguments nor result; their explicit-type surface is still open (they may
+fold into `decode`).
 
 ### core.template
 
@@ -1104,7 +1112,7 @@ User {
 pub fn main(args: array<str>) -> Result<(), Error> {
   arena {
     data := fs.read_file(args[1])?
-    users := json.decode<array<User>>(data)?
+    users: array<User> := json.decode(data)?
 
     total := users
       .where(.active)

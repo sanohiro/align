@@ -274,17 +274,18 @@ later slices (struct arrays, M5 strings/JSON).
   be a function parameter, a return type, a call argument, copied via `let y := x`, and
   reassigned whole. Codegen passes/returns the LLVM aggregate by value (`declare_fn` maps
   `Ty::Struct`); params are already stored into their slots, and a struct-literal expression
-  materializes into a temp slot then loads. The gateway to `json.decode<T>`.
+  materializes into a temp slot then loads. The gateway to `json.decode`.
 - [done] composite (struct) payloads in `Option`/`Result` — lifts the M2 scalar-only cut.
   `Scalar` gains `Struct(u32)`, so `Option<Pt>` / `Result<User, Error>` are representable;
   `Some`/`Ok`/`Err` accept a struct, `?` unwraps to a struct, `else` unwraps `Option<Struct>`.
   Codegen threads the struct-type table through the `Option`/`Result` aggregate builders so a
-  struct payload lowers to a nested aggregate. The second `json.decode<T>` prerequisite
+  struct payload lowers to a nested aggregate. The second `json.decode` prerequisite
   (decode returns `Result<T, Error>`).
 - [done] `json.decode` (first cut) — parse a `str` into a struct, yielding `Result<T, Error>`.
   The target `T` is inferred from the binding annotation threaded through `?`
-  (`let u: T := json.decode(s)?`); `check_try` now passes the expected type inward. `<T>`
-  call syntax is future. MIR fills a zeroed out-struct via the runtime parser (status `i32`)
+  (`let u: T := json.decode(s)?`); `check_try` now passes the expected type inward. There is no
+  `<T>` call syntax — settled: Align has no expression-position type arguments (no turbofish;
+  `open-questions.md` Settled). MIR fills a zeroed out-struct via the runtime parser (status `i32`)
   then branches into `Ok(<struct>)` / `Err(<code>)`. Codegen builds a field-descriptor table
   (name / type-tag / byte offset via the target layout) and calls `align_rt_json_decode`, a
   minimal object parser (field order irrelevant, unknown keys ignored, missing/malformed →
@@ -294,8 +295,8 @@ later slices (struct arrays, M5 strings/JSON).
 - [done, via Memory Model v2] `json.decode` for `str` fields (zero-copy `{ptr,len}` views
   region-tied to the input), owned `array<scalar>`, and owned `array<Struct>` (AoS) — the last
   is the `draft.md` §19 headline. Field tables are emitted as compile-time constant globals.
-  Still deferred: nested-struct fields, SIMD scan, and `<T>` generic-call syntax (the binding
-  annotation infers the target through `?` today).
+  Still deferred: nested-struct fields and SIMD scan. (`<T>` generic-call syntax is not deferred
+  but **settled away** — the binding annotation infers the target through `?`; no turbofish.)
 - [todo] owned `string` / `bytes`, const string pool, `html`/`json` template variants.
 
 Status (M5-A): `str` is a Copy view, lexed with the common escapes; literals lower to a
@@ -307,8 +308,8 @@ field and folds `where(.active).score.sum()` into one loop, both delivered by th
 borrow-region decode + owned `array<Struct>` + fused-pipeline work (MMv2 slices 8d-1/8d-2). The
 remaining gap is `main(args: array<str>)`: **`fs.read_file`** reads a file into an owned `string`,
 and **`io.stdout.write`** writes a `str`/`string`/`builder` to stdout (no newline), so the §19
-body — read file → `json.decode<array<User>>` → `where(.active).score.sum()` → format with a
-`builder` → `io.stdout.write(out)` — runs **verbatim** bar the signature. Full `§19` *verbatim*
+body — read file → `json.decode` (into `array<User>`) → `where(.active).score.sum()` → format with
+a `builder` → `io.stdout.write(out)` — runs **verbatim** bar the signature. Full `§19` *verbatim*
 needs only `main(args: array<str>)`, being added as `str`-in-composites (the ideal form, extending
 the MMv2 region model rather than a `main`-only special case), in three steps:
 - **[done] PR-A** — `Scalar::Str`: `str` as a composite payload. `Option<str>` / `Result<str,E>`
@@ -326,10 +327,12 @@ the MMv2 region model rather than a `main`-only special case), in three steps:
   `align_rt_args_build` (a buffer of `str` views into argv — argv strings process-lifetime, the
   buffer `Drop`-freed at `main` exit), then `align_main(args)`. `alignc run` forwards trailing args
   to the program. The §19 program now runs from a file path in `args[1]`.
-- **[todo] PR-D** — the last verbatim gap: `json.decode<array<User>>(data)` generic-*call* syntax
-  (explicit `<T>` type argument). Today the target is inferred from the binding annotation
-  (`users: array<User> := json.decode(data)?`); the `<T>` call form needs the parser to read type
-  arguments after a method name (the `<` disambiguation). Then draft.md §19 runs **literally**.
+- **[settled, no code] PR-D** — the one apparent residual was the `json.decode<array<User>>(data)`
+  generic-*call* syntax. Resolved by **design, not implementation**: Align has no expression-position
+  type-argument syntax (no turbofish — `open-questions.md` Settled "Type-argument syntax"). draft.md
+  §19 is amended to the inference form `users: array<User> := json.decode(data)?`, which the checker
+  already supports (target inferred from the binding through `?`). So §19 runs verbatim **as written
+  in the amended spec**, and the `<` disambiguation is avoided outright rather than implemented.
 M5 language features are complete (strings, templates, `json.encode` for struct/array,
 `json.decode` for scalar / `str` / `array<scalar>` / `array<Struct>`).
 
@@ -350,8 +353,8 @@ drop, zero-copy decode); slices 1–8d are **implemented**. The two foundations 
 Delivered on top of it: zero-copy `str`/`array<T>`/`array<Struct>` decode region-tied to the
 input, with explicit `.clone()` to escape; owned-array materialization; and bounds-checked element
 indexing — `recv[index]` (scalar) and `arr[index].field` (a struct-array element's field).
-**`draft.md` §19 now runs end-to-end except the `fs`/`io` std boundary** (`json.decode<array<User>>`
-→ `where(.active).score.sum()` as one fused loop). Still **deferred** (separate, deliberately
+**`draft.md` §19 now runs end-to-end except the `fs`/`io` std boundary** (`json.decode` into
+`array<User>` → `where(.active).score.sum()` as one fused loop). Still **deferred** (separate, deliberately
 un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`),
 `array<slice<T>>` (for `chunks`), `array<Struct>.clone()`, and a bare whole-struct element value
 `users[i]` (no field) — see `08-memory-model-v2.md` §11 and `open-questions.md`.

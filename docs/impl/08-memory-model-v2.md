@@ -455,7 +455,7 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      for now — sound, just not arena-bump); and `bytes`/`buffer` (the spec defines only the type
      names + one-line roles so far — surface API to be fleshed out in the spec first).
 8. **Owned (Move) payloads in `Option`/`Result`.** The remaining "ideal form" carryover (a
-   materializing `json.decode<array<T>>`, fallible functions returning owned values) is gated on
+   materializing `json.decode` into `array<T>`, fallible functions returning owned values) is gated on
    one type-system gap: `Ty::Result(Scalar, Scalar)` could only carry *scalars*, so a fallible
    function could not even return `Result<string, Error>`. This slice lets an `Option`/`Result`
    hold an owned **Move** payload.
@@ -486,7 +486,7 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      Enables `fn f() -> Result<array<i64>, Error>` / `Option<array<f64>>`. MIR-verified: the
      heap buffer is moved `mk → Result → ?-unwrap → local` and freed exactly once; Err/None free
      null. Tested e2e (Result/Option unwrap + sum) + sema (construct/return/box-rejection).
-   - **[done] 8c — `json.decode<array<scalar>>`.** Parse a JSON array of scalars into an **owned**
+   - **[done] 8c — `json.decode` into `array<scalar>`.** Parse a JSON array of scalars into an **owned**
      `array<T>` (`Result<array<T>, Error>`, now representable thanks to 8b). New
      `ExprKind::JsonDecodeArray` + MIR `Rvalue::JsonDecodeArray` + runtime `align_rt_json_decode_array`,
      mirroring the struct-decode pattern (materialize into an out slot, branch `Ok(<array>)` /
@@ -500,7 +500,7 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      `Ok`/`Some`/`Err` wrappers, so `return Ok(xs)` of a *bound* owned local nulls its slot — else
      the local's exit `Drop` double-freed the buffer now owned by the returned aggregate (a slice-8a
      gap exposed by `return Ok(decoded_array)`; also fixes `return Ok(bound_string)`).
-   - **[done] 8d-1 — `json.decode<array<Struct>>` (decode + len + drop + region/escape).** The
+   - **[done] 8d-1 — `json.decode` into `array<Struct>` (decode + len + drop + region/escape).** The
      draft.md §19 headline type: an owned, dynamic AoS of structs. New `Ty::DynStructArray(id)` +
      `Scalar::DynStructArray(id)` (the struct dual of `DynArray`; both `{ptr,len}`, Move, freed by
      `Drop`), so `Result<array<Struct>, Error>` is representable and threads through `?`. The
@@ -568,7 +568,7 @@ decode-escape semantics and lifted several deferrals. All of the following are n
   the arena" are stated; the two allocation modes' implementation detail lives here (§6) and in
   `03-types.md` rather than the high-level spec.
 - **[done] docs/language-spec.md** — the feature-surface digest (terse keyword lists) already
-  names `array<T>` / `json.decode<T>` / arena / explicit heap; no contradiction to reconcile.
+  names `array<T>` / `json.decode` / arena / explicit heap; no contradiction to reconcile.
 - **[done] docs/design-notes.md** — the "Memory model v2: one region lattice, explicit copies"
   section records both rationales.
 - **[done] docs/impl/03-types.md §7** — a status note generalizing the sketch to the region

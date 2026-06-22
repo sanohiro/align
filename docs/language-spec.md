@@ -121,10 +121,15 @@ builder
 
 ```text
 json.scan
-json.decode<T>
-json.encode<T>
+json.decode
+json.encode
 json.validate<T>
 ```
+
+`decode`/`encode` take no written type argument — the target type comes from
+context (`u: User := json.decode(d)?`) or the value argument; Align has no
+expression-position type-argument syntax (no turbofish). `validate<T>` is the
+residual schema-selector case (type in neither args nor result), still open.
 
 ### Templates
 

@@ -270,6 +270,17 @@ field tables
 arena allocation
 ```
 
+"Typed decode" is written `u: User := json.decode(d)?`, not `json.decode<User>(d)`.
+A decode's target type is return-position-only — it cannot come from the arguments —
+so it is recovered from the expected type propagated from context (the binding
+annotation, flowing back through `?`). Align deliberately has **no
+expression-position type-argument syntax** (no turbofish): the binding annotation is
+the single place a type is written ("one way"), and refusing `f<T>(x)` removes the
+`<`-vs-comparison parse ambiguity at expression position outright — the same
+ambiguity that pushed Go to `f[T](x)` and Rust to `::<>`. When context supplies no
+type, that is a hard error asking for an annotation, never a silently-defaulted type.
+(Settled 2026-06-22; see `open-questions.md`.)
+
 ---
 
 ## The safety stance
