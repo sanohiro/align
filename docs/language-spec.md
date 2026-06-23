@@ -87,7 +87,6 @@ No exceptions.
 ```text
 map
 par_map
-filter
 where
 reduce
 scan

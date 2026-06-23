@@ -121,6 +121,13 @@ the positional companion of the keyword-less named struct: a named struct for a 
 tuple for an ad-hoc result. A tuple's ownership falls out of its elements (the same rule as a
 struct), so it adds no new ownership concept either.
 
+It is also why there is **one filtering operation, `where`** — not both `where` and `filter`.
+The two would be exact synonyms (keep the elements a predicate selects), and two names for one
+operation is precisely the divergence Align rejects: different code would arrive at different
+spellings of the same thing. `where` wins because it reads naturally with field selectors
+(`users.where(.active)`) and fits the data-oriented, query-like core. (`filter` was dropped from
+the function list for this reason.)
+
 ---
 
 ## Compiler-friendly first
