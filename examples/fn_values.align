@@ -1,13 +1,17 @@
-// First-class function values (slice ①): a top-level function used as a value is a function
-// pointer; calling such a binding is an indirect call. (Non-capturing — lambda-as-value and
-// captures come in later slices.)
+// First-class function values: a top-level function (or a typed-parameter lambda) used as a
+// value is a function pointer; calling such a binding is an indirect call. (Non-capturing —
+// captures come in a later slice.)
 fn add(a: i64, b: i64) -> i64 = a + b
 fn sub(a: i64, b: i64) -> i64 = a - b
 
 fn main() -> Result<(), Error> {
-  mut op := add       // `op` holds a function value (Ty::Fn)
-  print(op(10, 3))    // 13  — indirect call
-  op = sub            // add and sub share a signature → assignable
-  print(op(10, 3))    // 7
+  mut op := add          // `op` holds a function value (Ty::Fn)
+  print(op(10, 3))       // 13  — indirect call
+  op = sub               // add and sub share a signature → assignable
+  print(op(10, 3))       // 7
+
+  // A lambda used as a value (typed parameters) is also a function value (slice ②a).
+  twice := fn x: i64 { x * 2 }
+  print(twice(21))       // 42
   return Ok(())
 }

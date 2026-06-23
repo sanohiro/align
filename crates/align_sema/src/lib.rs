@@ -372,7 +372,7 @@ struct FnSig {
 /// lambda (which sema lifts to a synthetic top-level function — see [`Checker::lift_lambda`]).
 enum StageFn {
     Named(ast::Ident),
-    Lambda { params: Vec<ast::Ident>, body: ast::Block, span: Span },
+    Lambda { params: Vec<ast::LambdaParam>, body: ast::Block, span: Span },
 }
 
 enum RawStage {
@@ -2126,15 +2126,10 @@ impl<'a, 't> Checker<'a, 't> {
                 );
                 Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span }
             }
-            // A lambda is only meaningful as a stage/reducer argument, where it is lifted; a
-            // bare lambda value (first-class function values) is a later slice.
-            ast::ExprKind::Lambda { .. } => {
-                self.diags.error(
-                    "a lambda (`fn … { … }`) is only valid as a pipeline/reducer argument (e.g. `map(fn x { x * 2 })`)".to_string(),
-                    e.span,
-                );
-                Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span }
-            }
+            // A lambda used as a value (`f := fn x: i32 { … }`) is a first-class function value
+            // (`Ty::Fn`): lift it like a stage lambda, but its parameter types come from explicit
+            // annotations (there is no use site to infer from). Slice ②a: non-capturing only.
+            ast::ExprKind::Lambda { params, body } => self.check_lambda_value(params, body, expected, e.span),
             ast::ExprKind::ElseUnwrap { opt, fallback } => {
                 self.check_else_unwrap(opt, fallback, expected, e.span)
             }
@@ -2579,6 +2574,53 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let ty = operands[0].ty;
         Expr { kind: ExprKind::MathOp { fn_, operands }, ty, span }
+    }
+
+    /// `f := fn x: i32 { … }` — a lambda used as a value. Lifts the lambda (its parameter types
+    /// from the explicit annotations, the return type from the body) to a synthetic top-level
+    /// function and yields a `Ty::Fn` value. Slice ②a: non-capturing only; scalar signatures.
+    fn check_lambda_value(&mut self, params: &[ast::LambdaParam], body: &ast::Block, expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // Parameter types come from the explicit annotations (no use site to infer from).
+        let mut param_tys = Vec::with_capacity(params.len());
+        for p in params {
+            let Some(ann) = &p.ty else {
+                self.diags.error(
+                    format!("lambda parameter '{}' needs a type annotation to be used as a value (e.g. `fn {}: i32 {{ … }}`)", p.name.name, p.name.name),
+                    p.name.span,
+                );
+                return err;
+            };
+            param_tys.push(resolve_type(ann, self.struct_ids, self.tuples, self.diags));
+        }
+        // Lift with the annotated parameter types as the expected signature; the return type is
+        // inferred from the body.
+        let Some((name, ret, captures)) = self.lift_lambda(params, body, &param_tys, None, span) else {
+            return err;
+        };
+        if !captures.is_empty() {
+            self.diags.error(
+                "a lambda that captures an enclosing variable cannot be used as a value yet (slice ②b)".to_string(),
+                span,
+            );
+            return err;
+        }
+        // A type error in the annotations or the body has already been reported — don't pile on a
+        // confusing secondary "only scalar" message.
+        if param_tys.iter().any(|t| self.finalize(*t) == Ty::Error) || self.finalize(ret) == Ty::Error {
+            return err;
+        }
+        // Scalar signature only (slice ②a), matching named function values.
+        let pscalars: Option<Vec<Scalar>> = param_tys.iter().map(|t| ty_to_scalar(self.finalize(*t))).collect();
+        let rscalar = ty_to_scalar(self.finalize(ret));
+        let (Some(ps), Some(r)) = (pscalars, rscalar) else {
+            self.diags.error("a lambda value supports only scalar parameters and return type".to_string(), span);
+            return err;
+        };
+        let fid = intern_fn_type(self.fn_types, ps, r);
+        let ty = Ty::Fn(fid);
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::FnValue(name), ty, span }
     }
 
     /// `f(args)` where `f` is a `Ty::Fn` local — an indirect call through a function value.
@@ -3064,7 +3106,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// surfaces as an undefined-variable error here).
     fn lift_lambda(
         &mut self,
-        params: &[ast::Ident],
+        params: &[ast::LambdaParam],
         body: &ast::Block,
         expected_params: &[Ty],
         expected_ret: Option<Ty>,
@@ -3106,7 +3148,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.capture = Some(CaptureScope { enclosing, captured: Vec::new() });
 
         let mut param_ids: Vec<LocalId> =
-            params.iter().zip(&param_tys).map(|(p, ty)| self.declare(&p.name, *ty, false)).collect();
+            params.iter().zip(&param_tys).map(|(p, ty)| self.declare(&p.name.name, *ty, false)).collect();
         let checked = self.check_block(body, expected_ret);
         let ret = match expected_ret {
             Some(t) => t,

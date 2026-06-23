@@ -73,6 +73,14 @@ pub struct Param {
     pub ty: Type,
 }
 
+/// A lambda parameter: a name with an optional type annotation (`x` or `x: T`). The type is
+/// inferred from the use site when omitted; it is required when the lambda is used as a value.
+#[derive(Clone, Debug)]
+pub struct LambdaParam {
+    pub name: Ident,
+    pub ty: Option<Type>,
+}
+
 /// Function body: a block, or a single-expression `= expr` form (`02-frontend.md` §3).
 #[derive(Clone, Debug)]
 pub enum FnBody {
@@ -228,11 +236,13 @@ pub enum ExprKind {
     /// `.field` — element-field shorthand, valid only as a pipeline stage argument
     /// (e.g. `where(.active)`); refers to a field of the current pipeline element.
     FieldShorthand(Ident),
-    /// `fn p0, p1 { ... }` — an anonymous function (lambda). Parameter types are inferred
-    /// from the use site (a pipeline stage's element type); the body is a block. Valid as a
-    /// pipeline-stage / reducer argument, where sema lifts it to a synthetic top-level function.
+    /// `fn p0, p1: T { ... }` — an anonymous function (lambda). A parameter's type is inferred
+    /// from the use site (a pipeline stage's element type) when unannotated, or written explicitly
+    /// (`p: T`) — explicit types are required when the lambda is used as a value (`f := fn x: i32
+    /// { … }`), since there is no use site to infer from. The body is a block; sema lifts the
+    /// lambda to a synthetic top-level function.
     Lambda {
-        params: Vec<Ident>,
+        params: Vec<LambdaParam>,
         body: Block,
     },
     /// `(e0, e1, ...)` — a tuple value (arity ≥ 2; `()` is `Unit`, `(e)` is just `e`).

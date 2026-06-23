@@ -39,8 +39,10 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    (`open-questions.md`); closures are the foundation, `task_group` the consumer. Built in slices:
    **① non-capturing function values DONE** — a top-level fn used as a value is a function pointer
    (`Ty::Fn`, Copy/`Static`, no env), and calling such a local is an indirect call (`f := double;
-   f(5)`; scalar signatures). Next: **② lambda-as-value + captures** (escape → region-owned env),
-   then **③ `task_group`**.
+   f(5)`; scalar signatures). **②a lambda-as-value DONE** — a non-capturing lambda with typed
+   parameters (`f := fn x: i32 { x*2 }`) lifts to a function value (params from the annotations,
+   no use site to infer from; captures rejected). Next: **②b captures** (escape → region-owned
+   env), then **③ `task_group`**.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

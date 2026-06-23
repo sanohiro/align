@@ -63,6 +63,36 @@ fn arg_type_mismatch_rejected() {
 }
 
 #[test]
+fn lambda_as_value_and_call() {
+    if !backend_available() {
+        return;
+    }
+    // A lambda used as a value (typed params) is lifted to a function pointer (slice ②a).
+    let src = "fn main() -> Result<(), Error> {\n  f := fn x: i32 { x * 2 }\n  print(f(5))\n  g := fn a: i64, b: i64 { a + b }\n  print(g(10, 32))\n  return Ok(())\n}\n";
+    let out = build_and_run("fv-lambda", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n42\n");
+}
+
+#[test]
+fn untyped_lambda_param_rejected_as_value() {
+    // A lambda value has no use site to infer from, so params need explicit types.
+    assert!(check_errs(
+        "fv-untyped",
+        "fn main() -> Result<(), Error> {\n  f := fn x { x * 2 }\n  print(f(5))\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
+fn capturing_lambda_rejected_as_value() {
+    // Captures (escape → region-owned environment) are slice ②b — rejected for now.
+    assert!(check_errs(
+        "fv-capture",
+        "fn main() -> Result<(), Error> {\n  k: i32 := 3\n  f := fn x: i32 { x + k }\n  print(f(5))\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
 fn non_scalar_signature_rejected_as_value() {
     // slice ①: only scalar params/return may become a function value.
     assert!(check_errs(
