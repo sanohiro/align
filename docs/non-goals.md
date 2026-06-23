@@ -18,6 +18,12 @@ DSL creation
 advanced type wizardry
 ```
 
+This includes a **general compile-time execution model** (Zig-style `comptime` / user-defined CTFE
+running arbitrary code at compile time). It is a deliberate non-goal: a second computation model
+erodes *One Way* and AI-friendliness. Align's compile-time story is **builtin-driven static data**
+only — JSON field tables, `template` analysis, literal/hash tables — computed by the compiler, not
+by user `comptime` code. (Considered and declined in the 2026-06-24 language stock-take.)
+
 ---
 
 ## Not OOP-first
