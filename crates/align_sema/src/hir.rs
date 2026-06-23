@@ -229,19 +229,19 @@ pub enum ExprKind {
     ArrayCount { source: Box<Expr>, stages: Vec<Stage> },
     /// `source.….any(p)` / `.all(p)` — whether the predicate `func` holds for any / all
     /// surviving (scalar) elements. Always `bool`; `all` selects an `&&`-fold over `||`.
-    ArrayAnyAll { source: Box<Expr>, stages: Vec<Stage>, func: String, all: bool },
+    ArrayAnyAll { source: Box<Expr>, stages: Vec<Stage>, func: String, captures: Vec<Expr>, all: bool },
     /// `source.….min()` / `.max()` — the smallest / largest surviving (scalar, numeric)
     /// element. `is_max` selects max over min. Seeded with the element type's extreme, so an
     /// empty pipeline yields that extreme (the fold identity, as `sum` yields 0).
     ArrayMinMax { source: Box<Expr>, stages: Vec<Stage>, is_max: bool },
     /// `source.…​.reduce(f, init)` — fold the (post-stage) elements with the binary
     /// function `func` starting from `init`. `ty` is the accumulator type.
-    ArrayReduce { source: Box<Expr>, stages: Vec<Stage>, func: String, init: Box<Expr> },
+    ArrayReduce { source: Box<Expr>, stages: Vec<Stage>, func: String, captures: Vec<Expr>, init: Box<Expr> },
     /// `source.….scan(f, init)` — a *materializing* prefix fold: emit the running accumulator
     /// after each surviving element (`out[k] = acc` after `acc = f(acc, elem)`), starting from
     /// `init`. Yields an owned `array<A>` of survivor length. `elem` is the accumulator scalar
     /// (the output element type, `A`); `func` has type `(A, E) -> A`.
-    ArrayScan { source: Box<Expr>, stages: Vec<Stage>, func: String, init: Box<Expr>, elem: crate::Ty },
+    ArrayScan { source: Box<Expr>, stages: Vec<Stage>, func: String, captures: Vec<Expr>, init: Box<Expr>, elem: crate::Ty },
     /// `a.dot(b)` — the inner product `Σ a[i]*b[i]` of two fixed-length arrays of the same
     /// numeric scalar element and the same (statically known) length. `elem` is that scalar;
     /// the result has type `elem`.
@@ -258,13 +258,13 @@ pub enum ExprKind {
     /// the predicate `func`: those satisfying it, then the rest. The expression `ty` is a tuple
     /// `(array<T>, array<T>)` (`Ty::Tuple`); `elem` is the element scalar. One fused loop fills
     /// both buffers (no intermediate array).
-    ArrayPartition { source: Box<Expr>, stages: Vec<Stage>, func: String, elem: crate::Ty },
+    ArrayPartition { source: Box<Expr>, stages: Vec<Stage>, func: String, captures: Vec<Expr>, elem: crate::Ty },
     /// `source.….par_map(f)` — apply the **Pure** function `func` to each (post-stage) element
     /// and materialize the results into an owned `array<R>` (`elem` = `R`). Semantically a
     /// data-parallel map; the first cut lowers to the sequential collect loop (`map(f)` +
     /// `to_array`), with real thread-parallel execution a runtime follow-up. `func` is required to
     /// be Pure (checked in the parallelism pass over the full call graph).
-    ArrayParMap { source: Box<Expr>, stages: Vec<Stage>, func: String, elem: crate::Ty },
+    ArrayParMap { source: Box<Expr>, stages: Vec<Stage>, func: String, captures: Vec<Expr>, elem: crate::Ty },
     /// `arr.chunks(n)` — split `source` (an array/slice of primitive `elem`) into sub-slices of
     /// length `n` (the last may be shorter), yielding an owned `array<slice<elem>>` whose elements
     /// borrow `source`. The unit of chunk parallelism (`draft.md` §11). `n` is an `i64`.

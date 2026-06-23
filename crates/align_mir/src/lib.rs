@@ -808,14 +808,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let init = Operand::Const(Const::Int(0, i64_ty()));
             lower_array_reduce(b, source, stages, i64_ty(), init, Reducer::Count)
         }
-        hir::ExprKind::ArrayReduce { source, stages, func, init } => {
+        hir::ExprKind::ArrayReduce { source, stages, func, captures, init } => {
             let init_op = lower_expr(b, init);
-            lower_array_reduce(b, source, stages, e.ty, init_op, Reducer::Fold(func.clone()))
+            lower_array_reduce(b, source, stages, e.ty, init_op, Reducer::Fold { func: func.clone(), captures: captures.clone() })
         }
-        hir::ExprKind::ArrayAnyAll { source, stages, func, all } => {
+        hir::ExprKind::ArrayAnyAll { source, stages, func, captures, all } => {
             // bool accumulator: `all` seeds true (&&-fold), `any` seeds false (||-fold).
             let init = Operand::Const(Const::Bool(*all));
-            lower_array_reduce(b, source, stages, Ty::Bool, init, Reducer::AnyAll { func: func.clone(), all: *all })
+            lower_array_reduce(b, source, stages, Ty::Bool, init, Reducer::AnyAll { func: func.clone(), captures: captures.clone(), all: *all })
         }
         hir::ExprKind::ArrayMinMax { source, stages, is_max } => {
             // Seed with the element type's extreme so the running `min`/`max` is replaced by the
@@ -826,29 +826,30 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayToArray { source, stages, elem } => {
             lower_array_collect(b, source, stages, *elem, CollectKind::Collect)
         }
-        hir::ExprKind::ArrayScan { source, stages, func, init, elem } => {
+        hir::ExprKind::ArrayScan { source, stages, func, captures, init, elem } => {
             let init_op = lower_expr(b, init);
-            lower_array_collect(b, source, stages, *elem, CollectKind::Scan { func: func.clone(), init: init_op })
+            lower_array_collect(b, source, stages, *elem, CollectKind::Scan { func: func.clone(), init: init_op, captures: captures.clone() })
         }
         hir::ExprKind::ArrayDot { a, b: bex, elem } => lower_array_dot(b, a, bex, *elem),
         hir::ExprKind::ArraySort { source, stages, elem } => lower_array_sort(b, source, stages, *elem),
-        hir::ExprKind::ArrayPartition { source, stages, func, elem } => {
+        hir::ExprKind::ArrayPartition { source, stages, func, captures, elem } => {
             let tuple_id = match e.ty {
                 Ty::Tuple(id) => id,
                 _ => unreachable!("partition result is a tuple"),
             };
-            lower_array_partition(b, source, stages, *elem, func, tuple_id)
+            lower_array_partition(b, source, stages, *elem, func, captures, tuple_id)
         }
-        hir::ExprKind::ArrayParMap { source, stages, func, elem } => {
-            // With no prior stages and a `{ptr,len}` (or fixed scalar-array) source, run in parallel
-            // via the runtime; otherwise (prior stages, struct-array source) fall back to the
+        hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
+            // With no prior stages, a `{ptr,len}` (or fixed scalar-array) source, and no captures,
+            // run in parallel via the runtime; otherwise (prior stages, struct-array source, or a
+            // capturing lambda — the parallel thunk takes no capture context) fall back to the
             // sequential collect loop.
             let elem_in = match source.ty {
                 Ty::Slice(s) | Ty::DynArray(s) | Ty::Array(s, _) => Some(align_sema::scalar_to_ty(s)),
                 Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
                 _ => None,
             };
-            if stages.is_empty() {
+            if stages.is_empty() && captures.is_empty() {
                 if let Some(elem_in) = elem_in {
                     let src = match source.ty {
                         Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => lower_expr(b, source),
@@ -876,9 +877,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     return Operand::Value(v);
                 }
             }
-            // Sequential fallback: append a `map(f)` stage and materialize via the collect loop.
+            // Sequential fallback: append a `map(f)` stage (carrying any captures) and materialize
+            // via the collect loop.
             let mut stages2 = stages.clone();
-            stages2.push(hir::Stage { kind: hir::StageKind::Map { func: func.clone(), captures: Vec::new() }, out_ty: *elem });
+            stages2.push(hir::Stage { kind: hir::StageKind::Map { func: func.clone(), captures: captures.clone() }, out_ty: *elem });
             lower_array_collect(b, source, &stages2, *elem, CollectKind::Collect)
         }
         hir::ExprKind::ArrayChunks { source, n, elem } => {
@@ -1110,10 +1112,11 @@ enum Reducer {
     Sum,
     /// `count`: `acc + 1` (element value ignored).
     Count,
-    /// `reduce(f, init)`: `f(acc, element)`.
-    Fold(String),
-    /// `any(p)` / `all(p)`: `acc || p(element)` / `acc && p(element)`.
-    AnyAll { func: String, all: bool },
+    /// `reduce(f, init)`: `f(acc, element)`. `captures` are a lifted lambda's captured values,
+    /// passed after the `(acc, element)` arguments.
+    Fold { func: String, captures: Vec<hir::Expr> },
+    /// `any(p)` / `all(p)`: `acc || p(element)` / `acc && p(element)`. `captures` as `Fold`.
+    AnyAll { func: String, captures: Vec<hir::Expr>, all: bool },
     /// `min` / `max`: keep `element` when it is smaller / larger than `acc`.
     MinMax { is_max: bool },
 }
@@ -1414,15 +1417,20 @@ fn lower_array_reduce(
                 b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
             }
             // `reduce`: acc = f(acc, cur).
-            Reducer::Fold(func) => {
+            Reducer::Fold { func, captures } => {
                 let cur = cur.expect("reduce needs a scalar element");
-                b.push(Stmt::Let(next, Rvalue::Call(func.clone(), vec![Operand::Value(a), cur])));
+                let mut args = vec![Operand::Value(a), cur];
+                for c in captures {
+                    args.push(lower_expr(b, c));
+                }
+                b.push(Stmt::Let(next, Rvalue::Call(func.clone(), args)));
             }
             // `any`/`all`: t = p(cur); acc = acc || t  /  acc && t.
-            Reducer::AnyAll { func, all } => {
+            Reducer::AnyAll { func, captures, all } => {
                 let cur = cur.expect("any/all needs a scalar element");
                 let t = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(t, Rvalue::Call(func.clone(), vec![cur])));
+                let args = stage_call_args(b, cur, captures);
+                b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
                 let op = if *all { BinOp::And } else { BinOp::Or };
                 b.push(Stmt::Let(next, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
             }
@@ -1457,8 +1465,9 @@ enum CollectKind {
     /// `to_array`: append the element itself.
     Collect,
     /// `scan(f, init)`: thread an accumulator (`acc = f(acc, element)`, seeded with `init`) and
-    /// append the running accumulator.
-    Scan { func: String, init: Operand },
+    /// append the running accumulator. `captures` are a lifted lambda's captured values, passed
+    /// after the `(acc, element)` arguments.
+    Scan { func: String, init: Operand, captures: Vec<hir::Expr> },
 }
 
 /// `source.….to_array()` / `.scan(f, init)` — the fused loop, but each surviving element is
@@ -1604,11 +1613,15 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
     // element; for `scan` it is the updated accumulator `acc = f(acc, element)`.
     let cur = cur.expect("to_array/scan needs a scalar element");
     let value = match (&kind, scan_acc) {
-        (CollectKind::Scan { func, .. }, Some(acc_slot)) => {
+        (CollectKind::Scan { func, captures, .. }, Some(acc_slot)) => {
             let prev = b.fresh_value(elem);
             b.push(Stmt::Let(prev, Rvalue::Load(acc_slot)));
             let folded = b.fresh_value(elem);
-            b.push(Stmt::Let(folded, Rvalue::Call(func.clone(), vec![Operand::Value(prev), cur])));
+            let mut args = vec![Operand::Value(prev), cur];
+            for c in captures {
+                args.push(lower_expr(b, c));
+            }
+            b.push(Stmt::Let(folded, Rvalue::Call(func.clone(), args)));
             b.push(Stmt::Store(acc_slot, Operand::Value(folded)));
             Operand::Value(folded)
         }
@@ -1654,6 +1667,7 @@ fn lower_array_partition(
     stages: &[hir::Stage],
     elem: Ty,
     pred_func: &str,
+    pred_captures: &[hir::Expr],
     tuple_id: u32,
 ) -> Operand {
     let arena = b.arenas.last().copied();
@@ -1775,7 +1789,8 @@ fn lower_array_partition(
     // Split: pred = p(element); true → out_a[acc_a++] = element, false → out_b[acc_b++] = element.
     let cur = cur.expect("partition needs a scalar element");
     let pred = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(pred, Rvalue::Call(pred_func.to_string(), vec![cur.clone()])));
+    let pred_args = stage_call_args(b, cur.clone(), pred_captures);
+    b.push(Stmt::Let(pred, Rvalue::Call(pred_func.to_string(), pred_args)));
     let to_a = b.new_block();
     let to_b = b.new_block();
     b.terminate(Term::Branch(Operand::Value(pred), to_a, to_b));
