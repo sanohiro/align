@@ -1223,7 +1223,6 @@ struct TgRun {
     slot: *mut u8,
 }
 unsafe impl Send for TgRun {}
-unsafe impl Sync for TgRun {}
 
 /// Run every registered task **in parallel** — spawn a worker thread per task, then join them all
 /// (fork-join). All allocations happened at `spawn` time (on this thread), so no thread mutates
@@ -1251,10 +1250,16 @@ pub extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> i32 {
             })
             .collect();
         // Join all (the scope joins even on panic); the first nonzero code is the group's error.
+        // A worker panic must not be swallowed (that would falsely report success and then read an
+        // unwritten slot) — re-raise it on the joining thread.
         for h in handles {
-            let code = h.join().unwrap_or(0);
-            if first_err == 0 && code != 0 {
-                first_err = code;
+            match h.join() {
+                Ok(code) => {
+                    if first_err == 0 && code != 0 {
+                        first_err = code;
+                    }
+                }
+                Err(payload) => std::panic::resume_unwind(payload),
             }
         }
     });

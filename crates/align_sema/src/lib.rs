@@ -2766,6 +2766,8 @@ impl<'a, 't> Checker<'a, 't> {
         let is_prim = |s: Scalar| matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Unit | Scalar::ErrCode);
         let (ok, fallible) = match self.finalize(ret) {
             Ty::Result(o, Scalar::ErrCode) if is_prim(o) => (o, true),
+            // A type error in the lambda body was already reported — don't cascade.
+            Ty::Error => return err,
             other => match ty_to_scalar(other) {
                 Some(s) if is_prim(s) => (s, false),
                 _ => {
@@ -4827,6 +4829,10 @@ impl<'a, 't> Checker<'a, 't> {
         let v = self.check_expr(inner, inner_expected);
         // `wait()?` on a fallible task_group: control only continues past the `?` if no task failed
         // (the `Err` was propagated), so every task succeeded → `get()` is now safe (slice ④c-2).
+        // Recognised when `?` is applied directly to `wait()` (`wait()?`, also `w := wait()?`);
+        // binding the raw `Result` first and unwrapping the local later (`w := wait(); w?`) is a
+        // sound over-restriction — `get()` would still be rejected. (Indirect unwrap is a later,
+        // local-tracking refinement.)
         if matches!(v.kind, ExprKind::Wait) {
             if let Some(w) = self.wait_state.last_mut() {
                 *w = true;
