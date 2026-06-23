@@ -111,6 +111,9 @@ pub enum Rvalue {
     /// `Option<int_ty>` (`None` on overflow). Lowers to the LLVM `{s,u}OP.sat` / `{s,u}OP.with.overflow`
     /// intrinsics (signedness from `int_ty`).
     IntArith { op: BinOp, mode: align_sema::ArithMode, int_ty: Ty, a: Operand, b: Operand },
+    /// A scalar math builtin (`core.math`): `abs` (1 operand) / `min` / `max` (2). `ty` is the
+    /// numeric operand/result type; lowers to the matching LLVM intrinsic (signedness/float from `ty`).
+    MathOp { fn_: align_sema::MathFn, ty: Ty, operands: Vec<Operand> },
     Call(String, Vec<Operand>),
     /// Load field `index` from the struct in `slot`.
     Field(Slot, u32),
@@ -670,6 +673,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let bb = lower_expr(b, rhs);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::IntArith { op: *op, mode: *mode, int_ty, a, b: bb }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::MathOp { fn_, operands } => {
+            let ty = operands[0].ty;
+            let ops: Vec<Operand> = operands.iter().map(|o| lower_expr(b, o)).collect();
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::MathOp { fn_: *fn_, ty, operands: ops }));
             Operand::Value(v)
         }
         hir::ExprKind::Call { func, args } => {

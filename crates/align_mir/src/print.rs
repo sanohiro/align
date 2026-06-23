@@ -100,6 +100,15 @@ fn rvalue_str(rv: &Rvalue) -> String {
             };
             format!("{m}({} {} {} : {})", operand_str(a), binop_str(*op), operand_str(b), ty_name(*int_ty))
         }
+        Rvalue::MathOp { fn_, ty, operands } => {
+            let f = match fn_ {
+                align_sema::MathFn::Abs => "abs",
+                align_sema::MathFn::Min => "min",
+                align_sema::MathFn::Max => "max",
+            };
+            let a: Vec<String> = operands.iter().map(operand_str).collect();
+            format!("{f}({}) : {}", a.join(", "), ty_name(*ty))
+        }
         Rvalue::Call(name, args) => {
             let a: Vec<String> = args.iter().map(operand_str).collect();
             format!("call {name}({})", a.join(", "))

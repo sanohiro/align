@@ -705,6 +705,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
         CodegenError::Lowering(e.to_string())
     }
 
+    /// Find + declare + call an overloaded LLVM intrinsic by name, with the given overload types
+    /// and call arguments.
+    fn call_intrinsic(
+        &self,
+        name: &str,
+        overloads: &[BasicTypeEnum<'c>],
+        args: &[inkwell::values::BasicMetadataValueEnum<'c>],
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let intr = Intrinsic::find(name).ok_or_else(|| self.err(format!("intrinsic {name} not found")))?;
+        let f = intr
+            .get_declaration(self.module, overloads)
+            .ok_or_else(|| self.err(format!("could not declare intrinsic {name}")))?;
+        self.builder
+            .build_call(f, args, "intr")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| self.err(format!("intrinsic {name} returned no value")))
+    }
+
     /// Find + declare + call an overloaded binary integer intrinsic (`llvm.sadd.sat`,
     /// `llvm.umul.with.overflow`, …) on `int_ty`, returning its result value (`iN` for `.sat`,
     /// `{ iN, i1 }` for `.with.overflow`).
@@ -1085,6 +1105,42 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|e| self.err(e))?
                             .into_struct_value()
                             .into()
+                    }
+                }
+            }
+            Rvalue::MathOp { fn_, ty, operands } => {
+                let is_float = matches!(ty, Ty::Float(_));
+                let signed = is_signed(*ty);
+                let overload = scalar_type(self.ctx, *ty, self.struct_types);
+                let ops: Vec<BasicValueEnum> = operands.iter().map(|o| self.operand(o)).collect();
+                match fn_ {
+                    align_sema::MathFn::Abs => {
+                        if is_float {
+                            self.call_intrinsic("llvm.fabs", &[overload], &[ops[0].into()])?
+                        } else if signed {
+                            // llvm.abs.iN(x, is_int_min_poison=false): INT_MIN.abs() = INT_MIN (defined wrap).
+                            let no_poison = self.ctx.bool_type().const_zero();
+                            self.call_intrinsic("llvm.abs", &[overload], &[ops[0].into(), no_poison.into()])?
+                        } else {
+                            // Unsigned abs is the identity.
+                            ops[0]
+                        }
+                    }
+                    align_sema::MathFn::Min | align_sema::MathFn::Max => {
+                        let is_max = matches!(fn_, align_sema::MathFn::Max);
+                        let name = if is_float {
+                            // `minimum`/`maximum` (IEEE 754-2019), not `minnum`/`maxnum`: they
+                            // propagate NaN and order ±0 deterministically — consistent across
+                            // targets (Align values predictable, identical-across-builds results).
+                            if is_max { "llvm.maximum" } else { "llvm.minimum" }
+                        } else if signed {
+                            if is_max { "llvm.smax" } else { "llvm.smin" }
+                        } else if is_max {
+                            "llvm.umax"
+                        } else {
+                            "llvm.umin"
+                        };
+                        self.call_intrinsic(name, &[overload], &[ops[0].into(), ops[1].into()])?
                     }
                 }
             }
