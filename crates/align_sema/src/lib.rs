@@ -2584,22 +2584,24 @@ impl<'a, 't> Checker<'a, 't> {
     /// `f(args)` where `f` is a `Ty::Fn` local — an indirect call through a function value.
     fn check_call_fn_value(&mut self, lid: LocalId, fid: u32, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let ft = self.fn_types[fid as usize].clone();
-        let param_tys: Vec<Ty> = ft.params.iter().map(|s| scalar_to_ty(*s)).collect();
-        let ret = scalar_to_ty(ft.ret);
-        if args.len() != param_tys.len() {
+        // Clone only the parameter scalars (needed across the `&mut self` `check_expr` calls);
+        // the per-arg LLVM type is computed in the loop, with no intermediate `Vec<Ty>`.
+        let params = self.fn_types[fid as usize].params.clone();
+        let ret = scalar_to_ty(self.fn_types[fid as usize].ret);
+        if args.len() != params.len() {
             self.diags.error(
-                format!("this function value expects {} argument(s), got {}", param_tys.len(), args.len()),
+                format!("this function value expects {} argument(s), got {}", params.len(), args.len()),
                 span,
             );
             return err;
         }
         let mut checked = Vec::with_capacity(args.len());
-        for (a, pt) in args.iter().zip(&param_tys) {
-            let e = self.check_expr(a, Some(*pt));
-            if e.ty != Ty::Error && self.resolve(e.ty) != *pt {
+        for (a, p) in args.iter().zip(&params) {
+            let pt = scalar_to_ty(*p);
+            let e = self.check_expr(a, Some(pt));
+            if e.ty != Ty::Error && self.resolve(e.ty) != pt {
                 self.diags.error(
-                    format!("argument type mismatch: expected {}, got {}", ty_name(*pt), ty_name(e.ty)),
+                    format!("argument type mismatch: expected {}, got {}", ty_name(pt), ty_name(e.ty)),
                     e.span,
                 );
             }

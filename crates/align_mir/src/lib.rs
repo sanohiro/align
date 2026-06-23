@@ -697,8 +697,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let c = lower_expr(b, callee);
             // The function type for the indirect call comes from the (sema-checked) arg types and
             // the call's result type — no signature table is threaded into MIR.
-            let param_tys: Vec<Ty> = args.iter().map(|a| a.ty).collect();
-            let ops: Vec<Operand> = args.iter().map(|a| lower_expr(b, a)).collect();
+            let (param_tys, ops): (Vec<Ty>, Vec<Operand>) =
+                args.iter().map(|a| (a.ty, lower_expr(b, a))).unzip();
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: c, args: ops, param_tys, ret_ty: e.ty }));
             Operand::Value(v)
