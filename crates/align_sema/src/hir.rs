@@ -23,6 +23,7 @@ pub enum ArithMode {
 }
 
 /// A scalar math builtin ([`ExprKind::MathOp`]) — a method on a numeric value (`core.math`).
+/// `Abs`/`Min`/`Max` accept any numeric type; the rest are **float-only**.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MathFn {
     /// `x.abs()` — absolute value (signed int / float; identity on unsigned).
@@ -31,6 +32,18 @@ pub enum MathFn {
     Min,
     /// `a.max(b)` — the larger of two numbers (pairwise).
     Max,
+    /// `x.sqrt()` — square root (float).
+    Sqrt,
+    /// `x.floor()` — round toward -∞ (float).
+    Floor,
+    /// `x.ceil()` — round toward +∞ (float).
+    Ceil,
+    /// `x.round()` — round to nearest, ties away from zero (float).
+    Round,
+    /// `x.trunc()` — round toward zero (float).
+    Trunc,
+    /// `b.pow(e)` — `b` raised to `e` (float).
+    Pow,
 }
 
 #[derive(Clone, Debug)]

@@ -1,12 +1,16 @@
-// Scalar math methods (core.math): abs / min / max on any numeric value.
-// `a.min(b)` is the pairwise minimum (distinct from the array reduction `arr.min()`).
+// Scalar math methods (core.math): abs / min / max on any numeric value; sqrt / floor / ceil /
+// round / trunc / pow on floats. `a.min(b)` is the pairwise minimum (distinct from the array
+// reduction `arr.min()`).
 fn main() -> Result<(), Error> {
   x: i32 := -42
-  print(x.abs())        // 42
-  print((3).min(7))     // 3
-  print((3).max(7))     // 7
+  print(x.abs())         // 42
+  print((3).min(7))      // 3
+  print((3).max(7))      // 7
 
   f: f64 := -2.5
-  print(f.abs())        // 2.5
+  print(f.abs())         // 2.5
+  print((2.0).sqrt())    // 1.4142135623730951
+  print((3.7).floor())   // 3.0
+  print((2.0).pow(10.0)) // 1024.0
   return Ok(())
 }
