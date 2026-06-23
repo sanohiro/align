@@ -857,6 +857,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> Option<Type> {
+        // A function type `fn(T, U) -> R` (a higher-order-function parameter).
+        if self.at(&TokKind::Fn) {
+            let start = self.span();
+            self.bump();
+            self.expect(&TokKind::LParen, "'('");
+            let mut params = Vec::new();
+            while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
+                params.push(self.parse_type()?);
+                if !self.eat(&TokKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokKind::RParen, "')'");
+            self.expect(&TokKind::Arrow, "'->'");
+            let ret = Box::new(self.parse_type()?);
+            let span = start.merge(self.prev_span());
+            return Some(Type::Fn { params, ret, span });
+        }
         // A parenthesized type: `()` = unit, `(T)` = grouping, `(T, U, ...)` = tuple.
         if self.at(&TokKind::LParen) {
             let start = self.span();
