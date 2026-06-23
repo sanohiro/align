@@ -52,9 +52,16 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    function value (named fn, lambda, or capturing closure) can be **passed** to a function
    (`fn apply(f: fn(i64)->i64, x: i64) = f(x)`). Sound with the frame-local env: the closure's env
    outlives the call. A fn-typed **return** is rejected (it would carry a frame env out of the
-   frame); struct fields already reject `Ty::Fn`. Next: **④ `task_group`** — the first *escaping*
-   consumer, where the env moves to the enclosing region (per the settled design); a fn-typed
-   return then becomes possible too.
+   frame); struct fields already reject `Ty::Fn`. Next: **④ `task_group`** (`draft.md` §11) — the
+   structured concurrency scope. It uses the **region-owned env**: each `spawn` snapshots its
+   captures into a **fresh environment in the `task_group` region** (an arena-like region freed at
+   scope end). The ②b-2 frame-local env (one hoisted slot per closure site) cannot back a spawned
+   closure — a `spawn` in a loop would reuse that slot, so a deferred task reads the final value
+   and a concurrent task races the next iteration (this is why the settled design specified the
+   region env; `spawn` is the escape that triggers it). Sub-slices: **④a** `task_group {}` + the
+   task region + `spawn(fn{…}) -> Task<R>` (fresh region env) + `wait()` + `.get()` (with
+   `get`-before-`wait` a compile-time error), deferred-sequential execution; **④b** real threads
+   (reuse the `par_map` runtime); **④c** the `wait()?` error boundary.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
