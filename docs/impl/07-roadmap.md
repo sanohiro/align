@@ -95,7 +95,7 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    the genuine gaps — everything else they raised is either std-adjacent, perf-tier, or off-philosophy
    (see the "not adopted" note below). Build in order — each unblocks the next:
    - **4a. Sum types + exhaustive `match`** *(design SETTLED, `open-questions.md`)* — the keystone.
-     Keyword-less `Name { Circle(f32), Rect(f32,f32) }`, `Type.Variant` construction, a
+     Keyword-less `Name { Circle(f32), Rect(f32, f32) }`, `Type.Variant` construction, a
      mandatory-exhaustive `match` expression; works on `Option`/`Result` too. The OOP-free way to
      model variants, AI-friendly (exhaustiveness), and lower-risk than generics. Slices S1–S4 in
      `open-questions.md`.
