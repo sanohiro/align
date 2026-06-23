@@ -13,7 +13,7 @@ use std::path::Path;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{payload_is_move, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty};
+use align_sema::{payload_is_move, ty_to_scalar, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty};
 
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
@@ -182,7 +182,7 @@ fn build_module<'c>(
     );
     funcs.insert(
         "tg_wait".to_string(),
-        module.add_function("align_rt_tg_wait", ctx.void_type().fn_type(&[ptr.into()], false), None),
+        module.add_function("align_rt_tg_wait", ctx.i32_type().fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
         "tg_end".to_string(),
@@ -532,19 +532,24 @@ fn build_module<'c>(
     // spawned closure (`thunk(env) -> R`) and stores the result into `slot` (the typed store is
     // why it is generated, not in the runtime). ④b-1 calls it sequentially at `wait`; ④b-2 runs
     // it on a worker thread.
-    let mut tramp_rs: std::collections::BTreeMap<String, Ty> = std::collections::BTreeMap::new();
+    // A trampoline per (result type `R`, fallibility): `tramp(thunk, env, slot) -> i32` runs the
+    // spawned closure and writes its result into `slot`, returning an error code (`0` = ok). A
+    // fallible closure returns `Result<R, Error>`; the trampoline stores the `Ok` payload and
+    // returns `0`, or returns the `Err` code (which `tg_wait` surfaces to `wait()?`).
+    let lower = |e: inkwell::builder::BuilderError| CodegenError::Lowering(e.to_string());
+    let i32t = ctx.i32_type();
+    let mut tramp_keys: std::collections::BTreeMap<String, (Ty, bool)> = std::collections::BTreeMap::new();
     for f in &program.fns {
         for b in &f.blocks {
             for s in &b.stmts {
-                if let Stmt::Let(_, Rvalue::SpawnTask { r, .. }) = s {
-                    tramp_rs.insert(task_tramp_key(*r), *r);
+                if let Stmt::Let(_, Rvalue::SpawnTask { r, fallible, .. }) = s {
+                    tramp_keys.insert(spawn_tramp_key(*r, *fallible), (*r, *fallible));
                 }
             }
         }
     }
-    for (key, r) in &tramp_rs {
-        let rt = scalar_type(ctx, *r, &struct_types);
-        let fn_ty = ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false);
+    for (key, (r, fallible)) in &tramp_keys {
+        let fn_ty = i32t.fn_type(&[ptr.into(), ptr.into(), ptr.into()], false);
         let tramp = module.add_function(&format!("tramp${key}"), fn_ty, None);
         let bb = ctx.append_basic_block(tramp, "entry");
         let tb = ctx.create_builder();
@@ -552,24 +557,49 @@ fn build_module<'c>(
         let thunk = tramp.get_nth_param(0).unwrap().into_pointer_value();
         let env = tramp.get_nth_param(1).unwrap();
         let slot = tramp.get_nth_param(2).unwrap().into_pointer_value();
-        if *r == Ty::Unit {
-            // A `()`-returning closure is `void(ptr)` in LLVM (not `i32(ptr)`), so it must be
-            // called with a void signature; the slot (i32-sized) gets a dummy value.
-            let clos_fn_ty = ctx.void_type().fn_type(&[ptr.into()], false);
-            tb.build_indirect_call(clos_fn_ty, thunk, &[env.into()], "")
-                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
-            tb.build_store(slot, ctx.i32_type().const_zero()).map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        if *fallible {
+            // The closure returns `Result<R, Error>` = `{ i8 tag, R ok, i32 err }` (tag 0 = Ok).
+            let ok_s = ty_to_scalar(*r).ok_or_else(|| CodegenError::Lowering("fallible task Ok is not a scalar".into()))?;
+            let result_ty = result_struct_type(ctx, ok_s, Scalar::ErrCode, &struct_types);
+            let agg = tb
+                .build_indirect_call(result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
+                .map_err(lower)?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?
+                .into_struct_value();
+            let tag = tb.build_extract_value(agg, 0, "tag").map_err(lower)?.into_int_value();
+            let ok = tb.build_extract_value(agg, 1, "ok").map_err(lower)?;
+            let err = tb.build_extract_value(agg, 2, "err").map_err(lower)?;
+            let is_err = tb
+                .build_int_compare(IntPredicate::EQ, tag, ctx.i8_type().const_int(1, false), "iserr")
+                .map_err(lower)?;
+            let err_bb = ctx.append_basic_block(tramp, "err");
+            let ok_bb = ctx.append_basic_block(tramp, "ok");
+            tb.build_conditional_branch(is_err, err_bb, ok_bb).map_err(lower)?;
+            tb.position_at_end(err_bb);
+            tb.build_return(Some(&err)).map_err(lower)?;
+            tb.position_at_end(ok_bb);
+            tb.build_store(slot, ok).map_err(lower)?;
+            tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
+        } else if *r == Ty::Unit {
+            // A `()`-returning closure is `void(ptr)` in LLVM (not `i32(ptr)`); call it with a void
+            // signature and store a dummy into the (i32-sized) slot.
+            tb.build_indirect_call(ctx.void_type().fn_type(&[ptr.into()], false), thunk, &[env.into()], "")
+                .map_err(lower)?;
+            tb.build_store(slot, i32t.const_zero()).map_err(lower)?;
+            tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else {
-            let clos_fn_ty = rt.fn_type(&[ptr.into()], false);
+            let rt = scalar_type(ctx, *r, &struct_types);
             let res = tb
-                .build_indirect_call(clos_fn_ty, thunk, &[env.into()], "r")
-                .map_err(|e| CodegenError::Lowering(e.to_string()))?
+                .build_indirect_call(rt.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
+                .map_err(lower)?
                 .try_as_basic_value()
                 .basic()
                 .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?;
-            tb.build_store(slot, res).map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            tb.build_store(slot, res).map_err(lower)?;
+            tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         }
-        tb.build_return(None).map_err(|e| CodegenError::Lowering(e.to_string()))?;
         funcs.insert(format!("tramp${key}"), tramp);
     }
 
@@ -799,6 +829,11 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
 }
 
 /// Size/alignment (bytes) of a scalar's in-memory representation.
+/// A symbol-safe key for a spawn trampoline, by result type `R` and fallibility (`tramp$<key>`).
+fn spawn_tramp_key(ty: Ty, fallible: bool) -> String {
+    format!("{}{}", task_tramp_key(ty), if fallible { "$f" } else { "" })
+}
+
 /// A symbol-safe key for a spawn result type `R`, naming its trampoline (`tramp$<key>`).
 fn task_tramp_key(ty: Ty) -> String {
     match ty {
@@ -1501,7 +1536,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 cs.try_as_basic_value().basic().expect("tg_begin returns a pointer")
             }
-            Rvalue::SpawnTask { tg, closure, capture_tys, r } => {
+            Rvalue::SpawnTask { tg, closure, capture_tys, r, fallible } => {
                 let i64t = self.ctx.i64_type();
                 let tgv = self.operand(tg).into_pointer_value();
                 let clos = self.operand(closure).into_struct_value();
@@ -1540,12 +1575,49 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(rbytes, false).into(), i64t.const_int(ralign, false).into()], "slot")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tg_alloc returns a pointer").into_pointer_value();
-                // The per-`R` trampoline runs the closure and writes the slot at `wait`.
-                let tramp = self.funcs[&format!("tramp${}", task_tramp_key(*r))].as_global_value().as_pointer_value();
+                // The per-(R, fallibility) trampoline runs the closure and writes the slot at `wait`.
+                let tramp = self.funcs[&format!("tramp${}", spawn_tramp_key(*r, *fallible))].as_global_value().as_pointer_value();
                 self.builder
                     .build_call(self.funcs["tg_register"], &[tgv.into(), tramp.into(), thunk.into(), env.into(), slot.into()], "")
                     .map_err(|e| self.err(e))?;
                 slot.into()
+            }
+            Rvalue::TgWaitResult { tg, fallible } => {
+                let tgv = self.operand(tg).into();
+                let code = self
+                    .builder
+                    .build_call(self.funcs["tg_wait"], &[tgv], "tgwait")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("tg_wait returns an i32")
+                    .into_int_value();
+                if *fallible {
+                    // Build `Result<(), Error>` = `{ i8 tag, () ok, i32 err }` directly: tag =
+                    // `code != 0` (0 = Ok, 1 = Err), err = code. No branch — `?`/`Try` branches later.
+                    let Ty::Result(o, e) = result_ty else {
+                        return Err(self.err("wait result is not a Result"));
+                    };
+                    let rty = result_struct_type(self.ctx, o, e, self.struct_types);
+                    let is_err = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, code, self.ctx.i32_type().const_zero(), "iserr")
+                        .map_err(|e| self.err(e))?;
+                    let tag = self.builder.build_int_z_extend(is_err, self.ctx.i8_type(), "tag").map_err(|e| self.err(e))?;
+                    let a0 = self
+                        .builder
+                        .build_insert_value(rty.const_zero(), tag, 0, "wtag")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value();
+                    self.builder
+                        .build_insert_value(a0, code, 2, "werr")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value()
+                        .into()
+                } else {
+                    // Infallible group: ignore the code, yield `()` (an i32, like other unit values).
+                    self.ctx.i32_type().const_zero().into()
+                }
             }
             Rvalue::HeapAlloc(handle, init) => {
                 // A `box<T>` (heap.new) or a `Task<R>` (spawn) — both a boxed scalar in an arena.

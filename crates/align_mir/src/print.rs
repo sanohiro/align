@@ -146,7 +146,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::ResultUnwrapErr(op) => format!("unwrap_err({})", operand_str(op)),
         Rvalue::ArenaBegin => "arena_begin".to_string(),
         Rvalue::TgBegin => "tg_begin".to_string(),
-        Rvalue::SpawnTask { closure, .. } => format!("spawn_task {}", operand_str(closure)),
+        Rvalue::SpawnTask { closure, fallible, .. } => {
+            format!("spawn_task{} {}", if *fallible { " fallible" } else { "" }, operand_str(closure))
+        }
+        Rvalue::TgWaitResult { tg, fallible } => {
+            format!("tg_wait{} {}", if *fallible { " fallible" } else { "" }, operand_str(tg))
+        }
         Rvalue::HeapAlloc(h, init) => format!("heap_alloc({}, {})", operand_str(h), operand_str(init)),
         Rvalue::BoxGet(op) => format!("box_get({})", operand_str(op)),
         Rvalue::BoxClone(h, src) => format!("box_clone({}, {})", operand_str(h), operand_str(src)),

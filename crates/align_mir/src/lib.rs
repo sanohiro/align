@@ -159,7 +159,11 @@ pub enum Rvalue {
     /// task-group region, allocate the result slot there, and register the task. Yields the slot
     /// pointer (the `Task<R>` handle). `tg` = the task-group handle, `closure` = the `{fn, env}`
     /// value, `capture_tys` give the env layout (empty = non-capturing), `r` = the result scalar.
-    SpawnTask { tg: Operand, closure: Operand, capture_tys: Vec<Ty>, r: Ty },
+    SpawnTask { tg: Operand, closure: Operand, capture_tys: Vec<Ty>, r: Ty, fallible: bool },
+    /// `wait()` as a value: join the task_group and yield its outcome. `fallible` → build
+    /// `Result<(), Error>` from the runtime's first error code (`Ok(())` if `0`, else `Err(code)`);
+    /// otherwise yields `()`.
+    TgWaitResult { tg: Operand, fallible: bool },
     /// `heap.new(init)` in an arena: bump-allocate, store `init`, yield the `box` pointer.
     /// First operand is the arena handle, second is the initial value.
     HeapAlloc(Operand, Operand),
@@ -798,17 +802,17 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // ④b-1b (deferred): `spawn(closure)` snapshots the closure's captures into a fresh env in
         // the task-group region and registers the task; it runs at `wait`. The `Task<R>` handle is
         // the task's result slot. The closure's captures give the env layout.
-        hir::ExprKind::Spawn(inner) => {
+        hir::ExprKind::Spawn { closure, fallible } => {
             let Ty::Task(s) = e.ty else { unreachable!("spawn result is a Task") };
             let r_ty = align_sema::scalar_to_ty(s);
-            let capture_tys: Vec<Ty> = match &inner.kind {
+            let capture_tys: Vec<Ty> = match &closure.kind {
                 hir::ExprKind::Closure { captures, .. } => captures.iter().map(|c| c.ty).collect(),
                 _ => Vec::new(),
             };
-            let closure = lower_expr(b, inner);
+            let clos = lower_expr(b, closure);
             let tg = Operand::Value(*b.task_groups.last().expect("spawn outside a task_group"));
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::SpawnTask { tg, closure, capture_tys, r: r_ty }));
+            b.push(Stmt::Let(v, Rvalue::SpawnTask { tg, closure: clos, capture_tys, r: r_ty, fallible: *fallible }));
             Operand::Value(v)
         }
         // `t.get()` reads the result out of the task's slot.
@@ -821,8 +825,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `wait()` — run all deferred tasks of the enclosing task_group.
         hir::ExprKind::Wait => {
             let tg = Operand::Value(*b.task_groups.last().expect("wait outside a task_group"));
-            b.push(Stmt::TgWait(tg));
-            Operand::Const(Const::Unit)
+            // A fallible group's `wait()` yields `Result<(), Error>` (built from the runtime's
+            // error code); an infallible group's yields `()`.
+            let fallible = matches!(e.ty, Ty::Result(..));
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::TgWaitResult { tg, fallible }));
+            Operand::Value(v)
         }
         hir::ExprKind::OptionSome(inner) => {
             let op = lower_expr(b, inner);

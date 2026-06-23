@@ -155,6 +155,39 @@ fn else_unwrap_conditional_spawn_rejected() {
 }
 
 #[test]
+fn fallible_tasks_all_ok() {
+    if !backend_available() {
+        return;
+    }
+    // Tasks returning Result<R, Error>; all Ok → wait()? continues, get() yields the Ok values.
+    let src = "fn try_n(n: i64) -> Result<i64, Error> {\n  if n < 0 { return Err(error(7)) }\n  return Ok(n * 2)\n}\nfn main() -> Result<(), Error> {\n  task_group {\n    a := spawn(fn { try_n(5) })\n    b := spawn(fn { try_n(10) })\n    wait()?\n    print(a.get() + b.get())\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-fallible-ok", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n");
+}
+
+#[test]
+fn fallible_task_err_propagates() {
+    if !backend_available() {
+        return;
+    }
+    // One task fails → wait()? propagates its Err out of main → exit code 7, nothing printed.
+    let src = "fn try_n(n: i64) -> Result<i64, Error> {\n  if n < 0 { return Err(error(7)) }\n  return Ok(n * 2)\n}\nfn main() -> Result<(), Error> {\n  task_group {\n    a := spawn(fn { try_n(5) })\n    b := spawn(fn { try_n(-1) })\n    wait()?\n    print(a.get() + b.get())\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-fallible-err", src);
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn fallible_bare_wait_then_get_rejected() {
+    // A fallible group: a bare `wait()` (Err ignored) does not make `get()` safe — needs `wait()?`.
+    assert!(check_errs(
+        "tg-fallible-barewait",
+        "fn ok() -> Result<i64, Error> = Ok(5)\nfn main() -> Result<(), Error> {\n  task_group {\n    a := spawn(fn { ok() })\n    wait()\n    print(a.get())\n  }\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
 fn owned_payload_task_rejected() {
     // ④b-1a: a task result is boxed in the region, so it must be a primitive scalar for now;
     // an owned result (`string`) is rejected (the region drop/borrow handling is a later slice).
