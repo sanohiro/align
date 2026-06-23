@@ -203,6 +203,9 @@ pub enum Ty {
     /// A first-class function value type (`fn(params) -> ret`), indexed into `Program.fn_types`.
     /// A function pointer — Copy, `Static`, no environment (non-capturing functions, slice ①).
     Fn(u32),
+    /// `Task<R>` — a handle to a spawned task's result (`task_group`, slice ④). The payload is a
+    /// scalar. ④a represents it identically to `R` (eager execution); ④b makes it a real future.
+    Task(Scalar),
     Unit,
     /// Type-checking error sentinel (bottom). Distinct from the `Error` *type*
     /// ([`Ty::ErrCode`]).
@@ -510,6 +513,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             scope: Vec::new(),
             ret_hint: Ty::Unit,
             arena_depth: 0,
+            task_group_depth: 0,
             slice_bases: std::collections::HashMap::new(),
             cur_fn: String::new(),
             lifted: Vec::new(),
@@ -770,7 +774,15 @@ impl EffectScan {
                 self.expr(builder);
                 self.expr(arg);
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) => self.block(b),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b),
+            // Spawning / joining concurrent work is an observable effect (the enclosing function
+            // is not pure); the spawned closure's own effects live in its lifted function.
+            ExprKind::Spawn(inner) => {
+                self.impure_direct = true;
+                self.expr(inner);
+            }
+            ExprKind::TaskGet(inner) => self.expr(inner),
+            ExprKind::Wait => self.impure_direct = true,
             ExprKind::TupleIndex { recv, .. } => self.expr(recv),
             ExprKind::Index { recv, index } => {
                 self.expr(recv);
@@ -1201,6 +1213,10 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::Block(b) => self.block(b, depth),
+            // ④a: `task_group` adds no region (eager; `Task<R>` is repr-identical to `R`). Recurse.
+            ExprKind::TaskGroup(b) => self.block(b, depth),
+            ExprKind::Spawn(inner) | ExprKind::TaskGet(inner) => self.walk(inner, depth),
+            ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
                 self.walk(cond, depth);
                 self.block(then, depth);
@@ -1536,7 +1552,9 @@ impl<'a> MoveCheck<'a> {
                 self.expr(fallback, moved, consuming, false);
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
-            ExprKind::Block(b) | ExprKind::Arena(b) => self.block(b, moved, consuming, direct),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b, moved, consuming, direct),
+            ExprKind::Spawn(inner) | ExprKind::TaskGet(inner) => self.expr(inner, moved, false, false),
+            ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
                 self.expr(cond, moved, false, false);
                 // An `if`/`else` arm value is a consuming-but-NOT-direct position: moving a
@@ -1632,6 +1650,9 @@ struct Checker<'a, 't> {
     ret_hint: Ty,
     /// Nesting depth of `arena {}` blocks (0 = not in an arena).
     arena_depth: u32,
+    /// Nesting depth of `task_group {}` blocks (0 = not in one). `spawn`/`wait` are valid only
+    /// inside a `task_group` scope (slice ④).
+    task_group_depth: u32,
     /// For each slice local bound from an array/slice (`s: slice<T> := a`), the **root** buffer
     /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
     /// is caught even though `s` and `a` are different locals.
@@ -2175,6 +2196,20 @@ impl<'a, 't> Checker<'a, 't> {
                 };
                 Expr { kind: ExprKind::Arena(block), ty, span: e.span }
             }
+            ast::ExprKind::TaskGroup(b) => {
+                let diverges = ast_block_diverges(b);
+                self.task_group_depth += 1;
+                let block = self.check_block(b, if diverges { None } else { expected });
+                self.task_group_depth -= 1;
+                let ty = if diverges {
+                    expected.unwrap_or(Ty::Unit)
+                } else {
+                    let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
+                    self.constrain(t, expected, e.span);
+                    t
+                };
+                Expr { kind: ExprKind::TaskGroup(block), ty, span: e.span }
+            }
             ast::ExprKind::StructLit { name, fields } => {
                 // A struct literal is a value expression (constructed, then passed/returned/
                 // stored). The `let` path checks it directly to store fields in place.
@@ -2651,6 +2686,47 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `spawn(fn { … })` — defer a task in the enclosing `task_group`. The argument is a
+    /// `fn() -> R` value (a no-parameter lambda, captures by value); the result is `Task<R>`.
+    fn check_spawn(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if self.task_group_depth == 0 {
+            self.diags.error("'spawn' is only valid inside a `task_group { … }` scope".to_string(), span);
+            return err;
+        }
+        let [arg] = args else {
+            self.diags.error(format!("'spawn' takes one argument (a `fn {{ … }}`), got {}", args.len()), span);
+            return err;
+        };
+        let f = self.check_expr(arg, None);
+        if f.ty == Ty::Error {
+            return err;
+        }
+        let Ty::Fn(fid) = self.resolve(f.ty) else {
+            self.diags.error(format!("'spawn' takes a function value `fn {{ … }}`, got {}", ty_name(f.ty)), arg.span);
+            return err;
+        };
+        let ft = &self.fn_types[fid as usize];
+        if !ft.params.is_empty() {
+            self.diags.error("a spawned task takes no parameters (`spawn(fn { … })`)".to_string(), arg.span);
+            return err;
+        }
+        let r = ft.ret;
+        Expr { kind: ExprKind::Spawn(Box::new(f)), ty: Ty::Task(r), span }
+    }
+
+    /// `wait()` — join all spawned tasks. ④a: a no-op marker (eager execution).
+    fn check_wait(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if self.task_group_depth == 0 {
+            self.diags.error("'wait' is only valid inside a `task_group { … }` scope".to_string(), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        if !args.is_empty() {
+            self.diags.error(format!("'wait' takes no arguments, got {}", args.len()), span);
+        }
+        Expr { kind: ExprKind::Wait, ty: Ty::Unit, span }
+    }
+
     /// `f(args)` where `f` is a `Ty::Fn` local — an indirect call through a function value.
     fn check_call_fn_value(&mut self, lid: LocalId, fid: u32, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -2710,6 +2786,12 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if name == "builder" {
             return self.check_builder_new(args, span);
+        }
+        if name == "spawn" {
+            return self.check_spawn(args, span);
+        }
+        if name == "wait" {
+            return self.check_wait(args, span);
         }
         // An indirect call through a function-value local: `f(args)` where `f: Ty::Fn`.
         if let Some(lid) = self.lookup(&name) {
@@ -4546,10 +4628,12 @@ impl<'a, 't> Checker<'a, 't> {
         }
         match recv_ty {
             Ty::Box(s) => Expr { kind: ExprKind::BoxGet(Box::new(recv)), ty: scalar_to_ty(s), span },
+            // `task.get()` — read a spawned task's result (`task_group`, slice ④).
+            Ty::Task(s) => Expr { kind: ExprKind::TaskGet(Box::new(recv)), ty: scalar_to_ty(s), span },
             Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
             other => {
                 self.diags
-                    .error(format!("'.get()' is only available on box<T>, got {}", ty_name(other)), span);
+                    .error(format!("'.get()' is only available on box<T> or Task<R>, got {}", ty_name(other)), span);
                 Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
             }
         }
@@ -4749,7 +4833,9 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(f);
                 }
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.finalize_block(b),
+            ExprKind::Spawn(inner) | ExprKind::TaskGet(inner) => self.finalize_expr(inner),
+            ExprKind::Wait => {}
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
             | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArraySortBy { source: inner, .. } | ExprKind::ArrayToSlice(inner)
@@ -4899,6 +4985,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
+        Ty::Task(s) => format!("Task<{}>", scalar_name(s)),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }

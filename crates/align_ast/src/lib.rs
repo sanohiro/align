@@ -228,6 +228,10 @@ pub enum ExprKind {
     Try(Box<Expr>),
     /// `arena { ... }` — a region whose allocations are freed in bulk at block end.
     Arena(Block),
+    /// `task_group { ... }` — a structured concurrency scope: `spawn(fn { … })` defers work and
+    /// returns a `Task<R>`; `wait()` joins; `t.get()` reads a result. (`spawn`/`wait`/`get` are
+    /// name-based builtins, like `print`/`heap.new`, valid only inside this scope.)
+    TaskGroup(Block),
     /// `[e1, e2, ...]` — a fixed-length array literal.
     ArrayLit(Vec<Expr>),
     /// `recv[index]` — element access into an array / slice / owned array. Out-of-bounds is a

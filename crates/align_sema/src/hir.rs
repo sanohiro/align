@@ -209,6 +209,16 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `task_group { … }` — a structured concurrency scope (slice ④). ④a lowers it as its block.
+    TaskGroup(Block),
+    /// `spawn(fn { … })` — defer a task; the inner expr is the spawned `fn() -> R` closure value.
+    /// Result is `Task<R>`. ④a (eager): lowers to an immediate indirect call of the closure.
+    Spawn(Box<Expr>),
+    /// `t.get()` — read a spawned task's result. ④a: identity (the `Task<R>` already holds `R`).
+    TaskGet(Box<Expr>),
+    /// `wait()` — join all spawned tasks (the single error boundary, ④c). ④a: a no-op marker
+    /// (eager execution already completed each task at its `spawn`).
+    Wait,
     Call {
         func: String,
         args: Vec<Expr>,

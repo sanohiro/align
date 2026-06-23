@@ -755,6 +755,28 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Block(blk) => {
             lower_block(b, blk).unwrap_or(Operand::Const(Const::Bool(false)))
         }
+        // ④a: `task_group` is just its block (eager execution; no runtime region yet).
+        hir::ExprKind::TaskGroup(blk) => {
+            lower_block(b, blk).unwrap_or(Operand::Const(Const::Bool(false)))
+        }
+        // ④a (eager): `spawn(closure)` calls the (zero-arg) closure immediately; the result is the
+        // `Task<R>` value (represented identically to `R`). ④b makes this a deferred/threaded call.
+        hir::ExprKind::Spawn(inner) => {
+            let closure = lower_expr(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: closure, args: vec![], param_tys: vec![], ret_ty: e.ty }));
+            Operand::Value(v)
+        }
+        // `t.get()` reads the result; in ④a the `Task<R>` already holds `R`, so copy it into an
+        // `R`-typed value (so downstream sees `R`, not `Task<R>`).
+        hir::ExprKind::TaskGet(inner) => {
+            let op = lower_expr(b, inner);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Use(op)));
+            Operand::Value(v)
+        }
+        // `wait()` — a no-op marker in ④a (eager); ④b/④c give it join + error-boundary semantics.
+        hir::ExprKind::Wait => Operand::Const(Const::Bool(false)),
         hir::ExprKind::OptionSome(inner) => {
             let op = lower_expr(b, inner);
             let v = b.fresh_value(e.ty);
@@ -2426,6 +2448,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
+        Ty::Task(_) => "Task".to_string(),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }
