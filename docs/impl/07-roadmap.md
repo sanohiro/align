@@ -41,8 +41,11 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    (`Ty::Fn`, Copy/`Static`, no env), and calling such a local is an indirect call (`f := double;
    f(5)`; scalar signatures). **②a lambda-as-value DONE** — a non-capturing lambda with typed
    parameters (`f := fn x: i32 { x*2 }`) lifts to a function value (params from the annotations,
-   no use site to infer from; captures rejected). Next: **②b captures** (escape → region-owned
-   env), then **③ `task_group`**.
+   no use site to infer from; captures rejected). **②b-1 closure ABI DONE** — a `Ty::Fn` value is
+   now a `{ fn_ptr, env_ptr }` fat pointer with the env-ABI `fn(env, args)`; non-capturing / named
+   functions are wrapped by a thunk `X$fnval(env, args) = X(args)` (env null). Behavior-preserving;
+   the foundation for captures. Next: **②b-2 captures** (env struct + capturing lift, escape →
+   region-owned env), then **③ `task_group`**.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

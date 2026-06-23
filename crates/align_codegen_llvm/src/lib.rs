@@ -403,6 +403,46 @@ fn build_module<'c>(
             None,
         ),
     );
+    // Pass 1b: emit a thunk for each function used as a value (`FnValue`/`FnAddr`). A closure
+    // value has the env-ABI `fn(env, args)`; a non-capturing / named function is wrapped by
+    // `name$fnval(env, args) = name(args)` so all closure callees share that ABI (the env pointer
+    // is null and ignored). Capturing closures (a later slice) instead point at an env-reading fn.
+    let mut thunk_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for f in &program.fns {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Let(_, Rvalue::FnAddr(name)) = s {
+                    thunk_names.insert(name.clone());
+                }
+            }
+        }
+    }
+    for name in &thunk_names {
+        let orig = *funcs
+            .get(name)
+            .ok_or_else(|| CodegenError::Lowering(format!("unknown function {name}")))?;
+        let orig_ty = orig.get_type();
+        let mut params: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
+        params.extend(orig_ty.get_param_types().iter().map(|t| BasicMetadataTypeEnum::from(*t)));
+        let thunk_ty = match orig_ty.get_return_type() {
+            Some(rt) => rt.fn_type(&params, false),
+            None => ctx.void_type().fn_type(&params, false),
+        };
+        let thunk = module.add_function(&format!("{name}$fnval"), thunk_ty, None);
+        let bb = ctx.append_basic_block(thunk, "entry");
+        let tb = ctx.create_builder();
+        tb.position_at_end(bb);
+        let fwd: Vec<inkwell::values::BasicMetadataValueEnum> =
+            thunk.get_params()[1..].iter().map(|p| (*p).into()).collect();
+        let cs = tb.build_call(orig, &fwd, "r").map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        match cs.try_as_basic_value().basic() {
+            Some(v) => tb.build_return(Some(&v)),
+            None => tb.build_return(None),
+        }
+        .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        funcs.insert(format!("{name}$fnval"), thunk);
+    }
+
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
@@ -602,6 +642,13 @@ fn slice_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
     ctx.struct_type(&[ctx.ptr_type(AddressSpace::default()).into(), ctx.i64_type().into()], false)
 }
 
+/// The LLVM representation of a `Ty::Fn` value: a closure `{ fn_ptr, env_ptr }`. All closure
+/// `fn_ptr`s use the env-ABI `fn(env, args)`; `env_ptr` is null for a non-capturing function.
+fn closure_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
+    let p = ctx.ptr_type(AddressSpace::default());
+    ctx.struct_type(&[p.into(), p.into()], false)
+}
+
 /// LLVM type for a function parameter/return (scalars + `Option`/`Result`/`slice`/`str`,
 /// and structs/struct-arrays by value).
 fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnum<'c> {
@@ -609,6 +656,9 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
         Ty::Option(s) => option_struct_type(ctx, s, sx).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx).into(),
         Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => ctx.ptr_type(AddressSpace::default()).into(),
+        // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
+        // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
+        Ty::Fn(_) => closure_struct_type(ctx).into(),
         Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
@@ -1665,17 +1715,39 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Ok(cs.try_as_basic_value().basic());
             }
             Rvalue::FnAddr(name) => {
-                let f = self.funcs.get(name).ok_or_else(|| self.err(format!("unknown function {name}")))?;
-                f.as_global_value().as_pointer_value().into()
+                // A non-capturing function value: `{ thunk_ptr, null_env }`.
+                let thunk = self
+                    .funcs
+                    .get(&format!("{name}$fnval"))
+                    .ok_or_else(|| self.err(format!("no function-value thunk for {name}")))?;
+                let fn_ptr = thunk.as_global_value().as_pointer_value();
+                let null_env = self.ctx.ptr_type(AddressSpace::default()).const_null();
+                let cty = closure_struct_type(self.ctx);
+                let a0 = self
+                    .builder
+                    .build_insert_value(cty.const_zero(), fn_ptr, 0, "cf")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(a0, null_env, 1, "ce")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
             }
             Rvalue::CallIndirect { callee, args, param_tys, ret_ty } => {
-                let ptr = self.operand(callee).into_pointer_value();
-                let param_meta: Vec<BasicMetadataTypeEnum> = param_tys.iter().map(|t| self.llvm_type(*t).into()).collect();
+                // Extract `{ fn_ptr, env_ptr }` and call with the env-ABI `fn(env, args)`.
+                let clos = self.operand(callee).into_struct_value();
+                let fn_ptr = self.builder.build_extract_value(clos, 0, "cf").map_err(|e| self.err(e))?.into_pointer_value();
+                let env = self.builder.build_extract_value(clos, 1, "ce").map_err(|e| self.err(e))?;
+                let mut param_meta: Vec<BasicMetadataTypeEnum> =
+                    vec![self.ctx.ptr_type(AddressSpace::default()).into()];
+                param_meta.extend(param_tys.iter().map(|t| BasicMetadataTypeEnum::from(self.llvm_type(*t))));
                 let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
-                let argv: Vec<_> = args.iter().map(|o| self.operand(o).into()).collect();
+                let mut argv: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env.into()];
+                argv.extend(args.iter().map(|o| inkwell::values::BasicMetadataValueEnum::from(self.operand(o))));
                 let cs = self
                     .builder
-                    .build_indirect_call(fn_ty, ptr, &argv, "icall")
+                    .build_indirect_call(fn_ty, fn_ptr, &argv, "icall")
                     .map_err(|e| self.err(e))?;
                 return Ok(cs.try_as_basic_value().basic());
             }
@@ -1690,7 +1762,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Fn(_) => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
