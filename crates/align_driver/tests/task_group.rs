@@ -54,6 +54,16 @@ fn multiple_capturing_tasks() {
 }
 
 #[test]
+fn double_get_of_move_payload_rejected() {
+    // `Task<R>` inherits `R`'s move-ness: a second `get()` of a `Task<string>` moves the buffer
+    // out twice — caught as use-after-move (prevents a double-free).
+    assert!(check_errs(
+        "tg-double-get",
+        "fn main() -> Result<(), Error> {\n  task_group {\n    s := spawn(fn { \"hi\".clone() })\n    wait()\n    a := s.get()\n    b := s.get()\n    return Ok(())\n  }\n}\n"
+    ));
+}
+
+#[test]
 fn spawn_outside_task_group_rejected() {
     assert!(check_errs(
         "tg-outside",

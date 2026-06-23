@@ -472,6 +472,9 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                 null_moved_source(b, v);
             }
         }
+        // `t.get()` moves an owned result out of the task; null the task slot so its exit `Drop`
+        // doesn't double-free the buffer the gotten value now owns.
+        hir::ExprKind::TaskGet(inner) => null_moved_source(b, inner),
         // A bound owned local moved into a wrapper (`return Ok(xs)` / `Some(xs)` / `Err(xs)`) is
         // consumed by the construction — see through the wrapper to null the source slot, else the
         // local's exit `Drop` double-frees the buffer now owned by the aggregate.

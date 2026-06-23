@@ -293,6 +293,10 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// Whether `ty` is a Move (owned) type — used to reject capturing an owned value into a lambda
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
+    // `Task<R>` shares `R`'s representation (④a), so it captures-as-move exactly when `R` does.
+    if let Ty::Task(s) = ty {
+        return ty_capture_is_move(scalar_to_ty(s), tuples);
+    }
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
@@ -345,6 +349,10 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 /// region is `Static`) — the predicate the drop set is built from. A free-standing owned
 /// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
 fn is_owned_droppable(ty: Ty) -> bool {
+    // `Task<R>` shares `R`'s representation (④a), so it owns/drops exactly when `R` does.
+    if let Ty::Task(s) = ty {
+        return is_owned_droppable(scalar_to_ty(s));
+    }
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty)
 }
 
@@ -942,6 +950,9 @@ impl<'a> EscapeCheck<'a> {
             // `json.decode`-d struct) and now a `str` payload (a view) both track; scalars do not.
             Ty::Option(s) => self.tracks_region(scalar_to_ty(s)),
             Ty::Result(o, e) => self.tracks_region(scalar_to_ty(o)) || self.tracks_region(scalar_to_ty(e)),
+            // `Task<R>` shares `R`'s representation (④a) — it is region-tracked iff `R` is (a
+            // `Task<str>` holding an arena view must not outlive that arena).
+            Ty::Task(s) => self.tracks_region(scalar_to_ty(s)),
             _ => false,
         }
     }
@@ -1364,6 +1375,11 @@ impl<'a> MoveCheck<'a> {
 
     /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple.
     fn is_move_ty(&self, ty: Ty) -> bool {
+        // `Task<R>` shares `R`'s representation (④a) — it is a Move value iff `R` is, so a second
+        // `get()` of a `Task<string>` is caught as use-after-move.
+        if let Ty::Task(s) = ty {
+            return self.is_move_ty(scalar_to_ty(s));
+        }
         matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
             || payload_is_move(ty)
             || ty_tuple_is_move(ty, self.tuples)
@@ -1553,7 +1569,13 @@ impl<'a> MoveCheck<'a> {
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b, moved, consuming, direct),
-            ExprKind::Spawn(inner) | ExprKind::TaskGet(inner) => self.expr(inner, moved, false, false),
+            ExprKind::Spawn(inner) => self.expr(inner, moved, false, false),
+            // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
+            // consumes the task (a second `get()` would double-free the buffer).
+            ExprKind::TaskGet(inner) => {
+                let consuming = is_owned_droppable(e.ty);
+                self.expr(inner, moved, consuming, consuming);
+            }
             ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
                 self.expr(cond, moved, false, false);
