@@ -1402,7 +1402,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::HeapAlloc(handle, init) => {
                 // A `box<T>` (heap.new) or a `Task<R>` (spawn) — both a boxed scalar in an arena.
                 let (Ty::Box(s) | Ty::Task(s)) = result_ty else {
-                    return Err(self.err("heap.new result is not a box"));
+                    return Err(self.err("heap allocation result is not a box or task"));
                 };
                 let i64t = self.ctx.i64_type();
                 let bytes = scalar_bytes(s);

@@ -54,6 +54,18 @@ fn multiple_capturing_tasks() {
 }
 
 #[test]
+fn unit_returning_side_effect_task() {
+    if !backend_available() {
+        return;
+    }
+    // A fire-and-forget side-effect task returns `()` (a primitive scalar — box-able).
+    let src = "fn main() -> Result<(), Error> {\n  x: i64 := 7\n  task_group {\n    a := spawn(fn { print(x) })\n    wait()\n    a.get()\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-unit", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+#[test]
 fn owned_payload_task_rejected() {
     // ④b-1a: a task result is boxed in the region, so it must be a primitive scalar for now;
     // an owned result (`string`) is rejected (the region drop/borrow handling is a later slice).

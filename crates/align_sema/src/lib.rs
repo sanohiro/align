@@ -2746,9 +2746,9 @@ impl<'a, 't> Checker<'a, 't> {
         // ④b: a task's result is stored in a `box` in the task_group region, so it must be a
         // box-able primitive scalar for now (owned/view results — `string`/`array`/`str` — need
         // the region drop/borrow handling, a later slice).
-        if !matches!(r, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char) {
+        if !matches!(r, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Unit | Scalar::ErrCode) {
             self.diags.error(
-                format!("a spawned task must return a primitive scalar (int/float/bool/char) for now, got {}", scalar_name(r)),
+                format!("a spawned task must return a primitive scalar (int/float/bool/char/unit/error) for now, got {}", scalar_name(r)),
                 arg.span,
             );
             return err;
