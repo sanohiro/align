@@ -215,13 +215,23 @@ just a loop-invariant argument the backend hoists. This keeps lambdas inside the
 guarantees rather than introducing a new cost class: **Nothing hidden** (no silent heap
 environment), **Predictable performance** (a lambda is never secretly slower than the named
 equivalent), and **Compiler-friendly** (the optimizer sees a direct call, not an indirect one
-through a closure object). The only case that would need a visible heap environment is a lambda
-that escapes and outlives its captures (a first-class function value stored or returned) — and
-that allocation, when it eventually exists, will be explicit like every other one.
+through a closure object).
+
+**Escape decides the representation.** A lambda that *escapes* — stored in a variable, returned,
+or handed to `task_group`'s `spawn` to run later — outlives the locals it captures, so it cannot
+borrow them; it needs a heap **closure environment** holding the captured values. The compiler's
+escape analysis (the same one that governs views and arenas) chooses: a non-escaping lambda (every
+pipeline `map`/`where`/`reduce`/`par_map`) is inlined with captures-as-parameters — zero
+allocation, SIMD/GPU-friendly; an escaping lambda gets the heap environment, and that allocation is
+**explicit** like every other one. This is the load-bearing design point — it lets first-class
+function values and `task_group` exist *without* eroding the inlined, offload-ready pipeline path.
+The two paths are distinguished by escape, not by two different lambda syntaxes.
 
 The **Side Effect Rule** completes the picture: a `par_map` lambda must be Pure (it may read
-captured values but not mutate external state), which is what makes parallel execution safe
-without locks. Purity is inferred, never annotated.
+captured values but not mutate external state), which is what makes data-parallel execution safe
+without locks. A `task_group` task, by contrast, *may* be impure — it performs I/O — and its
+safety comes from capture being by value (no shared mutable state) rather than from purity.
+Purity is inferred, never annotated.
 
 ---
 

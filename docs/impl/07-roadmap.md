@@ -496,7 +496,17 @@ Completion condition: confirm that the vectorized code contains vector instructi
   construction** — `f` is Pure (no shared mutable state) and the output ranges never overlap. A
   *staged* `par_map` (`where(p).par_map(f)`) still uses the sequential collect loop (a flat split
   can't see through a filter). Results are identical to the sequential lowering.
-- `task_group` / `spawn` / `wait` (I/O concurrency).
+- [todo] **first-class closures (escape-driven)** — the foundation for `task_group` and for
+  function values stored/returned. A lambda that *escapes* gets a heap closure environment; a
+  non-escaping pipeline lambda stays inlined (captures-as-params). The existing escape analysis
+  picks the representation, so the offload-ready pipeline path is untouched. (Design SETTLED, see
+  `open-questions.md` "First-class closures + task_group".)
+- [todo] **`task_group` / `spawn` / `wait` (I/O concurrency)** — a structured scope (like
+  `arena {}`): `spawn(fn { … })` takes a lambda (deferred work, visible), returns `Task<R>`;
+  `wait()?` joins all + propagates the first `Err`; `a.get()` reads a result after the join. Tasks
+  may be impure (I/O); safety from by-value capture. Built on first-class closures (above). The
+  walking skeleton runs the deferred tasks at `wait` (sequential first, real threads as the
+  widening — errors surface at `wait` either way, so the semantics match).
 - async/await is not included (`non-goals.md`).
 
 ## M8 — Tooling and Quality

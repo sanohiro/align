@@ -549,18 +549,36 @@ total := users.reduce(0, fn acc, u {
 
 ### Task Group
 
-I/O concurrency uses task_group.
+I/O concurrency uses `task_group` — a **structured** scope (like `arena {}`): the tasks it
+spawns cannot outlive it, and the scope joins them at its end.
 
 ```align
-tasks := task_group()
-
-a := tasks.spawn(fs.read_file("a.txt"))
-b := tasks.spawn(fs.read_file("b.txt"))
-
-tasks.wait()?
+task_group {
+  a := spawn(fn { fs.read_file("a.txt") })   // a deferred task; the `fn { }` makes the
+  b := spawn(fn { fs.read_file("b.txt") })   // "runs as a separate task" visible
+  wait()?                                     // join all; propagate the first error
+  process(a.get(), b.get())                   // extract each result (after the join)
+}
 ```
 
-async/await is not in the initial specification.
+`spawn` takes a **lambda** (the deferred work), not a bare call — the deferral is then visible
+in the source (*Nothing hidden*), and it is the same lambda mechanism as `map`/`reduce`/`par_map`
+rather than a second, special-cased one (*One way*). It returns a `Task<R>` handle; `wait()?` is
+the single error boundary (it joins every task and propagates the first `Err`), and `a.get()`
+reads a task's result after the join.
+
+Unlike a `par_map` lambda (which must be Pure), a spawned task **may** be impure — that is the
+point: it performs I/O. Safety comes from capture being by value (a task shares no mutable state
+with another) rather than from purity.
+
+A spawned lambda *escapes* (it outlives the `spawn` call, running later on the task), so it is
+represented as a first-class closure with a heap environment — distinct from a pipeline lambda,
+which never escapes and is inlined. The compiler's escape analysis chooses the representation, so
+pipelines stay allocation-free and SIMD/GPU-friendly while spawned tasks get the environment they
+need.
+
+async/await is not in the initial specification; structured `task_group` is the one concurrency
+model for I/O.
 
 ---
 
