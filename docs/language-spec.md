@@ -109,6 +109,11 @@ all
 dot
 ```
 
+Stages and reducers take a named function or an inline lambda `fn x { ... }` (parameter types
+inferred). A lambda may capture enclosing variables by value — with no hidden closure
+environment (it compiles like a named function, captures passed as arguments). `where(.active)`
+is shorthand for a one-field lambda.
+
 ### Strings
 
 ```text

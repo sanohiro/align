@@ -393,6 +393,27 @@ active := users.where(.active)
 total := active.score.sum()
 ```
 
+### Function Arguments
+
+Every stage and reducer (`map` / `where` / `reduce` / `par_map` / `scan` / `partition` /
+`any` / `all`) takes a function — either a named function, or an inline **lambda**
+`fn params { body }`. Parameter types are inferred from the element type; the body is a block
+whose trailing expression is its value.
+
+```align
+doubled := xs.map(fn x { x * 2 })
+big     := xs.where(fn x { x > limit })   // captures `limit`
+```
+
+A lambda may **capture** enclosing variables (`limit` above). Capture is by value, and there is
+**no hidden closure environment**: a lambda compiles exactly like a named function — captured
+values are passed as ordinary arguments — so it fuses into the same loop and adds no allocation.
+(Consistent with *Nothing hidden*: a lambda that escaped and outlived its captures would need a
+visible heap environment; the in-loop case never does.)
+
+A field selector is shorthand for a one-field lambda — `where(.active)` is `where(fn u { u.active })`,
+and `.score` projects a field out of each element.
+
 ### Core Array Functions
 
 ```text
