@@ -80,6 +80,19 @@ fn checked_mul_unsigned_overflow() {
 }
 
 #[test]
+fn saturating_mul_clamps() {
+    if !backend_available() {
+        return;
+    }
+    // LLVM has no smul.sat/umul.sat — saturating mul is built from mul.with.overflow + select.
+    // i8 100*2 → 127 (MAX); u8 200*2 → 255 (MAX); i8 -100*2 → -128 (MIN); i8 -100*-2 → 127 (MAX).
+    let src = "fn main() -> Result<(), Error> {\n  a: i8 := 100\n  print(a.saturating_mul(2))\n  u: u8 := 200\n  print(u.saturating_mul(2))\n  n: i8 := -100\n  print(n.saturating_mul(2))\n  print(n.saturating_mul(-2))\n  return Ok(())\n}\n";
+    let out = build_and_run("ca-satmul", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "127\n255\n-128\n127\n");
+}
+
+#[test]
 fn non_integer_receiver_rejected() {
     // These ops are integer-only — a float receiver is rejected.
     assert!(check_errs("ca-float", "fn main() -> i32 {\n  x: f64 := 1.0\n  return x.checked_add(2.0) else { 0 }\n}\n"));

@@ -2443,7 +2443,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'{method}' needs integer operands, got {}", ty_name(t)), span);
             return err;
         }
-        let (lhs, rhs) = (Box::new(r.clone()), Box::new(a));
+        let (lhs, rhs) = (Box::new(r), Box::new(a));
         match mode {
             // `wrapping_*` is the default wrapping arithmetic.
             None => Expr { kind: ExprKind::Binary { op, lhs, rhs }, ty: t, span },
