@@ -284,6 +284,7 @@ fn pipeline_stages(kind: &ExprKind) -> Option<&[Stage]> {
         | ExprKind::ArrayReduce { stages, .. }
         | ExprKind::ArrayScan { stages, .. }
         | ExprKind::ArraySort { stages, .. }
+        | ExprKind::ArraySortBy { stages, .. }
         | ExprKind::ArrayToArray { stages, .. }
         | ExprKind::ArrayPartition { stages, .. }
         | ExprKind::ArrayParMap { stages, .. } => Some(stages),
@@ -308,6 +309,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
         | ExprKind::ArrayScan { captures, .. }
         | ExprKind::ArrayPartition { captures, .. }
         | ExprKind::ArrayParMap { captures, .. }
+        | ExprKind::ArraySortBy { captures, .. }
         | ExprKind::ArrayAnyAll { captures, .. } => captures,
         _ => &[],
     }
@@ -658,6 +660,7 @@ impl EffectScan {
             ExprKind::ArrayAnyAll { source, stages, func, .. }
             | ExprKind::ArrayReduce { source, stages, func, .. }
             | ExprKind::ArrayScan { source, stages, func, .. }
+            | ExprKind::ArraySortBy { source, stages, key_func: func, .. }
             | ExprKind::ArrayPartition { source, stages, func, .. } => {
                 self.stage_funcs(stages);
                 self.calls.push(func.clone());
@@ -894,6 +897,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayParMap { .. }
             | ExprKind::ArrayScan { .. }
             | ExprKind::ArraySort { .. }
+            | ExprKind::ArraySortBy { .. }
             | ExprKind::ArrayReduce { .. } => Region::arena(depth),
             // `str + str` concatenation is also built in the enclosing arena.
             ExprKind::Binary { op: BinOp::Add, .. } if e.ty == Ty::Str => Region::arena(depth),
@@ -1161,7 +1165,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.walk(recv, depth);
@@ -1405,7 +1409,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::BuilderNew => {}
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
@@ -2617,6 +2621,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "sort" {
             return self.check_array_sort(recv, args, span);
         }
+        if method == "sort_by_key" {
+            return self.check_array_sort_by_key(recv, args, span);
+        }
         if method == "count" {
             return self.check_array_count(recv, args, span);
         }
@@ -3552,6 +3559,53 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `source.….sort_by_key(f)` — materialize the surviving (primitive scalar) elements and sort
+    /// them ascending by `f(element)`. Unlike `sort`, the element need not be numeric (it is ordered
+    /// by the key); the key `f` must return an orderable scalar (int/float/char). `f` may be a named
+    /// function or a lambda (which may capture).
+    fn check_array_sort_by_key(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [fn_arg] = args else {
+            self.diags.error(format!("'sort_by_key' takes 1 argument (a key function), got {}", args.len()), span);
+            return err;
+        };
+        let elem_hint = self.named_param_hint(fn_arg, 0);
+        let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
+            return err;
+        };
+        if matches!(elem, Ty::Struct(_)) {
+            self.diags.error("'sort_by_key' over struct elements is not supported yet (project a field first)".to_string(), span);
+            return err;
+        }
+        // The element must materialize into `array<T>`, i.e. be a primitive scalar.
+        let Some(scalar) = ty_to_scalar(elem).filter(|s| scalar_to_prim(*s).is_some()) else {
+            self.diags.error(
+                format!("'sort_by_key' element must be a primitive scalar (int/float/bool/char), got {}", ty_name(elem)),
+                span,
+            );
+            return err;
+        };
+        // The key function `f: (elem) -> K`; `K` must be an orderable scalar.
+        let Some((key_func, key_ty, captures)) = self.resolve_fn(fn_arg, &[elem], None, "sort_by_key", span) else {
+            return err;
+        };
+        if key_ty == Ty::Error {
+            return err;
+        }
+        if !(key_ty.is_numeric() || key_ty == Ty::Char) {
+            self.diags.error(
+                format!("'sort_by_key' key must be an orderable scalar (int/float/char), got {}", ty_name(key_ty)),
+                span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ArraySortBy { source: Box::new(source), stages, key_func, captures, key_ty, elem },
+            ty: Ty::DynArray(scalar),
+            span,
+        }
+    }
+
     /// `a.dot(b)` — the inner product `Σ a[i]*b[i]`. First cut: both operands must be
     /// fixed-length arrays of the same numeric scalar element and the same statically known
     /// length (the SIMD/vector case; `slice`/`array<T>` dot with runtime lengths is a follow-up).
@@ -4353,7 +4407,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::Block(b) | ExprKind::Arena(b) => self.finalize_block(b),
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArraySortBy { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }

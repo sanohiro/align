@@ -426,6 +426,7 @@ scan
 partition
 group_by
 sort
+sort_by_key
 chunks
 ```
 

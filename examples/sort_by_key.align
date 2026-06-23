@@ -1,0 +1,16 @@
+// sort_by_key(f) sorts the elements ascending by a computed key (draft.md §8). The key
+// function may be named or an inline lambda (which may capture). Reuses the same insertion
+// sort as `sort`, comparing keys instead of elements.
+fn main() -> Result<(), Error> {
+  arena {
+    // sort by the last digit: 10, 21, 32, 3
+    by_digit := [10, 21, 32, 3].sort_by_key(fn x { x % 10 })
+    print(by_digit[0])   // 10
+    print(by_digit[3])   // 3
+
+    // descending = sort by the negated value
+    desc := [3, 1, 4, 1, 5].sort_by_key(fn x { -x })
+    print(desc[0])       // 5
+  }
+  return Ok(())
+}
