@@ -1854,12 +1854,21 @@ struct SortKey {
 
 fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty, sort_key: Option<SortKey>) -> Operand {
     let arr = lower_array_collect(b, source, stages, elem, CollectKind::Collect);
+    // Lower the key function's captures ONCE before the loop — they are loop-invariant, so
+    // re-lowering them inside the per-comparison block would emit redundant loads on the hot path
+    // (and LICM is not run). `key_of` reuses these pre-lowered operands.
+    let lowered_captures: Vec<Operand> = match &sort_key {
+        Some(sk) => sk.captures.iter().map(|c| lower_expr(b, c)).collect(),
+        None => Vec::new(),
+    };
     // Compute the sort key of an element value (`key(elem)` for `sort_by_key`, else the element).
     let key_of = |b: &mut Builder, v: Operand| -> Operand {
         match &sort_key {
             Some(sk) => {
                 let kc = b.fresh_value(sk.key_ty);
-                let args = stage_call_args(b, v, &sk.captures);
+                let mut args = Vec::with_capacity(1 + lowered_captures.len());
+                args.push(v);
+                args.extend(lowered_captures.iter().cloned());
                 b.push(Stmt::Let(kc, Rvalue::Call(sk.func.clone(), args)));
                 Operand::Value(kc)
             }
