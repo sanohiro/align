@@ -109,12 +109,12 @@ Lowered to a `Switch` terminator + variant decomposition (`Field`/payload extrac
 
 ## 3. Loop Fusion (Align's flagship)
 
-The core of "writing it the normal way makes it easy for the compiler to optimize" (`draft.md` §1). Collapse a chain of `map`/`where`/`filter`/`scan`/reduction into **one loop**, eliminating intermediate arrays.
+The core of "writing it the normal way makes it easy for the compiler to optimize" (`draft.md` §1). Collapse a chain of `map`/`where`/`scan`/reduction into **one loop**, eliminating intermediate arrays.
 
 ### Targets and rules
 ```text
 map(f)       per-element transform. passes through to the next stage
-where(p)/filter(p)  only elements satisfying the predicate pass to the next stage (can be masked, §4)
+where(p)            only elements satisfying the predicate pass to the next stage (can be masked, §4)
 Project(field)      extract an element's field (no intermediate array)
 reduce/sum/min/max/count/dot/any/all  terminal. fold into an accumulator
 ```

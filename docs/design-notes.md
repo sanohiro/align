@@ -237,7 +237,7 @@ Examples:
 map
 reduce
 scan
-filter
+where
 mask
 ```
 
