@@ -697,7 +697,10 @@ impl<'a> Parser<'a> {
                 let mut params = Vec::new();
                 if !matches!(self.peek(), TokKind::LBrace) {
                     loop {
-                        params.push(self.parse_ident("lambda parameter")?);
+                        let name = self.parse_ident("lambda parameter")?;
+                        // Optional type annotation (`x: T`); required when the lambda is a value.
+                        let ty = if self.eat(&TokKind::Colon) { Some(self.parse_type()?) } else { None };
+                        params.push(LambdaParam { name, ty });
                         if !self.eat(&TokKind::Comma) {
                             break;
                         }
