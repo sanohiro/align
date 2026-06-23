@@ -44,8 +44,12 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    no use site to infer from; captures rejected). **②b-1 closure ABI DONE** — a `Ty::Fn` value is
    now a `{ fn_ptr, env_ptr }` fat pointer with the env-ABI `fn(env, args)`; non-capturing / named
    functions are wrapped by a thunk `X$fnval(env, args) = X(args)` (env null). Behavior-preserving;
-   the foundation for captures. Next: **②b-2 captures** (env struct + capturing lift, escape →
-   region-owned env), then **③ `task_group`**.
+   the foundation for captures. **②b-2 captures DONE** — a capturing lambda (`f := fn x: i32 { x +
+   k }`) copies its captures into a frame-local env (hoisted alloca); a per-lifted-fn thunk
+   `lifted$clos(env, args) = lifted(args, env.0, …)` unpacks it. Scalar (Copy) captures; no escape
+   check needed yet (a `Ty::Fn` value can't leave its frame — no fn-typed returns/fields/params).
+   Next: **③ `task_group`** (and, when fn values can escape, the env moves to the enclosing
+   region per the settled design). 
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

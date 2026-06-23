@@ -120,6 +120,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("call {name}({})", a.join(", "))
         }
         Rvalue::FnAddr(name) => format!("fn_addr {name}"),
+        Rvalue::Closure { lifted, captures, .. } => {
+            let c: Vec<String> = captures.iter().map(operand_str).collect();
+            format!("closure {lifted} [{}]", c.join(", "))
+        }
         Rvalue::CallIndirect { callee, args, .. } => {
             let a: Vec<String> = args.iter().map(operand_str).collect();
             format!("call_indirect {}({})", operand_str(callee), a.join(", "))

@@ -667,6 +667,11 @@ impl EffectScan {
             // A function value (taking a fn's address) is not a call; an indirect call walks its
             // callee + args (the target is not statically known — not used in `par_map` contexts).
             ExprKind::FnValue(_) => {}
+            ExprKind::Closure { captures, .. } => {
+                for c in captures {
+                    self.expr(c);
+                }
+            }
             ExprKind::CallFnValue { callee, args } => {
                 self.expr(callee);
                 for a in args {
@@ -1205,6 +1210,14 @@ impl<'a> EscapeCheck<'a> {
             }
             // A fn value is a `Static` pointer (no region); an indirect call recurses its parts.
             ExprKind::FnValue(_) => {}
+            // A capturing closure's env is frame-local and the closure cannot leave the frame
+            // (no fn-typed returns/fields/parameters), so there is nothing to escape-check; just
+            // recurse the captured values.
+            ExprKind::Closure { captures, .. } => {
+                for c in captures {
+                    self.walk(c, depth);
+                }
+            }
             ExprKind::CallFnValue { callee, args } => {
                 self.walk(callee, depth);
                 for a in args {
@@ -1451,6 +1464,12 @@ impl<'a> MoveCheck<'a> {
             }
             // A fn value is Copy (a pointer); an indirect call's callee + args are reads.
             ExprKind::FnValue(_) => {}
+            // A closure copies its captured (Copy) values into its env — reads, not moves.
+            ExprKind::Closure { captures, .. } => {
+                for c in captures {
+                    self.expr(c, moved, false, false);
+                }
+            }
             ExprKind::CallFnValue { callee, args } => {
                 self.expr(callee, moved, false, false);
                 for a in args {
@@ -2598,19 +2617,13 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((name, ret, captures)) = self.lift_lambda(params, body, &param_tys, None, span) else {
             return err;
         };
-        if !captures.is_empty() {
-            self.diags.error(
-                "a lambda that captures an enclosing variable cannot be used as a value yet (slice ②b)".to_string(),
-                span,
-            );
-            return err;
-        }
         // A type error in the annotations or the body has already been reported — don't pile on a
         // confusing secondary "only scalar" message.
         if param_tys.iter().any(|t| self.finalize(*t) == Ty::Error) || self.finalize(ret) == Ty::Error {
             return err;
         }
-        // Scalar signature only (slice ②a), matching named function values.
+        // Scalar signature only (slice ②a), matching named function values. The captures are
+        // hidden from the closure's *type* — only the explicit parameters appear in `Ty::Fn`.
         let pscalars: Option<Vec<Scalar>> = param_tys.iter().map(|t| ty_to_scalar(self.finalize(*t))).collect();
         let rscalar = ty_to_scalar(self.finalize(ret));
         let (Some(ps), Some(r)) = (pscalars, rscalar) else {
@@ -2620,7 +2633,14 @@ impl<'a, 't> Checker<'a, 't> {
         let fid = intern_fn_type(self.fn_types, ps, r);
         let ty = Ty::Fn(fid);
         self.constrain(ty, expected, span);
-        Expr { kind: ExprKind::FnValue(name), ty, span }
+        // No captures → a plain function pointer (slice ②a). Captures → a closure carrying its
+        // captured values in an environment (slice ②b-2); since a `Ty::Fn` value cannot leave its
+        // frame yet (no fn-typed returns/fields/parameters), the environment is frame-local.
+        if captures.is_empty() {
+            Expr { kind: ExprKind::FnValue(name), ty, span }
+        } else {
+            Expr { kind: ExprKind::Closure { lifted: name, captures }, ty, span }
+        }
     }
 
     /// `f(args)` where `f` is a `Ty::Fn` local — an indirect call through a function value.
@@ -4690,6 +4710,11 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             ExprKind::FnValue(_) => {}
+            ExprKind::Closure { captures, .. } => {
+                for c in captures {
+                    self.finalize_expr(c);
+                }
+            }
             ExprKind::CallFnValue { callee, args } => {
                 self.finalize_expr(callee);
                 for a in args {

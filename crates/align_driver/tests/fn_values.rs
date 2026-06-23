@@ -84,12 +84,27 @@ fn untyped_lambda_param_rejected_as_value() {
 }
 
 #[test]
-fn capturing_lambda_rejected_as_value() {
-    // Captures (escape → region-owned environment) are slice ②b — rejected for now.
-    assert!(check_errs(
-        "fv-capture",
-        "fn main() -> Result<(), Error> {\n  k: i32 := 3\n  f := fn x: i32 { x + k }\n  print(f(5))\n  return Ok(())\n}\n"
-    ));
+fn capturing_closure_value_and_call() {
+    if !backend_available() {
+        return;
+    }
+    // A capturing lambda copies the captured value into a frame-local env (slice ②b-2).
+    let src = "fn main() -> Result<(), Error> {\n  k: i32 := 100\n  f := fn x: i32 { x + k }\n  print(f(5))\n  print(f(20))\n  return Ok(())\n}\n";
+    let out = build_and_run("fv-capture", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "105\n120\n");
+}
+
+#[test]
+fn closure_multiple_captures() {
+    if !backend_available() {
+        return;
+    }
+    // Two captures (a, b) + two explicit params: (x+y)*a - b.
+    let src = "fn main() -> Result<(), Error> {\n  a: i64 := 10\n  b: i64 := 3\n  g := fn x: i64, y: i64 { (x + y) * a - b }\n  print(g(1, 2))\n  return Ok(())\n}\n";
+    let out = build_and_run("fv-multicap", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "27\n");
 }
 
 #[test]
