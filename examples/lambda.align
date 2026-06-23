@@ -6,5 +6,12 @@ fn main() -> Result<(), Error> {
   // map *10, keep the ones over 25, sum: 30 + 40 + 50 = 120
   total := [1, 2, 3, 4, 5].map(fn x { x * 10 }).where(fn x { x > 25 }).sum()
   print(total)
+
+  // A lambda captures enclosing locals by value — the captured value becomes an extra
+  // parameter of the lifted function (no closure environment; LLVM hoists it as loop-invariant).
+  // This is something a named function fundamentally cannot do.
+  factor := 3
+  scaled := [1, 2, 3].map(fn x { x * factor }).sum()   // (1+2+3)*3 = 18
+  print(scaled)
   return Ok(())
 }

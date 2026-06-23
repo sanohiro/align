@@ -286,8 +286,12 @@ are compiler-known builtins, monomorphic per element type.
   par_map Pure requirement applies to a lifted lambda too. For the two-parameter reducers
   (`reduce`/`scan`), a named fold takes its accumulator/element types from its signature; a
   lambda infers the accumulator from the initial value and the element from the source.
-  **Non-capturing** still (the body sees its parameters and top-level functions, not enclosing
-  locals); capture and first-class function values are follow-up slices.
+  A lambda in `map`/`where` may **capture** enclosing locals (slice ③): a captured local becomes
+  a trailing **value parameter** of the lifted function, passed at the call site (`stage_call_args`
+  appends it). No closure environment — the capture is a loop-invariant argument LLVM hoists. This
+  is something a named function cannot do (`map(fn x { x * factor })`). Capture is copy-values only
+  (an owned/Move capture is rejected) and wired into `map`/`where` only (the reducers reject a
+  capturing lambda for now). First-class function values remain a follow-up.
 - Method chains rely on the slice-0 postfix `.` (FieldAccess); the pipeline is
   collected from the AST at the `sum` terminal and lowered as one loop.
 - Arrays are not yet Move-checked (literals are consumed only by the reduction);
