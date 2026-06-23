@@ -29,7 +29,12 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    `.with.overflow`). Scalar `abs` / `min` / `max` **DONE** (methods on numerics; `a.min(b)`
    pairwise is arity-dispatched alongside the `arr.min()` reduction; LLVM `abs`/`fabs`/
    `{s,u}min`/`{s,u}max`/`minimum`/`maximum`). Float `sqrt`/`floor`/`ceil`/`round`/`trunc`/`pow` DONE (float-only methods, LLVM intrinsics; `round` = ties-away-from-zero). **core.math DONE.**
-2. **core.bytes / core.buffer** — read-only byte views + mutable byte buffers.
+2. **core.bytes / core.buffer** — design SETTLED, **build deferred until a consumer**:
+   `bytes` = `slice<u8>` (no separate type — largely exists already); `buffer` = a distinct
+   growable owned byte container (distinct from fixed `array<u8>` and the text-only `builder`).
+   Its real consumers are binary I/O (`std`) and `core.hash`, not yet built — building it ahead
+   of them risks the wrong op set (premature). See `open-questions.md` "bytes / buffer". So the
+   next *build* is #3.
 3. **first-class closures (escape-driven) → `task_group`** — M7 concurrency. Design SETTLED
    (`open-questions.md`); closures are the foundation, `task_group` the consumer.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
