@@ -293,11 +293,8 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// Whether `ty` is a Move (owned) type — used to reject capturing an owned value into a lambda
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
-    // `Task<R>` shares `R`'s representation (④a), so it captures-as-move exactly when `R` does.
-    if let Ty::Task(s) = ty {
-        return ty_capture_is_move(scalar_to_ty(s), tuples);
-    }
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_))
+    // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
 }
@@ -349,10 +346,8 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 /// region is `Static`) — the predicate the drop set is built from. A free-standing owned
 /// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
 fn is_owned_droppable(ty: Ty) -> bool {
-    // `Task<R>` shares `R`'s representation (④a), so it owns/drops exactly when `R` does.
-    if let Ty::Task(s) = ty {
-        return is_owned_droppable(scalar_to_ty(s));
-    }
+    // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
+    // individually-dropped owned value (like `box<T>`).
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty)
 }
 
@@ -950,9 +945,9 @@ impl<'a> EscapeCheck<'a> {
             // `json.decode`-d struct) and now a `str` payload (a view) both track; scalars do not.
             Ty::Option(s) => self.tracks_region(scalar_to_ty(s)),
             Ty::Result(o, e) => self.tracks_region(scalar_to_ty(o)) || self.tracks_region(scalar_to_ty(e)),
-            // `Task<R>` shares `R`'s representation (④a) — it is region-tracked iff `R` is (a
-            // `Task<str>` holding an arena view must not outlive that arena).
-            Ty::Task(s) => self.tracks_region(scalar_to_ty(s)),
+            // `Task<R>` (④b) is a box in the task_group region — region-tracked like `box<T>`, so
+            // a task handle cannot escape its `task_group` scope.
+            Ty::Task(_) => true,
             _ => false,
         }
     }
@@ -965,6 +960,8 @@ impl<'a> EscapeCheck<'a> {
             // Allocating producers are bound to the enclosing arena (Static outside any arena,
             // where the result is leaked / process-lifetime and safe to return).
             ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => Region::arena(depth),
+            // A spawned task's handle is a box in the enclosing `task_group` region.
+            ExprKind::Spawn(_) => Region::arena(depth),
             // `.to_array()` bump-allocates the owned array in the enclosing arena. `reduce` folds
             // its accumulator there too — when that accumulator is region-tracked (a `str` built by
             // concatenation, a struct), the result lives in the enclosing arena and must not escape
@@ -1224,8 +1221,20 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::Block(b) => self.block(b, depth),
-            // ④a: `task_group` adds no region (eager; `Task<R>` is repr-identical to `R`). Recurse.
-            ExprKind::TaskGroup(b) => self.block(b, depth),
+            // ④b: `task_group` opens a region (its task boxes live there), like `arena {}` — so a
+            // region value (e.g. a `Task` handle) cannot escape as the block's value.
+            ExprKind::TaskGroup(b) => {
+                let inner = depth + 1;
+                self.block(b, inner);
+                if let Some(v) = &b.value {
+                    if self.tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
+                        self.diags.error(
+                            "a value from this task_group cannot escape as the block's value".to_string(),
+                            v.span,
+                        );
+                    }
+                }
+            }
             ExprKind::Spawn(inner) | ExprKind::TaskGet(inner) => self.walk(inner, depth),
             ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
@@ -1375,12 +1384,8 @@ impl<'a> MoveCheck<'a> {
 
     /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple.
     fn is_move_ty(&self, ty: Ty) -> bool {
-        // `Task<R>` shares `R`'s representation (④a) — it is a Move value iff `R` is, so a second
-        // `get()` of a `Task<string>` is caught as use-after-move.
-        if let Ty::Task(s) = ty {
-            return self.is_move_ty(scalar_to_ty(s));
-        }
-        matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
+        // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
+        matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
             || payload_is_move(ty)
             || ty_tuple_is_move(ty, self.tuples)
     }
@@ -2220,8 +2225,12 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ast::ExprKind::TaskGroup(b) => {
                 let diverges = ast_block_diverges(b);
+                // A `task_group` opens a region (like `arena {}`): spawned task handles are boxes
+                // in it, region-tied to the scope (so a `Task` can't escape).
                 self.task_group_depth += 1;
+                self.arena_depth += 1;
                 let block = self.check_block(b, if diverges { None } else { expected });
+                self.arena_depth -= 1;
                 self.task_group_depth -= 1;
                 let ty = if diverges {
                     expected.unwrap_or(Ty::Unit)
@@ -2734,6 +2743,16 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         let r = ft.ret;
+        // ④b: a task's result is stored in a `box` in the task_group region, so it must be a
+        // box-able primitive scalar for now (owned/view results — `string`/`array`/`str` — need
+        // the region drop/borrow handling, a later slice).
+        if !matches!(r, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Unit | Scalar::ErrCode) {
+            self.diags.error(
+                format!("a spawned task must return a primitive scalar (int/float/bool/char/unit/error) for now, got {}", scalar_name(r)),
+                arg.span,
+            );
+            return err;
+        }
         Expr { kind: ExprKind::Spawn(Box::new(f)), ty: Ty::Task(r), span }
     }
 

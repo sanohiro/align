@@ -664,9 +664,8 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicType
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
-        // `Task<R>` is represented identically to its payload `R` (④a: eager; the handle just
-        // holds the result). ④b will give it a real future representation.
-        Ty::Task(s) => scalar_type(ctx, scalar_to_ty(s), sx),
+        // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
+        Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         _ => int_type(ctx, ty).into(),
     }
 }
@@ -1401,8 +1400,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 cs.try_as_basic_value().basic().expect("arena_begin returns a pointer")
             }
             Rvalue::HeapAlloc(handle, init) => {
-                let Ty::Box(s) = result_ty else {
-                    return Err(self.err("heap.new result is not a box"));
+                // A `box<T>` (heap.new) or a `Task<R>` (spawn) — both a boxed scalar in an arena.
+                let (Ty::Box(s) | Ty::Task(s)) = result_ty else {
+                    return Err(self.err("heap allocation result is not a box or task"));
                 };
                 let i64t = self.ctx.i64_type();
                 let bytes = scalar_bytes(s);

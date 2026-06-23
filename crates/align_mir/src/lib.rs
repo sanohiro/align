@@ -758,28 +758,43 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Block(blk) => {
             lower_block(b, blk).unwrap_or(Operand::Const(Const::Bool(false)))
         }
-        // ④a: `task_group` is just its block (eager execution; no runtime region yet).
+        // ④b: `task_group` opens a region (like `arena {}`) that owns the task result boxes.
         hir::ExprKind::TaskGroup(blk) => {
-            lower_block(b, blk).unwrap_or(Operand::Const(Const::Bool(false)))
+            let handle = b.fresh_value(Ty::ArenaHandle);
+            b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
+            b.arenas.push(handle);
+            let tail = lower_block(b, blk);
+            b.arenas.pop();
+            if b.is_terminated() {
+                Operand::Const(Const::Unit)
+            } else {
+                b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+                tail.unwrap_or(Operand::Const(Const::Unit))
+            }
         }
-        // ④a (eager): `spawn(closure)` calls the (zero-arg) closure immediately; the result is the
-        // `Task<R>` value (represented identically to `R`). ④b makes this a deferred/threaded call.
+        // ④b-1a (eager): `spawn(closure)` calls the zero-arg closure now, then boxes the result `R`
+        // in the task_group region — the `Task<R>` handle is that box. ④b-1b defers the call (a
+        // trampoline writes the box at `wait`); ④b-2 runs it on a thread.
         hir::ExprKind::Spawn(inner) => {
+            let Ty::Task(s) = e.ty else { unreachable!("spawn result is a Task") };
+            let r_ty = align_sema::scalar_to_ty(s);
             let closure = lower_expr(b, inner);
+            let rv = b.fresh_value(r_ty);
+            b.push(Stmt::Let(rv, Rvalue::CallIndirect { callee: closure, args: vec![], param_tys: vec![], ret_ty: r_ty }));
+            let handle = *b.arenas.last().expect("spawn outside a task_group region");
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: closure, args: vec![], param_tys: vec![], ret_ty: e.ty }));
+            b.push(Stmt::Let(v, Rvalue::HeapAlloc(Operand::Value(handle), Operand::Value(rv))));
             Operand::Value(v)
         }
-        // `t.get()` reads the result; in ④a the `Task<R>` already holds `R`, so copy it into an
-        // `R`-typed value (so downstream sees `R`, not `Task<R>`).
+        // `t.get()` reads the result out of the task's box.
         hir::ExprKind::TaskGet(inner) => {
-            let op = lower_expr(b, inner);
+            let bx = lower_expr(b, inner);
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Use(op)));
+            b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
             Operand::Value(v)
         }
-        // `wait()` — a no-op marker in ④a (eager); ④b/④c give it join + error-boundary semantics.
-        hir::ExprKind::Wait => Operand::Const(Const::Bool(false)),
+        // `wait()` — a no-op marker in ④b-1a (eager); ④b-2/④c give it join + error-boundary.
+        hir::ExprKind::Wait => Operand::Const(Const::Unit),
         hir::ExprKind::OptionSome(inner) => {
             let op = lower_expr(b, inner);
             let v = b.fresh_value(e.ty);

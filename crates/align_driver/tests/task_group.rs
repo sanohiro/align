@@ -54,12 +54,34 @@ fn multiple_capturing_tasks() {
 }
 
 #[test]
-fn double_get_of_move_payload_rejected() {
-    // `Task<R>` inherits `R`'s move-ness: a second `get()` of a `Task<string>` moves the buffer
-    // out twice — caught as use-after-move (prevents a double-free).
+fn unit_returning_side_effect_task() {
+    if !backend_available() {
+        return;
+    }
+    // A fire-and-forget side-effect task returns `()` (a primitive scalar — box-able).
+    let src = "fn main() -> Result<(), Error> {\n  x: i64 := 7\n  task_group {\n    a := spawn(fn { print(x) })\n    wait()\n    a.get()\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-unit", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+#[test]
+fn owned_payload_task_rejected() {
+    // ④b-1a: a task result is boxed in the region, so it must be a primitive scalar for now;
+    // an owned result (`string`) is rejected (the region drop/borrow handling is a later slice).
     assert!(check_errs(
-        "tg-double-get",
-        "fn main() -> Result<(), Error> {\n  task_group {\n    s := spawn(fn { \"hi\".clone() })\n    wait()\n    a := s.get()\n    b := s.get()\n    return Ok(())\n  }\n}\n"
+        "tg-owned",
+        "fn main() -> Result<(), Error> {\n  task_group {\n    s := spawn(fn { \"hi\".clone() })\n    wait()\n    return Ok(())\n  }\n}\n"
+    ));
+}
+
+#[test]
+fn task_cannot_escape_scope() {
+    // A `Task` handle is a box in the task_group region — it cannot escape as the block's value
+    // (it would outlive the region). (Reading the scalar result with `.get()` is fine.)
+    assert!(check_errs(
+        "tg-escape",
+        "fn main() -> Result<(), Error> {\n  t := task_group {\n    a := spawn(fn { 42 })\n    wait()\n    a\n  }\n  return Ok(())\n}\n"
     ));
 }
 
