@@ -299,6 +299,20 @@ fn stage_capture_exprs(stages: &[Stage]) -> impl Iterator<Item = &Expr> {
     })
 }
 
+/// The capture operands carried by a reducer/terminal node's own function (a lifted lambda's
+/// captured values for `reduce`/`scan`/`partition`/`par_map`/`any`/`all`). The flow analyses walk
+/// these like stage captures.
+fn node_captures(kind: &ExprKind) -> &[Expr] {
+    match kind {
+        ExprKind::ArrayReduce { captures, .. }
+        | ExprKind::ArrayScan { captures, .. }
+        | ExprKind::ArrayPartition { captures, .. }
+        | ExprKind::ArrayParMap { captures, .. }
+        | ExprKind::ArrayAnyAll { captures, .. } => captures,
+        _ => &[],
+    }
+}
+
 /// Whether a local of `ty` owns a heap buffer that must be freed by a per-binding `Drop` (when its
 /// region is `Static`) — the predicate the drop set is built from. A free-standing owned
 /// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
@@ -601,6 +615,12 @@ impl EffectScan {
     }
 
     fn expr(&mut self, e: &Expr) {
+        // A reducer node may carry capture operands (a lifted lambda's captured enclosing locals);
+        // walk them so no call edge / effect they contain is missed. (Stage captures are walked by
+        // `stage_funcs`.)
+        for c in node_captures(&e.kind) {
+            self.expr(c);
+        }
         match &e.kind {
             // Observable side effects.
             ExprKind::Call { func, args } => {
@@ -1084,12 +1104,15 @@ impl<'a> EscapeCheck<'a> {
 
     /// Recurse to find nested arenas and value positions that let a box escape.
     fn walk(&mut self, e: &Expr, depth: u32) {
-        // A pipeline stage may carry capture operands (a lifted lambda's captured enclosing
-        // locals); walk them so a captured value escaping its region is caught.
+        // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
+        // enclosing locals); walk them so a captured value escaping its region is caught.
         if let Some(stages) = pipeline_stages(&e.kind) {
             for c in stage_capture_exprs(stages) {
                 self.walk(c, depth);
             }
+        }
+        for c in node_captures(&e.kind) {
+            self.walk(c, depth);
         }
         match &e.kind {
             ExprKind::Tuple { elems, .. } => {
@@ -1317,12 +1340,15 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) {
-        // A pipeline stage may carry capture operands (a lifted lambda's captured enclosing
-        // locals); walk them as borrows so use-after-move of a captured value is caught.
+        // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
+        // enclosing locals); walk them as borrows so use-after-move of a captured value is caught.
         if let Some(stages) = pipeline_stages(&e.kind) {
             for c in stage_capture_exprs(stages) {
                 self.expr(c, moved, false, false);
             }
+        }
+        for c in node_captures(&e.kind) {
+            self.expr(c, moved, false, false);
         }
         match &e.kind {
             ExprKind::Local(id) => {
@@ -2872,19 +2898,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// expected signature; a lambda is lifted (`lift_lambda`). `label` names the operation for
     /// diagnostics. Used by `reduce`/`par_map`/`scan`/`partition`/`any`/`all` (the element/acc
     /// types are known after `check_pipeline`/the initial value).
-    fn resolve_fn(&mut self, arg: &ast::Expr, expected_params: &[Ty], expected_ret: Option<Ty>, label: &str, span: Span) -> Option<(String, Ty)> {
+    fn resolve_fn(&mut self, arg: &ast::Expr, expected_params: &[Ty], expected_ret: Option<Ty>, label: &str, span: Span) -> Option<(String, Ty, Vec<Expr>)> {
         if let ast::ExprKind::Lambda { params, body } = &arg.kind {
-            let (name, ret, captures) = self.lift_lambda(params, body, expected_params, expected_ret, arg.span)?;
-            if !captures.is_empty() {
-                // Capture is wired into the fused-loop stages (`map`/`where`); the reducers
-                // (`reduce`/`par_map`/`scan`/`partition`/`any`/`all`) don't pass captures yet.
-                self.diags.error(
-                    format!("a capturing lambda is not supported in '{label}' yet — use a named function or a non-capturing lambda"),
-                    span,
-                );
-                return None;
-            }
-            return Some((name, ret));
+            return self.lift_lambda(params, body, expected_params, expected_ret, arg.span);
         }
         let Some(fname) = self.pipeline_fn_name(arg) else {
             self.diags.error(format!("'{label}' needs a function (named or `fn … {{ … }}`)"), span);
@@ -2911,7 +2927,7 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return None;
         }
-        Some((fname.name, ret))
+        Some((fname.name, ret, Vec::new()))
     }
 
     /// The `idx`-th parameter type of a *named* function argument, to seed an inline-literal source's
@@ -3264,7 +3280,7 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         // The predicate has type `(elem) -> bool` (named or lambda).
-        let Some((func, _)) = self.resolve_fn(fn_arg, &[elem], Some(Ty::Bool), "partition", span) else {
+        let Some((func, _, captures)) = self.resolve_fn(fn_arg, &[elem], Some(Ty::Bool), "partition", span) else {
             return err;
         };
         // The element must materialize into `array<T>`, i.e. be a primitive scalar.
@@ -3280,7 +3296,7 @@ impl<'a, 't> Checker<'a, 't> {
         let arr = ty_to_scalar(Ty::DynArray(ty_to_scalar(elem).unwrap())).expect("array<prim> is a payload scalar");
         let tuple_id = intern_tuple(self.tuples, vec![arr, arr]);
         Expr {
-            kind: ExprKind::ArrayPartition { source: Box::new(source), stages, func, elem },
+            kind: ExprKind::ArrayPartition { source: Box::new(source), stages, func, captures, elem },
             ty: Ty::Tuple(tuple_id),
             span,
         }
@@ -3355,7 +3371,7 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         // `f: (elem) -> R` (named or lambda); `R` is inferred.
-        let Some((func, r)) = self.resolve_fn(fn_arg, &[elem], None, "par_map", span) else {
+        let Some((func, r, captures)) = self.resolve_fn(fn_arg, &[elem], None, "par_map", span) else {
             return err;
         };
         if r == Ty::Error {
@@ -3370,7 +3386,7 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         Expr {
-            kind: ExprKind::ArrayParMap { source: Box::new(source), stages, func, elem: r },
+            kind: ExprKind::ArrayParMap { source: Box::new(source), stages, func, captures, elem: r },
             ty: Ty::DynArray(scalar),
             span,
         }
@@ -3400,11 +3416,11 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         // Predicate must be `(elem) -> bool` (named or lambda).
-        let Some((func, _)) = self.resolve_fn(fn_arg, &[elem], Some(Ty::Bool), name, span) else {
+        let Some((func, _, captures)) = self.resolve_fn(fn_arg, &[elem], Some(Ty::Bool), name, span) else {
             return err;
         };
         Expr {
-            kind: ExprKind::ArrayAnyAll { source: Box::new(source), stages, func, all },
+            kind: ExprKind::ArrayAnyAll { source: Box::new(source), stages, func, captures, all },
             ty: Ty::Bool,
             span,
         }
@@ -3437,12 +3453,12 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         // `f: (acc, elem) -> acc` (named or lambda).
-        let Some((func, _)) = self.resolve_fn(fn_arg, &[acc_ty, elem], Some(acc_ty), "reduce", span) else {
+        let Some((func, _, captures)) = self.resolve_fn(fn_arg, &[acc_ty, elem], Some(acc_ty), "reduce", span) else {
             return err;
         };
         self.constrain(acc_ty, expected, span);
         Expr {
-            kind: ExprKind::ArrayReduce { source: Box::new(source), stages, func, init: Box::new(init) },
+            kind: ExprKind::ArrayReduce { source: Box::new(source), stages, func, captures, init: Box::new(init) },
             ty: acc_ty,
             span,
         }
@@ -3496,11 +3512,11 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         // `f: (acc, elem) -> acc` (named or lambda).
-        let Some((func, _)) = self.resolve_fn(fn_arg, &[acc_ty, elem], Some(acc_ty), "scan", span) else {
+        let Some((func, _, captures)) = self.resolve_fn(fn_arg, &[acc_ty, elem], Some(acc_ty), "scan", span) else {
             return err;
         };
         Expr {
-            kind: ExprKind::ArrayScan { source: Box::new(source), stages, func, init: Box::new(init), elem: acc_ty },
+            kind: ExprKind::ArrayScan { source: Box::new(source), stages, func, captures, init: Box::new(init), elem: acc_ty },
             ty: Ty::DynArray(scalar),
             span,
         }

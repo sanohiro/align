@@ -221,10 +221,44 @@ fn lambda_captures_lower_to_extra_call_args() {
 }
 
 #[test]
-fn lambda_capture_in_reduce_rejected_for_now() {
-    // Capture is wired into map/where; the reducers don't pass captures yet.
+fn lambda_captures_in_reduce() {
+    if !backend_available() {
+        return;
+    }
+    // Capture in a two-parameter fold: 1*2 + 2*2 + 3*2 = 12.
     let src = "fn main() -> Result<(), Error> {\n  k := 2\n  print([1, 2, 3].reduce(fn acc, x { acc + x * k }, 0))\n  return Ok(())\n}\n";
-    assert!(check_errs("lam-capture-reduce", src));
+    let out = build_and_run("lam-capture-reduce", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n");
+}
+
+#[test]
+fn lambda_captures_in_partition_and_any_all() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> Result<(), Error> {\n  t := 2\n  (big, small) := [1, 2, 3, 4].partition(fn x { x > t })\n  print(big.sum())\n  print(small.sum())\n  if [3, 4, 5].all(fn x { x > t }) { print(1) }\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-capture-part", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n3\n1\n");
+}
+
+#[test]
+fn lambda_captures_in_par_map_falls_back_to_sequential() {
+    if !backend_available() {
+        return;
+    }
+    // A capturing par_map lambda is correct via the sequential path (the parallel thunk takes no
+    // capture context): (1+100)+(2+100)+(3+100) = 306.
+    let src = "fn main() -> Result<(), Error> {\n  b := 100\n  print([1, 2, 3].par_map(fn x { x + b }).sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-capture-parmap", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "306\n");
+    // With a capture, par_map does NOT take the parallel runtime path.
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(!text.contains("par_map["), "a capturing par_map must fall back to sequential:\n{text}");
 }
 
 #[test]

@@ -286,12 +286,15 @@ are compiler-known builtins, monomorphic per element type.
   par_map Pure requirement applies to a lifted lambda too. For the two-parameter reducers
   (`reduce`/`scan`), a named fold takes its accumulator/element types from its signature; a
   lambda infers the accumulator from the initial value and the element from the source.
-  A lambda in `map`/`where` may **capture** enclosing locals (slice ③): a captured local becomes
-  a trailing **value parameter** of the lifted function, passed at the call site (`stage_call_args`
-  appends it). No closure environment — the capture is a loop-invariant argument LLVM hoists. This
-  is something a named function cannot do (`map(fn x { x * factor })`). Capture is copy-values only
-  (an owned/Move capture is rejected) and wired into `map`/`where` only (the reducers reject a
-  capturing lambda for now). First-class function values remain a follow-up.
+  A lambda may **capture** enclosing locals (slice ③): a captured local becomes a trailing **value
+  parameter** of the lifted function, passed at the call site (`stage_call_args` appends it). No
+  closure environment — the capture is a loop-invariant argument LLVM hoists. This is something a
+  named function cannot do (`map(fn x { x * factor })`). Capture is copy-values only (an owned/Move
+  capture is rejected); it works in **every** stage and reducer — `map`/`where` (in `StageKind`)
+  and `reduce`/`scan`/`partition`/`any`/`all`/`par_map` (a `captures` field on each node, threaded
+  to the per-element call). A *capturing* `par_map` falls back to the sequential path (the parallel
+  runtime thunk takes no capture context). All three flow analyses (`MoveCheck`/`EscapeCheck`/
+  `EffectScan`) walk stage and node captures. First-class function values remain a follow-up.
 - Method chains rely on the slice-0 postfix `.` (FieldAccess); the pipeline is
   collected from the AST at the `sum` terminal and lowered as one loop.
 - Arrays are not yet Move-checked (literals are consumed only by the reduction);
