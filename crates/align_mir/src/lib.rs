@@ -85,6 +85,11 @@ pub enum Stmt {
     StoreElemField(Slot, Operand, u32, Operand),
     /// End an arena, freeing all its allocations (the operand is the arena handle).
     ArenaEnd(Operand),
+    /// Run all deferred tasks of a `task_group` and clear the list (`wait()`). Operand = the
+    /// task-group handle. ④b-1 runs them sequentially; ④b-2 joins threads.
+    TgWait(Operand),
+    /// End a `task_group`, freeing its region (the operand is the task-group handle).
+    TgEnd(Operand),
     /// Null-initialise an owned-array slot (`{null, 0}`) so a later [`Stmt::Drop`] on a path
     /// that never allocated is a no-op (MMv2 slice 4 drop-flag-via-null-slot).
     DropFlagInit(Slot),
@@ -148,6 +153,13 @@ pub enum Rvalue {
     ResultUnwrapErr(Operand),
     /// Open a new arena; the value is its handle.
     ArenaBegin,
+    /// Open a `task_group`; the value is its handle (a `*TaskGroup`).
+    TgBegin,
+    /// Register a deferred task (`spawn`): snapshot the closure's captures into a fresh env in the
+    /// task-group region, allocate the result slot there, and register the task. Yields the slot
+    /// pointer (the `Task<R>` handle). `tg` = the task-group handle, `closure` = the `{fn, env}`
+    /// value, `capture_tys` give the env layout (empty = non-capturing), `r` = the result scalar.
+    SpawnTask { tg: Operand, closure: Operand, capture_tys: Vec<Ty>, r: Ty },
     /// `heap.new(init)` in an arena: bump-allocate, store `init`, yield the `box` pointer.
     /// First operand is the arena handle, second is the initial value.
     HeapAlloc(Operand, Operand),
@@ -313,6 +325,8 @@ struct Builder {
     /// Handles of the arenas currently open (innermost last); any exit out of them
     /// (`return`, `?`) must free them first.
     arenas: Vec<ValueId>,
+    /// Handles of the `task_group`s currently open (innermost last); `spawn`/`wait` use the top.
+    task_groups: Vec<ValueId>,
     /// Free-standing owned locals (heap `array<T>`) that must be freed at every function
     /// exit (MMv2 slice 4; `hir::Fn::drop_locals`). Their slots are null-initialised at
     /// entry, so a drop on a path that never allocated frees null (a no-op).
@@ -323,11 +337,18 @@ struct Builder {
 }
 
 impl Builder {
-    /// Free every open arena (innermost first) and drop every owned free-standing local —
-    /// emitted before any exit that leaves the function / arena scopes.
+    /// Free every open arena (innermost first), join + free every open `task_group`, and drop
+    /// every owned free-standing local — emitted before any exit that leaves these scopes.
     fn emit_exit_cleanup(&mut self) {
         for s in self.drop_locals.clone() {
             self.push(Stmt::Drop(s));
+        }
+        // An early exit out of a `task_group` still joins its tasks (structured concurrency) and
+        // frees the region.
+        let tgs = self.task_groups.clone();
+        for h in tgs.into_iter().rev() {
+            self.push(Stmt::TgWait(Operand::Value(h)));
+            self.push(Stmt::TgEnd(Operand::Value(h)));
         }
         let handles = self.arenas.clone();
         for h in handles.into_iter().rev() {
@@ -382,6 +403,7 @@ fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef]) -> Function {
         cur: 0,
         ret: f.ret,
         arenas: Vec::new(),
+        task_groups: Vec::new(),
         drop_locals: f.drop_locals.clone(),
         tuples: tuples.to_vec(),
     };
@@ -758,43 +780,50 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Block(blk) => {
             lower_block(b, blk).unwrap_or(Operand::Const(Const::Bool(false)))
         }
-        // ④b: `task_group` opens a region (like `arena {}`) that owns the task result boxes.
+        // ④b: `task_group` opens a region owning each task's env + result slot, plus a deferred
+        // task list. `spawn`/`wait` use the handle; the region is freed at scope end.
         hir::ExprKind::TaskGroup(blk) => {
             let handle = b.fresh_value(Ty::ArenaHandle);
-            b.push(Stmt::Let(handle, Rvalue::ArenaBegin));
-            b.arenas.push(handle);
+            b.push(Stmt::Let(handle, Rvalue::TgBegin));
+            b.task_groups.push(handle);
             let tail = lower_block(b, blk);
-            b.arenas.pop();
+            b.task_groups.pop();
             if b.is_terminated() {
                 Operand::Const(Const::Unit)
             } else {
-                b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+                b.push(Stmt::TgEnd(Operand::Value(handle)));
                 tail.unwrap_or(Operand::Const(Const::Unit))
             }
         }
-        // ④b-1a (eager): `spawn(closure)` calls the zero-arg closure now, then boxes the result `R`
-        // in the task_group region — the `Task<R>` handle is that box. ④b-1b defers the call (a
-        // trampoline writes the box at `wait`); ④b-2 runs it on a thread.
+        // ④b-1b (deferred): `spawn(closure)` snapshots the closure's captures into a fresh env in
+        // the task-group region and registers the task; it runs at `wait`. The `Task<R>` handle is
+        // the task's result slot. The closure's captures give the env layout.
         hir::ExprKind::Spawn(inner) => {
             let Ty::Task(s) = e.ty else { unreachable!("spawn result is a Task") };
             let r_ty = align_sema::scalar_to_ty(s);
+            let capture_tys: Vec<Ty> = match &inner.kind {
+                hir::ExprKind::Closure { captures, .. } => captures.iter().map(|c| c.ty).collect(),
+                _ => Vec::new(),
+            };
             let closure = lower_expr(b, inner);
-            let rv = b.fresh_value(r_ty);
-            b.push(Stmt::Let(rv, Rvalue::CallIndirect { callee: closure, args: vec![], param_tys: vec![], ret_ty: r_ty }));
-            let handle = *b.arenas.last().expect("spawn outside a task_group region");
+            let tg = Operand::Value(*b.task_groups.last().expect("spawn outside a task_group"));
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::HeapAlloc(Operand::Value(handle), Operand::Value(rv))));
+            b.push(Stmt::Let(v, Rvalue::SpawnTask { tg, closure, capture_tys, r: r_ty }));
             Operand::Value(v)
         }
-        // `t.get()` reads the result out of the task's box.
+        // `t.get()` reads the result out of the task's slot.
         hir::ExprKind::TaskGet(inner) => {
             let bx = lower_expr(b, inner);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
             Operand::Value(v)
         }
-        // `wait()` — a no-op marker in ④b-1a (eager); ④b-2/④c give it join + error-boundary.
-        hir::ExprKind::Wait => Operand::Const(Const::Unit),
+        // `wait()` — run all deferred tasks of the enclosing task_group.
+        hir::ExprKind::Wait => {
+            let tg = Operand::Value(*b.task_groups.last().expect("wait outside a task_group"));
+            b.push(Stmt::TgWait(tg));
+            Operand::Const(Const::Unit)
+        }
         hir::ExprKind::OptionSome(inner) => {
             let op = lower_expr(b, inner);
             let v = b.fresh_value(e.ty);

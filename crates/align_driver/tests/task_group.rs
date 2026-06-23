@@ -66,6 +66,32 @@ fn unit_returning_side_effect_task() {
 }
 
 #[test]
+fn tasks_run_deferred_at_wait() {
+    if !backend_available() {
+        return;
+    }
+    // ④b-1b: a spawned task runs at `wait()`, not at `spawn` — so the side effect prints after
+    // the statements between `spawn` and `wait` (matching the eventual "complete by wait" model).
+    let src = "fn main() -> Result<(), Error> {\n  task_group {\n    a := spawn(fn { print(1) })\n    print(2)\n    wait()\n    a.get()\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-deferred", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n1\n");
+}
+
+#[test]
+fn early_return_joins_tasks() {
+    if !backend_available() {
+        return;
+    }
+    // An early `return` out of a `task_group` still joins its tasks (structured concurrency):
+    // the spawned side effect runs during the exit cleanup.
+    let src = "fn main() -> Result<(), Error> {\n  task_group {\n    spawn(fn { print(9) })\n    return Ok(())\n  }\n}\n";
+    let out = build_and_run("tg-early-return", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
+}
+
+#[test]
 fn owned_payload_task_rejected() {
     // ④b-1a: a task result is boxed in the region, so it must be a primitive scalar for now;
     // an owned result (`string`) is rejected (the region drop/borrow handling is a later slice).

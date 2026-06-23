@@ -1167,6 +1167,66 @@ pub extern "C" fn align_rt_arena_end(arena: *mut Arena) {
     drop(unsafe { Box::from_raw(arena) });
 }
 
+// `task_group` runtime (slice ④b). A `TaskGroup` owns a region (arena) holding each spawned
+// task's environment + result slot, plus the deferred task list. ④b-1 runs the tasks
+// sequentially at `wait`; ④b-2 will spawn a thread per task and join at `wait` (the per-task
+// trampoline, env, and slot are already heap-stable in the region, so that is the only change).
+struct TgTask {
+    /// `tramp(thunk, env, slot)` — runs the spawned closure and writes its result into `slot`.
+    tramp: extern "C" fn(*const u8, *mut u8, *mut u8),
+    /// The closure's function pointer (env-ABI `fn(env) -> R`), passed through to the trampoline.
+    thunk: *const u8,
+    /// The task's environment (capture snapshot) — a fresh region allocation per `spawn`.
+    env: *mut u8,
+    /// The task's result slot (a region allocation sized for `R`).
+    slot: *mut u8,
+}
+
+pub struct TaskGroup {
+    arena: Arena,
+    tasks: Vec<TgTask>,
+}
+
+/// Open a `task_group`. Freed by [`align_rt_tg_end`].
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_tg_begin() -> *mut TaskGroup {
+    Box::into_raw(Box::new(TaskGroup { arena: Arena { chunks: Vec::new(), off: 0 }, tasks: Vec::new() }))
+}
+
+/// Bump-allocate `size` bytes (with `align`) from the task group's region (envs + result slots).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align: i64) -> *mut u8 {
+    unsafe { &mut *tg }.arena.alloc(size as usize, align as usize)
+}
+
+/// Register a deferred task (its trampoline + closure pointer + env + result slot).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_tg_register(
+    tg: *mut TaskGroup,
+    tramp: extern "C" fn(*const u8, *mut u8, *mut u8),
+    thunk: *const u8,
+    env: *mut u8,
+    slot: *mut u8,
+) {
+    unsafe { &mut *tg }.tasks.push(TgTask { tramp, thunk, env, slot });
+}
+
+/// Run every registered task (④b-1: sequentially, in spawn order) and clear the list.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) {
+    let tg = unsafe { &mut *tg };
+    for t in &tg.tasks {
+        (t.tramp)(t.thunk, t.env, t.slot);
+    }
+    tg.tasks.clear();
+}
+
+/// Release the task group's region and the handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
+    drop(unsafe { Box::from_raw(tg) });
+}
+
 // Free-standing heap allocation for owned collections (`array<T>` produced by `.to_array()`
 // outside an arena). Backed by the C allocator so `free` needs no size/layout — the buffer
 // may be over-allocated (map/where never grow) and is freed whole. `free(null)` is a no-op,

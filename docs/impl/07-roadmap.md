@@ -66,9 +66,13 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    fine here. **④b-1a DONE** — `Task<R>` is now a **`box<R>` in the task_group region** (the scope opens an
    arena; `spawn` boxes its result there, `get` is a box load), so a task handle is region-tied
    (cannot escape the scope) and the result lives in a region slot — the memory model real threads
-   need. Still eager + primitive-scalar `R` (owned/view results deferred). Next: **④b-1b** deferred
-   execution (a per-spawn trampoline writes the box at `wait`, fresh region env per spawn); **④b-2**
-   real threads (reuse the `par_map` runtime); **④c** the `wait()?` error boundary + the
+   need. Still eager + primitive-scalar `R` (owned/view results deferred). **④b-1b DONE** — deferred
+   execution: a `task_group` is now a runtime `TaskGroup` (a region + a task list); `spawn`
+   snapshots its captures into a fresh region env and registers a task (it does **not** run yet);
+   `wait()` runs all tasks (sequentially) via a per-`R` trampoline that writes each result slot;
+   an early `return`/`?` out of the scope joins + frees it. (`get`-before-`wait` reads an
+   uncomputed slot — rejected by the ④c check.) Next: **④b-2** real threads (the trampoline runs
+   on a worker thread; reuse the `par_map` runtime); **④c** the `wait()?` error boundary + the
    `get`-before-`wait` compile-time check.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.

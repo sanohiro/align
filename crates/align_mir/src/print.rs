@@ -64,6 +64,12 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::ArenaEnd(op) => {
                 let _ = writeln!(out, "    arena_end {}", operand_str(op));
             }
+            Stmt::TgWait(op) => {
+                let _ = writeln!(out, "    tg_wait {}", operand_str(op));
+            }
+            Stmt::TgEnd(op) => {
+                let _ = writeln!(out, "    tg_end {}", operand_str(op));
+            }
         }
     }
     match &b.term {
@@ -139,6 +145,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::ResultUnwrapOk(op) => format!("unwrap_ok({})", operand_str(op)),
         Rvalue::ResultUnwrapErr(op) => format!("unwrap_err({})", operand_str(op)),
         Rvalue::ArenaBegin => "arena_begin".to_string(),
+        Rvalue::TgBegin => "tg_begin".to_string(),
+        Rvalue::SpawnTask { closure, .. } => format!("spawn_task {}", operand_str(closure)),
         Rvalue::HeapAlloc(h, init) => format!("heap_alloc({}, {})", operand_str(h), operand_str(init)),
         Rvalue::BoxGet(op) => format!("box_get({})", operand_str(op)),
         Rvalue::BoxClone(h, src) => format!("box_clone({}, {})", operand_str(h), operand_str(src)),
