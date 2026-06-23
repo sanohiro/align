@@ -163,6 +163,31 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `task_group` runtime (slice ④b).
+    funcs.insert(
+        "tg_begin".to_string(),
+        module.add_function("align_rt_tg_begin", ptr.fn_type(&[], false), None),
+    );
+    funcs.insert(
+        "tg_alloc".to_string(),
+        module.add_function("align_rt_tg_alloc", ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false), None),
+    );
+    funcs.insert(
+        "tg_register".to_string(),
+        module.add_function(
+            "align_rt_tg_register",
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "tg_wait".to_string(),
+        module.add_function("align_rt_tg_wait", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "tg_end".to_string(),
+        module.add_function("align_rt_tg_end", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     // Free-standing heap allocation for owned arrays (MMv2 slice 4).
     funcs.insert(
         "alloc".to_string(),
@@ -503,6 +528,51 @@ fn build_module<'c>(
         funcs.insert(format!("{lifted}$clos"), thunk);
     }
 
+    // Pass 1d: a `spawn` trampoline per result type `R`. `tramp$R(thunk, env, slot)` runs the
+    // spawned closure (`thunk(env) -> R`) and stores the result into `slot` (the typed store is
+    // why it is generated, not in the runtime). ④b-1 calls it sequentially at `wait`; ④b-2 runs
+    // it on a worker thread.
+    let mut tramp_rs: std::collections::BTreeMap<String, Ty> = std::collections::BTreeMap::new();
+    for f in &program.fns {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Let(_, Rvalue::SpawnTask { r, .. }) = s {
+                    tramp_rs.insert(task_tramp_key(*r), *r);
+                }
+            }
+        }
+    }
+    for (key, r) in &tramp_rs {
+        let rt = scalar_type(ctx, *r, &struct_types);
+        let fn_ty = ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false);
+        let tramp = module.add_function(&format!("tramp${key}"), fn_ty, None);
+        let bb = ctx.append_basic_block(tramp, "entry");
+        let tb = ctx.create_builder();
+        tb.position_at_end(bb);
+        let thunk = tramp.get_nth_param(0).unwrap().into_pointer_value();
+        let env = tramp.get_nth_param(1).unwrap();
+        let slot = tramp.get_nth_param(2).unwrap().into_pointer_value();
+        if *r == Ty::Unit {
+            // A `()`-returning closure is `void(ptr)` in LLVM (not `i32(ptr)`), so it must be
+            // called with a void signature; the slot (i32-sized) gets a dummy value.
+            let clos_fn_ty = ctx.void_type().fn_type(&[ptr.into()], false);
+            tb.build_indirect_call(clos_fn_ty, thunk, &[env.into()], "")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            tb.build_store(slot, ctx.i32_type().const_zero()).map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        } else {
+            let clos_fn_ty = rt.fn_type(&[ptr.into()], false);
+            let res = tb
+                .build_indirect_call(clos_fn_ty, thunk, &[env.into()], "r")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?;
+            tb.build_store(slot, res).map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        }
+        tb.build_return(None).map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        funcs.insert(format!("tramp${key}"), tramp);
+    }
+
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
@@ -729,6 +799,19 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
 }
 
 /// Size/alignment (bytes) of a scalar's in-memory representation.
+/// A symbol-safe key for a spawn result type `R`, naming its trampoline (`tramp$<key>`).
+fn task_tramp_key(ty: Ty) -> String {
+    match ty {
+        Ty::Int(it) => format!("{}{}", if it.signed { 'i' } else { 'u' }, it.bits),
+        Ty::Float(ft) => format!("f{}", ft.bits),
+        Ty::Bool => "bool".to_string(),
+        Ty::Char => "char".to_string(),
+        Ty::Unit => "unit".to_string(),
+        Ty::ErrCode => "err".to_string(),
+        _ => "x".to_string(),
+    }
+}
+
 fn scalar_bytes(s: Scalar) -> u64 {
     match s {
         Scalar::Int(it) => (it.bits / 8).max(1) as u64,
@@ -993,6 +1076,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let handle = self.operand(op).into();
                     self.builder
                         .build_call(self.funcs["arena_end"], &[handle], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                Stmt::TgWait(op) => {
+                    let handle = self.operand(op).into();
+                    self.builder
+                        .build_call(self.funcs["tg_wait"], &[handle], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                Stmt::TgEnd(op) => {
+                    let handle = self.operand(op).into();
+                    self.builder
+                        .build_call(self.funcs["tg_end"], &[handle], "")
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::DropFlagInit(slot) => {
@@ -1398,6 +1493,59 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["arena_begin"], &[], "arena")
                     .map_err(|e| self.err(e))?;
                 cs.try_as_basic_value().basic().expect("arena_begin returns a pointer")
+            }
+            Rvalue::TgBegin => {
+                let cs = self
+                    .builder
+                    .build_call(self.funcs["tg_begin"], &[], "tg")
+                    .map_err(|e| self.err(e))?;
+                cs.try_as_basic_value().basic().expect("tg_begin returns a pointer")
+            }
+            Rvalue::SpawnTask { tg, closure, capture_tys, r } => {
+                let i64t = self.ctx.i64_type();
+                let tgv = self.operand(tg).into_pointer_value();
+                let clos = self.operand(closure).into_struct_value();
+                let thunk = self.builder.build_extract_value(clos, 0, "thunk").map_err(|e| self.err(e))?;
+                let frame_env = self.builder.build_extract_value(clos, 1, "fenv").map_err(|e| self.err(e))?.into_pointer_value();
+                // Snapshot the captures into a fresh env in the task-group region (so a deferred
+                // task reads its own captures, not a frame slot reused by a later `spawn`).
+                let env: BasicValueEnum = if capture_tys.is_empty() {
+                    self.ctx.ptr_type(AddressSpace::default()).const_null().into()
+                } else {
+                    let fields: Vec<BasicTypeEnum> = capture_tys.iter().map(|t| abi_type(self.ctx, *t, self.struct_types)).collect();
+                    let env_struct = self.ctx.struct_type(&fields, false);
+                    let size = self.target_data.get_store_size(&env_struct);
+                    let align = self.target_data.get_abi_alignment(&env_struct) as u64;
+                    let re = self
+                        .builder
+                        .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(size, false).into(), i64t.const_int(align, false).into()], "env")
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value().basic().expect("tg_alloc returns a pointer").into_pointer_value();
+                    self.builder
+                        .build_memcpy(re, align as u32, frame_env, align as u32, i64t.const_int(size, false))
+                        .map_err(|e| self.err(e))?;
+                    re.into()
+                };
+                // The result slot (a `box<R>` in the region — the `Task<R>` handle).
+                let rbytes = match r {
+                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::ErrCode => {
+                        let t = scalar_type(self.ctx, *r, self.struct_types);
+                        self.target_data.get_store_size(&t)
+                    }
+                    _ => return Err(self.err("a spawned task result must be a primitive scalar")),
+                };
+                let ralign = self.target_data.get_abi_alignment(&scalar_type(self.ctx, *r, self.struct_types)) as u64;
+                let slot = self
+                    .builder
+                    .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(rbytes, false).into(), i64t.const_int(ralign, false).into()], "slot")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("tg_alloc returns a pointer").into_pointer_value();
+                // The per-`R` trampoline runs the closure and writes the slot at `wait`.
+                let tramp = self.funcs[&format!("tramp${}", task_tramp_key(*r))].as_global_value().as_pointer_value();
+                self.builder
+                    .build_call(self.funcs["tg_register"], &[tgv.into(), tramp.into(), thunk.into(), env.into(), slot.into()], "")
+                    .map_err(|e| self.err(e))?;
+                slot.into()
             }
             Rvalue::HeapAlloc(handle, init) => {
                 // A `box<T>` (heap.new) or a `Task<R>` (spawn) — both a boxed scalar in an arena.
