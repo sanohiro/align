@@ -272,6 +272,33 @@ fn ty_capture_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
         || ty_tuple_is_move(ty, tuples)
 }
 
+/// The pipeline stages of a stage-bearing pipeline node (else `None`). Lets the flow analyses
+/// (`MoveCheck`/`EscapeCheck`) walk stage captures — a lifted lambda's captured enclosing locals,
+/// which are reads of enclosing locals and must be analyzed like any other use.
+fn pipeline_stages(kind: &ExprKind) -> Option<&[Stage]> {
+    match kind {
+        ExprKind::ArraySum { stages, .. }
+        | ExprKind::ArrayCount { stages, .. }
+        | ExprKind::ArrayAnyAll { stages, .. }
+        | ExprKind::ArrayMinMax { stages, .. }
+        | ExprKind::ArrayReduce { stages, .. }
+        | ExprKind::ArrayScan { stages, .. }
+        | ExprKind::ArraySort { stages, .. }
+        | ExprKind::ArrayToArray { stages, .. }
+        | ExprKind::ArrayPartition { stages, .. }
+        | ExprKind::ArrayParMap { stages, .. } => Some(stages),
+        _ => None,
+    }
+}
+
+/// The capture operands carried by a pipeline's stages (a lifted lambda's captured values).
+fn stage_capture_exprs(stages: &[Stage]) -> impl Iterator<Item = &Expr> {
+    stages.iter().flat_map(|s| match &s.kind {
+        StageKind::Map { captures, .. } | StageKind::Where { captures, .. } => captures.as_slice(),
+        StageKind::Project { .. } | StageKind::WhereField { .. } => &[][..],
+    })
+}
+
 /// Whether a local of `ty` owns a heap buffer that must be freed by a per-binding `Drop` (when its
 /// region is `Static`) — the predicate the drop set is built from. A free-standing owned
 /// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
@@ -1057,6 +1084,13 @@ impl<'a> EscapeCheck<'a> {
 
     /// Recurse to find nested arenas and value positions that let a box escape.
     fn walk(&mut self, e: &Expr, depth: u32) {
+        // A pipeline stage may carry capture operands (a lifted lambda's captured enclosing
+        // locals); walk them so a captured value escaping its region is caught.
+        if let Some(stages) = pipeline_stages(&e.kind) {
+            for c in stage_capture_exprs(stages) {
+                self.walk(c, depth);
+            }
+        }
         match &e.kind {
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
@@ -1283,6 +1317,13 @@ impl<'a> MoveCheck<'a> {
         consuming: bool,
         direct: bool,
     ) {
+        // A pipeline stage may carry capture operands (a lifted lambda's captured enclosing
+        // locals); walk them as borrows so use-after-move of a captured value is caught.
+        if let Some(stages) = pipeline_stages(&e.kind) {
+            for c in stage_capture_exprs(stages) {
+                self.expr(c, moved, false, false);
+            }
+        }
         match &e.kind {
             ExprKind::Local(id) => {
                 if whole_moved(moved, *id) {
@@ -1622,7 +1663,7 @@ impl<'a, 't> Checker<'a, 't> {
         if let Some(id) = self.lookup(name) {
             return Some(id);
         }
-        let cap = self.capture.as_ref()?;
+        let cap = self.capture.as_mut()?;
         if let Some(&(_, param_id, _)) = cap.captured.iter().find(|(n, _, _)| n == name) {
             return Some(param_id);
         }
@@ -1631,7 +1672,7 @@ impl<'a, 't> Checker<'a, 't> {
         // into the visible scope so a nested-block exit can't truncate it).
         let param_id = self.locals.len() as LocalId;
         self.locals.push(Local { id: param_id, name: name.to_string(), ty, is_mut: false });
-        self.capture.as_mut().unwrap().captured.push((name.to_string(), param_id, enc_id));
+        cap.captured.push((name.to_string(), param_id, enc_id));
         Some(param_id)
     }
 

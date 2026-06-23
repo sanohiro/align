@@ -1143,7 +1143,8 @@ struct SrcSetup {
 /// lambda's captured enclosing locals, passed by value). Captures are lowered each iteration —
 /// they reference loop-invariant enclosing locals, so LLVM hoists the loads out of the loop.
 fn stage_call_args(b: &mut Builder, arg: Operand, captures: &[hir::Expr]) -> Vec<Operand> {
-    let mut args = vec![arg];
+    let mut args = Vec::with_capacity(1 + captures.len());
+    args.push(arg);
     for c in captures {
         args.push(lower_expr(b, c));
     }

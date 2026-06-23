@@ -228,6 +228,20 @@ fn lambda_capture_in_reduce_rejected_for_now() {
 }
 
 #[test]
+fn lambda_capture_does_not_false_positive_move_or_escape() {
+    if !backend_available() {
+        return;
+    }
+    // The flow analyses now walk stage captures; a valid copy-value capture (used after the
+    // pipeline, and a fixed-array capture) must not be wrongly flagged as moved/escaping.
+    let src = "fn main() -> Result<(), Error> {\n  factor := 4\n  a := [10, 20, 30]\n  s := [1, 2].map(fn x { x * factor + a[0] }).sum()\n  print(s)\n  print(factor)\n  return Ok(())\n}\n";
+    let out = build_and_run("lam-capture-noflag", src);
+    assert_eq!(out.status.code(), Some(0));
+    // (1*4+10) + (2*4+10) = 14 + 18 = 32, then factor=4.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "32\n4\n");
+}
+
+#[test]
 fn lambda_capture_owned_value_rejected_for_now() {
     // Slice ③ captures copy values; capturing an owned (Move) value is deferred.
     let src = "fn main() -> Result<(), Error> {\n  ys := [10, 20].to_array()\n  print([1, 2, 3].map(fn x { x + ys.sum() }).sum())\n  return Ok(())\n}\n";
