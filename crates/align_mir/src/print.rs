@@ -93,6 +93,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::Bin(op, a, b) => {
             format!("{} {} {}", operand_str(a), binop_str(*op), operand_str(b))
         }
+        Rvalue::IntArith { op, mode, int_ty, a, b } => {
+            let m = match mode {
+                align_sema::ArithMode::Saturating => "saturating",
+                align_sema::ArithMode::Checked => "checked",
+            };
+            format!("{m}({} {} {} : {})", operand_str(a), binop_str(*op), operand_str(b), ty_name(*int_ty))
+        }
         Rvalue::Call(name, args) => {
             let a: Vec<String> = args.iter().map(operand_str).collect();
             format!("call {name}({})", a.join(", "))

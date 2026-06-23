@@ -22,6 +22,7 @@ use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
+use inkwell::intrinsics::Intrinsic;
 use inkwell::module::Module;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
@@ -995,6 +996,66 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             },
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
+            Rvalue::IntArith { op, mode, int_ty, a, b } => {
+                let llvm_int = int_type(self.ctx, *int_ty);
+                let sign = if is_signed(*int_ty) { 's' } else { 'u' };
+                let opname = match op {
+                    BinOp::Add => "add",
+                    BinOp::Sub => "sub",
+                    BinOp::Mul => "mul",
+                    _ => return Err(self.err("IntArith op must be add/sub/mul")),
+                };
+                let av = self.operand(a).into_int_value();
+                let bv = self.operand(b).into_int_value();
+                let suffix = match mode {
+                    align_sema::ArithMode::Saturating => "sat",
+                    align_sema::ArithMode::Checked => "with.overflow",
+                };
+                let name = format!("llvm.{sign}{opname}.{suffix}");
+                let intr = Intrinsic::find(&name).ok_or_else(|| self.err(format!("intrinsic {name} not found")))?;
+                let f = intr
+                    .get_declaration(self.module, &[llvm_int.into()])
+                    .ok_or_else(|| self.err(format!("could not declare intrinsic {name}")))?;
+                let ret = self
+                    .builder
+                    .build_call(f, &[av.into(), bv.into()], "ovf")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("overflow/saturating intrinsic returns a value");
+                match mode {
+                    // `saturating_*`: the intrinsic already returns the clamped int.
+                    align_sema::ArithMode::Saturating => ret,
+                    // `checked_*`: the intrinsic returns `{ iN result, i1 overflow }`; build
+                    // `Option<iN>` — tag 0 (None) on overflow, else tag 1 (Some) with the result.
+                    align_sema::ArithMode::Checked => {
+                        let Ty::Option(s) = result_ty else {
+                            return Err(self.err("checked result is not an Option"));
+                        };
+                        let agg = ret.into_struct_value();
+                        let res = self.builder.build_extract_value(agg, 0, "res").map_err(|e| self.err(e))?;
+                        let ovf = self.builder.build_extract_value(agg, 1, "of").map_err(|e| self.err(e))?.into_int_value();
+                        let oty = option_struct_type(self.ctx, s, self.struct_types);
+                        let some_tag = self.ctx.i8_type().const_int(1, false);
+                        let none_tag = self.ctx.i8_type().const_int(0, false);
+                        let tag = self
+                            .builder
+                            .build_select(ovf, none_tag, some_tag, "tag")
+                            .map_err(|e| self.err(e))?
+                            .into_int_value();
+                        let a0 = self
+                            .builder
+                            .build_insert_value(oty.const_zero(), tag, 0, "tag")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                        self.builder
+                            .build_insert_value(a0, res, 1, "val")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value()
+                            .into()
+                    }
+                }
+            }
             Rvalue::Field(slot, idx) => {
                 let fty = abi_type(self.ctx, self.field_ty(*slot, *idx), self.struct_types);
                 let field_ptr = self.field_ptr(*slot, *idx)?;

@@ -24,8 +24,10 @@ escape-driven design settled); **`sort_by_key`**; whole-struct **`arr[i]`** by v
 enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` + purity inference.
 
 **Forward plan (ordered — finish the language, then std):**
-1. **core.math** — `checked_*` / `saturating_*` / `wrapping_*` arithmetic (*in progress*), then
-   scalar `abs` / `min` / `max` / … (Settled core identity: defined wrap + explicit overflow ops).
+1. **core.math** — explicit-overflow arithmetic `checked_*` / `saturating_*` / `wrapping_*` for
+   add/sub/mul **DONE** (methods on integers; `checked_*` → `Option<T>`, via LLVM `.sat` /
+   `.with.overflow`). Next: scalar `abs` / `min` / `max` / `pow` / … (Settled core identity:
+   defined wrap + explicit overflow ops).
 2. **core.bytes / core.buffer** — read-only byte views + mutable byte buffers.
 3. **first-class closures (escape-driven) → `task_group`** — M7 concurrency. Design SETTLED
    (`open-questions.md`); closures are the foundation, `task_group` the consumer.

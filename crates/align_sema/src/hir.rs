@@ -13,6 +13,15 @@ use align_span::Span;
 /// Identifier of a local variable (and its memory slot) within a function body.
 pub type LocalId = u32;
 
+/// The overflow handling of an explicit-overflow integer op ([`ExprKind::IntArith`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArithMode {
+    /// `saturating_*`: clamp to the type's MIN/MAX; result is the same int type.
+    Saturating,
+    /// `checked_*`: `Option<T>` — `None` on overflow, else `Some(result)`.
+    Checked,
+}
+
 #[derive(Clone, Debug)]
 pub struct Program {
     pub fns: Vec<Fn>,
@@ -128,6 +137,16 @@ pub enum ExprKind {
     },
     Binary {
         op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    /// Explicit-overflow integer arithmetic (`core.math`): `x.saturating_add(y)` /
+    /// `x.checked_mul(y)` etc. `op` is `Add`/`Sub`/`Mul`. `Saturating` clamps to the type's
+    /// MIN/MAX and yields the same int type; `Checked` yields `Option<T>` (`None` on overflow).
+    /// (`wrapping_*` is just the default wrapping `Binary`, so it is not represented here.)
+    IntArith {
+        op: BinOp,
+        mode: ArithMode,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
