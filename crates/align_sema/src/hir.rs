@@ -54,6 +54,18 @@ pub struct Program {
     /// Anonymous tuple types, indexed by the id carried in [`crate::Ty::Tuple`]. Interned
     /// (deduplicated by element list) during checking, so `(i64, i64)` is one entry.
     pub tuples: Vec<TupleDef>,
+    /// Function-value types, indexed by the id carried in [`crate::Ty::Fn`]. Interned during
+    /// checking. A `Ty::Fn` value is a function pointer (Copy / `Static`, no environment yet —
+    /// non-capturing first-class functions, slice ①).
+    pub fn_types: Vec<FnTy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FnTy {
+    /// Parameter types (scalar-only for now).
+    pub params: Vec<crate::Scalar>,
+    /// Return type (a scalar).
+    pub ret: crate::Scalar,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +191,14 @@ pub enum ExprKind {
     MathOp {
         fn_: MathFn,
         operands: Vec<Expr>,
+    },
+    /// A first-class function value (`f := fn x: i32 { … }`): a pointer to the lifted top-level
+    /// function `name`. Non-capturing only (slice ①) — no environment. Type is `Ty::Fn`.
+    FnValue(String),
+    /// An indirect call through a function value: `f(args)` where `f` is a `Ty::Fn` local.
+    CallFnValue {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
     },
     Call {
         func: String,

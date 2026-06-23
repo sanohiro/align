@@ -200,6 +200,9 @@ pub enum Ty {
     /// are primitive scalars (Copy, `Static`) — a tuple is Copy and never dropped/region-tied
     /// yet; owned/`str` elements are a later, additive slice.
     Tuple(u32),
+    /// A first-class function value type (`fn(params) -> ret`), indexed into `Program.fn_types`.
+    /// A function pointer — Copy, `Static`, no environment (non-capturing functions, slice ①).
+    Fn(u32),
     Unit,
     /// Type-checking error sentinel (bottom). Distinct from the `Error` *type*
     /// ([`Ty::ErrCode`]).
@@ -406,6 +409,8 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
 
     // The shared tuple-type interner (anonymous `(T, U, …)`), built on demand as types resolve.
     let mut tuples: Vec<hir::TupleDef> = Vec::new();
+    // The shared function-value-type interner (`Ty::Fn`), built on demand as lambdas become values.
+    let mut fn_types: Vec<hir::FnTy> = Vec::new();
 
     // Pass 0b: resolve field types. M1 restricts struct fields to primitives.
     let mut structs: Vec<StructDef> = Vec::with_capacity(struct_decls.len());
@@ -488,6 +493,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             struct_ids: &struct_ids,
             structs: &structs,
             tuples: &mut tuples,
+            fn_types: &mut fn_types,
             int_vars: Vec::new(),
             int_parent: Vec::new(),
             float_vars: Vec::new(),
@@ -506,7 +512,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         fns.push(checked);
         fns.extend(lifted);
     }
-    let mut program = Program { fns, structs, tuples };
+    let mut program = Program { fns, structs, tuples, fn_types };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
@@ -654,6 +660,15 @@ impl EffectScan {
                 } else {
                     self.calls.push(func.clone());
                 }
+                for a in args {
+                    self.expr(a);
+                }
+            }
+            // A function value (taking a fn's address) is not a call; an indirect call walks its
+            // callee + args (the target is not statically known — not used in `par_map` contexts).
+            ExprKind::FnValue(_) => {}
+            ExprKind::CallFnValue { callee, args } => {
+                self.expr(callee);
                 for a in args {
                     self.expr(a);
                 }
@@ -1188,6 +1203,14 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(a, depth);
                 }
             }
+            // A fn value is a `Static` pointer (no region); an indirect call recurses its parts.
+            ExprKind::FnValue(_) => {}
+            ExprKind::CallFnValue { callee, args } => {
+                self.walk(callee, depth);
+                for a in args {
+                    self.walk(a, depth);
+                }
+            }
             ExprKind::StructLit { fields, .. } => {
                 // No per-field rejection: the struct *carries* the region of its fields
                 // (`region_of`), and escape is checked when the whole struct is returned /
@@ -1426,6 +1449,14 @@ impl<'a> MoveCheck<'a> {
                     self.expr(a, moved, consuming, consuming);
                 }
             }
+            // A fn value is Copy (a pointer); an indirect call's callee + args are reads.
+            ExprKind::FnValue(_) => {}
+            ExprKind::CallFnValue { callee, args } => {
+                self.expr(callee, moved, false, false);
+                for a in args {
+                    self.expr(a, moved, true, true);
+                }
+            }
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
                     self.expr(f, moved, true, true);
@@ -1556,6 +1587,8 @@ struct Checker<'a, 't> {
     /// `'a` so each per-function `Checker` can reborrow it mutably without conflicting with the
     /// long-lived shared `structs`/`struct_ids` borrows.
     tuples: &'t mut Vec<hir::TupleDef>,
+    /// The shared `Ty::Fn` interner (function-value types). Same lifetime as `tuples`.
+    fn_types: &'t mut Vec<hir::FnTy>,
     // Integer/float inference variables. `*_vars[i]` is the binding for the *root* of var
     // `i`; `*_parent[i]` is its union-find parent (self when `i` is a root). Linking two
     // unconstrained vars (rather than dropping one) means a later constraint on either
@@ -2265,6 +2298,27 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let base = p.segments.first().map(|s| s.name.as_str()).unwrap_or("");
         let Some(id) = self.lookup_or_capture(base) else {
+            // A top-level function used as a value (`f := double`) is a first-class function
+            // pointer (`Ty::Fn`). Slice ①: scalar params/ret, no `out` params.
+            if let Some(sig) = self.sigs.get(base) {
+                let params: Option<Vec<Scalar>> = sig.params.iter().map(|t| ty_to_scalar(*t)).collect();
+                let ret = ty_to_scalar(sig.ret);
+                match (params, ret) {
+                    (Some(ps), Some(r)) if !sig.out.iter().any(|o| *o) => {
+                        let fid = intern_fn_type(self.fn_types, ps, r);
+                        let ty = Ty::Fn(fid);
+                        self.constrain(ty, expected, span);
+                        return Expr { kind: ExprKind::FnValue(base.to_string()), ty, span };
+                    }
+                    _ => {
+                        self.diags.error(
+                            format!("'{base}' cannot be used as a function value yet (only scalar parameters/return, no `out`)"),
+                            span,
+                        );
+                        return err(span);
+                    }
+                }
+            }
             self.diags.error(format!("undefined name: '{base}'"), span);
             return err(span);
         };
@@ -2527,6 +2581,35 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::MathOp { fn_, operands }, ty, span }
     }
 
+    /// `f(args)` where `f` is a `Ty::Fn` local — an indirect call through a function value.
+    fn check_call_fn_value(&mut self, lid: LocalId, fid: u32, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let ft = self.fn_types[fid as usize].clone();
+        let param_tys: Vec<Ty> = ft.params.iter().map(|s| scalar_to_ty(*s)).collect();
+        let ret = scalar_to_ty(ft.ret);
+        if args.len() != param_tys.len() {
+            self.diags.error(
+                format!("this function value expects {} argument(s), got {}", param_tys.len(), args.len()),
+                span,
+            );
+            return err;
+        }
+        let mut checked = Vec::with_capacity(args.len());
+        for (a, pt) in args.iter().zip(&param_tys) {
+            let e = self.check_expr(a, Some(*pt));
+            if e.ty != Ty::Error && self.resolve(e.ty) != *pt {
+                self.diags.error(
+                    format!("argument type mismatch: expected {}, got {}", ty_name(*pt), ty_name(e.ty)),
+                    e.span,
+                );
+            }
+            checked.push(e);
+        }
+        let callee = Expr { kind: ExprKind::Local(lid), ty: Ty::Fn(fid), span };
+        self.constrain(ret, expected, span);
+        Expr { kind: ExprKind::CallFnValue { callee: Box::new(callee), args: checked }, ty: ret, span }
+    }
+
     fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         // Method call `recv.method(...)`: a module builtin (`heap.new`) or a method on a
         // value (`box.get()`, `box.clone()`).
@@ -2555,6 +2638,12 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if name == "builder" {
             return self.check_builder_new(args, span);
+        }
+        // An indirect call through a function-value local: `f(args)` where `f: Ty::Fn`.
+        if let Some(lid) = self.lookup(&name) {
+            if let Ty::Fn(fid) = self.resolve(self.locals[lid as usize].ty) {
+                return self.check_call_fn_value(lid, fid, args, expected, span);
+            }
         }
         let Some(sig) = self.sigs.get(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
@@ -4556,6 +4645,13 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(a);
                 }
             }
+            ExprKind::FnValue(_) => {}
+            ExprKind::CallFnValue { callee, args } => {
+                self.finalize_expr(callee);
+                for a in args {
+                    self.finalize_expr(a);
+                }
+            }
             ExprKind::If { cond, then, els } => {
                 self.finalize_expr(cond);
                 self.finalize_block(then);
@@ -4715,6 +4811,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
+        Ty::Fn(id) => format!("fn#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }
@@ -4741,6 +4838,15 @@ fn intern_tuple(tuples: &mut Vec<hir::TupleDef>, elems: Vec<Scalar>) -> u32 {
     }
     tuples.push(hir::TupleDef { elems });
     (tuples.len() - 1) as u32
+}
+
+fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scalar) -> u32 {
+    let ft = hir::FnTy { params, ret };
+    if let Some(i) = fn_types.iter().position(|t| *t == ft) {
+        return i as u32;
+    }
+    fn_types.push(ft);
+    (fn_types.len() - 1) as u32
 }
 
 fn resolve_type(
