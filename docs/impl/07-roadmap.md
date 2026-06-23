@@ -37,8 +37,8 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
 7. **M8 — tooling**: the formatter, the standard lints, `unsafe` blocks + `raw.*`.
 8. **Then `std`** (OS boundary) and `pkg`.
 
-Deferred-on-purpose until their slot (not gaps): GPU backend, FFI (before std driver/compress
-work), reflection — see `non-goals.md` / `open-questions.md` Future.
+Deferred-on-purpose until their slot (not gaps): GPU backend, FFI (before the `pkg` DB drivers /
+`std.compress` that wrap C engines), reflection — see `non-goals.md` / `open-questions.md` Future.
 
 ---
 
