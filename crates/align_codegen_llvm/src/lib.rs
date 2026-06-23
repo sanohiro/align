@@ -433,7 +433,7 @@ fn build_module<'c>(
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
         let fwd: Vec<inkwell::values::BasicMetadataValueEnum> =
-            thunk.get_params()[1..].iter().map(|p| (*p).into()).collect();
+            thunk.get_params().iter().skip(1).map(|p| (*p).into()).collect();
         let cs = tb.build_call(orig, &fwd, "r").map_err(|e| CodegenError::Lowering(e.to_string()))?;
         match cs.try_as_basic_value().basic() {
             Some(v) => tb.build_return(Some(&v)),
@@ -451,7 +451,7 @@ fn build_module<'c>(
         for b in &f.blocks {
             for s in &b.stmts {
                 if let Stmt::Let(_, Rvalue::Closure { lifted, capture_tys, .. }) = s {
-                    closure_thunks.insert(lifted.clone(), capture_tys.clone());
+                    closure_thunks.entry(lifted.clone()).or_insert_with(|| capture_tys.clone());
                 }
             }
         }
@@ -462,7 +462,13 @@ fn build_module<'c>(
             .ok_or_else(|| CodegenError::Lowering(format!("unknown lifted function {lifted}")))?;
         let orig_ty = orig.get_type();
         let all_params = orig_ty.get_param_types();
-        let n_explicit = all_params.len() - capture_tys.len();
+        let n_explicit = all_params.len().checked_sub(capture_tys.len()).ok_or_else(|| {
+            CodegenError::Lowering(format!(
+                "lifted function {lifted} has {} parameters, fewer than its {} captures",
+                all_params.len(),
+                capture_tys.len()
+            ))
+        })?;
         let mut tparams: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
         tparams.extend(all_params[..n_explicit].iter().map(|t| BasicMetadataTypeEnum::from(*t)));
         let thunk_ty = match orig_ty.get_return_type() {
@@ -478,7 +484,7 @@ fn build_module<'c>(
         let env_struct = ctx.struct_type(&env_fields, false);
         // The explicit parameters are forwarded as-is; the captures are loaded from the env.
         let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
-            thunk.get_params()[1..].iter().map(|p| (*p).into()).collect();
+            thunk.get_params().iter().skip(1).map(|p| (*p).into()).collect();
         for (i, cty) in capture_tys.iter().enumerate() {
             let fld = tb
                 .build_struct_gep(env_struct, env, i as u32, "capg")
@@ -813,7 +819,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// does not grow the stack each iteration), then restore the builder to the current position.
     fn alloca_at_entry(&self, ty: BasicTypeEnum<'c>, name: &str) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let saved = self.builder.get_insert_block().ok_or_else(|| self.err("no insertion block"))?;
-        let entry = self.blocks[self.f.entry as usize];
+        let entry = *self.blocks.get(self.f.entry as usize).ok_or_else(|| self.err("entry block not found"))?;
         match entry.get_first_instruction() {
             Some(inst) => self.builder.position_before(&inst),
             None => self.builder.position_at_end(entry),
