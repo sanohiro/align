@@ -2587,7 +2587,7 @@ impl<'a, 't> Checker<'a, 't> {
             let Some(ann) = &p.ty else {
                 self.diags.error(
                     format!("lambda parameter '{}' needs a type annotation to be used as a value (e.g. `fn {}: i32 {{ … }}`)", p.name.name, p.name.name),
-                    span,
+                    p.name.span,
                 );
                 return err;
             };
@@ -2603,6 +2603,11 @@ impl<'a, 't> Checker<'a, 't> {
                 "a lambda that captures an enclosing variable cannot be used as a value yet (slice ②b)".to_string(),
                 span,
             );
+            return err;
+        }
+        // A type error in the annotations or the body has already been reported — don't pile on a
+        // confusing secondary "only scalar" message.
+        if param_tys.iter().any(|t| self.finalize(*t) == Ty::Error) || self.finalize(ret) == Ty::Error {
             return err;
         }
         // Scalar signature only (slice ②a), matching named function values.
