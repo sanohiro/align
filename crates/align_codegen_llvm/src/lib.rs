@@ -1142,6 +1142,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         };
                         self.call_intrinsic(name, &[overload], &[ops[0].into(), ops[1].into()])?
                     }
+                    // Float-only unary intrinsics.
+                    align_sema::MathFn::Sqrt => self.call_intrinsic("llvm.sqrt", &[overload], &[ops[0].into()])?,
+                    align_sema::MathFn::Floor => self.call_intrinsic("llvm.floor", &[overload], &[ops[0].into()])?,
+                    align_sema::MathFn::Ceil => self.call_intrinsic("llvm.ceil", &[overload], &[ops[0].into()])?,
+                    align_sema::MathFn::Round => self.call_intrinsic("llvm.round", &[overload], &[ops[0].into()])?,
+                    align_sema::MathFn::Trunc => self.call_intrinsic("llvm.trunc", &[overload], &[ops[0].into()])?,
+                    // `pow(base, exp)`.
+                    align_sema::MathFn::Pow => self.call_intrinsic("llvm.pow", &[overload], &[ops[0].into(), ops[1].into()])?,
                 }
             }
             Rvalue::Field(slot, idx) => {

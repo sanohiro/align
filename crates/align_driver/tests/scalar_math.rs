@@ -77,6 +77,25 @@ fn pairwise_min_coexists_with_array_reduction() {
 }
 
 #[test]
+fn float_transcendentals() {
+    if !backend_available() {
+        return;
+    }
+    // sqrt(2)=1.414…, floor(3.7)=3, ceil(3.2)=4, round(2.5)=3 (away from zero), trunc(3.9)=3,
+    // pow(2,10)=1024.
+    let src = "fn main() -> Result<(), Error> {\n  print((2.0).sqrt())\n  print((3.7).floor())\n  print((3.2).ceil())\n  print((2.5).round())\n  print((3.9).trunc())\n  print((2.0).pow(10.0))\n  return Ok(())\n}\n";
+    let out = build_and_run("sm-float-fns", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1.4142135623730951\n3.0\n4.0\n3.0\n3.0\n1024.0\n");
+}
+
+#[test]
+fn sqrt_on_int_rejected() {
+    // The transcendentals are float-only.
+    assert!(check_errs("sm-int-sqrt", "fn main() -> i32 {\n  x: i32 := 4\n  return x.sqrt()\n}\n"));
+}
+
+#[test]
 fn non_numeric_receiver_rejected() {
     // abs/min/max are numeric-only.
     assert!(check_errs("sm-bool", "fn main() -> i32 {\n  b := true\n  if b.abs() == 1 { return 1 }\n  return 0\n}\n"));

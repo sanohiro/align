@@ -2475,21 +2475,37 @@ impl<'a, 't> Checker<'a, 't> {
     /// `x.abs()` / `a.min(b)` / `a.max(b)` (`core.math`). The receiver must be numeric; `min`/`max`
     /// take one operand of the same type. The result is that numeric type.
     fn check_scalar_math(&mut self, recv: &ast::Expr, fn_: hir::MathFn, args: &[ast::Expr], span: Span) -> Expr {
+        use hir::MathFn::*;
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let name = match fn_ {
-            hir::MathFn::Abs => "abs",
-            hir::MathFn::Min => "min",
-            hir::MathFn::Max => "max",
+            Abs => "abs",
+            Min => "min",
+            Max => "max",
+            Sqrt => "sqrt",
+            Floor => "floor",
+            Ceil => "ceil",
+            Round => "round",
+            Trunc => "trunc",
+            Pow => "pow",
+        };
+        // `(want_args, float_only)`: `abs`/`min`/`max` accept any numeric; the rest are float-only.
+        // `min`/`max`/`pow` take one operand; the others take none.
+        let (want_args, float_only) = match fn_ {
+            Abs => (0, false),
+            Min | Max => (1, false),
+            Sqrt | Floor | Ceil | Round | Trunc => (0, true),
+            Pow => (1, true),
         };
         let r = self.check_expr(recv, None);
         if r.ty == Ty::Error {
             return err;
         }
-        if !r.ty.is_numeric() {
-            self.diags.error(format!("'{name}' needs a numeric receiver, got {}", ty_name(r.ty)), span);
+        let ok_ty = if float_only { r.ty.is_float_like() } else { r.ty.is_numeric() };
+        if !ok_ty {
+            let want = if float_only { "a float" } else { "a numeric" };
+            self.diags.error(format!("'{name}' needs {want} receiver, got {}", ty_name(r.ty)), span);
             return err;
         }
-        let want_args = if matches!(fn_, hir::MathFn::Abs) { 0 } else { 1 };
         if args.len() != want_args {
             self.diags.error(format!("'{name}' takes {want_args} argument(s), got {}", args.len()), span);
             return err;
@@ -2774,6 +2790,19 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if method == "max" {
             return self.check_scalar_math(recv, hir::MathFn::Max, args, span);
+        }
+        // Float-only math functions (`core.math`).
+        let float_fn = match method {
+            "sqrt" => Some(hir::MathFn::Sqrt),
+            "floor" => Some(hir::MathFn::Floor),
+            "ceil" => Some(hir::MathFn::Ceil),
+            "round" => Some(hir::MathFn::Round),
+            "trunc" => Some(hir::MathFn::Trunc),
+            "pow" => Some(hir::MathFn::Pow),
+            _ => None,
+        };
+        if let Some(f) = float_fn {
+            return self.check_scalar_math(recv, f, args, span);
         }
         if method == "to_array" {
             return self.check_array_to_array(recv, args, span);
