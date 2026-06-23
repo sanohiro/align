@@ -1226,23 +1226,25 @@ unsafe impl Send for TgRun {}
 /// Run every registered task **in parallel** — spawn a worker thread per task, then join them all
 /// (fork-join). All allocations happened at `spawn` time (on this thread), so no thread mutates
 /// the region during the run; each worker only reads its own `env` and writes its own `slot`.
+///
+/// Uses `std::thread::scope` (like `align_rt_par_map`) so that *every* spawned thread is joined
+/// before this returns even if a later `spawn` panics — otherwise an unwinding panic would detach
+/// running threads and they would read the arena after `tg_end` frees it (a use-after-free).
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) {
     let tg = unsafe { &mut *tg };
     let tasks = std::mem::take(&mut tg.tasks);
-    let handles: Vec<std::thread::JoinHandle<()>> = tasks
-        .into_iter()
-        .map(|t| {
+    std::thread::scope(|s| {
+        for t in tasks {
             let run = TgRun { tramp: t.tramp, thunk: t.thunk, env: t.env, slot: t.slot };
-            std::thread::spawn(move || {
+            s.spawn(move || {
+                // Rebind the whole value so the closure captures the `Send` `TgRun` as a unit
+                // (edition-2021 disjoint capture would otherwise grab the non-`Send` raw fields).
                 let run = run;
                 (run.tramp)(run.thunk, run.env, run.slot);
-            })
-        })
-        .collect();
-    for h in handles {
-        let _ = h.join();
-    }
+            });
+        }
+    });
 }
 
 /// Release the task group's region and the handle.
