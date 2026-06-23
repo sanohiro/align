@@ -75,8 +75,12 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    on **real threads**: it spawns a worker thread per registered task and joins them all (fork-join).
    Safe by construction — each task's env/slot are a fresh, private region allocation (no sharing;
    env read-only, slot write-only), all allocated at `spawn` time so no thread mutates the region
-   during the run, and the region outlives the join. Next: **④c** the `wait()?` error boundary +
-   the `get`-before-`wait` compile-time check (the last task_group slice).
+   during the run, and the region outlives the join. **④c-1 DONE** — the `get`-before-`wait`
+   compile-time check, done soundly by **dominance**: a per-`task_group` `wait`-state flag (`spawn`
+   clears it, `wait` sets it) merged across `if`/`else` as `then && else`, so `get()` is allowed
+   only when a `wait()` ran on *every* path to it (a conditional `wait()` in one branch does not
+   suffice — sound, not a linear approximation). Next: **④c-2** the `wait()?` error boundary
+   (`Result`-returning tasks + first-`Err` propagation) — the last task_group slice.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

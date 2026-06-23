@@ -517,6 +517,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             ret_hint: Ty::Unit,
             arena_depth: 0,
             task_group_depth: 0,
+            wait_state: Vec::new(),
             slice_bases: std::collections::HashMap::new(),
             cur_fn: String::new(),
             lifted: Vec::new(),
@@ -1680,6 +1681,11 @@ struct Checker<'a, 't> {
     /// Nesting depth of `task_group {}` blocks (0 = not in one). `spawn`/`wait` are valid only
     /// inside a `task_group` scope (slice ④).
     task_group_depth: u32,
+    /// Per open `task_group` (innermost last): whether a `wait()` is guaranteed to have run at the
+    /// current point (so `get()` is allowed). `spawn` clears it (a new task is pending), `wait`
+    /// sets it, and `if`/`else` merge it by dominance (`then && else`). Slice ④c: the
+    /// `get`-before-`wait` check.
+    wait_state: Vec<bool>,
     /// For each slice local bound from an array/slice (`s: slice<T> := a`), the **root** buffer
     /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
     /// is caught even though `s` and `a` are different locals.
@@ -2229,7 +2235,9 @@ impl<'a, 't> Checker<'a, 't> {
                 // in it, region-tied to the scope (so a `Task` can't escape).
                 self.task_group_depth += 1;
                 self.arena_depth += 1;
+                self.wait_state.push(false);
                 let block = self.check_block(b, if diverges { None } else { expected });
+                self.wait_state.pop();
                 self.arena_depth -= 1;
                 self.task_group_depth -= 1;
                 let ty = if diverges {
@@ -2753,6 +2761,11 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
+        // A new task is now pending and unjoined, so a prior `wait()` no longer covers everything:
+        // a `get()` must be preceded by a fresh `wait()`.
+        if let Some(w) = self.wait_state.last_mut() {
+            *w = false;
+        }
         Expr { kind: ExprKind::Spawn(Box::new(f)), ty: Ty::Task(r), span }
     }
 
@@ -2764,6 +2777,10 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if !args.is_empty() {
             self.diags.error(format!("'wait' takes no arguments, got {}", args.len()), span);
+        }
+        // All tasks spawned so far are now joined → their results may be read with `get()`.
+        if let Some(w) = self.wait_state.last_mut() {
+            *w = true;
         }
         Expr { kind: ExprKind::Wait, ty: Ty::Unit, span }
     }
@@ -3292,10 +3309,16 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_float_parent = std::mem::take(&mut self.float_parent);
         let saved_ret = self.ret_hint;
         let saved_arena = self.arena_depth;
+        // A lambda body is a separate function: it is not lexically inside the enclosing
+        // `task_group`, so reset the task-group / `wait`-state tracking (else a `wait()` inside the
+        // lambda would set the enclosing group's flag at compile time and bypass the check).
+        let saved_tg_depth = self.task_group_depth;
+        let saved_wait_state = std::mem::take(&mut self.wait_state);
         let saved_bases = std::mem::take(&mut self.slice_bases);
         let saved_capture = self.capture.take();
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
         self.arena_depth = 0;
+        self.task_group_depth = 0;
         self.capture = Some(CaptureScope { enclosing, captured: Vec::new() });
 
         let mut param_ids: Vec<LocalId> =
@@ -3349,6 +3372,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.float_parent = saved_float_parent;
         self.ret_hint = saved_ret;
         self.arena_depth = saved_arena;
+        self.task_group_depth = saved_tg_depth;
+        self.wait_state = saved_wait_state;
         self.slice_bases = saved_bases;
         self.capture = saved_capture;
         // A lambda must not return a function value: the returned closure's environment is
@@ -4669,8 +4694,18 @@ impl<'a, 't> Checker<'a, 't> {
         }
         match recv_ty {
             Ty::Box(s) => Expr { kind: ExprKind::BoxGet(Box::new(recv)), ty: scalar_to_ty(s), span },
-            // `task.get()` — read a spawned task's result (`task_group`, slice ④).
-            Ty::Task(s) => Expr { kind: ExprKind::TaskGet(Box::new(recv)), ty: scalar_to_ty(s), span },
+            // `task.get()` — read a spawned task's result (`task_group`, slice ④). The result is
+            // only computed after `wait()` joins, so `get()` before `wait()` reads an uncomputed
+            // slot — rejected (the result is guaranteed ready only if a `wait()` dominates here).
+            Ty::Task(s) => {
+                if !self.wait_state.last().copied().unwrap_or(false) {
+                    self.diags.error(
+                        "cannot call '.get()' before 'wait()' — a task's result is ready only after the group is joined".to_string(),
+                        span,
+                    );
+                }
+                Expr { kind: ExprKind::TaskGet(Box::new(recv)), ty: scalar_to_ty(s), span }
+            }
             Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
             other => {
                 self.diags
@@ -4776,6 +4811,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// `return` (only the braced `else { … }` form is supported in M2).
     fn check_else_unwrap(&mut self, opt: &ast::Expr, fallback: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
         let o = self.check_expr(opt, None);
+        // The fallback runs only on `None`, so its `wait()`/`spawn()` must not leak into the
+        // post-unwrap `wait`-state (slice ④c) — snapshot here and restore after the fallback.
+        let w_snapshot = self.wait_state.last().copied();
         let payload = match self.resolve(o.ty) {
             Ty::Option(s) => scalar_to_ty(s),
             Ty::Error => Ty::Error,
@@ -4791,13 +4829,28 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             self.check_expr(fallback, Some(payload))
         };
+        // Dominance merge: the `Some` path skips the fallback (state `w`), the `None` path runs it
+        // (current state). After the unwrap, a `wait()` is guaranteed only if both held — `w &&
+        // current` — so a conditional `spawn` in the fallback correctly clears the flag.
+        if let (Some(w), Some(top)) = (w_snapshot, self.wait_state.last_mut()) {
+            *top = w && *top;
+        }
         self.constrain(payload, expected, span);
         Expr { kind: ExprKind::ElseUnwrap { opt: Box::new(o), fallback: Box::new(fb) }, ty: payload, span }
     }
 
     fn check_if(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Expr>, expected: Option<Ty>, span: Span) -> Expr {
         let c = self.check_expr(cond, Some(Ty::Bool));
+        // `task_group` `wait`-state (slice ④c): each branch starts from the pre-`if` state; after
+        // the `if`, a `wait()` is guaranteed only if it ran on *every* path — `then && else` (and
+        // an absent `else` is a path that did not wait). Soundly tracks `get`-before-`wait`.
+        let in_tg = !self.wait_state.is_empty();
+        let w_before = self.wait_state.last().copied().unwrap_or(false);
         let then_b = self.check_block(then, expected);
+        let w_then = self.wait_state.last().copied().unwrap_or(false);
+        if in_tg {
+            *self.wait_state.last_mut().unwrap() = w_before;
+        }
         let els_b = match els {
             Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block(b, expected),
             Some(e) => {
@@ -4807,6 +4860,10 @@ impl<'a, 't> Checker<'a, 't> {
             }
             None => Block { stmts: Vec::new(), value: None },
         };
+        if in_tg {
+            let w_els = if els.is_some() { self.wait_state.last().copied().unwrap_or(false) } else { w_before };
+            *self.wait_state.last_mut().unwrap() = w_then && w_els;
+        }
 
         // If both branches produce a value, the if has that (unified) type; else Unit.
         let ty = match (&then_b.value, &els_b.value) {
