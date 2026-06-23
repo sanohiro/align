@@ -3228,6 +3228,16 @@ impl<'a, 't> Checker<'a, 't> {
         self.arena_depth = saved_arena;
         self.slice_bases = saved_bases;
         self.capture = saved_capture;
+        // A lambda must not return a function value: the returned closure's environment is
+        // frame-local to *this* lifted function and would dangle once it returns (the same rule as
+        // a top-level fn — checked here too so a stage/value lambda can't slip a closure out).
+        if matches!(ret, Ty::Fn(_)) {
+            self.diags.error(
+                "a lambda cannot return a function value (a closure's environment is frame-local)".to_string(),
+                span,
+            );
+            return None;
+        }
         Some((name, ret, capture_ops))
     }
 

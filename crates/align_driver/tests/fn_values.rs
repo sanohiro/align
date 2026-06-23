@@ -87,6 +87,16 @@ fn returning_fn_value_rejected() {
 }
 
 #[test]
+fn lambda_returning_fn_value_rejected() {
+    // A stage/value lambda whose body yields a function value would let a frame-local closure
+    // env escape via the lift — rejected in lift_lambda (mirrors the top-level return check).
+    assert!(check_errs(
+        "fv-lam-ret",
+        "fn main() -> Result<(), Error> {\n  print([1,2,3].map(fn x: i64 { fn y: i64 { x + y } }).sum())\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
 fn arg_type_mismatch_rejected() {
     // Calling a fn value with the wrong argument type is a type error.
     assert!(check_errs(
