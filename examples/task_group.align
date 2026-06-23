@@ -1,0 +1,13 @@
+// Structured concurrency (slice ④a — walking skeleton; tasks run sequentially for now, real
+// threads arrive next). `spawn(fn { … })` defers work and returns a Task<R>; `wait()` joins;
+// `t.get()` reads a result. The spawned closures capture by value.
+fn main() -> Result<(), Error> {
+  base: i64 := 100
+  task_group {
+    a := spawn(fn { base + 5 })
+    b := spawn(fn { base * 2 })
+    wait()
+    print(a.get() + b.get())   // 105 + 200 = 305
+  }
+  return Ok(())
+}

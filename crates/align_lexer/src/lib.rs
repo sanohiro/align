@@ -34,6 +34,7 @@ pub enum TokKind {
     True,
     False,
     Arena,
+    TaskGroup,
     Template,
     // Symbols / operators
     ColonEq, // :=
@@ -383,6 +384,7 @@ impl<'a> Lexer<'a> {
             "true" => TokKind::True,
             "false" => TokKind::False,
             "arena" => TokKind::Arena,
+            "task_group" => TokKind::TaskGroup,
             "template" => TokKind::Template,
             _ => TokKind::Ident(text.to_string()),
         };

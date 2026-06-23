@@ -718,6 +718,13 @@ impl<'a> Parser<'a> {
                 let span = start.merge(self.prev_span());
                 Some(Expr { kind: ExprKind::Arena(block), span })
             }
+            TokKind::TaskGroup => {
+                let start = self.span();
+                self.bump();
+                let block = self.parse_block()?;
+                let span = start.merge(self.prev_span());
+                Some(Expr { kind: ExprKind::TaskGroup(block), span })
+            }
             TokKind::LParen => {
                 self.bump();
                 // `()` is the unit value; `(e)` is grouping; `(e0, e1, ...)` is a tuple.

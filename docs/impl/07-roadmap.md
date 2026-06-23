@@ -58,10 +58,14 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    scope end). The ②b-2 frame-local env (one hoisted slot per closure site) cannot back a spawned
    closure — a `spawn` in a loop would reuse that slot, so a deferred task reads the final value
    and a concurrent task races the next iteration (this is why the settled design specified the
-   region env; `spawn` is the escape that triggers it). Sub-slices: **④a** `task_group {}` + the
-   task region + `spawn(fn{…}) -> Task<R>` (fresh region env) + `wait()` + `.get()` (with
-   `get`-before-`wait` a compile-time error), deferred-sequential execution; **④b** real threads
-   (reuse the `par_map` runtime); **④c** the `wait()?` error boundary.
+   region env; `spawn` is the escape that triggers it). Sub-slices: **④a DONE** (walking skeleton)
+   — `task_group {}` scope + `spawn(fn{…}) -> Task<R>` + `wait()` + `t.get()`, `spawn`/`wait` valid
+   only inside the scope. Tasks run **eagerly** (`spawn` calls the zero-arg closure immediately;
+   `Task<R>` is represented identically to `R`; `get` is identity, `wait` a no-op) — correct
+   sequential results, and eager execution sidesteps the env-reuse race so the ②b-2 frame env is
+   fine here. **④b** real threads + the fresh per-spawn region env (reuse the `par_map` runtime; the
+   region env becomes load-bearing once tasks run concurrently/deferred). **④c** the `wait()?`
+   error boundary + the `get`-before-`wait` compile-time check.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
