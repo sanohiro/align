@@ -79,6 +79,19 @@ fn tasks_run_deferred_at_wait() {
 }
 
 #[test]
+fn many_parallel_tasks() {
+    if !backend_available() {
+        return;
+    }
+    // ④b-2: each task runs on its own worker thread (joined at `wait`); results are read after the
+    // join, so the sum is deterministic regardless of thread interleaving.
+    let src = "fn main() -> Result<(), Error> {\n  k: i64 := 10\n  task_group {\n    a := spawn(fn { k + 1 })\n    b := spawn(fn { k + 2 })\n    c := spawn(fn { k + 3 })\n    d := spawn(fn { k + 4 })\n    wait()\n    print(a.get() + b.get() + c.get() + d.get())\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-parallel", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "50\n");
+}
+
+#[test]
 fn early_return_joins_tasks() {
     if !backend_available() {
         return;

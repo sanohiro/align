@@ -1211,14 +1211,38 @@ pub extern "C" fn align_rt_tg_register(
     unsafe { &mut *tg }.tasks.push(TgTask { tramp, thunk, env, slot });
 }
 
-/// Run every registered task (④b-1: sequentially, in spawn order) and clear the list.
+/// A task's data, made `Send` so it can move into a worker thread. Safe by construction (slice
+/// ④b): each task's `env`/`slot` are a fresh, private region allocation — no task shares them, the
+/// `env` is only read (its capture snapshot) and the `slot` only written, and the region outlives
+/// the join (`wait` happens before `tg_end`). `get()` reads a slot only after the join (④c).
+struct TgRun {
+    tramp: extern "C" fn(*const u8, *mut u8, *mut u8),
+    thunk: *const u8,
+    env: *mut u8,
+    slot: *mut u8,
+}
+unsafe impl Send for TgRun {}
+
+/// Run every registered task **in parallel** — spawn a worker thread per task, then join them all
+/// (fork-join). All allocations happened at `spawn` time (on this thread), so no thread mutates
+/// the region during the run; each worker only reads its own `env` and writes its own `slot`.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) {
     let tg = unsafe { &mut *tg };
-    for t in &tg.tasks {
-        (t.tramp)(t.thunk, t.env, t.slot);
+    let tasks = std::mem::take(&mut tg.tasks);
+    let handles: Vec<std::thread::JoinHandle<()>> = tasks
+        .into_iter()
+        .map(|t| {
+            let run = TgRun { tramp: t.tramp, thunk: t.thunk, env: t.env, slot: t.slot };
+            std::thread::spawn(move || {
+                let run = run;
+                (run.tramp)(run.thunk, run.env, run.slot);
+            })
+        })
+        .collect();
+    for h in handles {
+        let _ = h.join();
     }
-    tg.tasks.clear();
 }
 
 /// Release the task group's region and the handle.
