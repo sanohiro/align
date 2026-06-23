@@ -64,6 +64,25 @@ mask<T>
 bitset
 ```
 
+### Type declarations (keyword-less)
+
+```text
+User  { id: i64, name: str }              // struct (field: Type bodies)
+Shape { Circle(f32), Rect(f32, f32) }     // sum type (variant bodies)
+```
+
+A sum type models variation (there is no class / inheritance). Construct with `Type.Variant`
+(`Shape.Circle(3.0)`); branch with an exhaustive `match` expression (every variant covered or a
+`_` wildcard — a missing variant is a compile error). `Option<T>` / `Result<T,E>` are sum types;
+`match` works on them, with `else`-unwrap and `?` as the common-case shorthands.
+
+```align
+area := match s {
+  Circle(r)  => 3.14159 * r * r,
+  Rect(w, h) => w * h,
+}
+```
+
 ### Memory
 
 ```text

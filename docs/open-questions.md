@@ -24,6 +24,27 @@ Record: `draft.md` §5, `impl/03-types.md`
 **Decision: keyword-less.** Contains `ident: Type` → struct; `ident`/`ident(...)` → sum type, disambiguated by content. Fields/variants are `,`-separated.
 Record: `draft.md` §4, `impl/02-frontend.md`
 
+### Sum types + exhaustive `match` — design SETTLED (the keystone language-spec slice)
+**Decision (2026-06-24): keyword-less sum types + a mandatory-exhaustive `match` expression** — the OOP-free way to model domain variants, AI-friendly (a new variant turns every incomplete `match` into a compile error), and the convergence point that will eventually generalize the currently-builtin `Option`/`Result`. Grounded in the actual code: today the parser/AST/`Ty` only have structs (`Item::{Fn,Struct}`, `parse_struct` requires `ident: Type` bodies); `Option`/`Result` are builtin `Ty` variants (scalar payloads); `match` has no keyword/AST node. The keyword-less type-decl decision above already reserves the sum-type half.
+- **Declaration (keyword-less, disambiguated by content).** A body of `ident: Type` fields is a struct; a body of bare `ident` / `ident(payload…)` variants is a sum type. A body is wholly one or the other (the parser branches after `Name {` on whether the first variant/field is followed by `:`). Variants are `,`/newline-separated.
+  ```
+  Color { Red, Green, Blue }                 // tag-only
+  Shape { Circle(f32), Rect(f32, f32) }      // positional payloads
+  ```
+  Payloads are **positional** (tuple-style); a variant needing named fields uses a struct payload (`Node(TreeNode)`). First cut: scalar payloads (later: struct/tuple); **non-recursive** (a self-referential variant needs `box`, a later widening).
+- **Construction — qualified `Type.Variant`** (matches the draft's `Error.NotFound`): `Color.Red`, `Shape.Circle(3.0)`. Qualified (no unqualified `Red`) → no cross-type ambiguity, one-way, explicit. In sema this is a `FieldAccess`/`Call` whose base path resolves to a sum-type name.
+- **`match` (expression, mandatory-exhaustive).**
+  ```
+  area := match s { Circle(r) => 3.14159 * r * r, Rect(w, h) => w * h }
+  ```
+  An expression — every arm unifies to the `match`'s type (or all diverge). Patterns are **unqualified** variant names (the scrutinee's type is known): `Variant` / `Variant(b0, b1)` (binds the payload positionally). **Exhaustiveness is mandatory from day one**: every variant covered, or a `_` wildcard arm; a missing variant with no `_` is a compile error naming the omissions. `match` is for sum types (incl. `Option`/`Result`); value conditions stay with `if` (one way: `match` = variants, `if` = conditions). First cut: no guards / `|` or-patterns / nested patterns (additive later).
+- **Works on `Option`/`Result`** (they are builtin sum types): `match opt { Some(x) => x, None => 0 }`. `else`-unwrap and `?` remain the **ergonomic shorthands** over the general mechanism (sugar, like Rust's `?` — not a second way).
+- **Representation.** `Ty::Enum(id)` interned into `Program.enums` (mirroring `Ty::Struct`/`Program.structs`); LLVM = a tagged union `{ iN tag, <bytes for the largest payload> }` — the existing `Option`/`Result` `{i8 tag, payload}` shape, generalized. Construction stores tag+payload; `match` branches on the tag, extracts the payload; rare arms can later get the cold-path treatment `Err` already has.
+- **Convergence path.** With minimal generics, `Option<T>`/`Result<T,E>` become generic sum types in the general mechanism (retiring the builtin `Ty::Option`/`Ty::Result` special-case — "one way"); until then they coexist, with `match` already unifying their use.
+- **Why the keystone:** replaces OOP/inheritance (a non-goal), AI-friendly via exhaustiveness, removes a "one way" exception, lower-risk than generics (no constraint model), and unblocks the **Error type** redesign (Error = a sum type of categories).
+Implementation slices: **S1** tag-only + scalar-payload enums + `Type.Variant` + exhaustive `match` (no guards/nesting); **S2** struct/tuple payloads; **S3** `match` on `Option`/`Result`; **S4** guards / `|` / recursive (boxed) enums (additive).
+Record: `draft.md` §5 (Sum Type), `impl/07-roadmap.md`.
+
 ### Purity model
 **Decision: compiler inference (no explicit marks).** Effects (Pure/Impure) are inferred from the body, and `par_map` etc. require Pure closures. **Implemented** (`align_sema` Pass 4, `check_parallelism`): a function is Impure iff it transitively performs an observable side effect — calling `print` / `io.stdout.write` / `fs.read_file`, or calling an Impure function (fixpoint over the call graph). Everything else (arithmetic, reads, builder/arena/heap, owned-value moves) is Pure. `par_map(f)` rejects an Impure `f`. (Sound for the language as it stands: a `par_map` function is `(T) -> R` with no `out` parameter, so reaching an I/O builtin is the only route to impurity.)
 Record: `impl/03-types.md` §8
@@ -138,8 +159,14 @@ Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`
 ### Generics (minimal system) — before M4
 Structural-constraint inference vs explicit bounds (trait-style). Unit of monomorphization implementation. Value generics for `vec<N,T>`. Required to write core in Align itself (`impl/03-types.md` §9, `impl/06-runtime-std.md` §10). Note: the *call-site* surface is already settled — no expression-position type arguments (see "Type-argument syntax: no turbofish" under Settled); a return-only type parameter is supplied by the binding annotation.
 
-### Error type design — M2
-single `Error` / typed errors / error categories. Includes the `E → E'` conversion rule for `?` and the exit-code mapping (`impl/03-types.md` §5, `impl/06-runtime-std.md` §9).
+### Error type design — Open (next after sum types; the i32 is an M2 placeholder)
+Today `Error` is the M2 `Ty::ErrCode` (an i32 code). **Leaning (2026-06-24, validated by external review):** build the real `Error` **on the sum-type mechanism** — `Error` is a **sum type of categories** (the variant carries a lightweight payload: a `str` view + position for a parse error, a code for an OS error, …). Constraints from the philosophy:
+- **An explicit value, nothing hidden:** no exceptions, no unwinding, no implicit stack-trace allocation. (The cold-`Err`-edge treatment stays.)
+- **Static, predictable `?` conversion:** the `E → E'` rule for `?` is limited and statically resolved (a known small conversion), not an open coercion graph.
+- **Context is explicit:** an opt-in `.with_context(...)` (allocating into the enclosing frame/arena, visibly) rather than auto-captured backtraces.
+- **Structured errors carry position:** e.g. a JSON/parse error includes the offset/line.
+- **Exit-code mapping** at the `main` boundary stays as today (`clamp(1,255)`).
+So this entry **waits on sum types** (4a) and then defines `Error` as a concrete sum type + the `?` conversion + exit mapping (`impl/03-types.md` §5, `impl/06-runtime-std.md` §9).
 
 ### Arena with explicit allocator — partially settled (M3)
 **M3 decision: anonymous `arena {}` only.** Nested arenas use region = arena nesting

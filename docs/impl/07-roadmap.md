@@ -89,16 +89,42 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    first-class-closures → `task_group` arc (slices ①–④c) is COMPLETE**: closures as values /
    captures / higher-order arguments, and a real parallel `task_group` with structured join,
    sound `get`-before-`wait`, and a `wait()?` error boundary.
-4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
-5. **core.bitset / core.hash** — design, then build.
-6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
+4. **Language-spec stock-take (2026-06-24) → the "big three" expressiveness gaps.** Before `std`,
+   the language itself needs three interlocked features to be expressively complete (model any
+   domain, handle errors well). Validated against an external review pass (Codex/Gemini); these are
+   the genuine gaps — everything else they raised is either std-adjacent, perf-tier, or off-philosophy
+   (see the "not adopted" note below). Build in order — each unblocks the next:
+   - **4a. Sum types + exhaustive `match`** *(design SETTLED, `open-questions.md`)* — the keystone.
+     Keyword-less `Name { Circle(f32), Rect(f32, f32) }`, `Type.Variant` construction, a
+     mandatory-exhaustive `match` expression; works on `Option`/`Result` too. The OOP-free way to
+     model variants, AI-friendly (exhaustiveness), and lower-risk than generics. Slices S1–S4 in
+     `open-questions.md`.
+   - **4b. Error type** *(refine the Open entry)* — built **on** sum types: `Error` as a sum type of
+     categories + lightweight context, an explicit value (no unwinding / no stack-trace alloc),
+     static/predictable `?` conversion, explicit `.with_context(...)`, structured (position-bearing)
+     parse errors. Replaces the M2 i32 placeholder.
+   - **4c. Minimal generics + constraints** — the riskiest; approach minimally (structural
+     constraints or tiny builtin bounds, explicit monomorphization, no turbofish, no Rust-trait
+     complexity). Unblocks generic containers and lets `Option`/`Result` become generic sum types in
+     the general mechanism (retiring their builtin special-case).
+5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
+6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.
+7. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
    LLVM-version upgrade — the perf tier. The optimizer makes the already-inlined/fused pipelines
    actually vectorize (today it is not run; see "Status note" in `open-questions.md` Future).
-7. **M8 — tooling**: the formatter, the standard lints, `unsafe` blocks + `raw.*`.
-8. **Then `std`** (OS boundary) and `pkg`.
+8. **M8 — tooling**: the formatter, the standard lints, `unsafe` blocks + `raw.*`.
+9. **Then `std`** (OS boundary) and `pkg`.
 
 Deferred-on-purpose until their slot (not gaps): GPU backend, FFI (before the `pkg` DB drivers /
-`std.compress` that wrap C engines), reflection — see `non-goals.md` / `open-questions.md` Future.
+`std.compress` that wrap C engines — `unsafe`-required, `layout(C)` ABI, `{ptr,len}` views),
+`task_group` cancellation / timeout (needs `std.time` / `std.net` I/O checkpoints — cooperative,
+never an implicit kill), reflection — see `non-goals.md` / `open-questions.md` Future.
+
+**Reviewed but NOT adopted (off-philosophy or low-value now):** a general Zig-style `comptime` /
+user CTFE — rejected as a *second* computation model that erodes One-Way / AI-friendliness; Align's
+compile-time story stays **builtin-driven static data** (JSON field tables, `template` analysis,
+literal/hash tables) only. A standalone allocation-monitor / profiler is tooling (folds into the M8
+lints — "allocation in a loop", "unnecessary clone"), not a language feature.
 
 ---
 

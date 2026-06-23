@@ -185,6 +185,43 @@ User {
 
 There is no class / inheritance.
 
+### Sum Type
+
+A type whose body is **variants** (not `field: Type`) is a sum type — the keyword-less companion of
+the struct, disambiguated by content. This is how variation is modeled (there is no inheritance);
+adding a variant turns every incomplete `match` into a compile error.
+
+```align
+Color { Red, Green, Blue }                  // tag-only
+Shape { Circle(f32), Rect(f32, f32) }       // positional payloads
+```
+
+Construct a value by the qualified `Type.Variant`:
+
+```align
+c := Color.Red
+s := Shape.Circle(3.0)
+```
+
+`Option<T>` and `Result<T, E>` are themselves sum types (`{ Some(T), None }` / `{ Ok(T), Err(E) }`).
+
+### Match
+
+`match` is an expression; every arm yields the match's value (or all arms diverge). Patterns are the
+(unqualified) variants of the scrutinee, binding any payload positionally. **`match` must be
+exhaustive** — cover every variant, or end with a `_` wildcard; a missing variant is a compile
+error. Use `match` for variants and `if` for value conditions (one way each).
+
+```align
+area := match s {
+  Circle(r)  => 3.14159 * r * r,
+  Rect(w, h) => w * h,
+}
+```
+
+`match` also works on `Option` / `Result`; `else`-unwrap and `?` are the ergonomic shorthands for the
+common unwrap / propagate cases.
+
 ---
 
 ## 5. Types
