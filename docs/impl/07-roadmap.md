@@ -63,9 +63,13 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    only inside the scope. Tasks run **eagerly** (`spawn` calls the zero-arg closure immediately;
    `Task<R>` is represented identically to `R`; `get` is identity, `wait` a no-op) — correct
    sequential results, and eager execution sidesteps the env-reuse race so the ②b-2 frame env is
-   fine here. **④b** real threads + the fresh per-spawn region env (reuse the `par_map` runtime; the
-   region env becomes load-bearing once tasks run concurrently/deferred). **④c** the `wait()?`
-   error boundary + the `get`-before-`wait` compile-time check.
+   fine here. **④b-1a DONE** — `Task<R>` is now a **`box<R>` in the task_group region** (the scope opens an
+   arena; `spawn` boxes its result there, `get` is a box load), so a task handle is region-tied
+   (cannot escape the scope) and the result lives in a region slot — the memory model real threads
+   need. Still eager + primitive-scalar `R` (owned/view results deferred). Next: **④b-1b** deferred
+   execution (a per-spawn trampoline writes the box at `wait`, fresh region env per spawn); **④b-2**
+   real threads (reuse the `par_map` runtime); **④c** the `wait()?` error boundary + the
+   `get`-before-`wait` compile-time check.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
