@@ -1129,7 +1129,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::MathFn::Min | align_sema::MathFn::Max => {
                         let is_max = matches!(fn_, align_sema::MathFn::Max);
                         let name = if is_float {
-                            if is_max { "llvm.maxnum" } else { "llvm.minnum" }
+                            // `minimum`/`maximum` (IEEE 754-2019), not `minnum`/`maxnum`: they
+                            // propagate NaN and order ±0 deterministically — consistent across
+                            // targets (Align values predictable, identical-across-builds results).
+                            if is_max { "llvm.maximum" } else { "llvm.minimum" }
                         } else if signed {
                             if is_max { "llvm.smax" } else { "llvm.smin" }
                         } else if is_max {

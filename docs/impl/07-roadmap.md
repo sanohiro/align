@@ -28,7 +28,7 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    add/sub/mul **DONE** (methods on integers; `checked_*` → `Option<T>`, via LLVM `.sat` /
    `.with.overflow`). Scalar `abs` / `min` / `max` **DONE** (methods on numerics; `a.min(b)`
    pairwise is arity-dispatched alongside the `arr.min()` reduction; LLVM `abs`/`fabs`/
-   `{s,u}min`/`{s,u}max`/`minnum`/`maxnum`). Next: float `sqrt` / `floor` / `ceil` / `round` /
+   `{s,u}min`/`{s,u}max`/`minimum`/`maximum`). Next: float `sqrt` / `floor` / `ceil` / `round` /
    `pow` (Settled core identity: defined wrap + explicit overflow ops).
 2. **core.bytes / core.buffer** — read-only byte views + mutable byte buffers.
 3. **first-class closures (escape-driven) → `task_group`** — M7 concurrency. Design SETTLED

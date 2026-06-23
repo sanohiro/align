@@ -1,6 +1,6 @@
 //! Scalar math methods (`core.math`): `x.abs()`, `a.min(b)`, `a.max(b)` on numeric values. `abs`
 //! uses `llvm.abs`/`llvm.fabs` (identity on unsigned); `min`/`max` use `llvm.{s,u}min`/`{s,u}max`
-//! (int) / `llvm.minnum`/`maxnum` (float). `a.min(b)` (pairwise) coexists with `arr.min()`
+//! (int) / `llvm.minimum`/`maximum` (float, IEEE 754-2019: NaN-propagating). `a.min(b)` (pairwise) coexists with `arr.min()`
 //! (reduction), dispatched by arity.
 
 use align_driver::{backend_available, check, emit_object_file, link_executable, lower_to_mir};
