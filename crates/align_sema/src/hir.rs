@@ -195,6 +195,15 @@ pub enum ExprKind {
     /// A first-class function value (`f := fn x: i32 { … }`): a pointer to the lifted top-level
     /// function `name`. Non-capturing only (slice ①) — no environment. Type is `Ty::Fn`.
     FnValue(String),
+    /// A *capturing* closure value (`f := fn x: i32 { x + k }`): the lifted function `lifted`
+    /// (which takes the captures as trailing parameters) plus the captured values, which are
+    /// copied into a heap/stack environment. `captures` are the enclosing locals, in the order the
+    /// lifted function expects them. Type is `Ty::Fn`. Slice ②b-2: scalar (Copy) captures, env on
+    /// the stack (the closure cannot escape its frame yet).
+    Closure {
+        lifted: String,
+        captures: Vec<Expr>,
+    },
     /// An indirect call through a function value: `f(args)` where `f` is a `Ty::Fn` local.
     CallFnValue {
         callee: Box<Expr>,

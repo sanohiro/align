@@ -117,6 +117,11 @@ pub enum Rvalue {
     Call(String, Vec<Operand>),
     /// The address of a top-level function as a value (`Ty::Fn`) — a function pointer.
     FnAddr(String),
+    /// A capturing closure value: the lifted function `lifted` (which takes the captures as
+    /// trailing parameters) plus the captured values. Codegen copies the captures into a
+    /// frame-local environment and builds `{ thunk_ptr, env_ptr }`, where the thunk unpacks the
+    /// env and forwards to `lifted`. `capture_tys` give the env layout.
+    Closure { lifted: String, captures: Vec<Operand>, capture_tys: Vec<Ty> },
     /// An indirect call through a function-value `callee` (a `Ty::Fn` pointer). `param_tys`/`ret_ty`
     /// give codegen the LLVM function type for the indirect `call` (taken from the checked args /
     /// result type — no signature table needed).
@@ -691,6 +696,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::FnValue(name) => {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::FnAddr(name.clone())));
+            Operand::Value(v)
+        }
+        hir::ExprKind::Closure { lifted, captures } => {
+            let capture_tys: Vec<Ty> = captures.iter().map(|c| c.ty).collect();
+            let ops: Vec<Operand> = captures.iter().map(|c| lower_expr(b, c)).collect();
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Closure { lifted: lifted.clone(), captures: ops, capture_tys }));
             Operand::Value(v)
         }
         hir::ExprKind::CallFnValue { callee, args } => {

@@ -433,7 +433,7 @@ fn build_module<'c>(
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
         let fwd: Vec<inkwell::values::BasicMetadataValueEnum> =
-            thunk.get_params()[1..].iter().map(|p| (*p).into()).collect();
+            thunk.get_params().iter().skip(1).map(|p| (*p).into()).collect();
         let cs = tb.build_call(orig, &fwd, "r").map_err(|e| CodegenError::Lowering(e.to_string()))?;
         match cs.try_as_basic_value().basic() {
             Some(v) => tb.build_return(Some(&v)),
@@ -441,6 +441,66 @@ fn build_module<'c>(
         }
         .map_err(|e| CodegenError::Lowering(e.to_string()))?;
         funcs.insert(format!("{name}$fnval"), thunk);
+    }
+
+    // Pass 1c: a closure thunk per lifted function used as a *capturing* closure. The env-ABI
+    // thunk `lifted$clos(env, explicit…)` loads the captured values out of `env` and forwards them
+    // as the lifted function's trailing capture parameters: `lifted(explicit…, env.0, env.1, …)`.
+    let mut closure_thunks: std::collections::BTreeMap<String, Vec<Ty>> = std::collections::BTreeMap::new();
+    for f in &program.fns {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                if let Stmt::Let(_, Rvalue::Closure { lifted, capture_tys, .. }) = s {
+                    closure_thunks.entry(lifted.clone()).or_insert_with(|| capture_tys.clone());
+                }
+            }
+        }
+    }
+    for (lifted, capture_tys) in &closure_thunks {
+        let orig = *funcs
+            .get(lifted)
+            .ok_or_else(|| CodegenError::Lowering(format!("unknown lifted function {lifted}")))?;
+        let orig_ty = orig.get_type();
+        let all_params = orig_ty.get_param_types();
+        let n_explicit = all_params.len().checked_sub(capture_tys.len()).ok_or_else(|| {
+            CodegenError::Lowering(format!(
+                "lifted function {lifted} has {} parameters, fewer than its {} captures",
+                all_params.len(),
+                capture_tys.len()
+            ))
+        })?;
+        let mut tparams: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
+        tparams.extend(all_params[..n_explicit].iter().map(|t| BasicMetadataTypeEnum::from(*t)));
+        let thunk_ty = match orig_ty.get_return_type() {
+            Some(rt) => rt.fn_type(&tparams, false),
+            None => ctx.void_type().fn_type(&tparams, false),
+        };
+        let thunk = module.add_function(&format!("{lifted}$clos"), thunk_ty, None);
+        let bb = ctx.append_basic_block(thunk, "entry");
+        let tb = ctx.create_builder();
+        tb.position_at_end(bb);
+        let env = thunk.get_nth_param(0).unwrap().into_pointer_value();
+        let env_fields: Vec<BasicTypeEnum> = capture_tys.iter().map(|t| abi_type(ctx, *t, &struct_types)).collect();
+        let env_struct = ctx.struct_type(&env_fields, false);
+        // The explicit parameters are forwarded as-is; the captures are loaded from the env.
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+            thunk.get_params().iter().skip(1).map(|p| (*p).into()).collect();
+        for (i, cty) in capture_tys.iter().enumerate() {
+            let fld = tb
+                .build_struct_gep(env_struct, env, i as u32, "capg")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            let v = tb
+                .build_load(abi_type(ctx, *cty, &struct_types), fld, "capv")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            call_args.push(v.into());
+        }
+        let cs = tb.build_call(orig, &call_args, "r").map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        match cs.try_as_basic_value().basic() {
+            Some(v) => tb.build_return(Some(&v)),
+            None => tb.build_return(None),
+        }
+        .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        funcs.insert(format!("{lifted}$clos"), thunk);
     }
 
     // Pass 2: define bodies.
@@ -753,6 +813,20 @@ struct FnGen<'c, 'a> {
 impl<'c, 'a> FnGen<'c, 'a> {
     fn err(&self, e: impl std::fmt::Display) -> CodegenError {
         CodegenError::Lowering(e.to_string())
+    }
+
+    /// Allocate stack storage hoisted to the top of the entry block (so an alloca inside a loop
+    /// does not grow the stack each iteration), then restore the builder to the current position.
+    fn alloca_at_entry(&self, ty: BasicTypeEnum<'c>, name: &str) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let saved = self.builder.get_insert_block().ok_or_else(|| self.err("no insertion block"))?;
+        let entry = *self.blocks.get(self.f.entry as usize).ok_or_else(|| self.err("entry block not found"))?;
+        match entry.get_first_instruction() {
+            Some(inst) => self.builder.position_before(&inst),
+            None => self.builder.position_at_end(entry),
+        }
+        let p = self.builder.build_alloca(ty, name).map_err(|e| self.err(e))?;
+        self.builder.position_at_end(saved);
+        Ok(p)
     }
 
     /// Find + declare + call an overloaded LLVM intrinsic by name, with the given overload types
@@ -1730,6 +1804,39 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value();
                 self.builder
                     .build_insert_value(a0, null_env, 1, "ce")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
+            Rvalue::Closure { lifted, captures, capture_tys } => {
+                // A capturing closure: copy the captures into a frame-local env, then build
+                // `{ thunk_ptr, env_ptr }` where the thunk unpacks the env into the lifted fn's
+                // trailing capture parameters.
+                let env_fields: Vec<BasicTypeEnum> =
+                    capture_tys.iter().map(|t| abi_type(self.ctx, *t, self.struct_types)).collect();
+                let env_struct = self.ctx.struct_type(&env_fields, false);
+                let env_ptr = self.alloca_at_entry(env_struct.into(), "clos_env")?;
+                for (i, op) in captures.iter().enumerate() {
+                    let v = self.operand(op);
+                    let fld = self
+                        .builder
+                        .build_struct_gep(env_struct, env_ptr, i as u32, "capg")
+                        .map_err(|e| self.err(e))?;
+                    self.builder.build_store(fld, v).map_err(|e| self.err(e))?;
+                }
+                let thunk = self
+                    .funcs
+                    .get(&format!("{lifted}$clos"))
+                    .ok_or_else(|| self.err(format!("no closure thunk for {lifted}")))?;
+                let fn_ptr = thunk.as_global_value().as_pointer_value();
+                let cty = closure_struct_type(self.ctx);
+                let a0 = self
+                    .builder
+                    .build_insert_value(cty.const_zero(), fn_ptr, 0, "cf")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(a0, env_ptr, 1, "ce")
                     .map_err(|e| self.err(e))?
                     .into_struct_value()
                     .into()

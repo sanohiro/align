@@ -1,6 +1,5 @@
-// First-class function values: a top-level function (or a typed-parameter lambda) used as a
-// value is a function pointer; calling such a binding is an indirect call. (Non-capturing —
-// captures come in a later slice.)
+// First-class function values: a top-level function, a typed-parameter lambda, or a *capturing*
+// lambda used as a value; calling such a binding is an indirect call.
 fn add(a: i64, b: i64) -> i64 = a + b
 fn sub(a: i64, b: i64) -> i64 = a - b
 
@@ -13,5 +12,10 @@ fn main() -> Result<(), Error> {
   // A lambda used as a value (typed parameters) is also a function value (slice ②a).
   twice := fn x: i64 { x * 2 }
   print(twice(21))       // 42
+
+  // A capturing lambda copies the captured values into its environment (slice ②b-2).
+  k: i64 := 100
+  shift := fn x: i64 { x + k }
+  print(shift(5))        // 105
   return Ok(())
 }
