@@ -290,6 +290,17 @@ driver settings, or library internals** — none touch parser / type checker / I
 `work/proposals/` (kept there as raw drafts); listed here so the drafts can be discarded
 without losing the backlog.
 
+**Status note (the foundational lever): the LLVM middle-end optimization pipeline is not run yet.**
+`emit_object` builds IR and calls `TargetMachine::write_to_file` at `OptimizationLevel::Default`,
+which runs only the **backend codegen** passes — *not* the inliner / LICM / loop-vectorizer / SLP.
+So today the lifted lambdas, fused pipelines, and `map`/`reduce` loops are emitted in a form that
+*would* inline and vectorize well, but at runtime they are **not** inlined (a per-element call
+remains) and **not** SIMD-vectorized. The fix is small and additive — run the default `-O2`
+pipeline (`module.run_passes("default<O2>", …)`) before emitting — and is the prerequisite for
+every vectorization lever below. Slotted with **M6** (verify a canonical pipeline emits vector
+instructions) and the LLVM-version upgrade. Deferred deliberately, not a gap: it is reversible and
+purely additive (no front-end change).
+
 ```text
 Backend / codegen lowering (MIR -> LLVM, source unchanged):
 - Scalable-vector (VLA) loops: emit <vscale x N x T> + predication for ARM SVE /
