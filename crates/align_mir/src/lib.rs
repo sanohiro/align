@@ -1115,7 +1115,7 @@ enum Reducer {
     Sum,
     /// `count`: `acc + 1` (element value ignored).
     Count,
-    /// `reduce(f, init)`: `f(acc, element)`. `captures` are a lifted lambda's captured values,
+    /// `reduce(init, f)`: `f(acc, element)`. `captures` are a lifted lambda's captured values,
     /// passed after the `(acc, element)` arguments.
     Fold { func: String, captures: Vec<hir::Expr> },
     /// `any(p)` / `all(p)`: `acc || p(element)` / `acc && p(element)`. `captures` as `Fold`.
@@ -1467,13 +1467,13 @@ fn lower_array_reduce(
 enum CollectKind {
     /// `to_array`: append the element itself.
     Collect,
-    /// `scan(f, init)`: thread an accumulator (`acc = f(acc, element)`, seeded with `init`) and
+    /// `scan(init, f)`: thread an accumulator (`acc = f(acc, element)`, seeded with `init`) and
     /// append the running accumulator. `captures` are a lifted lambda's captured values, passed
     /// after the `(acc, element)` arguments.
     Scan { func: String, init: Operand, captures: Vec<hir::Expr> },
 }
 
-/// `source.….to_array()` / `.scan(f, init)` — the fused loop, but each surviving element is
+/// `source.….to_array()` / `.scan(init, f)` — the fused loop, but each surviving element is
 /// appended to a freshly allocated buffer (arena-bump inside an arena, else heap) instead of
 /// folded into a scalar. Yields an owned `array<T>` value `{ ptr, len }` where `len` is the
 /// survivor count. (MMv2 slice 3 `to_array`; slice 5 adds `scan`.)

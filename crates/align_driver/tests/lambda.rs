@@ -95,8 +95,8 @@ fn reduce_lambda() {
     if !backend_available() {
         return;
     }
-    // `reduce(f, init)` with a two-parameter lambda: 1+2+3+4 = 10.
-    let src = "fn main() -> Result<(), Error> {\n  print([1, 2, 3, 4].reduce(fn acc, x { acc + x }, 0))\n  return Ok(())\n}\n";
+    // `reduce(init, f)` with a two-parameter lambda: 1+2+3+4 = 10.
+    let src = "fn main() -> Result<(), Error> {\n  print([1, 2, 3, 4].reduce(0, fn acc, x { acc + x }))\n  return Ok(())\n}\n";
     let out = build_and_run("lam-reduce", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n");
@@ -138,7 +138,7 @@ fn scan_lambda() {
         return;
     }
     // Prefix sums [1,3,6,10]; last = 10.
-    let src = "fn main() -> Result<(), Error> {\n  arena {\n    ps := [1, 2, 3, 4].scan(fn acc, x { acc + x }, 0)\n    print(ps[3])\n  }\n  return Ok(())\n}\n";
+    let src = "fn main() -> Result<(), Error> {\n  arena {\n    ps := [1, 2, 3, 4].scan(0, fn acc, x { acc + x })\n    print(ps[3])\n  }\n  return Ok(())\n}\n";
     let out = build_and_run("lam-scan", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "10\n");
@@ -226,7 +226,7 @@ fn lambda_captures_in_reduce() {
         return;
     }
     // Capture in a two-parameter fold: 1*2 + 2*2 + 3*2 = 12.
-    let src = "fn main() -> Result<(), Error> {\n  k := 2\n  print([1, 2, 3].reduce(fn acc, x { acc + x * k }, 0))\n  return Ok(())\n}\n";
+    let src = "fn main() -> Result<(), Error> {\n  k := 2\n  print([1, 2, 3].reduce(0, fn acc, x { acc + x * k }))\n  return Ok(())\n}\n";
     let out = build_and_run("lam-capture-reduce", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n");

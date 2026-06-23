@@ -131,8 +131,8 @@ fn scan_prefix_sum_in_arena() {
     if !backend_available() {
         return;
     }
-    // scan(add, 0) over [1,2,3,4] → running sums [1,3,6,10]; sum of those = 20.
-    let src = "fn add(acc: i32, x: i32) -> i32 = acc + x\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  arena {\n    prefix := [1, 2, 3, 4].map(id).scan(add, 0)\n    return prefix.sum()\n  }\n}\n";
+    // scan(0, add) over [1,2,3,4] → running sums [1,3,6,10]; sum of those = 20.
+    let src = "fn add(acc: i32, x: i32) -> i32 = acc + x\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  arena {\n    prefix := [1, 2, 3, 4].map(id).scan(0, add)\n    return prefix.sum()\n  }\n}\n";
     let out = build_and_run("scan-arena", src);
     assert_eq!(out.status.code(), Some(20));
 }
@@ -142,9 +142,9 @@ fn scan_after_where_free_standing() {
     if !backend_available() {
         return;
     }
-    // where >1 over [1,2,3,4] keeps [2,3,4]; scan(add,0) → [2,5,9]; max = 9. No arena, so the
+    // where >1 over [1,2,3,4] keeps [2,3,4]; scan(0, add) → [2,5,9]; max = 9. No arena, so the
     // scan buffer is free-standing and freed as an unbound temporary after `.max()` consumes it.
-    let src = "fn add(acc: i32, x: i32) -> i32 = acc + x\nfn id(x: i32) -> i32 = x\nfn big(x: i32) -> bool = x > 1\nfn main() -> i32 {\n  return [1, 2, 3, 4].map(id).where(big).scan(add, 0).max()\n}\n";
+    let src = "fn add(acc: i32, x: i32) -> i32 = acc + x\nfn id(x: i32) -> i32 = x\nfn big(x: i32) -> bool = x > 1\nfn main() -> i32 {\n  return [1, 2, 3, 4].map(id).where(big).scan(0, add).max()\n}\n";
     let out = build_and_run("scan-where", src);
     assert_eq!(out.status.code(), Some(9));
 }
@@ -156,7 +156,7 @@ fn sort_orders_ascending_in_arena() {
     }
     // sort([3,1,2]) → [1,2,3]; an order-sensitive base-4 Horner fold (acc*4 + x) = 27 proves
     // the elements are actually ordered (min/max/sum would not). Within a byte exit range.
-    let src = "fn id(x: i32) -> i32 = x\nfn horner(acc: i32, x: i32) -> i32 = acc * 4 + x\nfn main() -> i32 {\n  arena {\n    return [3, 1, 2].map(id).sort().reduce(horner, 0)\n  }\n}\n";
+    let src = "fn id(x: i32) -> i32 = x\nfn horner(acc: i32, x: i32) -> i32 = acc * 4 + x\nfn main() -> i32 {\n  arena {\n    return [3, 1, 2].map(id).sort().reduce(0, horner)\n  }\n}\n";
     let out = build_and_run("sort-arena", src);
     assert_eq!(out.status.code(), Some(27));
 }
@@ -168,7 +168,7 @@ fn sort_reverse_input_free_standing() {
     }
     // Worst case for insertion sort: [4,3,2,1] → [1,2,3,4]; base-5 Horner = 194. No arena, so
     // the sorted buffer is a free-standing temporary freed after `reduce` consumes it.
-    let src = "fn id(x: i32) -> i32 = x\nfn h(acc: i32, x: i32) -> i32 = acc * 5 + x\nfn main() -> i32 {\n  return [4, 3, 2, 1].map(id).sort().reduce(h, 0)\n}\n";
+    let src = "fn id(x: i32) -> i32 = x\nfn h(acc: i32, x: i32) -> i32 = acc * 5 + x\nfn main() -> i32 {\n  return [4, 3, 2, 1].map(id).sort().reduce(0, h)\n}\n";
     let out = build_and_run("sort-rev", src);
     assert_eq!(out.status.code(), Some(194));
 }
@@ -179,7 +179,7 @@ fn sort_after_where() {
         return;
     }
     // where >2 over [5,3,1,4] keeps [5,3,4]; sort → [3,4,5]; base-8 Horner = 229.
-    let src = "fn id(x: i32) -> i32 = x\nfn big(x: i32) -> bool = x > 2\nfn h8(acc: i32, x: i32) -> i32 = acc * 8 + x\nfn main() -> i32 {\n  return [5, 3, 1, 4].map(id).where(big).sort().reduce(h8, 0)\n}\n";
+    let src = "fn id(x: i32) -> i32 = x\nfn big(x: i32) -> bool = x > 2\nfn h8(acc: i32, x: i32) -> i32 = acc * 8 + x\nfn main() -> i32 {\n  return [5, 3, 1, 4].map(id).where(big).sort().reduce(0, h8)\n}\n";
     let out = build_and_run("sort-where", src);
     assert_eq!(out.status.code(), Some(229));
 }
