@@ -1664,6 +1664,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(cs.try_as_basic_value().basic());
             }
+            Rvalue::FnAddr(name) => {
+                let f = self.funcs.get(name).ok_or_else(|| self.err(format!("unknown function {name}")))?;
+                f.as_global_value().as_pointer_value().into()
+            }
+            Rvalue::CallIndirect { callee, args, param_tys, ret_ty } => {
+                let ptr = self.operand(callee).into_pointer_value();
+                let param_meta: Vec<BasicMetadataTypeEnum> = param_tys.iter().map(|t| self.llvm_type(*t).into()).collect();
+                let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
+                let argv: Vec<_> = args.iter().map(|o| self.operand(o).into()).collect();
+                let cs = self
+                    .builder
+                    .build_indirect_call(fn_ty, ptr, &argv, "icall")
+                    .map_err(|e| self.err(e))?;
+                return Ok(cs.try_as_basic_value().basic());
+            }
         };
         Ok(Some(v))
     }
@@ -1675,7 +1690,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Fn(_) => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),

@@ -36,7 +36,11 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    of them risks the wrong op set (premature). See `open-questions.md` "bytes / buffer". So the
    next *build* is #3.
 3. **first-class closures (escape-driven) → `task_group`** — M7 concurrency. Design SETTLED
-   (`open-questions.md`); closures are the foundation, `task_group` the consumer.
+   (`open-questions.md`); closures are the foundation, `task_group` the consumer. Built in slices:
+   **① non-capturing function values DONE** — a top-level fn used as a value is a function pointer
+   (`Ty::Fn`, Copy/`Static`, no env), and calling such a local is an indirect call (`f := double;
+   f(5)`; scalar signatures). Next: **② lambda-as-value + captures** (escape → region-owned env),
+   then **③ `task_group`**.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

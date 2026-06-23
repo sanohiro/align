@@ -119,6 +119,11 @@ fn rvalue_str(rv: &Rvalue) -> String {
             let a: Vec<String> = args.iter().map(operand_str).collect();
             format!("call {name}({})", a.join(", "))
         }
+        Rvalue::FnAddr(name) => format!("fn_addr {name}"),
+        Rvalue::CallIndirect { callee, args, .. } => {
+            let a: Vec<String> = args.iter().map(operand_str).collect();
+            format!("call_indirect {}({})", operand_str(callee), a.join(", "))
+        }
         Rvalue::Field(slot, idx) => format!("_{slot}.{idx}"),
         Rvalue::OptionSome(op) => format!("Some({})", operand_str(op)),
         Rvalue::OptionNone => "None".to_string(),

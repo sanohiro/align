@@ -115,6 +115,12 @@ pub enum Rvalue {
     /// numeric operand/result type; lowers to the matching LLVM intrinsic (signedness/float from `ty`).
     MathOp { fn_: align_sema::MathFn, ty: Ty, operands: Vec<Operand> },
     Call(String, Vec<Operand>),
+    /// The address of a top-level function as a value (`Ty::Fn`) — a function pointer.
+    FnAddr(String),
+    /// An indirect call through a function-value `callee` (a `Ty::Fn` pointer). `param_tys`/`ret_ty`
+    /// give codegen the LLVM function type for the indirect `call` (taken from the checked args /
+    /// result type — no signature table needed).
+    CallIndirect { callee: Operand, args: Vec<Operand>, param_tys: Vec<Ty>, ret_ty: Ty },
     /// Load field `index` from the struct in `slot`.
     Field(Slot, u32),
     /// `Some(operand)` — build an `Option` aggregate (tag = Some).
@@ -680,6 +686,21 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let ops: Vec<Operand> = operands.iter().map(|o| lower_expr(b, o)).collect();
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::MathOp { fn_: *fn_, ty, operands: ops }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::FnValue(name) => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::FnAddr(name.clone())));
+            Operand::Value(v)
+        }
+        hir::ExprKind::CallFnValue { callee, args } => {
+            let c = lower_expr(b, callee);
+            // The function type for the indirect call comes from the (sema-checked) arg types and
+            // the call's result type — no signature table is threaded into MIR.
+            let (param_tys, ops): (Vec<Ty>, Vec<Operand>) =
+                args.iter().map(|a| (a.ty, lower_expr(b, a))).unzip();
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: c, args: ops, param_tys, ret_ty: e.ty }));
             Operand::Value(v)
         }
         hir::ExprKind::Call { func, args } => {
@@ -2392,6 +2413,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
+        Ty::Fn(id) => format!("fn#{id}"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }
