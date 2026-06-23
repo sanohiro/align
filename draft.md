@@ -572,10 +572,12 @@ point: it performs I/O. Safety comes from capture being by value (a task shares 
 with another) rather than from purity.
 
 A spawned lambda *escapes* (it outlives the `spawn` call, running later on the task), so it is
-represented as a first-class closure with a heap environment — distinct from a pipeline lambda,
-which never escapes and is inlined. The compiler's escape analysis chooses the representation, so
-pipelines stay allocation-free and SIMD/GPU-friendly while spawned tasks get the environment they
-need.
+represented as a first-class closure with an environment holding its captured values — distinct
+from a pipeline lambda, which never escapes and is inlined. The compiler's escape analysis chooses
+the representation, so pipelines stay allocation-free and SIMD/GPU-friendly while spawned tasks get
+the environment they need. That environment is **owned by the `task_group` scope** (like an
+`arena {}` allocation) and freed when the scope ends — not a hidden allocation, but a region one,
+with the visible scope as its boundary.
 
 async/await is not in the initial specification; structured `task_group` is the one concurrency
 model for I/O.
