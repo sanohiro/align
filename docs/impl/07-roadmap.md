@@ -175,6 +175,12 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   array-valued results, and the materializing terminals `scan`/`sort`/`to_array` all landed on
   the owned/dynamic-heap-array + drop foundation. Non-materializing terminals
   (`sum`/`reduce`/`count`/`any`/`all`) were already complete.
+- [done] **`sort_by_key(f)`** — materialize the surviving (primitive scalar) elements and sort
+  ascending by `f(element)` (an orderable scalar key: int/float/char). Reuses the MIR insertion
+  sort (`lower_array_sort` gained an optional `SortKey`), comparing `key(a) > key(b)` instead of
+  `a > b`; the element need not be numeric (it is ordered by the key). `f` is a named function or
+  a lambda and **may capture** (the key call is in the enclosing loop, so captures are ordinary
+  arguments). Struct-element sort stays deferred (needs struct-array materialization, like `sort`).
 - [done] **mutable element writes + `out` parameters (write mechanism)** — `place[i] = v` into a
   `mut` array local or an `out slice<T>` parameter (a writable output buffer the callee fills),
   bounds-checked (abort on out-of-range, like a read). `out` is restricted to `slice<T>` params and

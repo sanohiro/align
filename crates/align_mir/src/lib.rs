@@ -831,7 +831,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             lower_array_collect(b, source, stages, *elem, CollectKind::Scan { func: func.clone(), init: init_op, captures: captures.clone() })
         }
         hir::ExprKind::ArrayDot { a, b: bex, elem } => lower_array_dot(b, a, bex, *elem),
-        hir::ExprKind::ArraySort { source, stages, elem } => lower_array_sort(b, source, stages, *elem),
+        hir::ExprKind::ArraySort { source, stages, elem } => lower_array_sort(b, source, stages, *elem, None),
+        hir::ExprKind::ArraySortBy { source, stages, key_func, captures, key_ty, elem } => {
+            lower_array_sort(b, source, stages, *elem, Some(SortKey { func: key_func.clone(), captures: captures.clone(), key_ty: *key_ty }))
+        }
         hir::ExprKind::ArrayPartition { source, stages, func, captures, elem } => {
             let tuple_id = match e.ty {
                 Ty::Tuple(id) => id,
@@ -867,7 +870,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                         || (matches!(
                             source.kind,
                             hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. }
-                                | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. }
+                                | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. } | hir::ExprKind::ArraySortBy { .. }
                         ) && b.arenas.is_empty());
                     let v = b.fresh_value(e.ty);
                     b.push(Stmt::Let(v, Rvalue::ParMapParallel { src: src.clone(), func: func.clone(), elem_in, elem_out: *elem }));
@@ -1181,7 +1184,7 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             let arena_if_in_arena = matches!(
                 source.kind,
                 hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. }
-                    | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. }
+                    | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. } | hir::ExprKind::ArraySortBy { .. }
             );
             let temp_free =
                 (always_heap || (arena_if_in_arena && b.arenas.is_empty())).then(|| sv.clone());
@@ -1841,8 +1844,28 @@ fn lower_array_partition(
 /// Reads use `SliceIndex` over the `{ptr,len}` value; writes use `PtrStore` through its buffer
 /// pointer (`SlicePtr`). Returns the same owned array. O(n²) — fine for the small arrays this
 /// first cut targets; a faster sort is a follow-up.
-fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty) -> Operand {
+/// A `sort_by_key` key: the per-element key function, its captures, and the key type. The
+/// insertion sort compares `key(a) > key(b)` instead of `a > b`.
+struct SortKey {
+    func: String,
+    captures: Vec<hir::Expr>,
+    key_ty: Ty,
+}
+
+fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty, sort_key: Option<SortKey>) -> Operand {
     let arr = lower_array_collect(b, source, stages, elem, CollectKind::Collect);
+    // Compute the sort key of an element value (`key(elem)` for `sort_by_key`, else the element).
+    let key_of = |b: &mut Builder, v: Operand| -> Operand {
+        match &sort_key {
+            Some(sk) => {
+                let kc = b.fresh_value(sk.key_ty);
+                let args = stage_call_args(b, v, &sk.captures);
+                b.push(Stmt::Let(kc, Rvalue::Call(sk.func.clone(), args)));
+                Operand::Value(kc)
+            }
+            None => v,
+        }
+    };
     let ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
     b.push(Stmt::Let(ptr, Rvalue::SlicePtr(arr.clone())));
     let len = b.fresh_value(i64_ty());
@@ -1877,6 +1900,8 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.push(Stmt::Let(i_cur, Rvalue::Load(iv)));
     let key = b.fresh_value(elem);
     b.push(Stmt::Let(key, Rvalue::SliceIndex(arr.clone(), Operand::Value(i_cur))));
+    // The sort key of the element being inserted (invariant across the inner loop).
+    let key_cmp = key_of(b, Operand::Value(key));
     let j0 = b.fresh_value(i64_ty());
     b.push(Stmt::Let(j0, Rvalue::Bin(BinOp::Sub, Operand::Value(i_cur), index_const(1))));
     b.push(Stmt::Store(jv, Operand::Value(j0)));
@@ -1894,8 +1919,10 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.cur = cmp_bb;
     let aj = b.fresh_value(elem);
     b.push(Stmt::Let(aj, Rvalue::SliceIndex(arr.clone(), Operand::Value(j_val))));
+    // Compare keys: `key(arr[j]) > key(element)` (for a plain sort, the keys are the elements).
+    let aj_cmp = key_of(b, Operand::Value(aj));
     let gt = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(gt, Rvalue::Bin(BinOp::Gt, Operand::Value(aj), Operand::Value(key))));
+    b.push(Stmt::Let(gt, Rvalue::Bin(BinOp::Gt, aj_cmp, key_cmp.clone())));
     b.terminate(Term::Branch(Operand::Value(gt), shift, place));
 
     // shift: arr[j+1] = arr[j]; j -= 1.

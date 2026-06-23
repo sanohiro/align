@@ -250,6 +250,11 @@ pub enum ExprKind {
     /// `array<T>` and sort them ascending in place. `elem` is the element scalar; the result
     /// type is `DynArray(elem)`.
     ArraySort { source: Box<Expr>, stages: Vec<Stage>, elem: crate::Ty },
+    /// `source.….sort_by_key(f)` — materialize the surviving (primitive scalar) elements into an
+    /// owned `array<T>` and sort them ascending by the key `f(element)` (`key_func`, type
+    /// `(elem) -> key_ty`, an orderable scalar). `captures` are a lifted lambda's captured values.
+    /// `elem` is the element scalar; the result type is `DynArray(elem)`.
+    ArraySortBy { source: Box<Expr>, stages: Vec<Stage>, key_func: String, captures: Vec<Expr>, key_ty: crate::Ty, elem: crate::Ty },
     /// `source.….to_array()` — materialize the surviving (post-stage) elements into an
     /// *owned* `array<T>` (MMv2 slice 3: arena-bump-allocated). `elem` is the element
     /// scalar type; the expression `ty` is `DynArray(elem)`.
