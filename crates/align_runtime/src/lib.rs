@@ -1224,7 +1224,9 @@ pub extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) {
 /// Release the task group's region and the handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
-    drop(unsafe { Box::from_raw(tg) });
+    if !tg.is_null() {
+        drop(unsafe { Box::from_raw(tg) });
+    }
 }
 
 // Free-standing heap allocation for owned collections (`array<T>` produced by `.to_array()`

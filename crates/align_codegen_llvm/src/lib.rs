@@ -552,14 +552,23 @@ fn build_module<'c>(
         let thunk = tramp.get_nth_param(0).unwrap().into_pointer_value();
         let env = tramp.get_nth_param(1).unwrap();
         let slot = tramp.get_nth_param(2).unwrap().into_pointer_value();
-        let clos_fn_ty = rt.fn_type(&[ptr.into()], false);
-        let res = tb
-            .build_indirect_call(clos_fn_ty, thunk, &[env.into()], "r")
-            .map_err(|e| CodegenError::Lowering(e.to_string()))?
-            .try_as_basic_value()
-            .basic()
-            .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?;
-        tb.build_store(slot, res).map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        if *r == Ty::Unit {
+            // A `()`-returning closure is `void(ptr)` in LLVM (not `i32(ptr)`), so it must be
+            // called with a void signature; the slot (i32-sized) gets a dummy value.
+            let clos_fn_ty = ctx.void_type().fn_type(&[ptr.into()], false);
+            tb.build_indirect_call(clos_fn_ty, thunk, &[env.into()], "")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            tb.build_store(slot, ctx.i32_type().const_zero()).map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        } else {
+            let clos_fn_ty = rt.fn_type(&[ptr.into()], false);
+            let res = tb
+                .build_indirect_call(clos_fn_ty, thunk, &[env.into()], "r")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?;
+            tb.build_store(slot, res).map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        }
         tb.build_return(None).map_err(|e| CodegenError::Lowering(e.to_string()))?;
         funcs.insert(format!("tramp${key}"), tramp);
     }
