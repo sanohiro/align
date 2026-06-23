@@ -53,13 +53,15 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    (`fn apply(f: fn(i64)->i64, x: i64) = f(x)`). Sound with the frame-local env: the closure's env
    outlives the call. A fn-typed **return** is rejected (it would carry a frame env out of the
    frame); struct fields already reject `Ty::Fn`. Next: **④ `task_group`** (`draft.md` §11) — the
-   structured concurrency scope. Key finding (see `open-questions.md`): it does **not** need the
-   region-owned env — `wait()` joins all tasks before the frame returns, so the ②b-2 frame-local
-   env is alive for every task's lifetime even on another thread. So `spawn` reuses the closure
-   value as-is. Sub-slices: **④a** `task_group {}` + `spawn(fn{…}) -> Task<R>` + `wait()` +
-   `.get()`, deferred-sequential execution; **④b** real threads (reuse the `par_map` runtime);
-   **④c** the `wait()?` error boundary. (The region-owned env stays the ideal for a closure that
-   escapes the *frame* — a returned closure — which is a separate, later feature.)
+   structured concurrency scope. It uses the **region-owned env**: each `spawn` snapshots its
+   captures into a **fresh environment in the `task_group` region** (an arena-like region freed at
+   scope end). The ②b-2 frame-local env (one hoisted slot per closure site) cannot back a spawned
+   closure — a `spawn` in a loop would reuse that slot, so a deferred task reads the final value
+   and a concurrent task races the next iteration (this is why the settled design specified the
+   region env; `spawn` is the escape that triggers it). Sub-slices: **④a** `task_group {}` + the
+   task region + `spawn(fn{…}) -> Task<R>` (fresh region env) + `wait()` + `.get()` (with
+   `get`-before-`wait` a compile-time error), deferred-sequential execution; **④b** real threads
+   (reuse the `par_map` runtime); **④c** the `wait()?` error boundary.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
