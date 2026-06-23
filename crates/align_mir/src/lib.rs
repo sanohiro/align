@@ -106,6 +106,11 @@ pub enum Rvalue {
     Load(Slot),
     Un(UnOp, Operand),
     Bin(BinOp, Operand, Operand),
+    /// Explicit-overflow integer arithmetic (`core.math`): `op` is `Add`/`Sub`/`Mul` on the
+    /// integer type `int_ty`. `Saturating` → the clamped result (`int_ty`); `Checked` → an
+    /// `Option<int_ty>` (`None` on overflow). Lowers to the LLVM `{s,u}OP.sat` / `{s,u}OP.with.overflow`
+    /// intrinsics (signedness from `int_ty`).
+    IntArith { op: BinOp, mode: align_sema::ArithMode, int_ty: Ty, a: Operand, b: Operand },
     Call(String, Vec<Operand>),
     /// Load field `index` from the struct in `slot`.
     Field(Slot, u32),
@@ -657,6 +662,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Bin(*op, l, r)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::IntArith { op, mode, lhs, rhs } => {
+            let int_ty = lhs.ty;
+            let a = lower_expr(b, lhs);
+            let bb = lower_expr(b, rhs);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::IntArith { op: *op, mode: *mode, int_ty, a, b: bb }));
             Operand::Value(v)
         }
         hir::ExprKind::Call { func, args } => {

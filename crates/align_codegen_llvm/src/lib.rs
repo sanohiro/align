@@ -22,6 +22,7 @@ use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
+use inkwell::intrinsics::Intrinsic;
 use inkwell::module::Module;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
@@ -704,6 +705,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
         CodegenError::Lowering(e.to_string())
     }
 
+    /// Find + declare + call an overloaded binary integer intrinsic (`llvm.sadd.sat`,
+    /// `llvm.umul.with.overflow`, …) on `int_ty`, returning its result value (`iN` for `.sat`,
+    /// `{ iN, i1 }` for `.with.overflow`).
+    fn call_overflow_intrinsic(
+        &self,
+        name: &str,
+        int_ty: IntType<'c>,
+        a: inkwell::values::IntValue<'c>,
+        b: inkwell::values::IntValue<'c>,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let intr = Intrinsic::find(name).ok_or_else(|| self.err(format!("intrinsic {name} not found")))?;
+        let f = intr
+            .get_declaration(self.module, &[int_ty.into()])
+            .ok_or_else(|| self.err(format!("could not declare intrinsic {name}")))?;
+        self.builder
+            .build_call(f, &[a.into(), b.into()], "intr")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| self.err(format!("intrinsic {name} returned no value")))
+    }
+
     /// Get (building it once) the `void(in_ptr, out_ptr)` thunk for `func` — load the input
     /// element (`in_ty`), call `func`, store its result through `out_ptr` — and return its pointer.
     /// The runtime `align_rt_par_map` calls this per element. Building it temporarily repositions
@@ -995,6 +1018,76 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             },
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
+            Rvalue::IntArith { op, mode, int_ty, a, b } => {
+                let llvm_int = int_type(self.ctx, *int_ty);
+                let signed = is_signed(*int_ty);
+                let sign = if signed { 's' } else { 'u' };
+                let opname = match op {
+                    BinOp::Add => "add",
+                    BinOp::Sub => "sub",
+                    BinOp::Mul => "mul",
+                    _ => return Err(self.err("IntArith op must be add/sub/mul")),
+                };
+                let av = self.operand(a).into_int_value();
+                let bv = self.operand(b).into_int_value();
+                match mode {
+                    align_sema::ArithMode::Saturating if *op != BinOp::Mul => {
+                        // add/sub: LLVM has the saturating intrinsic directly.
+                        let name = format!("llvm.{sign}{opname}.sat");
+                        self.call_overflow_intrinsic(&name, llvm_int, av, bv)?
+                    }
+                    align_sema::ArithMode::Saturating => {
+                        // LLVM has NO `{s,u}mul.sat`; build it from `mul.with.overflow` + selecting
+                        // the saturated extreme. Unsigned overflow → MAX; signed → MAX when the
+                        // operands share a sign (product positive), else MIN.
+                        let name = format!("llvm.{sign}mul.with.overflow");
+                        let agg = self.call_overflow_intrinsic(&name, llvm_int, av, bv)?.into_struct_value();
+                        let prod = self.builder.build_extract_value(agg, 0, "prod").map_err(|e| self.err(e))?.into_int_value();
+                        let ovf = self.builder.build_extract_value(agg, 1, "of").map_err(|e| self.err(e))?.into_int_value();
+                        let sat = if signed {
+                            let smax = self.builder.build_right_shift(llvm_int.const_all_ones(), llvm_int.const_int(1, false), false, "smax").map_err(|e| self.err(e))?;
+                            let smin = self.builder.build_not(smax, "smin").map_err(|e| self.err(e))?;
+                            let zero = llvm_int.const_zero();
+                            let a_neg = self.builder.build_int_compare(IntPredicate::SLT, av, zero, "an").map_err(|e| self.err(e))?;
+                            let b_neg = self.builder.build_int_compare(IntPredicate::SLT, bv, zero, "bn").map_err(|e| self.err(e))?;
+                            let same = self.builder.build_int_compare(IntPredicate::EQ, a_neg, b_neg, "ss").map_err(|e| self.err(e))?;
+                            self.builder.build_select(same, smax, smin, "sat").map_err(|e| self.err(e))?.into_int_value()
+                        } else {
+                            llvm_int.const_all_ones()
+                        };
+                        self.builder.build_select(ovf, sat, prod, "satmul").map_err(|e| self.err(e))?
+                    }
+                    // `checked_*`: the `with.overflow` intrinsic returns `{ iN result, i1 overflow }`;
+                    // build `Option<iN>` — tag 0 (None) on overflow, else tag 1 (Some) with the result.
+                    align_sema::ArithMode::Checked => {
+                        let Ty::Option(s) = result_ty else {
+                            return Err(self.err("checked result is not an Option"));
+                        };
+                        let name = format!("llvm.{sign}{opname}.with.overflow");
+                        let agg = self.call_overflow_intrinsic(&name, llvm_int, av, bv)?.into_struct_value();
+                        let res = self.builder.build_extract_value(agg, 0, "res").map_err(|e| self.err(e))?;
+                        let ovf = self.builder.build_extract_value(agg, 1, "of").map_err(|e| self.err(e))?.into_int_value();
+                        let oty = option_struct_type(self.ctx, s, self.struct_types);
+                        let some_tag = self.ctx.i8_type().const_int(1, false);
+                        let none_tag = self.ctx.i8_type().const_int(0, false);
+                        let tag = self
+                            .builder
+                            .build_select(ovf, none_tag, some_tag, "tag")
+                            .map_err(|e| self.err(e))?
+                            .into_int_value();
+                        let a0 = self
+                            .builder
+                            .build_insert_value(oty.const_zero(), tag, 0, "tag")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                        self.builder
+                            .build_insert_value(a0, res, 1, "val")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value()
+                            .into()
+                    }
+                }
+            }
             Rvalue::Field(slot, idx) => {
                 let fty = abi_type(self.ctx, self.field_ty(*slot, *idx), self.struct_types);
                 let field_ptr = self.field_ptr(*slot, *idx)?;

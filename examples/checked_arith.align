@@ -1,0 +1,15 @@
+// Explicit-overflow arithmetic (core.math). The default `+`/`-`/`*` wrap (defined two's-
+// complement); these methods make the overflow behavior explicit:
+//   wrapping_*   → wrap (same as the default), stated for intent
+//   saturating_* → clamp to the type's MIN/MAX
+//   checked_*    → Option<T>: None on overflow
+fn main() -> Result<(), Error> {
+  a: i8 := 100
+  print(a.wrapping_add(100))      // 100 + 100 wraps to -56
+  print(a.saturating_add(100))    // clamps to 127 (i8 MAX)
+
+  x: i32 := 2000000000
+  print(x.checked_add(x) else { -1 })   // overflow → None → -1
+  print(x.checked_add(5) else { -1 })   // in range → 2000000005
+  return Ok(())
+}

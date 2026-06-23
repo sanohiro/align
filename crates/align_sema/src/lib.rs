@@ -264,6 +264,26 @@ fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
     matches!(ty, Ty::Tuple(id) if tuples[id as usize].elems.iter().any(|s| s.is_move()))
 }
 
+/// Parse an explicit-overflow arithmetic method name into its op and overflow mode (`core.math`).
+/// `None` mode = `wrapping_*` (the default wrapping arithmetic — lowered to a plain `Binary`);
+/// `Some(_)` = `saturating_*` / `checked_*`. Returns `None` for any other method name.
+fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
+    let (prefix, opname) = method.rsplit_once('_')?;
+    let op = match opname {
+        "add" => BinOp::Add,
+        "sub" => BinOp::Sub,
+        "mul" => BinOp::Mul,
+        _ => return None,
+    };
+    let mode = match prefix {
+        "wrapping" => None,
+        "saturating" => Some(hir::ArithMode::Saturating),
+        "checked" => Some(hir::ArithMode::Checked),
+        _ => return None,
+    };
+    Some((op, mode))
+}
+
 /// Whether `ty` is a Move (owned) type — used to reject capturing an owned value into a lambda
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
@@ -685,7 +705,7 @@ impl EffectScan {
             }
             // Structural recursion (no effect of their own).
             ExprKind::Unary { expr, .. } => self.expr(expr),
-            ExprKind::Binary { lhs, rhs, .. } => {
+            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.expr(lhs);
                 self.expr(rhs);
             }
@@ -1149,7 +1169,7 @@ impl<'a> EscapeCheck<'a> {
                 self.block(els, depth);
             }
             ExprKind::Unary { expr, .. } => self.walk(expr, depth),
-            ExprKind::Binary { lhs, rhs, .. } => {
+            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.walk(lhs, depth);
                 self.walk(rhs, depth);
             }
@@ -1383,7 +1403,7 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::Unary { expr, .. } => self.expr(expr, moved, false, false),
-            ExprKind::Binary { lhs, rhs, .. } => {
+            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.expr(lhs, moved, false, false);
                 self.expr(rhs, moved, false, false);
             }
@@ -2387,6 +2407,56 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::Binary { op, lhs: Box::new(l), rhs: Box::new(r) }, ty, span }
     }
 
+    /// `x.wrapping_add(y)` / `x.saturating_sub(y)` / `x.checked_mul(y)` etc. (`core.math`). The
+    /// receiver and the single operand must be the same integer type. `wrapping_*` is the default
+    /// (the language already wraps), so it lowers to a plain `Binary`; `saturating_*` clamps and
+    /// yields the int type; `checked_*` yields `Option<T>` (`None` on overflow).
+    fn check_int_arith_method(&mut self, recv: &ast::Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let (op, mode) = parse_int_arith(method).expect("dispatched only for an int-arith method");
+        let r = self.check_expr(recv, None);
+        if r.ty == Ty::Error {
+            return err;
+        }
+        if !r.ty.is_int_like() {
+            self.diags.error(
+                format!("'{method}' is an integer overflow operation, but the receiver is {}", ty_name(r.ty)),
+                span,
+            );
+            return err;
+        }
+        let [arg] = args else {
+            self.diags.error(format!("'{method}' takes 1 argument (the other operand), got {}", args.len()), span);
+            return err;
+        };
+        let a = self.check_expr(arg, Some(r.ty));
+        if a.ty == Ty::Error {
+            return err;
+        }
+        // Unify the operands (binds an unconstrained literal operand to the other's type) rather
+        // than compare — `a.checked_add(5)` must accept the literal `5` as the same int.
+        let t = self.unify(r.ty, a.ty, span);
+        if t == Ty::Error {
+            return err;
+        }
+        if !t.is_int_like() {
+            self.diags.error(format!("'{method}' needs integer operands, got {}", ty_name(t)), span);
+            return err;
+        }
+        let (lhs, rhs) = (Box::new(r), Box::new(a));
+        match mode {
+            // `wrapping_*` is the default wrapping arithmetic.
+            None => Expr { kind: ExprKind::Binary { op, lhs, rhs }, ty: t, span },
+            Some(m @ hir::ArithMode::Saturating) => Expr { kind: ExprKind::IntArith { op, mode: m, lhs, rhs }, ty: t, span },
+            // `checked_*` yields `Option<T>`. The payload scalar must be concrete now (no inference
+            // var inside a composite), so resolve `t` — an unconstrained literal pair defaults to i64.
+            Some(m @ hir::ArithMode::Checked) => {
+                let scalar = ty_to_scalar(self.finalize(t)).expect("an integer type is a scalar payload");
+                Expr { kind: ExprKind::IntArith { op, mode: m, lhs, rhs }, ty: Ty::Option(scalar), span }
+            }
+        }
+    }
+
     fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         // Method call `recv.method(...)`: a module builtin (`heap.new`) or a method on a
         // value (`box.get()`, `box.clone()`).
@@ -2607,6 +2677,10 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
+        }
+        // Explicit-overflow integer arithmetic (`core.math`): `x.{wrapping,saturating,checked}_{add,sub,mul}(y)`.
+        if parse_int_arith(method).is_some() {
+            return self.check_int_arith_method(recv, method, args, span);
         }
         // `sum` / `reduce` are the terminals of a fused pipeline.
         if method == "sum" {
@@ -4379,7 +4453,7 @@ impl<'a, 't> Checker<'a, 't> {
         e.ty = self.finalize(e.ty);
         match &mut e.kind {
             ExprKind::Unary { expr, .. } => self.finalize_expr(expr),
-            ExprKind::Binary { lhs, rhs, .. } => {
+            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.finalize_expr(lhs);
                 self.finalize_expr(rhs);
             }
