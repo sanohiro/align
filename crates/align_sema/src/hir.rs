@@ -22,6 +22,17 @@ pub enum ArithMode {
     Checked,
 }
 
+/// A scalar math builtin ([`ExprKind::MathOp`]) — a method on a numeric value (`core.math`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MathFn {
+    /// `x.abs()` — absolute value (signed int / float; identity on unsigned).
+    Abs,
+    /// `a.min(b)` — the smaller of two numbers (pairwise; distinct from the array reduction).
+    Min,
+    /// `a.max(b)` — the larger of two numbers (pairwise).
+    Max,
+}
+
 #[derive(Clone, Debug)]
 pub struct Program {
     pub fns: Vec<Fn>,
@@ -149,6 +160,12 @@ pub enum ExprKind {
         mode: ArithMode,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+    },
+    /// A scalar math builtin (`core.math`): `x.abs()` (one operand) / `a.min(b)` / `a.max(b)`
+    /// (two operands). All operands and the result share the numeric type (the `Expr`'s `ty`).
+    MathOp {
+        fn_: MathFn,
+        operands: Vec<Expr>,
     },
     Call {
         func: String,

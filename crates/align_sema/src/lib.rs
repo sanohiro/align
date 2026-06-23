@@ -724,6 +724,11 @@ impl EffectScan {
                     self.expr(el);
                 }
             }
+            ExprKind::MathOp { operands, .. } => {
+                for o in operands {
+                    self.expr(o);
+                }
+            }
             ExprKind::ArrayLit { elems, .. } => {
                 for el in elems {
                     self.expr(el);
@@ -1147,6 +1152,11 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(el, depth);
                 }
             }
+            ExprKind::MathOp { operands, .. } => {
+                for o in operands {
+                    self.walk(o, depth);
+                }
+            }
             ExprKind::TupleIndex { recv, .. } => self.walk(recv, depth),
             ExprKind::Arena(b) => {
                 let inner = depth + 1;
@@ -1497,6 +1507,11 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
                     self.expr(el, moved, true, true);
+                }
+            }
+            ExprKind::MathOp { operands, .. } => {
+                for o in operands {
+                    self.expr(o, moved, false, false);
                 }
             }
             // `t.N` of a bound tuple reads field `N` independently of the other fields: it is
@@ -2457,6 +2472,45 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `x.abs()` / `a.min(b)` / `a.max(b)` (`core.math`). The receiver must be numeric; `min`/`max`
+    /// take one operand of the same type. The result is that numeric type.
+    fn check_scalar_math(&mut self, recv: &ast::Expr, fn_: hir::MathFn, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let name = match fn_ {
+            hir::MathFn::Abs => "abs",
+            hir::MathFn::Min => "min",
+            hir::MathFn::Max => "max",
+        };
+        let r = self.check_expr(recv, None);
+        if r.ty == Ty::Error {
+            return err;
+        }
+        if !r.ty.is_numeric() {
+            self.diags.error(format!("'{name}' needs a numeric receiver, got {}", ty_name(r.ty)), span);
+            return err;
+        }
+        let want_args = if matches!(fn_, hir::MathFn::Abs) { 0 } else { 1 };
+        if args.len() != want_args {
+            self.diags.error(format!("'{name}' takes {want_args} argument(s), got {}", args.len()), span);
+            return err;
+        }
+        let mut operands = vec![r];
+        if let [arg] = args {
+            let recv_ty = operands[0].ty;
+            let a = self.check_expr(arg, Some(recv_ty));
+            if a.ty == Ty::Error {
+                return err;
+            }
+            let t = self.unify(recv_ty, a.ty, span);
+            if t == Ty::Error {
+                return err;
+            }
+            operands.push(a);
+        }
+        let ty = operands[0].ty;
+        Expr { kind: ExprKind::MathOp { fn_, operands }, ty, span }
+    }
+
     fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         // Method call `recv.method(...)`: a module builtin (`heap.new`) or a method on a
         // value (`box.get()`, `box.clone()`).
@@ -2707,8 +2761,19 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "any" || method == "all" {
             return self.check_array_any_all(recv, args, method == "all", span);
         }
-        if method == "min" || method == "max" {
+        // `arr.min()` / `arr.max()` (no args) is the array reduction; `a.min(b)` / `a.max(b)`
+        // (one arg) is the pairwise scalar math op.
+        if (method == "min" || method == "max") && args.is_empty() {
             return self.check_array_min_max(recv, args, expected, method == "max", span);
+        }
+        if method == "abs" {
+            return self.check_scalar_math(recv, hir::MathFn::Abs, args, span);
+        }
+        if method == "min" {
+            return self.check_scalar_math(recv, hir::MathFn::Min, args, span);
+        }
+        if method == "max" {
+            return self.check_scalar_math(recv, hir::MathFn::Max, args, span);
         }
         if method == "to_array" {
             return self.check_array_to_array(recv, args, span);
@@ -4522,6 +4587,11 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
                     self.finalize_expr(el);
+                }
+            }
+            ExprKind::MathOp { operands, .. } => {
+                for o in operands {
+                    self.finalize_expr(o);
                 }
             }
             ExprKind::TupleIndex { recv, .. } => self.finalize_expr(recv),
