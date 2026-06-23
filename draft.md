@@ -419,7 +419,6 @@ and `.score` projects a field out of each element.
 ```text
 map
 par_map
-filter
 where
 reduce
 scan
@@ -862,7 +861,6 @@ array<T>
 slice<T>
 chunks
 map
-filter
 where
 reduce
 scan

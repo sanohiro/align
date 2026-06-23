@@ -12,7 +12,7 @@ the still-deferred, deliberately un-rushed tracks (tuples/`partition`, `array<sl
 It exists because the deferred "ideal forms" of M4 and M5 both rest on one foundation:
 - M5 `json.decode` for `str` / `array<T>` / nested fields → zero-copy views region-tied to
   the input → **draft.md §19 runs in full** (true M5 completion).
-- M4 carryover `filter` / `scan` / `partition` / `sort` / `chunks` + array-valued results →
+- M4 carryover `where` / `scan` / `partition` / `sort` / `chunks` + array-valued results →
   built on owned, dynamic heap arrays with drop (materialization).
 
 Today these are handled by three unrelated **point solutions** in `align_sema`'s
@@ -224,13 +224,13 @@ arenas but consistent with lexical nesting.
 
 With §6 + §7 in place, the M4 carryover terminals become ordinary owned-array producers:
 
-- `filter(p)`, `map(f).to_array()`, `partition(p)`, `sort()` / `sort_by(k)`, `chunks(n)`,
+- `where(p)`, `map(f).to_array()`, `partition(p)`, `sort()` / `sort_by(k)`, `chunks(n)`,
   and array-valued results all return an owned `array<T>` (or `array<array<T>>` for
   `chunks`).
 - Allocation site follows §6 (arena bump if in an arena, else heap-owned + drop).
 - The fused single-loop model (M4) still applies to the *non-materializing* prefix; a
   materializing terminal writes into the freshly allocated result buffer at the end of that
-  loop (sizing: `filter`/`partition` need a count pass or a growable buffer — v1 uses a
+  loop (sizing: `where`/`partition` need a count pass or a growable buffer — v1 uses a
   growable owned buffer, an over-allocate-then-shrink or two-pass count; decide per terminal
   in its slice).
 
@@ -584,7 +584,7 @@ decode-escape semantics and lifted several deferrals. All of the following are n
 
 ## 13. Open sub-questions (decide within the phase, not before)
 
-- `filter`/`partition` result sizing: two-pass count vs growable buffer vs over-allocate +
+- `where`/`partition` result sizing: two-pass count vs growable buffer vs over-allocate +
   shrink (per-terminal, slice 3/5).
 - Drop order across mixed arena + free-standing owned values at one scope exit (likely:
   inner arenas freed first, then per-binding drops in reverse declaration order).
