@@ -234,10 +234,10 @@ pub enum ExprKind {
     /// element. `is_max` selects max over min. Seeded with the element type's extreme, so an
     /// empty pipeline yields that extreme (the fold identity, as `sum` yields 0).
     ArrayMinMax { source: Box<Expr>, stages: Vec<Stage>, is_max: bool },
-    /// `source.…​.reduce(f, init)` — fold the (post-stage) elements with the binary
+    /// `source.…​.reduce(init, f)` — fold the (post-stage) elements with the binary
     /// function `func` starting from `init`. `ty` is the accumulator type.
     ArrayReduce { source: Box<Expr>, stages: Vec<Stage>, func: String, captures: Vec<Expr>, init: Box<Expr> },
-    /// `source.….scan(f, init)` — a *materializing* prefix fold: emit the running accumulator
+    /// `source.….scan(init, f)` — a *materializing* prefix fold: emit the running accumulator
     /// after each surviving element (`out[k] = acc` after `acc = f(acc, elem)`), starting from
     /// `init`. Yields an owned `array<A>` of survivor length. `elem` is the accumulator scalar
     /// (the output element type, `A`); `func` has type `(A, E) -> A`.

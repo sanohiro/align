@@ -3433,12 +3433,12 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `src.…​.reduce(f, init)` — fold the post-stage elements with `f: (A, E) -> A`,
+    /// `src.…​.reduce(init, f)` — fold the post-stage elements with `f: (A, E) -> A`,
     /// starting from `init: A`.
     fn check_array_reduce(&mut self, recv: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let [fn_arg, init_arg] = args else {
-            self.diags.error(format!("'reduce' takes 2 arguments (a function and an initial value), got {}", args.len()), span);
+        let [init_arg, fn_arg] = args else {
+            self.diags.error(format!("'reduce' takes 2 arguments (an initial value and a function), got {}", args.len()), span);
             return err;
         };
         // The accumulator type + element hint: a named fold fixes both from its signature; a
@@ -3471,12 +3471,12 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `source.….scan(f, init)` — a materializing prefix fold: emit the running accumulator
+    /// `source.….scan(init, f)` — a materializing prefix fold: emit the running accumulator
     /// after each surviving element, yielding an owned `array<A>`. `f: (A, E) -> A`, `init: A`.
     fn check_array_scan(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let [fn_arg, init_arg] = args else {
-            self.diags.error(format!("'scan' takes 2 arguments (a function and an initial value), got {}", args.len()), span);
+        let [init_arg, fn_arg] = args else {
+            self.diags.error(format!("'scan' takes 2 arguments (an initial value and a function), got {}", args.len()), span);
             return err;
         };
         // Accumulator type + element hint: a named fold fixes both from its signature; a lambda
@@ -5289,7 +5289,7 @@ mod tests {
     fn reduce_scalar_accumulator_returns_ok() {
         // A scalar reduce result carries no region (it is Copy), so folding inside an arena and
         // returning the scalar is fine — the arena region must not leak onto plain scalars.
-        let (_p, d) = check("fn add(a: i64, e: i64) -> i64 = a + e\nfn total() -> i64 {\n  arena {\n    ns := [1, 2, 3]\n    return ns.reduce(add, 0)\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("fn add(a: i64, e: i64) -> i64 = a + e\nfn total() -> i64 {\n  arena {\n    ns := [1, 2, 3]\n    return ns.reduce(0, add)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(!d.has_errors(), "a scalar reduce accumulator carries no region and may be returned");
     }
 
@@ -5586,7 +5586,7 @@ mod tests {
     #[test]
     fn reduce_checks() {
         let (_p, d) = check(
-            "fn add(acc: i32, x: i32) -> i32 = acc + x\nfn main() -> i32 {\n  return [1, 2, 3].reduce(add, 0)\n}\n",
+            "fn add(acc: i32, x: i32) -> i32 = acc + x\nfn main() -> i32 {\n  return [1, 2, 3].reduce(0, add)\n}\n",
         );
         assert!(!d.has_errors(), "reduce with a matching fold should check");
     }
@@ -5674,21 +5674,21 @@ mod tests {
 
     #[test]
     fn scan_inline_checks() {
-        // scan(f, init) with f: (i32, i32) -> i32 yields array<i32>; summing it checks.
-        let (_p, d) = check("fn add(acc: i32, x: i32) -> i32 = acc + x\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(add, 0).sum()\n}\n");
+        // scan(init, f) with f: (i32, i32) -> i32 yields array<i32>; summing it checks.
+        let (_p, d) = check("fn add(acc: i32, x: i32) -> i32 = acc + x\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(0, add).sum()\n}\n");
         assert!(!d.has_errors(), "scan(add, 0) over an i32 pipeline should check");
     }
 
     #[test]
     fn scan_fn_arity_mismatch_errors() {
         // scan needs a 2-arg fold; a 1-arg function must error.
-        let (_p, d) = check("fn bad(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].scan(bad, 0).sum()\n}\n");
+        let (_p, d) = check("fn bad(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].scan(0, bad).sum()\n}\n");
         assert!(d.has_errors(), "scan with a non-binary function must error");
     }
 
     #[test]
     fn sort_inline_checks() {
-        let (_p, d) = check("fn id(x: i32) -> i32 = x\nfn h(acc: i32, x: i32) -> i32 = acc + x\nfn main() -> i32 {\n  return [3, 1, 2].map(id).sort().reduce(h, 0)\n}\n");
+        let (_p, d) = check("fn id(x: i32) -> i32 = x\nfn h(acc: i32, x: i32) -> i32 = acc + x\nfn main() -> i32 {\n  return [3, 1, 2].map(id).sort().reduce(0, h)\n}\n");
         assert!(!d.has_errors(), "sort of a numeric pipeline should check");
     }
 
@@ -5728,14 +5728,14 @@ mod tests {
     #[test]
     fn scan_over_struct_element_rejected_not_panicked() {
         // A struct element (no field projection) must be rejected in sema, not panic in MIR.
-        let (_p, d) = check("Point { x: i32, y: i32 }\nfn addx(acc: i32, p: Point) -> i32 = acc + p.x\nfn main() -> i32 {\n  return [Point { x: 1, y: 2 }].scan(addx, 0).sum()\n}\n");
+        let (_p, d) = check("Point { x: i32, y: i32 }\nfn addx(acc: i32, p: Point) -> i32 = acc + p.x\nfn main() -> i32 {\n  return [Point { x: 1, y: 2 }].scan(0, addx).sum()\n}\n");
         assert!(d.has_errors(), "scan over struct elements must error (project a field first)");
     }
 
     #[test]
     fn scan_struct_accumulator_rejected() {
         // A struct accumulator (ty_to_scalar succeeds for structs) must be rejected explicitly.
-        let (_p, d) = check("Acc { s: i32 }\nfn step(a: Acc, x: i32) -> Acc = Acc { s: a.s + x }\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(step, Acc { s: 0 }).len()\n}\n");
+        let (_p, d) = check("Acc { s: i32 }\nfn step(a: Acc, x: i32) -> Acc = Acc { s: a.s + x }\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(Acc { s: 0 }, step).len()\n}\n");
         assert!(d.has_errors(), "scan with a struct accumulator must error");
     }
 
@@ -5743,7 +5743,7 @@ mod tests {
     fn reduce_fold_type_mismatch_errors() {
         // fold that takes the wrong element type.
         let (_p, d) = check(
-            "fn add(acc: i32, x: bool) -> i32 = acc\nfn main() -> i32 {\n  return [1, 2, 3].reduce(add, 0)\n}\n",
+            "fn add(acc: i32, x: bool) -> i32 = acc\nfn main() -> i32 {\n  return [1, 2, 3].reduce(0, add)\n}\n",
         );
         assert!(d.has_errors(), "a fold whose element param mismatches must error");
     }
