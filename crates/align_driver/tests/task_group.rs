@@ -105,6 +105,36 @@ fn early_return_joins_tasks() {
 }
 
 #[test]
+fn get_before_wait_rejected() {
+    // ④c: a task's result is ready only after `wait()` joins — `get()` before it is rejected.
+    assert!(check_errs(
+        "tg-get-before-wait",
+        "fn main() -> Result<(), Error> {\n  task_group {\n    a := spawn(fn { 1 })\n    print(a.get())\n    wait()\n  }\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
+fn wait_in_both_branches_dominates() {
+    if !backend_available() {
+        return;
+    }
+    // `wait()` on every path before the `get()` → accepted (dominance).
+    let src = "fn main() -> Result<(), Error> {\n  c := true\n  task_group {\n    a := spawn(fn { 5 })\n    if c { wait() } else { wait() }\n    print(a.get())\n  }\n  return Ok(())\n}\n";
+    let out = build_and_run("tg-dom-ok", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+}
+
+#[test]
+fn wait_in_one_branch_rejected() {
+    // `wait()` on only one path does not dominate the `get()` → rejected (sound, not just linear).
+    assert!(check_errs(
+        "tg-dom-bad",
+        "fn main() -> Result<(), Error> {\n  c := true\n  task_group {\n    a := spawn(fn { 5 })\n    if c { wait() }\n    print(a.get())\n  }\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
 fn owned_payload_task_rejected() {
     // ④b-1a: a task result is boxed in the region, so it must be a primitive scalar for now;
     // an owned result (`string`) is rejected (the region drop/borrow handling is a later slice).
