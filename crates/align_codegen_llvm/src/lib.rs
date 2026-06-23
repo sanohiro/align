@@ -418,10 +418,12 @@ fn build_module<'c>(
         }
     }
     for name in &thunk_names {
-        let orig = funcs[name];
+        let orig = *funcs
+            .get(name)
+            .ok_or_else(|| CodegenError::Lowering(format!("unknown function {name}")))?;
         let orig_ty = orig.get_type();
         let mut params: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
-        params.extend(orig_ty.get_param_types().iter().map(|t| Into::<BasicMetadataTypeEnum>::into(*t)));
+        params.extend(orig_ty.get_param_types().iter().map(|t| BasicMetadataTypeEnum::from(*t)));
         let thunk_ty = match orig_ty.get_return_type() {
             Some(rt) => rt.fn_type(&params, false),
             None => ctx.void_type().fn_type(&params, false),
@@ -654,6 +656,9 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>]) -> BasicTypeEnu
         Ty::Option(s) => option_struct_type(ctx, s, sx).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx).into(),
         Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => ctx.ptr_type(AddressSpace::default()).into(),
+        // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
+        // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
+        Ty::Fn(_) => closure_struct_type(ctx).into(),
         Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
@@ -1736,10 +1741,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let env = self.builder.build_extract_value(clos, 1, "ce").map_err(|e| self.err(e))?;
                 let mut param_meta: Vec<BasicMetadataTypeEnum> =
                     vec![self.ctx.ptr_type(AddressSpace::default()).into()];
-                param_meta.extend(param_tys.iter().map(|t| Into::<BasicMetadataTypeEnum>::into(self.llvm_type(*t))));
+                param_meta.extend(param_tys.iter().map(|t| BasicMetadataTypeEnum::from(self.llvm_type(*t))));
                 let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
                 let mut argv: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env.into()];
-                argv.extend(args.iter().map(|o| Into::<inkwell::values::BasicMetadataValueEnum>::into(self.operand(o))));
+                argv.extend(args.iter().map(|o| inkwell::values::BasicMetadataValueEnum::from(self.operand(o))));
                 let cs = self
                     .builder
                     .build_indirect_call(fn_ty, fn_ptr, &argv, "icall")
