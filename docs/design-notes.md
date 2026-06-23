@@ -215,13 +215,29 @@ just a loop-invariant argument the backend hoists. This keeps lambdas inside the
 guarantees rather than introducing a new cost class: **Nothing hidden** (no silent heap
 environment), **Predictable performance** (a lambda is never secretly slower than the named
 equivalent), and **Compiler-friendly** (the optimizer sees a direct call, not an indirect one
-through a closure object). The only case that would need a visible heap environment is a lambda
-that escapes and outlives its captures (a first-class function value stored or returned) — and
-that allocation, when it eventually exists, will be explicit like every other one.
+through a closure object).
+
+**Escape decides the representation.** A lambda that *escapes* — stored in a variable, returned,
+or handed to `task_group`'s `spawn` to run later — outlives the locals it captures, so it cannot
+borrow them; it needs a **closure environment** holding the captured values. The compiler's escape
+analysis (the same one that governs views and arenas) chooses: a non-escaping lambda (every
+pipeline `map`/`where`/`reduce`/`par_map`) is inlined with captures-as-parameters — zero
+allocation, SIMD/GPU-friendly; an escaping lambda gets an environment. That environment is not a
+new hidden cost class: it is **owned by the enclosing region** — the `task_group {}` / `arena {}`
+scope it escapes into — and freed with that region, exactly like every other region allocation. So
+it stays inside the one region-based allocation model, and the *visible* act of escaping (and the
+*visible* enclosing scope) is the allocation boundary — consistent with **Nothing hidden** (no
+silent free-floating `malloc`). This is the load-bearing design point: it lets first-class function
+values and `task_group` exist *without* eroding the inlined, offload-ready pipeline path, and the
+two paths are distinguished by escape, not by two different lambda syntaxes. (The allocation model
+for a closure that escapes *every* region — e.g. one returned to an unbounded caller — is part of
+the deferred first-class-closure design; the `task_group` consumer is scope-bounded and clean.)
 
 The **Side Effect Rule** completes the picture: a `par_map` lambda must be Pure (it may read
-captured values but not mutate external state), which is what makes parallel execution safe
-without locks. Purity is inferred, never annotated.
+captured values but not mutate external state), which is what makes data-parallel execution safe
+without locks. A `task_group` task, by contrast, *may* be impure — it performs I/O — and its
+safety comes from capture being by value (no shared mutable state) rather than from purity.
+Purity is inferred, never annotated.
 
 ---
 
