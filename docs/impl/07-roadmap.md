@@ -2,7 +2,47 @@
 
 Milestones. The principle is as in `00-overview.md` — **fix the whole design first, drive a vertical skeleton through the implementation first, and plug each feature into all stages**. Each M has the completion condition of "works end to end (`.align` → run → output verification)." Do not create tasks that do not run vertically through the stages (e.g. doing the whole type system first).
 
-## M0 — Skeleton Traversal (walking skeleton)
+---
+
+## Status & forward plan (snapshot)
+
+This section is the **live sequence** — what is done and what is next, in order. The per-milestone
+detail further below is the historical / spec record; consult it for *how* a milestone is built,
+but read the order from here.
+
+**Standing principles** (full text in `CLAUDE.md`):
+- **Ideal form, or defer** — ship only the ideal / unified / philosophy-aligned form; if a feature
+  can't be done that way, present the design and defer it. Never a half-hearted compromise.
+- **No backward compatibility** (pre-release) — change APIs outright; no aliases / shims / dual paths.
+- **Finish all of `core` + the language before `std`** — the OS-boundary layer (`std`/`pkg`) waits.
+
+**Done:** M0–M3 (skeleton · functions/control/struct/bool · Result/Option/`?` · move/value/arena) ·
+**Memory Model v2** (borrow-region propagation + owned heap/drop) · **M4** (array-processing core) ·
+**M5** (strings, templates, `json.encode`/`decode`). Cross-cutting since: first-class **tuples**
+(incl. partial field moves); **lambdas** in every stage & reducer with **capture** (lifted,
+escape-driven design settled); **`sort_by_key`**; whole-struct **`arr[i]`** by value (struct fields
+enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` + purity inference.
+
+**Forward plan (ordered — finish the language, then std):**
+1. **core.math** — `checked_*` / `saturating_*` / `wrapping_*` arithmetic (*in progress*), then
+   scalar `abs` / `min` / `max` / … (Settled core identity: defined wrap + explicit overflow ops).
+2. **core.bytes / core.buffer** — read-only byte views + mutable byte buffers.
+3. **first-class closures (escape-driven) → `task_group`** — M7 concurrency. Design SETTLED
+   (`open-questions.md`); closures are the foundation, `task_group` the consumer.
+4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
+5. **core.bitset / core.hash** — design, then build.
+6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
+   LLVM-version upgrade — the perf tier. The optimizer makes the already-inlined/fused pipelines
+   actually vectorize (today it is not run; see "Status note" in `open-questions.md` Future).
+7. **M8 — tooling**: the formatter, the standard lints, `unsafe` blocks + `raw.*`.
+8. **Then `std`** (OS boundary) and `pkg`.
+
+Deferred-on-purpose until their slot (not gaps): GPU backend, FFI (before the `pkg` DB drivers /
+`std.compress` that wrap C engines), reflection — see `non-goals.md` / `open-questions.md` Future.
+
+---
+
+## M0 — Skeleton Traversal (walking skeleton) — DONE
 
 Goal: the whole pipeline connects, including crate boundaries. Features minimal.
 
@@ -20,7 +60,7 @@ Completion conditions:
 
 At this point only `i64`/`i32` integers, `:=`, `fn`, `return`, and the four arithmetic operations. Type inference and move checking are minimal.
 
-## M1 — The Bones of the Language (functions, control, struct, bool)
+## M1 — The Bones of the Language (functions, control, struct, bool) — DONE
 
 - [done] `fn` (normal form + `= expr` short form), multiple arguments, function calls.
 - [done] `if` / comparison operations / `bool`.
@@ -39,7 +79,7 @@ At this point only `i64`/`i32` integers, `:=`, `fn`, `return`, and the four arit
 Completion condition (met): control-flow + struct/float/char programs compile and run
 (`examples/point.align`, `examples/circle.align`, `examples/hello.align`).
 
-## M2 — Errors and Existence (Result / Option / ?)
+## M2 — Errors and Existence (Result / Option / ?) — DONE
 
 - [done] `Option<T>` (no null), extraction via `else` (braced diverging form or a
   value fallback).
@@ -110,7 +150,7 @@ Build order: generic type syntax → `Ty::Option`/`Ty::Result`/`Scalar` → AST/
 lowering + the `main` wrapper. (`std.fs.read_file` later landed as a real builtin reading a file
 into an owned `string` — see the M5 §19 note below.)
 
-## M3 — Memory Model (move / value / arena)
+## M3 — Memory Model (move / value / arena) — DONE
 
 - [done] move of owning types and use-after-move errors, explicit `clone()`.
 - [done] `arena {}` block → calls to `align_runtime`'s arena allocator and bulk free.
@@ -148,7 +188,7 @@ HIR flow analyses (`align_sema`: MoveCheck / EscapeCheck). `examples/arena.align
 Completion condition (met): data allocated inside `arena {}` is freed at block exit
 (and on early exits), and escapes are compile errors.
 
-## M4 — Array Processing Core (Align's protagonist)
+## M4 — Array Processing Core (Align's protagonist) — DONE
 
 - [done] `array<T>` (fixed-length, from literals) + chains `map` / `where` / `sum`.
 - [done] **loop fusion** in MIR (`[...].map(f).where(p).sum()` → a single loop, no
@@ -311,7 +351,7 @@ Completion condition (met): an array-aggregation pipeline (`map`/`where`/`sum`) 
 as fused code (one loop). The full `draft.md` §19 example (JSON, struct fields) needs
 later slices (struct arrays, M5 strings/JSON).
 
-## M5 — Strings and JSON
+## M5 — Strings and JSON — DONE
 
 - [done] `str` view (`{ u8* ptr, i64 len }`), string literals (interned constants),
   `print(str)` via `align_rt_print_str` (M5-A).
@@ -447,7 +487,7 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
 `array<slice<T>>` (for `chunks`), `array<Struct>.clone()`, and a bare whole-struct element value
 `users[i]` (no field) — see `08-memory-model-v2.md` §11 and `open-questions.md`.
 
-## M6 — SIMD / vec / mask
+## M6 — SIMD / vec / mask — NOT STARTED (perf tier; needs the optimizer + LLVM upgrade)
 
 - `vec2/4/8/16<T>`, `mask<T>`, `bitset`.
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
@@ -465,7 +505,7 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 
-## M7 — Parallelism
+## M7 — Parallelism — IN PROGRESS (par_map/chunks/purity done; first-class closures → task_group remain)
 
 - [done] **purity / effect inference** (`align_sema` Pass 4, `check_parallelism`): a function is
   Impure iff it transitively performs an observable side effect (`print` / `io.stdout.write` /
@@ -509,7 +549,7 @@ Completion condition: confirm that the vectorized code contains vector instructi
   widening — errors surface at `wait` either way, so the semantics match).
 - async/await is not included (`non-goals.md`).
 
-## M8 — Tooling and Quality
+## M8 — Tooling and Quality — NOT STARTED
 
 - the official formatter (mandatory, `draft.md` §16).
 - the full set of standard lints (allocation in loop / huge struct copy / unnecessary clone / unnecessary heap / unhandled Result / branch in hot loop / string re-scan / implicit copy).
