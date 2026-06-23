@@ -414,6 +414,22 @@ visible heap environment; the in-loop case never does.)
 A field selector is shorthand for a one-field lambda — `where(.active)` is `where(fn u { u.active })`,
 and `.score` projects a field out of each element.
 
+A function is also a **first-class value**: it can be bound (`f := fn x: i32 { x * 2 }`), reassigned,
+and passed to another function through a `fn(T, U) -> R`-typed parameter — a **higher-order function**.
+A function value's parameter types must be written when there is no use site to infer them (a bound
+or passed lambda: `fn x: i32 { … }`); a stage lambda still infers them from the element type.
+
+```align
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 = f(x)
+apply(fn n: i64 { n + base }, 5)   // a (capturing) closure passed as an argument
+```
+
+A passed closure's captured environment lives in the caller's frame for the duration of the call, so
+no heap allocation is needed. A function value that *escapes* — returned from a function, stored
+beyond the frame, or handed to `spawn` (§11) — needs a region-owned environment, owned by the
+enclosing `arena {}` / `task_group {}` scope (never a hidden `malloc`); escape analysis chooses the
+representation.
+
 ### Core Array Functions
 
 ```text

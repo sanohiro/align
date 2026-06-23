@@ -417,7 +417,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     for s in &struct_decls {
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
-            let ty = resolve_type(&f.ty, &struct_ids, &mut tuples, diags);
+            let ty = resolve_type(&f.ty, &struct_ids, &mut tuples, &mut fn_types, diags);
             // Fields are **Copy** only: a primitive scalar (int/float/bool/char) or `str`. A
             // `str` field may hold an arena-backed str: the struct *carries* that field's region
             // (MMv2 slice 2), so `EscapeCheck` lets it live inside the arena and only rejects the
@@ -451,7 +451,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let ast::Item::Fn(f) = item else { continue };
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
-            params.push(resolve_type(&p.ty, &struct_ids, &mut tuples, diags));
+            params.push(resolve_type(&p.ty, &struct_ids, &mut tuples, &mut fn_types, diags));
         }
         // A box across a call boundary would escape its arena, so M3 forbids box
         // parameters and returns (boxes are arena-local). This also closes escape
@@ -466,10 +466,18 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         }
         let ret = match &f.ret {
             Some(t) => {
-                let r = resolve_type(t, &struct_ids, &mut tuples, diags);
+                let r = resolve_type(t, &struct_ids, &mut tuples, &mut fn_types, diags);
                 if matches!(r, Ty::Box(_)) {
                     diags.error(
                         "a box cannot be a function return type (it would escape its arena)".to_string(),
+                        t.span(),
+                    );
+                }
+                // A returned function value would carry a frame-local closure environment out of
+                // the frame (use-after-free); deferred until closures can own a region-backed env.
+                if matches!(r, Ty::Fn(_)) {
+                    diags.error(
+                        "returning a function value is not supported yet (a closure's environment is frame-local)".to_string(),
                         t.span(),
                     );
                 }
@@ -1985,7 +1993,7 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn resolve_type(&mut self, t: &ast::Type) -> Ty {
-        resolve_type(t, self.struct_ids, self.tuples, self.diags)
+        resolve_type(t, self.struct_ids, self.tuples, self.fn_types, self.diags)
     }
 
     /// Resolve an assignable place: a `mut` local, or `mut_local.field`.
@@ -2610,7 +2618,7 @@ impl<'a, 't> Checker<'a, 't> {
                 );
                 return err;
             };
-            param_tys.push(resolve_type(ann, self.struct_ids, self.tuples, self.diags));
+            param_tys.push(resolve_type(ann, self.struct_ids, self.tuples, self.fn_types, self.diags));
         }
         // Lift with the annotated parameter types as the expected signature; the return type is
         // inferred from the body.
@@ -3220,6 +3228,16 @@ impl<'a, 't> Checker<'a, 't> {
         self.arena_depth = saved_arena;
         self.slice_bases = saved_bases;
         self.capture = saved_capture;
+        // A lambda must not return a function value: the returned closure's environment is
+        // frame-local to *this* lifted function and would dangle once it returns (the same rule as
+        // a top-level fn — checked here too so a stage/value lambda can't slip a closure out).
+        if matches!(ret, Ty::Fn(_)) {
+            self.diags.error(
+                "a lambda cannot return a function value (a closure's environment is frame-local)".to_string(),
+                span,
+            );
+            return None;
+        }
         Some((name, ret, capture_ops))
     }
 
@@ -4922,16 +4940,44 @@ fn resolve_type(
     t: &ast::Type,
     struct_ids: &HashMap<String, u32>,
     tuples: &mut Vec<hir::TupleDef>,
+    fn_types: &mut Vec<hir::FnTy>,
     diags: &mut Diagnostics,
 ) -> Ty {
     let (path, args, span) = match t {
         ast::Type::Named { path, args, span } => (path, args.as_slice(), *span),
+        // `fn(T, U) -> R` — a function-value type. Scalar parameters/return (matching first-class
+        // function values); interned into `fn_types` like a tuple type.
+        ast::Type::Fn { params, ret, span: _ } => {
+            let mut pscalars = Vec::with_capacity(params.len());
+            for p in params {
+                let pty = resolve_type(p, struct_ids, tuples, fn_types, diags);
+                if pty == Ty::Error {
+                    return Ty::Error;
+                }
+                match ty_to_scalar(pty) {
+                    Some(s) => pscalars.push(s),
+                    None => {
+                        diags.error(format!("a function-type parameter must be a scalar for now, got {}", ty_name(pty)), p.span());
+                        return Ty::Error;
+                    }
+                }
+            }
+            let rty = resolve_type(ret, struct_ids, tuples, fn_types, diags);
+            if rty == Ty::Error {
+                return Ty::Error;
+            }
+            let Some(rs) = ty_to_scalar(rty) else {
+                diags.error(format!("a function-type return must be a scalar for now, got {}", ty_name(rty)), ret.span());
+                return Ty::Error;
+            };
+            return Ty::Fn(intern_fn_type(fn_types, pscalars, rs));
+        }
         ast::Type::Tuple { elems, span: _ } => {
             // PR1 cut: tuple elements are primitive scalars (int/float/bool/char) — Copy,
             // `Static`, so the tuple needs no drop/region machinery. `str`/owned elements later.
             let mut scalars = Vec::with_capacity(elems.len());
             for e in elems {
-                let ety = resolve_type(e, struct_ids, tuples, diags);
+                let ety = resolve_type(e, struct_ids, tuples, fn_types, diags);
                 if ety == Ty::Error {
                     return Ty::Error;
                 }
@@ -4962,7 +5008,7 @@ fn resolve_type(
         "Error" => Ty::ErrCode,
         "box" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, tuples, diags),
+                [a] => resolve_type(a, struct_ids, tuples, fn_types, diags),
                 _ => {
                     diags.error("box takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -4991,7 +5037,7 @@ fn resolve_type(
         }
         "Option" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, tuples, diags),
+                [a] => resolve_type(a, struct_ids, tuples, fn_types, diags),
                 _ => {
                     diags.error("Option takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5004,7 +5050,7 @@ fn resolve_type(
         }
         "slice" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, tuples, diags),
+                [a] => resolve_type(a, struct_ids, tuples, fn_types, diags),
                 _ => {
                     diags.error("slice takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5019,7 +5065,7 @@ fn resolve_type(
         // type so a function can hand back a free-standing owned array.
         "array" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, tuples, diags),
+                [a] => resolve_type(a, struct_ids, tuples, fn_types, diags),
                 _ => {
                     diags.error("array takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5038,8 +5084,8 @@ fn resolve_type(
         "Result" => {
             let (ok, err) = match args {
                 [a, b] => (
-                    resolve_type(a, struct_ids, tuples, diags),
-                    resolve_type(b, struct_ids, tuples, diags),
+                    resolve_type(a, struct_ids, tuples, fn_types, diags),
+                    resolve_type(b, struct_ids, tuples, fn_types, diags),
                 ),
                 _ => {
                     diags.error("Result takes two type arguments".to_string(), span);

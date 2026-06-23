@@ -48,8 +48,13 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    k }`) copies its captures into a frame-local env (hoisted alloca); a per-lifted-fn thunk
    `lifted$clos(env, args) = lifted(args, env.0, …)` unpacks it. Scalar (Copy) captures; no escape
    check needed yet (a `Ty::Fn` value can't leave its frame — no fn-typed returns/fields/params).
-   Next: **③ `task_group`** (and, when fn values can escape, the env moves to the enclosing
-   region per the settled design). 
+   **③ higher-order functions DONE** — the `fn(T) -> R` type syntax + fn-typed parameters, so a
+   function value (named fn, lambda, or capturing closure) can be **passed** to a function
+   (`fn apply(f: fn(i64)->i64, x: i64) = f(x)`). Sound with the frame-local env: the closure's env
+   outlives the call. A fn-typed **return** is rejected (it would carry a frame env out of the
+   frame); struct fields already reject `Ty::Fn`. Next: **④ `task_group`** — the first *escaping*
+   consumer, where the env moves to the enclosing region (per the settled design); a fn-typed
+   return then becomes possible too.
 4. **group_by** — design the return type first (no map type yet / nested owned arrays), then build.
 5. **core.bitset / core.hash** — design, then build.
 6. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

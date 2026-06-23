@@ -96,12 +96,15 @@ pub enum Type {
     Named { path: Path, args: Vec<Type>, span: Span },
     /// `(T, U, ...)` — an anonymous product type (arity ≥ 2; `()` is unit, `(T)` is grouping).
     Tuple { elems: Vec<Type>, span: Span },
+    /// `fn(T, U) -> R` — a function-value type (a higher-order-function parameter, e.g.
+    /// `fn apply(f: fn(i64) -> i64, x: i64) -> i64`). `ret` is the return type.
+    Fn { params: Vec<Type>, ret: Box<Type>, span: Span },
 }
 
 impl Type {
     pub fn span(&self) -> Span {
         match self {
-            Type::Named { span, .. } | Type::Tuple { span, .. } => *span,
+            Type::Named { span, .. } | Type::Tuple { span, .. } | Type::Fn { span, .. } => *span,
         }
     }
 }

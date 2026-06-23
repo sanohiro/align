@@ -54,6 +54,49 @@ fn reassign_fn_value_same_signature() {
 }
 
 #[test]
+fn higher_order_named_fn() {
+    if !backend_available() {
+        return;
+    }
+    // A fn-typed parameter (`fn(i64) -> i64`) receiving a named function.
+    let src = "fn apply(f: fn(i64) -> i64, x: i64) -> i64 = f(x)\nfn dbl(n: i64) -> i64 = n * 2\n\nfn main() -> Result<(), Error> {\n  print(apply(dbl, 21))\n  return Ok(())\n}\n";
+    let out = build_and_run("fv-hof", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+}
+
+#[test]
+fn higher_order_capturing_closure() {
+    if !backend_available() {
+        return;
+    }
+    // A capturing closure passed to a HOF — its env lives in the caller's frame, alive for the call.
+    let src = "fn apply(f: fn(i64) -> i64, x: i64) -> i64 = f(x)\n\nfn main() -> Result<(), Error> {\n  k: i64 := 100\n  print(apply(fn n: i64 { n + k }, 5))\n  return Ok(())\n}\n";
+    let out = build_and_run("fv-hof-cap", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "105\n");
+}
+
+#[test]
+fn returning_fn_value_rejected() {
+    // A returned function value would carry a frame-local env out of the frame — rejected for now.
+    assert!(check_errs(
+        "fv-ret",
+        "fn pick() -> fn(i64) -> i64 = dbl\nfn dbl(n: i64) -> i64 = n * 2\nfn main() -> i32 { return 0 }\n"
+    ));
+}
+
+#[test]
+fn lambda_returning_fn_value_rejected() {
+    // A stage/value lambda whose body yields a function value would let a frame-local closure
+    // env escape via the lift — rejected in lift_lambda (mirrors the top-level return check).
+    assert!(check_errs(
+        "fv-lam-ret",
+        "fn main() -> Result<(), Error> {\n  print([1,2,3].map(fn x: i64 { fn y: i64 { x + y } }).sum())\n  return Ok(())\n}\n"
+    ));
+}
+
+#[test]
 fn arg_type_mismatch_rejected() {
     // Calling a fn value with the wrong argument type is a type error.
     assert!(check_errs(
