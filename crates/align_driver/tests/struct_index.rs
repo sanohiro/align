@@ -74,6 +74,15 @@ fn primitive_struct_element_is_returnable_from_a_function() {
 }
 
 #[test]
+fn struct_with_owned_field_rejected() {
+    // A struct is Copy (no per-binding Drop), and `arr[i]` / `:=` copy it by value — so a Move
+    // (owned) field would double-free across copies. Such fields are rejected at declaration,
+    // which keeps whole-struct indexing (and struct copy in general) sound.
+    assert!(check_errs("si-owned-string", "U { name: string }\nfn main() -> i32 = 0\n"));
+    assert!(check_errs("si-owned-array", "U { items: array<i64> }\nfn main() -> i32 = 0\n"));
+}
+
+#[test]
 fn str_bearing_struct_element_cannot_escape_arena() {
     // A `str`-bearing struct is region-tied to the array; indexing one out of an arena-decoded
     // array and letting it escape the arena is rejected (the `str` view would dangle).

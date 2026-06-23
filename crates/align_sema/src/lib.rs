@@ -393,16 +393,19 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
             let ty = resolve_type(&f.ty, &struct_ids, &mut tuples, diags);
-            // Fields are scalars or `str`. A `str` field may now hold an arena-backed
-            // str: the struct *carries* that field's region (MMv2 slice 2), so
-            // `EscapeCheck` lets it live inside the arena and only rejects the whole
-            // struct escaping. A scalar/literal-only struct stays `Static` (returnable).
-            // Other composite/region-bearing fields (box/slice/array/option/result/
-            // nested struct/tuple) the layout can't hold yet remain rejected. NOTE:
-            // `ty_to_scalar` now also accepts `Ty::Struct` (a valid Option/Result
-            // payload), so a nested struct field is rejected explicitly here.
-            let is_field_ok =
-                (ty_to_scalar(ty).is_some() && !matches!(ty, Ty::Struct(_))) || ty == Ty::Str || ty == Ty::Error;
+            // Fields are **Copy** only: a primitive scalar (int/float/bool/char) or `str`. A
+            // `str` field may hold an arena-backed str: the struct *carries* that field's region
+            // (MMv2 slice 2), so `EscapeCheck` lets it live inside the arena and only rejects the
+            // whole struct escaping; a scalar/literal-only struct stays `Static` (returnable).
+            //
+            // Owned (Move) fields — `string` / `array<T>` / `box` / `builder` / a `Move` tuple —
+            // are rejected: a struct is treated as Copy (it has no per-binding `Drop` and is copied
+            // by value on assignment / `arr[i]` indexing), so a Move field would let two struct
+            // copies free the same buffer (double-free). `ty_to_scalar` is NOT a sufficient test
+            // here — it returns `Some` for `string`/`array<T>` (they have a scalar repr) — so match
+            // the Copy field types explicitly. (Nested struct / slice / option / result fields the
+            // layout can't hold yet are likewise excluded.)
+            let is_field_ok = matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error);
             if !is_field_ok {
                 diags.error(
                     format!("struct fields must be a primitive scalar or str for now, got {}", ty_name(ty)),
