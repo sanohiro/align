@@ -980,8 +980,9 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
     }
     let (src, len): (Src, Operand) = match recv.ty {
         // A `{ptr,len}` value: scalar `slice`/owned `array` loads a scalar element; an
-        // `array<slice<T>>` (`chunks` result) loads a whole `slice<T>` element (`elem_ty`).
-        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => {
+        // `array<slice<T>>` (`chunks` result) loads a whole `slice<T>` element; an owned dynamic
+        // `array<Struct>` loads a whole struct element (all by `elem_ty` via `SliceIndex`).
+        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(..) => {
             let sv = lower_expr(b, recv);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));

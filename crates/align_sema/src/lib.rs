@@ -4059,31 +4059,17 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             // Indexing an `array<slice<T>>` (a `chunks` result) yields one chunk `slice<T>`.
             Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
-            Ty::StructArray(..) | Ty::DynStructArray(..) => {
-                // A whole-struct element value is deferred (it needs a struct copy + region tie);
-                // `arr[i].field` is supported and handled in `check_field_access`.
-                self.diags.error(
-                    "indexing a struct array yields a whole struct, which is not supported yet — read a field directly (`arr[i].field`) or use a pipeline".to_string(),
-                    span,
-                );
-                return err;
-            }
+            // Indexing a struct array yields the whole struct by value (a copy). A struct is Copy
+            // (primitive / `str` fields), so the copy transfers no ownership; if it holds `str`
+            // views, the value is region-tied to the array (handled by `region_of`, which inherits
+            // the receiver's region for an `Index`).
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Ty::Struct(id),
             Ty::Error => return err,
             other => {
                 self.diags.error(format!("cannot index {} (only array / slice / owned array)", ty_name(other)), span);
                 return err;
             }
         };
-        // A `slice<Struct>` resolves `elem` to a whole struct via the scalar arm above; that is the
-        // same deferred whole-struct value as a struct array (and its `str` fields' region tie is
-        // unhandled here), so reject it too — `arr[i].field` is the supported form.
-        if matches!(elem, Ty::Struct(_)) {
-            self.diags.error(
-                "indexing yields a whole struct, which is not supported yet — read a field directly (`arr[i].field`)".to_string(),
-                span,
-            );
-            return err;
-        }
         // A Move-only element (e.g. `array<string>`, `array<array<T>>`) cannot be indexed yet:
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
@@ -4097,7 +4083,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // A slot-backed fixed array must be a literal or a variable (same restriction as a
         // pipeline source — MIR addresses it through a slot). A `{ptr,len}` view is fine as a value.
-        if matches!(r.ty, Ty::Array(..)) && !matches!(r.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+        if matches!(r.ty, Ty::Array(..) | Ty::StructArray(..)) && !matches!(r.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
             self.diags.error(
                 "indexing a fixed array requires an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
                 span,
@@ -5013,18 +4999,19 @@ mod tests {
         // Indexing a non-array is rejected.
         let (_r, nonarr) = check("fn main() -> i32 {\n  x := 5\n  return x[0]\n}\n");
         assert!(nonarr.has_errors(), "indexing a non-array must be rejected");
-        // A bare whole-struct `ps[0]` value is deferred → a clean error, not a panic. (Reading a
-        // field, `ps[0].x`, is supported — see `struct_array_element_field_checks`.)
+        // A whole-struct element `ps[0]` is a by-value (Copy) load — supported; the bound struct's
+        // field reads fine. (Reading a field directly, `ps[0].x`, also works — see
+        // `struct_array_element_field_checks`.)
         let (_s, structarr) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}, P{x: 2}]\n  q := ps[0]\n  return q.x\n}\n");
-        assert!(structarr.has_errors(), "a whole-struct element value is deferred and must error cleanly");
+        assert!(!structarr.has_errors(), "a whole-struct element value should check (by-value copy)");
         // Indexing a Move-only element (here a nested owned array) is rejected — copying the
         // element's {ptr,len} without ownership transfer would double-free.
         let (_m, moveelem) = check("fn take(xs: array<array<i64>>) -> i64 {\n  ys := xs[0]\n  return ys.len()\n}\nfn main() -> i32 = 0\n");
         assert!(moveelem.has_errors(), "indexing an array of a Move type must be rejected (double-free)");
-        // A `slice<Struct>` element index also yields a whole struct (deferred) — it must not slip
-        // through the scalar-index path (its element resolves to a struct via the slice arm).
+        // A `slice<Struct>` element index also yields a whole struct by value — supported (the
+        // element resolves to a struct via the slice arm and loads through `SliceIndex`).
         let (_sl, slstruct) = check("P { x: i32 }\nfn first(s: slice<P>) -> i32 {\n  q := s[0]\n  return q.x\n}\nfn main() -> i32 = 0\n");
-        assert!(slstruct.has_errors(), "indexing a slice<Struct> for a whole struct must be rejected");
+        assert!(!slstruct.has_errors(), "indexing a slice<Struct> for a whole struct should check");
     }
 
     #[test]
@@ -5114,9 +5101,9 @@ mod tests {
         // bounds-checked.
         let (_p, ok) = check("User { id: i64, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users[0].score)\n  return Ok(())\n}\n");
         assert!(!ok.has_errors(), "arr[i].field on a struct array should check");
-        // A whole-struct `arr[i]` value (no field) is still deferred → clean error.
+        // A whole-struct `arr[i]` value (no field) is a by-value load — supported.
         let (_q, whole) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}]\n  q := ps[0]\n  return q.x\n}\n");
-        assert!(whole.has_errors(), "a whole-struct element value is deferred and must error cleanly");
+        assert!(!whole.has_errors(), "a whole-struct element value should check (by-value copy)");
         // An unknown field on the element is rejected.
         let (_r, badf) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}]\n  return ps[0].nope\n}\n");
         assert!(badf.has_errors(), "an unknown element field must be rejected");
