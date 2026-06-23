@@ -3309,10 +3309,16 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_float_parent = std::mem::take(&mut self.float_parent);
         let saved_ret = self.ret_hint;
         let saved_arena = self.arena_depth;
+        // A lambda body is a separate function: it is not lexically inside the enclosing
+        // `task_group`, so reset the task-group / `wait`-state tracking (else a `wait()` inside the
+        // lambda would set the enclosing group's flag at compile time and bypass the check).
+        let saved_tg_depth = self.task_group_depth;
+        let saved_wait_state = std::mem::take(&mut self.wait_state);
         let saved_bases = std::mem::take(&mut self.slice_bases);
         let saved_capture = self.capture.take();
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
         self.arena_depth = 0;
+        self.task_group_depth = 0;
         self.capture = Some(CaptureScope { enclosing, captured: Vec::new() });
 
         let mut param_ids: Vec<LocalId> =
@@ -3366,6 +3372,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.float_parent = saved_float_parent;
         self.ret_hint = saved_ret;
         self.arena_depth = saved_arena;
+        self.task_group_depth = saved_tg_depth;
+        self.wait_state = saved_wait_state;
         self.slice_bases = saved_bases;
         self.capture = saved_capture;
         // A lambda must not return a function value: the returned closure's environment is
@@ -4821,8 +4829,11 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             self.check_expr(fallback, Some(payload))
         };
+        // Dominance merge: the `Some` path skips the fallback (state `w`), the `None` path runs it
+        // (current state). After the unwrap, a `wait()` is guaranteed only if both held — `w &&
+        // current` — so a conditional `spawn` in the fallback correctly clears the flag.
         if let (Some(w), Some(top)) = (w_snapshot, self.wait_state.last_mut()) {
-            *top = w;
+            *top = w && *top;
         }
         self.constrain(payload, expected, span);
         Expr { kind: ExprKind::ElseUnwrap { opt: Box::new(o), fallback: Box::new(fb) }, ty: payload, span }
