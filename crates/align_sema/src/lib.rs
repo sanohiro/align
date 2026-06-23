@@ -518,6 +518,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             arena_depth: 0,
             task_group_depth: 0,
             wait_state: Vec::new(),
+            task_group_fallible: Vec::new(),
             slice_bases: std::collections::HashMap::new(),
             cur_fn: String::new(),
             lifted: Vec::new(),
@@ -781,9 +782,9 @@ impl EffectScan {
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b),
             // Spawning / joining concurrent work is an observable effect (the enclosing function
             // is not pure); the spawned closure's own effects live in its lifted function.
-            ExprKind::Spawn(inner) => {
+            ExprKind::Spawn { closure, .. } => {
                 self.impure_direct = true;
-                self.expr(inner);
+                self.expr(closure);
             }
             ExprKind::TaskGet(inner) => self.expr(inner),
             ExprKind::Wait => self.impure_direct = true,
@@ -962,7 +963,7 @@ impl<'a> EscapeCheck<'a> {
             // where the result is leaked / process-lifetime and safe to return).
             ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => Region::arena(depth),
             // A spawned task's handle is a box in the enclosing `task_group` region.
-            ExprKind::Spawn(_) => Region::arena(depth),
+            ExprKind::Spawn { .. } => Region::arena(depth),
             // `.to_array()` bump-allocates the owned array in the enclosing arena. `reduce` folds
             // its accumulator there too — when that accumulator is region-tracked (a `str` built by
             // concatenation, a struct), the result lives in the enclosing arena and must not escape
@@ -1236,7 +1237,8 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            ExprKind::Spawn(inner) | ExprKind::TaskGet(inner) => self.walk(inner, depth),
+            ExprKind::Spawn { closure, .. } => self.walk(closure, depth),
+            ExprKind::TaskGet(inner) => self.walk(inner, depth),
             ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
                 self.walk(cond, depth);
@@ -1575,7 +1577,7 @@ impl<'a> MoveCheck<'a> {
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b, moved, consuming, direct),
-            ExprKind::Spawn(inner) => self.expr(inner, moved, false, false),
+            ExprKind::Spawn { closure, .. } => self.expr(closure, moved, false, false),
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
             // consumes the task (a second `get()` would double-free the buffer).
             ExprKind::TaskGet(inner) => {
@@ -1686,6 +1688,10 @@ struct Checker<'a, 't> {
     /// sets it, and `if`/`else` merge it by dominance (`then && else`). Slice ④c: the
     /// `get`-before-`wait` check.
     wait_state: Vec<bool>,
+    /// Per open `task_group` (innermost last): whether any spawned task is fallible (its closure
+    /// returns `Result`). When true, `wait()` yields `Result<(), Error>` (else `()`) and only a
+    /// `wait()?` (not a bare `wait()`) makes `get()` safe. Slice ④c-2.
+    task_group_fallible: Vec<bool>,
     /// For each slice local bound from an array/slice (`s: slice<T> := a`), the **root** buffer
     /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
     /// is caught even though `s` and `a` are different locals.
@@ -2236,7 +2242,9 @@ impl<'a, 't> Checker<'a, 't> {
                 self.task_group_depth += 1;
                 self.arena_depth += 1;
                 self.wait_state.push(false);
+                self.task_group_fallible.push(false);
                 let block = self.check_block(b, if diverges { None } else { expected });
+                self.task_group_fallible.pop();
                 self.wait_state.pop();
                 self.arena_depth -= 1;
                 self.task_group_depth -= 1;
@@ -2737,36 +2745,60 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'spawn' takes one argument (a `fn {{ … }}`), got {}", args.len()), span);
             return err;
         };
-        let f = self.check_expr(arg, None);
-        if f.ty == Ty::Error {
-            return err;
-        }
-        let Ty::Fn(fid) = self.resolve(f.ty) else {
-            self.diags.error(format!("'spawn' takes a function value `fn {{ … }}`, got {}", ty_name(f.ty)), arg.span);
+        // `spawn` takes a literal lambda (consumed here, never a free `Ty::Fn` value), so it is
+        // lifted directly — which lets the task closure return `Result<R, Error>` (a fallible
+        // task), unlike a `Ty::Fn` value whose return is scalar-only.
+        let ast::ExprKind::Lambda { params, body } = &arg.kind else {
+            self.diags.error("'spawn' takes a `fn { … }` literal".to_string(), arg.span);
             return err;
         };
-        let ft = &self.fn_types[fid as usize];
-        if !ft.params.is_empty() {
+        if !params.is_empty() {
             self.diags.error("a spawned task takes no parameters (`spawn(fn { … })`)".to_string(), arg.span);
             return err;
         }
-        let r = ft.ret;
-        // ④b: a task's result is stored in a `box` in the task_group region, so it must be a
-        // box-able primitive scalar for now (owned/view results — `string`/`array`/`str` — need
-        // the region drop/borrow handling, a later slice).
-        if !matches!(r, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Unit | Scalar::ErrCode) {
-            self.diags.error(
-                format!("a spawned task must return a primitive scalar (int/float/bool/char/unit/error) for now, got {}", scalar_name(r)),
-                arg.span,
-            );
+        let Some((name, ret, captures)) = self.lift_lambda(params, body, &[], None, arg.span) else {
             return err;
+        };
+        // Classify the result: `Result<ok, Error>` → a fallible task (`wait()?` surfaces the `Err`),
+        // `Task<ok>`; a primitive scalar → an infallible task, `Task<scalar>`. The result is stored
+        // in a `box` in the region, so `ok` must be a box-able primitive (owned/view results are a
+        // later slice).
+        let is_prim = |s: Scalar| matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Unit | Scalar::ErrCode);
+        let (ok, fallible) = match self.finalize(ret) {
+            Ty::Result(o, Scalar::ErrCode) if is_prim(o) => (o, true),
+            // A type error in the lambda body was already reported — don't cascade.
+            Ty::Error => return err,
+            other => match ty_to_scalar(other) {
+                Some(s) if is_prim(s) => (s, false),
+                _ => {
+                    self.diags.error(
+                        format!("a spawned task must return a primitive scalar or `Result<scalar, Error>` for now, got {}", ty_name(other)),
+                        arg.span,
+                    );
+                    return err;
+                }
+            },
+        };
+        // The closure value (the `{thunk, env}` machinery is reused as-is; the lifted function may
+        // return `Result` — the thunk just forwards it). Its `Ty::Fn` tag uses the `ok` scalar as
+        // the return (a repr-only tag — a closure value is a pointer pair regardless).
+        let fid = intern_fn_type(self.fn_types, Vec::new(), ok);
+        let cty = Ty::Fn(fid);
+        let closure = if captures.is_empty() {
+            Expr { kind: ExprKind::FnValue(name), ty: cty, span: arg.span }
+        } else {
+            Expr { kind: ExprKind::Closure { lifted: name, captures }, ty: cty, span: arg.span }
+        };
+        if fallible {
+            if let Some(f) = self.task_group_fallible.last_mut() {
+                *f = true;
+            }
         }
-        // A new task is now pending and unjoined, so a prior `wait()` no longer covers everything:
-        // a `get()` must be preceded by a fresh `wait()`.
+        // A new task is now pending and unjoined, so a prior `wait()` no longer covers everything.
         if let Some(w) = self.wait_state.last_mut() {
             *w = false;
         }
-        Expr { kind: ExprKind::Spawn(Box::new(f)), ty: Ty::Task(r), span }
+        Expr { kind: ExprKind::Spawn { closure: Box::new(closure), fallible }, ty: Ty::Task(ok), span }
     }
 
     /// `wait()` — join all spawned tasks. ④a: a no-op marker (eager execution).
@@ -2778,11 +2810,20 @@ impl<'a, 't> Checker<'a, 't> {
         if !args.is_empty() {
             self.diags.error(format!("'wait' takes no arguments, got {}", args.len()), span);
         }
-        // All tasks spawned so far are now joined → their results may be read with `get()`.
-        if let Some(w) = self.wait_state.last_mut() {
-            *w = true;
+        let fallible = self.task_group_fallible.last().copied().unwrap_or(false);
+        if fallible {
+            // A fallible group's `wait()` yields `Result<(), Error>`. `get()` is made safe only by a
+            // *successful* `wait()` — i.e. `wait()?` (the `Try` sets the wait-state); a bare `wait()`
+            // whose `Err` is ignored leaves failed tasks' slots uninitialised, so it does NOT enable
+            // `get()` here.
+            Expr { kind: ExprKind::Wait, ty: Ty::Result(Scalar::Unit, Scalar::ErrCode), span }
+        } else {
+            // Infallible group: `wait()` joins and yields `()`; all results are now readable.
+            if let Some(w) = self.wait_state.last_mut() {
+                *w = true;
+            }
+            Expr { kind: ExprKind::Wait, ty: Ty::Unit, span }
         }
-        Expr { kind: ExprKind::Wait, ty: Ty::Unit, span }
     }
 
     /// `f(args)` where `f` is a `Ty::Fn` local — an indirect call through a function value.
@@ -3314,6 +3355,7 @@ impl<'a, 't> Checker<'a, 't> {
         // lambda would set the enclosing group's flag at compile time and bypass the check).
         let saved_tg_depth = self.task_group_depth;
         let saved_wait_state = std::mem::take(&mut self.wait_state);
+        let saved_tg_fallible = std::mem::take(&mut self.task_group_fallible);
         let saved_bases = std::mem::take(&mut self.slice_bases);
         let saved_capture = self.capture.take();
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
@@ -3374,6 +3416,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.arena_depth = saved_arena;
         self.task_group_depth = saved_tg_depth;
         self.wait_state = saved_wait_state;
+        self.task_group_fallible = saved_tg_fallible;
         self.slice_bases = saved_bases;
         self.capture = saved_capture;
         // A lambda must not return a function value: the returned closure's environment is
@@ -4699,10 +4742,14 @@ impl<'a, 't> Checker<'a, 't> {
             // slot — rejected (the result is guaranteed ready only if a `wait()` dominates here).
             Ty::Task(s) => {
                 if !self.wait_state.last().copied().unwrap_or(false) {
-                    self.diags.error(
-                        "cannot call '.get()' before 'wait()' — a task's result is ready only after the group is joined".to_string(),
-                        span,
-                    );
+                    let msg = if self.task_group_fallible.last().copied().unwrap_or(false) {
+                        // A fallible group: a bare `wait()` ignores the error; only `wait()?` makes
+                        // the results safe to read.
+                        "cannot call '.get()' before a successful 'wait()?' — this task_group is fallible, so use 'wait()?' to join (its error propagates) before reading results"
+                    } else {
+                        "cannot call '.get()' before 'wait()' — a task's result is ready only after the group is joined"
+                    };
+                    self.diags.error(msg.to_string(), span);
                 }
                 Expr { kind: ExprKind::TaskGet(Box::new(recv)), ty: scalar_to_ty(s), span }
             }
@@ -4780,6 +4827,17 @@ impl<'a, 't> Checker<'a, 't> {
             _ => None,
         };
         let v = self.check_expr(inner, inner_expected);
+        // `wait()?` on a fallible task_group: control only continues past the `?` if no task failed
+        // (the `Err` was propagated), so every task succeeded → `get()` is now safe (slice ④c-2).
+        // Recognised when `?` is applied directly to `wait()` (`wait()?`, also `w := wait()?`);
+        // binding the raw `Result` first and unwrapping the local later (`w := wait(); w?`) is a
+        // sound over-restriction — `get()` would still be rejected. (Indirect unwrap is a later,
+        // local-tracking refinement.)
+        if matches!(v.kind, ExprKind::Wait) {
+            if let Some(w) = self.wait_state.last_mut() {
+                *w = true;
+            }
+        }
         let (ok, err) = match self.resolve(v.ty) {
             Ty::Result(o, e) => (o, e),
             Ty::Error => return Expr { kind: ExprKind::Try(Box::new(v)), ty: Ty::Error, span },
@@ -4932,7 +4990,8 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.finalize_block(b),
-            ExprKind::Spawn(inner) | ExprKind::TaskGet(inner) => self.finalize_expr(inner),
+            ExprKind::Spawn { closure, .. } => self.finalize_expr(closure),
+            ExprKind::TaskGet(inner) => self.finalize_expr(inner),
             ExprKind::Wait => {}
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)

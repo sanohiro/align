@@ -1172,8 +1172,9 @@ pub extern "C" fn align_rt_arena_end(arena: *mut Arena) {
 // sequentially at `wait`; ④b-2 will spawn a thread per task and join at `wait` (the per-task
 // trampoline, env, and slot are already heap-stable in the region, so that is the only change).
 struct TgTask {
-    /// `tramp(thunk, env, slot)` — runs the spawned closure and writes its result into `slot`.
-    tramp: extern "C" fn(*const u8, *mut u8, *mut u8),
+    /// `tramp(thunk, env, slot) -> i32` — runs the spawned closure, writing its result into `slot`
+    /// and returning an error code (`0` = ok; nonzero = the task's `Err` code, for `wait()?`).
+    tramp: extern "C" fn(*const u8, *mut u8, *mut u8) -> i32,
     /// The closure's function pointer (env-ABI `fn(env) -> R`), passed through to the trampoline.
     thunk: *const u8,
     /// The task's environment (capture snapshot) — a fresh region allocation per `spawn`.
@@ -1203,7 +1204,7 @@ pub extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align: i64) -
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_tg_register(
     tg: *mut TaskGroup,
-    tramp: extern "C" fn(*const u8, *mut u8, *mut u8),
+    tramp: extern "C" fn(*const u8, *mut u8, *mut u8) -> i32,
     thunk: *const u8,
     env: *mut u8,
     slot: *mut u8,
@@ -1216,7 +1217,7 @@ pub extern "C" fn align_rt_tg_register(
 /// `env` is only read (its capture snapshot) and the `slot` only written, and the region outlives
 /// the join (`wait` happens before `tg_end`). `get()` reads a slot only after the join (④c).
 struct TgRun {
-    tramp: extern "C" fn(*const u8, *mut u8, *mut u8),
+    tramp: extern "C" fn(*const u8, *mut u8, *mut u8) -> i32,
     thunk: *const u8,
     env: *mut u8,
     slot: *mut u8,
@@ -1231,20 +1232,38 @@ unsafe impl Send for TgRun {}
 /// before this returns even if a later `spawn` panics — otherwise an unwinding panic would detach
 /// running threads and they would read the arena after `tg_end` frees it (a use-after-free).
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) {
+pub extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> i32 {
     let tg = unsafe { &mut *tg };
     let tasks = std::mem::take(&mut tg.tasks);
+    let mut first_err: i32 = 0;
     std::thread::scope(|s| {
-        for t in tasks {
-            let run = TgRun { tramp: t.tramp, thunk: t.thunk, env: t.env, slot: t.slot };
-            s.spawn(move || {
+        let handles: Vec<_> = tasks
+            .into_iter()
+            .map(|t| {
+                let run = TgRun { tramp: t.tramp, thunk: t.thunk, env: t.env, slot: t.slot };
                 // Rebind the whole value so the closure captures the `Send` `TgRun` as a unit
                 // (edition-2021 disjoint capture would otherwise grab the non-`Send` raw fields).
-                let run = run;
-                (run.tramp)(run.thunk, run.env, run.slot);
-            });
+                s.spawn(move || {
+                    let run = run;
+                    (run.tramp)(run.thunk, run.env, run.slot)
+                })
+            })
+            .collect();
+        // Join all (the scope joins even on panic); the first nonzero code is the group's error.
+        // A worker panic must not be swallowed (that would falsely report success and then read an
+        // unwritten slot) — re-raise it on the joining thread.
+        for h in handles {
+            match h.join() {
+                Ok(code) => {
+                    if first_err == 0 && code != 0 {
+                        first_err = code;
+                    }
+                }
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
         }
     });
+    first_err
 }
 
 /// Release the task group's region and the handle.

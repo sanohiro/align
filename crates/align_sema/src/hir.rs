@@ -211,9 +211,10 @@ pub enum ExprKind {
     },
     /// `task_group { … }` — a structured concurrency scope (slice ④). ④a lowers it as its block.
     TaskGroup(Block),
-    /// `spawn(fn { … })` — defer a task; the inner expr is the spawned `fn() -> R` closure value.
-    /// Result is `Task<R>`. ④a (eager): lowers to an immediate indirect call of the closure.
-    Spawn(Box<Expr>),
+    /// `spawn(fn { … })` — defer a task; `closure` is the spawned closure value. `fallible` = the
+    /// closure returns `Result<R, Error>` (so its `Err` is surfaced by `wait()?`); the task's
+    /// result type is `Task<R>` (the `Ok` payload) either way.
+    Spawn { closure: Box<Expr>, fallible: bool },
     /// `t.get()` — read a spawned task's result. ④a: identity (the `Task<R>` already holds `R`).
     TaskGet(Box<Expr>),
     /// `wait()` — join all spawned tasks (the single error boundary, ④c). ④a: a no-op marker

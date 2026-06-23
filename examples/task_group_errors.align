@@ -1,0 +1,17 @@
+// Fallible tasks + the wait()? error boundary (slice ④c). A task closure may return
+// Result<R, Error>; wait()? joins all and propagates the first failing task's error out of the
+// enclosing function. After wait()?, get() yields the Ok results (errors are already handled).
+fn fetch(n: i64) -> Result<i64, Error> {
+  if n < 0 { return Err(error(2)) }
+  return Ok(n * 10)
+}
+
+fn main() -> Result<(), Error> {
+  task_group {
+    a := spawn(fn { fetch(3) })
+    b := spawn(fn { fetch(4) })
+    wait()?                       // joins; would propagate any task's Err here
+    print(a.get() + b.get())      // 30 + 40 = 70
+  }
+  return Ok(())
+}
