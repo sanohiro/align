@@ -194,6 +194,30 @@ reason exceptions and GC were — it hides cost.)
 
 ---
 
+## The lambda philosophy
+
+Lambdas (`fn x { ... }`) are not a separate paradigm bolted onto the data-processing core — they
+**are** how you pass behavior to `map` / `where` / `reduce` / `par_map`. A lambda and a named
+function are the same thing; the lambda just spares you a top-level declaration for a one-off.
+
+The load-bearing decision is **how capture works**. A lambda that captures an enclosing variable
+does *not* allocate a hidden closure environment: it is lifted to an ordinary function whose
+captured values become extra parameters, passed at the call site. So a captured pipeline lambda
+fuses into the same counted loop as a named function and carries zero allocation — the capture is
+just a loop-invariant argument the backend hoists. This keeps lambdas inside the existing
+guarantees rather than introducing a new cost class: **Nothing hidden** (no silent heap
+environment), **Predictable performance** (a lambda is never secretly slower than the named
+equivalent), and **Compiler-friendly** (the optimizer sees a direct call, not an indirect one
+through a closure object). The only case that would need a visible heap environment is a lambda
+that escapes and outlives its captures (a first-class function value stored or returned) — and
+that allocation, when it eventually exists, will be explicit like every other one.
+
+The **Side Effect Rule** completes the picture: a `par_map` lambda must be Pure (it may read
+captured values but not mutate external state), which is what makes parallel execution safe
+without locks. Purity is inferred, never annotated.
+
+---
+
 ## The SIMD philosophy
 
 Align does not try to make developers write SIMD.
