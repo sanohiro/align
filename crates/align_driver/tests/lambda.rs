@@ -95,7 +95,7 @@ fn reduce_lambda() {
     if !backend_available() {
         return;
     }
-    // `reduce(f, init)` with a two-parameter lambda: 1+2+3+4 = 10.
+    // `reduce(init, f)` with a two-parameter lambda: 1+2+3+4 = 10.
     let src = "fn main() -> Result<(), Error> {\n  print([1, 2, 3, 4].reduce(0, fn acc, x { acc + x }))\n  return Ok(())\n}\n";
     let out = build_and_run("lam-reduce", src);
     assert_eq!(out.status.code(), Some(0));

@@ -3492,6 +3492,11 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
+        // A failed initial value leaves `acc_ty == Ty::Error`; bail before the scalar check so it
+        // doesn't cascade into a confusing "accumulator must be a scalar" diagnostic (matching reduce).
+        if acc_ty == Ty::Error {
+            return err;
+        }
         // A struct element must be projected to a scalar first (the fused loop has no scalar
         // value loaded for a struct array, like `map`/`to_array`).
         if matches!(elem, Ty::Struct(_)) {
@@ -5676,7 +5681,7 @@ mod tests {
     fn scan_inline_checks() {
         // scan(init, f) with f: (i32, i32) -> i32 yields array<i32>; summing it checks.
         let (_p, d) = check("fn add(acc: i32, x: i32) -> i32 = acc + x\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(0, add).sum()\n}\n");
-        assert!(!d.has_errors(), "scan(add, 0) over an i32 pipeline should check");
+        assert!(!d.has_errors(), "scan(0, add) over an i32 pipeline should check");
     }
 
     #[test]
