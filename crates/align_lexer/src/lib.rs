@@ -35,11 +35,13 @@ pub enum TokKind {
     False,
     Arena,
     TaskGroup,
+    Match,
     Template,
     // Symbols / operators
     ColonEq, // :=
     Eq,      // =
     Arrow,   // ->
+    FatArrow, // =>
     LParen,
     RParen,
     LBrace,
@@ -385,6 +387,7 @@ impl<'a> Lexer<'a> {
             "false" => TokKind::False,
             "arena" => TokKind::Arena,
             "task_group" => TokKind::TaskGroup,
+            "match" => TokKind::Match,
             "template" => TokKind::Template,
             _ => TokKind::Ident(text.to_string()),
         };
@@ -398,6 +401,7 @@ impl<'a> Lexer<'a> {
             (b':', Some(b'=')) => (TokKind::ColonEq, 2),
             (b'-', Some(b'>')) => (TokKind::Arrow, 2),
             (b'=', Some(b'=')) => (TokKind::EqEq, 2),
+            (b'=', Some(b'>')) => (TokKind::FatArrow, 2),
             (b'!', Some(b'=')) => (TokKind::NotEq, 2),
             (b'<', Some(b'=')) => (TokKind::Le, 2),
             (b'>', Some(b'=')) => (TokKind::Ge, 2),

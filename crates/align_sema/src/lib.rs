@@ -203,6 +203,9 @@ pub enum Ty {
     /// A first-class function value type (`fn(params) -> ret`), indexed into `Program.fn_types`.
     /// A function pointer — Copy, `Static`, no environment (non-capturing functions, slice ①).
     Fn(u32),
+    /// A sum type, indexed into `Program.enums`. S1a: tag-only variants — a Copy/`Static` value
+    /// represented as the variant tag (`i32`); constructed `Type.Variant`, consumed by `match`.
+    Enum(u32),
     /// `Task<R>` — a handle to a spawned task's result (`task_group`, slice ④). The payload is a
     /// scalar. ④a represents it identically to `R` (eager execution); ④b makes it a real future.
     Task(Scalar),
@@ -404,12 +407,39 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // regardless of order).
     let mut struct_ids: HashMap<String, u32> = HashMap::new();
     let mut struct_decls: Vec<&ast::StructDecl> = Vec::new();
+    let mut enum_ids: HashMap<String, u32> = HashMap::new();
+    let mut enums: Vec<hir::EnumDef> = Vec::new();
     for item in &file.items {
-        if let ast::Item::Struct(s) = item {
-            if struct_ids.insert(s.name.name.clone(), struct_decls.len() as u32).is_some() {
-                diags.error(format!("duplicate type declaration: '{}'", s.name.name), s.span);
+        match item {
+            ast::Item::Struct(s) => {
+                if struct_ids.insert(s.name.name.clone(), struct_decls.len() as u32).is_some()
+                    || enum_ids.contains_key(&s.name.name)
+                {
+                    diags.error(format!("duplicate type declaration: '{}'", s.name.name), s.span);
+                }
+                struct_decls.push(s);
             }
-            struct_decls.push(s);
+            // A sum type (tag-only, S1a) needs no field resolution — build it here directly.
+            ast::Item::Enum(e) => {
+                if enum_ids.insert(e.name.name.clone(), enums.len() as u32).is_some()
+                    || struct_ids.contains_key(&e.name.name)
+                {
+                    diags.error(format!("duplicate type declaration: '{}'", e.name.name), e.span);
+                }
+                let mut seen = std::collections::HashSet::new();
+                let variants = e
+                    .variants
+                    .iter()
+                    .map(|v| {
+                        if !seen.insert(v.name.name.clone()) {
+                            diags.error(format!("duplicate variant '{}' in '{}'", v.name.name, e.name.name), v.span);
+                        }
+                        v.name.name.clone()
+                    })
+                    .collect();
+                enums.push(hir::EnumDef { name: e.name.name.clone(), variants });
+            }
+            ast::Item::Fn(_) => {}
         }
     }
 
@@ -423,7 +453,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     for s in &struct_decls {
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
-            let ty = resolve_type(&f.ty, &struct_ids, &mut tuples, &mut fn_types, diags);
+            let ty = resolve_type(&f.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags);
             // Fields are **Copy** only: a primitive scalar (int/float/bool/char) or `str`. A
             // `str` field may hold an arena-backed str: the struct *carries* that field's region
             // (MMv2 slice 2), so `EscapeCheck` lets it live inside the arena and only rejects the
@@ -457,7 +487,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let ast::Item::Fn(f) = item else { continue };
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
-            params.push(resolve_type(&p.ty, &struct_ids, &mut tuples, &mut fn_types, diags));
+            params.push(resolve_type(&p.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags));
         }
         // A box across a call boundary would escape its arena, so M3 forbids box
         // parameters and returns (boxes are arena-local). This also closes escape
@@ -472,7 +502,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         }
         let ret = match &f.ret {
             Some(t) => {
-                let r = resolve_type(t, &struct_ids, &mut tuples, &mut fn_types, diags);
+                let r = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags);
                 if matches!(r, Ty::Box(_)) {
                     diags.error(
                         "a box cannot be a function return type (it would escape its arena)".to_string(),
@@ -505,6 +535,8 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             diags,
             sigs: &sigs,
             struct_ids: &struct_ids,
+            enum_ids: &enum_ids,
+            enums: &enums,
             structs: &structs,
             tuples: &mut tuples,
             fn_types: &mut fn_types,
@@ -529,7 +561,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         fns.push(checked);
         fns.extend(lifted);
     }
-    let mut program = Program { fns, structs, tuples, fn_types };
+    let mut program = Program { fns, structs, enums, tuples, fn_types };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
@@ -788,6 +820,13 @@ impl EffectScan {
             }
             ExprKind::TaskGet(inner) => self.expr(inner),
             ExprKind::Wait => self.impure_direct = true,
+            ExprKind::EnumValue { .. } => {}
+            ExprKind::Match { scrutinee, arms } => {
+                self.expr(scrutinee);
+                for a in arms {
+                    self.expr(&a.body);
+                }
+            }
             ExprKind::TupleIndex { recv, .. } => self.expr(recv),
             ExprKind::Index { recv, index } => {
                 self.expr(recv);
@@ -1238,6 +1277,13 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::Spawn { closure, .. } => self.walk(closure, depth),
+            ExprKind::EnumValue { .. } => {}
+            ExprKind::Match { scrutinee, arms } => {
+                self.walk(scrutinee, depth);
+                for a in arms {
+                    self.walk(&a.body, depth);
+                }
+            }
             ExprKind::TaskGet(inner) => self.walk(inner, depth),
             ExprKind::Wait => {}
             ExprKind::If { cond, then, els } => {
@@ -1578,6 +1624,13 @@ impl<'a> MoveCheck<'a> {
             // A plain block is transparent: its tail inherits this position's consuming/direct.
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b, moved, consuming, direct),
             ExprKind::Spawn { closure, .. } => self.expr(closure, moved, false, false),
+            ExprKind::EnumValue { .. } => {}
+            ExprKind::Match { scrutinee, arms } => {
+                self.expr(scrutinee, moved, false, false);
+                for a in arms {
+                    self.expr(&a.body, moved, consuming, direct);
+                }
+            }
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
             // consumes the task (a second `get()` would double-free the buffer).
             ExprKind::TaskGet(inner) => {
@@ -1657,6 +1710,8 @@ struct Checker<'a, 't> {
     diags: &'a mut Diagnostics,
     sigs: &'a HashMap<String, FnSig>,
     struct_ids: &'a HashMap<String, u32>,
+    enum_ids: &'a HashMap<String, u32>,
+    enums: &'a [hir::EnumDef],
     structs: &'a [StructDef],
     /// The shared tuple-type interner (anonymous `(T, U, …)` types). A separate lifetime from
     /// `'a` so each per-function `Checker` can reborrow it mutably without conflicting with the
@@ -2053,7 +2108,7 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn resolve_type(&mut self, t: &ast::Type) -> Ty {
-        resolve_type(t, self.struct_ids, self.tuples, self.fn_types, self.diags)
+        resolve_type(t, self.struct_ids, self.enum_ids, self.tuples, self.fn_types, self.diags)
     }
 
     /// Resolve an assignable place: a `mut` local, or `mut_local.field`.
@@ -2265,6 +2320,7 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::Tuple(elems) => self.check_tuple(elems, expected, e.span),
             ast::ExprKind::TupleIndex { recv, index } => self.check_tuple_index(recv, *index, expected, e.span),
             ast::ExprKind::If { cond, then, els } => self.check_if(cond, then, els.as_deref(), expected, e.span),
+            ast::ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expected, e.span),
             ast::ExprKind::Block(b) => {
                 // A block that always returns never yields a value; let it take the
                 // expected type so it fits any value position.
@@ -2436,6 +2492,28 @@ impl<'a, 't> Checker<'a, 't> {
     /// a local (chained field access on a value comes later).
     fn check_field_access(&mut self, recv: &ast::Expr, field: &ast::Ident, expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
+        // `Type.Variant` — a sum-type value (not field access on a value). The base is a sum-type
+        // name, the field is a variant.
+        if let ast::ExprKind::Path(p) = &recv.kind {
+            if let Some(name) = single_name(p) {
+                if let Some(&enum_id) = self.enum_ids.get(name) {
+                    return match self.enums[enum_id as usize].variants.iter().position(|v| v == &field.name) {
+                        Some(idx) => {
+                            let ty = Ty::Enum(enum_id);
+                            self.constrain(ty, expected, span);
+                            Expr { kind: ExprKind::EnumValue { enum_id, variant: idx as u32 }, ty, span }
+                        }
+                        None => {
+                            self.diags.error(
+                                format!("'{}' is not a variant of '{}'", field.name, self.enums[enum_id as usize].name),
+                                span,
+                            );
+                            err
+                        }
+                    };
+                }
+            }
+        }
         // `arr[i].field` — field access on a struct-array element. Fused into one bounds-checked
         // element-field load (MMv2 slice 8f); a whole-struct `arr[i]` value is not materialized.
         if let ast::ExprKind::Index { recv: arr, index } = &recv.kind {
@@ -2700,7 +2778,7 @@ impl<'a, 't> Checker<'a, 't> {
                 );
                 return err;
             };
-            param_tys.push(resolve_type(ann, self.struct_ids, self.tuples, self.fn_types, self.diags));
+            param_tys.push(resolve_type(ann, self.struct_ids, self.enum_ids, self.tuples, self.fn_types, self.diags));
         }
         // Lift with the annotated parameter types as the expected signature; the return type is
         // inferred from the body.
@@ -4897,6 +4975,81 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::ElseUnwrap { opt: Box::new(o), fallback: Box::new(fb) }, ty: payload, span }
     }
 
+    /// `match scrutinee { Variant => body, _ => body }` — exhaustive match over a sum type. Each
+    /// arm's body unifies to the match's type; every variant must be covered, or a `_` wildcard.
+    fn check_match(&mut self, scrutinee: &ast::Expr, arms: &[ast::MatchArm], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let s = self.check_expr(scrutinee, None);
+        if s.ty == Ty::Error {
+            return err;
+        }
+        let Ty::Enum(enum_id) = self.resolve(s.ty) else {
+            self.diags.error(format!("`match` expects a sum type, got {}", ty_name(s.ty)), scrutinee.span);
+            return err;
+        };
+        let n_variants = self.enums[enum_id as usize].variants.len();
+        let mut covered = vec![false; n_variants];
+        let mut has_wildcard = false;
+        let mut checked: Vec<hir::MatchArm> = Vec::with_capacity(arms.len());
+        // The match's value type: unify all arm bodies (drives inference from `expected`).
+        let mut result_ty: Option<Ty> = expected;
+        for arm in arms {
+            let variant = match &arm.pattern {
+                ast::MatchPattern::Wildcard(_) => {
+                    if has_wildcard {
+                        self.diags.error("duplicate `_` arm".to_string(), arm.span);
+                    }
+                    has_wildcard = true;
+                    None
+                }
+                ast::MatchPattern::Variant(name) => {
+                    match self.enums[enum_id as usize].variants.iter().position(|v| v == &name.name) {
+                        Some(idx) => {
+                            if covered[idx] {
+                                self.diags.error(format!("duplicate arm for variant '{}'", name.name), arm.span);
+                            }
+                            covered[idx] = true;
+                            Some(idx as u32)
+                        }
+                        None => {
+                            self.diags.error(
+                                format!("'{}' is not a variant of '{}'", name.name, self.enums[enum_id as usize].name),
+                                name.span,
+                            );
+                            return err;
+                        }
+                    }
+                }
+            };
+            // Each arm body is checked against the running result type, so the constraint (and any
+            // mismatch error) comes from `check_expr`; the first non-error arm fixes the type.
+            let body = self.check_expr(&arm.body, result_ty);
+            if result_ty.is_none() && body.ty != Ty::Error {
+                result_ty = Some(body.ty);
+            }
+            checked.push(hir::MatchArm { variant, body });
+        }
+        // Exhaustiveness: every variant covered, or a `_` wildcard present.
+        if !has_wildcard {
+            let missing: Vec<&str> = self.enums[enum_id as usize]
+                .variants
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !covered[*i])
+                .map(|(_, v)| v.as_str())
+                .collect();
+            if !missing.is_empty() {
+                self.diags.error(
+                    format!("non-exhaustive `match` on '{}': missing {}", self.enums[enum_id as usize].name, missing.join(", ")),
+                    span,
+                );
+            }
+        }
+        let ty = result_ty.unwrap_or(Ty::Unit);
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::Match { scrutinee: Box::new(s), arms: checked }, ty, span }
+    }
+
     fn check_if(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Expr>, expected: Option<Ty>, span: Span) -> Expr {
         let c = self.check_expr(cond, Some(Ty::Bool));
         // `task_group` `wait`-state (slice ④c): each branch starts from the pre-`if` state; after
@@ -4991,6 +5144,13 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.finalize_block(b),
             ExprKind::Spawn { closure, .. } => self.finalize_expr(closure),
+            ExprKind::EnumValue { .. } => {}
+            ExprKind::Match { scrutinee, arms } => {
+                self.finalize_expr(scrutinee);
+                for a in arms {
+                    self.finalize_expr(&mut a.body);
+                }
+            }
             ExprKind::TaskGet(inner) => self.finalize_expr(inner),
             ExprKind::Wait => {}
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
@@ -5142,6 +5302,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
+        Ty::Enum(id) => format!("enum#{id}"),
         Ty::Task(s) => format!("Task<{}>", scalar_name(s)),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
@@ -5183,6 +5344,7 @@ fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scala
 fn resolve_type(
     t: &ast::Type,
     struct_ids: &HashMap<String, u32>,
+    enum_ids: &HashMap<String, u32>,
     tuples: &mut Vec<hir::TupleDef>,
     fn_types: &mut Vec<hir::FnTy>,
     diags: &mut Diagnostics,
@@ -5194,7 +5356,7 @@ fn resolve_type(
         ast::Type::Fn { params, ret, span: _ } => {
             let mut pscalars = Vec::with_capacity(params.len());
             for p in params {
-                let pty = resolve_type(p, struct_ids, tuples, fn_types, diags);
+                let pty = resolve_type(p, struct_ids, enum_ids, tuples, fn_types, diags);
                 if pty == Ty::Error {
                     return Ty::Error;
                 }
@@ -5206,7 +5368,7 @@ fn resolve_type(
                     }
                 }
             }
-            let rty = resolve_type(ret, struct_ids, tuples, fn_types, diags);
+            let rty = resolve_type(ret, struct_ids, enum_ids, tuples, fn_types, diags);
             if rty == Ty::Error {
                 return Ty::Error;
             }
@@ -5221,7 +5383,7 @@ fn resolve_type(
             // `Static`, so the tuple needs no drop/region machinery. `str`/owned elements later.
             let mut scalars = Vec::with_capacity(elems.len());
             for e in elems {
-                let ety = resolve_type(e, struct_ids, tuples, fn_types, diags);
+                let ety = resolve_type(e, struct_ids, enum_ids, tuples, fn_types, diags);
                 if ety == Ty::Error {
                     return Ty::Error;
                 }
@@ -5252,7 +5414,7 @@ fn resolve_type(
         "Error" => Ty::ErrCode,
         "box" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, tuples, fn_types, diags),
+                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
                 _ => {
                     diags.error("box takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5281,7 +5443,7 @@ fn resolve_type(
         }
         "Option" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, tuples, fn_types, diags),
+                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
                 _ => {
                     diags.error("Option takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5294,7 +5456,7 @@ fn resolve_type(
         }
         "slice" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, tuples, fn_types, diags),
+                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
                 _ => {
                     diags.error("slice takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5309,7 +5471,7 @@ fn resolve_type(
         // type so a function can hand back a free-standing owned array.
         "array" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, tuples, fn_types, diags),
+                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
                 _ => {
                     diags.error("array takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5328,8 +5490,8 @@ fn resolve_type(
         "Result" => {
             let (ok, err) = match args {
                 [a, b] => (
-                    resolve_type(a, struct_ids, tuples, fn_types, diags),
-                    resolve_type(b, struct_ids, tuples, fn_types, diags),
+                    resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
+                    resolve_type(b, struct_ids, enum_ids, tuples, fn_types, diags),
                 ),
                 _ => {
                     diags.error("Result takes two type arguments".to_string(), span);
@@ -5348,10 +5510,13 @@ fn resolve_type(
             Some(it) => Ty::Int(it),
             None => match struct_ids.get(name) {
                 Some(&id) => Ty::Struct(id),
-                None => {
-                    diags.error(format!("unknown type: '{name}'"), span);
-                    Ty::Error
-                }
+                None => match enum_ids.get(name) {
+                    Some(&id) => Ty::Enum(id),
+                    None => {
+                        diags.error(format!("unknown type: '{name}'"), span);
+                        Ty::Error
+                    }
+                },
             },
         },
     }

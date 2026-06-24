@@ -98,7 +98,13 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      Keyword-less `Name { Circle(f32), Rect(f32, f32) }`, `Type.Variant` construction, a
      mandatory-exhaustive `match` expression; works on `Option`/`Result` too. The OOP-free way to
      model variants, AI-friendly (exhaustiveness), and lower-risk than generics. Slices S1–S4 in
-     `open-questions.md`.
+     `open-questions.md`. **S1a DONE** — tag-only enums end to end: keyword-less decl
+     (`Color { Red, Green, Blue }`, disambiguated from a struct by content), `Type.Variant`
+     construction, and a mandatory-exhaustive `match` expression (missing-variant / unknown-variant
+     / non-enum scrutinee / duplicate-arm all diagnosed). `Ty::Enum(id)` interned into
+     `Program.enums`, repr = the variant tag (`i32`); `match` lowers to a tag-compare branch chain
+     with a result slot (like `if`); enums are Copy values usable as locals / params / returns.
+     Next: **S1b** scalar variant payloads (`Circle(f32)`), then **S3** `match` on `Option`/`Result`.
    - **4b. Error type** *(refine the Open entry)* — built **on** sum types: `Error` as a sum type of
      categories + lightweight context, an explicit value (no unwinding / no stack-trace alloc),
      static/predictable `?` conversion, explicit `.with_context(...)`, structured (position-bearing)

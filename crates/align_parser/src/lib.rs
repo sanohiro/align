@@ -190,7 +190,7 @@ impl<'a> Parser<'a> {
         if self.at(&TokKind::Fn) {
             self.parse_fn(vis).map(Item::Fn)
         } else if matches!(self.peek(), TokKind::Ident(_)) && matches!(self.peek_at(1), TokKind::LBrace) {
-            self.parse_struct(vis).map(Item::Struct)
+            self.parse_type_decl(vis)
         } else {
             self.diags
                 .error("expected `fn` or a type declaration at top level", self.span());
@@ -198,37 +198,54 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `Name { field: Type, ... }` (keyword-less struct declaration). Fields are
-    /// separated by commas and/or newlines. Sum types are deferred past M1.
-    fn parse_struct(&mut self, vis: Vis) -> Option<StructDecl> {
+    /// A keyword-less type declaration `Name { … }`, disambiguated by content: a body of
+    /// `field: Type` is a struct; a body of bare `Variant` names is a sum type. (S1a: tag-only
+    /// variants.)
+    fn parse_type_decl(&mut self, vis: Vis) -> Option<Item> {
         let start = self.span();
         let name = self.parse_ident("type name")?;
         self.expect(&TokKind::LBrace, "'{'");
-        let mut fields = Vec::new();
-        loop {
-            self.skip_ends();
-            if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
-                break;
+        self.skip_ends();
+        // `ident :` → struct; an empty body or `ident ,`/`ident }` → struct (no fields) / sum type.
+        let is_struct = self.at(&TokKind::RBrace) || matches!(self.peek_at(1), TokKind::Colon);
+        if is_struct {
+            let mut fields = Vec::new();
+            loop {
+                self.skip_ends();
+                if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
+                    break;
+                }
+                let fstart = self.span();
+                let fname = self.parse_ident("field name")?;
+                self.expect(&TokKind::Colon, "':'");
+                let ty = self.parse_type()?;
+                fields.push(FieldDef { name: fname, ty, span: fstart.merge(self.prev_span()) });
+                self.eat(&TokKind::Comma);
             }
-            let fstart = self.span();
-            let fname = self.parse_ident("field name")?;
-            if !self.eat(&TokKind::Colon) {
-                self.diags
-                    .error("expected ':' (only struct type declarations are supported)", self.span());
-                return None;
+            self.expect(&TokKind::RBrace, "'}'");
+            let span = start.merge(self.prev_span());
+            Some(Item::Struct(StructDecl { vis, name, fields, span }))
+        } else {
+            let mut variants = Vec::new();
+            loop {
+                self.skip_ends();
+                if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
+                    break;
+                }
+                let vstart = self.span();
+                let vname = self.parse_ident("variant name")?;
+                // S1a: tag-only variants — a payload `Variant(T, …)` is a later slice.
+                if self.at(&TokKind::LParen) {
+                    self.diags.error("variant payloads are not supported yet (tag-only variants for now)", self.span());
+                    return None;
+                }
+                variants.push(VariantDef { name: vname, span: vstart.merge(self.prev_span()) });
+                self.eat(&TokKind::Comma);
             }
-            let ty = self.parse_type()?;
-            fields.push(FieldDef {
-                name: fname,
-                ty,
-                span: fstart.merge(self.prev_span()),
-            });
-            // Separator: a comma and/or a newline (`End`); both are accepted.
-            self.eat(&TokKind::Comma);
+            self.expect(&TokKind::RBrace, "'}'");
+            let span = start.merge(self.prev_span());
+            Some(Item::Enum(EnumDecl { vis, name, variants, span }))
         }
-        self.expect(&TokKind::RBrace, "'}'");
-        let span = start.merge(self.prev_span());
-        Some(StructDecl { vis, name, fields, span })
     }
 
     fn parse_fn(&mut self, vis: Vis) -> Option<FnDecl> {
@@ -725,6 +742,7 @@ impl<'a> Parser<'a> {
                 let span = start.merge(self.prev_span());
                 Some(Expr { kind: ExprKind::TaskGroup(block), span })
             }
+            TokKind::Match => self.parse_match(),
             TokKind::LParen => {
                 self.bump();
                 // `()` is the unit value; `(e)` is grouping; `(e0, e1, ...)` is a tuple.
@@ -811,6 +829,37 @@ impl<'a> Parser<'a> {
             kind: ExprKind::StructLit { name, fields },
             span,
         })
+    }
+
+    /// `match scrutinee { Variant => body, _ => body }` — arms are `pattern => expr`, separated by
+    /// commas and/or newlines. The scrutinee parses like an `if` condition (a trailing `{` starts
+    /// the arms, not a struct literal).
+    fn parse_match(&mut self) -> Option<Expr> {
+        let start = self.span();
+        self.bump(); // match
+        let scrutinee = Box::new(self.parse_expr(0)?);
+        self.expect(&TokKind::LBrace, "'{'");
+        let mut arms = Vec::new();
+        loop {
+            self.skip_ends();
+            if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
+                break;
+            }
+            let astart = self.span();
+            let id = self.parse_ident("match pattern (a variant name or `_`)")?;
+            let pattern = if id.name == "_" {
+                MatchPattern::Wildcard(id.span)
+            } else {
+                MatchPattern::Variant(id)
+            };
+            self.expect(&TokKind::FatArrow, "'=>'");
+            let body = Box::new(self.parse_expr(0)?);
+            arms.push(MatchArm { pattern, body, span: astart.merge(self.prev_span()) });
+            self.eat(&TokKind::Comma);
+        }
+        self.expect(&TokKind::RBrace, "'}'");
+        let span = start.merge(self.prev_span());
+        Some(Expr { kind: ExprKind::Match { scrutinee, arms }, span })
     }
 
     fn parse_if(&mut self) -> Option<Expr> {

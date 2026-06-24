@@ -1,0 +1,15 @@
+// Sum types + exhaustive match (slice S1a). A keyword-less sum type models variation (no
+// inheritance); `match` must cover every variant, so adding one turns an incomplete match into a
+// compile error.
+Shape { Circle, Square, Triangle }
+
+fn sides(s: Shape) -> i64 = match s {
+  Circle   => 0,
+  Square   => 4,
+  Triangle => 3,
+}
+
+fn main() -> i32 {
+  s := Shape.Triangle
+  return sides(s)        // 3
+}

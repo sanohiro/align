@@ -759,6 +759,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty),
+        // A tag-only sum value is its variant tag (an int in the `Ty::Enum` repr).
+        hir::ExprKind::EnumValue { enum_id, variant } => {
+            Operand::Const(Const::Int(*variant as i128, Ty::Enum(*enum_id)))
+        }
+        hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty),
         hir::ExprKind::Field { base, index } => {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Field(*base, *index)));
@@ -2437,6 +2442,53 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     Operand::Value(r)
 }
 
+/// `match scrutinee { … }` (tag-only, S1a): test the scrutinee's tag against each arm's variant
+/// and branch to its body (storing into a result slot), defaulting to the `_`/last arm.
+fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], ty: Ty) -> Operand {
+    let result_slot = (ty != Ty::Unit).then(|| b.new_slot(ty));
+    let enum_ty = scrutinee.ty;
+    let tag = lower_expr(b, scrutinee);
+    let join_bb = b.new_block();
+    // The default (fallthrough) arm: the `_` wildcard if present, else the last arm (exhaustive).
+    let default_idx = arms.iter().position(|a| a.variant.is_none()).unwrap_or(arms.len() - 1);
+    for (i, arm) in arms.iter().enumerate() {
+        if i == default_idx {
+            continue;
+        }
+        let v = arm.variant.expect("a non-default match arm has a variant");
+        let eq = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(eq, Rvalue::Bin(BinOp::Eq, tag.clone(), Operand::Const(Const::Int(v as i128, enum_ty)))));
+        let arm_bb = b.new_block();
+        let next_bb = b.new_block();
+        b.terminate(Term::Branch(Operand::Value(eq), arm_bb, next_bb));
+        b.cur = arm_bb;
+        let av = lower_expr(b, &arm.body);
+        if !b.is_terminated() {
+            if let (Some(slot), Some(op)) = (result_slot, Some(av)) {
+                b.push(Stmt::Store(slot, op));
+            }
+            b.terminate(Term::Goto(join_bb));
+        }
+        b.cur = next_bb;
+    }
+    let dv = lower_expr(b, &arms[default_idx].body);
+    if !b.is_terminated() {
+        if let (Some(slot), Some(op)) = (result_slot, Some(dv)) {
+            b.push(Stmt::Store(slot, op));
+        }
+        b.terminate(Term::Goto(join_bb));
+    }
+    b.cur = join_bb;
+    match result_slot {
+        Some(slot) => {
+            let v = b.fresh_value(ty);
+            b.push(Stmt::Let(v, Rvalue::Load(slot)));
+            Operand::Value(v)
+        }
+        None => Operand::Const(Const::Unit),
+    }
+}
+
 fn lower_if(
     b: &mut Builder,
     cond: &hir::Expr,
@@ -2503,6 +2555,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
+        Ty::Enum(id) => format!("enum#{id}"),
         Ty::Task(_) => "Task".to_string(),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
