@@ -77,10 +77,6 @@ pub enum Scalar {
     /// (`tracks_region`), exactly the struct-with-`str`-field rule extended to scalars. Unlike
     /// `String`, it is never dropped (it borrows). A `box<str>` is rejected (a view is not boxable).
     Str,
-    /// Vestigial (4b-2): the `Error` type is now the builtin sum-type enum (`Scalar::Enum`). This
-    /// remains only as an i32-status alias inside the runtime-builtin lowerings (the raw code a
-    /// `fs`/`json` call returns, before it is wrapped into `Error.Code`); removable in a follow-up.
-    ErrCode,
     /// A sum-type payload (the enum's id) — a Copy tagged struct, like [`Scalar::Struct`]. Lets
     /// `Option`/`Result` carry an enum, notably `Result<T, MyError>` (4b). Non-recursive (just the
     /// id), so `Scalar` stays `Copy`.
@@ -197,8 +193,6 @@ pub enum Ty {
     /// object (a Move type): `builder()` opens it, `.write(...)` appends, `.to_string()` consumes
     /// it into an owned `string`. An unfinished builder is `Drop`-freed at scope exit (MMv2 7c).
     Builder,
-    /// The `Error` type (M2: an i32 code).
-    ErrCode,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -216,7 +210,6 @@ pub enum Ty {
     Task(Scalar),
     Unit,
     /// Type-checking error sentinel (bottom). Distinct from the `Error` *type*
-    /// ([`Ty::ErrCode`]).
     Error,
 }
 
@@ -236,7 +229,6 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // later concern (so `Scalar::DynStructArray` stays layout-free — always AoS).
         Ty::DynStructArray(id, Layout::Aos) => Some(Scalar::DynStructArray(id)),
         Ty::Str => Some(Scalar::Str),
-        Ty::ErrCode => Some(Scalar::ErrCode),
         // A sum type is a Copy value (a tagged struct of Copy fields), so it can be an
         // Option/Result payload — notably `Result<T, MyError>` with a user error enum (4b).
         Ty::Enum(id) => Some(Scalar::Enum(id)),
@@ -256,7 +248,6 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::DynArray(elem) => Ty::DynArray(prim_to_scalar(elem)),
         Scalar::DynStructArray(id) => Ty::DynStructArray(id, Layout::Aos),
         Scalar::Str => Ty::Str,
-        Scalar::ErrCode => Ty::ErrCode,
         Scalar::Enum(id) => Ty::Enum(id),
     }
 }
@@ -5463,7 +5454,6 @@ fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Builder => "builder".to_string(),
-        Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

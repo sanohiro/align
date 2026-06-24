@@ -880,7 +880,6 @@ fn task_tramp_key(ty: Ty) -> String {
         Ty::Bool => "bool".to_string(),
         Ty::Char => "char".to_string(),
         Ty::Unit => "unit".to_string(),
-        Ty::ErrCode => "err".to_string(),
         _ => "x".to_string(),
     }
 }
@@ -890,7 +889,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Int(it) => (it.bits / 8).max(1) as u64,
         Scalar::Float(ft) => (ft.bits / 8) as u64,
         Scalar::Bool => 1,
-        Scalar::Char | Scalar::ErrCode => 4,
+        Scalar::Char => 4,
         // `()` is lowered as `i32` (the `int_type` fallback), so it must be sized as 4
         // bytes: a `box<()>` allocates `scalar_bytes` and then stores/loads an `i32`, so a
         // 1-byte size would overflow the allocation on the store and read OOB on the load.
@@ -1642,7 +1641,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 // The result slot (a `box<R>` in the region — the `Task<R>` handle).
                 let rbytes = match r {
-                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::ErrCode => {
+                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit => {
                         let t = scalar_type(self.ctx, *r, self.struct_types, self.enum_types);
                         self.target_data.get_store_size(&t)
                     }
