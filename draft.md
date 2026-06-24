@@ -311,6 +311,18 @@ discriminate it with `match`, and at `main` it becomes the process exit code (`C
 category → a small distinct code). The standard fallible operations (`fs.read_file`, `json.decode`,
 …) return `Result<T, Error>`.
 
+**Context is structured, not free-form.** To attach context to an error — where it occurred, what
+failed — give the error variant a payload that *carries that data*: a position, a code, a name.
+There is no free-form string-chaining (`anyhow`-style `.with_context("…")`); the structured payload
+is the context, which keeps errors data-oriented and machine-inspectable.
+
+```align
+Pos        { line: i32, col: i32 }
+ParseError { BadToken(Pos), Eof }      // a parse error carries its position
+
+fn parse(src: str) -> Result<Ast, ParseError> = …
+```
+
 ### Tuple
 
 An anonymous, positional product type `(T, U, ...)` — the companion of the keyword-less
