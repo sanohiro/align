@@ -1,0 +1,29 @@
+// Structured, position-bearing errors (error type 4b-4). The Align way of attaching context to an
+// error is *structured data in a sum-type payload*, not free-form string chaining: a parse error
+// is a user error enum whose variant carries a `Pos` struct. It propagates via `?` / `Result` and
+// is read back with `match`. Built entirely on user error enums (4b-1) + struct payloads (S2).
+
+Pos { line: i32, col: i32 }
+
+ParseError { BadToken(Pos), Eof }
+
+fn parse(n: i32) -> Result<i32, ParseError> {
+  if n < 0 {
+    return Err(ParseError.BadToken(Pos { line: 3, col: 7 }))
+  }
+  if n == 0 {
+    return Err(ParseError.Eof)
+  }
+  return Ok(n * 2)
+}
+
+fn main() -> i32 {
+  // parse(-1) fails at line 3, col 7 → 3*10 + 7 = 37
+  return match parse(-1) {
+    Ok(v) => v
+    Err(e) => match e {
+      BadToken(p) => p.line * 10 + p.col
+      Eof => 99
+    }
+  }
+}

@@ -123,10 +123,10 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      in `open-questions.md`). So **4a (sum types + exhaustive `match`) is complete** for the planned
      surface. (A space-optimal union layout instead of flattened fields is a deferred codegen
      optimization — no surface change.)
-   - **4b. Error type** *(refine the Open entry)* — built **on** sum types: `Error` as a sum type of
-     categories + lightweight context, an explicit value (no unwinding / no stack-trace alloc),
-     static/predictable `?` conversion, explicit `.with_context(...)`, structured (position-bearing)
-     parse errors. Replaces the M2 i32 placeholder. **4b-1 DONE (foundation)** — errors can be
+   - **4b. Error type** *(DONE)* — built **on** sum types: `Error` as a sum type of
+     categories + structured payloads, an explicit value (no unwinding / no stack-trace alloc),
+     static/predictable `?` conversion, structured (position-bearing) errors. Replaces the M2 i32
+     placeholder. **4b-1 DONE (foundation)** — errors can be
      **user-defined sum types**: `Scalar::Enum(u32)` makes an enum a first-class `Option`/`Result`
      payload, so `Result<T, MyError>` works end to end. **4b-2 DONE** — the canonical **`Error` is a
      builtin sum type** `{ NotFound, Invalid, Denied, Code(i32) }` (a reserved type name):
@@ -134,7 +134,7 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      `?` propagates. Every fallible builtin returns `Result<_, Error>` (wrapping its i32 status as
      `Error.Code`); `main` maps the error to an exit code (`Code(c)`→c, category→tag+1); and the
      **task_group fallible path was reworked** to carry the full `Error` across threads via a
-     per-task err-slot (`tg_wait` returns the first errored slot). Explicit error conversion is `result.map_err(f)` (4b-3 DONE; no implicit `?` coercion). Still to do: `.with_context`, position-bearing structured errors. (ErrCode removed.)
+     per-task err-slot (`tg_wait` returns the first errored slot). **4b-3 DONE** — explicit error conversion is `result.map_err(f)` (no implicit `?` coercion). **4b-4 DONE** — position-bearing **structured errors** work on the 4b-1 + S2 foundation (a variant carrying a `Pos` struct, `?`-propagated, `match`-read — `examples/structured_error.align`); free-form **`.with_context` was reviewed and NOT adopted** (off-philosophy: structured sum-type payloads are the context mechanism, not dynamic string chaining — rationale in `open-questions.md`). **So 4b (the Error type) is complete** for the planned surface. (ErrCode removed; richer `str`-carrying error payloads remain deferred with S2's `str`-field payloads.)
    - **4c. Minimal generics + constraints** — the riskiest; approach minimally (structural
      constraints or tiny builtin bounds, explicit monomorphization, no turbofish, no Rust-trait
      complexity). Unblocks generic containers and lets `Option`/`Result` become generic sum types in
