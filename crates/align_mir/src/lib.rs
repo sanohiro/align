@@ -1095,6 +1095,12 @@ fn i64_ty() -> Ty {
     Ty::Int(IntTy { bits: 64, signed: true })
 }
 
+/// The i32 status code a runtime builtin (`fs`/`json`/`io`) returns, before it is wrapped into
+/// `Error.Code`.
+fn status_ty() -> Ty {
+    Ty::Int(IntTy { bits: 32, signed: true })
+}
+
 /// Emit the explicit bounds check for `recv[index]` (semantics live in MIR):
 /// `if index < 0 || index >= len { bounds_fail(index, len); unreachable }`. Leaves `b.cur` at the
 /// in-bounds block so the caller emits the element load. Out-of-bounds is a hard error (the
@@ -2185,11 +2191,11 @@ fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_
     let sty = Ty::Struct(struct_id);
     let out = b.new_slot(sty);
     let inp = lower_expr(b, input);
-    let code = b.fresh_value(Ty::ErrCode);
+    let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, input: inp, out }));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -2226,11 +2232,11 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
     let arr_ty = Ty::DynArray(scalar_of(elem));
     let out = b.new_slot(arr_ty);
     let inp = lower_expr(b, input);
-    let code = b.fresh_value(Ty::ErrCode);
+    let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::JsonDecodeArray { elem, input: inp, out }));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -2281,11 +2287,11 @@ fn make_error_code(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand {
 fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::String);
     let p = lower_expr(b, path);
-    let code = b.fresh_value(Ty::ErrCode);
+    let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::FsReadFile { path: p, out }));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -2325,11 +2331,11 @@ fn lower_io_stdout_write(
     write_rv: impl FnOnce(Operand) -> Rvalue,
 ) -> Operand {
     let a = lower_expr(b, arg);
-    let code = b.fresh_value(Ty::ErrCode);
+    let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, write_rv(a)));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -2365,11 +2371,11 @@ fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::
     let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
     let out = b.new_slot(arr_ty);
     let inp = lower_expr(b, input);
-    let code = b.fresh_value(Ty::ErrCode);
+    let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, input: inp, out }));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, Ty::ErrCode)))));
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -2660,7 +2666,6 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Builder => "builder".to_string(),
-        Ty::ErrCode => "Error".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
