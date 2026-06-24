@@ -2208,7 +2208,8 @@ fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_
     // Err: wrap the status code as the Error.
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
-    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
+    let ec = make_error_code(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));
 
@@ -2248,7 +2249,8 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
     // Err: wrap the status code (the out slot was zeroed → no buffer allocated on failure).
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
-    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
+    let ec = make_error_code(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));
 
@@ -2261,6 +2263,21 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
 /// `fs.read_file(path)` → read the file into an owned `string` materialized in an out slot via
 /// the runtime (status `i32`), then branch `Ok(<string>)` / `Err(<code>)`. Mirrors
 /// [`lower_json_decode_array`]; the `string` is heap-owned (the unwrapped local `Drop`-frees it).
+/// Wrap a runtime builtin's i32 status `code` into `Error.Code(code)` — the `err` payload of
+/// `result_ty`'s `Result<_, Error>` (4b-2). The Error enum id comes from `result_ty`'s err scalar.
+fn make_error_code(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand {
+    let error_id = match result_ty {
+        Ty::Result(_, align_sema::Scalar::Enum(eid)) => eid,
+        _ => 0, // sema guarantees `Result<_, Error>` for these builtins
+    };
+    let ev = b.fresh_value(Ty::Enum(error_id));
+    b.push(Stmt::Let(
+        ev,
+        Rvalue::MakeEnum { enum_id: error_id, variant: align_sema::ERROR_VARIANT_CODE, payload: vec![Operand::Value(code)] },
+    ));
+    Operand::Value(ev)
+}
+
 fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::String);
     let p = lower_expr(b, path);
@@ -2287,7 +2304,8 @@ fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Opera
     // Err: wrap the status code (the out slot was zeroed → no buffer allocated on failure).
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
-    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
+    let ec = make_error_code(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));
 
@@ -2328,7 +2346,8 @@ fn lower_io_stdout_write(
     // Err: wrap the status code.
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
-    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
+    let ec = make_error_code(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));
 
@@ -2369,7 +2388,8 @@ fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::
     // Err: wrap the status code (the out slot was zeroed → no buffer allocated on failure).
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
-    b.push(Stmt::Let(errv, Rvalue::ResultErr(Operand::Value(code))));
+    let ec = make_error_code(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));
 

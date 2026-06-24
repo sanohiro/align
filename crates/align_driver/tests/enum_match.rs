@@ -127,6 +127,45 @@ fn duplicate_binding_rejected() {
 }
 
 #[test]
+fn builtin_error_categories_and_match() {
+    if !backend_available() {
+        return;
+    }
+    // 4b-2: the canonical `Error` is a sum type — `Error.NotFound` / `Error.Code(c)` construct it,
+    // and `match` discriminates the categories. Here the error is matched into an exit code.
+    let src = "fn check(n: i32) -> Result<i32, Error> {\n  if n == 0 { return Err(Error.NotFound) }\n  if n < 0  { return Err(Error.Code(n)) }\n  return Ok(n)\n}\nfn describe(r: Result<i32, Error>) -> i32 = match r {\n  Ok(v)  => v,\n  Err(e) => match e {\n    NotFound => 100,\n    Invalid  => 101,\n    Denied   => 102,\n    Code(c)  => c,\n  },\n}\nfn main() -> i32 {\n  return describe(check(5)) + describe(check(0))\n}\n";
+    let out = build_and_run("error-categories", src);
+    assert_eq!(out.status.code(), Some(105)); // 5 + NotFound(100)
+}
+
+#[test]
+fn error_code_maps_to_exit_code() {
+    if !backend_available() {
+        return;
+    }
+    // `Err(Error.Code(c))` propagated out of main → exit code `c` (the payload). `error(c)` is sugar.
+    let src = "fn f() -> Result<(), Error> { return Err(error(42)) }\nfn main() -> Result<(), Error> {\n  f()?\n  return Ok(())\n}\n";
+    let out = build_and_run("error-exit-code", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn error_category_maps_to_distinct_exit_code() {
+    if !backend_available() {
+        return;
+    }
+    // A categorical `Error` propagated out of main → a small distinct nonzero code (tag + 1).
+    let src = "fn f() -> Result<(), Error> { return Err(Error.Denied) }\nfn main() -> Result<(), Error> {\n  f()?\n  return Ok(())\n}\n";
+    let out = build_and_run("error-category-exit", src);
+    assert_eq!(out.status.code(), Some(3)); // Denied tag 2 → exit 3
+}
+
+#[test]
+fn error_is_reserved_type_name() {
+    assert!(check_errs("error-reserved", "Error { Oops }\nfn main() -> i32 { return 0 }\n"));
+}
+
+#[test]
 fn enum_box_payload_rejected() {
     // A sum type is a Copy scalar (so it's an Option/Result payload), but not a box payload —
     // both the `box<Enum>` annotation and `heap.new(Enum.X)` must be rejected, not panic codegen.

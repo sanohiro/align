@@ -13,7 +13,7 @@ use std::path::Path;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{payload_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty};
+use align_sema::{payload_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};
 
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
@@ -192,13 +192,15 @@ fn build_module<'c>(
         "tg_register".to_string(),
         module.add_function(
             "align_rt_tg_register",
-            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into(), ptr.into()], false),
+            // (tg, tramp, thunk, env, slot, err_slot)
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into(), ptr.into(), ptr.into()], false),
             None,
         ),
     );
     funcs.insert(
         "tg_wait".to_string(),
-        module.add_function("align_rt_tg_wait", ctx.i32_type().fn_type(&[ptr.into()], false), None),
+        // Returns the first errored task's `err_slot` pointer (null if all succeeded).
+        module.add_function("align_rt_tg_wait", ptr.fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
         "tg_end".to_string(),
@@ -564,8 +566,11 @@ fn build_module<'c>(
             }
         }
     }
+    // The builtin `Error` enum id (always registered), for fallible trampolines.
+    let error_id = program.enums.iter().position(|e| e.name == "Error").map(|i| i as u32);
     for (key, (r, fallible)) in &tramp_keys {
-        let fn_ty = i32t.fn_type(&[ptr.into(), ptr.into(), ptr.into()], false);
+        // `tramp(thunk, env, slot, err_slot) -> i32` (0 = ok, 1 = errored).
+        let fn_ty = i32t.fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into()], false);
         let tramp = module.add_function(&format!("tramp${key}"), fn_ty, None);
         let bb = ctx.append_basic_block(tramp, "entry");
         let tb = ctx.create_builder();
@@ -573,10 +578,13 @@ fn build_module<'c>(
         let thunk = tramp.get_nth_param(0).unwrap().into_pointer_value();
         let env = tramp.get_nth_param(1).unwrap();
         let slot = tramp.get_nth_param(2).unwrap().into_pointer_value();
+        let err_slot = tramp.get_nth_param(3).unwrap().into_pointer_value();
         if *fallible {
-            // The closure returns `Result<R, Error>` = `{ i8 tag, R ok, i32 err }` (tag 0 = Ok).
+            // The closure returns `Result<R, Error>` = `{ i8 tag, R ok, Error err }` (tag 0 = Ok).
+            // On `Err`, write the full `Error` value to `err_slot` and return 1; on `Ok`, write R.
             let ok_s = ty_to_scalar(*r).ok_or_else(|| CodegenError::Lowering("fallible task Ok is not a scalar".into()))?;
-            let result_ty = result_struct_type(ctx, ok_s, Scalar::ErrCode, &struct_types, &enum_types);
+            let err_s = Scalar::Enum(error_id.ok_or_else(|| CodegenError::Lowering("Error enum not registered".into()))?);
+            let result_ty = result_struct_type(ctx, ok_s, err_s, &struct_types, &enum_types);
             let agg = tb
                 .build_indirect_call(result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
                 .map_err(lower)?
@@ -594,7 +602,8 @@ fn build_module<'c>(
             let ok_bb = ctx.append_basic_block(tramp, "ok");
             tb.build_conditional_branch(is_err, err_bb, ok_bb).map_err(lower)?;
             tb.position_at_end(err_bb);
-            tb.build_return(Some(&err)).map_err(lower)?;
+            tb.build_store(err_slot, err).map_err(lower)?;
+            tb.build_return(Some(&i32t.const_int(1, false))).map_err(lower)?;
             tb.position_at_end(ok_bb);
             tb.build_store(slot, ok).map_err(lower)?;
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
@@ -730,7 +739,16 @@ fn emit_main_wrapper<'c>(
     builder.build_conditional_branch(is_err, err_bb, ok_bb).map_err(lower)?;
 
     builder.position_at_end(err_bb);
-    let code = builder.build_extract_value(res, 2, "err").map_err(lower)?.into_int_value();
+    // The err payload is the `Error` enum `{ i32 tag, i32 code }`. Its exit code: `Code(c)` → `c`
+    // (the payload), a category → `tag + 1` (a small distinct nonzero code). `report_error` clamps.
+    let err_enum = builder.build_extract_value(res, 2, "err").map_err(lower)?.into_struct_value();
+    let etag = builder.build_extract_value(err_enum, 0, "etag").map_err(lower)?.into_int_value();
+    let ecode = builder.build_extract_value(err_enum, 1, "ecode").map_err(lower)?.into_int_value();
+    let is_code = builder
+        .build_int_compare(IntPredicate::EQ, etag, i32t.const_int(ERROR_VARIANT_CODE as u64, false), "iscode")
+        .map_err(lower)?;
+    let cat_code = builder.build_int_add(etag, i32t.const_int(1, false), "catcode").map_err(lower)?;
+    let code = builder.build_select(is_code, ecode, cat_code, "exitcode").map_err(lower)?.into_int_value();
     let exit = builder
         .build_call(report, &[code.into()], "exit")
         .map_err(lower)?
@@ -1636,47 +1654,74 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(rbytes, false).into(), i64t.const_int(ralign, false).into()], "slot")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tg_alloc returns a pointer").into_pointer_value();
+                // A fallible task also gets an `err_slot` (sized for the `Error` enum) the trampoline
+                // writes its `Err` value into; a non-fallible task passes null.
+                let err_slot = if *fallible {
+                    let eid = self.enums.iter().position(|e| e.name == "Error").expect("Error enum registered");
+                    let ety = self.enum_types[eid];
+                    let ebytes = self.target_data.get_store_size(&ety);
+                    let ealign = self.target_data.get_abi_alignment(&ety) as u64;
+                    self.builder
+                        .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(ebytes, false).into(), i64t.const_int(ealign, false).into()], "errslot")
+                        .map_err(|e| self.err(e))?
+                        .try_as_basic_value().basic().expect("tg_alloc returns a pointer").into_pointer_value()
+                } else {
+                    self.ctx.ptr_type(AddressSpace::default()).const_null()
+                };
                 // The per-(R, fallibility) trampoline runs the closure and writes the slot at `wait`.
                 let tramp = self.funcs[&format!("tramp${}", spawn_tramp_key(*r, *fallible))].as_global_value().as_pointer_value();
                 self.builder
-                    .build_call(self.funcs["tg_register"], &[tgv.into(), tramp.into(), thunk.into(), env.into(), slot.into()], "")
+                    .build_call(self.funcs["tg_register"], &[tgv.into(), tramp.into(), thunk.into(), env.into(), slot.into(), err_slot.into()], "")
                     .map_err(|e| self.err(e))?;
                 slot.into()
             }
             Rvalue::TgWaitResult { tg, fallible } => {
                 let tgv = self.operand(tg).into();
-                let code = self
+                // `tg_wait` returns the first errored task's `err_slot` (null if all succeeded).
+                let errp = self
                     .builder
                     .build_call(self.funcs["tg_wait"], &[tgv], "tgwait")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("tg_wait returns an i32")
-                    .into_int_value();
+                    .expect("tg_wait returns a pointer")
+                    .into_pointer_value();
                 if *fallible {
-                    // Build `Result<(), Error>` = `{ i8 tag, () ok, i32 err }` directly: tag =
-                    // `code != 0` (0 = Ok, 1 = Err), err = code. No branch — `?`/`Try` branches later.
+                    // Build `Result<(), Error>`: null `errp` → `Ok(())`; else load the `Error` from
+                    // `errp` → `Err(error)`. A branch (loading null would be UB), result via a slot.
                     let Ty::Result(o, e) = result_ty else {
                         return Err(self.err("wait result is not a Result"));
                     };
                     let rty = result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types);
+                    let ety = scalar_type(self.ctx, scalar_to_ty(e), self.struct_types, self.enum_types);
+                    let rslot = self.alloca_at_entry(rty.into(), "waitr")?;
                     let is_err = self
                         .builder
-                        .build_int_compare(IntPredicate::NE, code, self.ctx.i32_type().const_zero(), "iserr")
+                        .build_is_not_null(errp, "iserr")
                         .map_err(|e| self.err(e))?;
-                    let tag = self.builder.build_int_z_extend(is_err, self.ctx.i8_type(), "tag").map_err(|e| self.err(e))?;
-                    let a0 = self
+                    let err_bb = self.ctx.append_basic_block(self.func, "waiterr");
+                    let ok_bb = self.ctx.append_basic_block(self.func, "waitok");
+                    let join_bb = self.ctx.append_basic_block(self.func, "waitjoin");
+                    self.builder.build_conditional_branch(is_err, err_bb, ok_bb).map_err(|e| self.err(e))?;
+                    // Err: tag 1, err = *errp.
+                    self.builder.position_at_end(err_bb);
+                    let errv = self.builder.build_load(ety, errp, "errv").map_err(|e| self.err(e))?;
+                    let e0 = self
                         .builder
-                        .build_insert_value(rty.const_zero(), tag, 0, "wtag")
+                        .build_insert_value(rty.const_zero(), self.ctx.i8_type().const_int(1, false), 0, "etag")
                         .map_err(|e| self.err(e))?
                         .into_struct_value();
-                    self.builder
-                        .build_insert_value(a0, code, 2, "werr")
-                        .map_err(|e| self.err(e))?
-                        .into_struct_value()
-                        .into()
+                    let ev = self.builder.build_insert_value(e0, errv, 2, "eerr").map_err(|e| self.err(e))?.into_struct_value();
+                    self.builder.build_store(rslot, ev).map_err(|e| self.err(e))?;
+                    self.builder.build_unconditional_branch(join_bb).map_err(|e| self.err(e))?;
+                    // Ok: a zeroed Result (tag 0).
+                    self.builder.position_at_end(ok_bb);
+                    self.builder.build_store(rslot, rty.const_zero()).map_err(|e| self.err(e))?;
+                    self.builder.build_unconditional_branch(join_bb).map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(join_bb);
+                    self.builder.build_load(rty, rslot, "waitres").map_err(|e| self.err(e))?
                 } else {
-                    // Infallible group: ignore the code, yield `()` (an i32, like other unit values).
+                    // Infallible group: ignore the (always-null) pointer, yield `()`.
                     self.ctx.i32_type().const_zero().into()
                 }
             }

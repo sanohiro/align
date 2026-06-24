@@ -278,7 +278,19 @@ data := fs.read_file(path)?
 user: User := json.decode(data)?
 ```
 
-`?` is Result-only.
+`?` is Result-only. The error type `E` is any sum type (or scalar) — a domain may define its own
+error enum and use `Result<T, MyError>`.
+
+`Error` is the canonical builtin error sum type — universal categories plus a generic code:
+
+```align
+Error { NotFound, Invalid, Denied, Code(i32) }
+```
+
+Construct it with `Error.NotFound` / `Error.Code(c)` (`error(c)` is sugar for `Error.Code(c)`),
+discriminate it with `match`, and at `main` it becomes the process exit code (`Code(c)` → `c`, a
+category → a small distinct code). The standard fallible operations (`fs.read_file`, `json.decode`,
+…) return `Result<T, Error>`.
 
 ### Tuple
 

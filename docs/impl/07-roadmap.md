@@ -122,10 +122,14 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      static/predictable `?` conversion, explicit `.with_context(...)`, structured (position-bearing)
      parse errors. Replaces the M2 i32 placeholder. **4b-1 DONE (foundation)** — errors can be
      **user-defined sum types**: `Scalar::Enum(u32)` makes an enum a first-class `Option`/`Result`
-     payload, so `Result<T, MyError>` works end to end (`Err(MyError.X)`, `match` the result + the
-     error enum, `?`-propagate same `E`). Still to do: the canonical std `Error` sum type (the
-     `Error` keyword is still `ErrCode` today), the static `?` `E → E'` conversion, `.with_context`,
-     and position-bearing structured errors.
+     payload, so `Result<T, MyError>` works end to end. **4b-2 DONE** — the canonical **`Error` is a
+     builtin sum type** `{ NotFound, Invalid, Denied, Code(i32) }` (a reserved type name):
+     `Error.NotFound` / `Error.Code(c)` construct it (`error(c)` = sugar), `match` discriminates,
+     `?` propagates. Every fallible builtin returns `Result<_, Error>` (wrapping its i32 status as
+     `Error.Code`); `main` maps the error to an exit code (`Code(c)`→c, category→tag+1); and the
+     **task_group fallible path was reworked** to carry the full `Error` across threads via a
+     per-task err-slot (`tg_wait` returns the first errored slot). Still to do: the static `?`
+     `E → E'` conversion, `.with_context`, position-bearing structured errors; remove the now-vestigial `ErrCode`.
    - **4c. Minimal generics + constraints** — the riskiest; approach minimally (structural
      constraints or tiny builtin bounds, explicit monomorphization, no turbofish, no Rust-trait
      complexity). Unblocks generic containers and lets `Option`/`Result` become generic sum types in

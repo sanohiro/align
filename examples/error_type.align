@@ -1,0 +1,14 @@
+// The canonical `Error` is a builtin sum type (4b-2): universal categories + a generic `Code(i32)`.
+// `Result<T, Error>` is the common error model; `match` discriminates the category, `?` propagates,
+// and at `main` the error becomes the process exit code (`Code(c)` → c, a category → a small code).
+fn parse(s: str) -> Result<i32, Error> {
+  if s == ""     { return Err(Error.Invalid) }
+  if s == "secret" { return Err(Error.Denied) }
+  return Ok(42)
+}
+
+fn main() -> Result<(), Error> {
+  n := parse("ok")?          // Ok(42)
+  print(n)
+  return Ok(())
+}

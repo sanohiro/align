@@ -97,9 +97,13 @@ unsafe
 ```text
 Result<T,E>
 ?
+Error { NotFound, Invalid, Denied, Code(i32) }   // canonical builtin error sum type
 ```
 
-No exceptions.
+No exceptions. `E` is any sum type (a domain may use its own error enum). `Error` is the builtin
+error type — construct `Error.NotFound` / `Error.Code(c)` (`error(c)` is sugar), `match` it, and at
+`main` it maps to the process exit code. Fallible builtins (`fs.read_file`, `json.decode`, …)
+return `Result<T, Error>`.
 
 ### Data processing
 
