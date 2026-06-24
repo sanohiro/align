@@ -127,6 +127,17 @@ fn duplicate_binding_rejected() {
 }
 
 #[test]
+fn enum_box_payload_rejected() {
+    // A sum type is a Copy scalar (so it's an Option/Result payload), but not a box payload —
+    // both the `box<Enum>` annotation and `heap.new(Enum.X)` must be rejected, not panic codegen.
+    assert!(check_errs("enum-box-ann", "C { R }\nfn f(b: box<C>) -> i32 = 0\nfn main() -> i32 { return 0 }\n"));
+    assert!(check_errs(
+        "enum-box-new",
+        "C { R }\nfn main() -> i32 {\n  b := arena { heap.new(C.R) }\n  return 0\n}\n"
+    ));
+}
+
+#[test]
 fn non_primitive_payload_rejected() {
     // S1b: payloads are primitive scalars only — `string` (owned) is rejected for now.
     assert!(check_errs("enum-strpayload", "Wrap { S(string) }\nfn main() -> i32 { return 0 }\n"));

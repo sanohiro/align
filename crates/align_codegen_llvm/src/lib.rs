@@ -1369,7 +1369,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let agg = self.call_overflow_intrinsic(&name, llvm_int, av, bv)?.into_struct_value();
                         let res = self.builder.build_extract_value(agg, 0, "res").map_err(|e| self.err(e))?;
                         let ovf = self.builder.build_extract_value(agg, 1, "of").map_err(|e| self.err(e))?.into_int_value();
-                        let oty = option_struct_type(self.ctx, s, self.struct_types, &self.enum_types);
+                        let oty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
                         let some_tag = self.ctx.i8_type().const_int(1, false);
                         let none_tag = self.ctx.i8_type().const_int(0, false);
                         let tag = self
@@ -1393,7 +1393,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::MathOp { fn_, ty, operands } => {
                 let is_float = matches!(ty, Ty::Float(_));
                 let signed = is_signed(*ty);
-                let overload = scalar_type(self.ctx, *ty, self.struct_types, &self.enum_types);
+                let overload = scalar_type(self.ctx, *ty, self.struct_types, self.enum_types);
                 let ops: Vec<BasicValueEnum> = operands.iter().map(|o| self.operand(o)).collect();
                 match fn_ {
                     align_sema::MathFn::Abs => {
@@ -1435,7 +1435,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
             Rvalue::Field(slot, idx) => {
-                let fty = abi_type(self.ctx, self.field_ty(*slot, *idx), self.struct_types, &self.enum_types);
+                let fty = abi_type(self.ctx, self.field_ty(*slot, *idx), self.struct_types, self.enum_types);
                 let field_ptr = self.field_ptr(*slot, *idx)?;
                 self.builder
                     .build_load(fty, field_ptr, "fld")
@@ -1445,7 +1445,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Option(s) = result_ty else {
                     return Err(self.err("Some result is not an Option"));
                 };
-                let oty = option_struct_type(self.ctx, s, self.struct_types, &self.enum_types);
+                let oty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
                 let payload = self.operand(op);
                 let tag = self.ctx.i8_type().const_int(1, false);
                 // Start zeroed (not undef): an owned (Move) payload's drop frees the payload field
@@ -1466,7 +1466,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     return Err(self.err("None result is not an Option"));
                 };
                 // All-zero aggregate → tag 0 (None).
-                option_struct_type(self.ctx, s, self.struct_types, &self.enum_types).const_zero().into()
+                option_struct_type(self.ctx, s, self.struct_types, self.enum_types).const_zero().into()
             }
             Rvalue::OptionIsSome(op) => {
                 let agg = self.operand(op).into_struct_value();
@@ -1490,7 +1490,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Result(o, e) = result_ty else {
                     return Err(self.err("Ok result is not a Result"));
                 };
-                let rty = result_struct_type(self.ctx, o, e, self.struct_types, &self.enum_types);
+                let rty = result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types);
                 let tag = self.ctx.i8_type().const_int(0, false);
                 // Zeroed base (see OptionSome): the inactive `err` arm reads {null,0}, so an owned
                 // (Move) payload there drops null-safely (slice 8a).
@@ -1509,7 +1509,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Result(o, e) = result_ty else {
                     return Err(self.err("Err result is not a Result"));
                 };
-                let rty = result_struct_type(self.ctx, o, e, self.struct_types, &self.enum_types);
+                let rty = result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types);
                 let tag = self.ctx.i8_type().const_int(1, false);
                 // Zeroed base (see OptionSome): the inactive `ok` arm reads {null,0}, so an owned
                 // (Move) payload there drops null-safely (slice 8a).
@@ -1608,7 +1608,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let env: BasicValueEnum = if capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                 } else {
-                    let fields: Vec<BasicTypeEnum> = capture_tys.iter().map(|t| abi_type(self.ctx, *t, self.struct_types, &self.enum_types)).collect();
+                    let fields: Vec<BasicTypeEnum> = capture_tys.iter().map(|t| abi_type(self.ctx, *t, self.struct_types, self.enum_types)).collect();
                     let env_struct = self.ctx.struct_type(&fields, false);
                     let size = self.target_data.get_store_size(&env_struct);
                     let align = self.target_data.get_abi_alignment(&env_struct) as u64;
@@ -1625,12 +1625,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // The result slot (a `box<R>` in the region — the `Task<R>` handle).
                 let rbytes = match r {
                     Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::ErrCode => {
-                        let t = scalar_type(self.ctx, *r, self.struct_types, &self.enum_types);
+                        let t = scalar_type(self.ctx, *r, self.struct_types, self.enum_types);
                         self.target_data.get_store_size(&t)
                     }
                     _ => return Err(self.err("a spawned task result must be a primitive scalar")),
                 };
-                let ralign = self.target_data.get_abi_alignment(&scalar_type(self.ctx, *r, self.struct_types, &self.enum_types)) as u64;
+                let ralign = self.target_data.get_abi_alignment(&scalar_type(self.ctx, *r, self.struct_types, self.enum_types)) as u64;
                 let slot = self
                     .builder
                     .build_call(self.funcs["tg_alloc"], &[tgv.into(), i64t.const_int(rbytes, false).into(), i64t.const_int(ralign, false).into()], "slot")
@@ -1659,7 +1659,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let Ty::Result(o, e) = result_ty else {
                         return Err(self.err("wait result is not a Result"));
                     };
-                    let rty = result_struct_type(self.ctx, o, e, self.struct_types, &self.enum_types);
+                    let rty = result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types);
                     let is_err = self
                         .builder
                         .build_int_compare(IntPredicate::NE, code, self.ctx.i32_type().const_zero(), "iserr")
@@ -1706,7 +1706,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 ptr.into()
             }
             Rvalue::BoxGet(op) => {
-                let ty = scalar_type(self.ctx, result_ty, self.struct_types, &self.enum_types);
+                let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 let ptr = self.operand(op).into_pointer_value();
                 self.builder
                     .build_load(ty, ptr, "boxget")
@@ -1714,12 +1714,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::Index(slot, idx) => {
                 let ep = self.elem_ptr(*slot, idx)?;
-                let ty = scalar_type(self.ctx, result_ty, self.struct_types, &self.enum_types);
+                let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 self.builder.build_load(ty, ep, "idx").map_err(|e| self.err(e))?
             }
             Rvalue::IndexField(slot, idx, field) => {
                 let ep = self.elem_field_ptr(*slot, idx, *field)?;
-                let ty = abi_type(self.ctx, result_ty, self.struct_types, &self.enum_types);
+                let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 self.builder.build_load(ty, ep, "idxfld").map_err(|e| self.err(e))?
             }
             Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
@@ -1734,7 +1734,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_in_bounds_gep(st, buf, &[index, f], "aosfield")
                         .map_err(|e| self.err(e))?
                 };
-                let ty = abi_type(self.ctx, result_ty, self.struct_types, &self.enum_types);
+                let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 self.builder.build_load(ty, ep, "idxfldp").map_err(|e| self.err(e))?
             }
             Rvalue::IndexPtr { base, index, struct_id } => {
@@ -2026,7 +2026,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::SliceIndex(s, idx) => {
                 let agg = self.operand(s).into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?.into_pointer_value();
-                let ty = scalar_type(self.ctx, result_ty, self.struct_types, &self.enum_types);
+                let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 let index = self.operand(idx).into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -2039,7 +2039,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Box(s) = result_ty else {
                     return Err(self.err("clone result is not a box"));
                 };
-                let ty = scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, &self.enum_types);
+                let ty = scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types);
                 let i64t = self.ctx.i64_type();
                 let bytes = scalar_bytes(s);
                 // Allocate a fresh box, then copy the value over.
@@ -2097,7 +2097,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // `{ thunk_ptr, env_ptr }` where the thunk unpacks the env into the lifted fn's
                 // trailing capture parameters.
                 let env_fields: Vec<BasicTypeEnum> =
-                    capture_tys.iter().map(|t| abi_type(self.ctx, *t, self.struct_types, &self.enum_types)).collect();
+                    capture_tys.iter().map(|t| abi_type(self.ctx, *t, self.struct_types, self.enum_types)).collect();
                 let env_struct = self.ctx.struct_type(&env_fields, false);
                 let env_ptr = self.alloca_at_entry(env_struct.into(), "clos_env")?;
                 for (i, op) in captures.iter().enumerate() {
@@ -2151,16 +2151,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         match ty {
             Ty::Struct(id) => self.struct_types[id as usize].into(),
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
-            Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, &self.enum_types).into(),
-            Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, &self.enum_types).into(),
+            Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
+            Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
             Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
-            Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, &self.enum_types).array_type(n).into(),
+            Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
             Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(self.ctx).into(),
-            _ => scalar_type(self.ctx, ty, self.struct_types, &self.enum_types),
+            _ => scalar_type(self.ctx, ty, self.struct_types, self.enum_types),
         }
     }
 

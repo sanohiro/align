@@ -4488,6 +4488,7 @@ impl<'a, 't> Checker<'a, 't> {
         let reject = match scalar {
             _ if scalar.is_move() => Some(format!("an owned `{}` cannot be boxed", scalar_name(scalar))),
             Scalar::Struct(_) => Some("struct boxes are not supported".to_string()),
+            Scalar::Enum(_) => Some("sum-type boxes are not supported".to_string()),
             Scalar::Str => Some("a `str` view is not boxable".to_string()),
             _ => None,
         };
@@ -5557,6 +5558,10 @@ fn resolve_type(
             match scalar_arg(inner, "box payload", span, diags) {
                 Some(Scalar::Struct(_)) => {
                     diags.error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), span);
+                    Ty::Error
+                }
+                Some(Scalar::Enum(_)) => {
+                    diags.error("a box payload must be a primitive scalar (sum-type boxes are not supported)".to_string(), span);
                     Ty::Error
                 }
                 Some(s) if s.is_move() => {
