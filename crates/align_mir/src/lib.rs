@@ -2617,6 +2617,9 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     };
     let rv = lower_expr(b, result);
     let fv = lower_expr(b, f);
+    // `map_err` unwraps the result on both branches — if it was an owned local, null its slot so
+    // the exit cleanup doesn't double-free the moved-out payload.
+    null_moved_source(b, result);
     let rslot = b.new_slot(out_ty);
     let is_ok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(rv.clone())));

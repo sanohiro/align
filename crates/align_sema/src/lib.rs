@@ -1120,6 +1120,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
             | ExprKind::ResultErr(inner) => self.region_of(inner, depth),
+            // `map_err` passes the `Ok` payload through unchanged, so its region is the source's
+            // (a region-tied Ok payload must not escape via the converted result).
+            ExprKind::ResultMapErr { result, .. } => self.region_of(result, depth),
             // `opt else fb` yields one of two values, so it lives only as long as the shorter.
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.region_of(opt, depth).shorter(self.region_of(fallback, depth))
@@ -1704,7 +1707,8 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::ResultMapErr { result, f } => {
-                self.expr(result, moved, false, false);
+                // `map_err` unwraps/consumes the result (its Ok payload may be an owned Move type).
+                self.expr(result, moved, true, true);
                 self.expr(f, moved, false, false);
             }
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
