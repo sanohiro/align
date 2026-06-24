@@ -102,10 +102,14 @@ pub struct MatchArm {
 }
 
 /// A `match` arm pattern: an (unqualified) variant name (optionally binding its payload
-/// positionally — `Circle(r)`, `Rect(w, h)`) or the `_` wildcard.
+/// positionally — `Circle(r)`, `Rect(w, h)`), an or-pattern of bare variant names
+/// (`Red | Green | Blue`, binding nothing), or the `_` wildcard.
 #[derive(Clone, Debug)]
 pub enum MatchPattern {
     Variant { name: Ident, bindings: Vec<Ident> },
+    /// `A | B | ...` — matches if the scrutinee is any of these variants; binds nothing (a payload
+    /// variant may appear, its payload is simply not bound). Always ≥ 2 alternatives.
+    Or { variants: Vec<Ident>, span: Span },
     Wildcard(Span),
 }
 

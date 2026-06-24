@@ -219,6 +219,19 @@ area := match s {
 }
 ```
 
+Several variants may share one arm with an **or-pattern** — `A | B | ...`, matching if the
+scrutinee is any of them. An or-pattern lists bare variant names and **binds nothing** (a
+payload variant may appear; its payload is simply not bound). Use it for "match the shape, not
+the data"; when you need a binding, write separate arms. Or-patterns count toward exhaustiveness
+like any other arm, so they can partition all the variants with no `_`:
+
+```align
+warm := match signal {
+  Red | Yellow => true,
+  Green | Off  => false,
+}
+```
+
 `match` also works on `Option` / `Result`; `else`-unwrap and `?` are the ergonomic shorthands for the
 common unwrap / propagate cases.
 
