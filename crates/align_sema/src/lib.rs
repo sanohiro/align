@@ -446,60 +446,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // The shared function-value-type interner (`Ty::Fn`), built on demand as lambdas become values.
     let mut fn_types: Vec<hir::FnTy> = Vec::new();
 
-    // Pass 0a': resolve enum variant payloads (now that all type names are known). The enum lowers
-    // to a non-union struct `{ i32 tag, <every variant's payload flattened> }`, so each variant's
-    // `field_base` is `1 + (payload slots of earlier variants)`. S1b: primitive scalar payloads.
-    let mut enums: Vec<hir::EnumDef> = Vec::with_capacity(enum_decls.len());
-    for e in &enum_decls {
-        let mut seen = std::collections::HashSet::new();
-        let mut variants = Vec::with_capacity(e.variants.len());
-        let mut field_base = 1u32;
-        for v in &e.variants {
-            if !seen.insert(v.name.name.clone()) {
-                diags.error(format!("duplicate variant '{}' in '{}'", v.name.name, e.name.name), v.span);
-            }
-            let mut payload = Vec::with_capacity(v.payload.len());
-            for t in &v.payload {
-                let ty = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags);
-                match ty {
-                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
-                        payload.push(ty_to_scalar(ty).expect("primitive scalar"));
-                    }
-                    Ty::Error => {}
-                    other => diags.error(
-                        format!("variant payloads must be a primitive scalar for now, got {}", ty_name(other)),
-                        t.span(),
-                    ),
-                }
-            }
-            let n = payload.len() as u32;
-            variants.push(hir::EnumVariant { name: v.name.name.clone(), payload, field_base });
-            field_base += n;
-        }
-        enums.push(hir::EnumDef { name: e.name.name.clone(), variants });
-    }
-
-    // The canonical builtin `Error` sum type (4b-2): universal categories + a generic `Code(i32)`
-    // (the variant order must match `ERROR_VARIANT_CODE`). Registered after the user enums; `Error`
-    // is a reserved type name (rejected in pass 0a). Every fallible builtin and `Result<_, Error>`
-    // use this enum.
-    let error_enum_id = enums.len() as u32;
-    enum_ids.insert("Error".to_string(), error_enum_id);
-    enums.push(hir::EnumDef {
-        name: "Error".to_string(),
-        variants: vec![
-            hir::EnumVariant { name: "NotFound".to_string(), payload: Vec::new(), field_base: 1 },
-            hir::EnumVariant { name: "Invalid".to_string(), payload: Vec::new(), field_base: 1 },
-            hir::EnumVariant { name: "Denied".to_string(), payload: Vec::new(), field_base: 1 },
-            hir::EnumVariant {
-                name: "Code".to_string(),
-                payload: vec![Scalar::Int(IntTy { bits: 32, signed: true })],
-                field_base: 1,
-            },
-        ],
-    });
-
-    // Pass 0b: resolve field types. M1 restricts struct fields to primitives.
+    // Pass 0b: resolve struct field types (before enum payloads, which may be structs).
     let mut structs: Vec<StructDef> = Vec::with_capacity(struct_decls.len());
     for s in &struct_decls {
         let mut fields = Vec::with_capacity(s.fields.len());
@@ -531,6 +478,68 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         // change at the alignment seam, not a retrofit.
         structs.push(StructDef { name: s.name.name.clone(), fields, align: None });
     }
+
+    // Pass 0c: resolve enum variant payloads (all type names + structs are known). The enum lowers
+    // to a non-union struct `{ i32 tag, <every variant's payload flattened> }`, so each variant's
+    // `field_base` is `1 + (payload slots of earlier variants)`. Payloads are primitive scalars
+    // (S1b) or a **plain-data struct** with no `str`/region-tracked field (S2) — a region-tied
+    // struct payload would need enum region-tracking (deferred).
+    let mut enums: Vec<hir::EnumDef> = Vec::with_capacity(enum_decls.len());
+    for e in &enum_decls {
+        let mut seen = std::collections::HashSet::new();
+        let mut variants = Vec::with_capacity(e.variants.len());
+        let mut field_base = 1u32;
+        for v in &e.variants {
+            if !seen.insert(v.name.name.clone()) {
+                diags.error(format!("duplicate variant '{}' in '{}'", v.name.name, e.name.name), v.span);
+            }
+            let mut payload = Vec::with_capacity(v.payload.len());
+            for t in &v.payload {
+                let ty = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags);
+                match ty {
+                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
+                        payload.push(ty_to_scalar(ty).expect("primitive scalar"));
+                    }
+                    Ty::Struct(id) if structs[id as usize].fields.iter().all(|f| f.ty != Ty::Str) => {
+                        payload.push(Scalar::Struct(id));
+                    }
+                    Ty::Struct(_) => diags.error(
+                        "a sum-type payload struct may not contain a `str` field yet (region tracking pending)".to_string(),
+                        t.span(),
+                    ),
+                    Ty::Error => {}
+                    other => diags.error(
+                        format!("variant payloads must be a primitive scalar or plain struct for now, got {}", ty_name(other)),
+                        t.span(),
+                    ),
+                }
+            }
+            let n = payload.len() as u32;
+            variants.push(hir::EnumVariant { name: v.name.name.clone(), payload, field_base });
+            field_base += n;
+        }
+        enums.push(hir::EnumDef { name: e.name.name.clone(), variants });
+    }
+
+    // The canonical builtin `Error` sum type (4b-2): universal categories + a generic `Code(i32)`
+    // (the variant order must match `ERROR_VARIANT_CODE`). Registered after the user enums; `Error`
+    // is a reserved type name (rejected in pass 0a). Every fallible builtin and `Result<_, Error>`
+    // use this enum.
+    let error_enum_id = enums.len() as u32;
+    enum_ids.insert("Error".to_string(), error_enum_id);
+    enums.push(hir::EnumDef {
+        name: "Error".to_string(),
+        variants: vec![
+            hir::EnumVariant { name: "NotFound".to_string(), payload: Vec::new(), field_base: 1 },
+            hir::EnumVariant { name: "Invalid".to_string(), payload: Vec::new(), field_base: 1 },
+            hir::EnumVariant { name: "Denied".to_string(), payload: Vec::new(), field_base: 1 },
+            hir::EnumVariant {
+                name: "Code".to_string(),
+                payload: vec![Scalar::Int(IntTy { bits: 32, signed: true })],
+                field_base: 1,
+            },
+        ],
+    });
 
     // Pass 1: collect function signatures so calls can resolve regardless of order.
     let mut sigs: HashMap<String, FnSig> = HashMap::new();

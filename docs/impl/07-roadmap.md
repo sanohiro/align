@@ -114,9 +114,10 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      `check_match` derives the variant list from the scrutinee type (a `match_variants` helper
      covering enum + Option + Result uniformly), and MIR lowers these two-variant types as a single
      `IsSome`/`IsOk` branch reusing the existing `Option`/`Result` unwrap rvalues (order-independent,
-     no negation). `else`-unwrap and `?` remain the ergonomic shorthands. Next: **S4** recursive
-     (boxed) enums / guards / `|`-patterns; **S2** struct/tuple payloads. (A space-optimal union
-     layout instead of flattened fields is a deferred codegen optimization — no surface change.)
+     no negation). `else`-unwrap and `?` remain the ergonomic shorthands. **S2 DONE** — plain-data
+     struct variant payloads (`Dot(Point)`); `str`-field structs + tuple payloads deferred. Next:
+     **S4** recursive (boxed) enums / guards / `|`-patterns. (A space-optimal union layout instead
+     of flattened fields is a deferred codegen optimization — no surface change.)
    - **4b. Error type** *(refine the Open entry)* — built **on** sum types: `Error` as a sum type of
      categories + lightweight context, an explicit value (no unwinding / no stack-trace alloc),
      static/predictable `?` conversion, explicit `.with_context(...)`, structured (position-bearing)
