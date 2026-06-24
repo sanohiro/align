@@ -71,9 +71,11 @@ pub struct FnTy {
 }
 
 /// One checked `match` arm. `variant` = the covered variant tag, or `None` for the `_` wildcard.
+/// `bindings` are the locals bound to the variant's payload (one per payload slot, in order).
 #[derive(Clone, Debug)]
 pub struct MatchArm {
     pub variant: Option<u32>,
+    pub bindings: Vec<crate::LocalId>,
     pub body: Expr,
 }
 
@@ -88,8 +90,19 @@ pub struct TupleDef {
 #[derive(Clone, Debug)]
 pub struct EnumDef {
     pub name: String,
-    /// Variant names in declaration order; the index is the tag. S1a: tag-only (no payloads).
-    pub variants: Vec<String>,
+    /// Variants in declaration order; the index is the tag.
+    pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EnumVariant {
+    pub name: String,
+    /// Positional scalar payload (S1b); empty for a tag-only variant.
+    pub payload: Vec<crate::Scalar>,
+    /// The first struct field index holding this variant's payload. The enum lowers to a
+    /// non-union struct `{ i32 tag, <every variant's payload flattened> }`, so field 0 is the tag
+    /// and this variant's payload occupies fields `field_base .. field_base + payload.len()`.
+    pub field_base: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -227,9 +240,9 @@ pub enum ExprKind {
     },
     /// `task_group { … }` — a structured concurrency scope (slice ④). ④a lowers it as its block.
     TaskGroup(Block),
-    /// `Type.Variant` — a sum-type value (S1a: tag-only). `enum_id` indexes `Program.enums`,
-    /// `variant` is the tag (index into that enum's variants).
-    EnumValue { enum_id: u32, variant: u32 },
+    /// `Type.Variant` / `Type.Variant(args)` — a sum-type value. `enum_id` indexes `Program.enums`,
+    /// `variant` is the tag; `payload` are the constructor arguments (empty for a tag-only variant).
+    EnumValue { enum_id: u32, variant: u32, payload: Vec<Expr> },
     /// `match scrutinee { … }` — exhaustive match over a sum type. `arms` are in source order; a
     /// `variant` of `None` is the `_` wildcard. The expression's value is the matched arm's value.
     Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },

@@ -53,6 +53,9 @@ pub struct EnumDecl {
 #[derive(Clone, Debug)]
 pub struct VariantDef {
     pub name: Ident,
+    /// Positional payload types (`Circle(f32)`, `Rect(f32, f32)`); empty for a tag-only variant.
+    /// S1b: scalar payloads only.
+    pub payload: Vec<Type>,
     pub span: Span,
 }
 
@@ -98,10 +101,11 @@ pub struct MatchArm {
     pub span: Span,
 }
 
-/// A `match` arm pattern. S1a: an (unqualified) variant name or the `_` wildcard.
+/// A `match` arm pattern: an (unqualified) variant name (optionally binding its payload
+/// positionally — `Circle(r)`, `Rect(w, h)`) or the `_` wildcard.
 #[derive(Clone, Debug)]
 pub enum MatchPattern {
-    Variant(Ident),
+    Variant { name: Ident, bindings: Vec<Ident> },
     Wildcard(Span),
 }
 

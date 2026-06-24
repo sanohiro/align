@@ -408,7 +408,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut struct_ids: HashMap<String, u32> = HashMap::new();
     let mut struct_decls: Vec<&ast::StructDecl> = Vec::new();
     let mut enum_ids: HashMap<String, u32> = HashMap::new();
-    let mut enums: Vec<hir::EnumDef> = Vec::new();
+    let mut enum_decls: Vec<&ast::EnumDecl> = Vec::new();
     for item in &file.items {
         match item {
             ast::Item::Struct(s) => {
@@ -419,25 +419,13 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 }
                 struct_decls.push(s);
             }
-            // A sum type (tag-only, S1a) needs no field resolution — build it here directly.
             ast::Item::Enum(e) => {
-                if enum_ids.insert(e.name.name.clone(), enums.len() as u32).is_some()
+                if enum_ids.insert(e.name.name.clone(), enum_decls.len() as u32).is_some()
                     || struct_ids.contains_key(&e.name.name)
                 {
                     diags.error(format!("duplicate type declaration: '{}'", e.name.name), e.span);
                 }
-                let mut seen = std::collections::HashSet::new();
-                let variants = e
-                    .variants
-                    .iter()
-                    .map(|v| {
-                        if !seen.insert(v.name.name.clone()) {
-                            diags.error(format!("duplicate variant '{}' in '{}'", v.name.name, e.name.name), v.span);
-                        }
-                        v.name.name.clone()
-                    })
-                    .collect();
-                enums.push(hir::EnumDef { name: e.name.name.clone(), variants });
+                enum_decls.push(e);
             }
             ast::Item::Fn(_) => {}
         }
@@ -447,6 +435,39 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut tuples: Vec<hir::TupleDef> = Vec::new();
     // The shared function-value-type interner (`Ty::Fn`), built on demand as lambdas become values.
     let mut fn_types: Vec<hir::FnTy> = Vec::new();
+
+    // Pass 0a': resolve enum variant payloads (now that all type names are known). The enum lowers
+    // to a non-union struct `{ i32 tag, <every variant's payload flattened> }`, so each variant's
+    // `field_base` is `1 + (payload slots of earlier variants)`. S1b: primitive scalar payloads.
+    let mut enums: Vec<hir::EnumDef> = Vec::with_capacity(enum_decls.len());
+    for e in &enum_decls {
+        let mut seen = std::collections::HashSet::new();
+        let mut variants = Vec::with_capacity(e.variants.len());
+        let mut field_base = 1u32;
+        for v in &e.variants {
+            if !seen.insert(v.name.name.clone()) {
+                diags.error(format!("duplicate variant '{}' in '{}'", v.name.name, e.name.name), v.span);
+            }
+            let mut payload = Vec::with_capacity(v.payload.len());
+            for t in &v.payload {
+                let ty = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags);
+                match ty {
+                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
+                        payload.push(ty_to_scalar(ty).expect("primitive scalar"));
+                    }
+                    Ty::Error => {}
+                    other => diags.error(
+                        format!("variant payloads must be a primitive scalar for now, got {}", ty_name(other)),
+                        t.span(),
+                    ),
+                }
+            }
+            let n = payload.len() as u32;
+            variants.push(hir::EnumVariant { name: v.name.name.clone(), payload, field_base });
+            field_base += n;
+        }
+        enums.push(hir::EnumDef { name: e.name.name.clone(), variants });
+    }
 
     // Pass 0b: resolve field types. M1 restricts struct fields to primitives.
     let mut structs: Vec<StructDef> = Vec::with_capacity(struct_decls.len());
@@ -820,7 +841,11 @@ impl EffectScan {
             }
             ExprKind::TaskGet(inner) => self.expr(inner),
             ExprKind::Wait => self.impure_direct = true,
-            ExprKind::EnumValue { .. } => {}
+            ExprKind::EnumValue { payload, .. } => {
+                for p in payload {
+                    self.expr(p);
+                }
+            }
             ExprKind::Match { scrutinee, arms } => {
                 self.expr(scrutinee);
                 for a in arms {
@@ -1277,7 +1302,11 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::Spawn { closure, .. } => self.walk(closure, depth),
-            ExprKind::EnumValue { .. } => {}
+            ExprKind::EnumValue { payload, .. } => {
+                for p in payload {
+                    self.walk(p, depth);
+                }
+            }
             ExprKind::Match { scrutinee, arms } => {
                 self.walk(scrutinee, depth);
                 for a in arms {
@@ -1624,7 +1653,11 @@ impl<'a> MoveCheck<'a> {
             // A plain block is transparent: its tail inherits this position's consuming/direct.
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b, moved, consuming, direct),
             ExprKind::Spawn { closure, .. } => self.expr(closure, moved, false, false),
-            ExprKind::EnumValue { .. } => {}
+            ExprKind::EnumValue { payload, .. } => {
+                for p in payload {
+                    self.expr(p, moved, false, false);
+                }
+            }
             ExprKind::Match { scrutinee, arms } => {
                 self.expr(scrutinee, moved, false, false);
                 for a in arms {
@@ -2497,11 +2530,19 @@ impl<'a, 't> Checker<'a, 't> {
         if let ast::ExprKind::Path(p) = &recv.kind {
             if let Some(name) = single_name(p) {
                 if let Some(&enum_id) = self.enum_ids.get(name) {
-                    return match self.enums[enum_id as usize].variants.iter().position(|v| v == &field.name) {
+                    return match self.enums[enum_id as usize].variants.iter().position(|v| v.name == field.name) {
                         Some(idx) => {
+                            let arity = self.enums[enum_id as usize].variants[idx].payload.len();
+                            if arity != 0 {
+                                self.diags.error(
+                                    format!("variant '{}' takes {arity} argument(s); construct it as `{}.{}(…)`", field.name, name, field.name),
+                                    span,
+                                );
+                                return err;
+                            }
                             let ty = Ty::Enum(enum_id);
                             self.constrain(ty, expected, span);
-                            Expr { kind: ExprKind::EnumValue { enum_id, variant: idx as u32 }, ty, span }
+                            Expr { kind: ExprKind::EnumValue { enum_id, variant: idx as u32, payload: Vec::new() }, ty, span }
                         }
                         None => {
                             self.diags.error(
@@ -2936,6 +2977,16 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        // `Type.Variant(args)` — constructing a sum-type value with a payload.
+        if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
+            if let ast::ExprKind::Path(p) = &recv.kind {
+                if let Some(name) = single_name(p) {
+                    if let Some(&enum_id) = self.enum_ids.get(name) {
+                        return self.check_variant_ctor(enum_id, field, args, expected, span);
+                    }
+                }
+            }
+        }
         // Method call `recv.method(...)`: a module builtin (`heap.new`) or a method on a
         // value (`box.get()`, `box.clone()`).
         if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
@@ -4975,6 +5026,39 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::ElseUnwrap { opt: Box::new(o), fallback: Box::new(fb) }, ty: payload, span }
     }
 
+    /// `Type.Variant(args)` — construct a sum-type value with a payload. Checks the argument count
+    /// and each argument against the variant's payload scalar.
+    fn check_variant_ctor(&mut self, enum_id: u32, field: &ast::Ident, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some(idx) = self.enums[enum_id as usize].variants.iter().position(|v| v.name == field.name) else {
+            self.diags.error(format!("'{}' is not a variant of '{}'", field.name, self.enums[enum_id as usize].name), span);
+            return err;
+        };
+        let payload = self.enums[enum_id as usize].variants[idx].payload.clone();
+        if args.len() != payload.len() {
+            self.diags.error(
+                format!("variant '{}' takes {} argument(s), got {}", field.name, payload.len(), args.len()),
+                span,
+            );
+            return err;
+        }
+        let checked: Vec<Expr> = args
+            .iter()
+            .zip(&payload)
+            .map(|(a, &s)| {
+                let pt = scalar_to_ty(s);
+                let e = self.check_expr(a, Some(pt));
+                if e.ty != Ty::Error && self.resolve(e.ty) != pt {
+                    self.diags.error(format!("payload type mismatch: expected {}, got {}", ty_name(pt), ty_name(e.ty)), e.span);
+                }
+                e
+            })
+            .collect();
+        let ty = Ty::Enum(enum_id);
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::EnumValue { enum_id, variant: idx as u32, payload: checked }, ty, span }
+    }
+
     /// `match scrutinee { Variant => body, _ => body }` — exhaustive match over a sum type. Each
     /// arm's body unifies to the match's type; every variant must be covered, or a `_` wildcard.
     fn check_match(&mut self, scrutinee: &ast::Expr, arms: &[ast::MatchArm], expected: Option<Ty>, span: Span) -> Expr {
@@ -4994,22 +5078,46 @@ impl<'a, 't> Checker<'a, 't> {
         // The match's value type: unify all arm bodies (drives inference from `expected`).
         let mut result_ty: Option<Ty> = expected;
         for arm in arms {
-            let variant = match &arm.pattern {
+            // Payload bindings are scoped to this arm only — snapshot the scope and restore after.
+            let scope_mark = self.scope.len();
+            let (variant, bindings) = match &arm.pattern {
                 ast::MatchPattern::Wildcard(_) => {
                     if has_wildcard {
                         self.diags.error("duplicate `_` arm".to_string(), arm.span);
                     }
                     has_wildcard = true;
-                    None
+                    (None, Vec::new())
                 }
-                ast::MatchPattern::Variant(name) => {
-                    match self.enums[enum_id as usize].variants.iter().position(|v| v == &name.name) {
+                ast::MatchPattern::Variant { name, bindings } => {
+                    match self.enums[enum_id as usize].variants.iter().position(|v| v.name == name.name) {
                         Some(idx) => {
                             if covered[idx] {
                                 self.diags.error(format!("duplicate arm for variant '{}'", name.name), arm.span);
                             }
                             covered[idx] = true;
-                            Some(idx as u32)
+                            let payload = self.enums[enum_id as usize].variants[idx].payload.clone();
+                            if bindings.len() != payload.len() {
+                                self.diags.error(
+                                    format!("variant '{}' binds {} value(s), got {}", name.name, payload.len(), bindings.len()),
+                                    arm.span,
+                                );
+                            }
+                            // Declare each binding (typed by the matching payload scalar) so the arm
+                            // body resolves even when the count is wrong. Binding names must be
+                            // distinct — `Rect(w, w)` would otherwise silently shadow.
+                            let mut seen_bindings = std::collections::HashSet::new();
+                            let locals = bindings
+                                .iter()
+                                .enumerate()
+                                .map(|(i, b)| {
+                                    if !seen_bindings.insert(&b.name) {
+                                        self.diags.error(format!("duplicate binding '{}' in pattern", b.name), b.span);
+                                    }
+                                    let ty = payload.get(i).map(|&s| scalar_to_ty(s)).unwrap_or(Ty::Error);
+                                    self.declare(&b.name, ty, false)
+                                })
+                                .collect();
+                            (Some(idx as u32), locals)
                         }
                         None => {
                             self.diags.error(
@@ -5027,7 +5135,8 @@ impl<'a, 't> Checker<'a, 't> {
             if result_ty.is_none() && body.ty != Ty::Error {
                 result_ty = Some(body.ty);
             }
-            checked.push(hir::MatchArm { variant, body });
+            self.scope.truncate(scope_mark);
+            checked.push(hir::MatchArm { variant, bindings, body });
         }
         // Exhaustiveness: every variant covered, or a `_` wildcard present.
         if !has_wildcard {
@@ -5036,7 +5145,7 @@ impl<'a, 't> Checker<'a, 't> {
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !covered[*i])
-                .map(|(_, v)| v.as_str())
+                .map(|(_, v)| v.name.as_str())
                 .collect();
             if !missing.is_empty() {
                 self.diags.error(
@@ -5144,7 +5253,11 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.finalize_block(b),
             ExprKind::Spawn { closure, .. } => self.finalize_expr(closure),
-            ExprKind::EnumValue { .. } => {}
+            ExprKind::EnumValue { payload, .. } => {
+                for p in payload {
+                    self.finalize_expr(p);
+                }
+            }
             ExprKind::Match { scrutinee, arms } => {
                 self.finalize_expr(scrutinee);
                 for a in arms {

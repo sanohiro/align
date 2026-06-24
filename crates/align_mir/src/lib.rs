@@ -27,6 +27,9 @@ pub struct Program {
     /// Struct layouts, indexed by the id in [`Ty::Struct`]; codegen builds LLVM struct
     /// types from these.
     pub structs: Vec<hir::StructDef>,
+    /// Sum-type layouts, indexed by the id in [`Ty::Enum`]; codegen builds the tagged struct
+    /// `{ i32 tag, … }` from each (variant payloads + `field_base`).
+    pub enums: Vec<hir::EnumDef>,
     /// Tuple layouts, indexed by the id in [`Ty::Tuple`]; codegen builds an anonymous LLVM
     /// struct type from each element list.
     pub tuples: Vec<hir::TupleDef>,
@@ -151,6 +154,13 @@ pub enum Rvalue {
     ResultUnwrapOk(Operand),
     /// The err payload of a `Result` operand (valid only when `Err`).
     ResultUnwrapErr(Operand),
+    /// `Type.Variant(payload…)` — build a sum-type aggregate `{ i32 tag, … }`: store the variant
+    /// tag in field 0 and each payload operand in this variant's fields.
+    MakeEnum { enum_id: u32, variant: u32, payload: Vec<Operand> },
+    /// Whether a sum-type operand's tag equals `variant` (the `match`-arm test).
+    EnumTagEq { enum_id: u32, scrutinee: Operand, variant: u32 },
+    /// The `slot`-th payload field of a sum-type operand for `variant` (valid only on that variant).
+    EnumPayload { enum_id: u32, variant: u32, slot: u32, operand: Operand },
     /// Open a new arena; the value is its handle.
     ArenaBegin,
     /// Open a `task_group`; the value is its handle (a `*TaskGroup`).
@@ -310,6 +320,7 @@ pub fn lower_program(program: &hir::Program) -> Program {
     Program {
         fns: program.fns.iter().map(|f| lower_fn(f, &program.tuples)).collect(),
         structs: program.structs.clone(),
+        enums: program.enums.clone(),
         tuples: program.tuples.clone(),
     }
 }
@@ -759,9 +770,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty),
-        // A tag-only sum value is its variant tag (an int in the `Ty::Enum` repr).
-        hir::ExprKind::EnumValue { enum_id, variant } => {
-            Operand::Const(Const::Int(*variant as i128, Ty::Enum(*enum_id)))
+        // `Type.Variant(payload…)` — build the sum-type aggregate `{ i32 tag, … }`.
+        hir::ExprKind::EnumValue { enum_id, variant, payload } => {
+            let ops: Vec<Operand> = payload.iter().map(|p| lower_expr(b, p)).collect();
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::MakeEnum { enum_id: *enum_id, variant: *variant, payload: ops }));
+            Operand::Value(v)
         }
         hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty),
         hir::ExprKind::Field { base, index } => {
@@ -2451,9 +2465,13 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
         lower_expr(b, scrutinee);
         return Operand::Const(Const::Unit);
     }
+    let Ty::Enum(enum_id) = scrutinee.ty else {
+        // Guarded by sema (`match` requires a sum type); be defensive rather than panic.
+        lower_expr(b, scrutinee);
+        return Operand::Const(Const::Unit);
+    };
     let result_slot = (ty != Ty::Unit).then(|| b.new_slot(ty));
-    let enum_ty = scrutinee.ty;
-    let tag = lower_expr(b, scrutinee);
+    let scrut = lower_expr(b, scrutinee);
     let join_bb = b.new_block();
     // The default (fallthrough) arm: the `_` wildcard if present, else the last arm (exhaustive).
     let default_idx = arms.iter().position(|a| a.variant.is_none()).unwrap_or(arms.len() - 1);
@@ -2463,27 +2481,15 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
         }
         let v = arm.variant.expect("a non-default match arm has a variant");
         let eq = b.fresh_value(Ty::Bool);
-        b.push(Stmt::Let(eq, Rvalue::Bin(BinOp::Eq, tag.clone(), Operand::Const(Const::Int(v as i128, enum_ty)))));
+        b.push(Stmt::Let(eq, Rvalue::EnumTagEq { enum_id, scrutinee: scrut.clone(), variant: v }));
         let arm_bb = b.new_block();
         let next_bb = b.new_block();
         b.terminate(Term::Branch(Operand::Value(eq), arm_bb, next_bb));
         b.cur = arm_bb;
-        let av = lower_expr(b, &arm.body);
-        if !b.is_terminated() {
-            if let (Some(slot), Some(op)) = (result_slot, Some(av)) {
-                b.push(Stmt::Store(slot, op));
-            }
-            b.terminate(Term::Goto(join_bb));
-        }
+        lower_arm(b, enum_id, arm, &scrut, result_slot, join_bb);
         b.cur = next_bb;
     }
-    let dv = lower_expr(b, &arms[default_idx].body);
-    if !b.is_terminated() {
-        if let (Some(slot), Some(op)) = (result_slot, Some(dv)) {
-            b.push(Stmt::Store(slot, op));
-        }
-        b.terminate(Term::Goto(join_bb));
-    }
+    lower_arm(b, enum_id, &arms[default_idx], &scrut, result_slot, join_bb);
     b.cur = join_bb;
     match result_slot {
         Some(slot) => {
@@ -2492,6 +2498,27 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
             Operand::Value(v)
         }
         None => Operand::Const(Const::Unit),
+    }
+}
+
+/// Lower one `match` arm: bind its payload (extract each field into the binding's slot), lower the
+/// body, and (unless it diverged) store the value and jump to the join block.
+fn lower_arm(b: &mut Builder, enum_id: u32, arm: &hir::MatchArm, scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId) {
+    if let Some(v) = arm.variant {
+        for (slot, &local) in arm.bindings.iter().enumerate() {
+            // Extract the payload field into a value, then store it into the binding local's slot.
+            let pty = b.slots[local as usize];
+            let pv = b.fresh_value(pty);
+            b.push(Stmt::Let(pv, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() }));
+            b.push(Stmt::Store(local, Operand::Value(pv)));
+        }
+    }
+    let av = lower_expr(b, &arm.body);
+    if !b.is_terminated() {
+        if let Some(slot) = result_slot {
+            b.push(Stmt::Store(slot, av));
+        }
+        b.terminate(Term::Goto(join_bb));
     }
 }
 
