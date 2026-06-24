@@ -458,7 +458,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                     Ty::Error => {}
                     other => diags.error(
                         format!("variant payloads must be a primitive scalar for now, got {}", ty_name(other)),
-                        v.span,
+                        t.span(),
                     ),
                 }
             }
@@ -5103,11 +5103,16 @@ impl<'a, 't> Checker<'a, 't> {
                                 );
                             }
                             // Declare each binding (typed by the matching payload scalar) so the arm
-                            // body resolves even when the count is wrong.
+                            // body resolves even when the count is wrong. Binding names must be
+                            // distinct — `Rect(w, w)` would otherwise silently shadow.
+                            let mut seen_bindings = std::collections::HashSet::new();
                             let locals = bindings
                                 .iter()
                                 .enumerate()
                                 .map(|(i, b)| {
+                                    if !seen_bindings.insert(&b.name) {
+                                        self.diags.error(format!("duplicate binding '{}' in pattern", b.name), b.span);
+                                    }
                                     let ty = payload.get(i).map(|&s| scalar_to_ty(s)).unwrap_or(Ty::Error);
                                     self.declare(&b.name, ty, false)
                                 })

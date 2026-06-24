@@ -118,6 +118,15 @@ fn binding_count_mismatch_rejected() {
 }
 
 #[test]
+fn duplicate_binding_rejected() {
+    // Two bindings with the same name in one pattern (`Both(w, w)`) would silently shadow.
+    assert!(check_errs(
+        "enum-dupbind",
+        "P { Both(i32, i32) }\nfn main() -> i32 {\n  p := P.Both(1, 2)\n  return match p { Both(w, w) => w }\n}\n"
+    ));
+}
+
+#[test]
 fn non_primitive_payload_rejected() {
     // S1b: payloads are primitive scalars only — `string` (owned) is rejected for now.
     assert!(check_errs("enum-strpayload", "Wrap { S(string) }\nfn main() -> i32 { return 0 }\n"));
