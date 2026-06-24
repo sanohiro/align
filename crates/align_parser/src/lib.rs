@@ -887,6 +887,12 @@ impl<'a> Parser<'a> {
                             "an or-pattern cannot bind a payload; list bare variant names (`A | B`) or use separate arms".to_string(),
                             self.span(),
                         );
+                        // Recover: consume the rest of the (invalid) or-pattern tail so parsing
+                        // resumes at `=>` rather than cascading into an "expected '=>'" error.
+                        while self.eat(&TokKind::Pipe) {
+                            self.skip_ends();
+                            let _ = self.parse_ident("a variant name in an or-pattern");
+                        }
                     }
                 }
                 MatchPattern::Variant { name: id, bindings }
