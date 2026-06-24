@@ -883,6 +883,10 @@ impl EffectScan {
                     self.expr(&a.body);
                 }
             }
+            ExprKind::ResultMapErr { result, f } => {
+                self.expr(result);
+                self.expr(f);
+            }
             ExprKind::TupleIndex { recv, .. } => self.expr(recv),
             ExprKind::Index { recv, index } => {
                 self.expr(recv);
@@ -1116,6 +1120,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
             | ExprKind::ResultErr(inner) => self.region_of(inner, depth),
+            // `map_err` passes the `Ok` payload through unchanged, so its region is the source's
+            // (a region-tied Ok payload must not escape via the converted result).
+            ExprKind::ResultMapErr { result, .. } => self.region_of(result, depth),
             // `opt else fb` yields one of two values, so it lives only as long as the shorter.
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.region_of(opt, depth).shorter(self.region_of(fallback, depth))
@@ -1343,6 +1350,10 @@ impl<'a> EscapeCheck<'a> {
                 for a in arms {
                     self.walk(&a.body, depth);
                 }
+            }
+            ExprKind::ResultMapErr { result, f } => {
+                self.walk(result, depth);
+                self.walk(f, depth);
             }
             ExprKind::TaskGet(inner) => self.walk(inner, depth),
             ExprKind::Wait => {}
@@ -1694,6 +1705,11 @@ impl<'a> MoveCheck<'a> {
                 for a in arms {
                     self.expr(&a.body, moved, consuming, direct);
                 }
+            }
+            ExprKind::ResultMapErr { result, f } => {
+                // `map_err` unwraps/consumes the result (its Ok payload may be an owned Move type).
+                self.expr(result, moved, true, true);
+                self.expr(f, moved, false, false);
             }
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
             // consumes the task (a second `get()` would double-free the buffer).
@@ -3344,6 +3360,9 @@ impl<'a, 't> Checker<'a, 't> {
         match method {
             "get" => self.check_box_get(recv_expr, recv_ty, args, span),
             "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
+            "map_err" if matches!(self.resolve(recv_ty), Ty::Result(..)) => {
+                self.check_map_err(recv_expr, args, expected, span)
+            }
             _ => {
                 if recv_ty != Ty::Error {
                     self.diags
@@ -4382,6 +4401,41 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::ArrayDot { a: Box::new(a_src), b: Box::new(b), elem }, ty: elem, span }
     }
 
+    /// `r.map_err(f)` — convert a `Result<T, E>`'s error with `f: fn(E) -> E'`, yielding
+    /// `Result<T, E'>` (`Ok` passes through). The explicit, visible way to change a result's error
+    /// type — Align has no implicit `?` conversion (that would be a hidden coercion).
+    fn check_map_err(&mut self, recv: Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Ty::Result(ok, e) = self.resolve(recv.ty) else {
+            return err; // guarded by the caller
+        };
+        if args.len() != 1 {
+            self.diags.error(format!("'map_err' takes 1 argument, got {}", args.len()), span);
+            return err;
+        }
+        let f = self.check_expr(&args[0], None);
+        let Ty::Fn(fid) = self.resolve(f.ty) else {
+            if f.ty != Ty::Error {
+                self.diags.error(format!("'map_err' expects a function `fn(E) -> E'`, got {}", ty_name(f.ty)), args[0].span);
+            }
+            return err;
+        };
+        let (params, e2) = {
+            let ft = &self.fn_types[fid as usize];
+            (ft.params.clone(), ft.ret)
+        };
+        if params.as_slice() != [e] {
+            self.diags.error(
+                format!("'map_err' function must take the error type {} (got {})", scalar_name(e), ty_name(f.ty)),
+                args[0].span,
+            );
+            return err;
+        }
+        let ty = Ty::Result(ok, e2);
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::ResultMapErr { result: Box::new(recv), f: Box::new(f) }, ty, span }
+    }
+
     /// `b.clone()` — deep-copy a `box<T>`. Allocates a fresh box, so it needs an arena.
     fn check_box_clone(&mut self, recv: Expr, recv_ty: Ty, args: &[ast::Expr], span: Span) -> Expr {
         if !args.is_empty() {
@@ -5306,6 +5360,10 @@ impl<'a, 't> Checker<'a, 't> {
                 for a in arms {
                     self.finalize_expr(&mut a.body);
                 }
+            }
+            ExprKind::ResultMapErr { result, f } => {
+                self.finalize_expr(result);
+                self.finalize_expr(f);
             }
             ExprKind::TaskGet(inner) => self.finalize_expr(inner),
             ExprKind::Wait => {}

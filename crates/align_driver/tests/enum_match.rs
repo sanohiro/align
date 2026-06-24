@@ -166,6 +166,52 @@ fn error_is_reserved_type_name() {
 }
 
 #[test]
+fn map_err_converts_then_propagates() {
+    if !backend_available() {
+        return;
+    }
+    // 4b-3: explicit error conversion. `inner().map_err(f)?` turns a `Result<_, MyErr>` into
+    // `Result<_, Error>` and propagates — no implicit `?` coercion (that would be hidden).
+    let src = "MyErr { Bad, Worse }\nfn to_error(e: MyErr) -> Error = match e {\n  Bad   => Error.Code(7),\n  Worse => Error.Code(9),\n}\nfn inner(n: i32) -> Result<i32, MyErr> {\n  if n < 0 { return Err(MyErr.Worse) }\n  return Ok(n)\n}\nfn outer(n: i32) -> Result<i32, Error> {\n  v := inner(n).map_err(to_error)?\n  return Ok(v + 1)\n}\nfn main() -> Result<(), Error> {\n  print(outer(5)?)\n  return Ok(())\n}\n";
+    let out = build_and_run("maperr-ok", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n");
+}
+
+#[test]
+fn map_err_error_path_propagates_converted() {
+    if !backend_available() {
+        return;
+    }
+    // The converted error propagates: `MyErr.Worse` → `Error.Code(9)` → exit 9, nothing printed.
+    let src = "MyErr { Bad, Worse }\nfn to_error(e: MyErr) -> Error = match e {\n  Bad   => Error.Code(7),\n  Worse => Error.Code(9),\n}\nfn inner(n: i32) -> Result<i32, MyErr> {\n  if n < 0 { return Err(MyErr.Worse) }\n  return Ok(n)\n}\nfn outer(n: i32) -> Result<i32, Error> {\n  v := inner(n).map_err(to_error)?\n  return Ok(v)\n}\nfn main() -> Result<(), Error> {\n  print(outer(-1)?)\n  return Ok(())\n}\n";
+    let out = build_and_run("maperr-err", src);
+    assert_eq!(out.status.code(), Some(9));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn map_err_owned_ok_payload_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // `map_err` on a `Result<string, E>` moves the owned `Ok` payload through; the source local's
+    // slot must be nulled so the exit cleanup doesn't double-free it.
+    let src = "MyErr { Bad }\nfn to_error(e: MyErr) -> Error = Error.Code(1)\nfn load(ok: bool) -> Result<string, MyErr> {\n  if ok { return Ok(\"hello\".clone()) }\n  return Err(MyErr.Bad)\n}\nfn main() -> Result<(), Error> {\n  s := load(true).map_err(to_error)?\n  print(s.len())\n  return Ok(())\n}\n";
+    let out = build_and_run("maperr-owned", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+}
+
+#[test]
+fn map_err_wrong_function_signature_rejected() {
+    assert!(check_errs(
+        "maperr-badsig",
+        "MyErr { Bad }\nfn inner() -> Result<i32, MyErr> { return Err(MyErr.Bad) }\nfn wrong(x: i32) -> Error = Error.NotFound\nfn outer() -> Result<i32, Error> { return inner().map_err(wrong) }\nfn main() -> i32 { return 0 }\n"
+    ));
+}
+
+#[test]
 fn enum_box_payload_rejected() {
     // A sum type is a Copy scalar (so it's an Option/Result payload), but not a box payload —
     // both the `box<Enum>` annotation and `heap.new(Enum.X)` must be rejected, not panic codegen.

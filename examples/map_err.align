@@ -1,0 +1,20 @@
+// Explicit error conversion (4b-3): `?` requires the same error type — to change it, convert
+// visibly with `map_err`, then propagate. (Align has no implicit `?` coercion.)
+ParseError { Empty, TooBig }
+
+fn to_error(e: ParseError) -> Error = match e {
+  Empty  => Error.Invalid,
+  TooBig => Error.Code(22),
+}
+
+fn parse(n: i32) -> Result<i32, ParseError> {
+  if n == 0   { return Err(ParseError.Empty) }
+  if n > 100  { return Err(ParseError.TooBig) }
+  return Ok(n)
+}
+
+fn main() -> Result<(), Error> {
+  v := parse(42).map_err(to_error)?    // Ok(42)
+  print(v)
+  return Ok(())
+}
