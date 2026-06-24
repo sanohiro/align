@@ -64,6 +64,66 @@ fn enum_returned_and_rematched() {
 }
 
 #[test]
+fn payload_construct_and_match_bind() {
+    if !backend_available() {
+        return;
+    }
+    // Multi-arity scalar payloads (`Both(i32,i32)`, `One(i32)`) + tag-only (`Zero`) in one enum;
+    // construction with args and a `match` binding each payload positionally.
+    let src = "Pair { Both(i32, i32), One(i32), Zero }\nfn val(p: Pair) -> i32 = match p {\n  Both(a, b) => a + b,\n  One(x)     => x,\n  Zero       => 0,\n}\nfn main() -> i32 {\n  return val(Pair.Both(30, 12)) + val(Pair.One(0)) + val(Pair.Zero)\n}\n";
+    let out = build_and_run("enum-payload", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn single_payload_option_like() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Maybe { Nothing, Just(i32) }\nfn get(m: Maybe) -> i32 = match m {\n  Nothing => -1,\n  Just(n) => n,\n}\nfn main() -> i32 {\n  return get(Maybe.Just(42)) - get(Maybe.Nothing) - 1\n}\n";
+    let out = build_and_run("enum-maybe", src);
+    assert_eq!(out.status.code(), Some(42)); // 42 - (-1) - 1
+}
+
+#[test]
+fn float_payload_type_checks() {
+    // `f64` payloads + a `match` binding used in float arithmetic — type-checks (no backend needed).
+    let src = "Shape { Circle(f64), Rect(f64, f64) }\nfn area(s: Shape) -> f64 = match s {\n  Circle(r)  => 3.0 * r * r,\n  Rect(w, h) => w * h,\n}\nfn main() -> i32 {\n  x := area(Shape.Rect(3.0, 4.0))\n  return 0\n}\n";
+    assert!(!check_errs("enum-float", src));
+}
+
+#[test]
+fn ctor_arity_mismatch_rejected() {
+    assert!(check_errs(
+        "enum-ctor-arity",
+        "Shape { Circle(f64) }\nfn main() -> i32 {\n  s := Shape.Circle(1.0, 2.0)\n  return 0\n}\n"
+    ));
+}
+
+#[test]
+fn no_paren_payload_ctor_rejected() {
+    // A payload variant cannot be constructed bare (`Shape.Circle`); it needs its argument.
+    assert!(check_errs(
+        "enum-noparen",
+        "Shape { Circle(f64) }\nfn main() -> i32 {\n  s := Shape.Circle\n  return 0\n}\n"
+    ));
+}
+
+#[test]
+fn binding_count_mismatch_rejected() {
+    assert!(check_errs(
+        "enum-bindcount",
+        "Shape { Circle(f64) }\nfn main() -> f64 {\n  s := Shape.Circle(1.0)\n  return match s { Circle => 0.0 }\n}\n"
+    ));
+}
+
+#[test]
+fn non_primitive_payload_rejected() {
+    // S1b: payloads are primitive scalars only — `string` (owned) is rejected for now.
+    assert!(check_errs("enum-strpayload", "Wrap { S(string) }\nfn main() -> i32 { return 0 }\n"));
+}
+
+#[test]
 fn non_exhaustive_rejected() {
     // Every variant must be covered (or a `_`); a missing variant is a compile error.
     assert!(check_errs(

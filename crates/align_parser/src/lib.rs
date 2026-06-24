@@ -234,12 +234,22 @@ impl<'a> Parser<'a> {
                 }
                 let vstart = self.span();
                 let vname = self.parse_ident("variant name")?;
-                // S1a: tag-only variants — a payload `Variant(T, …)` is a later slice.
-                if self.at(&TokKind::LParen) {
-                    self.diags.error("variant payloads are not supported yet (tag-only variants for now)", self.span());
-                    return None;
+                // An optional positional payload: `Variant(T, U, …)`.
+                let mut payload = Vec::new();
+                if self.eat(&TokKind::LParen) {
+                    loop {
+                        self.skip_ends();
+                        if self.at(&TokKind::RParen) || self.at(&TokKind::Eof) {
+                            break;
+                        }
+                        payload.push(self.parse_type()?);
+                        if !self.eat(&TokKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&TokKind::RParen, "')'");
                 }
-                variants.push(VariantDef { name: vname, span: vstart.merge(self.prev_span()) });
+                variants.push(VariantDef { name: vname, payload, span: vstart.merge(self.prev_span()) });
                 self.eat(&TokKind::Comma);
             }
             self.expect(&TokKind::RBrace, "'}'");
@@ -850,7 +860,22 @@ impl<'a> Parser<'a> {
             let pattern = if id.name == "_" {
                 MatchPattern::Wildcard(id.span)
             } else {
-                MatchPattern::Variant(id)
+                // Optional positional payload bindings: `Circle(r)`, `Rect(w, h)`.
+                let mut bindings = Vec::new();
+                if self.eat(&TokKind::LParen) {
+                    loop {
+                        self.skip_ends();
+                        if self.at(&TokKind::RParen) || self.at(&TokKind::Eof) {
+                            break;
+                        }
+                        bindings.push(self.parse_ident("a payload binding")?);
+                        if !self.eat(&TokKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&TokKind::RParen, "')'");
+                }
+                MatchPattern::Variant { name: id, bindings }
             };
             self.expect(&TokKind::FatArrow, "'=>'");
             let body = Box::new(self.parse_expr(0)?);

@@ -104,7 +104,14 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      / non-enum scrutinee / duplicate-arm all diagnosed). `Ty::Enum(id)` interned into
      `Program.enums`, repr = the variant tag (`i32`); `match` lowers to a tag-compare branch chain
      with a result slot (like `if`); enums are Copy values usable as locals / params / returns.
-     Next: **S1b** scalar variant payloads (`Circle(f32)`), then **S3** `match` on `Option`/`Result`.
+     **S1b DONE** — scalar variant payloads: `Shape { Circle(f64), Rect(f64, f64) }`,
+     `Type.Variant(args)` construction (arity/type checked), and `match` arms binding the payload
+     positionally (`Circle(r) => …`, scoped to the arm). The enum now lowers to a non-union tagged
+     struct `{ i32 tag, <every variant's payload flattened> }` (the `Result` `{tag, ok, err}` shape
+     generalized), built/read via SSA insert/extract-value (MIR `MakeEnum` / `EnumTagEq` /
+     `EnumPayload`); payloads are primitive scalars. Next: **S3** `match` on `Option`/`Result`,
+     then **S4** recursive (boxed) enums / guards / `|`-patterns. (A space-optimal union layout
+     instead of flattened fields is a deferred codegen optimization — no surface change.)
    - **4b. Error type** *(refine the Open entry)* — built **on** sum types: `Error` as a sum type of
      categories + lightweight context, an explicit value (no unwinding / no stack-trace alloc),
      static/predictable `?` conversion, explicit `.with_context(...)`, structured (position-bearing)

@@ -144,6 +144,16 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::ResultIsOk(op) => format!("is_ok({})", operand_str(op)),
         Rvalue::ResultUnwrapOk(op) => format!("unwrap_ok({})", operand_str(op)),
         Rvalue::ResultUnwrapErr(op) => format!("unwrap_err({})", operand_str(op)),
+        Rvalue::MakeEnum { enum_id, variant, payload } => {
+            let ps: Vec<String> = payload.iter().map(operand_str).collect();
+            format!("enum#{enum_id}.{variant}({})", ps.join(", "))
+        }
+        Rvalue::EnumTagEq { enum_id, scrutinee, variant } => {
+            format!("tag_eq(enum#{enum_id}, {}, {variant})", operand_str(scrutinee))
+        }
+        Rvalue::EnumPayload { enum_id, variant, slot, operand } => {
+            format!("enum_payload(enum#{enum_id}.{variant}[{slot}], {})", operand_str(operand))
+        }
         Rvalue::ArenaBegin => "arena_begin".to_string(),
         Rvalue::TgBegin => "tg_begin".to_string(),
         Rvalue::SpawnTask { closure, fallible, .. } => {
