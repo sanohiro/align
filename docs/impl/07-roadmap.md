@@ -120,7 +120,12 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    - **4b. Error type** *(refine the Open entry)* — built **on** sum types: `Error` as a sum type of
      categories + lightweight context, an explicit value (no unwinding / no stack-trace alloc),
      static/predictable `?` conversion, explicit `.with_context(...)`, structured (position-bearing)
-     parse errors. Replaces the M2 i32 placeholder.
+     parse errors. Replaces the M2 i32 placeholder. **4b-1 DONE (foundation)** — errors can be
+     **user-defined sum types**: `Scalar::Enum(u32)` makes an enum a first-class `Option`/`Result`
+     payload, so `Result<T, MyError>` works end to end (`Err(MyError.X)`, `match` the result + the
+     error enum, `?`-propagate same `E`). Still to do: the canonical std `Error` sum type (the
+     `Error` keyword is still `ErrCode` today), the static `?` `E → E'` conversion, `.with_context`,
+     and position-bearing structured errors.
    - **4c. Minimal generics + constraints** — the riskiest; approach minimally (structural
      constraints or tiny builtin bounds, explicit monomorphization, no turbofish, no Rust-trait
      complexity). Unblocks generic containers and lets `Option`/`Result` become generic sum types in
