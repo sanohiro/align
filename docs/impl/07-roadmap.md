@@ -128,8 +128,7 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      `?` propagates. Every fallible builtin returns `Result<_, Error>` (wrapping its i32 status as
      `Error.Code`); `main` maps the error to an exit code (`Code(c)`→c, category→tag+1); and the
      **task_group fallible path was reworked** to carry the full `Error` across threads via a
-     per-task err-slot (`tg_wait` returns the first errored slot). Still to do: the static `?`
-     `E → E'` conversion, `.with_context`, position-bearing structured errors; remove the now-vestigial `ErrCode`.
+     per-task err-slot (`tg_wait` returns the first errored slot). Explicit error conversion is `result.map_err(f)` (4b-3 DONE; no implicit `?` coercion). Still to do: `.with_context`, position-bearing structured errors. (ErrCode removed.)
    - **4c. Minimal generics + constraints** — the riskiest; approach minimally (structural
      constraints or tiny builtin bounds, explicit monomorphization, no turbofish, no Rust-trait
      complexity). Unblocks generic containers and lets `Option`/`Result` become generic sum types in

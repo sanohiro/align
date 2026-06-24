@@ -162,7 +162,7 @@ Structural-constraint inference vs explicit bounds (trait-style). Unit of monomo
 ### Error type design — Open (next after sum types; the i32 is an M2 placeholder)
 Today `Error` is the M2 `Ty::ErrCode` (an i32 code). **Leaning (2026-06-24, validated by external review):** build the real `Error` **on the sum-type mechanism** — `Error` is a **sum type of categories** (the variant carries a lightweight payload: a `str` view + position for a parse error, a code for an OS error, …). Constraints from the philosophy:
 - **An explicit value, nothing hidden:** no exceptions, no unwinding, no implicit stack-trace allocation. (The cold-`Err`-edge treatment stays.)
-- **Static, predictable `?` conversion:** the `E → E'` rule for `?` is limited and statically resolved (a known small conversion), not an open coercion graph.
+- **No implicit `?` conversion — explicit `map_err` instead (4b-3 DONE).** `?` requires the same `E` (an implicit `E → E'` coercion would be *hidden* — Align has no `From`-trait to point at, unlike Rust). To change a result's error type, use `result.map_err(f)` (`f: fn(E) -> E'`), then `?`: `inner().map_err(to_error)?`. Explicit, visible, closure-based; lowers to a branch over the `Result` reusing the existing unwrap rvalues + an indirect call.
 - **Context is explicit:** an opt-in `.with_context(...)` (allocating into the enclosing frame/arena, visibly) rather than auto-captured backtraces.
 - **Structured errors carry position:** e.g. a JSON/parse error includes the offset/line.
 - **Exit-code mapping** at the `main` boundary stays as today (`clamp(1,255)`).

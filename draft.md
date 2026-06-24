@@ -279,7 +279,13 @@ user: User := json.decode(data)?
 ```
 
 `?` is Result-only. The error type `E` is any sum type (or scalar) — a domain may define its own
-error enum and use `Result<T, MyError>`.
+error enum and use `Result<T, MyError>`. `?` requires the *same* `E` (there is no implicit error
+conversion — that would be hidden); to change the error type, convert it explicitly with
+`result.map_err(f)` (`f: fn(E) -> E'`), then `?`:
+
+```align
+v := inner().map_err(to_error)?
+```
 
 `Error` is the canonical builtin error sum type — universal categories plus a generic code:
 

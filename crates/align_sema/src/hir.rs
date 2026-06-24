@@ -246,6 +246,8 @@ pub enum ExprKind {
     /// `match scrutinee { … }` — exhaustive match over a sum type. `arms` are in source order; a
     /// `variant` of `None` is the `_` wildcard. The expression's value is the matched arm's value.
     Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },
+    /// `result.map_err(f)` — map a `Result`'s error with `f: fn(E) -> E'` (`Ok` passes through).
+    ResultMapErr { result: Box<Expr>, f: Box<Expr> },
     /// `spawn(fn { … })` — defer a task; `closure` is the spawned closure value. `fallible` = the
     /// closure returns `Result<R, Error>` (so its `Err` is surfaced by `wait()?`); the task's
     /// result type is `Task<R>` (the `Ok` payload) either way.

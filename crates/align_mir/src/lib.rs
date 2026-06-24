@@ -778,6 +778,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty),
+        hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
         hir::ExprKind::Field { base, index } => {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Field(*base, *index)));
@@ -2602,6 +2603,52 @@ fn finish_arm(b: &mut Builder, body: &hir::Expr, result_slot: Option<Slot>, join
         }
         b.terminate(Term::Goto(join_bb));
     }
+}
+
+/// `result.map_err(f)` — branch on `Result`: `Ok(v)` passes through; `Err(e)` becomes `Err(f(e))`.
+fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty) -> Operand {
+    let (ok_s, e_s) = match result.ty {
+        Ty::Result(o, e) => (o, e),
+        _ => return lower_expr(b, result), // guarded by sema
+    };
+    let e2_ty = match out_ty {
+        Ty::Result(_, e2) => align_sema::scalar_to_ty(e2),
+        _ => out_ty,
+    };
+    let rv = lower_expr(b, result);
+    let fv = lower_expr(b, f);
+    let rslot = b.new_slot(out_ty);
+    let is_ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(rv.clone())));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(is_ok), ok_bb, err_bb));
+    // Ok: pass the payload through unchanged.
+    b.cur = ok_bb;
+    let okp = b.fresh_value(align_sema::scalar_to_ty(ok_s));
+    b.push(Stmt::Let(okp, Rvalue::ResultUnwrapOk(rv.clone())));
+    let okr = b.fresh_value(out_ty);
+    b.push(Stmt::Let(okr, Rvalue::ResultOk(Operand::Value(okp))));
+    b.push(Stmt::Store(rslot, Operand::Value(okr)));
+    b.terminate(Term::Goto(join));
+    // Err: apply `f` to the error, re-wrap.
+    b.cur = err_bb;
+    let errp = b.fresh_value(align_sema::scalar_to_ty(e_s));
+    b.push(Stmt::Let(errp, Rvalue::ResultUnwrapErr(rv)));
+    let conv = b.fresh_value(e2_ty);
+    b.push(Stmt::Let(
+        conv,
+        Rvalue::CallIndirect { callee: fv, args: vec![Operand::Value(errp)], param_tys: vec![align_sema::scalar_to_ty(e_s)], ret_ty: e2_ty },
+    ));
+    let errr = b.fresh_value(out_ty);
+    b.push(Stmt::Let(errr, Rvalue::ResultErr(Operand::Value(conv))));
+    b.push(Stmt::Store(rslot, Operand::Value(errr)));
+    b.terminate(Term::Goto(join));
+    b.cur = join;
+    let r = b.fresh_value(out_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
 }
 
 fn lower_if(
