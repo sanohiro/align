@@ -1694,7 +1694,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     };
                     let rty = result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types);
                     let ety = scalar_type(self.ctx, scalar_to_ty(e), self.struct_types, self.enum_types);
-                    let rslot = self.builder.build_alloca(rty, "waitr").map_err(|e| self.err(e))?;
+                    let rslot = self.alloca_at_entry(rty.into(), "waitr")?;
                     let is_err = self
                         .builder
                         .build_is_not_null(errp, "iserr")
