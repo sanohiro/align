@@ -109,9 +109,14 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      positionally (`Circle(r) => …`, scoped to the arm). The enum now lowers to a non-union tagged
      struct `{ i32 tag, <every variant's payload flattened> }` (the `Result` `{tag, ok, err}` shape
      generalized), built/read via SSA insert/extract-value (MIR `MakeEnum` / `EnumTagEq` /
-     `EnumPayload`); payloads are primitive scalars. Next: **S3** `match` on `Option`/`Result`,
-     then **S4** recursive (boxed) enums / guards / `|`-patterns. (A space-optimal union layout
-     instead of flattened fields is a deferred codegen optimization — no surface change.)
+     `EnumPayload`); payloads are primitive scalars. **S3 DONE** — `match` on the builtin
+     `Option`/`Result` (`match o { Some(x) => …, None => … }`, `match r { Ok(v) => …, Err(e) => … }`):
+     `check_match` derives the variant list from the scrutinee type (a `match_variants` helper
+     covering enum + Option + Result uniformly), and MIR lowers these two-variant types as a single
+     `IsSome`/`IsOk` branch reusing the existing `Option`/`Result` unwrap rvalues (order-independent,
+     no negation). `else`-unwrap and `?` remain the ergonomic shorthands. Next: **S4** recursive
+     (boxed) enums / guards / `|`-patterns; **S2** struct/tuple payloads. (A space-optimal union
+     layout instead of flattened fields is a deferred codegen optimization — no surface change.)
    - **4b. Error type** *(refine the Open entry)* — built **on** sum types: `Error` as a sum type of
      categories + lightweight context, an explicit value (no unwinding / no stack-trace alloc),
      static/predictable `?` conversion, explicit `.with_context(...)`, structured (position-bearing)

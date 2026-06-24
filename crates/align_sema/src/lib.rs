@@ -5059,20 +5059,35 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::EnumValue { enum_id, variant: idx as u32, payload: checked }, ty, span }
     }
 
-    /// `match scrutinee { Variant => body, _ => body }` — exhaustive match over a sum type. Each
-    /// arm's body unifies to the match's type; every variant must be covered, or a `_` wildcard.
+    /// The variants of a matchable type: a user sum type, or the builtin `Option`/`Result`
+    /// (so `match` works on them too). Each variant is `(name, positional payload scalars)`, in
+    /// the order the lowering expects (Option: 0 = Some, 1 = None; Result: 0 = Ok, 1 = Err).
+    fn match_variants(&self, ty: Ty) -> Option<(String, Vec<(String, Vec<Scalar>)>)> {
+        match ty {
+            Ty::Enum(id) => {
+                let e = &self.enums[id as usize];
+                Some((e.name.clone(), e.variants.iter().map(|v| (v.name.clone(), v.payload.clone())).collect()))
+            }
+            Ty::Option(s) => Some(("Option".into(), vec![("Some".into(), vec![s]), ("None".into(), Vec::new())])),
+            Ty::Result(o, e) => Some(("Result".into(), vec![("Ok".into(), vec![o]), ("Err".into(), vec![e])])),
+            _ => None,
+        }
+    }
+
+    /// `match scrutinee { Variant => body, _ => body }` — exhaustive match over a sum type (a user
+    /// `enum`, or builtin `Option`/`Result`). Each arm's body unifies to the match's type; every
+    /// variant must be covered, or a `_` wildcard.
     fn check_match(&mut self, scrutinee: &ast::Expr, arms: &[ast::MatchArm], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let s = self.check_expr(scrutinee, None);
         if s.ty == Ty::Error {
             return err;
         }
-        let Ty::Enum(enum_id) = self.resolve(s.ty) else {
+        let Some((type_name, variants)) = self.match_variants(self.resolve(s.ty)) else {
             self.diags.error(format!("`match` expects a sum type, got {}", ty_name(s.ty)), scrutinee.span);
             return err;
         };
-        let n_variants = self.enums[enum_id as usize].variants.len();
-        let mut covered = vec![false; n_variants];
+        let mut covered = vec![false; variants.len()];
         let mut has_wildcard = false;
         let mut checked: Vec<hir::MatchArm> = Vec::with_capacity(arms.len());
         // The match's value type: unify all arm bodies (drives inference from `expected`).
@@ -5089,13 +5104,13 @@ impl<'a, 't> Checker<'a, 't> {
                     (None, Vec::new())
                 }
                 ast::MatchPattern::Variant { name, bindings } => {
-                    match self.enums[enum_id as usize].variants.iter().position(|v| v.name == name.name) {
+                    match variants.iter().position(|(vn, _)| vn == &name.name) {
                         Some(idx) => {
                             if covered[idx] {
                                 self.diags.error(format!("duplicate arm for variant '{}'", name.name), arm.span);
                             }
                             covered[idx] = true;
-                            let payload = self.enums[enum_id as usize].variants[idx].payload.clone();
+                            let payload = &variants[idx].1;
                             if bindings.len() != payload.len() {
                                 self.diags.error(
                                     format!("variant '{}' binds {} value(s), got {}", name.name, payload.len(), bindings.len()),
@@ -5120,10 +5135,7 @@ impl<'a, 't> Checker<'a, 't> {
                             (Some(idx as u32), locals)
                         }
                         None => {
-                            self.diags.error(
-                                format!("'{}' is not a variant of '{}'", name.name, self.enums[enum_id as usize].name),
-                                name.span,
-                            );
+                            self.diags.error(format!("'{}' is not a variant of '{}'", name.name, type_name), name.span);
                             return err;
                         }
                     }
@@ -5140,18 +5152,15 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Exhaustiveness: every variant covered, or a `_` wildcard present.
         if !has_wildcard {
-            let missing: Vec<&str> = self.enums[enum_id as usize]
-                .variants
+            let missing: Vec<&str> = variants
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !covered[*i])
-                .map(|(_, v)| v.name.as_str())
+                .map(|(_, v)| v.0.as_str())
                 .collect();
             if !missing.is_empty() {
-                self.diags.error(
-                    format!("non-exhaustive `match` on '{}': missing {}", self.enums[enum_id as usize].name, missing.join(", ")),
-                    span,
-                );
+                self.diags
+                    .error(format!("non-exhaustive `match` on '{type_name}': missing {}", missing.join(", ")), span);
             }
         }
         let ty = result_ty.unwrap_or(Ty::Unit);
