@@ -2456,24 +2456,38 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     Operand::Value(r)
 }
 
-/// `match scrutinee { … }` (tag-only, S1a): test the scrutinee's tag against each arm's variant
-/// and branch to its body (storing into a result slot), defaulting to the `_`/last arm.
+/// `match scrutinee { … }`: lower per scrutinee kind — a user `enum` (a tag-compare chain over the
+/// non-union struct) or builtin `Option`/`Result` (a single 2-way branch on `IsSome`/`IsOk`).
 fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], ty: Ty) -> Operand {
     // A zero-arm `match` is already a (non-exhaustive) sema error; lower the scrutinee for its
-    // effects and yield unit so we never panic on `arms.len() - 1` / `arms[default_idx]`.
+    // effects and yield unit so we never panic on the indexing below.
     if arms.is_empty() {
         lower_expr(b, scrutinee);
         return Operand::Const(Const::Unit);
     }
-    let Ty::Enum(enum_id) = scrutinee.ty else {
-        // Guarded by sema (`match` requires a sum type); be defensive rather than panic.
-        lower_expr(b, scrutinee);
-        return Operand::Const(Const::Unit);
-    };
     let result_slot = (ty != Ty::Unit).then(|| b.new_slot(ty));
     let scrut = lower_expr(b, scrutinee);
     let join_bb = b.new_block();
-    // The default (fallthrough) arm: the `_` wildcard if present, else the last arm (exhaustive).
+    match scrutinee.ty {
+        Ty::Enum(enum_id) => lower_match_enum(b, enum_id, arms, &scrut, result_slot, join_bb),
+        Ty::Option(_) | Ty::Result(..) => lower_match_binary(b, scrutinee.ty, arms, &scrut, result_slot, join_bb),
+        // Guarded by sema (`match` requires a sum type); be defensive rather than panic.
+        _ => b.terminate(Term::Goto(join_bb)),
+    }
+    b.cur = join_bb;
+    match result_slot {
+        Some(slot) => {
+            let v = b.fresh_value(ty);
+            b.push(Stmt::Let(v, Rvalue::Load(slot)));
+            Operand::Value(v)
+        }
+        None => Operand::Const(Const::Unit),
+    }
+}
+
+/// A user `enum`: test the scrutinee's tag against each arm's variant and branch to its body,
+/// defaulting to the `_`/last arm.
+fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId) {
     let default_idx = arms.iter().position(|a| a.variant.is_none()).unwrap_or(arms.len() - 1);
     for (i, arm) in arms.iter().enumerate() {
         if i == default_idx {
@@ -2486,34 +2500,76 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
         let next_bb = b.new_block();
         b.terminate(Term::Branch(Operand::Value(eq), arm_bb, next_bb));
         b.cur = arm_bb;
-        lower_arm(b, enum_id, arm, &scrut, result_slot, join_bb);
+        for (slot, &local) in arm.bindings.iter().enumerate() {
+            bind_local(b, local, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() });
+        }
+        finish_arm(b, &arm.body, result_slot, join_bb);
         b.cur = next_bb;
     }
-    lower_arm(b, enum_id, &arms[default_idx], &scrut, result_slot, join_bb);
-    b.cur = join_bb;
-    match result_slot {
-        Some(slot) => {
-            let v = b.fresh_value(ty);
-            b.push(Stmt::Let(v, Rvalue::Load(slot)));
-            Operand::Value(v)
+    let d = &arms[default_idx];
+    if let Some(v) = d.variant {
+        for (slot, &local) in d.bindings.iter().enumerate() {
+            bind_local(b, local, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() });
         }
-        None => Operand::Const(Const::Unit),
     }
+    finish_arm(b, &d.body, result_slot, join_bb);
 }
 
-/// Lower one `match` arm: bind its payload (extract each field into the binding's slot), lower the
-/// body, and (unless it diverged) store the value and jump to the join block.
-fn lower_arm(b: &mut Builder, enum_id: u32, arm: &hir::MatchArm, scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId) {
-    if let Some(v) = arm.variant {
-        for (slot, &local) in arm.bindings.iter().enumerate() {
-            // Extract the payload field into a value, then store it into the binding local's slot.
-            let pty = b.slots[local as usize];
-            let pv = b.fresh_value(pty);
-            b.push(Stmt::Let(pv, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() }));
-            b.push(Stmt::Store(local, Operand::Value(pv)));
-        }
+/// Builtin `Option`/`Result` (exactly two variants): one boolean branch on `IsSome`/`IsOk`, the
+/// `true` edge to the Some/Ok arm and `false` to the None/Err arm. Variant 0 = Some/Ok, 1 = None/Err
+/// (matching `match_variants`); either side may be the `_` wildcard.
+fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId) {
+    let wild = arms.iter().find(|a| a.variant.is_none());
+    let pos = arms.iter().find(|a| a.variant == Some(0)).or(wild).expect("exhaustive (sema)");
+    let neg = arms.iter().find(|a| a.variant == Some(1)).or(wild).expect("exhaustive (sema)");
+    // A lone `_` covers both variants — no test needed.
+    if std::ptr::eq(pos, neg) {
+        finish_arm(b, &pos.body, result_slot, join_bb);
+        return;
     }
-    let av = lower_expr(b, &arm.body);
+    let cond = b.fresh_value(Ty::Bool);
+    let test = match ty {
+        Ty::Option(_) => Rvalue::OptionIsSome(scrut.clone()),
+        _ => Rvalue::ResultIsOk(scrut.clone()),
+    };
+    b.push(Stmt::Let(cond, test));
+    let pos_bb = b.new_block();
+    let neg_bb = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(cond), pos_bb, neg_bb));
+    b.cur = pos_bb;
+    bind_binary(b, ty, true, pos, scrut);
+    finish_arm(b, &pos.body, result_slot, join_bb);
+    b.cur = neg_bb;
+    bind_binary(b, ty, false, neg, scrut);
+    finish_arm(b, &neg.body, result_slot, join_bb);
+}
+
+/// Bind the payload of an `Option`/`Result` arm: Some/Ok → the unwrapped value, Err → the error;
+/// None (and any `_` wildcard) binds nothing.
+fn bind_binary(b: &mut Builder, ty: Ty, is_pos: bool, arm: &hir::MatchArm, scrut: &Operand) {
+    if arm.variant.is_none() || arm.bindings.is_empty() {
+        return;
+    }
+    let rv = match (ty, is_pos) {
+        (Ty::Option(_), true) => Rvalue::OptionUnwrap(scrut.clone()),
+        (Ty::Result(..), true) => Rvalue::ResultUnwrapOk(scrut.clone()),
+        (Ty::Result(..), false) => Rvalue::ResultUnwrapErr(scrut.clone()),
+        _ => return,
+    };
+    bind_local(b, arm.bindings[0], rv);
+}
+
+/// Compute an rvalue into a fresh value and store it into a binding local's slot.
+fn bind_local(b: &mut Builder, local: u32, rv: Rvalue) {
+    let pty = b.slots[local as usize];
+    let pv = b.fresh_value(pty);
+    b.push(Stmt::Let(pv, rv));
+    b.push(Stmt::Store(local, Operand::Value(pv)));
+}
+
+/// Lower an arm body and, unless it diverged, store the value into the result slot and jump to join.
+fn finish_arm(b: &mut Builder, body: &hir::Expr, result_slot: Option<Slot>, join_bb: BlockId) {
+    let av = lower_expr(b, body);
     if !b.is_terminated() {
         if let Some(slot) = result_slot {
             b.push(Stmt::Store(slot, av));

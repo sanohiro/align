@@ -1,0 +1,12 @@
+// `match` works on the builtin Option / Result too (slice S3) — the same exhaustive match used for
+// user sum types. `else`-unwrap and `?` remain the ergonomic shorthands for the common cases.
+fn classify(r: Result<i32, Error>) -> i32 = match r {
+  Ok(v)  => v * 2,
+  Err(e) => 0,
+}
+
+fn main() -> i32 {
+  ok := classify(Ok(21))      // 42
+  bad := classify(Err(error(1)))   // 0
+  return ok + bad
+}

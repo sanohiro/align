@@ -133,6 +133,37 @@ fn non_primitive_payload_rejected() {
 }
 
 #[test]
+fn match_on_option() {
+    if !backend_available() {
+        return;
+    }
+    // S3: `match` works on the builtin `Option`, binding the `Some` payload.
+    let src = "fn unwrap_or(o: Option<i32>, d: i32) -> i32 = match o {\n  Some(x) => x,\n  None    => d,\n}\nfn main() -> i32 {\n  return unwrap_or(Some(40), 0) + unwrap_or(None, 2)\n}\n";
+    let out = build_and_run("match-option", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn match_on_result_arm_order_and_wildcard() {
+    if !backend_available() {
+        return;
+    }
+    // `match` on `Result`; `Err`-first arm order (the 2-way branch is order-independent) and a
+    // wildcard covering the error case.
+    let src = "fn code(r: Result<i32, Error>) -> i32 = match r {\n  Err(e) => 99,\n  Ok(v)  => v,\n}\nfn first_ok(r: Result<i32, Error>) -> i32 = match r {\n  Ok(v) => v,\n  _     => -1,\n}\nfn main() -> i32 {\n  return code(Ok(20)) + first_ok(Ok(22))\n}\n";
+    let out = build_and_run("match-result", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn match_option_non_exhaustive_rejected() {
+    assert!(check_errs(
+        "match-opt-nonexhaustive",
+        "fn f(o: Option<i32>) -> i32 = match o { Some(x) => x }\nfn main() -> i32 { return f(None) }\n"
+    ));
+}
+
+#[test]
 fn non_exhaustive_rejected() {
     // Every variant must be covered (or a `_`); a missing variant is a compile error.
     assert!(check_errs(
