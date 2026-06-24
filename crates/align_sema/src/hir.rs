@@ -51,6 +51,8 @@ pub struct Program {
     pub fns: Vec<Fn>,
     /// Struct definitions, indexed by the id carried in [`crate::Ty::Struct`].
     pub structs: Vec<StructDef>,
+    /// Sum-type definitions, indexed by the id carried in [`crate::Ty::Enum`].
+    pub enums: Vec<EnumDef>,
     /// Anonymous tuple types, indexed by the id carried in [`crate::Ty::Tuple`]. Interned
     /// (deduplicated by element list) during checking, so `(i64, i64)` is one entry.
     pub tuples: Vec<TupleDef>,
@@ -68,12 +70,26 @@ pub struct FnTy {
     pub ret: crate::Scalar,
 }
 
+/// One checked `match` arm. `variant` = the covered variant tag, or `None` for the `_` wildcard.
+#[derive(Clone, Debug)]
+pub struct MatchArm {
+    pub variant: Option<u32>,
+    pub body: Expr,
+}
+
 #[derive(Clone, Debug)]
 pub struct TupleDef {
     /// Element types in positional order (`t.0`, `t.1`, …). PR1 cut: primitive scalars only
     /// (int/float/bool/char) — all Copy / `Static`, so a tuple needs no drop or region tracking
     /// yet; owned (`string`/`array<T>`) and `str` elements are a later, additive slice.
     pub elems: Vec<crate::Scalar>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EnumDef {
+    pub name: String,
+    /// Variant names in declaration order; the index is the tag. S1a: tag-only (no payloads).
+    pub variants: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +227,12 @@ pub enum ExprKind {
     },
     /// `task_group { … }` — a structured concurrency scope (slice ④). ④a lowers it as its block.
     TaskGroup(Block),
+    /// `Type.Variant` — a sum-type value (S1a: tag-only). `enum_id` indexes `Program.enums`,
+    /// `variant` is the tag (index into that enum's variants).
+    EnumValue { enum_id: u32, variant: u32 },
+    /// `match scrutinee { … }` — exhaustive match over a sum type. `arms` are in source order; a
+    /// `variant` of `None` is the `_` wildcard. The expression's value is the matched arm's value.
+    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },
     /// `spawn(fn { … })` — defer a task; `closure` is the spawned closure value. `fallible` = the
     /// closure returns `Result<R, Error>` (so its `Err` is surfaced by `wait()?`); the task's
     /// result type is `Task<R>` (the `Ok` payload) either way.

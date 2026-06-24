@@ -37,6 +37,23 @@ pub enum Vis {
 pub enum Item {
     Fn(FnDecl),
     Struct(StructDecl),
+    Enum(EnumDecl),
+}
+
+/// A keyword-less sum type — a body of bare `Variant` / `Variant(payload…)` (not `field: Type`).
+/// S1a: tag-only variants (no payloads yet).
+#[derive(Clone, Debug)]
+pub struct EnumDecl {
+    pub vis: Vis,
+    pub name: Ident,
+    pub variants: Vec<VariantDef>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct VariantDef {
+    pub name: Ident,
+    pub span: Span,
 }
 
 /// A keyword-less type declaration whose body is all `name: Type` fields → a struct
@@ -71,6 +88,21 @@ pub struct Param {
     pub is_out: bool,
     pub name: Ident,
     pub ty: Type,
+}
+
+/// One arm of a `match`: `pattern => body`.
+#[derive(Clone, Debug)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub body: Box<Expr>,
+    pub span: Span,
+}
+
+/// A `match` arm pattern. S1a: an (unqualified) variant name or the `_` wildcard.
+#[derive(Clone, Debug)]
+pub enum MatchPattern {
+    Variant(Ident),
+    Wildcard(Span),
 }
 
 /// A lambda parameter: a name with an optional type annotation (`x` or `x: T`). The type is
@@ -251,6 +283,12 @@ pub enum ExprKind {
     Lambda {
         params: Vec<LambdaParam>,
         body: Block,
+    },
+    /// `match scrutinee { Variant => expr, _ => expr }` — an exhaustive match over a sum type.
+    /// An expression: every arm's value is the match's value.
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
     },
     /// `(e0, e1, ...)` — a tuple value (arity ≥ 2; `()` is `Unit`, `(e)` is just `e`).
     Tuple(Vec<Expr>),
