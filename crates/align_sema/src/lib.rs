@@ -77,8 +77,9 @@ pub enum Scalar {
     /// (`tracks_region`), exactly the struct-with-`str`-field rule extended to scalars. Unlike
     /// `String`, it is never dropped (it borrows). A `box<str>` is rejected (a view is not boxable).
     Str,
-    /// The M2 `Error` type — an opaque i32 error code (placeholder for the eventual
-    /// Error sum type; see `open-questions.md`).
+    /// Vestigial (4b-2): the `Error` type is now the builtin sum-type enum (`Scalar::Enum`). This
+    /// remains only as an i32-status alias inside the runtime-builtin lowerings (the raw code a
+    /// `fs`/`json` call returns, before it is wrapped into `Error.Code`); removable in a follow-up.
     ErrCode,
     /// A sum-type payload (the enum's id) — a Copy tagged struct, like [`Scalar::Struct`]. Lets
     /// `Option`/`Result` carry an enum, notably `Result<T, MyError>` (4b). Non-recursive (just the
@@ -409,6 +410,10 @@ enum Place {
     Err,
 }
 
+/// The tag of the builtin `Error` enum's `Code(i32)` variant (the generic error-code category).
+/// Must match the variant order registered in `check_file`.
+pub const ERROR_VARIANT_CODE: u32 = 3;
+
 /// Analyze a file into a typed program. Errors are pushed to `diags`.
 pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // Pass 0a: assign an id to every struct name (so field/sig types can refer to them
@@ -420,6 +425,9 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     for item in &file.items {
         match item {
             ast::Item::Struct(s) => {
+                if s.name.name == "Error" {
+                    diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), s.span);
+                }
                 if struct_ids.insert(s.name.name.clone(), struct_decls.len() as u32).is_some()
                     || enum_ids.contains_key(&s.name.name)
                 {
@@ -428,6 +436,9 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 struct_decls.push(s);
             }
             ast::Item::Enum(e) => {
+                if e.name.name == "Error" {
+                    diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), e.span);
+                }
                 if enum_ids.insert(e.name.name.clone(), enum_decls.len() as u32).is_some()
                     || struct_ids.contains_key(&e.name.name)
                 {
@@ -476,6 +487,26 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         }
         enums.push(hir::EnumDef { name: e.name.name.clone(), variants });
     }
+
+    // The canonical builtin `Error` sum type (4b-2): universal categories + a generic `Code(i32)`
+    // (the variant order must match `ERROR_VARIANT_CODE`). Registered after the user enums; `Error`
+    // is a reserved type name (rejected in pass 0a). Every fallible builtin and `Result<_, Error>`
+    // use this enum.
+    let error_enum_id = enums.len() as u32;
+    enum_ids.insert("Error".to_string(), error_enum_id);
+    enums.push(hir::EnumDef {
+        name: "Error".to_string(),
+        variants: vec![
+            hir::EnumVariant { name: "NotFound".to_string(), payload: Vec::new(), field_base: 1 },
+            hir::EnumVariant { name: "Invalid".to_string(), payload: Vec::new(), field_base: 1 },
+            hir::EnumVariant { name: "Denied".to_string(), payload: Vec::new(), field_base: 1 },
+            hir::EnumVariant {
+                name: "Code".to_string(),
+                payload: vec![Scalar::Int(IntTy { bits: 32, signed: true })],
+                field_base: 1,
+            },
+        ],
+    });
 
     // Pass 0b: resolve field types. M1 restricts struct fields to primitives.
     let mut structs: Vec<StructDef> = Vec::with_capacity(struct_decls.len());
@@ -566,6 +597,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             struct_ids: &struct_ids,
             enum_ids: &enum_ids,
             enums: &enums,
+            error_enum_id,
             structs: &structs,
             tuples: &mut tuples,
             fn_types: &mut fn_types,
@@ -1753,6 +1785,8 @@ struct Checker<'a, 't> {
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
     enums: &'a [hir::EnumDef],
+    /// The id of the builtin `Error` enum (so `Result<_, Error>` builtins build the right payload).
+    error_enum_id: u32,
     structs: &'a [StructDef],
     /// The shared tuple-type interner (anonymous `(T, U, …)` types). A separate lifetime from
     /// `'a` so each per-function `Checker` can reborrow it mutably without conflicting with the
@@ -1970,7 +2004,7 @@ impl<'a, 't> Checker<'a, 't> {
         // argv into (an `-> i32` argv `main` is a later follow-up).
         if f.name.name == "main" && !f.params.is_empty() {
             let args_ok = param_tys.as_slice() == [Ty::DynArray(Scalar::Str)]
-                && matches!(ret, Ty::Result(Scalar::Unit, Scalar::ErrCode));
+                && matches!(ret, Ty::Result(Scalar::Unit, Scalar::Enum(eid)) if eid == self.error_enum_id);
             if !args_ok {
                 self.diags.error(
                     "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return".to_string(),
@@ -2890,9 +2924,9 @@ impl<'a, 't> Checker<'a, 't> {
         // `Task<ok>`; a primitive scalar → an infallible task, `Task<scalar>`. The result is stored
         // in a `box` in the region, so `ok` must be a box-able primitive (owned/view results are a
         // later slice).
-        let is_prim = |s: Scalar| matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Unit | Scalar::ErrCode);
+        let is_prim = |s: Scalar| matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Unit);
         let (ok, fallible) = match self.finalize(ret) {
-            Ty::Result(o, Scalar::ErrCode) if is_prim(o) => (o, true),
+            Ty::Result(o, Scalar::Enum(eid)) if eid == self.error_enum_id && is_prim(o) => (o, true),
             // A type error in the lambda body was already reported — don't cascade.
             Ty::Error => return err,
             other => match ty_to_scalar(other) {
@@ -2943,7 +2977,7 @@ impl<'a, 't> Checker<'a, 't> {
             // *successful* `wait()` — i.e. `wait()?` (the `Try` sets the wait-state); a bare `wait()`
             // whose `Err` is ignored leaves failed tasks' slots uninitialised, so it does NOT enable
             // `get()` here.
-            Expr { kind: ExprKind::Wait, ty: Ty::Result(Scalar::Unit, Scalar::ErrCode), span }
+            Expr { kind: ExprKind::Wait, ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)), span }
         } else {
             // Infallible group: `wait()` joins and yields `()`; all results are now readable.
             if let Some(w) = self.wait_state.last_mut() {
@@ -4585,7 +4619,7 @@ impl<'a, 't> Checker<'a, 't> {
                 let input = self.check_str_init(&args[0]);
                 return Expr {
                     kind: ExprKind::JsonDecodeArray { elem, input: Box::new(input) },
-                    ty: Ty::Result(Scalar::DynArray(prim), Scalar::ErrCode),
+                    ty: Ty::Result(Scalar::DynArray(prim), Scalar::Enum(self.error_enum_id)),
                     span,
                 };
             }
@@ -4602,7 +4636,7 @@ impl<'a, 't> Checker<'a, 't> {
                 let input = self.check_str_init(&args[0]);
                 return Expr {
                     kind: ExprKind::JsonDecodeStructArray { struct_id: id, input: Box::new(input) },
-                    ty: Ty::Result(Scalar::DynStructArray(id), Scalar::ErrCode),
+                    ty: Ty::Result(Scalar::DynStructArray(id), Scalar::Enum(self.error_enum_id)),
                     span,
                 };
             }
@@ -4623,7 +4657,7 @@ impl<'a, 't> Checker<'a, 't> {
         let input = self.check_str_init(&args[0]);
         Expr {
             kind: ExprKind::JsonDecode { struct_id: sid, input: Box::new(input) },
-            ty: Ty::Result(Scalar::Struct(sid), Scalar::ErrCode),
+            ty: Ty::Result(Scalar::Struct(sid), Scalar::Enum(self.error_enum_id)),
             span,
         }
     }
@@ -4778,7 +4812,7 @@ impl<'a, 't> Checker<'a, 't> {
         let path = self.check_str_init(&args[0]);
         Expr {
             kind: ExprKind::FsReadFile { path: Box::new(path) },
-            ty: Ty::Result(Scalar::String, Scalar::ErrCode),
+            ty: Ty::Result(Scalar::String, Scalar::Enum(self.error_enum_id)),
             span,
         }
     }
@@ -4792,7 +4826,7 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'io.stdout.write' expects 1 argument, got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let result_ty = Ty::Result(Scalar::Unit, Scalar::ErrCode);
+        let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
         // The argument is written as bytes: a `builder` (its accumulated bytes, written directly —
         // no `to_string()` materialization), or a `str` / owned `string` (auto-borrowed). The
         // builder is *borrowed* (not consumed), so it is still usable / dropped normally after.
@@ -4900,19 +4934,19 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// Builtin `error(code)` → an `Error` value (M2: an i32 code).
+    /// Builtin `error(code)` — sugar for `Error.Code(code)` (the generic error category).
     fn check_error_ctor(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let ty = Ty::Enum(self.error_enum_id);
         if args.len() != 1 {
-            self.diags
-                .error(format!("'error' takes 1 argument, got {}", args.len()), span);
+            self.diags.error(format!("'error' takes 1 argument, got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let arg = args
-            .first()
-            .map(|a| self.check_expr(a, Some(Ty::Int(IntTy { bits: 32, signed: true }))));
-        let args_hir = arg.into_iter().collect();
-        // Lower as a plain call to the runtime-less builtin; codegen treats `error` as
-        // identity on the i32 code, but the Align type is `Error`.
-        Expr { kind: ExprKind::Call { func: "error".to_string(), args: args_hir }, ty: Ty::ErrCode, span }
+        let arg = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 32, signed: true })));
+        Expr {
+            kind: ExprKind::EnumValue { enum_id: self.error_enum_id, variant: ERROR_VARIANT_CODE, payload: vec![arg] },
+            ty,
+            span,
+        }
     }
 
     /// Builtins `Ok(x)` / `Err(e)`. Both payload types come from the expected
@@ -5542,7 +5576,7 @@ fn resolve_type(
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
-        "Error" => Ty::ErrCode,
+        // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {
             let inner = match args {
                 [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
