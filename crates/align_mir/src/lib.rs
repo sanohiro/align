@@ -2445,6 +2445,12 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
 /// `match scrutinee { … }` (tag-only, S1a): test the scrutinee's tag against each arm's variant
 /// and branch to its body (storing into a result slot), defaulting to the `_`/last arm.
 fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], ty: Ty) -> Operand {
+    // A zero-arm `match` is already a (non-exhaustive) sema error; lower the scrutinee for its
+    // effects and yield unit so we never panic on `arms.len() - 1` / `arms[default_idx]`.
+    if arms.is_empty() {
+        lower_expr(b, scrutinee);
+        return Operand::Const(Const::Unit);
+    }
     let result_slot = (ty != Ty::Unit).then(|| b.new_slot(ty));
     let enum_ty = scrutinee.ty;
     let tag = lower_expr(b, scrutinee);
