@@ -1095,7 +1095,7 @@ fn i64_ty() -> Ty {
     Ty::Int(IntTy { bits: 64, signed: true })
 }
 
-/// The i32 status code a runtime builtin (`fs`/`json`) returns, before it is wrapped into
+/// The i32 status code a runtime builtin (`fs`/`json`/`io`) returns, before it is wrapped into
 /// `Error.Code`.
 fn status_ty() -> Ty {
     Ty::Int(IntTy { bits: 32, signed: true })
