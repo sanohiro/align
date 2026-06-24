@@ -2515,30 +2515,44 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
 /// A user `enum`: test the scrutinee's tag against each arm's variant and branch to its body,
 /// defaulting to the `_`/last arm.
 fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId) {
-    let default_idx = arms.iter().position(|a| a.variant.is_none()).unwrap_or(arms.len() - 1);
+    // The default arm is the `_` wildcard (no variants); absent it, the last arm — exhaustiveness
+    // guarantees the scrutinee must be one of its variants by the time control reaches it.
+    let default_idx = arms.iter().position(|a| a.variants.is_empty()).unwrap_or(arms.len() - 1);
+    // Bind a single-variant arm's payload (an or-pattern / wildcard binds nothing).
+    let bind_payload = |b: &mut Builder, arm: &hir::MatchArm| {
+        if let [v] = arm.variants[..] {
+            for (slot, &local) in arm.bindings.iter().enumerate() {
+                bind_local(b, local, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() });
+            }
+        }
+    };
     for (i, arm) in arms.iter().enumerate() {
         if i == default_idx {
             continue;
         }
-        let v = arm.variant.expect("a non-default match arm has a variant");
-        let eq = b.fresh_value(Ty::Bool);
-        b.push(Stmt::Let(eq, Rvalue::EnumTagEq { enum_id, scrutinee: scrut.clone(), variant: v }));
         let arm_bb = b.new_block();
         let next_bb = b.new_block();
-        b.terminate(Term::Branch(Operand::Value(eq), arm_bb, next_bb));
-        b.cur = arm_bb;
-        for (slot, &local) in arm.bindings.iter().enumerate() {
-            bind_local(b, local, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() });
+        // Branch into the arm if the scrutinee's tag equals ANY of the arm's variants (an
+        // or-pattern tests them in sequence, each falling through to the next on a miss).
+        let n = arm.variants.len();
+        for (k, &v) in arm.variants.iter().enumerate() {
+            let eq = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(eq, Rvalue::EnumTagEq { enum_id, scrutinee: scrut.clone(), variant: v }));
+            if k + 1 == n {
+                b.terminate(Term::Branch(Operand::Value(eq), arm_bb, next_bb));
+            } else {
+                let try_next = b.new_block();
+                b.terminate(Term::Branch(Operand::Value(eq), arm_bb, try_next));
+                b.cur = try_next;
+            }
         }
+        b.cur = arm_bb;
+        bind_payload(b, arm);
         finish_arm(b, &arm.body, result_slot, join_bb);
         b.cur = next_bb;
     }
     let d = &arms[default_idx];
-    if let Some(v) = d.variant {
-        for (slot, &local) in d.bindings.iter().enumerate() {
-            bind_local(b, local, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() });
-        }
-    }
+    bind_payload(b, d);
     finish_arm(b, &d.body, result_slot, join_bb);
 }
 
@@ -2546,9 +2560,9 @@ fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut
 /// `true` edge to the Some/Ok arm and `false` to the None/Err arm. Variant 0 = Some/Ok, 1 = None/Err
 /// (matching `match_variants`); either side may be the `_` wildcard.
 fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId) {
-    let wild = arms.iter().find(|a| a.variant.is_none());
-    let pos = arms.iter().find(|a| a.variant == Some(0)).or(wild).expect("exhaustive (sema)");
-    let neg = arms.iter().find(|a| a.variant == Some(1)).or(wild).expect("exhaustive (sema)");
+    let wild = arms.iter().find(|a| a.variants.is_empty());
+    let pos = arms.iter().find(|a| a.variants.contains(&0)).or(wild).expect("exhaustive (sema)");
+    let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
     // A lone `_` covers both variants — no test needed.
     if std::ptr::eq(pos, neg) {
         finish_arm(b, &pos.body, result_slot, join_bb);
@@ -2574,7 +2588,8 @@ fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &O
 /// Bind the payload of an `Option`/`Result` arm: Some/Ok → the unwrapped value, Err → the error;
 /// None (and any `_` wildcard) binds nothing.
 fn bind_binary(b: &mut Builder, ty: Ty, is_pos: bool, arm: &hir::MatchArm, scrut: &Operand) {
-    if arm.variant.is_none() || arm.bindings.is_empty() {
+    // A wildcard / or-pattern arm binds nothing (no bindings); only a single Some/Ok/Err arm does.
+    if arm.bindings.is_empty() {
         return;
     }
     let rv = match (ty, is_pos) {

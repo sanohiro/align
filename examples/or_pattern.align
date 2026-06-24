@@ -1,0 +1,16 @@
+// Or-patterns (sum types S4): one arm matches any of several variants — `A | B`. An or-pattern
+// binds nothing; a payload variant may appear (its payload is not bound). Two or-patterns can
+// partition all variants, so no `_` is needed and the match stays exhaustive.
+
+Signal { Red, Yellow, Green, Off }
+
+fn rank(s: Signal) -> i32 = match s {
+  Red | Yellow => 1
+  Green => 2
+  _ => 0
+}
+
+fn main() -> i32 {
+  // 1 (Yellow) + 2 (Green) + 0 (Off) = 3
+  return rank(Signal.Yellow) + rank(Signal.Green) + rank(Signal.Off)
+}

@@ -859,6 +859,14 @@ impl<'a> Parser<'a> {
             let id = self.parse_ident("match pattern (a variant name or `_`)")?;
             let pattern = if id.name == "_" {
                 MatchPattern::Wildcard(id.span)
+            } else if self.at(&TokKind::Pipe) {
+                // Or-pattern: `A | B | ...` — bare variant names, no bindings.
+                let mut variants = vec![id];
+                while self.eat(&TokKind::Pipe) {
+                    self.skip_ends();
+                    variants.push(self.parse_ident("a variant name in an or-pattern")?);
+                }
+                MatchPattern::Or { span: variants[0].span.merge(self.prev_span()), variants }
             } else {
                 // Optional positional payload bindings: `Circle(r)`, `Rect(w, h)`.
                 let mut bindings = Vec::new();
@@ -874,6 +882,18 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(&TokKind::RParen, "')'");
+                    if self.at(&TokKind::Pipe) {
+                        self.diags.error(
+                            "an or-pattern cannot bind a payload; list bare variant names (`A | B`) or use separate arms".to_string(),
+                            self.span(),
+                        );
+                        // Recover: consume the rest of the (invalid) or-pattern tail so parsing
+                        // resumes at `=>` rather than cascading into an "expected '=>'" error.
+                        while self.eat(&TokKind::Pipe) {
+                            self.skip_ends();
+                            let _ = self.parse_ident("a variant name in an or-pattern");
+                        }
+                    }
                 }
                 MatchPattern::Variant { name: id, bindings }
             };

@@ -5192,50 +5192,68 @@ impl<'a, 't> Checker<'a, 't> {
         for arm in arms {
             // Payload bindings are scoped to this arm only — snapshot the scope and restore after.
             let scope_mark = self.scope.len();
-            let (variant, bindings) = match &arm.pattern {
+            // Mark a variant covered, diagnosing a duplicate; returns its tag index, or None if the
+            // name is not a variant of the scrutinee type (a hard error).
+            let mut cover = |me: &mut Self, name: &ast::Ident| -> Option<u32> {
+                match variants.iter().position(|(vn, _)| vn == &name.name) {
+                    Some(idx) => {
+                        if covered[idx] {
+                            me.diags.error(format!("duplicate arm for variant '{}'", name.name), name.span);
+                        }
+                        covered[idx] = true;
+                        Some(idx as u32)
+                    }
+                    None => {
+                        me.diags.error(format!("'{}' is not a variant of '{}'", name.name, type_name), name.span);
+                        None
+                    }
+                }
+            };
+            let (variant_tags, bindings) = match &arm.pattern {
                 ast::MatchPattern::Wildcard(_) => {
                     if has_wildcard {
                         self.diags.error("duplicate `_` arm".to_string(), arm.span);
                     }
                     has_wildcard = true;
-                    (None, Vec::new())
+                    (Vec::new(), Vec::new())
+                }
+                ast::MatchPattern::Or { variants: names, .. } => {
+                    // Bare variant names, no bindings. A payload variant may appear (its payload is
+                    // not bound). Each must be a real, not-yet-covered variant.
+                    let tags = names
+                        .iter()
+                        .filter_map(|n| cover(self, n))
+                        .collect::<Vec<_>>();
+                    if tags.len() != names.len() {
+                        return err;
+                    }
+                    (tags, Vec::new())
                 }
                 ast::MatchPattern::Variant { name, bindings } => {
-                    match variants.iter().position(|(vn, _)| vn == &name.name) {
-                        Some(idx) => {
-                            if covered[idx] {
-                                self.diags.error(format!("duplicate arm for variant '{}'", name.name), arm.span);
-                            }
-                            covered[idx] = true;
-                            let payload = &variants[idx].1;
-                            if bindings.len() != payload.len() {
-                                self.diags.error(
-                                    format!("variant '{}' binds {} value(s), got {}", name.name, payload.len(), bindings.len()),
-                                    arm.span,
-                                );
-                            }
-                            // Declare each binding (typed by the matching payload scalar) so the arm
-                            // body resolves even when the count is wrong. Binding names must be
-                            // distinct — `Rect(w, w)` would otherwise silently shadow.
-                            let mut seen_bindings = std::collections::HashSet::new();
-                            let locals = bindings
-                                .iter()
-                                .enumerate()
-                                .map(|(i, b)| {
-                                    if !seen_bindings.insert(&b.name) {
-                                        self.diags.error(format!("duplicate binding '{}' in pattern", b.name), b.span);
-                                    }
-                                    let ty = payload.get(i).map(|&s| scalar_to_ty(s)).unwrap_or(Ty::Error);
-                                    self.declare(&b.name, ty, false)
-                                })
-                                .collect();
-                            (Some(idx as u32), locals)
-                        }
-                        None => {
-                            self.diags.error(format!("'{}' is not a variant of '{}'", name.name, type_name), name.span);
-                            return err;
-                        }
+                    let Some(idx) = cover(self, name) else { return err };
+                    let payload = &variants[idx as usize].1;
+                    if bindings.len() != payload.len() {
+                        self.diags.error(
+                            format!("variant '{}' binds {} value(s), got {}", name.name, payload.len(), bindings.len()),
+                            arm.span,
+                        );
                     }
+                    // Declare each binding (typed by the matching payload scalar) so the arm
+                    // body resolves even when the count is wrong. Binding names must be
+                    // distinct — `Rect(w, w)` would otherwise silently shadow.
+                    let mut seen_bindings = std::collections::HashSet::new();
+                    let locals = bindings
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| {
+                            if !seen_bindings.insert(&b.name) {
+                                self.diags.error(format!("duplicate binding '{}' in pattern", b.name), b.span);
+                            }
+                            let ty = payload.get(i).map(|&s| scalar_to_ty(s)).unwrap_or(Ty::Error);
+                            self.declare(&b.name, ty, false)
+                        })
+                        .collect();
+                    (vec![idx], locals)
                 }
             };
             // Each arm body is checked against the running result type, so the constraint (and any
@@ -5245,7 +5263,7 @@ impl<'a, 't> Checker<'a, 't> {
                 result_ty = Some(body.ty);
             }
             self.scope.truncate(scope_mark);
-            checked.push(hir::MatchArm { variant, bindings, body });
+            checked.push(hir::MatchArm { variants: variant_tags, bindings, body });
         }
         // Exhaustiveness: every variant covered, or a `_` wildcard present.
         if !has_wildcard {

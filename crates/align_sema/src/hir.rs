@@ -70,11 +70,12 @@ pub struct FnTy {
     pub ret: crate::Scalar,
 }
 
-/// One checked `match` arm. `variant` = the covered variant tag, or `None` for the `_` wildcard.
-/// `bindings` are the locals bound to the variant's payload (one per payload slot, in order).
+/// One checked `match` arm. `variants` = the covered variant tags: empty = the `_` wildcard, one
+/// = a simple arm, many = an or-pattern (`A | B`). `bindings` are the locals bound to the variant's
+/// payload (one per payload slot, in order); an or-pattern / wildcard binds nothing.
 #[derive(Clone, Debug)]
 pub struct MatchArm {
-    pub variant: Option<u32>,
+    pub variants: Vec<u32>,
     pub bindings: Vec<crate::LocalId>,
     pub body: Expr,
 }
