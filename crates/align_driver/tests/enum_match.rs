@@ -164,6 +164,39 @@ fn match_option_non_exhaustive_rejected() {
 }
 
 #[test]
+fn enum_as_result_error_type() {
+    if !backend_available() {
+        return;
+    }
+    // 4b foundation: a user sum type as the `E` in `Result<T, E>` — construct `Err(MyError.X)`,
+    // `match` the Result, and `match` the error enum itself.
+    let src = "MyError { NotFound, Io(i32) }\nfn find(ok: bool) -> Result<i32, MyError> {\n  if ok { return Ok(42) }\n  return Err(MyError.Io(5))\n}\nfn handle(r: Result<i32, MyError>) -> i32 = match r {\n  Ok(v)  => v,\n  Err(e) => match e { NotFound => -1, Io(code) => code },\n}\nfn main() -> i32 {\n  return handle(find(true)) + handle(find(false))\n}\n";
+    let out = build_and_run("enum-result-err", src);
+    assert_eq!(out.status.code(), Some(47));
+}
+
+#[test]
+fn enum_error_propagated_with_question() {
+    if !backend_available() {
+        return;
+    }
+    // `?` propagates a user enum error type (same `E` through the call chain).
+    let src = "E { Bad }\nfn inner(ok: bool) -> Result<i32, E> {\n  if ok { return Ok(7) }\n  return Err(E.Bad)\n}\nfn outer(ok: bool) -> Result<i32, E> {\n  v := inner(ok)?\n  return Ok(v + 1)\n}\nfn main() -> i32 = match outer(true) { Ok(v) => v, Err(e) => -1 }\n";
+    let out = build_and_run("enum-result-q", src);
+    assert_eq!(out.status.code(), Some(8));
+}
+
+#[test]
+fn enum_as_option_payload() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Color { Red, Green }\nfn pick(some: bool) -> Option<Color> {\n  if some { return Some(Color.Green) }\n  return None\n}\nfn main() -> i32 = match pick(true) {\n  Some(c) => match c { Red => 1, Green => 2 },\n  None    => 0,\n}\n";
+    let out = build_and_run("enum-option", src);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
 fn non_exhaustive_rejected() {
     // Every variant must be covered (or a `_`); a missing variant is a compile error.
     assert!(check_errs(

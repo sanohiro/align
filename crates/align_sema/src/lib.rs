@@ -80,6 +80,10 @@ pub enum Scalar {
     /// The M2 `Error` type — an opaque i32 error code (placeholder for the eventual
     /// Error sum type; see `open-questions.md`).
     ErrCode,
+    /// A sum-type payload (the enum's id) — a Copy tagged struct, like [`Scalar::Struct`]. Lets
+    /// `Option`/`Result` carry an enum, notably `Result<T, MyError>` (4b). Non-recursive (just the
+    /// id), so `Scalar` stays `Copy`.
+    Enum(u32),
 }
 
 impl Scalar {
@@ -232,6 +236,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::DynStructArray(id, Layout::Aos) => Some(Scalar::DynStructArray(id)),
         Ty::Str => Some(Scalar::Str),
         Ty::ErrCode => Some(Scalar::ErrCode),
+        // A sum type is a Copy value (a tagged struct of Copy fields), so it can be an
+        // Option/Result payload — notably `Result<T, MyError>` with a user error enum (4b).
+        Ty::Enum(id) => Some(Scalar::Enum(id)),
         _ => None,
     }
 }
@@ -249,6 +256,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::DynStructArray(id) => Ty::DynStructArray(id, Layout::Aos),
         Scalar::Str => Ty::Str,
         Scalar::ErrCode => Ty::ErrCode,
+        Scalar::Enum(id) => Ty::Enum(id),
     }
 }
 

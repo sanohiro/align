@@ -1,0 +1,22 @@
+// Errors are sum types (4b): a user-defined error enum as the `E` in `Result<T, E>`. Construct it
+// with `Err(MyError.Variant)`, propagate with `?` (same `E`), and `match` it exhaustively.
+FileError { NotFound, Permission, Io(i32) }
+
+fn open(id: i32) -> Result<i32, FileError> {
+  if id == 0 { return Err(FileError.NotFound) }
+  if id < 0  { return Err(FileError.Io(id)) }
+  return Ok(id)
+}
+
+fn exit_code(r: Result<i32, FileError>) -> i32 = match r {
+  Ok(fd) => fd,
+  Err(e) => match e {
+    NotFound   => 1,
+    Permission => 2,
+    Io(code)   => code,
+  },
+}
+
+fn main() -> i32 {
+  return exit_code(open(40))   // Ok(40) → 40
+}

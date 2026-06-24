@@ -576,7 +576,7 @@ fn build_module<'c>(
         if *fallible {
             // The closure returns `Result<R, Error>` = `{ i8 tag, R ok, i32 err }` (tag 0 = Ok).
             let ok_s = ty_to_scalar(*r).ok_or_else(|| CodegenError::Lowering("fallible task Ok is not a scalar".into()))?;
-            let result_ty = result_struct_type(ctx, ok_s, Scalar::ErrCode, &struct_types);
+            let result_ty = result_struct_type(ctx, ok_s, Scalar::ErrCode, &struct_types, &enum_types);
             let agg = tb
                 .build_indirect_call(result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
                 .map_err(lower)?
@@ -803,17 +803,17 @@ fn move_payload_fields(ty: Ty) -> impl Iterator<Item = u32> {
 }
 
 /// `Option<T>` lowers to `{ i8 tag, T value }` (tag 1 = Some, 0 = None).
-fn option_struct_type<'c>(ctx: &'c Context, s: Scalar, sx: &[StructType<'c>]) -> StructType<'c> {
-    ctx.struct_type(&[ctx.i8_type().into(), scalar_type(ctx, scalar_to_ty(s), sx, &[])], false)
+fn option_struct_type<'c>(ctx: &'c Context, s: Scalar, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> StructType<'c> {
+    ctx.struct_type(&[ctx.i8_type().into(), scalar_type(ctx, scalar_to_ty(s), sx, ex)], false)
 }
 
 /// `Result<T, E>` lowers to `{ i8 tag, T ok, E err }` (tag 0 = Ok, 1 = Err).
-fn result_struct_type<'c>(ctx: &'c Context, ok: Scalar, err: Scalar, sx: &[StructType<'c>]) -> StructType<'c> {
+fn result_struct_type<'c>(ctx: &'c Context, ok: Scalar, err: Scalar, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> StructType<'c> {
     ctx.struct_type(
         &[
             ctx.i8_type().into(),
-            scalar_type(ctx, scalar_to_ty(ok), sx, &[]),
-            scalar_type(ctx, scalar_to_ty(err), sx, &[]),
+            scalar_type(ctx, scalar_to_ty(ok), sx, ex),
+            scalar_type(ctx, scalar_to_ty(err), sx, ex),
         ],
         false,
     )
@@ -835,8 +835,8 @@ fn closure_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
 /// and structs/struct-arrays by value).
 fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> BasicTypeEnum<'c> {
     match ty {
-        Ty::Option(s) => option_struct_type(ctx, s, sx).into(),
-        Ty::Result(o, e) => result_struct_type(ctx, o, e, sx).into(),
+        Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
+        Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
         Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
@@ -883,6 +883,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::DynArray(_) => unreachable!("an owned array is not a box payload"),
         Scalar::DynStructArray(_) => unreachable!("an owned struct array is not a box payload"),
         Scalar::Str => unreachable!("a str view is not a box payload"),
+        Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
     }
 }
 
@@ -1368,7 +1369,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let agg = self.call_overflow_intrinsic(&name, llvm_int, av, bv)?.into_struct_value();
                         let res = self.builder.build_extract_value(agg, 0, "res").map_err(|e| self.err(e))?;
                         let ovf = self.builder.build_extract_value(agg, 1, "of").map_err(|e| self.err(e))?.into_int_value();
-                        let oty = option_struct_type(self.ctx, s, self.struct_types);
+                        let oty = option_struct_type(self.ctx, s, self.struct_types, &self.enum_types);
                         let some_tag = self.ctx.i8_type().const_int(1, false);
                         let none_tag = self.ctx.i8_type().const_int(0, false);
                         let tag = self
@@ -1444,7 +1445,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Option(s) = result_ty else {
                     return Err(self.err("Some result is not an Option"));
                 };
-                let oty = option_struct_type(self.ctx, s, self.struct_types);
+                let oty = option_struct_type(self.ctx, s, self.struct_types, &self.enum_types);
                 let payload = self.operand(op);
                 let tag = self.ctx.i8_type().const_int(1, false);
                 // Start zeroed (not undef): an owned (Move) payload's drop frees the payload field
@@ -1465,7 +1466,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     return Err(self.err("None result is not an Option"));
                 };
                 // All-zero aggregate → tag 0 (None).
-                option_struct_type(self.ctx, s, self.struct_types).const_zero().into()
+                option_struct_type(self.ctx, s, self.struct_types, &self.enum_types).const_zero().into()
             }
             Rvalue::OptionIsSome(op) => {
                 let agg = self.operand(op).into_struct_value();
@@ -1489,7 +1490,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Result(o, e) = result_ty else {
                     return Err(self.err("Ok result is not a Result"));
                 };
-                let rty = result_struct_type(self.ctx, o, e, self.struct_types);
+                let rty = result_struct_type(self.ctx, o, e, self.struct_types, &self.enum_types);
                 let tag = self.ctx.i8_type().const_int(0, false);
                 // Zeroed base (see OptionSome): the inactive `err` arm reads {null,0}, so an owned
                 // (Move) payload there drops null-safely (slice 8a).
@@ -1508,7 +1509,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Ty::Result(o, e) = result_ty else {
                     return Err(self.err("Err result is not a Result"));
                 };
-                let rty = result_struct_type(self.ctx, o, e, self.struct_types);
+                let rty = result_struct_type(self.ctx, o, e, self.struct_types, &self.enum_types);
                 let tag = self.ctx.i8_type().const_int(1, false);
                 // Zeroed base (see OptionSome): the inactive `ok` arm reads {null,0}, so an owned
                 // (Move) payload there drops null-safely (slice 8a).
@@ -1658,7 +1659,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let Ty::Result(o, e) = result_ty else {
                         return Err(self.err("wait result is not a Result"));
                     };
-                    let rty = result_struct_type(self.ctx, o, e, self.struct_types);
+                    let rty = result_struct_type(self.ctx, o, e, self.struct_types, &self.enum_types);
                     let is_err = self
                         .builder
                         .build_int_compare(IntPredicate::NE, code, self.ctx.i32_type().const_zero(), "iserr")
@@ -2150,8 +2151,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         match ty {
             Ty::Struct(id) => self.struct_types[id as usize].into(),
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
-            Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types).into(),
-            Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types).into(),
+            Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, &self.enum_types).into(),
+            Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, &self.enum_types).into(),
             Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, &self.enum_types).array_type(n).into(),

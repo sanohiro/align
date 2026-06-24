@@ -168,6 +168,8 @@ Today `Error` is the M2 `Ty::ErrCode` (an i32 code). **Leaning (2026-06-24, vali
 - **Exit-code mapping** at the `main` boundary stays as today (`clamp(1,255)`).
 So this entry **waits on sum types** (4a) and then defines `Error` as a concrete sum type + the `?` conversion + exit mapping (`impl/03-types.md` §5, `impl/06-runtime-std.md` §9).
 
+**4b-1 DONE (the foundation): errors can be user-defined sum types.** `Scalar::Enum(u32)` was added (a sum type is a Copy composite payload, like `Scalar::Struct`), so an enum is now a first-class `Option`/`Result` payload — most importantly **`Result<T, MyError>`** with a user error enum: construct `Err(MyError.Variant(…))`, `match` the `Result` then the error enum, and `?`-propagate it (same `E`). `option_struct_type`/`result_struct_type` (and `scalar_type`/`abi_type`) thread the enum-type table so the aggregate can hold an enum field. Still **Open** (later 4b slices): the canonical std **`Error`** type as a sum type (today the `Error` keyword is still `ErrCode`/`error(code)`), the static **`?` `E → E'` conversion**, `.with_context(...)`, and position-bearing structured errors.
+
 ### Arena with explicit allocator — partially settled (M3)
 **M3 decision: anonymous `arena {}` only.** Nested arenas use region = arena nesting
 depth; a box's region is the depth at which it was allocated, and escape = reaching a
