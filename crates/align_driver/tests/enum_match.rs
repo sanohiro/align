@@ -212,6 +212,23 @@ fn map_err_wrong_function_signature_rejected() {
 }
 
 #[test]
+fn struct_variant_payload() {
+    if !backend_available() {
+        return;
+    }
+    // S2: a plain-data struct as a variant payload — construct, `match`-bind it, access its fields.
+    let src = "Point { x: i32, y: i32 }\nShape { Dot(Point), Seg(Point, Point), Empty }\nfn area(s: Shape) -> i32 = match s {\n  Dot(p)    => p.x + p.y,\n  Seg(a, b) => (b.x - a.x) + (b.y - a.y),\n  Empty     => 0,\n}\nfn main() -> i32 {\n  return area(Shape.Seg(Point { x: 1, y: 2 }, Point { x: 5, y: 8 }))\n}\n";
+    let out = build_and_run("struct-payload", src);
+    assert_eq!(out.status.code(), Some(10));
+}
+
+#[test]
+fn str_field_struct_payload_rejected() {
+    // A region-tracked struct (a `str` field) as a variant payload needs enum region-tracking — deferred.
+    assert!(check_errs("str-struct-payload", "Name { s: str }\nTag { Named(Name) }\nfn main() -> i32 { return 0 }\n"));
+}
+
+#[test]
 fn enum_box_payload_rejected() {
     // A sum type is a Copy scalar (so it's an Option/Result payload), but not a box payload —
     // both the `box<Enum>` annotation and `heap.new(Enum.X)` must be rejected, not panic codegen.
