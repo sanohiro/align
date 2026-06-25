@@ -342,6 +342,29 @@ first := t.0              // positional access: `t.0`, `t.1`, ...
 derived from its elements (Move if any element is Move; a tuple of views is region-tied to
 their sources) — the same rule as a struct, no new ownership concept.
 
+### Generics
+
+A function may take **type parameters** in `<...>` — `fn f<T>(...)`. Each distinct use is compiled
+to a concrete copy (**monomorphization**): there is one specialized instance per set of concrete
+type arguments, so generic code costs nothing at run time and a type parameter behaves exactly like
+the type it is instantiated with (a Move `T` moves; a Copy `T` copies).
+
+```align
+fn id<T>(x: T) -> T = x
+fn pick<T>(a: T, b: T) -> T = a
+
+n := id(5)                 // T = i32
+p := pick(point, origin)   // T = Point
+```
+
+Type arguments are **inferred** — from the arguments, or from the expected type propagated to the
+call (the binding annotation). There is no turbofish (`f<T>(x)` at a call); when a type cannot be
+inferred, annotate the binding. A type parameter is **opaque**: it is passed, returned, and stored
+by value, but it has no operations of its own — `x + x` on a bare `T` is a compile error, because
+nothing says `T` is a number. A small set of builtin constraints (`Num` / `Ord` / `Eq`) that
+unlocks generic arithmetic and comparison is a planned extension; user-defined trait-style bounds
+are deliberately out of scope (AI-friendliness, *one way*).
+
 ---
 
 ## 6. Memory Model

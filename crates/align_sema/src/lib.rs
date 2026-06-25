@@ -141,6 +141,11 @@ pub enum Layout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
     Int(IntTy),
+    /// A generic type parameter, by its index in the enclosing function's `<...>` list
+    /// (`fn f<T, U>` → `T` = `Param(0)`, `U` = `Param(1)`). Present only inside a generic-function
+    /// template; monomorphization substitutes each `Param(i)` with a concrete type *before* the
+    /// flow analyses / MIR run, so MIR and codegen never see a `Param`.
+    Param(u32),
     /// Unresolved integer (inference variable). Eventually fixed to a concrete [`IntTy`].
     IntVar(u32),
     Float(FloatTy),
@@ -374,6 +379,9 @@ struct FnSig {
     /// `out[i]` — whether parameter `i` is an `out` (writable, no-alias) output buffer.
     out: Vec<bool>,
     ret: Ty,
+    /// Generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty for a non-generic fn.
+    /// The `params`/`ret` types may contain `Ty::Param(i)` indexing into this list.
+    type_params: Vec<String>,
 }
 
 /// A pipeline stage as collected from the AST (before type checking).
@@ -451,7 +459,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     for s in &struct_decls {
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
-            let ty = resolve_type(&f.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags);
+            let ty = resolve_type(&f.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &[], diags);
             // Fields are **Copy** only: a primitive scalar (int/float/bool/char) or `str`. A
             // `str` field may hold an arena-backed str: the struct *carries* that field's region
             // (MMv2 slice 2), so `EscapeCheck` lets it live inside the arena and only rejects the
@@ -495,7 +503,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             }
             let mut payload = Vec::with_capacity(v.payload.len());
             for t in &v.payload {
-                let ty = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags);
+                let ty = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &[], diags);
                 match ty {
                     Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
                         payload.push(ty_to_scalar(ty).expect("primitive scalar"));
@@ -545,9 +553,25 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for item in &file.items {
         let ast::Item::Fn(f) = item else { continue };
+        // Generic type-parameter names (`fn f<T, U>`). Reject duplicates and names that collide
+        // with a declared type, so `Param` resolution is unambiguous.
+        let tparams: Vec<String> = f.type_params.iter().map(|t| t.name.clone()).collect();
+        for (i, t) in f.type_params.iter().enumerate() {
+            if tparams[..i].contains(&t.name) {
+                diags.error(format!("duplicate type parameter '{}'", t.name), t.span);
+            }
+            if struct_ids.contains_key(&t.name) || enum_ids.contains_key(&t.name) {
+                diags.error(format!("type parameter '{}' shadows a declared type", t.name), t.span);
+            }
+        }
+        // `main` is the program entry; it cannot be a generic template (no concrete instance would
+        // be generated, so the entry point would vanish).
+        if f.name.name == "main" && !tparams.is_empty() {
+            diags.error("main cannot be generic".to_string(), f.span);
+        }
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
-            params.push(resolve_type(&p.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags));
+            params.push(resolve_type(&p.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &tparams, diags));
         }
         // A box across a call boundary would escape its arena, so M3 forbids box
         // parameters and returns (boxes are arena-local). This also closes escape
@@ -562,7 +586,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         }
         let ret = match &f.ret {
             Some(t) => {
-                let r = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, diags);
+                let r = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &tparams, diags);
                 if matches!(r, Ty::Box(_)) {
                     diags.error(
                         "a box cannot be a function return type (it would escape its arena)".to_string(),
@@ -582,45 +606,74 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             None => Ty::Unit,
         };
         let out = f.params.iter().map(|p| p.is_out).collect();
-        sigs.insert(f.name.name.clone(), FnSig { params, out, ret });
+        sigs.insert(f.name.name.clone(), FnSig { params, out, ret, type_params: tparams });
     }
 
     // Pass 2: check each function body. A function's inline lambdas are lifted to synthetic
     // top-level functions (`cx.lifted`) and appended to the program, so all later passes treat
-    // them like ordinary named functions.
+    // them like ordinary named functions. A **generic** function (`fn f<T>`) is a template: it is
+    // not checked here but instantiated on demand below (its body is checked per monomorph, like a
+    // C++ template — an uninstantiated generic is not type-checked).
     let mut fns: Vec<hir::Fn> = Vec::new();
+    // Generic-function templates by name, for monomorphization.
+    let generic_decls: HashMap<&str, &ast::FnDecl> = file
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            ast::Item::Fn(f) if !f.type_params.is_empty() => Some((f.name.name.as_str(), f)),
+            _ => None,
+        })
+        .collect();
+    // Monomorphization worklist: `(generic_fn_name, concrete_type_args)`, collected from every
+    // generic call and processed to a fixpoint below.
+    let mut worklist: Vec<(String, Vec<Ty>)> = Vec::new();
     for item in &file.items {
         let ast::Item::Fn(f) = item else { continue };
-        let mut cx = Checker {
-            diags,
-            sigs: &sigs,
-            struct_ids: &struct_ids,
-            enum_ids: &enum_ids,
-            enums: &enums,
-            error_enum_id,
-            structs: &structs,
-            tuples: &mut tuples,
-            fn_types: &mut fn_types,
-            int_vars: Vec::new(),
-            int_parent: Vec::new(),
-            float_vars: Vec::new(),
-            float_parent: Vec::new(),
-            locals: Vec::new(),
-            scope: Vec::new(),
-            ret_hint: Ty::Unit,
-            arena_depth: 0,
-            task_group_depth: 0,
-            wait_state: Vec::new(),
-            task_group_fallible: Vec::new(),
-            slice_bases: std::collections::HashMap::new(),
-            cur_fn: String::new(),
-            lifted: Vec::new(),
-            capture: None,
-        };
+        let is_template = !f.type_params.is_empty();
+        let tparams = f.type_params.iter().map(|t| t.name.clone()).collect();
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &structs, &mut tuples, &mut fn_types, tparams, Vec::new());
         let checked = cx.check_fn(f);
         let lifted = std::mem::take(&mut cx.lifted);
+        if is_template {
+            // A generic template is checked here only to validate its body abstractly (`T` is the
+            // opaque `Ty::Param`, so an operation needing a capability — arithmetic, a field, … —
+            // is rejected; the constraint model is a later slice). Its HIR carries `Param` and is
+            // discarded; concrete instances are generated on demand below. Instantiations it
+            // *would* trigger are rediscovered when it is itself monomorphized, so they are not
+            // collected here (a never-instantiated template emits no code).
+            if !lifted.is_empty() {
+                diags.error(
+                    format!("a generic function ('{}') may not contain a lambda or pipeline yet", f.name.name),
+                    f.span,
+                );
+            }
+        } else {
+            worklist.append(&mut cx.instantiations);
+            fns.push(checked);
+            fns.extend(lifted);
+        }
+    }
+    // Monomorphization: generate one concrete instance per distinct `(template, type_args)`, then
+    // scan each instance for further generic calls (transitive). `check_generic_call` already
+    // rewrote every call target to the mangled name, so nothing else needs renaming.
+    let mut generated: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut wi = 0;
+    while wi < worklist.len() {
+        let (oname, targs) = worklist[wi].clone();
+        wi += 1;
+        let mangled = mangle_mono(&oname, &targs);
+        if !generated.insert(mangled.clone()) {
+            continue; // already instantiated
+        }
+        let Some(decl) = generic_decls.get(oname.as_str()) else { continue };
+        let tparams = decl.type_params.iter().map(|t| t.name.clone()).collect();
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &structs, &mut tuples, &mut fn_types, tparams, targs);
+        let mut checked = cx.check_fn(decl);
+        checked.name = mangled;
+        worklist.append(&mut cx.instantiations);
+        // A lambda / pipeline inside a generic function is already rejected when the template is
+        // checked in Pass 2, so a monomorph never has lifted helpers here.
         fns.push(checked);
-        fns.extend(lifted);
     }
     let mut program = Program { fns, structs, enums, tuples, fn_types };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
@@ -764,7 +817,7 @@ impl EffectScan {
         }
         match &e.kind {
             // Observable side effects.
-            ExprKind::Call { func, args } => {
+            ExprKind::Call { func, args, .. } => {
                 if func == "print" {
                     self.impure_direct = true;
                 } else {
@@ -1630,7 +1683,7 @@ impl<'a> MoveCheck<'a> {
             // Value arguments / wrapped payloads are consumed (a direct move site). `print` is a
             // read-only builtin, so it *borrows* its argument (a `string` printed once is still
             // usable — `print(s); s.len()`); it never takes ownership.
-            ExprKind::Call { func, args } => {
+            ExprKind::Call { func, args, .. } => {
                 let consuming = func != "print";
                 for a in args {
                     self.expr(a, moved, consuming, consuming);
@@ -1844,6 +1897,17 @@ struct Checker<'a, 't> {
     slice_bases: std::collections::HashMap<LocalId, LocalId>,
     /// The enclosing function's name — used to generate unique names for lifted lambdas.
     cur_fn: String,
+    /// The enclosing function's generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty
+    /// for a non-generic function. A `let`/lambda type annotation naming one resolves to `Ty::Param`.
+    type_params: Vec<String>,
+    /// Concrete type arguments when checking a **monomorph** instance of a generic function
+    /// (parallel to `type_params`); empty in normal / template mode. When set, every `Ty::Param(i)`
+    /// produced by type resolution is immediately substituted to `mono_args[i]`, so the resulting
+    /// HIR is fully concrete (no `Param` reaches MIR).
+    mono_args: Vec<Ty>,
+    /// Generic-call instantiations discovered while checking this function: `(generic_fn_name,
+    /// concrete_type_args)`. Drained by `check_file` to drive monomorphization (the worklist).
+    instantiations: Vec<(String, Vec<Ty>)>,
     /// Lambdas lifted to synthetic top-level functions while checking this function's body. Pass 2
     /// appends them to `program.fns` so later passes / codegen treat them like named functions.
     lifted: Vec<hir::Fn>,
@@ -1863,6 +1927,54 @@ struct CaptureScope {
 }
 
 impl<'a, 't> Checker<'a, 't> {
+    /// Build a fresh checker for one function body. `type_params` are the function's generic
+    /// parameter names; `mono_args` are the concrete type arguments when checking a monomorph
+    /// instance (empty in normal / template mode).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        diags: &'a mut Diagnostics,
+        sigs: &'a HashMap<String, FnSig>,
+        struct_ids: &'a HashMap<String, u32>,
+        enum_ids: &'a HashMap<String, u32>,
+        enums: &'a [hir::EnumDef],
+        error_enum_id: u32,
+        structs: &'a [StructDef],
+        tuples: &'t mut Vec<hir::TupleDef>,
+        fn_types: &'t mut Vec<hir::FnTy>,
+        type_params: Vec<String>,
+        mono_args: Vec<Ty>,
+    ) -> Self {
+        Checker {
+            diags,
+            sigs,
+            struct_ids,
+            enum_ids,
+            enums,
+            error_enum_id,
+            structs,
+            tuples,
+            fn_types,
+            int_vars: Vec::new(),
+            int_parent: Vec::new(),
+            float_vars: Vec::new(),
+            float_parent: Vec::new(),
+            locals: Vec::new(),
+            scope: Vec::new(),
+            ret_hint: Ty::Unit,
+            arena_depth: 0,
+            task_group_depth: 0,
+            wait_state: Vec::new(),
+            task_group_fallible: Vec::new(),
+            slice_bases: std::collections::HashMap::new(),
+            cur_fn: String::new(),
+            type_params,
+            mono_args,
+            instantiations: Vec::new(),
+            lifted: Vec::new(),
+            capture: None,
+        }
+    }
+
     fn fresh_int_var(&mut self) -> Ty {
         let id = self.int_vars.len() as u32;
         self.int_vars.push(None);
@@ -2013,8 +2125,16 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_fn(&mut self, f: &ast::FnDecl) -> Fn {
         self.cur_fn = f.name.name.clone();
         let sig = &self.sigs[&f.name.name];
-        let ret = sig.ret;
-        let param_tys = sig.params.clone();
+        let mut ret = sig.ret;
+        let mut param_tys = sig.params.clone();
+        // Monomorph mode: substitute the concrete type arguments into the (generic) signature so
+        // the param locals and return type are concrete — no `Ty::Param` reaches the body.
+        if !self.mono_args.is_empty() {
+            ret = subst_param_ty(ret, &self.mono_args);
+            for t in &mut param_tys {
+                *t = subst_param_ty(*t, &self.mono_args);
+            }
+        }
         // `main` takes no arguments, or exactly `args: array<str>` (argv, draft.md §19) with a
         // `Result<(), Error>` return — the latter is the only form the C-`main` wrapper marshals
         // argv into (an `-> i32` argv `main` is a later follow-up).
@@ -2199,7 +2319,13 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn resolve_type(&mut self, t: &ast::Type) -> Ty {
-        resolve_type(t, self.struct_ids, self.enum_ids, self.tuples, self.fn_types, self.diags)
+        let ty = resolve_type(t, self.struct_ids, self.enum_ids, self.tuples, self.fn_types, &self.type_params, self.diags);
+        // In monomorph mode a type-parameter annotation (`let x: T`) resolves to the concrete arg.
+        if self.mono_args.is_empty() {
+            ty
+        } else {
+            subst_param_ty(ty, &self.mono_args)
+        }
     }
 
     /// Resolve an assignable place: a `mut` local, or `mut_local.field`.
@@ -2877,7 +3003,7 @@ impl<'a, 't> Checker<'a, 't> {
                 );
                 return err;
             };
-            param_tys.push(resolve_type(ann, self.struct_ids, self.enum_ids, self.tuples, self.fn_types, self.diags));
+            param_tys.push(resolve_type(ann, self.struct_ids, self.enum_ids, self.tuples, self.fn_types, &self.type_params, self.diags));
         }
         // Lift with the annotated parameter types as the expected signature; the return type is
         // inferred from the body.
@@ -3090,6 +3216,12 @@ impl<'a, 't> Checker<'a, 't> {
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         };
         let (param_tys, ret, out) = (sig.params.clone(), sig.ret, sig.out.clone());
+        // A generic function: infer the concrete type arguments from the call, then take its own
+        // dedicated path (the result type and `type_args` come from the substitution).
+        if !sig.type_params.is_empty() {
+            let type_params = sig.type_params.clone();
+            return self.check_generic_call(&name, &type_params, &param_tys, ret, args, expected, span);
+        }
         if args.len() != param_tys.len() {
             self.diags.error(
                 format!("'{name}' expects {} argument(s), got {}", param_tys.len(), args.len()),
@@ -3123,7 +3255,76 @@ impl<'a, 't> Checker<'a, 't> {
             .enumerate()
             .map(|(i, a)| self.check_arg(a, param_tys.get(i).copied()))
             .collect();
-        Expr { kind: ExprKind::Call { func: name, args: checked }, ty: ret, span }
+        Expr { kind: ExprKind::Call { func: name, args: checked, type_args: Vec::new() }, ty: ret, span }
+    }
+
+    /// Check a call to a **generic** function `fn f<T, …>(…)`. Type arguments are inferred — never
+    /// written at the call site (no turbofish; settled). Each declared parameter typed `Ty::Param(p)`
+    /// binds `p` from the corresponding argument's type (all occurrences of `p` are unified
+    /// together); a `Param` appearing only in the return type is taken from the expected type. Every
+    /// parameter must be inferable. The skeleton restricts a type parameter to a **bare** position
+    /// (a whole parameter / return), so `T` is passed/returned by value with no operations — the
+    /// constraint model (`Num`/`Ord`/`Eq`) is a later slice. `type_args` is recorded for
+    /// monomorphization, which generates the concrete instance and rewrites the call target.
+    #[allow(clippy::too_many_arguments)]
+    fn check_generic_call(&mut self, name: &str, type_params: &[String], param_tys: &[Ty], ret: Ty, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != param_tys.len() {
+            self.diags.error(
+                format!("'{name}' expects {} argument(s), got {}", param_tys.len(), args.len()),
+                span,
+            );
+            return err;
+        }
+        // One inference slot per type parameter; each `Param(p)` argument unifies into slot p.
+        let mut subst: Vec<Option<Ty>> = vec![None; type_params.len()];
+        let mut checked = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            match param_tys[i] {
+                Ty::Param(p) => {
+                    // Check the argument unconstrained (a bare type parameter applies no coercion),
+                    // then unify it into the parameter's slot so all occurrences agree.
+                    let ce = self.check_expr(a, None);
+                    let inferred = match subst[p as usize] {
+                        Some(prev) => self.unify(prev, ce.ty, a.span),
+                        None => ce.ty,
+                    };
+                    subst[p as usize] = Some(inferred);
+                    checked.push(ce);
+                }
+                concrete => {
+                    checked.push(self.check_arg(a, Some(concrete)));
+                    let last = checked.last().unwrap();
+                    self.unify(last.ty, concrete, a.span);
+                }
+            }
+        }
+        // A return-only type parameter is supplied by the expected type (the binding annotation).
+        if let (Ty::Param(p), Some(exp)) = (ret, expected) {
+            subst[p as usize].get_or_insert(exp);
+        }
+        // A type parameter mentioned by no argument and not supplied by the expected type is
+        // immediately uninferable; the rest may still be inference variables (e.g. an integer
+        // literal argument) that whole-function inference resolves later.
+        let mut type_args = Vec::with_capacity(type_params.len());
+        for (i, s) in subst.iter().enumerate() {
+            match s {
+                Some(t) => type_args.push(*t),
+                None => {
+                    self.diags.error(
+                        format!("cannot infer type parameter '{}' of '{name}'; annotate the call's context", type_params[i]),
+                        span,
+                    );
+                    return err;
+                }
+            }
+        }
+        let result_ty = subst_param_ty(ret, &type_args);
+        self.constrain(result_ty, expected, span);
+        // The type arguments are kept (still possibly inference variables) and finalized in
+        // `finalize_expr`, which then records the instantiation and rewrites `func` to the
+        // monomorph's mangled name — by then a literal argument's type has flowed from context.
+        Expr { kind: ExprKind::Call { func: name.to_string(), args: checked, type_args }, ty: result_ty, span }
     }
 
     /// Check a call argument against a parameter type, applying an array → slice borrow
@@ -3205,7 +3406,7 @@ impl<'a, 't> Checker<'a, 't> {
             })
             .collect();
         Expr {
-            kind: ExprKind::Call { func: "print".to_string(), args: checked },
+            kind: ExprKind::Call { func: "print".to_string(), args: checked, type_args: Vec::new() },
             ty: Ty::Unit,
             span,
         }
@@ -5320,7 +5521,7 @@ impl<'a, 't> Checker<'a, 't> {
 
     // --- finalize ---
 
-    fn finalize_block(&self, b: &mut Block) {
+    fn finalize_block(&mut self, b: &mut Block) {
         for s in &mut b.stmts {
             match s {
                 Stmt::Let { init, .. } => self.finalize_expr(init),
@@ -5340,7 +5541,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    fn finalize_expr(&self, e: &mut Expr) {
+    fn finalize_expr(&mut self, e: &mut Expr) {
         e.ty = self.finalize(e.ty);
         match &mut e.kind {
             ExprKind::Unary { expr, .. } => self.finalize_expr(expr),
@@ -5348,9 +5549,27 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(lhs);
                 self.finalize_expr(rhs);
             }
-            ExprKind::Call { args, .. } => {
+            ExprKind::Call { func, args, type_args } => {
                 for a in args {
                     self.finalize_expr(a);
+                }
+                // A generic call: finalize its inferred type arguments (now that whole-function
+                // inference is complete), record the instantiation for monomorphization, and
+                // rewrite the target to the monomorph's mangled name.
+                if !type_args.is_empty() {
+                    for t in type_args.iter_mut() {
+                        *t = self.finalize(*t);
+                    }
+                    // A `Param` type argument means this call sits inside a generic *template* and
+                    // is parameterized by the enclosing `T`; it is instantiated (and recorded) when
+                    // the template itself is monomorphized — skip it here (the template HIR is
+                    // discarded). An `IntVar`/`FloatVar` never survives `finalize` (it defaults), and
+                    // a truly uninferable parameter already errored in `check_generic_call`.
+                    let abstract_call = type_args.iter().any(|t| matches!(t, Ty::Param(_)));
+                    if !abstract_call && !type_args.contains(&Ty::Error) {
+                        self.instantiations.push((func.clone(), type_args.clone()));
+                        *func = mangle_mono(func, type_args);
+                    }
                 }
             }
             ExprKind::FnValue(_) => {}
@@ -5544,9 +5763,37 @@ fn ty_name(ty: Ty) -> String {
         Ty::Fn(id) => format!("fn#{id}"),
         Ty::Enum(id) => format!("enum#{id}"),
         Ty::Task(s) => format!("Task<{}>", scalar_name(s)),
+        Ty::Param(i) => format!("<type param {i}>"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }
+}
+
+/// Substitute a generic function's type parameters: `Ty::Param(i)` → `args[i]`. The skeleton keeps
+/// a type parameter in a **bare** position (never nested inside `Option`/`array`/a tuple — `Scalar`
+/// can't hold a `Param`), so this is a single top-level replacement. Used by both call-result typing
+/// and monomorphization.
+fn subst_param_ty(ty: Ty, args: &[Ty]) -> Ty {
+    match ty {
+        Ty::Param(i) => args.get(i as usize).copied().unwrap_or(Ty::Error),
+        other => other,
+    }
+}
+
+/// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument
+/// (`pick` with `[i32]` → `pick$i32`). Deterministic and collision-free across instantiations.
+fn mangle_mono(name: &str, args: &[Ty]) -> String {
+    let mut s = name.to_string();
+    for a in args {
+        s.push('$');
+        s.push_str(&ty_mangle(*a));
+    }
+    s
+}
+
+/// A compact, identifier-safe spelling of a concrete type for use in a mangled symbol name.
+fn ty_mangle(ty: Ty) -> String {
+    ty_name(ty).chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
 }
 
 /// A composite type argument must resolve to a concrete scalar in M2.
@@ -5587,6 +5834,7 @@ fn resolve_type(
     enum_ids: &HashMap<String, u32>,
     tuples: &mut Vec<hir::TupleDef>,
     fn_types: &mut Vec<hir::FnTy>,
+    type_params: &[String],
     diags: &mut Diagnostics,
 ) -> Ty {
     let (path, args, span) = match t {
@@ -5596,7 +5844,7 @@ fn resolve_type(
         ast::Type::Fn { params, ret, span: _ } => {
             let mut pscalars = Vec::with_capacity(params.len());
             for p in params {
-                let pty = resolve_type(p, struct_ids, enum_ids, tuples, fn_types, diags);
+                let pty = resolve_type(p, struct_ids, enum_ids, tuples, fn_types, type_params, diags);
                 if pty == Ty::Error {
                     return Ty::Error;
                 }
@@ -5608,7 +5856,7 @@ fn resolve_type(
                     }
                 }
             }
-            let rty = resolve_type(ret, struct_ids, enum_ids, tuples, fn_types, diags);
+            let rty = resolve_type(ret, struct_ids, enum_ids, tuples, fn_types, type_params, diags);
             if rty == Ty::Error {
                 return Ty::Error;
             }
@@ -5623,7 +5871,7 @@ fn resolve_type(
             // `Static`, so the tuple needs no drop/region machinery. `str`/owned elements later.
             let mut scalars = Vec::with_capacity(elems.len());
             for e in elems {
-                let ety = resolve_type(e, struct_ids, enum_ids, tuples, fn_types, diags);
+                let ety = resolve_type(e, struct_ids, enum_ids, tuples, fn_types, type_params, diags);
                 if ety == Ty::Error {
                     return Ty::Error;
                 }
@@ -5643,6 +5891,13 @@ fn resolve_type(
         }
     };
     let name = path.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+    // A generic type parameter (`fn f<T>` → `T`): a bare name (no type arguments) matching a
+    // declared parameter resolves to `Ty::Param(i)`.
+    if args.is_empty() && path.segments.len() == 1 {
+        if let Some(i) = type_params.iter().position(|p| p == name) {
+            return Ty::Param(i as u32);
+        }
+    }
     match name {
         "bool" => Ty::Bool,
         "char" => Ty::Char,
@@ -5654,7 +5909,7 @@ fn resolve_type(
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
+                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
                 _ => {
                     diags.error("box takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5687,7 +5942,7 @@ fn resolve_type(
         }
         "Option" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
+                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
                 _ => {
                     diags.error("Option takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5700,7 +5955,7 @@ fn resolve_type(
         }
         "slice" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
+                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
                 _ => {
                     diags.error("slice takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5715,7 +5970,7 @@ fn resolve_type(
         // type so a function can hand back a free-standing owned array.
         "array" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
+                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
                 _ => {
                     diags.error("array takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -5734,8 +5989,8 @@ fn resolve_type(
         "Result" => {
             let (ok, err) = match args {
                 [a, b] => (
-                    resolve_type(a, struct_ids, enum_ids, tuples, fn_types, diags),
-                    resolve_type(b, struct_ids, enum_ids, tuples, fn_types, diags),
+                    resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
+                    resolve_type(b, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
                 ),
                 _ => {
                     diags.error("Result takes two type arguments".to_string(), span);

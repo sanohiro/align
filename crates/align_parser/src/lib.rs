@@ -263,6 +263,18 @@ impl<'a> Parser<'a> {
         self.bump(); // fn
         let name = self.parse_ident("function name")?;
 
+        // Optional generic type parameters: `fn f<T, U>(...)`.
+        let mut type_params = Vec::new();
+        if self.eat(&TokKind::Lt) {
+            while !self.at(&TokKind::Gt) && !self.at(&TokKind::Eof) {
+                type_params.push(self.parse_ident("a type parameter name")?);
+                if !self.eat(&TokKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokKind::Gt, "'>'");
+        }
+
         self.expect(&TokKind::LParen, "'('");
         let mut params = Vec::new();
         while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
@@ -299,6 +311,7 @@ impl<'a> Parser<'a> {
         Some(FnDecl {
             vis,
             name,
+            type_params,
             params,
             ret,
             body,

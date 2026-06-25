@@ -261,6 +261,10 @@ pub enum ExprKind {
     Call {
         func: String,
         args: Vec<Expr>,
+        /// Concrete type arguments inferred for a call to a generic function (one per declared
+        /// type parameter); empty for a non-generic call. Monomorphization uses these to pick /
+        /// generate the specialized instance and rewrites `func` to its mangled name.
+        type_args: Vec<Ty>,
     },
     /// `if` as a value. An absent `else` becomes an empty block with no value, and the
     /// whole expression's `ty` is then `Unit`.

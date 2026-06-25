@@ -80,6 +80,9 @@ pub struct FieldDef {
 pub struct FnDecl {
     pub vis: Vis,
     pub name: Ident,
+    /// Generic type parameters declared as `fn f<T, U>(...)`. Empty for a non-generic function.
+    /// A parameter / return `Type` whose name matches one of these resolves to `Ty::Param(i)`.
+    pub type_params: Vec<Ident>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: FnBody,
