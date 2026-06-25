@@ -1,0 +1,30 @@
+// The "unhandled Result" lint: a Result returned by a call must be handled, never silently
+// dropped (Align makes errors visible). Discarding one as a statement — `save(x)` on its own —
+// is a compile error. Handle it by propagating with `?`, branching with `match`, or binding it.
+
+fn save(n: i32) -> Result<i32, Error> {
+  if n < 0 {
+    return Err(Error.Invalid)
+  }
+  return Ok(n)
+}
+
+fn run() -> Result<i32, Error> {
+  // `?` propagates the error (handled).
+  a := save(10)?
+  // Binding handles it explicitly.
+  r := save(32)
+  b := match r {
+    Ok(v) => v
+    Err(e) => 0
+  }
+  return Ok(a + b)
+}
+
+fn main() -> i32 {
+  // 10 + 32 = 42
+  return match run() {
+    Ok(v) => v
+    Err(e) => 99
+  }
+}

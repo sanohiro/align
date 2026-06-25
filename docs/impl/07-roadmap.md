@@ -703,11 +703,17 @@ Completion condition: confirm that the vectorized code contains vector instructi
   widening — errors surface at `wait` either way, so the semantics match).
 - async/await is not included (`non-goals.md`).
 
-## M8 — Tooling and Quality — NOT STARTED
+## M8 — Tooling and Quality — STARTED (first lint landed)
 
-- the official formatter (mandatory, `draft.md` §16).
-- the full set of standard lints (allocation in loop / huge struct copy / unnecessary clone / unnecessary heap / unhandled Result / branch in hot loop / string re-scan / implicit copy).
-- `unsafe` blocks and `raw.*`.
+- the official formatter (mandatory, `draft.md` §16). — not started
+- the standard lints (allocation in loop / huge struct copy / unnecessary clone / unnecessary heap /
+  unhandled Result / branch in hot loop / string re-scan / implicit copy).
+  - **unhandled `Result` — DONE.** Discarding a `Result` as a statement is a compile **error** (not
+    a warning — it fits "errors are visible / handled"): propagate with `?`, branch with `match` /
+    `else`, or bind it (`r := …`). Checked inline in `check_block` (a `Stmt::Expr` of `Result` type).
+    (`tests/lint_unhandled_result.rs`, `examples/unhandled_result.align`.) The rest of the lint set
+    is not started.
+- `unsafe` blocks and `raw.*`. — not started
 
 ## Design Issues to Settle in Parallel
 
