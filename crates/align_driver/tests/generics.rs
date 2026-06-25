@@ -281,6 +281,20 @@ fn generic_box_param_rejected() {
 }
 
 #[test]
+fn generic_struct_decl_rejected_for_now() {
+    // Groundwork: `Pair<T> { ... }` parses (generic type-parameter syntax on a type declaration),
+    // but monomorphizing it needs the resolver refactor — sema rejects it with a clear message.
+    let src = "Pair<T> { a: T, b: T }\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-struct-decl", src));
+}
+
+#[test]
+fn generic_enum_decl_rejected_for_now() {
+    let src = "Opt<T> { Some(T), None }\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-enum-decl", src));
+}
+
+#[test]
 fn concrete_nested_mismatch_rejected() {
     // A concrete part of a nested generic parameter type must still match: `Result<T, i32>` cannot
     // accept a `Result<_, bool>` (the `i32` vs `bool` mismatch must be a type error).

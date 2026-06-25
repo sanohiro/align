@@ -155,8 +155,13 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      `fn unwrap_or<T>(o: Option<T>, d: T) -> T` / `fn ok<T>(x: T) -> Result<T, Error>` work. New
      `Scalar::Param`; structural inference (`match_param`) binds `Param` bare or nested + seeds a
      return-only param from the expected type; a nested param finalizes eagerly at the call, a bare
-     one stays deferred. (`box`/`slice`/`array`/tuple positions still rejected.) **Next 4c slices**
-     (`open-questions.md`): `array<T>` / `slice<T>` params + generic containers (`Stack<T>`), then
+     one stays deferred. (`box`/`slice`/`array`/tuple positions still rejected.) **4c-4 groundwork DONE**
+     — generic type *declaration* syntax `Pair<T> { … }` / `Opt<T> { … }` parses (`StructDecl`/
+     `EnumDecl.type_params`; top-level dispatch recognizes `Ident <`), and sema rejects it with a
+     clear "not supported yet" message. **Next 4c slice (the resolver refactor):** make `structs`
+     grow *during* type resolution (a `&mut Vec` threaded through `resolve_type`, mirroring
+     `tuples`/`fn_types`) so `Pair<i32>` interns a monomorph `StructDef` on demand; then struct-
+     literal type inference + generic containers (`Stack<T>` needs `array<T>` fields too). Then
      value generics (`vec<N,T>`, M6) and folding `Option`/`Result` into the general mechanism.
 5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
 6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.

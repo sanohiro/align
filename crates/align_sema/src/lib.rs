@@ -489,6 +489,11 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 if s.name.name == "Error" {
                     diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), s.span);
                 }
+                // Generic struct *declarations* (`Pair<T>`) parse, but monomorphizing them needs the
+                // struct table to grow during type resolution (the resolver refactor); not yet wired.
+                if !s.type_params.is_empty() {
+                    diags.error(format!("generic struct declarations are not supported yet ('{}')", s.name.name), s.span);
+                }
                 if struct_ids.insert(s.name.name.clone(), struct_decls.len() as u32).is_some()
                     || enum_ids.contains_key(&s.name.name)
                 {
@@ -499,6 +504,9 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             ast::Item::Enum(e) => {
                 if e.name.name == "Error" {
                     diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), e.span);
+                }
+                if !e.type_params.is_empty() {
+                    diags.error(format!("generic sum-type declarations are not supported yet ('{}')", e.name.name), e.span);
                 }
                 if enum_ids.insert(e.name.name.clone(), enum_decls.len() as u32).is_some()
                     || struct_ids.contains_key(&e.name.name)
@@ -519,6 +527,12 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // Pass 0b: resolve struct field types (before enum payloads, which may be structs).
     let mut structs: Vec<StructDef> = Vec::with_capacity(struct_decls.len());
     for s in &struct_decls {
+        // A generic struct is already rejected (Pass 0a); skip resolving its `Param`-typed fields so
+        // they don't cascade into "unknown type 'T'". Keep the slot (empty) for id consistency.
+        if !s.type_params.is_empty() {
+            structs.push(StructDef { name: s.name.name.clone(), fields: Vec::new(), align: None });
+            continue;
+        }
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
             let ty = resolve_type(&f.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &[], diags);
@@ -556,6 +570,12 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // struct payload would need enum region-tracking (deferred).
     let mut enums: Vec<hir::EnumDef> = Vec::with_capacity(enum_decls.len());
     for e in &enum_decls {
+        // A generic sum type is already rejected (Pass 0a); skip resolving its `Param`-typed
+        // payloads so they don't cascade into "unknown type 'T'". Keep the slot for id consistency.
+        if !e.type_params.is_empty() {
+            enums.push(hir::EnumDef { name: e.name.name.clone(), variants: Vec::new() });
+            continue;
+        }
         let mut seen = std::collections::HashSet::new();
         let mut variants = Vec::with_capacity(e.variants.len());
         let mut field_base = 1u32;

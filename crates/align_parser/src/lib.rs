@@ -189,7 +189,10 @@ impl<'a> Parser<'a> {
         };
         if self.at(&TokKind::Fn) {
             self.parse_fn(vis).map(Item::Fn)
-        } else if matches!(self.peek(), TokKind::Ident(_)) && matches!(self.peek_at(1), TokKind::LBrace) {
+        } else if matches!(self.peek(), TokKind::Ident(_))
+            && matches!(self.peek_at(1), TokKind::LBrace | TokKind::Lt)
+        {
+            // `Name { … }` or a generic `Name<T> { … }` type declaration.
             self.parse_type_decl(vis)
         } else {
             self.diags
@@ -204,6 +207,23 @@ impl<'a> Parser<'a> {
     fn parse_type_decl(&mut self, vis: Vis) -> Option<Item> {
         let start = self.span();
         let name = self.parse_ident("type name")?;
+        // Optional generic type parameters: `Pair<T, U: Ord>` (same form as a function's).
+        let mut type_params = Vec::new();
+        if self.eat(&TokKind::Lt) {
+            while !self.at(&TokKind::Gt) && !self.at(&TokKind::Eof) {
+                let tname = self.parse_ident("a type parameter name")?;
+                let bound = if self.eat(&TokKind::Colon) {
+                    Some(self.parse_ident("a bound (Eq, Ord, or Num)")?)
+                } else {
+                    None
+                };
+                type_params.push(TypeParam { name: tname, bound });
+                if !self.eat(&TokKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokKind::Gt, "'>'");
+        }
         self.expect(&TokKind::LBrace, "'{'");
         self.skip_ends();
         // `ident :` → struct; an empty body or `ident ,`/`ident }` → struct (no fields) / sum type.
@@ -224,7 +244,7 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokKind::RBrace, "'}'");
             let span = start.merge(self.prev_span());
-            Some(Item::Struct(StructDecl { vis, name, fields, span }))
+            Some(Item::Struct(StructDecl { vis, name, type_params, fields, span }))
         } else {
             let mut variants = Vec::new();
             loop {
@@ -254,7 +274,7 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokKind::RBrace, "'}'");
             let span = start.merge(self.prev_span());
-            Some(Item::Enum(EnumDecl { vis, name, variants, span }))
+            Some(Item::Enum(EnumDecl { vis, name, type_params, variants, span }))
         }
     }
 
