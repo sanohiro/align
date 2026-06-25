@@ -143,10 +143,16 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      Type arguments are inferred (no turbofish); a type parameter is **opaque** (no operations — the
      template is checked abstractly, an uninstantiated generic is not checked, C++-template-like);
      skeleton cut = bare positions only (no `array<T>` / nested), no lambda/pipeline in a generic.
-     (`tests/generics.rs`, `examples/generics.align`.) **Next 4c slices** (`open-questions.md`): the
-     **constraint model — chosen direction `Num`/`Ord`/`Eq` builtin bounds** (no user trait bounds),
-     then type parameters in nested positions (generic containers), then value generics (`vec<N,T>`,
-     M6) and folding `Option`/`Result` into the general mechanism (retiring their builtin special-case).
+     (`tests/generics.rs`, `examples/generics.align`.) **4c-2 DONE (the constraint model)** — a type
+     parameter may carry a **builtin bound** `fn f<T: Ord>` from the fixed hierarchy `Num` ⊃ `Ord` ⊃
+     `Eq` (`Num` = arithmetic+ordering+equality on numerics, `Ord` = ordering+equality on
+     numerics/`char`, `Eq` = equality on numerics/`char`/`bool`/`str`); the bound gates which
+     operations a `Param` value allows in the template (`x + x` needs `Num`, `a > b` needs `Ord`,
+     `a == b` needs `Eq`), and a concrete type argument is checked against it at instantiation. No
+     user-defined trait bounds. (Closes a 4c-1 hole where `==`/`>` on an unconstrained `T` slipped
+     through.) **Next 4c slices** (`open-questions.md`): type parameters in nested positions
+     (generic containers `Stack<T>`, `array<T>` params), then value generics (`vec<N,T>`, M6) and
+     folding `Option`/`Result` into the general mechanism (retiring their builtin special-case).
 5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
 6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.
 7. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

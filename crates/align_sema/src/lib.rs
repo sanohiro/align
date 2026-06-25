@@ -373,6 +373,58 @@ impl Ty {
     }
 }
 
+/// A builtin generic bound — the only constraints (no user-defined trait bounds). A capability
+/// hierarchy: `Num` ⊃ `Ord` ⊃ `Eq`. `Num` grants arithmetic + ordering + equality, `Ord` grants
+/// ordering + equality, `Eq` grants equality, `Unconstrained` grants nothing (the parameter is
+/// opaque — pass / return / store only). A concrete type argument is checked against the bound at
+/// instantiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bound {
+    Unconstrained,
+    Eq,
+    Ord,
+    Num,
+}
+
+impl Bound {
+    fn grants_arith(self) -> bool {
+        self == Bound::Num
+    }
+    fn grants_ord(self) -> bool {
+        matches!(self, Bound::Ord | Bound::Num)
+    }
+    fn grants_eq(self) -> bool {
+        matches!(self, Bound::Eq | Bound::Ord | Bound::Num)
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Bound::Unconstrained => "(none)",
+            Bound::Eq => "Eq",
+            Bound::Ord => "Ord",
+            Bound::Num => "Num",
+        }
+    }
+    fn from_name(s: &str) -> Option<Bound> {
+        match s {
+            "Eq" => Some(Bound::Eq),
+            "Ord" => Some(Bound::Ord),
+            "Num" => Some(Bound::Num),
+            _ => None,
+        }
+    }
+    /// Whether a concrete type satisfies this bound (checked at instantiation). `Eq` = anything with
+    /// `==` (int/float/char/bool/str); `Ord` = the ordered scalars (int/float/char — `str` has only
+    /// `==`); `Num` = the numerics (int/float).
+    fn satisfied_by(self, ty: Ty) -> bool {
+        match self {
+            Bound::Unconstrained => true,
+            Bound::Eq => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Bool | Ty::Str),
+            Bound::Ord => ty.is_numeric() || ty == Ty::Char,
+            Bound::Num => ty.is_numeric(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct FnSig {
     params: Vec<Ty>,
@@ -382,6 +434,8 @@ struct FnSig {
     /// Generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty for a non-generic fn.
     /// The `params`/`ret` types may contain `Ty::Param(i)` indexing into this list.
     type_params: Vec<String>,
+    /// The builtin bound declared for each type parameter (parallel to `type_params`).
+    bounds: Vec<Bound>,
 }
 
 /// A pipeline stage as collected from the AST (before type checking).
@@ -553,16 +607,25 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for item in &file.items {
         let ast::Item::Fn(f) = item else { continue };
-        // Generic type-parameter names (`fn f<T, U>`). Reject duplicates and names that collide
-        // with a declared type, so `Param` resolution is unambiguous.
-        let tparams: Vec<String> = f.type_params.iter().map(|t| t.name.clone()).collect();
+        // Generic type-parameter names (`fn f<T, U: Ord>`). Reject duplicates and names that collide
+        // with a declared type, so `Param` resolution is unambiguous; resolve each builtin bound.
+        let tparams: Vec<String> = f.type_params.iter().map(|t| t.name.name.clone()).collect();
+        let mut bounds: Vec<Bound> = Vec::with_capacity(f.type_params.len());
         for (i, t) in f.type_params.iter().enumerate() {
-            if tparams[..i].contains(&t.name) {
-                diags.error(format!("duplicate type parameter '{}'", t.name), t.span);
+            if tparams[..i].contains(&t.name.name) {
+                diags.error(format!("duplicate type parameter '{}'", t.name.name), t.name.span);
             }
-            if struct_ids.contains_key(&t.name) || enum_ids.contains_key(&t.name) {
-                diags.error(format!("type parameter '{}' shadows a declared type", t.name), t.span);
+            if struct_ids.contains_key(&t.name.name) || enum_ids.contains_key(&t.name.name) {
+                diags.error(format!("type parameter '{}' shadows a declared type", t.name.name), t.name.span);
             }
+            let bound = match &t.bound {
+                None => Bound::Unconstrained,
+                Some(id) => Bound::from_name(&id.name).unwrap_or_else(|| {
+                    diags.error(format!("unknown bound '{}' (expected `Eq`, `Ord`, or `Num`)", id.name), id.span);
+                    Bound::Unconstrained
+                }),
+            };
+            bounds.push(bound);
         }
         // `main` is the program entry; it cannot be a generic template (no concrete instance would
         // be generated, so the entry point would vanish).
@@ -606,7 +669,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             None => Ty::Unit,
         };
         let out = f.params.iter().map(|p| p.is_out).collect();
-        sigs.insert(f.name.name.clone(), FnSig { params, out, ret, type_params: tparams });
+        sigs.insert(f.name.name.clone(), FnSig { params, out, ret, type_params: tparams, bounds });
     }
 
     // Pass 2: check each function body. A function's inline lambdas are lifted to synthetic
@@ -630,8 +693,9 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     for item in &file.items {
         let ast::Item::Fn(f) = item else { continue };
         let is_template = !f.type_params.is_empty();
-        let tparams = f.type_params.iter().map(|t| t.name.clone()).collect();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &structs, &mut tuples, &mut fn_types, tparams, Vec::new());
+        let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
+        let bounds = sigs[&f.name.name].bounds.clone();
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &structs, &mut tuples, &mut fn_types, tparams, bounds, Vec::new());
         let checked = cx.check_fn(f);
         let lifted = std::mem::take(&mut cx.lifted);
         if is_template {
@@ -666,8 +730,9 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             continue; // already instantiated
         }
         let Some(decl) = generic_decls.get(oname.as_str()) else { continue };
-        let tparams = decl.type_params.iter().map(|t| t.name.clone()).collect();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &structs, &mut tuples, &mut fn_types, tparams, targs);
+        let tparams = decl.type_params.iter().map(|t| t.name.name.clone()).collect();
+        let bounds = sigs[oname.as_str()].bounds.clone();
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &structs, &mut tuples, &mut fn_types, tparams, bounds, targs);
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
         worklist.append(&mut cx.instantiations);
@@ -1900,6 +1965,9 @@ struct Checker<'a, 't> {
     /// The enclosing function's generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty
     /// for a non-generic function. A `let`/lambda type annotation naming one resolves to `Ty::Param`.
     type_params: Vec<String>,
+    /// The builtin bound of each type parameter (parallel to `type_params`); used to decide which
+    /// operations are allowed on a `Ty::Param` value in a template body.
+    param_bounds: Vec<Bound>,
     /// Concrete type arguments when checking a **monomorph** instance of a generic function
     /// (parallel to `type_params`); empty in normal / template mode. When set, every `Ty::Param(i)`
     /// produced by type resolution is immediately substituted to `mono_args[i]`, so the resulting
@@ -1942,6 +2010,7 @@ impl<'a, 't> Checker<'a, 't> {
         tuples: &'t mut Vec<hir::TupleDef>,
         fn_types: &'t mut Vec<hir::FnTy>,
         type_params: Vec<String>,
+        param_bounds: Vec<Bound>,
         mono_args: Vec<Ty>,
     ) -> Self {
         Checker {
@@ -1968,6 +2037,7 @@ impl<'a, 't> Checker<'a, 't> {
             slice_bases: std::collections::HashMap::new(),
             cur_fn: String::new(),
             type_params,
+            param_bounds,
             mono_args,
             instantiations: Vec::new(),
             lifted: Vec::new(),
@@ -2316,6 +2386,17 @@ impl<'a, 't> Checker<'a, 't> {
             .map(|e| Box::new(self.check_expr(e, expected)));
         self.scope.truncate(scope_mark);
         Block { stmts, value }
+    }
+
+    /// The declared bound of type parameter `i` in the function being checked.
+    fn param_bound(&self, i: u32) -> Bound {
+        self.param_bounds.get(i as usize).copied().unwrap_or(Bound::Unconstrained)
+    }
+
+    /// "operation X on the generic type 'T' requires the `B` bound (`<T: B>`)".
+    fn bound_needed_msg(&self, i: u32, what: &str, needed: Bound) -> String {
+        let name = self.type_params.get(i as usize).map(|s| s.as_str()).unwrap_or("T");
+        format!("{what} on the generic type '{name}' requires the `{}` bound (declare `<{name}: {}>`)", needed.name(), needed.name())
     }
 
     fn resolve_type(&mut self, t: &ast::Type) -> Ty {
@@ -2855,7 +2936,12 @@ impl<'a, 't> Checker<'a, 't> {
                 r = self.check_expr(rhs, Some(l.ty));
                 let t = self.unify(l.ty, r.ty, span);
                 // `str + str` is concatenation; other ops on str are errors.
-                if t == Ty::Str && op != BinOp::Add {
+                if let Ty::Param(i) = t {
+                    // A generic value: arithmetic needs the `Num` bound.
+                    if !self.param_bound(i).grants_arith() {
+                        self.diags.error(self.bound_needed_msg(i, "arithmetic", Bound::Num), span);
+                    }
+                } else if t == Ty::Str && op != BinOp::Add {
                     self.diags.error("str supports only `+` (concatenation)", span);
                 } else if t != Ty::Str && !t.is_numeric() && t != Ty::Error {
                     self.diags.error("arithmetic expects numbers (int or float)", span);
@@ -2866,8 +2952,20 @@ impl<'a, 't> Checker<'a, 't> {
                 l = self.check_expr(lhs, None);
                 r = self.check_expr(rhs, Some(l.ty));
                 let t = self.unify(l.ty, r.ty, span);
-                // `str` supports only equality (no ordering yet).
-                if t == Ty::Str && !matches!(op, BinOp::Eq | BinOp::Ne) {
+                let is_eq = matches!(op, BinOp::Eq | BinOp::Ne);
+                if let Ty::Param(i) = t {
+                    // A generic value: equality needs `Eq`, ordering needs `Ord`.
+                    let (ok, needed) = if is_eq {
+                        (self.param_bound(i).grants_eq(), Bound::Eq)
+                    } else {
+                        (self.param_bound(i).grants_ord(), Bound::Ord)
+                    };
+                    if !ok {
+                        let what = if is_eq { "equality" } else { "ordering" };
+                        self.diags.error(self.bound_needed_msg(i, what, needed), span);
+                    }
+                } else if t == Ty::Str && !is_eq {
+                    // `str` supports only equality (no ordering yet).
                     self.diags
                         .error("str supports only == and != (ordering is not available)".to_string(), span);
                 }
@@ -5543,6 +5641,7 @@ impl<'a, 't> Checker<'a, 't> {
 
     fn finalize_expr(&mut self, e: &mut Expr) {
         e.ty = self.finalize(e.ty);
+        let span = e.span;
         match &mut e.kind {
             ExprKind::Unary { expr, .. } => self.finalize_expr(expr),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
@@ -5567,6 +5666,17 @@ impl<'a, 't> Checker<'a, 't> {
                     // a truly uninferable parameter already errored in `check_generic_call`.
                     let abstract_call = type_args.iter().any(|t| matches!(t, Ty::Param(_)));
                     if !abstract_call && !type_args.contains(&Ty::Error) {
+                        // Each concrete type argument must satisfy its parameter's bound.
+                        if let Some(bounds) = self.sigs.get(func).map(|s| s.bounds.clone()) {
+                            for (i, (arg, bound)) in type_args.iter().zip(&bounds).enumerate() {
+                                if !bound.satisfied_by(*arg) {
+                                    self.diags.error(
+                                        format!("type argument {} = `{}` does not satisfy the `{}` bound of '{func}'", i + 1, ty_name(*arg), bound.name()),
+                                        span,
+                                    );
+                                }
+                            }
+                        }
                         self.instantiations.push((func.clone(), type_args.clone()));
                         *func = mangle_mono(func, type_args);
                     }

@@ -265,12 +265,15 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   inference (so a literal argument's type can flow from the call's context).
 - A template is checked abstractly (T = Param) — operations needing a capability are rejected; an
   uninstantiated generic is not checked. Instantiations are discovered transitively to a fixpoint.
+- 4c-2: builtin bounds `fn f<T: Bound>` — a fixed hierarchy `Num` ⊃ `Ord` ⊃ `Eq` (`FnSig.bounds` +
+  `Checker.param_bounds`). The bound gates operations on a `Param` value in `check_binary`
+  (`Num`→arith, `Ord`→ordering, `Eq`→equality); a concrete type argument is checked against the
+  bound at instantiation (`finalize_expr`). No user-defined trait bounds.
 ```
 
-`// OPEN:` the constraint model — chosen direction is a **small builtin bound set (`Num`/`Ord`/`Eq`)**,
-not user trait-style bounds (`open-questions.md` Generics); type parameters in nested positions
-(generic containers — needs `Param` representable inside composites); the `N` in `vec<N,T>` (value
-generics, M6).
+`// OPEN:` type parameters in nested positions (generic containers — needs `Param` representable
+inside composites); the `N` in `vec<N,T>` (value generics, M6); folding `Option`/`Result` into the
+general generic mechanism.
 
 ---
 
