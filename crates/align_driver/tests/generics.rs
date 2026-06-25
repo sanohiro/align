@@ -152,3 +152,10 @@ fn generic_call_arity_mismatch_rejected() {
     let src = "fn pick<T>(a: T, b: T) -> T = a\nfn main() -> i32 = pick(1)\n";
     assert!(check_errs("gen-arity", src));
 }
+
+#[test]
+fn generic_main_rejected() {
+    // `main` is the entry point and cannot be a generic template.
+    let src = "fn main<T>() -> i32 = 0\n";
+    assert!(check_errs("gen-main", src));
+}

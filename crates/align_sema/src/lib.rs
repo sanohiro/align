@@ -564,6 +564,11 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 diags.error(format!("type parameter '{}' shadows a declared type", t.name), t.span);
             }
         }
+        // `main` is the program entry; it cannot be a generic template (no concrete instance would
+        // be generated, so the entry point would vanish).
+        if f.name.name == "main" && !tparams.is_empty() {
+            diags.error("main cannot be generic".to_string(), f.span);
+        }
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
             params.push(resolve_type(&p.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &tparams, diags));
@@ -651,16 +656,15 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // Monomorphization: generate one concrete instance per distinct `(template, type_args)`, then
     // scan each instance for further generic calls (transitive). `check_generic_call` already
     // rewrote every call target to the mangled name, so nothing else needs renaming.
-    let mut generated: Vec<String> = Vec::new();
+    let mut generated: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut wi = 0;
     while wi < worklist.len() {
         let (oname, targs) = worklist[wi].clone();
         wi += 1;
         let mangled = mangle_mono(&oname, &targs);
-        if generated.contains(&mangled) {
+        if !generated.insert(mangled.clone()) {
             continue; // already instantiated
         }
-        generated.push(mangled.clone());
         let Some(decl) = generic_decls.get(oname.as_str()) else { continue };
         let tparams = decl.type_params.iter().map(|t| t.name.clone()).collect();
         let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &structs, &mut tuples, &mut fn_types, tparams, targs);
