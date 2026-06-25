@@ -3454,15 +3454,15 @@ impl<'a, 't> Checker<'a, 't> {
         let a = self.resolve(actual);
         match (declared, a) {
             (Ty::Param(p), _) => self.bind_param(p, a, subst, span),
-            (Ty::Option(ds), Ty::Option(asc)) => self.match_scalar_param(ds, asc, subst, span),
+            (Ty::Option(ds), Ty::Option(asc)) => self.match_scalar_param(ds, asc, subst, span, bind_only),
             (Ty::Result(dok, derr), Ty::Result(aok, aerr)) => {
-                self.match_scalar_param(dok, aok, subst, span);
-                self.match_scalar_param(derr, aerr, subst, span);
+                self.match_scalar_param(dok, aok, subst, span, bind_only);
+                self.match_scalar_param(derr, aerr, subst, span, bind_only);
             }
             (Ty::Slice(ds), Ty::Slice(asc))
             | (Ty::Box(ds), Ty::Box(asc))
             | (Ty::Array(ds, _), Ty::Array(asc, _))
-            | (Ty::Task(ds), Ty::Task(asc)) => self.match_scalar_param(ds, asc, subst, span),
+            | (Ty::Task(ds), Ty::Task(asc)) => self.match_scalar_param(ds, asc, subst, span, bind_only),
             _ => {
                 if !bind_only {
                     self.unify(a, declared, span);
@@ -3471,10 +3471,14 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// The scalar-level companion of [`match_param`]: bind a `Scalar::Param` from the actual scalar.
-    fn match_scalar_param(&mut self, declared: Scalar, actual: Scalar, subst: &mut [Option<Ty>], span: Span) {
+    /// The scalar-level companion of [`match_param`]: bind a `Scalar::Param` from the actual scalar,
+    /// or (when not seeding) unify a concrete declared scalar against the actual so a mismatch in a
+    /// concrete nested position (`Result<T, i32>` vs `Result<_, bool>`) is still a type error.
+    fn match_scalar_param(&mut self, declared: Scalar, actual: Scalar, subst: &mut [Option<Ty>], span: Span, bind_only: bool) {
         if let Scalar::Param(p) = declared {
             self.bind_param(p, scalar_to_ty(actual), subst, span);
+        } else if !bind_only {
+            self.unify(scalar_to_ty(declared), scalar_to_ty(actual), span);
         }
     }
 

@@ -279,3 +279,11 @@ fn generic_box_param_rejected() {
     let src = "fn f<T>(b: box<T>) -> i32 = 0\nfn main() -> i32 = 0\n";
     assert!(check_errs("gen-box", src));
 }
+
+#[test]
+fn concrete_nested_mismatch_rejected() {
+    // A concrete part of a nested generic parameter type must still match: `Result<T, i32>` cannot
+    // accept a `Result<_, bool>` (the `i32` vs `bool` mismatch must be a type error).
+    let src = "fn f<T>(r: Result<T, i32>) -> i32 = 0\nfn main() -> i32 {\n  x: Result<f64, bool> := Ok(1.0)\n  return f(x)\n}\n";
+    assert!(check_errs("gen-nested-mismatch", src));
+}
