@@ -155,14 +155,17 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      `fn unwrap_or<T>(o: Option<T>, d: T) -> T` / `fn ok<T>(x: T) -> Result<T, Error>` work. New
      `Scalar::Param`; structural inference (`match_param`) binds `Param` bare or nested + seeds a
      return-only param from the expected type; a nested param finalizes eagerly at the call, a bare
-     one stays deferred. (`box`/`slice`/`array`/tuple positions still rejected.) **4c-4 groundwork DONE**
-     — generic type *declaration* syntax `Pair<T> { … }` / `Opt<T> { … }` parses (`StructDecl`/
-     `EnumDecl.type_params`; top-level dispatch recognizes `Ident <`), and sema rejects it with a
-     clear "not supported yet" message. **Next 4c slice (the resolver refactor):** make `structs`
-     grow *during* type resolution (a `&mut Vec` threaded through `resolve_type`, mirroring
-     `tuples`/`fn_types`) so `Pair<i32>` interns a monomorph `StructDef` on demand; then struct-
-     literal type inference + generic containers (`Stack<T>` needs `array<T>` fields too). Then
-     value generics (`vec<N,T>`, M6) and folding `Option`/`Result` into the general mechanism.
+     one stays deferred. (`box`/`slice`/`array`/tuple positions still rejected.) **4c-4 + 4c-5 DONE —
+     generic structs.** `Pair<T> { a: T, b: T }` works end to end: the resolver refactor landed
+     (`resolve_type` takes a `TyCx` bundling the interners; `structs` grows *during* resolution, a
+     `&mut Vec` like `tuples`/`fn_types`; a `Pair<i32>` type interns a monomorph `StructDef` on
+     demand, deduped by mangled name; templates with `Param` fields live in a separate registry kept
+     out of codegen; concrete struct ids get reserved slots so monomorphs never shift them). A
+     generic struct literal `Pair { a: 1, b: 2 }` infers its type arguments from the field values
+     (no turbofish) then monomorphizes. (`examples/generic_struct.align`.) **Next 4c slices:**
+     generic **sum types** (`Opt<T>`), type parameters in `array<T>`/`slice<T>` params + real
+     containers (`Stack<T>` needs an `array<T>` field — the fused-pipeline + `PrimScalar` work),
+     then value generics (`vec<N,T>`, M6) and folding `Option`/`Result` into the general mechanism.
 5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
 6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.
 7. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

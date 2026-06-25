@@ -201,20 +201,23 @@ can't hold an inference variable), while a *bare* parameter stays deferred (keep
 return-context inference). `box<T>` / `slice<T>` / `array<T>` / tuple positions are still rejected
 (only Option/Result are wired).
 
-**4c-4 groundwork DONE:** generic type *declaration* syntax `Pair<T> { … }` / `Opt<T> { … }` parses
-(`StructDecl`/`EnumDecl.type_params`; the top-level item dispatch recognizes `Ident <`); sema rejects
-it with a clear "not supported yet" message. The implementation is the **resolver refactor** below.
+**4c-4 (decl syntax groundwork) + 4c-5 (generic structs) DONE.** Generic struct declarations
+`Pair<T> { a: T, b: T }` work end to end: the **resolver refactor** landed — `resolve_type` takes a
+`TyCx` bundling the interners, the concrete `structs` table grows *during* resolution (a `&mut Vec`,
+like `tuples`/`fn_types`), and a `Pair<i32>` type interns a concrete monomorph `StructDef` on demand
+(deduped by mangled name via `struct_mono`; templates with `Param` fields live in a separate
+`struct_templates` registry, kept out of codegen). Concrete struct ids get reserved slots so
+monomorphs (appended after) never shift them. A **generic struct literal** (`Pair { a: 1, b: 2 }`)
+infers its type arguments from the field values (`match_param`, no turbofish) then monomorphizes;
+`Pair<i32>` is also a parameter/annotation type. A field must be Copy after substitution.
 
 **Still open (later 4c slices):**
-- **The resolver refactor + generic structs.** Monomorphizing `Pair<i32>` must intern a concrete
-  `StructDef` *during* type resolution, so `structs` has to grow during resolution — a `&mut Vec`
-  threaded through `resolve_type` (and held mutably by the `Checker`), mirroring how `tuples` /
-  `fn_types` already work; generic-struct templates (with `Param` fields) live in a separate
-  registry kept out of codegen. Then struct-literal type-argument inference. The `Scalar::Param`
-  foundation + the decl syntax are in place; this is the invasive-but-mechanical remaining piece.
+- **Generic sum types** (`Opt<T> { Some(T), None }`) — still rejected; needs the enum analogue of the
+  struct-template monomorphization (and `Scalar::Param` already exists for the payloads).
 - **Type parameters in `array<T>` / `slice<T>` params** + real generic containers (`Stack<T>` needs
   an `array<T>` field) — `array<T>` needs the fused-pipeline machinery to handle a generic element
-  + `PrimScalar` to carry a `Param`.
+  + `PrimScalar` to carry a `Param`. (Generic structs with bare-T / Copy fields work now; an
+  `array<T>` *field* is the remaining gap for a true growable container.)
 - **Value generics for `vec<N, T>`** (the `N`) — M6.
 - **Generic `Option`/`Result`** in the general mechanism (retiring the builtin `Ty::Option`/`Result`
   special-case) — once nested-position generics + a `Some`/`Ok` generic-enum path exist.

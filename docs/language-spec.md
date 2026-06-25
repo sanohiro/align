@@ -96,8 +96,10 @@ ordering+equality (numbers, `char`), `Eq` = equality (numbers, `char`, `bool`, `
 argument that does not satisfy the bound is a compile error. No user-defined trait bounds.
 
 A type parameter may also appear nested in an `Option<T>` / `Result<T, E>` (parameter or return
-position) — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T`. (Nested in
-`array<T>` / `box<T>` / a tuple, and generic structs, are later slices.)
+position) — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T`. **Structs may be
+generic** — `Pair<T> { a: T, b: T }` — monomorphized per instantiation, type arguments inferred
+from the field values (`Pair { a: 1, b: 2 }`) or written as a type (`Pair<i32>`). (Nested in
+`array<T>` / `box<T>` / a tuple, and generic sum types, are later slices.)
 
 ```align
 fn id<T>(x: T) -> T = x                  // unconstrained: pass/return only

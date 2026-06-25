@@ -256,16 +256,61 @@ fn generic_box_param_rejected() {
     assert!(check_errs("gen-box", src));
 }
 
+// ---- 4c-5: generic structs ----
+
 #[test]
-fn generic_struct_decl_rejected_for_now() {
-    // Groundwork: `Pair<T> { ... }` parses (generic type-parameter syntax on a type declaration),
-    // but monomorphizing it needs the resolver refactor — sema rejects it with a clear message.
-    let src = "Pair<T> { a: T, b: T }\nfn main() -> i32 = 0\n";
-    assert!(check_errs("gen-struct-decl", src));
+fn generic_struct_construct_and_field_access() {
+    if !backend_available() {
+        return;
+    }
+    // `Pair<T>` declared, constructed (T inferred from the field values), fields read.
+    let src = "Pair<T> { a: T, b: T }\nfn ident(x: i32) -> i32 = x\nfn main() -> i32 {\n  p := Pair { a: ident(10), b: ident(32) }\n  return p.a + p.b\n}\n";
+    let out = build_and_run("gen-struct-pair", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_struct_as_function_param() {
+    if !backend_available() {
+        return;
+    }
+    // `Pair<i32>` as a parameter type monomorphizes; a literal passed to it matches the instance.
+    let src = "Pair<T> { a: T, b: T }\nfn sum(p: Pair<i32>) -> i32 = p.a + p.b\nfn ident(x: i32) -> i32 = x\nfn main() -> i32 = sum(Pair { a: ident(40), b: ident(2) })\n";
+    let out = build_and_run("gen-struct-param", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_struct_two_instantiations() {
+    if !backend_available() {
+        return;
+    }
+    // `Pair<i32>` and `Pair<bool>` are distinct monomorph instances.
+    let src = "Pair<T> { a: T, b: T }\nfn ident(x: i32) -> i32 = x\nfn main() -> i32 {\n  pi := Pair { a: ident(40), b: ident(2) }\n  pb := Pair { a: true, b: false }\n  if pb.a { return pi.a + pi.b }\n  return 0\n}\n";
+    let out = build_and_run("gen-struct-two", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_struct_multi_type_params() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Two<A, B> { x: A, y: B }\nfn ident(n: i32) -> i32 = n\nfn main() -> i32 {\n  t := Two { x: ident(42), y: true }\n  if t.y { return t.x }\n  return 0\n}\n";
+    let out = build_and_run("gen-struct-multi", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_struct_uninferable_rejected() {
+    // No field pins `T`, so it cannot be inferred from the literal.
+    let src = "Empty<T> { }\nfn main() -> i32 {\n  e := Empty { }\n  return 0\n}\n";
+    assert!(check_errs("gen-struct-uninfer", src));
 }
 
 #[test]
 fn generic_enum_decl_rejected_for_now() {
+    // Generic sum types are not supported yet (only generic structs are).
     let src = "Opt<T> { Some(T), None }\nfn main() -> i32 = 0\n";
     assert!(check_errs("gen-enum-decl", src));
 }

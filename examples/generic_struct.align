@@ -1,0 +1,25 @@
+// Generic structs (4c-5): a struct may take type parameters — `Pair<T>` — and is monomorphized
+// per concrete instantiation, just like a generic function. The type arguments are inferred from
+// the field values at the literal (no turbofish); `Pair<i32>` can also be written as a parameter
+// or annotation type. A field type must be Copy (a scalar or `str`) after substitution.
+
+Pair<T> { a: T, b: T }
+
+Two<A, B> { x: A, y: B }
+
+fn sum(p: Pair<i32>) -> i32 = p.a + p.b
+
+fn ident(x: i32) -> i32 = x
+
+fn main() -> i32 {
+  // T = i32, inferred from the field values → monomorph `Pair$i32`.
+  p := Pair { a: ident(40), b: ident(2) }
+  // A second instantiation, `Pair$bool`, distinct from `Pair$i32`.
+  flag := Pair { a: true, b: false }
+  // A multi-parameter generic struct.
+  t := Two { x: ident(0), y: false }
+  if flag.a && !t.y {
+    return sum(p)   // 40 + 2 = 42
+  }
+  return 0
+}
