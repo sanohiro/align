@@ -166,11 +166,12 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      `Opt<T> { Some(T), None }` works end to end (the enum analogue of 4c-5: `enum_templates`, the
      `enums` table grows during resolution with reserved slots + `enum_mono` dedup, `Opt<i32>` interns
      a monomorph `EnumDef`, and `Opt.Some(7)` infers the type args from the payload then
-     monomorphizes). `examples/generic_sum_type.align`. **Next 4c slices:** using a generic def inside
-     a generic function (`fn mk<T> -> Pair<T>` — deferred generic-instance type), type parameters in
-     `array<T>`/`slice<T>` params + real containers (`Stack<T>` needs an `array<T>` field — the
-     fused-pipeline + `PrimScalar` work), then value generics (`vec<N,T>`, M6) and folding
-     `Option`/`Result` into the general mechanism.
+     monomorphizes). `examples/generic_sum_type.align`. **→ 4c is CLOSED.** Minimal generics is
+     complete (functions + builtin bounds + generic structs + generic sum types); per the philosophy
+     it is deliberately *not* extended further. The leftovers are not generics: generic **containers**
+     (`Stack<T>`/`array<T>` fields) fold into #5 `group_by` if a consumer needs them; **`vec<N,T>`** is
+     M6; a generic-def-inside-a-generic-fn is an optional refinement. The "big three" (4a/4b/4c) are
+     done.
 5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
 6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.
 7. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

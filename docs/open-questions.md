@@ -156,7 +156,15 @@ elements) — bind it first. A Copy element reads fine in any position. The firs
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
-### Generics (minimal system) — in progress (4c)
+### Generics (minimal system) — DONE / CLOSED (4c)
+**This feature is complete and closed.** Generics is deliberately a *minimal*, supporting feature
+(`CLAUDE.md`: "approach minimally", "no Rust-trait complexity", "AI-friendliness is a constraint —
+avoid complex generics"). Align is **data-oriented** — arrays/slices are the protagonist, not
+generics. The implemented surface below (generic functions + builtin bounds + generic structs +
+generic sum types) is the intended scope; **do not keep extending it.** The items once listed as
+"later 4c slices" are not generics work and have moved to their real homes (see "Out of generics —
+moved to their own tracks" at the end of this entry).
+
 **Settled & built — 4c-1 (the unconstrained walking skeleton) DONE.** A function may declare type
 parameters `fn f<T, U>(...)` and is **monomorphized** per distinct concrete instantiation. Decisions
 made and implemented:
@@ -218,18 +226,22 @@ and variant construction (`Opt.Some(7)`) infers the type arguments from the payl
 then monomorphizes. A no-payload variant (`Opt.None`) is uninferable on its own (no expected-type
 decomposition yet). Payloads are scalars / plain structs (same as a non-generic enum).
 
-**Still open (later 4c slices):**
-- **Using a generic def inside a generic function** — `fn mk<T>(x: T) -> Pair<T>` / `Opt<T>` with a
-  `Param` arg — needs a deferred generic-instance type (monomorphized when the enclosing fn is);
-  currently rejected cleanly. Also: expected-type decomposition so `o: Opt<i32> := Opt.None` infers.
-- **Type parameters in `array<T>` / `slice<T>` params** + real generic containers (`Stack<T>` needs
-  an `array<T>` field) — `array<T>` needs the fused-pipeline machinery to handle a generic element
-  + `PrimScalar` to carry a `Param`. (Generic structs/enums with bare-T / Copy payloads work now; an
-  `array<T>` field is the remaining gap for a true growable container.)
-- **Value generics for `vec<N, T>`** (the `N`) — M6.
-- **Generic `Option`/`Result`** in the general mechanism (retiring the builtin `Ty::Option`/`Result`
-  special-case) — once nested-position generics + a `Some`/`Ok` generic-enum path exist.
-Required to write core in Align itself (`impl/03-types.md` §9, `impl/06-runtime-std.md` §10).
+**Generics is closed — the surface above is the whole feature.** The minimal-generics goal is met:
+generic functions, builtin bounds (`Num`/`Ord`/`Eq`), generic structs, and generic sum types, all
+monomorphized, no turbofish, no user trait bounds. That covers ordinary generic code; further
+extension is explicitly **not** pursued, to keep generics minimal and Align data-oriented.
+
+**Out of generics — moved to their own tracks (NOT generics todo):**
+- **Generic containers** (`Stack<T>`, an `array<T>`/`slice<T>` field/param) belong to the
+  **data-oriented core / `group_by` track** (roadmap #5), not here. They need the fused-pipeline
+  machinery to carry a generic element (and `PrimScalar` to hold a `Param`) — a perf-core change,
+  pursued *if and when* a concrete consumer (e.g. `group_by`) needs it. Align already ships builtin
+  `array`/`slice`/`Option`/`Result`/`Error`/tuples, so the language is complete without generic
+  containers.
+- **Value generics `vec<N, T>`** — part of **M6 (SIMD)**, not generics.
+- **A generic def used inside a generic function** (`fn mk<T> -> Pair<T>`) and expected-type
+  decomposition for `Opt.None` — small optional refinements, rejected cleanly today; only revisit
+  if real code demands them. Not required for the language to be complete.
 
 ### Error type design — Open (next after sum types; the i32 is an M2 placeholder)
 Today `Error` is the M2 `Ty::ErrCode` (an i32 code). **Leaning (2026-06-24, validated by external review):** build the real `Error` **on the sum-type mechanism** — `Error` is a **sum type of categories** (the variant carries a lightweight payload: a `str` view + position for a parse error, a code for an OS error, …). Constraints from the philosophy:
