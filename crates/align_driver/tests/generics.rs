@@ -309,6 +309,14 @@ fn generic_struct_uninferable_rejected() {
 }
 
 #[test]
+fn generic_struct_with_type_param_arg_rejected_for_now() {
+    // A generic struct instantiated with a (generic function's) type parameter — `Pair<T>` inside
+    // `fn mk<T>` — needs a deferred generic-struct type; rejected cleanly for now.
+    let src = "Pair<T> { a: T, b: T }\nfn mk<T>(x: T) -> Pair<T> = Pair { a: x, b: x }\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-struct-in-fn", src));
+}
+
+#[test]
 fn generic_enum_decl_rejected_for_now() {
     // Generic sum types are not supported yet (only generic structs are).
     let src = "Opt<T> { Some(T), None }\nfn main() -> i32 = 0\n";

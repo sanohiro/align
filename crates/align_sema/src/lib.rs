@@ -3069,7 +3069,16 @@ impl<'a, 't> Checker<'a, 't> {
         let mut args = Vec::with_capacity(tmpl.type_params.len());
         for (i, s) in subst.iter().enumerate() {
             let concrete = s.map(|t| self.finalize(t)).unwrap_or(Ty::Error);
-            if matches!(concrete, Ty::Param(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error) {
+            if matches!(concrete, Ty::Param(_)) {
+                // The field value's type is a (generic function's) type parameter — constructing a
+                // generic struct from inside a generic function. Deferred (see `resolve_type`).
+                self.diags.error(
+                    format!("constructing a generic struct ('{name}') with a type parameter inside a generic function is not supported yet"),
+                    span,
+                );
+                return err;
+            }
+            if matches!(concrete, Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error) {
                 self.diags.error(
                     format!("cannot infer type parameter '{}' of '{name}' from the fields", tmpl.type_params[i]),
                     span,
@@ -6438,6 +6447,17 @@ fn resolve_type(
                     return Ty::Error;
                 }
                 if arg_tys.contains(&Ty::Error) {
+                    return Ty::Error;
+                }
+                // A type argument that is itself a (generic function's) type parameter — `Pair<T>`
+                // inside `fn f<T>` — would need a deferred generic-struct type (monomorphized when
+                // the enclosing function is). Not supported yet; reject cleanly rather than intern a
+                // bogus `Param`-field struct into the concrete table.
+                if arg_tys.iter().any(|t| ty_mentions_param(*t)) {
+                    diags.error(
+                        format!("instantiating a generic struct with a type parameter ('{name}<…>' inside a generic function) is not supported yet"),
+                        span,
+                    );
                     return Ty::Error;
                 }
                 return Ty::Struct(instantiate_struct(name, &tmpl, &arg_tys, cx, span, diags));
