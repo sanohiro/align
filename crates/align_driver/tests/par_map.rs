@@ -2,33 +2,9 @@
 //! (`draft.md` §11). The Pure requirement is enforced by effect/purity inference. The first cut
 //! runs sequentially (real thread-parallel execution is a runtime follow-up).
 
-use align_driver::{backend_available, check, emit_object_file, link_executable, lower_to_mir};
-use align_span::SourceMap;
 
-fn build_and_run(name: &str, src: &str) -> std::process::Output {
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, name, src);
-    assert!(
-        !checked.diags.has_errors(),
-        "unexpected errors:\n{}",
-        align_driver::format_diagnostics(&sm, &checked.diags)
-    );
-    let mir = lower_to_mir(&checked.hir);
-    let dir = std::env::temp_dir();
-    let obj = dir.join(format!("align-test-{name}.o"));
-    let exe = dir.join(format!("align-test-{name}"));
-    emit_object_file(&mir, &obj).expect("codegen");
-    link_executable(&obj, &exe).expect("link");
-    let out = std::process::Command::new(&exe).output().expect("run");
-    let _ = std::fs::remove_file(&obj);
-    let _ = std::fs::remove_file(&exe);
-    out
-}
-
-fn check_errs(name: &str, src: &str) -> bool {
-    let mut sm = SourceMap::new();
-    check(&mut sm, name, src).diags.has_errors()
-}
+mod common;
+use common::*;
 
 #[test]
 fn par_map_pure_function() {

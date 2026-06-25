@@ -2,38 +2,12 @@
 //! (PRs #18–#36, all closed unmerged — the code was already in `main`). Each test pins a
 //! specific finding that was still live in `main` at review time.
 
-use align_driver::{
-    backend_available, check, emit_llvm_ir, emit_object_file, link_executable, lower_to_mir,
-};
-use align_span::SourceMap;
 
-fn build_and_run(name: &str, src: &str) -> std::process::Output {
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, name, src);
-    assert!(
-        !checked.diags.has_errors(),
-        "unexpected errors:\n{}",
-        align_driver::format_diagnostics(&sm, &checked.diags)
-    );
-    let mir = lower_to_mir(&checked.hir);
-    let dir = std::env::temp_dir();
-    let obj = dir.join(format!("align-test-{name}.o"));
-    let exe = dir.join(format!("align-test-{name}"));
-    emit_object_file(&mir, &obj).expect("codegen");
-    link_executable(&obj, &exe).expect("link");
-    let out = std::process::Command::new(&exe).output().expect("run");
-    let _ = std::fs::remove_file(&obj);
-    let _ = std::fs::remove_file(&exe);
-    out
-}
+mod common;
+use common::*;
 
 /// Type-check `src` and return whether it reported an error. The point of the panic-guard
 /// tests is that this returns (with `true`) instead of crashing the compiler.
-fn check_errs(name: &str, src: &str) -> bool {
-    let mut sm = SourceMap::new();
-    check(&mut sm, name, src).diags.has_errors()
-}
-
 // --- #18a: a `//` comment line must not be read as a `/` line-continuation ---
 
 #[test]

@@ -1,26 +1,9 @@
 //! M1 end-to-end: the builtin `print` reaches the runtime and writes to stdout
 //! (`docs/impl/07-roadmap.md` M1). Requires LLVM/cc, so skip where they are absent.
 
-use align_driver::{backend_available, check, emit_object_file, link_executable, lower_to_mir};
-use align_span::SourceMap;
 
-fn build_and_run(name: &str, src: &str) -> std::process::Output {
-    let mut sm = SourceMap::new();
-    let checked = check(&mut sm, name, src);
-    assert!(
-        !checked.diags.has_errors(),
-        "unexpected errors:\n{}",
-        align_driver::format_diagnostics(&sm, &checked.diags)
-    );
-    let mir = lower_to_mir(&checked.hir);
-
-    let dir = std::env::temp_dir();
-    let obj = dir.join(format!("align-test-{name}.o"));
-    let exe = dir.join(format!("align-test-{name}"));
-    emit_object_file(&mir, &obj).expect("codegen");
-    link_executable(&obj, &exe).expect("link");
-    std::process::Command::new(&exe).output().expect("run")
-}
+mod common;
+use common::*;
 
 #[test]
 fn print_outputs_integer_and_newline() {
