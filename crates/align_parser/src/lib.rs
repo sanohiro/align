@@ -263,11 +263,18 @@ impl<'a> Parser<'a> {
         self.bump(); // fn
         let name = self.parse_ident("function name")?;
 
-        // Optional generic type parameters: `fn f<T, U>(...)`.
+        // Optional generic type parameters: `fn f<T, U: Ord>(...)`.
         let mut type_params = Vec::new();
         if self.eat(&TokKind::Lt) {
             while !self.at(&TokKind::Gt) && !self.at(&TokKind::Eof) {
-                type_params.push(self.parse_ident("a type parameter name")?);
+                let name = self.parse_ident("a type parameter name")?;
+                // Optional builtin bound: `T: Ord`.
+                let bound = if self.eat(&TokKind::Colon) {
+                    Some(self.parse_ident("a bound (Eq, Ord, or Num)")?)
+                } else {
+                    None
+                };
+                type_params.push(TypeParam { name, bound });
                 if !self.eat(&TokKind::Comma) {
                     break;
                 }

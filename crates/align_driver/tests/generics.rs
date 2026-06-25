@@ -159,3 +159,67 @@ fn generic_main_rejected() {
     let src = "fn main<T>() -> i32 = 0\n";
     assert!(check_errs("gen-main", src));
 }
+
+// ---- 4c-2: builtin bounds (Num / Ord / Eq) ----
+
+#[test]
+fn num_bound_enables_arithmetic() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn add<T: Num>(a: T, b: T) -> T = a + b\nfn main() -> i32 = add(10, 20) + add(5, 7)\n";
+    let out = build_and_run("gen-num", src);
+    assert_eq!(out.status.code(), Some(42)); // 30 + 12
+}
+
+#[test]
+fn ord_bound_enables_comparison() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn max<T: Ord>(a: T, b: T) -> T = if a > b { a } else { b }\nfn main() -> i32 = max(7, 12) + max(30, 2)\n";
+    let out = build_and_run("gen-ord", src);
+    assert_eq!(out.status.code(), Some(42)); // 12 + 30
+}
+
+#[test]
+fn eq_bound_enables_equality_on_char() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn same<T: Eq>(a: T, b: T) -> bool = a == b\nfn main() -> i32 = if same('x', 'x') { 42 } else { 0 }\n";
+    let out = build_and_run("gen-eq", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn arithmetic_without_num_bound_rejected() {
+    let src = "fn add<T>(a: T, b: T) -> T = a + b\nfn main() -> i32 = add(1, 2)\n";
+    assert!(check_errs("gen-noarith", src));
+}
+
+#[test]
+fn ordering_with_only_eq_rejected() {
+    let src = "fn gt<T: Eq>(a: T, b: T) -> bool = a > b\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-eq-noord", src));
+}
+
+#[test]
+fn ord_instantiated_with_non_ord_rejected() {
+    // `bool` is not Ord — the instantiation must fail.
+    let src = "fn max<T: Ord>(a: T, b: T) -> T = if a > b { a } else { b }\nfn main() -> i32 = if max(true, false) { 1 } else { 0 }\n";
+    assert!(check_errs("gen-ord-bool", src));
+}
+
+#[test]
+fn num_instantiated_with_char_rejected() {
+    // `char` is Ord/Eq but not Num.
+    let src = "fn add<T: Num>(a: T, b: T) -> T = a + b\nfn main() -> i32 {\n  add('a', 'b')\n  return 0\n}\n";
+    assert!(check_errs("gen-num-char", src));
+}
+
+#[test]
+fn unknown_bound_rejected() {
+    let src = "fn f<T: Display>(x: T) -> T = x\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-badbound", src));
+}

@@ -359,11 +359,23 @@ p := pick(point, origin)   // T = Point
 
 Type arguments are **inferred** — from the arguments, or from the expected type propagated to the
 call (the binding annotation). There is no turbofish (`f<T>(x)` at a call); when a type cannot be
-inferred, annotate the binding. A type parameter is **opaque**: it is passed, returned, and stored
-by value, but it has no operations of its own — `x + x` on a bare `T` is a compile error, because
-nothing says `T` is a number. A small set of builtin constraints (`Num` / `Ord` / `Eq`) that
-unlocks generic arithmetic and comparison is a planned extension; user-defined trait-style bounds
-are deliberately out of scope (AI-friendliness, *one way*).
+inferred, annotate the binding. A bare type parameter is **opaque**: it is passed, returned, and
+stored by value, but it has no operations of its own — `x + x` on a bare `T` is a compile error,
+because nothing says `T` is a number.
+
+To use a type parameter in operations, give it a **builtin bound** — `fn f<T: Bound>`:
+
+```align
+fn add<T: Num>(a: T, b: T) -> T = a + b               // Num → arithmetic
+fn max<T: Ord>(a: T, b: T) -> T = if a > b { a } else { b }   // Ord → comparison
+fn same<T: Eq>(a: T, b: T) -> bool = a == b           // Eq  → equality
+```
+
+The bounds are a small fixed hierarchy — **`Num` ⊃ `Ord` ⊃ `Eq`**: `Num` grants arithmetic,
+ordering, and equality (the numeric types); `Ord` grants ordering and equality (numbers and
+`char`); `Eq` grants equality (numbers, `char`, `bool`, `str`). A type argument that does not
+satisfy a parameter's bound is a compile error at the call. There are **no user-defined
+trait-style bounds** — deliberately, for AI-friendliness and *one way*.
 
 ---
 

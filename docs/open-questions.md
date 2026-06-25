@@ -176,12 +176,20 @@ made and implemented:
   `Param`); and a generic function may not contain a lambda / pipeline yet (its lifted helper would
   collide across instances). (`crates/align_driver/tests/generics.rs`, `examples/generics.align`.)
 
+**Settled & built — 4c-2 (the constraint model) DONE.** A type parameter may carry a **builtin
+bound** — `fn f<T: Ord>` — from a small fixed hierarchy **`Num` ⊃ `Ord` ⊃ `Eq`**: `Num` grants
+arithmetic + ordering + equality (the numerics), `Ord` grants ordering + equality (numerics +
+`char`), `Eq` grants equality (numerics + `char` + `bool` + `str`). The bound gates which operations
+a `Ty::Param` value allows in the template body (an op needing a capability the bound doesn't grant
+is rejected — `x + x` needs `Num`, `a > b` needs `Ord`, `a == b` needs `Eq`), and at instantiation a
+concrete type argument is checked against the bound (`max<T: Ord>(true, false)` → "bool does not
+satisfy Ord"). **No user-defined trait-style bounds** (avoids Rust-trait complexity; AI-friendly;
+*one way*). Structural inference of bounds-from-usage was considered and set aside (implicit, harder
+error messages). (`FnSig.bounds` + `Checker.param_bounds`; gated in `check_binary`; instantiation
+check in `finalize_expr`. Closes a 4c-1 hole where `==`/`>` on an unconstrained `T` were wrongly
+allowed.)
+
 **Still open (later 4c slices):**
-- **The constraint model — chosen direction: a small set of builtin bounds (`Num` / `Ord` / `Eq`),
-  no user-defined trait-style bounds** (avoids Rust-trait complexity; AI-friendly; *one way*). This
-  unlocks generic `max` / `sum` / comparison and is what lets a type parameter be used in operations.
-  Structural inference of bounds-from-usage was considered and set aside (harder error messages,
-  implicit). Not yet built.
 - **Type parameters in nested positions** (generic containers `Stack<T>`, `array<T>` params) — needs
   `Param` representable inside composites (today `Scalar` is var-free); lifts the bare-position cut.
 - **Value generics for `vec<N, T>`** (the `N`) — M6.

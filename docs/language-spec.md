@@ -89,12 +89,15 @@ area := match s {
 A function may declare type parameters — `fn f<T>(...)` — and is **monomorphized** per distinct
 concrete instantiation (zero run-time cost; a Move `T` moves, a Copy `T` copies). Type arguments
 are **inferred** (from arguments or the expected type via the binding annotation) — no turbofish.
-A type parameter is **opaque**: passed / returned / stored by value, with no operations of its own
-(`x + x` on a bare `T` is rejected). A small builtin constraint set (`Num` / `Ord` / `Eq`) is a
-planned extension; user-defined trait bounds are out of scope.
+A bare type parameter is **opaque**: passed / returned / stored by value, with no operations of its
+own (`x + x` on a bare `T` is rejected). A **builtin bound** grants capabilities — `fn f<T: Bound>`
+— in a fixed `Num ⊃ Ord ⊃ Eq` hierarchy: `Num` = arithmetic+ordering+equality (numbers), `Ord` =
+ordering+equality (numbers, `char`), `Eq` = equality (numbers, `char`, `bool`, `str`). A type
+argument that does not satisfy the bound is a compile error. No user-defined trait bounds.
 
 ```align
-fn id<T>(x: T) -> T = x
+fn id<T>(x: T) -> T = x                  // unconstrained: pass/return only
+fn max<T: Ord>(a: T, b: T) -> T = if a > b { a } else { b }
 n := id(5)        // T = i32, monomorphized to id$i32
 ```
 

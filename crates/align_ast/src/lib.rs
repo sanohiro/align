@@ -80,13 +80,21 @@ pub struct FieldDef {
 pub struct FnDecl {
     pub vis: Vis,
     pub name: Ident,
-    /// Generic type parameters declared as `fn f<T, U>(...)`. Empty for a non-generic function.
+    /// Generic type parameters declared as `fn f<T, U: Ord>(...)`. Empty for a non-generic function.
     /// A parameter / return `Type` whose name matches one of these resolves to `Ty::Param(i)`.
-    pub type_params: Vec<Ident>,
+    pub type_params: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: FnBody,
     pub span: Span,
+}
+
+/// A generic type-parameter declaration: a name and an optional builtin bound (`T` or `T: Ord`).
+/// The bound is kept as an identifier here (`Eq` / `Ord` / `Num`) and resolved in sema.
+#[derive(Clone, Debug)]
+pub struct TypeParam {
+    pub name: Ident,
+    pub bound: Option<Ident>,
 }
 
 #[derive(Clone, Debug)]

@@ -1,10 +1,10 @@
-// Minimal generics (4c-1): unconstrained generic functions, monomorphized per use.
+// Minimal generics: generic functions, monomorphized per use, with builtin bounds.
 //
 // A `fn f<T>(...)` is a template. Each distinct call instantiates a concrete copy (`id$i32`,
 // `id$i64`, `pick$i32`, …) — type arguments are inferred from the call, never written (no
-// turbofish). A type parameter is opaque here: `T` is passed / returned / stored by value, but it
-// has no operations (arithmetic, fields), so `x + x` on a bare `T` is a compile error. The small
-// builtin constraint set (`Num` / `Ord` / `Eq`) that unlocks generic `max` / `sum` is a later slice.
+// turbofish). A bare type parameter is opaque: `T` is passed / returned / stored by value but has
+// no operations. A **builtin bound** grants capabilities — `Num` (arithmetic), `Ord` (comparison),
+// `Eq` (equality), in a `Num ⊃ Ord ⊃ Eq` hierarchy. There are no user-defined trait bounds.
 
 fn id<T>(x: T) -> T = x
 
@@ -13,10 +13,16 @@ fn pick<T>(a: T, b: T) -> T = a
 // A generic calling a generic — instantiating `wrap` at i32 instantiates `id` at i32 too.
 fn wrap<T>(x: T) -> T = id(x)
 
+// Bounded generics: `Num` unlocks `+`, `Ord` unlocks `>`.
+fn add<T: Num>(a: T, b: T) -> T = a + b
+fn max<T: Ord>(a: T, b: T) -> T = if a > b { a } else { b }
+
 fn main() -> i32 {
   a := id(5)          // id$i32
   b := pick(10, 20)   // pick$i32 → 10
   c := wrap(7)        // wrap$i32 → id$i32 → 7
-  // 5 + 10 + 7 = 22
-  return a + b + c
+  d := add(1, 2)      // add$i32 → 3
+  e := max(4, 1)      // max$i32 → 4
+  // 5 + 10 + 7 + 3 + 4 = 29
+  return a + b + c + d + e
 }
