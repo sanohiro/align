@@ -348,6 +348,14 @@ fn generic_enum_no_payload_variant_uninferable() {
 }
 
 #[test]
+fn generic_enum_invalid_payload_rejected() {
+    // A monomorph payload must satisfy the same rule a non-generic enum enforces: no `str`-field
+    // struct (an enum is neither dropped nor region-tracked) — else use-after-free / leak.
+    let src = "Named { s: str }\nOpt<T> { Some(T), None }\nfn main() -> i32 {\n  o := Opt.Some(Named { s: \"hi\" })\n  return 0\n}\n";
+    assert!(check_errs("gen-enum-badpayload", src));
+}
+
+#[test]
 fn concrete_nested_mismatch_rejected() {
     // A concrete part of a nested generic parameter type must still match: `Result<T, i32>` cannot
     // accept a `Result<_, bool>` (the `i32` vs `bool` mismatch must be a type error).

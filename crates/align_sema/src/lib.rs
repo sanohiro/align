@@ -6615,6 +6615,17 @@ fn is_field_ok(ty: Ty) -> bool {
     matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error)
 }
 
+/// Whether a scalar is a valid sum-type variant payload — the same rule the non-generic enum pass
+/// (0c) enforces on resolved types: a primitive scalar, or a plain-data struct with no `str` field
+/// (an enum is neither dropped nor region-tracked, so Move/`str`-bearing payloads are rejected).
+fn enum_payload_ok(s: Scalar, structs: &[StructDef]) -> bool {
+    match s {
+        Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char => true,
+        Scalar::Struct(id) => structs.get(id as usize).is_some_and(|sd| sd.fields.iter().all(|f| f.ty != Ty::Str)),
+        _ => false,
+    }
+}
+
 /// Monomorphize a generic struct: substitute its template fields with `args`, intern a concrete
 /// `StructDef` into `cx.structs` (deduped by mangled name), and return its id. Shared by
 /// `resolve_type` (a `Pair<i32>` type) and the generic struct-literal path (`Pair { a, b }`).
@@ -6679,10 +6690,16 @@ fn instantiate_enum(name: &str, tmpl: &EnumTemplate, args: &[Ty], cx: &mut TyCx,
     for v in &tmpl.variants {
         let payload: Vec<Scalar> = v.payload.iter().map(|&s| subst_scalar(s, args)).collect();
         for &p in &payload {
-            // A payload must be a real concrete scalar after substitution (sum-type payloads accept
-            // the same scalars as `Option`/`Result`); reject e.g. a `str`-field struct via `Scalar`.
-            if matches!(p, Scalar::Param(_)) {
-                diags.error(format!("variant '{}' of '{name}' has an unresolved payload", v.name), span);
+            // The substituted payload must be a valid sum-type payload — the SAME rule a non-generic
+            // enum enforces in Pass 0c: a primitive scalar or a plain-data struct (no `str` field).
+            // Without this, `Opt<string>` / `Opt<StructWithStrField>` would slip through, putting a
+            // Move/region-tracked value in an enum that is neither dropped nor region-tracked
+            // (use-after-free / leak).
+            if !enum_payload_ok(p, cx.structs) {
+                diags.error(
+                    format!("variant '{}' of '{name}' resolves to {}, which is not a valid sum-type payload yet", v.name, scalar_name(p)),
+                    span,
+                );
             }
         }
         variants.push(hir::EnumVariant { name: v.name.clone(), payload, field_base: v.field_base });
