@@ -377,6 +377,14 @@ ordering, and equality (the numeric types); `Ord` grants ordering and equality (
 satisfy a parameter's bound is a compile error at the call. There are **no user-defined
 trait-style bounds** — deliberately, for AI-friendliness and *one way*.
 
+A type parameter may also appear **nested** in an `Option<T>` / `Result<T, E>`, in a parameter or
+return position — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T` or
+`fn ok<T>(x: T) -> Result<T, Error>`:
+
+```align
+fn unwrap_or<T>(o: Option<T>, fallback: T) -> T = o else fallback
+```
+
 ---
 
 ## 6. Memory Model

@@ -230,3 +230,52 @@ fn equality_without_eq_bound_rejected() {
     let src = "fn eq<T>(a: T, b: T) -> bool = a == b\nfn main() -> i32 = 0\n";
     assert!(check_errs("gen-eq-hole", src));
 }
+
+// ---- 4c-3: type parameters in Option / Result positions ----
+
+#[test]
+fn option_return_position() {
+    if !backend_available() {
+        return;
+    }
+    // `T` nested in the return type `Option<T>`; the binding annotation seeds `T = i32`.
+    let src = "fn wrap<T>(x: T) -> Option<T> = Some(x)\nfn main() -> i32 {\n  o: Option<i32> := wrap(41)\n  return o else 0\n}\n";
+    let out = build_and_run("gen-opt-ret", src);
+    assert_eq!(out.status.code(), Some(41));
+}
+
+#[test]
+fn option_param_position() {
+    if !backend_available() {
+        return;
+    }
+    // `T` nested in a parameter type `Option<T>`, inferred from the argument.
+    let src = "fn unwrap_or<T>(o: Option<T>, d: T) -> T = o else d\nfn main() -> i32 {\n  a: Option<i32> := Some(7)\n  b: Option<i32> := None\n  return unwrap_or(a, 0) + unwrap_or(b, 5)\n}\n";
+    let out = build_and_run("gen-opt-param", src);
+    assert_eq!(out.status.code(), Some(12)); // 7 + 5
+}
+
+#[test]
+fn result_return_and_question_mark() {
+    if !backend_available() {
+        return;
+    }
+    // `Result<T, Error>` return position, propagated through `?`.
+    let src = concat!(
+        "fn ok<T>(x: T) -> Result<T, Error> = Ok(x)\n",
+        "fn run() -> Result<i32, Error> {\n",
+        "  v: i32 := ok(40)?\n",
+        "  return Ok(v + 2)\n",
+        "}\n",
+        "fn main() -> i32 = match run() { Ok(v) => v, Err(e) => 99 }\n",
+    );
+    let out = build_and_run("gen-result-ret", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_box_param_rejected() {
+    // `box<T>` over a type parameter is not supported yet (only Option/Result positions are).
+    let src = "fn f<T>(b: box<T>) -> i32 = 0\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-box", src));
+}

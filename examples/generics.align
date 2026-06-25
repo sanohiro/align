@@ -17,12 +17,17 @@ fn wrap<T>(x: T) -> T = id(x)
 fn add<T: Num>(a: T, b: T) -> T = a + b
 fn max<T: Ord>(a: T, b: T) -> T = if a > b { a } else { b }
 
+// A type parameter may also appear nested in an `Option<T>` / `Result<T, E>` (4c-3).
+fn unwrap_or<T>(o: Option<T>, fallback: T) -> T = o else fallback
+
 fn main() -> i32 {
-  a := id(5)          // id$i32
-  b := pick(10, 20)   // pick$i32 → 10
-  c := wrap(7)        // wrap$i32 → id$i32 → 7
-  d := add(1, 2)      // add$i32 → 3
-  e := max(4, 1)      // max$i32 → 4
-  // 5 + 10 + 7 + 3 + 4 = 29
-  return a + b + c + d + e
+  a := id(5)                      // id$i32
+  b := pick(10, 20)               // pick$i32 → 10
+  c := wrap(7)                    // wrap$i32 → id$i32 → 7
+  d := add(1, 2)                  // add$i32 → 3
+  e := max(4, 1)                  // max$i32 → 4
+  some: Option<i32> := Some(2)
+  f := unwrap_or(some, 0)         // unwrap_or$i32 → 2
+  // 5 + 10 + 7 + 3 + 4 + 2 = 31
+  return a + b + c + d + e + f
 }

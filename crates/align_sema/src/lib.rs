@@ -81,6 +81,11 @@ pub enum Scalar {
     /// `Option`/`Result` carry an enum, notably `Result<T, MyError>` (4b). Non-recursive (just the
     /// id), so `Scalar` stays `Copy`.
     Enum(u32),
+    /// A generic type parameter as a composite payload — `Option<T>` / `Result<T, E>` inside a
+    /// generic template (4c-3). Carries the parameter index (like [`Ty::Param`]). Present **only**
+    /// while a generic template is type-checked abstractly; monomorphization re-resolves every type
+    /// with the concrete arguments, so a `Scalar::Param` never reaches MoveCheck / MIR / codegen.
+    Param(u32),
 }
 
 impl Scalar {
@@ -237,6 +242,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // A sum type is a Copy value (a tagged struct of Copy fields), so it can be an
         // Option/Result payload — notably `Result<T, MyError>` with a user error enum (4b).
         Ty::Enum(id) => Some(Scalar::Enum(id)),
+        // A generic type parameter as an Option/Result payload (4c-3, template mode only).
+        Ty::Param(i) => Some(Scalar::Param(i)),
         _ => None,
     }
 }
@@ -254,6 +261,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::DynStructArray(id) => Ty::DynStructArray(id, Layout::Aos),
         Scalar::Str => Ty::Str,
         Scalar::Enum(id) => Ty::Enum(id),
+        Scalar::Param(i) => Ty::Param(i),
     }
 }
 
@@ -3374,32 +3382,45 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        // One inference slot per type parameter; each `Param(p)` argument unifies into slot p.
+        // One inference slot per type parameter. Each argument's type is matched structurally
+        // against its declared parameter type, binding any `Param` it carries (bare `T`, or nested
+        // in `Option<T>` / `Result<T, E>` / `slice<T>` / `box<T>` / a fixed `array<T>`).
         let mut subst: Vec<Option<Ty>> = vec![None; type_params.len()];
         let mut checked = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
-            match param_tys[i] {
-                Ty::Param(p) => {
-                    // Check the argument unconstrained (a bare type parameter applies no coercion),
-                    // then unify it into the parameter's slot so all occurrences agree.
-                    let ce = self.check_expr(a, None);
-                    let inferred = match subst[p as usize] {
-                        Some(prev) => self.unify(prev, ce.ty, a.span),
-                        None => ce.ty,
-                    };
-                    subst[p as usize] = Some(inferred);
-                    checked.push(ce);
-                }
-                concrete => {
-                    checked.push(self.check_arg(a, Some(concrete)));
-                    let last = checked.last().unwrap();
-                    self.unify(last.ty, concrete, a.span);
-                }
-            }
+            let declared = param_tys[i];
+            // A position mentioning a type parameter applies no coercion (the type is unknown), so
+            // check the argument unconstrained; a fully concrete parameter checks against it.
+            let ce = if ty_mentions_param(declared) {
+                self.check_expr(a, None)
+            } else {
+                self.check_arg(a, Some(declared))
+            };
+            self.match_param(declared, ce.ty, &mut subst, a.span, false);
+            checked.push(ce);
         }
-        // A return-only type parameter is supplied by the expected type (the binding annotation).
-        if let (Ty::Param(p), Some(exp)) = (ret, expected) {
-            subst[p as usize].get_or_insert(exp);
+        // Seed the remaining parameters from the expected type (the binding annotation), structurally
+        // — `o: Option<i32> := wrap(x)` gives `T = i32` from the return position. Bind-only: do not
+        // unify concrete leaves against `expected` (that constraint comes later via `result_ty`).
+        if let Some(exp) = expected {
+            self.match_param(ret, exp, &mut subst, span, true);
+        }
+        // A parameter that appears *nested* (inside `Option<T>` / `Result<…>` / …) must resolve to a
+        // concrete scalar now — a `Scalar` cannot hold an inference variable, so leaving it deferred
+        // would leak a `Param` into the result type and downstream checking. Finalize those eagerly
+        // (an unconstrained literal defaults). A purely-*bare* parameter stays deferred so a literal
+        // can still infer its type from the call's context (the 4c-1 return-context behavior).
+        let mut nested = vec![false; type_params.len()];
+        for t in param_tys.iter().chain(std::iter::once(&ret)) {
+            mark_nested_params(*t, &mut nested);
+        }
+        for (p, &is_nested) in nested.iter().enumerate() {
+            if !is_nested {
+                continue;
+            }
+            if let Some(s) = subst[p].as_mut() {
+                *s = self.finalize(*s);
+            }
         }
         // A type parameter mentioned by no argument and not supplied by the expected type is
         // immediately uninferable; the rest may still be inference variables (e.g. an integer
@@ -3423,6 +3444,46 @@ impl<'a, 't> Checker<'a, 't> {
         // `finalize_expr`, which then records the instantiation and rewrites `func` to the
         // monomorph's mangled name — by then a literal argument's type has flowed from context.
         Expr { kind: ExprKind::Call { func: name.to_string(), args: checked, type_args }, ty: result_ty, span }
+    }
+
+    /// Match an `actual` type against a `declared` parameter/return type, binding each `Ty::Param`
+    /// it carries into `subst` (unifying repeated occurrences). `bind_only` skips unifying concrete
+    /// leaves (used when seeding from the expected type). Handles `Param` bare or nested one level
+    /// in a scalar-payload composite (`Option`/`Result`/`slice`/`box`/`array`/`Task`).
+    fn match_param(&mut self, declared: Ty, actual: Ty, subst: &mut [Option<Ty>], span: Span, bind_only: bool) {
+        let a = self.resolve(actual);
+        match (declared, a) {
+            (Ty::Param(p), _) => self.bind_param(p, a, subst, span),
+            (Ty::Option(ds), Ty::Option(asc)) => self.match_scalar_param(ds, asc, subst, span),
+            (Ty::Result(dok, derr), Ty::Result(aok, aerr)) => {
+                self.match_scalar_param(dok, aok, subst, span);
+                self.match_scalar_param(derr, aerr, subst, span);
+            }
+            (Ty::Slice(ds), Ty::Slice(asc))
+            | (Ty::Box(ds), Ty::Box(asc))
+            | (Ty::Array(ds, _), Ty::Array(asc, _))
+            | (Ty::Task(ds), Ty::Task(asc)) => self.match_scalar_param(ds, asc, subst, span),
+            _ => {
+                if !bind_only {
+                    self.unify(a, declared, span);
+                }
+            }
+        }
+    }
+
+    /// The scalar-level companion of [`match_param`]: bind a `Scalar::Param` from the actual scalar.
+    fn match_scalar_param(&mut self, declared: Scalar, actual: Scalar, subst: &mut [Option<Ty>], span: Span) {
+        if let Scalar::Param(p) = declared {
+            self.bind_param(p, scalar_to_ty(actual), subst, span);
+        }
+    }
+
+    fn bind_param(&mut self, p: u32, actual: Ty, subst: &mut [Option<Ty>], span: Span) {
+        let slot = &mut subst[p as usize];
+        *slot = Some(match *slot {
+            Some(prev) => self.unify(prev, actual, span),
+            None => actual,
+        });
     }
 
     /// Check a call argument against a parameter type, applying an array → slice borrow
@@ -5640,8 +5701,12 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn finalize_expr(&mut self, e: &mut Expr) {
-        e.ty = self.finalize(e.ty);
+        let cur_ty = self.finalize(e.ty);
+        e.ty = cur_ty;
         let span = e.span;
+        // A nested-`Param` generic-call result (`Option<T>` → `Option<i32>`) is resolved here, after
+        // the type arguments are finalized; set from the Call arm and applied after the match.
+        let mut recomputed: Option<Ty> = None;
         match &mut e.kind {
             ExprKind::Unary { expr, .. } => self.finalize_expr(expr),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
@@ -5666,6 +5731,8 @@ impl<'a, 't> Checker<'a, 't> {
                     // a truly uninferable parameter already errored in `check_generic_call`.
                     let abstract_call = type_args.iter().any(|t| matches!(t, Ty::Param(_)));
                     if !abstract_call && !type_args.contains(&Ty::Error) {
+                        // Resolve a nested-`Param` result type (`Option<T>` → `Option<i32>`).
+                        recomputed = Some(subst_param_ty(cur_ty, type_args));
                         // Each concrete type argument must satisfy its parameter's bound.
                         if let Some(bounds) = self.sigs.get(func).map(|s| s.bounds.clone()) {
                             for (i, (arg, bound)) in type_args.iter().zip(&bounds).enumerate() {
@@ -5792,6 +5859,9 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::BuilderNew
             | ExprKind::IndexField { .. } => {}
         }
+        if let Some(t) = recomputed {
+            e.ty = t;
+        }
     }
 }
 
@@ -5884,9 +5954,55 @@ fn ty_name(ty: Ty) -> String {
 /// can't hold a `Param`), so this is a single top-level replacement. Used by both call-result typing
 /// and monomorphization.
 fn subst_param_ty(ty: Ty, args: &[Ty]) -> Ty {
+    // A `Param` nested in a scalar-payload composite (`Option<T>` / `Result<T, E>` / `box<T>` /
+    // `slice<T>` / `array<T>` fixed / `Task<T>`). Tuples/structs/`array<T>` dynamic carry their
+    // element via an interner or `PrimScalar` and are not supported in a nested generic position yet.
+    let subst_s = |s: Scalar| -> Scalar {
+        match s {
+            Scalar::Param(i) => ty_to_scalar(args.get(i as usize).copied().unwrap_or(Ty::Error)).unwrap_or(s),
+            other => other,
+        }
+    };
     match ty {
         Ty::Param(i) => args.get(i as usize).copied().unwrap_or(Ty::Error),
+        Ty::Option(s) => Ty::Option(subst_s(s)),
+        Ty::Result(o, e) => Ty::Result(subst_s(o), subst_s(e)),
+        Ty::Box(s) => Ty::Box(subst_s(s)),
+        Ty::Slice(s) => Ty::Slice(subst_s(s)),
+        Ty::Array(s, n) => Ty::Array(subst_s(s), n),
+        Ty::Task(s) => Ty::Task(subst_s(s)),
         other => other,
+    }
+}
+
+/// Whether a type carries a generic `Param` — bare, or nested one level in a scalar-payload
+/// composite. Used to decide whether a call argument applies a coercion (it does not when the
+/// parameter type is generic).
+/// Mark every type parameter that appears **nested** in a composite (not a bare `Ty::Param`):
+/// such a parameter must resolve to a concrete scalar at the call (a `Scalar` can't hold an
+/// inference variable).
+fn mark_nested_params(ty: Ty, nested: &mut [bool]) {
+    let mut mark = |s: Scalar| {
+        if let Scalar::Param(p) = s {
+            nested[p as usize] = true;
+        }
+    };
+    match ty {
+        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => mark(s),
+        Ty::Result(o, e) => {
+            mark(o);
+            mark(e);
+        }
+        _ => {}
+    }
+}
+
+fn ty_mentions_param(ty: Ty) -> bool {
+    match ty {
+        Ty::Param(_) => true,
+        Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::Array(s, _) | Ty::Task(s) => matches!(s, Scalar::Param(_)),
+        Ty::Result(o, e) => matches!(o, Scalar::Param(_)) || matches!(e, Scalar::Param(_)),
+        _ => false,
     }
 }
 
@@ -5907,7 +6023,13 @@ fn ty_mangle(ty: Ty) -> String {
 }
 
 /// A composite type argument must resolve to a concrete scalar in M2.
-fn scalar_arg(ty: Ty, what: &str, span: Span, diags: &mut Diagnostics) -> Option<Scalar> {
+fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Diagnostics) -> Option<Scalar> {
+    // A generic type parameter is a valid payload only where 4c-3 supports it (`Option`/`Result`);
+    // `box`/`slice`/`array` over a `T` are not supported yet, so reject `Param` there.
+    if matches!(ty, Ty::Param(_)) && !allow_param {
+        diags.error(format!("{what} cannot be a generic type parameter yet, got {}", ty_name(ty)), span);
+        return None;
+    }
     match ty_to_scalar(ty) {
         Some(s) => Some(s),
         None => {
@@ -6029,7 +6151,7 @@ fn resolve_type(
             // a box payload must be a true primitive scalar: codegen can't size a struct box, and
             // a Move payload (`string`) has no `box` drop story. Reject both with a clean
             // diagnostic (else `box<string>`/`box<Struct>` would type-check then panic in codegen).
-            match scalar_arg(inner, "box payload", span, diags) {
+            match scalar_arg(inner, "box payload", false, span, diags) {
                 Some(Scalar::Struct(_)) => {
                     diags.error("a box payload must be a primitive scalar (struct boxes are not supported)".to_string(), span);
                     Ty::Error
@@ -6058,7 +6180,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match scalar_arg(inner, "Option payload", span, diags) {
+            match scalar_arg(inner, "Option payload", true, span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,
             }
@@ -6071,7 +6193,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match scalar_arg(inner, "slice element", span, diags) {
+            match scalar_arg(inner, "slice element", false, span, diags) {
                 Some(s) => Ty::Slice(s),
                 None => Ty::Error,
             }
@@ -6090,7 +6212,7 @@ fn resolve_type(
             // element resolves to the scalar `array<T>` (`DynArray`).
             match inner {
                 Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
-                _ => match scalar_arg(inner, "array element", span, diags) {
+                _ => match scalar_arg(inner, "array element", false, span, diags) {
                     Some(s) => Ty::DynArray(s),
                     None => Ty::Error,
                 },
@@ -6108,8 +6230,8 @@ fn resolve_type(
                 }
             };
             match (
-                scalar_arg(ok, "Result ok payload", span, diags),
-                scalar_arg(err, "Result err payload", span, diags),
+                scalar_arg(ok, "Result ok payload", true, span, diags),
+                scalar_arg(err, "Result err payload", true, span, diags),
             ) {
                 (Some(o), Some(e)) => Ty::Result(o, e),
                 _ => Ty::Error,

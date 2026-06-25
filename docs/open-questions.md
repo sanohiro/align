@@ -189,9 +189,23 @@ error messages). (`FnSig.bounds` + `Checker.param_bounds`; gated in `check_binar
 check in `finalize_expr`. Closes a 4c-1 hole where `==`/`>` on an unconstrained `T` were wrongly
 allowed.)
 
+**Settled & built — 4c-3 (type parameters in `Option`/`Result` positions) DONE.** A type parameter
+may appear **nested** in an `Option<T>` / `Result<T, E>` payload (parameter or return position) —
+generic combinators `fn unwrap_or<T>(o: Option<T>, d: T) -> T`, `fn ok<T>(x: T) -> Result<T, Error>`.
+`Scalar::Param(u32)` makes a parameter representable as an Option/Result payload (var-free invariant
+relaxed only inside the abstract template check — never reaches MIR/codegen, like `Ty::Param`).
+Inference is **structural** (`match_param`): a type argument is matched against the declared type,
+binding `Param` bare or nested; a return-only param is seeded from the expected type
+(`o: Option<i32> := wrap(x)`). A *nested* parameter is finalized eagerly at the call (a `Scalar`
+can't hold an inference variable), while a *bare* parameter stays deferred (keeps 4c-1's
+return-context inference). `box<T>` / `slice<T>` / `array<T>` / tuple positions are still rejected
+(only Option/Result are wired).
+
 **Still open (later 4c slices):**
-- **Type parameters in nested positions** (generic containers `Stack<T>`, `array<T>` params) — needs
-  `Param` representable inside composites (today `Scalar` is var-free); lifts the bare-position cut.
+- **Type parameters in the remaining nested positions** (`array<T>` / `slice<T>` params, generic
+  containers `Stack<T>`) — `array<T>` needs the fused-pipeline machinery to handle a generic element
+  + `PrimScalar` to carry a `Param`; generic structs need generic type *declarations* + per-monomorph
+  struct interning. The `Scalar::Param` foundation is in place; these lift the remaining cuts.
 - **Value generics for `vec<N, T>`** (the `N`) — M6.
 - **Generic `Option`/`Result`** in the general mechanism (retiring the builtin `Ty::Option`/`Result`
   special-case) — once nested-position generics + a `Some`/`Ok` generic-enum path exist.

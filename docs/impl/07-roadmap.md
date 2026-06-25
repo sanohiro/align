@@ -150,9 +150,14 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      operations a `Param` value allows in the template (`x + x` needs `Num`, `a > b` needs `Ord`,
      `a == b` needs `Eq`), and a concrete type argument is checked against it at instantiation. No
      user-defined trait bounds. (Closes a 4c-1 hole where `==`/`>` on an unconstrained `T` slipped
-     through.) **Next 4c slices** (`open-questions.md`): type parameters in nested positions
-     (generic containers `Stack<T>`, `array<T>` params), then value generics (`vec<N,T>`, M6) and
-     folding `Option`/`Result` into the general mechanism (retiring their builtin special-case).
+     through.) **4c-3 DONE (type parameters in `Option`/`Result` positions)** — `T` may be nested in
+     an `Option<T>` / `Result<T, E>` payload (param or return), so generic combinators
+     `fn unwrap_or<T>(o: Option<T>, d: T) -> T` / `fn ok<T>(x: T) -> Result<T, Error>` work. New
+     `Scalar::Param`; structural inference (`match_param`) binds `Param` bare or nested + seeds a
+     return-only param from the expected type; a nested param finalizes eagerly at the call, a bare
+     one stays deferred. (`box`/`slice`/`array`/tuple positions still rejected.) **Next 4c slices**
+     (`open-questions.md`): `array<T>` / `slice<T>` params + generic containers (`Stack<T>`), then
+     value generics (`vec<N,T>`, M6) and folding `Option`/`Result` into the general mechanism.
 5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
 6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.
 7. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
