@@ -211,13 +211,21 @@ monomorphs (appended after) never shift them. A **generic struct literal** (`Pai
 infers its type arguments from the field values (`match_param`, no turbofish) then monomorphizes;
 `Pair<i32>` is also a parameter/annotation type. A field must be Copy after substitution.
 
+**4c-6 (generic sum types) DONE.** `Opt<T> { Some(T), None }` works end to end — the enum analogue
+of generic structs: an `enum_templates` registry, the concrete `enums` table grows during resolution
+(reserved slots + `enum_mono` dedup), `resolve_type` interns a monomorph `EnumDef` for `Opt<i32>`,
+and variant construction (`Opt.Some(7)`) infers the type arguments from the payload (`match_param`)
+then monomorphizes. A no-payload variant (`Opt.None`) is uninferable on its own (no expected-type
+decomposition yet). Payloads are scalars / plain structs (same as a non-generic enum).
+
 **Still open (later 4c slices):**
-- **Generic sum types** (`Opt<T> { Some(T), None }`) — still rejected; needs the enum analogue of the
-  struct-template monomorphization (and `Scalar::Param` already exists for the payloads).
+- **Using a generic def inside a generic function** — `fn mk<T>(x: T) -> Pair<T>` / `Opt<T>` with a
+  `Param` arg — needs a deferred generic-instance type (monomorphized when the enclosing fn is);
+  currently rejected cleanly. Also: expected-type decomposition so `o: Opt<i32> := Opt.None` infers.
 - **Type parameters in `array<T>` / `slice<T>` params** + real generic containers (`Stack<T>` needs
   an `array<T>` field) — `array<T>` needs the fused-pipeline machinery to handle a generic element
-  + `PrimScalar` to carry a `Param`. (Generic structs with bare-T / Copy fields work now; an
-  `array<T>` *field* is the remaining gap for a true growable container.)
+  + `PrimScalar` to carry a `Param`. (Generic structs/enums with bare-T / Copy payloads work now; an
+  `array<T>` field is the remaining gap for a true growable container.)
 - **Value generics for `vec<N, T>`** (the `N`) — M6.
 - **Generic `Option`/`Result`** in the general mechanism (retiring the builtin `Ty::Option`/`Result`
   special-case) — once nested-position generics + a `Some`/`Ok` generic-enum path exist.

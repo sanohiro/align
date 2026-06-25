@@ -385,17 +385,22 @@ return position — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T
 fn unwrap_or<T>(o: Option<T>, fallback: T) -> T = o else fallback
 ```
 
-**Structs may be generic too** — `Pair<T> { a: T, b: T }` — and are monomorphized per concrete
-instantiation like generic functions. The type arguments are inferred from the field values at a
-literal (no turbofish); the concrete form is also written as a type — `Pair<i32>` — for a parameter
-or annotation. Each field must still be a Copy type after substitution.
+**Structs and sum types may be generic too** — `Pair<T> { a: T, b: T }`, `Opt<T> { Some(T), None }`
+— and are monomorphized per concrete instantiation like generic functions. The type arguments are
+inferred (no turbofish): from a struct literal's field values, or from a variant's payload; the
+concrete form is also written as a type — `Pair<i32>` — for a parameter or annotation.
 
 ```align
 Pair<T> { a: T, b: T }
+Opt<T>  { Some(T), None }
 
 p := Pair { a: 1, b: 2 }          // Pair<i32>, inferred from the fields
+o := Opt.Some(7)                  // Opt<i32>, inferred from the payload
 fn sum(q: Pair<i32>) -> i32 = q.a + q.b
 ```
+
+A struct field must be a Copy type after substitution. A no-payload variant (`Opt.None`) has nothing
+to infer its type from, so it needs a payload-bearing sibling to fix the type at construction.
 
 ---
 

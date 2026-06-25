@@ -281,11 +281,16 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   slots (so monomorphs, appended after, don't shift their ids). Templates (with `Param` fields) are
   kept in `struct_templates`, out of codegen. A literal `Pair { a, b }` infers the args from the
   field values (`match_param`) then monomorphizes.
+- 4c-6: generic sum types `Opt<T>` — the enum analogue of 4c-5. `enum_templates` registry; the
+  `enums` table grows during resolution (reserved slots + `enum_mono` dedup); `resolve_type` interns
+  a monomorph `EnumDef` for `Opt<i32>` (`instantiate_enum`); variant construction `Opt.Some(7)`
+  infers the args from the payload (`match_param`) then monomorphizes.
 ```
 
-`// OPEN:` generic sum types (`Opt<T>`); `array<T>` / `slice<T>` params + generic containers
-(`Stack<T>` needs an `array<T>` field); the `N` in `vec<N,T>` (value generics, M6); folding
-`Option`/`Result` into the general generic mechanism.
+`// OPEN:` using a generic def inside a generic function (`fn mk<T> -> Pair<T>` — deferred
+generic-instance type); `array<T>` / `slice<T>` params + generic containers (`Stack<T>` needs an
+`array<T>` field); the `N` in `vec<N,T>` (value generics, M6); folding `Option`/`Result` into the
+general generic mechanism.
 
 ---
 
