@@ -527,6 +527,12 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // Pass 0b: resolve struct field types (before enum payloads, which may be structs).
     let mut structs: Vec<StructDef> = Vec::with_capacity(struct_decls.len());
     for s in &struct_decls {
+        // A generic struct is already rejected (Pass 0a); skip resolving its `Param`-typed fields so
+        // they don't cascade into "unknown type 'T'". Keep the slot (empty) for id consistency.
+        if !s.type_params.is_empty() {
+            structs.push(StructDef { name: s.name.name.clone(), fields: Vec::new(), align: None });
+            continue;
+        }
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
             let ty = resolve_type(&f.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &[], diags);
@@ -564,6 +570,12 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // struct payload would need enum region-tracking (deferred).
     let mut enums: Vec<hir::EnumDef> = Vec::with_capacity(enum_decls.len());
     for e in &enum_decls {
+        // A generic sum type is already rejected (Pass 0a); skip resolving its `Param`-typed
+        // payloads so they don't cascade into "unknown type 'T'". Keep the slot for id consistency.
+        if !e.type_params.is_empty() {
+            enums.push(hir::EnumDef { name: e.name.name.clone(), variants: Vec::new() });
+            continue;
+        }
         let mut seen = std::collections::HashSet::new();
         let mut variants = Vec::with_capacity(e.variants.len());
         let mut field_base = 1u32;

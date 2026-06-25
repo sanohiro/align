@@ -207,12 +207,17 @@ impl<'a> Parser<'a> {
     fn parse_type_decl(&mut self, vis: Vis) -> Option<Item> {
         let start = self.span();
         let name = self.parse_ident("type name")?;
-        // Optional generic type parameters: `Pair<T, U>` (a bound is fn-only for now).
+        // Optional generic type parameters: `Pair<T, U: Ord>` (same form as a function's).
         let mut type_params = Vec::new();
         if self.eat(&TokKind::Lt) {
             while !self.at(&TokKind::Gt) && !self.at(&TokKind::Eof) {
                 let tname = self.parse_ident("a type parameter name")?;
-                type_params.push(TypeParam { name: tname, bound: None });
+                let bound = if self.eat(&TokKind::Colon) {
+                    Some(self.parse_ident("a bound (Eq, Ord, or Num)")?)
+                } else {
+                    None
+                };
+                type_params.push(TypeParam { name: tname, bound });
                 if !self.eat(&TokKind::Comma) {
                     break;
                 }
