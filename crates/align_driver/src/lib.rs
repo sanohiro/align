@@ -13,14 +13,90 @@ pub struct Checked {
     pub diags: Diagnostics,
 }
 
-/// lexer -> parser -> sema. Diagnostics are collected into `Checked.diags`.
+/// lexer -> parser -> sema for the entry file plus its transitively-imported **user** modules
+/// (multi-file, slice B1). User modules resolve by filename convention: `import geom` →
+/// `<entry-dir>/geom.align`, which must declare `module geom`. Builtin imports (`core.*`/`std.*`)
+/// are not files. Diagnostics are collected into `Checked.diags`.
 pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
-    let file = source_map.add_file(name, src);
     let mut diags = Diagnostics::new();
+    let entry_dir = std::path::Path::new(name).parent().map(|p| p.to_path_buf());
 
-    let tokens = align_lexer::tokenize(file, src, &mut diags);
-    let ast = align_parser::parse_file(tokens, &mut diags);
-    let hir = align_sema::check_file(&ast, &mut diags);
+    /// A parsed source module awaiting checking (kept alive so the `Module` borrows are valid).
+    struct Loaded {
+        path: String,
+        ast: align_ast::File,
+        is_entry: bool,
+    }
+
+    // A user-module import is one whose first segment is neither `core` nor `std` (builtins).
+    fn user_import(p: &align_ast::Path) -> bool {
+        p.segments.first().is_some_and(|s| s.name != "core" && s.name != "std")
+    }
+
+    // The entry module's own name is its `module` decl, or `main` by default.
+    let entry_tokens = align_lexer::tokenize(source_map.add_file(name, src), src, &mut diags);
+    let entry_ast = align_parser::parse_file(entry_tokens, &mut diags);
+    let entry_path = entry_ast
+        .module
+        .as_ref()
+        .and_then(|m| m.segments.last())
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "main".to_string());
+
+    let mut loaded = vec![Loaded { path: entry_path.clone(), ast: entry_ast, is_entry: true }];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from([entry_path]);
+
+    // Breadth-first over user-module imports, resolving each to `<entry-dir>/<name>.align`.
+    let mut i = 0;
+    while i < loaded.len() {
+        let imports: Vec<align_ast::Path> =
+            loaded[i].ast.imports.iter().filter(|p| user_import(p)).cloned().collect();
+        i += 1;
+        for imp in imports {
+            if imp.segments.len() != 1 {
+                diags.error(
+                    "nested user modules (`import a.b`) are not supported yet — use a single-segment module name".to_string(),
+                    imp.span,
+                );
+                continue;
+            }
+            let modname = imp.segments[0].name.clone();
+            if !seen.insert(modname.clone()) {
+                continue; // already loaded (shared / cyclic import)
+            }
+            let Some(dir) = &entry_dir else {
+                diags.error(format!("cannot resolve `import {modname}`: the entry file has no directory"), imp.span);
+                continue;
+            };
+            let file_path = dir.join(format!("{modname}.align"));
+            let msrc = match std::fs::read_to_string(&file_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    diags.error(format!("cannot find module `{modname}` (expected {}): {e}", file_path.display()), imp.span);
+                    continue;
+                }
+            };
+            let fid = source_map.add_file(file_path.display().to_string(), msrc.clone());
+            let toks = align_lexer::tokenize(fid, &msrc, &mut diags);
+            let mast = align_parser::parse_file(toks, &mut diags);
+            // The file must declare `module <modname>` (filename ↔ module-name agreement).
+            let declared = mast.module.as_ref().and_then(|m| m.segments.last()).map(|s| s.name.as_str());
+            if declared != Some(modname.as_str()) {
+                diags.error(
+                    format!("module file `{}` must declare `module {modname}` (found {})", file_path.display(),
+                        declared.map(|d| format!("`module {d}`")).unwrap_or_else(|| "no module declaration".to_string())),
+                    imp.span,
+                );
+            }
+            loaded.push(Loaded { path: modname, ast: mast, is_entry: false });
+        }
+    }
+
+    let modules: Vec<align_sema::Module> = loaded
+        .iter()
+        .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry })
+        .collect();
+    let hir = align_sema::check_program(&modules, &mut diags);
 
     Checked { hir, diags }
 }

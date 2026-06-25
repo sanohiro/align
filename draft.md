@@ -1030,7 +1030,29 @@ fn main() -> Result<(), Error> {
 
 Using `json.*` / `fs.*` / `io.stdout.write` without the matching `import` is a compile error; an `import` naming a module that does not exist is a compile error. The **language-syntactic** core — `Option` / `Result` / `?` / `else`, `arena`, the array pipeline (`map` / `where` / `reduce` / `sum` / …), the numeric methods (`x.abs()`, `a.min(b)`), `template "…"` — is always in scope and needs no import (requiring one would be requiring an import for syntax).
 
-`core` is language-intrinsic and `std` is the OS boundary; both are compiler builtins today (std becomes real Align-over-FFI library code once FFI lands). Multi-file user-authored modules (`import myproj.foo` resolving to another source file, `pub` cross-module visibility) are the next slice.
+`core` is language-intrinsic and `std` is the OS boundary; both are compiler builtins today (std becomes real Align-over-FFI library code once FFI lands).
+
+### User modules (multi-file)
+
+A program spans multiple files. A non-entry file declares its module name and exports with `pub`:
+
+```align
+// geom.align
+module geom
+
+pub fn area(w: i64, h: i64) -> i64 = w * h
+fn helper() -> i64 = 1            // private — not visible to importers
+```
+
+```align
+// main.align
+module main
+import geom
+
+fn main() -> i32 = geom.area(2, 3) as i32
+```
+
+`import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A cross-module call is written `geom.area(...)` and reaches only `pub` functions; a bare call resolves within the calling module. Each module has its own function namespace, so two modules may define a function with the same name. (Nested module paths `a.b`, and exporting types across modules, are later slices.)
 
 ---
 
