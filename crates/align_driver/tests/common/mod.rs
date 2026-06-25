@@ -59,3 +59,64 @@ pub fn check_errs(name: &str, src: &str) -> bool {
     let mut sm = SourceMap::new();
     check(&mut sm, name, src).diags.has_errors()
 }
+
+/// A temp directory written with the given `(filename, source)` files, removed on scope exit.
+/// Used by the multi-file (module-system) tests: the driver resolves `import`s from disk relative
+/// to the entry file, so the modules must be real files in one directory.
+struct TempProject {
+    dir: PathBuf,
+}
+
+impl TempProject {
+    fn new(name: &str, files: &[(&str, &str)]) -> TempProject {
+        let dir = std::env::temp_dir().join(format!("align-mtest-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir temp project");
+        for (fname, src) in files {
+            std::fs::write(dir.join(fname), src).expect("write module file");
+        }
+        TempProject { dir }
+    }
+    fn entry(&self, entry: &str) -> PathBuf {
+        self.dir.join(entry)
+    }
+}
+
+impl Drop for TempProject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Compile + run a multi-file program. `files` are `(filename, source)` written to a fresh temp
+/// directory; `entry` is the entry filename. The entry is compiled by path so the driver resolves
+/// `import`s from disk. Asserts it type-checks; returns the program `Output`.
+pub fn build_and_run_multi(name: &str, files: &[(&str, &str)], entry: &str) -> std::process::Output {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let entry_name = entry_path.display().to_string();
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, &entry_name, &entry_src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let pid = std::process::id();
+    let obj = proj.dir.join(format!("align-mtest-{pid}-{name}.o"));
+    let exe = proj.dir.join(format!("align-mtest-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
+    emit_object_file(&mir, &obj).expect("codegen");
+    link_executable(&obj, &exe).expect("link");
+    std::process::Command::new(&exe).output().expect("run")
+}
+
+/// Whether checking a multi-file program (`entry` + the other `files`) produces any error.
+pub fn check_multi_errs(name: &str, files: &[(&str, &str)], entry: &str) -> bool {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let mut sm = SourceMap::new();
+    check(&mut sm, &entry_path.display().to_string(), &entry_src).diags.has_errors()
+}

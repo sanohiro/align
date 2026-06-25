@@ -475,8 +475,47 @@ enum Place {
 /// Must match the variant order registered in `check_file`.
 pub const ERROR_VARIANT_CODE: u32 = 3;
 
-/// Analyze a file into a typed program. Errors are pushed to `diags`.
+/// One source module compiled together with the others (multi-file, slice B1). The entry module is
+/// the file passed on the command line; the rest are reached transitively through `import`.
+pub struct Module<'f> {
+    /// The module's path (`main` for the entry, else the imported name, e.g. `geom`).
+    pub path: String,
+    pub file: &'f ast::File,
+    /// The entry module (holds `main`). Its functions keep their plain names; every other module's
+    /// functions are mangled `module$fn`, so single-file programs are byte-identical and two modules
+    /// may share a function name.
+    pub is_entry: bool,
+}
+
+/// The codegen name of a function: plain in the entry module (so `main` stays `main` and single-file
+/// programs are unchanged), `module$fn` elsewhere. Per-module mangling lets two modules define a
+/// function with the same name and is what `pub`/private visibility resolution rewrites calls to.
+fn mangle_fn(module: &str, is_entry: bool, name: &str) -> String {
+    if is_entry {
+        name.to_string()
+    } else {
+        format!("{module}${name}")
+    }
+}
+
+/// Per-module resolution facts: each module's functions (bare name → mangled name + whether `pub`)
+/// and the user modules it `import`s (so a `mod.fn()` call is resolved + visibility-checked).
+#[derive(Default)]
+struct ModuleInfo {
+    fns: HashMap<String, (String, bool)>,
+    user_imports: std::collections::HashSet<String>,
+}
+type ModuleTable = HashMap<String, ModuleInfo>;
+
+/// Analyze a single file into a typed program (the single-module entry point; tests and the
+/// single-file driver path use this). Multi-file compilation goes through [`check_program`].
 pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
+    check_program(&[Module { path: "main".to_string(), file, is_entry: true }], diags)
+}
+
+/// Analyze a set of modules (the entry file plus its transitively-imported user modules) into one
+/// typed program. Errors are pushed to `diags`.
+pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // Pass 0a: assign an id to every struct name (so field/sig types can refer to them
     // regardless of order).
     let mut struct_ids: HashMap<String, u32> = HashMap::new();
@@ -488,7 +527,10 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut generic_struct_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut generic_enum_decls: Vec<&ast::EnumDecl> = Vec::new();
     let mut generic_enum_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for item in &file.items {
+    // Types are flat-global across modules in B1 (no per-module type namespace yet — a later
+    // slice); a type name must be unique program-wide. Functions, by contrast, are module-scoped
+    // (mangled below). Iterate every module's items for type collection.
+    for item in modules.iter().flat_map(|m| m.file.items.iter()) {
         match item {
             ast::Item::Struct(s) => {
                 if s.name.name == "Error" {
@@ -708,10 +750,64 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         enums[i] = hir::EnumDef { name: e.name.name.clone(), variants };
     }
 
-    // Pass 1: collect function signatures so calls can resolve regardless of order.
+    // Every function across all modules, tagged with its module path + whether that is the entry
+    // module (so its name is unmangled). Used by passes 1 / 2 and the module-resolution table.
+    let all_fns: Vec<(&str, bool, &ast::FnDecl)> = modules
+        .iter()
+        .flat_map(|m| {
+            m.file.items.iter().filter_map(move |it| match it {
+                ast::Item::Fn(f) => Some((m.path.as_str(), m.is_entry, f)),
+                _ => None,
+            })
+        })
+        .collect();
+
+    // The module-resolution table: each module's functions (bare name → mangled name + `pub`?) and
+    // the user modules it imports. A bare call resolves in the caller's own module; a `mod.fn()`
+    // call resolves in `mod` (which must be imported) and requires `fn` to be `pub`. Each module's
+    // imported builtin namespaces (`core.json`/`std.fs`/…) are also collected here — the
+    // capability-header check needs them per file.
+    let known_modules: std::collections::HashSet<&str> = modules.iter().map(|m| m.path.as_str()).collect();
+    let mut mod_table: ModuleTable = HashMap::new();
+    let mut mod_builtin_imports: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for m in modules {
+        let info = mod_table.entry(m.path.clone()).or_default();
+        for (path, is_entry, f) in all_fns.iter().filter(|(p, _, _)| *p == m.path) {
+            let mangled = mangle_fn(path, *is_entry, &f.name.name);
+            let is_pub = matches!(f.vis, ast::Vis::Pub);
+            if info.fns.insert(f.name.name.clone(), (mangled, is_pub)).is_some() {
+                diags.error(format!("duplicate function '{}' in module '{}'", f.name.name, m.path), f.span);
+            }
+        }
+        // Validate each `import`: a builtin `core.*`/`std.*` module (recorded for the capability
+        // check), a known user module (recorded for `mod.fn` resolution), or an error.
+        let builtins = mod_builtin_imports.entry(m.path.clone()).or_default();
+        let mut seen = std::collections::HashSet::new();
+        for imp in &m.file.imports {
+            let p = path_str(imp);
+            if !seen.insert(p.clone()) {
+                diags.error(format!("duplicate import `{p}`"), imp.span);
+                continue;
+            }
+            if BUILTIN_MODULES.contains(&p.as_str()) {
+                builtins.insert(p);
+            } else if known_modules.contains(p.as_str()) {
+                info.user_imports.insert(p);
+            } else {
+                diags.error(
+                    format!("unknown module `{p}`: not a builtin `core.*` / `std.*` module, and no source file provides it"),
+                    imp.span,
+                );
+            }
+        }
+    }
+
+    // Pass 1: collect function signatures so calls can resolve regardless of order. `sigs` is keyed
+    // by the **mangled** name (module-qualified for non-entry modules), so every function across the
+    // program has a distinct key even when two modules share a bare name.
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
-    for item in &file.items {
-        let ast::Item::Fn(f) = item else { continue };
+    for &(module, is_entry, f) in &all_fns {
+        let mangled = mangle_fn(module, is_entry, &f.name.name);
         // Generic type-parameter names (`fn f<T, U: Ord>`). Reject duplicates and names that collide
         // with a declared type, so `Param` resolution is unambiguous; resolve each builtin bound.
         let tparams: Vec<String> = f.type_params.iter().map(|t| t.name.name.clone()).collect();
@@ -774,7 +870,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             None => Ty::Unit,
         };
         let out = f.params.iter().map(|p| p.is_out).collect();
-        sigs.insert(f.name.name.clone(), FnSig { params, out, ret, type_params: tparams, bounds });
+        sigs.insert(mangled, FnSig { params, out, ret, type_params: tparams, bounds });
     }
 
     // Pass 2: check each function body. A function's inline lambdas are lifted to synthetic
@@ -783,29 +879,28 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     // not checked here but instantiated on demand below (its body is checked per monomorph, like a
     // C++ template — an uninstantiated generic is not type-checked).
     let mut fns: Vec<hir::Fn> = Vec::new();
-    // Generic-function templates by name, for monomorphization.
-    let generic_decls: HashMap<&str, &ast::FnDecl> = file
-        .items
+    // Generic-function templates by **mangled** name, for monomorphization (the worklist + every
+    // call target use mangled names, so the template lookup must too). The value carries the
+    // template's module so a monomorph's body resolves its own bare calls in that module.
+    let generic_decls: HashMap<String, (&str, &ast::FnDecl)> = all_fns
         .iter()
-        .filter_map(|it| match it {
-            ast::Item::Fn(f) if !f.type_params.is_empty() => Some((f.name.name.as_str(), f)),
-            _ => None,
-        })
+        .filter(|(_, _, f)| !f.type_params.is_empty())
+        .map(|&(module, is_entry, f)| (mangle_fn(module, is_entry, &f.name.name), (module, f)))
         .collect();
-    // Validate `import`s once per file (unknown-module errors) and collect the imported builtin
-    // modules — the per-function checkers enforce that `json`/`fs`/`io` are imported before use.
-    let imported = collect_imports(file, diags);
+    let empty_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Monomorphization worklist: `(generic_fn_name, concrete_type_args)`, collected from every
-    // generic call and processed to a fixpoint below.
+    // Monomorphization worklist: `(generic_fn_mangled_name, concrete_type_args)`, collected from
+    // every generic call and processed to a fixpoint below.
     let mut worklist: Vec<(String, Vec<Ty>)> = Vec::new();
-    for item in &file.items {
-        let ast::Item::Fn(f) = item else { continue };
+    for &(module, is_entry, f) in &all_fns {
+        let mangled = mangle_fn(module, is_entry, &f.name.name);
         let is_template = !f.type_params.is_empty();
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
-        let bounds = sigs[&f.name.name].bounds.clone();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new(), &imported);
-        let checked = cx.check_fn(f);
+        let bounds = sigs[&mangled].bounds.clone();
+        let imported = mod_builtin_imports.get(module).unwrap_or(&empty_imports);
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new(), imported, module.to_string(), &mod_table);
+        let mut checked = cx.check_fn(f);
+        checked.name = mangled;
         let lifted = std::mem::take(&mut cx.lifted);
         if is_template {
             // A generic template is checked here only to validate its body abstractly (`T` is the
@@ -838,10 +933,11 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         if !generated.insert(mangled.clone()) {
             continue; // already instantiated
         }
-        let Some(decl) = generic_decls.get(oname.as_str()) else { continue };
+        let Some(&(tmpl_module, decl)) = generic_decls.get(oname.as_str()) else { continue };
         let tparams = decl.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[oname.as_str()].bounds.clone();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, &imported);
+        let imported = mod_builtin_imports.get(tmpl_module).unwrap_or(&empty_imports);
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, imported, tmpl_module.to_string(), &mod_table);
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
         worklist.append(&mut cx.instantiations);
@@ -2107,6 +2203,12 @@ struct Checker<'a, 't> {
     /// The prefix-accessed builtin namespaces (`json`/`fs`/`io`) must be imported before use —
     /// the "capability header" rule (`open-questions.md` module system).
     imports: &'a std::collections::HashSet<String>,
+    /// The module this function belongs to (`main` for the entry). A bare call/function-value
+    /// resolves in this module; a `mod.fn()` call resolves in `mod` (which must be imported here).
+    cur_module: String,
+    /// The program's module-resolution table (every module's functions + imports), used to map a
+    /// bare or `mod.fn` reference to its mangled target and enforce `pub` visibility.
+    mods: &'a ModuleTable,
 }
 
 /// Captured-variable bookkeeping while lifting a lambda. A reference in the body that misses the
@@ -2142,11 +2244,15 @@ impl<'a, 't> Checker<'a, 't> {
         param_bounds: Vec<Bound>,
         mono_args: Vec<Ty>,
         imports: &'a std::collections::HashSet<String>,
+        cur_module: String,
+        mods: &'a ModuleTable,
     ) -> Self {
         Checker {
             diags,
             sigs,
             imports,
+            cur_module,
+            mods,
             struct_ids,
             enum_ids,
             enums,
@@ -2328,8 +2434,12 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn check_fn(&mut self, f: &ast::FnDecl) -> Fn {
-        self.cur_fn = f.name.name.clone();
-        let sig = &self.sigs[&f.name.name];
+        // Look the signature up by the function's **mangled** name (module-qualified outside the
+        // entry module). `cur_fn` is the mangled name too, so lifted-lambda names stay unique across
+        // modules (two modules may each have `fn run` with a lambda).
+        let mangled = self.resolve_local_fn(&f.name.name).unwrap_or_else(|| f.name.name.clone());
+        self.cur_fn = mangled.clone();
+        let sig = &self.sigs[&mangled];
         let mut ret = sig.ret;
         let mut param_tys = sig.params.clone();
         // Monomorph mode: substitute the concrete type arguments into the (generic) signature so
@@ -2915,8 +3025,10 @@ impl<'a, 't> Checker<'a, 't> {
         let base = p.segments.first().map(|s| s.name.as_str()).unwrap_or("");
         let Some(id) = self.lookup_or_capture(base) else {
             // A top-level function used as a value (`f := double`) is a first-class function
-            // pointer (`Ty::Fn`). Slice ①: scalar params/ret, no `out` params.
-            if let Some(sig) = self.sigs.get(base) {
+            // pointer (`Ty::Fn`). Slice ①: scalar params/ret, no `out` params. The name resolves
+            // in the current module to its mangled codegen name (cross-module fn values are later).
+            if let Some(mangled) = self.resolve_local_fn(base) {
+                let sig = &self.sigs[&mangled];
                 let params: Option<Vec<Scalar>> = sig.params.iter().map(|t| ty_to_scalar(*t)).collect();
                 let ret = ty_to_scalar(sig.ret);
                 match (params, ret) {
@@ -2924,7 +3036,7 @@ impl<'a, 't> Checker<'a, 't> {
                         let fid = intern_fn_type(self.fn_types, ps, r);
                         let ty = Ty::Fn(fid);
                         self.constrain(ty, expected, span);
-                        return Expr { kind: ExprKind::FnValue(base.to_string()), ty, span };
+                        return Expr { kind: ExprKind::FnValue(mangled), ty, span };
                     }
                     _ => {
                         self.diags.error(
@@ -3565,6 +3677,19 @@ impl<'a, 't> Checker<'a, 't> {
                 return self.check_call_fn_value(lid, fid, args, expected, span);
             }
         }
+        // A user function: a bare call resolves in the caller's own module (`module$fn` mangled
+        // name); cross-module calls are written `mod.fn(...)` (handled in `check_method_call`).
+        let Some(name) = self.resolve_local_fn(&name) else {
+            self.diags.error(format!("undefined function: '{name}'"), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        };
+        self.check_named_call(name, args, expected, span)
+    }
+
+    /// The shared tail of a direct call once its target is a resolved (mangled) function name:
+    /// signature lookup, generic-call dispatch, the `out` no-alias check, argument checking, and the
+    /// `Call` node. Reused by a bare call (`check_call`) and a cross-module `mod.fn(...)` call.
+    fn check_named_call(&mut self, name: String, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let Some(sig) = self.sigs.get(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -3872,6 +3997,35 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Resolve a bare function name to its mangled codegen name within the *current* module
+    /// (`module$fn`, or the plain name in the entry module). `None` if no such function — a bare
+    /// name never reaches into another module (cross-module calls are written `mod.fn(...)`).
+    fn resolve_local_fn(&self, name: &str) -> Option<String> {
+        self.mods.get(&self.cur_module)?.fns.get(name).map(|(m, _)| m.clone())
+    }
+
+    /// Resolve a cross-module call `mod.fn` to its mangled target, checking that `mod` is imported
+    /// here and that `fn` exists and is `pub`. `Ok(None)` means `mod` is not an imported user module
+    /// (so the `mod.fn` shape is something else — a builtin namespace or a method); `Err` is a
+    /// reported resolution error.
+    fn resolve_qualified_fn(&mut self, module: &str, name: &str, span: Span) -> Result<Option<String>, ()> {
+        let here = self.mods.get(&self.cur_module);
+        if !here.is_some_and(|mi| mi.user_imports.contains(module)) {
+            return Ok(None); // not a `mod.fn` user-module call — let the caller try other shapes
+        }
+        match self.mods.get(module).and_then(|mi| mi.fns.get(name)) {
+            Some((mangled, true)) => Ok(Some(mangled.clone())),
+            Some((_, false)) => {
+                self.diags.error(format!("'{name}' is private to module '{module}' (mark it `pub` to export it)"), span);
+                Err(())
+            }
+            None => {
+                self.diags.error(format!("module '{module}' has no function '{name}'"), span);
+                Err(())
+            }
+        }
+    }
+
     /// A method call `recv.method(args)`: the `heap.new` builtin, or a method on a value
     /// (`box.get()`, `box.clone()`).
     fn check_method_call(&mut self, recv: &ast::Expr, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
@@ -3892,6 +4046,16 @@ impl<'a, 't> Checker<'a, 't> {
             if single_name(p) == Some("fs") && method == "read_file" {
                 self.require_import("std.fs", "fs.read_file", span);
                 return self.check_fs_read_file(args, span);
+            }
+            // `mod.fn(...)` — a cross-module call to an imported user module. Resolved + visibility-
+            // checked here; falls through (`Ok(None)`) when `mod` is not an imported user module, so
+            // a builtin namespace or a value method is still handled below.
+            if let Some(modname) = single_name(p) {
+                match self.resolve_qualified_fn(modname, method, span) {
+                    Ok(Some(mangled)) => return self.check_named_call(mangled, args, expected, span),
+                    Ok(None) => {}
+                    Err(()) => return err,
+                }
             }
         }
         // `io.stdout.write(s)` — the receiver is the 2-segment `io.stdout`, so it parses as a
@@ -6283,29 +6447,6 @@ const BUILTIN_MODULES: &[&str] = &[
 /// A dotted path's segments joined with `.` (`core` `.` `json` → `"core.json"`).
 fn path_str(p: &ast::Path) -> String {
     p.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".")
-}
-
-/// Validate a file's `import`s (each must name a known builtin module; no duplicates) and return the
-/// set of imported module paths. The per-function checkers then require `core.json` / `std.fs` /
-/// `std.io` before a `json.*` / `fs.read_file` / `io.stdout.write` use — the capability-header rule.
-fn collect_imports(file: &ast::File, diags: &mut Diagnostics) -> std::collections::HashSet<String> {
-    let mut imported = std::collections::HashSet::new();
-    for imp in &file.imports {
-        let path = path_str(imp);
-        if !BUILTIN_MODULES.contains(&path.as_str()) {
-            diags.error(
-                format!("unknown module `{path}`: not a builtin `core.*` / `std.*` module (user-authored modules are not supported yet)"),
-                imp.span,
-            );
-            continue;
-        }
-        if imported.contains(&path) {
-            diags.error(format!("duplicate import `{path}`"), imp.span);
-        } else {
-            imported.insert(path);
-        }
-    }
-    imported
 }
 
 /// Types `print` and a `template` hole can render: integers, floats, `str`, `bool`, `char`

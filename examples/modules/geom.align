@@ -1,0 +1,9 @@
+// A user module (slice B1). `import geom` resolves to this file (`geom.align`) in the same
+// directory; its name must match the filename. Only `pub` functions are visible to importers.
+module geom
+
+pub fn square(x: i64) -> i64 = x * x
+pub fn area(w: i64, h: i64) -> i64 = w * h
+
+// Private to `geom` — callable here but not from another module.
+fn double(x: i64) -> i64 = x * 2

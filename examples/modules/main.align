@@ -1,0 +1,8 @@
+// Multi-file program. `import geom` pulls in `geom.align`; cross-module calls are `geom.fn(...)`
+// and reach only its `pub` functions.
+module main
+import geom
+
+fn main() -> i32 {
+  return (geom.square(5) + geom.area(2, 3)) as i32   // 25 + 6 = 31
+}

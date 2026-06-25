@@ -253,8 +253,12 @@ import std.fs
 Using `json.*` / `fs.*` / `io.stdout.write` without its `import`, or importing a non-existent
 module, is a compile error. The language-syntactic core (`Option`/`Result`/`?`/`else`, `arena`, the
 array pipeline, numeric methods, `template`) is always in scope and needs no import. `core` is
-language-intrinsic and `std` the OS boundary; both are compiler builtins today. Multi-file
-user-authored modules + `pub` cross-module visibility are the next slice. (`draft.md` §17.)
+language-intrinsic and `std` the OS boundary; both are compiler builtins today.
+
+A program also spans **user modules**: a non-entry file declares `module geom` and exports with
+`pub`; `import geom` resolves by filename to `geom.align` in the entry's directory. A cross-module
+call is `geom.area(...)` (reaching only `pub` functions); each module has its own function
+namespace. (Exporting types across modules + nested module paths are later slices.) (`draft.md` §17.)
 
 ## Core library
 
