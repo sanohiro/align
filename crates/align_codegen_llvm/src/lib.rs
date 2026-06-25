@@ -1338,6 +1338,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder.build_not(a, "not").map_err(|e| self.err(e))?.into()
                 }
             },
+            Rvalue::Cast { operand, from, to } => {
+                let val = self.operand(operand);
+                self.gen_cast(val, *from, *to)?
+            }
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
             Rvalue::IntArith { op, mode, int_ty, a, b } => {
                 let llvm_int = int_type(self.ctx, *int_ty);
@@ -2328,6 +2332,46 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_call(callee, &[wide.into()], "")
             .map_err(|e| self.err(e))?;
         Ok(None)
+    }
+
+    /// `value as to` — an explicit numeric/char conversion. `char` is treated as a 32-bit unsigned
+    /// integer; sema guarantees `from`/`to` are concrete primitives and that `char` never pairs
+    /// with a float. Equal-type casts are elided in MIR, so this always changes representation.
+    fn gen_cast(&self, value: BasicValueEnum<'c>, from: Ty, to: Ty) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let from_float = matches!(from, Ty::Float(_));
+        let to_float = matches!(to, Ty::Float(_));
+        match (from_float, to_float) {
+            // int/char → int/char: truncate / sign-or-zero-extend (sign from the *source*).
+            (false, false) => {
+                let v = value.into_int_value();
+                let dst = int_type(self.ctx, to);
+                Ok(self.builder.build_int_cast_sign_flag(v, dst, is_signed(from), "cast").map_err(|e| self.err(e))?.into())
+            }
+            // int → float: `sitofp` / `uitofp` (source signedness).
+            (false, true) => {
+                let v = value.into_int_value();
+                let dst = float_type(self.ctx, to);
+                Ok(if is_signed(from) {
+                    self.builder.build_signed_int_to_float(v, dst, "cast").map_err(|e| self.err(e))?.into()
+                } else {
+                    self.builder.build_unsigned_int_to_float(v, dst, "cast").map_err(|e| self.err(e))?.into()
+                })
+            }
+            // float → int: the *saturating* conversion (out-of-range clamps to MIN/MAX, NaN → 0) —
+            // no UB, matching the settled "never silent / no UB" rule. LLVM `llvm.fpto{s,u}i.sat`.
+            (true, false) => {
+                let dst = int_type(self.ctx, to);
+                let src = float_type(self.ctx, from);
+                let name = if is_signed(to) { "llvm.fptosi.sat" } else { "llvm.fptoui.sat" };
+                self.call_intrinsic(name, &[dst.into(), src.into()], &[value.into()])
+            }
+            // float → float: `fpext` (widen) / `fptrunc` (narrow).
+            (true, true) => {
+                let v = value.into_float_value();
+                let dst = float_type(self.ctx, to);
+                Ok(self.builder.build_float_cast(v, dst, "cast").map_err(|e| self.err(e))?.into())
+            }
+        }
     }
 
     fn gen_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {

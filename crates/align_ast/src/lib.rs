@@ -244,6 +244,13 @@ pub enum ExprKind {
         op: UnOp,
         expr: Box<Expr>,
     },
+    /// `expr as T` — an explicit numeric/char conversion. `ty` is the (concrete, primitive)
+    /// target type. Binds tighter than binary operators, looser than unary prefix (`-x as i64`
+    /// is `(-x) as i64`). The only conversion in the language — there is no implicit coercion.
+    Cast {
+        expr: Box<Expr>,
+        ty: Type,
+    },
     Binary {
         op: BinOp,
         lhs: Box<Expr>,

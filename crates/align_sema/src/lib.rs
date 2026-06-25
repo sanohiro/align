@@ -1057,7 +1057,7 @@ impl EffectScan {
                 self.expr(n);
             }
             // Structural recursion (no effect of their own).
-            ExprKind::Unary { expr, .. } => self.expr(expr),
+            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.expr(expr),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.expr(lhs);
                 self.expr(rhs);
@@ -1594,7 +1594,7 @@ impl<'a> EscapeCheck<'a> {
                 self.block(then, depth);
                 self.block(els, depth);
             }
-            ExprKind::Unary { expr, .. } => self.walk(expr, depth),
+            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.walk(expr, depth),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.walk(lhs, depth);
                 self.walk(rhs, depth);
@@ -1845,7 +1845,7 @@ impl<'a> MoveCheck<'a> {
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
                 }
             }
-            ExprKind::Unary { expr, .. } => self.expr(expr, moved, false, false),
+            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.expr(expr, moved, false, false),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.expr(lhs, moved, false, false);
                 self.expr(rhs, moved, false, false);
@@ -2698,6 +2698,7 @@ impl<'a, 't> Checker<'a, 't> {
                 };
                 Expr { kind: ExprKind::Unary { op: *op, expr: Box::new(inner) }, ty, span: e.span }
             }
+            ast::ExprKind::Cast { expr, ty } => self.check_cast(expr, ty, expected, e.span),
             ast::ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expected, e.span),
             ast::ExprKind::Call { callee, args } => self.check_call(callee, args, expected, e.span),
             ast::ExprKind::FieldAccess { recv, field } => {
@@ -5642,6 +5643,45 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind, ty, span }
     }
 
+    /// `expr as T` — the language's only conversion (no implicit coercion). The source and
+    /// target must each be a primitive numeric type (`i8..u64`, `f32`/`f64`) or `char`; `char`
+    /// pairs only with integers (a code point is a `u32`), never with a float. The source/target
+    /// must be concrete — casting a generic type parameter is unsupported.
+    fn check_cast(&mut self, expr: &ast::Expr, ty: &ast::Type, expected: Option<Ty>, span: Span) -> Expr {
+        let target = self.resolve_type(ty);
+        // A cast re-types its operand, so the operand is checked with no expected type — a literal
+        // keeps its own default width (`1 as i32` casts a default-`i64` literal to `i32`).
+        let inner = self.check_expr(expr, None);
+        let src = self.resolve(inner.ty);
+        let ok_target = matches!(target, Ty::Int(_) | Ty::Float(_) | Ty::Char);
+        if !ok_target && target != Ty::Error {
+            self.diags.error(
+                format!("cannot cast to `{}`: `as` converts only between numeric types and `char`", ty_name(target)),
+                span,
+            );
+        }
+        let ok_src = src.is_numeric() || src == Ty::Char;
+        if !ok_src && src != Ty::Error {
+            self.diags.error(
+                format!("cannot cast from `{}`: `as` converts only between numeric types and `char`", ty_name(src)),
+                span,
+            );
+        }
+        // `char` is a code point — it converts to/from integers, never directly to/from a float.
+        if ok_target && ok_src {
+            let char_float = (src == Ty::Char && matches!(target, Ty::Float(_)))
+                || (src.is_float_like() && target == Ty::Char);
+            if char_float {
+                self.diags.error(
+                    "cannot cast between `char` and a float; convert through an integer".to_string(),
+                    span,
+                );
+            }
+        }
+        self.constrain(target, expected, span);
+        Expr { kind: ExprKind::Cast(Box::new(inner)), ty: target, span }
+    }
+
     /// `expr?` — propagate. The operand must be `Result<T, E>` and the enclosing
     /// function must return `Result<_, E>` (same `E`). Yields `T`.
     fn check_try(&mut self, inner: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
@@ -6018,7 +6058,7 @@ impl<'a, 't> Checker<'a, 't> {
         // the type arguments are finalized; set from the Call arm and applied after the match.
         let mut recomputed: Option<Ty> = None;
         match &mut e.kind {
-            ExprKind::Unary { expr, .. } => self.finalize_expr(expr),
+            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.finalize_expr(expr),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.finalize_expr(lhs);
                 self.finalize_expr(rhs);

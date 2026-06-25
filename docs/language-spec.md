@@ -64,6 +64,20 @@ mask<T>
 bitset
 ```
 
+### Numeric conversion
+
+No implicit coercion — not even widening. The explicit `as` operator is the **only** conversion,
+between the numeric primitives (`i8..u64`, `f32`/`f64`) and `char`:
+
+```align
+b: i64 := a as i64        // widen (explicit); int→int truncates/extends with defined wrap
+n := x as i32             // float → int truncates toward zero, saturating (no UB; NaN → 0)
+code := 'A' as i32        // char ↔ int = the Unicode code point; char never pairs with a float
+```
+
+`bool` and composite types do not participate. Integer overflow is defined two's-complement wrap;
+explicit `checked_*` / `saturating_*` / `wrapping_*` ops cover the rest. (`draft.md` §3.)
+
 ### Type declarations (keyword-less)
 
 ```text

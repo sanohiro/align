@@ -77,6 +77,21 @@ z := 10i32;         // suffix → i32
 s := xs.sum();      // xs: array<i32> → i32 (determined by context)
 ```
 
+### Numeric conversion — `as` (settled, draft.md §3)
+
+There is **no implicit numeric coercion** (not even widening); the explicit `as` operator is the only conversion. It applies between the numeric primitives (`i8..u64`, `f32`/`f64`) and `char`, and is **zero-UB by design** (matching the overflow model).
+
+Pipeline: a new `As` token (lexer); `parse_cast` sits between unary prefix and the binary operators (so `-x as i64` is `(-x) as i64`, `a + b as i64` is `a + (b as i64)`), producing `ast::ExprKind::Cast { expr, ty }`. sema's `check_cast` resolves the target, checks both sides are numeric/`char` (the source may still be an int/float inference var — width is irrelevant to legality), forbids `char`↔float, and emits `hir::ExprKind::Cast(inner)` (the target is the node's own `ty`, the source is `inner.ty`). MIR lowers it to `Rvalue::Cast { operand, from, to }` (eliding a same-type cast). codegen's `gen_cast` picks the LLVM op by the from/to kinds:
+
+```text
+int → int      build_int_cast_sign_flag  (trunc / sext / zext; sign from the SOURCE)
+int → float    {s,u}itofp                 (source signedness)
+float → float  fpext / fptrunc
+float → int    llvm.fpto{s,u}i.sat        (SATURATING — out-of-range → MIN/MAX, NaN → 0; no UB)
+```
+
+`char` is treated as a 32-bit unsigned integer for the conversion. The source/target must be concrete — casting a generic type parameter is rejected (deferred). `bool` and composite types do not participate.
+
 ---
 
 ## 3. Inference and checking (bidirectional)
