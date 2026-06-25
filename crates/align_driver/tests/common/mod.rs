@@ -43,8 +43,11 @@ pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::pro
     );
     let mir = lower_to_mir(&checked.hir);
     let dir = std::env::temp_dir();
-    let obj = dir.join(format!("align-test-{name}.o"));
-    let exe = dir.join(format!("align-test-{name}{}", std::env::consts::EXE_SUFFIX));
+    // Include the process id so two concurrent test-suite runs on one machine (e.g. parallel CI)
+    // don't collide on these temp paths.
+    let pid = std::process::id();
+    let obj = dir.join(format!("align-test-{pid}-{name}.o"));
+    let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
     let _artifacts = TempArtifacts { obj: obj.clone(), exe: exe.clone() };
     emit_object_file(&mir, &obj).expect("codegen");
     link_executable(&obj, &exe).expect("link");
