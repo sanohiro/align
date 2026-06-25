@@ -385,6 +385,18 @@ return position — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T
 fn unwrap_or<T>(o: Option<T>, fallback: T) -> T = o else fallback
 ```
 
+**Structs may be generic too** — `Pair<T> { a: T, b: T }` — and are monomorphized per concrete
+instantiation like generic functions. The type arguments are inferred from the field values at a
+literal (no turbofish); the concrete form is also written as a type — `Pair<i32>` — for a parameter
+or annotation. Each field must still be a Copy type after substitution.
+
+```align
+Pair<T> { a: T, b: T }
+
+p := Pair { a: 1, b: 2 }          // Pair<i32>, inferred from the fields
+fn sum(q: Pair<i32>) -> i32 = q.a + q.b
+```
+
 ---
 
 ## 6. Memory Model

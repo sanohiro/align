@@ -274,10 +274,18 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   (binds `Param` bare or nested, seeds a return-only param from the expected type); a nested param
   is finalized eagerly at the call (a `Scalar` can't hold an inference var), a bare one deferred.
   `box`/`slice`/`array`/tuple over `T` are rejected (`scalar_arg`'s `allow_param`).
+- 4c-5: generic structs `Pair<T>`. The resolver refactor — `resolve_type` takes a `TyCx` (bundling
+  `struct_ids`/`enum_ids`/`struct_templates`/`structs`/`struct_mono`/`tuples`/`fn_types`); `structs`
+  grows during resolution; a `Pair<i32>` type calls `instantiate_struct` to substitute the template
+  fields and intern a concrete `StructDef` (deduped by mangled name). Concrete structs get reserved
+  slots (so monomorphs, appended after, don't shift their ids). Templates (with `Param` fields) are
+  kept in `struct_templates`, out of codegen. A literal `Pair { a, b }` infers the args from the
+  field values (`match_param`) then monomorphizes.
 ```
 
-`// OPEN:` `array<T>` / `slice<T>` params + generic containers (`Stack<T>`); the `N` in `vec<N,T>`
-(value generics, M6); folding `Option`/`Result` into the general generic mechanism.
+`// OPEN:` generic sum types (`Opt<T>`); `array<T>` / `slice<T>` params + generic containers
+(`Stack<T>` needs an `array<T>` field); the `N` in `vec<N,T>` (value generics, M6); folding
+`Option`/`Result` into the general generic mechanism.
 
 ---
 

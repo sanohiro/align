@@ -483,23 +483,30 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut struct_decls: Vec<&ast::StructDecl> = Vec::new();
     let mut enum_ids: HashMap<String, u32> = HashMap::new();
     let mut enum_decls: Vec<&ast::EnumDecl> = Vec::new();
+    // Generic struct templates (`Pair<T>`) — kept separate from concrete structs.
+    let mut generic_struct_decls: Vec<&ast::StructDecl> = Vec::new();
+    let mut generic_struct_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in &file.items {
         match item {
             ast::Item::Struct(s) => {
                 if s.name.name == "Error" {
                     diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), s.span);
                 }
-                // Generic struct *declarations* (`Pair<T>`) parse, but monomorphizing them needs the
-                // struct table to grow during type resolution (the resolver refactor); not yet wired.
-                if !s.type_params.is_empty() {
-                    diags.error(format!("generic struct declarations are not supported yet ('{}')", s.name.name), s.span);
-                }
-                if struct_ids.insert(s.name.name.clone(), struct_decls.len() as u32).is_some()
+                let dup = struct_ids.contains_key(&s.name.name)
                     || enum_ids.contains_key(&s.name.name)
-                {
+                    || generic_struct_names.contains(&s.name.name);
+                if dup {
                     diags.error(format!("duplicate type declaration: '{}'", s.name.name), s.span);
                 }
-                struct_decls.push(s);
+                if s.type_params.is_empty() {
+                    struct_ids.insert(s.name.name.clone(), struct_decls.len() as u32);
+                    struct_decls.push(s);
+                } else {
+                    // A generic struct is a template, monomorphized on demand by `resolve_type`; it
+                    // is not in `struct_ids`/`structs` (its fields carry `Ty::Param`).
+                    generic_struct_names.insert(s.name.name.clone());
+                    generic_struct_decls.push(s);
+                }
             }
             ast::Item::Enum(e) => {
                 if e.name.name == "Error" {
@@ -510,6 +517,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 }
                 if enum_ids.insert(e.name.name.clone(), enum_decls.len() as u32).is_some()
                     || struct_ids.contains_key(&e.name.name)
+                    || generic_struct_names.contains(&e.name.name)
                 {
                     diags.error(format!("duplicate type declaration: '{}'", e.name.name), e.span);
                 }
@@ -519,37 +527,70 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         }
     }
 
-    // The shared tuple-type interner (anonymous `(T, U, …)`), built on demand as types resolve.
+    // The shared type-resolution interners, grown on demand as types resolve. `structs` grows with
+    // monomorph instances of generic structs; `struct_mono` dedups them by mangled name.
     let mut tuples: Vec<hir::TupleDef> = Vec::new();
-    // The shared function-value-type interner (`Ty::Fn`), built on demand as lambdas become values.
     let mut fn_types: Vec<hir::FnTy> = Vec::new();
+    // Reserve a fixed slot per concrete struct (its `struct_ids` index), filled in Pass 0b.
+    // Monomorph instances of generic structs are appended *after* these, so a concrete struct's id
+    // stays valid even as monomorphs grow the table.
+    let mut structs: Vec<StructDef> =
+        struct_decls.iter().map(|s| StructDef { name: s.name.name.clone(), fields: Vec::new(), align: None }).collect();
+    let mut struct_mono: HashMap<String, u32> = HashMap::new();
 
-    // Pass 0b: resolve struct field types (before enum payloads, which may be structs).
-    let mut structs: Vec<StructDef> = Vec::with_capacity(struct_decls.len());
-    for s in &struct_decls {
-        // A generic struct is already rejected (Pass 0a); skip resolving its `Param`-typed fields so
-        // they don't cascade into "unknown type 'T'". Keep the slot (empty) for id consistency.
-        if !s.type_params.is_empty() {
-            structs.push(StructDef { name: s.name.name.clone(), fields: Vec::new(), align: None });
-            continue;
+    // Build the generic-struct templates: resolve each template's fields with its type parameters in
+    // scope (so a field `T` becomes `Ty::Param`). A template may not (yet) reference another generic
+    // struct, so an empty template map suffices while building them.
+    let mut struct_templates: HashMap<String, StructTemplate> = HashMap::new();
+    {
+        let empty_templates: HashMap<String, StructTemplate> = HashMap::new();
+        for s in &generic_struct_decls {
+            let tparams: Vec<String> = s.type_params.iter().map(|t| t.name.name.clone()).collect();
+            let mut fields = Vec::with_capacity(s.fields.len());
+            for f in &s.fields {
+                let mut cx = TyCx {
+                    struct_ids: &struct_ids,
+                    enum_ids: &enum_ids,
+                    struct_templates: &empty_templates,
+                    structs: &mut structs,
+                    struct_mono: &mut struct_mono,
+                    tuples: &mut tuples,
+                    fn_types: &mut fn_types,
+                };
+                let ty = resolve_type(&f.ty, &mut cx, &tparams, diags);
+                fields.push(hir::FieldDef { name: f.name.name.clone(), ty });
+            }
+            struct_templates.insert(s.name.name.clone(), StructTemplate { type_params: tparams, fields });
         }
+    }
+
+    // A fresh `TyCx` borrowing the resolution interners — built per `resolve_type` call so each
+    // borrow is released immediately (the macro keeps the many call sites readable).
+    macro_rules! tcx {
+        () => {
+            &mut TyCx {
+                struct_ids: &struct_ids,
+                enum_ids: &enum_ids,
+                struct_templates: &struct_templates,
+                structs: &mut structs,
+                struct_mono: &mut struct_mono,
+                tuples: &mut tuples,
+                fn_types: &mut fn_types,
+            }
+        };
+    }
+
+    // Pass 0b: resolve concrete struct field types (before enum payloads, which may be structs).
+    // Each concrete struct fills its reserved slot `i`; monomorphs created while resolving a field
+    // append after the reserved slots, so `structs[i]` stays the struct `struct_ids` named.
+    for (i, s) in struct_decls.iter().enumerate() {
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
-            let ty = resolve_type(&f.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &[], diags);
-            // Fields are **Copy** only: a primitive scalar (int/float/bool/char) or `str`. A
-            // `str` field may hold an arena-backed str: the struct *carries* that field's region
-            // (MMv2 slice 2), so `EscapeCheck` lets it live inside the arena and only rejects the
-            // whole struct escaping; a scalar/literal-only struct stays `Static` (returnable).
-            //
-            // Owned (Move) fields — `string` / `array<T>` / `box` / `builder` / a `Move` tuple —
-            // are rejected: a struct is treated as Copy (it has no per-binding `Drop` and is copied
-            // by value on assignment / `arr[i]` indexing), so a Move field would let two struct
-            // copies free the same buffer (double-free). `ty_to_scalar` is NOT a sufficient test
-            // here — it returns `Some` for `string`/`array<T>` (they have a scalar repr) — so match
-            // the Copy field types explicitly. (Nested struct / slice / option / result fields the
-            // layout can't hold yet are likewise excluded.)
-            let is_field_ok = matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error);
-            if !is_field_ok {
+            let ty = resolve_type(&f.ty, tcx!(), &[], diags);
+            // Fields are **Copy** only: a primitive scalar (int/float/bool/char) or `str` (see
+            // `is_field_ok`). Owned (Move) fields and nested struct/slice/option fields are rejected
+            // — a struct is copied by value, so a Move field would double-free.
+            if !is_field_ok(ty) {
                 diags.error(
                     format!("struct fields must be a primitive scalar or str for now, got {}", ty_name(ty)),
                     f.span,
@@ -560,7 +601,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         // `align`: natural alignment today — the `align(N)` surface syntax + custom value
         // arrive at M6 (`open-questions.md`); the field is reserved so that is an additive
         // change at the alignment seam, not a retrofit.
-        structs.push(StructDef { name: s.name.name.clone(), fields, align: None });
+        structs[i] = StructDef { name: s.name.name.clone(), fields, align: None };
     }
 
     // Pass 0c: resolve enum variant payloads (all type names + structs are known). The enum lowers
@@ -585,7 +626,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             }
             let mut payload = Vec::with_capacity(v.payload.len());
             for t in &v.payload {
-                let ty = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &[], diags);
+                let ty = resolve_type(t, tcx!(), &[], diags);
                 match ty {
                     Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
                         payload.push(ty_to_scalar(ty).expect("primitive scalar"));
@@ -662,7 +703,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         }
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
-            params.push(resolve_type(&p.ty, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &tparams, diags));
+            params.push(resolve_type(&p.ty, tcx!(), &tparams, diags));
         }
         // A box across a call boundary would escape its arena, so M3 forbids box
         // parameters and returns (boxes are arena-local). This also closes escape
@@ -677,7 +718,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         }
         let ret = match &f.ret {
             Some(t) => {
-                let r = resolve_type(t, &struct_ids, &enum_ids, &mut tuples, &mut fn_types, &tparams, diags);
+                let r = resolve_type(t, tcx!(), &tparams, diags);
                 if matches!(r, Ty::Box(_)) {
                     diags.error(
                         "a box cannot be a function return type (it would escape its arena)".to_string(),
@@ -723,7 +764,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let is_template = !f.type_params.is_empty();
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[&f.name.name].bounds.clone();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &structs, &mut tuples, &mut fn_types, tparams, bounds, Vec::new());
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new());
         let checked = cx.check_fn(f);
         let lifted = std::mem::take(&mut cx.lifted);
         if is_template {
@@ -760,7 +801,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let Some(decl) = generic_decls.get(oname.as_str()) else { continue };
         let tparams = decl.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[oname.as_str()].bounds.clone();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &structs, &mut tuples, &mut fn_types, tparams, bounds, targs);
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs);
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
         worklist.append(&mut cx.instantiations);
@@ -1949,10 +1990,16 @@ struct Checker<'a, 't> {
     enums: &'a [hir::EnumDef],
     /// The id of the builtin `Error` enum (so `Result<_, Error>` builtins build the right payload).
     error_enum_id: u32,
-    structs: &'a [StructDef],
+    /// The concrete struct table, grown with monomorph instances of generic structs during
+    /// resolution (mutable, like the other interners). Field access reads it.
+    structs: &'t mut Vec<StructDef>,
+    /// Generic struct templates (`Pair<T>`), monomorphized on demand by `resolve_type`.
+    struct_templates: &'a HashMap<String, StructTemplate>,
+    /// Mangled monomorph name -> `structs` index — the shared monomorph dedup cache.
+    struct_mono: &'t mut HashMap<String, u32>,
     /// The shared tuple-type interner (anonymous `(T, U, …)` types). A separate lifetime from
     /// `'a` so each per-function `Checker` can reborrow it mutably without conflicting with the
-    /// long-lived shared `structs`/`struct_ids` borrows.
+    /// long-lived shared `struct_ids` borrow.
     tuples: &'t mut Vec<hir::TupleDef>,
     /// The shared `Ty::Fn` interner (function-value types). Same lifetime as `tuples`.
     fn_types: &'t mut Vec<hir::FnTy>,
@@ -2034,7 +2081,9 @@ impl<'a, 't> Checker<'a, 't> {
         enum_ids: &'a HashMap<String, u32>,
         enums: &'a [hir::EnumDef],
         error_enum_id: u32,
-        structs: &'a [StructDef],
+        structs: &'t mut Vec<StructDef>,
+        struct_templates: &'a HashMap<String, StructTemplate>,
+        struct_mono: &'t mut HashMap<String, u32>,
         tuples: &'t mut Vec<hir::TupleDef>,
         fn_types: &'t mut Vec<hir::FnTy>,
         type_params: Vec<String>,
@@ -2049,6 +2098,8 @@ impl<'a, 't> Checker<'a, 't> {
             enums,
             error_enum_id,
             structs,
+            struct_templates,
+            struct_mono,
             tuples,
             fn_types,
             int_vars: Vec::new(),
@@ -2428,7 +2479,16 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn resolve_type(&mut self, t: &ast::Type) -> Ty {
-        let ty = resolve_type(t, self.struct_ids, self.enum_ids, self.tuples, self.fn_types, &self.type_params, self.diags);
+        let mut cx = TyCx {
+            struct_ids: self.struct_ids,
+            enum_ids: self.enum_ids,
+            struct_templates: self.struct_templates,
+            structs: self.structs,
+            struct_mono: self.struct_mono,
+            tuples: self.tuples,
+            fn_types: self.fn_types,
+        };
+        let ty = resolve_type(t, &mut cx, &self.type_params, self.diags);
         // In monomorph mode a type-parameter annotation (`let x: T`) resolves to the concrete arg.
         if self.mono_args.is_empty() {
             ty
@@ -2910,7 +2970,26 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `Name { field: value, ... }`. Reorders inits into declaration order and requires
     /// every field exactly once. Only reached from a `let` initializer (M1).
+    /// Monomorphize a generic struct from the Checker (builds a `TyCx` over its interner fields).
+    fn instantiate_struct(&mut self, name: &str, tmpl: &StructTemplate, args: &[Ty], span: Span) -> u32 {
+        let mut cx = TyCx {
+            struct_ids: self.struct_ids,
+            enum_ids: self.enum_ids,
+            struct_templates: self.struct_templates,
+            structs: self.structs,
+            struct_mono: self.struct_mono,
+            tuples: self.tuples,
+            fn_types: self.fn_types,
+        };
+        instantiate_struct(name, tmpl, args, &mut cx, span, self.diags)
+    }
+
     fn check_struct_lit(&mut self, name: &ast::Ident, fields: &[ast::FieldInit], span: Span) -> Expr {
+        // A generic struct literal (`Pair { a: 1, b: 2 }`): infer the type arguments from the field
+        // values, then monomorphize. (Type arguments are not written at the literal — same as calls.)
+        if let Some(tmpl) = self.struct_templates.get(&name.name).cloned() {
+            return self.check_generic_struct_lit(&name.name, &tmpl, fields, span);
+        }
         let Some(&id) = self.struct_ids.get(&name.name) else {
             self.diags
                 .error(format!("undefined type: '{}'", name.name), name.span);
@@ -2952,6 +3031,73 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
+        Expr { kind: ExprKind::StructLit { struct_id: id, fields: out }, ty: Ty::Struct(id), span }
+    }
+
+    /// A generic struct literal `Pair { a: 1, b: 2 }`: check each field value, infer the type
+    /// parameters by matching the value's type against the template field's type, monomorphize the
+    /// struct, and build the literal against the resulting concrete instance.
+    fn check_generic_struct_lit(&mut self, name: &str, tmpl: &StructTemplate, fields: &[ast::FieldInit], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let mut subst: Vec<Option<Ty>> = vec![None; tmpl.type_params.len()];
+        let mut values: Vec<Option<Expr>> = (0..tmpl.fields.len()).map(|_| None).collect();
+        for fi in fields {
+            match tmpl.fields.iter().position(|f| f.name == fi.name.name) {
+                Some(idx) => {
+                    if values[idx].is_some() {
+                        self.diags.error(format!("duplicate field '{}'", fi.name.name), fi.span);
+                    }
+                    // A `Param` field applies no coercion (its type is being inferred); a concrete
+                    // field checks against its declared type.
+                    let declared = tmpl.fields[idx].ty;
+                    let ce = if ty_mentions_param(declared) {
+                        self.check_expr(&fi.value, None)
+                    } else {
+                        self.check_expr(&fi.value, Some(declared))
+                    };
+                    self.match_param(declared, ce.ty, &mut subst, fi.span, false);
+                    values[idx] = Some(ce);
+                }
+                None => {
+                    self.diags.error(format!("no field '{}' on '{name}'", fi.name.name), fi.span);
+                    let _ = self.check_expr(&fi.value, None);
+                }
+            }
+        }
+        // Every type parameter must be inferable from the fields; finalize each (a field carrying a
+        // `Param` resolves to a concrete struct field, so finalize eagerly — defaults a bare literal).
+        let mut args = Vec::with_capacity(tmpl.type_params.len());
+        for (i, s) in subst.iter().enumerate() {
+            let concrete = s.map(|t| self.finalize(t)).unwrap_or(Ty::Error);
+            if matches!(concrete, Ty::Param(_)) {
+                // The field value's type is a (generic function's) type parameter — constructing a
+                // generic struct from inside a generic function. Deferred (see `resolve_type`).
+                self.diags.error(
+                    format!("constructing a generic struct ('{name}') with a type parameter inside a generic function is not supported yet"),
+                    span,
+                );
+                return err;
+            }
+            if matches!(concrete, Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error) {
+                self.diags.error(
+                    format!("cannot infer type parameter '{}' of '{name}' from the fields", tmpl.type_params[i]),
+                    span,
+                );
+                return err;
+            }
+            args.push(concrete);
+        }
+        let mut out = Vec::with_capacity(tmpl.fields.len());
+        for (idx, v) in values.into_iter().enumerate() {
+            match v {
+                Some(e) => out.push(e),
+                None => {
+                    self.diags.error(format!("missing field '{}' in '{name}'", tmpl.fields[idx].name), span);
+                    out.push(Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span });
+                }
+            }
+        }
+        let id = self.instantiate_struct(name, tmpl, &args, span);
         Expr { kind: ExprKind::StructLit { struct_id: id, fields: out }, ty: Ty::Struct(id), span }
     }
 
@@ -3129,7 +3275,7 @@ impl<'a, 't> Checker<'a, 't> {
                 );
                 return err;
             };
-            param_tys.push(resolve_type(ann, self.struct_ids, self.enum_ids, self.tuples, self.fn_types, &self.type_params, self.diags));
+            param_tys.push(self.resolve_type(ann));
         }
         // Lift with the annotated parameter types as the expected signature; the return type is
         // inferred from the body.
@@ -6084,12 +6230,35 @@ fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scala
     (fn_types.len() - 1) as u32
 }
 
+/// A generic struct declaration (`Pair<T> { a: T, b: T }`): its type-parameter names and its
+/// fields with `Ty::Param` in the parameter positions. Monomorphized on demand by `resolve_type`
+/// when a concrete `Pair<i32>` is resolved — kept out of the concrete `structs` table (and thus out
+/// of codegen) until then.
+#[derive(Clone)]
+struct StructTemplate {
+    type_params: Vec<String>,
+    fields: Vec<hir::FieldDef>,
+}
+
+/// The mutable + shared type-resolution context threaded through [`resolve_type`]: the concrete
+/// struct table (grown with monomorph instances), the generic-struct templates + their monomorph
+/// cache, and the tuple / `Ty::Fn` interners.
+struct TyCx<'a> {
+    struct_ids: &'a HashMap<String, u32>,
+    enum_ids: &'a HashMap<String, u32>,
+    /// Generic struct templates, by name (not in `structs` — they carry `Param` fields).
+    struct_templates: &'a HashMap<String, StructTemplate>,
+    /// Concrete struct table; monomorph instances of generic structs are appended here.
+    structs: &'a mut Vec<StructDef>,
+    /// Mangled monomorph name (`Pair$i32`) -> `structs` index — dedups monomorph instances.
+    struct_mono: &'a mut HashMap<String, u32>,
+    tuples: &'a mut Vec<hir::TupleDef>,
+    fn_types: &'a mut Vec<hir::FnTy>,
+}
+
 fn resolve_type(
     t: &ast::Type,
-    struct_ids: &HashMap<String, u32>,
-    enum_ids: &HashMap<String, u32>,
-    tuples: &mut Vec<hir::TupleDef>,
-    fn_types: &mut Vec<hir::FnTy>,
+    cx: &mut TyCx,
     type_params: &[String],
     diags: &mut Diagnostics,
 ) -> Ty {
@@ -6100,7 +6269,7 @@ fn resolve_type(
         ast::Type::Fn { params, ret, span: _ } => {
             let mut pscalars = Vec::with_capacity(params.len());
             for p in params {
-                let pty = resolve_type(p, struct_ids, enum_ids, tuples, fn_types, type_params, diags);
+                let pty = resolve_type(p, cx, type_params, diags);
                 if pty == Ty::Error {
                     return Ty::Error;
                 }
@@ -6112,7 +6281,7 @@ fn resolve_type(
                     }
                 }
             }
-            let rty = resolve_type(ret, struct_ids, enum_ids, tuples, fn_types, type_params, diags);
+            let rty = resolve_type(ret, cx, type_params, diags);
             if rty == Ty::Error {
                 return Ty::Error;
             }
@@ -6120,14 +6289,14 @@ fn resolve_type(
                 diags.error(format!("a function-type return must be a scalar for now, got {}", ty_name(rty)), ret.span());
                 return Ty::Error;
             };
-            return Ty::Fn(intern_fn_type(fn_types, pscalars, rs));
+            return Ty::Fn(intern_fn_type(cx.fn_types, pscalars, rs));
         }
         ast::Type::Tuple { elems, span: _ } => {
             // PR1 cut: tuple elements are primitive scalars (int/float/bool/char) — Copy,
             // `Static`, so the tuple needs no drop/region machinery. `str`/owned elements later.
             let mut scalars = Vec::with_capacity(elems.len());
             for e in elems {
-                let ety = resolve_type(e, struct_ids, enum_ids, tuples, fn_types, type_params, diags);
+                let ety = resolve_type(e, cx, type_params, diags);
                 if ety == Ty::Error {
                     return Ty::Error;
                 }
@@ -6143,7 +6312,7 @@ fn resolve_type(
                     }
                 }
             }
-            return Ty::Tuple(intern_tuple(tuples, scalars));
+            return Ty::Tuple(intern_tuple(cx.tuples, scalars));
         }
     };
     let name = path.segments.last().map(|s| s.name.as_str()).unwrap_or("");
@@ -6165,7 +6334,7 @@ fn resolve_type(
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
+                [a] => resolve_type(a, cx, type_params, diags),
                 _ => {
                     diags.error("box takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -6198,7 +6367,7 @@ fn resolve_type(
         }
         "Option" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
+                [a] => resolve_type(a, cx, type_params, diags),
                 _ => {
                     diags.error("Option takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -6211,7 +6380,7 @@ fn resolve_type(
         }
         "slice" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
+                [a] => resolve_type(a, cx, type_params, diags),
                 _ => {
                     diags.error("slice takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -6226,7 +6395,7 @@ fn resolve_type(
         // type so a function can hand back a free-standing owned array.
         "array" => {
             let inner = match args {
-                [a] => resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
+                [a] => resolve_type(a, cx, type_params, diags),
                 _ => {
                     diags.error("array takes exactly one type argument".to_string(), span);
                     return Ty::Error;
@@ -6245,8 +6414,8 @@ fn resolve_type(
         "Result" => {
             let (ok, err) = match args {
                 [a, b] => (
-                    resolve_type(a, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
-                    resolve_type(b, struct_ids, enum_ids, tuples, fn_types, type_params, diags),
+                    resolve_type(a, cx, type_params, diags),
+                    resolve_type(b, cx, type_params, diags),
                 ),
                 _ => {
                     diags.error("Result takes two type arguments".to_string(), span);
@@ -6261,20 +6430,83 @@ fn resolve_type(
                 _ => Ty::Error,
             }
         }
-        _ => match parse_int_name(name) {
-            Some(it) => Ty::Int(it),
-            None => match struct_ids.get(name) {
-                Some(&id) => Ty::Struct(id),
-                None => match enum_ids.get(name) {
-                    Some(&id) => Ty::Enum(id),
-                    None => {
-                        diags.error(format!("unknown type: '{name}'"), span);
-                        Ty::Error
-                    }
+        _ => {
+            // A generic struct used with type arguments — `Pair<i32>` — monomorphizes on demand:
+            // substitute its fields and intern a concrete `StructDef` (deduped), returning its id.
+            if let Some(tmpl) = cx.struct_templates.get(name).cloned() {
+                if args.is_empty() {
+                    diags.error(format!("'{name}' is a generic struct — write `{name}<...>` with type arguments"), span);
+                    return Ty::Error;
+                }
+                let mut arg_tys = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_tys.push(resolve_type(a, cx, type_params, diags));
+                }
+                if arg_tys.len() != tmpl.type_params.len() {
+                    diags.error(format!("'{name}' takes {} type argument(s), got {}", tmpl.type_params.len(), arg_tys.len()), span);
+                    return Ty::Error;
+                }
+                if arg_tys.contains(&Ty::Error) {
+                    return Ty::Error;
+                }
+                // A type argument that is itself a (generic function's) type parameter — `Pair<T>`
+                // inside `fn f<T>` — would need a deferred generic-struct type (monomorphized when
+                // the enclosing function is). Not supported yet; reject cleanly rather than intern a
+                // bogus `Param`-field struct into the concrete table.
+                if arg_tys.iter().any(|t| ty_mentions_param(*t)) {
+                    diags.error(
+                        format!("instantiating a generic struct with a type parameter ('{name}<…>' inside a generic function) is not supported yet"),
+                        span,
+                    );
+                    return Ty::Error;
+                }
+                return Ty::Struct(instantiate_struct(name, &tmpl, &arg_tys, cx, span, diags));
+            }
+            match parse_int_name(name) {
+                Some(it) => Ty::Int(it),
+                None => match cx.struct_ids.get(name) {
+                    Some(&id) => Ty::Struct(id),
+                    None => match cx.enum_ids.get(name) {
+                        Some(&id) => Ty::Enum(id),
+                        None => {
+                            diags.error(format!("unknown type: '{name}'"), span);
+                            Ty::Error
+                        }
+                    },
                 },
-            },
-        },
+            }
+        }
     }
+}
+
+/// Whether a resolved type is a valid struct field (Copy: a primitive scalar or a `str` view).
+fn is_field_ok(ty: Ty) -> bool {
+    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error)
+}
+
+/// Monomorphize a generic struct: substitute its template fields with `args`, intern a concrete
+/// `StructDef` into `cx.structs` (deduped by mangled name), and return its id. Shared by
+/// `resolve_type` (a `Pair<i32>` type) and the generic struct-literal path (`Pair { a, b }`).
+fn instantiate_struct(name: &str, tmpl: &StructTemplate, args: &[Ty], cx: &mut TyCx, span: Span, diags: &mut Diagnostics) -> u32 {
+    let mangled = mangle_mono(name, args);
+    if let Some(&id) = cx.struct_mono.get(&mangled) {
+        return id;
+    }
+    let mut fields = Vec::with_capacity(tmpl.fields.len());
+    for f in &tmpl.fields {
+        let fty = subst_param_ty(f.ty, args);
+        if !is_field_ok(fty) {
+            diags.error(
+                format!("field '{}' of '{name}' resolves to {}, which is not a valid struct field type yet", f.name, ty_name(fty)),
+                span,
+            );
+        }
+        fields.push(hir::FieldDef { name: f.name.clone(), ty: fty });
+    }
+    let id = cx.structs.len() as u32;
+    cx.structs.push(StructDef { name: mangled.clone(), fields, align: None });
+    cx.struct_mono.insert(mangled, id);
+    id
 }
 
 fn parse_int_name(name: &str) -> Option<IntTy> {
