@@ -150,7 +150,7 @@ fn owned_struct_array_tuple_element() {
         return;
     }
     // An owned `array<Struct>` (decoded) is a valid Move tuple element, destructured in scope.
-    let src = "User { id: i64, score: i32 }\nfn main() -> Result<(), Error> {\n  arena {\n    users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"score\\\":10},{\\\"id\\\":2,\\\"score\\\":20}]\")?\n    (a, n) := (users, 5)\n    print(a.len())\n    print(n)\n  }\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, score: i32 }\nfn main() -> Result<(), Error> {\n  arena {\n    users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"score\\\":10},{\\\"id\\\":2,\\\"score\\\":20}]\")?\n    (a, n) := (users, 5)\n    print(a.len())\n    print(n)\n  }\n  return Ok(())\n}\n";
     let out = build_and_run("tup-structarr", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n5\n");

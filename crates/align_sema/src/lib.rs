@@ -792,6 +792,10 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             _ => None,
         })
         .collect();
+    // Validate `import`s once per file (unknown-module errors) and collect the imported builtin
+    // modules — the per-function checkers enforce that `json`/`fs`/`io` are imported before use.
+    let imported = collect_imports(file, diags);
+
     // Monomorphization worklist: `(generic_fn_name, concrete_type_args)`, collected from every
     // generic call and processed to a fixpoint below.
     let mut worklist: Vec<(String, Vec<Ty>)> = Vec::new();
@@ -800,7 +804,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let is_template = !f.type_params.is_empty();
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[&f.name.name].bounds.clone();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new());
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new(), &imported);
         let checked = cx.check_fn(f);
         let lifted = std::mem::take(&mut cx.lifted);
         if is_template {
@@ -837,7 +841,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let Some(decl) = generic_decls.get(oname.as_str()) else { continue };
         let tparams = decl.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[oname.as_str()].bounds.clone();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs);
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, &imported);
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
         worklist.append(&mut cx.instantiations);
@@ -2099,6 +2103,10 @@ struct Checker<'a, 't> {
     /// Set while checking a lambda body — lets a reference to an enclosing local become a capture
     /// (a synthetic value parameter of the lifted function, passed at the call site).
     capture: Option<CaptureScope>,
+    /// The builtin modules `import`ed by this file (validated module paths, e.g. `core.json`).
+    /// The prefix-accessed builtin namespaces (`json`/`fs`/`io`) must be imported before use —
+    /// the "capability header" rule (`open-questions.md` module system).
+    imports: &'a std::collections::HashSet<String>,
 }
 
 /// Captured-variable bookkeeping while lifting a lambda. A reference in the body that misses the
@@ -2133,10 +2141,12 @@ impl<'a, 't> Checker<'a, 't> {
         type_params: Vec<String>,
         param_bounds: Vec<Bound>,
         mono_args: Vec<Ty>,
+        imports: &'a std::collections::HashSet<String>,
     ) -> Self {
         Checker {
             diags,
             sigs,
+            imports,
             struct_ids,
             enum_ids,
             enums,
@@ -3849,6 +3859,19 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Enforce the "capability header" rule: a prefix-accessed builtin namespace (`json`/`fs`/`io`)
+    /// must be `import`ed before use (`open-questions.md` module system). `module` is the required
+    /// module path, `used` the surface form for the diagnostic. Checked once per *source* function
+    /// — skipped for monomorph instances (`mono_args` non-empty), which would re-report the same use.
+    fn require_import(&mut self, module: &str, used: &str, span: Span) {
+        if self.mono_args.is_empty() && !self.imports.contains(module) {
+            self.diags.error(
+                format!("`{used}` requires `import {module}` — the capability is not imported"),
+                span,
+            );
+        }
+    }
+
     /// A method call `recv.method(args)`: the `heap.new` builtin, or a method on a value
     /// (`box.get()`, `box.clone()`).
     fn check_method_call(&mut self, recv: &ast::Expr, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
@@ -3859,12 +3882,15 @@ impl<'a, 't> Checker<'a, 't> {
                 return self.check_heap_new(args, expected, span);
             }
             if single_name(p) == Some("json") && method == "encode" {
+                self.require_import("core.json", "json.encode", span);
                 return self.check_json_encode(args, span);
             }
             if single_name(p) == Some("json") && method == "decode" {
+                self.require_import("core.json", "json.decode", span);
                 return self.check_json_decode(args, expected, span);
             }
             if single_name(p) == Some("fs") && method == "read_file" {
+                self.require_import("std.fs", "fs.read_file", span);
                 return self.check_fs_read_file(args, span);
             }
         }
@@ -3874,6 +3900,7 @@ impl<'a, 't> Checker<'a, 't> {
             if let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind {
                 if let ast::ExprKind::Path(p) = &inner.kind {
                     if single_name(p) == Some("io") && field.name == "stdout" {
+                        self.require_import("std.io", "io.stdout.write", span);
                         return self.check_io_stdout_write(args, span);
                     }
                 }
@@ -6238,6 +6265,47 @@ fn single_name(p: &ast::Path) -> Option<&str> {
     }
 }
 
+/// Every importable builtin module (`draft.md` §18). `core.*` is language-intrinsic; `std.*` is the
+/// OS boundary. Both are compiler builtins today (std becomes real Align-over-FFI library code only
+/// post-M8). An `import` naming anything outside this set is an error — user-authored modules are a
+/// later slice (`open-questions.md` module system).
+const BUILTIN_MODULES: &[&str] = &[
+    // core — language-intrinsic primitives
+    "core.option", "core.result", "core.array", "core.slice", "core.chunks", "core.vec",
+    "core.mask", "core.bitset", "core.map", "core.reduce", "core.scan", "core.partition",
+    "core.sort", "core.str", "core.string", "core.bytes", "core.buffer", "core.builder",
+    "core.arena", "core.json", "core.template", "core.hash", "core.math",
+    // std — the OS boundary
+    "std.io", "std.fs", "std.path", "std.process", "std.env", "std.time", "std.net",
+    "std.cli", "std.encoding", "std.compress", "std.rand", "std.crypto", "std.http",
+];
+
+/// A dotted path's segments joined with `.` (`core` `.` `json` → `"core.json"`).
+fn path_str(p: &ast::Path) -> String {
+    p.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".")
+}
+
+/// Validate a file's `import`s (each must name a known builtin module; no duplicates) and return the
+/// set of imported module paths. The per-function checkers then require `core.json` / `std.fs` /
+/// `std.io` before a `json.*` / `fs.read_file` / `io.stdout.write` use — the capability-header rule.
+fn collect_imports(file: &ast::File, diags: &mut Diagnostics) -> std::collections::HashSet<String> {
+    let mut imported = std::collections::HashSet::new();
+    for imp in &file.imports {
+        let path = path_str(imp);
+        if !BUILTIN_MODULES.contains(&path.as_str()) {
+            diags.error(
+                format!("unknown module `{path}`: not a builtin `core.*` / `std.*` module (user-authored modules are not supported yet)"),
+                imp.span,
+            );
+            continue;
+        }
+        if !imported.insert(path.clone()) {
+            diags.error(format!("duplicate import `{path}`"), imp.span);
+        }
+    }
+    imported
+}
+
 /// Types `print` and a `template` hole can render: integers, floats, `str`, `bool`, `char`
 /// (and the error sentinel, to avoid cascading diagnostics).
 fn is_printable(ty: Ty) -> bool {
@@ -6996,14 +7064,14 @@ mod tests {
     #[test]
     fn json_decode_checks_and_infers_target() {
         // T is inferred from the binding annotation through `?`.
-        let (_p, ok) = check("User { id: i64, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> i32 { return 0 }\n");
+        let (_p, ok) = check("import core.json\nUser { id: i64, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> i32 { return 0 }\n");
         assert!(!ok.has_errors(), "json.decode into an annotated struct should check");
         // Without an inferable target type, decode errors.
-        let (_q, noty) = check("fn main() -> i32 {\n  x := json.decode(\"{}\")\n  return 0\n}\n");
+        let (_q, noty) = check("import core.json\nfn main() -> i32 {\n  x := json.decode(\"{}\")\n  return 0\n}\n");
         assert!(noty.has_errors(), "json.decode needs an inferable target type");
         // A `str` field now decodes as a zero-copy view (MMv2 slice 6); decoding from a param
         // (region Static, the caller owns the buffer) and returning the struct is allowed.
-        let (_r, strf) = check("U { name: str }\nfn parse(s: str) -> Result<U, Error> {\n  u: U := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> i32 { return 0 }\n");
+        let (_r, strf) = check("import core.json\nU { name: str }\nfn parse(s: str) -> Result<U, Error> {\n  u: U := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> i32 { return 0 }\n");
         assert!(!strf.has_errors(), "a str field decodes zero-copy and is returnable from a param");
     }
 
@@ -7011,7 +7079,7 @@ mod tests {
     fn json_decoded_str_view_cannot_escape_arena() {
         // A `str` field decoded from an arena-allocated input is a view into that input; the
         // decoded struct is region-tied to it, so the view cannot escape the arena.
-        let (_p, d) = check("U { id: i64, name: str }\nfn bad(key: str) -> Result<i32, Error> {\n  mut outer := \"\"\n  arena {\n    d := key + key\n    u: U := json.decode(d)?\n    outer = u.name\n  }\n  return Ok(0)\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("import core.json\nU { id: i64, name: str }\nfn bad(key: str) -> Result<i32, Error> {\n  mut outer := \"\"\n  arena {\n    d := key + key\n    u: U := json.decode(d)?\n    outer = u.name\n  }\n  return Ok(0)\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "a decoded str view from arena input must not escape the arena");
     }
 
@@ -7019,14 +7087,14 @@ mod tests {
     fn json_decode_struct_array_checks_and_escape() {
         // MMv2 slice 8d: `json.decode` into `array<Struct>` infers the target through `?` and is
         // usable as a frame-local when decoded from a param (Static input, caller owns the buffer).
-        let (_p, ok) = check("User { id: i64, name: str }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.len())\n  return Ok(())\n}\n");
+        let (_p, ok) = check("import core.json\nUser { id: i64, name: str }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.len())\n  return Ok(())\n}\n");
         assert!(!ok.has_errors(), "json.decode into array<Struct> should check");
         // The decoded array's `str` fields are views into the input, so an array decoded from an
         // arena-allocated input must not escape the arena (use-after-free of the freed buffer).
-        let (_q, esc) = check("User { id: i64, name: str }\nfn bad(key: str) -> Result<i64, Error> {\n  mut total := 0\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    total = users.len()\n  }\n  return Ok(total)\n}\nfn main() -> i32 = 0\n");
+        let (_q, esc) = check("import core.json\nUser { id: i64, name: str }\nfn bad(key: str) -> Result<i64, Error> {\n  mut total := 0\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    total = users.len()\n  }\n  return Ok(total)\n}\nfn main() -> i32 = 0\n");
         assert!(!esc.has_errors(), "reading .len() inside the arena is fine (no escape)");
         // Returning the arena-decoded array (region-tied to the arena input) must be rejected.
-        let (_r, ret) = check("User { id: i64, name: str }\nfn bad(key: str) -> Result<array<User>, Error> {\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    return Ok(users)\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_r, ret) = check("import core.json\nUser { id: i64, name: str }\nfn bad(key: str) -> Result<array<User>, Error> {\n  arena {\n    d := key + key\n    users: array<User> := json.decode(d)?\n    return Ok(users)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(ret.has_errors(), "an arena-tied decoded struct array must not escape via return");
     }
 
@@ -7035,7 +7103,7 @@ mod tests {
         // Indexing a scalar array / slice / owned array yields the element scalar.
         let (_p, ok) = check("fn main() -> i32 {\n  xs := [10, 20, 30]\n  return xs[1]\n}\n");
         assert!(!ok.has_errors(), "indexing a scalar array should check");
-        let (_o, owned) = check("fn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[1,2]\")?\n  print(xs[0])\n  return Ok(())\n}\n");
+        let (_o, owned) = check("import core.json\nfn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[1,2]\")?\n  print(xs[0])\n  return Ok(())\n}\n");
         assert!(!owned.has_errors(), "indexing an owned array<i64> should check");
         // A non-integer index is rejected.
         let (_q, badidx) = check("fn main() -> i32 {\n  xs := [10, 20]\n  return xs[true]\n}\n");
@@ -7113,29 +7181,29 @@ mod tests {
     #[test]
     fn fs_read_file_checks() {
         // std.fs: `fs.read_file(path)` yields `Result<string, Error>`; `?` unwraps an owned string.
-        let (_p, ok) = check("fn main() -> Result<(), Error> {\n  data := fs.read_file(\"x.txt\")?\n  print(data.len())\n  return Ok(())\n}\n");
+        let (_p, ok) = check("import std.fs\nfn main() -> Result<(), Error> {\n  data := fs.read_file(\"x.txt\")?\n  print(data.len())\n  return Ok(())\n}\n");
         assert!(!ok.has_errors(), "fs.read_file should check and yield an owned string");
         // The owned string owns a fresh buffer (not a view), so it is returnable.
-        let (_q, ret) = check("fn load(p: str) -> Result<string, Error> {\n  return Ok(fs.read_file(p)?)\n}\nfn main() -> i32 = 0\n");
+        let (_q, ret) = check("import std.fs\nfn load(p: str) -> Result<string, Error> {\n  return Ok(fs.read_file(p)?)\n}\nfn main() -> i32 = 0\n");
         assert!(!ret.has_errors(), "an fs.read_file string is owned and returnable");
         // Wrong arity errors cleanly.
-        let (_r, ar) = check("fn main() -> Result<(), Error> {\n  data := fs.read_file()?\n  return Ok(())\n}\n");
+        let (_r, ar) = check("import std.fs\nfn main() -> Result<(), Error> {\n  data := fs.read_file()?\n  return Ok(())\n}\n");
         assert!(ar.has_errors(), "fs.read_file needs exactly one argument");
     }
 
     #[test]
     fn io_stdout_write_checks() {
         // std.io: `io.stdout.write(s)` (s: str / owned string) yields `Result<(), Error>`.
-        let (_p, ok) = check("fn main() -> Result<(), Error> {\n  io.stdout.write(\"hi\")?\n  return Ok(())\n}\n");
+        let (_p, ok) = check("import std.io\nfn main() -> Result<(), Error> {\n  io.stdout.write(\"hi\")?\n  return Ok(())\n}\n");
         assert!(!ok.has_errors(), "io.stdout.write of a str should check");
         // An owned string is accepted (auto-borrowed to str) and stays usable afterwards.
-        let (_q, owned) = check("fn mk() -> string = \"x\".clone()\nfn main() -> Result<(), Error> {\n  s := mk()\n  io.stdout.write(s)?\n  print(s.len())\n  return Ok(())\n}\n");
+        let (_q, owned) = check("import std.io\nfn mk() -> string = \"x\".clone()\nfn main() -> Result<(), Error> {\n  s := mk()\n  io.stdout.write(s)?\n  print(s.len())\n  return Ok(())\n}\n");
         assert!(!owned.has_errors(), "io.stdout.write borrows an owned string (does not move it)");
         // A `builder` is accepted directly (written, not consumed — still usable / dropped after).
-        let (_b, bld) = check("fn main() -> Result<(), Error> {\n  b := builder()\n  b.write(\"hi\")\n  io.stdout.write(b)?\n  print(b.to_string())\n  return Ok(())\n}\n");
+        let (_b, bld) = check("import std.io\nfn main() -> Result<(), Error> {\n  b := builder()\n  b.write(\"hi\")\n  io.stdout.write(b)?\n  print(b.to_string())\n  return Ok(())\n}\n");
         assert!(!bld.has_errors(), "io.stdout.write accepts a builder directly (borrows it)");
         // Wrong arity errors.
-        let (_r, ar) = check("fn main() -> Result<(), Error> {\n  io.stdout.write()?\n  return Ok(())\n}\n");
+        let (_r, ar) = check("import std.io\nfn main() -> Result<(), Error> {\n  io.stdout.write()?\n  return Ok(())\n}\n");
         assert!(ar.has_errors(), "io.stdout.write needs exactly one argument");
     }
 
@@ -7143,7 +7211,7 @@ mod tests {
     fn struct_array_element_field_checks() {
         // MMv2 slice 8f: `arr[i].field` on a struct array reads one field (scalar or str view),
         // bounds-checked.
-        let (_p, ok) = check("User { id: i64, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users[0].score)\n  return Ok(())\n}\n");
+        let (_p, ok) = check("import core.json\nUser { id: i64, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users[0].score)\n  return Ok(())\n}\n");
         assert!(!ok.has_errors(), "arr[i].field on a struct array should check");
         // A whole-struct `arr[i]` value (no field) is a by-value load — supported.
         let (_q, whole) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}]\n  q := ps[0]\n  return q.x\n}\n");
@@ -7152,7 +7220,7 @@ mod tests {
         let (_r, badf) = check("P { x: i32 }\nfn main() -> i32 {\n  ps := [P{x: 1}]\n  return ps[0].nope\n}\n");
         assert!(badf.has_errors(), "an unknown element field must be rejected");
         // A `str` field read from an arena-decoded element must not escape the arena.
-        let (_s, esc) = check("U { id: i64, name: str }\nfn bad(key: str) -> Result<str, Error> {\n  mut out := \"\"\n  arena {\n    d := key + key\n    users: array<U> := json.decode(d)?\n    out = users[0].name\n  }\n  return Ok(out)\n}\nfn main() -> i32 = 0\n");
+        let (_s, esc) = check("import core.json\nU { id: i64, name: str }\nfn bad(key: str) -> Result<str, Error> {\n  mut out := \"\"\n  arena {\n    d := key + key\n    users: array<U> := json.decode(d)?\n    out = users[0].name\n  }\n  return Ok(out)\n}\nfn main() -> i32 = 0\n");
         assert!(esc.has_errors(), "a str field of an arena-decoded element must not escape the arena");
     }
 
@@ -7160,11 +7228,11 @@ mod tests {
     fn pipeline_over_dynamic_struct_array_checks() {
         // MMv2 slice 8d-2: a fused pipeline over a decoded `array<Struct>` variable type-checks
         // (`where(.field)` + projection + reduction).
-        let (_p, ok) = check("User { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(.active).score.sum())\n  return Ok(())\n}\n");
+        let (_p, ok) = check("import core.json\nUser { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(.active).score.sum())\n  return Ok(())\n}\n");
         assert!(!ok.has_errors(), "a where(.field).field.sum() pipeline over array<Struct> should check");
         // `where` with a whole-struct predicate over a dynamic struct array now checks (it loads
         // the element by value and keeps it, so the following `.score` projection reads the source).
-        let (_q, ok2) = check("User { id: i64, active: bool, score: i32 }\nfn keep(u: User) -> bool = u.active\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(keep).score.sum())\n  return Ok(())\n}\n");
+        let (_q, ok2) = check("import core.json\nUser { id: i64, active: bool, score: i32 }\nfn keep(u: User) -> bool = u.active\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(keep).score.sum())\n  return Ok(())\n}\n");
         assert!(!ok2.has_errors(), "'where' with a whole-struct predicate should check");
     }
 
@@ -7173,7 +7241,7 @@ mod tests {
         // The decoded struct's region must survive while wrapped in a `Result`: binding the raw
         // `json.decode(...)` to a `Result`-typed local, unwrapping it with `?`, then returning
         // `Ok(u)` must still be rejected (otherwise the arena-tied str views escape → UAF).
-        let (_p, d) = check("U { id: i64, name: str }\nfn bad(key: str) -> Result<U, Error> {\n  arena {\n    d := key + key\n    res: Result<U, Error> := json.decode(d)\n    u: U := res?\n    return Ok(u)\n  }\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("import core.json\nU { id: i64, name: str }\nfn bad(key: str) -> Result<U, Error> {\n  arena {\n    d := key + key\n    res: Result<U, Error> := json.decode(d)\n    u: U := res?\n    return Ok(u)\n  }\n}\nfn main() -> i32 = 0\n");
         assert!(d.has_errors(), "a region-tied decoded struct must not escape through a Result-typed local");
     }
 
@@ -7406,11 +7474,11 @@ mod tests {
     fn json_decode_scalar_array_checks() {
         // MMv2 slice 8c: `json.decode` into an owned `array<scalar>` checks (target inferred from
         // the `array<T>` annotation threaded through `?`).
-        let (_p, d) = check("fn parse(s: str) -> Result<array<i64>, Error> {\n  xs: array<i64> := json.decode(s)?\n  return Ok(xs)\n}\nfn main() -> i32 = 0\n");
+        let (_p, d) = check("import core.json\nfn parse(s: str) -> Result<array<i64>, Error> {\n  xs: array<i64> := json.decode(s)?\n  return Ok(xs)\n}\nfn main() -> i32 = 0\n");
         assert!(!d.has_errors(), "json.decode into array<i64> should check");
         // `array<char>` is a representable owned-array type, but the runtime parser only handles
         // int/float/bool elements — `json.decode` rejects it cleanly (exercises the element check).
-        let (_q, d2) = check("fn parse(s: str) -> Result<array<char>, Error> {\n  xs: array<char> := json.decode(s)?\n  return Ok(xs)\n}\nfn main() -> i32 = 0\n");
+        let (_q, d2) = check("import core.json\nfn parse(s: str) -> Result<array<char>, Error> {\n  xs: array<char> := json.decode(s)?\n  return Ok(xs)\n}\nfn main() -> i32 = 0\n");
         assert!(d2.has_errors(), "json.decode into array<char> must be rejected for now");
     }
 
@@ -7588,19 +7656,19 @@ mod tests {
 
     #[test]
     fn json_encode_struct_checks() {
-        let (_p, d) = check("User { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 1, name: \"a\", active: true}\n  print(json.encode(u))\n  return 0\n}\n");
+        let (_p, d) = check("import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 1, name: \"a\", active: true}\n  print(json.encode(u))\n  return 0\n}\n");
         assert!(!d.has_errors(), "json.encode of a flat struct should check");
     }
 
     #[test]
     fn json_encode_struct_array_checks() {
-        let (_p, d) = check("User { id: i64, name: str }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\"}, User{id: 2, name: \"b\"}]\n  print(json.encode(us))\n  return 0\n}\n");
+        let (_p, d) = check("import core.json\nUser { id: i64, name: str }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\"}, User{id: 2, name: \"b\"}]\n  print(json.encode(us))\n  return 0\n}\n");
         assert!(!d.has_errors(), "json.encode of a struct array should check");
     }
 
     #[test]
     fn json_encode_rejects_non_struct() {
-        let (_p, d) = check("fn main() -> i32 {\n  x := 5\n  print(json.encode(x))\n  return 0\n}\n");
+        let (_p, d) = check("import core.json\nfn main() -> i32 {\n  x := 5\n  print(json.encode(x))\n  return 0\n}\n");
         assert!(d.has_errors(), "json.encode requires a struct");
     }
 
@@ -7608,7 +7676,7 @@ mod tests {
     fn json_encode_rejects_unsupported_field() {
         // A char field is a valid struct field but not encodable yet; json.encode must error
         // (and not return a malformed template).
-        let (_p, d) = check("C { ch: char, n: i32 }\nfn main() -> i32 {\n  c := C{ch: 'x', n: 1}\n  print(json.encode(c))\n  return 0\n}\n");
+        let (_p, d) = check("import core.json\nC { ch: char, n: i32 }\nfn main() -> i32 {\n  c := C{ch: 'x', n: 1}\n  print(json.encode(c))\n  return 0\n}\n");
         assert!(d.has_errors(), "json.encode rejects a struct with an unsupported field type");
     }
 

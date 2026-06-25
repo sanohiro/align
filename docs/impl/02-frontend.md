@@ -132,6 +132,8 @@ item        = vis? ( fn_decl | type_decl | const_decl )
 vis         = "pub"
 ```
 
+**Import resolution (slice A — `open-questions.md` module system).** `module_decl`/`import_decl` are parsed into `File.module`/`File.imports`. sema's `collect_imports` validates each import against `BUILTIN_MODULES` (the `core.*`/`std.*` table from `draft.md` §18; unknown → error, duplicate → error) and threads the imported set into every per-function `Checker`. At a prefix-accessed builtin dispatch (`json.encode`/`json.decode` → `core.json`, `fs.read_file` → `std.fs`, `io.stdout.write` → `std.io`), `require_import` errors if the module is not imported (checked once per *source* function — skipped for monomorph instances). The language-syntactic core (the array pipeline, `Option`/`Result`, `arena`, numeric methods, `template`) is dispatched by method/keyword and needs no import. The `module` *name* and user-authored multi-file modules (resolving `import myproj.foo` to another file, `pub` cross-module visibility) are slice B (unbuilt).
+
 ### Functions
 
 ```ebnf
