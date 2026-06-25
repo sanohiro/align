@@ -223,3 +223,10 @@ fn unknown_bound_rejected() {
     let src = "fn f<T: Display>(x: T) -> T = x\nfn main() -> i32 = 0\n";
     assert!(check_errs("gen-badbound", src));
 }
+
+#[test]
+fn equality_without_eq_bound_rejected() {
+    // Regression: in 4c-1 `==` on an unconstrained `T` slipped through ungated; 4c-2 closes it.
+    let src = "fn eq<T>(a: T, b: T) -> bool = a == b\nfn main() -> i32 = 0\n";
+    assert!(check_errs("gen-eq-hole", src));
+}
