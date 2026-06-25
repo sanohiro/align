@@ -2477,6 +2477,16 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 ast::Stmt::Expr(e) => {
                     let te = self.check_expr(e, None);
+                    // Unhandled `Result` lint (`draft.md` §16): discarding a `Result` as a statement
+                    // silently drops a possible error — against "errors are visible / handled". It is
+                    // an error (not a warning): propagate with `?`, branch with `match`/`else`, or
+                    // bind it (`r := f()`) to handle it explicitly.
+                    if matches!(self.resolve(te.ty), Ty::Result(..)) {
+                        self.diags.error(
+                            "unhandled `Result`: propagate it with `?`, handle it with `match`, or bind it (`r := …`) — a discarded Result hides a possible error".to_string(),
+                            te.span,
+                        );
+                    }
                     stmts.push(Stmt::Expr(te));
                 }
                 ast::Stmt::Assign { place, value } => match self.check_place(place) {
