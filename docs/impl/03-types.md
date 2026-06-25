@@ -287,10 +287,11 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   infers the args from the payload (`match_param`) then monomorphizes.
 ```
 
-`// OPEN:` using a generic def inside a generic function (`fn mk<T> -> Pair<T>` — deferred
-generic-instance type); `array<T>` / `slice<T>` params + generic containers (`Stack<T>` needs an
-`array<T>` field); the `N` in `vec<N,T>` (value generics, M6); folding `Option`/`Result` into the
-general generic mechanism.
+**Generics is CLOSED** (minimal by design — see `open-questions.md`). The implemented surface
+(functions + builtin bounds + generic structs + generic sum types) is the whole feature; it is not
+extended further. Not-generics leftovers moved to their tracks: generic **containers** → the
+`group_by` track (roadmap #5, if a consumer needs them); **`vec<N,T>`** → M6; a generic-def-inside-a-
+generic-fn / `Opt.None` expected-type decomposition → optional refinements, revisit only on demand.
 
 ---
 
