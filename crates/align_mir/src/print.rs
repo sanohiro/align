@@ -96,6 +96,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::Use(op) => operand_str(op),
         Rvalue::Load(slot) => format!("load _{slot}"),
         Rvalue::Un(op, a) => format!("{}{}", unop_str(*op), operand_str(a)),
+        Rvalue::Cast { operand, from, to } => {
+            format!("{} as {} (from {})", operand_str(operand), ty_name(*to), ty_name(*from))
+        }
         Rvalue::Bin(op, a, b) => {
             format!("{} {} {}", operand_str(a), binop_str(*op), operand_str(b))
         }

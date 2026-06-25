@@ -113,6 +113,11 @@ pub enum Rvalue {
     Use(Operand),
     Load(Slot),
     Un(UnOp, Operand),
+    /// `operand as to` — an explicit numeric/char conversion. `from`/`to` are concrete primitive
+    /// scalars (int / float / char); codegen picks truncate / sign-or-zero-extend (int→int),
+    /// `sitofp`/`uitofp` (int→float), `fpext`/`fptrunc` (float→float), or the saturating
+    /// `fptosi`/`fptoui` (float→int, no UB on overflow / NaN).
+    Cast { operand: Operand, from: Ty, to: Ty },
     Bin(BinOp, Operand, Operand),
     /// Explicit-overflow integer arithmetic (`core.math`): `op` is `Add`/`Sub`/`Mul` on the
     /// integer type `int_ty`. `Saturating` → the clamped result (`int_ty`); `Checked` → an
@@ -699,6 +704,17 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let a = lower_expr(b, expr);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Un(*op, a)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::Cast(inner) => {
+            let from = inner.ty;
+            let operand = lower_expr(b, inner);
+            // A no-op cast (same type, e.g. `x as i32` where `x: i32`) is just the operand.
+            if from == e.ty {
+                return operand;
+            }
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Cast { operand, from, to: e.ty }));
             Operand::Value(v)
         }
         hir::ExprKind::Binary { op, lhs, rhs } => {

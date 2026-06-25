@@ -1,0 +1,21 @@
+// Numeric conversion — the explicit `as` operator (draft.md §3).
+// There is no implicit coercion; every type change is visible in source.
+fn main() -> i32 {
+  a: i32 := 300
+  b: i64 := a as i64           // widen i32 -> i64 (explicit, never implicit)
+  c: i64 := b * 1000000        // arithmetic in i64
+  d: i32 := c as i32           // narrow back (defined two's-complement truncation)
+
+  x: f64 := 3.9
+  y: i32 := x as i32           // float -> int, truncates toward zero (= 3)
+
+  n: i64 := 65
+  ch: char := n as char        // int -> char (the Unicode code point)
+  code: i32 := ch as i32       // char -> int ('A' = 65)
+
+  big: f64 := 1e20
+  sat: i32 := big as i32       // out-of-range float -> int saturates to i32::MAX (no UB)
+
+  // d=300000000, y=3, code=65, sat=2147483647
+  return d - 299999997 + y + code - 65 + (sat - 2147483647)  // 3 + 3 + 0 + 0 = 6
+}

@@ -266,6 +266,31 @@ The reason is to commit fully to "predictably fast." Behavior is the same across
 
 Arithmetic errors other than overflow, such as division by zero, are handled separately; they are never silent and always produce an error.
 
+### Numeric Conversion
+
+There is **no implicit numeric coercion** — not even widening. A value changes type only through the explicit `as` operator, so every conversion is visible in source ("nothing hidden"):
+
+```align
+a: i32 := 300
+b: i64 := a as i64        // widen — explicit, never implicit
+n := b as i32             // narrow — defined two's-complement truncation
+x := 3.9 as i32           // float → int — truncates toward zero
+f := a as f32             // int → float
+code := 'A' as i32        // char → its code point (a u32); int as char goes the other way
+```
+
+`as` is the language's **only** conversion, and applies only between the numeric primitives (`i8..u64`, `f32`/`f64`) and `char`. It is **zero-UB by design**, matching the overflow model above:
+
+```text
+int → int      truncate / sign- or zero-extend (defined wrap; sign from the source)
+int → float    exact where representable, else nearest
+float → float  widen / narrow
+float → int    truncate toward zero, SATURATING (out-of-range clamps to MIN/MAX, NaN → 0)
+char ↔ int     the Unicode code point (a u32); char never converts directly to/from a float
+```
+
+`bool` does not participate (use `if`); there is no conversion to or from struct, string, or other composite types.
+
 ### Optional
 
 ```align

@@ -550,7 +550,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self, min_bp: u8) -> Option<Expr> {
-        let mut lhs = self.parse_prefix()?;
+        let mut lhs = self.parse_cast()?;
         loop {
             let Some((op, bp)) = Self::binop(self.peek()) else {
                 break;
@@ -588,6 +588,20 @@ impl<'a> Parser<'a> {
             };
         }
         Some(lhs)
+    }
+
+    /// `expr as T (as U)*` — explicit conversions, between unary prefix and the binary operators.
+    /// `as` applies to the whole prefix expression (so `-x as i64` is `(-x) as i64`), and chains
+    /// left-to-right (`x as i64 as f64`).
+    fn parse_cast(&mut self) -> Option<Expr> {
+        let mut e = self.parse_prefix()?;
+        while self.at(&TokKind::As) {
+            self.bump();
+            let ty = self.parse_type()?;
+            let span = e.span.merge(ty.span());
+            e = Expr { kind: ExprKind::Cast { expr: Box::new(e), ty }, span };
+        }
+        Some(e)
     }
 
     fn parse_prefix(&mut self) -> Option<Expr> {

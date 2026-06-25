@@ -201,6 +201,10 @@ pub enum ExprKind {
         op: UnOp,
         expr: Box<Expr>,
     },
+    /// `expr as T` — an explicit numeric/char conversion. The target type is this expression's
+    /// `ty`; the source type is `inner.ty`. Both are concrete primitive scalars (int / float /
+    /// char). Lowers to one MIR `Cast` (truncate / extend / int↔float / float-saturating-to-int).
+    Cast(Box<Expr>),
     Binary {
         op: BinOp,
         lhs: Box<Expr>,

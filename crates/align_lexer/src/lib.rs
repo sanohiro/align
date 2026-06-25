@@ -37,6 +37,8 @@ pub enum TokKind {
     TaskGroup,
     Match,
     Template,
+    /// `as` — the explicit numeric/char conversion operator (`x as T`).
+    As,
     // Symbols / operators
     ColonEq, // :=
     Eq,      // =
@@ -390,6 +392,7 @@ impl<'a> Lexer<'a> {
             "task_group" => TokKind::TaskGroup,
             "match" => TokKind::Match,
             "template" => TokKind::Template,
+            "as" => TokKind::As,
             _ => TokKind::Ident(text.to_string()),
         };
         self.push(kind, start);
