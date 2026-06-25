@@ -6299,8 +6299,10 @@ fn collect_imports(file: &ast::File, diags: &mut Diagnostics) -> std::collection
             );
             continue;
         }
-        if !imported.insert(path.clone()) {
+        if imported.contains(&path) {
             diags.error(format!("duplicate import `{path}`"), imp.span);
+        } else {
+            imported.insert(path);
         }
     }
     imported
