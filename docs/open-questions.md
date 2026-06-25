@@ -400,16 +400,16 @@ driver settings, or library internals** — none touch parser / type checker / I
 `work/proposals/` (kept there as raw drafts); listed here so the drafts can be discarded
 without losing the backlog.
 
-**Status note (the foundational lever): the LLVM middle-end optimization pipeline is not run yet.**
-`emit_object` builds IR and calls `TargetMachine::write_to_file` at `OptimizationLevel::Default`,
-which runs only the **backend codegen** passes — *not* the inliner / LICM / loop-vectorizer / SLP.
-So today the lifted lambdas, fused pipelines, and `map`/`reduce` loops are emitted in a form that
-*would* inline and vectorize well, but at runtime they are **not** inlined (a per-element call
-remains) and **not** SIMD-vectorized. The fix is small and additive — run the default `-O2`
-pipeline (`module.run_passes("default<O2>", …)`) before emitting — and is the prerequisite for
-every vectorization lever below. Slotted with **M6** (verify a canonical pipeline emits vector
-instructions) and the LLVM-version upgrade. Deferred deliberately, not a gap: it is reversible and
-purely additive (no front-end change).
+**Status note (the foundational lever): the LLVM middle-end optimization pipeline is now run.**
+`write_object` runs the default **`-O2`** pipeline (`module.run_passes("default<O2>", &tm,
+PassBuilderOptions)`) before `TargetMachine::write_to_file`, so the inliner / LICM / loop-vectorizer
+/ SLP all run. The lifted lambdas are inlined and the fused `map`/`where`/`reduce` loops vectorize:
+e.g. `xs.map(dbl).sum()` lowers to one SSE2 loop (`movdqu` + `paddq`, two `i64` per instruction,
+the `dbl` call inlined) with a horizontal-reduction tail — verified via `objdump`, and all
+end-to-end tests stay correct under `-O2` (no miscompile from latent IR UB). `emit-llvm` still
+prints the *un*-optimized IR (it is for inspecting codegen output). This was the prerequisite for
+every vectorization lever below; the remaining ones (the explicit `vec`/`mask`/SoA surface, VLA,
+non-temporal, fast-math, `-march=native`) are **M6** proper, alongside the LLVM-version upgrade.
 
 ```text
 Backend / codegen lowering (MIR -> LLVM, source unchanged):
