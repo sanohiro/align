@@ -1,0 +1,22 @@
+// Minimal generics (4c-1): unconstrained generic functions, monomorphized per use.
+//
+// A `fn f<T>(...)` is a template. Each distinct call instantiates a concrete copy (`id$i32`,
+// `id$i64`, `pick$i32`, …) — type arguments are inferred from the call, never written (no
+// turbofish). A type parameter is opaque here: `T` is passed / returned / stored by value, but it
+// has no operations (arithmetic, fields), so `x + x` on a bare `T` is a compile error. The small
+// builtin constraint set (`Num` / `Ord` / `Eq`) that unlocks generic `max` / `sum` is a later slice.
+
+fn id<T>(x: T) -> T = x
+
+fn pick<T>(a: T, b: T) -> T = a
+
+// A generic calling a generic — instantiating `wrap` at i32 instantiates `id` at i32 too.
+fn wrap<T>(x: T) -> T = id(x)
+
+fn main() -> i32 {
+  a := id(5)          // id$i32
+  b := pick(10, 20)   // pick$i32 → 10
+  c := wrap(7)        // wrap$i32 → id$i32 → 7
+  // 5 + 10 + 7 = 22
+  return a + b + c
+}

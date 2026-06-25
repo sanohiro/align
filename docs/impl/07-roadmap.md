@@ -135,10 +135,18 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
      `Error.Code`); `main` maps the error to an exit code (`Code(c)`→c, category→tag+1); and the
      **task_group fallible path was reworked** to carry the full `Error` across threads via a
      per-task err-slot (`tg_wait` returns the first errored slot). **4b-3 DONE** — explicit error conversion is `result.map_err(f)` (no implicit `?` coercion). **4b-4 DONE** — position-bearing **structured errors** work on the 4b-1 + S2 foundation (a variant carrying a `Pos` struct, `?`-propagated, `match`-read — `examples/structured_error.align`); free-form **`.with_context` was reviewed and NOT adopted** (off-philosophy: structured sum-type payloads are the context mechanism, not dynamic string chaining — rationale in `open-questions.md`). **So 4b (the Error type) is complete** for the planned surface. (ErrCode removed; richer `str`-carrying error payloads remain deferred with S2's `str`-field payloads.)
-   - **4c. Minimal generics + constraints** — the riskiest; approach minimally (structural
-     constraints or tiny builtin bounds, explicit monomorphization, no turbofish, no Rust-trait
-     complexity). Unblocks generic containers and lets `Option`/`Result` become generic sum types in
-     the general mechanism (retiring their builtin special-case).
+   - **4c. Minimal generics + constraints** — the riskiest; approach minimally (tiny builtin bounds,
+     explicit monomorphization, no turbofish, no Rust-trait complexity). **4c-1 DONE (the
+     unconstrained walking skeleton)** — `fn f<T>(...)` monomorphized per distinct concrete
+     instantiation (`Ty::Param(i)` substituted *before* the flow analyses / MIR, so MoveCheck/drop /
+     codegen see only concrete types; mangled `id$i32`; transitive instantiation to a fixpoint).
+     Type arguments are inferred (no turbofish); a type parameter is **opaque** (no operations — the
+     template is checked abstractly, an uninstantiated generic is not checked, C++-template-like);
+     skeleton cut = bare positions only (no `array<T>` / nested), no lambda/pipeline in a generic.
+     (`tests/generics.rs`, `examples/generics.align`.) **Next 4c slices** (`open-questions.md`): the
+     **constraint model — chosen direction `Num`/`Ord`/`Eq` builtin bounds** (no user trait bounds),
+     then type parameters in nested positions (generic containers), then value generics (`vec<N,T>`,
+     M6) and folding `Option`/`Result` into the general mechanism (retiring their builtin special-case).
 5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
 6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.
 7. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the

@@ -755,7 +755,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::CallIndirect { callee: c, args: ops, param_tys, ret_ty: e.ty }));
             Operand::Value(v)
         }
-        hir::ExprKind::Call { func, args } => {
+        hir::ExprKind::Call { func, args, .. } => {
             let ops = args.iter().map(|a| lower_expr(b, a)).collect();
             // A by-value owned-array argument is moved into the callee: null the caller's slot.
             // `print` only reads its argument (it borrows), so it must not null the source — it
@@ -2736,6 +2736,8 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Fn(id) => format!("fn#{id}"),
         Ty::Enum(id) => format!("enum#{id}"),
         Ty::Task(_) => "Task".to_string(),
+        // Monomorphization substitutes every `Ty::Param` before MIR; reaching here is a compiler bug.
+        Ty::Param(_) => unreachable!("Ty::Param survived monomorphization"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }

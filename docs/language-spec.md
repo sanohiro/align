@@ -84,6 +84,20 @@ area := match s {
 }
 ```
 
+### Generics
+
+A function may declare type parameters — `fn f<T>(...)` — and is **monomorphized** per distinct
+concrete instantiation (zero run-time cost; a Move `T` moves, a Copy `T` copies). Type arguments
+are **inferred** (from arguments or the expected type via the binding annotation) — no turbofish.
+A type parameter is **opaque**: passed / returned / stored by value, with no operations of its own
+(`x + x` on a bare `T` is rejected). A small builtin constraint set (`Num` / `Ord` / `Eq`) is a
+planned extension; user-defined trait bounds are out of scope.
+
+```align
+fn id<T>(x: T) -> T = x
+n := id(5)        // T = i32, monomorphized to id$i32
+```
+
 ### Memory
 
 ```text

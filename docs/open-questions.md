@@ -156,8 +156,38 @@ elements) — bind it first. A Copy element reads fine in any position. The firs
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
-### Generics (minimal system) — before M4
-Structural-constraint inference vs explicit bounds (trait-style). Unit of monomorphization implementation. Value generics for `vec<N,T>`. Required to write core in Align itself (`impl/03-types.md` §9, `impl/06-runtime-std.md` §10). Note: the *call-site* surface is already settled — no expression-position type arguments (see "Type-argument syntax: no turbofish" under Settled); a return-only type parameter is supplied by the binding annotation.
+### Generics (minimal system) — in progress (4c)
+**Settled & built — 4c-1 (the unconstrained walking skeleton) DONE.** A function may declare type
+parameters `fn f<T, U>(...)` and is **monomorphized** per distinct concrete instantiation. Decisions
+made and implemented:
+- **Monomorphization unit = the function, specialized per concrete type-argument tuple**, generated
+  *before* the flow analyses / MIR (so MoveCheck/EscapeCheck/drop and codegen only ever see concrete
+  types — a Move `T` moves, a Copy `T` copies, all "for free"). `Ty::Param(i)` represents a type
+  parameter inside a template; it never reaches MIR. Mangled symbol = `name$arg$arg…` (`id$i32`).
+  Instantiations are discovered transitively (a generic calling a generic) to a fixpoint.
+- **Type arguments are inferred, never written** (reaffirms the no-turbofish decision): from a value
+  argument, or the expected type via the binding annotation. Uninferable → annotate-the-binding error.
+- **A type parameter is opaque (no constraints yet)**: in the template body `T` may only be passed /
+  returned / stored / moved; an operation needing a capability (arithmetic, field access) is rejected
+  (the template is checked abstractly with `T = Param`). An **uninstantiated** generic is not
+  type-checked (C++-template-like; only its instances are).
+- **Skeleton cut**: a type parameter appears only in a **bare** position (a whole parameter / return),
+  never nested (`array<T>` / `Option<T>` / a tuple of `T` are rejected — `Scalar` can't hold a
+  `Param`); and a generic function may not contain a lambda / pipeline yet (its lifted helper would
+  collide across instances). (`crates/align_driver/tests/generics.rs`, `examples/generics.align`.)
+
+**Still open (later 4c slices):**
+- **The constraint model — chosen direction: a small set of builtin bounds (`Num` / `Ord` / `Eq`),
+  no user-defined trait-style bounds** (avoids Rust-trait complexity; AI-friendly; *one way*). This
+  unlocks generic `max` / `sum` / comparison and is what lets a type parameter be used in operations.
+  Structural inference of bounds-from-usage was considered and set aside (harder error messages,
+  implicit). Not yet built.
+- **Type parameters in nested positions** (generic containers `Stack<T>`, `array<T>` params) — needs
+  `Param` representable inside composites (today `Scalar` is var-free); lifts the bare-position cut.
+- **Value generics for `vec<N, T>`** (the `N`) — M6.
+- **Generic `Option`/`Result`** in the general mechanism (retiring the builtin `Ty::Option`/`Result`
+  special-case) — once nested-position generics + a `Some`/`Ok` generic-enum path exist.
+Required to write core in Align itself (`impl/03-types.md` §9, `impl/06-runtime-std.md` §10).
 
 ### Error type design — Open (next after sum types; the i32 is an M2 placeholder)
 Today `Error` is the M2 `Ty::ErrCode` (an i32 code). **Leaning (2026-06-24, validated by external review):** build the real `Error` **on the sum-type mechanism** — `Error` is a **sum type of categories** (the variant carries a lightweight payload: a `str` view + position for a parse error, a code for an OS error, …). Constraints from the philosophy:

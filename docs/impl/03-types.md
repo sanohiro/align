@@ -249,17 +249,28 @@ The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked e
 
 ---
 
-## 9. Generics (minimal, settle before M4)
+## 9. Generics (minimal) — 4c-1 built
 
-monomorphization (specialize per use site). No Rust/C++ trait/template complexity (`non-goals.md`).
+Monomorphization (specialize per use site). No Rust/C++ trait/template complexity (`non-goals.md`).
 
+**Settled & built (4c-1, the unconstrained skeleton):**
 ```text
-- type parameters can appear on Named / Fn / array<T> etc.
-- for now the baseline policy for constraints is structural "inferred from the operations used"
-- whether to introduce explicit bounds (trait-like) is decided before starting M4
+- A function declares type parameters: `fn f<T, U>(...)`. `Ty::Param(i)` represents one inside a
+  template (Copy, var-free); it is substituted before the flow analyses / MIR run.
+- Monomorphization unit = the function, specialized per concrete type-argument tuple, generated
+  in sema AFTER type-checking and BEFORE MoveCheck/EscapeCheck/MIR (so those passes and codegen see
+  only concrete types — answers the "before or after MIR" question: BEFORE). Mangled `name$arg$arg`.
+- Type arguments are inferred (no turbofish): a `Param` parameter binds from its argument (all
+  occurrences unified); a return-only `Param` from the expected type; finalized after whole-function
+  inference (so a literal argument's type can flow from the call's context).
+- A template is checked abstractly (T = Param) — operations needing a capability are rejected; an
+  uninstantiated generic is not checked. Instantiations are discovered transitively to a fixpoint.
 ```
 
-`// OPEN:` representation of constraints (structural vs explicit bounds), handling of the N in `vec<N,T>` (value generics), and the unit of monomorphization. This is tied to `04-mir.md` (whether monomorphization happens before or after MIR generation).
+`// OPEN:` the constraint model — chosen direction is a **small builtin bound set (`Num`/`Ord`/`Eq`)**,
+not user trait-style bounds (`open-questions.md` Generics); type parameters in nested positions
+(generic containers — needs `Param` representable inside composites); the `N` in `vec<N,T>` (value
+generics, M6).
 
 ---
 
