@@ -240,6 +240,22 @@ unsafe
 
 Only inside an unsafe block.
 
+### Modules / imports
+
+A prefix-accessed library namespace must be `import`ed before use — a file's header lists the
+capabilities it reaches ("nothing hidden"):
+
+```align
+import core.json
+import std.fs
+```
+
+Using `json.*` / `fs.*` / `io.stdout.write` without its `import`, or importing a non-existent
+module, is a compile error. The language-syntactic core (`Option`/`Result`/`?`/`else`, `arena`, the
+array pipeline, numeric methods, `template`) is always in scope and needs no import. `core` is
+language-intrinsic and `std` the OS boundary; both are compiler builtins today. Multi-file
+user-authored modules + `pub` cross-module visibility are the next slice. (`draft.md` §17.)
+
 ## Core library
 
 ```text

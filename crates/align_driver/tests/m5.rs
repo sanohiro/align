@@ -84,7 +84,7 @@ fn json_decode_str_field_zero_copy() {
     }
     // A `str` field decodes as a zero-copy view into the input buffer (MMv2 slice 6): the
     // printed name comes straight from the input bytes, no allocation. id=7, name="alice".
-    let src = "User { id: i64, name: str, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"id\\\": 7, \\\"name\\\": \\\"alice\\\", \\\"active\\\": true}\")?\n  print(u.id)\n  print(u.name)\n  if u.active { print(1) }\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"id\\\": 7, \\\"name\\\": \\\"alice\\\", \\\"active\\\": true}\")?\n  print(u.id)\n  print(u.name)\n  if u.active { print(1) }\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-str", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "7\nalice\n1\n");
@@ -112,7 +112,7 @@ fn str_clone_of_decoded_field_is_owned() {
     }
     // Clone a zero-copy decoded `str` field into an owned `string` — the explicit escape hatch
     // out of the borrow. name="alice" (len 5).
-    let src = "User { id: i64, name: str }\nfn decode(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := decode(\"{\\\"id\\\": 7, \\\"name\\\": \\\"alice\\\"}\")?\n  owned := u.name.clone()\n  print(owned)\n  print(owned.len())\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str }\nfn decode(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := decode(\"{\\\"id\\\": 7, \\\"name\\\": \\\"alice\\\"}\")?\n  owned := u.name.clone()\n  print(owned)\n  print(owned.len())\n  return Ok(())\n}\n";
     let out = build_and_run("str-clone-decoded", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "alice\n5\n");
@@ -264,7 +264,7 @@ fn json_decode_scalar_array() {
     // MMv2 slice 8c: `json.decode` into an owned `array<i64>` — the JSON array is parsed and the
     // elements copied into a fresh heap buffer (owned, returnable). sum = 100, len = 4. Also
     // exercises `return Ok(xs)` moving a bound owned local through the `Ok` wrapper (freed once).
-    let src = "fn parse(s: str) -> Result<array<i64>, Error> {\n  xs: array<i64> := json.decode(s)?\n  return Ok(xs)\n}\nfn main() -> Result<(), Error> {\n  xs := parse(\"[10, 20, 30, 40]\")?\n  print(xs.sum())\n  print(xs.len())\n  return Ok(())\n}\n";
+    let src = "import core.json\nfn parse(s: str) -> Result<array<i64>, Error> {\n  xs: array<i64> := json.decode(s)?\n  return Ok(xs)\n}\nfn main() -> Result<(), Error> {\n  xs := parse(\"[10, 20, 30, 40]\")?\n  print(xs.sum())\n  print(xs.len())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-array", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "100\n4\n");
@@ -276,7 +276,7 @@ fn json_decode_float_array() {
         return;
     }
     // `array<f64>` decode: 1.5 + 2.5 + 3.0 = 7.0.
-    let src = "fn main() -> Result<(), Error> {\n  xs: array<f64> := json.decode(\"[1.5, 2.5, 3.0]\")?\n  print(xs.sum())\n  return Ok(())\n}\n";
+    let src = "import core.json\nfn main() -> Result<(), Error> {\n  xs: array<f64> := json.decode(\"[1.5, 2.5, 3.0]\")?\n  print(xs.sum())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-farray", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "7.0\n");
@@ -288,7 +288,7 @@ fn json_decode_array_malformed_errors() {
         return;
     }
     // A malformed element propagates an error (exit code 1), with no allocation leaked.
-    let src = "fn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[1, 2, oops]\")?\n  print(xs.sum())\n  return Ok(())\n}\n";
+    let src = "import core.json\nfn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[1, 2, oops]\")?\n  print(xs.sum())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-array-bad", src);
     assert_eq!(out.status.code(), Some(1));
 }
@@ -301,7 +301,7 @@ fn json_decode_array_from_owned_string() {
     // The `json.decode` input accepts an owned `string` (auto-borrowed to `str` via the same
     // coercion as `let`/call args); the decoded `array<i64>` is copied, so it outlives the
     // borrow. Build "[1, 2, 3]" with a builder, decode it: sum = 6, len = 3.
-    let src = "fn main() -> Result<(), Error> {\n  b := builder()\n  b.write(\"[1, 2, 3]\")\n  doc := b.to_string()\n  xs: array<i64> := json.decode(doc)?\n  print(xs.sum())\n  print(xs.len())\n  return Ok(())\n}\n";
+    let src = "import core.json\nfn main() -> Result<(), Error> {\n  b := builder()\n  b.write(\"[1, 2, 3]\")\n  doc := b.to_string()\n  xs: array<i64> := json.decode(doc)?\n  print(xs.sum())\n  print(xs.len())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-array-owned", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n3\n");
@@ -315,7 +315,7 @@ fn json_decode_empty_array_is_safe() {
     // An empty JSON array decodes to a `{null, 0}` owned array — `.len()` is 0, `.sum()` is 0,
     // and the runtime must not `from_raw_parts(null, 0)` on either the empty result or, when the
     // source itself is an empty owned `string`, the input buffer. Output: "0\n0\n".
-    let src = "fn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[]\")?\n  print(xs.sum())\n  print(xs.len())\n  return Ok(())\n}\n";
+    let src = "import core.json\nfn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[]\")?\n  print(xs.sum())\n  print(xs.len())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-empty-array", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n0\n");
@@ -330,7 +330,7 @@ fn json_decode_struct_array_len() {
     // (AoS). The two objects parse into a heap buffer of `User` structs; `.len()` reads the count
     // (2), and the buffer is freed at scope exit (no double-free / leak crash). `str` fields are
     // zero-copy views into the input literal (Static), so no arena is needed here.
-    let src = "User { id: i64, name: str, active: bool }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false}]\")?\n  print(users.len())\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false}]\")?\n  print(users.len())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-struct-array", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
@@ -342,7 +342,7 @@ fn json_decode_struct_array_scalar_only() {
         return;
     }
     // A scalar-only struct array (no `str` fields) decodes the same way; len = 3.
-    let src = "P { x: i64, y: i64 }\nfn main() -> Result<(), Error> {\n  ps: array<P> := json.decode(\"[{\\\"x\\\":1,\\\"y\\\":2},{\\\"x\\\":3,\\\"y\\\":4},{\\\"x\\\":5,\\\"y\\\":6}]\")?\n  print(ps.len())\n  return Ok(())\n}\n";
+    let src = "import core.json\nP { x: i64, y: i64 }\nfn main() -> Result<(), Error> {\n  ps: array<P> := json.decode(\"[{\\\"x\\\":1,\\\"y\\\":2},{\\\"x\\\":3,\\\"y\\\":4},{\\\"x\\\":5,\\\"y\\\":6}]\")?\n  print(ps.len())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-struct-array-scalar", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n");
@@ -355,7 +355,7 @@ fn json_decode_empty_struct_array_is_safe() {
     }
     // An empty `[]` decodes to a `{null, 0}` owned struct array — `.len()` is 0, and the runtime
     // must not `from_raw_parts(null, 0)` nor `free` a non-null buffer. Output: "0\n".
-    let src = "User { id: i64, name: str }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.len())\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.len())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-empty-struct-array", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
@@ -368,7 +368,7 @@ fn json_decode_struct_array_malformed_errors() {
     }
     // A malformed element (missing the required `active` field) propagates an error (exit 1),
     // leaving the out slot `{null,0}` (nothing allocated / leaked).
-    let src = "User { id: i64, name: str, active: bool }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\"}]\")?\n  print(users.len())\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\"}]\")?\n  print(users.len())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-struct-array-bad", src);
     assert_eq!(out.status.code(), Some(1));
 }
@@ -382,7 +382,7 @@ fn json_decode_struct_array_pipeline_sum() {
     // array of objects into an owned `array<User>`, then fuse `where(.active).score.sum()` into a
     // single counted loop over the heap AoS (field access via `IndexFieldPtr`). The inactive `bob`
     // (score 99) is filtered out → 10 + 5 = 15.
-    let src = "User { id: i64, name: str, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false,\\\"score\\\":99},{\\\"id\\\":3,\\\"name\\\":\\\"cyd\\\",\\\"active\\\":true,\\\"score\\\":5}]\")?\n  total := users.where(.active).score.sum()\n  print(total)\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false,\\\"score\\\":99},{\\\"id\\\":3,\\\"name\\\":\\\"cyd\\\",\\\"active\\\":true,\\\"score\\\":5}]\")?\n  total := users.where(.active).score.sum()\n  print(total)\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-struct-array-pipeline", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n");
@@ -395,7 +395,7 @@ fn json_decode_struct_array_pipeline_project_and_count() {
     }
     // A bare field projection + `sum` (no `where`): sum all `score`s = 10 + 99 + 5 = 114. And a
     // `where(.active)` count of survivors = 2. Two pipelines over the same decoded array.
-    let src = "User { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"active\\\":false,\\\"score\\\":99},{\\\"id\\\":3,\\\"active\\\":true,\\\"score\\\":5}]\")?\n  print(users.score.sum())\n  print(users.where(.active).score.count())\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"active\\\":false,\\\"score\\\":99},{\\\"id\\\":3,\\\"active\\\":true,\\\"score\\\":5}]\")?\n  print(users.score.sum())\n  print(users.where(.active).score.count())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-struct-array-project", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "114\n2\n");
@@ -408,7 +408,7 @@ fn json_decode_struct_array_pipeline_empty() {
     }
     // A pipeline over an empty decoded array folds to the identity (sum = 0) without touching the
     // null buffer.
-    let src = "User { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(.active).score.sum())\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[]\")?\n  print(users.where(.active).score.sum())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-struct-array-pipeline-empty", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
@@ -421,7 +421,7 @@ fn json_decode_struct_array_map_sum() {
     }
     // `map(f)` over whole struct elements of an owned, dynamic `array<Struct>` (decoded from
     // JSON), loaded through the buffer pointer (`IndexPtr`): dbl(u) = u.score * 2 → 20 + 22 = 42.
-    let src = "User { score: i64, active: bool }\nfn dbl(u: User) -> i64 = u.score * 2\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"score\\\":10,\\\"active\\\":true},{\\\"score\\\":11,\\\"active\\\":true}]\")?\n  print(users.map(dbl).sum())\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { score: i64, active: bool }\nfn dbl(u: User) -> i64 = u.score * 2\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"score\\\":10,\\\"active\\\":true},{\\\"score\\\":11,\\\"active\\\":true}]\")?\n  print(users.map(dbl).sum())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-struct-map", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
@@ -434,7 +434,7 @@ fn json_decode_struct_array_where_struct_predicate() {
     }
     // A whole-struct `where` predicate over a decoded dynamic `array<Struct>` (loaded by
     // `IndexPtr`): keep score > 8 AND active → 10 + 12 = 22 (bob inactive, dot too low).
-    let src = "User { active: bool, score: i64 }\nfn good(u: User) -> bool = u.score > 8 && u.active\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":12}]\")?\n  print(users.where(good).score.sum())\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { active: bool, score: i64 }\nfn good(u: User) -> bool = u.score > 8 && u.active\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":12}]\")?\n  print(users.where(good).score.sum())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-struct-where-pred", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "22\n");
@@ -447,7 +447,7 @@ fn json_decode_struct_array_where_field_then_map() {
     }
     // `where(.active)` then `map(f)` over the surviving whole structs of a dynamic `array<Struct>`:
     // dbl(u) = u.score * 2 over active rows → 10*2 + 5*2 = 30 (bob, inactive, is skipped).
-    let src = "User { active: bool, score: i64 }\nfn dbl(u: User) -> i64 = u.score * 2\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":5}]\")?\n  print(users.where(.active).map(dbl).sum())\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { active: bool, score: i64 }\nfn dbl(u: User) -> i64 = u.score * 2\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"active\\\":true,\\\"score\\\":10},{\\\"active\\\":false,\\\"score\\\":99},{\\\"active\\\":true,\\\"score\\\":5}]\")?\n  print(users.where(.active).map(dbl).sum())\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-struct-wheremap", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n");
@@ -461,7 +461,7 @@ fn array_index_fixed_and_owned() {
     // Element access `recv[index]` on a fixed stack array and on an owned `array<i64>` (from
     // `json.decode`). Fixed: xs[2] = 30. Owned: ys[0] + ys[3] = 5 + 35 = 40. A computed index
     // (1 + 1) exercises a non-constant subscript.
-    let src = "fn main() -> Result<(), Error> {\n  xs := [10, 20, 30, 40]\n  print(xs[1 + 1])\n  ys: array<i64> := json.decode(\"[5, 15, 25, 35]\")?\n  print(ys[0] + ys[3])\n  return Ok(())\n}\n";
+    let src = "import core.json\nfn main() -> Result<(), Error> {\n  xs := [10, 20, 30, 40]\n  print(xs[1 + 1])\n  ys: array<i64> := json.decode(\"[5, 15, 25, 35]\")?\n  print(ys[0] + ys[3])\n  return Ok(())\n}\n";
     let out = build_and_run("array-index", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n40\n");
@@ -516,7 +516,7 @@ fn struct_array_element_field_dynamic() {
     // MMv2 slice 8f: `users[i].field` on an owned `array<Struct>` from `json.decode`. Reads a
     // `str` field (zero-copy view), an `i32`, and a `bool` from specific elements — bounds-checked,
     // no whole-struct copy. Output: "ann\n99\ntrue\n".
-    let src = "User { id: i64, name: str, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false,\\\"score\\\":99}]\")?\n  print(users[0].name)\n  print(users[1].score)\n  print(users[0].active)\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str, active: bool, score: i32 }\nfn main() -> Result<(), Error> {\n  users: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\",\\\"active\\\":true,\\\"score\\\":10},{\\\"id\\\":2,\\\"name\\\":\\\"bob\\\",\\\"active\\\":false,\\\"score\\\":99}]\")?\n  print(users[0].name)\n  print(users[1].score)\n  print(users[0].active)\n  return Ok(())\n}\n";
     let out = build_and_run("struct-array-elem-field", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ann\n99\ntrue\n");
@@ -555,7 +555,7 @@ fn fs_read_file_reads_owned_string() {
     let path = std::env::temp_dir().join("align-fs-read.txt");
     std::fs::write(&path, "hello from align\n42").expect("write temp file");
     let src = format!(
-        "fn main() -> Result<(), Error> {{\n  data := fs.read_file(\"{}\")?\n  print(data)\n  print(data.len())\n  return Ok(())\n}}\n",
+        "import std.fs\nfn main() -> Result<(), Error> {{\n  data := fs.read_file(\"{}\")?\n  print(data)\n  print(data.len())\n  return Ok(())\n}}\n",
         path.display()
     );
     let out = build_and_run("fs-read-file", &src);
@@ -572,7 +572,7 @@ fn fs_read_file_missing_propagates_err() {
     let missing = std::env::temp_dir().join("align-fs-does-not-exist-xyzzy.txt");
     let _ = std::fs::remove_file(&missing);
     let src = format!(
-        "fn main() -> Result<(), Error> {{\n  data := fs.read_file(\"{}\")?\n  print(data.len())\n  return Ok(())\n}}\n",
+        "import std.fs\nfn main() -> Result<(), Error> {{\n  data := fs.read_file(\"{}\")?\n  print(data.len())\n  return Ok(())\n}}\n",
         missing.display()
     );
     let out = build_and_run("fs-read-missing", &src);
@@ -596,7 +596,7 @@ fn fs_read_file_feeds_json_decode() {
     )
     .expect("write json");
     let src = format!(
-        "User {{ id: i64, name: str, active: bool, score: i32 }}\nfn main() -> Result<(), Error> {{\n  arena {{\n    data := fs.read_file(\"{}\")?\n    users: array<User> := json.decode(data)?\n    print(users.where(.active).score.sum())\n    print(users[0].name)\n  }}\n  return Ok(())\n}}\n",
+        "import core.json\nimport std.fs\nUser {{ id: i64, name: str, active: bool, score: i32 }}\nfn main() -> Result<(), Error> {{\n  arena {{\n    data := fs.read_file(\"{}\")?\n    users: array<User> := json.decode(data)?\n    print(users.where(.active).score.sum())\n    print(users[0].name)\n  }}\n  return Ok(())\n}}\n",
         path.display()
     );
     let out = build_and_run("fs-read-json", &src);
@@ -611,7 +611,7 @@ fn io_stdout_write_has_no_newline() {
     }
     // std.io: `io.stdout.write(s)` writes the bytes with no trailing newline (unlike `print`), so
     // three writes concatenate: "a" + "b" + "c\n" = "abc\n".
-    let src = "fn main() -> Result<(), Error> {\n  io.stdout.write(\"a\")?\n  io.stdout.write(\"b\")?\n  io.stdout.write(\"c\\n\")?\n  return Ok(())\n}\n";
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  io.stdout.write(\"a\")?\n  io.stdout.write(\"b\")?\n  io.stdout.write(\"c\\n\")?\n  return Ok(())\n}\n";
     let out = build_and_run("io-stdout-write", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "abc\n");
@@ -632,7 +632,7 @@ fn s19_full_flow_read_decode_aggregate_write() {
     )
     .expect("write json");
     let src = format!(
-        "User {{ id: i64, name: str, active: bool, score: i32 }}\nfn main() -> Result<(), Error> {{\n  arena {{\n    data := fs.read_file(\"{}\")?\n    users: array<User> := json.decode(data)?\n    total := users.where(.active).score.sum()\n    out := builder()\n    out.write(\"active score: \")\n    out.write_int(total)\n    out.write(\"\\n\")\n    io.stdout.write(out.to_string())?\n  }}\n  return Ok(())\n}}\n",
+        "import core.json\nimport std.fs\nimport std.io\nUser {{ id: i64, name: str, active: bool, score: i32 }}\nfn main() -> Result<(), Error> {{\n  arena {{\n    data := fs.read_file(\"{}\")?\n    users: array<User> := json.decode(data)?\n    total := users.where(.active).score.sum()\n    out := builder()\n    out.write(\"active score: \")\n    out.write_int(total)\n    out.write(\"\\n\")\n    io.stdout.write(out.to_string())?\n  }}\n  return Ok(())\n}}\n",
         path.display()
     );
     let out = build_and_run("s19-full", &src);
@@ -648,7 +648,7 @@ fn io_stdout_write_accepts_builder_directly() {
     // `io.stdout.write(b)` accepts a `builder` directly (writes its bytes, no `to_string()`), the
     // draft.md §19 output form. The builder is borrowed (not consumed) and dropped normally after.
     // Output: "n=7\n".
-    let src = "fn main() -> Result<(), Error> {\n  b := builder()\n  b.write(\"n=\")\n  b.write_int(7)\n  b.write(\"\\n\")\n  io.stdout.write(b)?\n  return Ok(())\n}\n";
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  b := builder()\n  b.write(\"n=\")\n  b.write_int(7)\n  b.write(\"\\n\")\n  io.stdout.write(b)?\n  return Ok(())\n}\n";
     let out = build_and_run("io-stdout-write-builder", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "n=7\n");
@@ -668,7 +668,7 @@ fn s19_verbatim_output_via_builder() {
     )
     .expect("write json");
     let src = format!(
-        "User {{ id: i64, name: str, active: bool, score: i32 }}\nfn main() -> Result<(), Error> {{\n  arena {{\n    data := fs.read_file(\"{}\")?\n    users: array<User> := json.decode(data)?\n    total := users.where(.active).score.sum()\n    out := builder()\n    out.write(\"active score: \")\n    out.write_int(total)\n    out.write(\"\\n\")\n    io.stdout.write(out)?\n  }}\n  return Ok(())\n}}\n",
+        "import core.json\nimport std.fs\nimport std.io\nUser {{ id: i64, name: str, active: bool, score: i32 }}\nfn main() -> Result<(), Error> {{\n  arena {{\n    data := fs.read_file(\"{}\")?\n    users: array<User> := json.decode(data)?\n    total := users.where(.active).score.sum()\n    out := builder()\n    out.write(\"active score: \")\n    out.write_int(total)\n    out.write(\"\\n\")\n    io.stdout.write(out)?\n  }}\n  return Ok(())\n}}\n",
         path.display()
     );
     let out = build_and_run("s19-verbatim", &src);
@@ -737,7 +737,7 @@ fn main_args_argv_marshalling() {
     // PR-C: `main(args: array<str>)` — the C `main` wrapper marshals argv into an `array<str>`.
     // argv[0] is the executable, then the forwarded args. With ["one", "two"]: len = 3, args[1] =
     // "one". `io.stdout.write` (no newline) on args[1], then "\n".
-    let src = "pub fn main(args: array<str>) -> Result<(), Error> {\n  print(args.len())\n  io.stdout.write(args[1])?\n  io.stdout.write(\"\\n\")?\n  return Ok(())\n}\n";
+    let src = "import std.io\npub fn main(args: array<str>) -> Result<(), Error> {\n  print(args.len())\n  io.stdout.write(args[1])?\n  io.stdout.write(\"\\n\")?\n  return Ok(())\n}\n";
     let out = build_and_run_args("main-args", src, &["one", "two"]);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3\none\n");
@@ -757,7 +757,7 @@ fn s19_main_args_reads_file() {
         "[{\"id\":1,\"name\":\"ann\",\"active\":true,\"score\":10},{\"id\":2,\"name\":\"bob\",\"active\":false,\"score\":99},{\"id\":3,\"name\":\"cyd\",\"active\":true,\"score\":5}]",
     )
     .expect("write json");
-    let src = "User { id: i64, name: str, active: bool, score: i32 }\npub fn main(args: array<str>) -> Result<(), Error> {\n  arena {\n    data := fs.read_file(args[1])?\n    users: array<User> := json.decode(data)?\n    total := users.where(.active).score.sum()\n    out := builder()\n    out.write(\"active score: \")\n    out.write_int(total)\n    out.write(\"\\n\")\n    io.stdout.write(out)?\n  }\n  return Ok(())\n}\n";
+    let src = "import core.json\nimport std.fs\nimport std.io\nUser { id: i64, name: str, active: bool, score: i32 }\npub fn main(args: array<str>) -> Result<(), Error> {\n  arena {\n    data := fs.read_file(args[1])?\n    users: array<User> := json.decode(data)?\n    total := users.where(.active).score.sum()\n    out := builder()\n    out.write(\"active score: \")\n    out.write_int(total)\n    out.write(\"\\n\")\n    io.stdout.write(out)?\n  }\n  return Ok(())\n}\n";
     let out = build_and_run_args("s19-main-args", src, &[path.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "active score: 15\n");
@@ -798,7 +798,7 @@ fn json_decode_flat_struct() {
     }
     // Decode {"id":40,"active":true} into User; `?` unwraps the struct. Unknown keys are
     // ignored and field order is irrelevant.
-    let src = "User { id: i64, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"active\\\": true, \\\"x\\\": 9, \\\"id\\\": 40}\")?\n  print(u.id)\n  if u.active { print(2) }\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"active\\\": true, \\\"x\\\": 9, \\\"id\\\": 40}\")?\n  print(u.id)\n  if u.active { print(2) }\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "40\n2\n");
@@ -810,7 +810,7 @@ fn json_decode_errors_on_missing_or_malformed() {
         return;
     }
     // A missing field (`active`) makes decode fail; `?` propagates → nonzero exit.
-    let src = "User { id: i64, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"id\\\": 40}\")?\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, active: bool }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"id\\\": 40}\")?\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-missing", src);
     assert_eq!(out.status.code(), Some(1), "a missing field propagates an Err");
 }
@@ -821,7 +821,7 @@ fn json_decode_float_and_mixed_scalars() {
         return;
     }
     // Decode f64 / f32 / i32 / bool fields together.
-    let src = "Pt { x: f64, y: f32, n: i32, on: bool }\nfn parse(s: str) -> Result<Pt, Error> {\n  p: Pt := json.decode(s)?\n  return Ok(p)\n}\nfn main() -> Result<(), Error> {\n  p := parse(\"{\\\"x\\\": 1.5, \\\"y\\\": 0.25, \\\"n\\\": 40, \\\"on\\\": true}\")?\n  print(p.x)\n  print(p.y)\n  print(p.n)\n  if p.on { print(1) }\n  return Ok(())\n}\n";
+    let src = "import core.json\nPt { x: f64, y: f32, n: i32, on: bool }\nfn parse(s: str) -> Result<Pt, Error> {\n  p: Pt := json.decode(s)?\n  return Ok(p)\n}\nfn main() -> Result<(), Error> {\n  p := parse(\"{\\\"x\\\": 1.5, \\\"y\\\": 0.25, \\\"n\\\": 40, \\\"on\\\": true}\")?\n  print(p.x)\n  print(p.y)\n  print(p.n)\n  if p.on { print(1) }\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-float", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1.5\n0.25\n40\n1\n");
@@ -833,7 +833,7 @@ fn json_decode_skips_unknown_string_value() {
         return;
     }
     // An unknown key with a string value is skipped, not a parse error.
-    let src = "P { a: i32 }\nfn parse(s: str) -> Result<P, Error> {\n  p: P := json.decode(s)?\n  return Ok(p)\n}\nfn main() -> Result<(), Error> {\n  p := parse(\"{\\\"note\\\": \\\"hi\\\", \\\"a\\\": 42}\")?\n  print(p.a)\n  return Ok(())\n}\n";
+    let src = "import core.json\nP { a: i32 }\nfn parse(s: str) -> Result<P, Error> {\n  p: P := json.decode(s)?\n  return Ok(p)\n}\nfn main() -> Result<(), Error> {\n  p := parse(\"{\\\"note\\\": \\\"hi\\\", \\\"a\\\": 42}\")?\n  print(p.a)\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-skipstr", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
@@ -845,7 +845,7 @@ fn json_decode_then_encode_roundtrips() {
         return;
     }
     // §19 spirit: decode → (re-)encode. {"id":7,"active":false} round-trips.
-    let src = "User { id: i64, active: bool }\nfn run(s: str) -> Result<(), Error> {\n  u: User := json.decode(s)?\n  print(json.encode(u))\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  run(\"{\\\"id\\\": 7, \\\"active\\\": false}\")?\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, active: bool }\nfn run(s: str) -> Result<(), Error> {\n  u: User := json.decode(s)?\n  print(json.encode(u))\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  run(\"{\\\"id\\\": 7, \\\"active\\\": false}\")?\n  return Ok(())\n}\n";
     let out = build_and_run("json-roundtrip", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"id\":7,\"active\":false}\n");
@@ -858,7 +858,7 @@ fn json_encode_flat_struct() {
     }
     // A struct of i64/str/bool encodes to a JSON object; the str field's embedded quote
     // is JSON-escaped.
-    let src = "User { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 7, name: \"a\\\"b\", active: true}\n  print(json.encode(u))\n  return 0\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 7, name: \"a\\\"b\", active: true}\n  print(json.encode(u))\n  return 0\n}\n";
     let out = build_and_run("json-encode", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"id\":7,\"name\":\"a\\\"b\",\"active\":true}\n");
@@ -870,7 +870,7 @@ fn json_encode_struct_array() {
         return;
     }
     // A fixed struct array encodes to a JSON array of objects (str fields escaped).
-    let src = "User { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\", active: true}, User{id: 2, name: \"b\\n\", active: false}]\n  print(json.encode(us))\n  return 0\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\", active: true}, User{id: 2, name: \"b\\n\", active: false}]\n  print(json.encode(us))\n  return 0\n}\n";
     let out = build_and_run("json-encode-array", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(

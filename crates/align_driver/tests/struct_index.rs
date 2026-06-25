@@ -24,7 +24,7 @@ fn dynamic_struct_array_whole_element() {
         return;
     }
     // A json-decoded `array<User>` (DynStructArray, `{ptr,len}`): `us[0]` loads the whole struct.
-    let src = "User { id: i64, score: i32 }\nfn main() -> Result<(), Error> {\n  arena {\n    us: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"score\\\":10},{\\\"id\\\":2,\\\"score\\\":20}]\")?\n    u := us[1]\n    print(u.score)\n  }\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, score: i32 }\nfn main() -> Result<(), Error> {\n  arena {\n    us: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"score\\\":10},{\\\"id\\\":2,\\\"score\\\":20}]\")?\n    u := us[1]\n    print(u.score)\n  }\n  return Ok(())\n}\n";
     let out = build_and_run("si-dyn", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "20\n");
@@ -62,6 +62,6 @@ fn struct_with_owned_field_rejected() {
 fn str_bearing_struct_element_cannot_escape_arena() {
     // A `str`-bearing struct is region-tied to the array; indexing one out of an arena-decoded
     // array and letting it escape the arena is rejected (the `str` view would dangle).
-    let src = "U { id: i64, name: str }\nfn bad(j: str) -> i64 {\n  mut keep := U{id: 0, name: \"\"}\n  arena {\n    us: array<U> := json.decode(j)?\n    keep = us[0]\n  }\n  return keep.id\n}\nfn main() -> i32 = 0\n";
+    let src = "import core.json\nU { id: i64, name: str }\nfn bad(j: str) -> i64 {\n  mut keep := U{id: 0, name: \"\"}\n  arena {\n    us: array<U> := json.decode(j)?\n    keep = us[0]\n  }\n  return keep.id\n}\nfn main() -> i32 = 0\n";
     assert!(check_errs("si-escape", src));
 }
