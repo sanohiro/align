@@ -316,11 +316,43 @@ fn generic_struct_with_type_param_arg_rejected_for_now() {
     assert!(check_errs("gen-struct-in-fn", src));
 }
 
+// ---- 4c-6: generic sum types ----
+
 #[test]
-fn generic_enum_decl_rejected_for_now() {
-    // Generic sum types are not supported yet (only generic structs are).
-    let src = "Opt<T> { Some(T), None }\nfn main() -> i32 = 0\n";
-    assert!(check_errs("gen-enum-decl", src));
+fn generic_enum_construct_and_match() {
+    if !backend_available() {
+        return;
+    }
+    // `Opt<T>` declared, a payload variant constructed (T inferred from the arg), matched.
+    let src = "Opt<T> { Some(T), None }\nfn ident(x: i32) -> i32 = x\nfn main() -> i32 {\n  o := Opt.Some(ident(42))\n  return match o {\n    Some(x) => x\n    None => 0\n  }\n}\n";
+    let out = build_and_run("gen-enum-opt", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_enum_struct_payload() {
+    if !backend_available() {
+        return;
+    }
+    // A generic sum type whose payload is a (plain-data) struct.
+    let src = "Point { x: i32, y: i32 }\nBox<T> { Has(T), Empty }\nfn main() -> i32 {\n  b := Box.Has(Point { x: 40, y: 2 })\n  return match b {\n    Has(p) => p.x + p.y\n    Empty => 0\n  }\n}\n";
+    let out = build_and_run("gen-enum-box", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn generic_enum_no_payload_variant_uninferable() {
+    // `Opt.None` alone gives nothing to infer `T` from (no payload), so it is uninferable here.
+    let src = "Opt<T> { Some(T), None }\nfn main() -> i32 {\n  o := Opt.None\n  return 0\n}\n";
+    assert!(check_errs("gen-enum-none", src));
+}
+
+#[test]
+fn generic_enum_invalid_payload_rejected() {
+    // A monomorph payload must satisfy the same rule a non-generic enum enforces: no `str`-field
+    // struct (an enum is neither dropped nor region-tracked) — else use-after-free / leak.
+    let src = "Named { s: str }\nOpt<T> { Some(T), None }\nfn main() -> i32 {\n  o := Opt.Some(Named { s: \"hi\" })\n  return 0\n}\n";
+    assert!(check_errs("gen-enum-badpayload", src));
 }
 
 #[test]

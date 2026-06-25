@@ -1,0 +1,30 @@
+// Generic sum types (4c-6): a sum type may take type parameters — `Opt<T>` — and is monomorphized
+// per concrete instantiation, like a generic struct or function. Construct a variant with
+// `Type.Variant(args)`; the type arguments are inferred from the payload (no turbofish), then
+// `match` discriminates. A no-payload variant (`Opt.None`) has nothing to infer `T` from, so it
+// needs a payload-bearing sibling (or a future annotation) to fix the type.
+
+Point { x: i32, y: i32 }
+
+Opt<T> { Some(T), None }
+
+// A generic sum type whose payload is a plain-data struct.
+Boxed<T> { Has(T), Empty }
+
+fn ident(x: i32) -> i32 = x
+
+fn main() -> i32 {
+  o := Opt.Some(ident(40))            // Opt$i32, inferred from the payload
+  b := Boxed.Has(Point { x: 0, y: 2 })
+
+  some := match o {
+    Some(n) => n
+    None => 0
+  }
+  pt := match b {
+    Has(p) => p.x + p.y
+    Empty => 0
+  }
+  // 40 + 2 = 42
+  return some + pt
+}

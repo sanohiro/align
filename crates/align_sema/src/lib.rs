@@ -483,9 +483,11 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
     let mut struct_decls: Vec<&ast::StructDecl> = Vec::new();
     let mut enum_ids: HashMap<String, u32> = HashMap::new();
     let mut enum_decls: Vec<&ast::EnumDecl> = Vec::new();
-    // Generic struct templates (`Pair<T>`) — kept separate from concrete structs.
+    // Generic templates (`Pair<T>` / `Opt<T>`) — kept separate from concrete structs / enums.
     let mut generic_struct_decls: Vec<&ast::StructDecl> = Vec::new();
     let mut generic_struct_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut generic_enum_decls: Vec<&ast::EnumDecl> = Vec::new();
+    let mut generic_enum_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in &file.items {
         match item {
             ast::Item::Struct(s) => {
@@ -512,55 +514,114 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 if e.name.name == "Error" {
                     diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), e.span);
                 }
-                if !e.type_params.is_empty() {
-                    diags.error(format!("generic sum-type declarations are not supported yet ('{}')", e.name.name), e.span);
-                }
-                if enum_ids.insert(e.name.name.clone(), enum_decls.len() as u32).is_some()
-                    || struct_ids.contains_key(&e.name.name)
+                let dup = struct_ids.contains_key(&e.name.name)
+                    || enum_ids.contains_key(&e.name.name)
                     || generic_struct_names.contains(&e.name.name)
-                {
+                    || generic_enum_names.contains(&e.name.name);
+                if dup {
                     diags.error(format!("duplicate type declaration: '{}'", e.name.name), e.span);
                 }
-                enum_decls.push(e);
+                if e.type_params.is_empty() {
+                    enum_ids.insert(e.name.name.clone(), enum_decls.len() as u32);
+                    enum_decls.push(e);
+                } else {
+                    // A generic sum type is a template, monomorphized on demand by `resolve_type`.
+                    generic_enum_names.insert(e.name.name.clone());
+                    generic_enum_decls.push(e);
+                }
             }
             ast::Item::Fn(_) => {}
         }
     }
 
-    // The shared type-resolution interners, grown on demand as types resolve. `structs` grows with
-    // monomorph instances of generic structs; `struct_mono` dedups them by mangled name.
+    // The shared type-resolution interners, grown on demand as types resolve. `structs`/`enums`
+    // grow with monomorph instances of generic structs / sum types; `*_mono` dedup them by name.
     let mut tuples: Vec<hir::TupleDef> = Vec::new();
     let mut fn_types: Vec<hir::FnTy> = Vec::new();
-    // Reserve a fixed slot per concrete struct (its `struct_ids` index), filled in Pass 0b.
-    // Monomorph instances of generic structs are appended *after* these, so a concrete struct's id
-    // stays valid even as monomorphs grow the table.
+    // Reserve a fixed slot per concrete struct / enum (its `*_ids` index), filled in Pass 0b/0c.
+    // Monomorph instances are appended *after* these, so a concrete def's id stays valid as the
+    // tables grow.
     let mut structs: Vec<StructDef> =
         struct_decls.iter().map(|s| StructDef { name: s.name.name.clone(), fields: Vec::new(), align: None }).collect();
     let mut struct_mono: HashMap<String, u32> = HashMap::new();
+    let mut enums: Vec<hir::EnumDef> =
+        enum_decls.iter().map(|e| hir::EnumDef { name: e.name.name.clone(), variants: Vec::new() }).collect();
+    let mut enum_mono: HashMap<String, u32> = HashMap::new();
 
-    // Build the generic-struct templates: resolve each template's fields with its type parameters in
-    // scope (so a field `T` becomes `Ty::Param`). A template may not (yet) reference another generic
-    // struct, so an empty template map suffices while building them.
+    // The canonical builtin `Error` sum type (4b-2): universal categories + a generic `Code(i32)`
+    // (variant order must match `ERROR_VARIANT_CODE`). Registered right after the concrete user
+    // enums' reserved slots; `Error` is a reserved type name (rejected in pass 0a).
+    let error_enum_id = enums.len() as u32;
+    enum_ids.insert("Error".to_string(), error_enum_id);
+    enums.push(hir::EnumDef {
+        name: "Error".to_string(),
+        variants: vec![
+            hir::EnumVariant { name: "NotFound".to_string(), payload: Vec::new(), field_base: 1 },
+            hir::EnumVariant { name: "Invalid".to_string(), payload: Vec::new(), field_base: 1 },
+            hir::EnumVariant { name: "Denied".to_string(), payload: Vec::new(), field_base: 1 },
+            hir::EnumVariant {
+                name: "Code".to_string(),
+                payload: vec![Scalar::Int(IntTy { bits: 32, signed: true })],
+                field_base: 1,
+            },
+        ],
+    });
+
+    // Build the generic templates: resolve each template's fields / payloads with its type
+    // parameters in scope (so `T` becomes `Ty::Param`). A template may not (yet) reference another
+    // generic def, so empty template maps suffice while building them.
     let mut struct_templates: HashMap<String, StructTemplate> = HashMap::new();
+    let mut enum_templates: HashMap<String, EnumTemplate> = HashMap::new();
     {
-        let empty_templates: HashMap<String, StructTemplate> = HashMap::new();
+        let est: HashMap<String, StructTemplate> = HashMap::new();
+        let eet: HashMap<String, EnumTemplate> = HashMap::new();
+        macro_rules! build_cx {
+            () => {
+                &mut TyCx {
+                    struct_ids: &struct_ids,
+                    enum_ids: &enum_ids,
+                    struct_templates: &est,
+                    structs: &mut structs,
+                    struct_mono: &mut struct_mono,
+                    enum_templates: &eet,
+                    enums: &mut enums,
+                    enum_mono: &mut enum_mono,
+                    tuples: &mut tuples,
+                    fn_types: &mut fn_types,
+                }
+            };
+        }
         for s in &generic_struct_decls {
             let tparams: Vec<String> = s.type_params.iter().map(|t| t.name.name.clone()).collect();
             let mut fields = Vec::with_capacity(s.fields.len());
             for f in &s.fields {
-                let mut cx = TyCx {
-                    struct_ids: &struct_ids,
-                    enum_ids: &enum_ids,
-                    struct_templates: &empty_templates,
-                    structs: &mut structs,
-                    struct_mono: &mut struct_mono,
-                    tuples: &mut tuples,
-                    fn_types: &mut fn_types,
-                };
-                let ty = resolve_type(&f.ty, &mut cx, &tparams, diags);
+                let ty = resolve_type(&f.ty, build_cx!(), &tparams, diags);
                 fields.push(hir::FieldDef { name: f.name.name.clone(), ty });
             }
             struct_templates.insert(s.name.name.clone(), StructTemplate { type_params: tparams, fields });
+        }
+        for e in &generic_enum_decls {
+            let tparams: Vec<String> = e.type_params.iter().map(|t| t.name.name.clone()).collect();
+            let mut variants = Vec::with_capacity(e.variants.len());
+            let mut field_base = 1u32;
+            for v in &e.variants {
+                let mut payload = Vec::with_capacity(v.payload.len());
+                for t in &v.payload {
+                    let ty = resolve_type(t, build_cx!(), &tparams, diags);
+                    match ty_to_scalar(ty) {
+                        Some(s) => payload.push(s),
+                        None if ty != Ty::Error => diags.error(
+                            format!("variant payloads must be a scalar or a type parameter for now, got {}", ty_name(ty)),
+                            t.span(),
+                        ),
+                        None => {}
+                    }
+                }
+                let n = payload.len() as u32;
+                variants.push(hir::EnumVariant { name: v.name.name.clone(), payload, field_base });
+                field_base += n;
+            }
+            enum_templates.insert(e.name.name.clone(), EnumTemplate { type_params: tparams, variants });
         }
     }
 
@@ -574,6 +635,9 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 struct_templates: &struct_templates,
                 structs: &mut structs,
                 struct_mono: &mut struct_mono,
+                enum_templates: &enum_templates,
+                enums: &mut enums,
+                enum_mono: &mut enum_mono,
                 tuples: &mut tuples,
                 fn_types: &mut fn_types,
             }
@@ -604,19 +668,11 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         structs[i] = StructDef { name: s.name.name.clone(), fields, align: None };
     }
 
-    // Pass 0c: resolve enum variant payloads (all type names + structs are known). The enum lowers
-    // to a non-union struct `{ i32 tag, <every variant's payload flattened> }`, so each variant's
-    // `field_base` is `1 + (payload slots of earlier variants)`. Payloads are primitive scalars
-    // (S1b) or a **plain-data struct** with no `str`/region-tracked field (S2) — a region-tied
-    // struct payload would need enum region-tracking (deferred).
-    let mut enums: Vec<hir::EnumDef> = Vec::with_capacity(enum_decls.len());
-    for e in &enum_decls {
-        // A generic sum type is already rejected (Pass 0a); skip resolving its `Param`-typed
-        // payloads so they don't cascade into "unknown type 'T'". Keep the slot for id consistency.
-        if !e.type_params.is_empty() {
-            enums.push(hir::EnumDef { name: e.name.name.clone(), variants: Vec::new() });
-            continue;
-        }
+    // Pass 0c: resolve concrete enum variant payloads (structs are now known) into the reserved
+    // slots. The enum lowers to a non-union struct `{ i32 tag, <flattened payloads> }`; payloads are
+    // primitive scalars (S1b) or a plain-data struct (S2). Monomorph instances of generic sum types
+    // append after the reserved slots, so a concrete enum's id stays valid.
+    for (i, e) in enum_decls.iter().enumerate() {
         let mut seen = std::collections::HashSet::new();
         let mut variants = Vec::with_capacity(e.variants.len());
         let mut field_base = 1u32;
@@ -649,28 +705,8 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             variants.push(hir::EnumVariant { name: v.name.name.clone(), payload, field_base });
             field_base += n;
         }
-        enums.push(hir::EnumDef { name: e.name.name.clone(), variants });
+        enums[i] = hir::EnumDef { name: e.name.name.clone(), variants };
     }
-
-    // The canonical builtin `Error` sum type (4b-2): universal categories + a generic `Code(i32)`
-    // (the variant order must match `ERROR_VARIANT_CODE`). Registered after the user enums; `Error`
-    // is a reserved type name (rejected in pass 0a). Every fallible builtin and `Result<_, Error>`
-    // use this enum.
-    let error_enum_id = enums.len() as u32;
-    enum_ids.insert("Error".to_string(), error_enum_id);
-    enums.push(hir::EnumDef {
-        name: "Error".to_string(),
-        variants: vec![
-            hir::EnumVariant { name: "NotFound".to_string(), payload: Vec::new(), field_base: 1 },
-            hir::EnumVariant { name: "Invalid".to_string(), payload: Vec::new(), field_base: 1 },
-            hir::EnumVariant { name: "Denied".to_string(), payload: Vec::new(), field_base: 1 },
-            hir::EnumVariant {
-                name: "Code".to_string(),
-                payload: vec![Scalar::Int(IntTy { bits: 32, signed: true })],
-                field_base: 1,
-            },
-        ],
-    });
 
     // Pass 1: collect function signatures so calls can resolve regardless of order.
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
@@ -764,7 +800,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let is_template = !f.type_params.is_empty();
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[&f.name.name].bounds.clone();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new());
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new());
         let checked = cx.check_fn(f);
         let lifted = std::mem::take(&mut cx.lifted);
         if is_template {
@@ -801,7 +837,7 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
         let Some(decl) = generic_decls.get(oname.as_str()) else { continue };
         let tparams = decl.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[oname.as_str()].bounds.clone();
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &enums, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs);
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs);
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
         worklist.append(&mut cx.instantiations);
@@ -1987,7 +2023,13 @@ struct Checker<'a, 't> {
     sigs: &'a HashMap<String, FnSig>,
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
-    enums: &'a [hir::EnumDef],
+    /// The concrete enum table, grown with monomorph instances of generic sum types (mutable, like
+    /// `structs`). `match` / variant construction read it.
+    enums: &'t mut Vec<hir::EnumDef>,
+    /// Generic sum-type templates (`Opt<T>`), monomorphized on demand by `resolve_type`.
+    enum_templates: &'a HashMap<String, EnumTemplate>,
+    /// Mangled monomorph name -> `enums` index — the shared monomorph dedup cache.
+    enum_mono: &'t mut HashMap<String, u32>,
     /// The id of the builtin `Error` enum (so `Result<_, Error>` builtins build the right payload).
     error_enum_id: u32,
     /// The concrete struct table, grown with monomorph instances of generic structs during
@@ -2079,7 +2121,9 @@ impl<'a, 't> Checker<'a, 't> {
         sigs: &'a HashMap<String, FnSig>,
         struct_ids: &'a HashMap<String, u32>,
         enum_ids: &'a HashMap<String, u32>,
-        enums: &'a [hir::EnumDef],
+        enums: &'t mut Vec<hir::EnumDef>,
+        enum_templates: &'a HashMap<String, EnumTemplate>,
+        enum_mono: &'t mut HashMap<String, u32>,
         error_enum_id: u32,
         structs: &'t mut Vec<StructDef>,
         struct_templates: &'a HashMap<String, StructTemplate>,
@@ -2096,6 +2140,8 @@ impl<'a, 't> Checker<'a, 't> {
             struct_ids,
             enum_ids,
             enums,
+            enum_templates,
+            enum_mono,
             error_enum_id,
             structs,
             struct_templates,
@@ -2485,6 +2531,9 @@ impl<'a, 't> Checker<'a, 't> {
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
+            enum_templates: self.enum_templates,
+            enums: self.enums,
+            enum_mono: self.enum_mono,
             tuples: self.tuples,
             fn_types: self.fn_types,
         };
@@ -2882,6 +2931,12 @@ impl<'a, 't> Checker<'a, 't> {
         // name, the field is a variant.
         if let ast::ExprKind::Path(p) = &recv.kind {
             if let Some(name) = single_name(p) {
+                if let Some(tmpl) = self.enum_templates.get(name).cloned() {
+                    // A no-arg variant of a generic sum type (`Opt.None`) — the type parameters must
+                    // come from the payload args (here none), so they are only inferable when the
+                    // variant carries a payload. Routed through the same path for a clear error.
+                    return self.check_generic_variant_ctor(name, &tmpl, field, &[], expected, span);
+                }
                 if let Some(&enum_id) = self.enum_ids.get(name) {
                     return match self.enums[enum_id as usize].variants.iter().position(|v| v.name == field.name) {
                         Some(idx) => {
@@ -2978,6 +3033,9 @@ impl<'a, 't> Checker<'a, 't> {
             struct_templates: self.struct_templates,
             structs: self.structs,
             struct_mono: self.struct_mono,
+            enum_templates: self.enum_templates,
+            enums: self.enums,
+            enum_mono: self.enum_mono,
             tuples: self.tuples,
             fn_types: self.fn_types,
         };
@@ -3439,6 +3497,9 @@ impl<'a, 't> Checker<'a, 't> {
                 if let Some(name) = single_name(p) {
                     if let Some(&enum_id) = self.enum_ids.get(name) {
                         return self.check_variant_ctor(enum_id, field, args, expected, span);
+                    }
+                    if let Some(tmpl) = self.enum_templates.get(name).cloned() {
+                        return self.check_generic_variant_ctor(name, &tmpl, field, args, expected, span);
                     }
                 }
             }
@@ -5686,6 +5747,75 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::EnumValue { enum_id, variant: idx as u32, payload: checked }, ty, span }
     }
 
+    /// Monomorphize a generic sum type from the Checker (builds a `TyCx` over its interner fields).
+    fn instantiate_enum(&mut self, name: &str, tmpl: &EnumTemplate, args: &[Ty], span: Span) -> u32 {
+        let mut cx = TyCx {
+            struct_ids: self.struct_ids,
+            enum_ids: self.enum_ids,
+            struct_templates: self.struct_templates,
+            structs: self.structs,
+            struct_mono: self.struct_mono,
+            enum_templates: self.enum_templates,
+            enums: self.enums,
+            enum_mono: self.enum_mono,
+            tuples: self.tuples,
+            fn_types: self.fn_types,
+        };
+        instantiate_enum(name, tmpl, args, &mut cx, span, self.diags)
+    }
+
+    /// Construct a generic sum-type value (`Opt.Some(42)`): infer the type arguments from the
+    /// variant's payload args (no turbofish), monomorphize, and build the value. A no-payload
+    /// variant (`Opt.None`) has nothing to infer from, so its type arguments are uninferable here.
+    fn check_generic_variant_ctor(&mut self, name: &str, tmpl: &EnumTemplate, field: &ast::Ident, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some(vidx) = tmpl.variants.iter().position(|v| v.name == field.name) else {
+            self.diags.error(format!("'{}' is not a variant of '{name}'", field.name), span);
+            return err;
+        };
+        let payload = tmpl.variants[vidx].payload.clone();
+        if args.len() != payload.len() {
+            self.diags.error(
+                format!("variant '{}' takes {} argument(s), got {}", field.name, payload.len(), args.len()),
+                span,
+            );
+            return err;
+        }
+        let mut subst: Vec<Option<Ty>> = vec![None; tmpl.type_params.len()];
+        let mut checked = Vec::with_capacity(args.len());
+        for (a, &ps) in args.iter().zip(&payload) {
+            // A `Param` payload applies no coercion (its type is inferred); a concrete one checks
+            // against its declared scalar.
+            let ce = if matches!(ps, Scalar::Param(_)) {
+                self.check_expr(a, None)
+            } else {
+                self.check_expr(a, Some(scalar_to_ty(ps)))
+            };
+            if let Scalar::Param(p) = ps {
+                self.bind_param(p, ce.ty, &mut subst, a.span);
+            }
+            checked.push(ce);
+        }
+        // Each type parameter must be inferable from the payload args (a payload carrying a `Param`
+        // resolves to a concrete scalar — finalize eagerly).
+        let mut targs = Vec::with_capacity(tmpl.type_params.len());
+        for (i, s) in subst.iter().enumerate() {
+            let concrete = s.map(|t| self.finalize(t)).unwrap_or(Ty::Error);
+            if matches!(concrete, Ty::Param(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error) {
+                self.diags.error(
+                    format!("cannot infer type parameter '{}' of '{name}' from the variant's arguments (annotate the binding)", tmpl.type_params[i]),
+                    span,
+                );
+                return err;
+            }
+            targs.push(concrete);
+        }
+        let enum_id = self.instantiate_enum(name, tmpl, &targs, span);
+        let ty = Ty::Enum(enum_id);
+        self.constrain(ty, expected, span);
+        Expr { kind: ExprKind::EnumValue { enum_id, variant: vidx as u32, payload: checked }, ty, span }
+    }
+
     /// The variants of a matchable type: a user sum type, or the builtin `Option`/`Result`
     /// (so `match` works on them too). Each variant is `(name, positional payload scalars)`, in
     /// the order the lowering expects (Option: 0 = Some, 1 = None; Result: 0 = Ok, 1 = Err).
@@ -6127,20 +6257,23 @@ fn subst_param_ty(ty: Ty, args: &[Ty]) -> Ty {
     // A `Param` nested in a scalar-payload composite (`Option<T>` / `Result<T, E>` / `box<T>` /
     // `slice<T>` / `array<T>` fixed / `Task<T>`). Tuples/structs/`array<T>` dynamic carry their
     // element via an interner or `PrimScalar` and are not supported in a nested generic position yet.
-    let subst_s = |s: Scalar| -> Scalar {
-        match s {
-            Scalar::Param(i) => ty_to_scalar(args.get(i as usize).copied().unwrap_or(Ty::Error)).unwrap_or(s),
-            other => other,
-        }
-    };
     match ty {
         Ty::Param(i) => args.get(i as usize).copied().unwrap_or(Ty::Error),
-        Ty::Option(s) => Ty::Option(subst_s(s)),
-        Ty::Result(o, e) => Ty::Result(subst_s(o), subst_s(e)),
-        Ty::Box(s) => Ty::Box(subst_s(s)),
-        Ty::Slice(s) => Ty::Slice(subst_s(s)),
-        Ty::Array(s, n) => Ty::Array(subst_s(s), n),
-        Ty::Task(s) => Ty::Task(subst_s(s)),
+        Ty::Option(s) => Ty::Option(subst_scalar(s, args)),
+        Ty::Result(o, e) => Ty::Result(subst_scalar(o, args), subst_scalar(e, args)),
+        Ty::Box(s) => Ty::Box(subst_scalar(s, args)),
+        Ty::Slice(s) => Ty::Slice(subst_scalar(s, args)),
+        Ty::Array(s, n) => Ty::Array(subst_scalar(s, args), n),
+        Ty::Task(s) => Ty::Task(subst_scalar(s, args)),
+        other => other,
+    }
+}
+
+/// Substitute a `Scalar::Param(i)` with the scalar form of `args[i]` (a generic enum's variant
+/// payload, or a composite payload). A non-`Param` scalar is unchanged.
+fn subst_scalar(s: Scalar, args: &[Ty]) -> Scalar {
+    match s {
+        Scalar::Param(i) => ty_to_scalar(args.get(i as usize).copied().unwrap_or(Ty::Error)).unwrap_or(s),
         other => other,
     }
 }
@@ -6240,9 +6373,18 @@ struct StructTemplate {
     fields: Vec<hir::FieldDef>,
 }
 
+/// A generic sum-type declaration (`Opt<T> { Some(T), None }`): its type-parameter names and its
+/// variants with `Scalar::Param` payloads. Monomorphized on demand like a struct template — kept
+/// out of the concrete `enums` table (and thus out of codegen) until instantiated.
+#[derive(Clone)]
+struct EnumTemplate {
+    type_params: Vec<String>,
+    variants: Vec<hir::EnumVariant>,
+}
+
 /// The mutable + shared type-resolution context threaded through [`resolve_type`]: the concrete
-/// struct table (grown with monomorph instances), the generic-struct templates + their monomorph
-/// cache, and the tuple / `Ty::Fn` interners.
+/// struct / enum tables (grown with monomorph instances), the generic templates + their monomorph
+/// caches, and the tuple / `Ty::Fn` interners.
 struct TyCx<'a> {
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
@@ -6252,6 +6394,12 @@ struct TyCx<'a> {
     structs: &'a mut Vec<StructDef>,
     /// Mangled monomorph name (`Pair$i32`) -> `structs` index — dedups monomorph instances.
     struct_mono: &'a mut HashMap<String, u32>,
+    /// Generic sum-type templates, by name (not in `enums` — they carry `Scalar::Param` payloads).
+    enum_templates: &'a HashMap<String, EnumTemplate>,
+    /// Concrete enum table; monomorph instances of generic sum types are appended here.
+    enums: &'a mut Vec<hir::EnumDef>,
+    /// Mangled monomorph name (`Opt$i32`) -> `enums` index — dedups monomorph instances.
+    enum_mono: &'a mut HashMap<String, u32>,
     tuples: &'a mut Vec<hir::TupleDef>,
     fn_types: &'a mut Vec<hir::FnTy>,
 }
@@ -6431,36 +6579,19 @@ fn resolve_type(
             }
         }
         _ => {
-            // A generic struct used with type arguments — `Pair<i32>` — monomorphizes on demand:
-            // substitute its fields and intern a concrete `StructDef` (deduped), returning its id.
+            // A generic struct / sum type used with type arguments — `Pair<i32>` / `Opt<i32>` —
+            // monomorphizes on demand: substitute its template and intern a concrete def (deduped).
             if let Some(tmpl) = cx.struct_templates.get(name).cloned() {
-                if args.is_empty() {
-                    diags.error(format!("'{name}' is a generic struct — write `{name}<...>` with type arguments"), span);
-                    return Ty::Error;
-                }
-                let mut arg_tys = Vec::with_capacity(args.len());
-                for a in args {
-                    arg_tys.push(resolve_type(a, cx, type_params, diags));
-                }
-                if arg_tys.len() != tmpl.type_params.len() {
-                    diags.error(format!("'{name}' takes {} type argument(s), got {}", tmpl.type_params.len(), arg_tys.len()), span);
-                    return Ty::Error;
-                }
-                if arg_tys.contains(&Ty::Error) {
-                    return Ty::Error;
-                }
-                // A type argument that is itself a (generic function's) type parameter — `Pair<T>`
-                // inside `fn f<T>` — would need a deferred generic-struct type (monomorphized when
-                // the enclosing function is). Not supported yet; reject cleanly rather than intern a
-                // bogus `Param`-field struct into the concrete table.
-                if arg_tys.iter().any(|t| ty_mentions_param(*t)) {
-                    diags.error(
-                        format!("instantiating a generic struct with a type parameter ('{name}<…>' inside a generic function) is not supported yet"),
-                        span,
-                    );
-                    return Ty::Error;
-                }
-                return Ty::Struct(instantiate_struct(name, &tmpl, &arg_tys, cx, span, diags));
+                return match resolve_generic_args(name, "struct", args, tmpl.type_params.len(), cx, type_params, span, diags) {
+                    Some(arg_tys) => Ty::Struct(instantiate_struct(name, &tmpl, &arg_tys, cx, span, diags)),
+                    None => Ty::Error,
+                };
+            }
+            if let Some(tmpl) = cx.enum_templates.get(name).cloned() {
+                return match resolve_generic_args(name, "sum type", args, tmpl.type_params.len(), cx, type_params, span, diags) {
+                    Some(arg_tys) => Ty::Enum(instantiate_enum(name, &tmpl, &arg_tys, cx, span, diags)),
+                    None => Ty::Error,
+                };
             }
             match parse_int_name(name) {
                 Some(it) => Ty::Int(it),
@@ -6482,6 +6613,17 @@ fn resolve_type(
 /// Whether a resolved type is a valid struct field (Copy: a primitive scalar or a `str` view).
 fn is_field_ok(ty: Ty) -> bool {
     matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error)
+}
+
+/// Whether a scalar is a valid sum-type variant payload — the same rule the non-generic enum pass
+/// (0c) enforces on resolved types: a primitive scalar, or a plain-data struct with no `str` field
+/// (an enum is neither dropped nor region-tracked, so Move/`str`-bearing payloads are rejected).
+fn enum_payload_ok(s: Scalar, structs: &[StructDef]) -> bool {
+    match s {
+        Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char => true,
+        Scalar::Struct(id) => structs.get(id as usize).is_some_and(|sd| sd.fields.iter().all(|f| f.ty != Ty::Str)),
+        _ => false,
+    }
 }
 
 /// Monomorphize a generic struct: substitute its template fields with `args`, intern a concrete
@@ -6506,6 +6648,65 @@ fn instantiate_struct(name: &str, tmpl: &StructTemplate, args: &[Ty], cx: &mut T
     let id = cx.structs.len() as u32;
     cx.structs.push(StructDef { name: mangled.clone(), fields, align: None });
     cx.struct_mono.insert(mangled, id);
+    id
+}
+
+/// Resolve + validate the type arguments of a generic struct / sum-type use (`Pair<i32>` /
+/// `Opt<i32>`): arity, no error args, and not a `Param` arg (a generic def parameterized by a
+/// generic *function's* type parameter needs a deferred type — a later slice). `None` on error.
+#[allow(clippy::too_many_arguments)]
+fn resolve_generic_args(name: &str, kind: &str, args: &[ast::Type], n_params: usize, cx: &mut TyCx, type_params: &[String], span: Span, diags: &mut Diagnostics) -> Option<Vec<Ty>> {
+    if args.is_empty() {
+        diags.error(format!("'{name}' is a generic {kind} — write `{name}<...>` with type arguments"), span);
+        return None;
+    }
+    let arg_tys: Vec<Ty> = args.iter().map(|a| resolve_type(a, cx, type_params, diags)).collect();
+    if arg_tys.len() != n_params {
+        diags.error(format!("'{name}' takes {} type argument(s), got {}", n_params, arg_tys.len()), span);
+        return None;
+    }
+    if arg_tys.contains(&Ty::Error) {
+        return None;
+    }
+    if arg_tys.iter().any(|t| ty_mentions_param(*t)) {
+        diags.error(
+            format!("instantiating a generic {kind} with a type parameter ('{name}<…>' inside a generic function) is not supported yet"),
+            span,
+        );
+        return None;
+    }
+    Some(arg_tys)
+}
+
+/// Monomorphize a generic sum type: substitute its variant payloads with `args`, intern a concrete
+/// `EnumDef` into `cx.enums` (deduped by mangled name), and return its id. The enum analogue of
+/// [`instantiate_struct`].
+fn instantiate_enum(name: &str, tmpl: &EnumTemplate, args: &[Ty], cx: &mut TyCx, span: Span, diags: &mut Diagnostics) -> u32 {
+    let mangled = mangle_mono(name, args);
+    if let Some(&id) = cx.enum_mono.get(&mangled) {
+        return id;
+    }
+    let mut variants = Vec::with_capacity(tmpl.variants.len());
+    for v in &tmpl.variants {
+        let payload: Vec<Scalar> = v.payload.iter().map(|&s| subst_scalar(s, args)).collect();
+        for &p in &payload {
+            // The substituted payload must be a valid sum-type payload — the SAME rule a non-generic
+            // enum enforces in Pass 0c: a primitive scalar or a plain-data struct (no `str` field).
+            // Without this, `Opt<string>` / `Opt<StructWithStrField>` would slip through, putting a
+            // Move/region-tracked value in an enum that is neither dropped nor region-tracked
+            // (use-after-free / leak).
+            if !enum_payload_ok(p, cx.structs) {
+                diags.error(
+                    format!("variant '{}' of '{name}' resolves to {}, which is not a valid sum-type payload yet", v.name, scalar_name(p)),
+                    span,
+                );
+            }
+        }
+        variants.push(hir::EnumVariant { name: v.name.clone(), payload, field_base: v.field_base });
+    }
+    let id = cx.enums.len() as u32;
+    cx.enums.push(hir::EnumDef { name: mangled.clone(), variants });
+    cx.enum_mono.insert(mangled, id);
     id
 }
 
