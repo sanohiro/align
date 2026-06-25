@@ -73,7 +73,11 @@ impl TempProject {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir temp project");
         for (fname, src) in files {
-            std::fs::write(dir.join(fname), src).expect("write module file");
+            let path = dir.join(fname);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir module subdir");
+            }
+            std::fs::write(path, src).expect("write module file");
         }
         TempProject { dir }
     }

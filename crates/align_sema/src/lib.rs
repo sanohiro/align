@@ -4049,16 +4049,6 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.fs", "fs.read_file", span);
                 return self.check_fs_read_file(args, span);
             }
-            // `mod.fn(...)` — a cross-module call to an imported user module. Resolved + visibility-
-            // checked here; falls through (`Ok(None)`) when `mod` is not an imported user module, so
-            // a builtin namespace or a value method is still handled below.
-            if let Some(modname) = single_name(p) {
-                match self.resolve_qualified_fn(modname, method, span) {
-                    Ok(Some(mangled)) => return self.check_named_call(mangled, args, expected, span),
-                    Ok(None) => {}
-                    Err(()) => return err,
-                }
-            }
         }
         // `io.stdout.write(s)` — the receiver is the 2-segment `io.stdout`, so it parses as a
         // `FieldAccess` (`io` . `stdout`), not a single-name path.
@@ -4070,6 +4060,16 @@ impl<'a, 't> Checker<'a, 't> {
                         return self.check_io_stdout_write(args, span);
                     }
                 }
+            }
+        }
+        // `mod.fn(...)` / `a.b.fn(...)` — a cross-module call into an imported user module. The
+        // receiver is a pure dotted name (`geom` or `util.math`); resolved + visibility-checked here.
+        // `Ok(None)` (not an imported user module) falls through to the value-method dispatch below.
+        if let Some(modpath) = flatten_module_path(recv) {
+            match self.resolve_qualified_fn(&modpath, method, span) {
+                Ok(Some(mangled)) => return self.check_named_call(mangled, args, expected, span),
+                Ok(None) => {}
+                Err(()) => return err,
             }
         }
         // Explicit-overflow integer arithmetic (`core.math`): `x.{wrapping,saturating,checked}_{add,sub,mul}(y)`.
@@ -6428,6 +6428,17 @@ fn single_name(p: &ast::Path) -> Option<&str> {
         Some(p.segments[0].name.as_str())
     } else {
         None
+    }
+}
+
+/// Flatten a receiver that is a pure dotted name into a module path string: `geom` → `"geom"`,
+/// `util.math` → `"util.math"` (a `Path` or a chain of field accesses over idents). `None` if the
+/// receiver is anything else (a call result, an index, …), so a value-method receiver never matches.
+fn flatten_module_path(e: &ast::Expr) -> Option<String> {
+    match &e.kind {
+        ast::ExprKind::Path(p) => Some(p.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".")),
+        ast::ExprKind::FieldAccess { recv, field } => Some(format!("{}.{}", flatten_module_path(recv)?, field.name)),
+        _ => None,
     }
 }
 

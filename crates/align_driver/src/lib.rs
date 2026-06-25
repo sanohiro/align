@@ -53,42 +53,41 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
             loaded[i].ast.imports.iter().filter(|p| user_import(p)).cloned().collect();
         i += 1;
         for imp in imports {
-            if imp.segments.len() != 1 {
-                diags.error(
-                    "nested user modules (`import a.b`) are not supported yet — use a single-segment module name".to_string(),
-                    imp.span,
-                );
-                continue;
-            }
-            let modname = imp.segments[0].name.clone();
-            if !seen.insert(modname.clone()) {
+            // The dotted module path (`util.math`) and the matching file path under the entry
+            // directory (`util/math.align`): each segment is a directory, the last names the file.
+            let modpath = imp.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".");
+            if !seen.insert(modpath.clone()) {
                 continue; // already loaded (shared / cyclic import)
             }
             let Some(dir) = &entry_dir else {
-                diags.error(format!("cannot resolve `import {modname}`: the entry file has no directory"), imp.span);
+                diags.error(format!("cannot resolve `import {modpath}`: the entry file has no directory"), imp.span);
                 continue;
             };
-            let file_path = dir.join(format!("{modname}.align"));
+            let mut file_path = dir.clone();
+            for seg in &imp.segments {
+                file_path.push(&seg.name);
+            }
+            file_path.set_extension("align");
             let msrc = match std::fs::read_to_string(&file_path) {
                 Ok(s) => s,
                 Err(e) => {
-                    diags.error(format!("cannot find module `{modname}` (expected {}): {e}", file_path.display()), imp.span);
+                    diags.error(format!("cannot find module `{modpath}` (expected {}): {e}", file_path.display()), imp.span);
                     continue;
                 }
             };
             let fid = source_map.add_file(file_path.display().to_string(), msrc.clone());
             let toks = align_lexer::tokenize(fid, &msrc, &mut diags);
             let mast = align_parser::parse_file(toks, &mut diags);
-            // The file must declare `module <modname>` (filename ↔ module-name agreement).
-            let declared = mast.module.as_ref().and_then(|m| m.segments.last()).map(|s| s.name.as_str());
-            if declared != Some(modname.as_str()) {
+            // The file must declare the full `module util.math` (path ↔ filename agreement).
+            let declared = mast.module.as_ref().map(|m| m.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."));
+            if declared.as_deref() != Some(modpath.as_str()) {
                 diags.error(
-                    format!("module file `{}` must declare `module {modname}` (found {})", file_path.display(),
+                    format!("module file `{}` must declare `module {modpath}` (found {})", file_path.display(),
                         declared.map(|d| format!("`module {d}`")).unwrap_or_else(|| "no module declaration".to_string())),
                     imp.span,
                 );
             }
-            loaded.push(Loaded { path: modname, ast: mast, is_entry: false });
+            loaded.push(Loaded { path: modpath, ast: mast, is_entry: false });
         }
     }
 

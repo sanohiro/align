@@ -91,6 +91,30 @@ fn transitive_imports_load() {
 }
 
 #[test]
+fn nested_module_path_resolves_to_subdirectory() {
+    if !backend_available() {
+        return;
+    }
+    // `import util.math` → `util/math.align` (declaring `module util.math`); called `util.math.fn`.
+    let math = "module util.math\npub fn cube(x: i64) -> i64 = x * x * x\n";
+    let main = "module main\nimport util.math\nfn main() -> i32 = util.math.cube(3) as i32\n";
+    let out = build_and_run_multi(
+        "mod-nested",
+        &[("util/math.align", math), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(27));
+}
+
+#[test]
+fn nested_module_wrong_declaration_is_rejected() {
+    // `util/math.align` must declare the full `module util.math`, not just `module math`.
+    let math = "module math\npub fn cube(x: i64) -> i64 = x * x * x\n";
+    let main = "module main\nimport util.math\nfn main() -> i32 = util.math.cube(3) as i32\n";
+    assert!(check_multi_errs("mod-nested-bad", &[("util/math.align", math), ("main.align", main)], "main.align"));
+}
+
+#[test]
 fn a_module_using_a_builtin_must_import_it() {
     // The capability rule applies per file: `geom` uses `json` but does not import `core.json`.
     let geom = concat!(
