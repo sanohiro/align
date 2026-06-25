@@ -489,6 +489,11 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
                 if s.name.name == "Error" {
                     diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), s.span);
                 }
+                // Generic struct *declarations* (`Pair<T>`) parse, but monomorphizing them needs the
+                // struct table to grow during type resolution (the resolver refactor); not yet wired.
+                if !s.type_params.is_empty() {
+                    diags.error(format!("generic struct declarations are not supported yet ('{}')", s.name.name), s.span);
+                }
                 if struct_ids.insert(s.name.name.clone(), struct_decls.len() as u32).is_some()
                     || enum_ids.contains_key(&s.name.name)
                 {
@@ -499,6 +504,9 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
             ast::Item::Enum(e) => {
                 if e.name.name == "Error" {
                     diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), e.span);
+                }
+                if !e.type_params.is_empty() {
+                    diags.error(format!("generic sum-type declarations are not supported yet ('{}')", e.name.name), e.span);
                 }
                 if enum_ids.insert(e.name.name.clone(), enum_decls.len() as u32).is_some()
                     || struct_ids.contains_key(&e.name.name)

@@ -46,6 +46,9 @@ pub enum Item {
 pub struct EnumDecl {
     pub vis: Vis,
     pub name: Ident,
+    /// Generic type parameters (parsed for symmetry with structs; generic enums are not yet
+    /// supported — sema rejects a non-empty list).
+    pub type_params: Vec<TypeParam>,
     pub variants: Vec<VariantDef>,
     pub span: Span,
 }
@@ -65,6 +68,9 @@ pub struct VariantDef {
 pub struct StructDecl {
     pub vis: Vis,
     pub name: Ident,
+    /// Generic type parameters (`Pair<T>`); empty for a non-generic struct. A field `Type` whose
+    /// name matches one resolves to `Ty::Param(i)`; the struct is monomorphized per instantiation.
+    pub type_params: Vec<TypeParam>,
     pub fields: Vec<FieldDef>,
     pub span: Span,
 }
