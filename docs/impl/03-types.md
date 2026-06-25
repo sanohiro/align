@@ -269,11 +269,15 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   `Checker.param_bounds`). The bound gates operations on a `Param` value in `check_binary`
   (`Num`→arith, `Ord`→ordering, `Eq`→equality); a concrete type argument is checked against the
   bound at instantiation (`finalize_expr`). No user-defined trait bounds.
+- 4c-3: type parameters nested in `Option<T>` / `Result<T, E>` (param/return). `Scalar::Param(u32)`
+  (template-only, like `Ty::Param`); deep `subst_param_ty`; structural inference `match_param`
+  (binds `Param` bare or nested, seeds a return-only param from the expected type); a nested param
+  is finalized eagerly at the call (a `Scalar` can't hold an inference var), a bare one deferred.
+  `box`/`slice`/`array`/tuple over `T` are rejected (`scalar_arg`'s `allow_param`).
 ```
 
-`// OPEN:` type parameters in nested positions (generic containers — needs `Param` representable
-inside composites); the `N` in `vec<N,T>` (value generics, M6); folding `Option`/`Result` into the
-general generic mechanism.
+`// OPEN:` `array<T>` / `slice<T>` params + generic containers (`Stack<T>`); the `N` in `vec<N,T>`
+(value generics, M6); folding `Option`/`Result` into the general generic mechanism.
 
 ---
 

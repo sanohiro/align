@@ -95,9 +95,14 @@ own (`x + x` on a bare `T` is rejected). A **builtin bound** grants capabilities
 ordering+equality (numbers, `char`), `Eq` = equality (numbers, `char`, `bool`, `str`). A type
 argument that does not satisfy the bound is a compile error. No user-defined trait bounds.
 
+A type parameter may also appear nested in an `Option<T>` / `Result<T, E>` (parameter or return
+position) — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T`. (Nested in
+`array<T>` / `box<T>` / a tuple, and generic structs, are later slices.)
+
 ```align
 fn id<T>(x: T) -> T = x                  // unconstrained: pass/return only
 fn max<T: Ord>(a: T, b: T) -> T = if a > b { a } else { b }
+fn unwrap_or<T>(o: Option<T>, d: T) -> T = o else d
 n := id(5)        // T = i32, monomorphized to id$i32
 ```
 
