@@ -770,15 +770,17 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     let known_modules: std::collections::HashSet<&str> = modules.iter().map(|m| m.path.as_str()).collect();
     let mut mod_table: ModuleTable = HashMap::new();
     let mut mod_builtin_imports: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    // Populate each module's function set in one linear pass over all functions.
+    for &(module, is_entry, f) in &all_fns {
+        let info = mod_table.entry(module.to_string()).or_default();
+        let mangled = mangle_fn(module, is_entry, &f.name.name);
+        let is_pub = matches!(f.vis, ast::Vis::Pub);
+        if info.fns.insert(f.name.name.clone(), (mangled, is_pub)).is_some() {
+            diags.error(format!("duplicate function '{}' in module '{}'", f.name.name, module), f.span);
+        }
+    }
     for m in modules {
         let info = mod_table.entry(m.path.clone()).or_default();
-        for (path, is_entry, f) in all_fns.iter().filter(|(p, _, _)| *p == m.path) {
-            let mangled = mangle_fn(path, *is_entry, &f.name.name);
-            let is_pub = matches!(f.vis, ast::Vis::Pub);
-            if info.fns.insert(f.name.name.clone(), (mangled, is_pub)).is_some() {
-                diags.error(format!("duplicate function '{}' in module '{}'", f.name.name, m.path), f.span);
-            }
-        }
         // Validate each `import`: a builtin `core.*`/`std.*` module (recorded for the capability
         // check), a known user module (recorded for `mod.fn` resolution), or an error.
         let builtins = mod_builtin_imports.entry(m.path.clone()).or_default();
