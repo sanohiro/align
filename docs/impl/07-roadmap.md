@@ -161,8 +161,11 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
 5. **group_by** — design the return type first (needs a map-like container, which needs 4c); then build.
 6. **core.bitset / core.hash** — design (also map-like / generic-aware), then build.
 7. **LLVM optimizer pipeline (`run_passes`) + M6 SIMD** (`vec` / `mask` / SoA / `align(N)`) + the
-   LLVM-version upgrade — the perf tier. The optimizer makes the already-inlined/fused pipelines
-   actually vectorize (today it is not run; see "Status note" in `open-questions.md` Future).
+   LLVM-version upgrade — the perf tier. **Optimizer DONE** — `write_object` runs the default `-O2`
+   pipeline before emitting, so the lifted lambdas inline and the fused `map`/`where`/`reduce` loops
+   vectorize (`xs.map(dbl).sum()` → one SSE2 `paddq` loop with `dbl` inlined; verified via `objdump`,
+   all e2e tests correct under `-O2`). Remaining: the explicit `vec`/`mask`/SoA/`align(N)` surface,
+   the LLVM-version upgrade, and the other backend levers — M6 proper (`open-questions.md` Future).
 8. **M8 — tooling**: the formatter, the standard lints, `unsafe` blocks + `raw.*`.
 9. **Then `std`** (OS boundary) and `pkg`.
 

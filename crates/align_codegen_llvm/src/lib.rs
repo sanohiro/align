@@ -24,6 +24,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::Module;
+use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
@@ -2725,6 +2726,15 @@ fn write_object(module: &Module, out: &Path) -> Result<(), CodegenError> {
             CodeModel::Default,
         )
         .ok_or_else(|| CodegenError::Target("failed to create TargetMachine".to_string()))?;
+
+    // Run the LLVM middle-end optimization pipeline (`-O2`) before emitting. Without this, only the
+    // backend codegen passes run — the lifted-lambda calls, fused `map`/`reduce`/`where` loops, and
+    // bounds checks are left un-inlined and un-vectorized. The default `-O2` pipeline inlines the
+    // per-element calls, hoists invariants (LICM), and runs the loop / SLP vectorizers, so the
+    // data-oriented core actually lowers to SIMD. Purely additive — no IR is generated differently.
+    module
+        .run_passes("default<O2>", &tm, PassBuilderOptions::create())
+        .map_err(|e| CodegenError::Target(format!("optimization pipeline: {e}")))?;
 
     tm.write_to_file(module, FileType::Object, out)
         .map_err(|e| CodegenError::Target(e.to_string()))
