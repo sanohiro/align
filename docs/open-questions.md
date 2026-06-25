@@ -201,11 +201,20 @@ can't hold an inference variable), while a *bare* parameter stays deferred (keep
 return-context inference). `box<T>` / `slice<T>` / `array<T>` / tuple positions are still rejected
 (only Option/Result are wired).
 
+**4c-4 groundwork DONE:** generic type *declaration* syntax `Pair<T> { … }` / `Opt<T> { … }` parses
+(`StructDecl`/`EnumDecl.type_params`; the top-level item dispatch recognizes `Ident <`); sema rejects
+it with a clear "not supported yet" message. The implementation is the **resolver refactor** below.
+
 **Still open (later 4c slices):**
-- **Type parameters in the remaining nested positions** (`array<T>` / `slice<T>` params, generic
-  containers `Stack<T>`) — `array<T>` needs the fused-pipeline machinery to handle a generic element
-  + `PrimScalar` to carry a `Param`; generic structs need generic type *declarations* + per-monomorph
-  struct interning. The `Scalar::Param` foundation is in place; these lift the remaining cuts.
+- **The resolver refactor + generic structs.** Monomorphizing `Pair<i32>` must intern a concrete
+  `StructDef` *during* type resolution, so `structs` has to grow during resolution — a `&mut Vec`
+  threaded through `resolve_type` (and held mutably by the `Checker`), mirroring how `tuples` /
+  `fn_types` already work; generic-struct templates (with `Param` fields) live in a separate
+  registry kept out of codegen. Then struct-literal type-argument inference. The `Scalar::Param`
+  foundation + the decl syntax are in place; this is the invasive-but-mechanical remaining piece.
+- **Type parameters in `array<T>` / `slice<T>` params** + real generic containers (`Stack<T>` needs
+  an `array<T>` field) — `array<T>` needs the fused-pipeline machinery to handle a generic element
+  + `PrimScalar` to carry a `Param`.
 - **Value generics for `vec<N, T>`** (the `N`) — M6.
 - **Generic `Option`/`Result`** in the general mechanism (retiring the builtin `Ty::Option`/`Result`
   special-case) — once nested-position generics + a `Some`/`Ok` generic-enum path exist.
