@@ -4,6 +4,7 @@
 //!   alignc check     <file>   lexer -> parser -> sema. Print diagnostics
 //!   alignc emit-mir  <file>   Print MIR as text
 //!   alignc emit-llvm <file>   Print LLVM IR as text
+//!   alignc emit-obj  <file>   Write an object file (no link, no `main` required)
 //!   alignc build     <file>   Build an executable (<stem> in cwd)
 //!   alignc run       <file>   Build, run, and return its exit code
 
@@ -28,6 +29,9 @@ fn main() -> ExitCode {
         (Some("check"), Some(p)) => run_check(p),
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
         (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, target),
+        // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
+        // (a library / benchmark kernel). Default output is `<stem>.o`.
+        (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target),
         (Some("build"), Some(p)) => run_build(p, target),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
         (Some("run"), Some(p)) => run_run(p, &args[3..], target),
@@ -79,6 +83,7 @@ fn usage() {
            check      check through lexer/parser/sema\n  \
            emit-mir   print MIR as text\n  \
            emit-llvm  print LLVM IR as text\n  \
+           emit-obj   write an object file (<file> [out.o]; no link, no `main` needed)\n  \
            build      build an executable\n  \
            run        build and run (returns the exit code)\n  \
          \n\
@@ -149,6 +154,23 @@ fn run_emit_llvm(path: &str, target: BuildTarget) -> ExitCode {
         }
         Err(e) => {
             eprintln!("alignc: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget) -> ExitCode {
+    let Some(mir) = front_to_mir(path) else {
+        return ExitCode::FAILURE;
+    };
+    let obj = PathBuf::from(out.map(String::from).unwrap_or_else(|| format!("{}.o", stem(path))));
+    match emit_object_file(&mir, &obj, target) {
+        Ok(()) => {
+            println!("alignc: wrote object: {}", obj.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("alignc: codegen failed: {e}");
             ExitCode::FAILURE
         }
     }

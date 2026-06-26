@@ -1,0 +1,12 @@
+// Benchmark kernels — a no-`main` library, compiled to an object with `alignc emit-obj` and linked
+// into the Rust harness (`harness.rs`). Each `pub fn` is called from Rust with matching runtime data
+// so the comparison is against genuine memory (a literal array would constant-fold away).
+//
+// Kernel 1: a fused where + map + reduce over a flat slice — the data-oriented pipeline. This is the
+// "does Align's auto-SIMD match hand-written Rust" check. (Spoiler: it compiles to the same machine
+// code, so it matches. Align beats idiomatic Rust only with a *structural* edge — `soa<T>` layout —
+// added in a later kernel.)
+
+pub fn sum_sq_pos(s: slice<i64>) -> i64 = s.where(pos).map(sq).sum()
+fn pos(x: i64) -> bool = x > 0
+fn sq(x: i64) -> i64 = x * x
