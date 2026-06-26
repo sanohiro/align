@@ -781,6 +781,11 @@ The column buffer is arena-allocated (the `soa` view borrows it), so both forms 
 form is the analytics win: idiomatic Rust decodes to a `Vec<User>` (AoS) and deserializes every
 field, while Align lands the data column-major and a scan reads only the fields it touches.
 
+`json.decode` only parses the fields you declare — any other key in the input is skipped
+structurally (no value conversion, no copy). To read just a few columns of a wide record, declare a
+struct with only those: `soa<{ active: bool, pay: i32 }>` over a JSON object with twenty keys parses
+two columns and skips the rest.
+
 This is the layout lever that lets Align *beat* an array-of-structs (what a hand-written `Vec<User>`
 gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags
 whole structs through cache. Measured ≈7× faster than an idiomatic-Rust `Vec<Struct>` field sum on a

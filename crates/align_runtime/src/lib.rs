@@ -492,6 +492,9 @@ pub unsafe extern "C" fn align_rt_json_decode(
     n_fields: i64,
     out: *mut u8,
     out_size: i64,
+    phf: *const i32,
+    phf_len: i64,
+    phf_seed: i64,
 ) -> i32 {
     // `from_raw_parts` is UB on a null pointer even with len 0, and an empty owned `string`
     // (e.g. an empty `builder().to_string()` or `str.clone()`) is `{null, 0}` — guard it.
@@ -506,10 +509,11 @@ pub unsafe extern "C" fn align_rt_json_decode(
     } else {
         unsafe { std::slice::from_raw_parts(fields, n_fields as usize) }
     };
+    let phf = unsafe { phf_slice(phf, phf_len) };
 
     let mut p = JsonParser { src, pos: 0 };
     let ok = (|| -> Option<()> {
-        unsafe { parse_object(&mut p, descs, out, out_size)? };
+        unsafe { parse_object(&mut p, descs, out, out_size, phf, phf_seed as u64)? };
         p.ws();
         // Trailing garbage after the object is an error.
         if p.pos != src.len() {
@@ -573,6 +577,57 @@ impl SeenSet {
     }
 }
 
+/// FNV-1a over `bytes`, seeded — the hash behind the compile-time perfect-hash field dispatch.
+/// **MUST byte-for-byte match the codegen-side `phf_hash` in `align_codegen_llvm`**, which computes
+/// each field name's slot at compile time; if the two diverge, a field would hash to the wrong slot.
+#[inline]
+fn json_phf_hash(bytes: &[u8], seed: u64) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Rebuild the perfect-hash slot table from the C ABI `(ptr, len)`: `None` (→ linear scan) when the
+/// pointer is null or the length is non-positive, else the `[i32]` slot → index table.
+///
+/// # Safety
+/// `(ptr, len)` must describe a valid `i32` range when `len > 0`.
+unsafe fn phf_slice<'a>(ptr: *const i32, len: i64) -> Option<&'a [i32]> {
+    if len <= 0 || ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
+    }
+}
+
+/// Resolve `key` to a field-descriptor index, or `None` for an unknown key (which the caller skips).
+/// With a perfect-hash table `phf` (slot → index, `-1` = empty; length is a power of two) this is
+/// O(1): hash the key to a slot, then **one** name comparison confirms it (an unknown key can hash
+/// into an occupied slot, so the compare is required for soundness). Without a table it falls back
+/// to a linear scan (e.g. an empty struct, or when codegen found no collision-free table).
+///
+/// # Safety
+/// Each descriptor's `name_ptr`/`name_len` must describe a valid byte range.
+unsafe fn find_field(descs: &[JsonField], key: &[u8], phf: Option<&[i32]>, phf_seed: u64) -> Option<usize> {
+    let name_of = |d: &JsonField| unsafe { std::slice::from_raw_parts(d.name_ptr, d.name_len.max(0) as usize) };
+    match phf {
+        Some(table) if !table.is_empty() => {
+            // `table.len()` is a power of two (codegen guarantees it), so `& (len-1)` is the modulo.
+            let slot = (json_phf_hash(key, phf_seed) & (table.len() as u64 - 1)) as usize;
+            let idx = table[slot];
+            if idx < 0 {
+                return None;
+            }
+            let i = idx as usize;
+            (i < descs.len() && name_of(&descs[i]) == key).then_some(i)
+        }
+        _ => descs.iter().position(|d| name_of(d) == key),
+    }
+}
+
 /// Parse one JSON object from `p` into the (caller-zeroed) struct at `out` (`out_size` bytes) per
 /// the field `descs`, leaving `p` positioned just past the closing `}`. Returns `None` on a parse
 /// error, a missing or duplicate declared field, or an out-of-range descriptor. Shared by the
@@ -581,7 +636,14 @@ impl SeenSet {
 /// # Safety
 /// `out` must point to `out_size` writable, already-zeroed bytes; each descriptor's `name_ptr`
 /// must describe a valid byte range. `str` fields write a `{ptr,len}` view into `p`'s input.
-unsafe fn parse_object(p: &mut JsonParser, descs: &[JsonField], out: *mut u8, out_size: i64) -> Option<()> {
+unsafe fn parse_object(
+    p: &mut JsonParser,
+    descs: &[JsonField],
+    out: *mut u8,
+    out_size: i64,
+    phf: Option<&[i32]>,
+    phf_seed: u64,
+) -> Option<()> {
     // `parse_object` runs once per array element (slice 8d), so avoid a per-object heap allocation:
     // a struct of <= 64 fields tracks "seen" in a `u64` bitmask, falling back to a `Vec` only for
     // a wider struct (which essentially never occurs).
@@ -598,11 +660,9 @@ unsafe fn parse_object(p: &mut JsonParser, descs: &[JsonField], out: *mut u8, ou
             p.ws();
             p.expect(b':')?;
             p.ws();
-            // Find the matching field descriptor (unknown keys are skipped).
-            let idx = descs.iter().position(|d| {
-                let name = unsafe { std::slice::from_raw_parts(d.name_ptr, d.name_len.max(0) as usize) };
-                name == key
-            });
+            // Find the matching field descriptor (unknown keys are skipped). O(1) via the
+            // compile-time perfect-hash table when present, else a linear scan.
+            let idx = unsafe { find_field(descs, key, phf, phf_seed) };
             match idx {
                 Some(i) => {
                     if !seen.mark(i) {
@@ -715,6 +775,9 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     n_fields: i64,
     elem_size: i64,
     out: *mut AlignStr,
+    phf: *const i32,
+    phf_len: i64,
+    phf_seed: i64,
 ) -> i32 {
     // `from_raw_parts` is UB on a null pointer even with len 0 — guard an empty owned `string`.
     let src: &[u8] = if input_len <= 0 || input.is_null() {
@@ -728,6 +791,8 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     } else {
         unsafe { std::slice::from_raw_parts(fields, n_fields as usize) }
     };
+    let phf = unsafe { phf_slice(phf, phf_len) };
+    let phf_seed = phf_seed as u64;
     let esz = elem_size.max(0) as usize;
     let mut buf: Vec<u8> = Vec::new();
     let mut count: i64 = 0;
@@ -747,7 +812,7 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
                 // next `resize` keeps them valid.
                 let base = buf.len();
                 buf.resize(base + esz, 0);
-                unsafe { parse_object(&mut p, descs, buf.as_mut_ptr().add(base), esz as i64)? };
+                unsafe { parse_object(&mut p, descs, buf.as_mut_ptr().add(base), esz as i64, phf, phf_seed)? };
                 count += 1;
                 p.ws();
                 match p.peek() {
@@ -1319,6 +1384,43 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phf_hash_matches_codegen() {
+        // The same pinned value as `align_codegen_llvm`'s `phf_hash_is_pinned` test. If these two
+        // ever diverge, the compile-time perfect-hash table would route JSON keys to wrong slots.
+        assert_eq!(json_phf_hash(b"score", 0), 0xc10e_63fb_e7f6_24f5);
+    }
+
+    #[test]
+    fn find_field_via_phf_matches_linear_scan() {
+        // Build descriptors for a few names, then check the PHF lookup agrees with a linear scan for
+        // both known keys and an unknown key (which both must report as absent → skipped).
+        let names = [b"id".as_slice(), b"score", b"age"];
+        let descs: Vec<JsonField> =
+            names.iter().map(|n| JsonField { name_ptr: n.as_ptr(), name_len: n.len() as i64, tag: 0, offset: 0 }).collect();
+        // A hand-built collision-free table (m=4, seed found by scanning) — mirrors `build_phf`.
+        let m = 4usize;
+        let mut seed = 0u64;
+        let slots = loop {
+            let mut s = vec![-1i32; m];
+            let mut ok = true;
+            for (i, n) in names.iter().enumerate() {
+                let slot = (json_phf_hash(n, seed) & (m as u64 - 1)) as usize;
+                if s[slot] != -1 { ok = false; break; }
+                s[slot] = i as i32;
+            }
+            if ok { break s; }
+            seed += 1;
+        };
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(unsafe { find_field(&descs, n, Some(&slots), seed) }, Some(i));
+        }
+        assert_eq!(unsafe { find_field(&descs, b"unknown", Some(&slots), seed) }, None);
+        // And the linear-scan fallback (no table) agrees.
+        assert_eq!(unsafe { find_field(&descs, b"age", None, 0) }, Some(2));
+        assert_eq!(unsafe { find_field(&descs, b"nope", None, 0) }, None);
+    }
 
     #[test]
     fn arena_alloc_is_stable_across_chunks() {

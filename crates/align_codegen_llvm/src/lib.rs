@@ -392,12 +392,14 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
-        // json.decode(input, fields, n, out, out_size) -> i32 status (0 = ok).
+        // json.decode(input, fields, n, out, out_size, phf, phf_len, phf_seed) -> i32 status
+        // (0 = ok). The trailing 3 args are the compile-time perfect-hash field table (`phf_len = 0`
+        // → linear scan).
         "json_decode".to_string(),
         module.add_function(
             "align_rt_json_decode",
             ctx.i32_type().fn_type(
-                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()],
+                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into()],
                 false,
             ),
             None,
@@ -443,13 +445,13 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
-        // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len})
-        // -> i32 status (MMv2 slice 8d).
+        // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len},
+        // phf, phf_len, phf_seed) -> i32 status (MMv2 slice 8d; trailing 3 = perfect-hash table).
         "json_decode_struct_array".to_string(),
         module.add_function(
             "align_rt_json_decode_struct_array",
             ctx.i32_type().fn_type(
-                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into()],
+                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into(), i64t2.into()],
                 false,
             ),
             None,
@@ -952,6 +954,62 @@ fn scalar_bytes(s: Scalar) -> u64 {
 
 fn is_signed(ty: Ty) -> bool {
     matches!(ty, Ty::Int(IntTy { signed: true, .. }))
+}
+
+/// The constant data `json.decode` codegen emits for one struct: the field-descriptor table, the
+/// field count + struct store size, and the perfect-hash slot table (`phf_len = 0` → linear scan).
+struct DecodeTable<'c> {
+    descs: inkwell::values::PointerValue<'c>,
+    n_fields: u64,
+    store_size: u64,
+    phf_ptr: inkwell::values::PointerValue<'c>,
+    phf_len: u64,
+    phf_seed: u64,
+}
+
+/// FNV-1a over `bytes`, seeded — the hash behind the compile-time perfect-hash field dispatch.
+/// **MUST byte-for-byte match the runtime-side `json_phf_hash` in `align_runtime`** (the runtime
+/// hashes each JSON key with this to find its slot; a divergence would mis-route a field).
+fn phf_hash(bytes: &[u8], seed: u64) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Build a perfect-hash slot table for the field `names`: a power-of-two-sized `[i32]` where
+/// `slots[hash(name, seed) & (len-1)] = field_index` (empty slots `-1`), plus the chosen `seed`.
+/// Searches table sizes `next_pow2(n) .. ×8` and seeds `0..4096`; returns `None` if none is
+/// collision-free (the caller then omits the table and the runtime uses a linear scan — so a
+/// pathological name set degrades gracefully, never incorrectly). Empty / single-field structs
+/// return `None` (a linear scan is already O(1) there).
+fn build_phf(names: &[&str]) -> Option<(Vec<i32>, u64)> {
+    let n = names.len();
+    if n < 2 {
+        return None;
+    }
+    let mut m = n.next_power_of_two();
+    for _ in 0..4 {
+        for seed in 0u64..4096 {
+            let mut slots = vec![-1i32; m];
+            let mut ok = true;
+            for (i, name) in names.iter().enumerate() {
+                let slot = (phf_hash(name.as_bytes(), seed) & (m as u64 - 1)) as usize;
+                if slots[slot] != -1 {
+                    ok = false;
+                    break;
+                }
+                slots[slot] = i as i32;
+            }
+            if ok {
+                return Some((slots, seed));
+            }
+        }
+        m *= 2;
+    }
+    None
 }
 
 fn int_bits(ty: Ty) -> u32 {
@@ -2614,7 +2672,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// struct `struct_id`, returning `(table base, n_fields, struct store size)`. The table is a
     /// private constant global (no per-call alloca → safe inside a loop). Shared by single-struct
     /// and `array<Struct>` decode (MMv2 slice 8d).
-    fn decode_field_table(&mut self, struct_id: u32) -> (inkwell::values::PointerValue<'c>, u64, u64) {
+    fn decode_field_table(&mut self, struct_id: u32) -> DecodeTable<'c> {
         let sty = self.struct_types[struct_id as usize];
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
@@ -2648,7 +2706,32 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let table = self.module.add_global(table_val.get_type(), None, "jfields");
         table.set_initializer(&table_val);
         table.set_constant(true);
-        (table.as_pointer_value(), fields.len() as u64, self.target_data.get_store_size(&sty))
+
+        // Compile-time perfect-hash table for the field names: O(1) key → index lookup at runtime
+        // instead of a linear scan over `descs` (the win on wide schemas). If no collision-free
+        // (seed, size) is found, `phf_ptr` is null / `phf_len` is 0 and the runtime falls back to
+        // the linear scan — so this is a pure speedup, never a correctness dependency.
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        let (phf_ptr, phf_len, phf_seed) = match build_phf(&names) {
+            Some((slots, seed)) => {
+                let vals: Vec<_> = slots.iter().map(|&s| i32t.const_int(s as u64, true)).collect();
+                let arr = i32t.const_array(&vals);
+                let g = self.module.add_global(arr.get_type(), None, "jphf");
+                g.set_initializer(&arr);
+                g.set_constant(true);
+                (g.as_pointer_value(), slots.len() as u64, seed)
+            }
+            None => (ptr_ty.const_null(), 0, 0),
+        };
+
+        DecodeTable {
+            descs: table.as_pointer_value(),
+            n_fields: fields.len() as u64,
+            store_size: self.target_data.get_store_size(&sty),
+            phf_ptr,
+            phf_len,
+            phf_seed,
+        }
     }
 
     fn gen_json_decode(&mut self, struct_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
@@ -2662,14 +2745,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
         let i64t = self.ctx.i64_type();
-        let (base, n_fields, size) = self.decode_field_table(struct_id);
-        let n = i64t.const_int(n_fields, false);
-        let size = i64t.const_int(size, false);
+        let t = self.decode_field_table(struct_id);
+        let n = i64t.const_int(t.n_fields, false);
+        let size = i64t.const_int(t.store_size, false);
+        let phf_len = i64t.const_int(t.phf_len, false);
+        let phf_seed = i64t.const_int(t.phf_seed, false);
         let cs = self
             .builder
             .build_call(
                 self.funcs["json_decode"],
-                &[in_ptr.into(), in_len.into(), base.into(), n.into(), out_ptr.into(), size.into()],
+                &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), out_ptr.into(), size.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
                 "jdec",
             )
             .map_err(|e| self.err(e))?;
@@ -2690,14 +2775,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
         let i64t = self.ctx.i64_type();
-        let (base, n_fields, size) = self.decode_field_table(struct_id);
-        let n = i64t.const_int(n_fields, false);
-        let elem_size = i64t.const_int(size, false);
+        let t = self.decode_field_table(struct_id);
+        let n = i64t.const_int(t.n_fields, false);
+        let elem_size = i64t.const_int(t.store_size, false);
+        let phf_len = i64t.const_int(t.phf_len, false);
+        let phf_seed = i64t.const_int(t.phf_seed, false);
         let cs = self
             .builder
             .build_call(
                 self.funcs["json_decode_struct_array"],
-                &[in_ptr.into(), in_len.into(), base.into(), n.into(), elem_size.into(), out_ptr.into()],
+                &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), elem_size.into(), out_ptr.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
                 "jdecsa",
             )
             .map_err(|e| self.err(e))?;
@@ -2978,6 +3065,32 @@ mod tests {
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
         emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline).unwrap()
+    }
+
+    #[test]
+    fn phf_hash_is_pinned() {
+        // Pins the hash of a known input so the codegen and runtime implementations can't silently
+        // drift apart (the runtime's `json_phf_hash` must produce the same value — see its test).
+        assert_eq!(phf_hash(b"score", 0), 0xc10e_63fb_e7f6_24f5);
+    }
+
+    #[test]
+    fn build_phf_is_collision_free_and_covers_each_field() {
+        let names = ["id", "score", "age", "rank", "active", "name", "lat", "lon"];
+        let (slots, seed) = build_phf(&names).expect("a small distinct name set has a PHF");
+        assert!(slots.len().is_power_of_two());
+        // Every field maps to its own slot, and a round-trip through the slot recovers its index.
+        for (i, n) in names.iter().enumerate() {
+            let slot = (phf_hash(n.as_bytes(), seed) & (slots.len() as u64 - 1)) as usize;
+            assert_eq!(slots[slot], i as i32, "field {n} should resolve to index {i}");
+        }
+    }
+
+    #[test]
+    fn build_phf_declines_trivial_sets() {
+        // 0/1-field structs use the linear scan (already O(1)); no table is emitted.
+        assert!(build_phf(&[]).is_none());
+        assert!(build_phf(&["only"]).is_none());
     }
 
     #[test]

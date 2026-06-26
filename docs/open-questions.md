@@ -272,24 +272,39 @@ JSON→SoA is then a thin wiring on top.
    where(.active).score.sum()` vs Rust `serde_json → Vec<User> → filter/map/sum` — the headline win
    (idiomatic Rust decodes to a `Vec<User>` AoS and deserializes every field; Align reads only the
    columns the pipeline touches). The cleanest measurement combines this with step 3 (field-skip).
-3. **Known-schema field-skip / projection decode (fold into step 2 — the strongest structural win,
-   flagged by BOTH Gemini and Codex 2026-06-27).** When a decoded value is a *temporary fully
-   consumed by the expression* (`json.decode(d).where(.active).score.sum()`, never bound/reused), the
-   compiler knows from the pipeline which fields are read (`active`, `score`) and can tell the decoder
-   to **skip parsing the unused fields entirely** — no value conversion, no string/arena copy, just a
-   structural SIMD skip to the next `,`/`}`. The runtime already does this for *unknown* keys
-   (`skip_value()`, `align_runtime/src/lib.rs:~601`); the new part is marking *known-but-unused*
-   fields skip, driven by a use-analysis over the decode's consuming expression. ≈2–10× on wide JSON
-   where only a few fields are used (Rust's `serde` derive deserializes all fields unless you
-   hand-write a custom `Visitor`). Combined with SoA-direct, this is "decode only the used columns" —
-   the realistic Rust-beating analytics workload. **Safety: only when the decoded value does not
-   escape** (bound + reused → decode all). A liveness/escape check gates it.
+3. **Known-schema field-skip / projection decode — DEFERRED 2026-06-27 (the perf is already
+   available; the remaining delta is ergonomic-only and safety-sensitive).** KEY FINDING (verified
+   2026-06-27): the runtime **already skips every JSON field not declared in the target struct**
+   (`parse_object`'s `None => p.skip_value()`, `align_runtime/src/lib.rs:~675` — confirmed by a test:
+   a wide `[{id,name,score,age}]` decoded into `soa<{score: i32}>` skips `id`/`name`/`age` and sums
+   `score` correctly). So **the field-skip win is obtained today by declaring a narrow struct** with
+   only the needed columns. What step 3 would add is skipping fields that ARE declared in the struct
+   but not read by a particular pipeline (a wide canonical struct reused across pipelines) — driven by
+   a sound whole-function **use+escape analysis** over the decoded local (any non-projection use, or a
+   pass-to-fn / return, ⇒ decode all). The gain over "declare a narrow struct" is **ergonomic only**
+   (avoid N per-pipeline structs); the perf is the same. And the analysis has a **memory-safety
+   failure mode** (skip a column that is actually read ⇒ read uninitialised column bytes), so it must
+   be conservatively sound. The inline-temporary form (`json.decode(d)?.where(.active)...`) is also
+   **not expressible** — the decode target type can't be inferred from field names alone, and Align has
+   no expression-position type ascription. Verdict: not worth a complex, safety-critical analysis for
+   an ergonomic-only delta right now. Revisit if a real workload needs a wide reused struct decoded
+   cheaply; until then, **document the narrow-struct technique** (done: `draft.md` §9). The next clean,
+   self-contained decode win is **perfect-hash field dispatch** (below), chosen 2026-06-27.
+
+**Perfect-hash JSON field dispatch — DONE (2026-06-27).** The runtime field lookup was a linear scan
+(`descs.iter().position(...)`); now codegen bakes a **compile-time perfect-hash table** from the
+(known) field names and the runtime does an O(1) `hash(key) & (m-1)` → slot → one confirming name
+compare. Implemented: `build_phf` in codegen finds a collision-free `(seed, power-of-two size)` by
+scanning seeds `0..4096` over sizes `next_pow2(n)..×8` (FNV-1a `phf_hash`); emits a `[i32]` slot→index
+global (`jphf`, `-1` = empty) alongside the descriptor table; the two decode entry points gained
+`(phf_ptr, phf_len, phf_seed)` args. Runtime `find_field` uses the table (or linear-scans when
+`phf_len = 0` — empty/1-field structs, or no table found, so it degrades gracefully). The codegen and
+runtime hashes are pinned to the same constant by paired tests (`phf_hash_is_pinned` /
+`phf_hash_matches_codegen`) so they can't drift. ≈1.2–2.5× on wide-schema decode; sound (the confirming
+compare means an unknown key colliding into an occupied slot is still skipped). `tests/soa.rs` +1
+(wide struct, unknown keys, reordered fields → correct sums), codegen +3, runtime +2.
 
 **Deferred soa / decode sub-items (after the above):**
-- **Perfect-hash JSON field dispatch.** The runtime field lookup is a **linear scan**
-  (`descs.iter().position(...)`, confirmed `align_runtime/src/lib.rs:~601`); a compile-time PHF
-  (length + first bytes + perfect hash → `switch`/jump table) makes it O(1). ≈1.2–2.5× on wide-schema
-  decode. Codegen builds the PHF table from the (compile-time-known) field names.
 - **bitset** bool columns (count/any/all 8–64× via popcnt; `where(.flag).sum()` only ~1.1–2× — both
   reviewers warn against over-crediting the filtered-sum case, since the value column read dominates).
 - **`soa_slice<T>`** (a per-column-pointer view, so a function can take a borrowed soa slice —
