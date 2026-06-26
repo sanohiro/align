@@ -78,6 +78,22 @@ code := 'A' as i32        // char ↔ int = the Unicode code point; char never p
 `bool` and composite types do not participate. Integer overflow is defined two's-complement wrap;
 explicit `checked_*` / `saturating_*` / `wrapping_*` ops cover the rest. (`draft.md` §3.)
 
+### Constants
+
+A top-level `:=` (outside any function) is a **named constant**: the same keyword-less binding form,
+evaluated at compile time and substituted as a literal at each use. It is immutable (no `mut`); its
+value is a scalar / string built from literals, unary/binary operators, and other constants.
+
+```align
+WIDTH: i32 := 6
+AREA := WIDTH * 7        // folded at compile time
+GREETING := "hello"
+```
+
+A constant's type is fixed at the definition (it does not infer from a use site — it is stable
+across modules), so an unannotated integer defaults to `i64` / a float to `f64`; annotate otherwise.
+`pub` exports it; an importer names it qualified (`mod.NAME`), like a `pub` function/type. (`draft.md` §3/§4.)
+
 ### Type declarations (keyword-less)
 
 ```text

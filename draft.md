@@ -124,6 +124,27 @@ The default is immutable.
 x: i64 := 10
 ```
 
+### Constants
+
+A `:=` binding at the top level (outside any function) is a **named constant**: the same
+keyword-less form as a local binding, but evaluated at compile time and substituted as a literal
+wherever it is used. It is immutable — `mut` is not allowed at the top level.
+
+```align
+WIDTH: i32 := 6
+HEIGHT: i32 := 7
+AREA := WIDTH * HEIGHT      // folded at compile time
+MAX_USERS := 1000
+GREETING := "hello"
+```
+
+A constant's value is a scalar or string, computed from literals, unary/binary operators, and
+other constants. Its type is **fixed at the definition** (a constant is stable across modules, so
+it does not infer from a use site the way a local does): an unannotated integer defaults to `i64`
+and a float to `f64`, so annotate when another width is wanted. `pub` exports a constant to
+importing modules, where it is named qualified — `mod.NAME` — exactly like a `pub` function or
+type. Division by zero, a cyclic definition, or a type mismatch is a compile-time error.
+
 ### Function
 
 ```align

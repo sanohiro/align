@@ -189,16 +189,43 @@ impl<'a> Parser<'a> {
         };
         if self.at(&TokKind::Fn) {
             self.parse_fn(vis).map(Item::Fn)
+        } else if self.at(&TokKind::Mut) {
+            // A top-level constant is immutable; `mut` is only for local bindings.
+            self.diags
+                .error("a top-level constant is immutable; `mut` is not allowed here", self.span());
+            None
         } else if matches!(self.peek(), TokKind::Ident(_))
             && matches!(self.peek_at(1), TokKind::LBrace | TokKind::Lt)
         {
             // `Name { … }` or a generic `Name<T> { … }` type declaration.
             self.parse_type_decl(vis)
+        } else if matches!(self.peek(), TokKind::Ident(_))
+            && matches!(self.peek_at(1), TokKind::ColonEq | TokKind::Colon)
+        {
+            // `NAME := expr` / `NAME: Type := expr` — a top-level named constant.
+            self.parse_const(vis)
         } else {
             self.diags
-                .error("expected `fn` or a type declaration at top level", self.span());
+                .error("expected `fn`, a type declaration, or a constant (`NAME := …`) at top level", self.span());
             None
         }
+    }
+
+    /// A top-level constant `NAME := expr` / `NAME: Type := expr`. Mirrors a local `let` minus `mut`
+    /// (rejected at the call site). The value is evaluated at compile time in sema.
+    fn parse_const(&mut self, vis: Vis) -> Option<Item> {
+        let start = self.span();
+        let name = self.parse_ident("constant name")?;
+        let ty = if self.eat(&TokKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&TokKind::ColonEq, "':='");
+        let value = self.parse_expr(0)?;
+        self.eat(&TokKind::End);
+        let span = start.merge(self.prev_span());
+        Some(Item::Const(ConstDecl { vis, name, ty, value, span }))
     }
 
     /// A keyword-less type declaration `Name { … }`, disambiguated by content: a body of
