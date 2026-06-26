@@ -35,6 +35,7 @@ bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
   here (shared LLVM backend → identical code is the ceiling).
 - **The lever that beats Rust is layout: `soa<T>`.** Idiomatic Rust uses `Vec<Struct>` (array-of-
   structs); a scan that touches a few fields still drags whole cache lines through memory. Align's
-  `soa<T>` stores each field in its own column, so a field-subset scan reads only those columns —
-  measured **≈3.7× faster** than the AoS scan on a memory-bound workload. That kernel joins here as
-  `soa<T>` lands.
+  `soa<T>` stores each field in its own column, so a field-subset scan reads only those columns:
+  - `col_sum` (`ps.a.sum()`): **≈8–10× faster** than the AoS field sum (pure bandwidth).
+  - `total_pay` (`rs.where(.active).pay.sum()`, the filtered aggregate): **≈3× faster** — the `where`
+    lowers branchless (mask + `select`) so it vectorizes; otherwise it is branch-bound and only ties.

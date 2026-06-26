@@ -141,6 +141,9 @@ pub enum Rvalue {
     CallIndirect { callee: Operand, args: Vec<Operand>, param_tys: Vec<Ty>, ret_ty: Ty },
     /// Load field `index` from the struct in `slot`.
     Field(Slot, u32),
+    /// `cond ? a : b` — branchless select (LLVM `select`). `a`/`b` share a type; `cond` is `bool`.
+    /// Used for branchless `where` reductions (`acc += cond ? value : identity`).
+    Select { cond: Operand, a: Operand, b: Operand },
     /// Project one column of a `soa<Struct>` value in `slot` (a `{ ptr, len }` column-major buffer)
     /// as the `field`-th column's `slice<FieldTy>` — `{ ptr + len * prefix_bytes, len }`, where
     /// `prefix_bytes` (the sizes of the preceding fields) is computed in codegen from `struct_id`.
@@ -1232,6 +1235,27 @@ fn zero_of(ty: Ty) -> Operand {
     }
 }
 
+/// Fold a `where` predicate into a reduction loop. Branchless (`sum`/`count`): AND `pred` into the
+/// running `mask` (`mask && pred`); the reducer then `select`s the contribution to the identity.
+/// Otherwise: branch — `false` skips this element to the increment block `cont`.
+fn accumulate_mask(b: &mut Builder, branchless: bool, mask: Option<Operand>, pred: Operand, cont: BlockId) -> Option<Operand> {
+    if branchless {
+        Some(match mask {
+            None => pred,
+            Some(m) => {
+                let v = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(v, Rvalue::Bin(BinOp::And, m, pred)));
+                Operand::Value(v)
+            }
+        })
+    } else {
+        let keep = b.new_block();
+        b.terminate(Term::Branch(pred, keep, cont));
+        b.cur = keep;
+        None
+    }
+}
+
 /// The seed for a `min` (`is_max = false`) / `max` (`is_max = true`) fold: the element type's
 /// largest / smallest value, so the first element always replaces it. Floats use ±infinity.
 fn extreme_of(ty: Ty, is_max: bool) -> Operand {
@@ -1552,6 +1576,14 @@ fn lower_array_reduce(
         None
     };
 
+    // Branchless `where` for identity-based reductions (`sum`/`count`): rather than a per-element
+    // branch that skips the accumulate (it doesn't auto-vectorize when the mask and value are in
+    // different soa columns), AND the predicates into a `mask` and `select` the contribution to the
+    // identity at the reducer (`acc += mask ? value : 0`). `reduce`/`any`/`all`/`min`/`max` have no
+    // simple identity-masked form here, so they keep the branch.
+    let branchless = matches!(reducer, Reducer::Sum | Reducer::Count);
+    let mut mask: Option<Operand> = None;
+
     for stage in stages {
         match &stage.kind {
             hir::StageKind::Project { field } => {
@@ -1593,17 +1625,12 @@ fn lower_array_reduce(
                 let call_args = stage_call_args(b, arg, captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
-                let keep = b.new_block();
-                // false → skip this element (go to the increment).
-                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
-                b.cur = keep;
+                mask = accumulate_mask(b, branchless, mask, Operand::Value(pred), cont);
             }
             hir::StageKind::WhereField { field } => {
                 // Predicate on a struct element's (bool) field; the element is unchanged.
                 let pred = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
-                let keep = b.new_block();
-                b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
-                b.cur = keep;
+                mask = accumulate_mask(b, branchless, mask, Operand::Value(pred), cont);
             }
         }
     }
@@ -1625,12 +1652,32 @@ fn lower_array_reduce(
     } else {
         let next = b.fresh_value(acc_ty);
         match &reducer {
-            // `count`: acc = acc + 1 (the element value is irrelevant).
-            Reducer::Count => b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), index_const(1)))),
-            // `sum`: acc = acc + cur.
+            // `count`: acc = acc + (mask ? 1 : 0). Without a branchless `where`, mask is None → +1.
+            Reducer::Count => {
+                let one = index_const(1);
+                let inc = match &mask {
+                    Some(m) => {
+                        let s = b.fresh_value(acc_ty);
+                        b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: one, b: index_const(0) }));
+                        Operand::Value(s)
+                    }
+                    None => one,
+                };
+                b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), inc)));
+            }
+            // `sum`: acc = acc + (mask ? cur : 0). A branchless `where` masks the contribution to
+            // the additive identity instead of branching, so the loop vectorizes.
             Reducer::Sum => {
                 let cur = cur.expect("sum needs a scalar element");
-                b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
+                let contribution = match &mask {
+                    Some(m) => {
+                        let s = b.fresh_value(acc_ty);
+                        b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: cur, b: zero_of(acc_ty) }));
+                        Operand::Value(s)
+                    }
+                    None => cur,
+                };
+                b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), contribution)));
             }
             // `reduce`: acc = f(acc, cur).
             Reducer::Fold { func, captures } => {

@@ -17,3 +17,9 @@ fn sq(x: i64) -> i64 = x * x
 // This is where Align *beats* idiomatic Rust (≈7x on a memory-bound scan), not just matches it.
 Particle { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64 }
 pub fn col_sum(ps: soa<Particle>) -> i64 = ps.a.sum()
+
+// Kernel 3: filtered aggregation `where(.active).pay.sum()` — the draft.md §9 headline. soa reads
+// only the `active` (bool) and `pay` (i64) columns; the `where` lowers branchless (mask + select),
+// so it vectorizes and the bandwidth win shows. Idiomatic Rust `Vec<Row>` drags whole 48-byte rows.
+Row { active: bool, pay: i64, a: i64, b: i64, c: i64, d: i64 }
+pub fn total_pay(rs: soa<Row>) -> i64 = rs.where(.active).pay.sum()

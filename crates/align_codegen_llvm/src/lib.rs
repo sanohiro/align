@@ -1501,6 +1501,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::MathFn::Pow => self.call_intrinsic("llvm.pow", &[overload], &[ops[0].into(), ops[1].into()])?,
                 }
             }
+            Rvalue::Select { cond, a, b } => {
+                let c = self.operand(cond).into_int_value();
+                let av = self.operand(a);
+                let bv = self.operand(b);
+                self.builder.build_select(c, av, bv, "sel").map_err(|e| self.err(e))?
+            }
             Rvalue::Field(slot, idx) => {
                 let fty = abi_type(self.ctx, self.field_ty(*slot, *idx), self.struct_types, self.enum_types);
                 let field_ptr = self.field_ptr(*slot, *idx)?;
