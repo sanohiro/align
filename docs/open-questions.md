@@ -24,6 +24,22 @@ Record: `draft.md` §5, `impl/03-types.md`
 **Decision: no implicit coercion (not even widening); the explicit `as` operator is the only conversion.** It applies between the numeric primitives (`i8..u64`, `f32`/`f64`) and `char` (the Unicode code point, a `u32`; `char` never pairs with a float), and is **zero-UB by design** — int→int truncates/extends with defined wrap, float→int *saturates* (out-of-range → MIN/MAX, NaN → 0). `bool` and composite types do not participate; casting a generic type parameter is rejected (deferred). Fully implemented end-to-end (`As` token → `parse_cast` → `check_cast` → `hir::Cast` → `Rvalue::Cast` → `gen_cast`).
 Record: `draft.md` §3, `impl/03-types.md` §2, `examples/cast.align`, `tests/numeric_cast.rs`
 
+### Top-level named constants (DONE 2026-06-26)
+**Decision: a top-level `:=` is a compile-time constant — no `const` keyword.** It reuses the
+keyword-less binding form (`NAME := expr` / `NAME: T := expr`), is immutable (`mut` rejected at the
+top level), and is **evaluated at compile time** to a scalar / string value that is substituted as a
+literal at every use — so a constant never reaches MIR/codegen (zero new backend surface). Its value
+is built from literals, unary/binary operators, and references to other constants (cross-module
+references *inside* an initializer are deferred; aggregate/struct constants and `as` in a constant
+are deferred). A constant's type is **fixed at the definition** (unlike a local it does not infer
+from a use site — it must be stable across modules), so an unannotated integer defaults to `i64` /
+a float to `f64`. Constants are **per-module namespaced like functions/types** (`module$NAME`
+canonical, entry unmangled so single-file programs stay byte-identical): `pub` exports one, an
+importer names it qualified (`mod.NAME`), and a name may not be both a function and a constant in
+one module. Overflow wraps (defined two's-complement); division by zero, a cyclic definition, and a
+type mismatch are compile-time errors. Folded values feed the const string pool (`draft.md` §12).
+Record: `draft.md` §3/§4, `docs/language-spec.md`, `impl/02-frontend.md` §3, `examples/constants.align`, `tests/constants.rs`
+
 ### Type declaration syntax
 **Decision: keyword-less.** Contains `ident: Type` → struct; `ident`/`ident(...)` → sum type, disambiguated by content. Fields/variants are `,`-separated.
 Record: `draft.md` §4, `impl/02-frontend.md`

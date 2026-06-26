@@ -1,0 +1,14 @@
+// Top-level named constants — `NAME := expr` / `NAME: Type := expr` (draft.md §3).
+// Keyword-less and immutable (no `mut`), evaluated at compile time and substituted as a literal
+// at every use. A constant initializer may be a literal, a unary/binary expression, or another
+// constant; an unannotated integer defaults to i64 (a constant's type is fixed at its definition).
+WIDTH: i32 := 6
+HEIGHT: i32 := 7
+AREA: i32 := WIDTH * HEIGHT      // folded to 42 at compile time
+
+DEBUG := false
+
+fn main() -> i32 {
+  if DEBUG { return 0 }
+  return AREA                    // exits 42
+}

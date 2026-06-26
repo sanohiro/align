@@ -572,6 +572,322 @@ fn canonical_type_name(
     }
 }
 
+// --- top-level constants ---------------------------------------------------------------------
+//
+// A top-level `NAME := expr` is a **compile-time constant**: it is evaluated to a scalar / string
+// value here in sema and substituted as a literal at every use, so it never reaches MIR/codegen.
+// Constants are per-module namespaced like functions/types (`pub` exports; a qualified `mod.NAME`
+// reaches an imported module's `pub` constant), and a constant initializer may reference other
+// constants *in the same module* (cross-module references inside an initializer are deferred).
+
+/// A folded compile-time constant value (the `Ty` travels alongside it in [`ConstTable::values`]).
+#[derive(Clone, Debug)]
+enum ConstVal {
+    Int(i128),
+    Float(f64),
+    Bool(bool),
+    Char(u32),
+    Str(String),
+}
+
+/// A constant's declaration facts, collected before evaluation (keyed by canonical name).
+struct ConstDeclInfo<'a> {
+    module: &'a str,
+    /// The resolved type annotation, if one was written (`NAME: i32 := …`); else `None` (inferred).
+    ann_ty: Option<Ty>,
+    value: &'a ast::Expr,
+    span: Span,
+}
+
+/// The program's evaluated constants: a per-module bare→(canonical, pub?) lookup and the folded
+/// value of each canonical constant. One `&ConstTable` is threaded into every [`Checker`].
+#[derive(Default)]
+struct ConstTable {
+    /// module path → (bare const name → (canonical key, is_pub)).
+    by_module: HashMap<String, HashMap<String, (String, bool)>>,
+    /// canonical name → (type, folded value).
+    values: HashMap<String, (Ty, ConstVal)>,
+}
+
+impl ConstTable {
+    /// Resolve a constant reference to its folded `(ty, value)`, applying module visibility: a bare
+    /// name (`module == cur`) resolves in its own module; a qualified `mod.NAME` requires `mod`
+    /// imported (checked by the caller) and the constant `pub`. `Err(msg)` is a reported-style
+    /// resolution failure; `Ok(None)` means "no such constant here" (let the caller try other
+    /// interpretations).
+    fn resolve(&self, module: &str, name: &str, cur_module: &str) -> Result<Option<(Ty, ConstVal)>, String> {
+        let Some((canonical, is_pub)) = self.by_module.get(module).and_then(|m| m.get(name)) else {
+            return Ok(None);
+        };
+        if module != cur_module && !is_pub {
+            return Err(format!("constant `{name}` is private to module `{module}` (mark it `pub` to export it)"));
+        }
+        Ok(self.values.get(canonical).cloned())
+    }
+}
+
+/// Wrap an `i128` arithmetic result into a concrete integer width (defined two's-complement wrap,
+/// the same rule as runtime integer overflow — `draft.md` §5).
+fn wrap_to_int(v: i128, it: IntTy) -> i128 {
+    let bits = it.bits as u32;
+    if bits >= 128 {
+        return v;
+    }
+    let mask = (1i128 << bits) - 1;
+    let m = v & mask;
+    if it.signed && (m & (1i128 << (bits - 1))) != 0 {
+        m - (1i128 << bits) // sign-extend
+    } else {
+        m
+    }
+}
+
+/// Evaluates top-level constant initializers to folded values, resolving same-module references
+/// on demand (memoized) with cycle detection.
+struct ConstEval<'a, 'd> {
+    decls: &'a HashMap<String, ConstDeclInfo<'a>>,
+    /// module → bare → canonical (for resolving a bare reference inside an initializer).
+    by_module: &'a HashMap<String, HashMap<String, (String, bool)>>,
+    values: HashMap<String, (Ty, ConstVal)>,
+    in_progress: std::collections::HashSet<String>,
+    diags: &'d mut Diagnostics,
+}
+
+impl<'a, 'd> ConstEval<'a, 'd> {
+    /// Fold the constant named by `canonical` (memoized; recurses into referenced constants).
+    fn value(&mut self, canonical: &str) -> Option<(Ty, ConstVal)> {
+        if let Some(v) = self.values.get(canonical) {
+            return Some(v.clone());
+        }
+        let decls = self.decls; // copy the `&'a` so the borrow is independent of `&mut self`
+        let info = decls.get(canonical)?;
+        let error = || (Ty::Error, ConstVal::Int(0));
+        if !self.in_progress.insert(canonical.to_string()) {
+            self.diags.error(
+                format!("constant `{canonical}` is defined in terms of itself (cyclic constant)"),
+                info.span,
+            );
+            return Some(error());
+        }
+        let result = self.expr(info.value, info.ann_ty, info.module);
+        self.in_progress.remove(canonical);
+        // Enforce the annotation type if one was written and evaluation produced a concrete type.
+        let result = match (result, info.ann_ty) {
+            (Some((ty, val)), Some(ann)) if ty != ann && ty != Ty::Error => {
+                self.diags.error(
+                    format!("constant has type {} but its value is {}", ty_name(ann), ty_name(ty)),
+                    info.value.span,
+                );
+                Some((ann, val))
+            }
+            (r, _) => r,
+        };
+        // Memoize — folding to an `Error` sentinel on failure, returned consistently (not `None`),
+        // so every reference to a bad constant resolves silently to `Ty::Error` rather than
+        // cascading (the first vs. later references must behave identically).
+        let result = result.unwrap_or_else(error);
+        self.values.insert(canonical.to_string(), result.clone());
+        Some(result)
+    }
+
+    /// Evaluate one constant-expression node. `expected` carries a numeric literal's type down from
+    /// context (annotation / enclosing operand); `module` is the constant's home module (for
+    /// resolving a bare reference).
+    fn expr(&mut self, e: &ast::Expr, expected: Option<Ty>, module: &str) -> Option<(Ty, ConstVal)> {
+        use ast::ExprKind as K;
+        match &e.kind {
+            K::Int(v) => {
+                let ty = match expected {
+                    Some(Ty::Int(it)) => Ty::Int(it),
+                    Some(other) if other != Ty::Error => {
+                        self.diags.error(format!("expected {}, found an integer literal", ty_name(other)), e.span);
+                        return None;
+                    }
+                    _ => Ty::Int(IntTy { bits: 64, signed: true }), // unconstrained int defaults to i64
+                };
+                Some((ty, ConstVal::Int(*v)))
+            }
+            K::Float(v) => {
+                let ty = match expected {
+                    Some(Ty::Float(ft)) => Ty::Float(ft),
+                    Some(other) if other != Ty::Error => {
+                        self.diags.error(format!("expected {}, found a float literal", ty_name(other)), e.span);
+                        return None;
+                    }
+                    _ => Ty::Float(FloatTy { bits: 64 }), // unconstrained float defaults to f64
+                };
+                Some((ty, ConstVal::Float(*v)))
+            }
+            K::Bool(b) => self.expect_scalar(Ty::Bool, ConstVal::Bool(*b), expected, e.span),
+            K::Char(c) => self.expect_scalar(Ty::Char, ConstVal::Char(*c), expected, e.span),
+            K::Str(s) => self.expect_scalar(Ty::Str, ConstVal::Str(s.clone()), expected, e.span),
+            K::Unary { op, expr } => self.unary(*op, expr, expected, module, e.span),
+            K::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, expected, module, e.span),
+            K::Path(p) => {
+                let Some(name) = single_name(p) else {
+                    self.diags.error("a constant initializer may not be a qualified reference yet".to_string(), e.span);
+                    return None;
+                };
+                let Some((canonical, _)) = self.by_module.get(module).and_then(|m| m.get(name)).cloned() else {
+                    self.diags.error(format!("`{name}` is not a constant (a constant initializer may reference only literals and other constants)"), e.span);
+                    return None;
+                };
+                let (ty, val) = self.value(&canonical)?;
+                self.check_const_type(ty, expected, e.span)?;
+                Some((ty, val))
+            }
+            _ => {
+                self.diags.error(
+                    "a constant initializer must be a literal, a unary/binary expression, or another constant".to_string(),
+                    e.span,
+                );
+                None
+            }
+        }
+    }
+
+    fn expect_scalar(&mut self, ty: Ty, val: ConstVal, expected: Option<Ty>, span: Span) -> Option<(Ty, ConstVal)> {
+        self.check_const_type(ty, expected, span)?;
+        Some((ty, val))
+    }
+
+    /// A constant has a fixed type; `Some(())` if it matches `expected` (or there is none), else a
+    /// reported error and `None` (no implicit numeric coercion — `draft.md` §3).
+    fn check_const_type(&mut self, ty: Ty, expected: Option<Ty>, span: Span) -> Option<()> {
+        if ty == Ty::Error {
+            return Some(()); // a constant that failed to fold already reported; do not cascade
+        }
+        match expected {
+            Some(exp) if exp != ty && exp != Ty::Error => {
+                self.diags.error(format!("expected {}, found {}", ty_name(exp), ty_name(ty)), span);
+                None
+            }
+            _ => Some(()),
+        }
+    }
+
+    fn unary(&mut self, op: UnOp, expr: &ast::Expr, expected: Option<Ty>, module: &str, span: Span) -> Option<(Ty, ConstVal)> {
+        match op {
+            UnOp::Neg => {
+                let (ty, val) = self.expr(expr, expected, module)?;
+                match (ty, val) {
+                    (Ty::Int(it), ConstVal::Int(v)) => Some((ty, ConstVal::Int(wrap_to_int(v.wrapping_neg(), it)))),
+                    (Ty::Float(_), ConstVal::Float(v)) => Some((ty, ConstVal::Float(-v))),
+                    (Ty::Error, _) => None, // operand failed to fold; do not cascade
+                    _ => {
+                        self.diags.error("unary `-` expects a number".to_string(), span);
+                        None
+                    }
+                }
+            }
+            UnOp::Not => {
+                let (ty, val) = self.expr(expr, Some(Ty::Bool), module)?;
+                match (ty, val) {
+                    (_, ConstVal::Bool(b)) => Some((Ty::Bool, ConstVal::Bool(!b))),
+                    (Ty::Error, _) => None,
+                    _ => {
+                        self.diags.error("unary `!` expects a bool".to_string(), span);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, module: &str, span: Span) -> Option<(Ty, ConstVal)> {
+        use BinOp::*;
+        let is_cmp = matches!(op, Eq | Ne | Lt | Le | Gt | Ge);
+        let is_logic = matches!(op, And | Or);
+        if is_logic {
+            let (_, l) = self.expr(lhs, Some(Ty::Bool), module)?;
+            let (_, r) = self.expr(rhs, Some(Ty::Bool), module)?;
+            let (ConstVal::Bool(a), ConstVal::Bool(b)) = (l, r) else {
+                self.diags.error("logical operators expect bools".to_string(), span);
+                return None;
+            };
+            let v = if op == And { a && b } else { a || b };
+            return self.expect_scalar(Ty::Bool, ConstVal::Bool(v), expected, span);
+        }
+        // Arithmetic / comparison: both operands share one numeric (or, for `==`/`!=`, scalar) type.
+        // The result is that type for arithmetic, or `bool` for a comparison.
+        let arith_expected = if is_cmp { None } else { expected };
+        let (lty, lval) = self.expr(lhs, arith_expected, module)?;
+        let (rty, rval) = self.expr(rhs, Some(lty), module)?;
+        if lty == Ty::Error || rty == Ty::Error {
+            return None; // an operand failed to fold; do not cascade a mismatch error
+        }
+        if lty != rty {
+            self.diags.error(format!("operands have mismatched types: {} vs {}", ty_name(lty), ty_name(rty)), span);
+            return None;
+        }
+        if is_cmp {
+            let v = self.compare(op, &lval, &rval, span)?;
+            return self.expect_scalar(Ty::Bool, ConstVal::Bool(v), expected, span);
+        }
+        // Arithmetic: numeric operands only.
+        match (lval, rval, lty) {
+            (ConstVal::Int(a), ConstVal::Int(b), Ty::Int(it)) => {
+                let r = match op {
+                    Add => a.wrapping_add(b),
+                    Sub => a.wrapping_sub(b),
+                    Mul => a.wrapping_mul(b),
+                    Div | Rem => {
+                        if b == 0 {
+                            self.diags.error("division by zero in a constant expression".to_string(), span);
+                            return None;
+                        }
+                        if op == Div { a.wrapping_div(b) } else { a.wrapping_rem(b) }
+                    }
+                    _ => unreachable!(),
+                };
+                Some((lty, ConstVal::Int(wrap_to_int(r, it))))
+            }
+            (ConstVal::Float(a), ConstVal::Float(b), Ty::Float(_)) => {
+                let r = match op {
+                    Add => a + b,
+                    Sub => a - b,
+                    Mul => a * b,
+                    Div => a / b,
+                    Rem => a % b,
+                    _ => unreachable!(),
+                };
+                Some((lty, ConstVal::Float(r)))
+            }
+            _ => {
+                self.diags.error(format!("arithmetic expects numbers, found {}", ty_name(lty)), span);
+                None
+            }
+        }
+    }
+
+    fn compare(&mut self, op: BinOp, l: &ConstVal, r: &ConstVal, span: Span) -> Option<bool> {
+        use std::cmp::Ordering;
+        let ord: Option<Ordering> = match (l, r) {
+            (ConstVal::Int(a), ConstVal::Int(b)) => Some(a.cmp(b)),
+            (ConstVal::Float(a), ConstVal::Float(b)) => a.partial_cmp(b),
+            (ConstVal::Char(a), ConstVal::Char(b)) => Some(a.cmp(b)),
+            (ConstVal::Bool(a), ConstVal::Bool(b)) if matches!(op, BinOp::Eq | BinOp::Ne) => Some(a.cmp(b)),
+            _ => {
+                self.diags.error("these values are not comparable in a constant expression".to_string(), span);
+                return None;
+            }
+        };
+        let Some(ord) = ord else {
+            // NaN comparison: `==`/`!=` are defined, ordering is always false.
+            return Some(op == BinOp::Ne);
+        };
+        Some(match op {
+            BinOp::Eq => ord == Ordering::Equal,
+            BinOp::Ne => ord != Ordering::Equal,
+            BinOp::Lt => ord == Ordering::Less,
+            BinOp::Le => ord != Ordering::Greater,
+            BinOp::Gt => ord == Ordering::Greater,
+            BinOp::Ge => ord != Ordering::Less,
+            _ => unreachable!(),
+        })
+    }
+}
+
 /// Analyze a single file into a typed program (the single-module entry point; tests and the
 /// single-file driver path use this). Multi-file compilation goes through [`check_program`].
 pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
@@ -603,7 +919,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             let (bare, vis, type_params, span) = match item {
                 ast::Item::Struct(s) => (&s.name.name, s.vis, s.type_params.len(), s.span),
                 ast::Item::Enum(e) => (&e.name.name, e.vis, e.type_params.len(), e.span),
-                ast::Item::Fn(_) => continue,
+                ast::Item::Fn(_) | ast::Item::Const(_) => continue,
             };
             if bare == "Error" {
                 diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), span);
@@ -629,7 +945,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                     enum_decls.push((m.path.as_str(), m.is_entry, e));
                 }
                 ast::Item::Enum(e) => generic_enum_decls.push((m.path.as_str(), m.is_entry, e)),
-                ast::Item::Fn(_) => unreachable!(),
+                ast::Item::Fn(_) | ast::Item::Const(_) => unreachable!(),
             }
         }
     }
@@ -877,6 +1193,57 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         }
     }
 
+    // Pass 0d: collect top-level constants and fold them to compile-time values. A constant is
+    // per-module namespaced like a function (`module$NAME` canonical, unmangled in the entry so a
+    // single-file program is byte-identical); a bare name resolves in its own module, a qualified
+    // `mod.NAME` in an imported module's `pub` constant. The folded value is substituted as a literal
+    // at every use (`check_path` / `check_field_access`), so constants never reach MIR/codegen.
+    let mut const_table = ConstTable::default();
+    {
+        let mut decls: HashMap<String, ConstDeclInfo> = HashMap::new();
+        for m in modules {
+            let by = const_table.by_module.entry(m.path.clone()).or_default();
+            for item in &m.file.items {
+                let ast::Item::Const(c) = item else { continue };
+                let bare = &c.name.name;
+                // A constant shares the value namespace with functions; a clash is ambiguous.
+                if mod_table.get(&m.path).is_some_and(|mi| mi.fns.contains_key(bare)) {
+                    diags.error(format!("`{bare}` is declared as both a function and a constant in module `{}`", m.path), c.span);
+                    continue;
+                }
+                if by.contains_key(bare) {
+                    diags.error(format!("duplicate constant `{bare}` in module `{}`", m.path), c.span);
+                    continue;
+                }
+                let canonical = mangle_fn(&m.path, m.is_entry, bare);
+                let ann_ty = c.ty.as_ref().map(|t| {
+                    let ty = resolve_type(t, tcx!(m.path.as_str(), &no_imports), &[], diags);
+                    if matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error) {
+                        ty
+                    } else {
+                        diags.error(format!("a constant's type must be a scalar or `str`, got {}", ty_name(ty)), t.span());
+                        Ty::Error // suppress a cascading mismatch when folding the initializer
+                    }
+                });
+                by.insert(bare.clone(), (canonical.clone(), matches!(c.vis, ast::Vis::Pub)));
+                decls.insert(canonical, ConstDeclInfo { module: m.path.as_str(), ann_ty, value: &c.value, span: c.span });
+            }
+        }
+        let mut eval = ConstEval {
+            decls: &decls,
+            by_module: &const_table.by_module,
+            values: HashMap::new(),
+            in_progress: std::collections::HashSet::new(),
+            diags,
+        };
+        // Evaluate every constant (memoized; order-independent — a reference folds its target first).
+        let canonicals: Vec<String> = decls.keys().cloned().collect();
+        for canonical in &canonicals {
+            eval.value(canonical);
+        }
+        const_table.values = eval.values;
+    }
+
     // Pass 1: collect function signatures so calls can resolve regardless of order. `sigs` is keyed
     // by the **mangled** name (module-qualified for non-entry modules), so every function across the
     // program has a distinct key even when two modules share a bare name.
@@ -974,7 +1341,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[&mangled].bounds.clone();
         let imported = mod_builtin_imports.get(module).unwrap_or(&empty_imports);
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new(), imported, module.to_string(), &mod_table, &type_table, mod_table.get(module).map(|i| &i.user_imports).unwrap_or(&empty_imports));
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new(), imported, module.to_string(), &mod_table, &type_table, mod_table.get(module).map(|i| &i.user_imports).unwrap_or(&empty_imports), &const_table);
         let mut checked = cx.check_fn(f);
         checked.name = mangled;
         let lifted = std::mem::take(&mut cx.lifted);
@@ -1014,7 +1381,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         let bounds = sigs[oname.as_str()].bounds.clone();
         let imported = mod_builtin_imports.get(tmpl_module).unwrap_or(&empty_imports);
         let user_imported = mod_table.get(tmpl_module).map(|i| &i.user_imports).unwrap_or(&empty_imports);
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, imported, tmpl_module.to_string(), &mod_table, &type_table, user_imported);
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, imported, tmpl_module.to_string(), &mod_table, &type_table, user_imported, &const_table);
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
         worklist.append(&mut cx.instantiations);
@@ -2292,6 +2659,9 @@ struct Checker<'a, 't> {
     /// The user modules `cur_module` `import`s (distinct from `imports`, which is the builtin
     /// capability set). A qualified type / call into a user module must name one of these.
     user_imports: &'a std::collections::HashSet<String>,
+    /// Every module's folded top-level constants. A bare name resolves in `cur_module`, a qualified
+    /// `mod.NAME` in an imported `pub` constant; either is substituted as a literal.
+    consts: &'a ConstTable,
 }
 
 /// Captured-variable bookkeeping while lifting a lambda. A reference in the body that misses the
@@ -2331,6 +2701,7 @@ impl<'a, 't> Checker<'a, 't> {
         mods: &'a ModuleTable,
         type_table: &'a ModTypes,
         user_imports: &'a std::collections::HashSet<String>,
+        consts: &'a ConstTable,
     ) -> Self {
         Checker {
             diags,
@@ -2340,6 +2711,7 @@ impl<'a, 't> Checker<'a, 't> {
             mods,
             type_table,
             user_imports,
+            consts,
             struct_ids,
             enum_ids,
             enums,
@@ -3099,6 +3471,20 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Substitute a folded constant `(ty, value)` as a literal HIR expression (constrained against
+    /// the expected type — a constant has a fixed type, so a mismatch is a normal type error).
+    fn const_literal(&mut self, ty: Ty, val: &ConstVal, expected: Option<Ty>, span: Span) -> Expr {
+        self.constrain(ty, expected, span);
+        let kind = match val {
+            ConstVal::Int(v) => ExprKind::Int(*v),
+            ConstVal::Float(v) => ExprKind::Float(*v),
+            ConstVal::Bool(b) => ExprKind::Bool(*b),
+            ConstVal::Char(c) => ExprKind::Char(*c),
+            ConstVal::Str(s) => ExprKind::Str(s.clone()),
+        };
+        Expr { kind, ty, span }
+    }
+
     fn check_path(&mut self, p: &ast::Path, expected: Option<Ty>, span: Span) -> Expr {
         let err = |s: Span| Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span: s };
         // `None` builtin: its Option type comes from context.
@@ -3114,6 +3500,10 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let base = p.segments.first().map(|s| s.name.as_str()).unwrap_or("");
         let Some(id) = self.lookup_or_capture(base) else {
+            // A top-level constant in this module — substitute its folded value as a literal.
+            if let Ok(Some((ty, val))) = self.consts.resolve(&self.cur_module, base, &self.cur_module) {
+                return self.const_literal(ty, &val, expected, span);
+            }
             // A top-level function used as a value (`f := double`) is a first-class function
             // pointer (`Ty::Fn`). Slice ①: scalar params/ret, no `out` params. The name resolves
             // in the current module to its mangled codegen name (cross-module fn values are later).
@@ -3185,6 +3575,33 @@ impl<'a, 't> Checker<'a, 't> {
                             err
                         }
                     };
+                }
+            }
+        }
+        // `mod.NAME` / `a.b.NAME` — a qualified reference to an imported module's `pub` constant.
+        // The receiver is a pure dotted module name; a local shadowing the leftmost segment makes
+        // this ordinary value field access instead.
+        // A local *or captured* variable shadowing the leftmost segment makes this value field
+        // access, not a `mod.NAME` constant reference (mirrors `check_method_call`).
+        let leftmost_is_local = leftmost_segment(recv).is_some_and(|leftmost| {
+            self.lookup(leftmost).is_some()
+                || self.capture.as_ref().is_some_and(|cap| {
+                    cap.captured.iter().any(|(n, _, _)| n == leftmost)
+                        || cap.enclosing.iter().any(|(n, _, _)| n == leftmost)
+                })
+        });
+        if let Some(modpath) = flatten_module_path(recv).filter(|m| {
+            !leftmost_is_local && m != &self.cur_module && self.user_imports.contains(m)
+        }) {
+            match self.consts.resolve(&modpath, &field.name, &self.cur_module) {
+                Ok(Some((ty, val))) => return self.const_literal(ty, &val, expected, span),
+                Ok(None) => {
+                    self.diags.error(format!("module `{modpath}` has no constant `{}`", field.name), span);
+                    return err;
+                }
+                Err(msg) => {
+                    self.diags.error(msg, span);
+                    return err;
                 }
             }
         }

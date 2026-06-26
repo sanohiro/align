@@ -38,6 +38,22 @@ pub enum Item {
     Fn(FnDecl),
     Struct(StructDecl),
     Enum(EnumDecl),
+    Const(ConstDecl),
+}
+
+/// A top-level named constant: `NAME := expr` or `NAME: Type := expr` (keyword-less, like every
+/// other top-level item). It is immutable (`mut` is rejected at this position) and **evaluated at
+/// compile time** to a scalar / string value, substituted as a literal at every use. `pub` exports
+/// it to importing modules (referenced qualified, `mod.NAME`), exactly like a `pub` function/type.
+#[derive(Clone, Debug)]
+pub struct ConstDecl {
+    pub vis: Vis,
+    pub name: Ident,
+    /// Optional type annotation (`NAME: i32 := …`); when absent the type is inferred from the value
+    /// (an unconstrained integer defaults to `i64`, a float to `f64`, like a local `:=`).
+    pub ty: Option<Type>,
+    pub value: Expr,
+    pub span: Span,
 }
 
 /// A keyword-less sum type — a body of bare `Variant` / `Variant(payload…)` (not `field: Type`).
