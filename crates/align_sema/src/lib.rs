@@ -1219,22 +1219,25 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     for m in modules {
         let mut refs = std::collections::HashSet::new();
         collect_refs(&m.file.items, &mut refs);
-        let used = |needle: &str| refs.iter().any(|r| r == needle || r.starts_with(&format!("{needle}.")));
+        // Used iff some collected prefix equals `needle` or is `needle.` + more (allocation-free).
+        let used = |needle: &str| {
+            refs.iter().any(|r| r == needle || (r.starts_with(needle) && r.as_bytes().get(needle.len()) == Some(&b'.')))
+        };
         let mut seen = std::collections::HashSet::new();
         for imp in &m.file.imports {
             let p = path_str(imp);
             if !seen.insert(p.clone()) {
                 continue; // a duplicate import already errored above
             }
-            let namespace = if BUILTIN_MODULES.contains(&p.as_str()) {
+            let namespace: &str = if BUILTIN_MODULES.contains(&p.as_str()) {
                 // The accessed namespace is the prefix after the last `.` (`core.json` → `json`).
-                p.rsplit('.').next().unwrap_or(p.as_str()).to_string()
+                p.rsplit('.').next().unwrap_or(p.as_str())
             } else if known_modules.contains(p.as_str()) {
-                p.clone() // a user module is referenced by its full dotted path
+                p.as_str() // a user module is referenced by its full dotted path
             } else {
                 continue; // an unknown import already errored above
             };
-            if !used(&namespace) {
+            if !used(namespace) {
                 diags.push(align_diag::Diagnostic::warning(format!("unused import `{p}`"), imp.span));
             }
         }
@@ -7065,8 +7068,6 @@ fn single_name(p: &ast::Path) -> Option<&str> {
     }
 }
 
-/// Flatten a receiver that is a pure dotted name into a module path string: `geom` → `"geom"`,
-/// `util.math` → `"util.math"` (a `Path` or a chain of field accesses over idents). `None` if the
 // --- unused-import lint -----------------------------------------------------------------------
 //
 // An `import` is **used** if the module's source contains a qualified reference whose dotted prefix
@@ -7239,6 +7240,8 @@ fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
     }
 }
 
+/// Flatten a receiver that is a pure dotted name into a module path string: `geom` → `"geom"`,
+/// `util.math` → `"util.math"` (a `Path` or a chain of field accesses over idents). `None` if the
 /// receiver is anything else (a call result, an index, …), so a value-method receiver never matches.
 /// Builds the path in a single allocation rather than one per field-access level.
 fn flatten_module_path(e: &ast::Expr) -> Option<String> {
