@@ -393,6 +393,72 @@ convergent signal is the function-attributes lever above):
 (Codex's parallel report, when shared, gets the same treatment — record useful candidates here as
 unverified, verify later; current soa/decode work takes priority.)
 
+### External idea-generation review — Codex (2026-06-27, UNVERIFIED candidates)
+Codex's parallel "how Align beats Rust" pass — **code-grounded** (cites real `file:line`, knows the
+shipped state), so weighted higher than a feature catalog. Recorded as idea-generation; verify later.
+
+**Guiding framing (worth adopting):** the win is not "a stronger optimizer than Rust" (flat scalar
+loops hit ~parity — same LLVM) but **"a language where the slow form is hard to write"** — naturally
+steering AI-written code to SoA / fusion / arena / zero-copy / sink-first I/O instead of Rust's
+default `Vec<Struct>` / `serde_json` / owned `String` / unbuffered output. The reason to use a minor
+language. This is the existing one-way / nothing-hidden / data-oriented stance, sharpened.
+
+- **Converges with already-recorded items (raises their priority):**
+  - **LLVM attributes** (`nounwind`, pure-fn `memory(none)`/`readonly`, `noalias`, `nonnull`, `align`,
+    cold-Err edge metadata). NOW THREE INDEPENDENT REVIEWS converge (own code-review + Gemini + Codex)
+    → the strongest-supported next perf slice. See "Additional perf levers" above. (codegen still emits
+    zero — verified again 2026-06-27.)
+  - **Bitset bool columns** (popcnt `count`/`any`/`all`). Also 3-way convergent; deferred soa sub-item.
+  - **`map_into(out)` / surface `noalias`** — already a deferred soa sub-item; Codex endorses as the
+    SIMD scaffold.
+  - **Runtime CPU dispatch** (AVX2/NEON for JSON/string/hash, baseline-binary-safe) — already SETTLED
+    in the build-target policy (library layer).
+  - **Narrow-struct field skip already works** — Codex independently confirms the "declare only the
+    fields you need" experience (verified + documented in `draft.md` §9; the auto known-but-unused
+    version stays deferred). And **no hidden auto-SoA** — Codex agrees it must stay explicit `soa<T>`
+    + lint guidance (matches the Gemini-review rejection above).
+
+- **New candidates worth carrying (unverified):**
+  - **★ Performance-rail lints + "missed performance rail" diagnostics.** The concrete mechanism for
+    "hard to write the slow form": the compiler *suggests* (not errors) the fast Align shape — e.g.
+    `array<Struct>` field-scanned more than once → `to_soa()`; many decoded fields unused → narrow
+    struct; `io.stdout.write(x.to_string())` → pass the builder directly. Distinctive and highly
+    on-philosophy; pairs with the formatter below.
+  - **★ Column-oriented `group_by` + aggregate** — the next headline after json→soa:
+    `json → soa → group_by → aggregate`. Primitive-key-specialised (radix/hash), arena-allocated,
+    string keys interned/dictionary-encoded — *not* a general `HashMap`. The data-processing-language
+    win. Big-ticket; design slice of its own.
+  - **View-first / sink-first std + buffered I/O.** `print` locks+flushes stdout every call
+    (`align_runtime/src/lib.rs:~19`) — it's the debug path; the fast path is `builder →
+    io.stdout.write(builder)` / a buffered writer (the no-`to_string()` API is already right, make it
+    standard). Std should be `read_file_view`/`mmap`, `json.decode(view)`, `json.write(out, value)`,
+    `csv.scan(view)`, `io.copy`/`writev` — never materialise an owned string in the hot path. (Std
+    layer — after core; records the *direction*.)
+  - **Two-pass JSON→SoA (count then direct column fill).** The eventual form of json→soa: a structural
+    count pass for N, allocate columns, then fill columns directly — dropping the AoS intermediate +
+    transpose (the shipped #161 path). `str` columns via an offset+len column borrowing the input, or
+    a string arena. Refinement, not a redo.
+  - **Formatter (implement).** CONFIRMED not implemented (only `format_diagnostics`; the settled
+    source-formatter that normalises spacing/`;`/trailing-comma is absent). Needed to converge
+    AI-generated code / docs / tests. Pairs with the perf-rail lints.
+  - **FFI "borrow-engine" wrapping for heavy libs** (zstd / sqlite / simdjson-class) — don't reimplement
+    in pure Align; wrap via FFI as borrow engines (FFI is the library layer per `non-goals`/memory).
+  - **Expand `bench/`** beyond flat / col_sum / total_pay: AoS-vs-SoA, json→soa,
+    fs→json→aggregate→write, par_map, task_group — each vs a Rust baseline.
+  - **Build robustness — runtime-archive staleness (CONFIRMED, fix later).** `runtime_archive()`
+    (`align_driver/src/lib.rs:~149`) path-locates `libalign_runtime.a` near the exe with **no cargo
+    artifact-dependency edge**, so a runtime-source change not followed by a full `cargo build` links a
+    stale archive. Codex flagged it as recurring. Fix candidate: an artifact dep / build.rs
+    `rerun-if-changed` / a source-vs-archive mtime assertion in the driver.
+
+- **Anti-recommendations (all align with existing non-goals):** don't chase Rust trait/generic/async
+  (generics CLOSED; async = a far future `task_group`-first story); no early *general* async runtime
+  (task_group + fast blocking batch I/O first); don't write all of std in pure Align (FFI-wrap the
+  heavy engines).
+
+(Both external reports are idea-generation; the convergent + on-philosophy items above are recorded
+as unverified candidates. Current soa/decode work takes priority; benchmark before shipping any.)
+
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
 opt-in; wide SIMD on a varied fleet comes from runtime dispatch in the library, not a fixed high
