@@ -184,7 +184,23 @@ Settles the `impl/05` §3 "automatic vs annotation" OPEN in favor of annotation.
   `.clone()` / return a composite read-only view for whole-element access. Leaning toward
   **Copy-only `soa<T>`** for the first cut (whole-element extraction of a Move element is the rare
   case; field-wise pipelines — the reason to use `soa` — don't need it).
-Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3.
+
+**First slice DONE (2026-06-26):** `Ty::Soa(struct_id)` — a **borrowed, Copy** view of a
+primitive-scalar struct, ABI = `{ptr, len}` over a **column-major** single buffer (column `i` at
+`ptr + len * prefix_bytes_i`). **First cut requires uniform field width** (all fields the same byte
+size), so column `i` sits at `ptr + i*len*size` — always a multiple of `size` (= the field
+alignment), hence naturally aligned for any `len`. Mixed-width columns (e.g. `i8`+`i64`) would land
+at unaligned offsets for some lengths (→ UB on strict-alignment archs); they need per-column
+alignment padding, deferred to a later slice. `soa<T>` type syntax; field projection `ps.field` → the column's
+`slice<FieldTy>` (HIR `SoaColumn`, MIR `Rvalue::SoaColumn`, codegen does the column GEP), which then
+feeds the normal scalar pipeline (`ps.a.where(p).map(f).sum()`). **Measured ≈7–10× faster than an
+idiomatic Rust `Vec<Struct>` field sum** on a memory-bound scan (`bench/` `col_sum`, "Align faster")
+— the first place Align beats hand-written Rust. `tests/soa.rs`. **Remaining:** owned-`soa`
+construction (AoS→SoA transpose / build), the `soa_slice<T>` view question above, `str`/Move columns,
+and a column-spanning `where(.field)` (filter one column, read another). The chosen design used a
+dedicated `Ty::Soa` (Copy borrowed view) rather than `DynStructArray(_, Layout::Soa)` (owned/Move)
+for this borrowed-param cut.
+Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
 
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is

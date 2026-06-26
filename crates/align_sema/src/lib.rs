@@ -179,6 +179,13 @@ pub enum Ty {
     DynStructArray(u32, Layout),
     /// `slice<T>` — a borrowed view `{ T* ptr, i64 len }` of scalar elements. Copy. M4.
     Slice(Scalar),
+    /// `soa<Struct>` — a struct-of-arrays **view**: one contiguous column per field, all in a
+    /// single column-major buffer addressed as `{ ptr, i64 len }` (same ABI as a slice). Copy and
+    /// borrowed (M6 first cut — primitive-scalar fields only, no ownership/drop). A field
+    /// projection `s.field` yields the `slice<FieldTy>` for that column, so a scan touches only the
+    /// fields it reads — the cache lever that beats an array-of-structs (`draft.md` §3.4/§9). The
+    /// id indexes `Program::structs`.
+    Soa(u32),
     /// `array<slice<T>>` — an *owned*, dynamic-length array whose elements are `slice<T>` views
     /// (each `{ T* ptr, i64 len }`). Laid out like a slice (`{ slice* ptr, i64 count }`), Move
     /// (owns the buffer of slice headers, freed at scope exit), and region-tracked (the element
@@ -1738,7 +1745,7 @@ impl EffectScan {
             // Leaves.
             ExprKind::Unit | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_)
             | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::OptionNone
-            | ExprKind::Field { .. } | ExprKind::IndexField { .. } | ExprKind::BuilderNew => {}
+            | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::IndexField { .. } | ExprKind::BuilderNew => {}
         }
     }
 }
@@ -2275,6 +2282,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Local(_)
             | ExprKind::OptionNone
             | ExprKind::Field { .. }
+            | ExprKind::SoaColumn { .. }
             | ExprKind::BuilderNew
             | ExprKind::IndexField { .. } => {}
         }
@@ -2433,7 +2441,7 @@ impl<'a> MoveCheck<'a> {
                     moved.insert(MovedKey::Whole(*id));
                 }
             }
-            ExprKind::Field { base, .. } | ExprKind::IndexField { base, .. } => {
+            ExprKind::Field { base, .. } | ExprKind::SoaColumn { base, .. } | ExprKind::IndexField { base, .. } => {
                 if whole_moved(moved, *base) {
                     let name = &self.f.locals[*base as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
@@ -3656,6 +3664,20 @@ impl<'a, 't> Checker<'a, 't> {
             }
         };
         let base_ty = self.locals[base as usize].ty;
+        // `soa_value.field` — project one column of a struct-of-arrays as a `slice<FieldTy>` (the
+        // cache lever: a scan reads only the touched columns). Reuses the slice pipeline downstream.
+        if let Ty::Soa(id) = base_ty {
+            let def = &self.structs[id as usize];
+            let Some(index) = def.field_index(&field.name) else {
+                self.diags.error(format!("no field '{}' on soa<{}>", field.name, def.name), span);
+                return err;
+            };
+            let field_ty = def.fields[index as usize].ty;
+            let elem = ty_to_scalar(field_ty).expect("soa fields are primitive scalars");
+            let ty = Ty::Slice(elem);
+            self.constrain(ty, expected, span);
+            return Expr { kind: ExprKind::SoaColumn { base, struct_id: id, field: index }, ty, span };
+        }
         match self.field_of(base_ty, &field.name, span) {
             Some((index, ty)) => {
                 self.constrain(ty, expected, span);
@@ -5186,10 +5208,33 @@ impl<'a, 't> Checker<'a, 't> {
             None => elem_expected_no_stages,
             _ => None,
         };
-        let source = match &source_ast.kind {
+        let mut source = match &source_ast.kind {
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, elem_expected, span),
             _ => self.check_expr(source_ast, None),
         };
+        let mut raw_stages = raw_stages;
+        // A `soa<Struct>` source selects a column first (`ps.field.…`): fold that leading field
+        // projection into a column-slice source, so the rest of the pipeline streams just that
+        // column (the cache win). (First cut: a leading `where(.field)` over soa — filter one
+        // column, read another — is not yet supported.)
+        if let Ty::Soa(id) = source.ty {
+            let ExprKind::Local(base) = source.kind else {
+                self.diags.error("a soa<T> pipeline must start from a variable".to_string(), span);
+                return None;
+            };
+            let Some(RawStage::Project(field)) = raw_stages.first() else {
+                self.diags.error("a soa<T> pipeline must select a column first (e.g. `ps.field.sum()`)".to_string(), span);
+                return None;
+            };
+            let def = &self.structs[id as usize];
+            let Some(fidx) = def.field_index(&field.name) else {
+                self.diags.error(format!("no field '{}' on soa<{}>", field.name, def.name), field.span);
+                return None;
+            };
+            let elem_scalar = ty_to_scalar(def.fields[fidx as usize].ty).expect("soa field is a scalar");
+            source = Expr { kind: ExprKind::SoaColumn { base, struct_id: id, field: fidx }, ty: Ty::Slice(elem_scalar), span };
+            raw_stages.remove(0);
+        }
         let mut elem = match source.ty {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Ty::Struct(id),
@@ -7036,6 +7081,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::Local(_)
             | ExprKind::OptionNone
             | ExprKind::Field { .. }
+            | ExprKind::SoaColumn { .. }
             | ExprKind::BuilderNew
             | ExprKind::IndexField { .. } => {}
         }
@@ -7346,6 +7392,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(p) => format!("array<slice<{}>>", scalar_name(prim_to_scalar(p))),
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
+        Ty::Soa(id) => format!("soa<struct#{id}>"),
         Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
@@ -7664,6 +7711,53 @@ fn resolve_type(
             match scalar_arg(inner, "slice element", false, span, diags) {
                 Some(s) => Ty::Slice(s),
                 None => Ty::Error,
+            }
+        }
+        // `soa<Struct>` — a struct-of-arrays view (column-major). First cut: the element must be a
+        // struct of primitive scalars (no `str`/Move fields), so each column is a flat scalar array.
+        "soa" => {
+            let inner = match args {
+                [a] => resolve_type(a, cx, type_params, diags),
+                _ => {
+                    diags.error("soa takes exactly one type argument".to_string(), span);
+                    return Ty::Error;
+                }
+            };
+            match inner {
+                Ty::Struct(id) => {
+                    // Byte size of a primitive scalar field (its natural alignment equals its size).
+                    let field_bytes = |t: Ty| -> Option<u8> {
+                        match t {
+                            Ty::Int(it) => Some(it.bits / 8),
+                            Ty::Float(ft) => Some(ft.bits / 8),
+                            Ty::Bool => Some(1),
+                            Ty::Char => Some(4),
+                            _ => None,
+                        }
+                    };
+                    let fields = &cx.structs[id as usize].fields;
+                    let sizes: Option<Vec<u8>> = fields.iter().map(|f| field_bytes(f.ty)).collect();
+                    match sizes {
+                        // First cut: **uniform field width**. Column `i` then starts at
+                        // `ptr + i*len*size`, always a multiple of `size` (= the field alignment),
+                        // so every column is naturally aligned regardless of `len`. Mixed widths
+                        // would need per-column alignment padding — a later slice.
+                        Some(s) if !s.is_empty() && s.iter().all(|&b| b == s[0]) => Ty::Soa(id),
+                        Some(_) => {
+                            diags.error("soa<T> requires all fields to have the same size for now (uniform-width columns); mixed-width layout is a later slice".to_string(), span);
+                            Ty::Error
+                        }
+                        None => {
+                            diags.error("soa<T> requires a struct of primitive scalar fields (no `str`/owned fields yet)".to_string(), span);
+                            Ty::Error
+                        }
+                    }
+                }
+                Ty::Error => Ty::Error,
+                other => {
+                    diags.error(format!("soa<T> requires a struct element, got {}", ty_name(other)), span);
+                    Ty::Error
+                }
             }
         }
         // `array<T>` — an owned, dynamic-length array (MMv2). Currently usable as a return

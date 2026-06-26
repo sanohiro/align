@@ -10,3 +10,10 @@
 pub fn sum_sq_pos(s: slice<i64>) -> i64 = s.where(pos).map(sq).sum()
 fn pos(x: i64) -> bool = x > 0
 fn sq(x: i64) -> i64 = x * x
+
+// Kernel 2: the layout lever. Summing ONE field over many structs. Idiomatic Rust's `Vec<Struct>`
+// (array-of-structs) drags whole 64-byte cache lines through memory to read 8 bytes; Align's
+// `soa<Struct>` keeps each field in its own column, so `ps.a.sum()` streams only the `a` column.
+// This is where Align *beats* idiomatic Rust (≈7x on a memory-bound scan), not just matches it.
+Particle { a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64 }
+pub fn col_sum(ps: soa<Particle>) -> i64 = ps.a.sum()

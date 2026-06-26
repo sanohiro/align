@@ -289,6 +289,14 @@ pub enum ExprKind {
         base: LocalId,
         index: u32,
     },
+    /// `soa_value.field` — project one column of a `soa<Struct>` view as a `slice<FieldTy>`. `base`
+    /// is the soa local; `struct_id`/`field` identify the column. Lowers to the column's
+    /// `{ ptr + len*prefix_bytes, len }` slice (prefix_bytes = the sizes of the preceding fields).
+    SoaColumn {
+        base: LocalId,
+        struct_id: u32,
+        field: u32,
+    },
     /// `(e0, e1, ...)` — a tuple value. `tuple_id` indexes [`Program::tuples`]; the
     /// expression `ty` is `Ty::Tuple(tuple_id)`.
     Tuple {

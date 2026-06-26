@@ -22,6 +22,20 @@ struct Slice {
 
 extern "C" {
     fn sum_sq_pos(s: Slice) -> i64; // Align: s.where(pos).map(sq).sum()
+    fn col_sum(s: Slice) -> i64; // Align: ps.a.sum() over soa<Particle> (column-major {ptr,len})
+}
+
+/// 8-field, 64-byte struct — what idiomatic Rust stores as `Vec<Particle>` (array-of-structs).
+#[derive(Clone, Copy)]
+struct Particle {
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+    e: i64,
+    f: i64,
+    g: i64,
+    h: i64,
 }
 
 fn rust_sum_sq_pos(s: &[i64]) -> i64 {
@@ -76,5 +90,21 @@ fn main() {
         let sl = || Slice { ptr: data.as_ptr(), len: n as i64 };
         let (a, r) = duel(rounds, || unsafe { sum_sq_pos(black_box(sl())) }, || rust_sum_sq_pos(black_box(&data)));
         report("sum_sq_pos", n, a, r);
+    }
+
+    // 2) Field-subset scan — Align `soa<T>` (column) vs idiomatic Rust `Vec<Struct>` (AoS). Align
+    //    reads only the `a` column; idiomatic Rust drags whole 64-byte structs through cache. Align
+    //    wins (≈7x on a memory-bound scan) — the layout lever.
+    println!("  -- field-subset scan: Align soa<T> column vs Rust Vec<Struct> (AoS) --");
+    for &(n, rounds) in &[(1_000_000usize, 500usize), (20_000_000, 20)] {
+        let g = gen(n);
+        let aos: Vec<Particle> = g.iter().map(|&a| Particle { a, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0, h: 0 }).collect();
+        // Align's soa<Particle> is one column-major buffer [all a | all b | … | all h]; the `a`
+        // column is [0..n). Only column `a` is read by the kernel, so only it needs real data.
+        let mut soa = vec![0i64; 8 * n];
+        soa[..n].copy_from_slice(&g);
+        let sl = || Slice { ptr: soa.as_ptr(), len: n as i64 };
+        let (a, r) = duel(rounds, || unsafe { col_sum(black_box(sl())) }, || black_box(&aos).iter().map(|p| p.a).sum());
+        report("col_sum(soa)", n, a, r);
     }
 }
