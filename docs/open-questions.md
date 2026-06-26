@@ -93,9 +93,37 @@ Record: `draft.md` §12, `impl/07-roadmap.md`.
 Record: `impl/03-types.md` §6–§7
 
 ### SIMD exposure (basic policy)
-**Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class.
-(Whether to place explicit SIMD intrinsics in std is open, see below)
+**Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
+pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element
+branch — `impl/05` §5), which is what keeps hot loops vectorizable and branch-predictor-friendly.
+(Whether to place explicit SIMD intrinsics in std is open, see below; **wide SIMD on a varied fleet
+comes from the library layer's runtime dispatch — see "Build targets & portability".**)
 Record: `draft.md` §9, `impl/04-mir.md` §4, `impl/05-backend-llvm.md` §5
+
+### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
+**Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
+opt-in; wide SIMD on a varied fleet comes from runtime dispatch in the library, not a fixed high
+baseline.** Driven by the real deployment model — cloud VMs and containers are *build-once, run on an
+unknown/varied fleet* (Intel/AMD/Graviton, feature-masked or live-migrated hosts), so a binary baked
+for the build host's CPU (or a high fixed baseline like AVX2) would `SIGILL` somewhere.
+
+- **Default baseline (portable):** `x86-64-v2` (SSE4.2; universal across cloud x86 since ~2010) for
+  amd64; `armv8-a` (NEON is mandatory in the base ISA) for arm64. One binary runs across the fleet.
+- **Opt-in, never default:** `--target-cpu native` (fastest on the build host, non-portable — for
+  source-build-on-host) and higher baselines (`x86-64-v3`/AVX2, v4) for those who control their fleet.
+- **Wide SIMD for the varied fleet = runtime CPU-feature dispatch in the library layer** (portable
+  crates / `std::arch` `is_x86_feature_detected!`): one binary detects the host CPU and picks the best
+  path (AVX2/NEON), falling back safely. Heavy SIMD work (JSON/UTF-8/string scan, bulk copy) lives
+  here. **No hand-written per-architecture intrinsics** — portable mechanisms (`std::simd` /
+  dispatching crates) cover x86-64 and aarch64 from one source. AOT-generated pipeline loops stay at
+  the safe baseline (128-bit) for portability; runtime-multiversioning generated loops is a possible
+  future refinement (this settles the `impl/05` §5 / `04` §9 "target width W + multi-ISA" OPEN item).
+- **Multi-arch containers:** cross-build per arch+baseline into one image manifest (`linux/amd64` +
+  `linux/arm64`); the driver gains a target (arch + baseline) selector. Implementation lands with the
+  std / runtime layer (core-first); the policy is fixed now.
+
+Style: one good portable default + visible opt-in for more (nothing hidden).
+Record: `draft.md` §3.4, `design-notes.md`, `impl/05-backend-llvm.md` §5, `impl/06-runtime-std.md` §1
 
 ### Reflection
 **Decision: none.** Only the feasibility of limited compile-time reflection is considered for the future.

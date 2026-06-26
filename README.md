@@ -31,6 +31,18 @@ cargo run --bin alignc -- run examples/pipeline.align  # fused map/where/sum; ex
 
 `alignc` subcommands: `check`, `emit-mir`, `emit-llvm`, `build`, `run`.
 
+## Performance & portability
+
+Align targets the cloud/container reality of *build once, run on a varied fleet*. The default build
+uses a **safe, portable per-architecture baseline** (`x86-64-v2` on amd64, `armv8-a`/NEON on arm64),
+so one binary runs across mixed Intel/AMD/Graviton and feature-masked hosts. More aggressive targets
+are **opt-in, never the default** (`--target-cpu native` for a source build on the host you run on,
+or a higher baseline for a fleet you control). Wide SIMD on a varied fleet comes from **runtime
+CPU-feature dispatch in the library** (one binary picks AVX2/NEON at run time, falling back safely) —
+not from a fixed high baseline. See `draft.md` §3.4 and `docs/open-questions.md` ("Build targets &
+portability"). *(Policy is settled; the target selector and library SIMD land with the std/runtime
+layer — the current backend builds scalar IR and leans on LLVM `-O2` autovectorization.)*
+
 ## Requirements
 
 - Rust (stable)

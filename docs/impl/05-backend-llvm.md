@@ -126,9 +126,20 @@ loop:
 ### Target width W
 ```text
 from vec<N,T>   N becomes the LLVM vector width directly
-inferred loops  the target ISA's native width (e.g. AVX2: 256bit) as default
+inferred loops  the default build's safe baseline width (amd64 x86-64-v2 / arm64 NEON = 128bit);
+                wider (AVX2 256bit, …) only under an opt-in --target-cpu
 ```
-`// OPEN:` final policy for deciding W (same point as `04 §9`). Multi-ISA support (per-feature codegen / runtime dispatch) is a candidate outside the v1 scope.
+**SETTLED (`open-questions.md` "Build targets & portability"):** the default targets a portable
+per-arch baseline (`x86-64-v2` / `armv8-a`), so inferred-loop W is the baseline width (128-bit);
+`--target-cpu native` / higher baselines are opt-in. This keeps one binary runnable across a varied
+cloud/Docker fleet. **Wide SIMD on that fleet comes from runtime CPU-feature dispatch in the library
+layer** (`06 §1`), not from raising the generated-code baseline — one binary picks AVX2/NEON at
+runtime and falls back safely. Runtime-multiversioning the generated loops themselves (emitting v2 +
+v3 variants behind an ifunc-style selector) is a possible future refinement, deferred.
+
+> Status note: the current backend builds **scalar** IR and leans on the LLVM `-O2` pipeline
+> (SLP / loop vectorizer) for the actual SIMD, at the `generic` (SSE2) target. Moving to the
+> baseline-default + self-built vector IR above is M6 work (`07-roadmap.md`); the policy here is fixed.
 
 ---
 
