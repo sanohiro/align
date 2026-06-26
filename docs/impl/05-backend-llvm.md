@@ -145,8 +145,10 @@ layer** (`06 §1`), not from raising the generated-code baseline — one binary 
 runtime and falls back safely. Runtime-multiversioning the generated loops themselves (emitting v2 +
 v3 variants behind an ifunc-style selector) is a possible future refinement, deferred.
 
-> Status note: the current backend builds **scalar** IR and leans on the LLVM `-O2` pipeline
-> (SLP / loop vectorizer) for the actual SIMD, at the `generic` (SSE2) target. In particular,
+> Status note: the default build now targets the **portable per-arch baseline** (`x86-64-v2` on
+> amd64, `generic`/`armv8-a` on arm64) via `BuildTarget` in `align_codegen_llvm`; `--target-cpu
+> native` opts into the host CPU. The backend still builds **scalar** IR and leans on the LLVM `-O2`
+> pipeline (SLP / loop vectorizer) for the actual SIMD. In particular,
 > `where` / conditional reductions currently lower to a **per-element branch** (`Term::Branch` in
 > `align_mir`) — a naive placeholder, **not** the intended final form. The branchless mask + `select`
 > lowering above (`where(p).sum()` → masked reduce; materialize via stream-compaction) is M6 work
