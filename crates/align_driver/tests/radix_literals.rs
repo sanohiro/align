@@ -66,3 +66,25 @@ fn an_invalid_digit_is_an_error() {
 fn an_empty_radix_literal_is_an_error() {
     assert!(check_errs("radix-empty", "fn main() -> i32 {\n  x := 0x\n  return 0\n}\n"));
 }
+
+#[test]
+fn a_literal_suffix_is_rejected_with_a_hint() {
+    // Align has no literal suffix (`10i32`); `as` is the one expression-position form. The lexer
+    // rejects the suffix attempt rather than silently lexing `10` then an identifier `i32`.
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "suffix", "fn main() -> i32 {\n  z := 10i32\n  return z\n}\n");
+    assert!(checked.diags.has_errors());
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(rendered.contains("10 as i32"), "expected an `as` hint, got: {rendered}");
+}
+
+#[test]
+fn a_radix_literal_suffix_is_rejected_with_a_hint() {
+    // `0x10i32` is a suffix attempt on a radix literal: the same `as` hint (not the generic
+    // "invalid hex" error). `0xFFf64` stays a valid hex number (every char is a hex digit).
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "radix-suffix", "fn main() -> i32 {\n  z := 0x10i32\n  return 0\n}\n");
+    assert!(checked.diags.has_errors());
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(rendered.contains("0x10 as i32"), "expected an `as` hint, got: {rendered}");
+}

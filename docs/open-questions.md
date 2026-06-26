@@ -64,6 +64,17 @@ lexer parses the prefix (greedy alphanumeric run → `i128::from_str_radix`, so 
 body is a clean error). Decimal `_` separators already worked; this extends them to all bases. Pairs
 naturally with the bitwise/shift operators. Record: `draft.md` §3/§5, `docs/language-spec.md`, `examples/bitwise.align`, `tests/radix_literals.rs`
 
+### Numeric literal typing — no suffix (DONE 2026-06-26)
+**Decision: a literal's type comes from the binding annotation or the `as` operator — there is NO
+literal suffix (`10i32` / `2.0f32`).** A suffix would be a *third* way to type a literal, and for a
+literal it is exactly redundant with `as`: `10 as i32` ≡ `10i32`, and a binding annotation
+(`x: i32 := 10`) covers the binding case. Two complementary, non-overlapping mechanisms — annotation
+(types a *binding*) and `as` (types an *expression*) — beat three overlapping spellings ("one way" /
+convergence). The earlier `impl/03-types.md` / `impl/02-frontend.md` suffix claim (it was only ever
+in the impl plan, never the authoritative `draft.md`, and never implemented) is **removed**. Default
+type when fully unconstrained stays i64 / f64; a "wasteful i64 default in large arrays" lint remains a
+Future item. Record: `docs/impl/02-frontend.md` §2, `docs/impl/03-types.md` §2.
+
 ### Type declaration syntax
 **Decision: keyword-less.** Contains `ident: Type` → struct; `ident`/`ident(...)` → sum type, disambiguated by content. Fields/variants are `,`-separated.
 Record: `draft.md` §4, `impl/02-frontend.md`
@@ -434,7 +445,7 @@ Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLV
 
 ### Details (settled during implementation)
 ```text
-- Numeric literal suffix set and default-type lint
+- default-type lint (warn when the i64 default is wasteful in large arrays; no literal *suffix* — `as` covers expression-position typing, see "Numeric literal typing" Settled)
 - match exhaustiveness algorithm / guards / | multiple patterns
 - struct size threshold dividing Copy/Move
 - Determining vector width W (vec<N> fixed vs target ISA)

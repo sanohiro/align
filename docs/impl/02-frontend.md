@@ -69,14 +69,16 @@ Char / string / bool:
 true   false
 ```
 
-Numeric literals in principle **have no type**; the type is fixed by context (annotation / inference) (`03-types.md`). A suffix makes it explicit only when ambiguous.
+Numeric literals in principle **have no type**; the type is fixed by context — a binding annotation
+or inference (`03-types.md`). When an explicit type is wanted in expression position, the `as`
+operator provides it (`10 as i64`); there is **no literal suffix** (`10i64`), which would only
+duplicate `as` (a third way to type a literal — against "one way"). The lexer accepts the radix
+prefixes `0x` / `0o` / `0b` and `_` digit separators, but no trailing type suffix.
 
 ```align
 x := 10        // type determined by context
-y := 10i64     // explicit
+y := 10 as i64 // explicit (no `10i64` suffix)
 ```
-
-`// OPEN:` the exact set of suffixes (`i8..u64`/`f32`/`f64`).
 
 String literals get their **compile-time meta** (len / hash / ascii / utf8_valid / whether escaping is needed, `draft.md` §12) precomputed at the lexer stage and attached to the token.
 
@@ -518,7 +520,6 @@ enum Expr {
 ## 11. Open items (to be settled)
 
 ```text
-- The exact set of numeric suffixes and the default type (i32? i64?)
 - Whether to allow named fields in a variant (Rect { w, h })
 - match guards / | multiple patterns / exhaustiveness checking
 - Explicit generic-type-argument syntax at expression position (need turbofish or not)

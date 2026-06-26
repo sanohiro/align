@@ -260,10 +260,23 @@ impl<'a> Lexer<'a> {
                 } else {
                     match i128::from_str_radix(&text, radix) {
                         Ok(v) => self.push(TokKind::Int(v), start),
-                        Err(_) => diags.error(
-                            format!("invalid {name} integer literal: '{}'", std::str::from_utf8(&self.src[start..self.pos]).unwrap()),
-                            self.span(start, self.pos),
-                        ),
+                        // A type-suffix tail (`0x10i32`) is the likely cause when the digits don't
+                        // parse but stripping an `i`/`u`/`f`+digits tail leaves a valid radix number;
+                        // give the same "use `as`" hint as a decimal suffix. (`0xFFf64` parses as
+                        // pure hex, so it never reaches here — the hint can't shadow a real number.)
+                        Err(_) => {
+                            let prefix = &self.src[start..start + 2].iter().map(|&b| b as char).collect::<String>();
+                            match split_num_suffix(&text) {
+                                Some((digits, suffix)) if i128::from_str_radix(digits, radix).is_ok() => diags.error(
+                                    format!("numeric literal suffixes are not supported (`{suffix}`); convert explicitly, e.g. `{prefix}{digits} as {suffix}`"),
+                                    self.span(start, self.pos),
+                                ),
+                                _ => diags.error(
+                                    format!("invalid {name} integer literal: '{}'", std::str::from_utf8(&self.src[start..self.pos]).unwrap()),
+                                    self.span(start, self.pos),
+                                ),
+                            }
+                        }
                     }
                 }
                 return;
@@ -304,6 +317,21 @@ impl<'a> Lexer<'a> {
                     diags.error(format!("integer literal out of range: '{text}'"), self.span(start, self.pos));
                 }
             }
+        }
+        // A literal directly followed by a letter is a type-suffix attempt (`10i32`). Align has no
+        // literal suffix — `as` is the one expression-position form — so guide the user there (and
+        // consume the run so it does not cascade into an "undefined name" error). The numeric token
+        // was already pushed, so the surrounding expression still has a value.
+        if self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+            let suf = self.pos;
+            while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                self.pos += 1;
+            }
+            let suffix = std::str::from_utf8(&self.src[suf..self.pos]).unwrap();
+            diags.error(
+                format!("numeric literal suffixes are not supported (`{suffix}`); convert explicitly, e.g. `{} as {suffix}`", &text),
+                self.span(start, self.pos),
+            );
         }
     }
 
@@ -500,6 +528,23 @@ fn is_ident_start(c: u8) -> bool {
 
 fn is_ident_continue(c: u8) -> bool {
     c == b'_' || c.is_ascii_alphanumeric()
+}
+
+/// If `text` ends in a numeric type-suffix tail — `i`/`u`/`f` then ASCII digits, preceded by at
+/// least one digit (`10i32`, `FFu8`) — split it into `(leading_digits, suffix)`. Used to give the
+/// "suffixes are not supported; use `as`" hint for a radix literal whose digits failed to parse.
+fn split_num_suffix(text: &str) -> Option<(&str, &str)> {
+    let b = text.as_bytes();
+    let mut i = b.len();
+    while i > 0 && b[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    // Need digits after the marker (i < len), the i/u/f marker, and a leading digit before it.
+    if i < text.len() && i >= 2 && matches!(b[i - 1], b'i' | b'u' | b'f') && b[i - 2].is_ascii_alphanumeric() {
+        Some((&text[..i - 1], &text[i - 1..]))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

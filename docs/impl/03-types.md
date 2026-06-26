@@ -64,7 +64,11 @@ integer literal default = i64    (modern/64bit default. Safe against id overflow
 float literal default   = f64
 ```
 
-Can be made explicit with a suffix: `10i32` / `2.0f32`. `// OPEN:` lint for when the i64 default is wasteful in large arrays (noting that i32 suffices).
+An explicit type comes from the **binding annotation** (`y: i32 := 10`) or the **`as` operator**
+(`10 as i32`) — there is no literal *suffix* (`10i32`). A suffix would be a third, redundant way to
+type a literal: for a literal, `10 as i32` is exactly `10i32`, and a binding annotation covers the
+rest, so a suffix only adds a second spelling of something `as` already does — against "one way".
+`// OPEN:` lint for when the i64 default is wasteful in large arrays (noting that i32 suffices).
 
 ### Integer overflow (settled, draft.md §5)
 
@@ -73,7 +77,7 @@ Integer arithmetic is **not UB**. The default is two's-complement wrap (identica
 ```align
 x := 10;            // unconstrained → i64
 y: i32 := 10;       // annotation → i32
-z := 10i32;         // suffix → i32
+z := 10 as i32;     // `as` → i32 (no literal suffix; `as` is the one expression-position form)
 s := xs.sum();      // xs: array<i32> → i32 (determined by context)
 ```
 
