@@ -357,6 +357,42 @@ acc+n)}` compiles to a **call-free 14-instruction tight loop** (`run(1e6)` corre
 the tail recursion to a loop at O2. So the loop-less design is not a perf liability for tail-recursive
 algorithms.
 
+### External idea-generation review — Gemini (2026-06-27, UNVERIFIED candidates)
+Gemini was asked for Rust-beating perf/architecture ideas (advanced-model pass). Treated as
+idea-generation, vetted against the code + settled decisions; **not yet independently benchmarked**.
+Verdict per idea (most are already shipped/planned or conflict with a core invariant — the one new
+convergent signal is the function-attributes lever above):
+
+- **Function attributes (`noalias`/`nounwind`/`dereferenceable`/`align`).** ✓ Converges with the
+  "Additional perf levers" item above (codegen emits zero attributes today). Strengthens that lever's
+  priority. `nounwind` + pure-fn `memory(none)`/`readonly` are the cheap, sound first cut; aggressive
+  `noalias` still needs the `map_into(out)` write-construct (deferred above). **Best actionable item.**
+- **Bitset bool / `Option` columns.** Already a deferred soa sub-item above. Real but bounded
+  (popcnt `count`/`any`/`all` 8–64×; `where(.flag).sum()` only ~1.1–2× — value-column read dominates).
+- **Tagged-array dispatch (batch a sum-type array by variant).** FUTURE / speculative. Note: Align
+  has **no `dyn`/vtable** (grep = 0; OOP + generics are non-goals/CLOSED), so this solves a
+  non-problem today; the underlying "SoA-for-sum-types, tag-partition then batch" is a possible far
+  future idea only if a real polymorphic-array workload appears.
+- **Evaluated and NOT pursued (recorded so they aren't re-proposed):**
+  - *Hidden default arena allocator.* ✗ Violates **Nothing-hidden** + predictable-performance (and
+    the settled memory-model v2). Arena is correct but stays **explicit** (`arena {}`, already
+    ergonomic); the request/task-scoped pattern is expressible today.
+  - *Chunked / tiled SoA (AoS-of-SoA), auto.* ✗ Premise (row-access L1 thrashing) doesn't fit
+    Align's access pattern — soa pipelines are **column streams** (`s.field.sum()`), where plain SoA
+    is optimal (max bandwidth + HW prefetch); chunking helps only same-row multi-column access (the
+    AoS case). Also conflicts with the settled "layout chosen by explicit type, not whole-program
+    inference." Revisit only if a real row-wise soa workload appears.
+  - *Transpose-free one-pass JSON→SoA.* ✗ Not possible for arrays — N is unknown until parsed, so
+    column bases can't be computed up front (the AoS→transpose path, shipped #161, is the correct
+    form; the perfect-hash #162 covers the parse-speed angle).
+  - *Blanket `if`→`select` predication for all branches.* ✗ `select` evaluates both arms — wrong for
+    side-effecting / expensive / early-exit (`return`/`?`, the settled cold-Err) branches; LLVM
+    already if-converts profitable branches at O2. The **targeted** branchless `where` (#156) is the
+    right scope.
+
+(Codex's parallel report, when shared, gets the same treatment — record useful candidates here as
+unverified, verify later; current soa/decode work takes priority.)
+
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
 opt-in; wide SIMD on a varied fleet comes from runtime dispatch in the library, not a fixed high
