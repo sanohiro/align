@@ -775,7 +775,7 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                     (Ty::Float(_), ConstVal::Float(v)) => Some((ty, ConstVal::Float(-v))),
                     (Ty::Error, _) => None, // operand failed to fold; do not cascade
                     _ => {
-                        self.diags.error("unary `-` expects a number".to_string(), span);
+                        self.diags.error("unary '-' expects a number".to_string(), span);
                         None
                     }
                 }
@@ -786,7 +786,7 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                     (_, ConstVal::Bool(b)) => Some((Ty::Bool, ConstVal::Bool(!b))),
                     (Ty::Error, _) => None,
                     _ => {
-                        self.diags.error("unary `!` expects a bool".to_string(), span);
+                        self.diags.error("unary '!' expects a bool".to_string(), span);
                         None
                     }
                 }
@@ -797,7 +797,7 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                     (Ty::Int(it), ConstVal::Int(v)) => Some((ty, ConstVal::Int(wrap_to_int(!v, it)))),
                     (Ty::Error, _) => None,
                     _ => {
-                        self.diags.error("unary `~` expects an integer".to_string(), span);
+                        self.diags.error("unary '~' expects an integer".to_string(), span);
                         None
                     }
                 }
