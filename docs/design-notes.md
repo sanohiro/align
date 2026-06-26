@@ -262,6 +262,16 @@ pipeline walks memory sequentially (no random jumps), and `where` / conditional 
 branchless (mask + `select`, not a per-element `if`) — so the predictable shape, not hand-tuning, is
 what keeps hot loops vectorizable.
 
+For the layout itself, Align takes the **explicit `soa<T>` over automatic inference** road. The safe
+core has no raw pointers or field-address-taking, so a struct array's physical layout is
+semantically unobservable — the compiler *could* silently turn `array<User>` into struct-of-arrays.
+We deliberately don't: a silent layout switch hides performance (against "predictably fast") and
+needs an opaque heuristic. Instead the choice is one visible token — `array<User>` (rows) vs
+`soa<User>` (columns) — and the compiler does the field-wise column lowering *under* that type. So
+the decision is explicit and predictable; the mechanism is automatic. It is the principled,
+first-class form of the "split it into parallel arrays by hand" trick every data-oriented programmer
+already reaches for.
+
 ### Where the SIMD actually comes from (and why the default build is conservative)
 
 Align targets the real deployment world — **cloud and containers, where you build once and run on an

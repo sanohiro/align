@@ -100,6 +100,28 @@ branch — `impl/05` §5), which is what keeps hot loops vectorizable and branch
 comes from the library layer's runtime dispatch — see "Build targets & portability".**)
 Record: `draft.md` §9, `impl/04-mir.md` §4, `impl/05-backend-llvm.md` §5
 
+### Memory layout — `soa<T>` (struct-of-arrays) — SETTLED (2026-06-26)
+**Decision: the layout is chosen by an explicit type — `soa<T>` — not by automatic whole-program
+inference.** Add a first-class columnar collection `soa<User>` (peer to the row-major `array<User>`);
+the compiler lowers field access and pipeline stages over it to one contiguous column per field
+(SIMD-aligned, `align(N)` when needed). A pipeline touching a subset of fields
+(`users.where(.active).pay.sum()`) then streams only those columns — the canonical data-oriented
+cache/SIMD win, and the principled form of today's hand-rolled "parallel arrays".
+
+Why explicit over automatic: Align's safe core has no raw pointers / field-address-taking, so the
+physical layout is *semantically* unobservable and a compiler **could** auto-transform — but that
+hides performance, which fights "predictably fast", and needs an opaque heuristic. An explicit type
+keeps the choice visible ("nothing hidden"), predictable, and AI-legible, while the *field-wise
+lowering under the type* is the automatic part. This is not a "two ways to do one thing" violation:
+`array` (row) and `soa` (column) are distinct tools like `array` vs `slice`. Guidance: default
+`array<T>`; reach for `soa<T>` on large, hot, field-wise-processed tables.
+
+Boundaries that assume a byte layout (FFI, `json` encode/decode, by-value pass) **materialize to AoS
+explicitly** (a visible conversion). Composes with branchless `where` (masked reduce over columns).
+Settles the `impl/05` §3 "automatic vs annotation" OPEN in favor of annotation. Build is M6 (uses the
+`Layout::Soa` seam already reserved in `align_sema`).
+Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3.
+
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
 opt-in; wide SIMD on a varied fleet comes from runtime dispatch in the library, not a fixed high

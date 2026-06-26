@@ -687,7 +687,27 @@ m := scores > 80
 total := scores.sum_where(m)
 ```
 
-A mask is a first-class concept for SIMD / branchless / GPU.
+A mask is a first-class concept for SIMD / branchless / GPU. The pipeline's `where` is the implicit
+form: `xs.where(p).sum()` lowers **branchless** (mask + `select`, a masked reduction), not a
+per-element `if` — so a filtered hot loop stays vectorizable and does not fight the branch predictor.
+
+### Memory Layout (`soa<T>`)
+
+By default a collection is row-major (array-of-structs): `array<User>` stores each `User`
+contiguously. For a large table processed field-wise, declare it column-major
+(struct-of-arrays) with `soa<T>`:
+
+```align
+users: soa<User>
+total := users.where(.active).pay.sum()
+```
+
+`soa<User>` stores one contiguous column per field, so a pipeline that touches only some fields
+streams only those columns — better cache use and clean vectorization. The layout is **chosen
+explicitly by the type** (not inferred behind your back): the choice is visible and performance is
+predictable, while the field-wise lowering under the type is automatic. Crossing a byte-layout
+boundary (FFI, `json`, by-value) materializes to AoS explicitly. Use `array<T>` by default; reach
+for `soa<T>` on large, hot, field-wise-processed data.
 
 ---
 

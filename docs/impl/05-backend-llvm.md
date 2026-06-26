@@ -46,11 +46,19 @@ Fn(..)            function pointer (+ environment pointer if there is a capture)
 The default is **AoS** (declaration order, natural alignment, the value-type-centric `draft.md`). **SoA**, which helps for data parallelism, is treated as a transform over arrays.
 
 ```text
-AoS   array<User> = contiguous User → { User* , len, cap }
-SoA   for hot processing, array<User> → {id[], name[], active[], score[]}
+AoS   array<User> = contiguous User → { User* , len, cap }      (row-major, default)
+SoA   soa<User>   = one contiguous column per field → {id[], name[], active[], score[]}
 ```
 
-`// OPEN:` trigger for the SoA transform (automatic decision vs. annotation). The direction is to allow placing arrays that MIR's projection/fusion analysis (`04 §3`) judges to be more advantageous as SoA. Fields are naturally aligned for SIMD, and an explicit alignment attribute is added when needed (`draft.md` §3.4 alignment).
+**SETTLED (`open-questions.md` "Memory layout — `soa<T>`"): the layout is chosen by an explicit type,
+not by automatic whole-program inference.** `soa<T>` is a first-class columnar collection (peer to
+`array<T>`); the compiler lowers field access / pipeline stages over it to per-column contiguous
+storage (fields naturally SIMD-aligned, `align(N)` when needed — `draft.md` §3.4). A pipeline that
+touches a subset of fields (`users.where(.active).pay.sum()`) then streams only those columns. The
+choice is visible (predictable performance, "nothing hidden"); the *field-wise lowering under the
+type* is the automatic part. Crossing a byte-layout boundary (FFI, `json` encode/decode, by-value)
+**materializes to AoS explicitly**. (This closes the earlier "automatic decision vs. annotation"
+question in favor of annotation.) Uses the `Layout::Soa` seam; build is M6.
 
 ---
 
@@ -138,8 +146,12 @@ runtime and falls back safely. Runtime-multiversioning the generated loops thems
 v3 variants behind an ifunc-style selector) is a possible future refinement, deferred.
 
 > Status note: the current backend builds **scalar** IR and leans on the LLVM `-O2` pipeline
-> (SLP / loop vectorizer) for the actual SIMD, at the `generic` (SSE2) target. Moving to the
-> baseline-default + self-built vector IR above is M6 work (`07-roadmap.md`); the policy here is fixed.
+> (SLP / loop vectorizer) for the actual SIMD, at the `generic` (SSE2) target. In particular,
+> `where` / conditional reductions currently lower to a **per-element branch** (`Term::Branch` in
+> `align_mir`) — a naive placeholder, **not** the intended final form. The branchless mask + `select`
+> lowering above (`where(p).sum()` → masked reduce; materialize via stream-compaction) is M6 work
+> (`07-roadmap.md`). The design is fixed: **`where` is branchless**; no per-element `if` is part of
+> the source semantics. (`mask<T>` is the explicit hand-written form of the same.)
 
 ---
 
