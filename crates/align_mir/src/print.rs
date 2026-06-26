@@ -174,6 +174,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
             format!("{}[{}].{field} (struct#{struct_id})", operand_str(base), operand_str(index))
         }
+        Rvalue::IndexColumn { base, index, field, struct_id } => {
+            format!("{}.col{field}[{}] (soa struct#{struct_id})", operand_str(base), operand_str(index))
+        }
         Rvalue::IndexPtr { base, index, struct_id } => {
             format!("{}[{}] (struct#{struct_id})", operand_str(base), operand_str(index))
         }

@@ -195,11 +195,26 @@ alignment padding, deferred to a later slice. `soa<T>` type syntax; field projec
 `slice<FieldTy>` (HIR `SoaColumn`, MIR `Rvalue::SoaColumn`, codegen does the column GEP), which then
 feeds the normal scalar pipeline (`ps.a.where(p).map(f).sum()`). **Measured ≈7–10× faster than an
 idiomatic Rust `Vec<Struct>` field sum** on a memory-bound scan (`bench/` `col_sum`, "Align faster")
-— the first place Align beats hand-written Rust. `tests/soa.rs`. **Remaining:** owned-`soa`
-construction (AoS→SoA transpose / build), the `soa_slice<T>` view question above, `str`/Move columns,
-and a column-spanning `where(.field)` (filter one column, read another). The chosen design used a
+— the first place Align beats hand-written Rust. `tests/soa.rs`. The chosen design used a
 dedicated `Ty::Soa` (Copy borrowed view) rather than `DynStructArray(_, Layout::Soa)` (owned/Move)
 for this borrowed-param cut.
+
+**Second slice DONE (2026-06-27) — multi-column + mixed-width:** a soa source now flows through the
+**`Layout::Soa` seam** in the existing struct-array pipeline (not a single-column fold): field access
+lowers to `Rvalue::IndexColumn` (`column_base(field) + index`), so a column-spanning pipeline
+`rs.where(.active).pay.sum()` reads only the `active` and `pay` columns. **Mixed widths are now
+allowed** — each column's start is padded to the field's alignment in codegen (`align_up` chain), so
+`soa<{active: bool, pay: i64}>` is well-formed and aligned for any `len`. A whole-struct stage over
+soa (`where(fn)`/`map(fn)` taking the struct) is rejected cleanly (it would gather every column —
+field projection / `where(.field)` only). **Honest benchmark finding:** the filtered aggregate is
+currently only **≈parity** with Rust AoS (0.93×), NOT a win — disassembly shows the `where` lowers to
+a scalar per-element **branch** (20 conditional jumps, no vectorization), so it is branch-bound and
+the soa bandwidth advantage (5× less data touched) is lost. **This gives branchless-`where` a
+measurable target at last** (it was deferred because the single-column case already vectorizes via
+LLVM if-conversion; the mixed bool-mask + i64-value column case does NOT, so an explicit mask+select
+lowering would unblock the win). Branchless-`where` for the sum/count reducers is the next slice.
+**Still remaining:** owned-`soa` construction (AoS→SoA transpose / build — soa is param-only today),
+`soa_slice<T>` view, `str`/Move columns.
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
 
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)

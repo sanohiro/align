@@ -1857,6 +1857,42 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 self.builder.build_load(ty, ep, "idxfldp").map_err(|e| self.err(e))?
             }
+            Rvalue::IndexColumn { base, index, field, struct_id } => {
+                // `base` is a `{ptr,len}` column-major soa buffer. Each column j occupies
+                // `len * size_j` bytes; its start is padded up to the field's alignment (= its size
+                // for a primitive), so mixed-width columns (`bool` + `i64`) stay naturally aligned
+                // for any `len`. Walk to column `field`'s byte offset, then element `index` is
+                // `column_base + index*size_field`. Reads only the touched column.
+                let agg = self.operand(base).into_struct_value();
+                let buf = self.builder.build_extract_value(agg, 0, "soaptr").map_err(|e| self.err(e))?.into_pointer_value();
+                let len = self.builder.build_extract_value(agg, 1, "soalen").map_err(|e| self.err(e))?.into_int_value();
+                let i64t = self.ctx.i64_type();
+                let sizes: Vec<u64> = self.structs[*struct_id as usize]
+                    .fields
+                    .iter()
+                    .map(|f| scalar_bytes(align_sema::ty_to_scalar(f.ty).expect("soa field is a scalar")))
+                    .collect();
+                // offset of column `field` (i64 value): start_0 = 0; start_j = align_up(start_{j-1}
+                // + len*size_{j-1}, size_j).
+                let mut off = i64t.const_zero();
+                for j in 1..=(*field as usize) {
+                    let adv = self.builder.build_int_mul(len, i64t.const_int(sizes[j - 1], false), "coladv").map_err(|e| self.err(e))?;
+                    let sum = self.builder.build_int_add(off, adv, "colend").map_err(|e| self.err(e))?;
+                    let a = sizes[j]; // field alignment = its size (power of two)
+                    let bumped = self.builder.build_int_add(sum, i64t.const_int(a - 1, false), "colbump").map_err(|e| self.err(e))?;
+                    off = self.builder.build_and(bumped, i64t.const_int(!(a - 1), false), "colalign").map_err(|e| self.err(e))?;
+                }
+                let col_base = unsafe {
+                    self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "colbase").map_err(|e| self.err(e))?
+                };
+                let fty = scalar_type(self.ctx, self.structs[*struct_id as usize].fields[*field as usize].ty, self.struct_types, self.enum_types);
+                let index = self.operand(index).into_int_value();
+                let ep = unsafe {
+                    self.builder.build_in_bounds_gep(fty, col_base, &[index], "colelem").map_err(|e| self.err(e))?
+                };
+                let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
+                self.builder.build_load(ty, ep, "idxcol").map_err(|e| self.err(e))?
+            }
             Rvalue::IndexPtr { base, index, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index` and load
                 // the whole element (a `map(f)` consuming the struct by value).
