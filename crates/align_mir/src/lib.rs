@@ -1966,8 +1966,9 @@ fn transpose_to_soa(
     let field_tys: Vec<Ty> = b.structs[struct_id as usize].fields.iter().map(|f| f.ty).collect();
 
     // Allocate the column-major buffer (`len` rows). The element-pointer type is opaque, so the
-    // `Box` scalar is irrelevant — use the first field's.
-    let first_scalar = align_sema::ty_to_scalar(field_tys[0]).expect("soa field is a scalar");
+    // `Box` scalar is irrelevant — use the first field's. A soa struct always has ≥1 field (sema).
+    let first_ty = *field_tys.first().expect("a soa struct has at least one field");
+    let first_scalar = align_sema::ty_to_scalar(first_ty).expect("soa field is a scalar");
     let buf = b.fresh_value(Ty::Box(first_scalar));
     b.push(Stmt::Let(buf, Rvalue::SoaAlloc { handle: Operand::Value(handle), len: len.clone(), struct_id }));
 
@@ -2041,7 +2042,10 @@ fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, res
     b.push(Stmt::Let(a, Rvalue::Load(out)));
     let len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(a))));
-    let soa = transpose_to_soa(b, Some((struct_id, Layout::Aos)), &Some(Operand::Value(a)), 0, Operand::Value(len), struct_id);
+    // `out` holds the decoded AoS array; pass it as the slot. An AoS struct-view addresses elements
+    // through `slice_val` (so the slot is unused here), but passing the real slot rather than a dummy
+    // `0` is not fragile if a future pass reads it.
+    let soa = transpose_to_soa(b, Some((struct_id, Layout::Aos)), &Some(Operand::Value(a)), out, Operand::Value(len), struct_id);
     b.push(Stmt::DropValue(Operand::Value(a)));
     let okv = b.fresh_value(result_ty);
     b.push(Stmt::Let(okv, Rvalue::ResultOk(soa)));
