@@ -257,7 +257,40 @@ where
 mask
 ```
 
-These should lower naturally to vectorized code.
+These should lower naturally to vectorized code. The point is *structural*: contiguous arrays mean a
+pipeline walks memory sequentially (no random jumps), and `where` / conditional reductions lower
+branchless (mask + `select`, not a per-element `if`) — so the predictable shape, not hand-tuning, is
+what keeps hot loops vectorizable.
+
+For the layout itself, Align takes the **explicit `soa<T>` over automatic inference** road. The safe
+core has no raw pointers or field-address-taking, so a struct array's physical layout is
+semantically unobservable — the compiler *could* silently turn `array<User>` into struct-of-arrays.
+We deliberately don't: a silent layout switch hides performance (against "predictably fast") and
+needs an opaque heuristic. Instead the choice is one visible token — `array<User>` (rows) vs
+`soa<User>` (columns) — and the compiler does the field-wise column lowering *under* that type. So
+the decision is explicit and predictable; the mechanism is automatic. It is the principled,
+first-class form of the "split it into parallel arrays by hand" trick every data-oriented programmer
+already reaches for.
+
+### Where the SIMD actually comes from (and why the default build is conservative)
+
+Align targets the real deployment world — **cloud and containers, where you build once and run on an
+unknown, varied fleet** (Intel/AMD/Graviton, feature-masked or live-migrated hosts). A binary baked
+for the build host's CPU (`native`), or for a high fixed baseline like AVX2, would crash (`SIGILL`)
+on some hosts. So the philosophy splits SIMD by layer:
+
+- **Generated code** is fixed at build time, so it targets a **safe, portable per-arch baseline by
+  default** (`x86-64-v2` / `armv8-a`). `native` and higher baselines are **opt-in** — one good
+  default, visible opt-in, never hidden. This caps generated-loop SIMD at the baseline (128-bit) for
+  portability.
+- **Wide SIMD on a varied fleet comes from the library**, via *runtime* CPU-feature dispatch (the
+  binary detects AVX2/NEON at run time and falls back safely). This is why the library leans on
+  portable dispatching crates rather than hand-written intrinsics: it adapts per-host *and* stays
+  multi-arch (x86-64 + aarch64) from one source. The heavy SIMD work (JSON, string scan, bulk copy)
+  lives here precisely because this is the only layer that can adapt at run time.
+
+The lesson: for an AOT language aimed at the cloud, "automatic SIMD" is not a single fixed target —
+it is a conservative portable floor in the codegen plus runtime-adaptive SIMD in the library.
 
 ---
 

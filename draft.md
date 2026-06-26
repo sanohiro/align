@@ -85,6 +85,23 @@ alignment
 
 Make it easy to generate code that maps cleanly to modern CPU / GPU / Cache / SIMD / Branch Predictor.
 
+The data-oriented core is built so the *shape* of ordinary code avoids the usual stalls: arrays and
+slices are contiguous, so pipelines (`map` / `where` / `reduce`) walk memory **sequentially** (no
+pointer-chasing, no random jumps), and a `where` / conditional reduction lowers **branchless** (a
+mask + `select`, not a per-element `if`) so hot loops stay vectorizable and don't fight the branch
+predictor.
+
+**Build targets and portability.** The default build targets a **safe, portable, per-architecture
+baseline** — `x86-64-v2` (SSE4.2) for amd64, `armv8-a` (NEON included) for arm64 — so one binary
+runs across a varied, unknown fleet (cloud VMs, containers, feature-masked or migrated hosts).
+Anything more is **opt-in, never the default**: `--target-cpu native` (fastest on the build host,
+non-portable) and higher baselines (`x86-64-v3`/AVX2, …) for a fleet you control. Because
+AOT-generated code is fixed at build time, **wide SIMD for a varied fleet comes from runtime
+CPU-feature dispatch in the library layer** (one binary detects AVX2 / NEON at runtime and falls
+back safely) — not from a fixed high baseline. Heavy SIMD work (JSON / UTF-8 / string scan, bulk
+copy) lives in the library, written once with portable mechanisms (no per-architecture intrinsics),
+covering x86-64 and aarch64. One good portable default; visible opt-in for more.
+
 ---
 
 ## 4. Basic Syntax
@@ -670,7 +687,27 @@ m := scores > 80
 total := scores.sum_where(m)
 ```
 
-A mask is a first-class concept for SIMD / branchless / GPU.
+A mask is a first-class concept for SIMD / branchless / GPU. The pipeline's `where` is the implicit
+form: `xs.where(p).sum()` lowers **branchless** (mask + `select`, a masked reduction), not a
+per-element `if` — so a filtered hot loop stays vectorizable and does not fight the branch predictor.
+
+### Memory Layout (`soa<T>`)
+
+By default a collection is row-major (array-of-structs): `array<User>` stores each `User`
+contiguously. For a large table processed field-wise, declare it column-major
+(struct-of-arrays) with `soa<T>`:
+
+```align
+users: soa<User>
+total := users.where(.active).pay.sum()
+```
+
+`soa<User>` stores one contiguous column per field, so a pipeline that touches only some fields
+streams only those columns — better cache use and clean vectorization. The layout is **chosen
+explicitly by the type** (not inferred behind your back): the choice is visible and performance is
+predictable, while the field-wise lowering under the type is automatic. Crossing a byte-layout
+boundary (FFI, `json`, by-value) materializes to AoS explicitly. Use `array<T>` by default; reach
+for `soa<T>` on large, hot, field-wise-processed data.
 
 ---
 

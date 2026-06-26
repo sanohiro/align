@@ -28,8 +28,24 @@ align_runtime
   task           I/O concurrency (task_group)
   buffer/builder mutable byte buffer
   panic          abort + message
-  intrinsics     memcpy/memset etc., SIMD helpers (remainder handling, etc.)
+  intrinsics     memcpy/memset etc.; SIMD helpers via RUNTIME CPU-feature dispatch
 ```
+
+**SIMD in the library is runtime-dispatched** (`open-questions.md` "Build targets & portability"):
+because the default build targets a portable per-arch baseline, the wide-SIMD speedups (JSON / UTF-8
+/ string scan, bulk copy) come from the *library* detecting the host CPU at run time and falling back
+safely — so one binary uses AVX2 / NEON when present across a varied cloud/Docker fleet.
+
+How the dispatch actually works (important detail): runtime adaptation requires **function
+multi-versioning**, not a single portable function. A SIMD routine is compiled in several variants
+(e.g. `#[target_feature(enable = "avx2")]` and a baseline one) and a thin entry selects among them
+via `is_x86_feature_detected!`. **`std::simd` does not by itself produce a runtime-adaptive binary** —
+it lets us write each variant's body *portably* (one source compiling to SSE/AVX/NEON per the active
+target features), but the per-feature variants + the runtime selector are still explicit. In practice
+the cheapest path is to lean on crates that already do this internally (`memchr` etc.); we add our own
+multi-versioned routine only where no crate fits. Either way **no hand-written per-architecture
+intrinsics**, and x86-64 + aarch64 are covered from one source. (Build lands with the std/runtime
+layer; the policy is fixed.)
 
 `// OPEN:` whether to pin static linking, and how far to depend on libc (`05 §10`). Whether to hit the OS directly (syscalls) or go through libc is a decision shared with std.
 

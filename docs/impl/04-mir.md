@@ -156,7 +156,11 @@ don't fuse sort / group_by / partition (involve whole-collection rearrangement),
 Carry vec/mask in MIR as **first-class** (`draft.md` §9), in a form that codegen can deterministically lower to vector instructions.
 
 ### masks are branchless
-`where`/comparisons are lowered, where possible, not to a branch but to a `mask` + predicated ops (suited to SIMD/GPU).
+`where`/comparisons are lowered not to a per-element branch but to a `mask` + predicated ops
+(suited to SIMD/GPU) — **settled** (`open-questions.md` "SIMD exposure"; `05` §5): `where(p).sum()`
+→ masked reduce, materialization → stream-compaction. No per-element `if` is part of the source
+semantics. *(The current backend still emits a placeholder `Term::Branch` for `where`; the mask
+lowering here is M6.)*
 
 ```align
 m := scores > 80;
