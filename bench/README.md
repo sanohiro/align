@@ -39,3 +39,9 @@ bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
   - `col_sum` (`ps.a.sum()`): **≈8–10× faster** than the AoS field sum (pure bandwidth).
   - `total_pay` (`rs.where(.active).pay.sum()`, the filtered aggregate): **≈3× faster** — the `where`
     lowers branchless (mask + `select`) so it vectorizes; otherwise it is branch-bound and only ties.
+- **But end-to-end JSON→SoA currently LOSES (`bench/json_soa/`, ≈0.6× vs `serde_json`).** The
+  column-layout win above is on the *aggregation*; the realistic `json.decode → soa → aggregate`
+  pipeline is **parse-bound**, and Align's scalar JSON parser (+ a decode-to-AoS-then-transpose pass)
+  is slower than the optimized `serde_json`. The layout win is swamped by the parse both sides pay.
+  So the analytics headline needs **parser** work (SIMD/structural parse; two-pass direct-column
+  fill) before it's real — see `bench/json_soa/README.md` + `docs/open-questions.md`.
