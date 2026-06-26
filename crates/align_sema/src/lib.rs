@@ -1653,6 +1653,8 @@ impl EffectScan {
                 self.parmaps.push((func.clone(), e.span));
                 self.expr(source);
             }
+            // `to_soa` transposes its source array — no stage/reducer functions of its own.
+            ExprKind::ArrayToSoa { source, .. } => self.expr(source),
             ExprKind::ArrayDot { a, b, .. } => {
                 self.expr(a);
                 self.expr(b);
@@ -1867,6 +1869,9 @@ impl<'a> EscapeCheck<'a> {
     fn tracks_region(&self, ty: Ty) -> bool {
         match ty {
             Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => true,
+            // A `soa<Struct>` view borrows its column buffer (arena-allocated by `to_soa`), so it is
+            // region-tracked — it must not outlive the arena that owns the buffer.
+            Ty::Soa(_) => true,
             // A tuple is region-tracked iff any element is (today: a `str` element — a view tied to
             // its source). A tuple of plain scalars is Copy / `Static`, freely returnable.
             Ty::Tuple(id) => self.tuples[id as usize].elems.iter().any(|s| self.tracks_region(scalar_to_ty(*s))),
@@ -1906,7 +1911,10 @@ impl<'a> EscapeCheck<'a> {
             // it. `arena(depth)` is the shortest-lived (most restrictive) region anything allocated
             // at this depth can have, so it conservatively covers an accumulator that instead just
             // forwards `init` or borrows a source element (both outlive `arena(depth)`).
-            ExprKind::ArrayToArray { .. }
+            // `to_soa` bump-allocates the column buffer in the enclosing arena; the returned view
+            // borrows it, so it is arena-regioned and cannot escape (like `to_array`'s buffer).
+            ExprKind::ArrayToSoa { .. }
+            | ExprKind::ArrayToArray { .. }
             | ExprKind::ArrayPartition { .. }
             | ExprKind::ArrayParMap { .. }
             | ExprKind::ArrayScan { .. }
@@ -2235,7 +2243,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.walk(recv, depth);
@@ -2495,7 +2503,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::BuilderNew => {}
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
                 self.expr(i, moved, false, false)
             }
@@ -4791,6 +4799,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "to_array" {
             return self.check_array_to_array(recv, args, span);
         }
+        if method == "to_soa" {
+            return self.check_array_to_soa(recv, args, span);
+        }
         if method == "partition" {
             return self.check_array_partition(recv, args, span);
         }
@@ -5450,6 +5461,61 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::ArrayToArray { source: Box::new(source), stages, elem },
             ty: Ty::DynArray(scalar),
+            span,
+        }
+    }
+
+    /// `arr.to_soa()` — transpose an AoS `array<Struct>` into a column-major `soa<Struct>`. The
+    /// construction primitive that makes `soa<T>` usable in pure Align (it was parameter-only). The
+    /// buffer is arena-bump-allocated, so this requires an `arena {}` and the view is region-tied to
+    /// it (escape is checked like any arena value). First cut: a pure transpose — no `where`/`map`
+    /// stages and the struct's fields must all be primitive scalars (the `soa<T>` field rule).
+    fn check_array_to_soa(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !args.is_empty() {
+            self.diags.error("'to_soa' takes no arguments".to_string(), span);
+        }
+        // A pipeline with no stages: `elem` is the source's whole element type. `to_soa` keeps the
+        // whole struct (it transposes every field), so stages (`where`/`map`/`.field`) are rejected.
+        let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
+            return err;
+        };
+        if !stages.is_empty() {
+            self.diags.error(
+                "'to_soa' is a transpose of the whole struct array — pipeline stages (where/map/.field) before it are not supported yet".to_string(),
+                span,
+            );
+            return err;
+        }
+        let Ty::Struct(id) = elem else {
+            self.diags.error(
+                format!("'to_soa' needs an array of structs, got an array of {}", ty_name(elem)),
+                span,
+            );
+            return err;
+        };
+        // The struct must satisfy the `soa<T>` field rule (all primitive scalars), so each column is
+        // a flat scalar array — the same check `resolve_type` makes for the `soa<Struct>` type.
+        let fields = &self.structs[id as usize].fields;
+        if fields.is_empty() || !fields.iter().all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)) {
+            self.diags.error(
+                format!("'to_soa' needs a non-empty struct of primitive scalar fields (no `str`/owned fields yet), '{}' has other fields", self.structs[id as usize].name),
+                span,
+            );
+            return err;
+        }
+        // The buffer is arena-bump-allocated (a borrowed Copy view, no owned-soa type / per-value
+        // drop yet), so it requires an enclosing `arena {}`.
+        if self.arena_depth == 0 {
+            self.diags.error(
+                "'to_soa' allocates its column buffer in an arena — call it inside an `arena {}`".to_string(),
+                span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ArrayToSoa { source: Box::new(source), struct_id: id },
+            ty: Ty::Soa(id),
             span,
         }
     }
@@ -7011,7 +7077,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::Wait => {}
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArraySortBy { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArraySortBy { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }

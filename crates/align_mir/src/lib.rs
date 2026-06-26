@@ -86,6 +86,11 @@ pub enum Stmt {
     PtrStore(Operand, Operand, Operand),
     /// `slot[index].field <- value` (struct-array element field store).
     StoreElemField(Slot, Operand, u32, Operand),
+    /// Store `value` into column `field` at row `index` of a `soa<Struct>` column-major buffer
+    /// `base` (the [`Rvalue::SoaAlloc`] base pointer; `len` rows). The write counterpart of
+    /// [`Rvalue::IndexColumn`] — codegen reuses its per-column `align_up` offset chain. Used by
+    /// `to_soa` to scatter each AoS element's fields into their columns.
+    StoreColumn { base: Operand, len: Operand, index: Operand, field: u32, struct_id: u32, value: Operand },
     /// End an arena, freeing all its allocations (the operand is the arena handle).
     ArenaEnd(Operand),
     /// Run all deferred tasks of a `task_group` and clear the list (`wait()`). Operand = the
@@ -226,6 +231,11 @@ pub enum Rvalue {
     /// Heap-allocate `count` elements of type `elem` (free-standing owned array, outside any
     /// arena). Yields the element pointer; freed by a later [`Stmt::Drop`].
     HeapAllocBuf { count: Operand, elem: Ty },
+    /// Bump-allocate the **column-major buffer** for a `soa<Struct>` of `len` rows in the arena
+    /// `handle`; yields the buffer base pointer. The total size is the end of the last column —
+    /// codegen walks the same per-column `align_up` offset chain as [`Rvalue::IndexColumn`] from
+    /// `struct_id`'s field sizes (`to_soa`).
+    SoaAlloc { handle: Operand, len: Operand, struct_id: u32 },
     /// Build an owned `array<T>` value `{ ptr, len }` from a buffer pointer and a length.
     MakeDynArray { ptr: Operand, len: Operand },
     /// `chunks(n)`: split the `{ptr,len}` slice `src` (element size `elem`) into length-`n`
@@ -335,7 +345,7 @@ pub enum Term {
 /// typed HIR -> MIR.
 pub fn lower_program(program: &hir::Program) -> Program {
     Program {
-        fns: program.fns.iter().map(|f| lower_fn(f, &program.tuples)).collect(),
+        fns: program.fns.iter().map(|f| lower_fn(f, &program.tuples, &program.structs)).collect(),
         structs: program.structs.clone(),
         enums: program.enums.clone(),
         tuples: program.tuples.clone(),
@@ -366,6 +376,8 @@ struct Builder {
     /// Tuple defs — to tell whether a `Ty::Tuple` slot is a Move tuple (holds an owned element),
     /// which `null_moved_source` must null on move so its exit `Drop` doesn't double-free.
     tuples: Vec<hir::TupleDef>,
+    /// Struct defs — `to_soa` reads each field's type to scatter it into its column.
+    structs: Vec<hir::StructDef>,
 }
 
 impl Builder {
@@ -427,7 +439,7 @@ impl Builder {
     }
 }
 
-fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef]) -> Function {
+fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -> Function {
     let mut b = Builder {
         slots: f.locals.iter().map(|l| l.ty).collect(),
         value_tys: Vec::new(),
@@ -438,6 +450,7 @@ fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef]) -> Function {
         task_groups: Vec::new(),
         drop_locals: f.drop_locals.clone(),
         tuples: tuples.to_vec(),
+        structs: structs.to_vec(),
     };
     let entry = b.new_block();
     b.cur = entry;
@@ -1012,6 +1025,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayToArray { source, stages, elem } => {
             lower_array_collect(b, source, stages, *elem, CollectKind::Collect)
         }
+        hir::ExprKind::ArrayToSoa { source, struct_id } => lower_array_to_soa(b, source, *struct_id),
         hir::ExprKind::ArrayScan { source, stages, func, captures, init, elem } => {
             let init_op = lower_expr(b, init);
             lower_array_collect(b, source, stages, *elem, CollectKind::Scan { func: func.clone(), init: init_op, captures: captures.clone() })
@@ -1918,6 +1932,68 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
         b.push(Stmt::DropValue(tmp));
     }
     Operand::Value(arr)
+}
+
+/// `arr.to_soa()` — transpose an AoS `array<Struct>` source into a column-major `soa<Struct>`
+/// view. One fused loop reads each element and scatters its fields into their columns (the write
+/// counterpart of a soa field scan). The buffer is arena-bump-allocated (sema requires an arena),
+/// and the result `{ ptr, len }` view is region-tied to it. The construction primitive that makes
+/// `soa<T>` usable in pure Align — build once, then a multi-column scan touches only the fields
+/// it reads.
+fn lower_array_to_soa(b: &mut Builder, source: &hir::Expr, struct_id: u32) -> Operand {
+    let handle = *b.arenas.last().expect("to_soa outside an arena (sema-checked)");
+    // The source is a whole-struct array (no stages), so `struct_view`/`slot` address its elements;
+    // `bound` is the row count `len` (a constant for a fixed array, a runtime value otherwise).
+    let SrcSetup { slot, slice_val, bound, struct_view, .. } = setup_source(b, source);
+    let n = bound;
+    let field_tys: Vec<Ty> = b.structs[struct_id as usize].fields.iter().map(|f| f.ty).collect();
+
+    // Allocate the column-major buffer (`len` rows). The element-pointer type is opaque, so the
+    // `Box` scalar is irrelevant — use the first field's.
+    let first_scalar = align_sema::ty_to_scalar(field_tys[0]).expect("soa field is a scalar");
+    let buf = b.fresh_value(Ty::Box(first_scalar));
+    b.push(Stmt::Let(buf, Rvalue::SoaAlloc { handle: Operand::Value(handle), len: n.clone(), struct_id }));
+
+    // for i in 0..len: scatter element i's fields into their columns.
+    let iv = b.new_slot(i64_ty());
+    b.push(Stmt::Store(iv, Operand::Const(Const::Int(0, i64_ty()))));
+    let header = b.new_block();
+    let body = b.new_block();
+    let exit = b.new_block();
+    b.terminate(Term::Goto(header));
+
+    b.cur = header;
+    let i_val = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
+    let cond = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), n.clone())));
+    b.terminate(Term::Branch(Operand::Value(cond), body, exit));
+
+    b.cur = body;
+    let idx = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(idx, Rvalue::Load(iv)));
+    let index = Operand::Value(idx);
+    for (field, fty) in field_tys.iter().enumerate() {
+        let v = lower_field_access(b, struct_view, &slice_val, slot, &index, field as u32, *fty);
+        b.push(Stmt::StoreColumn {
+            base: Operand::Value(buf),
+            len: n.clone(),
+            index: index.clone(),
+            field: field as u32,
+            struct_id,
+            value: Operand::Value(v),
+        });
+    }
+    let inc = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, index.clone(), index_const(1))));
+    b.push(Stmt::Store(iv, Operand::Value(inc)));
+    b.terminate(Term::Goto(header));
+
+    // exit: build the soa `{ ptr, len }` view over the column buffer.
+    b.cur = exit;
+    let soa = b.fresh_value(Ty::Soa(struct_id));
+    b.push(Stmt::Let(soa, Rvalue::MakeDynArray { ptr: Operand::Value(buf), len: n }));
+    Operand::Value(soa)
 }
 
 /// `source.….partition(p)` — one fused loop that splits the surviving scalar elements into two

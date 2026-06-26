@@ -210,6 +210,11 @@ inferred). A lambda may capture enclosing variables by value — with no hidden 
 environment (it compiles like a named function, captures passed as arguments). `where(.active)`
 is shorthand for a one-field lambda.
 
+`array<T>` is row-major (array-of-structs); `soa<T>` is the explicit column-major (struct-of-arrays)
+layout, so a field-wise pipeline streams only the columns it touches (the cache lever that beats an
+AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`, arena-allocated). See
+`draft.md` §9.
+
 ### Strings
 
 ```text

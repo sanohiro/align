@@ -241,14 +241,23 @@ one-pass transpose is a small add-on. The **transpose (column store) is the core
 JSON→SoA is then a thin wiring on top.
 
 **Sequence (each a PR, benchmark-driven):**
-1. **Column store + `to_soa()` transpose primitive.** A codegen store into a soa column
-   (`column_base(field) + index`, the write counterpart of `Rvalue::IndexColumn`; reuse the
-   per-column `align_up` offset chain from the multi-column slice). `to_soa()` on a struct-array
-   source materializes a column-major buffer **arena-allocated** (like `to_array`) and returns a
-   `soa<Struct>` view region-tied to the arena — so no new owned type and no per-value drop (the
-   arena bulk-frees it). Bench: single-pass `arr.to_soa().a.sum()` LOSES (transpose cost), so bench
-   **multi-pass** (`s := arr.to_soa(); s.a.sum() + s.b.sum() + …`) where the transpose amortizes and
-   beats re-reading AoS.
+1. **Column store + `to_soa()` transpose primitive. — DONE (2026-06-27).** `arr.to_soa()` transposes
+   an AoS `array<Struct>` (literal or local) into a column-major `soa<Struct>`. Implemented:
+   `Rvalue::SoaAlloc { handle, len, struct_id }` (arena-bump the column buffer; total size = the
+   per-column `align_up` offset walk to the last column + its `len*size`, buffer aligned to the
+   widest field) and `Stmt::StoreColumn { base, len, index, field, struct_id, value }` (the write
+   counterpart of `Rvalue::IndexColumn`, sharing a new `soa_column_offset` codegen helper). MIR
+   `lower_array_to_soa` runs one fused loop reading each element's fields (`lower_field_access`, AoS)
+   and scattering them into their columns; the result `{ptr,len}` view (reusing `MakeDynArray`) is
+   `Ty::Soa(id)`, **arena-allocated** — so no new owned type and no per-value drop (arena bulk-frees
+   it; `region_of(ArrayToSoa)=arena(depth)`, `tracks_region(Soa)=true`, so escape is checked).
+   Sema `check_array_to_soa` requires an arena, an array-of-primitive-scalar-struct source, and (first
+   cut) no pipeline stages before it. `tests/soa.rs` (+9): build+two-column sum (66), mixed-width
+   alignment (i8+i32 → 42), built-soa→`where(.active).pay.sum()` (15), and the four rejections.
+   **Deferred to a later slice:** a `bench/` runtime-data duel of multi-pass `to_soa` (the harness
+   feeds AoS data + times `s := arr.to_soa(); s.a.sum()+s.b.sum()` vs re-reading AoS) — single-pass
+   `arr.to_soa().a.sum()` LOSES (transpose cost), so the win is the multi-pass amortization, and the
+   bench needs a no-`main` kernel taking an AoS `slice` param (the construction-from-param path).
 2. **`json.decode` → `soa<Struct>`.** Allow the decode target to be `soa<Struct>` (sema), lower as
    decode-AoS-then-`to_soa` (MIR). User syntax `s: soa<User> := json.decode(d)?`. Bench:
    `json.decode(data) → where(.active).score.sum()` vs Rust `serde_json → Vec<User> → filter/map/sum`

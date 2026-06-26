@@ -402,6 +402,13 @@ pub enum ExprKind {
     /// *owned* `array<T>` (MMv2 slice 3: arena-bump-allocated). `elem` is the element
     /// scalar type; the expression `ty` is `DynArray(elem)`.
     ArrayToArray { source: Box<Expr>, stages: Vec<Stage>, elem: crate::Ty },
+    /// `arr.to_soa()` — transpose an AoS struct array (`array<Struct>`) into a column-major
+    /// `soa<Struct>` view, arena-bump-allocated (so it needs an arena; the view is region-tied to
+    /// it and bulk-freed). `struct_id` indexes `Program::structs`; the expression `ty` is
+    /// `Soa(struct_id)`. One fused loop reads each element and scatters its fields into their
+    /// columns. The construction primitive that makes `soa<T>` usable in pure Align (it was
+    /// parameter-only before): build once, then a multi-column scan touches only the fields it reads.
+    ArrayToSoa { source: Box<Expr>, struct_id: u32 },
     /// `source.….partition(p)` — split the surviving (scalar) elements into two owned arrays by
     /// the predicate `func`: those satisfying it, then the rest. The expression `ty` is a tuple
     /// `(array<T>, array<T>)` (`Ty::Tuple`); `elem` is the element scalar. One fused loop fills

@@ -49,6 +49,16 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::PtrStore(ptr, idx, val) => {
                 let _ = writeln!(out, "    {}[{}] <- {}", operand_str(ptr), operand_str(idx), operand_str(val));
             }
+            Stmt::StoreColumn { base, len, index, field, struct_id, value } => {
+                let _ = writeln!(
+                    out,
+                    "    soa#{struct_id}({}, len={}).col{field}[{}] <- {}",
+                    operand_str(base),
+                    operand_str(len),
+                    operand_str(index),
+                    operand_str(value)
+                );
+            }
             Stmt::DropFlagInit(slot) => {
                 let _ = writeln!(out, "    drop_init _{slot}");
             }
@@ -192,6 +202,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::HeapAllocBuf { count, elem } => {
             format!("heap_alloc({} x {})", operand_str(count), crate::ty_name(*elem))
+        }
+        Rvalue::SoaAlloc { handle, len, struct_id } => {
+            format!("soa_alloc({}, {} rows x struct#{struct_id})", operand_str(handle), operand_str(len))
         }
         Rvalue::MakeDynArray { ptr, len } => {
             format!("array({}, {})", operand_str(ptr), operand_str(len))
