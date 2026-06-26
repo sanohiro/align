@@ -1034,12 +1034,13 @@ Using `json.*` / `fs.*` / `io.stdout.write` without the matching `import` is a c
 
 ### User modules (multi-file)
 
-A program spans multiple files. A non-entry file declares its module name and exports with `pub`:
+A program spans multiple files. A non-entry file declares its module name and exports functions and types with `pub`:
 
 ```align
 // geom.align
 module geom
 
+pub Point { x: i64, y: i64 }      // exported type
 pub fn area(w: i64, h: i64) -> i64 = w * h
 fn helper() -> i64 = 1            // private — not visible to importers
 ```
@@ -1049,10 +1050,15 @@ fn helper() -> i64 = 1            // private — not visible to importers
 module main
 import geom
 
-fn main() -> i32 = geom.area(2, 3) as i32
+fn main() -> i32 {
+  p := geom.Point { x: 2, y: 3 }  // an exported type is named qualified
+  return geom.area(p.x, p.y) as i32
+}
 ```
 
-`import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module call is written `geom.area(...)` and reaches only `pub` functions; a bare call resolves within the calling module. Each module has its own function namespace, so two modules may define a function with the same name. (Exporting types across modules is a later slice — types are currently program-global.)
+`import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module reference is written qualified — `geom.area(...)` for a function, `geom.Point` for a type — and reaches only `pub` members; a bare name resolves within the calling module (so an imported type *must* be qualified). Each module has its own function and type namespace, so two modules may define a function or type with the same name.
+
+> Constructing an imported sum type's variant is still written from its own module today (`geom.Color.Red` is a later slice); an exported sum type is otherwise usable across modules — held, returned from a `pub` function, and matched.
 
 ---
 

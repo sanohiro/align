@@ -507,6 +507,65 @@ struct ModuleInfo {
 }
 type ModuleTable = HashMap<String, ModuleInfo>;
 
+/// A type declared in some module: its canonical (codegen / interner) name and whether it is `pub`
+/// (visible to other modules). Types are per-module namespaced like functions.
+#[derive(Clone)]
+struct TypeEntry {
+    canonical: String,
+    is_pub: bool,
+}
+/// module path → (bare type name → entry). Used to resolve a bare type name in its own module and a
+/// qualified `mod.Type` from an importer (with import + `pub` checks).
+type ModTypes = HashMap<String, HashMap<String, TypeEntry>>;
+
+/// Resolve a type-name path to its canonical key, applying module visibility. A single segment is a
+/// type in `cur_module` (or the builtin `Error`); a dotted `mod.Type` must name an imported module
+/// and a `pub` type. `None` (with a diagnostic, unless the single-segment miss is left to the
+/// caller) if it does not resolve. `emit_unknown` controls whether a single-segment miss reports an
+/// error here (callers that still want to try other interpretations pass `false`).
+fn canonical_type_name(
+    path: &ast::Path,
+    cur_module: &str,
+    imports: &std::collections::HashSet<String>,
+    table: &ModTypes,
+    emit_unknown: bool,
+    span: Span,
+    diags: &mut Diagnostics,
+) -> Option<String> {
+    let segs = &path.segments;
+    let bare = segs.last().map(|s| s.name.as_str()).unwrap_or("");
+    if segs.len() <= 1 {
+        // `Error` is the builtin error sum type — visible everywhere, no import.
+        if bare == "Error" {
+            return Some("Error".to_string());
+        }
+        match table.get(cur_module).and_then(|m| m.get(bare)) {
+            Some(e) => Some(e.canonical.clone()),
+            None => {
+                if emit_unknown {
+                    diags.error(format!("unknown type: '{bare}'"), span);
+                }
+                None
+            }
+        }
+    } else {
+        let module = segs[..segs.len() - 1].iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".");
+        if module != cur_module && !imports.contains(&module) {
+            diags.error(format!("module `{module}` is not imported (add `import {module}`)"), span);
+            return None;
+        }
+        let Some(entry) = table.get(&module).and_then(|m| m.get(bare)) else {
+            diags.error(format!("no type `{bare}` in module `{module}`"), span);
+            return None;
+        };
+        if module != cur_module && !entry.is_pub {
+            diags.error(format!("type `{bare}` is private to module `{module}` (mark it `pub` to export it)"), span);
+            return None;
+        }
+        Some(entry.canonical.clone())
+    }
+}
+
 /// Analyze a single file into a typed program (the single-module entry point; tests and the
 /// single-file driver path use this). Multi-file compilation goes through [`check_program`].
 pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
@@ -516,63 +575,53 @@ pub fn check_file(file: &ast::File, diags: &mut Diagnostics) -> Program {
 /// Analyze a set of modules (the entry file plus its transitively-imported user modules) into one
 /// typed program. Errors are pushed to `diags`.
 pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
-    // Pass 0a: assign an id to every struct name (so field/sig types can refer to them
-    // regardless of order).
+    // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
+    // of order). Types are **per-module namespaced** like functions: a non-entry module's type `T`
+    // has canonical name `module$T` (the entry module keeps the bare `T`, so single-file programs
+    // are byte-identical), and two modules may define the same type name. `type_table` records each
+    // module's bare→(canonical, pub?) for name resolution (`canonical_type_name`); a bare name
+    // resolves in its own module, a qualified `mod.T` requires `mod` imported and `T` `pub`.
     let mut struct_ids: HashMap<String, u32> = HashMap::new();
-    let mut struct_decls: Vec<&ast::StructDecl> = Vec::new();
+    let mut struct_decls: Vec<(&str, bool, &ast::StructDecl)> = Vec::new();
     let mut enum_ids: HashMap<String, u32> = HashMap::new();
-    let mut enum_decls: Vec<&ast::EnumDecl> = Vec::new();
+    let mut enum_decls: Vec<(&str, bool, &ast::EnumDecl)> = Vec::new();
     // Generic templates (`Pair<T>` / `Opt<T>`) — kept separate from concrete structs / enums.
-    let mut generic_struct_decls: Vec<&ast::StructDecl> = Vec::new();
-    let mut generic_struct_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut generic_enum_decls: Vec<&ast::EnumDecl> = Vec::new();
-    let mut generic_enum_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Types are flat-global across modules in B1 (no per-module type namespace yet — a later
-    // slice); a type name must be unique program-wide. Functions, by contrast, are module-scoped
-    // (mangled below). Iterate every module's items for type collection.
-    for item in modules.iter().flat_map(|m| m.file.items.iter()) {
-        match item {
-            ast::Item::Struct(s) => {
-                if s.name.name == "Error" {
-                    diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), s.span);
-                }
-                let dup = struct_ids.contains_key(&s.name.name)
-                    || enum_ids.contains_key(&s.name.name)
-                    || generic_struct_names.contains(&s.name.name);
-                if dup {
-                    diags.error(format!("duplicate type declaration: '{}'", s.name.name), s.span);
-                }
-                if s.type_params.is_empty() {
-                    struct_ids.insert(s.name.name.clone(), struct_decls.len() as u32);
-                    struct_decls.push(s);
-                } else {
-                    // A generic struct is a template, monomorphized on demand by `resolve_type`; it
-                    // is not in `struct_ids`/`structs` (its fields carry `Ty::Param`).
-                    generic_struct_names.insert(s.name.name.clone());
-                    generic_struct_decls.push(s);
-                }
+    let mut generic_struct_decls: Vec<(&str, bool, &ast::StructDecl)> = Vec::new();
+    let mut generic_enum_decls: Vec<(&str, bool, &ast::EnumDecl)> = Vec::new();
+    let mut type_table: ModTypes = HashMap::new();
+    for m in modules {
+        // Ensure the module has an entry even if it declares no types (so a bare lookup in it is a
+        // clean miss, not a panic).
+        let tt = type_table.entry(m.path.clone()).or_default();
+        for item in &m.file.items {
+            let (bare, vis, type_params, span) = match item {
+                ast::Item::Struct(s) => (&s.name.name, s.vis, s.type_params.len(), s.span),
+                ast::Item::Enum(e) => (&e.name.name, e.vis, e.type_params.len(), e.span),
+                ast::Item::Fn(_) => continue,
+            };
+            if bare == "Error" {
+                diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), span);
             }
-            ast::Item::Enum(e) => {
-                if e.name.name == "Error" {
-                    diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), e.span);
-                }
-                let dup = struct_ids.contains_key(&e.name.name)
-                    || enum_ids.contains_key(&e.name.name)
-                    || generic_struct_names.contains(&e.name.name)
-                    || generic_enum_names.contains(&e.name.name);
-                if dup {
-                    diags.error(format!("duplicate type declaration: '{}'", e.name.name), e.span);
-                }
-                if e.type_params.is_empty() {
-                    enum_ids.insert(e.name.name.clone(), enum_decls.len() as u32);
-                    enum_decls.push(e);
-                } else {
-                    // A generic sum type is a template, monomorphized on demand by `resolve_type`.
-                    generic_enum_names.insert(e.name.name.clone());
-                    generic_enum_decls.push(e);
-                }
+            if tt.contains_key(bare) {
+                diags.error(format!("duplicate type declaration: '{bare}' in module '{}'", m.path), span);
             }
-            ast::Item::Fn(_) => {}
+            let canonical = mangle_fn(&m.path, m.is_entry, bare);
+            tt.insert(bare.clone(), TypeEntry { canonical: canonical.clone(), is_pub: matches!(vis, ast::Vis::Pub) });
+            match item {
+                ast::Item::Struct(s) if type_params == 0 => {
+                    struct_ids.insert(canonical, struct_decls.len() as u32);
+                    struct_decls.push((m.path.as_str(), m.is_entry, s));
+                }
+                // A generic struct/enum is a template, monomorphized on demand by `resolve_type`; it
+                // is not in `struct_ids`/`structs` (its fields carry `Ty::Param`).
+                ast::Item::Struct(s) => generic_struct_decls.push((m.path.as_str(), m.is_entry, s)),
+                ast::Item::Enum(e) if type_params == 0 => {
+                    enum_ids.insert(canonical, enum_decls.len() as u32);
+                    enum_decls.push((m.path.as_str(), m.is_entry, e));
+                }
+                ast::Item::Enum(e) => generic_enum_decls.push((m.path.as_str(), m.is_entry, e)),
+                ast::Item::Fn(_) => unreachable!(),
+            }
         }
     }
 
@@ -583,12 +632,20 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // Reserve a fixed slot per concrete struct / enum (its `*_ids` index), filled in Pass 0b/0c.
     // Monomorph instances are appended *after* these, so a concrete def's id stays valid as the
     // tables grow.
-    let mut structs: Vec<StructDef> =
-        struct_decls.iter().map(|s| StructDef { name: s.name.name.clone(), fields: Vec::new(), align: None }).collect();
+    let mut structs: Vec<StructDef> = struct_decls
+        .iter()
+        .map(|(m, e, s)| StructDef { name: mangle_fn(m, *e, &s.name.name), fields: Vec::new(), align: None })
+        .collect();
     let mut struct_mono: HashMap<String, u32> = HashMap::new();
-    let mut enums: Vec<hir::EnumDef> =
-        enum_decls.iter().map(|e| hir::EnumDef { name: e.name.name.clone(), variants: Vec::new() }).collect();
+    let mut enums: Vec<hir::EnumDef> = enum_decls
+        .iter()
+        .map(|(m, e, ed)| hir::EnumDef { name: mangle_fn(m, *e, &ed.name.name), variants: Vec::new() })
+        .collect();
     let mut enum_mono: HashMap<String, u32> = HashMap::new();
+    // Resolution context for type-declaration passes (0b/0c, templates): a bare field/payload type
+    // resolves in the declaring module. Cross-module field/payload types (`field: other.Type`) are
+    // deferred to a later slice, so these passes resolve with no imports in scope.
+    let no_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // The canonical builtin `Error` sum type (4b-2): universal categories + a generic `Code(i32)`
     // (variant order must match `ERROR_VARIANT_CODE`). Registered right after the concrete user
@@ -618,8 +675,11 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         let est: HashMap<String, StructTemplate> = HashMap::new();
         let eet: HashMap<String, EnumTemplate> = HashMap::new();
         macro_rules! build_cx {
-            () => {
+            ($module:expr) => {
                 &mut TyCx {
+                    cur_module: $module,
+                    imports: &no_imports,
+                    type_table: &type_table,
                     struct_ids: &struct_ids,
                     enum_ids: &enum_ids,
                     struct_templates: &est,
@@ -633,23 +693,23 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 }
             };
         }
-        for s in &generic_struct_decls {
+        for (module, is_entry, s) in &generic_struct_decls {
             let tparams: Vec<String> = s.type_params.iter().map(|t| t.name.name.clone()).collect();
             let mut fields = Vec::with_capacity(s.fields.len());
             for f in &s.fields {
-                let ty = resolve_type(&f.ty, build_cx!(), &tparams, diags);
+                let ty = resolve_type(&f.ty, build_cx!(module), &tparams, diags);
                 fields.push(hir::FieldDef { name: f.name.name.clone(), ty });
             }
-            struct_templates.insert(s.name.name.clone(), StructTemplate { type_params: tparams, fields });
+            struct_templates.insert(mangle_fn(module, *is_entry, &s.name.name), StructTemplate { type_params: tparams, fields });
         }
-        for e in &generic_enum_decls {
+        for (module, is_entry, e) in &generic_enum_decls {
             let tparams: Vec<String> = e.type_params.iter().map(|t| t.name.name.clone()).collect();
             let mut variants = Vec::with_capacity(e.variants.len());
             let mut field_base = 1u32;
             for v in &e.variants {
                 let mut payload = Vec::with_capacity(v.payload.len());
                 for t in &v.payload {
-                    let ty = resolve_type(t, build_cx!(), &tparams, diags);
+                    let ty = resolve_type(t, build_cx!(module), &tparams, diags);
                     match ty_to_scalar(ty) {
                         Some(s) => payload.push(s),
                         None if ty != Ty::Error => diags.error(
@@ -663,15 +723,19 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 variants.push(hir::EnumVariant { name: v.name.name.clone(), payload, field_base });
                 field_base += n;
             }
-            enum_templates.insert(e.name.name.clone(), EnumTemplate { type_params: tparams, variants });
+            enum_templates.insert(mangle_fn(module, *is_entry, &e.name.name), EnumTemplate { type_params: tparams, variants });
         }
     }
 
     // A fresh `TyCx` borrowing the resolution interners — built per `resolve_type` call so each
-    // borrow is released immediately (the macro keeps the many call sites readable).
+    // borrow is released immediately (the macro keeps the many call sites readable). `$module` is
+    // the module the type is resolved in; `$imports` are the modules it may qualify against.
     macro_rules! tcx {
-        () => {
+        ($module:expr, $imports:expr) => {
             &mut TyCx {
+                cur_module: $module,
+                imports: $imports,
+                type_table: &type_table,
                 struct_ids: &struct_ids,
                 enum_ids: &enum_ids,
                 struct_templates: &struct_templates,
@@ -689,10 +753,10 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // Pass 0b: resolve concrete struct field types (before enum payloads, which may be structs).
     // Each concrete struct fills its reserved slot `i`; monomorphs created while resolving a field
     // append after the reserved slots, so `structs[i]` stays the struct `struct_ids` named.
-    for (i, s) in struct_decls.iter().enumerate() {
+    for (i, (module, _is_entry, s)) in struct_decls.iter().enumerate() {
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
-            let ty = resolve_type(&f.ty, tcx!(), &[], diags);
+            let ty = resolve_type(&f.ty, tcx!(module, &no_imports), &[], diags);
             // Fields are **Copy** only: a primitive scalar (int/float/bool/char) or `str` (see
             // `is_field_ok`). Owned (Move) fields and nested struct/slice/option fields are rejected
             // — a struct is copied by value, so a Move field would double-free.
@@ -707,14 +771,14 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         // `align`: natural alignment today — the `align(N)` surface syntax + custom value
         // arrive at M6 (`open-questions.md`); the field is reserved so that is an additive
         // change at the alignment seam, not a retrofit.
-        structs[i] = StructDef { name: s.name.name.clone(), fields, align: None };
+        structs[i] = StructDef { name: mangle_fn(module, *_is_entry, &s.name.name), fields, align: None };
     }
 
     // Pass 0c: resolve concrete enum variant payloads (structs are now known) into the reserved
     // slots. The enum lowers to a non-union struct `{ i32 tag, <flattened payloads> }`; payloads are
     // primitive scalars (S1b) or a plain-data struct (S2). Monomorph instances of generic sum types
     // append after the reserved slots, so a concrete enum's id stays valid.
-    for (i, e) in enum_decls.iter().enumerate() {
+    for (i, (module, _is_entry, e)) in enum_decls.iter().enumerate() {
         let mut seen = std::collections::HashSet::new();
         let mut variants = Vec::with_capacity(e.variants.len());
         let mut field_base = 1u32;
@@ -724,7 +788,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             }
             let mut payload = Vec::with_capacity(v.payload.len());
             for t in &v.payload {
-                let ty = resolve_type(t, tcx!(), &[], diags);
+                let ty = resolve_type(t, tcx!(module, &no_imports), &[], diags);
                 match ty {
                     Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
                         payload.push(ty_to_scalar(ty).expect("primitive scalar"));
@@ -747,7 +811,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             variants.push(hir::EnumVariant { name: v.name.name.clone(), payload, field_base });
             field_base += n;
         }
-        enums[i] = hir::EnumDef { name: e.name.name.clone(), variants };
+        enums[i] = hir::EnumDef { name: mangle_fn(module, *_is_entry, &e.name.name), variants };
     }
 
     // Every function across all modules, tagged with its module path + whether that is the entry
@@ -810,6 +874,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for &(module, is_entry, f) in &all_fns {
         let mangled = mangle_fn(module, is_entry, &f.name.name);
+        let imports = mod_table.get(module).map(|i| &i.user_imports).unwrap_or(&no_imports);
         // Generic type-parameter names (`fn f<T, U: Ord>`). Reject duplicates and names that collide
         // with a declared type, so `Param` resolution is unambiguous; resolve each builtin bound.
         let tparams: Vec<String> = f.type_params.iter().map(|t| t.name.name.clone()).collect();
@@ -818,7 +883,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             if tparams[..i].contains(&t.name.name) {
                 diags.error(format!("duplicate type parameter '{}'", t.name.name), t.name.span);
             }
-            if struct_ids.contains_key(&t.name.name) || enum_ids.contains_key(&t.name.name) {
+            if type_table.get(module).is_some_and(|m| m.contains_key(&t.name.name)) {
                 diags.error(format!("type parameter '{}' shadows a declared type", t.name.name), t.name.span);
             }
             let bound = match &t.bound {
@@ -837,7 +902,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         }
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
-            params.push(resolve_type(&p.ty, tcx!(), &tparams, diags));
+            params.push(resolve_type(&p.ty, tcx!(module, imports), &tparams, diags));
         }
         // A box across a call boundary would escape its arena, so M3 forbids box
         // parameters and returns (boxes are arena-local). This also closes escape
@@ -852,7 +917,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         }
         let ret = match &f.ret {
             Some(t) => {
-                let r = resolve_type(t, tcx!(), &tparams, diags);
+                let r = resolve_type(t, tcx!(module, imports), &tparams, diags);
                 if matches!(r, Ty::Box(_)) {
                     diags.error(
                         "a box cannot be a function return type (it would escape its arena)".to_string(),
@@ -900,7 +965,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         let tparams = f.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[&mangled].bounds.clone();
         let imported = mod_builtin_imports.get(module).unwrap_or(&empty_imports);
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new(), imported, module.to_string(), &mod_table);
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, Vec::new(), imported, module.to_string(), &mod_table, &type_table, mod_table.get(module).map(|i| &i.user_imports).unwrap_or(&empty_imports));
         let mut checked = cx.check_fn(f);
         checked.name = mangled;
         let lifted = std::mem::take(&mut cx.lifted);
@@ -939,7 +1004,8 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         let tparams = decl.type_params.iter().map(|t| t.name.name.clone()).collect();
         let bounds = sigs[oname.as_str()].bounds.clone();
         let imported = mod_builtin_imports.get(tmpl_module).unwrap_or(&empty_imports);
-        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, imported, tmpl_module.to_string(), &mod_table);
+        let user_imported = mod_table.get(tmpl_module).map(|i| &i.user_imports).unwrap_or(&empty_imports);
+        let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, imported, tmpl_module.to_string(), &mod_table, &type_table, user_imported);
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
         worklist.append(&mut cx.instantiations);
@@ -2211,6 +2277,12 @@ struct Checker<'a, 't> {
     /// The program's module-resolution table (every module's functions + imports), used to map a
     /// bare or `mod.fn` reference to its mangled target and enforce `pub` visibility.
     mods: &'a ModuleTable,
+    /// Every module's type names (bare → canonical + `pub`?), used to resolve a bare type in
+    /// `cur_module` and a qualified `mod.Type` (with import + `pub` checks).
+    type_table: &'a ModTypes,
+    /// The user modules `cur_module` `import`s (distinct from `imports`, which is the builtin
+    /// capability set). A qualified type / call into a user module must name one of these.
+    user_imports: &'a std::collections::HashSet<String>,
 }
 
 /// Captured-variable bookkeeping while lifting a lambda. A reference in the body that misses the
@@ -2248,6 +2320,8 @@ impl<'a, 't> Checker<'a, 't> {
         imports: &'a std::collections::HashSet<String>,
         cur_module: String,
         mods: &'a ModuleTable,
+        type_table: &'a ModTypes,
+        user_imports: &'a std::collections::HashSet<String>,
     ) -> Self {
         Checker {
             diags,
@@ -2255,6 +2329,8 @@ impl<'a, 't> Checker<'a, 't> {
             imports,
             cur_module,
             mods,
+            type_table,
+            user_imports,
             struct_ids,
             enum_ids,
             enums,
@@ -2658,6 +2734,9 @@ impl<'a, 't> Checker<'a, 't> {
 
     fn resolve_type(&mut self, t: &ast::Type) -> Ty {
         let mut cx = TyCx {
+            cur_module: &self.cur_module,
+            imports: self.user_imports,
+            type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
             struct_templates: self.struct_templates,
@@ -3065,14 +3144,16 @@ impl<'a, 't> Checker<'a, 't> {
         // `Type.Variant` — a sum-type value (not field access on a value). The base is a sum-type
         // name, the field is a variant.
         if let ast::ExprKind::Path(p) = &recv.kind {
-            if let Some(name) = single_name(p) {
-                if let Some(tmpl) = self.enum_templates.get(name).cloned() {
+            let bare = single_name(p);
+            if let Some(canonical) = bare.and_then(|n| self.local_type(n)) {
+                let name = bare.unwrap_or("");
+                if let Some(tmpl) = self.enum_templates.get(&canonical).cloned() {
                     // A no-arg variant of a generic sum type (`Opt.None`) — the type parameters must
                     // come from the payload args (here none), so they are only inferable when the
                     // variant carries a payload. Routed through the same path for a clear error.
-                    return self.check_generic_variant_ctor(name, &tmpl, field, &[], expected, span);
+                    return self.check_generic_variant_ctor(&canonical, &tmpl, field, &[], expected, span);
                 }
-                if let Some(&enum_id) = self.enum_ids.get(name) {
+                if let Some(&enum_id) = self.enum_ids.get(&canonical) {
                     return match self.enums[enum_id as usize].variants.iter().position(|v| v.name == field.name) {
                         Some(idx) => {
                             let arity = self.enums[enum_id as usize].variants[idx].payload.len();
@@ -3163,6 +3244,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// Monomorphize a generic struct from the Checker (builds a `TyCx` over its interner fields).
     fn instantiate_struct(&mut self, name: &str, tmpl: &StructTemplate, args: &[Ty], span: Span) -> u32 {
         let mut cx = TyCx {
+            cur_module: &self.cur_module,
+            imports: self.user_imports,
+            type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
             struct_templates: self.struct_templates,
@@ -3177,16 +3261,34 @@ impl<'a, 't> Checker<'a, 't> {
         instantiate_struct(name, tmpl, args, &mut cx, span, self.diags)
     }
 
-    fn check_struct_lit(&mut self, name: &ast::Ident, fields: &[ast::FieldInit], span: Span) -> Expr {
+    /// Resolve a type-name path to its canonical key (a bare name in `cur_module`, or a qualified
+    /// `mod.Type` with import + `pub` checks). Emits a diagnostic on failure.
+    fn canonical_type(&mut self, path: &ast::Path, span: Span) -> Option<String> {
+        canonical_type_name(path, &self.cur_module, self.user_imports, self.type_table, true, span, self.diags)
+    }
+
+    /// Resolve a bare type name to its canonical key in the current module (or the builtin `Error`),
+    /// without emitting an error — for speculative interpretations (e.g. `Name.Variant`) that fall
+    /// through to other meanings when `Name` is not a type here.
+    fn local_type(&self, bare: &str) -> Option<String> {
+        if bare == "Error" {
+            return Some("Error".to_string());
+        }
+        self.type_table.get(&self.cur_module)?.get(bare).map(|e| e.canonical.clone())
+    }
+
+    fn check_struct_lit(&mut self, name: &ast::Path, fields: &[ast::FieldInit], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some(canonical) = self.canonical_type(name, name.span) else { return err };
         // A generic struct literal (`Pair { a: 1, b: 2 }`): infer the type arguments from the field
         // values, then monomorphize. (Type arguments are not written at the literal — same as calls.)
-        if let Some(tmpl) = self.struct_templates.get(&name.name).cloned() {
-            return self.check_generic_struct_lit(&name.name, &tmpl, fields, span);
+        if let Some(tmpl) = self.struct_templates.get(&canonical).cloned() {
+            return self.check_generic_struct_lit(&canonical, &tmpl, fields, span);
         }
-        let Some(&id) = self.struct_ids.get(&name.name) else {
-            self.diags
-                .error(format!("undefined type: '{}'", name.name), name.span);
-            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some(&id) = self.struct_ids.get(&canonical) else {
+            let bare = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+            self.diags.error(format!("'{bare}' is not a struct"), name.span);
+            return err;
         };
         let layout: Vec<(String, Ty)> = self.structs[id as usize]
             .fields
@@ -3629,12 +3731,12 @@ impl<'a, 't> Checker<'a, 't> {
         // `Type.Variant(args)` — constructing a sum-type value with a payload.
         if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
             if let ast::ExprKind::Path(p) = &recv.kind {
-                if let Some(name) = single_name(p) {
-                    if let Some(&enum_id) = self.enum_ids.get(name) {
+                if let Some(canonical) = single_name(p).and_then(|n| self.local_type(n)) {
+                    if let Some(&enum_id) = self.enum_ids.get(&canonical) {
                         return self.check_variant_ctor(enum_id, field, args, expected, span);
                     }
-                    if let Some(tmpl) = self.enum_templates.get(name).cloned() {
-                        return self.check_generic_variant_ctor(name, &tmpl, field, args, expected, span);
+                    if let Some(tmpl) = self.enum_templates.get(&canonical).cloned() {
+                        return self.check_generic_variant_ctor(&canonical, &tmpl, field, args, expected, span);
                     }
                 }
             }
@@ -6004,6 +6106,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// Monomorphize a generic sum type from the Checker (builds a `TyCx` over its interner fields).
     fn instantiate_enum(&mut self, name: &str, tmpl: &EnumTemplate, args: &[Ty], span: Span) -> u32 {
         let mut cx = TyCx {
+            cur_module: &self.cur_module,
+            imports: self.user_imports,
+            type_table: self.type_table,
             struct_ids: self.struct_ids,
             enum_ids: self.enum_ids,
             struct_templates: self.struct_templates,
@@ -6701,6 +6806,12 @@ struct EnumTemplate {
 /// struct / enum tables (grown with monomorph instances), the generic templates + their monomorph
 /// caches, and the tuple / `Ty::Fn` interners.
 struct TyCx<'a> {
+    /// The module whose body is being resolved — a bare type name resolves here.
+    cur_module: &'a str,
+    /// The user modules `cur_module` imports — a qualified `mod.Type` must name one (or `cur_module`).
+    imports: &'a std::collections::HashSet<String>,
+    /// Every module's bare→(canonical, pub?) type names, for qualified-type resolution.
+    type_table: &'a ModTypes,
     struct_ids: &'a HashMap<String, u32>,
     enum_ids: &'a HashMap<String, u32>,
     /// Generic struct templates, by name (not in `structs` — they carry `Param` fields).
@@ -6779,9 +6890,17 @@ fn resolve_type(
         }
     };
     let name = path.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+    // A qualified type `mod.Type` (or `a.b.Type`) is always a user type — never a builtin keyword or
+    // a generic parameter. Resolve it via the type table (import + `pub` checked) directly.
+    if path.segments.len() > 1 {
+        return match canonical_type_name(path, cx.cur_module, cx.imports, cx.type_table, true, span, diags) {
+            Some(canonical) => resolve_user_type(&canonical, args, cx, type_params, span, diags),
+            None => Ty::Error,
+        };
+    }
     // A generic type parameter (`fn f<T>` → `T`): a bare name (no type arguments) matching a
     // declared parameter resolves to `Ty::Param(i)`.
-    if args.is_empty() && path.segments.len() == 1 {
+    if args.is_empty() {
         if let Some(i) = type_params.iter().position(|p| p == name) {
             return Ty::Param(i as u32);
         }
@@ -6894,34 +7013,53 @@ fn resolve_type(
             }
         }
         _ => {
-            // A generic struct / sum type used with type arguments — `Pair<i32>` / `Opt<i32>` —
-            // monomorphizes on demand: substitute its template and intern a concrete def (deduped).
-            if let Some(tmpl) = cx.struct_templates.get(name).cloned() {
-                return match resolve_generic_args(name, "struct", args, tmpl.type_params.len(), cx, type_params, span, diags) {
-                    Some(arg_tys) => Ty::Struct(instantiate_struct(name, &tmpl, &arg_tys, cx, span, diags)),
-                    None => Ty::Error,
-                };
+            // A builtin sized integer (`i8`..`u64`) wins over any user type of the same name.
+            if let Some(it) = parse_int_name(name) {
+                return Ty::Int(it);
             }
-            if let Some(tmpl) = cx.enum_templates.get(name).cloned() {
-                return match resolve_generic_args(name, "sum type", args, tmpl.type_params.len(), cx, type_params, span, diags) {
-                    Some(arg_tys) => Ty::Enum(instantiate_enum(name, &tmpl, &arg_tys, cx, span, diags)),
-                    None => Ty::Error,
-                };
-            }
-            match parse_int_name(name) {
-                Some(it) => Ty::Int(it),
-                None => match cx.struct_ids.get(name) {
-                    Some(&id) => Ty::Struct(id),
-                    None => match cx.enum_ids.get(name) {
-                        Some(&id) => Ty::Enum(id),
-                        None => {
-                            diags.error(format!("unknown type: '{name}'"), span);
-                            Ty::Error
-                        }
-                    },
-                },
+            // Otherwise a user type in the current module (a bare name resolves there). The canonical
+            // key handles per-module namespacing; `resolve_user_type` dispatches to struct / enum /
+            // generic template.
+            match canonical_type_name(path, cx.cur_module, cx.imports, cx.type_table, true, span, diags) {
+                Some(canonical) => resolve_user_type(&canonical, args, cx, type_params, span, diags),
+                None => Ty::Error,
             }
         }
+    }
+}
+
+/// Resolve a user type by its canonical (namespaced) key into a `Ty`. A generic template
+/// (`Pair<T>` / `Opt<T>`) used with type arguments monomorphizes on demand (substitute + intern a
+/// concrete def, deduped); a concrete struct / sum type resolves to its reserved id.
+fn resolve_user_type(
+    canonical: &str,
+    args: &[ast::Type],
+    cx: &mut TyCx,
+    type_params: &[String],
+    span: Span,
+    diags: &mut Diagnostics,
+) -> Ty {
+    if let Some(tmpl) = cx.struct_templates.get(canonical).cloned() {
+        return match resolve_generic_args(canonical, "struct", args, tmpl.type_params.len(), cx, type_params, span, diags) {
+            Some(arg_tys) => Ty::Struct(instantiate_struct(canonical, &tmpl, &arg_tys, cx, span, diags)),
+            None => Ty::Error,
+        };
+    }
+    if let Some(tmpl) = cx.enum_templates.get(canonical).cloned() {
+        return match resolve_generic_args(canonical, "sum type", args, tmpl.type_params.len(), cx, type_params, span, diags) {
+            Some(arg_tys) => Ty::Enum(instantiate_enum(canonical, &tmpl, &arg_tys, cx, span, diags)),
+            None => Ty::Error,
+        };
+    }
+    match cx.struct_ids.get(canonical) {
+        Some(&id) => Ty::Struct(id),
+        None => match cx.enum_ids.get(canonical) {
+            Some(&id) => Ty::Enum(id),
+            None => {
+                diags.error(format!("unknown type: '{canonical}'"), span);
+                Ty::Error
+            }
+        },
     }
 }
 

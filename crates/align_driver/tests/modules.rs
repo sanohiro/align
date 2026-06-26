@@ -1,7 +1,8 @@
-//! Multi-file user modules (`draft.md` §17, module-system slice B1). User modules resolve by
-//! filename convention: `import geom` → `geom.align` in the entry file's directory, which must
-//! declare `module geom`. Cross-module calls are written `geom.fn(...)` and reach only `pub`
-//! functions; each module has its own function namespace (two modules may share a name).
+//! Multi-file user modules (`draft.md` §17). User modules resolve by filename convention:
+//! `import geom` → `geom.align` in the entry file's directory (nested `import a.b` → `a/b.align`),
+//! which must declare `module geom`. Cross-module calls are written `geom.fn(...)` and an exported
+//! type is named `geom.Point`; both reach only `pub` members. Each module has its own function and
+//! type namespace, so two modules may share a name.
 
 mod common;
 use common::*;
@@ -139,6 +140,99 @@ fn a_local_variable_shadows_a_module_of_the_same_name() {
         "main.align",
     );
     assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn cross_module_struct_type_is_qualified() {
+    if !backend_available() {
+        return;
+    }
+    // A `pub` struct in `geom` is constructed + read in `main` via the qualified `geom.Point`.
+    let geom = "module geom\npub Point { x: i64, y: i64 }\n";
+    let main = concat!(
+        "module main\n",
+        "import geom\n",
+        "fn main() -> i32 {\n",
+        "  p := geom.Point { x: 3, y: 4 }\n",
+        "  return (p.x + p.y) as i32\n", // 7
+        "}\n",
+    );
+    let out = build_and_run_multi(
+        "mod-struct",
+        &[("geom.align", geom), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn a_private_struct_is_not_exportable() {
+    // A non-`pub` struct is not visible across modules even when qualified.
+    let geom = "module geom\nPoint { x: i64, y: i64 }\n";
+    let main = "module main\nimport geom\nfn main() -> i32 {\n  p := geom.Point { x: 1, y: 2 }\n  return p.x as i32\n}\n";
+    assert!(check_multi_errs("mod-struct-priv", &[("geom.align", geom), ("main.align", main)], "main.align"));
+}
+
+#[test]
+fn a_qualified_type_requires_importing_its_module() {
+    // `geom.Point` needs `import geom`.
+    let geom = "module geom\npub Point { x: i64, y: i64 }\n";
+    let main = "module main\nfn main() -> i32 {\n  p := geom.Point { x: 1, y: 2 }\n  return p.x as i32\n}\n";
+    assert!(check_multi_errs("mod-struct-noimport", &[("geom.align", geom), ("main.align", main)], "main.align"));
+}
+
+#[test]
+fn an_imported_type_must_be_qualified() {
+    // A bare `Point` does not name a type in `main` (it lives in `geom`); it must be `geom.Point`.
+    let geom = "module geom\npub Point { x: i64, y: i64 }\n";
+    let main = "module main\nimport geom\nfn main() -> i32 {\n  p := Point { x: 1, y: 2 }\n  return p.x as i32\n}\n";
+    assert!(check_multi_errs("mod-struct-bare", &[("geom.align", geom), ("main.align", main)], "main.align"));
+}
+
+#[test]
+fn same_struct_name_in_two_modules_does_not_collide() {
+    if !backend_available() {
+        return;
+    }
+    // Each module defines its own `Point`; per-module namespacing keeps them distinct.
+    let geom = "module geom\npub Point { x: i64, y: i64 }\n";
+    let phys = "module phys\npub Point { mass: i64, vel: i64 }\n";
+    let main = concat!(
+        "module main\n",
+        "import geom\n",
+        "import phys\n",
+        "fn main() -> i32 {\n",
+        "  a := geom.Point { x: 3, y: 4 }\n",
+        "  b := phys.Point { mass: 10, vel: 20 }\n",
+        "  return (a.x + b.mass) as i32\n", // 3 + 10 = 13
+        "}\n",
+    );
+    let out = build_and_run_multi(
+        "mod-struct-dup",
+        &[("geom.align", geom), ("phys.align", phys), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(13));
+}
+
+#[test]
+fn an_enum_in_a_nonentry_module_constructs_and_matches() {
+    if !backend_available() {
+        return;
+    }
+    // A sum type declared + constructed + matched entirely inside a non-entry module: per-module
+    // type namespacing must resolve the bare `Dir.North` against `nav`'s own canonical key.
+    let nav = concat!(
+        "module nav\n",
+        "Dir { North, South }\n",
+        "pub fn step() -> i64 {\n",
+        "  d := Dir.North\n",
+        "  return match d { North => 1, South => 2 }\n",
+        "}\n",
+    );
+    let main = "module main\nimport nav\nfn main() -> i32 = nav.step() as i32\n";
+    let out = build_and_run_multi("mod-enum", &[("nav.align", nav), ("main.align", main)], "main.align");
+    assert_eq!(out.status.code(), Some(1));
 }
 
 #[test]

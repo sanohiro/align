@@ -275,10 +275,11 @@ pub enum ExprKind {
         els: Option<Box<Expr>>,
     },
     Block(Block),
-    /// `Name { field: value, ... }` — a struct value literal. Field access (`base.field`)
-    /// is parsed as a [`Path`] and resolved in sema.
+    /// `Name { field: value, ... }` — a struct value literal. `name` is a path so an imported
+    /// type can be qualified (`geom.Point { ... }`); a single segment is a local type. Field
+    /// access (`base.field`) is parsed as a [`Path`] and resolved in sema.
     StructLit {
-        name: Ident,
+        name: Path,
         fields: Vec<FieldInit>,
     },
     /// `opt else fallback` — Option unwrap. `Some(x)` yields `x`; `None` evaluates
