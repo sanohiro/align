@@ -27,3 +27,7 @@ target
 
 # Local scratch / proposal drafts — not tracked
 /work
+
+# bench build artifacts
+bench/kernels.o
+bench/harness
