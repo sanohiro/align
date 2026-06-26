@@ -4065,11 +4065,22 @@ impl<'a, 't> Checker<'a, 't> {
         // `mod.fn(...)` / `a.b.fn(...)` — a cross-module call into an imported user module. The
         // receiver is a pure dotted name (`geom` or `util.math`); resolved + visibility-checked here.
         // `Ok(None)` (not an imported user module) falls through to the value-method dispatch below.
-        if let Some(modpath) = flatten_module_path(recv) {
-            match self.resolve_qualified_fn(&modpath, method, span) {
-                Ok(Some(mangled)) => return self.check_named_call(mangled, args, expected, span),
-                Ok(None) => {}
-                Err(()) => return err,
+        // A local/captured variable shadows a module of the same name: if the leftmost segment names
+        // an in-scope value, this is value-method dispatch (`box.get()`), not a cross-module call.
+        let leftmost_is_local = leftmost_segment(recv).is_some_and(|leftmost| {
+            self.lookup(leftmost).is_some()
+                || self.capture.as_ref().is_some_and(|cap| {
+                    cap.captured.iter().any(|(n, _, _)| n == leftmost)
+                        || cap.enclosing.iter().any(|(n, _, _)| n == leftmost)
+                })
+        });
+        if !leftmost_is_local {
+            if let Some(modpath) = flatten_module_path(recv) {
+                match self.resolve_qualified_fn(&modpath, method, span) {
+                    Ok(Some(mangled)) => return self.check_named_call(mangled, args, expected, span),
+                    Ok(None) => {}
+                    Err(()) => return err,
+                }
             }
         }
         // Explicit-overflow integer arithmetic (`core.math`): `x.{wrapping,saturating,checked}_{add,sub,mul}(y)`.
@@ -6434,10 +6445,40 @@ fn single_name(p: &ast::Path) -> Option<&str> {
 /// Flatten a receiver that is a pure dotted name into a module path string: `geom` → `"geom"`,
 /// `util.math` → `"util.math"` (a `Path` or a chain of field accesses over idents). `None` if the
 /// receiver is anything else (a call result, an index, …), so a value-method receiver never matches.
+/// Builds the path in a single allocation rather than one per field-access level.
 fn flatten_module_path(e: &ast::Expr) -> Option<String> {
+    let mut path = String::new();
+    flatten_module_path_into(e, &mut path).then_some(path)
+}
+
+fn flatten_module_path_into(e: &ast::Expr, out: &mut String) -> bool {
     match &e.kind {
-        ast::ExprKind::Path(p) => Some(p.segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".")),
-        ast::ExprKind::FieldAccess { recv, field } => Some(format!("{}.{}", flatten_module_path(recv)?, field.name)),
+        ast::ExprKind::Path(p) => {
+            for (i, s) in p.segments.iter().enumerate() {
+                if i > 0 {
+                    out.push('.');
+                }
+                out.push_str(&s.name);
+            }
+            true
+        }
+        ast::ExprKind::FieldAccess { recv, field } => {
+            flatten_module_path_into(recv, out) && {
+                out.push('.');
+                out.push_str(&field.name);
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The leftmost identifier of a dotted receiver (`util.math.cube` → `"util"`); `None` if the
+/// receiver root is not a plain name. Used to let an in-scope local shadow a module of that name.
+fn leftmost_segment(e: &ast::Expr) -> Option<&str> {
+    match &e.kind {
+        ast::ExprKind::Path(p) => p.segments.first().map(|s| s.name.as_str()),
+        ast::ExprKind::FieldAccess { recv, .. } => leftmost_segment(recv),
         _ => None,
     }
 }

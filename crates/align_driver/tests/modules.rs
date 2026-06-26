@@ -115,6 +115,33 @@ fn nested_module_wrong_declaration_is_rejected() {
 }
 
 #[test]
+fn a_local_variable_shadows_a_module_of_the_same_name() {
+    if !backend_available() {
+        return;
+    }
+    // A local box named `geom` must shadow the imported module `geom`: `geom.get()` is the box
+    // method, not a (nonexistent) cross-module call. Without the shadowing check, module-path
+    // resolution would intercept `geom.get()` and reject it.
+    let geom = "module geom\npub fn square(x: i64) -> i64 = x * x\n";
+    let main = concat!(
+        "module main\n",
+        "import geom\n",
+        "fn main() -> i32 {\n",
+        "  arena {\n",
+        "    geom := heap.new(7)\n",
+        "    return geom.get() as i32\n",
+        "  }\n",
+        "}\n",
+    );
+    let out = build_and_run_multi(
+        "mod-shadow",
+        &[("geom.align", geom), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn a_module_using_a_builtin_must_import_it() {
     // The capability rule applies per file: `geom` uses `json` but does not import `core.json`.
     let geom = concat!(
