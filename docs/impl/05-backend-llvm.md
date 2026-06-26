@@ -68,8 +68,15 @@ Construction is `.to_soa()`: `Rvalue::SoaAlloc` arena-bump-allocates the buffer 
 offset walk to the last column + its `len*size`, aligned to the widest field), then a fused loop
 scatters each AoS element's fields into their columns (`StoreColumn`), yielding the `{ptr,len}` view.
 `s: soa<T> := json.decode(d)?` reuses this: decode to a temporary AoS (the array length is unknown
-until parsed), `transpose_to_soa`, then free the AoS temp. Known-schema field-skip decode (parse only
-the used columns) and `str`/owned columns are later slices.
+until parsed), `transpose_to_soa`, then free the AoS temp. `str`/owned columns are a later slice.
+
+JSON field dispatch is O(1): codegen bakes a **compile-time perfect-hash table** from the (known)
+field names (`build_phf` finds a collision-free FNV-1a seed + power-of-two size; emits a `[i32]`
+slot→index global beside the descriptor table), and the runtime hashes each key to a slot + one
+confirming name compare instead of a linear scan. `phf_len = 0` (empty/1-field, or no table found)
+falls back to the scan, so it is a pure speedup. The two hashes are pinned by paired tests so they
+can't drift. (Known-schema field-skip decode is deferred — the perf is already had by declaring a
+narrow struct, since unknown keys are skipped; see `open-questions.md`.)
 
 ---
 

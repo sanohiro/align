@@ -312,3 +312,22 @@ fn json_decode_into_soa_propagates_a_parse_error() {
     assert_ne!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
 }
+
+#[test]
+fn json_decode_resolves_fields_via_perfect_hash() {
+    if !backend_available() {
+        return;
+    }
+    // A 4-field struct triggers the compile-time perfect-hash field dispatch. Unknown keys
+    // (`junk`/`extra`) are skipped, and field order varies between objects — the hash lookup must
+    // resolve each by name regardless. score=30+12=42, age=7+8=15, rank=2+3=5.
+    let out = build_and_run(
+        "soa-json-phf",
+        concat!(
+            "import core.json\n",
+            "Rec { id: i64, score: i32, age: i32, rank: i32 }\n",
+            "fn main() -> Result<(), Error> {\n  arena {\n    s: soa<Rec> := json.decode(\"[{\\\"id\\\":1,\\\"junk\\\":9,\\\"score\\\":30,\\\"age\\\":7,\\\"rank\\\":2},{\\\"rank\\\":3,\\\"id\\\":2,\\\"score\\\":12,\\\"extra\\\":0,\\\"age\\\":8}]\")?\n    print(s.score.sum())\n    print(s.age.sum())\n    print(s.rank.sum())\n  }\n  return Ok(())\n}\n",
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n15\n5\n");
+}
