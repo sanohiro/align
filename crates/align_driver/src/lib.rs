@@ -114,12 +114,12 @@ pub fn backend_available() -> bool {
 /// Write MIR out to an object file (codegen). `target` selects the CPU baseline (portable default
 /// vs. host-`native`).
 pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget) -> Result<(), String> {
-    align_codegen_llvm::emit_object(mir, obj, target).map_err(|e| e.to_string())
+    align_codegen_llvm::emit_object(mir, obj, &target).map_err(|e| e.to_string())
 }
 
 /// MIR to LLVM IR text (`alignc emit-llvm`).
 pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget) -> Result<String, String> {
-    align_codegen_llvm::emit_llvm_ir(mir, target).map_err(|e| e.to_string())
+    align_codegen_llvm::emit_llvm_ir(mir, &target).map_err(|e| e.to_string())
 }
 
 /// Link an object into an executable. Uses the system C compiler (`cc`); crt0 calls

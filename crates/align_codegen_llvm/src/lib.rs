@@ -53,7 +53,7 @@ impl std::fmt::Display for CodegenError {
 /// Which CPU the generated code targets. Align builds for the *cloud/container* reality — build once,
 /// run on a varied fleet — so the default is a conservative, portable per-architecture baseline; a
 /// host-specific build is opt-in (`draft.md` §3.4, `open-questions.md` "Build targets & portability").
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum BuildTarget {
     /// A safe, portable per-architecture baseline (the default): `x86-64-v2` on amd64 (≈2010+, no
     /// AVX), the generic `armv8-a` baseline on arm64. One binary runs across a mixed Intel / AMD /
@@ -63,11 +63,15 @@ pub enum BuildTarget {
     /// The build host's exact CPU + features (`--target-cpu native`): fastest on this machine, but
     /// the binary may `SIGILL` on a host with fewer features — opt-in, never for distribution.
     Native,
+    /// An explicit LLVM CPU name (`--target-cpu x86-64-v3`): a portable performance tier you pick
+    /// for a fleet you control (`x86-64-v3` = AVX2/FMA/BMI2, runs on any such host — the recommended
+    /// server/container "fast" build). Features are derived from the CPU name.
+    Cpu(String),
 }
 
 /// Build the `TargetMachine` for `target` — the one place that picks the CPU / feature string, so
 /// the data-layout machine (`build_module`) and the emission machine (`write_object`) always agree.
-fn create_target_machine(target: BuildTarget) -> Result<TargetMachine, CodegenError> {
+fn create_target_machine(target: &BuildTarget) -> Result<TargetMachine, CodegenError> {
     Target::initialize_native(&InitializationConfig::default())
         .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
     let triple = TargetMachine::get_default_triple();
@@ -78,6 +82,7 @@ fn create_target_machine(target: BuildTarget) -> Result<TargetMachine, CodegenEr
             TargetMachine::get_host_cpu_name().to_string(),
             TargetMachine::get_host_cpu_features().to_string(),
         ),
+        BuildTarget::Cpu(name) => (name.clone(), String::new()),
         BuildTarget::Baseline => {
             let ts = triple.as_str().to_string_lossy().to_ascii_lowercase();
             // Conservative per-arch floor: bump amd64 to x86-64-v2 (still pre-AVX, so cloud-safe);
@@ -102,7 +107,7 @@ fn create_target_machine(target: BuildTarget) -> Result<TargetMachine, CodegenEr
 }
 
 /// Write the program as an object file.
-pub fn emit_object(program: &Program, out: &Path, target: BuildTarget) -> Result<(), CodegenError> {
+pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
     build_module(&ctx, &module, program, target)?;
@@ -110,7 +115,7 @@ pub fn emit_object(program: &Program, out: &Path, target: BuildTarget) -> Result
 }
 
 /// Render the program as textual LLVM IR (`alignc emit-llvm`).
-pub fn emit_llvm_ir(program: &Program, target: BuildTarget) -> Result<String, CodegenError> {
+pub fn emit_llvm_ir(program: &Program, target: &BuildTarget) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
     build_module(&ctx, &module, program, target)?;
@@ -121,7 +126,7 @@ fn build_module<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
     program: &Program,
-    target: BuildTarget,
+    target: &BuildTarget,
 ) -> Result<(), CodegenError> {
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -2835,7 +2840,7 @@ fn pred(signed: bool, c: Cmp) -> IntPredicate {
     }
 }
 
-fn write_object(module: &Module, out: &Path, target: BuildTarget) -> Result<(), CodegenError> {
+fn write_object(module: &Module, out: &Path, target: &BuildTarget) -> Result<(), CodegenError> {
     let tm = create_target_machine(target)?;
 
     // Run the LLVM middle-end optimization pipeline (`-O2`) before emitting. Without this, only the
@@ -2866,7 +2871,7 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
-        emit_llvm_ir(&lower_program(&hir), BuildTarget::Baseline).unwrap()
+        emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline).unwrap()
     }
 
     #[test]

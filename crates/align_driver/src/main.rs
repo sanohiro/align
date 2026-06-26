@@ -45,13 +45,12 @@ fn main() -> ExitCode {
 /// Pull `--target-cpu <baseline|native>` (or `--target-cpu=…`) out of `args`, returning the chosen
 /// target and the remaining (positional) arguments. Default = the portable `Baseline`.
 fn parse_target(args: &[String]) -> (BuildTarget, Vec<String>) {
+    // `baseline` / `native` are keywords; anything else is passed to LLVM as a CPU name
+    // (`x86-64-v3`, `znver3`, …) — the portable-performance tier for a fleet you control.
     let value = |v: &str| match v {
         "native" => BuildTarget::Native,
         "baseline" => BuildTarget::Baseline,
-        other => {
-            eprintln!("alignc: unknown --target-cpu '{other}' (expected `baseline` or `native`); using baseline");
-            BuildTarget::Baseline
-        }
+        other => BuildTarget::Cpu(other.to_string()),
     };
     let mut target = BuildTarget::Baseline;
     let mut rest = Vec::new();
@@ -87,7 +86,8 @@ fn usage() {
            build      build an executable\n  \
            run        build and run (returns the exit code)\n  \
          \n\
-         --target-cpu  baseline (default; portable per-arch floor) or native (this host's CPU)"
+         --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
+                       or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)"
     );
 }
 
