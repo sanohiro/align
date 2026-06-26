@@ -83,6 +83,12 @@ narrow struct, since unknown keys are skipped; see `open-questions.md`.)
 ## 3. Functions, CFG, cold path
 
 - MIR `Function` → LLVM function. `Block` → LLVM basic block (nearly one-to-one).
+- Every **Align-generated** function is marked **`nounwind`** (`mark_nounwind`): Align never unwinds
+  (errors are `Result` values; a fatal fault `abort`s — see "Panic / unwinding" in
+  `open-questions.md`), so this is always sound and lets LLVM drop exception edges / unwind tables and
+  inline more aggressively. The external `align_rt_*` declarations are **not** marked (ordinary Rust
+  fns). Pure-function `memory(none)`/`readonly` is *not* emitted — Align's purity is "no I/O effect"
+  and permits allocation, so it doesn't imply LLVM `readonly` (deferred; `open-questions.md`).
 - Terminator correspondence:
 
 ```text

@@ -518,6 +518,7 @@ fn build_module<'c>(
             None => ctx.void_type().fn_type(&params, false),
         };
         let thunk = module.add_function(&format!("{name}$fnval"), thunk_ty, None);
+        mark_nounwind(ctx, thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
@@ -565,6 +566,7 @@ fn build_module<'c>(
             None => ctx.void_type().fn_type(&tparams, false),
         };
         let thunk = module.add_function(&format!("{lifted}$clos"), thunk_ty, None);
+        mark_nounwind(ctx, thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
@@ -744,6 +746,7 @@ fn emit_main_wrapper<'c>(
         i32t.fn_type(&[], false)
     };
     let main = module.add_function("main", main_ty, None);
+    mark_nounwind(ctx, main);
     let builder = ctx.create_builder();
     let entry = ctx.append_basic_block(main, "entry");
     builder.position_at_end(entry);
@@ -1051,7 +1054,21 @@ fn declare_fn<'c>(
     } else {
         map(f.ret).fn_type(&param_types, false)
     };
-    module.add_function(symbol, fn_ty, None)
+    let fv = module.add_function(symbol, fn_ty, None);
+    mark_nounwind(ctx, fv);
+    fv
+}
+
+/// Mark a function `nounwind`: Align functions never unwind — errors are `Result` values and a
+/// fatal fault (`abort`) does not unwind (settled "no unwinding, immediate abort"; codegen emits
+/// plain `call`, never `invoke`). The attribute lets LLVM drop exception edges / unwind tables and
+/// inline more aggressively. Applied only to **Align-generated** functions (program fns, the C
+/// `main` wrapper, fn-value / closure thunks) — never the external `align_rt_*` runtime
+/// declarations, which are ordinary Rust functions and not promised `nounwind` here.
+fn mark_nounwind<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
+    let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("nounwind");
+    let attr = ctx.create_enum_attribute(kind, 0);
+    f.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
 }
 
 struct FnGen<'c, 'a> {
@@ -3065,6 +3082,19 @@ mod tests {
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
         emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline).unwrap()
+    }
+
+    #[test]
+    fn align_functions_are_marked_nounwind() {
+        // Align functions never unwind, so codegen marks them `nounwind` (drops exception edges /
+        // unwind tables, enables more inlining). Every Align-defined function carries it...
+        let out = ir("fn sq(x: i64) -> i64 = x * x\nfn main() -> i32 = sq(7) as i32\n");
+        assert!(out.contains("define i64 @sq(i64 %0) #0"));
+        assert!(out.contains("define i32 @main() #0"));
+        assert!(out.contains("attributes #0 = { nounwind }"));
+        // ...but the external runtime declarations (ordinary Rust fns) are NOT promised nounwind.
+        let out2 = ir("fn main() -> i32 {\n  print(1)\n  return 0\n}\n");
+        assert!(out2.contains("declare void @align_rt_print_i64(i64)\n"));
     }
 
     #[test]

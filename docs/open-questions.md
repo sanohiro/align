@@ -328,21 +328,28 @@ Rust. No residual-overhead cleanup is needed before construction.
 Beyond the JSON→SoA / field-skip thrust (which both external reviews converged on), two orthogonal,
 *cheap* levers that neither external review surfaced — found by reading the codegen + disassembling:
 
-- **★ Emit the LLVM function attributes Align can soundly assert (`nounwind` always; `memory(none)` /
-  `readonly` on pure functions).** Codegen currently emits **zero** such attributes (`grep` =
-  0 in `align_codegen_llvm`). This is the function-level generalization of the out-param `noalias`
-  idea — broader, since it applies to *every* function:
-  - `nounwind` on **all** Align functions — they never unwind (errors are `Result` values; a bounds
-    failure `abort`s, it does not unwind). Lets LLVM drop landing pads / unwind tables and **inline
-    more aggressively**. (Rust only gets this under `panic=abort` or `extern "C"`.)
-  - `memory(none)` (readnone) / `memory(read)` (readonly) on functions Sema's purity pass marks pure
-    — lets LLVM **CSE / loop-invariant-hoist / DCE** pure calls (`f(x)+f(x)` → one call; an invariant
-    pure call hoists out of a loop). Align *infers* purity (`EffectScan`); LLVM only auto-infers it
-    for the simple cases it can see through, so the delta is the complex / non-inlined pure functions.
-  - Cost: emit attributes in `declare_fn` (the purity info already exists). **Cheaper and more
-    orthogonal than JSON→SoA — a good "tighten the foundation" slice.** Measure: a non-inlined pure
-    fn called with loop-invariant args in a hot loop — with the attr the call hoists/vanishes, without
-    it stays (`instructions`/`cycles`). Confidence: medium-high.
+- **Emit the LLVM function attributes Align can soundly assert.** The function-level generalization
+  of the out-param `noalias` idea — broader, since it applies to *every* function.
+  - **`nounwind` on all Align functions — DONE (2026-06-27).** Align functions never unwind (errors
+    are `Result` values; a fatal fault `abort`s, it does not unwind — settled "no unwinding"; codegen
+    emits plain `call`, never `invoke`). `mark_nounwind` (`align_codegen_llvm`) tags every
+    **Align-generated** function — program fns (`declare_fn`), the C `main` wrapper, and the fn-value
+    / closure thunks — but **not** the external `align_rt_*` runtime declarations (ordinary Rust fns,
+    not promised nounwind here). Lets LLVM drop exception edges / unwind tables and inline more
+    aggressively. Verified in IR (`attributes #0 = { nounwind }`); test
+    `align_functions_are_marked_nounwind`.
+  - **`memory(none)` / `readonly` on pure functions — DEFERRED (purity ≠ readonly).** Align's
+    inferred purity (`EffectScan`) means only **"no observable I/O side effect"** — it *explicitly*
+    counts arena/heap allocation, builder use, and reads/writes through args as **pure** (see the
+    `check_parallelism` doc-comment). So a "pure" Align fn may allocate and touch arg-pointed memory →
+    asserting LLVM `readnone`/`readonly` would be **unsound** (LLVM could CSE/DCE a call that really
+    allocates). A sound version needs a *stricter* analysis ("allocation-free + no arg writes, reads
+    only through args" → `readonly`; "scalar args only, no alloc" → `readnone`). Worth it only for
+    non-inlined pure calls with loop-invariant args — pipeline stage fns are inlined by fusion, so the
+    attr is usually moot. Deferred until that stricter analysis exists.
+  - Remaining sound-but-unbuilt: `noalias`/`nonnull`/`dereferenceable`/`align` on pointer args —
+    blocked the same way (`nonnull` is false for an empty `{null,0}` slice; aggressive `noalias` wants
+    the `map_into(out)` write-construct, deferred above).
 - **Compile-time pipeline evaluation = zero-cost lookup tables.** Verified: a pipeline over literal /
   const data **constant-folds entirely** (`[1..16].sum()` → `mov $136`, no loop). So a declarative
   `[...].map(f)` that builds a lookup table (CRC/hash/codec/math LUT) costs **zero at runtime** (a
