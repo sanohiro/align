@@ -249,10 +249,11 @@ impl<'a> Lexer<'a> {
                 while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
                     self.pos += 1;
                 }
-                let text: String = std::str::from_utf8(&self.src[digits_start..self.pos])
-                    .unwrap()
-                    .chars()
-                    .filter(|c| *c != '_')
+                // The eaten run is all ASCII (alphanumeric + `_`), so map bytes to `char` directly.
+                let text: String = self.src[digits_start..self.pos]
+                    .iter()
+                    .filter(|&&b| b != b'_')
+                    .map(|&b| b as char)
                     .collect();
                 if text.is_empty() {
                     diags.error(format!("{name} literal has no digits"), self.span(start, self.pos));
@@ -260,7 +261,7 @@ impl<'a> Lexer<'a> {
                     match i128::from_str_radix(&text, radix) {
                         Ok(v) => self.push(TokKind::Int(v), start),
                         Err(_) => diags.error(
-                            format!("invalid {name} integer literal: '{}'", &self.src[start..self.pos].iter().map(|&b| b as char).collect::<String>()),
+                            format!("invalid {name} integer literal: '{}'", std::str::from_utf8(&self.src[start..self.pos]).unwrap()),
                             self.span(start, self.pos),
                         ),
                     }
