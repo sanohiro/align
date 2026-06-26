@@ -71,8 +71,10 @@ fn main() {
     println!("Align vs idiomatic Rust (same --target-cpu, alternating-min timing):");
     for &(n, rounds) in &[(100_000usize, 2000usize), (1_000_000, 500), (50_000_000, 15)] {
         let data = gen(n);
+        // `black_box` the inputs so the Rust kernel can't be hoisted out of the round loop (the data
+        // is loop-invariant) — both sides must do the full work each call.
         let sl = || Slice { ptr: data.as_ptr(), len: n as i64 };
-        let (a, r) = duel(rounds, || unsafe { sum_sq_pos(sl()) }, || rust_sum_sq_pos(&data));
+        let (a, r) = duel(rounds, || unsafe { sum_sq_pos(black_box(sl())) }, || rust_sum_sq_pos(black_box(&data)));
         report("sum_sq_pos", n, a, r);
     }
 }

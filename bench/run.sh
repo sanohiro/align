@@ -10,8 +10,15 @@ cd "$(dirname "$0")"
 
 mode="${1:-native}"
 case "$mode" in
-  native)   align_tgt="native";   rust_tgt="native" ;;
-  baseline) align_tgt="baseline"; rust_tgt="x86-64-v2" ;;  # amd64 floor; adjust for arm64
+  native) align_tgt="native"; rust_tgt="native" ;;
+  baseline)
+    align_tgt="baseline"
+    # Match alignc's per-arch baseline: x86-64-v2 on amd64, the generic (armv8-a) floor elsewhere.
+    case "$(uname -m)" in
+      x86_64|amd64) rust_tgt="x86-64-v2" ;;
+      *)            rust_tgt="generic" ;;
+    esac
+    ;;
   *) echo "usage: run.sh [baseline|native]" >&2; exit 2 ;;
 esac
 
