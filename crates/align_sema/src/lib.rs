@@ -549,7 +549,13 @@ fn canonical_type_name(
             }
         }
     } else {
-        let module = segs[..segs.len() - 1].iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(".");
+        let mut module = String::new();
+        for (i, s) in segs[..segs.len() - 1].iter().enumerate() {
+            if i > 0 {
+                module.push('.');
+            }
+            module.push_str(&s.name);
+        }
         if module != cur_module && !imports.contains(&module) {
             diags.error(format!("module `{module}` is not imported (add `import {module}`)"), span);
             return None;
@@ -603,7 +609,10 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), span);
             }
             if tt.contains_key(bare) {
+                // Keep the first declaration; ignore this one so it cannot overwrite the valid
+                // `type_table` / `*_ids` entry and cascade into confusing secondary errors.
                 diags.error(format!("duplicate type declaration: '{bare}' in module '{}'", m.path), span);
+                continue;
             }
             let canonical = mangle_fn(&m.path, m.is_entry, bare);
             tt.insert(bare.clone(), TypeEntry { canonical: canonical.clone(), is_pub: matches!(vis, ast::Vis::Pub) });
