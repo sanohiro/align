@@ -1,0 +1,22 @@
+// Benchmark kernel: decode a JSON array of records straight into a column-major `soa<Row>`, then
+// run a filtered column aggregate `where(.active).pay.sum()`. Touches 2 of 4 columns — the
+// analytics workload Align should beat idiomatic Rust (`serde_json` → `Vec<Row>` AoS → filter/sum)
+// on, because Align lands the data column-major and the scan reads only the columns it touches.
+import core.json
+
+Row { active: bool, pay: i64, score: i64, extra: i64 }
+
+fn run(data: str) -> Result<i64, Error> {
+  arena {
+    s: soa<Row> := json.decode(data)?
+    return Ok(s.where(.active).pay.sum())
+  }
+}
+
+// Exported C-ABI entry: returns the aggregate, or -1 on a parse error (so the harness can detect it).
+pub fn agg(data: str) -> i64 {
+  match run(data) {
+    Ok(v) => v,
+    Err(_) => 0 - 1,
+  }
+}

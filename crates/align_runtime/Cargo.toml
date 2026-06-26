@@ -7,5 +7,8 @@ license.workspace = true
 # Thin native runtime linked into generated code (docs/impl/06-runtime-std.md).
 # `lib` keeps the in-tree unit tests; `staticlib` produces libalign_runtime.a, which
 # the driver links into every generated executable (M1: the builtin `print`).
+# `cdylib` produces libalign_runtime.so — used only to link the runtime into a *Rust* binary
+# (the `bench/json_soa` serde harness) over a clean C-ABI boundary: linking the staticlib (which
+# bundles its own std) into another std binary duplicates std symbols, but a cdylib hides its std.
 [lib]
-crate-type = ["lib", "staticlib"]
+crate-type = ["lib", "staticlib", "cdylib"]

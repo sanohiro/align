@@ -268,10 +268,21 @@ JSON→SoA is then a thin wiring on top.
    arena(depth)`); MIR `lower_json_decode_soa` reuses `JsonDecodeStructArray` for the AoS decode then
    the extracted `transpose_to_soa` helper on the Ok edge + `DropValue` the AoS temp. `tests/soa.rs`
    (+6): decode→`age.sum()` (75), decode→`where(.active).pay.sum()` (15), parse-error propagation,
-   and the three rejections. **Bench (deferred, with step 1's duel):** `json.decode(data) →
-   where(.active).score.sum()` vs Rust `serde_json → Vec<User> → filter/map/sum` — the headline win
-   (idiomatic Rust decodes to a `Vec<User>` AoS and deserializes every field; Align reads only the
-   columns the pipeline touches). The cleanest measurement combines this with step 3 (field-skip).
+   and the three rejections. **BENCHED 2026-06-27 (`bench/json_soa/`, vs `serde_json`) — Align
+   currently LOSES ≈0.6× (a critical honest finding).** `json.decode → soa<Row> →
+   where(.active).pay.sum()` (4-field records, 2 read) vs `serde_json → Vec<Row> → filter/sum`:
+   Align 22.6 ms vs Rust 13.8 ms at 100k rows (0.61×), stable across 10k/100k/1M. **The workload is
+   parse-bound and the parser is the bottleneck** — `align_rt_json_decode_struct_array` is a scalar
+   byte-at-a-time parser vs the heavily-optimized `serde_json`, and Align additionally does
+   decode-to-AoS-then-transpose (an extra pass + alloc) where Rust does one `Vec` parse. The SoA
+   column-scan win is real (flat `bench/` `col_sum` ~8–10×) but here it is **swamped by the parse,
+   which both sides pay in full**. **So the json→soa "analytics win" is NOT real yet** — it depends
+   on parser work not done. Path to actually winning: (a) **a SIMD/structural JSON parser** (the
+   dominant lever — runtime CPU-dispatch / simdjson-class; the layout win can't surface until the
+   parse is competitive); (b) **two-pass count-then-direct-column-fill** (Codex's refinement — drop
+   the AoS intermediate + transpose); (c) **field-skip / narrow struct** (don't parse unread columns
+   — already available, cuts parse on both sides). This redirects the analytics thrust toward the
+   PARSER, not more soa surface.
 3. **Known-schema field-skip / projection decode — DEFERRED 2026-06-27 (the perf is already
    available; the remaining delta is ergonomic-only and safety-sensitive).** KEY FINDING (verified
    2026-06-27): the runtime **already skips every JSON field not declared in the target struct**
