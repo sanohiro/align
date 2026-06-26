@@ -162,6 +162,16 @@ fn a_cyclic_constant_is_an_error() {
 }
 
 #[test]
+fn a_reference_to_a_failed_constant_does_not_panic() {
+    // `A` fails to fold (division by zero); `B := -A` references it. Folding `B` must not panic
+    // (the failed `A` resolves to an error sentinel) and must report only the root cause.
+    assert!(check_errs(
+        "const-fail-ref",
+        "A := 1 / 0\nB := -A\nfn main() -> i32 { return B as i32 }\n",
+    ));
+}
+
+#[test]
 fn a_function_and_a_constant_may_not_share_a_name() {
     assert!(check_errs(
         "const-fn-clash",
