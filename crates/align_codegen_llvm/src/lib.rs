@@ -79,7 +79,7 @@ fn create_target_machine(target: BuildTarget) -> Result<TargetMachine, CodegenEr
             TargetMachine::get_host_cpu_features().to_string(),
         ),
         BuildTarget::Baseline => {
-            let ts = triple.as_str().to_string_lossy();
+            let ts = triple.as_str().to_string_lossy().to_ascii_lowercase();
             // Conservative per-arch floor: bump amd64 to x86-64-v2 (still pre-AVX, so cloud-safe);
             // arm64 / anything else uses `generic` (= the architecture baseline, e.g. armv8-a).
             let cpu = if ts.starts_with("x86_64") || ts.starts_with("amd64") {

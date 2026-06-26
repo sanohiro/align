@@ -60,6 +60,8 @@ fn parse_target(args: &[String]) -> (BuildTarget, Vec<String>) {
             if let Some(v) = args.get(i + 1) {
                 target = value(v);
                 i += 1;
+            } else {
+                eprintln!("alignc: missing value for --target-cpu (expected `baseline` or `native`); using baseline");
             }
         } else {
             rest.push(a.clone());
