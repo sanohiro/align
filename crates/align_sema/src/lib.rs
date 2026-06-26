@@ -1214,6 +1214,32 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         }
     }
 
+    // Unused-import lint (warning): an `import` whose module is never referenced in the file. A
+    // builtin (`core.json`) is matched by its `json.*` namespace; a user module by its dotted path.
+    for m in modules {
+        let mut refs = std::collections::HashSet::new();
+        collect_refs(&m.file.items, &mut refs);
+        let used = |needle: &str| refs.iter().any(|r| r == needle || r.starts_with(&format!("{needle}.")));
+        let mut seen = std::collections::HashSet::new();
+        for imp in &m.file.imports {
+            let p = path_str(imp);
+            if !seen.insert(p.clone()) {
+                continue; // a duplicate import already errored above
+            }
+            let namespace = if BUILTIN_MODULES.contains(&p.as_str()) {
+                // The accessed namespace is the prefix after the last `.` (`core.json` → `json`).
+                p.rsplit('.').next().unwrap_or(p.as_str()).to_string()
+            } else if known_modules.contains(p.as_str()) {
+                p.clone() // a user module is referenced by its full dotted path
+            } else {
+                continue; // an unknown import already errored above
+            };
+            if !used(&namespace) {
+                diags.push(align_diag::Diagnostic::warning(format!("unused import `{p}`"), imp.span));
+            }
+        }
+    }
+
     // Pass 0d: collect top-level constants and fold them to compile-time values. A constant is
     // per-module namespaced like a function (`module$NAME` canonical, unmangled in the entry so a
     // single-file program is byte-identical); a bare name resolves in its own module, a qualified
@@ -7041,6 +7067,178 @@ fn single_name(p: &ast::Path) -> Option<&str> {
 
 /// Flatten a receiver that is a pure dotted name into a module path string: `geom` → `"geom"`,
 /// `util.math` → `"util.math"` (a `Path` or a chain of field accesses over idents). `None` if the
+// --- unused-import lint -----------------------------------------------------------------------
+//
+// An `import` is **used** if the module's source contains a qualified reference whose dotted prefix
+// matches it — `geom.area(...)`, `geom.Point { }`, `geom.Color.Red`, `geom.MAX`, or a type
+// `geom.Point` all contribute the prefix `geom` (or `util.math` for a nested module); a builtin
+// `core.json` import is matched by the `json.*` namespace. We collect those prefixes with a syntactic
+// AST walk (independent of the resolution code, so signatures / bodies / consts are covered
+// uniformly), then warn on any import that never appears. The walk over-approximates "used" (a local
+// shadowing a module name still counts), so the lint never *wrongly* fires.
+
+/// The dotted module prefix of a path used as a qualified reference (all segments but the last),
+/// e.g. `geom.Point` → `geom`, `util.math.Foo` → `util.math`. `None` for a single-segment path.
+fn path_module_prefix(p: &ast::Path) -> Option<String> {
+    if p.segments.len() < 2 {
+        return None;
+    }
+    Some(p.segments[..p.segments.len() - 1].iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."))
+}
+
+fn collect_refs(items: &[ast::Item], out: &mut std::collections::HashSet<String>) {
+    for item in items {
+        match item {
+            ast::Item::Fn(f) => {
+                for p in &f.params {
+                    walk_type(&p.ty, out);
+                }
+                if let Some(t) = &f.ret {
+                    walk_type(t, out);
+                }
+                match &f.body {
+                    ast::FnBody::Block(b) => walk_block(b, out),
+                    ast::FnBody::Expr(e) => walk_expr(e, out),
+                }
+            }
+            ast::Item::Struct(s) => {
+                for fd in &s.fields {
+                    walk_type(&fd.ty, out);
+                }
+            }
+            ast::Item::Enum(e) => {
+                for v in &e.variants {
+                    for t in &v.payload {
+                        walk_type(t, out);
+                    }
+                }
+            }
+            ast::Item::Const(c) => {
+                if let Some(t) = &c.ty {
+                    walk_type(t, out);
+                }
+                walk_expr(&c.value, out);
+            }
+        }
+    }
+}
+
+fn walk_type(t: &ast::Type, out: &mut std::collections::HashSet<String>) {
+    match t {
+        ast::Type::Named { path, args, .. } => {
+            if let Some(prefix) = path_module_prefix(path) {
+                out.insert(prefix);
+            }
+            for a in args {
+                walk_type(a, out);
+            }
+        }
+        ast::Type::Tuple { elems, .. } => elems.iter().for_each(|e| walk_type(e, out)),
+        ast::Type::Fn { params, ret, .. } => {
+            params.iter().for_each(|p| walk_type(p, out));
+            walk_type(ret, out);
+        }
+    }
+}
+
+fn walk_block(b: &ast::Block, out: &mut std::collections::HashSet<String>) {
+    for s in &b.stmts {
+        match s {
+            ast::Stmt::Let { ty, init, .. } => {
+                if let Some(t) = ty {
+                    walk_type(t, out);
+                }
+                walk_expr(init, out);
+            }
+            ast::Stmt::LetTuple { init, .. } => walk_expr(init, out),
+            ast::Stmt::Assign { place, value } => {
+                walk_expr(place, out);
+                walk_expr(value, out);
+            }
+            ast::Stmt::Return(Some(e)) | ast::Stmt::Expr(e) => walk_expr(e, out),
+            ast::Stmt::Return(None) => {}
+        }
+    }
+    if let Some(tail) = &b.tail {
+        walk_expr(tail, out);
+    }
+}
+
+fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
+    use ast::ExprKind as K;
+    match &e.kind {
+        K::Unit | K::Int(_) | K::Float(_) | K::Char(_) | K::Str(_) | K::Bool(_) | K::FieldShorthand(_) => {}
+        K::Path(p) => {
+            if let Some(prefix) = path_module_prefix(p) {
+                out.insert(prefix);
+            }
+        }
+        K::Unary { expr, .. } | K::Try(expr) | K::TupleIndex { recv: expr, .. } => walk_expr(expr, out),
+        K::Cast { expr, ty } => {
+            walk_expr(expr, out);
+            walk_type(ty, out);
+        }
+        K::Binary { lhs, rhs, .. } => {
+            walk_expr(lhs, out);
+            walk_expr(rhs, out);
+        }
+        K::Call { callee, args } => {
+            walk_expr(callee, out);
+            args.iter().for_each(|a| walk_expr(a, out));
+        }
+        K::FieldAccess { recv, .. } => {
+            // The whole dotted receiver (`geom`, `util.math`, `geom.Color`) is the qualified prefix.
+            if let Some(prefix) = flatten_module_path(recv) {
+                out.insert(prefix);
+            } else {
+                walk_expr(recv, out);
+            }
+        }
+        K::If { cond, then, els } => {
+            walk_expr(cond, out);
+            walk_block(then, out);
+            if let Some(e) = els {
+                walk_expr(e, out);
+            }
+        }
+        K::Block(b) | K::Arena(b) | K::TaskGroup(b) => walk_block(b, out),
+        K::StructLit { name, fields } => {
+            if let Some(prefix) = path_module_prefix(name) {
+                out.insert(prefix);
+            }
+            fields.iter().for_each(|f| walk_expr(&f.value, out));
+        }
+        K::ElseUnwrap { opt, fallback } => {
+            walk_expr(opt, out);
+            walk_expr(fallback, out);
+        }
+        K::ArrayLit(es) | K::Tuple(es) => es.iter().for_each(|e| walk_expr(e, out)),
+        K::Index { recv, index } => {
+            walk_expr(recv, out);
+            walk_expr(index, out);
+        }
+        K::Lambda { params, body } => {
+            for p in params {
+                if let Some(t) = &p.ty {
+                    walk_type(t, out);
+                }
+            }
+            walk_block(body, out);
+        }
+        K::Match { scrutinee, arms } => {
+            walk_expr(scrutinee, out);
+            arms.iter().for_each(|a| walk_expr(&a.body, out));
+        }
+        K::Template(parts) => {
+            for p in parts {
+                if let ast::TemplatePart::Hole(e) = p {
+                    walk_expr(e, out);
+                }
+            }
+        }
+    }
+}
+
 /// receiver is anything else (a call result, an index, …), so a value-method receiver never matches.
 /// Builds the path in a single allocation rather than one per field-access level.
 fn flatten_module_path(e: &ast::Expr) -> Option<String> {
