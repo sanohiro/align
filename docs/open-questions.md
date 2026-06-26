@@ -252,13 +252,39 @@ JSON→SoA is then a thin wiring on top.
 2. **`json.decode` → `soa<Struct>`.** Allow the decode target to be `soa<Struct>` (sema), lower as
    decode-AoS-then-`to_soa` (MIR). User syntax `s: soa<User> := json.decode(d)?`. Bench:
    `json.decode(data) → where(.active).score.sum()` vs Rust `serde_json → Vec<User> → filter/map/sum`
-   — the headline real-world win.
+   — the headline real-world win (telemetry / log / analytics: idiomatic Rust decodes to a `Vec<User>`
+   AoS and deserializes every field; Align reads only the columns the pipeline touches).
+3. **Known-schema field-skip / projection decode (fold into step 2 — the strongest structural win,
+   flagged by BOTH Gemini and Codex 2026-06-27).** When a decoded value is a *temporary fully
+   consumed by the expression* (`json.decode(d).where(.active).score.sum()`, never bound/reused), the
+   compiler knows from the pipeline which fields are read (`active`, `score`) and can tell the decoder
+   to **skip parsing the unused fields entirely** — no value conversion, no string/arena copy, just a
+   structural SIMD skip to the next `,`/`}`. The runtime already does this for *unknown* keys
+   (`skip_value()`, `align_runtime/src/lib.rs:~601`); the new part is marking *known-but-unused*
+   fields skip, driven by a use-analysis over the decode's consuming expression. ≈2–10× on wide JSON
+   where only a few fields are used (Rust's `serde` derive deserializes all fields unless you
+   hand-write a custom `Visitor`). Combined with SoA-direct, this is "decode only the used columns" —
+   the realistic Rust-beating analytics workload. **Safety: only when the decoded value does not
+   escape** (bound + reused → decode all). A liveness/escape check gates it.
 
-**Deferred soa sub-items (after construction):** `soa_slice<T>` (a per-column-pointer view, so a
-function can take a borrowed soa slice — `slice<T>` is `{ptr,len}` AoS and can't); **bitset** bool
-columns (count/any/all 8–64×, `where(.flag).sum()` ~1.1–2×); `str`/Move columns; `map_into(out dst)`
-pipeline terminal (the minimal construct that makes `noalias` metadata worth emitting — lower
-priority than construction, per the 2026-06-27 Codex vetting).
+**Deferred soa / decode sub-items (after the above):**
+- **Perfect-hash JSON field dispatch.** The runtime field lookup is a **linear scan**
+  (`descs.iter().position(...)`, confirmed `align_runtime/src/lib.rs:~601`); a compile-time PHF
+  (length + first bytes + perfect hash → `switch`/jump table) makes it O(1). ≈1.2–2.5× on wide-schema
+  decode. Codegen builds the PHF table from the (compile-time-known) field names.
+- **bitset** bool columns (count/any/all 8–64× via popcnt; `where(.flag).sum()` only ~1.1–2× — both
+  reviewers warn against over-crediting the filtered-sum case, since the value column read dominates).
+- **`soa_slice<T>`** (a per-column-pointer view, so a function can take a borrowed soa slice —
+  `slice<T>` is `{ptr,len}` AoS and can't); `str`/Move columns.
+- **`map_into(out dst)`** pipeline terminal — the minimal construct that makes `out` `noalias`/`nonnull`
+  metadata worth emitting (Sema already has the no-alias check; only the LLVM attribute is missing —
+  `declare_fn`, `align_codegen_llvm/src/lib.rs:~965`). ≈1.0–1.5×, secondary to construction.
+- **`arena.checkpoint()` / `rollback()`** surface API over the existing `align_rt_arena_reset`
+  (`align_runtime/src/lib.rs:~1158`) — O(1) reuse of per-iteration transient allocations in a
+  long-running loop. ≈1.2–3× on alloc-heavy request loops (but Rust+`bumpalo` competes — bench against
+  it). Std/runtime layer.
+- **Runtime CPU dispatch** (AVX2/NEON multi-versioning) for JSON scan / UTF-8 / string search — the
+  std/runtime SIMD layer (after JSON→SoA), per the settled build-target policy.
 
 **Audit (2026-06-27):** the soa hot loops are clean — `objdump` of `col_sum` / `total_pay` shows zero
 `call` / `bounds_fail` in the loop (1 loop, no allocation, no bounds branch), which is why they beat
