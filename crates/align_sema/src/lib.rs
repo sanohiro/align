@@ -7725,15 +7725,32 @@ fn resolve_type(
             };
             match inner {
                 Ty::Struct(id) => {
-                    let ok = cx.structs[id as usize]
-                        .fields
-                        .iter()
-                        .all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char));
-                    if ok {
-                        Ty::Soa(id)
-                    } else {
-                        diags.error("soa<T> requires a struct of primitive scalar fields (no `str`/owned fields yet)".to_string(), span);
-                        Ty::Error
+                    // Byte size of a primitive scalar field (its natural alignment equals its size).
+                    let field_bytes = |t: Ty| -> Option<u8> {
+                        match t {
+                            Ty::Int(it) => Some(it.bits / 8),
+                            Ty::Float(ft) => Some(ft.bits / 8),
+                            Ty::Bool => Some(1),
+                            Ty::Char => Some(4),
+                            _ => None,
+                        }
+                    };
+                    let fields = &cx.structs[id as usize].fields;
+                    let sizes: Option<Vec<u8>> = fields.iter().map(|f| field_bytes(f.ty)).collect();
+                    match sizes {
+                        // First cut: **uniform field width**. Column `i` then starts at
+                        // `ptr + i*len*size`, always a multiple of `size` (= the field alignment),
+                        // so every column is naturally aligned regardless of `len`. Mixed widths
+                        // would need per-column alignment padding — a later slice.
+                        Some(s) if !s.is_empty() && s.iter().all(|&b| b == s[0]) => Ty::Soa(id),
+                        Some(_) => {
+                            diags.error("soa<T> requires all fields to have the same size for now (uniform-width columns); mixed-width layout is a later slice".to_string(), span);
+                            Ty::Error
+                        }
+                        None => {
+                            diags.error("soa<T> requires a struct of primitive scalar fields (no `str`/owned fields yet)".to_string(), span);
+                            Ty::Error
+                        }
                     }
                 }
                 Ty::Error => Ty::Error,

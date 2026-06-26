@@ -769,10 +769,10 @@ for `soa<T>` on large, hot, field-wise-processed data.
 This is the layout lever that lets Align *beat* an array-of-structs (what a hand-written `Vec<User>`
 gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags
 whole structs through cache. Measured ≈7× faster than an idiomatic-Rust `Vec<Struct>` field sum on a
-memory-bound workload (`bench/`, `col_sum`). *(Status: a borrowed `soa<T>` of a primitive-scalar
-struct with field-column projection `ps.field` is implemented; columns feed the normal pipeline.
-Owned-`soa` construction, `str`/owned columns, and a `where(.field)` filter spanning columns are the
-remaining slices.)*
+memory-bound workload (`bench/`, `col_sum`). *(Status: a borrowed `soa<T>` of a
+uniform-width primitive-scalar struct with field-column projection `ps.field` is implemented;
+columns feed the normal pipeline. Owned-`soa` construction, mixed-width columns, `str`/owned columns,
+and a `where(.field)` filter spanning columns are the remaining slices.)*
 
 ---
 

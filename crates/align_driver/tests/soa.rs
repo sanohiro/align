@@ -56,6 +56,25 @@ fn soa_with_a_str_field_is_rejected() {
 }
 
 #[test]
+fn soa_with_mixed_width_fields_is_rejected() {
+    // First cut requires uniform field width so every column lands at a naturally-aligned offset
+    // (`i8` then `i64` would put the i64 column at an unaligned address for some lengths).
+    assert!(!ok(concat!(
+        "P { tag: i8, value: i64 }\n",
+        "pub fn k(ps: soa<P>) -> i64 = ps.value.sum()\n",
+    )));
+}
+
+#[test]
+fn soa_with_uniform_width_but_mixed_types_is_allowed() {
+    // i32 and f32 are both 4 bytes → columns stay aligned, so this is fine.
+    assert!(ok(concat!(
+        "P { id: i32, weight: f32 }\n",
+        "pub fn k(ps: soa<P>) -> i32 = ps.id.sum()\n",
+    )));
+}
+
+#[test]
 fn projecting_an_unknown_column_is_rejected() {
     assert!(!ok(concat!(
         "P { a: i64, b: i64 }\n",
