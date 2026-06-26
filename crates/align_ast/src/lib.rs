@@ -226,14 +226,24 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    /// Logical `&&` / `||` (on `bool`, i1 — distinct from the bitwise ops).
     And,
     Or,
+    /// Bitwise integer operators: `&` `|` `^`, and the shifts `<<` (logical) / `>>` (arithmetic on
+    /// a signed value, logical on unsigned). Integer-only; the shift amount shares the value's type.
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
     Not,
+    /// Bitwise complement `~x` (integer-only; `!` stays the boolean `not`).
+    BitNot,
 }
 
 #[derive(Clone, Debug)]

@@ -66,7 +66,10 @@ pub enum TokKind {
     Ge,      // >=
     AndAnd,  // &&
     OrOr,    // ||
-    Pipe,    // | (or-pattern separator in `match`)
+    Amp,     // & (bitwise and)
+    Pipe,    // | (or-pattern separator in `match`, and bitwise or)
+    Caret,   // ^ (bitwise xor)
+    Tilde,   // ~ (bitwise complement)
     Bang,    // !
     Question, // ?
     /// Statement terminator (implicit `;` from a newline, or explicit `;`).
@@ -188,7 +191,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some(b'.') | Some(b'+') | Some(b'*') | Some(b'/') | Some(b'%') => return true,
-                Some(b'<') | Some(b'>') | Some(b'=') | Some(b'&') | Some(b'|') => return true,
+                Some(b'<') | Some(b'>') | Some(b'=') | Some(b'&') | Some(b'|') | Some(b'^') => return true,
                 // '-' is also unary, but at line start treat it as a binary continuation.
                 Some(b'-') => return self.src.get(i + 1).copied() != Some(b'>'),
                 _ => return false,
@@ -411,7 +414,10 @@ impl<'a> Lexer<'a> {
             (b'>', Some(b'=')) => (TokKind::Ge, 2),
             (b'&', Some(b'&')) => (TokKind::AndAnd, 2),
             (b'|', Some(b'|')) => (TokKind::OrOr, 2),
+            (b'&', _) => (TokKind::Amp, 1),
             (b'|', _) => (TokKind::Pipe, 1),
+            (b'^', _) => (TokKind::Caret, 1),
+            (b'~', _) => (TokKind::Tilde, 1),
             (b'=', _) => (TokKind::Eq, 1),
             (b'<', _) => (TokKind::Lt, 1),
             (b'>', _) => (TokKind::Gt, 1),

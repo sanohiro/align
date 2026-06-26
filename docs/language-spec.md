@@ -78,6 +78,14 @@ code := 'A' as i32        // char ↔ int = the Unicode code point; char never p
 `bool` and composite types do not participate. Integer overflow is defined two's-complement wrap;
 explicit `checked_*` / `saturating_*` / `wrapping_*` ops cover the rest. (`draft.md` §3.)
 
+### Bitwise & shift
+
+Integers have `&` `|` `^` `~` and the shifts `<<` / `>>` (integer-only — `bool` uses `&&`/`||`/`!`;
+no implicit coercion, so the shift amount shares the value's type). Precedence is Go's: `<< >> &`
+bind like `*`, `| ^` like `+`, so all of them bind tighter than comparison (`a & b == c` is
+`(a & b) == c`). A shift amount is masked mod the bit width (defined, zero-cost); `>>` is arithmetic
+on a signed value, logical on an unsigned one. The `bitset` type is built on these. (`draft.md` §5.)
+
 ### Constants
 
 A top-level `:=` (outside any function) is a **named constant**: the same keyword-less binding form,

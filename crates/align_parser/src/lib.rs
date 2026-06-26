@@ -519,9 +519,21 @@ impl<'a> Parser<'a> {
 
     // --- expressions (Pratt) ---
 
-    /// Binary operator binding power (higher binds tighter). `None` = not a binary op.
-    fn binop(kind: &TokKind) -> Option<(BinOp, u8)> {
-        Some(match kind {
+    /// Binary operator binding power (higher binds tighter) + how many tokens it spans. `None` = not
+    /// a binary operator here. Precedence follows Go: shifts and `&` bind like `*` (5); `|` / `^`
+    /// like `+` (4) — so every bitwise/shift operator binds tighter than comparison (3), avoiding the
+    /// C `a & b == c` footgun.
+    fn binop(&self) -> Option<(BinOp, u8, usize)> {
+        // Two-token shifts: in expression position `<`/`>` are comparison-only (Align has no
+        // turbofish), so an adjacent pair is unambiguously a shift. `>>` is deliberately *not* a
+        // single token, so nested generic type arguments (`Pair<Pair<T>>`) still close — shifts
+        // never occur in type position.
+        match (self.peek(), self.peek_at(1)) {
+            (TokKind::Lt, TokKind::Lt) => return Some((BinOp::Shl, 5, 2)),
+            (TokKind::Gt, TokKind::Gt) => return Some((BinOp::Shr, 5, 2)),
+            _ => {}
+        }
+        let (op, bp) = match self.peek() {
             TokKind::OrOr => (BinOp::Or, 1),
             TokKind::AndAnd => (BinOp::And, 2),
             TokKind::EqEq => (BinOp::Eq, 3),
@@ -532,11 +544,15 @@ impl<'a> Parser<'a> {
             TokKind::Ge => (BinOp::Ge, 3),
             TokKind::Plus => (BinOp::Add, 4),
             TokKind::Minus => (BinOp::Sub, 4),
+            TokKind::Pipe => (BinOp::BitOr, 4),
+            TokKind::Caret => (BinOp::BitXor, 4),
             TokKind::Star => (BinOp::Mul, 5),
             TokKind::Slash => (BinOp::Div, 5),
             TokKind::Percent => (BinOp::Rem, 5),
+            TokKind::Amp => (BinOp::BitAnd, 5),
             _ => return None,
-        })
+        };
+        Some((op, bp, 1))
     }
 
     /// Parse a `{...}` template hole's contents as a sub-expression. The hole source is
@@ -579,13 +595,15 @@ impl<'a> Parser<'a> {
     fn parse_expr(&mut self, min_bp: u8) -> Option<Expr> {
         let mut lhs = self.parse_cast()?;
         loop {
-            let Some((op, bp)) = Self::binop(self.peek()) else {
+            let Some((op, bp, n)) = self.binop() else {
                 break;
             };
             if bp < min_bp {
                 break;
             }
-            self.bump();
+            for _ in 0..n {
+                self.bump();
+            }
             let rhs = self.parse_expr(bp + 1)?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr {
@@ -636,6 +654,7 @@ impl<'a> Parser<'a> {
         let op = match self.peek() {
             TokKind::Minus => Some(UnOp::Neg),
             TokKind::Bang => Some(UnOp::Not),
+            TokKind::Tilde => Some(UnOp::BitNot),
             _ => None,
         };
         if let Some(op) = op {

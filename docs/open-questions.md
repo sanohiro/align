@@ -40,6 +40,23 @@ one module. Overflow wraps (defined two's-complement); division by zero, a cycli
 type mismatch are compile-time errors. Folded values feed the const string pool (`draft.md` §12).
 Record: `draft.md` §3/§4, `docs/language-spec.md`, `impl/02-frontend.md` §3, `examples/constants.align`, `tests/constants.rs`
 
+### Bitwise & shift operators (DONE 2026-06-26)
+**Decision: integer operators `& | ^ << >>` + unary `~`, NOT bitset methods.** Bit work on integers
+is done with operators (the AI-/human-familiar, terse, "one way" form); the `core.bitset` type (large
+SIMD-friendly bit sets) is a *separate* layer built on top, deferred to M6 with `vec`/`mask` — not
+bundled here (avoids premature bitset design before the M6 layout/SIMD model). Operators are
+**integer-only** (`bool` uses logical `&&`/`||`/`!`; `~` is bitwise complement, distinct from `!`),
+with **no implicit coercion** — the shift amount shares the value's type. **Precedence = Go's** (the
+settled "Go style" syntax): `<< >> &` bind like `*` (5), `| ^` like `+` (4), so every bitwise/shift
+operator binds tighter than comparison (`a & b == c` = `(a & b) == c`, no C footgun). **Shift amount
+masked mod the bit width** (defined, zero-cost, SIMD-non-blocking — the exact parallel of the
+overflow-wrap decision; codegen masks `n & (width-1)`, constant over-shift is a future lint), `>>`
+arithmetic on signed / logical on unsigned. `>>` is **not** a single lexer token (kept as two `>`),
+so nested generic type args (`Pair<Pair<T>>`) still close; the shift is formed only in expression
+position, where `<`/`>` are comparison-only (no turbofish). Folds in constant expressions. **Follow-up
+(noted, not blocking): hex/binary integer literals** (`0x1F` / `0b1010`) pair naturally with bitwise
+code and are not yet lexed. Record: `draft.md` §5, `docs/language-spec.md`, `examples/bitwise.align`, `tests/bitwise.rs`
+
 ### Type declaration syntax
 **Decision: keyword-less.** Contains `ident: Type` → struct; `ident`/`ident(...)` → sum type, disambiguated by content. Fields/variants are `,`-separated.
 Record: `draft.md` §4, `impl/02-frontend.md`

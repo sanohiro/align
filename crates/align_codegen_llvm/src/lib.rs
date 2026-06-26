@@ -1333,7 +1333,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let a = self.operand(a).into_int_value();
                     self.builder.build_int_neg(a, "neg").map_err(|e| self.err(e))?.into()
                 }
-                UnOp::Not => {
+                // `!` (boolean, i1) and `~` (integer bitwise complement) are both LLVM `not`.
+                UnOp::Not | UnOp::BitNot => {
                     let a = self.operand(a).into_int_value();
                     self.builder.build_not(a, "not").map_err(|e| self.err(e))?.into()
                 }
@@ -2393,8 +2394,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
             BinOp::Div => bld.build_int_unsigned_div(l, r, "udiv"),
             BinOp::Rem if signed => bld.build_int_signed_rem(l, r, "srem"),
             BinOp::Rem => bld.build_int_unsigned_rem(l, r, "urem"),
-            BinOp::And => bld.build_and(l, r, "and"),
-            BinOp::Or => bld.build_or(l, r, "or"),
+            // Logical `&&`/`||` on `bool` (i1) — and the integer bitwise `& | ^`.
+            BinOp::And | BinOp::BitAnd => bld.build_and(l, r, "and"),
+            BinOp::Or | BinOp::BitOr => bld.build_or(l, r, "or"),
+            BinOp::BitXor => bld.build_xor(l, r, "xor"),
+            // Shifts: mask the amount to the value's bit width (defined "mod width" behavior, and
+            // avoids LLVM poison from an out-of-range shift). Both operands share the value's int
+            // type (sema), so no width conversion is needed. `>>` is arithmetic on a signed value.
+            BinOp::Shl | BinOp::Shr => {
+                let width = l.get_type().get_bit_width();
+                let mask = l.get_type().const_int((width - 1) as u64, false);
+                let amt = bld.build_and(r, mask, "shamt").map_err(|e| self.err(e))?;
+                if op == BinOp::Shl {
+                    bld.build_left_shift(l, amt, "shl")
+                } else {
+                    bld.build_right_shift(l, amt, signed, "shr")
+                }
+            }
             BinOp::Eq => bld.build_int_compare(IntPredicate::EQ, l, r, "eq"),
             BinOp::Ne => bld.build_int_compare(IntPredicate::NE, l, r, "ne"),
             BinOp::Lt => bld.build_int_compare(pred(signed, Cmp::Lt), l, r, "lt"),
@@ -2712,7 +2728,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             BinOp::Le => bld.build_float_compare(FloatPredicate::OLE, l, r, "fle").map_err(|e| self.err(e))?.into(),
             BinOp::Gt => bld.build_float_compare(FloatPredicate::OGT, l, r, "fgt").map_err(|e| self.err(e))?.into(),
             BinOp::Ge => bld.build_float_compare(FloatPredicate::OGE, l, r, "fge").map_err(|e| self.err(e))?.into(),
-            BinOp::And | BinOp::Or => unreachable!("logical operators are not valid on floats (sema-checked)"),
+            BinOp::And | BinOp::Or | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                unreachable!("logical/bitwise operators are not valid on floats (sema-checked)")
+            }
         };
         Ok(v)
     }

@@ -261,6 +261,7 @@ fn unop_str(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "-",
         UnOp::Not => "!",
+        UnOp::BitNot => "~",
     }
 }
 
@@ -279,5 +280,10 @@ fn binop_str(op: BinOp) -> &'static str {
         BinOp::Ge => ">=",
         BinOp::And => "&&",
         BinOp::Or => "||",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
     }
 }
