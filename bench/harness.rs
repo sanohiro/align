@@ -137,18 +137,20 @@ fn main() {
             })
             .collect();
         // soa column-major buffer: active column (bool, 1 B) at 0, pay column (i64) padded to 8.
-        let pay_off = align_up(n, 8);
-        let mut buf = vec![0u8; pay_off + n * 8 * 5 + 64];
-        for (i, r) in aos.iter().enumerate() {
-            buf[i] = r.active as u8;
-        }
+        // Allocate as `Vec<i64>` so the base is 8-aligned (the kernel's i64 loads assume natural
+        // alignment); the 1-byte `active` flags are written through a `u8` view of the front.
+        let pay_off = align_up(n, 8); // bytes; a multiple of 8
+        let mut buf = vec![0i64; (pay_off + n * 8 * 5) / 8 + 8];
         {
-            let pay = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().add(pay_off) as *mut i64, n) };
+            let active = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, n) };
             for (i, r) in aos.iter().enumerate() {
-                pay[i] = r.pay;
+                active[i] = r.active as u8;
             }
         }
-        let sl = || Slice { ptr: buf.as_ptr() as *const i64, len: n as i64 };
+        for (i, r) in aos.iter().enumerate() {
+            buf[pay_off / 8 + i] = r.pay;
+        }
+        let sl = || Slice { ptr: buf.as_ptr(), len: n as i64 };
         let (a, r) = duel(rounds, || unsafe { total_pay(black_box(sl())) }, || black_box(&aos).iter().filter(|r| r.active).map(|r| r.pay).sum());
         report("total_pay(soa)", n, a, r);
     }
