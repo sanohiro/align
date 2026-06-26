@@ -290,6 +290,40 @@ JSON→SoA is then a thin wiring on top.
 `call` / `bounds_fail` in the loop (1 loop, no allocation, no bounds branch), which is why they beat
 Rust. No residual-overhead cleanup is needed before construction.
 
+### Additional perf levers — own code-grounded review (2026-06-27, empirically checked)
+
+Beyond the JSON→SoA / field-skip thrust (which both external reviews converged on), two orthogonal,
+*cheap* levers that neither external review surfaced — found by reading the codegen + disassembling:
+
+- **★ Emit the LLVM function attributes Align can soundly assert (`nounwind` always; `memory(none)` /
+  `readonly` on pure functions).** Codegen currently emits **zero** such attributes (`grep` =
+  0 in `align_codegen_llvm`). This is the function-level generalization of the out-param `noalias`
+  idea — broader, since it applies to *every* function:
+  - `nounwind` on **all** Align functions — they never unwind (errors are `Result` values; a bounds
+    failure `abort`s, it does not unwind). Lets LLVM drop landing pads / unwind tables and **inline
+    more aggressively**. (Rust only gets this under `panic=abort` or `extern "C"`.)
+  - `memory(none)` (readnone) / `memory(read)` (readonly) on functions Sema's purity pass marks pure
+    — lets LLVM **CSE / loop-invariant-hoist / DCE** pure calls (`f(x)+f(x)` → one call; an invariant
+    pure call hoists out of a loop). Align *infers* purity (`EffectScan`); LLVM only auto-infers it
+    for the simple cases it can see through, so the delta is the complex / non-inlined pure functions.
+  - Cost: emit attributes in `declare_fn` (the purity info already exists). **Cheaper and more
+    orthogonal than JSON→SoA — a good "tighten the foundation" slice.** Measure: a non-inlined pure
+    fn called with loop-invariant args in a hot loop — with the attr the call hoists/vanishes, without
+    it stays (`instructions`/`cycles`). Confidence: medium-high.
+- **Compile-time pipeline evaluation = zero-cost lookup tables.** Verified: a pipeline over literal /
+  const data **constant-folds entirely** (`[1..16].sum()` → `mov $136`, no loop). So a declarative
+  `[...].map(f)` that builds a lookup table (CRC/hash/codec/math LUT) costs **zero at runtime** (a
+  const global), where idiomatic Rust needs `const fn` (float/alloc-limited) or a build script. **Gap
+  /prerequisite:** top-level constants (PR #145) are scalar/string only — **aggregate (array)
+  constants don't exist yet**, so a top-level const *table* can't be expressed; that is the
+  prerequisite slice. Confidence: high (folding observed). Win is for table-driven code only.
+
+**Audit — ruled out a risk (2026-06-27):** Align has no loops (map/reduce + recursion), so tail
+recursion *must* match a Rust loop. Verified: `fn sum_to(n, acc) = if n==0 {acc} else {sum_to(n-1,
+acc+n)}` compiles to a **call-free 14-instruction tight loop** (`run(1e6)` correct) — LLVM converts
+the tail recursion to a loop at O2. So the loop-less design is not a perf liability for tail-recursive
+algorithms.
+
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
 opt-in; wide SIMD on a varied fleet comes from runtime dispatch in the library, not a fixed high
