@@ -37,7 +37,8 @@ Align targets the cloud/container reality of *build once, run on a varied fleet*
 uses a **safe, portable per-architecture baseline** (`x86-64-v2` on amd64, `armv8-a`/NEON on arm64),
 so one binary runs across mixed Intel/AMD/Graviton and feature-masked hosts. More aggressive targets
 are **opt-in, never the default** (`--target-cpu native` for a source build on the host you run on,
-or a higher baseline for a fleet you control). Wide SIMD on a varied fleet comes from **runtime
+or `--target-cpu x86-64-v3` — a portable AVX2/FMA tier, the recommended "fast" build for a server
+fleet you control). Wide SIMD on a varied fleet comes from **runtime
 CPU-feature dispatch in the library** (one binary picks AVX2/NEON at run time, falling back safely) —
 not from a fixed high baseline. See `draft.md` §3.4 and `docs/open-questions.md` ("Build targets &
 portability"). The default build now targets that portable baseline (`x86-64-v2` on amd64, the

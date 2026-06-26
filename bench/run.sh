@@ -11,6 +11,7 @@ cd "$(dirname "$0")"
 mode="${1:-native}"
 case "$mode" in
   native) align_tgt="native"; rust_tgt="native" ;;
+  v3) align_tgt="x86-64-v3"; rust_tgt="x86-64-v3" ;;  # portable AVX2/FMA tier (server/container)
   baseline)
     align_tgt="baseline"
     # Match alignc's per-arch baseline: x86-64-v2 on amd64, the generic (armv8-a) floor elsewhere.
@@ -19,7 +20,7 @@ case "$mode" in
       *)            rust_tgt="generic" ;;
     esac
     ;;
-  *) echo "usage: run.sh [baseline|native]" >&2; exit 2 ;;
+  *) echo "usage: run.sh [baseline|v3|native]" >&2; exit 2 ;;
 esac
 
 # Build alignc (release for realistic codegen speed; the produced code is the same either way).
