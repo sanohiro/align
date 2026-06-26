@@ -236,6 +236,59 @@ fn an_enum_in_a_nonentry_module_constructs_and_matches() {
 }
 
 #[test]
+fn an_imported_sum_type_variant_is_constructed_qualified() {
+    if !backend_available() {
+        return;
+    }
+    // `mod.Type.Variant` and `mod.Type.Variant(payload)` — constructing an imported `pub` sum type's
+    // variant from another module (the receiver `pal.Color` resolves the type qualified).
+    let pal = concat!(
+        "module pal\n",
+        "pub Color { Red, Green, Blue, Code(i32) }\n",
+        "pub fn code(c: Color) -> i32 = match c {\n",
+        "  Red => 1, Green => 2, Blue => 3, Code(n) => n,\n",
+        "}\n",
+    );
+    let main = concat!(
+        "import pal\n",
+        "fn main() -> i32 {\n",
+        "  g := pal.Color.Green\n",          // tag-only, qualified
+        "  c := pal.Color.Code(40)\n",       // payload, qualified
+        "  return pal.code(g) + pal.code(c)\n", // 2 + 40 = 42
+        "}\n",
+    );
+    let out = build_and_run_multi("mod-qual-variant", &[("pal.align", pal), ("main.align", main)], "main.align");
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn a_local_shadowing_a_sum_type_name_is_value_access() {
+    if !backend_available() {
+        return;
+    }
+    // A local named like a sum type wins over the type in `Name.field` position: `Tag.v` is field
+    // access on the local, not a `Tag` variant (the shadowing check precedes type resolution).
+    let src = concat!(
+        "Tag { A, B }\n",
+        "Holder { v: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  Tag := Holder { v: 7 }\n",
+        "  return Tag.v as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("mod-shadow-type", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn constructing_a_private_sum_type_variant_across_modules_is_rejected() {
+    // A non-`pub` sum type cannot be constructed from an importing module.
+    let lib = "module lib\nSecret { A, B }\n";
+    let main = "import lib\nfn main() -> i32 {\n  s := lib.Secret.A\n  return 0\n}\n";
+    assert!(check_multi_errs("mod-priv-variant", &[("lib.align", lib), ("main.align", main)], "main.align"));
+}
+
+#[test]
 fn a_module_using_a_builtin_must_import_it() {
     // The capability rule applies per file: `geom` uses `json` but does not import `core.json`.
     let geom = concat!(

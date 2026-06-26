@@ -3540,12 +3540,12 @@ impl<'a, 't> Checker<'a, 't> {
     /// a local (chained field access on a value comes later).
     fn check_field_access(&mut self, recv: &ast::Expr, field: &ast::Ident, expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
-        // `Type.Variant` — a sum-type value (not field access on a value). The base is a sum-type
-        // name, the field is a variant.
-        if let ast::ExprKind::Path(p) = &recv.kind {
-            let bare = single_name(p);
-            if let Some(canonical) = bare.and_then(|n| self.local_type(n)) {
-                let name = bare.unwrap_or("");
+        // `Type.Variant` / `mod.Type.Variant` — a (tag-only) sum-type value, not field access on a
+        // value. The receiver names a sum type (bare in this module, or a qualified import); a
+        // payload variant is a *call* (handled in `check_call`). `check_variant_ctor` reports a
+        // payload variant named without arguments here ("takes N argument(s)").
+        match self.resolve_type_receiver(recv) {
+            Ok(Some(canonical)) => {
                 if let Some(tmpl) = self.enum_templates.get(&canonical).cloned() {
                     // A no-arg variant of a generic sum type (`Opt.None`) — the type parameters must
                     // come from the payload args (here none), so they are only inferable when the
@@ -3553,30 +3553,11 @@ impl<'a, 't> Checker<'a, 't> {
                     return self.check_generic_variant_ctor(&canonical, &tmpl, field, &[], expected, span);
                 }
                 if let Some(&enum_id) = self.enum_ids.get(&canonical) {
-                    return match self.enums[enum_id as usize].variants.iter().position(|v| v.name == field.name) {
-                        Some(idx) => {
-                            let arity = self.enums[enum_id as usize].variants[idx].payload.len();
-                            if arity != 0 {
-                                self.diags.error(
-                                    format!("variant '{}' takes {arity} argument(s); construct it as `{}.{}(…)`", field.name, name, field.name),
-                                    span,
-                                );
-                                return err;
-                            }
-                            let ty = Ty::Enum(enum_id);
-                            self.constrain(ty, expected, span);
-                            Expr { kind: ExprKind::EnumValue { enum_id, variant: idx as u32, payload: Vec::new() }, ty, span }
-                        }
-                        None => {
-                            self.diags.error(
-                                format!("'{}' is not a variant of '{}'", field.name, self.enums[enum_id as usize].name),
-                                span,
-                            );
-                            err
-                        }
-                    };
+                    return self.check_variant_ctor(enum_id, field, &[], expected, span);
                 }
             }
+            Ok(None) => {}
+            Err(()) => return err,
         }
         // `mod.NAME` / `a.b.NAME` — a qualified reference to an imported module's `pub` constant.
         // The receiver is a pure dotted module name; a local shadowing the leftmost segment makes
@@ -3701,6 +3682,48 @@ impl<'a, 't> Checker<'a, 't> {
             return Some("Error".to_string());
         }
         self.type_table.get(&self.cur_module)?.get(bare).map(|e| e.canonical.clone())
+    }
+
+    /// Resolve the receiver of a `Type.Variant` access/constructor to the type's canonical name —
+    /// a bare `Type` (current module) or a qualified `mod.Type` (an imported module's `pub` type).
+    /// `Ok(None)` means the receiver is not a type reference (the caller falls through to other
+    /// meanings); `Err(())` means it definitively names an imported type that is not `pub` (the
+    /// error is already reported — the caller should stop, not cascade).
+    fn resolve_type_receiver(&mut self, recv: &ast::Expr) -> Result<Option<String>, ()> {
+        // A local/captured variable shadowing the leftmost segment makes this value access, not a
+        // type reference — checked first, so it applies to a bare `Type` as well as `mod.Type`.
+        let Some(leftmost) = leftmost_segment(recv) else { return Ok(None) };
+        let shadowed = self.lookup(leftmost).is_some()
+            || self.capture.as_ref().is_some_and(|cap| {
+                cap.captured.iter().any(|(n, _, _)| n == leftmost)
+                    || cap.enclosing.iter().any(|(n, _, _)| n == leftmost)
+            });
+        if shadowed {
+            return Ok(None);
+        }
+        // Bare `Type` in the current module.
+        if let ast::ExprKind::Path(p) = &recv.kind {
+            if let Some(name) = single_name(p) {
+                return Ok(self.local_type(name));
+            }
+        }
+        // Qualified `mod.Type` — the receiver is itself a pure dotted name.
+        let Some(flat) = flatten_module_path(recv) else { return Ok(None) };
+        let Some((module, type_name)) = flat.rsplit_once('.') else { return Ok(None) };
+        if module == self.cur_module || !self.user_imports.contains(module) {
+            return Ok(None);
+        }
+        let Some(entry) = self.type_table.get(module).and_then(|m| m.get(type_name)) else {
+            return Ok(None);
+        };
+        if !entry.is_pub {
+            self.diags.error(
+                format!("type `{type_name}` is private to module `{module}` (mark it `pub` to export it)"),
+                recv.span,
+            );
+            return Err(());
+        }
+        Ok(Some(entry.canonical.clone()))
     }
 
     fn check_struct_lit(&mut self, name: &ast::Path, fields: &[ast::FieldInit], span: Span) -> Expr {
@@ -4154,10 +4177,11 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
-        // `Type.Variant(args)` — constructing a sum-type value with a payload.
+        // `Type.Variant(args)` / `mod.Type.Variant(args)` — constructing a sum-type value with a
+        // payload (the receiver names a sum type, bare in this module or a qualified import).
         if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
-            if let ast::ExprKind::Path(p) = &recv.kind {
-                if let Some(canonical) = single_name(p).and_then(|n| self.local_type(n)) {
+            match self.resolve_type_receiver(recv) {
+                Ok(Some(canonical)) => {
                     if let Some(&enum_id) = self.enum_ids.get(&canonical) {
                         return self.check_variant_ctor(enum_id, field, args, expected, span);
                     }
@@ -4165,6 +4189,8 @@ impl<'a, 't> Checker<'a, 't> {
                         return self.check_generic_variant_ctor(&canonical, &tmpl, field, args, expected, span);
                     }
                 }
+                Ok(None) => {}
+                Err(()) => return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
             }
         }
         // Method call `recv.method(...)`: a module builtin (`heap.new`) or a method on a

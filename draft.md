@@ -1116,7 +1116,9 @@ fn main() -> i32 {
 
 `import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module reference is written qualified — `geom.area(...)` for a function, `geom.Point` for a type — and reaches only `pub` members; a bare name resolves within the calling module (so an imported type *must* be qualified). Each module has its own function and type namespace, so two modules may define a function or type with the same name.
 
-> Constructing an imported sum type's variant is still written from its own module today (`geom.Color.Red` is a later slice); an exported sum type is otherwise usable across modules — held, returned from a `pub` function, and matched.
+An imported `pub` sum type's variant is constructed qualified, the same way its type is named:
+`pal.Color.Green` (tag-only) and `pal.Color.Code(40)` (with a payload). Together with holding,
+returning, and `match`ing it, an exported sum type is fully usable across modules.
 
 ---
 
