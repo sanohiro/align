@@ -224,8 +224,45 @@ aggregate now beats Rust too (the plain column scan stays ~7-10×). `tests/branc
 `bench/`. (Materialize via stream-compaction — `to_array`/`partition` under a `where` — stays
 branchy; that is a separate slice.)
 
-**Still remaining for soa:** owned-`soa` construction (AoS→SoA transpose / build — soa is param-only
-today), `soa_slice<T>` view, `str`/Move columns.
+### soa construction — IMPLEMENTATION PLAN (the largest remaining soa gap; RESUME HERE for perf)
+
+**Goal.** Make `soa<T>` usable in real Align programs. Today it is a **borrowed parameter only** — the
+benchmark feeds column data from an external Rust harness; pure Align can't *make* a soa. The
+winning real-world flow (chosen 2026-06-27) is direct JSON→SoA:
+`users: soa<User> := json.decode(data)?` then `users.where(.active).score.sum()` — idiomatic Rust
+decodes to `Vec<User>` (AoS) and drags whole records through cache; Align decodes straight to columns
+and a scan reads only the touched ones.
+
+**Key constraint (found 2026-06-27).** A JSON array's length N is unknown until parsed, but
+column-major SoA needs N to compute column bases. So a *truly* transpose-free decode needs two passes;
+the pragmatic correct path is **json → AoS (reuse the tested `JsonDecodeStructArray` parser) →
+transpose to a column-major buffer → return the soa view**. JSON parsing dominates total time, so the
+one-pass transpose is a small add-on. The **transpose (column store) is the core new primitive**, and
+JSON→SoA is then a thin wiring on top.
+
+**Sequence (each a PR, benchmark-driven):**
+1. **Column store + `to_soa()` transpose primitive.** A codegen store into a soa column
+   (`column_base(field) + index`, the write counterpart of `Rvalue::IndexColumn`; reuse the
+   per-column `align_up` offset chain from the multi-column slice). `to_soa()` on a struct-array
+   source materializes a column-major buffer **arena-allocated** (like `to_array`) and returns a
+   `soa<Struct>` view region-tied to the arena — so no new owned type and no per-value drop (the
+   arena bulk-frees it). Bench: single-pass `arr.to_soa().a.sum()` LOSES (transpose cost), so bench
+   **multi-pass** (`s := arr.to_soa(); s.a.sum() + s.b.sum() + …`) where the transpose amortizes and
+   beats re-reading AoS.
+2. **`json.decode` → `soa<Struct>`.** Allow the decode target to be `soa<Struct>` (sema), lower as
+   decode-AoS-then-`to_soa` (MIR). User syntax `s: soa<User> := json.decode(d)?`. Bench:
+   `json.decode(data) → where(.active).score.sum()` vs Rust `serde_json → Vec<User> → filter/map/sum`
+   — the headline real-world win.
+
+**Deferred soa sub-items (after construction):** `soa_slice<T>` (a per-column-pointer view, so a
+function can take a borrowed soa slice — `slice<T>` is `{ptr,len}` AoS and can't); **bitset** bool
+columns (count/any/all 8–64×, `where(.flag).sum()` ~1.1–2×); `str`/Move columns; `map_into(out dst)`
+pipeline terminal (the minimal construct that makes `noalias` metadata worth emitting — lower
+priority than construction, per the 2026-06-27 Codex vetting).
+
+**Audit (2026-06-27):** the soa hot loops are clean — `objdump` of `col_sum` / `total_pay` shows zero
+`call` / `bounds_fail` in the loop (1 loop, no allocation, no bounds branch), which is why they beat
+Rust. No residual-overhead cleanup is needed before construction.
 
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
