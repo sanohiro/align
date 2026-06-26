@@ -120,6 +120,19 @@ Boundaries that assume a byte layout (FFI, `json` encode/decode, by-value pass) 
 explicitly** (a visible conversion). Composes with branchless `where` (masked reduce over columns).
 Settles the `impl/05` §3 "automatic vs annotation" OPEN in favor of annotation. Build is M6 (uses the
 `Layout::Soa` seam already reserved in `align_sema`).
+
+**Open sub-questions (settle before the M6 build):**
+- **Views/borrows of `soa<T>`.** `slice<T>` is `{T* ptr, i64 len}` — strictly AoS — so it cannot
+  view columnar data without an `O(N)` materialize. A modular function taking a view of a `soa`
+  table needs either a layout-parametric slice or a distinct `soa_slice<T>` (a small struct of
+  per-column base pointers + len). Leaning toward `soa_slice<T>` so the AoS `slice<T>` stays a simple
+  `{ptr,len}`; decide the exact shape + whether pipelines accept it directly.
+- **Move fields in `soa<T>`.** If `T` has an owned field (`string`, `array<U>`), `users[i]` by value
+  would move a field out of its column and leave the table invalid. Options: restrict `soa<T>` to
+  Copy/plain-data structs (simplest, matches the current struct-field rule), or require explicit
+  `.clone()` / return a composite read-only view for whole-element access. Leaning toward
+  **Copy-only `soa<T>`** for the first cut (whole-element extraction of a Move element is the rare
+  case; field-wise pipelines — the reason to use `soa` — don't need it).
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3.
 
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
@@ -133,11 +146,13 @@ for the build host's CPU (or a high fixed baseline like AVX2) would `SIGILL` som
   amd64; `armv8-a` (NEON is mandatory in the base ISA) for arm64. One binary runs across the fleet.
 - **Opt-in, never default:** `--target-cpu native` (fastest on the build host, non-portable — for
   source-build-on-host) and higher baselines (`x86-64-v3`/AVX2, v4) for those who control their fleet.
-- **Wide SIMD for the varied fleet = runtime CPU-feature dispatch in the library layer** (portable
-  crates / `std::arch` `is_x86_feature_detected!`): one binary detects the host CPU and picks the best
-  path (AVX2/NEON), falling back safely. Heavy SIMD work (JSON/UTF-8/string scan, bulk copy) lives
-  here. **No hand-written per-architecture intrinsics** — portable mechanisms (`std::simd` /
-  dispatching crates) cover x86-64 and aarch64 from one source. AOT-generated pipeline loops stay at
+- **Wide SIMD for the varied fleet = runtime CPU-feature dispatch in the library layer**: one binary
+  detects the host CPU and picks the best path (AVX2/NEON), falling back safely. Mechanism = function
+  **multi-versioning** (`#[target_feature]` variants selected via `is_x86_feature_detected!`), most
+  cheaply by leaning on crates that already do it (`memchr` etc.). `std::simd` alone is *not*
+  runtime-adaptive — it writes each variant's body portably; the per-feature variants + selector stay
+  explicit (`impl/06` §1). **No hand-written per-architecture intrinsics**; x86-64 + aarch64 from one
+  source. Heavy SIMD work (JSON/UTF-8/string scan, bulk copy) lives here. AOT-generated pipeline loops stay at
   the safe baseline (128-bit) for portability; runtime-multiversioning generated loops is a possible
   future refinement (this settles the `impl/05` §5 / `04` §9 "target width W + multi-ISA" OPEN item).
 - **Multi-arch containers:** cross-build per arch+baseline into one image manifest (`linux/amd64` +
@@ -508,6 +523,11 @@ non-temporal, fast-math, `-march=native`) are **M6** proper, alongside the LLVM-
 
 ```text
 Backend / codegen lowering (MIR -> LLVM, source unchanged):
+- Cold Err edge metadata: the `?` / Result Err edge is the designed cold path (§10), but codegen
+  emits a plain branch with no branch-weight / cold hint (verified; align_mir notes it deferred).
+  Needs a cold-hint on the MIR Result/`?` branch (Term representation) + codegen emitting
+  `!prof branch_weights` (or llvm.expect), so the optimizer lays the Err path out of line and the
+  predictor assumes Ok. NOT a few lines — it touches the MIR Term, hence backlog not a quick fix.
 - Scalable-vector (VLA) loops: emit <vscale x N x T> + predication for ARM SVE /
   RISC-V V, eliminating the scalar remainder loop. (Baseline = fixed-width vec<N> at M6.)
 - Non-temporal stores: tag large materializing writes with !nontemporal to bypass cache.
@@ -518,8 +538,11 @@ Backend / codegen lowering (MIR -> LLVM, source unchanged):
 - GPU codegen for pure par_map/reduce: compile the closure to PTX / SPIR-V / MSL, embed as
   a blob, runtime device-dispatch with a length heuristic + unified-memory zero-copy.
   (GPU backend is already listed Future, above.)
-- panic=abort build + strip .eh_frame: drop the Rust-std unwinder (smaller binary, cleaner
-  I-cache). The no-unwind CFG itself is already Settled; this is the build-flag half.
+- panic=abort build + strip .eh_frame: drop the Rust-std unwinder (cleaner I-cache, marginally
+  smaller). The no-unwind CFG itself is already Settled; this is the build-flag half.
+  NOTE (2026-06-26): the earlier "~5 MB + libgcc_s" concern is stale — a built example is now
+  ~16 KB (14 KB stripped), dynamically linked to libc + ld only (no libgcc_s in `ldd`). Binary
+  size / startup is already good; this lever is now only marginal polish, not a real problem.
 
 Runtime / std internals (API unchanged, fast path swapped in):
 - SIMD-accelerated runtime: JSON structural scan, str find/split/trim, UTF-8 validation,
