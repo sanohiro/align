@@ -305,6 +305,21 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+        // A literal directly followed by a letter is a type-suffix attempt (`10i32`). Align has no
+        // literal suffix — `as` is the one expression-position form — so guide the user there (and
+        // consume the run so it does not cascade into an "undefined name" error). The numeric token
+        // was already pushed, so the surrounding expression still has a value.
+        if self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+            let suf = self.pos;
+            while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                self.pos += 1;
+            }
+            let suffix = std::str::from_utf8(&self.src[suf..self.pos]).unwrap();
+            diags.error(
+                format!("numeric literal suffixes are not supported (`{suffix}`); convert explicitly, e.g. `{} as {suffix}`", &text),
+                self.span(start, self.pos),
+            );
+        }
     }
 
     fn eat_digits(&mut self) {
