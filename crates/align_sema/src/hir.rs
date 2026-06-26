@@ -456,6 +456,12 @@ pub enum ExprKind {
     /// fields are zero-copy views into the input, so the array is region-tied to that input; the
     /// expression `ty` is `Result<array<Struct>, Error>`.
     JsonDecodeStructArray { struct_id: u32, input: Box<Expr> },
+    /// `json.decode(input)` targeting a `soa<Struct>` (the cache-optimal decode) — parse a JSON
+    /// array of objects into AoS (reusing the tested struct-array parser, since the array length N
+    /// is unknown until parsed) then transpose to a column-major `soa<Struct>`, arena-allocated.
+    /// Fields must be primitive scalars (the `soa<T>` rule, so no `str` columns / input region tie),
+    /// and it needs an enclosing `arena {}`. The expression `ty` is `Result<soa<Struct>, Error>`.
+    JsonDecodeSoa { struct_id: u32, input: Box<Expr> },
     /// `fs.read_file(path)` — read the file at `path` (a `str`) into a freshly heap-allocated owned
     /// `string`; the expression `ty` is `Result<string, Error>`. The first `std.fs` surface.
     FsReadFile { path: Box<Expr> },

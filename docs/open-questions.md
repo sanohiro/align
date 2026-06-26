@@ -258,11 +258,20 @@ JSON→SoA is then a thin wiring on top.
    feeds AoS data + times `s := arr.to_soa(); s.a.sum()+s.b.sum()` vs re-reading AoS) — single-pass
    `arr.to_soa().a.sum()` LOSES (transpose cost), so the win is the multi-pass amortization, and the
    bench needs a no-`main` kernel taking an AoS `slice` param (the construction-from-param path).
-2. **`json.decode` → `soa<Struct>`.** Allow the decode target to be `soa<Struct>` (sema), lower as
-   decode-AoS-then-`to_soa` (MIR). User syntax `s: soa<User> := json.decode(d)?`. Bench:
-   `json.decode(data) → where(.active).score.sum()` vs Rust `serde_json → Vec<User> → filter/map/sum`
-   — the headline real-world win (telemetry / log / analytics: idiomatic Rust decodes to a `Vec<User>`
-   AoS and deserializes every field; Align reads only the columns the pipeline touches).
+2. **`json.decode` → `soa<Struct>`. — DONE (2026-06-27).** `s: soa<User> := json.decode(d)?` decodes
+   the JSON array of objects into a temporary AoS via the tested struct-array parser (N is unknown
+   until parsed), then transposes to a column-major `soa<Struct>` and frees the AoS temp. Implemented:
+   new `Scalar::Soa(u32)` (so `Result<soa<T>, Error>` is representable — Copy/region-tracked like
+   `Scalar::Str`, never dropped); HIR `JsonDecodeSoa { struct_id, input }`; sema arm in
+   `check_json_decode` (requires an arena + an all-primitive-scalar struct, so no `str` columns ⇒ the
+   soa is self-contained, region-tied to the arena not the input — `region_of(JsonDecodeSoa)=
+   arena(depth)`); MIR `lower_json_decode_soa` reuses `JsonDecodeStructArray` for the AoS decode then
+   the extracted `transpose_to_soa` helper on the Ok edge + `DropValue` the AoS temp. `tests/soa.rs`
+   (+6): decode→`age.sum()` (75), decode→`where(.active).pay.sum()` (15), parse-error propagation,
+   and the three rejections. **Bench (deferred, with step 1's duel):** `json.decode(data) →
+   where(.active).score.sum()` vs Rust `serde_json → Vec<User> → filter/map/sum` — the headline win
+   (idiomatic Rust decodes to a `Vec<User>` AoS and deserializes every field; Align reads only the
+   columns the pipeline touches). The cleanest measurement combines this with step 3 (field-skip).
 3. **Known-schema field-skip / projection decode (fold into step 2 — the strongest structural win,
    flagged by BOTH Gemini and Codex 2026-06-27).** When a decoded value is a *temporary fully
    consumed by the expression* (`json.decode(d).where(.active).score.sum()`, never bound/reused), the

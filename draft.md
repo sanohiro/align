@@ -766,17 +766,20 @@ predictable, while the field-wise lowering under the type is automatic. Crossing
 boundary (FFI, `json`, by-value) materializes to AoS explicitly. Use `array<T>` by default; reach
 for `soa<T>` on large, hot, field-wise-processed data.
 
-Build one with `.to_soa()`, which transposes a row-major struct array into the column layout:
+Build one with `.to_soa()` (transpose a row-major struct array) or decode JSON straight into it:
 
 ```align
 arena {
-  users := rows.to_soa()              // rows: array<User> (AoS) → soa<User> (column-major)
-  total := users.where(.active).pay.sum()
+  users := rows.to_soa()                       // rows: array<User> (AoS) → soa<User> (columns)
+  hot: soa<User> := json.decode(body)?         // decode straight into columns
+  total := hot.where(.active).pay.sum()        // streams only the active + pay columns
 }
 ```
 
-The column buffer is arena-allocated (the `soa` view borrows it), so `to_soa` lives inside an
-`arena {}` — building once and then running several column scans amortizes the transpose.
+The column buffer is arena-allocated (the `soa` view borrows it), so both forms live inside an
+`arena {}` — building once and then running several column scans amortizes the transpose. The JSON
+form is the analytics win: idiomatic Rust decodes to a `Vec<User>` (AoS) and deserializes every
+field, while Align lands the data column-major and a scan reads only the fields it touches.
 
 This is the layout lever that lets Align *beat* an array-of-structs (what a hand-written `Vec<User>`
 gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags
@@ -784,9 +787,10 @@ whole structs through cache. Measured ≈7× faster than an idiomatic-Rust `Vec<
 memory-bound workload (`bench/`, `col_sum`). *(Status: a borrowed `soa<T>` of a
 primitive-scalar struct is implemented — field-column projection `ps.field`, mixed-width columns
 (each padded to its alignment), a column-spanning `rs.where(.active).pay.sum()` (branchless, ≈3× an
-AoS filtered aggregate), and `.to_soa()` construction (transpose an `array<Struct>`, arena-allocated)
-all work, feeding the normal pipeline. The plain column scan beats AoS ≈7×. The remaining slices are
-decode-direct-to-`soa` (`json.decode` → `soa<User>`) and `str`/owned columns.)*
+AoS filtered aggregate), `.to_soa()` construction (transpose an `array<Struct>`, arena-allocated),
+and decode-direct-to-`soa` (`s: soa<User> := json.decode(d)?`, decode-AoS-then-transpose) all work,
+feeding the normal pipeline. The plain column scan beats AoS ≈7×. The remaining slices are
+known-schema field-skip decode (parse only the used columns) and `str`/owned columns.)*
 
 ---
 

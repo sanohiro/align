@@ -212,8 +212,8 @@ is shorthand for a one-field lambda.
 
 `array<T>` is row-major (array-of-structs); `soa<T>` is the explicit column-major (struct-of-arrays)
 layout, so a field-wise pipeline streams only the columns it touches (the cache lever that beats an
-AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`, arena-allocated). See
-`draft.md` §9.
+AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`) or decode straight into
+it (`s: soa<User> := json.decode(d)?`), both arena-allocated. See `draft.md` §9.
 
 ### Strings
 
