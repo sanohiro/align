@@ -43,6 +43,7 @@ fn rust_agg(data: &str) -> i64 {
 /// Build a JSON array of `n` records with LCG-varied values (so neither parser can constant-fold),
 /// ~half `active`. Returns the JSON text and the expected `where(.active).pay.sum()`.
 fn gen_json(n: usize) -> (String, i64) {
+    use std::fmt::Write;
     let mut s = String::with_capacity(n * 56);
     let mut state: u64 = 0x9e3779b97f4a7c15;
     let mut expected: i64 = 0;
@@ -58,10 +59,8 @@ fn gen_json(n: usize) -> (String, i64) {
         if i > 0 {
             s.push(',');
         }
-        // Field order varied a little would also exercise the perfect-hash; keep it fixed + realistic.
-        s.push_str(&format!(
-            "{{\"active\":{active},\"pay\":{pay},\"score\":{score},\"extra\":{i}}}"
-        ));
+        // `write!` straight into the buffer — avoids a temporary `String` alloc per record.
+        write!(s, "{{\"active\":{active},\"pay\":{pay},\"score\":{score},\"extra\":{i}}}").unwrap();
     }
     s.push(']');
     (s, expected)
