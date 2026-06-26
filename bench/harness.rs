@@ -23,6 +23,22 @@ struct Slice {
 extern "C" {
     fn sum_sq_pos(s: Slice) -> i64; // Align: s.where(pos).map(sq).sum()
     fn col_sum(s: Slice) -> i64; // Align: ps.a.sum() over soa<Particle> (column-major {ptr,len})
+    fn total_pay(s: Slice) -> i64; // Align: rs.where(.active).pay.sum() over soa<Row>
+}
+
+/// 48-byte row with a bool flag — idiomatic Rust stores `Vec<Row>` (array-of-structs).
+#[derive(Clone, Copy)]
+struct Row {
+    active: bool,
+    pay: i64,
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+}
+
+fn align_up(x: usize, a: usize) -> usize {
+    (x + (a - 1)) & !(a - 1)
 }
 
 /// 8-field, 64-byte struct — what idiomatic Rust stores as `Vec<Particle>` (array-of-structs).
@@ -106,5 +122,36 @@ fn main() {
         let sl = || Slice { ptr: soa.as_ptr(), len: n as i64 };
         let (a, r) = duel(rounds, || unsafe { col_sum(black_box(sl())) }, || black_box(&aos).iter().map(|p| p.a).sum());
         report("col_sum(soa)", n, a, r);
+    }
+
+    // 3) Filtered aggregation — Align `soa` `where(.active).pay.sum()` vs idiomatic Rust
+    //    `Vec<Row>.iter().filter(...).map(...).sum()`. soa reads only the active + pay columns and
+    //    the `where` is branchless, so it beats the whole-struct AoS scan.
+    println!("  -- filtered aggregate: soa where(.active).pay.sum() vs Rust Vec<Row> (AoS) --");
+    for &(n, rounds) in &[(1_000_000usize, 500usize), (20_000_000, 20)] {
+        let mut s: u64 = 0x9E3779B97F4A7C15;
+        let aos: Vec<Row> = (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                Row { active: (s >> 40) & 1 == 0, pay: ((s >> 20) & 0xFFFF) as i64, a: 0, b: 0, c: 0, d: 0 }
+            })
+            .collect();
+        // soa column-major buffer: active column (bool, 1 B) at 0, pay column (i64) padded to 8.
+        // Allocate as `Vec<i64>` so the base is 8-aligned (the kernel's i64 loads assume natural
+        // alignment); the 1-byte `active` flags are written through a `u8` view of the front.
+        let pay_off = align_up(n, 8); // bytes; a multiple of 8
+        let mut buf = vec![0i64; (pay_off + n * 8 * 5) / 8 + 8];
+        {
+            let active = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, n) };
+            for (i, r) in aos.iter().enumerate() {
+                active[i] = r.active as u8;
+            }
+        }
+        for (i, r) in aos.iter().enumerate() {
+            buf[pay_off / 8 + i] = r.pay;
+        }
+        let sl = || Slice { ptr: buf.as_ptr(), len: n as i64 };
+        let (a, r) = duel(rounds, || unsafe { total_pay(black_box(sl())) }, || black_box(&aos).iter().filter(|r| r.active).map(|r| r.pay).sum());
+        report("total_pay(soa)", n, a, r);
     }
 }

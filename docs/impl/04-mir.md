@@ -159,8 +159,10 @@ Carry vec/mask in MIR as **first-class** (`draft.md` §9), in a form that codege
 `where`/comparisons are lowered not to a per-element branch but to a `mask` + predicated ops
 (suited to SIMD/GPU) — **settled** (`open-questions.md` "SIMD exposure"; `05` §5): `where(p).sum()`
 → masked reduce, materialization → stream-compaction. No per-element `if` is part of the source
-semantics. *(The current backend still emits a placeholder `Term::Branch` for `where`; the mask
-lowering here is M6.)*
+semantics. *(Done for the `sum`/`count` reducers: `where(p).sum()` lowers branchless via a mask +
+`Rvalue::Select` (`acc += mask ? value : 0`) — it vectorizes and makes the soa filtered aggregate
+beat Rust (`bench/` `total_pay`). `reduce`/`any`/`all`/`min`/`max` and materializing terminals still
+use `Term::Branch`.)*
 
 ```align
 m := scores > 80;

@@ -206,16 +206,26 @@ lowers to `Rvalue::IndexColumn` (`column_base(field) + index`), so a column-span
 allowed** — each column's start is padded to the field's alignment in codegen (`align_up` chain), so
 `soa<{active: bool, pay: i64}>` is well-formed and aligned for any `len`. A whole-struct stage over
 soa (`where(fn)`/`map(fn)` taking the struct) is rejected cleanly (it would gather every column —
-field projection / `where(.field)` only). **Honest benchmark finding:** the filtered aggregate is
-currently only **≈parity** with Rust AoS (0.93×), NOT a win — disassembly shows the `where` lowers to
-a scalar per-element **branch** (20 conditional jumps, no vectorization), so it is branch-bound and
-the soa bandwidth advantage (5× less data touched) is lost. **This gives branchless-`where` a
-measurable target at last** (it was deferred because the single-column case already vectorizes via
-LLVM if-conversion; the mixed bool-mask + i64-value column case does NOT, so an explicit mask+select
-lowering would unblock the win). Branchless-`where` for the sum/count reducers is the next slice.
-**Still remaining:** owned-`soa` construction (AoS→SoA transpose / build — soa is param-only today),
-`soa_slice<T>` view, `str`/Move columns.
+field projection / `where(.field)` only).
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
+
+### Branchless `where` (sum/count) — DONE (2026-06-27)
+**Decision: a `where`/`where(.field)` feeding `sum` or `count` lowers branchless** — AND the
+predicates into a `mask`, then `select` the contribution to the reduction identity
+(`acc += mask ? value : 0`, count `+= mask ? 1 : 0`) instead of a per-element branch (`Rvalue::Select`
++ `accumulate_mask` in `align_mir`). `reduce`/`any`/`all`/`min`/`max` have no simple identity-masked
+form, so they keep the branch. **Why it matters now (it was rightly deferred before):** the
+single-column `s.where(p).sum()` over `slice<i64>` already vectorized via LLVM if-conversion — no
+gain. But the **soa filtered aggregate** `rs.where(.active).pay.sum()` (bool mask column + i64 value
+column) did NOT auto-vectorize — scalar, 20 branches, branch-bound, **0.93× vs Rust AoS** (parity).
+After branchless lowering it vectorizes (16 vector ops, no per-element branch) and is **≈3.5× faster
+than idiomatic Rust `Vec<Row>`** (`bench/` `total_pay`, "Align faster"). So the soa filtered
+aggregate now beats Rust too (the plain column scan stays ~7-10×). `tests/branchless_where.rs`,
+`bench/`. (Materialize via stream-compaction — `to_array`/`partition` under a `where` — stays
+branchy; that is a separate slice.)
+
+**Still remaining for soa:** owned-`soa` construction (AoS→SoA transpose / build — soa is param-only
+today), `soa_slice<T>` view, `str`/Move columns.
 
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
