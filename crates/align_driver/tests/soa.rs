@@ -56,21 +56,32 @@ fn soa_with_a_str_field_is_rejected() {
 }
 
 #[test]
-fn soa_with_mixed_width_fields_is_rejected() {
-    // First cut requires uniform field width so every column lands at a naturally-aligned offset
-    // (`i8` then `i64` would put the i64 column at an unaligned address for some lengths).
-    assert!(!ok(concat!(
+fn soa_with_mixed_width_fields_is_allowed() {
+    // Mixed widths are fine: each column's start is padded to the field's alignment in codegen, so
+    // `i8` then `i64` keeps the i64 column naturally aligned for any length.
+    assert!(ok(concat!(
         "P { tag: i8, value: i64 }\n",
         "pub fn k(ps: soa<P>) -> i64 = ps.value.sum()\n",
     )));
 }
 
 #[test]
-fn soa_with_uniform_width_but_mixed_types_is_allowed() {
-    // i32 and f32 are both 4 bytes → columns stay aligned, so this is fine.
+fn a_filtered_aggregate_over_two_columns_type_checks() {
+    // `where(.active)` filters by one column, `.pay` reads another — a column-spanning pipeline.
     assert!(ok(concat!(
-        "P { id: i32, weight: f32 }\n",
-        "pub fn k(ps: soa<P>) -> i32 = ps.id.sum()\n",
+        "Row { active: bool, pay: i64 }\n",
+        "pub fn total(rs: soa<Row>) -> i64 = rs.where(.active).pay.sum()\n",
+    )));
+}
+
+#[test]
+fn a_whole_struct_stage_over_soa_is_rejected() {
+    // A `where(fn)` / `map(fn)` taking the whole struct would gather every column — rejected (no
+    // panic); filter a field with `where(.field)` instead.
+    assert!(!ok(concat!(
+        "Row { active: i64, pay: i64 }\n",
+        "pub fn total(rs: soa<Row>) -> i64 = rs.where(act).pay.sum()\n",
+        "fn act(r: Row) -> bool = r.active > 0\n",
     )));
 }
 

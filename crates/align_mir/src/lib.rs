@@ -200,6 +200,11 @@ pub enum Rvalue {
     /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
     /// fused pipeline (`users.where(.active).score.sum()`) can run over a runtime-length AoS.
     IndexFieldPtr { base: Operand, index: Operand, field: u32, struct_id: u32 },
+    /// `base.field[index]` for a `soa<Struct>` view: `base` is the `{ptr,len}` column-major buffer,
+    /// so column `field` begins at `ptr + len*prefix_bytes(field)` and element `index` is
+    /// `column_base + index*field_size`. The SoA counterpart of [`Rvalue::IndexFieldPtr`] — a scan
+    /// reads only the columns it touches.
+    IndexColumn { base: Operand, index: Operand, field: u32, struct_id: u32 },
     /// `base[index]` — load a **whole** struct element of `struct_id` from a `{ptr,len}` view of
     /// an owned, dynamic `array<Struct>` (GEP `%Struct, ptr, index`, then load the aggregate). The
     /// field-less analogue of [`Rvalue::IndexFieldPtr`]; emitted by `map(f)` whose `f` consumes a
@@ -1384,6 +1389,14 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, layout)), temp_free: None }
         }
+        // A `soa<Struct>` view: a `{ptr,len}` column-major buffer. Same `{ptr,len}` handling as an
+        // owned struct array, but the `Layout::Soa` struct-view makes field access column-addressed.
+        Ty::Soa(id) => {
+            let sv = lower_expr(b, source);
+            let len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+            SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, Layout::Soa)), temp_free: None }
+        }
         _ => {
             let (slot, n) = array_source_slot(b, source);
             SrcSetup {
@@ -1427,6 +1440,17 @@ fn lower_field_access(
                     struct_id,
                 },
             )),
+            // SoA: address column `field` then element `index` within it
+            // (`column_base(field) + index`), reading only the touched column.
+            Layout::Soa => b.push(Stmt::Let(
+                v,
+                Rvalue::IndexColumn {
+                    base: slice_val.clone().expect("a soa source has a {ptr,len} value"),
+                    index: index.clone(),
+                    field,
+                    struct_id,
+                },
+            )),
         },
         None => b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), field))),
     }
@@ -1457,6 +1481,10 @@ fn lower_struct_elem(
                     struct_id: sid,
                 },
             )),
+            // Loading a whole struct out of a `soa` would gather every column at `index`. The first
+            // soa cut allows only field projection / `where(.field)`, so sema rejects a whole-struct
+            // stage over soa and this is unreachable.
+            Layout::Soa => unreachable!("whole-struct access over a soa source is rejected in sema"),
         },
         None => b.push(Stmt::Let(v, Rvalue::Index(slot, index.clone()))),
     }

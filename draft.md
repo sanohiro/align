@@ -770,9 +770,11 @@ This is the layout lever that lets Align *beat* an array-of-structs (what a hand
 gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags
 whole structs through cache. Measured ≈7× faster than an idiomatic-Rust `Vec<Struct>` field sum on a
 memory-bound workload (`bench/`, `col_sum`). *(Status: a borrowed `soa<T>` of a
-uniform-width primitive-scalar struct with field-column projection `ps.field` is implemented;
-columns feed the normal pipeline. Owned-`soa` construction, mixed-width columns, `str`/owned columns,
-and a `where(.field)` filter spanning columns are the remaining slices.)*
+primitive-scalar struct is implemented — field-column projection `ps.field`, mixed-width columns
+(each padded to its alignment), and a column-spanning `rs.where(.active).pay.sum()` all work, feeding
+the normal pipeline. The plain column scan beats AoS ≈7×; the *filtered* aggregate is currently
+branch-bound at ≈parity until branchless-`where` lands. Owned-`soa` construction and `str`/owned
+columns are the remaining slices.)*
 
 ---
 
