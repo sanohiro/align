@@ -791,6 +791,17 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                     }
                 }
             }
+            UnOp::BitNot => {
+                let (ty, val) = self.expr(expr, expected, module)?;
+                match (ty, val) {
+                    (Ty::Int(it), ConstVal::Int(v)) => Some((ty, ConstVal::Int(wrap_to_int(!v, it)))),
+                    (Ty::Error, _) => None,
+                    _ => {
+                        self.diags.error("unary `~` expects an integer".to_string(), span);
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -824,7 +835,7 @@ impl<'a, 'd> ConstEval<'a, 'd> {
             let v = self.compare(op, &lval, &rval, span)?;
             return self.expect_scalar(Ty::Bool, ConstVal::Bool(v), expected, span);
         }
-        // Arithmetic: numeric operands only.
+        // Arithmetic + bitwise/shift: numeric operands only (bitwise/shift integer-only).
         match (lval, rval, lty) {
             (ConstVal::Int(a), ConstVal::Int(b), Ty::Int(it)) => {
                 let r = match op {
@@ -838,7 +849,14 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                         }
                         if op == Div { a.wrapping_div(b) } else { a.wrapping_rem(b) }
                     }
-                    _ => unreachable!(),
+                    BitAnd => a & b,
+                    BitOr => a | b,
+                    BitXor => a ^ b,
+                    // The shift amount is masked mod the bit width (the same defined behavior as
+                    // codegen), so a too-large shift wraps rather than being undefined.
+                    Shl => a << (b & (it.bits as i128 - 1)),
+                    Shr => a >> (b & (it.bits as i128 - 1)),
+                    _ => unreachable!("comparison/logic handled above"),
                 };
                 Some((lty, ConstVal::Int(wrap_to_int(r, it))))
             }
@@ -849,7 +867,10 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                     Mul => a * b,
                     Div => a / b,
                     Rem => a % b,
-                    _ => unreachable!(),
+                    _ => {
+                        self.diags.error("bitwise and shift operators expect integers".to_string(), span);
+                        return None;
+                    }
                 };
                 Some((lty, ConstVal::Float(r)))
             }
@@ -3277,6 +3298,12 @@ impl<'a, 't> Checker<'a, 't> {
                         self.unify(inner.ty, Ty::Bool, e.span);
                         Ty::Bool
                     }
+                    UnOp::BitNot => {
+                        if !inner.ty.is_int_like() && inner.ty != Ty::Error {
+                            self.diags.error("unary '~' expects an integer", e.span);
+                        }
+                        inner.ty
+                    }
                 };
                 Expr { kind: ExprKind::Unary { op: *op, expr: Box::new(inner) }, ty, span: e.span }
             }
@@ -3893,6 +3920,19 @@ impl<'a, 't> Checker<'a, 't> {
                 l = self.check_expr(lhs, Some(Ty::Bool));
                 r = self.check_expr(rhs, Some(Ty::Bool));
                 ty = Ty::Bool;
+            }
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                // Bitwise / shift: integer-only, no implicit coercion. The shift amount shares the
+                // value's type (unified like arithmetic), so the result is that integer type.
+                l = self.check_expr(lhs, expected);
+                r = self.check_expr(rhs, Some(l.ty));
+                let t = self.unify(l.ty, r.ty, span);
+                if let Ty::Param(_) = t {
+                    self.diags.error("bitwise and shift operators need a concrete integer (not a generic type parameter)".to_string(), span);
+                } else if !t.is_int_like() && t != Ty::Error {
+                    self.diags.error("bitwise and shift operators expect integers".to_string(), span);
+                }
+                ty = t;
             }
         }
         self.constrain(ty, expected, span);

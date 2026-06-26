@@ -329,6 +329,28 @@ char ↔ int     the Unicode code point (a u32); char never converts directly to
 
 `bool` does not participate (use `if`); there is no conversion to or from struct, string, or other composite types.
 
+### Bitwise and Shift Operators
+
+Integers support the bitwise operators `&` `|` `^` and unary `~` (complement), and the shifts `<<` /
+`>>`. They are **integer-only** — `bool` uses the logical `&&` / `||` / `!`, and there is no implicit
+coercion, so the shift amount shares the value's type (`x << (n as i32)` to mix widths).
+
+```align
+flags := 1 | 4             // set bits
+masked := flags & 6        // test bits
+toggled := flags ^ 2       // flip a bit
+high := value >> 8         // arithmetic shift on a signed value, logical on unsigned
+inv := ~mask               // complement
+```
+
+Precedence follows the Go model: `<<` `>>` `&` bind like `*`, and `|` `^` like `+` — so **every
+bitwise/shift operator binds tighter than a comparison** (`a & b == c` is `(a & b) == c`, avoiding
+the classic C footgun). A shift amount is taken **modulo the value's bit width** (defined and
+zero-cost — the same "no UB, predictable" stance as the overflow-wrap rule above; a constant shift
+≥ the width is a lint), and `>>` is arithmetic (sign-extending) on a signed value, logical
+(zero-filling) on an unsigned one. The higher-level `bitset` type (large bit sets, SIMD-friendly) is
+a separate `core` type built on these.
+
 ### Optional
 
 ```align

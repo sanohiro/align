@@ -1,0 +1,17 @@
+// Integer bitwise & shift operators — `& | ^ << >>` and unary `~` (draft.md §5).
+// Integer-only (bool uses `&&`/`||`/`!`); the shift amount shares the value's type.
+// Precedence is Go-style: bitwise/shift bind tighter than comparison, so `a & b == c`
+// is `(a & b) == c`. A shift amount is masked mod the bit width; `>>` is arithmetic on
+// a signed value, logical on unsigned.
+FLAGS: i32 := 1 << 3 | 1       // folded at compile time = 9
+
+fn main() -> i32 {
+  a: i32 := 12
+  b: i32 := 10
+  and := a & b                 // 8
+  or := a | b                  // 14
+  xor := a ^ b                 // 6
+  shifted := 64 >> 2           // 16
+  // 8 + 14 + 6 + 16 = 44, minus FLAGS (9) ... return 44 - 9 + 7 = 42
+  return and + or + xor + shifted - FLAGS + 7
+}
