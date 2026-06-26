@@ -836,7 +836,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::Enum(id) => ex[id as usize].into(),
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct.
-        Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Str | Ty::String | Ty::Slice(_) | Ty::Soa(_) | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
@@ -898,7 +898,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
-        Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
+        Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty, sx, ex),
@@ -1502,6 +1502,32 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder
                     .build_load(fty, field_ptr, "fld")
                     .map_err(|e| self.err(e))?
+            }
+            Rvalue::SoaColumn { base, struct_id, field } => {
+                // Load the soa `{ ptr, len }`, then view the `field`-th column: the buffer is
+                // column-major, so column `field` begins at `ptr + len * prefix_bytes` (the sizes
+                // of the preceding fields) and has the same `len`.
+                let sty = slice_struct_type(self.ctx);
+                let soa = self
+                    .builder
+                    .build_load(sty, self.slots[base], "soa")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let ptr = self.builder.build_extract_value(soa, 0, "soaptr").map_err(|e| self.err(e))?.into_pointer_value();
+                let len = self.builder.build_extract_value(soa, 1, "soalen").map_err(|e| self.err(e))?.into_int_value();
+                let prefix: u64 = self.structs[*struct_id as usize].fields[..*field as usize]
+                    .iter()
+                    .map(|f| scalar_bytes(align_sema::ty_to_scalar(f.ty).expect("soa field is a scalar")))
+                    .sum();
+                let i64t = self.ctx.i64_type();
+                let byte_off = self.builder.build_int_mul(len, i64t.const_int(prefix, false), "coloff").map_err(|e| self.err(e))?;
+                let new_ptr = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(self.ctx.i8_type(), ptr, &[byte_off], "colptr")
+                        .map_err(|e| self.err(e))?
+                };
+                let agg = self.builder.build_insert_value(sty.get_undef(), new_ptr, 0, "colptr").map_err(|e| self.err(e))?.into_struct_value();
+                self.builder.build_insert_value(agg, len, 1, "collen").map_err(|e| self.err(e))?.into_struct_value().into()
             }
             Rvalue::OptionSome(op) => {
                 let Ty::Option(s) = result_ty else {
@@ -2246,7 +2272,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
-            Ty::Slice(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
+            Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
             Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(self.ctx).into(),
             _ => scalar_type(self.ctx, ty, self.struct_types, self.enum_types),

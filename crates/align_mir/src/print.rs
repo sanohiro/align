@@ -138,6 +138,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("call_indirect {}({})", operand_str(callee), a.join(", "))
         }
         Rvalue::Field(slot, idx) => format!("_{slot}.{idx}"),
+        Rvalue::SoaColumn { base, struct_id, field } => format!("soa_col(_{base}: struct#{struct_id}, .{field})"),
         Rvalue::OptionSome(op) => format!("Some({})", operand_str(op)),
         Rvalue::OptionNone => "None".to_string(),
         Rvalue::OptionIsSome(op) => format!("is_some({})", operand_str(op)),

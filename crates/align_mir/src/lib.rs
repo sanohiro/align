@@ -141,6 +141,10 @@ pub enum Rvalue {
     CallIndirect { callee: Operand, args: Vec<Operand>, param_tys: Vec<Ty>, ret_ty: Ty },
     /// Load field `index` from the struct in `slot`.
     Field(Slot, u32),
+    /// Project one column of a `soa<Struct>` value in `slot` (a `{ ptr, len }` column-major buffer)
+    /// as the `field`-th column's `slice<FieldTy>` — `{ ptr + len * prefix_bytes, len }`, where
+    /// `prefix_bytes` (the sizes of the preceding fields) is computed in codegen from `struct_id`.
+    SoaColumn { base: Slot, struct_id: u32, field: u32 },
     /// `Some(operand)` — build an `Option` aggregate (tag = Some).
     OptionSome(Operand),
     /// `None` — build an `Option` aggregate (tag = None); the type is the value's.
@@ -798,6 +802,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Field { base, index } => {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Field(*base, *index)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::SoaColumn { base, struct_id, field } => {
+            let v = b.fresh_value(e.ty); // slice<FieldTy>
+            b.push(Stmt::Let(v, Rvalue::SoaColumn { base: *base, struct_id: *struct_id, field: *field }));
             Operand::Value(v)
         }
         hir::ExprKind::Tuple { tuple_id, elems } => {
@@ -2740,6 +2749,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Box(_) => "box".to_string(),
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
+        Ty::Soa(id) => format!("soa<struct#{id}>"),
         Ty::DynArray(_) => "array".to_string(),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(_) => "array<slice>".to_string(),
