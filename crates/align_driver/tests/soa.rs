@@ -122,3 +122,107 @@ fn the_compiled_object_exports_the_kernel() {
     assert!(obj.exists());
     let _ = std::fs::remove_file(&obj);
 }
+
+// ---- `to_soa()` construction (transpose AoS → column-major soa) ----
+
+#[test]
+fn to_soa_type_checks_inside_an_arena() {
+    assert!(ok(concat!(
+        "P { a: i32, b: i32 }\n",
+        "fn main() -> i32 {\n  arena {\n    s := [P { a: 1, b: 2 }].to_soa()\n    return s.a.sum()\n  }\n}\n",
+    )));
+}
+
+#[test]
+fn to_soa_outside_an_arena_is_rejected() {
+    // The column buffer is arena-bump-allocated (no owned-soa type yet), so it needs an arena.
+    assert!(!ok(concat!(
+        "P { a: i32, b: i32 }\n",
+        "fn main() -> i32 {\n  s := [P { a: 1, b: 2 }].to_soa()\n  return s.a.sum()\n}\n",
+    )));
+}
+
+#[test]
+fn a_built_soa_cannot_escape_its_arena() {
+    // The view borrows the arena buffer (region-tied), so returning it out of the arena is an escape.
+    assert!(!ok(concat!(
+        "P { a: i32, b: i32 }\n",
+        "fn build() -> soa<P> {\n  arena {\n    return [P { a: 1, b: 2 }].to_soa()\n  }\n}\n",
+        "fn main() -> i32 = 0\n",
+    )));
+}
+
+#[test]
+fn to_soa_over_a_non_struct_array_is_rejected() {
+    assert!(!ok("fn main() -> i32 {\n  arena {\n    s := [1, 2, 3].to_soa()\n    return 0\n  }\n}\n"));
+}
+
+#[test]
+fn to_soa_over_a_str_field_struct_is_rejected() {
+    assert!(!ok(concat!(
+        "Rec { id: i32, name: str }\n",
+        "fn main() -> i32 {\n  arena {\n    s := [Rec { id: 1, name: \"x\" }].to_soa()\n    return 0\n  }\n}\n",
+    )));
+}
+
+#[test]
+fn to_soa_with_a_pipeline_stage_is_rejected() {
+    // First cut is a pure transpose of the whole struct — `where`/`map`/`.field` before it is not
+    // supported yet.
+    assert!(!ok(concat!(
+        "P { a: i32, b: i32 }\n",
+        "fn main() -> i32 {\n  arena {\n    s := [P { a: 1, b: 2 }].where(pa).to_soa()\n    return 0\n  }\n}\n",
+        "fn pa(p: P) -> bool = p.a > 0\n",
+    )));
+}
+
+#[test]
+fn to_soa_builds_and_sums_two_columns() {
+    if !backend_available() {
+        return;
+    }
+    // a.sum()=1+2+3=6, b.sum()=10+20+30=60 → 66. The transpose scatters each element's fields into
+    // their columns, then two column scans read them back.
+    let out = build_and_run(
+        "soa-build",
+        concat!(
+            "P { a: i32, b: i32 }\n",
+            "fn main() -> i32 {\n  arena {\n    s := [P { a: 1, b: 10 }, P { a: 2, b: 20 }, P { a: 3, b: 30 }].to_soa()\n    return s.a.sum() + s.b.sum()\n  }\n}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(66));
+}
+
+#[test]
+fn to_soa_keeps_mixed_width_columns_aligned() {
+    if !backend_available() {
+        return;
+    }
+    // `i8` then `i32`: the `n` column starts at `align_up(2*1, 4) = 4`, so the write and the read
+    // must agree on the padded offset. n.sum()=40+2=42.
+    let out = build_and_run(
+        "soa-build-mixed",
+        concat!(
+            "P { flag: i8, n: i32 }\n",
+            "fn main() -> i32 {\n  arena {\n    s := [P { flag: 1, n: 40 }, P { flag: 1, n: 2 }].to_soa()\n    return s.n.sum()\n  }\n}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn a_built_soa_feeds_a_filtered_multi_column_aggregate() {
+    if !backend_available() {
+        return;
+    }
+    // The headline flow: build the soa, then `where(.active).pay.sum()` streams two columns —
+    // 10 + 5 = 15 (the inactive 20 is masked out).
+    let out = build_and_run(
+        "soa-build-where",
+        concat!(
+            "Row { active: bool, pay: i32 }\n",
+            "fn main() -> i32 {\n  arena {\n    s := [Row { active: true, pay: 10 }, Row { active: false, pay: 20 }, Row { active: true, pay: 5 }].to_soa()\n    return s.where(.active).pay.sum()\n  }\n}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(15));
+}

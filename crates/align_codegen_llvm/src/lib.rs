@@ -1023,6 +1023,44 @@ impl<'c, 'a> FnGen<'c, 'a> {
         CodegenError::Lowering(e.to_string())
     }
 
+    /// The byte size of each field (= column element size) of a `soa<Struct>`, in declaration
+    /// order. Fields are primitive scalars (sema-enforced).
+    fn soa_field_sizes(&self, struct_id: u32) -> Vec<u64> {
+        self.structs[struct_id as usize]
+            .fields
+            .iter()
+            .map(|f| scalar_bytes(align_sema::ty_to_scalar(f.ty).expect("soa field is a scalar")))
+            .collect()
+    }
+
+    /// Byte offset of column `field` within a `soa<Struct>` column-major buffer of `len` rows:
+    /// `start_0 = 0`, `start_j = align_up(start_{j-1} + len*size_{j-1}, size_j)`. Each column is
+    /// padded to the field's alignment (= its size for a primitive), so mixed-width columns stay
+    /// naturally aligned for any `len`. Shared by [`Rvalue::IndexColumn`], [`Stmt::StoreColumn`],
+    /// and the [`Rvalue::SoaAlloc`] total-size walk.
+    fn soa_column_offset(
+        &self,
+        len: inkwell::values::IntValue<'c>,
+        sizes: &[u64],
+        field: usize,
+    ) -> Result<inkwell::values::IntValue<'c>, CodegenError> {
+        let i64t = self.ctx.i64_type();
+        let mut off = i64t.const_zero();
+        for j in 1..=field {
+            let adv = self.builder.build_int_mul(len, i64t.const_int(sizes[j - 1], false), "coladv").map_err(|e| self.err(e))?;
+            let sum = self.builder.build_int_add(off, adv, "colend").map_err(|e| self.err(e))?;
+            let a = sizes[j]; // field alignment = its size (power of two)
+            // align_up(sum, a) = (sum + a-1) & ~(a-1); a no-op for a 1-byte column, so skip it.
+            off = if a > 1 {
+                let bumped = self.builder.build_int_add(sum, i64t.const_int(a - 1, false), "colbump").map_err(|e| self.err(e))?;
+                self.builder.build_and(bumped, i64t.const_int(!(a - 1), false), "colalign").map_err(|e| self.err(e))?
+            } else {
+                sum
+            };
+        }
+        Ok(off)
+    }
+
     /// Allocate stack storage hoisted to the top of the entry block (so an alloca inside a loop
     /// does not grow the stack each iteration), then restore the builder to the current position.
     fn alloca_at_entry(&self, ty: BasicTypeEnum<'c>, name: &str) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
@@ -1193,6 +1231,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_in_bounds_gep(val.get_type(), p, &[index], "ptrstore")
                             .map_err(|e| self.err(e))?
                     };
+                    self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                }
+                Stmt::StoreColumn { base, len, index, field, struct_id, value } => {
+                    // Scatter `value` into column `field` at row `index` of the soa buffer `base`:
+                    // `column_base(field) + index*size_field`. The write counterpart of
+                    // `Rvalue::IndexColumn`, sharing the same per-column `align_up` offset chain.
+                    let buf = self.operand(base).into_pointer_value();
+                    let len_v = self.operand(len).into_int_value();
+                    let sizes = self.soa_field_sizes(*struct_id);
+                    let off = self.soa_column_offset(len_v, &sizes, *field as usize)?;
+                    let col_base = unsafe {
+                        self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "colbase").map_err(|e| self.err(e))?
+                    };
+                    let fty = scalar_type(self.ctx, self.structs[*struct_id as usize].fields[*field as usize].ty, self.struct_types, self.enum_types);
+                    let idx_v = self.operand(index).into_int_value();
+                    let ep = unsafe {
+                        self.builder.build_in_bounds_gep(fty, col_base, &[idx_v], "colelem").map_err(|e| self.err(e))?
+                    };
+                    let val = self.operand(value);
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
                 Stmt::ArenaEnd(op) => {
@@ -1872,27 +1929,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let agg = self.operand(base).into_struct_value();
                 let buf = self.builder.build_extract_value(agg, 0, "soaptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let len = self.builder.build_extract_value(agg, 1, "soalen").map_err(|e| self.err(e))?.into_int_value();
-                let i64t = self.ctx.i64_type();
-                let sizes: Vec<u64> = self.structs[*struct_id as usize]
-                    .fields
-                    .iter()
-                    .map(|f| scalar_bytes(align_sema::ty_to_scalar(f.ty).expect("soa field is a scalar")))
-                    .collect();
-                // offset of column `field` (i64 value): start_0 = 0; start_j = align_up(start_{j-1}
-                // + len*size_{j-1}, size_j).
-                let mut off = i64t.const_zero();
-                for j in 1..=(*field as usize) {
-                    let adv = self.builder.build_int_mul(len, i64t.const_int(sizes[j - 1], false), "coladv").map_err(|e| self.err(e))?;
-                    let sum = self.builder.build_int_add(off, adv, "colend").map_err(|e| self.err(e))?;
-                    let a = sizes[j]; // field alignment = its size (power of two)
-                    // align_up(sum, a) = (sum + a-1) & ~(a-1); a no-op for a 1-byte column, so skip it.
-                    off = if a > 1 {
-                        let bumped = self.builder.build_int_add(sum, i64t.const_int(a - 1, false), "colbump").map_err(|e| self.err(e))?;
-                        self.builder.build_and(bumped, i64t.const_int(!(a - 1), false), "colalign").map_err(|e| self.err(e))?
-                    } else {
-                        sum
-                    };
-                }
+                let sizes = self.soa_field_sizes(*struct_id);
+                let off = self.soa_column_offset(len, &sizes, *field as usize)?;
                 let col_base = unsafe {
                     self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "colbase").map_err(|e| self.err(e))?
                 };
@@ -1987,6 +2025,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .expect("alloc returns a pointer")
+            }
+            Rvalue::SoaAlloc { handle, len, struct_id } => {
+                // Bump-allocate the column-major buffer for `len` rows. Total bytes = the end of the
+                // last column: the column-offset walk to the last field, plus that column's own
+                // `len*size` bytes. Buffer align = the widest field (so each column's `align_up`
+                // padding, computed relative to base, actually lands on an aligned address).
+                let len_v = self.operand(len).into_int_value();
+                let sizes = self.soa_field_sizes(*struct_id);
+                let last = sizes.len() - 1;
+                let i64t = self.ctx.i64_type();
+                let last_off = self.soa_column_offset(len_v, &sizes, last)?;
+                let last_bytes = self.builder.build_int_mul(len_v, i64t.const_int(sizes[last], false), "lastcol").map_err(|e| self.err(e))?;
+                let total = self.builder.build_int_add(last_off, last_bytes, "soabytes").map_err(|e| self.err(e))?;
+                let max_align = sizes.iter().copied().max().unwrap_or(1);
+                self.builder
+                    .build_call(self.funcs["arena_alloc"], &[self.operand(handle).into(), total.into(), i64t.const_int(max_align, false).into()], "soabuf")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("arena_alloc returns a pointer")
             }
             Rvalue::MakeDynArray { ptr, len } => {
                 // Build the owned array value `{ ptr, len }` (same layout as a slice).

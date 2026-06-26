@@ -58,7 +58,16 @@ touches a subset of fields (`users.where(.active).pay.sum()`) then streams only 
 choice is visible (predictable performance, "nothing hidden"); the *field-wise lowering under the
 type* is the automatic part. Crossing a byte-layout boundary (FFI, `json` encode/decode, by-value)
 **materializes to AoS explicitly**. (This closes the earlier "automatic decision vs. annotation"
-question in favor of annotation.) Uses the `Layout::Soa` seam; build is M6.
+question in favor of annotation.) Uses the `Layout::Soa` seam.
+
+The column buffer is **column-major with per-column alignment padding**: column `j` begins at
+`align_up(start_{j-1} + len*size_{j-1}, size_j)`, so mixed-width columns (`bool` then `i64`) stay
+naturally aligned for any `len`. A column read is `Rvalue::IndexColumn`; a column write (during
+construction) is `Stmt::StoreColumn` — both share one `soa_column_offset` codegen helper.
+Construction is `.to_soa()`: `Rvalue::SoaAlloc` arena-bump-allocates the buffer (total size = the
+offset walk to the last column + its `len*size`, aligned to the widest field), then a fused loop
+scatters each AoS element's fields into their columns (`StoreColumn`), yielding the `{ptr,len}` view.
+Decode-direct-to-`soa` and `str`/owned columns are later slices.
 
 ---
 
