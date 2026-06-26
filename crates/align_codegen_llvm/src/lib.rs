@@ -1879,8 +1879,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let adv = self.builder.build_int_mul(len, i64t.const_int(sizes[j - 1], false), "coladv").map_err(|e| self.err(e))?;
                     let sum = self.builder.build_int_add(off, adv, "colend").map_err(|e| self.err(e))?;
                     let a = sizes[j]; // field alignment = its size (power of two)
-                    let bumped = self.builder.build_int_add(sum, i64t.const_int(a - 1, false), "colbump").map_err(|e| self.err(e))?;
-                    off = self.builder.build_and(bumped, i64t.const_int(!(a - 1), false), "colalign").map_err(|e| self.err(e))?;
+                    // align_up(sum, a) = (sum + a-1) & ~(a-1); a no-op for a 1-byte column, so skip it.
+                    off = if a > 1 {
+                        let bumped = self.builder.build_int_add(sum, i64t.const_int(a - 1, false), "colbump").map_err(|e| self.err(e))?;
+                        self.builder.build_and(bumped, i64t.const_int(!(a - 1), false), "colalign").map_err(|e| self.err(e))?
+                    } else {
+                        sum
+                    };
                 }
                 let col_base = unsafe {
                     self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "colbase").map_err(|e| self.err(e))?
