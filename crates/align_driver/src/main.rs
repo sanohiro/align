@@ -12,21 +12,25 @@ use std::process::ExitCode;
 
 use align_driver::{
     check, emit_llvm_ir, emit_object_file, format_diagnostics, link_executable, lower_to_mir,
+    BuildTarget,
 };
 use align_span::SourceMap;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    let raw: Vec<String> = std::env::args().collect();
+    // Pull the `--target-cpu` flag out before positional parsing (so it may sit anywhere up to the
+    // program's own args, and `run` does not forward it to the built program).
+    let (target, args) = parse_target(&raw);
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
 
     match (cmd, path) {
         (Some("check"), Some(p)) => run_check(p),
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
-        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p),
-        (Some("build"), Some(p)) => run_build(p),
+        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, target),
+        (Some("build"), Some(p)) => run_build(p, target),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
-        (Some("run"), Some(p)) => run_run(p, &args[3..]),
+        (Some("run"), Some(p)) => run_run(p, &args[3..], target),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -34,16 +38,49 @@ fn main() -> ExitCode {
     }
 }
 
+/// Pull `--target-cpu <baseline|native>` (or `--target-cpu=…`) out of `args`, returning the chosen
+/// target and the remaining (positional) arguments. Default = the portable `Baseline`.
+fn parse_target(args: &[String]) -> (BuildTarget, Vec<String>) {
+    let value = |v: &str| match v {
+        "native" => BuildTarget::Native,
+        "baseline" => BuildTarget::Baseline,
+        other => {
+            eprintln!("alignc: unknown --target-cpu '{other}' (expected `baseline` or `native`); using baseline");
+            BuildTarget::Baseline
+        }
+    };
+    let mut target = BuildTarget::Baseline;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(v) = a.strip_prefix("--target-cpu=") {
+            target = value(v);
+        } else if a == "--target-cpu" {
+            if let Some(v) = args.get(i + 1) {
+                target = value(v);
+                i += 1;
+            }
+        } else {
+            rest.push(a.clone());
+        }
+        i += 1;
+    }
+    (target, rest)
+}
+
 fn usage() {
     eprintln!(
-        "usage: alignc <command> <file.align>\n\
+        "usage: alignc <command> <file.align> [--target-cpu baseline|native]\n\
          \n\
          commands:\n  \
            check      check through lexer/parser/sema\n  \
            emit-mir   print MIR as text\n  \
            emit-llvm  print LLVM IR as text\n  \
            build      build an executable\n  \
-           run        build and run (returns the exit code)"
+           run        build and run (returns the exit code)\n  \
+         \n\
+         --target-cpu  baseline (default; portable per-arch floor) or native (this host's CPU)"
     );
 }
 
@@ -99,11 +136,11 @@ fn run_emit_mir(path: &str) -> ExitCode {
     }
 }
 
-fn run_emit_llvm(path: &str) -> ExitCode {
+fn run_emit_llvm(path: &str, target: BuildTarget) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
-    match emit_llvm_ir(&mir) {
+    match emit_llvm_ir(&mir, target) {
         Ok(ir) => {
             print!("{ir}");
             ExitCode::SUCCESS
@@ -124,9 +161,9 @@ fn stem(path: &str) -> String {
 }
 
 /// Turn MIR into an object and link it into an executable. Returns the `exe` path.
-fn build_to(path: &str, mir: &align_mir::Program, exe: &PathBuf) -> Result<(), ExitCode> {
+fn build_to(path: &str, mir: &align_mir::Program, exe: &PathBuf, target: BuildTarget) -> Result<(), ExitCode> {
     let obj = std::env::temp_dir().join(format!("align-{}.o", stem(path)));
-    if let Err(e) = emit_object_file(mir, &obj) {
+    if let Err(e) = emit_object_file(mir, &obj, target) {
         eprintln!("alignc: codegen failed: {e}");
         return Err(ExitCode::FAILURE);
     }
@@ -137,12 +174,12 @@ fn build_to(path: &str, mir: &align_mir::Program, exe: &PathBuf) -> Result<(), E
     Ok(())
 }
 
-fn run_build(path: &str) -> ExitCode {
+fn run_build(path: &str, target: BuildTarget) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
     let exe = PathBuf::from(stem(path));
-    match build_to(path, &mir, &exe) {
+    match build_to(path, &mir, &exe, target) {
         Ok(()) => {
             println!("alignc: built executable: {}", exe.display());
             ExitCode::SUCCESS
@@ -151,12 +188,12 @@ fn run_build(path: &str) -> ExitCode {
     }
 }
 
-fn run_run(path: &str, prog_args: &[String]) -> ExitCode {
+fn run_run(path: &str, prog_args: &[String], target: BuildTarget) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
     let exe = std::env::temp_dir().join(format!("align-{}", stem(path)));
-    if let Err(code) = build_to(path, &mir, &exe) {
+    if let Err(code) = build_to(path, &mir, &exe, target) {
         return code;
     }
     // Forward trailing args so they reach the program's `main(args: array<str>)` (argv[0] is the

@@ -6,6 +6,7 @@
 
 use align_diag::{Diagnostics, Severity};
 use align_span::SourceMap;
+pub use align_codegen_llvm::BuildTarget;
 
 /// Result of running the pipeline through sema.
 pub struct Checked {
@@ -110,14 +111,15 @@ pub fn backend_available() -> bool {
     align_codegen_llvm::is_available()
 }
 
-/// Write MIR out to an object file (codegen).
-pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path) -> Result<(), String> {
-    align_codegen_llvm::emit_object(mir, obj).map_err(|e| e.to_string())
+/// Write MIR out to an object file (codegen). `target` selects the CPU baseline (portable default
+/// vs. host-`native`).
+pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget) -> Result<(), String> {
+    align_codegen_llvm::emit_object(mir, obj, target).map_err(|e| e.to_string())
 }
 
 /// MIR to LLVM IR text (`alignc emit-llvm`).
-pub fn emit_llvm_ir(mir: &align_mir::Program) -> Result<String, String> {
-    align_codegen_llvm::emit_llvm_ir(mir).map_err(|e| e.to_string())
+pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget) -> Result<String, String> {
+    align_codegen_llvm::emit_llvm_ir(mir, target).map_err(|e| e.to_string())
 }
 
 /// Link an object into an executable. Uses the system C compiler (`cc`); crt0 calls

@@ -40,8 +40,10 @@ are **opt-in, never the default** (`--target-cpu native` for a source build on t
 or a higher baseline for a fleet you control). Wide SIMD on a varied fleet comes from **runtime
 CPU-feature dispatch in the library** (one binary picks AVX2/NEON at run time, falling back safely) —
 not from a fixed high baseline. See `draft.md` §3.4 and `docs/open-questions.md` ("Build targets &
-portability"). *(Policy is settled; the target selector and library SIMD land with the std/runtime
-layer — the current backend builds scalar IR and leans on LLVM `-O2` autovectorization.)*
+portability"). The default build now targets that portable baseline (`x86-64-v2` on amd64, the
+`armv8-a` floor on arm64); `alignc build|run … --target-cpu native` opts into the build host's exact
+CPU. *(The codegen baseline + opt-in is in place; library runtime-dispatched SIMD still lands with the
+std/runtime layer — the current backend builds scalar IR and leans on LLVM `-O2` autovectorization.)*
 
 ## Requirements
 

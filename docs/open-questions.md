@@ -210,6 +210,14 @@ for the build host's CPU (or a high fixed baseline like AVX2) would `SIGILL` som
   `linux/arm64`); the driver gains a target (arch + baseline) selector. Implementation lands with the
   std / runtime layer (core-first); the policy is fixed now.
 
+**Codegen baseline + opt-in — DONE (2026-06-26):** the codegen half is implemented. `BuildTarget`
+(`align_codegen_llvm`) = `Baseline` (default: `x86-64-v2` on amd64, `generic`/`armv8-a` on arm64) or
+`Native` (host CPU + features); one `create_target_machine` picks the CPU/feature string for both the
+data-layout and the emission machine. The driver threads it from a `--target-cpu baseline|native`
+flag (`alignc build|run … --target-cpu native`). `tests/build_target.rs`. **Still pending (with the
+std/runtime layer):** the library's runtime CPU-feature dispatch (multi-versioning), higher opt-in
+baselines (`x86-64-v3`), and explicit cross-compile triples.
+
 Style: one good portable default + visible opt-in for more (nothing hidden).
 Record: `draft.md` §3.4, `design-notes.md`, `impl/05-backend-llvm.md` §5, `impl/06-runtime-std.md` §1
 

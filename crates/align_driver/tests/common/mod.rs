@@ -7,6 +7,7 @@
 
 pub use align_driver::{
     backend_available, check, emit_llvm_ir, emit_object_file, link_executable, lower_to_mir,
+    BuildTarget,
 };
 pub use align_span::SourceMap;
 
@@ -49,7 +50,7 @@ pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::pro
     let obj = dir.join(format!("align-test-{pid}-{name}.o"));
     let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
     let _artifacts = TempArtifacts { obj: obj.clone(), exe: exe.clone() };
-    emit_object_file(&mir, &obj).expect("codegen");
+    emit_object_file(&mir, &obj, BuildTarget::Baseline).expect("codegen");
     link_executable(&obj, &exe).expect("link");
     std::process::Command::new(&exe).args(prog_args).output().expect("run")
 }
@@ -111,7 +112,7 @@ pub fn build_and_run_multi(name: &str, files: &[(&str, &str)], entry: &str) -> s
     let pid = std::process::id();
     let obj = proj.dir.join(format!("align-mtest-{pid}-{name}.o"));
     let exe = proj.dir.join(format!("align-mtest-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
-    emit_object_file(&mir, &obj).expect("codegen");
+    emit_object_file(&mir, &obj, BuildTarget::Baseline).expect("codegen");
     link_executable(&obj, &exe).expect("link");
     std::process::Command::new(&exe).output().expect("run")
 }

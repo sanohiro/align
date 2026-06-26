@@ -50,19 +50,70 @@ impl std::fmt::Display for CodegenError {
     }
 }
 
+/// Which CPU the generated code targets. Align builds for the *cloud/container* reality — build once,
+/// run on a varied fleet — so the default is a conservative, portable per-architecture baseline; a
+/// host-specific build is opt-in (`draft.md` §3.4, `open-questions.md` "Build targets & portability").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BuildTarget {
+    /// A safe, portable per-architecture baseline (the default): `x86-64-v2` on amd64 (≈2010+, no
+    /// AVX), the generic `armv8-a` baseline on arm64. One binary runs across a mixed Intel / AMD /
+    /// Graviton, feature-masked, or live-migrated fleet.
+    #[default]
+    Baseline,
+    /// The build host's exact CPU + features (`--target-cpu native`): fastest on this machine, but
+    /// the binary may `SIGILL` on a host with fewer features — opt-in, never for distribution.
+    Native,
+}
+
+/// Build the `TargetMachine` for `target` — the one place that picks the CPU / feature string, so
+/// the data-layout machine (`build_module`) and the emission machine (`write_object`) always agree.
+fn create_target_machine(target: BuildTarget) -> Result<TargetMachine, CodegenError> {
+    Target::initialize_native(&InitializationConfig::default())
+        .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
+    let triple = TargetMachine::get_default_triple();
+    let t = Target::from_triple(&triple)
+        .map_err(|e| CodegenError::Target(format!("triple resolution: {e}")))?;
+    let (cpu, features) = match target {
+        BuildTarget::Native => (
+            TargetMachine::get_host_cpu_name().to_string(),
+            TargetMachine::get_host_cpu_features().to_string(),
+        ),
+        BuildTarget::Baseline => {
+            let ts = triple.as_str().to_string_lossy();
+            // Conservative per-arch floor: bump amd64 to x86-64-v2 (still pre-AVX, so cloud-safe);
+            // arm64 / anything else uses `generic` (= the architecture baseline, e.g. armv8-a).
+            let cpu = if ts.starts_with("x86_64") || ts.starts_with("amd64") {
+                "x86-64-v2"
+            } else {
+                "generic"
+            };
+            (cpu.to_string(), String::new())
+        }
+    };
+    t.create_target_machine(
+        &triple,
+        &cpu,
+        &features,
+        OptimizationLevel::Default,
+        RelocMode::PIC,
+        CodeModel::Default,
+    )
+    .ok_or_else(|| CodegenError::Target("failed to create TargetMachine".to_string()))
+}
+
 /// Write the program as an object file.
-pub fn emit_object(program: &Program, out: &Path) -> Result<(), CodegenError> {
+pub fn emit_object(program: &Program, out: &Path, target: BuildTarget) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    build_module(&ctx, &module, program)?;
-    write_object(&module, out)
+    build_module(&ctx, &module, program, target)?;
+    write_object(&module, out, target)
 }
 
 /// Render the program as textual LLVM IR (`alignc emit-llvm`).
-pub fn emit_llvm_ir(program: &Program) -> Result<String, CodegenError> {
+pub fn emit_llvm_ir(program: &Program, target: BuildTarget) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    build_module(&ctx, &module, program)?;
+    build_module(&ctx, &module, program, target)?;
     Ok(module.print_to_string().to_string())
 }
 
@@ -70,24 +121,11 @@ fn build_module<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
     program: &Program,
+    target: BuildTarget,
 ) -> Result<(), CodegenError> {
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
-    Target::initialize_native(&InitializationConfig::default())
-        .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
-    let triple = TargetMachine::get_default_triple();
-    let target = Target::from_triple(&triple)
-        .map_err(|e| CodegenError::Target(format!("triple resolution: {e}")))?;
-    let tm = target
-        .create_target_machine(
-            &triple,
-            "generic",
-            "",
-            OptimizationLevel::Default,
-            RelocMode::PIC,
-            CodeModel::Default,
-        )
-        .ok_or_else(|| CodegenError::Target("failed to create TargetMachine".to_string()))?;
+    let tm = create_target_machine(target)?;
     let target_data = tm.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
 
@@ -2771,23 +2809,8 @@ fn pred(signed: bool, c: Cmp) -> IntPredicate {
     }
 }
 
-fn write_object(module: &Module, out: &Path) -> Result<(), CodegenError> {
-    Target::initialize_native(&InitializationConfig::default())
-        .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
-
-    let triple = TargetMachine::get_default_triple();
-    let target = Target::from_triple(&triple)
-        .map_err(|e| CodegenError::Target(format!("triple resolution: {e}")))?;
-    let tm = target
-        .create_target_machine(
-            &triple,
-            "generic",
-            "",
-            OptimizationLevel::Default,
-            RelocMode::PIC,
-            CodeModel::Default,
-        )
-        .ok_or_else(|| CodegenError::Target("failed to create TargetMachine".to_string()))?;
+fn write_object(module: &Module, out: &Path, target: BuildTarget) -> Result<(), CodegenError> {
+    let tm = create_target_machine(target)?;
 
     // Run the LLVM middle-end optimization pipeline (`-O2`) before emitting. Without this, only the
     // backend codegen passes run — the lifted-lambda calls, fused `map`/`reduce`/`where` loops, and
@@ -2817,7 +2840,7 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
-        emit_llvm_ir(&lower_program(&hir)).unwrap()
+        emit_llvm_ir(&lower_program(&hir), BuildTarget::Baseline).unwrap()
     }
 
     #[test]
