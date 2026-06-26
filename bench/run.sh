@@ -11,7 +11,12 @@ cd "$(dirname "$0")"
 mode="${1:-native}"
 case "$mode" in
   native) align_tgt="native"; rust_tgt="native" ;;
-  v3) align_tgt="x86-64-v3"; rust_tgt="x86-64-v3" ;;  # portable AVX2/FMA tier (server/container)
+  v3) # portable AVX2/FMA tier (server/container) — x86_64 only
+    case "$(uname -m)" in
+      x86_64|amd64) align_tgt="x86-64-v3"; rust_tgt="x86-64-v3" ;;
+      *) echo "error: v3 mode is x86_64-only (host is $(uname -m)); use native or baseline" >&2; exit 1 ;;
+    esac
+    ;;
   baseline)
     align_tgt="baseline"
     # Match alignc's per-arch baseline: x86-64-v2 on amd64, the generic (armv8-a) floor elsewhere.
