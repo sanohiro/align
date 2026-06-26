@@ -372,7 +372,7 @@ convergent signal is the function-attributes lever above):
 
 - **Function attributes (`noalias`/`nounwind`/`dereferenceable`/`align`).** ✓ Converges with the
   "Additional perf levers" item above (codegen emits zero attributes today). Strengthens that lever's
-  priority. `nounwind` + pure-fn `memory(none)`/`readonly` are the cheap, sound first cut; aggressive
+  priority. `nounwind` + pure-fn `memory(none)`/`memory(read)` are the cheap, sound first cut; aggressive
   `noalias` still needs the `map_into(out)` write-construct (deferred above). **Best actionable item.**
 - **Bitset bool / `Option` columns.** Already a deferred soa sub-item above. Real but bounded
   (popcnt `count`/`any`/`all` 8–64×; `where(.flag).sum()` only ~1.1–2× — value-column read dominates).
@@ -381,7 +381,7 @@ convergent signal is the function-attributes lever above):
   non-problem today; the underlying "SoA-for-sum-types, tag-partition then batch" is a possible far
   future idea only if a real polymorphic-array workload appears.
 - **Evaluated and NOT pursued (recorded so they aren't re-proposed):**
-  - *Hidden default arena allocator.* ✗ Violates **Nothing-hidden** + predictable-performance (and
+  - *Hidden default arena allocator.* ✗ Violates **Nothing-hidden** + predictable performance (and
     the settled memory-model v2). Arena is correct but stays **explicit** (`arena {}`, already
     ergonomic); the request/task-scoped pattern is expressible today.
   - *Chunked / tiled SoA (AoS-of-SoA), auto.* ✗ Premise (row-access L1 thrashing) doesn't fit
@@ -393,7 +393,7 @@ convergent signal is the function-attributes lever above):
     column bases can't be computed up front (the AoS→transpose path, shipped #161, is the correct
     form; the perfect-hash #162 covers the parse-speed angle).
   - *Blanket `if`→`select` predication for all branches.* ✗ `select` evaluates both arms — wrong for
-    side-effecting / expensive / early-exit (`return`/`?`, the settled cold-Err) branches; LLVM
+    side-effecting / expensive / early-exit (`return`/`?`, the settled cold-path Err) branches; LLVM
     already if-converts profitable branches at O2. The **targeted** branchless `where` (#156) is the
     right scope.
 
@@ -411,8 +411,8 @@ default `Vec<Struct>` / `serde_json` / owned `String` / unbuffered output. The r
 language. This is the existing one-way / nothing-hidden / data-oriented stance, sharpened.
 
 - **Converges with already-recorded items (raises their priority):**
-  - **LLVM attributes** (`nounwind`, pure-fn `memory(none)`/`readonly`, `noalias`, `nonnull`, `align`,
-    cold-Err edge metadata). NOW THREE INDEPENDENT REVIEWS converge (own code-review + Gemini + Codex)
+  - **LLVM attributes** (`nounwind`, pure-fn `memory(none)`/`memory(read)`, `noalias`, `nonnull`, `align`,
+    cold-path-Err edge metadata). NOW THREE INDEPENDENT REVIEWS converge (own code-review + Gemini + Codex)
     → the strongest-supported next perf slice. See "Additional perf levers" above. (codegen still emits
     zero — verified again 2026-06-27.)
   - **Bitset bool columns** (popcnt `count`/`any`/`all`). Also 3-way convergent; deferred soa sub-item.
@@ -432,21 +432,21 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     struct; `io.stdout.write(x.to_string())` → pass the builder directly. Distinctive and highly
     on-philosophy; pairs with the formatter below.
   - **★ Column-oriented `group_by` + aggregate** — the next headline after json→soa:
-    `json → soa → group_by → aggregate`. Primitive-key-specialised (radix/hash), arena-allocated,
+    `json → soa → group_by → aggregate`. Primitive-key-specialized (radix/hash), arena-allocated,
     string keys interned/dictionary-encoded — *not* a general `HashMap`. The data-processing-language
     win. Big-ticket; design slice of its own.
   - **View-first / sink-first std + buffered I/O.** `print` locks+flushes stdout every call
     (`align_runtime/src/lib.rs:~19`) — it's the debug path; the fast path is `builder →
     io.stdout.write(builder)` / a buffered writer (the no-`to_string()` API is already right, make it
     standard). Std should be `read_file_view`/`mmap`, `json.decode(view)`, `json.write(out, value)`,
-    `csv.scan(view)`, `io.copy`/`writev` — never materialise an owned string in the hot path. (Std
+    `csv.scan(view)`, `io.copy`/`writev` — never materialize an owned string in the hot path. (Std
     layer — after core; records the *direction*.)
   - **Two-pass JSON→SoA (count then direct column fill).** The eventual form of json→soa: a structural
     count pass for N, allocate columns, then fill columns directly — dropping the AoS intermediate +
     transpose (the shipped #161 path). `str` columns via an offset+len column borrowing the input, or
     a string arena. Refinement, not a redo.
   - **Formatter (implement).** CONFIRMED not implemented (only `format_diagnostics`; the settled
-    source-formatter that normalises spacing/`;`/trailing-comma is absent). Needed to converge
+    source-formatter that normalizes spacing/`;`/trailing-comma is absent). Needed to converge
     AI-generated code / docs / tests. Pairs with the perf-rail lints.
   - **FFI "borrow-engine" wrapping for heavy libs** (zstd / sqlite / simdjson-class) — don't reimplement
     in pure Align; wrap via FFI as borrow engines (FFI is the library layer per `non-goals`/memory).

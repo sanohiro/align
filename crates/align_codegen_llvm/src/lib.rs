@@ -620,6 +620,7 @@ fn build_module<'c>(
         // `tramp(thunk, env, slot, err_slot) -> i32` (0 = ok, 1 = errored).
         let fn_ty = i32t.fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into()], false);
         let tramp = module.add_function(&format!("tramp${key}"), fn_ty, None);
+        mark_nounwind(ctx, tramp);
         let bb = ctx.append_basic_block(tramp, "entry");
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
@@ -995,8 +996,11 @@ fn build_phf(names: &[&str]) -> Option<(Vec<i32>, u64)> {
     }
     let mut m = n.next_power_of_two();
     for _ in 0..4 {
+        // Reuse one `slots` buffer across all seeds at this size (reset with `fill(-1)`) instead of
+        // allocating a fresh vec per seed — up to 4096 fewer heap allocations per size.
+        let mut slots = vec![-1i32; m];
         for seed in 0u64..4096 {
-            let mut slots = vec![-1i32; m];
+            slots.fill(-1);
             let mut ok = true;
             for (i, name) in names.iter().enumerate() {
                 let slot = (phf_hash(name.as_bytes(), seed) & (m as u64 - 1)) as usize;
@@ -1120,16 +1124,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
         sizes: &[u64],
         field: usize,
     ) -> Result<inkwell::values::IntValue<'c>, CodegenError> {
-        let i64t = self.ctx.i64_type();
-        let mut off = i64t.const_zero();
+        if field >= sizes.len() {
+            return Err(self.err("soa column index out of bounds"));
+        }
+        // Use `len`'s own int type (it is i64 today, but stay robust to a width change).
+        let ty = len.get_type();
+        let mut off = ty.const_zero();
         for j in 1..=field {
-            let adv = self.builder.build_int_mul(len, i64t.const_int(sizes[j - 1], false), "coladv").map_err(|e| self.err(e))?;
+            let adv = self.builder.build_int_mul(len, ty.const_int(sizes[j - 1], false), "coladv").map_err(|e| self.err(e))?;
             let sum = self.builder.build_int_add(off, adv, "colend").map_err(|e| self.err(e))?;
             let a = sizes[j]; // field alignment = its size (power of two)
             // align_up(sum, a) = (sum + a-1) & ~(a-1); a no-op for a 1-byte column, so skip it.
             off = if a > 1 {
-                let bumped = self.builder.build_int_add(sum, i64t.const_int(a - 1, false), "colbump").map_err(|e| self.err(e))?;
-                self.builder.build_and(bumped, i64t.const_int(!(a - 1), false), "colalign").map_err(|e| self.err(e))?
+                let bumped = self.builder.build_int_add(sum, ty.const_int(a - 1, false), "colbump").map_err(|e| self.err(e))?;
+                self.builder.build_and(bumped, ty.const_int(!(a - 1), false), "colalign").map_err(|e| self.err(e))?
             } else {
                 sum
             };
@@ -1208,6 +1216,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
         let ptr_t = self.ctx.ptr_type(AddressSpace::default());
         let thunk = self.module.add_function(&name, self.ctx.void_type().fn_type(&[ptr_t.into(), ptr_t.into()], false), None);
+        mark_nounwind(self.ctx, thunk);
         let saved = self.builder.get_insert_block();
         let entry = self.ctx.append_basic_block(thunk, "entry");
         self.builder.position_at_end(entry);
@@ -1320,7 +1329,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let col_base = unsafe {
                         self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "colbase").map_err(|e| self.err(e))?
                     };
-                    let fty = scalar_type(self.ctx, self.structs[*struct_id as usize].fields[*field as usize].ty, self.struct_types, self.enum_types);
+                    let field_def = self
+                        .structs
+                        .get(*struct_id as usize)
+                        .and_then(|s| s.fields.get(*field as usize))
+                        .ok_or_else(|| self.err("soa column field index out of bounds"))?;
+                    let fty = scalar_type(self.ctx, field_def.ty, self.struct_types, self.enum_types);
                     let idx_v = self.operand(index).into_int_value();
                     let ep = unsafe {
                         self.builder.build_in_bounds_gep(fty, col_base, &[idx_v], "colelem").map_err(|e| self.err(e))?
@@ -2109,7 +2123,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // padding, computed relative to base, actually lands on an aligned address).
                 let len_v = self.operand(len).into_int_value();
                 let sizes = self.soa_field_sizes(*struct_id);
-                let last = sizes.len() - 1;
+                // A soa struct always has ≥1 field (sema-enforced); guard the underflow anyway.
+                let last = sizes.len().checked_sub(1).ok_or_else(|| self.err("empty soa struct"))?;
                 let i64t = self.ctx.i64_type();
                 let last_off = self.soa_column_offset(len_v, &sizes, last)?;
                 let last_bytes = self.builder.build_int_mul(len_v, i64t.const_int(sizes[last], false), "lastcol").map_err(|e| self.err(e))?;
