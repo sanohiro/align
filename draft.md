@@ -290,6 +290,20 @@ f32 f64
 char
 ```
 
+### Integer Literals
+
+Integers are written in decimal, or with a base prefix: `0x` (hex), `0o` (octal), `0b` (binary). A
+literal is the same value whatever the base, with its width inferred from context like any literal,
+so a too-wide pattern truncates to the binding's type by the defined wrap rule. A `_` may separate
+digits for readability (in any base).
+
+```align
+mask := 0xFF_FF            // hex, = 65535
+flags := 0b1010            // binary
+perm := 0o755              // octal
+big := 1_000_000           // decimal with separators
+```
+
 ### Integer Overflow
 
 Integer arithmetic does **not** produce undefined behavior on overflow. The default is two's-complement wrap (identical across all builds, no branching).
@@ -336,9 +350,9 @@ Integers support the bitwise operators `&` `|` `^` and unary `~` (complement), a
 coercion, so the shift amount shares the value's type (`x << (n as i32)` to mix widths).
 
 ```align
-flags := 1 | 4             // set bits
-masked := flags & 6        // test bits
-toggled := flags ^ 2       // flip a bit
+flags := 0x1 | 0x4         // set bits
+masked := flags & 0x6      // test bits
+toggled := flags ^ 0x2     // flip a bit
 high := value >> 8         // arithmetic shift on a signed value, logical on unsigned
 inv := ~mask               // complement
 ```
