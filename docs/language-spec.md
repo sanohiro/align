@@ -255,10 +255,13 @@ module, is a compile error. The language-syntactic core (`Option`/`Result`/`?`/`
 array pipeline, numeric methods, `template`) is always in scope and needs no import. `core` is
 language-intrinsic and `std` the OS boundary; both are compiler builtins today.
 
-A program also spans **user modules**: a non-entry file declares `module geom` and exports with
-`pub`; `import geom` resolves by filename to `geom.align` in the entry's directory. A cross-module
-call is `geom.area(...)` (reaching only `pub` functions); each module has its own function
-namespace. (Exporting types across modules + nested module paths are later slices.) (`draft.md` §17.)
+A program also spans **user modules**: a non-entry file declares `module geom` and exports
+functions and types with `pub`; `import geom` resolves by filename to `geom.align` in the entry's
+directory (nested `import util.math` → `util/math.align`). A cross-module reference is qualified —
+`geom.area(...)` for a function, `geom.Point` for a type — reaching only `pub` members; a bare name
+resolves within the calling module (an imported type must be qualified). Each module has its own
+function and type namespace, so two modules may reuse a name. (Constructing an imported sum type's
+variant — `geom.Color.Red` — is a later slice.) (`draft.md` §17.)
 
 ## Core library
 

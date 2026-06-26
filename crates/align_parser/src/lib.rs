@@ -724,14 +724,12 @@ impl<'a> Parser<'a> {
                 })
             }
             TokKind::Ident(_) => {
-                // `Name { field: ... }` is a struct literal. Distinguish from a block
-                // following a bare name (e.g. an `if` condition) by the `{ ident :`
-                // shape — no valid statement-block starts that way.
-                if matches!(self.peek_at(1), TokKind::LBrace)
-                    && matches!(self.peek_at(2), TokKind::Ident(_))
-                    && matches!(self.peek_at(3), TokKind::Colon)
-                {
-                    return self.parse_struct_lit();
+                // `Name { field: ... }` / `mod.Name { field: ... }` is a struct literal.
+                // Distinguish from a block following a bare name (e.g. an `if` condition) by the
+                // `{ ident :` shape — no valid statement-block starts that way. The type name may
+                // be a dotted path (`geom.Point`), so skip over `(. ident)*` before the brace.
+                if let Some(segs) = self.struct_lit_path_len() {
+                    return self.parse_struct_lit(segs);
                 }
                 // A single name; dotted access (`a.b`, method chains) is handled as a
                 // postfix in `parse_postfix`.
@@ -865,10 +863,39 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `Name { field: value, ... }`. Assumes the `Ident {` lookahead already matched.
-    fn parse_struct_lit(&mut self) -> Option<Expr> {
+    /// Whether the tokens ahead form a struct literal `Path { ident : ...`, where `Path` is a
+    /// dotted name (`Name` or `geom.Point`). Returns the path's segment count so `parse_struct_lit`
+    /// knows how many `ident`-`.` pairs to consume; `None` if the shape does not match.
+    fn struct_lit_path_len(&self) -> Option<usize> {
+        // Path: ident (`.` ident)* — count segments, find the index just past the last one.
+        let mut segs = 1usize;
+        let mut i = 1; // index of the token after the leading ident
+        while matches!(self.peek_at(i), TokKind::Dot) && matches!(self.peek_at(i + 1), TokKind::Ident(_)) {
+            segs += 1;
+            i += 2;
+        }
+        // Followed by `{ ident :` — the unambiguous struct-literal shape.
+        if matches!(self.peek_at(i), TokKind::LBrace)
+            && matches!(self.peek_at(i + 1), TokKind::Ident(_))
+            && matches!(self.peek_at(i + 2), TokKind::Colon)
+        {
+            Some(segs)
+        } else {
+            None
+        }
+    }
+
+    /// `Path { field: value, ... }`. Assumes [`struct_lit_path_len`] already matched; `segs` is the
+    /// number of dotted segments in the type name.
+    fn parse_struct_lit(&mut self, segs: usize) -> Option<Expr> {
         let start = self.span();
-        let name = self.parse_ident("type name")?;
+        let mut segments = Vec::with_capacity(segs);
+        segments.push(self.parse_ident("type name")?);
+        for _ in 1..segs {
+            self.expect(&TokKind::Dot, "'.'");
+            segments.push(self.parse_ident("type name")?);
+        }
+        let name = Path { span: start.merge(self.prev_span()), segments };
         self.expect(&TokKind::LBrace, "'{'");
         let mut fields = Vec::new();
         loop {

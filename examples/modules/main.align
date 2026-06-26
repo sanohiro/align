@@ -1,8 +1,9 @@
 // Multi-file program. `import geom` pulls in `geom.align`; cross-module calls are `geom.fn(...)`
-// and reach only its `pub` functions.
+// and an exported type is named `geom.Point` — both reach only its `pub` members.
 module main
 import geom
 
 fn main() -> i32 {
-  return (geom.square(5) + geom.area(2, 3)) as i32   // 25 + 6 = 31
+  p := geom.Point { x: 2, y: 3 }
+  return (geom.square(5) + geom.area(p.x, p.y)) as i32   // 25 + 6 = 31
 }
