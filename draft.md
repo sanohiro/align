@@ -1052,7 +1052,7 @@ import geom
 fn main() -> i32 = geom.area(2, 3) as i32
 ```
 
-`import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A cross-module call is written `geom.area(...)` and reaches only `pub` functions; a bare call resolves within the calling module. Each module has its own function namespace, so two modules may define a function with the same name. (Nested module paths `a.b`, and exporting types across modules, are later slices.)
+`import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module call is written `geom.area(...)` and reaches only `pub` functions; a bare call resolves within the calling module. Each module has its own function namespace, so two modules may define a function with the same name. (Exporting types across modules is a later slice — types are currently program-global.)
 
 ---
 

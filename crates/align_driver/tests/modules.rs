@@ -91,6 +91,57 @@ fn transitive_imports_load() {
 }
 
 #[test]
+fn nested_module_path_resolves_to_subdirectory() {
+    if !backend_available() {
+        return;
+    }
+    // `import util.math` → `util/math.align` (declaring `module util.math`); called `util.math.fn`.
+    let math = "module util.math\npub fn cube(x: i64) -> i64 = x * x * x\n";
+    let main = "module main\nimport util.math\nfn main() -> i32 = util.math.cube(3) as i32\n";
+    let out = build_and_run_multi(
+        "mod-nested",
+        &[("util/math.align", math), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(27));
+}
+
+#[test]
+fn nested_module_wrong_declaration_is_rejected() {
+    // `util/math.align` must declare the full `module util.math`, not just `module math`.
+    let math = "module math\npub fn cube(x: i64) -> i64 = x * x * x\n";
+    let main = "module main\nimport util.math\nfn main() -> i32 = util.math.cube(3) as i32\n";
+    assert!(check_multi_errs("mod-nested-bad", &[("util/math.align", math), ("main.align", main)], "main.align"));
+}
+
+#[test]
+fn a_local_variable_shadows_a_module_of_the_same_name() {
+    if !backend_available() {
+        return;
+    }
+    // A local box named `geom` must shadow the imported module `geom`: `geom.get()` is the box
+    // method, not a (nonexistent) cross-module call. Without the shadowing check, module-path
+    // resolution would intercept `geom.get()` and reject it.
+    let geom = "module geom\npub fn square(x: i64) -> i64 = x * x\n";
+    let main = concat!(
+        "module main\n",
+        "import geom\n",
+        "fn main() -> i32 {\n",
+        "  arena {\n",
+        "    geom := heap.new(7)\n",
+        "    return geom.get() as i32\n",
+        "  }\n",
+        "}\n",
+    );
+    let out = build_and_run_multi(
+        "mod-shadow",
+        &[("geom.align", geom), ("main.align", main)],
+        "main.align",
+    );
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn a_module_using_a_builtin_must_import_it() {
     // The capability rule applies per file: `geom` uses `json` but does not import `core.json`.
     let geom = concat!(
