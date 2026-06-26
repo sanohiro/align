@@ -262,6 +262,25 @@ fn an_imported_sum_type_variant_is_constructed_qualified() {
 }
 
 #[test]
+fn a_local_shadowing_a_sum_type_name_is_value_access() {
+    if !backend_available() {
+        return;
+    }
+    // A local named like a sum type wins over the type in `Name.field` position: `Tag.v` is field
+    // access on the local, not a `Tag` variant (the shadowing check precedes type resolution).
+    let src = concat!(
+        "Tag { A, B }\n",
+        "Holder { v: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  Tag := Holder { v: 7 }\n",
+        "  return Tag.v as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("mod-shadow-type", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn constructing_a_private_sum_type_variant_across_modules_is_rejected() {
     // A non-`pub` sum type cannot be constructed from an importing module.
     let lib = "module lib\nSecret { A, B }\n";

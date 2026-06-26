@@ -3690,14 +3690,8 @@ impl<'a, 't> Checker<'a, 't> {
     /// meanings); `Err(())` means it definitively names an imported type that is not `pub` (the
     /// error is already reported — the caller should stop, not cascade).
     fn resolve_type_receiver(&mut self, recv: &ast::Expr) -> Result<Option<String>, ()> {
-        // Bare `Type` in the current module.
-        if let ast::ExprKind::Path(p) = &recv.kind {
-            if let Some(name) = single_name(p) {
-                return Ok(self.local_type(name));
-            }
-        }
-        // Qualified `mod.Type` — the receiver is itself a pure dotted name. A local/captured variable
-        // shadowing the leftmost segment makes it value access, not a type reference.
+        // A local/captured variable shadowing the leftmost segment makes this value access, not a
+        // type reference — checked first, so it applies to a bare `Type` as well as `mod.Type`.
         let Some(leftmost) = leftmost_segment(recv) else { return Ok(None) };
         let shadowed = self.lookup(leftmost).is_some()
             || self.capture.as_ref().is_some_and(|cap| {
@@ -3707,6 +3701,13 @@ impl<'a, 't> Checker<'a, 't> {
         if shadowed {
             return Ok(None);
         }
+        // Bare `Type` in the current module.
+        if let ast::ExprKind::Path(p) = &recv.kind {
+            if let Some(name) = single_name(p) {
+                return Ok(self.local_type(name));
+            }
+        }
+        // Qualified `mod.Type` — the receiver is itself a pure dotted name.
         let Some(flat) = flatten_module_path(recv) else { return Ok(None) };
         let Some((module, type_name)) = flat.rsplit_once('.') else { return Ok(None) };
         if module == self.cur_module || !self.user_imports.contains(module) {
