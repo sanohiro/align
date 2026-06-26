@@ -53,9 +53,16 @@ masked mod the bit width** (defined, zero-cost, SIMD-non-blocking — the exact 
 overflow-wrap decision; codegen masks `n & (width-1)`, constant over-shift is a future lint), `>>`
 arithmetic on signed / logical on unsigned. `>>` is **not** a single lexer token (kept as two `>`),
 so nested generic type args (`Pair<Pair<T>>`) still close; the shift is formed only in expression
-position, where `<`/`>` are comparison-only (no turbofish). Folds in constant expressions. **Follow-up
-(noted, not blocking): hex/binary integer literals** (`0x1F` / `0b1010`) pair naturally with bitwise
-code and are not yet lexed. Record: `draft.md` §5, `docs/language-spec.md`, `examples/bitwise.align`, `tests/bitwise.rs`
+position, where `<`/`>` are comparison-only (no turbofish). Folds in constant expressions.
+Record: `draft.md` §5, `docs/language-spec.md`, `examples/bitwise.align`, `tests/bitwise.rs`
+
+### Radix integer literals (DONE 2026-06-26)
+**Decision: base-prefixed integer literals `0x` (hex) / `0o` (octal) / `0b` (binary), `_` separators
+in any base.** A radix literal is an ordinary integer literal — same `i128` storage, width inferred
+from context, narrowed to the binding's type by the defined wrap rule (`0xFFFFFFFF: i32` = -1). The
+lexer parses the prefix (greedy alphanumeric run → `i128::from_str_radix`, so an invalid digit / empty
+body is a clean error). Decimal `_` separators already worked; this extends them to all bases. Pairs
+naturally with the bitwise/shift operators. Record: `draft.md` §3/§5, `docs/language-spec.md`, `examples/bitwise.align`, `tests/radix_literals.rs`
 
 ### Type declaration syntax
 **Decision: keyword-less.** Contains `ident: Type` → struct; `ident`/`ident(...)` → sum type, disambiguated by content. Fields/variants are `,`-separated.

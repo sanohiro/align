@@ -232,6 +232,42 @@ impl<'a> Lexer<'a> {
     /// point when a digit follows (so `p.x` and `1.method` keep the `.` as a separate
     /// token); an `e`/`E` exponent also makes the literal a float.
     fn lex_number(&mut self, start: usize, diags: &mut Diagnostics) {
+        // Radix-prefixed integer literals: `0x..` (hex), `0o..` (octal), `0b..` (binary). The value
+        // is stored as `i128` (positive), then narrowed to the binding's width like any int literal,
+        // so `0xFFFFFFFF as u32` / `i32` truncate by the defined wrap rule. `_` separators allowed.
+        if self.peek() == Some(b'0') {
+            let radix = match self.src.get(self.pos + 1) {
+                Some(b'x' | b'X') => Some((16u32, "hex")),
+                Some(b'o' | b'O') => Some((8, "octal")),
+                Some(b'b' | b'B') => Some((2, "binary")),
+                _ => None,
+            };
+            if let Some((radix, name)) = radix {
+                self.pos += 2; // consume the `0x` / `0o` / `0b` prefix
+                let digits_start = self.pos;
+                // Eat greedily (alphanumeric + `_`) so an invalid digit is reported, not split off.
+                while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                    self.pos += 1;
+                }
+                let text: String = std::str::from_utf8(&self.src[digits_start..self.pos])
+                    .unwrap()
+                    .chars()
+                    .filter(|c| *c != '_')
+                    .collect();
+                if text.is_empty() {
+                    diags.error(format!("{name} literal has no digits"), self.span(start, self.pos));
+                } else {
+                    match i128::from_str_radix(&text, radix) {
+                        Ok(v) => self.push(TokKind::Int(v), start),
+                        Err(_) => diags.error(
+                            format!("invalid {name} integer literal: '{}'", &self.src[start..self.pos].iter().map(|&b| b as char).collect::<String>()),
+                            self.span(start, self.pos),
+                        ),
+                    }
+                }
+                return;
+            }
+        }
         self.eat_digits();
         let mut is_float = false;
         if self.peek() == Some(b'.') && self.src.get(self.pos + 1).is_some_and(|c| c.is_ascii_digit()) {

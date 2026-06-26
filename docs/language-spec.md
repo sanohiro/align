@@ -64,6 +64,12 @@ mask<T>
 bitset
 ```
 
+### Integer literals
+
+Decimal, or base-prefixed `0x` (hex) / `0o` (octal) / `0b` (binary); `_` may separate digits in any
+base. A literal's width is inferred from context like any literal (an over-wide pattern truncates to
+the binding's type by the defined wrap rule). (`draft.md` §5.)
+
 ### Numeric conversion
 
 No implicit coercion — not even widening. The explicit `as` operator is the **only** conversion,
