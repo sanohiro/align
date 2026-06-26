@@ -712,6 +712,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::JsonDecode { struct_id, input } => lower_json_decode(b, *struct_id, input, e.ty),
         hir::ExprKind::JsonDecodeArray { elem, input } => lower_json_decode_array(b, *elem, input, e.ty),
         hir::ExprKind::JsonDecodeStructArray { struct_id, input } => lower_json_decode_struct_array(b, *struct_id, input, e.ty),
+        hir::ExprKind::JsonDecodeSoa { struct_id, input } => lower_json_decode_soa(b, *struct_id, input, e.ty),
         hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
         hir::ExprKind::IoStdoutWrite { arg } => {
             lower_io_stdout_write(b, arg, e.ty, |a| Rvalue::IoStdoutWrite { arg: a })
@@ -1941,18 +1942,34 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
 /// `soa<T>` usable in pure Align — build once, then a multi-column scan touches only the fields
 /// it reads.
 fn lower_array_to_soa(b: &mut Builder, source: &hir::Expr, struct_id: u32) -> Operand {
-    let handle = *b.arenas.last().expect("to_soa outside an arena (sema-checked)");
     // The source is a whole-struct array (no stages), so `struct_view`/`slot` address its elements;
     // `bound` is the row count `len` (a constant for a fixed array, a runtime value otherwise).
     let SrcSetup { slot, slice_val, bound, struct_view, .. } = setup_source(b, source);
-    let n = bound;
+    transpose_to_soa(b, struct_view, &slice_val, slot, bound, struct_id)
+}
+
+/// Transpose an AoS source (already set up for element addressing) into an arena-allocated
+/// column-major `soa<Struct>`: allocate the column buffer for `len` rows, then run one fused loop
+/// reading each element's fields (`lower_field_access`) and scattering them into their columns
+/// (`StoreColumn`). Returns the `{ptr,len}` soa view. Shared by `to_soa` (a literal/local array
+/// source) and `json.decode → soa` (a decoded AoS value). The buffer is bump-allocated in the
+/// innermost arena (sema requires one), so the view is region-tied to it and bulk-freed.
+fn transpose_to_soa(
+    b: &mut Builder,
+    struct_view: Option<(u32, Layout)>,
+    slice_val: &Option<Operand>,
+    slot: Slot,
+    len: Operand,
+    struct_id: u32,
+) -> Operand {
+    let handle = *b.arenas.last().expect("to_soa outside an arena (sema-checked)");
     let field_tys: Vec<Ty> = b.structs[struct_id as usize].fields.iter().map(|f| f.ty).collect();
 
     // Allocate the column-major buffer (`len` rows). The element-pointer type is opaque, so the
     // `Box` scalar is irrelevant — use the first field's.
     let first_scalar = align_sema::ty_to_scalar(field_tys[0]).expect("soa field is a scalar");
     let buf = b.fresh_value(Ty::Box(first_scalar));
-    b.push(Stmt::Let(buf, Rvalue::SoaAlloc { handle: Operand::Value(handle), len: n.clone(), struct_id }));
+    b.push(Stmt::Let(buf, Rvalue::SoaAlloc { handle: Operand::Value(handle), len: len.clone(), struct_id }));
 
     // for i in 0..len: scatter element i's fields into their columns.
     let iv = b.new_slot(i64_ty());
@@ -1966,7 +1983,7 @@ fn lower_array_to_soa(b: &mut Builder, source: &hir::Expr, struct_id: u32) -> Op
     let i_val = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
     let cond = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), n.clone())));
+    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), len.clone())));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
     b.cur = body;
@@ -1974,10 +1991,10 @@ fn lower_array_to_soa(b: &mut Builder, source: &hir::Expr, struct_id: u32) -> Op
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
     let index = Operand::Value(idx);
     for (field, fty) in field_tys.iter().enumerate() {
-        let v = lower_field_access(b, struct_view, &slice_val, slot, &index, field as u32, *fty);
+        let v = lower_field_access(b, struct_view, slice_val, slot, &index, field as u32, *fty);
         b.push(Stmt::StoreColumn {
             base: Operand::Value(buf),
-            len: n.clone(),
+            len: len.clone(),
             index: index.clone(),
             field: field as u32,
             struct_id,
@@ -1992,8 +2009,57 @@ fn lower_array_to_soa(b: &mut Builder, source: &hir::Expr, struct_id: u32) -> Op
     // exit: build the soa `{ ptr, len }` view over the column buffer.
     b.cur = exit;
     let soa = b.fresh_value(Ty::Soa(struct_id));
-    b.push(Stmt::Let(soa, Rvalue::MakeDynArray { ptr: Operand::Value(buf), len: n }));
+    b.push(Stmt::Let(soa, Rvalue::MakeDynArray { ptr: Operand::Value(buf), len }));
     Operand::Value(soa)
+}
+
+/// `json.decode(input)` into a `soa<Struct>` (runway step 2) — decode the JSON array of objects
+/// into a temporary AoS via the tested struct-array parser (the array length N is unknown until
+/// parsed, so a one-pass column-major decode isn't possible), then transpose to a column-major
+/// `soa<Struct>` and free the AoS temporary. Mirrors [`lower_json_decode_struct_array`]'s Ok/Err
+/// branch, with the transpose + free on the Ok edge. The soa columns are all primitive scalars
+/// (sema-enforced), so the result is self-contained — bound to the arena, not the input.
+fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
+    let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
+    let out = b.new_slot(arr_ty);
+    let inp = lower_expr(b, input);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, input: inp, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the decoded AoS array, transpose it into an arena soa, then free the AoS temporary
+    // (its scalar columns were copied into the soa buffer; nothing else holds it).
+    b.cur = ok_bb;
+    let a = b.fresh_value(arr_ty);
+    b.push(Stmt::Let(a, Rvalue::Load(out)));
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(a))));
+    let soa = transpose_to_soa(b, Some((struct_id, Layout::Aos)), &Some(Operand::Value(a)), 0, Operand::Value(len), struct_id);
+    b.push(Stmt::DropValue(Operand::Value(a)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(soa)));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: wrap the status code (the out slot was zeroed → no buffer allocated on failure).
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_code(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
 }
 
 /// `source.….partition(p)` — one fused loop that splits the surviving scalar elements into two

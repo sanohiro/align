@@ -944,6 +944,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::DynArray(_) => unreachable!("an owned array is not a box payload"),
         Scalar::DynStructArray(_) => unreachable!("an owned struct array is not a box payload"),
         Scalar::Str => unreachable!("a str view is not a box payload"),
+        Scalar::Soa(_) => unreachable!("a soa view is not a box payload"),
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
     }

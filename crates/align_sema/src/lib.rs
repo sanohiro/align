@@ -81,6 +81,11 @@ pub enum Scalar {
     /// `Option`/`Result` carry an enum, notably `Result<T, MyError>` (4b). Non-recursive (just the
     /// id), so `Scalar` stays `Copy`.
     Enum(u32),
+    /// A `soa<Struct>` view payload (the struct's id) — a `{ptr,len}` borrow over a column-major
+    /// buffer, **Copy, not Move** but **region-tracked** (like [`Scalar::Str`]: it borrows arena
+    /// storage, never dropped). Lets `Result<soa<T>, Error>` carry a decoded soa — the result type
+    /// of `s: soa<User> := json.decode(d)?`. Non-recursive (just the id), so `Scalar` stays `Copy`.
+    Soa(u32),
     /// A generic type parameter as a composite payload — `Option<T>` / `Result<T, E>` inside a
     /// generic template (4c-3). Carries the parameter index (like [`Ty::Param`]). Present **only**
     /// while a generic template is type-checked abstractly; monomorphization re-resolves every type
@@ -250,6 +255,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // later concern (so `Scalar::DynStructArray` stays layout-free — always AoS).
         Ty::DynStructArray(id, Layout::Aos) => Some(Scalar::DynStructArray(id)),
         Ty::Str => Some(Scalar::Str),
+        // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
+        // soa` result). Region-tracked, never dropped — like `Str`.
+        Ty::Soa(id) => Some(Scalar::Soa(id)),
         // A sum type is a Copy value (a tagged struct of Copy fields), so it can be an
         // Option/Result payload — notably `Result<T, MyError>` with a user error enum (4b).
         Ty::Enum(id) => Some(Scalar::Enum(id)),
@@ -272,6 +280,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::DynStructArray(id) => Ty::DynStructArray(id, Layout::Aos),
         Scalar::Str => Ty::Str,
         Scalar::Enum(id) => Ty::Enum(id),
+        Scalar::Soa(id) => Ty::Soa(id),
         Scalar::Param(i) => Ty::Param(i),
     }
 }
@@ -1747,7 +1756,7 @@ impl EffectScan {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. }
-            | ExprKind::JsonDecodeStructArray { input, .. } => self.expr(input),
+            | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.expr(input),
             // Leaves.
             ExprKind::Unit | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_)
             | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::OptionNone
@@ -1914,6 +1923,10 @@ impl<'a> EscapeCheck<'a> {
             // `to_soa` bump-allocates the column buffer in the enclosing arena; the returned view
             // borrows it, so it is arena-regioned and cannot escape (like `to_array`'s buffer).
             ExprKind::ArrayToSoa { .. }
+            // `json.decode → soa` transposes into an arena-allocated column buffer (all-scalar
+            // fields, so the result does not borrow the input — it is bound to the arena, like
+            // `to_soa`), unlike the AoS decode below which is tied to the input via its `str` views.
+            | ExprKind::JsonDecodeSoa { .. }
             | ExprKind::ArrayToArray { .. }
             | ExprKind::ArrayPartition { .. }
             | ExprKind::ArrayParMap { .. }
@@ -2281,7 +2294,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.walk(input, depth),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.walk(input, depth),
             ExprKind::FsReadFile { path } => self.walk(path, depth),
             ExprKind::IoStdoutWrite { arg } => self.walk(arg, depth),
             ExprKind::IoStdoutWriteBuilder { builder } => self.walk(builder, depth),
@@ -2583,7 +2596,7 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.expr(input, moved, false, false),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.expr(input, moved, false, false),
             ExprKind::FsReadFile { path } => self.expr(path, moved, false, false),
             ExprKind::IoStdoutWrite { arg } => self.expr(arg, moved, false, false),
             ExprKind::IoStdoutWriteBuilder { builder } => self.expr(builder, moved, false, false),
@@ -6228,6 +6241,35 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 };
             }
+            // `soa<Struct>` target (the cache-optimal decode, runway step 2): parse the JSON array
+            // of objects into AoS (length N is unknown until parsed), then transpose to a
+            // column-major `soa<Struct>`. The column buffer is arena-allocated, so this needs an
+            // `arena {}` and the result is region-tied to it (escape-checked). The struct's fields
+            // must be primitive scalars (the `soa<T>` rule) — which also means no `str` columns, so
+            // the decoded soa is fully self-contained (no zero-copy tie to the input).
+            Some(Ty::Result(Scalar::Soa(id), _)) => {
+                let fields = &self.structs[id as usize].fields;
+                if fields.is_empty() || !fields.iter().all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)) {
+                    self.diags.error(
+                        format!("'json.decode' into soa<{}> needs a non-empty struct of primitive scalar fields (no `str`/owned columns yet)", self.structs[id as usize].name),
+                        span,
+                    );
+                    return err;
+                }
+                if self.arena_depth == 0 {
+                    self.diags.error(
+                        "'json.decode' into a soa allocates its column buffer in an arena — decode inside an `arena {}`".to_string(),
+                        span,
+                    );
+                    return err;
+                }
+                let input = self.check_str_init(&args[0]);
+                return Expr {
+                    kind: ExprKind::JsonDecodeSoa { struct_id: id, input: Box::new(input) },
+                    ty: Ty::Result(Scalar::Soa(id), Scalar::Enum(self.error_enum_id)),
+                    span,
+                };
+            }
             _ => {
                 self.diags.error(
                     "cannot infer the decode target type; annotate the binding, e.g. `u: T := json.decode(d)?`".to_string(),
@@ -7117,7 +7159,7 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } => self.finalize_expr(input),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.finalize_expr(input),
             ExprKind::FsReadFile { path } => self.finalize_expr(path),
             ExprKind::IoStdoutWrite { arg } => self.finalize_expr(arg),
             ExprKind::IoStdoutWriteBuilder { builder } => self.finalize_expr(builder),

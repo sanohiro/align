@@ -226,3 +226,89 @@ fn a_built_soa_feeds_a_filtered_multi_column_aggregate() {
     );
     assert_eq!(out.status.code(), Some(15));
 }
+
+// ---- `json.decode` → `soa<Struct>` (decode-direct-to-columns; AoS-then-transpose) ----
+
+#[test]
+fn json_decode_into_soa_type_checks() {
+    assert!(ok(concat!(
+        "import core.json\n",
+        "User { id: i64, age: i32 }\n",
+        "fn main() -> Result<(), Error> {\n  arena {\n    s: soa<User> := json.decode(\"[]\")?\n    print(s.age.sum())\n  }\n  return Ok(())\n}\n",
+    )));
+}
+
+#[test]
+fn json_decode_into_soa_outside_an_arena_is_rejected() {
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "User { id: i64, age: i32 }\n",
+        "fn main() -> Result<(), Error> {\n  s: soa<User> := json.decode(\"[]\")?\n  return Ok(())\n}\n",
+    )));
+}
+
+#[test]
+fn a_decoded_soa_cannot_escape_its_arena() {
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "User { id: i64, age: i32 }\n",
+        "fn build() -> Result<soa<User>, Error> {\n  arena {\n    return Ok(json.decode(\"[]\")?)\n  }\n}\n",
+        "fn main() -> i32 = 0\n",
+    )));
+}
+
+#[test]
+fn json_decode_into_soa_sums_a_column() {
+    if !backend_available() {
+        return;
+    }
+    // Decode the JSON array of objects to AoS, transpose to columns, then scan one column:
+    // age.sum() = 30 + 40 + 5 = 75.
+    let out = build_and_run(
+        "soa-json-sum",
+        concat!(
+            "import core.json\n",
+            "User { id: i64, age: i32 }\n",
+            "fn main() -> Result<(), Error> {\n  arena {\n    s: soa<User> := json.decode(\"[{\\\"id\\\":1,\\\"age\\\":30},{\\\"id\\\":2,\\\"age\\\":40},{\\\"id\\\":3,\\\"age\\\":5}]\")?\n    print(s.age.sum())\n  }\n  return Ok(())\n}\n",
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "75\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn json_decode_into_soa_feeds_a_filtered_aggregate() {
+    if !backend_available() {
+        return;
+    }
+    // The headline real-world flow: decode straight to columns, then `where(.active).pay.sum()`
+    // streams only the two touched columns — 10 + 5 = 15 (the inactive 20 is masked out).
+    let out = build_and_run(
+        "soa-json-where",
+        concat!(
+            "import core.json\n",
+            "Row { active: bool, pay: i32 }\n",
+            "fn main() -> Result<(), Error> {\n  arena {\n    s: soa<Row> := json.decode(\"[{\\\"active\\\":true,\\\"pay\\\":10},{\\\"active\\\":false,\\\"pay\\\":20},{\\\"active\\\":true,\\\"pay\\\":5}]\")?\n    print(s.where(.active).pay.sum())\n  }\n  return Ok(())\n}\n",
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n");
+}
+
+#[test]
+fn json_decode_into_soa_propagates_a_parse_error() {
+    if !backend_available() {
+        return;
+    }
+    // Malformed JSON → the decode `Result` is `Err`, `?` propagates it out of `main`, which maps to
+    // a non-zero exit code and prints nothing.
+    let out = build_and_run(
+        "soa-json-err",
+        concat!(
+            "import core.json\n",
+            "Row { active: bool, pay: i32 }\n",
+            "fn main() -> Result<(), Error> {\n  arena {\n    s: soa<Row> := json.decode(\"not json\")?\n    print(s.pay.sum())\n  }\n  return Ok(())\n}\n",
+        ),
+    );
+    assert_ne!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
