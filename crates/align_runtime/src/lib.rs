@@ -403,24 +403,38 @@ pub unsafe extern "C" fn align_rt_par_map(
         return out_buf;
     }
     // Submit chunks 1.. to the pool and run chunk 0 on the caller, then wait for the submitted ones.
-    // `remaining` is the fork-join barrier (each worker decrements + signals; the caller waits to 0).
-    let remaining = std::sync::Arc::new((std::sync::Mutex::new(nchunks - 1), std::sync::Condvar::new()));
+    // The barrier is `(remaining count, first panic payload)`: each worker decrements + signals; the
+    // caller waits to 0. A worker job is wrapped in `catch_unwind` so a panic in it can't kill the
+    // pool worker or leave the barrier stuck (a deadlock) — it's recorded and re-raised on the caller
+    // (Align thunks abort rather than unwind, so this is defensive, but a stuck pool is unacceptable).
+    type PanicBox = Box<dyn std::any::Any + Send + 'static>;
+    let remaining: std::sync::Arc<(std::sync::Mutex<(usize, Option<PanicBox>)>, std::sync::Condvar)> =
+        std::sync::Arc::new((std::sync::Mutex::new((nchunks - 1, None)), std::sync::Condvar::new()));
     for t in 1..nchunks {
         let start = t * per;
         let end = (start + per).min(count);
         let remaining = remaining.clone();
         pool.submit(Box::new(move || {
-            run(start, end);
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(start, end)));
             let (m, cv) = &*remaining;
-            *m.lock().unwrap() -= 1;
+            let mut st = m.lock().unwrap();
+            st.0 -= 1;
+            if let Err(p) = res {
+                if st.1.is_none() {
+                    st.1 = Some(p);
+                }
+            }
             cv.notify_all();
         }));
     }
     run(0, per.min(count));
     let (m, cv) = &*remaining;
-    let mut left = m.lock().unwrap();
-    while *left > 0 {
-        left = cv.wait(left).unwrap();
+    let mut st = m.lock().unwrap();
+    while st.0 > 0 {
+        st = cv.wait(st).unwrap();
+    }
+    if let Some(p) = st.1.take() {
+        std::panic::resume_unwind(p);
     }
     out_buf
 }
