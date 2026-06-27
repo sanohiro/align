@@ -1055,9 +1055,27 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         .collect();
     let mut enum_mono: HashMap<String, u32> = HashMap::new();
     // Resolution context for type-declaration passes (0b/0c, templates): a bare field/payload type
-    // resolves in the declaring module. Cross-module field/payload types (`field: other.Type`) are
-    // deferred to a later slice, so these passes resolve with no imports in scope.
+    // resolves in the declaring module; a qualified `field: other.Type` resolves against that
+    // module's imports. `no_imports` is the fallback for a module with none / not in the map.
     let no_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-module user imports (module path → imported user-module paths), so a struct field / enum
+    // payload / generic-template member can name a `pub` type from another module (`field: other.T`).
+    // Resolution-only: the authoritative import validation (duplicates / unknown / builtins) is the
+    // module-resolution-table pass below — a bare set built here keeps it available before pass 0b.
+    let known_user_modules: std::collections::HashSet<&str> = modules.iter().map(|m| m.path.as_str()).collect();
+    let imports_by_module: HashMap<String, std::collections::HashSet<String>> = modules
+        .iter()
+        .map(|m| {
+            let set = m
+                .file
+                .imports
+                .iter()
+                .map(path_str)
+                .filter(|p| known_user_modules.contains(p.as_str()))
+                .collect();
+            (m.path.clone(), set)
+        })
+        .collect();
 
     // The canonical builtin `Error` sum type (4b-2): universal categories + a generic `Code(i32)`
     // (variant order must match `ERROR_VARIANT_CODE`). Registered right after the concrete user
@@ -1090,7 +1108,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             ($module:expr) => {
                 &mut TyCx {
                     cur_module: $module,
-                    imports: &no_imports,
+                    imports: imports_by_module.get(*$module).unwrap_or(&no_imports),
                     type_table: &type_table,
                     struct_ids: &struct_ids,
                     enum_ids: &enum_ids,
@@ -1168,7 +1186,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     for (i, (module, _is_entry, s)) in struct_decls.iter().enumerate() {
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
-            let ty = resolve_type(&f.ty, tcx!(module, &no_imports), &[], diags);
+            let ty = resolve_type(&f.ty, tcx!(module, imports_by_module.get(*module).unwrap_or(&no_imports)), &[], diags);
             // A field is a primitive scalar (int/float/bool/char), `str`, or a nested struct (the
             // nested-struct shape is checked structurally here; that it is scalar-only + acyclic is
             // validated in pass 0b-2, once all struct fields are populated). Slice/option/box/Move
@@ -1220,7 +1238,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             }
             let mut payload = Vec::with_capacity(v.payload.len());
             for t in &v.payload {
-                let ty = resolve_type(t, tcx!(module, &no_imports), &[], diags);
+                let ty = resolve_type(t, tcx!(module, imports_by_module.get(*module).unwrap_or(&no_imports)), &[], diags);
                 match ty {
                     Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
                         payload.push(ty_to_scalar(ty).expect("primitive scalar"));
