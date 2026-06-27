@@ -1081,7 +1081,11 @@ fn group_slot(k: i64, mask: usize) -> usize {
 /// (doubling past a 0.75 load) — a primitive-key, no-boxing, cache-tight aggregate, the lever vs
 /// Rust's generic `HashMap`. Three dense parallel arrays (key / acc / used) probe-scan well (a naive
 /// interleaved-slot layout measured *worse*; `docs/open-questions.md`).
-fn group_agg_i64(
+///
+/// # Safety
+/// `out_keys`/`out_vals` must each be valid for `cap` `i64` writes (they're written for the emitted
+/// group count, which is `≤ cap`).
+unsafe fn group_agg_i64(
     keys: &[i64],
     out_keys: *mut i64,
     out_vals: *mut i64,
@@ -1176,7 +1180,7 @@ unsafe fn group_io<'a>(keys: *const i64, vals: *const i64, len: i64) -> (&'a [i6
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_sum_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let (keys, vals) = unsafe { group_io(keys, vals, len) };
-    group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.wrapping_add(b))
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.wrapping_add(b)) }
 }
 
 /// `group_by(.key).min(.value)` — per-group minimum.
@@ -1186,7 +1190,7 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(keys: *const i64, vals: *const i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_min_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let (keys, vals) = unsafe { group_io(keys, vals, len) };
-    group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.min(b))
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.min(b)) }
 }
 
 /// `group_by(.key).max(.value)` — per-group maximum.
@@ -1196,7 +1200,7 @@ pub unsafe extern "C" fn align_rt_group_min_i64(keys: *const i64, vals: *const i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let (keys, vals) = unsafe { group_io(keys, vals, len) };
-    group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.max(b))
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.max(b)) }
 }
 
 /// `group_by(.key).count()` — per-group row count (no value column).
@@ -1206,7 +1210,7 @@ pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_count_i64(keys: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let keys: &[i64] = if len <= 0 || keys.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(keys, len as usize) } };
-    group_agg_i64(keys, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b))
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
 /// A minimal JSON scanner over a byte slice (just what `json.decode` needs: objects with
