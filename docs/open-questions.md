@@ -446,9 +446,9 @@ beat `ahash` at high cardinality (recorded, not done): a SwissTable-style layout
 key+value, SIMD control-byte probing) + a stronger/faster hash** — secondary, since Align already
 beats the *default* map everywhere. **NEGATIVE result (2026-06-27): just interleaving the table into
 one `{key,acc,used}` array (without SIMD control bytes) REGRESSED it** (1M: 52 → 77 ms, 0.74× → 0.49×
-vs ahash) — for linear probing the three dense parallel arrays are better (the `used`/`key` arrays
+vs `ahash`) — for linear probing the three dense parallel arrays are better (the `used`/`key` arrays
 pack many entries per cache line for probe-chain scans; a 24-byte interleaved slot packs ~2.6/line +
-a bigger footprint). So the current 3-array layout stays; beating ahash needs the *full* SwissTable
+a bigger footprint). So the current 3-array layout stays; beating `ahash` needs the *full* SwissTable
 (SIMD control-byte group probing + AES-class hash), not a naive interleave — a big, bounded-value
 effort, deferred. Then: `min`/`max`/`count` aggregates, string keys (intern), AoS source. Design ↓.
 
