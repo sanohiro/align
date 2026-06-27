@@ -995,18 +995,23 @@ impl<'a> JsonParser<'a> {
         None
     }
     fn integer(&mut self) -> Option<i64> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
+        let neg = self.peek() == Some(b'-');
+        if neg {
             self.pos += 1;
         }
         let digits = self.pos;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
+        // Accumulate digits directly in one pass (no UTF-8 validation, no generic `parse`) — the
+        // hot path for integer fields. Accumulate as a *negative* magnitude so `i64::MIN` stays
+        // representable; `checked_*` rejects overflow (matching the old `parse::<i64>()` reject).
+        let mut v: i64 = 0;
+        while let Some(c @ b'0'..=b'9') = self.peek() {
+            v = v.checked_mul(10)?.checked_sub((c - b'0') as i64)?;
             self.pos += 1;
         }
         if self.pos == digits {
             return None;
         }
-        std::str::from_utf8(&self.src[start..self.pos]).ok()?.parse::<i64>().ok()
+        if neg { Some(v) } else { v.checked_neg() }
     }
     /// Read a JSON number (`-?digits(.digits)?([eE][+-]?digits)?`) as `f64`.
     fn number(&mut self) -> Option<f64> {
@@ -1384,6 +1389,26 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_parses_edges() {
+        // The hand-rolled single-pass `integer()` must match the old `parse::<i64>()`: full range
+        // incl. `i64::MIN`, and reject overflow (return None) rather than wrap.
+        let cases: &[(&[u8], Option<i64>)] = &[
+            (b"0", Some(0)),
+            (b"7", Some(7)),
+            (b"-1", Some(-1)),
+            (b"9223372036854775807", Some(i64::MAX)),
+            (b"-9223372036854775808", Some(i64::MIN)),
+            (b"9223372036854775808", None),  // i64::MAX + 1 → overflow, reject
+            (b"-9223372036854775809", None), // i64::MIN - 1 → overflow, reject
+            (b"x", None),                    // no digits
+        ];
+        for (input, want) in cases {
+            let mut p = JsonParser { src: input, pos: 0 };
+            assert_eq!(p.integer(), *want, "integer({:?})", std::str::from_utf8(input).unwrap());
+        }
+    }
 
     #[test]
     fn phf_hash_matches_codegen() {
