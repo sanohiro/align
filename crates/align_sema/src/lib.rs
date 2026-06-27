@@ -338,10 +338,22 @@ fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -
 
 /// Whether struct `id` (transitively) owns a heap buffer — a `string`/owned field, or a nested
 /// struct that does — which makes it a **Move** type with a recursive `Drop` (Slice 3). The struct
-/// graph is acyclic (enforced in pass 0b-2 / `struct_acyclic`), so the recursion terminates without
-/// a visiting set.
+/// graph is *meant* to be acyclic (pass 0b-2 / `struct_acyclic` reports any cycle as an error), but
+/// the compiler keeps running later passes on the erroneous program, which then call this on a
+/// cyclic struct — so the walk is **cycle-safe** (a `visiting` set, like `struct_acyclic`) to report
+/// the error gracefully instead of overflowing the stack.
 pub fn struct_is_move(id: u32, structs: &[StructDef]) -> bool {
-    structs.get(id as usize).is_some_and(|def| def.fields.iter().any(|f| ty_owns_buffer(f.ty, structs)))
+    struct_is_move_rec(id, structs, &mut Vec::new())
+}
+
+fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
+    if visiting.contains(&id) {
+        return false; // a cycle (already reported by `struct_acyclic`) — not a Move type here
+    }
+    visiting.push(id);
+    let res = structs.get(id as usize).is_some_and(|def| def.fields.iter().any(|f| ty_owns_buffer_rec(f.ty, structs, visiting)));
+    visiting.pop();
+    res
 }
 
 /// Whether a value of `ty` owns a heap buffer that a `Drop` must free — used to decide a struct
@@ -349,9 +361,13 @@ pub fn struct_is_move(id: u32, structs: &[StructDef]) -> bool {
 /// `Option`/`Result` with a Move payload, or a nested Move struct. (Tuples can't be struct fields, so
 /// they are not considered here; `str` is a borrow, not owned.)
 fn ty_owns_buffer(ty: Ty, structs: &[StructDef]) -> bool {
+    ty_owns_buffer_rec(ty, structs, &mut Vec::new())
+}
+
+fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
         || payload_is_move(ty)
-        || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
+        || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
 
 /// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs

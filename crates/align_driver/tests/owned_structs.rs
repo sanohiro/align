@@ -132,6 +132,17 @@ fn move_struct_in_unsupported_containers_rejected() {
 }
 
 #[test]
+fn cyclic_struct_used_by_value_errors_gracefully() {
+    // A recursive struct is reported by the acyclicity pass, but the compiler keeps running later
+    // passes (move-check / drop-set) on the erroneous program — which call the Move-struct walk. That
+    // walk must be cycle-safe (not overflow the stack) when the struct is used in a value position.
+    assert!(check_errs(
+        "cyclic-byvalue",
+        "Node { next: Node, v: i64 }\nfn f(n: Node) -> i64 = n.v\nfn main() -> i32 = 0\n"
+    ));
+}
+
+#[test]
 fn partial_owned_field_move_out_rejected() {
     // Moving an owned field *out* of a struct (`n := u.name`, consuming just the `string`) is
     // deferred — bind/clone instead. Must be a clean sema error, not a miscompile.
