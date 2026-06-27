@@ -2581,9 +2581,19 @@ impl<'a> MoveCheck<'a> {
                 if path.len() == 1 {
                     let fld = path[0];
                     if field_moved(moved, *base, fld) {
-                        // The whole struct, or this specific field, was already moved out.
+                        // The whole struct, or just this field, was already moved out — name the
+                        // field in the latter case (the struct stays partially usable), like a tuple.
                         let name = &self.f.locals[*base as usize].name;
-                        self.diags.error(format!("use of moved value '{name}'"), e.span);
+                        let msg = if moved.contains(&MovedKey::Whole(*base)) {
+                            format!("use of moved value '{name}'")
+                        } else {
+                            let fld_name = match self.f.locals[*base as usize].ty {
+                                Ty::Struct(sid) => self.structs[sid as usize].fields[fld as usize].name.as_str(),
+                                _ => "field",
+                            };
+                            format!("use of moved field '{fld_name}' of '{name}'")
+                        };
+                        self.diags.error(msg, e.span);
                     } else if consuming && e.ty == Ty::String {
                         // A partial move of a depth-1 owned `string` field (`n := u.name`,
                         // `f(u.name)` by value, `return u.name`): mark just that field moved. The
@@ -2606,8 +2616,15 @@ impl<'a> MoveCheck<'a> {
                     // root struct was moved (as a whole or in any field — conservative for deep
                     // reads). Moving a field out through a nested path is deferred.
                     if whole_moved(moved, *base) {
+                        // A deep read is blocked by a whole-struct move or — conservatively — any
+                        // partial field move; distinguish the two for a clearer message.
                         let name = &self.f.locals[*base as usize].name;
-                        self.diags.error(format!("use of moved value '{name}'"), e.span);
+                        let msg = if moved.contains(&MovedKey::Whole(*base)) {
+                            format!("use of moved value '{name}'")
+                        } else {
+                            format!("use of partially moved value '{name}'")
+                        };
+                        self.diags.error(msg, e.span);
                     } else if consuming && self.is_move_ty(e.ty) {
                         self.diags.error(
                             "moving an owned field out through a nested path is not supported yet — clone it".to_string(),
