@@ -209,6 +209,15 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::MakeDynArray { ptr, len } => {
             format!("array({}, {})", operand_str(ptr), operand_str(len))
         }
+        Rvalue::GroupSum { keys, vals, out_keys, out_vals } => {
+            format!(
+                "group_sum(keys={}, vals={} -> {}, {})",
+                operand_str(keys),
+                operand_str(vals),
+                operand_str(out_keys),
+                operand_str(out_vals)
+            )
+        }
         Rvalue::Chunks { src, n, elem } => {
             format!("chunks({}, {} x {})", operand_str(src), operand_str(n), crate::ty_name(*elem))
         }

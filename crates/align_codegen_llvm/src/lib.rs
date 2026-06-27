@@ -465,6 +465,18 @@ fn build_module<'c>(
             None,
         ),
     );
+    funcs.insert(
+        // group_by(.key).sum(.value): (keys, vals, len, out_keys, out_vals, cap) -> group count.
+        "group_sum_i64".to_string(),
+        module.add_function(
+            "align_rt_group_sum_i64",
+            ctx.i64_type().fn_type(
+                &[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()],
+                false,
+            ),
+            None,
+        ),
+    );
     // `str.clone()` → deep-copy into a heap-owned `string` `{ptr,len}` (MMv2 slice 7).
     funcs.insert(
         "str_clone".to_string(),
@@ -2152,6 +2164,29 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .into_struct_value()
                     .into()
+            }
+            Rvalue::GroupSum { keys, vals, out_keys, out_vals } => {
+                // Extract the key/value column pointers + length from the `{ptr,len}` slices and call
+                // the runtime hash-aggregate; `cap` = the column length (an upper bound on groups).
+                let kagg = self.operand(keys).into_struct_value();
+                let kptr = self.builder.build_extract_value(kagg, 0, "kptr").map_err(|e| self.err(e))?;
+                let klen = self.builder.build_extract_value(kagg, 1, "klen").map_err(|e| self.err(e))?;
+                let vptr = self
+                    .builder
+                    .build_extract_value(self.operand(vals).into_struct_value(), 0, "vptr")
+                    .map_err(|e| self.err(e))?;
+                let ok = self.operand(out_keys);
+                let ov = self.operand(out_vals);
+                self.builder
+                    .build_call(
+                        self.funcs["group_sum_i64"],
+                        &[kptr.into(), vptr.into(), klen.into(), ok.into(), ov.into(), klen.into()],
+                        "groupsum",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("group_sum returns the group count (i64)")
             }
             Rvalue::Chunks { src, n, elem } => {
                 // Split the `{ptr,len}` `src` into length-`n` slices via the runtime; the result is
