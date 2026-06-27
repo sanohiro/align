@@ -20,3 +20,19 @@ pub fn agg(data: str) -> i64 {
     Err(_) => 0 - 1,
   }
 }
+
+// Decomposition variant: decode into a row-major `array<Row>` (AoS) — Align's parser with NO
+// transpose — then the same filtered aggregate over the AoS pipeline. Comparing this to `agg`
+// isolates the transpose cost; comparing it to the Rust `serde_json → Vec` baseline isolates the
+// parser (both land row storage then scan it).
+fn run_aos(data: str) -> Result<i64, Error> {
+  xs: array<Row> := json.decode(data)?
+  return Ok(xs.where(.active).pay.sum())
+}
+
+pub fn agg_aos(data: str) -> i64 {
+  match run_aos(data) {
+    Ok(v) => v,
+    Err(_) => 0 - 1,
+  }
+}

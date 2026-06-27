@@ -21,6 +21,9 @@ extern "C" {
     /// `pub fn agg(data: str) -> i64` — decode → `soa<Row>` → `where(.active).pay.sum()`, or -1 on
     /// a parse error.
     fn agg(data: AlignStr) -> i64;
+    /// `pub fn agg_aos(data: str) -> i64` — decode → `array<Row>` (AoS, no transpose) → same
+    /// aggregate. Isolates the transpose cost (vs `agg`) and the parser (vs the Rust baseline).
+    fn agg_aos(data: AlignStr) -> i64;
 }
 
 // `score`/`extra` are deserialized for fidelity (a fair 4-field record) but not read by the
@@ -69,39 +72,43 @@ fn gen_json(n: usize) -> (String, i64) {
 fn main() {
     let sizes = [10_000usize, 100_000, 1_000_000];
     let rounds = 30;
-    println!("JSON → SoA analytics: Align (decode→soa→where(.active).pay.sum) vs Rust (serde_json→Vec→filter/sum)");
-    println!("{:>10}  {:>10}  {:>12}  {:>12}  {:>7}", "records", "json KB", "align ms", "rust ms", "speedup");
+    println!("JSON decode + where(.active).pay.sum() — Align soa / Align AoS / Rust serde_json→Vec");
+    println!(
+        "{:>9}  {:>8}  {:>10}  {:>10}  {:>10}  {:>9}  {:>9}",
+        "records", "json KB", "soa ms", "aos ms", "rust ms", "soa/rust", "aos/rust"
+    );
     for &n in &sizes {
         let (json, expected) = gen_json(n);
         let astr = AlignStr { ptr: json.as_ptr(), len: json.len() as i64 };
 
-        // Correctness: both must agree with the generator before we trust the timing.
-        let a0 = unsafe { agg(AlignStr { ptr: json.as_ptr(), len: json.len() as i64 }) };
-        let r0 = rust_agg(&json);
-        assert_eq!(a0, expected, "align result wrong");
-        assert_eq!(r0, expected, "rust result wrong");
+        // Correctness: all three must agree with the generator before we trust the timing.
+        assert_eq!(unsafe { agg(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align soa wrong");
+        assert_eq!(unsafe { agg_aos(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align aos wrong");
+        assert_eq!(rust_agg(&json), expected, "rust wrong");
 
-        let (mut align_min, mut rust_min) = (f64::MAX, f64::MAX);
+        let (mut soa_min, mut aos_min, mut rust_min) = (f64::MAX, f64::MAX, f64::MAX);
         for _ in 0..rounds {
             let t = Instant::now();
-            let av = unsafe { agg(AlignStr { ptr: astr.ptr, len: astr.len }) };
-            let ad = t.elapsed().as_secs_f64() * 1e3;
-            std::hint::black_box(av);
-            align_min = align_min.min(ad);
+            std::hint::black_box(unsafe { agg(AlignStr { ptr: astr.ptr, len: astr.len }) });
+            soa_min = soa_min.min(t.elapsed().as_secs_f64() * 1e3);
 
             let t = Instant::now();
-            let rv = rust_agg(&json);
-            let rd = t.elapsed().as_secs_f64() * 1e3;
-            std::hint::black_box(rv);
-            rust_min = rust_min.min(rd);
+            std::hint::black_box(unsafe { agg_aos(AlignStr { ptr: astr.ptr, len: astr.len }) });
+            aos_min = aos_min.min(t.elapsed().as_secs_f64() * 1e3);
+
+            let t = Instant::now();
+            std::hint::black_box(rust_agg(&json));
+            rust_min = rust_min.min(t.elapsed().as_secs_f64() * 1e3);
         }
         println!(
-            "{:>10}  {:>10}  {:>12.3}  {:>12.3}  {:>6.2}x",
+            "{:>9}  {:>8}  {:>10.3}  {:>10.3}  {:>10.3}  {:>8.2}x  {:>8.2}x",
             n,
             json.len() / 1024,
-            align_min,
+            soa_min,
+            aos_min,
             rust_min,
-            rust_min / align_min
+            rust_min / soa_min,
+            rust_min / aos_min
         );
     }
 }

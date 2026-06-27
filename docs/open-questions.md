@@ -276,13 +276,17 @@ JSON→SoA is then a thin wiring on top.
    byte-at-a-time parser vs the heavily-optimized `serde_json`, and Align additionally does
    decode-to-AoS-then-transpose (an extra pass + alloc) where Rust does one `Vec` parse. The SoA
    column-scan win is real (flat `bench/` `col_sum` ~8–10×) but here it is **swamped by the parse,
-   which both sides pay in full**. **So the json→soa "analytics win" is NOT real yet** — it depends
-   on parser work not done. Path to actually winning: (a) **a SIMD/structural JSON parser** (the
-   dominant lever — runtime CPU-dispatch / simdjson-class; the layout win can't surface until the
-   parse is competitive); (b) **two-pass count-then-direct-column-fill** (Codex's refinement — drop
-   the AoS intermediate + transpose); (c) **field-skip / narrow struct** (don't parse unread columns
-   — already available, cuts parse on both sides). This redirects the analytics thrust toward the
-   PARSER, not more soa surface.
+   which both sides pay in full**. **DECOMPOSED + first parser fix (2026-06-27):** the bench now also
+   times Align `→array<Row>` (AoS, no transpose); soa≈aos → **the transpose is cheap, the gap is the
+   PARSER**. Hand-rolling `integer()` (was `str::from_utf8(..).parse::<i64>()` — UTF-8 validation +
+   generic parse + a second digit pass; now a single-pass `checked` digit accumulation, the int-field
+   hot path) moved it **≈0.61× → ≈0.82–0.85×** (AoS ≈parity at 1M). Remaining path to beat serde, in
+   order: (a) **more scalar-parser tuning** — drop the per-element zeroing memset (all declared
+   fields are required → the AoS buffer is fully overwritten), tighten `peek`/whitespace/string scan;
+   (b) **a SIMD/structural JSON parser** (the bigger lever — runtime CPU-dispatch / simdjson-class);
+   (c) **two-pass count-then-direct-column-fill** (drops the transpose — small, decomposition showed
+   it cheap); (d) **field-skip / narrow struct** (already available). The analytics thrust is a
+   PARSER problem, not more soa surface.
 3. **Known-schema field-skip / projection decode — DEFERRED 2026-06-27 (the perf is already
    available; the remaining delta is ergonomic-only and safety-sensitive).** KEY FINDING (verified
    2026-06-27): the runtime **already skips every JSON field not declared in the target struct**
