@@ -156,9 +156,19 @@ slices, but it reuses the Slice-3 Drop machinery). `crates/align_driver/tests/re
   the drop set entirely — a pre-existing conservative-region limitation, not this fix.
 
 ### Slice 4 — arrays / soa × nesting
-`arr[i].a.x` (struct-array element nested field) and a soa column over a nested field. Extends
-`StoreElemField` / `IndexFieldPtr` / soa offset math to field paths. Risk: medium–high (nested soa
-column layout is a design choice).
+`arr[i].a.x` (struct-array element nested field) and a soa column over a nested field.
+
+- **`arr[i].a.x` read — DONE.** `ElemField`'s `field: u32` became a `path: Vec<u32>`. Routing:
+  `check_field_access` peels a `FieldAccess` spine bottoming at an `Index` (`peel_index_field_chain`)
+  and hands the whole name path to `check_index_field`, which resolves it through the (nested) element
+  struct (each non-final field must be a struct). MIR loads the **first** field via the existing
+  single-field seam (`lower_field_access` — the pipeline path is untouched), materializes that
+  sub-struct to a temp slot, and projects the remainder with the ordinary slot-field GEP
+  (`Rvalue::Field`). Works for fixed and dynamic (`{ptr,len}`) struct arrays, any depth.
+  `crates/align_driver/tests/struct_index.rs`.
+- **deferred**: nested element *write* (`arr[i].a.x = v` — `StoreElemField` is still depth-1); a soa
+  column over a *nested* field (the nested-soa-column layout is a design choice); and **arrays of Move
+  structs** (`[User{name}]` — needs per-element drop). Risk for those: medium–high.
 
 ### Slice 5 — cross-module field types (`f: other.T`) — DONE
 The module B3 leftover. A struct field, enum payload, or generic-template member may name a `pub`

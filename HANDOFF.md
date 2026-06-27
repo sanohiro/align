@@ -55,6 +55,10 @@ Continue `docs/impl/08-nested-structs.md`:
   struct field / enum payload / template member. `tests/cross_module_types.rs`.
 - **Partial owned-field move DONE** — `n := u.name` (depth-1 `string` field) moves the buffer out,
   nulls the struct field, struct Drop frees null. Deeper paths / Move-struct fields still deferred.
+- **Slice 4 `arr[i].a.x` read DONE** — nested field of a struct-array element (`ElemField.field` →
+  `path`; first field loaded via the single-field seam, remainder projected from a temp slot — the
+  pipeline seam untouched). Deferred: nested element *write* (`arr[i].a.x = v`), nested soa column,
+  and **arrays of Move structs** (`[User{name}]`, per-element drop). `tests/struct_index.rs`.
 - Smaller follow-up unblocked by Slice 3: owned `array<T>` struct fields.
 - **DONE (this branch): borrowing an owned field out** — `u.name.len()` / `str` arg / `s: str :=
   u.name` now read a `string` field as a zero-copy `str` view (non-consuming, `Frame`-regioned so it

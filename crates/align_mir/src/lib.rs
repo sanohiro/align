@@ -1158,8 +1158,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::Index { recv, index } => lower_index(b, recv, index, e.ty),
-        hir::ExprKind::ElemField { recv, index, field, struct_id } => {
-            lower_index_field(b, recv, index, *field, *struct_id, e.ty)
+        hir::ExprKind::ElemField { recv, index, path, struct_id } => {
+            lower_index_field(b, recv, index, path, *struct_id, e.ty)
         }
         hir::ExprKind::ArrayLit { .. } => {
             unreachable!("array literal only appears as a let initializer or pipeline source")
@@ -1252,7 +1252,7 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
 /// A fixed stack `array<Struct>` uses the slot-based `IndexField`; an owned dynamic
 /// `array<Struct>` uses the pointer-based `IndexFieldPtr` (same addressing as a fused pipeline
 /// projection). Only the one field (a scalar or a `str` view) is loaded — no whole-struct copy.
-fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, field: u32, struct_id: u32, field_ty: Ty) -> Operand {
+fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path: &[u32], struct_id: u32, leaf_ty: Ty) -> Operand {
     let idx = lower_expr(b, index);
     // Set the element-field address up the same way the fused pipeline does (one shared seam,
     // `lower_field_access`): a fixed `array<Struct>` is slot-addressed, an owned dynamic
@@ -1272,8 +1272,20 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, field
         }
     };
     emit_bounds_check(b, &idx, len);
-    let v = lower_field_access(b, struct_view, &slice_val, slot, &idx, field, field_ty);
-    Operand::Value(v)
+    // Load the element's first field via the shared seam. For a depth-1 path that *is* the leaf; for
+    // a nested path (`arr[i].a.x`) it is the intermediate sub-struct, which we materialize to a temp
+    // slot and then project the remaining field path out of (reusing the slot-field GEP) — so the
+    // pipeline's single-field seam stays untouched.
+    let first_ty = if path.len() == 1 { leaf_ty } else { b.structs[struct_id as usize].fields[path[0] as usize].ty };
+    let first = lower_field_access(b, struct_view, &slice_val, slot, &idx, path[0], first_ty);
+    if path.len() == 1 {
+        return Operand::Value(first);
+    }
+    let tmp = b.new_slot(first_ty);
+    b.push(Stmt::Store(tmp, Operand::Value(first)));
+    let leaf = b.fresh_value(leaf_ty);
+    b.push(Stmt::Let(leaf, Rvalue::Field(tmp, path[1..].to_vec())));
+    Operand::Value(leaf)
 }
 
 fn index_const(i: usize) -> Operand {

@@ -408,6 +408,22 @@ fn stage_capture_exprs(stages: &[Stage]) -> impl Iterator<Item = &Expr> {
 /// The capture operands carried by a reducer/terminal node's own function (a lifted lambda's
 /// captured values for `reduce`/`scan`/`partition`/`par_map`/`any`/`all`). The flow analyses walk
 /// these like stage captures.
+/// Peel a `arr[i].f0.f1…` chain (an AST `FieldAccess` spine bottoming out at an `Index`) into the
+/// array expression, the index expression, and the field-name path in order. `None` if the receiver
+/// is not rooted at an index (ordinary local/field-path access then handles it). Used to route a
+/// nested struct-array element field access (`arr[i].a.x`) to `check_index_field`.
+fn peel_index_field_chain(e: &ast::Expr) -> Option<(&ast::Expr, &ast::Expr, Vec<&ast::Ident>)> {
+    match &e.kind {
+        ast::ExprKind::Index { recv, index } => Some((recv, index, Vec::new())),
+        ast::ExprKind::FieldAccess { recv, field } => {
+            let (arr, index, mut fields) = peel_index_field_chain(recv)?;
+            fields.push(field);
+            Some((arr, index, fields))
+        }
+        _ => None,
+    }
+}
+
 fn node_captures(kind: &ExprKind) -> &[Expr] {
     match kind {
         ExprKind::ArrayReduce { captures, .. }
@@ -3849,10 +3865,13 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
-        // `arr[i].field` — field access on a struct-array element. Fused into one bounds-checked
-        // element-field load (MMv2 slice 8f); a whole-struct `arr[i]` value is not materialized.
-        if let ast::ExprKind::Index { recv: arr, index } = &recv.kind {
-            return self.check_index_field(arr, index, field, expected, span);
+        // `arr[i].f0.f1…` — field access on a (possibly nested) field of a struct-array element. A
+        // depth-1 `arr[i].field` is one bounds-checked element-field load; a nested path
+        // (`arr[i].a.x`) loads the first sub-struct then projects. A whole-struct `arr[i]` value is
+        // not materialized.
+        if let Some((arr, index, mut names)) = peel_index_field_chain(recv) {
+            names.push(field);
+            return self.check_index_field(arr, index, &names, expected, span);
         }
         // Resolve the receiver to a struct **place** — a local, or a nested field path `l.a.b`.
         let (root, mut path, recv_ty) = match self.resolve_place(recv) {
@@ -6858,7 +6877,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// bounds-checked element-field load; only the field (a scalar or a `str` view) is read. The
     /// result inherits the array's region (a `str` field views the array's input), so it cannot
     /// escape that input.
-    fn check_index_field(&mut self, arr: &ast::Expr, index: &ast::Expr, field: &ast::Ident, expected: Option<Ty>, span: Span) -> Expr {
+    fn check_index_field(&mut self, arr: &ast::Expr, index: &ast::Expr, fields: &[&ast::Ident], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
         let r = self.check_expr(arr, None);
         let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
@@ -6873,7 +6892,7 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
             Ty::Error => return err,
             other => {
-                self.diags.error(format!("'{}[i].{}' needs a struct array, got {}", "arr", field.name, ty_name(other)), span);
+                self.diags.error(format!("'arr[i].{}' needs a struct array, got {}", fields[0].name, ty_name(other)), span);
                 return err;
             }
         };
@@ -6886,24 +6905,38 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        let (field_index, field_ty) = match self.field_of(Ty::Struct(struct_id), &field.name, field.span) {
-            Some(x) => x,
-            None => return err,
-        };
-        // A field-read that is itself a Move type would copy without ownership transfer (the same
-        // double-free concern as scalar indexing). Decoded structs only have scalar / `str`-view
-        // fields, but guard generally.
-        if matches!(field_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(field_ty) {
+        // Resolve the field path through the (possibly nested) element struct: each non-final field
+        // must itself be a struct so the path can continue (`arr[i].a.x`). The final field is the
+        // leaf whose value is read.
+        let mut path = Vec::with_capacity(fields.len());
+        let mut cur = Ty::Struct(struct_id);
+        let mut leaf_ty = Ty::Error;
+        for (k, f) in fields.iter().enumerate() {
+            let Some((idx, fty)) = self.field_of(cur, &f.name, f.span) else { return err };
+            path.push(idx);
+            if k + 1 == fields.len() {
+                leaf_ty = fty;
+            } else if let Ty::Struct(nid) = fty {
+                cur = Ty::Struct(nid);
+            } else {
+                self.diags.error(format!("field '{}' is {}, not a struct — cannot access '.{}' through it", f.name, ty_name(fty), fields[k + 1].name), f.span);
+                return err;
+            }
+        }
+        // A leaf that is itself a Move type would copy without ownership transfer (the same
+        // double-free concern as scalar indexing). An indexable struct array has a non-Move element
+        // (arrays of Move structs are rejected), so every nested field is non-Move; guard anyway.
+        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(leaf_ty) {
             self.diags.error(
-                format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(field_ty)),
+                format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
                 span,
             );
             return err;
         }
-        self.constrain(field_ty, expected, span);
+        self.constrain(leaf_ty, expected, span);
         Expr {
-            kind: ExprKind::ElemField { recv: Box::new(r), index: Box::new(i), field: field_index, struct_id },
-            ty: field_ty,
+            kind: ExprKind::ElemField { recv: Box::new(r), index: Box::new(i), path, struct_id },
+            ty: leaf_ty,
             span,
         }
     }
