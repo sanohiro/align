@@ -6286,6 +6286,9 @@ impl<'a, 't> Checker<'a, 't> {
         if !ok {
             return err;
         }
+        // `json.encode` desugars to a `Template` `str` — the same arena-allocating path, so it leaks
+        // the same way inside a lifted lambda with no arena.
+        self.guard_lambda_alloc_leak("json.encode", span);
         Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
     }
 

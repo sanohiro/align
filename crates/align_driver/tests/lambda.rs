@@ -304,3 +304,11 @@ fn builder_reduce_still_ok() {
     let src = "pub fn run(s: slice<i64>) -> i64 {\n  b := s.reduce(builder(), fn b, x { b.write_int(x); b })\n  return b.to_string().len()\n}\nfn main() -> i32 = 0\n";
     assert!(!check_errs("builder-reduce-ok", src));
 }
+
+#[test]
+fn json_encode_in_lambda_is_rejected() {
+    // `json.encode` desugars to a Template `str` — the same arena-allocating leak path, so it is
+    // also rejected inside a lifted lambda (reviewer's catch on the Gap A fix).
+    let src = "import core.json\nU { id: i64 }\nfn main() -> i32 {\n  arena {\n    xs := [U{id:1}, U{id:2}].map(fn u { json.encode(u) }).to_array()\n    return 0\n  }\n}\n";
+    assert!(check_errs("lam-jsonencode-leak", src));
+}

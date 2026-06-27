@@ -355,11 +355,12 @@ arm64 *numbers* here (linux x86), but every *code* claim was verified against th
   error).** `s.reduce("", fn acc, x { acc + x })`: the lambda lifts to a top-level fn whose `lower_fn`
   starts with `b.arenas` empty, so `str+str` (MIR ~757) got `arena = None` → `builder_finish`
   `Box::leak`d the buffer (runtime ~1196) → one leak per reduce step → OOM at N=10k. **Fix:**
-  `guard_lambda_alloc_leak` (align_sema) errors on a string allocation (`str + str` / `template`)
-  inside a lifted lambda with no arena of its own (`capture.is_some() && arena_depth == 0`), pointing
-  at the `builder` pattern — so the silent leak is now a clear compile error (Nothing-hidden restored).
-  Legitimate cases unaffected: top-level / named-fn concat, the builder-reduce pattern, and a concat
-  inside the lambda's own `arena {}`. `tests/lambda.rs` (+5). **Remaining sub-gap (recorded, NOT the
+  `guard_lambda_alloc_leak` (align_sema) errors on a string allocation (`str + str` / `template` /
+  `json.encode` — all desugar to an arena `Template` str) inside a lifted lambda with no arena of its
+  own (`capture.is_some() && arena_depth == 0`), pointing at the `builder` pattern — so the silent
+  leak is now a clear compile error (Nothing-hidden restored). Legitimate cases unaffected: top-level
+  / named-fn concat, the builder-reduce pattern, and a concat inside the lambda's own `arena {}`.
+  `tests/lambda.rs` (+6). **Remaining sub-gap (recorded, NOT the
   reported case):** a *named* reducer fn that concats (`fn cat(a,b)=a+b` used as `reduce("", cat)`)
   leaks the same way but isn't caught (the guard is scoped to inline lambdas via `capture`); the real
   fix is **owned `string` from concat** (str+str → a heap `string` with `Drop`, freeing each
