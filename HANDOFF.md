@@ -17,8 +17,10 @@ cd align
 cargo build && cargo test       # expect all green (~676 tests)
 ```
 
-`alignc run examples/...align` compiles `.align` → native. Subcommands: `check` / `emit-mir` /
-`emit-llvm` / `emit-obj` / `build` / `run`.
+The compiler is `./target/debug/alignc` (or `./target/release/alignc` after `--release`) — not on
+`PATH`. `./target/debug/alignc run examples/min.align` compiles `.align` → native. Subcommands:
+`check` / `emit-mir` / `emit-llvm` / `emit-obj` / `build` / `run`. (Or just drive it via `cargo run
+-p align_driver -- run <file>`.)
 
 ## Where we are (as of main @ commit for PR #183)
 
@@ -75,7 +77,12 @@ files: PR-review workflow, perf model, benchmark findings, language-completion s
 repo is self-sufficient without it, but to carry it over:
 
 ```bash
-# old machine:
-tar czf align-memory.tgz -C ~/.claude/projects -home-hiro-project-align
-# new machine: extract into ~/.claude/projects/  (clone to the SAME path so the project key matches)
+# old machine (note the leading ./ — the dir name starts with '-', which tar would else read as flags):
+tar czf align-memory.tgz -C ~/.claude/projects ./-home-hiro-project-align
+# new machine:
+tar xzf align-memory.tgz -C ~/.claude/projects
 ```
+The project key (`-home-hiro-project-align`) is derived from the clone path. Clone to the **same**
+path (`/home/<user>/project/align`) so it matches. If the new machine's user/path differs, the key
+changes (e.g. `-home-bob-project-align`) — rename the extracted folder to that new key, or Claude
+Code won't pick the memory up.
