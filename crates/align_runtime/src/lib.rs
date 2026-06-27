@@ -1005,8 +1005,21 @@ impl<'a> JsonParser<'a> {
         // representable; `checked_*` rejects overflow (matching the old `parse::<i64>()` reject).
         let mut v: i64 = 0;
         while let Some(c @ b'0'..=b'9') = self.peek() {
-            v = v.checked_mul(10)?.checked_sub((c - b'0') as i64)?;
-            self.pos += 1;
+            match v.checked_mul(10).and_then(|x| x.checked_sub((c - b'0') as i64)) {
+                Some(nv) => {
+                    v = nv;
+                    self.pos += 1;
+                }
+                // Overflow: consume the rest of the digits (so the parser ends up past the whole
+                // number, matching the old `parse` behavior) and then reject. No branch is added to
+                // the success path — this arm is the cold error edge.
+                None => {
+                    while matches!(self.peek(), Some(b'0'..=b'9')) {
+                        self.pos += 1;
+                    }
+                    return None;
+                }
+            }
         }
         if self.pos == digits {
             return None;
@@ -1408,6 +1421,11 @@ mod tests {
             let mut p = JsonParser { src: input, pos: 0 };
             assert_eq!(p.integer(), *want, "integer({:?})", std::str::from_utf8(input).unwrap());
         }
+        // On overflow the parser still consumes the whole number (ends past all digits), so it
+        // doesn't try to re-parse the tail as a new token.
+        let mut p = JsonParser { src: b"9223372036854775808,", pos: 0 };
+        assert_eq!(p.integer(), None);
+        assert_eq!(p.peek(), Some(b','), "overflow should consume all 19 digits, leaving pos at ','");
     }
 
     #[test]
