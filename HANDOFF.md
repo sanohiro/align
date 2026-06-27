@@ -55,9 +55,6 @@ Continue `docs/impl/08-nested-structs.md`:
   struct field / enum payload / template member. `tests/cross_module_types.rs`.
 - Smaller follow-ups unblocked by Slice 3: owned `array<T>` struct fields; the partial *move* of an
   owned field out (`n := u.name`).
-- **Bug found (pre-existing, not yet fixed): struct sum-type payload extraction is wrong** — `match
-  Shape.Dot(p) => p.x + p.y` returns a wrong value (reproduced single-module on main, exit 1 vs 5).
-  Orthogonal to the slices above; deserves its own PR. `S2` struct payloads (`docs/impl`).
 - **DONE (this branch): borrowing an owned field out** — `u.name.len()` / `str` arg / `s: str :=
   u.name` now read a `string` field as a zero-copy `str` view (non-consuming, `Frame`-regioned so it
   can't escape the struct). Moving the field out stays deferred. `tests/owned_structs.rs`.

@@ -53,17 +53,26 @@ fn struct_field_of_imported_move_struct() {
 }
 
 #[test]
-fn enum_payload_of_imported_type_resolves() {
-    // A sum-type payload may be an imported `pub` plain struct — it resolves and type-checks (the
-    // resolution path this slice unblocks). (Runtime extraction of a struct payload is exercised by
-    // the single-module sum-type tests.)
+fn enum_payload_of_imported_type() {
+    if !backend_available() {
+        return;
+    }
+    // A sum-type payload may be an imported `pub` plain struct: construct `Shape.Dot(geom.Point{…})`
+    // and extract the payload's fields in a `match` arm across the boundary. 2 + 3 = 5.
     let main = concat!(
         "module main\n",
         "import geom\n",
         "Shape { Dot(geom.Point), Empty }\n",
-        "fn main() -> i32 = 0\n",
+        "fn main() -> i32 {\n",
+        "  s := Shape.Dot(geom.Point{x: 2, y: 3})\n",
+        "  return match s {\n",
+        "    Dot(p) => (p.x + p.y) as i32\n",
+        "    Empty => 0\n",
+        "  }\n",
+        "}\n",
     );
-    assert!(!check_multi_errs("xmod-enum", &[("geom.align", GEOM), ("main.align", main)], "main.align"));
+    let out = build_and_run_multi("xmod-enum", &[("geom.align", GEOM), ("main.align", main)], "main.align");
+    assert_eq!(out.status.code(), Some(5));
 }
 
 #[test]
