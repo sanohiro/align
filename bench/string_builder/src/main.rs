@@ -15,6 +15,8 @@ struct Slice {
 extern "C" {
     /// `pub fn build(s: slice<i64>) -> i64` — builder reduce-append, returns the final string length.
     fn build(s: Slice) -> i64;
+    /// `build` with a pre-sized builder (`builder(n*16)`) — the capacity (Gap C) variant.
+    fn build_cap(s: Slice) -> i64;
 }
 
 fn rust_naive(s: &[i64]) -> i64 {
@@ -70,21 +72,29 @@ fn gen(n: usize) -> Vec<i64> {
 fn main() {
     let rounds = 50;
     println!("builder reduce-append (\"item-\" + int + \"-status \") — Align vs Rust String");
-    println!("{:>9}  {:>10}  {:>10}  {:>10}  {:>9}  {:>9}", "n", "align ms", "naive ms", "opt ms", "vs naive", "vs opt");
+    println!(
+        "{:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}",
+        "n", "align ms", "+cap ms", "naive ms", "opt ms", "cap/opt", "cap/naive"
+    );
     for &n in &[1_000usize, 10_000, 100_000] {
         let data = gen(n);
         let sl = Slice { ptr: data.as_ptr(), len: n as i64 };
 
-        // Correctness: all three produce the same length.
+        // Correctness: all four produce the same length.
         let a0 = unsafe { build(Slice { ptr: sl.ptr, len: sl.len }) };
+        assert_eq!(a0, unsafe { build_cap(Slice { ptr: sl.ptr, len: sl.len }) }, "align cap length");
         assert_eq!(a0, rust_naive(&data), "align vs naive length");
         assert_eq!(a0, rust_opt(&data), "align vs opt length");
 
-        let (mut am, mut nm, mut om) = (f64::MAX, f64::MAX, f64::MAX);
+        let (mut am, mut cm, mut nm, mut om) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
         for _ in 0..rounds {
             let t = Instant::now();
             std::hint::black_box(unsafe { build(Slice { ptr: sl.ptr, len: sl.len }) });
             am = am.min(t.elapsed().as_secs_f64() * 1e3);
+
+            let t = Instant::now();
+            std::hint::black_box(unsafe { build_cap(Slice { ptr: sl.ptr, len: sl.len }) });
+            cm = cm.min(t.elapsed().as_secs_f64() * 1e3);
 
             let t = Instant::now();
             std::hint::black_box(rust_naive(&data));
@@ -94,6 +104,6 @@ fn main() {
             std::hint::black_box(rust_opt(&data));
             om = om.min(t.elapsed().as_secs_f64() * 1e3);
         }
-        println!("{:>9}  {:>10.3}  {:>10.3}  {:>10.3}  {:>8.2}x  {:>8.2}x", n, am, nm, om, nm / am, om / am);
+        println!("{:>9}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {:>8.2}x  {:>8.2}x", n, am, cm, nm, om, om / cm, nm / cm);
     }
 }

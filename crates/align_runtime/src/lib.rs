@@ -376,11 +376,13 @@ pub struct Builder {
     arena: *mut Arena,
 }
 
-/// Open a builder. If `arena` is non-null, the finished string is allocated in that
-/// arena (freed in bulk at the block's end); otherwise it is leaked (no owner yet).
+/// Open a builder. If `arena` is non-null, the finished string is allocated in that arena (freed in
+/// bulk at the block's end); otherwise it is leaked (no owner yet). `capacity` (bytes) pre-sizes the
+/// backing buffer so appends don't reallocate as it grows; 0 = default (empty).
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_new(arena: *mut Arena) -> *mut Builder {
-    Box::into_raw(Box::new(Builder { buf: Vec::new(), arena }))
+pub extern "C" fn align_rt_builder_new(arena: *mut Arena, capacity: i64) -> *mut Builder {
+    let buf = if capacity > 0 { Vec::with_capacity(capacity as usize) } else { Vec::new() };
+    Box::into_raw(Box::new(Builder { buf, arena }))
 }
 
 /// Append raw bytes (a static template part or a `str` value).

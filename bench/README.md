@@ -51,8 +51,9 @@ bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
   primitive-key columnar hash-aggregate vs Rust's generic map. It loses to `ahash` at high cardinality
   (0.52–0.72×) — closing that needs a SwissTable layout. The benchmark caught a mechanism bug (a fixed
   `2·n` table thrashed cache, 0.11× at 10k groups); growing the table to the live group count fixed it.
-- **String building (`bench/string_builder/`): the `builder` reduce-append pattern beats naive Rust
-  (1.05–1.11×) and is ≈1.35× behind hand-optimized Rust.** Hand-rolling the runtime integer write
-  (`write!` → itoa) halved the gap to optimized (Gemini measured the old builder ~2.8× behind); the
-  residual ~1.35× is the builder's `Vec` realloc (a `builder(capacity)` hint would close it). This is
-  the string-accumulation tool the `str + str`-in-a-lambda error points to.
+- **String building (`bench/string_builder/`): the `builder` reduce-append pattern ties/beats naive
+  Rust and is ≈1.5× behind hand-optimized Rust.** Hand-rolling the runtime integer write (`write!` →
+  itoa) halved the gap (Gemini measured the old builder ~2.8× behind optimized). The residual is
+  **per-append FFI-call overhead** (3 runtime calls/element, not inlined) — measured, *not* the `Vec`
+  realloc: adding `builder(capacity)` did **not** close it (`+cap` ≈ `build`). The lever is inlining/
+  batching the appends. This is the string-accumulation tool the `str + str`-in-a-lambda error points to.

@@ -162,6 +162,25 @@ fn builder_constructs_owned_string() {
 }
 
 #[test]
+fn builder_with_capacity() {
+    if !backend_available() {
+        return;
+    }
+    // `builder(n)` pre-sizes the backing buffer (so appends don't reallocate); the result is
+    // identical to `builder()`. "hello, align! score=42" = 22 bytes; capacity is just a hint.
+    let src = "fn make(name: str, score: i64) -> string {\n  b := builder(64)\n  b.write(\"hello, \")\n  b.write(name)\n  b.write(\"! score=\")\n  b.write_int(score)\n  return b.to_string()\n}\nfn main() -> i32 {\n  print(make(\"align\", 42).len())\n  return 0\n}\n";
+    let out = build_and_run("builder-cap", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "22\n");
+}
+
+#[test]
+fn builder_capacity_must_be_int() {
+    // `builder(capacity)` takes an `i64`; a non-integer capacity is a type error.
+    assert!(check_errs("builder-cap-bad", "fn main() -> i32 { b := builder(\"x\")\n return 0 }\n"));
+}
+
+#[test]
 fn builder_write_borrows_owned_string() {
     if !backend_available() {
         return;

@@ -1757,10 +1757,16 @@ impl EffectScan {
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.expr(input),
+            // `builder(capacity)` — the capacity expr may itself have effects.
+            ExprKind::BuilderNew { capacity } => {
+                if let Some(c) = capacity {
+                    self.expr(c);
+                }
+            }
             // Leaves.
             ExprKind::Unit | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_)
             | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::OptionNone
-            | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupSum { .. } | ExprKind::IndexField { .. } | ExprKind::BuilderNew => {}
+            | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupSum { .. } | ExprKind::IndexField { .. } => {}
         }
     }
 }
@@ -2298,6 +2304,11 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::FsReadFile { path } => self.walk(path, depth),
             ExprKind::IoStdoutWrite { arg } => self.walk(arg, depth),
             ExprKind::IoStdoutWriteBuilder { builder } => self.walk(builder, depth),
+            ExprKind::BuilderNew { capacity } => {
+                if let Some(c) = capacity {
+                    self.walk(c, depth);
+                }
+            }
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -2309,7 +2320,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupSum { .. }
-            | ExprKind::BuilderNew
             | ExprKind::IndexField { .. } => {}
         }
     }
@@ -2515,7 +2525,11 @@ impl<'a> MoveCheck<'a> {
                 self.expr(builder, moved, false, false);
                 self.expr(arg, moved, false, false);
             }
-            ExprKind::BuilderNew => {}
+            ExprKind::BuilderNew { capacity } => {
+                if let Some(c) = capacity {
+                    self.expr(c, moved, false, false);
+                }
+            }
             // The receiver is borrowed, not consumed.
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
@@ -6126,11 +6140,23 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `builder()` — open an append-oriented string builder (MMv2 slice 7c, draft.md §12).
     fn check_builder_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
-        if !args.is_empty() {
-            self.diags
-                .error(format!("'builder' takes no arguments, got {}", args.len()), span);
-        }
-        Expr { kind: ExprKind::BuilderNew, ty: Ty::Builder, span }
+        // `builder()` (default capacity) or `builder(n)` (pre-size the backing buffer to `n` bytes
+        // so appends don't reallocate as it grows). `n` is an `i64`.
+        let capacity = match args {
+            [] => None,
+            [cap] => {
+                let c = self.check_expr(cap, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                if !c.ty.is_int_like() && c.ty != Ty::Error {
+                    self.diags.error(format!("'builder' capacity must be an integer, got {}", ty_name(c.ty)), cap.span);
+                }
+                Some(Box::new(c))
+            }
+            _ => {
+                self.diags.error(format!("'builder' takes an optional capacity (0 or 1 argument), got {}", args.len()), span);
+                None
+            }
+        };
+        Expr { kind: ExprKind::BuilderNew { capacity }, ty: Ty::Builder, span }
     }
 
     /// `b.write(s)` / `b.write_int(n)` / `b.write_bool(v)` / `b.write_char(c)` /
@@ -7282,6 +7308,11 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             ExprKind::TupleIndex { recv, .. } => self.finalize_expr(recv),
+            ExprKind::BuilderNew { capacity } => {
+                if let Some(c) = capacity {
+                    self.finalize_expr(c);
+                }
+            }
             ExprKind::Unit
             | ExprKind::Int(_)
             | ExprKind::Float(_)
@@ -7293,7 +7324,6 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupSum { .. }
-            | ExprKind::BuilderNew
             | ExprKind::IndexField { .. } => {}
         }
         if let Some(t) = recomputed {

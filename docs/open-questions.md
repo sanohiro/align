@@ -401,22 +401,25 @@ arm64 *numbers* here (linux x86), but every *code* claim was verified against th
   per-object free, so all N intermediate strings live until block exit (Rust frees each `acc`
   immediately → O(1)). Inherent; the answer is **guidance/lint: use `builder` for string
   accumulation, not `reduce(+)`** (a perf-rail lint candidate — Codex's idea). Not a core fix.
-- **Gap C — `builder` has no capacity hint** (`builder()` only) → the runtime `Vec<u8>` reallocates
-  as it grows. **Now the sole remaining builder lever, with a measured target: ≈0.73× (≈1.35× slower)
-  vs hand-optimized Rust in `bench/string_builder/` after the itoa fix — that residual is the
-  realloc.** Fix: a `builder(capacity)` surface hint + a runtime `builder_with_capacity`. The win is
-  closing ~1.35× → parity-with-optimized; note Align already **beats naive Rust** (1.05–1.11×) without
-  it, so it's opt-in polish, not a deficit. (Float writing still uses the generic formatter — `ryu`
-  is the float analogue of the itoa below.)
+- **Gap C — `builder(capacity)` — DONE 2026-06-27 as a feature, but MEASURED *not* to be the lever.**
+  Added the surface (`builder()` / `builder(capacity)`, an `i64`) + `align_rt_builder_new(arena, cap)`
+  → `Vec::with_capacity`. **But `bench/string_builder/` shows `+cap` ≈ `build` (2.77 vs 2.77 ms) — the
+  residual ~1.5× vs optimized Rust is NOT the realloc** (hypothesis was wrong, measured). It's the
+  **per-append FFI call overhead**: 3 `align_rt_builder_*` calls per element (~300k extern calls at
+  N=100k), not inlined, vs optimized Rust inlining `push_str`+itoa (~0.9 ms ≈ 300k × ~3 ns). Capacity
+  is still a legitimate nothing-hidden primitive (helps *realloc-bound* building), just not this
+  per-write-call-bound workload. **Real remaining lever (recorded): inline / batch the builder
+  appends** (remove the per-`write` FFI boundary) — a codegen/runtime concern. (Float write still uses
+  the generic formatter; `ryu` is the float analogue of the int itoa.)
 - **Gap D — `align_rt_builder_write_int` used `write!(b.buf, "{v}")` — DONE 2026-06-27.** Replaced with
   a back-to-front itoa straight into the buffer (negative-magnitude accumulation so `i64::MIN` works;
   the JSON integer hand-roll #168 in reverse). **Halved the gap to optimized Rust** (Gemini Part 1 had
-  the old builder ~2.8× slower; now ~1.35×) and overtook naive Rust. `bench/string_builder/` (new);
+  the old builder ~2.8× slower; now ~1.5×) and ties/beats naive Rust. `bench/string_builder/` (new);
   runtime test `builder_write_int_matches_format`.
 
-Suggested order for the rest: **Gap C** (builder capacity — the measured ~1.35×→parity lever) →
-**Gap B** (perf-rail lint, with the broader lint work). Gap A (leak) and Gap D (itoa) are DONE; none
-of the rest block current soa/analytics work.
+Remaining: **inline/batch builder appends** (the measured string-builder lever — per-write FFI
+overhead, not capacity) and **Gap B** (perf-rail lint, with the broader lint work). Gaps A (leak),
+C (capacity) and D (itoa) are DONE; none of the rest block current soa/analytics work.
 
 ### Column-oriented `group_by` — FIRST SLICE DONE + BENCHED (beats default Rust everywhere)
 **Implemented (2026-06-27):** `s.group_by(.key).sum(.value)` over a `soa<Struct>` local → `(array<i64>,

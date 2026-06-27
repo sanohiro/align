@@ -12,24 +12,31 @@ bench/string_builder/run.sh [baseline|v3|native]   # default native
 Same plumbing as `bench/json_soa/` / `bench/group_by/`: kernel via `alignc emit-obj`, runtime linked
 as the cdylib. No external deps (std-only baselines).
 
-## Result (2026-06-27, native) — after the runtime itoa fix
+## Result (2026-06-27, native) — after the itoa fix + `builder(capacity)`
+
+`build` = `builder()`; `+cap` = `builder(n*16)` (pre-sized). Both vs naive (`String` + `to_string`)
+and optimized (`with_capacity` + manual itoa) Rust:
 
 ```
-        n    align ms    naive ms      opt ms   vs naive     vs opt
-     1000       0.038       0.042       0.026      1.11x      0.67x
-    10000       0.264       0.281       0.198      1.06x      0.75x
-   100000       2.730       2.862       2.000      1.05x      0.73x
+        n   align ms    +cap ms   naive ms     opt ms    cap/opt  cap/naive
+     1000      0.025      0.025      0.025      0.017      0.69x      0.99x
+    10000      0.260      0.280      0.262      0.181      0.65x      0.94x
+   100000      2.767      2.771      2.699      1.870      0.67x      0.97x
 ```
 
-- **Beats idiomatic naive Rust (1.05–1.11×)** — the realistic baseline (`String` + `to_string`).
-- **≈0.73× (≈1.35× slower) vs hand-optimized Rust** (exact `with_capacity` + manual itoa).
+- **Beats / ties idiomatic naive Rust** (`String` + `to_string`) — the realistic baseline.
+- **≈0.67× (≈1.5× slower) vs hand-optimized Rust** — and **`builder(capacity)` does NOT close it**:
+  `+cap` ≈ `build` (2.77 vs 2.77 ms). The hypothesis that the residual was the `Vec` realloc was
+  **wrong** (measured). The real residual is the **per-append FFI call overhead**: each element does
+  3 `align_rt_builder_*` calls (≈300k extern calls at N=100k), which aren't inlined, where optimized
+  Rust inlines `push_str` + itoa. ~0.9 ms gap ≈ 300k × ~3 ns/call — that's the cost, not reallocation.
 
-Hand-rolling the runtime integer write (`align_rt_builder_write_int`: a generic `write!(buf, "{v}")`
-→ a back-to-front itoa straight into the buffer) **halved the gap to optimized Rust** — Gemini's M2
-Part 1 measured the old builder at ~2.8× slower than optimized; it's now ~1.35×, and it overtook naive.
+The earlier **itoa** fix (`align_rt_builder_write_int`: generic `write!` → a back-to-front byte itoa)
+*did* help — it halved the gap (Gemini's M2 Part 1 had the old builder ~2.8× slower than optimized;
+now ~1.5×). `builder(capacity)` is still a legitimate primitive (it helps *realloc-bound* building,
+and it's nothing-hidden), it just isn't the lever for this per-write-call-bound workload.
 
-### Remaining gap → builder capacity (Gap C, recorded)
-The last ~1.35× vs optimized Rust is the builder's `Vec<u8>` **reallocating** as it grows, where
-optimized Rust pre-sizes with `with_capacity`. Closing it needs a `builder(capacity)` hint (surface
-+ a runtime `builder_with_capacity`) — the next lever, now with a measured target (≈1.35× → parity).
-Float writing still uses the generic formatter (`ryu` would be the float analogue of this itoa).
+### Remaining lever (recorded): inline / batch the builder appends
+Closing the last ~1.5× needs removing the per-`write` FFI boundary — inlining the common append, or a
+batched write API — a codegen/runtime concern, not capacity. (Float writing also still uses the
+generic formatter; `ryu` is the float analogue of the integer itoa.)
