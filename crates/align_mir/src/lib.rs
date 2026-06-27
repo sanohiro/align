@@ -2931,11 +2931,12 @@ fn finish_arm(b: &mut Builder, body: &hir::Expr, result_slot: Option<Slot>, join
     if !b.is_terminated() {
         if let Some(slot) = result_slot {
             b.push(Stmt::Store(slot, av));
+            // If the arm yields an owned local (`Ok(xs) => xs`), it moved into the match result; null
+            // that source so its exit `Drop` doesn't double-free the buffer the result now owns. (A
+            // diverging arm already returned via `lower_fn`'s own null-on-move; a `result_slot`-less
+            // (Unit) match has a Unit body, so there is never an owned local to null in that case.)
+            null_moved_source(b, body);
         }
-        // If the arm yields an owned local (`Ok(xs) => xs`), it moved into the match result; null
-        // that source so its exit `Drop` doesn't double-free the buffer the result now owns. (A
-        // diverging arm already returned via `lower_fn`'s own null-on-move.)
-        null_moved_source(b, body);
         b.terminate(Term::Goto(join_bb));
     }
 }
