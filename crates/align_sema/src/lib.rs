@@ -6146,10 +6146,15 @@ impl<'a, 't> Checker<'a, 't> {
             [] => None,
             [cap] => {
                 let c = self.check_expr(cap, Some(Ty::Int(IntTy { bits: 64, signed: true })));
-                if !c.ty.is_int_like() && c.ty != Ty::Error {
-                    self.diags.error(format!("'builder' capacity must be an integer, got {}", ty_name(c.ty)), cap.span);
+                if c.ty.is_int_like() {
+                    Some(Box::new(c))
+                } else {
+                    if c.ty != Ty::Error {
+                        self.diags.error(format!("'builder' capacity must be an integer, got {}", ty_name(c.ty)), cap.span);
+                    }
+                    // Drop the ill-typed capacity so MIR/codegen never see a non-i64 operand.
+                    None
                 }
-                Some(Box::new(c))
             }
             _ => {
                 self.diags.error(format!("'builder' takes an optional capacity (0 or 1 argument), got {}", args.len()), span);

@@ -381,7 +381,12 @@ pub struct Builder {
 /// backing buffer so appends don't reallocate as it grows; 0 = default (empty).
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_builder_new(arena: *mut Arena, capacity: i64) -> *mut Builder {
-    let buf = if capacity > 0 { Vec::with_capacity(capacity as usize) } else { Vec::new() };
+    // `try_reserve` (not `with_capacity`) so a bogus/huge user capacity can't abort the process on
+    // OOM — an over-large reservation just fails silently and the buffer grows on demand instead.
+    let mut buf = Vec::new();
+    if let Ok(cap) = usize::try_from(capacity) {
+        let _ = buf.try_reserve(cap);
+    }
     Box::into_raw(Box::new(Builder { buf, arena }))
 }
 
