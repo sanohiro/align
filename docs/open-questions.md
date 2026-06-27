@@ -342,6 +342,18 @@ compare means an unknown key colliding into an occupied slot is still skipped). 
 `call` / `bounds_fail` in the loop (1 loop, no allocation, no bounds branch), which is why they beat
 Rust. No residual-overhead cleanup is needed before construction.
 
+### Column-oriented `group_by` — FIRST SLICE DONE (surface + wiring); benchmark next
+**Implemented (2026-06-27):** `s.group_by(.key).sum(.value)` over a `soa<Struct>` local → `(array<i64>,
+array<i64>)` (distinct keys, per-key sums). HIR `ArrayGroupSum { base, struct_id, key_field,
+value_field }`; sema detects the `X.group_by(.key).sum(.value)` chain (`as_group_by` + the `.sum(.field)`
+arg), requires a soa local + i64 key/value (first cut); MIR `lower_array_group_sum` projects the two
+columns (`SoaColumn`), heap-allocs two owned output buffers, calls `Rvalue::GroupSum` →
+`align_rt_group_sum_i64`, then builds the result tuple (owned arrays, so it can escape). `tests/soa.rs`
+(+5: aggregate-by-key 142 / 3 groups, type-check, and the rejections). **NEXT: benchmark vs Rust
+`std::HashMap` AND `ahash`/`FxHashMap`** (the design mandate — the win is a CLAIM until measured; if it
+doesn't beat the *fast* baseline, reconsider the mechanism before adding more). Then: `min`/`max`/
+`count` aggregates, string keys (intern), AoS source, the arena-table refinement. Original design ↓.
+
 ### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
 The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped
 aggregation. Idiomatic Rust reaches for `HashMap<K, Acc>` (SipHash by default, generic, per-entry

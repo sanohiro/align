@@ -786,6 +786,16 @@ structurally (no value conversion, no copy). To read just a few columns of a wid
 struct with only those: `soa<{ active: bool, pay: i32 }>` over a JSON object with twenty keys parses
 two columns and skips the rest.
 
+Grouped aggregation reads as a column pipeline too:
+
+```align
+totals := orders.group_by(.customer).sum(.amount)   // (array<Customer>, array<Amount>)
+```
+
+`group_by(.key).sum(.value)` yields two parallel arrays — the distinct keys and their per-key sums —
+not a hash map; idiomatic Rust reaches for a generic `HashMap<K, Acc>`, while Align reads the two
+columns sequentially into a primitive-key aggregate. (First cut: `i64` key + `i64` sum over a `soa`.)
+
 This is the layout lever that lets Align *beat* an array-of-structs (what a hand-written `Vec<User>`
 gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags
 whole structs through cache. Measured ≈7× faster than an idiomatic-Rust `Vec<Struct>` field sum on a

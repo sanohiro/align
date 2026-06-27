@@ -331,3 +331,51 @@ fn json_decode_resolves_fields_via_perfect_hash() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n15\n5\n");
 }
+
+// ---- `group_by(.key).sum(.value)` — column-oriented grouped sum over a soa ----
+
+#[test]
+fn group_by_sum_type_checks() {
+    assert!(ok(concat!(
+        "P { k: i64, v: i64 }\n",
+        "fn main() -> i32 {\n  arena {\n    s := [P{k:1,v:2}].to_soa()\n    g := s.group_by(.k).sum(.v)\n    return g.1.sum() as i32\n  }\n}\n",
+    )));
+}
+
+#[test]
+fn group_by_alone_is_rejected() {
+    assert!(!ok("P { k: i64, v: i64 }\nfn main() -> i32 { arena { s := [P{k:1,v:2}].to_soa()\n g := s.group_by(.k)\n return 0 } }\n"));
+}
+
+#[test]
+fn sum_field_without_group_by_is_rejected() {
+    assert!(!ok("fn main() -> i32 { return [1,2,3].sum(.x) }\n"));
+}
+
+#[test]
+fn group_by_non_i64_key_is_rejected() {
+    assert!(!ok("P { k: i32, v: i64 }\nfn main() -> i32 { arena { s := [P{k:1,v:2}].to_soa()\n g := s.group_by(.k).sum(.v)\n return 0 } }\n"));
+}
+
+#[test]
+fn group_by_sum_aggregates_by_key() {
+    if !backend_available() {
+        return;
+    }
+    // Rows: (k=1,v=10),(2,20),(1,5),(2,7),(3,100). Groups: {1:15, 2:27, 3:100}; 3 distinct keys.
+    // The per-group sums total the overall value sum (10+20+5+7+100 = 142), and the key count is 3 —
+    // checked order-independently (group output order is the hash table's).
+    let out = build_and_run(
+        "soa-group-sum",
+        concat!(
+            "P { k: i64, v: i64 }\n",
+            "fn main() -> i32 {\n  arena {\n",
+            "    s := [P{k:1,v:10}, P{k:2,v:20}, P{k:1,v:5}, P{k:2,v:7}, P{k:3,v:100}].to_soa()\n",
+            "    g := s.group_by(.k).sum(.v)\n",
+            "    print(g.0.len())\n",   // distinct keys = 3
+            "    print(g.1.sum())\n",   // sum of per-group sums = 142
+            "  }\n  return 0\n}\n",
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n142\n");
+}

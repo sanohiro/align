@@ -238,6 +238,12 @@ pub enum Rvalue {
     SoaAlloc { handle: Operand, len: Operand, struct_id: u32 },
     /// Build an owned `array<T>` value `{ ptr, len }` from a buffer pointer and a length.
     MakeDynArray { ptr: Operand, len: Operand },
+    /// Column-oriented grouped sum (`group_by(.key).sum(.value)` first slice): aggregate the i64
+    /// `vals` column by the i64 `keys` column into the caller `out_keys`/`out_vals` buffers (each
+    /// sized to the column length), via the runtime `align_rt_group_sum_i64`. Yields the group count
+    /// (i64). `keys`/`vals` are `{ptr,len}` slices (soa columns); `out_keys`/`out_vals` are buffer
+    /// pointers (from [`Rvalue::HeapAllocBuf`]).
+    GroupSum { keys: Operand, vals: Operand, out_keys: Operand, out_vals: Operand },
     /// `chunks(n)`: split the `{ptr,len}` slice `src` (element size `elem`) into length-`n`
     /// sub-slices, yielding an owned `array<slice<T>>` value `{ chunk_buf, count }` (via the
     /// runtime `align_rt_chunks`). The element slices borrow `src`.
@@ -1042,6 +1048,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 _ => unreachable!("partition result is a tuple"),
             };
             lower_array_partition(b, source, stages, *elem, func, captures, tuple_id)
+        }
+        hir::ExprKind::ArrayGroupSum { base, struct_id, key_field, value_field } => {
+            let tuple_id = match e.ty {
+                Ty::Tuple(id) => id,
+                _ => unreachable!("group_by sum result is a tuple"),
+            };
+            lower_array_group_sum(b, *base, *struct_id, *key_field, *value_field, tuple_id)
         }
         hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
             // With no prior stages, a `{ptr,len}` (or fixed scalar-array) source, and no captures,
@@ -2064,6 +2077,47 @@ fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, res
     let r = b.fresh_value(result_ty);
     b.push(Stmt::Let(r, Rvalue::Load(rslot)));
     Operand::Value(r)
+}
+
+/// `s.group_by(.key).sum(.value)` — column-oriented grouped sum over a `soa<Struct>` local. Reads
+/// the key + value columns as `{ptr,len}` slices (`SoaColumn`), heap-allocates two owned output
+/// buffers sized to the column length, calls the runtime hash-aggregate, and builds the result
+/// tuple `(array<i64>, array<i64>)` (distinct keys, per-key sums). The output arrays are owned
+/// (heap, `Drop`-freed) so the tuple can escape; the runtime's internal table is its own concern.
+fn lower_array_group_sum(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, value_field: u32, tuple_id: u32) -> Operand {
+    let i64s = scalar_of(i64_ty());
+    let islice = Ty::Slice(i64s);
+    // The two columns (each a `{ptr,len}` slice<i64>).
+    let key_col = b.fresh_value(islice);
+    b.push(Stmt::Let(key_col, Rvalue::SoaColumn { base, struct_id, field: key_field }));
+    let val_col = b.fresh_value(islice);
+    b.push(Stmt::Let(val_col, Rvalue::SoaColumn { base, struct_id, field: value_field }));
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(key_col))));
+    // Output buffers (owned heap, sized at the column length = an upper bound on the group count).
+    let out_keys = b.fresh_value(Ty::Box(i64s));
+    b.push(Stmt::Let(out_keys, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+    let out_vals = b.fresh_value(Ty::Box(i64s));
+    b.push(Stmt::Let(out_vals, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+    // Aggregate → group count.
+    let count = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(
+        count,
+        Rvalue::GroupSum {
+            keys: Operand::Value(key_col),
+            vals: Operand::Value(val_col),
+            out_keys: Operand::Value(out_keys),
+            out_vals: Operand::Value(out_vals),
+        },
+    ));
+    // Build the two owned result arrays and the tuple.
+    let karr = b.fresh_value(Ty::DynArray(i64s));
+    b.push(Stmt::Let(karr, Rvalue::MakeDynArray { ptr: Operand::Value(out_keys), len: Operand::Value(count) }));
+    let varr = b.fresh_value(Ty::DynArray(i64s));
+    b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(out_vals), len: Operand::Value(count) }));
+    let tup = b.fresh_value(Ty::Tuple(tuple_id));
+    b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(karr), Operand::Value(varr)] }));
+    Operand::Value(tup)
 }
 
 /// `source.….partition(p)` — one fused loop that splits the surviving scalar elements into two
