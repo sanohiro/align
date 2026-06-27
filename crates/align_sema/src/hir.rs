@@ -175,8 +175,9 @@ pub enum Stmt {
     /// `base[index] = value` — element store into a `mut` array local or `out` slice parameter.
     /// Lowering emits a bounds check (abort on out-of-range), like an element read.
     AssignIndex { base: LocalId, index: Expr, value: Expr },
-    /// `base.field = value` where `base` is a struct local.
-    AssignField { base: LocalId, index: u32, value: Expr },
+    /// `root.f0.f1.… = value` — store into a (possibly nested) field of a struct local. `path` is
+    /// the chain of field indices (length ≥ 1).
+    AssignField { root: LocalId, path: Vec<u32>, value: Expr },
     Return(Option<Expr>),
     Expr(Expr),
 }
@@ -283,11 +284,12 @@ pub enum ExprKind {
         struct_id: u32,
         fields: Vec<Expr>,
     },
-    /// `base.field` read, where `base` is a struct local. The expression `ty` is the
-    /// field type.
+    /// `root.f0.f1.…` read — a (possibly nested) field projection rooted at a struct local. `path`
+    /// is the chain of field indices (length ≥ 1); the expression `ty` is the innermost field type.
+    /// Lowers to a single GEP `[0, *path]`.
     Field {
-        base: LocalId,
-        index: u32,
+        root: LocalId,
+        path: Vec<u32>,
     },
     /// `soa_value.field` — project one column of a `soa<Struct>` view as a `slice<FieldTy>`. `base`
     /// is the soa local; `struct_id`/`field` identify the column. Lowers to the column's

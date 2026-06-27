@@ -37,8 +37,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::Store(slot, op) => {
                 let _ = writeln!(out, "    _{slot} <- {}", operand_str(op));
             }
-            Stmt::StoreField(slot, idx, op) => {
-                let _ = writeln!(out, "    _{slot}.{idx} <- {}", operand_str(op));
+            Stmt::StoreField(slot, path, op) => {
+                let path = path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".");
+                let _ = writeln!(out, "    _{slot}.{path} <- {}", operand_str(op));
             }
             Stmt::StoreIndex(slot, idx, val) => {
                 let _ = writeln!(out, "    _{slot}[{}] <- {}", operand_str(idx), operand_str(val));
@@ -147,7 +148,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             let a: Vec<String> = args.iter().map(operand_str).collect();
             format!("call_indirect {}({})", operand_str(callee), a.join(", "))
         }
-        Rvalue::Field(slot, idx) => format!("_{slot}.{idx}"),
+        Rvalue::Field(slot, path) => format!("_{slot}.{}", path.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".")),
         Rvalue::Select { cond, a, b } => format!("select({}, {}, {})", operand_str(cond), operand_str(a), operand_str(b)),
         Rvalue::SoaColumn { base, struct_id, field } => format!("soa_col(_{base}: struct#{struct_id}, .{field})"),
         Rvalue::OptionSome(op) => format!("Some({})", operand_str(op)),

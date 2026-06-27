@@ -134,20 +134,18 @@ fn build_module<'c>(
     let target_data = tm.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
 
-    // Struct layouts → LLVM struct types, indexed by struct id.
-    let struct_types: Vec<StructType<'c>> = program
-        .structs
-        .iter()
-        .map(|s| {
-            // Fields are scalars or `str` (sema-restricted); `abi_type` maps each correctly
-            // (floats to their float type, `str` to the `{ ptr, len }` view).
-            // Fields are scalars/str only (sema-restricted), so the struct-type table is
-            // never consulted here — and it isn't built yet — so an empty table is safe.
-            let fields: Vec<BasicTypeEnum> =
-                s.fields.iter().map(|f| abi_type(ctx, f.ty, &[], &[])).collect();
-            ctx.struct_type(&fields, false)
-        })
-        .collect();
+    // Struct layouts → LLVM struct types, indexed by struct id. Two phases so a **nested** struct
+    // field (`Struct(id)`) can reference another struct's type: first create every struct as a named
+    // opaque type, then set each body (sema forbids non-`box` recursion, so the bodies are acyclic).
+    let struct_types: Vec<StructType<'c>> =
+        program.structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
+    for (s, st) in program.structs.iter().zip(&struct_types) {
+        // `abi_type` maps each field (floats to their float type, `str` to the `{ ptr, len }` view,
+        // a nested struct to its (now-created) struct type).
+        let fields: Vec<BasicTypeEnum> =
+            s.fields.iter().map(|f| abi_type(ctx, f.ty, &struct_types, &[])).collect();
+        st.set_body(&fields, false);
+    }
 
     // Sum-type layouts → a non-union tagged struct `{ i32 tag, <every variant's payload flattened> }`,
     // indexed by enum id. Payloads are primitive scalars (S1b), so the tables are not consulted.
@@ -1308,8 +1306,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ptr = self.slots[slot];
                     self.builder.build_store(ptr, val).map_err(|e| self.err(e))?;
                 }
-                Stmt::StoreField(slot, idx, op) => {
-                    let field_ptr = self.field_ptr(*slot, *idx)?;
+                Stmt::StoreField(slot, path, op) => {
+                    let field_ptr = self.field_path_ptr(*slot, path)?;
                     let val = self.operand(op);
                     self.builder.build_store(field_ptr, val).map_err(|e| self.err(e))?;
                 }
@@ -1672,9 +1670,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let bv = self.operand(b);
                 self.builder.build_select(c, av, bv, "sel").map_err(|e| self.err(e))?
             }
-            Rvalue::Field(slot, idx) => {
-                let fty = abi_type(self.ctx, self.field_ty(*slot, *idx), self.struct_types, self.enum_types);
-                let field_ptr = self.field_ptr(*slot, *idx)?;
+            Rvalue::Field(slot, path) => {
+                let fty = abi_type(self.ctx, self.field_path_ty(*slot, path), self.struct_types, self.enum_types);
+                let field_ptr = self.field_path_ptr(*slot, path)?;
                 self.builder
                     .build_load(fty, field_ptr, "fld")
                     .map_err(|e| self.err(e))?
@@ -2588,16 +2586,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
-    /// `&slot.field` via a struct GEP (LLVM 19 opaque pointers need the pointee type).
-    fn field_ptr(&self, slot: Slot, idx: u32) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
-        let st = self.struct_types[self.slot_struct_id(slot) as usize];
-        self.builder
-            .build_struct_gep(st, self.slots[&slot], idx, "fldptr")
-            .map_err(|e| self.err(e))
+    /// `&slot.f0.f1.…` via a chain of struct GEPs (each level needs its pointee struct type — LLVM
+    /// 19 opaque pointers). Returns the pointer to the innermost field. `path` has length ≥ 1.
+    fn field_path_ptr(&self, slot: Slot, path: &[u32]) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let mut sid = self.slot_struct_id(slot);
+        let mut ptr = self.slots[&slot];
+        for (k, &idx) in path.iter().enumerate() {
+            let st = self.struct_types[sid as usize];
+            ptr = self.builder.build_struct_gep(st, ptr, idx, "fldptr").map_err(|e| self.err(e))?;
+            if k + 1 < path.len() {
+                sid = match self.structs[sid as usize].fields[idx as usize].ty {
+                    Ty::Struct(nid) => nid,
+                    other => unreachable!("nested field path through non-struct {other:?}"),
+                };
+            }
+        }
+        Ok(ptr)
     }
 
-    fn field_ty(&self, slot: Slot, idx: u32) -> Ty {
-        self.structs[self.slot_struct_id(slot) as usize].fields[idx as usize].ty
+    /// The type of the innermost field reached by `path` from `slot`'s struct.
+    fn field_path_ty(&self, slot: Slot, path: &[u32]) -> Ty {
+        let mut sid = self.slot_struct_id(slot);
+        for (k, &idx) in path.iter().enumerate() {
+            let fty = self.structs[sid as usize].fields[idx as usize].ty;
+            if k + 1 == path.len() {
+                return fty;
+            }
+            sid = match fty {
+                Ty::Struct(nid) => nid,
+                other => unreachable!("nested field path through non-struct {other:?}"),
+            };
+        }
+        unreachable!("empty field path")
     }
 
     /// Builtin `print`: widen the integer argument to i64 and call the runtime.

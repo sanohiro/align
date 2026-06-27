@@ -78,7 +78,9 @@ pub enum Stmt {
     /// `slot <- operand`.
     Store(Slot, Operand),
     /// `slot.field <- operand` (struct field store; `slot` holds a struct).
-    StoreField(Slot, u32, Operand),
+    /// Store `Operand` into the (possibly nested) field of a struct slot addressed by the index
+    /// `path` (length ≥ 1) — a GEP `[0, *path]`. A single-element path is a direct field.
+    StoreField(Slot, Vec<u32>, Operand),
     /// `slot[index] <- value` (array element store).
     StoreIndex(Slot, Operand, Operand),
     /// `ptr[index] <- value` — store into a raw element pointer (the buffer of an owned
@@ -144,8 +146,9 @@ pub enum Rvalue {
     /// give codegen the LLVM function type for the indirect `call` (taken from the checked args /
     /// result type — no signature table needed).
     CallIndirect { callee: Operand, args: Vec<Operand>, param_tys: Vec<Ty>, ret_ty: Ty },
-    /// Load field `index` from the struct in `slot`.
-    Field(Slot, u32),
+    /// Load a (possibly nested) field from the struct in `slot`, addressed by the index `path`
+    /// (length ≥ 1) — a GEP `[0, *path]` then a load.
+    Field(Slot, Vec<u32>),
     /// `cond ? a : b` — branchless select (LLVM `select`). `a`/`b` share a type; `cond` is `bool`.
     /// Used for branchless `where` reductions (`acc += cond ? value : identity`).
     Select { cond: Operand, a: Operand, b: Operand },
@@ -594,14 +597,10 @@ fn lower_block(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
 fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
     match s {
         hir::Stmt::Let { local, init } => match &init.kind {
-            // A struct literal initializes its slot field by field; there is no scalar
-            // value to bind.
-            hir::ExprKind::StructLit { fields, .. } => {
-                for (i, fe) in fields.iter().enumerate() {
-                    let op = lower_expr(b, fe);
-                    b.push(Stmt::StoreField(*local, i as u32, op));
-                }
-            }
+            // A struct literal initializes its slot field by field; there is no scalar value to
+            // bind. A nested struct-literal field is expanded in place (its leaves stored at the
+            // extended path), so no intermediate struct value is materialized.
+            hir::ExprKind::StructLit { .. } => store_value_at(b, *local, &mut Vec::new(), init),
             // An array literal stores its elements into the slot.
             hir::ExprKind::ArrayLit { elems, elem } => store_array_elems(b, *local, elems, *elem),
             _ => {
@@ -616,9 +615,10 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             b.push(Stmt::Store(*local, op));
             null_moved_source(b, value);
         }
-        hir::Stmt::AssignField { base, index, value } => {
-            let op = lower_expr(b, value);
-            b.push(Stmt::StoreField(*base, *index, op));
+        hir::Stmt::AssignField { root, path, value } => {
+            // `root.f0.… = value`. A struct-literal value is expanded in place at the path (its
+            // leaves stored under the extended path); a scalar value is a single field store.
+            store_value_at(b, *root, &mut path.clone(), value);
         }
         hir::Stmt::AssignIndex { base, index, value } => {
             // `base[index] = value` — bounds-checked element store (abort on out-of-range, like a
@@ -828,9 +828,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty),
         hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
-        hir::ExprKind::Field { base, index } => {
+        hir::ExprKind::Field { root, path } => {
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::Field(*base, *index)));
+            b.push(Stmt::Let(v, Rvalue::Field(*root, path.clone())));
             Operand::Value(v)
         }
         hir::ExprKind::SoaColumn { base, struct_id, field } => {
@@ -1144,12 +1144,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // A struct literal in value position (return/arg/assign): materialize it into a
         // temp slot field by field, then load the whole struct. (A `let` initializer stores
         // straight into its own slot — see `lower_stmt` — avoiding this copy.)
-        hir::ExprKind::StructLit { fields, .. } => {
+        hir::ExprKind::StructLit { .. } => {
             let slot = b.new_slot(e.ty);
-            for (i, fe) in fields.iter().enumerate() {
-                let op = lower_expr(b, fe);
-                b.push(Stmt::StoreField(slot, i as u32, op));
-            }
+            store_value_at(b, slot, &mut Vec::new(), e);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Load(slot)));
             Operand::Value(v)
@@ -1334,6 +1331,25 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
 
 /// Store an array literal's elements into `slot`: scalar arrays write each element by
 /// index; struct arrays write each element's fields (the elements are struct literals).
+/// Store `value` into `slot` at the field `path`, expanding a struct literal in place: a nested
+/// `StructLit` field recurses with the path extended by the field index, so only leaf scalars are
+/// stored (no intermediate struct value is materialized). A non-literal value is one field store.
+fn store_value_at(b: &mut Builder, slot: Slot, path: &mut Vec<u32>, value: &hir::Expr) {
+    match &value.kind {
+        hir::ExprKind::StructLit { fields, .. } => {
+            for (i, fe) in fields.iter().enumerate() {
+                path.push(i as u32);
+                store_value_at(b, slot, path, fe);
+                path.pop();
+            }
+        }
+        _ => {
+            let op = lower_expr(b, value);
+            b.push(Stmt::StoreField(slot, path.clone(), op));
+        }
+    }
+}
+
 fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty) {
     if matches!(elem, Ty::Struct(_)) {
         for (i, e) in elems.iter().enumerate() {
