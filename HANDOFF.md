@@ -53,8 +53,12 @@ Continue `docs/impl/08-nested-structs.md`:
   (`[User{…}]` — needs per-element drop; Slice 3 rejects it for now). Risk: medium–high.
 - **Slice 5** — cross-module field types (`f: other.T`, the module B3 leftover, now unblocked).
 - Smaller follow-ups unblocked by Slice 3: owned-field read/borrow out of a struct (`u.name.len()`),
-  owned `array<T>` struct fields, and the orthogonal reassign-drops-old gap (`mut s := …; s = …`
-  leaks the old buffer for *all* owned types today).
+  owned `array<T>` struct fields.
+- **DONE (this branch): reassign-drops-old** — `mut s := …; s = …` no longer leaks the old buffer
+  (all owned types). Sema's `MoveCheck` sets `Stmt::Assign::drop_old` (a `Cell<bool>`) iff the RHS
+  doesn't move the old value out; MIR drops the slot before the store. No double-free (`s = f(s)`
+  emits no drop). Still deferred: owned **field**/**element** reassign (`u.name = …`, `a[i] = …`).
+  `crates/align_driver/tests/reassign_drop.rs`.
 
 Or pause: this is a natural milestone (language core + S1/S2/S3 done, M6 perf validated).
 

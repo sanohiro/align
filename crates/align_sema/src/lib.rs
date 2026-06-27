@@ -359,11 +359,8 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// Whether a value of `ty` owns a heap buffer that a `Drop` must free — used to decide a struct
 /// field makes its enclosing struct a Move type. A free-standing owned collection/string/builder, an
 /// `Option`/`Result` with a Move payload, or a nested Move struct. (Tuples can't be struct fields, so
-/// they are not considered here; `str` is a borrow, not owned.)
-fn ty_owns_buffer(ty: Ty, structs: &[StructDef]) -> bool {
-    ty_owns_buffer_rec(ty, structs, &mut Vec::new())
-}
-
+/// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
+/// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
         || payload_is_move(ty)
@@ -2156,7 +2153,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(index, depth);
                 self.walk(value, depth);
             }
-            Stmt::Assign { local, value } => {
+            Stmt::Assign { local, value, .. } => {
                 self.walk(value, depth);
                 // Conservative without a dataflow join: a binding that is *ever* assigned a
                 // local-backed slice stays local-backed (a later branch could reach `return`
@@ -2480,8 +2477,17 @@ impl<'a> MoveCheck<'a> {
                     self.expr(init, moved, true, true);
                     clear_moved(moved, *local);
                 }
-                Stmt::Assign { local, value } => {
+                Stmt::Assign { local, value, drop_old } => {
+                    let was_moved = whole_moved(moved, *local);
                     self.expr(value, moved, true, true);
+                    // The RHS consumed the old value iff it just transitioned the local live→moved
+                    // (it appeared in a consuming position). If so, ownership of the old buffer
+                    // transferred away — MIR must NOT drop it here (double-free). Otherwise the
+                    // overwritten owned value must be dropped before the store (else its buffer
+                    // leaks); a no-op `free(null)` if the slot was already moved/null. Non-owned
+                    // locals never drop. (`s = make(s.len())` borrows, not moves → still drops.)
+                    let consumed_by_rhs = whole_moved(moved, *local) && !was_moved;
+                    drop_old.set(self.is_move(*local) && !consumed_by_rhs);
                     clear_moved(moved, *local);
                 }
                 Stmt::AssignField { value, .. } => self.expr(value, moved, true, true),
@@ -3249,7 +3255,7 @@ impl<'a, 't> Checker<'a, 't> {
                             Ty::Str => self.check_str_init(value),
                             _ => self.check_expr(value, Some(ty)),
                         };
-                        stmts.push(Stmt::Assign { local: id, value: v });
+                        stmts.push(Stmt::Assign { local: id, value: v, drop_old: std::cell::Cell::new(false) });
                     }
                     Place::Field { root, path, ty } => {
                         let v = self.check_expr(value, Some(ty));

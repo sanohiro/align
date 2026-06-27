@@ -171,7 +171,11 @@ pub enum Stmt {
     /// `(a, b, ...) := expr` — bind each tuple element to a local. A `None` entry is an
     /// ignored (`_`) element. `tuple_id` indexes [`Program::tuples`] (the `init`'s type).
     LetTuple { locals: Vec<Option<LocalId>>, tuple_id: u32, init: Expr },
-    Assign { local: LocalId, value: Expr },
+    /// `local = value` — reassign a `mut` local. `drop_old` (set by `MoveCheck`) is true when the
+    /// local owns a heap buffer that the RHS does *not* move out, so the value being overwritten
+    /// must be dropped (freed) before the store — else its buffer leaks. It is a [`Cell`] so the
+    /// move analysis, which holds only `&Stmt`, can record the decision without a mutable walk.
+    Assign { local: LocalId, value: Expr, drop_old: std::cell::Cell<bool> },
     /// `base[index] = value` — element store into a `mut` array local or `out` slice parameter.
     /// Lowering emits a bounds check (abort on out-of-range), like an element read.
     AssignIndex { base: LocalId, index: Expr, value: Expr },

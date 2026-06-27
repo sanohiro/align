@@ -99,8 +99,30 @@ double-free). Landed as built below. `crates/align_driver/tests/owned_structs.rs
   verified under `MALLOC_CHECK_=3`); the unsupported-container rejections above; partial owned-field
   move-out rejected.
 - **deferred**: owned-field *read/borrow* out of a struct (`u.name.len()`); owned **collection**
-  (`array<T>`) fields; reassigning an owned local drops the old value (a pre-existing gap for *all*
-  owned types — `mut s := …; s = …` leaks the old buffer; orthogonal to this slice).
+  (`array<T>`) fields.
+
+#### Follow-up (landed) — reassigning an owned local drops the old value
+A pre-existing gap for *all* owned types (`string`/`array<T>`/Move struct/box): `mut s := …; s = …`
+silently overwrote the slot and **leaked** the old buffer. Now fixed (orthogonal to the nesting
+slices, but it reuses the Slice-3 Drop machinery). `crates/align_driver/tests/reassign_drop.rs`.
+
+- **sema**: `hir::Stmt::Assign` carries `drop_old: Cell<bool>`. `MoveCheck` is the authority on
+  whether the RHS *moved the old value out* — it sets `drop_old` true iff the local is owned (Move)
+  and the RHS did **not** consume it (the local did not transition live→moved while checking the
+  value). A `Cell` lets the move walk, which holds only `&Stmt`, record the decision without a
+  mutable HIR traversal. Because it uses the real move analysis (not a structural "does the RHS
+  mention `s`?" heuristic), a *non-consuming borrow* of the local in the RHS — `s = make(s.len())` —
+  still drops the old value (no residual leak).
+- **MIR**: `Stmt::Assign` lowering computes the new value first (it may read the old), then, when
+  `drop_old` and the local is in `drop_locals` (arena-owned excluded — the arena bulk-frees those),
+  emits a `Drop` of the slot before the store. The slot holds a live buffer or null (a prior move /
+  the entry `DropFlagInit`), so the drop frees once or no-ops `free(null)`. `s = f(s)` / `s = s`
+  (RHS consumes the old value → ownership transferred) emit no reassign drop — no double-free.
+- **deferred**: reassigning an owned **field** (`u.name = …`) / **element** (`a[i] = …`) still leaks
+  the overwritten value (`AssignField`/`AssignIndex` don't yet drop-old). The degenerate self-assign
+  `s = s` keeps leaking (the move machinery nulls the slot before the store). Separately, a local
+  whose region is demoted by a self-borrowing reassign (`s = dup(s)` with `dup(v: str)`) drops out of
+  the drop set entirely — a pre-existing conservative-region limitation, not this fix.
 
 ### Slice 4 — arrays / soa × nesting
 `arr[i].a.x` (struct-array element nested field) and a soa column over a nested field. Extends
