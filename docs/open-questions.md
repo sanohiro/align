@@ -342,6 +342,38 @@ compare means an unknown key colliding into an occupied slot is still skipped). 
 `call` / `bounds_fail` in the loop (1 loop, no allocation, no bounds branch), which is why they beat
 Rust. No residual-overhead cleanup is needed before construction.
 
+### External benchmark report — Gemini on M2/arm64 (2026-06-27, claims VERIFIED against code)
+Gemini ran a 3-workload bench on Apple Silicon (arm64) and filed a gap report. Can't reproduce the
+arm64 *numbers* here (linux x86), but every *code* claim was verified against the source. Not urgent
+(shared for awareness); recorded so the gaps are tracked.
+
+- **Math pipeline (`map→where→sum`): Align 1.15–1.27× FASTER than Rust on M2 — a positive confirm.**
+  The branchless-`select` fusion wins on arm64 (on x86 it was parity — Rust's slice `filter` evidently
+  doesn't vectorize as cleanly on arm here). Nothing to do; good signal that the flagship lowering
+  holds cross-arch.
+- **★ Gap A — `str + str` inside a lifted lambda silently LEAKS → OOM. REAL correctness bug
+  (verified).** `s.reduce("", fn acc, x { acc + x })`: the lambda lifts to a top-level fn whose
+  `lower_fn` starts with `b.arenas` empty, so `str+str` (MIR ~757, `arena = b.arenas.last()`) gets
+  `arena = None` → `align_rt_builder_finish` `Box::leak`s the buffer (runtime ~1196, process-lifetime).
+  One leak per reduce step → ~750 MB / OOM at N=10k. **The arena the user wrote is lexically lost
+  across lambda lifting.** A silent leak violates Nothing-hidden — at minimum this should be a
+  compile **error** ("string building in a reduce/par_map lambda: use a `builder`"), ideally the
+  lift should thread the enclosing arena into the closure env. Priority: the only *correctness* gap.
+- **Gap B — `acc + x` string reduce is O(N²) arena space even if A were fixed.** Arena has no
+  per-object free, so all N intermediate strings live until block exit (Rust frees each `acc`
+  immediately → O(1)). Inherent; the answer is **guidance/lint: use `builder` for string
+  accumulation, not `reduce(+)`** (a perf-rail lint candidate — Codex's idea). Not a core fix.
+- **Gap C — `builder` has no capacity hint** (`builder()` only) → the runtime `Vec<u8>` reallocates
+  as it grows. ~2.8× behind capacity-preallocated Rust. Fix: `builder(capacity)` + a runtime
+  `builder_with_capacity`. Cheap, real.
+- **Gap D — `align_rt_builder_write_int` uses `write!(b.buf, "{v}")`** (runtime ~403) — the generic
+  formatter, slow vs an itoa byte-write. **Same fix as the JSON integer hand-roll (#168), in reverse.**
+  Cheap, real, isolated. Pairs with the builder being the *fast* string path (Codex's sink-first note).
+
+Suggested order if/when picked up: **Gap A** (correctness — error-or-arena-propagate, stop the silent
+leak) → **Gap D** (cheap itoa) → **Gap C** (builder capacity) → **Gap B** (perf-rail lint, with the
+broader lint work). None block current soa/analytics work.
+
 ### Column-oriented `group_by` — FIRST SLICE DONE + BENCHED (beats default Rust everywhere)
 **Implemented (2026-06-27):** `s.group_by(.key).sum(.value)` over a `soa<Struct>` local → `(array<i64>,
 array<i64>)` (distinct keys, per-key sums). HIR `ArrayGroupSum { base, struct_id, key_field,
