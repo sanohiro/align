@@ -63,3 +63,65 @@ fn position_bearing_error_propagated_via_question() {
     let out = build_and_run("structured-err-prop", src);
     assert_eq!(out.status.code(), Some(42)); // the propagated Span.off
 }
+
+// ---- match on an owned-payload Result/Option must not double-free the moved buffer ----
+// (Gemini M2 report Part 2 §4: matching `Ok(users)` moved the array out but the scrutinee's
+// exit Drop still freed it → double-free crash. The arm-binding now nulls the scrutinee.)
+
+#[test]
+fn match_owned_result_payload_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // Bind + consume the owned array via `.len()` in the Ok arm; the scrutinee `res` must not also
+    // free it. (Before the fix this aborted with "double free detected".)
+    let src = concat!(
+        "import core.json\n",
+        "User { id: i64 }\n",
+        "fn main() -> i32 {\n  arena {\n",
+        "    res: Result<array<User>, Error> := json.decode(\"[{\\\"id\\\":1},{\\\"id\\\":2}]\")\n",
+        "    n := match res {\n      Ok(users) => users.len(),\n      Err(_) => 0 - 1,\n    }\n",
+        "    print(n)\n  }\n  return 0\n}\n",
+    );
+    let out = build_and_run("match-owned-nodf", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n");
+}
+
+#[test]
+fn match_returns_owned_payload_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // The Ok arm *returns* the owned array (moves it out of the match result); neither the
+    // scrutinee nor the arm binding may free the buffer the caller now owns.
+    let src = concat!(
+        "import core.json\n",
+        "fn pick(data: str) -> array<i64> {\n",
+        "  res: Result<array<i64>, Error> := json.decode(data)\n",
+        "  return match res {\n    Ok(xs) => xs,\n    Err(_) => [0].to_array(),\n  }\n",
+        "}\n",
+        "fn main() -> i32 {\n  ys := pick(\"[10, 20, 12]\")\n  return ys.sum() as i32\n}\n",
+    );
+    let out = build_and_run("match-return-owned-nodf", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn match_wildcard_owned_result_frees_once() {
+    if !backend_available() {
+        return;
+    }
+    // A wildcard arm binds nothing, so the scrutinee keeps ownership and frees the buffer exactly
+    // once (no double-free, no leak/crash).
+    let src = concat!(
+        "import core.json\n",
+        "User { id: i64 }\n",
+        "fn main() -> i32 {\n  arena {\n",
+        "    res: Result<array<User>, Error> := json.decode(\"[{\\\"id\\\":1}]\")\n",
+        "    print(match res { Ok(_) => 7, Err(_) => 9 })\n  }\n  return 0\n}\n",
+    );
+    let out = build_and_run("match-wild-owned", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
