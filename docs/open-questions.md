@@ -368,7 +368,7 @@ A second Gemini bench (group_by / par_map / json-decode on arm64). Verified agai
 Gemini pass added the fundamentals: **arithmetic + branches** (`math_logic` 0.99×), **recursion /
 call ABI** (`recursive_fib` 1.00× — note fib is *non*-tail-recursive, so this confirms the call /
 stack-frame convention matches Rust, not just TCO loops), and **struct AoS *and* SoA scanning**
-(`sum_coords` 1.00× — stride/offset correctness, soa transpose adds no scan regression). All parity →
+(`sum_coords` 1.00× — stride/offset correctness, SoA transpose adds no scan regression). All parity →
 the core codegen/ABI is solid cross-arch; nothing to fix. group_by (1.4–4.2× vs std) and JSON
 (~14–17% off serde) re-confirmed. The match double-free is acknowledged **Resolved** (PR #175). The
 sole remaining open item it re-flags is the **par_map OS-thread-spawn** gap above (3rd time) — still
