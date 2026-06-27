@@ -441,12 +441,14 @@ pub enum ExprKind {
     /// is the scalar element). Lowering emits a bounds check (`0 <= index < len`) that aborts on
     /// an out-of-range index (the settled panic model). `index` is an `i64`.
     Index { recv: Box<Expr>, index: Box<Expr> },
-    /// `recv[index].field` — field access on an element of a struct array (`recv` is a fixed
+    /// `recv[index].f0.f1…` — field access on an element of a struct array (`recv` is a fixed
     /// `array<Struct>` or an owned dynamic `array<Struct>`) with a *runtime* index, MMv2 slice 8f.
-    /// Lowered as one bounds-checked element-field load (no whole-struct copy). `field` is the
-    /// field index; `struct_id` identifies the element struct (for the pointer-based dynamic-array
-    /// load). Distinct from [`IndexField`], which has a constant index and a slot-local base.
-    ElemField { recv: Box<Expr>, index: Box<Expr>, field: u32, struct_id: u32 },
+    /// `path` is the chain of field indices into the element struct (length ≥ 1); `struct_id`
+    /// identifies the element struct (for the pointer-based dynamic-array load). A depth-1 `path`
+    /// lowers to one bounds-checked element-field load; a nested `path` (`arr[i].a.x`) loads the
+    /// first field's sub-struct, then projects the remainder. Distinct from [`IndexField`], which has
+    /// a constant index and a slot-local base.
+    ElemField { recv: Box<Expr>, index: Box<Expr>, path: Vec<u32>, struct_id: u32 },
     /// `template "..."` — build a `str` from static parts and interpolated holes. Each
     /// hole is a local (int or str); lowering picks the right builder write by its type.
     Template(Vec<TemplatePart>),

@@ -70,3 +70,45 @@ fn str_bearing_struct_element_cannot_escape_arena() {
     let src = "import core.json\nU { id: i64, name: str }\nfn bad(j: str) -> i64 {\n  mut keep := U{id: 0, name: \"\"}\n  arena {\n    us: array<U> := json.decode(j)?\n    keep = us[0]\n  }\n  return keep.id\n}\nfn main() -> i32 = 0\n";
     assert!(check_errs("si-escape", src));
 }
+
+// --- Nested field of a struct-array element (`arr[i].a.x`), Slice 4 ---
+// Direct nested access on an indexed element: previously only `arr[i].field` (depth-1) worked, and a
+// nested read needed an intermediate `p := arr[i].a; p.x`. The first field loads the sub-struct; the
+// remaining path projects out of it (the pipeline's single-field seam is untouched).
+
+#[test]
+fn elem_nested_field_read() {
+    if !backend_available() {
+        return;
+    }
+    // `ls[0].a.x` (= 1) and `ls[0].b.y` (= 4) → 5; runtime index `ls[k].a.x` over two elements.
+    let src = concat!(
+        "Point { x: i64, y: i64 }\n",
+        "Line { a: Point, b: Point }\n",
+        "fn main() -> i32 {\n",
+        "  ls := [Line{a: Point{x: 1, y: 2}, b: Point{x: 3, y: 4}}, Line{a: Point{x: 10, y: 0}, b: Point{x: 0, y: 0}}]\n",
+        "  mut k := 1\n",
+        "  return (ls[0].a.x + ls[0].b.y + ls[k].a.x) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("elem-nested", src).status.code(), Some(15)); // 1 + 4 + 10
+}
+
+#[test]
+fn elem_nested_field_depth_three() {
+    if !backend_available() {
+        return;
+    }
+    // Depth-3 path on an element: `cs[0].b.a.v`.
+    let src = "A { v: i64 }\nB { a: A }\nC { b: B }\nfn main() -> i32 {\n  cs := [C{b: B{a: A{v: 42}}}]\n  return cs[0].b.a.v as i32\n}\n";
+    assert_eq!(build_and_run("elem-nested3", src).status.code(), Some(42));
+}
+
+#[test]
+fn elem_field_through_scalar_rejected() {
+    // A non-final field in the path must be a struct: `arr[i].a.z` where `a` is a scalar is an error.
+    assert!(check_errs(
+        "elem-scalar-path",
+        "Line { a: i64 }\nfn main() -> i32 {\n  ls := [Line{a: 5}]\n  return ls[0].a.z as i32\n}\n",
+    ));
+}
