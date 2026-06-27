@@ -92,3 +92,20 @@ fn mixed_width_and_float_struct_by_value() {
     );
     assert_eq!(build_and_run("mixed-byval", src).status.code(), Some(10));
 }
+
+#[test]
+fn struct_returned_then_mutated() {
+    if !backend_available() {
+        return;
+    }
+    // Return a struct by value, bind it to a mutable local, mutate a field, and read it: 10 + 5 = 15.
+    let src = concat!(
+        "Point { x: i64, y: i64 }\n",
+        "fn mk(v: i64) -> Point = Point{x: v, y: v}\n",
+        "fn main() -> i32 {\n",
+        "  mut p := mk(5)\n",
+        "  p.x = 10\n",
+        "  return (p.x + p.y) as i32\n}\n",
+    );
+    assert_eq!(build_and_run("returned-mutated", src).status.code(), Some(15));
+}
