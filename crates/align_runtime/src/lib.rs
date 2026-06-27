@@ -952,6 +952,82 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     0
 }
 
+/// Column-oriented grouped sum (`group_by` first slice): for each `i`, accumulate `vals[i]` into the
+/// bucket for `keys[i]`, then emit the distinct keys and their sums into `out_keys`/`out_vals`
+/// (caller-provided, capacity `cap`). Returns the group count, or `-1` if it would exceed `cap`
+/// (the caller sizes `cap = len`, an upper bound, so that never trips on valid input).
+///
+/// Mechanism: an internal open-addressing (linear-probe) table sized to the next power of two ≥ 2·len
+/// — a primitive-key, no-boxing, cache-tight aggregate, the lever vs Rust's generic `HashMap`. Sums
+/// wrap on overflow (Align's defined two's-complement wrap). Output order is table order (groups are
+/// unordered). The keys/values are read sequentially (soa columns). The table is a heap `Vec` (one
+/// allocation per call, amortized over all `len` elements) — keeping this primitive self-contained
+/// and unit-testable; allocating it in the caller's arena (to drop even that one `malloc` when
+/// `group_by` runs in a hot loop) is a recorded refinement once the language wiring threads an arena.
+///
+/// # Safety
+/// `keys`/`vals` must be valid for `len` `i64`s; `out_keys`/`out_vals` for `cap` `i64`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_sum_i64(
+    keys: *const i64,
+    vals: *const i64,
+    len: i64,
+    out_keys: *mut i64,
+    out_vals: *mut i64,
+    cap: i64,
+) -> i64 {
+    let n = if len <= 0 || keys.is_null() || vals.is_null() { 0 } else { len as usize };
+    if n == 0 {
+        return 0;
+    }
+    let keys = unsafe { std::slice::from_raw_parts(keys, n) };
+    let vals = unsafe { std::slice::from_raw_parts(vals, n) };
+
+    // Power-of-two table, load factor ≤ 0.5; `shift` extracts the well-mixed high bits of the
+    // multiplicative (Fibonacci) hash for the slot.
+    let tsize = (2 * n).next_power_of_two().max(16);
+    let mask = tsize - 1;
+    let shift = 64 - tsize.trailing_zeros();
+    let mut tkey = vec![0i64; tsize];
+    let mut tacc = vec![0i64; tsize];
+    let mut occ = vec![false; tsize];
+    let mut count: usize = 0;
+
+    for i in 0..n {
+        let k = keys[i];
+        let mut slot = ((k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize & mask;
+        loop {
+            if !occ[slot] {
+                occ[slot] = true;
+                tkey[slot] = k;
+                tacc[slot] = vals[i];
+                count += 1;
+                break;
+            }
+            if tkey[slot] == k {
+                tacc[slot] = tacc[slot].wrapping_add(vals[i]);
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    if cap < 0 || count > cap as usize || out_keys.is_null() || out_vals.is_null() {
+        return -1;
+    }
+    let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
+    let out_vals = unsafe { std::slice::from_raw_parts_mut(out_vals, count) };
+    let mut g = 0;
+    for slot in 0..tsize {
+        if occ[slot] {
+            out_keys[g] = tkey[slot];
+            out_vals[g] = tacc[slot];
+            g += 1;
+        }
+    }
+    count as i64
+}
+
 /// A minimal JSON scanner over a byte slice (just what `json.decode` needs: objects with
 /// integer / boolean values; strings only as keys).
 struct JsonParser<'a> {
@@ -1402,6 +1478,32 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_sum_i64_aggregates_by_key() {
+        // keys: 10,20,10,30,20,10 ; vals: 1,2,3,4,5,6 → {10:1+3+6=10, 20:2+5=7, 30:4}
+        let keys = [10i64, 20, 10, 30, 20, 10];
+        let vals = [1i64, 2, 3, 4, 5, 6];
+        let mut ok = vec![0i64; keys.len()];
+        let mut ov = vec![0i64; keys.len()];
+        let n = unsafe {
+            align_rt_group_sum_i64(keys.as_ptr(), vals.as_ptr(), keys.len() as i64, ok.as_mut_ptr(), ov.as_mut_ptr(), keys.len() as i64)
+        };
+        assert_eq!(n, 3, "three distinct keys");
+        // Output order is table order; collect into a map to check regardless of order.
+        let got: std::collections::HashMap<i64, i64> = ok[..3].iter().copied().zip(ov[..3].iter().copied()).collect();
+        assert_eq!(got, std::collections::HashMap::from([(10, 10), (20, 7), (30, 4)]));
+
+        // Empty input → zero groups.
+        assert_eq!(unsafe { align_rt_group_sum_i64(keys.as_ptr(), vals.as_ptr(), 0, ok.as_mut_ptr(), ov.as_mut_ptr(), 0) }, 0);
+
+        // A single key repeated → one group with the full sum (and many collisions exercise probing).
+        let k1 = [7i64; 1000];
+        let v1: Vec<i64> = (0..1000).collect();
+        let (mut ok1, mut ov1) = (vec![0i64; 1000], vec![0i64; 1000]);
+        let n1 = unsafe { align_rt_group_sum_i64(k1.as_ptr(), v1.as_ptr(), 1000, ok1.as_mut_ptr(), ov1.as_mut_ptr(), 1000) };
+        assert_eq!((n1, ok1[0], ov1[0]), (1, 7, (0..1000).sum()));
+    }
 
     #[test]
     fn integer_parses_edges() {

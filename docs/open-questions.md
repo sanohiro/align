@@ -342,6 +342,45 @@ compare means an unknown key colliding into an occupied slot is still skipped). 
 `call` / `bounds_fail` in the loop (1 loop, no allocation, no bounds branch), which is why they beat
 Rust. No residual-overhead cleanup is needed before construction.
 
+### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
+The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped
+aggregation. Idiomatic Rust reaches for `HashMap<K, Acc>` (SipHash by default, generic, per-entry
+churn, cache-unfriendly); Align can lower a **column-oriented group-aggregate** fed by sequential
+soa column reads. `group_by` is in the `draft.md` op list; the roadmap (`impl/07` #5) says **design
+the return type first** — done here.
+
+- **Return type = columnar, NOT a map.** `xs.group_by(.key).sum(.value)` yields **`(array<K>,
+  array<Acc>)`** — two parallel owned arrays (distinct keys, per-key aggregate), reusing the
+  `partition` tuple-of-two-owned-arrays result machinery (`Ty::Tuple` of two `DynArray`s). This is the
+  data-oriented form (no general `HashMap` in the surface; Codex agreed "not a general HashMap") and
+  sidesteps the "groups as a first-class container" problem (which would need generic containers,
+  deliberately not built).
+- **Surface.** `xs.group_by(.key).sum(.value)` — `group_by(.key)` takes a field-shorthand like
+  `where(.active)`; the following reduction names the value field. First slice: exactly one key field
+  + one `sum` aggregate. (Later: `min`/`max`/`count` aggregates, multiple aggregates → more result
+  columns, a `group_by(.key)` with a lambda key.)
+- **Mechanism = open-addressing hash-aggregate.** A primitive-key, no-boxing, linear-probing table
+  (the win lever vs std HashMap): hash the key, probe, insert or accumulate. Inputs are soa columns
+  read sequentially. Runtime helper `align_rt_group_sum_i64(keys_ptr, vals_ptr, len, out_keys,
+  out_vals, cap) -> count` for the first slice (i64 key + i64 sum); emits distinct keys + sums into
+  two caller arrays. **Table allocation:** the first-slice primitive uses an internal heap `Vec`
+  (one `malloc` per call, amortized over all elements) to stay self-contained + unit-testable;
+  allocating the table in the caller's arena (to drop that one `malloc` when `group_by` runs in a hot
+  loop) is a **refinement** for once the wiring threads an arena — secondary to the aggregate itself.
+- **First slice scope:** `i64` key + `i64` value + `sum`, source = `soa<Struct>` or `array<Struct>`
+  (read the key + value columns). Output `(array<i64>, array<i64>)`. Requires an arena (the hash
+  table is arena-allocated, like `to_soa`); the result arrays are owned (heap, `Drop`-freed) so they
+  can escape.
+- **BENCHMARK-DRIVEN (the json→soa lesson):** the "beats Rust" is a CLAIM until measured. Bench vs
+  Rust **both** `std::collections::HashMap` (SipHash) AND a fast idiomatic baseline (`ahash`/`FxHashMap`)
+  — only a win over the *fast* baseline is honest. Measure right after the first slice; if the
+  specialized table doesn't beat `ahash`, reconsider the mechanism (radix partition? two-pass?) before
+  building more.
+- **Deferred within group_by:** string keys (intern/dictionary-encode → an id column), `min`/`max`/
+  `count`/multiple aggregates, lambda keys, and parallel (per-chunk partial tables + merge).
+- **Why design-first, not rushed:** per "ideal form or defer" + roadmap #5 — the return-type and
+  mechanism are the load-bearing decisions; the above fixes them so implementation PRs are mechanical.
+
 ### Additional perf levers — own code-grounded review (2026-06-27, empirically checked)
 
 Beyond the JSON→SoA / field-skip thrust (which both external reviews converged on), two orthogonal,
