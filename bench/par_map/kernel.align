@@ -1,0 +1,11 @@
+// Benchmark kernel: par_map a moderately heavy per-element function over a slice, then sum. The
+// runtime now uses a persistent worker pool (no per-call OS-thread spawn), so this should beat
+// sequential Rust when there is real per-element work (and not regress on small inputs).
+fn work(x: i64) -> i64 {
+  mut a := x
+  a = a * 2654435761 + 12345
+  a = a * a + 7
+  a = a * 40503 - 99
+  return a
+}
+pub fn pmap(s: slice<i64>) -> i64 = s.par_map(work).sum()

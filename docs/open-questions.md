@@ -358,11 +358,17 @@ A second Gemini bench (group_by / par_map / json-decode on arm64). Verified agai
   `finish_arm` nulls an owned local *returned* from an arm (`Ok(xs) => xs`) — a second double-free in
   the same area, found while testing, also fixed. `tests/structured_error.rs` (+3: consume / return /
   wildcard). The `?`-workaround Gemini used is no longer needed.
-- **par_map thread-spawn overhead (open).** `align_rt_par_map` spawns raw OS threads via
-  `std::thread::scope` on *every* call (~20–50 µs/thread), so at N=100k Align is ~3× slower than
-  Rayon / ~7× slower than sequential; at N=1M it reaches sequential parity but stays ~1.7× behind
-  Rayon. Fix: a persistent (lazily-initialised) worker pool instead of per-call spawn. Real perf gap,
-  std/runtime layer — recorded, not urgent (par_map is an early cut).
+- **par_map thread-spawn overhead — FIXED 2026-06-27 (persistent pool).** `align_rt_par_map` spawned
+  raw OS threads via `std::thread::scope` on *every* call (~20–50 µs/thread) → ~7× slower than
+  sequential at N=100k. Fixed with a lazily-initialised process-lifetime worker pool (`par_pool`:
+  detached workers parked on a `Mutex<VecDeque<Job>>` + `Condvar`; `par_map` submits chunks + a
+  fork-join barrier, running one chunk on the caller) + a `PAR_MIN_CHUNK` floor so trivially-small
+  maps stay sequential. `bench/par_map/`: 100k went **~7× slower → ≈parity** with sequential.
+  **Remaining (recorded): par_map is now ≈sequential parity but still behind `rayon` (0.4–0.6×) for
+  cheap work** — the ceiling is the **per-element indirect `thunk` call** (no inlining/vectorization,
+  where seq/rayon inline + vectorize). par_map wins on *heavy non-vectorizable* per-element work; the
+  cheap-map fix is **inlining the thunk** (same class as the builder per-write overhead — cross-object
+  LTO or a specialized monomorphic emit). The shared pool can later back parallel `reduce`/`task_group` too.
 
 **Part 3 / consolidated (2026-06-27): basics confirmed at PARITY on arm64 — no new bugs.** A third
 Gemini pass added the fundamentals: **arithmetic + branches** (`math_logic` 0.99×), **recursion /

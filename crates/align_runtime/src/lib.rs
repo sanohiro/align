@@ -302,6 +302,51 @@ pub unsafe extern "C" fn align_rt_chunks(src: *const u8, src_len: i64, n: i64, e
     AlignStr { ptr: buf as *const u8, len: count }
 }
 
+/// A process-lifetime worker pool for data-parallel runtime ops. The first parallel call lazily
+/// spawns `available_parallelism` workers that park on a job queue; subsequent calls submit jobs
+/// instead of spawning fresh OS threads (raw per-call `thread::spawn` — ~tens of µs each — dominated
+/// small `par_map`s). Workers are detached and die when the process exits.
+type ParJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct ParPool {
+    queue: std::sync::Mutex<std::collections::VecDeque<ParJob>>,
+    available: std::sync::Condvar,
+}
+
+impl ParPool {
+    fn submit(&'static self, job: ParJob) {
+        self.queue.lock().unwrap().push_back(job);
+        self.available.notify_one();
+    }
+}
+
+/// The global pool (lazily created). Returns its worker count too (= the parallelism degree).
+fn par_pool() -> (&'static ParPool, usize) {
+    static POOL: std::sync::OnceLock<(&'static ParPool, usize)> = std::sync::OnceLock::new();
+    *POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+        let p: &'static ParPool = Box::leak(Box::new(ParPool {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            available: std::sync::Condvar::new(),
+        }));
+        for _ in 0..n {
+            std::thread::spawn(move || loop {
+                let job = {
+                    let mut q = p.queue.lock().unwrap();
+                    loop {
+                        match q.pop_front() {
+                            Some(j) => break j,
+                            None => q = p.available.wait(q).unwrap(),
+                        }
+                    }
+                };
+                job(); // run outside the lock so other workers can keep pulling
+            });
+        }
+        (p, n)
+    })
+}
+
 /// `par_map`: allocate an output buffer of `count` elements (`out_stride` bytes each) and apply
 /// `thunk` to each of `count` input elements — reading element `i` from `in_buf + i*in_stride`,
 /// writing its result to `out + i*out_stride` — splitting the work into contiguous, **disjoint**
@@ -335,35 +380,48 @@ pub unsafe extern "C" fn align_rt_par_map(
     let out_buf = align_rt_alloc(bytes);
     let in_addr = in_buf as usize;
     let out_addr = out_buf as usize;
-    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(count);
-    // Single-thread fast path: run on the caller, skipping the `thread::scope` overhead.
-    if nthreads <= 1 {
-        for i in 0..count {
+    // Run `[start, end)` of the map on this thread (buffers passed as `usize` so the closures are
+    // `Send` — raw pointers are not; the ranges are disjoint, so this is race-free).
+    let run = move |start: usize, end: usize| {
+        for i in start..end {
             let ip = (in_addr + i * in_stride) as *const u8;
             let op = (out_addr + i * out_stride) as *mut u8;
             thunk(ip, op);
         }
+    };
+
+    let (pool, workers) = par_pool();
+    // Don't parallelize trivially-small work: a chunk must be at least `PAR_MIN_CHUNK` elements, so
+    // tiny maps (where the pool round-trip would dwarf the work) fall to the single-chunk caller
+    // path. Standard parallel-runtime tuning (Rayon/OpenMP have an analogue); not thunk-cost-aware.
+    const PAR_MIN_CHUNK: usize = 4096;
+    let per = count.div_ceil(workers).max(PAR_MIN_CHUNK);
+    let nchunks = count.div_ceil(per); // ≤ workers, every chunk non-empty
+    // Single-chunk fast path: run on the caller, no pool round-trip.
+    if nchunks <= 1 {
+        run(0, count);
         return out_buf;
     }
-    // Pass the buffers as `usize` addresses so the per-thread closures are `Send` (raw pointers
-    // are not). Each thread owns a disjoint `[start, end)` output range, so this is race-free.
-    let per = count.div_ceil(nthreads);
-    std::thread::scope(|s| {
-        for t in 0..nthreads {
-            let start = t * per;
-            if start >= count {
-                break;
-            }
-            let end = (start + per).min(count);
-            s.spawn(move || {
-                for i in start..end {
-                    let ip = (in_addr + i * in_stride) as *const u8;
-                    let op = (out_addr + i * out_stride) as *mut u8;
-                    thunk(ip, op);
-                }
-            });
-        }
-    });
+    // Submit chunks 1.. to the pool and run chunk 0 on the caller, then wait for the submitted ones.
+    // `remaining` is the fork-join barrier (each worker decrements + signals; the caller waits to 0).
+    let remaining = std::sync::Arc::new((std::sync::Mutex::new(nchunks - 1), std::sync::Condvar::new()));
+    for t in 1..nchunks {
+        let start = t * per;
+        let end = (start + per).min(count);
+        let remaining = remaining.clone();
+        pool.submit(Box::new(move || {
+            run(start, end);
+            let (m, cv) = &*remaining;
+            *m.lock().unwrap() -= 1;
+            cv.notify_all();
+        }));
+    }
+    run(0, per.min(count));
+    let (m, cv) = &*remaining;
+    let mut left = m.lock().unwrap();
+    while *left > 0 {
+        left = cv.wait(left).unwrap();
+    }
     out_buf
 }
 

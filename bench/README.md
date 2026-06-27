@@ -57,3 +57,8 @@ bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
   **per-append FFI-call overhead** (3 runtime calls/element, not inlined) — measured, *not* the `Vec`
   realloc: adding `builder(capacity)` did **not** close it (`+cap` ≈ `build`). The lever is inlining/
   batching the appends. This is the string-accumulation tool the `str + str`-in-a-lambda error points to.
+- **Data-parallel map (`bench/par_map/`): the persistent worker pool removed the spawn regression
+  (100k went ~7× slower → ≈parity with sequential).** Old `par_map` spawned OS threads per call; now
+  it submits chunks to a process-lifetime pool. It's ≈sequential parity but still behind `rayon`
+  (0.4–0.6×) for cheap maps — the ceiling is the per-element indirect `thunk` call (no vectorization,
+  same class as the builder per-write overhead); par_map wins on heavy/non-vectorizable per-element work.
