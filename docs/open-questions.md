@@ -280,13 +280,17 @@ JSON→SoA is then a thin wiring on top.
    times Align `→array<Row>` (AoS, no transpose); soa≈aos → **the transpose is cheap, the gap is the
    PARSER**. Hand-rolling `integer()` (was `str::from_utf8(..).parse::<i64>()` — UTF-8 validation +
    generic parse + a second digit pass; now a single-pass `checked` digit accumulation, the int-field
-   hot path) moved it **≈0.61× → ≈0.82–0.85×** (AoS ≈parity at 1M). Remaining path to beat serde, in
-   order: (a) **more scalar-parser tuning** — drop the per-element zeroing memset (all declared
-   fields are required → the AoS buffer is fully overwritten), tighten `peek`/whitespace/string scan;
-   (b) **a SIMD/structural JSON parser** (the bigger lever — runtime CPU-dispatch / simdjson-class);
-   (c) **two-pass count-then-direct-column-fill** (drops the transpose — small, decomposition showed
-   it cheap); (d) **field-skip / narrow struct** (already available). The analytics thrust is a
-   PARSER problem, not more soa surface.
+   hot path) moved it **≈0.61× → ≈0.82–0.85×** (AoS ≈parity at 1M). Remaining path to beat serde:
+   **scalar tuning is now TAPPED OUT** — the per-element zeroing memset was MEASURED (skip it via
+   `set_len`: 0.80–0.81×, indistinguishable from 0.82× — ≲1%, noise; reverted, not worth `unsafe`),
+   and the rest is distributed per-byte overhead with no single >5% lever. So the real remaining lever
+   is **(a) a SIMD/structural JSON parser** (the big, dedicated, library-layer effort — runtime
+   CPU-dispatch / simdjson-class; what it takes to actually *beat* serde's optimized scalar parser).
+   Secondary: (b) **two-pass count-then-direct-column-fill** (drops the transpose — small, the
+   decomposition showed it cheap; note that for a *light* single aggregate decode→AoS is already
+   ≈parity and beats decode→soa, so soa's transpose only pays off under heavy/repeated column scans);
+   (c) **field-skip / narrow struct** (already available). Bottom line: json→soa is a PARSER problem;
+   the cheap scalar win is banked (#168), and beating serde now needs the SIMD slice.
 3. **Known-schema field-skip / projection decode — DEFERRED 2026-06-27 (the perf is already
    available; the remaining delta is ergonomic-only and safety-sensitive).** KEY FINDING (verified
    2026-06-27): the runtime **already skips every JSON field not declared in the target struct**
