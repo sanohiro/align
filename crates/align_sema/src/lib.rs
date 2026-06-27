@@ -1063,7 +1063,8 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // Resolution-only: the authoritative import validation (duplicates / unknown / builtins) is the
     // module-resolution-table pass below — a bare set built here keeps it available before pass 0b.
     let known_user_modules: std::collections::HashSet<&str> = modules.iter().map(|m| m.path.as_str()).collect();
-    let imports_by_module: HashMap<String, std::collections::HashSet<String>> = modules
+    // Keyed by `&str` borrowed from `modules` (which outlives this function) — no per-module clone.
+    let imports_by_module: HashMap<&str, std::collections::HashSet<String>> = modules
         .iter()
         .map(|m| {
             let set = m
@@ -1073,7 +1074,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 .map(path_str)
                 .filter(|p| known_user_modules.contains(p.as_str()))
                 .collect();
-            (m.path.clone(), set)
+            (m.path.as_str(), set)
         })
         .collect();
 
