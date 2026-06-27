@@ -142,18 +142,96 @@ fn cyclic_struct_used_by_value_errors_gracefully() {
     ));
 }
 
+// --- Partial owned-field *move* out of a struct (`n := u.name`) ---
+// A depth-1 owned `string` field can be moved out: the buffer transfers to the new binding, the
+// struct's slot field is nulled, and the struct's recursive Drop frees null there — so the buffer is
+// freed exactly once (by the new owner). The struct can no longer move as a whole / the field be
+// reused, but its other fields stay readable. Deeper paths and whole nested Move-struct fields are
+// still deferred.
+
 #[test]
-fn partial_owned_field_move_out_rejected() {
-    // Moving an owned field *out* of a struct (`n := u.name`, consuming just the `string`) is
-    // deferred — bind/clone instead. Must be a clean sema error, not a miscompile.
+fn owned_field_moved_out() {
+    if !backend_available() {
+        return;
+    }
+    // Move `u.name` into `n`, then still read the Copy sibling `u.age`. The buffer is freed once (via
+    // `n`); `u`'s Drop frees null for `name`. 5 + 9 = 14, no double-free.
+    let src = concat!(
+        "User { name: string, age: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  u := User{name: \"hello\".clone(), age: 9}\n",
+        "  n := u.name\n",
+        "  return (n.len() + u.age) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("ownfield-move", src).status.code(), Some(14));
+}
+
+#[test]
+fn owned_field_move_then_reuse_rejected() {
+    // After moving the field out, the field itself is gone — reusing it is a use-after-move error
+    // (the other fields remain usable, tested above at runtime).
     assert!(check_errs(
-        "partial-move",
+        "ownfield-move-reuse",
         concat!(
             "User { name: string, age: i64 }\n",
             "fn main() -> i32 {\n",
             "  u := User{name: \"z\".clone(), age: 1}\n",
             "  n := u.name\n",
+            "  return (n.len() + u.name.len()) as i32\n",
+            "}\n",
+        )
+    ));
+}
+
+#[test]
+fn owned_field_move_then_whole_struct_move_rejected() {
+    // A partially-moved struct can't be moved as a whole (one field's buffer already left).
+    assert!(check_errs(
+        "ownfield-move-whole",
+        concat!(
+            "User { name: string, age: i64 }\n",
+            "fn take(x: User) -> i32 = x.age as i32\n",
+            "fn main() -> i32 {\n",
+            "  u := User{name: \"z\".clone(), age: 1}\n",
+            "  n := u.name\n",
+            "  return take(u)\n",
+            "}\n",
+        )
+    ));
+}
+
+#[test]
+fn nested_path_owned_field_move_still_rejected() {
+    // Moving an owned field out through a *nested* path (`n := u.addr.name`) is still deferred (only
+    // a depth-1 field move is supported).
+    assert!(check_errs(
+        "ownfield-move-deep",
+        concat!(
+            "Addr { name: string }\n",
+            "User { addr: Addr }\n",
+            "fn main() -> i32 {\n",
+            "  u := User{addr: Addr{name: \"z\".clone()}}\n",
+            "  n := u.addr.name\n",
             "  return n.len() as i32\n",
+            "}\n",
+        )
+    ));
+}
+
+#[test]
+fn nested_move_struct_field_move_still_rejected() {
+    // Moving a whole nested Move-struct field out (`a := u.addr`) is still deferred (it needs the
+    // sub-struct nulled, not a single `{ptr,len}`).
+    assert!(check_errs(
+        "ownfield-move-substruct",
+        concat!(
+            "Addr { name: string }\n",
+            "User { addr: Addr }\n",
+            "fn main() -> i32 {\n",
+            "  u := User{addr: Addr{name: \"z\".clone()}}\n",
+            "  a := u.addr\n",
+            "  return a.name.len() as i32\n",
             "}\n",
         )
     ));

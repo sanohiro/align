@@ -107,6 +107,11 @@ pub enum Stmt {
     /// took its buffer — so the tuple's exit `Drop` frees null there, not the buffer now owned by
     /// the new binding. The other fields are untouched.
     NullTupleField(Slot, u32),
+    /// Null one owned `string` field (`{null, 0}`) of a struct slot, after a partial field move
+    /// (`n := u.name`) took its buffer — so the struct's recursive `Drop` frees null there, not the
+    /// buffer now owned by the new binding. Depth-1 (a direct field of the slot's struct); the other
+    /// fields are untouched.
+    NullStructField(Slot, u32),
     /// Drop a free-standing owned `array<T>` slot: free its buffer (null-safe).
     Drop(Slot),
     /// Free the buffer of a free-standing owned `array<T>` *value* (a `{ptr,len}` operand that
@@ -579,6 +584,13 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                     b.push(Stmt::NullTupleField(*t, *index));
                 }
             }
+        }
+        // A partial owned-field move out of a struct (`n := u.name`) took the `string` field's
+        // buffer; null that depth-1 field of the struct slot so the struct's recursive `Drop` frees
+        // null there, not the buffer the new binding now owns. (Sema allows this only for a depth-1
+        // `string` field; deeper paths / Move-struct fields stay rejected, so `path` is `[idx]`.)
+        hir::ExprKind::Field { root, path } if path.len() == 1 && e.ty == Ty::String => {
+            b.push(Stmt::NullStructField(*root, path[0]));
         }
         _ => {}
     }

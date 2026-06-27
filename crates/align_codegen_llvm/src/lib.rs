@@ -1408,6 +1408,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_store(field_ptr, slice_struct_type(self.ctx).const_zero())
                         .map_err(|e| self.err(e))?;
                 }
+                Stmt::NullStructField(slot, idx) => {
+                    // Null one owned `string` `{ptr,len}` field of a struct slot (after a partial
+                    // field move `n := u.name`), so the struct's recursive `Drop` frees null there.
+                    let Ty::Struct(sid) = self.f.slots[*slot as usize] else {
+                        unreachable!("NullStructField on a non-struct slot");
+                    };
+                    let field_ptr = self
+                        .builder
+                        .build_struct_gep(self.struct_types[sid as usize], self.slots[slot], *idx, "nullstructfld")
+                        .map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_store(field_ptr, slice_struct_type(self.ctx).const_zero())
+                        .map_err(|e| self.err(e))?;
+                }
                 Stmt::Drop(slot) => {
                     let ty = self.f.slots[*slot as usize];
                     if ty == Ty::Builder {
