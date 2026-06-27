@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# JSON → SoA analytics benchmark: Align `json.decode → soa<Row> → where(.active).pay.sum()` vs
-# idiomatic Rust `serde_json → Vec<Row> → filter/sum`. Unlike the flat `bench/`, the kernel pulls in
-# the Align runtime (JSON parser / arena), so the harness links `libalign_runtime.a` too.
+# group_by benchmark: Align `s.group_by(.k).sum(.v)` (column-oriented hash-aggregate) vs idiomatic
+# Rust grouped sum with `std::collections::HashMap` (SipHash) and a fast `ahash` map. The kernel
+# pulls in the Align runtime (the hash-aggregate), so the harness links `libalign_runtime.so`
+# (a cdylib — dynamic, over the C-ABI, so its std doesn't collide with the harness's std).
 #
-#   bench/json_soa/run.sh [baseline|v3|native]   (default: native — both sides at the host's best CPU)
+#   bench/group_by/run.sh [baseline|v3|native]   (default: native)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,8 +20,6 @@ case "$mode" in
   *) echo "usage: run.sh [baseline|v3|native]" >&2; exit 2 ;;
 esac
 
-# Build alignc + the runtime staticlib (release). Two invocations: the staticlib crate-type of
-# `align_runtime` is what produces `libalign_runtime.a`.
 ( cd ../.. && cargo build -q --release --bin alignc && cargo build -q --release -p align_runtime )
 ALIGNC="../../target/release/alignc"
 RT_DIR="$(cd ../.. && pwd)/target/release"

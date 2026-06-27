@@ -342,17 +342,25 @@ compare means an unknown key colliding into an occupied slot is still skipped). 
 `call` / `bounds_fail` in the loop (1 loop, no allocation, no bounds branch), which is why they beat
 Rust. No residual-overhead cleanup is needed before construction.
 
-### Column-oriented `group_by` — FIRST SLICE DONE (surface + wiring); benchmark next
+### Column-oriented `group_by` — FIRST SLICE DONE + BENCHED (beats default Rust everywhere)
 **Implemented (2026-06-27):** `s.group_by(.key).sum(.value)` over a `soa<Struct>` local → `(array<i64>,
 array<i64>)` (distinct keys, per-key sums). HIR `ArrayGroupSum { base, struct_id, key_field,
 value_field }`; sema detects the `X.group_by(.key).sum(.value)` chain (`as_group_by` + the `.sum(.field)`
 arg), requires a soa local + i64 key/value (first cut); MIR `lower_array_group_sum` projects the two
 columns (`SoaColumn`), heap-allocs two owned output buffers, calls `Rvalue::GroupSum` →
 `align_rt_group_sum_i64`, then builds the result tuple (owned arrays, so it can escape). `tests/soa.rs`
-(+5: aggregate-by-key 142 / 3 groups, type-check, and the rejections). **NEXT: benchmark vs Rust
-`std::HashMap` AND `ahash`/`FxHashMap`** (the design mandate — the win is a CLAIM until measured; if it
-doesn't beat the *fast* baseline, reconsider the mechanism before adding more). Then: `min`/`max`/
-`count` aggregates, string keys (intern), AoS source, the arena-table refinement. Original design ↓.
+(+5: aggregate-by-key 142 / 3 groups, type-check, and the rejections).
+**BENCHED (`bench/group_by/`, 1M rows, vs std HashMap + ahash): Align beats the DEFAULT `std::HashMap`
+(SipHash) everywhere (1.2–3.6×) and beats even `ahash` for low-cardinality grouping (1.31× at 100
+groups); it loses to `ahash` at high cardinality (0.52–0.72×).** The benchmark caught a mechanism bug —
+the first cut sized the table to `2·n` (row count), allocating a ~34 MB table regardless of group
+count and thrashing cache (lost ~9× to ahash at 10k groups, 0.11×); fixed by **growing the table to
+track the live group count** (start 16, double+rehash past 0.75 load), which is why it now beats std
+across the board (the "benchmark before claiming, reconsider the mechanism" mandate paying off). **To
+beat `ahash` at high cardinality (recorded, not done): a SwissTable-style layout (interleaved
+key+value, SIMD control-byte probing) + a stronger/faster hash** — secondary, since Align already
+beats the *default* map everywhere. Then: `min`/`max`/`count` aggregates, string keys (intern), AoS
+source. Original design ↓.
 
 ### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
 The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped

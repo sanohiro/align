@@ -1,8 +1,8 @@
-// Link the Align-compiled kernel object (`agg`) + the Align runtime into this harness. `run.sh`
+// Link the Align-compiled kernel object (`group`) + the Align runtime into this harness. `run.sh`
 // produces the object via `alignc emit-obj` and points these env vars at it and at the runtime's
-// build dir. The kernel calls `align_rt_json_decode_struct_array` / arena / alloc; those come from
-// `libalign_runtime.so` (a cdylib — linked dynamically over the C-ABI so its bundled std doesn't
-// collide with this harness's std, which a staticlib would).
+// build dir. The kernel calls `align_rt_group_sum_i64`; it comes from `libalign_runtime.so` (a
+// cdylib — linked dynamically over the C-ABI so its bundled std doesn't collide with this harness's
+// std, which a staticlib would).
 use std::env;
 
 fn main() {

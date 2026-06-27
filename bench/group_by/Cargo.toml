@@ -1,0 +1,16 @@
+[package]
+name = "group-by-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Detached from the parent Align workspace (its own deps stay isolated from the compiler crates).
+[workspace]
+
+[dependencies]
+ahash = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
