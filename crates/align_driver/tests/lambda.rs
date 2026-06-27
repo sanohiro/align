@@ -264,3 +264,51 @@ fn lambda_wrong_arity_rejected() {
     let src = "fn main() -> Result<(), Error> {\n  print([1, 2, 3].map(fn x, y { x + y }).sum())\n  return Ok(())\n}\n";
     assert!(check_errs("lam-arity", src));
 }
+
+// ---- Gap A: a lifted lambda loses the enclosing arena, so an allocating string op would leak ----
+
+#[test]
+fn str_concat_in_reduce_lambda_is_rejected() {
+    // `acc + x` inside a reduce lambda allocates per call; the enclosing arena isn't threaded into
+    // the lifted function, so it would leak (OOM in the loop — Gemini's M2 report, Gap A). It must
+    // be a hard error (use a `builder`), not a silent leak.
+    let src = "pub fn run(s: slice<str>) -> i64 {\n  arena {\n    res := s.reduce(\"\", fn acc, x { acc + x })\n    return res.len()\n  }\n}\nfn main() -> i32 = 0\n";
+    assert!(check_errs("lam-strcat-leak", src));
+}
+
+#[test]
+fn template_in_map_lambda_is_rejected() {
+    // A `template` string in a lifted lambda leaks the same way.
+    let src = "fn main() -> i32 {\n  arena {\n    xs := [1, 2, 3].map(fn x { template \"n={x}\" }).to_array()\n    return 0\n  }\n}\n";
+    assert!(check_errs("lam-template-leak", src));
+}
+
+#[test]
+fn str_concat_at_top_level_still_ok() {
+    // The guard is scoped to lifted lambdas — a plain top-level / named-function concat is unaffected.
+    let src = "fn cat(a: str, b: str) -> str = a + b\nfn main() -> i32 = 0\n";
+    assert!(!check_errs("strcat-toplevel-ok", src));
+}
+
+#[test]
+fn str_concat_in_lambda_own_arena_ok() {
+    // If the lambda opens its own `arena {}`, the concat has somewhere to live — allowed.
+    let src = "pub fn run(s: slice<str>) -> i64 {\n  return s.reduce(0, fn acc, x { arena { y := x + x; acc + y.len() } })\n}\nfn main() -> i32 = 0\n";
+    assert!(!check_errs("strcat-lambda-arena-ok", src));
+}
+
+#[test]
+fn builder_reduce_still_ok() {
+    // The correct string-accumulation pattern (the one the error points to) keeps working: the
+    // lambda only appends to the builder (no per-call allocation/leak).
+    let src = "pub fn run(s: slice<i64>) -> i64 {\n  b := s.reduce(builder(), fn b, x { b.write_int(x); b })\n  return b.to_string().len()\n}\nfn main() -> i32 = 0\n";
+    assert!(!check_errs("builder-reduce-ok", src));
+}
+
+#[test]
+fn json_encode_in_lambda_is_rejected() {
+    // `json.encode` desugars to a Template `str` — the same arena-allocating leak path, so it is
+    // also rejected inside a lifted lambda (reviewer's catch on the Gap A fix).
+    let src = "import core.json\nU { id: i64 }\nfn main() -> i32 {\n  arena {\n    xs := [U{id:1}, U{id:2}].map(fn u { json.encode(u) }).to_array()\n    return 0\n  }\n}\n";
+    assert!(check_errs("lam-jsonencode-leak", src));
+}

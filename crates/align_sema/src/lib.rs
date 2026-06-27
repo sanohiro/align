@@ -3968,6 +3968,9 @@ impl<'a, 't> Checker<'a, 't> {
                 } else if t != Ty::Str && !t.is_numeric() && t != Ty::Error {
                     self.diags.error("arithmetic expects numbers (int or float)", span);
                 }
+                if t == Ty::Str && op == BinOp::Add {
+                    self.guard_lambda_alloc_leak("string concatenation (`str + str`)", span);
+                }
                 ty = t;
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -4906,6 +4909,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         self.constrain(Ty::Str, expected, span);
+        self.guard_lambda_alloc_leak("a `template` string", span);
         Expr { kind: ExprKind::Template(hparts), ty: Ty::Str, span }
     }
 
@@ -5004,6 +5008,26 @@ impl<'a, 't> Checker<'a, 't> {
     /// Slice ① cut: **non-capturing** only — the lambda body sees its parameters and top-level
     /// functions, but not enclosing locals (capturing those is a follow-up; such a reference
     /// surfaces as an undefined-variable error here).
+    /// Reject an allocating string op inside a lifted lambda that has no arena to hold the result.
+    /// A pipeline lambda (`reduce`/`map`/`par_map`/…) is lifted to a synthetic top-level function;
+    /// the enclosing `arena {}` is **not** threaded into it, so an allocation there lowers with no
+    /// arena and is leaked to process-lifetime (`align_rt_builder_finish`). Per call, in a reduce
+    /// loop, that OOMs (Gemini's M2 report, Gap A). A silent leak violates "nothing hidden", so this
+    /// is a hard error pointing at the right tool. `capture.is_some()` ⇒ we are inside a lambda body;
+    /// `arena_depth == 0` ⇒ the lambda opened no arena of its own to catch the allocation.
+    fn guard_lambda_alloc_leak(&mut self, what: &str, span: Span) {
+        if self.capture.is_some() && self.arena_depth == 0 {
+            self.diags.error(
+                format!(
+                    "{what} inside a pipeline lambda leaks — the enclosing `arena {{}}` is not available in a \
+                     lifted lambda. Accumulate with a `builder` instead, e.g. \
+                     `reduce(builder(), fn b, x {{ b.write(x); b }})`, or open an `arena {{}}` inside the lambda."
+                ),
+                span,
+            );
+        }
+    }
+
     fn lift_lambda(
         &mut self,
         params: &[ast::LambdaParam],
@@ -6262,6 +6286,9 @@ impl<'a, 't> Checker<'a, 't> {
         if !ok {
             return err;
         }
+        // `json.encode` desugars to a `Template` `str` — the same arena-allocating path, so it leaks
+        // the same way inside a lifted lambda with no arena.
+        self.guard_lambda_alloc_leak("json.encode", span);
         Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
     }
 
