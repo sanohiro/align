@@ -613,8 +613,16 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 null_moved_source(b, init);
             }
         },
-        hir::Stmt::Assign { local, value } => {
+        hir::Stmt::Assign { local, value, drop_old } => {
+            // Compute the new value first (the RHS may read the old). Then, if reassigning an owned
+            // local whose old value the RHS did not move out (`drop_old`, set by sema's move
+            // analysis), free the buffer being overwritten — else it leaks. `drop_locals` excludes
+            // arena-owned locals (the arena bulk-frees those). The slot is a valid buffer or null
+            // (a prior move / the entry `DropFlagInit`), so the drop frees once or no-ops.
             let op = lower_expr(b, value);
+            if drop_old.get() && b.drop_locals.contains(local) {
+                b.push(Stmt::Drop(*local));
+            }
             b.push(Stmt::Store(*local, op));
             null_moved_source(b, value);
         }
