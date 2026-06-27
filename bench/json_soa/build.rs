@@ -16,5 +16,8 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,-rpath,{rt_dir}");
     println!("cargo:rerun-if-env-changed=ALIGN_KERNEL_OBJ");
     println!("cargo:rerun-if-env-changed=ALIGN_RUNTIME_DIR");
+    // The kernel object is a raw link-arg, so cargo doesn't track it — relink when its content
+    // changes even if the path (env var) stays the same.
+    println!("cargo:rerun-if-changed={kobj}");
     println!("cargo:rerun-if-changed=kernel.align");
 }

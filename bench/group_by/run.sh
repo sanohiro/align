@@ -26,9 +26,8 @@ RT_DIR="$(cd ../.. && pwd)/target/release"
 [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing libalign_runtime dynamic library (.so/.dylib) in $RT_DIR" >&2; exit 1; }
 
 KOBJ="$PWD/kernel.o"
+trap 'rm -f "$KOBJ"' EXIT  # always clean up the temp object, even on failure/interrupt
 "$ALIGNC" emit-obj kernel.align "$KOBJ" --target-cpu "$align_tgt"
 
 echo "target: $mode"
 ALIGN_KERNEL_OBJ="$KOBJ" ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release
-
-rm -f "$KOBJ"

@@ -1,8 +1,8 @@
-// Link the Align-compiled kernel object (`agg`) + the Align runtime into this harness. `run.sh`
+// Link the Align-compiled kernel object (`group`) + the Align runtime into this harness. `run.sh`
 // produces the object via `alignc emit-obj` and points these env vars at it and at the runtime's
-// build dir. The kernel calls `align_rt_json_decode_struct_array` / arena / alloc; those come from
-// `libalign_runtime.so` (a cdylib — linked dynamically over the C-ABI so its bundled std doesn't
-// collide with this harness's std, which a staticlib would).
+// build dir. The kernel calls `align_rt_group_sum_i64`; it comes from `libalign_runtime.so` (a
+// cdylib — linked dynamically over the C-ABI so its bundled std doesn't collide with this harness's
+// std, which a staticlib would).
 use std::env;
 
 fn main() {
@@ -16,5 +16,8 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,-rpath,{rt_dir}");
     println!("cargo:rerun-if-env-changed=ALIGN_KERNEL_OBJ");
     println!("cargo:rerun-if-env-changed=ALIGN_RUNTIME_DIR");
+    // The kernel object is a raw link-arg, so cargo doesn't track it — relink when its content
+    // changes even if the path (env var) stays the same.
+    println!("cargo:rerun-if-changed={kobj}");
     println!("cargo:rerun-if-changed=kernel.align");
 }
