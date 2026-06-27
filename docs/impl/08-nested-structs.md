@@ -63,10 +63,13 @@ down-payment on Slice 2). `crates/align_driver/tests/nested_structs.rs`.
   rejected; owned-in-nested rejected (early sema error).
 - **risk**: medium — the place-path generalization touches several flow walks (but `root`-based).
 
-### Slice 2 — whole inner-struct read / assign
-`p := l.a`, `l.a = pt`, struct-by-value params/returns. A struct value = a sub-struct **memcpy**
-(slot to slot); lifts the M1-deferred whole-struct copy/pass/return (safe for plain-data Copy).
-Risk: medium (SysV by-value ABI + temp-slot management).
+### Slice 2 — whole inner-struct read / assign — DONE (already working)
+`p := l.a`, `l.a = pt`, struct-by-value params/returns. A struct value = a sub-struct memcpy (LLVM
+aggregate load/store); safe for plain-data Copy. **Found already working** once Slice 1 generalized
+`Field`/`Load`/`Store` to struct values — verified across the SysV by-value ABI (mixed-width, float,
+and nested structs by value; returned-then-mutated; struct-to-struct assign). A `str`-bearing struct
+by value copies the `{ptr,len}` and *leaks* (no Drop yet) but does not double-free — that's S3.
+`crates/align_driver/tests/struct_by_value.rs`.
 
 ### Slice 3 — owned (str/array) nested fields + struct Drop
 `User { name: str, addr: Address }`. Recursive struct **Drop** (drop owned fields in order) + move /
