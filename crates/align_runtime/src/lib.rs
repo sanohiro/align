@@ -395,12 +395,31 @@ pub unsafe extern "C" fn align_rt_builder_write(b: *mut Builder, ptr: *const u8,
     }
 }
 
-/// Append a decimal integer.
+/// Append a decimal integer. Hand-rolled itoa straight into the buffer — no generic `write!`
+/// formatter (runtime format-string parsing + trait dispatch), the builder's hot path.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
-    use std::io::Write;
     let b = unsafe { &mut *b };
-    let _ = write!(b.buf, "{v}");
+    // 20 = the widest i64 decimal (`-9223372036854775808`). Emit digits back-to-front from the
+    // value's magnitude computed via `n % 10` / `unsigned_abs` (works for `i64::MIN` — never negates).
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    // Work on the unsigned magnitude (`unsigned_abs` handles `i64::MIN`): the loop then uses unsigned
+    // div/mod, which LLVM lowers to a multiply+shift — no signed-division sign corrections per digit.
+    let mut n = v.unsigned_abs();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if v < 0 {
+        i -= 1;
+        tmp[i] = b'-';
+    }
+    b.buf.extend_from_slice(&tmp[i..]);
 }
 
 /// Append `true`/`false`.
@@ -1551,6 +1570,16 @@ mod tests {
         let got2: std::collections::HashMap<i64, i64> = ok2[..n2].iter().copied().zip(ov2[..n2].iter().copied()).collect();
         for k in 0..200i64 {
             assert_eq!(got2.get(&k), Some(&(2 * k)), "group {k} after rehash");
+        }
+    }
+
+    #[test]
+    fn builder_write_int_matches_format() {
+        // The hand-rolled itoa must equal `format!("{v}")` across the i64 range incl. edges.
+        for v in [0i64, 7, -1, 42, -123, i64::MAX, i64::MIN, 1000000000000, -9999] {
+            let mut b = Builder { buf: Vec::new(), arena: std::ptr::null_mut() };
+            align_rt_builder_write_int(&mut b, v);
+            assert_eq!(String::from_utf8(b.buf).unwrap(), format!("{v}"), "write_int({v})");
         }
     }
 

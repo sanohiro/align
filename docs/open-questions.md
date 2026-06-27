@@ -402,15 +402,21 @@ arm64 *numbers* here (linux x86), but every *code* claim was verified against th
   immediately → O(1)). Inherent; the answer is **guidance/lint: use `builder` for string
   accumulation, not `reduce(+)`** (a perf-rail lint candidate — Codex's idea). Not a core fix.
 - **Gap C — `builder` has no capacity hint** (`builder()` only) → the runtime `Vec<u8>` reallocates
-  as it grows. ~2.8× behind capacity-preallocated Rust. Fix: `builder(capacity)` + a runtime
-  `builder_with_capacity`. Cheap, real.
-- **Gap D — `align_rt_builder_write_int` uses `write!(b.buf, "{v}")`** (runtime ~403) — the generic
-  formatter, slow vs an itoa byte-write. **Same fix as the JSON integer hand-roll (#168), in reverse.**
-  Cheap, real, isolated. Pairs with the builder being the *fast* string path (Codex's sink-first note).
+  as it grows. **Now the sole remaining builder lever, with a measured target: ≈0.73× (≈1.35× slower)
+  vs hand-optimized Rust in `bench/string_builder/` after the itoa fix — that residual is the
+  realloc.** Fix: a `builder(capacity)` surface hint + a runtime `builder_with_capacity`. The win is
+  closing ~1.35× → parity-with-optimized; note Align already **beats naive Rust** (1.05–1.11×) without
+  it, so it's opt-in polish, not a deficit. (Float writing still uses the generic formatter — `ryu`
+  is the float analogue of the itoa below.)
+- **Gap D — `align_rt_builder_write_int` used `write!(b.buf, "{v}")` — DONE 2026-06-27.** Replaced with
+  a back-to-front itoa straight into the buffer (negative-magnitude accumulation so `i64::MIN` works;
+  the JSON integer hand-roll #168 in reverse). **Halved the gap to optimized Rust** (Gemini Part 1 had
+  the old builder ~2.8× slower; now ~1.35×) and overtook naive Rust. `bench/string_builder/` (new);
+  runtime test `builder_write_int_matches_format`.
 
-Suggested order if/when picked up: **Gap A** (correctness — error-or-arena-propagate, stop the silent
-leak) → **Gap D** (cheap itoa) → **Gap C** (builder capacity) → **Gap B** (perf-rail lint, with the
-broader lint work). None block current soa/analytics work.
+Suggested order for the rest: **Gap C** (builder capacity — the measured ~1.35×→parity lever) →
+**Gap B** (perf-rail lint, with the broader lint work). Gap A (leak) and Gap D (itoa) are DONE; none
+of the rest block current soa/analytics work.
 
 ### Column-oriented `group_by` — FIRST SLICE DONE + BENCHED (beats default Rust everywhere)
 **Implemented (2026-06-27):** `s.group_by(.key).sum(.value)` over a `soa<Struct>` local → `(array<i64>,
