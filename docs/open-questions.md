@@ -450,7 +450,11 @@ vs `ahash`) — for linear probing the three dense parallel arrays are better (t
 pack many entries per cache line for probe-chain scans; a 24-byte interleaved slot packs ~2.6/line +
 a bigger footprint). So the current 3-array layout stays; beating `ahash` needs the *full* SwissTable
 (SIMD control-byte group probing + AES-class hash), not a naive interleave — a big, bounded-value
-effort, deferred. Then: `min`/`max`/`count` aggregates, string keys (intern), AoS source. Design ↓.
+effort, deferred. **`min`/`max`/`count` aggregates — DONE 2026-06-27** (`group_by(.key).min/max(.value)`
+and `.count()`; `ArrayGroupAgg{op}` + a monomorphized runtime `group_agg_i64` over per-op
+`per_row`/`combine`, `align_rt_group_{sum,min,max,count}_i64`). Still open: string keys (intern), AoS
+source, multiple aggregates in one pass → more result columns, a `group_by(.key)` with a lambda key.
+Design ↓.
 
 ### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
 The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped
@@ -466,9 +470,9 @@ the return type first** — done here.
   sidesteps the "groups as a first-class container" problem (which would need generic containers,
   deliberately not built).
 - **Surface.** `xs.group_by(.key).sum(.value)` — `group_by(.key)` takes a field-shorthand like
-  `where(.active)`; the following reduction names the value field. First slice: exactly one key field
-  + one `sum` aggregate. (Later: `min`/`max`/`count` aggregates, multiple aggregates → more result
-  columns, a `group_by(.key)` with a lambda key.)
+  `where(.active)`; the following reduction names the value field. **`sum`/`min`/`max(.value)` and
+  `count()` are implemented** (one key field, one aggregate). (Later: multiple aggregates in one pass
+  → more result columns, a `group_by(.key)` with a lambda key, string keys.)
 - **Mechanism = open-addressing hash-aggregate.** A primitive-key, no-boxing, linear-probing table
   (the win lever vs std HashMap): hash the key, probe, insert or accumulate. Inputs are soa columns
   read sequentially. Runtime helper `align_rt_group_sum_i64(keys_ptr, vals_ptr, len, out_keys,

@@ -463,13 +463,13 @@ pub enum ExprKind {
     /// Fields must be primitive scalars (the `soa<T>` rule, so no `str` columns / input region tie),
     /// and it needs an enclosing `arena {}`. The expression `ty` is `Result<soa<Struct>, Error>`.
     JsonDecodeSoa { struct_id: u32, input: Box<Expr> },
-    /// `s.group_by(.key).sum(.value)` over a `soa<Struct>` local `base` — column-oriented grouped
-    /// sum. Reads the `key_field` and `value_field` columns (each a `slice<i64>` via [`SoaColumn`])
-    /// and aggregates `value` per distinct `key` into two parallel owned arrays. The expression `ty`
-    /// is a tuple `(array<i64>, array<i64>)` (distinct keys, per-key sums) — the data-oriented
-    /// result (no `HashMap`), reusing `partition`'s tuple-of-two-owned-arrays shape. First slice:
-    /// `i64` key + `i64` value + `sum`.
-    ArrayGroupSum { base: LocalId, struct_id: u32, key_field: u32, value_field: u32 },
+    /// `s.group_by(.key).{sum,min,max}(.value)` / `.count()` over a `soa<Struct>` local `base` —
+    /// column-oriented grouped aggregate. Reads the `key_field` column (and `value_field` for
+    /// sum/min/max — `None` for `count`) as `slice<i64>` via [`SoaColumn`] and folds per distinct
+    /// `key` into two parallel owned arrays. The expression `ty` is a tuple `(array<i64>, array<i64>)`
+    /// (distinct keys, per-key aggregate) — the data-oriented result (no `HashMap`), reusing
+    /// `partition`'s tuple-of-two-owned-arrays shape. First slice: `i64` key + `i64` value.
+    ArrayGroupAgg { base: LocalId, struct_id: u32, key_field: u32, value_field: Option<u32>, op: GroupOp },
     /// `fs.read_file(path)` — read the file at `path` (a `str`) into a freshly heap-allocated owned
     /// `string`; the expression `ty` is `Result<string, Error>`. The first `std.fs` surface.
     FsReadFile { path: Box<Expr> },
@@ -480,6 +480,19 @@ pub enum ExprKind {
     /// stdout directly (no `to_string()` materialization), borrowing it (not consumed). `ty` is
     /// `Result<(), Error>`.
     IoStdoutWriteBuilder { builder: Box<Expr> },
+}
+
+/// The aggregate of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupOp {
+    /// `sum(.value)` — per-group sum.
+    Sum,
+    /// `min(.value)` — per-group minimum.
+    Min,
+    /// `max(.value)` — per-group maximum.
+    Max,
+    /// `count()` — per-group row count (no value field).
+    Count,
 }
 
 /// Which builder append a `BuilderWrite` performs (MMv2 slice 7c/7d).

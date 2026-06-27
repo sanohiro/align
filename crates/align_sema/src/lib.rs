@@ -1766,7 +1766,7 @@ impl EffectScan {
             // Leaves.
             ExprKind::Unit | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_)
             | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::OptionNone
-            | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupSum { .. } | ExprKind::IndexField { .. } => {}
+            | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupAgg { .. } | ExprKind::IndexField { .. } => {}
         }
     }
 }
@@ -2319,7 +2319,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::OptionNone
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
-            | ExprKind::ArrayGroupSum { .. }
+            | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::IndexField { .. } => {}
         }
     }
@@ -2477,7 +2477,7 @@ impl<'a> MoveCheck<'a> {
                     moved.insert(MovedKey::Whole(*id));
                 }
             }
-            ExprKind::Field { base, .. } | ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupSum { base, .. } | ExprKind::IndexField { base, .. } => {
+            ExprKind::Field { base, .. } | ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupAgg { base, .. } | ExprKind::IndexField { base, .. } => {
                 if whole_moved(moved, *base) {
                     let name = &self.f.locals[*base as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
@@ -4784,20 +4784,14 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
+        // `X.group_by(.key).<agg>(…)` — a grouped aggregate (`sum`/`min`/`max(.value)` or `count()`).
+        // Any method whose receiver is a `group_by(.key)` routes here, so a normal `xs.sum()` (recv
+        // is not a `group_by`) falls through to the pipeline terminals below.
+        if let Some((src, key_field)) = as_group_by(recv) {
+            return self.check_group_agg(src, key_field, method, args, span);
+        }
         // `sum` / `reduce` are the terminals of a fused pipeline.
         if method == "sum" {
-            // `X.group_by(.key).sum(.value)` — a grouped sum: a `.field` argument on `sum` is only
-            // valid right after `group_by`. (Plain `.sum()` takes no argument — handled below.)
-            if let [ast::Expr { kind: ast::ExprKind::FieldShorthand(value_field), .. }] = args {
-                let Some((src, key_field)) = as_group_by(recv) else {
-                    self.diags.error(
-                        "`.sum(.field)` is only valid right after `group_by(.key)`".to_string(),
-                        span,
-                    );
-                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-                };
-                return self.check_group_sum(src, key_field, value_field, span);
-            }
             return self.check_array_sum(recv, args, expected, span);
         }
         if method == "reduce" {
@@ -5469,13 +5463,43 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::ArraySum { source: Box::new(source), stages }, ty: elem, span }
     }
 
-    /// `s.group_by(.key).sum(.value)` — column-oriented grouped sum over a `soa<Struct>` local.
-    /// Yields `(array<i64>, array<i64>)` (distinct keys, per-key sums). First slice: the source must
-    /// be a `soa<Struct>` local and both `key`/`value` fields must be `i64` (the runtime aggregate is
-    /// `align_rt_group_sum_i64`). Idiomatic Rust reaches for a generic `HashMap<K, Acc>`; Align reads
-    /// the two columns sequentially into a primitive-key open-addressing aggregate.
-    fn check_group_sum(&mut self, source: &ast::Expr, key_field: &ast::Ident, value_field: &ast::Ident, span: Span) -> Expr {
+    /// `s.group_by(.key).<agg>(…)` — column-oriented grouped aggregate over a `soa<Struct>` local:
+    /// `sum`/`min`/`max(.value)` or `count()`. Yields `(array<i64>, array<i64>)` (distinct keys,
+    /// per-key aggregate). First slice: the source must be a `soa<Struct>` local and the `key` (and
+    /// `value`, for sum/min/max) fields must be `i64`. Idiomatic Rust reaches for a generic
+    /// `HashMap<K, Acc>`; Align reads the columns sequentially into a primitive-key open-addressing
+    /// aggregate. `method`/`args` are the aggregate call (`recv` was `X.group_by(.key)`).
+    fn check_group_agg(&mut self, source: &ast::Expr, key_field: &ast::Ident, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // Resolve the aggregate op + its (optional) value field from the method + args.
+        let (op, value_field): (hir::GroupOp, Option<&ast::Ident>) = match method {
+            "count" => {
+                if !args.is_empty() {
+                    self.diags.error("`group_by(.key).count()` takes no arguments".to_string(), span);
+                    return err;
+                }
+                (hir::GroupOp::Count, None)
+            }
+            "sum" | "min" | "max" => {
+                let [ast::Expr { kind: ast::ExprKind::FieldShorthand(v), .. }] = args else {
+                    self.diags.error(format!("`group_by(.key).{method}(.value)` needs a `.field` value argument"), span);
+                    return err;
+                };
+                let op = match method {
+                    "sum" => hir::GroupOp::Sum,
+                    "min" => hir::GroupOp::Min,
+                    _ => hir::GroupOp::Max,
+                };
+                (op, Some(v))
+            }
+            _ => {
+                self.diags.error(
+                    format!("`group_by(.key)` supports `.sum/.min/.max(.value)` or `.count()`, not `.{method}()`"),
+                    span,
+                );
+                return err;
+            }
+        };
         // The source must be a `soa<Struct>` local (a param or a `to_soa`/`json.decode` binding) —
         // its columns are contiguous, so they pass to the aggregate zero-copy.
         let base = match self.place_local(source) {
@@ -5515,14 +5539,19 @@ impl<'a, 't> Checker<'a, 't> {
             }
             Some(idx as u32)
         };
-        let (Some(ki), Some(vi)) = (resolve(self, key_field, "key"), resolve(self, value_field, "value")) else {
-            return err;
+        let Some(ki) = resolve(self, key_field, "key") else { return err };
+        let vi = match value_field {
+            Some(v) => match resolve(self, v, "value") {
+                Some(idx) => Some(idx),
+                None => return err,
+            },
+            None => None,
         };
-        // Result: a tuple of two owned arrays `(array<i64>, array<i64>)` (keys, sums).
+        // Result: a tuple of two owned arrays `(array<i64>, array<i64>)` (keys, per-key aggregate).
         let arr = ty_to_scalar(Ty::DynArray(ty_to_scalar(i64t).unwrap())).expect("array<i64> is a payload scalar");
         let tuple_id = intern_tuple(self.tuples, vec![arr, arr]);
         Expr {
-            kind: ExprKind::ArrayGroupSum { base, struct_id: id, key_field: ki, value_field: vi },
+            kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: vi, op },
             ty: Ty::Tuple(tuple_id),
             span,
         }
@@ -7328,7 +7357,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::OptionNone
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
-            | ExprKind::ArrayGroupSum { .. }
+            | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::IndexField { .. } => {}
         }
         if let Some(t) = recomputed {
