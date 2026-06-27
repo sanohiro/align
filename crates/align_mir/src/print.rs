@@ -66,6 +66,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::NullTupleField(slot, idx) => {
                 let _ = writeln!(out, "    null _{slot}.{idx}");
             }
+            Stmt::NullStructField(slot, idx) => {
+                let _ = writeln!(out, "    null _{slot}.{idx}");
+            }
             Stmt::Drop(slot) => {
                 let _ = writeln!(out, "    drop _{slot}");
             }

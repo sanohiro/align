@@ -98,8 +98,22 @@ double-free). Landed as built below. `crates/align_driver/tests/owned_structs.rs
 - **tests**: construct + drop; nested recursive drop; return / pass / assign by value (no double-free,
   verified under `MALLOC_CHECK_=3`); the unsupported-container rejections above; partial owned-field
   move-out rejected.
-- **deferred**: *moving* an owned field out of a struct (`n := u.name` — a partial move); owned
-  **collection** (`array<T>`) fields.
+- **deferred**: owned **collection** (`array<T>`) fields.
+
+#### Follow-up (landed) — moving an owned `string` field out of a struct (partial move)
+A depth-1 owned `string` field can now be **moved** out (`n := u.name`, `f(u.name)` by value,
+`return u.name`): the buffer transfers to the new owner, the struct's slot field is nulled, and the
+struct's recursive `Drop` frees null there — so the buffer is freed exactly once. The struct can no
+longer move as a whole / the field be reused, but its other fields stay readable. `crates/align_driver/tests/owned_structs.rs`.
+
+- **sema**: `MoveCheck`'s `Field` arm tracks per-field moves like a tuple (`MovedKey::Field` /
+  `field_moved`): a consuming read of a depth-1 `string` field marks just that field moved (so a
+  sibling Copy-field read still type-checks; `whole_moved` then blocks moving the struct as a whole).
+- **MIR/codegen**: `null_moved_source` on a depth-1 `Field` of `string` type pushes the new
+  `Stmt::NullStructField(slot, idx)`, which GEPs the field and stores a zeroed `{ptr,len}` — exactly
+  the tuple `NullTupleField` shape, for a struct slot.
+- **deferred**: moving a field out through a *nested path* (`n := u.addr.name`) or a whole nested
+  **Move-struct** field (`a := u.addr` — needs the sub-struct nulled, not a single `{ptr,len}`).
 
 #### Follow-up (landed) — borrowing an owned field out of a struct (read)
 Slice 3 made owned struct fields constructible/writable, but their contents were **unreadable** (any
@@ -116,8 +130,7 @@ argument, `io.stdout.write(u.name)`, a `s: str := u.name` binding. `crates/align
   arg / return). A borrow reaches that arm non-consuming (wrapped in `StrBorrow`/`Len`), so it passes.
 - **no codegen change**: a `Field` load of a `{ptr,len}` `string` leaf already works; `StrBorrow` is
   identity. The borrowed buffer is freed once, by the struct's recursive `Drop` (no separate free).
-- **deferred**: the partial *move* out (above) — it needs the field nulled so the struct's `Drop`
-  doesn't double-free it.
+- the partial *move* out (`n := u.name`) landed as its own follow-up (above).
 
 #### Follow-up (landed) — reassigning an owned local drops the old value
 A pre-existing gap for *all* owned types (`string`/`array<T>`/Move struct/box): `mut s := …; s = …`

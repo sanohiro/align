@@ -53,8 +53,9 @@ Continue `docs/impl/08-nested-structs.md`:
   (`[User{…}]` — needs per-element drop; Slice 3 rejects it for now). Risk: medium–high.
 - **Slice 5 DONE** — cross-module field types (`f: geom.Point`): an imported `pub` type may be a
   struct field / enum payload / template member. `tests/cross_module_types.rs`.
-- Smaller follow-ups unblocked by Slice 3: owned `array<T>` struct fields; the partial *move* of an
-  owned field out (`n := u.name`).
+- **Partial owned-field move DONE** — `n := u.name` (depth-1 `string` field) moves the buffer out,
+  nulls the struct field, struct Drop frees null. Deeper paths / Move-struct fields still deferred.
+- Smaller follow-up unblocked by Slice 3: owned `array<T>` struct fields.
 - **DONE (this branch): borrowing an owned field out** — `u.name.len()` / `str` arg / `s: str :=
   u.name` now read a `string` field as a zero-copy `str` view (non-consuming, `Frame`-regioned so it
   can't escape the struct). Moving the field out stays deferred. `tests/owned_structs.rs`.
