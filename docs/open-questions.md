@@ -342,6 +342,28 @@ compare means an unknown key colliding into an occupied slot is still skipped). 
 `call` / `bounds_fail` in the loop (1 loop, no allocation, no bounds branch), which is why they beat
 Rust. No residual-overhead cleanup is needed before construction.
 
+### External benchmark report — Gemini on M2/arm64, Part 2 (2026-06-27, VERIFIED; one bug FIXED)
+A second Gemini bench (group_by / par_map / json-decode on arm64). Verified against code:
+- **group_by: Align 1.4–4.2× faster than `std::HashMap` on M2** — confirms the x86 `bench/group_by`
+  result cross-arch. (A dense flat-array lookup that skips hashing is still faster — a different
+  algorithm, not a hash map; expected.) Nothing to do.
+- **JSON decode: Align only ~14% slower than `serde_json` (AoS), the SoA transpose adds <3%** —
+  confirms the integer-parse fix (#168) landed and the transpose is cheap (matches the x86 decomposition).
+- **★ Match double-free (VERIFIED by repro → FIXED 2026-06-27).** `match res { Ok(users) => … }`
+  where `res: Result<array<User>, Error>` is a bound local: binding `Ok(users)` moves the array out,
+  but the match lowering didn't null the scrutinee, so at scope exit BOTH `res` and `users` `Drop` →
+  `align_rt_free` twice → `free(): double free detected` / SIGABRT (reproduced). **A memory-safety bug
+  (worse than Gap A's leak).** Fix: `lower_match_binary`/`lower_match_enum` now call
+  `null_moved_source` on the scrutinee in any arm that binds a payload (mirrors `?`/`lower_try`), and
+  `finish_arm` nulls an owned local *returned* from an arm (`Ok(xs) => xs`) — a second double-free in
+  the same area, found while testing, also fixed. `tests/structured_error.rs` (+3: consume / return /
+  wildcard). The `?`-workaround Gemini used is no longer needed.
+- **par_map thread-spawn overhead (open).** `align_rt_par_map` spawns raw OS threads via
+  `std::thread::scope` on *every* call (~20–50 µs/thread), so at N=100k Align is ~3× slower than
+  Rayon / ~7× slower than sequential; at N=1M it reaches sequential parity but stays ~1.7× behind
+  Rayon. Fix: a persistent (lazily-initialised) worker pool instead of per-call spawn. Real perf gap,
+  std/runtime layer — recorded, not urgent (par_map is an early cut).
+
 ### External benchmark report — Gemini on M2/arm64 (2026-06-27, claims VERIFIED against code)
 Gemini ran a 3-workload bench on Apple Silicon (arm64) and filed a gap report. Can't reproduce the
 arm64 *numbers* here (linux x86), but every *code* claim was verified against the source. Not urgent

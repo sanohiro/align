@@ -2796,8 +2796,8 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     let scrut = lower_expr(b, scrutinee);
     let join_bb = b.new_block();
     match scrutinee.ty {
-        Ty::Enum(enum_id) => lower_match_enum(b, enum_id, arms, &scrut, result_slot, join_bb),
-        Ty::Option(_) | Ty::Result(..) => lower_match_binary(b, scrutinee.ty, arms, &scrut, result_slot, join_bb),
+        Ty::Enum(enum_id) => lower_match_enum(b, enum_id, arms, &scrut, result_slot, join_bb, scrutinee),
+        Ty::Option(_) | Ty::Result(..) => lower_match_binary(b, scrutinee.ty, arms, &scrut, result_slot, join_bb, scrutinee),
         // Guarded by sema (`match` requires a sum type); be defensive rather than panic.
         _ => b.terminate(Term::Goto(join_bb)),
     }
@@ -2814,7 +2814,7 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
 
 /// A user `enum`: test the scrutinee's tag against each arm's variant and branch to its body,
 /// defaulting to the `_`/last arm.
-fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId) {
+fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId, scrutinee: &hir::Expr) {
     // The default arm is the `_` wildcard (no variants); absent it, the last arm — exhaustiveness
     // guarantees the scrutinee must be one of its variants by the time control reaches it.
     let default_idx = arms.iter().position(|a| a.variants.is_empty()).unwrap_or(arms.len() - 1);
@@ -2848,22 +2848,30 @@ fn lower_match_enum(b: &mut Builder, enum_id: u32, arms: &[hir::MatchArm], scrut
         }
         b.cur = arm_bb;
         bind_payload(b, arm);
+        // Binding an owned payload moves it out of the scrutinee; null the scrutinee so its exit
+        // `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
+        if !arm.bindings.is_empty() {
+            null_moved_source(b, scrutinee);
+        }
         finish_arm(b, &arm.body, result_slot, join_bb);
         b.cur = next_bb;
     }
     let d = &arms[default_idx];
     bind_payload(b, d);
+    if !d.bindings.is_empty() {
+        null_moved_source(b, scrutinee);
+    }
     finish_arm(b, &d.body, result_slot, join_bb);
 }
 
 /// Builtin `Option`/`Result` (exactly two variants): one boolean branch on `IsSome`/`IsOk`, the
 /// `true` edge to the Some/Ok arm and `false` to the None/Err arm. Variant 0 = Some/Ok, 1 = None/Err
 /// (matching `match_variants`); either side may be the `_` wildcard.
-fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId) {
+fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &Operand, result_slot: Option<Slot>, join_bb: BlockId, scrutinee: &hir::Expr) {
     let wild = arms.iter().find(|a| a.variants.is_empty());
     let pos = arms.iter().find(|a| a.variants.contains(&0)).or(wild).expect("exhaustive (sema)");
     let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
-    // A lone `_` covers both variants — no test needed.
+    // A lone `_` covers both variants — no test needed (and binds nothing, so no move to null).
     if std::ptr::eq(pos, neg) {
         finish_arm(b, &pos.body, result_slot, join_bb);
         return;
@@ -2879,9 +2887,17 @@ fn lower_match_binary(b: &mut Builder, ty: Ty, arms: &[hir::MatchArm], scrut: &O
     b.terminate(Term::Branch(Operand::Value(cond), pos_bb, neg_bb));
     b.cur = pos_bb;
     bind_binary(b, ty, true, pos, scrut);
+    // Binding an owned payload (Ok/Some) moves it out of the scrutinee; null the scrutinee so its
+    // exit `Drop` doesn't double-free the buffer the binding now owns (mirrors `?`/`lower_try`).
+    if !pos.bindings.is_empty() {
+        null_moved_source(b, scrutinee);
+    }
     finish_arm(b, &pos.body, result_slot, join_bb);
     b.cur = neg_bb;
     bind_binary(b, ty, false, neg, scrut);
+    if !neg.bindings.is_empty() {
+        null_moved_source(b, scrutinee);
+    }
     finish_arm(b, &neg.body, result_slot, join_bb);
 }
 
@@ -2916,6 +2932,10 @@ fn finish_arm(b: &mut Builder, body: &hir::Expr, result_slot: Option<Slot>, join
         if let Some(slot) = result_slot {
             b.push(Stmt::Store(slot, av));
         }
+        // If the arm yields an owned local (`Ok(xs) => xs`), it moved into the match result; null
+        // that source so its exit `Drop` doesn't double-free the buffer the result now owns. (A
+        // diverging arm already returned via `lower_fn`'s own null-on-move.)
+        null_moved_source(b, body);
         b.terminate(Term::Goto(join_bb));
     }
 }
