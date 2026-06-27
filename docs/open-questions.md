@@ -351,14 +351,19 @@ arm64 *numbers* here (linux x86), but every *code* claim was verified against th
   The branchless-`select` fusion wins on arm64 (on x86 it was parity — Rust's slice `filter` evidently
   doesn't vectorize as cleanly on arm here). Nothing to do; good signal that the flagship lowering
   holds cross-arch.
-- **★ Gap A — `str + str` inside a lifted lambda silently LEAKS → OOM. REAL correctness bug
-  (verified).** `s.reduce("", fn acc, x { acc + x })`: the lambda lifts to a top-level fn whose
-  `lower_fn` starts with `b.arenas` empty, so `str+str` (MIR ~757, `arena = b.arenas.last()`) gets
-  `arena = None` → `align_rt_builder_finish` `Box::leak`s the buffer (runtime ~1196, process-lifetime).
-  One leak per reduce step → ~750 MB / OOM at N=10k. **The arena the user wrote is lexically lost
-  across lambda lifting.** A silent leak violates Nothing-hidden — at minimum this should be a
-  compile **error** ("string building in a reduce/par_map lambda: use a `builder`"), ideally the
-  lift should thread the enclosing arena into the closure env. Priority: the only *correctness* gap.
+- **★ Gap A — `str + str` inside a lifted lambda silently LEAKED → OOM. FIXED 2026-06-27 (now a hard
+  error).** `s.reduce("", fn acc, x { acc + x })`: the lambda lifts to a top-level fn whose `lower_fn`
+  starts with `b.arenas` empty, so `str+str` (MIR ~757) got `arena = None` → `builder_finish`
+  `Box::leak`d the buffer (runtime ~1196) → one leak per reduce step → OOM at N=10k. **Fix:**
+  `guard_lambda_alloc_leak` (align_sema) errors on a string allocation (`str + str` / `template`)
+  inside a lifted lambda with no arena of its own (`capture.is_some() && arena_depth == 0`), pointing
+  at the `builder` pattern — so the silent leak is now a clear compile error (Nothing-hidden restored).
+  Legitimate cases unaffected: top-level / named-fn concat, the builder-reduce pattern, and a concat
+  inside the lambda's own `arena {}`. `tests/lambda.rs` (+5). **Remaining sub-gap (recorded, NOT the
+  reported case):** a *named* reducer fn that concats (`fn cat(a,b)=a+b` used as `reduce("", cat)`)
+  leaks the same way but isn't caught (the guard is scoped to inline lambdas via `capture`); the real
+  fix is **owned `string` from concat** (str+str → a heap `string` with `Drop`, freeing each
+  intermediate → no leak, O(1) like Rust — also dissolves Gap B), the deferred M5 feature.
 - **Gap B — `acc + x` string reduce is O(N²) arena space even if A were fixed.** Arena has no
   per-object free, so all N intermediate strings live until block exit (Rust frees each `acc`
   immediately → O(1)). Inherent; the answer is **guidance/lint: use `builder` for string
