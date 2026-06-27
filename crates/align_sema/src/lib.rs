@@ -484,7 +484,7 @@ enum RawStage {
 /// An assignable location resolved by [`Checker::check_place`].
 enum Place {
     Local { id: LocalId, ty: Ty },
-    Field { base: LocalId, index: u32, ty: Ty },
+    Field { root: LocalId, path: Vec<u32>, ty: Ty },
     /// `base[index] = value` — an element store into a `mut` array local or an `out` slice
     /// parameter. `index` is the checked (`i64`) subscript; `elem` is the element type.
     Index { base: LocalId, index: Expr, elem: Ty },
@@ -1123,12 +1123,13 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         let mut fields = Vec::with_capacity(s.fields.len());
         for f in &s.fields {
             let ty = resolve_type(&f.ty, tcx!(module, &no_imports), &[], diags);
-            // Fields are **Copy** only: a primitive scalar (int/float/bool/char) or `str` (see
-            // `is_field_ok`). Owned (Move) fields and nested struct/slice/option fields are rejected
-            // — a struct is copied by value, so a Move field would double-free.
+            // A field is a primitive scalar (int/float/bool/char), `str`, or a nested struct (the
+            // nested-struct shape is checked structurally here; that it is scalar-only + acyclic is
+            // validated in pass 0b-2, once all struct fields are populated). Slice/option/box/Move
+            // fields are still rejected.
             if !is_field_ok(ty) {
                 diags.error(
-                    format!("struct fields must be a primitive scalar or str for now, got {}", ty_name(ty)),
+                    format!("struct fields must be a primitive scalar, str, or a plain struct for now, got {}", ty_name(ty)),
                     f.span,
                 );
             }
@@ -1138,6 +1139,25 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         // arrive at M6 (`open-questions.md`); the field is reserved so that is an additive
         // change at the alignment seam, not a retrofit.
         structs[i] = StructDef { name: mangle_fn(module, *_is_entry, &s.name.name), fields, align: None };
+    }
+
+    // Pass 0b-2: now that every struct's fields are populated, validate **nested** struct fields. A
+    // struct-typed field must reference a scalar-only, acyclic struct (Slice 1: no `str`/owned data
+    // or recursion inside a nested struct, so the outer struct stays Copy / needs no Drop). Done in a
+    // separate pass because the referenced struct may be declared after the referencing one.
+    for (i, (_m, _e, s)) in struct_decls.iter().enumerate() {
+        for (fi, f) in s.fields.iter().enumerate() {
+            let Ty::Struct(nid) = structs[i].fields[fi].ty else { continue };
+            if !struct_scalar_only(nid, &structs, &mut Vec::new()) {
+                diags.error(
+                    format!(
+                        "nested struct field '{}' must be a plain scalar-only struct (no `str`/owned fields or recursion) for now",
+                        f.name.name
+                    ),
+                    f.span,
+                );
+            }
+        }
     }
 
     // Pass 0c: resolve concrete enum variant payloads (structs are now known) into the reserved
@@ -2007,7 +2027,7 @@ impl<'a> EscapeCheck<'a> {
                 .iter()
                 .fold(Region::Static, |acc, f| acc.shorter(self.region_of(f, depth))),
             // A field read inherits its base struct's region (the field may be a view into it).
-            ExprKind::Field { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
+            ExprKind::Field { root, .. } => self.region.get(root).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
             // An `arena {}` *expression* yields its block value, evaluated one level deeper.
             // Without this, a binding that captures an arena's value (`p := arena { … }`) would
@@ -2109,12 +2129,12 @@ impl<'a> EscapeCheck<'a> {
                     self.region.insert(*local, r);
                 }
             }
-            Stmt::AssignField { base, value, .. } => {
+            Stmt::AssignField { root, value, .. } => {
                 self.walk(value, depth);
                 // The base struct lives at its own (fixed) region; a stored value must outlive
                 // it, else the value would escape its region via the longer-lived struct.
                 if self.tracks_region(value.ty) {
-                    let target = self.region.get(base).copied().unwrap_or(Region::Static);
+                    let target = self.region.get(root).copied().unwrap_or(Region::Static);
                     if !self.region_of(value, depth).outlives(target) {
                         self.diags.error(
                             "this value cannot be stored into a longer-lived struct field (it would escape its region)".to_string(),
@@ -2477,7 +2497,7 @@ impl<'a> MoveCheck<'a> {
                     moved.insert(MovedKey::Whole(*id));
                 }
             }
-            ExprKind::Field { base, .. } | ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupAgg { base, .. } | ExprKind::IndexField { base, .. } => {
+            ExprKind::Field { root: base, .. } | ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupAgg { base, .. } | ExprKind::IndexField { base, .. } => {
                 if whole_moved(moved, *base) {
                     let name = &self.f.locals[*base as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
@@ -3176,9 +3196,9 @@ impl<'a, 't> Checker<'a, 't> {
                         };
                         stmts.push(Stmt::Assign { local: id, value: v });
                     }
-                    Place::Field { base, index, ty } => {
+                    Place::Field { root, path, ty } => {
                         let v = self.check_expr(value, Some(ty));
-                        stmts.push(Stmt::AssignField { base, index, value: v });
+                        stmts.push(Stmt::AssignField { root, path, value: v });
                     }
                     Place::Index { base, index, elem } => {
                         let v = self.check_expr(value, Some(elem));
@@ -3282,21 +3302,24 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return Place::Index { base: id, index: i, elem };
         }
-        // `local.field = v`
+        // `local.f0.f1.… = v` — a (possibly nested) field path rooted at a mutable local.
         if let ast::ExprKind::FieldAccess { recv, field } = &place.kind {
-            let Some((id, local_ty)) = self.place_local(recv) else {
+            let Some((root, mut path, recv_ty)) = self.resolve_place(recv) else {
                 self.diags.error("invalid assignment target", place.span);
                 return Place::Err;
             };
-            if !self.locals[id as usize].is_mut {
-                let name = self.locals[id as usize].name.clone();
+            if !self.locals[root as usize].is_mut {
+                let name = self.locals[root as usize].name.clone();
                 self.diags.error(
                     format!("cannot assign to a field of immutable '{name}' (declare with `mut`)"),
                     place.span,
                 );
             }
-            return match self.field_of(local_ty, &field.name, place.span) {
-                Some((index, ty)) => Place::Field { base: id, index, ty },
+            return match self.field_of(recv_ty, &field.name, place.span) {
+                Some((index, ty)) => {
+                    path.push(index);
+                    Place::Field { root, path, ty }
+                }
                 None => Place::Err,
             };
         }
@@ -3695,18 +3718,23 @@ impl<'a, 't> Checker<'a, 't> {
         if let ast::ExprKind::Index { recv: arr, index } = &recv.kind {
             return self.check_index_field(arr, index, field, expected, span);
         }
-        let base = match self.place_local(recv) {
-            Some((id, _)) => id,
+        // Resolve the receiver to a struct **place** — a local, or a nested field path `l.a.b`.
+        let (root, mut path, recv_ty) = match self.resolve_place(recv) {
+            Some(t) => t,
             None => {
                 self.diags
                     .error("field access is only supported on a local binding".to_string(), span);
                 return err;
             }
         };
-        let base_ty = self.locals[base as usize].ty;
         // `soa_value.field` — project one column of a struct-of-arrays as a `slice<FieldTy>` (the
         // cache lever: a scan reads only the touched columns). Reuses the slice pipeline downstream.
-        if let Ty::Soa(id) = base_ty {
+        // (Only directly on a soa local; a column of a *nested* field is a later slice.)
+        if let Ty::Soa(id) = recv_ty {
+            if !path.is_empty() {
+                self.diags.error("soa column projection of a nested field is not supported yet".to_string(), span);
+                return err;
+            }
             let def = &self.structs[id as usize];
             let Some(index) = def.field_index(&field.name) else {
                 self.diags.error(format!("no field '{}' on soa<{}>", field.name, def.name), span);
@@ -3716,12 +3744,13 @@ impl<'a, 't> Checker<'a, 't> {
             let elem = ty_to_scalar(field_ty).expect("soa fields are primitive scalars");
             let ty = Ty::Slice(elem);
             self.constrain(ty, expected, span);
-            return Expr { kind: ExprKind::SoaColumn { base, struct_id: id, field: index }, ty, span };
+            return Expr { kind: ExprKind::SoaColumn { base: root, struct_id: id, field: index }, ty, span };
         }
-        match self.field_of(base_ty, &field.name, span) {
+        match self.field_of(recv_ty, &field.name, span) {
             Some((index, ty)) => {
+                path.push(index);
                 self.constrain(ty, expected, span);
-                Expr { kind: ExprKind::Field { base, index }, ty, span }
+                Expr { kind: ExprKind::Field { root, path }, ty, span }
             }
             None => err,
         }
@@ -3762,6 +3791,29 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         None
+    }
+
+    /// Resolve `e` to a struct **place** rooted at a local: `(root_local, field_path, place_ty)`.
+    /// A bare local is `(id, [], ty)`; a nested `recv.field` appends the field's index. Returns
+    /// `None` if the root isn't a local (caller reports the diagnostic) or an intermediate isn't a
+    /// struct (a soa/array nested place is a later slice); a missing field is reported via `field_of`.
+    fn resolve_place(&mut self, e: &ast::Expr) -> Option<(LocalId, Vec<u32>, Ty)> {
+        match &e.kind {
+            ast::ExprKind::Path(_) => {
+                let (id, ty) = self.place_local(e)?;
+                Some((id, Vec::new(), ty))
+            }
+            ast::ExprKind::FieldAccess { recv, field } => {
+                let (root, mut path, recv_ty) = self.resolve_place(recv)?;
+                if !matches!(recv_ty, Ty::Struct(_)) {
+                    return None;
+                }
+                let (idx, fty) = self.field_of(recv_ty, &field.name, e.span)?;
+                path.push(idx);
+                Some((root, path, fty))
+            }
+            _ => None,
+        }
     }
 
     /// `Name { field: value, ... }`. Reorders inits into declaration order and requires
@@ -6497,7 +6549,7 @@ impl<'a, 't> Checker<'a, 't> {
             let sep = if i == 0 { "" } else { "," };
             parts.push(TemplatePart::Text(format!("{sep}\"{}\":", f.name)));
             let kind = match elem {
-                None => ExprKind::Field { base, index: i as u32 },
+                None => ExprKind::Field { root: base, path: vec![i as u32] },
                 Some(e) => ExprKind::IndexField { base, index: e, field: i as u32 },
             };
             let field_expr = Expr { kind, ty: f.ty, span };
@@ -8125,7 +8177,29 @@ fn resolve_user_type(
 
 /// Whether a resolved type is a valid struct field (Copy: a primitive scalar or a `str` view).
 fn is_field_ok(ty: Ty) -> bool {
-    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error)
+    // A struct field is a primitive scalar, `str`, or a **nested struct** (validated separately to be
+    // scalar-only + acyclic — see `struct_scalar_only` / the nested-field pass; Slice 1 forbids owned
+    // `str`/Move data inside a nested struct so the outer struct stays Copy / Drop-free).
+    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Struct(_) | Ty::Error)
+}
+
+/// Whether struct `id` is plain scalar-only data (every field is int/float/bool/char or another
+/// scalar-only struct) and acyclic — the rule a **nested** struct field must satisfy (Slice 1: no
+/// `str`/owned inside, no recursion). `visiting` detects cycles. Out-of-range ids (a resolution
+/// error already reported) are treated as not-ok.
+fn struct_scalar_only(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
+    if visiting.contains(&id) {
+        return false; // recursion — forbidden without a `box` indirection
+    }
+    let Some(def) = structs.get(id as usize) else { return false };
+    visiting.push(id);
+    let ok = def.fields.iter().all(|f| match f.ty {
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => true,
+        Ty::Struct(nid) => struct_scalar_only(nid, structs, visiting),
+        _ => false, // str / owned / slice etc. — not allowed inside a nested struct yet
+    });
+    visiting.pop();
+    ok
 }
 
 /// Whether a scalar is a valid sum-type variant payload — the same rule the non-generic enum pass
@@ -8445,11 +8519,17 @@ mod tests {
     }
 
     #[test]
-    fn struct_payload_does_not_leak_into_fields_or_box() {
-        // Allowing struct Option/Result payloads must NOT accidentally allow nested struct
-        // fields or struct boxes (both would panic in codegen).
+    fn nested_struct_fields_and_struct_box() {
+        // A scalar-only nested struct field is allowed (Slice 1)...
         let (_p, nested) = check("A { v: i32 }\nB { a: A }\nfn main() -> i32 { return 0 }\n");
-        assert!(nested.has_errors(), "a nested struct field must still be rejected");
+        assert!(!nested.has_errors(), "a scalar-only nested struct field is allowed");
+        // ...but an owned (str-bearing) nested struct field is still rejected (no struct Drop yet).
+        let (_s, owned) = check("A { s: str }\nB { a: A }\nfn main() -> i32 { return 0 }\n");
+        assert!(owned.has_errors(), "an owned (str-bearing) nested struct field must be rejected");
+        // ...and a self-referential struct field is rejected (infinite layout, no `box` indirection).
+        let (_c, cyclic) = check("N { next: N, v: i32 }\nfn main() -> i32 { return 0 }\n");
+        assert!(cyclic.has_errors(), "a recursive struct field must be rejected");
+        // A struct box payload is still rejected (would panic in codegen).
         let (_q, boxed) = check("P { x: i32 }\nfn main() -> i32 {\n  arena {\n    b := heap.new(P{x: 1})\n  }\n  return 0\n}\n");
         assert!(boxed.has_errors(), "a struct box payload must still be rejected");
         let (_r, boxann) = check("P { x: i32 }\nfn f(b: box<P>) -> i32 = 0\nfn main() -> i32 { return 0 }\n");
