@@ -209,9 +209,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::MakeDynArray { ptr, len } => {
             format!("array({}, {})", operand_str(ptr), operand_str(len))
         }
-        Rvalue::GroupSum { keys, vals, out_keys, out_vals } => {
+        Rvalue::GroupAgg { keys, vals, out_keys, out_vals, op } => {
             format!(
-                "group_sum(keys={}, vals={} -> {}, {})",
+                "group_{:?}(keys={}, vals={} -> {}, {})",
+                op,
                 operand_str(keys),
                 operand_str(vals),
                 operand_str(out_keys),

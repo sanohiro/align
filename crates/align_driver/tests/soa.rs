@@ -379,3 +379,43 @@ fn group_by_sum_aggregates_by_key() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n142\n");
 }
+
+#[test]
+fn group_by_min_max_count_type_check() {
+    let agg = |m: &str| {
+        format!(
+            "P {{ k: i64, v: i64 }}\nfn main() -> i32 {{ arena {{ s := [P{{k:1,v:2}}].to_soa()\n g := s.group_by(.k).{m}\n return g.1.sum() as i32 }} }}\n"
+        )
+    };
+    assert!(ok(&agg("min(.v)")));
+    assert!(ok(&agg("max(.v)")));
+    assert!(ok(&agg("count()")));
+    // `count` takes no value field; an unknown aggregate is rejected.
+    assert!(!ok(&agg("count(.v)")));
+    assert!(!ok(&agg("avg(.v)")));
+}
+
+#[test]
+fn group_by_min_max_count_aggregate_by_key() {
+    if !backend_available() {
+        return;
+    }
+    // Rows: (k=1,v=10),(1,30),(2,5). Groups → min{1:10,2:5}=15, max{1:30,2:5}=35, count{1:2,2:1}=3.
+    // Checked order-independently (sum of the per-group aggregate column).
+    let out = build_and_run(
+        "soa-group-mmc",
+        concat!(
+            "P { k: i64, v: i64 }\n",
+            "fn main() -> i32 {\n  arena {\n",
+            "    s := [P{k:1,v:10}, P{k:1,v:30}, P{k:2,v:5}].to_soa()\n",
+            "    mn := s.group_by(.k).min(.v)\n",
+            "    print(mn.1.sum())\n",   // 10 + 5 = 15
+            "    mx := s.group_by(.k).max(.v)\n",
+            "    print(mx.1.sum())\n",   // 30 + 5 = 35
+            "    c := s.group_by(.k).count()\n",
+            "    print(c.1.sum())\n",   // 2 + 1 = 3
+            "  }\n  return 0\n}\n",
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n35\n3\n");
+}

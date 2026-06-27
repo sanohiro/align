@@ -1063,32 +1063,39 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
 /// and unit-testable; allocating it in the caller's arena (to drop even that one `malloc` when
 /// `group_by` runs in a hot loop) is a recorded refinement once the language wiring threads an arena.
 ///
+/// Slot index for a key: Fibonacci multiply + an XOR-fold so the low bits used by `& mask` are
+/// well-distributed at any (power-of-two) table size.
+#[inline]
+fn group_slot(k: i64, mask: usize) -> usize {
+    let h = (k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (h ^ (h >> 29)) as usize & mask
+}
+
+/// Generic column-oriented group-aggregate over i64 keys. `per_row(i)` is the value folded for row
+/// `i` (`vals[i]` for sum/min/max; `1` for count); `combine(acc, v)` folds it into the per-group
+/// accumulator (the first row of a group seeds the accumulator with its value). Emits the distinct
+/// keys + their accumulators into `out_keys`/`out_vals`. Returns the group count, or -1 if it would
+/// exceed `cap`. Monomorphized per op so `per_row`/`combine` inline (no per-element branch).
+///
+/// Mechanism: an open-addressing (linear-probe) table that grows to track the live group count
+/// (doubling past a 0.75 load) — a primitive-key, no-boxing, cache-tight aggregate, the lever vs
+/// Rust's generic `HashMap`. Three dense parallel arrays (key / acc / used) probe-scan well (a naive
+/// interleaved-slot layout measured *worse*; `docs/open-questions.md`).
+///
 /// # Safety
-/// `keys`/`vals` must be valid for `len` `i64`s; `out_keys`/`out_vals` for `cap` `i64`s.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_group_sum_i64(
-    keys: *const i64,
-    vals: *const i64,
-    len: i64,
+/// `out_keys`/`out_vals` must each be valid for `cap` `i64` writes (they're written for the emitted
+/// group count, which is `≤ cap`).
+unsafe fn group_agg_i64(
+    keys: &[i64],
     out_keys: *mut i64,
     out_vals: *mut i64,
     cap: i64,
+    per_row: impl Fn(usize) -> i64,
+    combine: impl Fn(i64, i64) -> i64,
 ) -> i64 {
-    let n = if len <= 0 || keys.is_null() || vals.is_null() { 0 } else { len as usize };
+    let n = keys.len();
     if n == 0 {
         return 0;
-    }
-    let keys = unsafe { std::slice::from_raw_parts(keys, n) };
-    let vals = unsafe { std::slice::from_raw_parts(vals, n) };
-
-    // Power-of-two table that **grows to track the group count** (doubling past a 0.75 load), NOT a
-    // fixed `2·n` table — sizing to `n` allocates/zeros a huge table and thrashes cache when groups ≪
-    // rows (it lost badly to `ahash` in that regime). `slot = mix(k) & mask` (Fibonacci multiply +
-    // an XOR-fold so the low bits used by `& mask` are well-distributed at any table size).
-    #[inline]
-    fn slot_of(k: i64, mask: usize) -> usize {
-        let h = (k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        (h ^ (h >> 29)) as usize & mask
     }
     let mut tsize = 16usize;
     let mut mask = tsize - 1;
@@ -1097,17 +1104,15 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(
     let mut occ = vec![false; tsize];
     let mut count: usize = 0;
 
-    for i in 0..n {
-        let k = keys[i];
-        let mut slot = slot_of(k, mask);
+    for (i, &k) in keys.iter().enumerate() {
+        let v = per_row(i);
+        let mut slot = group_slot(k, mask);
         loop {
             if !occ[slot] {
                 occ[slot] = true;
                 tkey[slot] = k;
-                tacc[slot] = vals[i];
+                tacc[slot] = v;
                 count += 1;
-                // Grow + rehash once the load factor would exceed 0.75 (keeps probe chains short
-                // and the table sized to the live group count).
                 if count * 4 > tsize * 3 {
                     let ns = tsize * 2;
                     let nm = ns - 1;
@@ -1116,7 +1121,7 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(
                     let mut no = vec![false; ns];
                     for s in 0..tsize {
                         if occ[s] {
-                            let mut t = slot_of(tkey[s], nm);
+                            let mut t = group_slot(tkey[s], nm);
                             while no[t] {
                                 t = (t + 1) & nm;
                             }
@@ -1134,7 +1139,7 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(
                 break;
             }
             if tkey[slot] == k {
-                tacc[slot] = tacc[slot].wrapping_add(vals[i]);
+                tacc[slot] = combine(tacc[slot], v);
                 break;
             }
             slot = (slot + 1) & mask;
@@ -1155,6 +1160,57 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(
         }
     }
     count as i64
+}
+
+/// `keys`/`vals` as `&[i64]` of `len`, or empty slices when degenerate (null / non-positive). The
+/// sum/min/max wrappers need `keys` and `vals` the same length.
+unsafe fn group_io<'a>(keys: *const i64, vals: *const i64, len: i64) -> (&'a [i64], &'a [i64]) {
+    if len <= 0 || keys.is_null() || vals.is_null() {
+        (&[], &[])
+    } else {
+        let n = len as usize;
+        unsafe { (std::slice::from_raw_parts(keys, n), std::slice::from_raw_parts(vals, n)) }
+    }
+}
+
+/// `group_by(.key).sum(.value)` — per-group sum. Wraps + sums in row order.
+///
+/// # Safety
+/// `keys`/`vals` must be valid for `len` `i64`s; `out_keys`/`out_vals` for `cap` `i64`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_sum_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
+    let (keys, vals) = unsafe { group_io(keys, vals, len) };
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.wrapping_add(b)) }
+}
+
+/// `group_by(.key).min(.value)` — per-group minimum.
+///
+/// # Safety
+/// Same as [`align_rt_group_sum_i64`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_min_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
+    let (keys, vals) = unsafe { group_io(keys, vals, len) };
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.min(b)) }
+}
+
+/// `group_by(.key).max(.value)` — per-group maximum.
+///
+/// # Safety
+/// Same as [`align_rt_group_sum_i64`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
+    let (keys, vals) = unsafe { group_io(keys, vals, len) };
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.max(b)) }
+}
+
+/// `group_by(.key).count()` — per-group row count (no value column).
+///
+/// # Safety
+/// `keys` must be valid for `len` `i64`s; `out_keys`/`out_vals` for `cap` `i64`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_count_i64(keys: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
+    let keys: &[i64] = if len <= 0 || keys.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(keys, len as usize) } };
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
 /// A minimal JSON scanner over a byte slice (just what `json.decode` needs: objects with
@@ -1650,6 +1706,33 @@ mod tests {
         for k in 0..200i64 {
             assert_eq!(got2.get(&k), Some(&(2 * k)), "group {k} after rehash");
         }
+    }
+
+    #[test]
+    fn group_min_max_count_aggregate_by_key() {
+        // keys: 10,20,10,30,20,10 ; vals: 1,2,3,4,5,6
+        let keys = [10i64, 20, 10, 30, 20, 10];
+        let vals = [1i64, 2, 3, 4, 5, 6];
+        let collect = |f: unsafe extern "C" fn(*const i64, *const i64, i64, *mut i64, *mut i64, i64) -> i64| {
+            let (mut ok, mut ov) = (vec![0i64; keys.len()], vec![0i64; keys.len()]);
+            let n = unsafe { f(keys.as_ptr(), vals.as_ptr(), keys.len() as i64, ok.as_mut_ptr(), ov.as_mut_ptr(), keys.len() as i64) } as usize;
+            ok[..n].iter().copied().zip(ov[..n].iter().copied()).collect::<std::collections::HashMap<i64, i64>>()
+        };
+        // min: {10:min(1,3,6)=1, 20:min(2,5)=2, 30:4}
+        assert_eq!(collect(align_rt_group_min_i64), std::collections::HashMap::from([(10, 1), (20, 2), (30, 4)]));
+        // max: {10:max(1,3,6)=6, 20:max(2,5)=5, 30:4}
+        assert_eq!(collect(align_rt_group_max_i64), std::collections::HashMap::from([(10, 6), (20, 5), (30, 4)]));
+        // count: {10:3, 20:2, 30:1} — no value column.
+        let (mut ok, mut ov) = (vec![0i64; keys.len()], vec![0i64; keys.len()]);
+        let n = unsafe { align_rt_group_count_i64(keys.as_ptr(), keys.len() as i64, ok.as_mut_ptr(), ov.as_mut_ptr(), keys.len() as i64) } as usize;
+        let counts: std::collections::HashMap<i64, i64> = ok[..n].iter().copied().zip(ov[..n].iter().copied()).collect();
+        assert_eq!(counts, std::collections::HashMap::from([(10, 3), (20, 2), (30, 1)]));
+        // Negative values: min/max must track sign (not magnitude).
+        let nk = [1i64, 1, 1];
+        let nv = [-5i64, 3, -2];
+        let (mut ok2, mut ov2) = (vec![0i64; 3], vec![0i64; 3]);
+        let nn = unsafe { align_rt_group_min_i64(nk.as_ptr(), nv.as_ptr(), 3, ok2.as_mut_ptr(), ov2.as_mut_ptr(), 3) };
+        assert_eq!((nn, ov2[0]), (1, -5));
     }
 
     #[test]

@@ -238,12 +238,12 @@ pub enum Rvalue {
     SoaAlloc { handle: Operand, len: Operand, struct_id: u32 },
     /// Build an owned `array<T>` value `{ ptr, len }` from a buffer pointer and a length.
     MakeDynArray { ptr: Operand, len: Operand },
-    /// Column-oriented grouped sum (`group_by(.key).sum(.value)` first slice): aggregate the i64
-    /// `vals` column by the i64 `keys` column into the caller `out_keys`/`out_vals` buffers (each
-    /// sized to the column length), via the runtime `align_rt_group_sum_i64`. Yields the group count
-    /// (i64). `keys`/`vals` are `{ptr,len}` slices (soa columns); `out_keys`/`out_vals` are buffer
-    /// pointers (from [`Rvalue::HeapAllocBuf`]).
-    GroupSum { keys: Operand, vals: Operand, out_keys: Operand, out_vals: Operand },
+    /// Column-oriented grouped aggregate (`group_by(.key).<op>(...)`): fold the i64 `vals` column by
+    /// the i64 `keys` column into the caller `out_keys`/`out_vals` buffers (each sized to the column
+    /// length), via the runtime `align_rt_group_{sum,min,max,count}_i64` per `op`. Yields the group
+    /// count (i64). `keys`/`vals` are `{ptr,len}` slices (soa columns; `vals` is unused for `count`);
+    /// `out_keys`/`out_vals` are buffer pointers (from [`Rvalue::HeapAllocBuf`]).
+    GroupAgg { keys: Operand, vals: Operand, out_keys: Operand, out_vals: Operand, op: hir::GroupOp },
     /// `chunks(n)`: split the `{ptr,len}` slice `src` (element size `elem`) into length-`n`
     /// sub-slices, yielding an owned `array<slice<T>>` value `{ chunk_buf, count }` (via the
     /// runtime `align_rt_chunks`). The element slices borrow `src`.
@@ -1054,12 +1054,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             };
             lower_array_partition(b, source, stages, *elem, func, captures, tuple_id)
         }
-        hir::ExprKind::ArrayGroupSum { base, struct_id, key_field, value_field } => {
+        hir::ExprKind::ArrayGroupAgg { base, struct_id, key_field, value_field, op } => {
             let tuple_id = match e.ty {
                 Ty::Tuple(id) => id,
-                _ => unreachable!("group_by sum result is a tuple"),
+                _ => unreachable!("group_by aggregate result is a tuple"),
             };
-            lower_array_group_sum(b, *base, *struct_id, *key_field, *value_field, tuple_id)
+            lower_array_group_agg(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id)
         }
         hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
             // With no prior stages, a `{ptr,len}` (or fixed scalar-array) source, and no captures,
@@ -2084,19 +2084,28 @@ fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, res
     Operand::Value(r)
 }
 
-/// `s.group_by(.key).sum(.value)` — column-oriented grouped sum over a `soa<Struct>` local. Reads
-/// the key + value columns as `{ptr,len}` slices (`SoaColumn`), heap-allocates two owned output
-/// buffers sized to the column length, calls the runtime hash-aggregate, and builds the result
-/// tuple `(array<i64>, array<i64>)` (distinct keys, per-key sums). The output arrays are owned
-/// (heap, `Drop`-freed) so the tuple can escape; the runtime's internal table is its own concern.
-fn lower_array_group_sum(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, value_field: u32, tuple_id: u32) -> Operand {
+/// `s.group_by(.key).<op>(…)` — column-oriented grouped aggregate over a `soa<Struct>` local. Reads
+/// the key column (and the value column for sum/min/max — `count` has none) as `{ptr,len}` slices
+/// (`SoaColumn`), heap-allocates two owned output buffers sized to the column length, calls the
+/// runtime hash-aggregate for the op, and builds the result tuple `(array<i64>, array<i64>)`
+/// (distinct keys, per-key aggregate). The output arrays are owned (heap, `Drop`-freed) so the tuple
+/// can escape; the runtime's internal table is its own concern.
+fn lower_array_group_agg(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, value_field: Option<u32>, op: hir::GroupOp, tuple_id: u32) -> Operand {
     let i64s = scalar_of(i64_ty());
     let islice = Ty::Slice(i64s);
-    // The two columns (each a `{ptr,len}` slice<i64>).
+    // The key column (always) and the value column (sum/min/max). `count` has no value column, so it
+    // reuses the key column as the (codegen-ignored) `vals` operand — the runtime `count` entry point
+    // takes no values.
     let key_col = b.fresh_value(islice);
     b.push(Stmt::Let(key_col, Rvalue::SoaColumn { base, struct_id, field: key_field }));
-    let val_col = b.fresh_value(islice);
-    b.push(Stmt::Let(val_col, Rvalue::SoaColumn { base, struct_id, field: value_field }));
+    let val_col = match value_field {
+        Some(vf) => {
+            let v = b.fresh_value(islice);
+            b.push(Stmt::Let(v, Rvalue::SoaColumn { base, struct_id, field: vf }));
+            v
+        }
+        None => key_col,
+    };
     let len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(key_col))));
     // Output buffers (owned heap, sized at the column length = an upper bound on the group count).
@@ -2108,11 +2117,12 @@ fn lower_array_group_sum(b: &mut Builder, base: u32, struct_id: u32, key_field: 
     let count = b.fresh_value(i64_ty());
     b.push(Stmt::Let(
         count,
-        Rvalue::GroupSum {
+        Rvalue::GroupAgg {
             keys: Operand::Value(key_col),
             vals: Operand::Value(val_col),
             out_keys: Operand::Value(out_keys),
             out_vals: Operand::Value(out_vals),
+            op,
         },
     ));
     // Build the two owned result arrays and the tuple.

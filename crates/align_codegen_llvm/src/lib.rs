@@ -465,15 +465,21 @@ fn build_module<'c>(
             None,
         ),
     );
+    // group_by(.key).{sum,min,max}(.value): (keys, vals, len, out_keys, out_vals, cap) -> group count.
+    let group_vty = ctx.i64_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()], false);
+    for (key, sym) in [
+        ("group_sum_i64", "align_rt_group_sum_i64"),
+        ("group_min_i64", "align_rt_group_min_i64"),
+        ("group_max_i64", "align_rt_group_max_i64"),
+    ] {
+        funcs.insert(key.to_string(), module.add_function(sym, group_vty, None));
+    }
     funcs.insert(
-        // group_by(.key).sum(.value): (keys, vals, len, out_keys, out_vals, cap) -> group count.
-        "group_sum_i64".to_string(),
+        // group_by(.key).count(): (keys, len, out_keys, out_vals, cap) -> group count (no value col).
+        "group_count_i64".to_string(),
         module.add_function(
-            "align_rt_group_sum_i64",
-            ctx.i64_type().fn_type(
-                &[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()],
-                false,
-            ),
+            "align_rt_group_count_i64",
+            ctx.i64_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()], false),
             None,
         ),
     );
@@ -2165,28 +2171,43 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value()
                     .into()
             }
-            Rvalue::GroupSum { keys, vals, out_keys, out_vals } => {
+            Rvalue::GroupAgg { keys, vals, out_keys, out_vals, op } => {
                 // Extract the key/value column pointers + length from the `{ptr,len}` slices and call
-                // the runtime hash-aggregate; `cap` = the column length (an upper bound on groups).
+                // the runtime hash-aggregate for the op; `cap` = the column length (an upper bound on
+                // groups). `count` has no value column (the runtime entry point takes no values).
+                use align_sema::hir::GroupOp;
                 let kagg = self.operand(keys).into_struct_value();
                 let kptr = self.builder.build_extract_value(kagg, 0, "kptr").map_err(|e| self.err(e))?;
                 let klen = self.builder.build_extract_value(kagg, 1, "klen").map_err(|e| self.err(e))?;
-                let vptr = self
-                    .builder
-                    .build_extract_value(self.operand(vals).into_struct_value(), 0, "vptr")
-                    .map_err(|e| self.err(e))?;
                 let ok = self.operand(out_keys);
                 let ov = self.operand(out_vals);
-                self.builder
-                    .build_call(
-                        self.funcs["group_sum_i64"],
-                        &[kptr.into(), vptr.into(), klen.into(), ok.into(), ov.into(), klen.into()],
-                        "groupsum",
+                let call = if let GroupOp::Count = op {
+                    self.builder.build_call(
+                        self.funcs["group_count_i64"],
+                        &[kptr.into(), klen.into(), ok.into(), ov.into(), klen.into()],
+                        "groupagg",
                     )
-                    .map_err(|e| self.err(e))?
+                } else {
+                    let vptr = self
+                        .builder
+                        .build_extract_value(self.operand(vals).into_struct_value(), 0, "vptr")
+                        .map_err(|e| self.err(e))?;
+                    let f = match op {
+                        GroupOp::Sum => "group_sum_i64",
+                        GroupOp::Min => "group_min_i64",
+                        GroupOp::Max => "group_max_i64",
+                        GroupOp::Count => unreachable!(),
+                    };
+                    self.builder.build_call(
+                        self.funcs[f],
+                        &[kptr.into(), vptr.into(), klen.into(), ok.into(), ov.into(), klen.into()],
+                        "groupagg",
+                    )
+                };
+                call.map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
-                    .expect("group_sum returns the group count (i64)")
+                    .expect("group aggregate returns the group count (i64)")
             }
             Rvalue::Chunks { src, n, elem } => {
                 // Split the `{ptr,len}` `src` into length-`n` slices via the runtime; the result is
