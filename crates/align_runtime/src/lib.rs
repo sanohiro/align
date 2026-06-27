@@ -404,10 +404,12 @@ pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
     // value's magnitude computed via `n % 10` / `unsigned_abs` (works for `i64::MIN` — never negates).
     let mut tmp = [0u8; 20];
     let mut i = tmp.len();
-    let mut n = v;
+    // Work on the unsigned magnitude (`unsigned_abs` handles `i64::MIN`): the loop then uses unsigned
+    // div/mod, which LLVM lowers to a multiply+shift — no signed-division sign corrections per digit.
+    let mut n = v.unsigned_abs();
     loop {
         i -= 1;
-        tmp[i] = b'0' + (n % 10).unsigned_abs() as u8;
+        tmp[i] = b'0' + (n % 10) as u8;
         n /= 10;
         if n == 0 {
             break;

@@ -41,10 +41,10 @@ fn rust_opt(s: &[i64]) -> i64 {
 /// Manual itoa into `buf`, returning the formatted slice (no allocation).
 fn itoa(v: i64, buf: &mut [u8; 20]) -> &str {
     let mut i = buf.len();
-    let mut n = v;
+    let mut n = v.unsigned_abs();
     loop {
         i -= 1;
-        buf[i] = b'0' + (n % 10).unsigned_abs() as u8;
+        buf[i] = b'0' + (n % 10) as u8;
         n /= 10;
         if n == 0 {
             break;
