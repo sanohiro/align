@@ -11,7 +11,7 @@
 //! features.
 
 use align_ast::{BinOp, UnOp};
-use align_sema::{hir, payload_is_move, FloatTy, IntTy, Layout, Ty};
+use align_sema::{hir, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
 
 pub mod print;
 
@@ -537,6 +537,9 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
                         || matches!(ty, Ty::Tuple(tid) if b.tuples[tid as usize].elems.iter().any(|s| s.is_move()))
+                        // A Move struct (owns a `string`/owned field) moved away must be nulled too,
+                        // so its exit `Drop` frees null, not the buffers the new owner took.
+                        || matches!(ty, Ty::Struct(sid) if struct_is_move(sid, &b.structs))
                 }
                 None => false,
             };

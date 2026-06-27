@@ -328,11 +328,56 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 
 /// Whether `ty` is a Move (owned) type — used to reject capturing an owned value into a lambda
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
-fn ty_capture_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
+fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
+        || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
+}
+
+/// Whether struct `id` (transitively) owns a heap buffer — a `string`/owned field, or a nested
+/// struct that does — which makes it a **Move** type with a recursive `Drop` (Slice 3). The struct
+/// graph is *meant* to be acyclic (pass 0b-2 / `struct_acyclic` reports any cycle as an error), but
+/// the compiler keeps running later passes on the erroneous program, which then call this on a
+/// cyclic struct — so the walk is **cycle-safe** (a `visiting` set, like `struct_acyclic`) to report
+/// the error gracefully instead of overflowing the stack.
+pub fn struct_is_move(id: u32, structs: &[StructDef]) -> bool {
+    struct_is_move_rec(id, structs, &mut Vec::new())
+}
+
+fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
+    if visiting.contains(&id) {
+        return false; // a cycle (already reported by `struct_acyclic`) — not a Move type here
+    }
+    visiting.push(id);
+    let res = structs.get(id as usize).is_some_and(|def| def.fields.iter().any(|f| ty_owns_buffer_rec(f.ty, structs, visiting)));
+    visiting.pop();
+    res
+}
+
+/// Whether a value of `ty` owns a heap buffer that a `Drop` must free — used to decide a struct
+/// field makes its enclosing struct a Move type. A free-standing owned collection/string/builder, an
+/// `Option`/`Result` with a Move payload, or a nested Move struct. (Tuples can't be struct fields, so
+/// they are not considered here; `str` is a borrow, not owned.)
+fn ty_owns_buffer(ty: Ty, structs: &[StructDef]) -> bool {
+    ty_owns_buffer_rec(ty, structs, &mut Vec::new())
+}
+
+fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
+        || payload_is_move(ty)
+        || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
+}
+
+/// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs
+/// and Move tuples; needs the struct/tuple tables to inspect composite members. The free-function
+/// form (vs `MoveCheck::is_move_ty`) is shared by the field-access checker.
+fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
+        || payload_is_move(ty)
+        || ty_tuple_is_move(ty, tuples)
+        || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
 }
 
 /// The pipeline stages of a stage-bearing pipeline node (else `None`). Lets the flow analyses
@@ -381,10 +426,14 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 /// Whether a local of `ty` owns a heap buffer that must be freed by a per-binding `Drop` (when its
 /// region is `Static`) — the predicate the drop set is built from. A free-standing owned
 /// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
-fn is_owned_droppable(ty: Ty) -> bool {
+fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder) || payload_is_move(ty)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
+        || payload_is_move(ty)
+        // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
+        // each owned field (Slice 3).
+        || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
 }
 
 impl Ty {
@@ -1142,18 +1191,18 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     }
 
     // Pass 0b-2: now that every struct's fields are populated, validate **nested** struct fields. A
-    // struct-typed field must reference a scalar-only, acyclic struct (Slice 1: no `str`/owned data
-    // or recursion inside a nested struct, so the outer struct stays Copy / needs no Drop). Done in a
-    // separate pass because the referenced struct may be declared after the referencing one.
+    // struct-typed field must reference an **acyclic** struct — self/mutual recursion without a `box`
+    // indirection is infinite layout (Slice 3 lifts the Slice-1 scalar-only restriction: a nested
+    // struct may now own a `string`, making the outer struct a Move type with a recursive `Drop`).
+    // Done in a separate pass because the referenced struct may be declared after the referencing one.
     for (i, (_m, _e, s)) in struct_decls.iter().enumerate() {
         for (fi, f) in s.fields.iter().enumerate() {
             let Ty::Struct(nid) = structs[i].fields[fi].ty else { continue };
-            if !struct_scalar_only(nid, &structs, &mut Vec::new()) {
+            // Seed the visiting path with the containing struct `i`, so a cycle back to it (even at
+            // depth 1, `Node { next: Node }`) is detected.
+            if !struct_acyclic(nid, &structs, &mut vec![i as u32]) {
                 diags.error(
-                    format!(
-                        "nested struct field '{}' must be a plain scalar-only struct (no `str`/owned fields or recursion) for now",
-                        f.name.name
-                    ),
+                    format!("struct field '{}' is recursive — a struct cannot contain itself without a `box` indirection", f.name.name),
                     f.span,
                 );
             }
@@ -1179,6 +1228,10 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                     Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
                         payload.push(ty_to_scalar(ty).expect("primitive scalar"));
                     }
+                    Ty::Struct(id) if struct_is_move(id, &structs) => diags.error(
+                        format!("a sum-type payload may not be the Move struct '{}' yet (its owned fields would not be dropped)", structs[id as usize].name),
+                        t.span(),
+                    ),
                     Ty::Struct(id) if structs[id as usize].fields.iter().all(|f| f.ty != Ty::Str) => {
                         payload.push(Scalar::Struct(id));
                     }
@@ -1484,10 +1537,11 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
     // holds a `str` element) while iterating `&mut fns`.
-    let Program { fns, tuples, .. } = &mut program;
+    let Program { fns, tuples, structs, .. } = &mut program;
     let tuples: &[hir::TupleDef] = tuples;
+    let structs: &[StructDef] = structs;
     for f in fns.iter_mut() {
-        MoveCheck { f, diags, tuples }.check();
+        MoveCheck { f, diags, tuples, structs }.check();
         let region = {
             let mut ec = EscapeCheck {
                 f,
@@ -1508,7 +1562,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         let drops: Vec<LocalId> = f
             .locals
             .iter()
-            .filter(|l| is_owned_droppable(l.ty) || ty_tuple_is_move(l.ty, tuples))
+            .filter(|l| is_owned_droppable(l.ty, structs) || ty_tuple_is_move(l.ty, tuples))
             .map(|l| l.id)
             .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
             .collect();
@@ -2354,6 +2408,9 @@ struct MoveCheck<'a> {
     /// Tuple defs — so a Move tuple (one with an owned element) is recognised as a Move type and
     /// its consumption (pass / destructure / return) is tracked for use-after-move.
     tuples: &'a [hir::TupleDef],
+    /// Struct defs — so a Move struct (one that owns a `string`/owned field, transitively) is
+    /// recognised as a Move type for use-after-move tracking (Slice 3).
+    structs: &'a [StructDef],
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -2392,12 +2449,10 @@ impl<'a> MoveCheck<'a> {
         self.block(&self.f.body, &mut moved, ret_is_move, true);
     }
 
-    /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple.
+    /// Whether `ty` is a Move type (owns a heap buffer consumed on move) — including a Move tuple
+    /// or Move struct.
     fn is_move_ty(&self, ty: Ty) -> bool {
-        // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-        matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
-            || payload_is_move(ty)
-            || ty_tuple_is_move(ty, self.tuples)
+        ty_is_move(ty, self.structs, self.tuples)
     }
 
     fn is_move(&self, id: LocalId) -> bool {
@@ -2608,7 +2663,7 @@ impl<'a> MoveCheck<'a> {
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
             // consumes the task (a second `get()` would double-free the buffer).
             ExprKind::TaskGet(inner) => {
-                let consuming = is_owned_droppable(e.ty);
+                let consuming = is_owned_droppable(e.ty, self.structs);
                 self.expr(inner, moved, consuming, consuming);
             }
             ExprKind::Wait => {}
@@ -3143,7 +3198,7 @@ impl<'a, 't> Checker<'a, 't> {
                                 // bind it to a fresh hidden local so it joins the normal drop path
                                 // (freed once at scope exit, or bulk-freed if arena-regioned). A
                                 // Copy / `str` element needs no cleanup, so `_` binds nothing.
-                                None if is_owned_droppable(ety) => {
+                                None if is_owned_droppable(ety, self.structs) => {
                                     locals.push(Some(self.declare(&format!("_drop{i}"), ety, false)));
                                 }
                                 None => locals.push(None),
@@ -3749,6 +3804,20 @@ impl<'a, 't> Checker<'a, 't> {
         match self.field_of(recv_ty, &field.name, span) {
             Some((index, ty)) => {
                 path.push(index);
+                // Reading an **owned** (Move) value out of a struct field — a `string` field, or a
+                // whole nested Move struct — is deferred (Slice 3): it is a partial move that would
+                // need the field nulled so the struct's `Drop` doesn't double-free it. Scalar/`str`
+                // (Copy) field reads are unaffected; clone the field or bind the whole struct instead.
+                if ty_is_move(ty, self.structs, self.tuples) {
+                    self.diags.error(
+                        format!(
+                            "reading the owned field '{}' out of a struct is not supported yet — clone it, or move the whole struct",
+                            field.name
+                        ),
+                        span,
+                    );
+                    return err;
+                }
                 self.constrain(ty, expected, span);
                 Expr { kind: ExprKind::Field { root, path }, ty, span }
             }
@@ -5002,6 +5071,16 @@ impl<'a, 't> Checker<'a, 't> {
                 checked.push(lit);
             }
             return match sid {
+                // An array of a **Move struct** (one that owns a `string`/owned field) needs
+                // per-element drop and ownership-aware indexing — deferred to the arrays×nesting
+                // slice. Reject cleanly so the owned elements aren't silently leaked / double-freed.
+                Some(id) if struct_is_move(id, self.structs) => {
+                    self.diags.error(
+                        format!("an array of the Move struct '{}' is not supported yet (owned-struct elements need per-element drop — a later slice)", self.structs[id as usize].name),
+                        span,
+                    );
+                    Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
+                }
                 Some(id) => Expr {
                     kind: ExprKind::ArrayLit { elems: checked, elem: Ty::Struct(id) },
                     ty: Ty::StructArray(id, n),
@@ -5158,7 +5237,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut capture_ops = Vec::new();
         for (cname, pid, enc_id) in &captured {
             let ty = locals[*pid as usize].ty;
-            if ty_capture_is_move(ty, self.tuples) {
+            if ty_capture_is_move(ty, self.structs, self.tuples) {
                 self.diags.error(
                     format!("a lambda cannot capture the owned value '{cname}' yet (capture supports copy values like int/float/bool/char)"),
                     span,
@@ -6614,10 +6693,10 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             // Indexing an `array<slice<T>>` (a `chunks` result) yields one chunk `slice<T>`.
             Ty::DynSliceArray(p) => Ty::Slice(prim_to_scalar(p)),
-            // Indexing a struct array yields the whole struct by value (a copy). A struct is Copy
-            // (primitive / `str` fields), so the copy transfers no ownership; if it holds `str`
-            // views, the value is region-tied to the array (handled by `region_of`, which inherits
-            // the receiver's region for an `Index`).
+            // Indexing a struct array yields the whole struct by value (a copy). A plain-data struct
+            // is Copy (primitive / `str` fields), so the copy transfers no ownership; if it holds
+            // `str` views, the value is region-tied to the array (handled by `region_of`, which
+            // inherits the receiver's region for an `Index`). A Move struct is rejected just below.
             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Ty::Struct(id),
             Ty::Error => return err,
             other => {
@@ -6629,7 +6708,10 @@ impl<'a, 't> Checker<'a, 't> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(elem) {
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder)
+            || payload_is_move(elem)
+            || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs))
+        {
             self.diags.error(
                 format!("indexing an array of the Move type {} is not supported yet (it would copy the element without transferring ownership)", ty_name(elem)),
                 span,
@@ -7831,6 +7913,24 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     }
 }
 
+/// An `Option`/`Result` payload may not be a **Move struct** (one that owns a `string`/owned field):
+/// the aggregate's drop is scalar-shaped (`payload_is_move` / `move_payload_fields` free a flat
+/// `{ptr,len}`) and does not recurse into a struct's owned fields, so an owned-struct payload would
+/// leak / double-free. Maps such a payload to `None` (with an error); passes anything else through
+/// unchanged (plain-data and `str`-bearing struct payloads keep their pre-Slice-3 behavior).
+fn reject_move_struct_payload(s: Option<Scalar>, structs: &[StructDef], what: &str, span: Span, diags: &mut Diagnostics) -> Option<Scalar> {
+    match s {
+        Some(Scalar::Struct(id)) if struct_is_move(id, structs) => {
+            diags.error(
+                format!("{what} cannot be the Move struct '{}' yet (its owned fields would not be dropped)", structs[id as usize].name),
+                span,
+            );
+            None
+        }
+        other => other,
+    }
+}
+
 /// Intern a tuple type (dedup by element list) into `tuples`, returning its id. Tuples are
 /// few, so a linear scan is fine.
 /// Match `X.group_by(.key)`, returning the source expr `X` and the key field ident. Used to detect
@@ -8035,7 +8135,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match scalar_arg(inner, "Option payload", true, span, diags) {
+            match reject_move_struct_payload(scalar_arg(inner, "Option payload", true, span, diags), &cx.structs, "Option payload", span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,
             }
@@ -8117,8 +8217,8 @@ fn resolve_type(
                 }
             };
             match (
-                scalar_arg(ok, "Result ok payload", true, span, diags),
-                scalar_arg(err, "Result err payload", true, span, diags),
+                reject_move_struct_payload(scalar_arg(ok, "Result ok payload", true, span, diags), &cx.structs, "Result ok payload", span, diags),
+                reject_move_struct_payload(scalar_arg(err, "Result err payload", true, span, diags), &cx.structs, "Result err payload", span, diags),
             ) {
                 (Some(o), Some(e)) => Ty::Result(o, e),
                 _ => Ty::Error,
@@ -8175,28 +8275,29 @@ fn resolve_user_type(
     }
 }
 
-/// Whether a resolved type is a valid struct field (Copy: a primitive scalar or a `str` view).
+/// Whether a resolved type is a valid struct field: a primitive scalar, a `str` borrow, an owned
+/// `string`, or a nested struct.
 fn is_field_ok(ty: Ty) -> bool {
-    // A struct field is a primitive scalar, `str`, or a **nested struct** (validated separately to be
-    // scalar-only + acyclic — see `struct_scalar_only` / the nested-field pass; Slice 1 forbids owned
-    // `str`/Move data inside a nested struct so the outer struct stays Copy / Drop-free).
-    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Struct(_) | Ty::Error)
+    // A struct field is a primitive scalar, `str` (a borrow), an owned `string`, or a **nested
+    // struct** (validated separately to be acyclic — see `struct_acyclic` / the nested-field pass).
+    // An owned (`string` or Move-struct) field makes the enclosing struct a Move type with a
+    // recursive `Drop` (Slice 3). Owned *collections* (`array<T>` etc.) as fields are a later slice.
+    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Error)
 }
 
-/// Whether struct `id` is plain scalar-only data (every field is int/float/bool/char or another
-/// scalar-only struct) and acyclic — the rule a **nested** struct field must satisfy (Slice 1: no
-/// `str`/owned inside, no recursion). `visiting` detects cycles. Out-of-range ids (a resolution
-/// error already reported) are treated as not-ok.
-fn struct_scalar_only(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
+/// Whether struct `id`'s field graph is **acyclic** — no struct contains itself, directly or
+/// transitively, without a `box` indirection (which would be an infinite layout). `visiting` is the
+/// current DFS path (seeded with the original containing struct). An out-of-range id is a resolution
+/// error already reported elsewhere — treated as acyclic so it doesn't emit a spurious cycle error.
+fn struct_acyclic(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
     if visiting.contains(&id) {
         return false; // recursion — forbidden without a `box` indirection
     }
-    let Some(def) = structs.get(id as usize) else { return false };
+    let Some(def) = structs.get(id as usize) else { return true };
     visiting.push(id);
     let ok = def.fields.iter().all(|f| match f.ty {
-        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => true,
-        Ty::Struct(nid) => struct_scalar_only(nid, structs, visiting),
-        _ => false, // str / owned / slice etc. — not allowed inside a nested struct yet
+        Ty::Struct(nid) => struct_acyclic(nid, structs, visiting),
+        _ => true,
     });
     visiting.pop();
     ok
@@ -8208,7 +8309,10 @@ fn struct_scalar_only(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 fn enum_payload_ok(s: Scalar, structs: &[StructDef]) -> bool {
     match s {
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char => true,
-        Scalar::Struct(id) => structs.get(id as usize).is_some_and(|sd| sd.fields.iter().all(|f| f.ty != Ty::Str)),
+        // A plain-data struct with no `str` field. A Move struct (owns a `string`/owned field) is
+        // rejected — an enum/Option payload is neither dropped recursively nor move-tracked through a
+        // struct, so an owned field would leak / double-free (Slice 3).
+        Scalar::Struct(id) => structs.get(id as usize).is_some_and(|sd| !struct_is_move(id, structs) && sd.fields.iter().all(|f| f.ty != Ty::Str)),
         _ => false,
     }
 }
@@ -8523,9 +8627,13 @@ mod tests {
         // A scalar-only nested struct field is allowed (Slice 1)...
         let (_p, nested) = check("A { v: i32 }\nB { a: A }\nfn main() -> i32 { return 0 }\n");
         assert!(!nested.has_errors(), "a scalar-only nested struct field is allowed");
-        // ...but an owned (str-bearing) nested struct field is still rejected (no struct Drop yet).
-        let (_s, owned) = check("A { s: str }\nB { a: A }\nfn main() -> i32 { return 0 }\n");
-        assert!(owned.has_errors(), "an owned (str-bearing) nested struct field must be rejected");
+        // ...an owned (`string`-bearing) nested struct field is now allowed (Slice 3): the outer
+        // struct becomes a Move type with a recursive `Drop`.
+        let (_s, owned) = check("A { s: string }\nB { a: A }\nfn main() -> i32 { return 0 }\n");
+        assert!(!owned.has_errors(), "an owned (string-bearing) nested struct field is allowed (Slice 3)");
+        // ...as is a nested `str` *borrow* field (Copy, region-tracked through the nesting).
+        let (_t, borrow) = check("A { s: str }\nB { a: A }\nfn main() -> i32 { return 0 }\n");
+        assert!(!borrow.has_errors(), "a nested `str` borrow field is allowed");
         // ...and a self-referential struct field is rejected (infinite layout, no `box` indirection).
         let (_c, cyclic) = check("N { next: N, v: i32 }\nfn main() -> i32 { return 0 }\n");
         assert!(cyclic.has_errors(), "a recursive struct field must be rejected");
