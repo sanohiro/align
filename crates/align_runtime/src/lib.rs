@@ -983,11 +983,17 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(
     let keys = unsafe { std::slice::from_raw_parts(keys, n) };
     let vals = unsafe { std::slice::from_raw_parts(vals, n) };
 
-    // Power-of-two table, load factor ≤ 0.5; `shift` extracts the well-mixed high bits of the
-    // multiplicative (Fibonacci) hash for the slot.
-    let tsize = (2 * n).next_power_of_two().max(16);
-    let mask = tsize - 1;
-    let shift = 64 - tsize.trailing_zeros();
+    // Power-of-two table that **grows to track the group count** (doubling past a 0.75 load), NOT a
+    // fixed `2·n` table — sizing to `n` allocates/zeros a huge table and thrashes cache when groups ≪
+    // rows (it lost badly to `ahash` in that regime). `slot = mix(k) & mask` (Fibonacci multiply +
+    // an XOR-fold so the low bits used by `& mask` are well-distributed at any table size).
+    #[inline]
+    fn slot_of(k: i64, mask: usize) -> usize {
+        let h = (k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (h ^ (h >> 29)) as usize & mask
+    }
+    let mut tsize = 16usize;
+    let mut mask = tsize - 1;
     let mut tkey = vec![0i64; tsize];
     let mut tacc = vec![0i64; tsize];
     let mut occ = vec![false; tsize];
@@ -995,13 +1001,38 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(
 
     for i in 0..n {
         let k = keys[i];
-        let mut slot = ((k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize & mask;
+        let mut slot = slot_of(k, mask);
         loop {
             if !occ[slot] {
                 occ[slot] = true;
                 tkey[slot] = k;
                 tacc[slot] = vals[i];
                 count += 1;
+                // Grow + rehash once the load factor would exceed 0.75 (keeps probe chains short
+                // and the table sized to the live group count).
+                if count * 4 > tsize * 3 {
+                    let ns = tsize * 2;
+                    let nm = ns - 1;
+                    let mut nk = vec![0i64; ns];
+                    let mut na = vec![0i64; ns];
+                    let mut no = vec![false; ns];
+                    for s in 0..tsize {
+                        if occ[s] {
+                            let mut t = slot_of(tkey[s], nm);
+                            while no[t] {
+                                t = (t + 1) & nm;
+                            }
+                            no[t] = true;
+                            nk[t] = tkey[s];
+                            na[t] = tacc[s];
+                        }
+                    }
+                    tkey = nk;
+                    tacc = na;
+                    occ = no;
+                    tsize = ns;
+                    mask = nm;
+                }
                 break;
             }
             if tkey[slot] == k {
@@ -1503,6 +1534,24 @@ mod tests {
         let (mut ok1, mut ov1) = (vec![0i64; 1000], vec![0i64; 1000]);
         let n1 = unsafe { align_rt_group_sum_i64(k1.as_ptr(), v1.as_ptr(), 1000, ok1.as_mut_ptr(), ov1.as_mut_ptr(), 1000) };
         assert_eq!((n1, ok1[0], ov1[0]), (1, 7, (0..1000).sum()));
+
+        // Many distinct keys force several table doublings + rehashes — check every group survives.
+        // 200 keys, each appearing twice (k and again), so group k sums to 2*k.
+        let mut k2 = Vec::new();
+        let mut v2 = Vec::new();
+        for k in 0..200i64 {
+            k2.push(k);
+            v2.push(k);
+            k2.push(k);
+            v2.push(k);
+        }
+        let (mut ok2, mut ov2) = (vec![0i64; k2.len()], vec![0i64; k2.len()]);
+        let n2 = unsafe { align_rt_group_sum_i64(k2.as_ptr(), v2.as_ptr(), k2.len() as i64, ok2.as_mut_ptr(), ov2.as_mut_ptr(), k2.len() as i64) } as usize;
+        assert_eq!(n2, 200, "200 distinct keys after growth");
+        let got2: std::collections::HashMap<i64, i64> = ok2[..n2].iter().copied().zip(ov2[..n2].iter().copied()).collect();
+        for k in 0..200i64 {
+            assert_eq!(got2.get(&k), Some(&(2 * k)), "group {k} after rehash");
+        }
     }
 
     #[test]

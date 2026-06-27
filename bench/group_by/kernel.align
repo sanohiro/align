@@ -1,0 +1,9 @@
+// Benchmark kernel: column-oriented grouped sum over a soa<KV>. `group_by(.k).sum(.v)` aggregates
+// the value column by the key column into (keys, sums); we return the group count, forcing the full
+// aggregate. The harness compares this to idiomatic Rust HashMap<i64,i64> (std SipHash + fast ahash).
+KV { k: i64, v: i64 }
+
+pub fn group(s: soa<KV>) -> i64 {
+  g := s.group_by(.k).sum(.v)
+  return g.0.len()
+}

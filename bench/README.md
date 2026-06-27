@@ -46,3 +46,8 @@ bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
   (`str::from_utf8(..).parse` → a single-pass digit accumulation) moved it ≈0.61× → ≈0.82–0.85×
   (AoS ≈parity at 1M). Remaining gap → more scalar tuning + a SIMD/structural parser. See
   `bench/json_soa/README.md` + `docs/open-questions.md`.
+- **Grouped aggregation (`bench/group_by/`): Align beats the *default* `std::HashMap` everywhere
+  (1.2–3.6×) and beats `ahash` for low-cardinality grouping (1.31×).** `s.group_by(.k).sum(.v)` is a
+  primitive-key columnar hash-aggregate vs Rust's generic map. It loses to `ahash` at high cardinality
+  (0.52–0.72×) — closing that needs a SwissTable layout. The benchmark caught a mechanism bug (a fixed
+  `2·n` table thrashed cache, 0.11× at 10k groups); growing the table to the live group count fixed it.
