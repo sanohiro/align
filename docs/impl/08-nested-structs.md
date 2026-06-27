@@ -147,9 +147,22 @@ slices, but it reuses the Slice-3 Drop machinery). `crates/align_driver/tests/re
 `StoreElemField` / `IndexFieldPtr` / soa offset math to field paths. Risk: medium–high (nested soa
 column layout is a design choice).
 
-### Slice 5 — cross-module field types (`f: other.T`)
-The module B3 leftover, unblocked once nesting exists. Thread module qualification through field-type
-resolution. Risk: low (plumbing only).
+### Slice 5 — cross-module field types (`f: other.T`) — DONE
+The module B3 leftover. A struct field, enum payload, or generic-template member may name a `pub`
+type exported by an imported module (`field: geom.Point`); reaches only `pub` types of `import`ed
+modules — the same visibility rule as functions. `crates/align_driver/tests/cross_module_types.rs`.
+
+- **sema**: the resolver already handled `mod.Type` in function signatures / `let`s; the gap was that
+  the type-declaration passes (0b struct fields, 0c enum payloads, generic templates) resolved with
+  `no_imports` in scope (a deliberate Slice-1 stub). Now a per-module `imports_by_module` map (built
+  before pass 0b, resolution-only — the authoritative import validation stays in the module-table
+  pass) is threaded into those passes' `TyCx`, so a qualified field/payload type resolves against the
+  declaring module's imports. An imported Move struct as a field makes the outer a Move type as usual
+  (its recursive Drop crosses the boundary).
+- **no MIR/codegen change**: types are interned to a global id in pass 0a, so a cross-module field is
+  byte-identical to a same-module one downstream.
+- **risk**: low (plumbing) — confirmed: the full suite is unchanged and the only new surface is the
+  resolution context.
 
 ## Order
 
