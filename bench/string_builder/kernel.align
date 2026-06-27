@@ -1,0 +1,13 @@
+// Benchmark kernel: build a string by appending a literal + an integer + a literal per element,
+// via the `builder` reduce pattern (the one the Gap A error points users to). Exercises the
+// runtime builder write path (esp. the hand-rolled integer itoa).
+pub fn build(s: slice<i64>) -> i64 {
+  b := s.reduce(builder(), fn b, x {
+    b.write("item-")
+    b.write_int(x)
+    b.write("-status ")
+    b
+  })
+  res := b.to_string()
+  return res.len()
+}
