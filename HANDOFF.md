@@ -52,8 +52,11 @@ Continue `docs/impl/08-nested-structs.md`:
 - **Slice 4** — arrays/soa × nesting (`arr[i].a.x`, nested soa column) **and arrays of Move structs**
   (`[User{…}]` — needs per-element drop; Slice 3 rejects it for now). Risk: medium–high.
 - **Slice 5** — cross-module field types (`f: other.T`, the module B3 leftover, now unblocked).
-- Smaller follow-ups unblocked by Slice 3: owned-field read/borrow out of a struct (`u.name.len()`),
-  owned `array<T>` struct fields.
+- Smaller follow-ups unblocked by Slice 3: owned `array<T>` struct fields; the partial *move* of an
+  owned field out (`n := u.name`).
+- **DONE (this branch): borrowing an owned field out** — `u.name.len()` / `str` arg / `s: str :=
+  u.name` now read a `string` field as a zero-copy `str` view (non-consuming, `Frame`-regioned so it
+  can't escape the struct). Moving the field out stays deferred. `tests/owned_structs.rs`.
 - **DONE (this branch): reassign-drops-old** — `mut s := …; s = …` no longer leaks the old buffer
   (all owned types). Sema's `MoveCheck` sets `Stmt::Assign::drop_old` (a `Cell<bool>`) iff the RHS
   doesn't move the old value out; MIR drops the slot before the store. No double-free (`s = f(s)`

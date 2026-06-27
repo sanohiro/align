@@ -2558,7 +2558,23 @@ impl<'a> MoveCheck<'a> {
                     moved.insert(MovedKey::Whole(*id));
                 }
             }
-            ExprKind::Field { root: base, .. } | ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupAgg { base, .. } | ExprKind::IndexField { base, .. } => {
+            ExprKind::Field { root: base, .. } => {
+                if whole_moved(moved, *base) {
+                    let name = &self.f.locals[*base as usize].name;
+                    self.diags.error(format!("use of moved value '{name}'"), e.span);
+                } else if consuming && self.is_move_ty(e.ty) {
+                    // Moving an owned field *out* of a struct (`n := u.name`, `f(u.name)` by value,
+                    // `return u.name`) is a partial move: it would need the field nulled so the
+                    // struct's `Drop` doesn't double-free that buffer — deferred. A *borrow* of the
+                    // field (`u.name.len()`, a `str` argument) reaches here non-consuming (the
+                    // borrow/`Len` node wraps the `Field`), so it is allowed.
+                    self.diags.error(
+                        "moving an owned field out of a struct is not supported yet — clone it, or move the whole struct".to_string(),
+                        e.span,
+                    );
+                }
+            }
+            ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupAgg { base, .. } | ExprKind::IndexField { base, .. } => {
                 if whole_moved(moved, *base) {
                     let name = &self.f.locals[*base as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
@@ -3810,20 +3826,13 @@ impl<'a, 't> Checker<'a, 't> {
         match self.field_of(recv_ty, &field.name, span) {
             Some((index, ty)) => {
                 path.push(index);
-                // Reading an **owned** (Move) value out of a struct field — a `string` field, or a
-                // whole nested Move struct — is deferred (Slice 3): it is a partial move that would
-                // need the field nulled so the struct's `Drop` doesn't double-free it. Scalar/`str`
-                // (Copy) field reads are unaffected; clone the field or bind the whole struct instead.
-                if ty_is_move(ty, self.structs, self.tuples) {
-                    self.diags.error(
-                        format!(
-                            "reading the owned field '{}' out of a struct is not supported yet — clone it, or move the whole struct",
-                            field.name
-                        ),
-                        span,
-                    );
-                    return err;
-                }
+                // An **owned** (Move) leaf field — a `string`, or a whole nested Move struct — may be
+                // *borrowed* (`u.name.len()`, a `str` argument, `io.stdout.write(u.name)`): the
+                // `string` → `str` coercion / `Len` wrap the access non-consuming, and the borrow is
+                // `Frame`-regioned (tied to the struct, can't escape). *Moving* it out (`n := u.name`,
+                // `f(u.name)` by value, `return u.name`) is a partial move — still deferred, rejected
+                // by `MoveCheck` at the consuming site (it would need the field nulled so the
+                // struct's `Drop` doesn't double-free it).
                 self.constrain(ty, expected, span);
                 Expr { kind: ExprKind::Field { root, path }, ty, span }
             }

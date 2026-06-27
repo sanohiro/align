@@ -158,3 +158,97 @@ fn partial_owned_field_move_out_rejected() {
         )
     ));
 }
+
+// --- Owned-field *borrow* out of a struct (read, non-consuming) ---
+// Slice 3 made owned struct fields constructible/writable but their contents were unreadable. A
+// `string` field can now be borrowed as a zero-copy `str` view (`u.name.len()`, a `str` argument, a
+// `str` binding): non-consuming (the struct keeps owning the buffer, dropped once) and `Frame`-
+// regioned (the view can't escape the struct's frame). *Moving* the field out stays deferred (above).
+
+#[test]
+fn owned_field_borrowed_via_len() {
+    if !backend_available() {
+        return;
+    }
+    // `u.name.len()` borrows the `string` field as a `str` and reads its length; `u` is still dropped
+    // once at exit (the borrowed buffer is freed by the struct's Drop, not separately). len = 5.
+    let src = concat!(
+        "User { name: string, age: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  u := User{name: \"hello\".clone(), age: 9}\n",
+        "  return u.name.len() as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("ownfield-len", src).status.code(), Some(5));
+}
+
+#[test]
+fn owned_field_borrow_does_not_consume() {
+    if !backend_available() {
+        return;
+    }
+    // Borrowing the field leaves the struct fully usable: read `u.name.len()`, then still read a
+    // Copy field `u.age`. 5 + 9 = 14, and `u` drops once (no double-free).
+    let src = concat!(
+        "User { name: string, age: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  u := User{name: \"hello\".clone(), age: 9}\n",
+        "  a := u.name.len()\n",
+        "  return (a + u.age) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("ownfield-noconsume", src).status.code(), Some(14));
+}
+
+#[test]
+fn nested_owned_field_borrowed() {
+    if !backend_available() {
+        return;
+    }
+    // Borrow a `string` reached through a nested Move-struct field (`u.addr.name`). The whole `u`
+    // (which transitively owns both buffers) drops once. len("world!!") = 7.
+    let src = concat!(
+        "Addr { name: string }\n",
+        "User { addr: Addr }\n",
+        "fn main() -> i32 {\n",
+        "  u := User{addr: Addr{name: \"world!!\".clone()}}\n",
+        "  return u.addr.name.len() as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("ownfield-nested", src).status.code(), Some(7));
+}
+
+#[test]
+fn owned_field_str_binding() {
+    if !backend_available() {
+        return;
+    }
+    // `s: str := u.name` binds a borrow of the field to a `str` local (used after); the struct keeps
+    // ownership and drops once. len = 4.
+    let src = concat!(
+        "User { name: string }\n",
+        "fn main() -> i32 {\n",
+        "  u := User{name: \"abcd\".clone()}\n",
+        "  s: str := u.name\n",
+        "  return s.len() as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("ownfield-strbind", src).status.code(), Some(4));
+}
+
+#[test]
+fn owned_field_str_borrow_cannot_escape() {
+    // A `str` view borrowing an owned field is `Frame`-regioned: returning it (here via a `str`
+    // local) would dangle once the struct is dropped — rejected by the escape check.
+    assert!(check_errs(
+        "ownfield-escape",
+        concat!(
+            "User { name: string }\n",
+            "fn leak(u: User) -> str {\n",
+            "  s: str := u.name\n",
+            "  return s\n",
+            "}\n",
+            "fn main() -> i32 = 0\n",
+        )
+    ));
+}

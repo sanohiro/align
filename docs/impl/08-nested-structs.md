@@ -98,8 +98,26 @@ double-free). Landed as built below. `crates/align_driver/tests/owned_structs.rs
 - **tests**: construct + drop; nested recursive drop; return / pass / assign by value (no double-free,
   verified under `MALLOC_CHECK_=3`); the unsupported-container rejections above; partial owned-field
   move-out rejected.
-- **deferred**: owned-field *read/borrow* out of a struct (`u.name.len()`); owned **collection**
-  (`array<T>`) fields.
+- **deferred**: *moving* an owned field out of a struct (`n := u.name` — a partial move); owned
+  **collection** (`array<T>`) fields.
+
+#### Follow-up (landed) — borrowing an owned field out of a struct (read)
+Slice 3 made owned struct fields constructible/writable, but their contents were **unreadable** (any
+`u.name` read was rejected). A `string` (or nested-Move-struct → `string`) field can now be
+**borrowed** as a zero-copy `str` view in any non-consuming position — `u.name.len()`, a `str`
+argument, `io.stdout.write(u.name)`, a `s: str := u.name` binding. `crates/align_driver/tests/owned_structs.rs`.
+
+- **sema**: `check_field_access` no longer rejects a Move-typed leaf — it returns the `Field` (typed
+  `string`), and the existing `string`→`str` coercion (`check_str_init` → `StrBorrow`) / `Len` wraps
+  it non-consuming. The borrow inherits the struct's region (`region_of(Field)` = the root's region)
+  and is then `Frame`-capped by `StrBorrow`, so a view of a field cannot escape the struct's frame
+  (returning it is an escape error). **Moving** the field out is still a partial move: `MoveCheck`'s
+  `Field` arm now errors when a Move-typed field is read in a *consuming* position (bind / by-value
+  arg / return). A borrow reaches that arm non-consuming (wrapped in `StrBorrow`/`Len`), so it passes.
+- **no codegen change**: a `Field` load of a `{ptr,len}` `string` leaf already works; `StrBorrow` is
+  identity. The borrowed buffer is freed once, by the struct's recursive `Drop` (no separate free).
+- **deferred**: the partial *move* out (above) — it needs the field nulled so the struct's `Drop`
+  doesn't double-free it.
 
 #### Follow-up (landed) — reassigning an owned local drops the old value
 A pre-existing gap for *all* owned types (`string`/`array<T>`/Move struct/box): `mut s := …; s = …`
