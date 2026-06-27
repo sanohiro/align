@@ -138,7 +138,7 @@ fn build_module<'c>(
     // field (`Struct(id)`) can reference another struct's type: first create every struct as a named
     // opaque type, then set each body (sema forbids non-`box` recursion, so the bodies are acyclic).
     let struct_types: Vec<StructType<'c>> =
-        program.structs.iter().map(|_| ctx.opaque_struct_type("struct")).collect();
+        program.structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
     for (s, st) in program.structs.iter().zip(&struct_types) {
         // `abi_type` maps each field (floats to their float type, `str` to the `{ ptr, len }` view,
         // a nested struct to its (now-created) struct type).
