@@ -50,11 +50,16 @@ fn primitive_struct_element_is_returnable_from_a_function() {
 }
 
 #[test]
-fn struct_with_owned_field_rejected() {
-    // A struct is Copy (no per-binding Drop), and `arr[i]` / `:=` copy it by value — so a Move
-    // (owned) field would double-free across copies. Such fields are rejected at declaration,
-    // which keeps whole-struct indexing (and struct copy in general) sound.
-    assert!(check_errs("si-owned-string", "U { name: string }\nfn main() -> i32 = 0\n"));
+fn struct_with_owned_field() {
+    // Slice 3: a `string` field is now allowed — the struct becomes a Move type with a recursive
+    // Drop, and a move (not a silent Copy) transfers it. An *array* of such a Move struct is still
+    // rejected (per-element drop = a later slice), so whole-struct indexing stays sound.
+    assert!(!check_errs("si-owned-string", "U { name: string }\nfn main() -> i32 = 0\n"));
+    assert!(check_errs(
+        "si-owned-string-arr",
+        "U { name: string }\nfn main() -> i32 {\n  us := [U{name: \"a\".clone()}, U{name: \"b\".clone()}]\n  return 0\n}\n"
+    ));
+    // An owned *collection* (`array<T>`) field is still rejected (only `string` owned fields so far).
     assert!(check_errs("si-owned-array", "U { items: array<i64> }\nfn main() -> i32 = 0\n"));
 }
 

@@ -64,9 +64,12 @@ fn assign_whole_nested_struct_literal() {
 }
 
 #[test]
-fn owned_nested_struct_field_rejected() {
-    // A nested struct that carries `str` (owned) is rejected (no struct Drop yet).
-    assert!(check_errs("owned-nested", "Inner { s: str }\nOuter { i: Inner }\nfn main() -> i32 { return 0 }\n"));
+fn owned_nested_struct_field_now_accepted() {
+    // Slice 3 lifted the Slice-1 restriction: a nested struct may carry an owned `string` (making
+    // the outer struct a Move type with a recursive Drop) or a `str` borrow (Copy, region-tracked).
+    // Runtime drop behavior is covered in `owned_structs.rs`; here we only assert it type-checks.
+    assert!(!check_errs("owned-nested-string", "Inner { s: string }\nOuter { i: Inner }\nfn main() -> i32 { return 0 }\n"));
+    assert!(!check_errs("owned-nested-str", "Inner { s: str }\nOuter { i: Inner }\nfn main() -> i32 { return 0 }\n"));
 }
 
 #[test]
@@ -80,7 +83,7 @@ fn top_level_str_field_still_ok() {
     if !backend_available() {
         return;
     }
-    // A struct may still have a *direct* `str` field; only nesting an owned struct is restricted.
+    // A struct may have a direct `str` borrow field (Copy, region-tracked) — unchanged by Slice 3.
     let src = concat!(
         "Foo { s: str, n: i64 }\n",
         "fn main() -> i32 {\n  f := Foo{s: \"hi\", n: 7}\n  return f.n as i32\n}\n",

@@ -5,7 +5,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-06-27._
+_Last updated: 2026-06-28._
 
 ## Setup on the new machine
 
@@ -40,16 +40,23 @@ Rust ~8–10×; `group_by(.key).sum/min/max/.count()` beats the default `std::Ha
 - **Slice 2 DONE** (PR #183): whole-struct value semantics (read `p := l.a`, struct-by-value
   params/returns, struct-to-struct assign) — was already working once Slice 1 generalized
   Field/Load/Store; locked in by `tests/struct_by_value.rs`.
+- **Slice 3 DONE** (this branch): owned (`string`-bearing) struct fields → the struct becomes a
+  **Move** type with a recursive **Drop**; whole-struct move (return/pass/assign) nulls the source.
+  Closed the Move-vs-Copy soundness seams (array-of / Option-Result-enum-payload-of a Move struct
+  rejected). `tests/owned_structs.rs`. Deferred: owned-field read-out (`u.name.len()`), `array<T>`
+  fields, reassign-drops-old (a pre-existing gap for all owned types).
 
 ## Next action
 
 Continue `docs/impl/08-nested-structs.md`:
-- **Slice 3 — owned (`str`-bearing) nested fields + struct `Drop`** (highest value, **highest risk**:
-  the double-free class fixed in #175; also stops the current `str`-by-value leak). Best done fresh.
-- **Slice 4** — arrays/soa × nesting (`arr[i].a.x`, nested soa column).
+- **Slice 4** — arrays/soa × nesting (`arr[i].a.x`, nested soa column) **and arrays of Move structs**
+  (`[User{…}]` — needs per-element drop; Slice 3 rejects it for now). Risk: medium–high.
 - **Slice 5** — cross-module field types (`f: other.T`, the module B3 leftover, now unblocked).
+- Smaller follow-ups unblocked by Slice 3: owned-field read/borrow out of a struct (`u.name.len()`),
+  owned `array<T>` struct fields, and the orthogonal reassign-drops-old gap (`mut s := …; s = …`
+  leaks the old buffer for *all* owned types today).
 
-Or pause: this is a natural milestone (language core + S1/S2 done, M6 perf validated).
+Or pause: this is a natural milestone (language core + S1/S2/S3 done, M6 perf validated).
 
 ## This session's PRs (#174–#183)
 

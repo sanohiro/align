@@ -71,10 +71,36 @@ and nested structs by value; returned-then-mutated; struct-to-struct assign). A 
 by value copies the `{ptr,len}` and *leaks* (no Drop yet) but does not double-free — that's S3.
 `crates/align_driver/tests/struct_by_value.rs`.
 
-### Slice 3 — owned (str/array) nested fields + struct Drop
-`User { name: str, addr: Address }`. Recursive struct **Drop** (drop owned fields in order) + move /
-null-flag along the field path; extends the M3 box-drop machinery to structs. Risk: **high**
-(move/drop correctness, the double-free class fixed in #175). Independent PR, fresh context.
+### Slice 3 — owned (`string`-bearing) nested fields + struct Drop — DONE
+`User { name: string, addr: Address }`. A struct that (transitively) owns a heap buffer — a `string`
+field, or a nested struct that does — becomes a **Move** type: it gets a recursive **Drop** (free each
+owned field in declared order, recursing into nested Move-struct fields) and whole-struct move
+semantics (return / pass / assign by value nulls the source so its exit Drop is a no-op — no
+double-free). Landed as built below. `crates/align_driver/tests/owned_structs.rs`.
+
+- **sema**: `struct_is_move(id)` (recursive over the acyclic field graph); `is_field_ok` allows
+  `Ty::String`; pass 0b-2 relaxes the Slice-1 scalar-only nested gate to an **acyclicity-only** check
+  (`struct_acyclic`) — a nested struct may now own a `string` (region tracking already flows through
+  `StructLit`/`Field`, so a nested `str` *borrow* field is sound too). `is_owned_droppable` /
+  `is_move_ty` / `ty_capture_is_move` include Move structs (so they join the drop set, use-after-move
+  tracking, and the lambda-capture rejection). Reading an **owned field out** of a struct (`n := u.name`,
+  a partial move) is deferred — a clean sema error.
+- **soundness (the Move-vs-Copy seams)**: a Move struct must never be silently copied. Rejected:
+  an **array** of a Move struct (`[User{…}]` / indexing → per-element drop is a later slice); a Move
+  struct as an **`Option`/`Result`/sum-type payload** (the aggregate's drop frees a flat `{ptr,len}`,
+  not a struct). `box`/`soa`/tuple payloads were already scalar/primitive-only.
+- **MIR**: `null_moved_source` nulls a moved-out Move-struct slot; `DropFlagInit`/`Drop` already cover
+  every `drop_local` (Move structs now qualify); struct-literal lowering stores each owned field
+  operand into its slot path (moved in).
+- **codegen**: `DropFlagInit` zeroes the whole struct aggregate; `Stmt::Drop` for a Move struct calls
+  `drop_struct_fields` — GEP+free each `string` field's buffer, recurse into nested Move-struct fields
+  (null-safe: a zeroed / moved-out struct frees `null`).
+- **tests**: construct + drop; nested recursive drop; return / pass / assign by value (no double-free,
+  verified under `MALLOC_CHECK_=3`); the unsupported-container rejections above; partial owned-field
+  move-out rejected.
+- **deferred**: owned-field *read/borrow* out of a struct (`u.name.len()`); owned **collection**
+  (`array<T>`) fields; reassigning an owned local drops the old value (a pre-existing gap for *all*
+  owned types — `mut s := …; s = …` leaks the old buffer; orthogonal to this slice).
 
 ### Slice 4 — arrays / soa × nesting
 `arr[i].a.x` (struct-array element nested field) and a soa column over a nested field. Extends

@@ -13,7 +13,7 @@ use std::path::Path;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{Block, Const, Function, Operand, Program, Rvalue, Slot, Stmt, Term, ValueId};
-use align_sema::{payload_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};
+use align_sema::{payload_is_move, struct_is_move, ty_to_scalar, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty, scalar_to_ty, ERROR_VARIANT_CODE};
 
 use inkwell::AddressSpace;
 use inkwell::FloatPredicate;
@@ -1384,8 +1384,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ty = self.f.slots[*slot as usize];
                     let z: BasicValueEnum = if ty == Ty::Builder {
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
-                    } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_)) {
-                        // Zero the whole aggregate so each owned field/element reads {null,0}.
+                    } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_) | Ty::Struct(_)) {
+                        // Zero the whole aggregate so each owned field/element reads {null,0}. A Move
+                        // struct is zeroed wholesale here; its recursive `Drop` then frees nulls on an
+                        // unconstructed / moved-out path (no-op) — see `drop_struct_fields`.
                         self.llvm_type(ty).into_struct_type().const_zero().into()
                     } else {
                         slice_struct_type(self.ctx).const_zero().into()
@@ -1462,6 +1464,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_call(self.funcs["free"], &[ptr.into()], "")
                                 .map_err(|e| self.err(e))?;
                         }
+                    } else if let Ty::Struct(sid) = ty {
+                        // A Move struct: recursively free each owned field's buffer, in declared order,
+                        // recursing into nested Move-struct fields (null-safe — a moved-out struct was
+                        // zeroed, and Copy fields are skipped).
+                        self.drop_struct_fields(self.slots[slot], sid)?;
                     } else {
                         // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
                         let agg = self
@@ -2602,6 +2609,40 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
         }
         Ok(ptr)
+    }
+
+    /// Recursively free the owned fields of a Move struct at `base` (a pointer to the struct value),
+    /// in declared order. A `string` field's `{ptr,len}` buffer is freed; a nested Move-struct field
+    /// recurses. Null-safe: an unconstructed / moved-out struct was zeroed (`DropFlagInit`), so each
+    /// owned leaf reads `{null,0}` and `free(null)` is a no-op. Copy fields (scalars, `str` borrows,
+    /// plain-data nested structs) are skipped. (Slice 3 of `08-nested-structs.md`.)
+    fn drop_struct_fields(&self, base: inkwell::values::PointerValue<'c>, struct_id: u32) -> Result<(), CodegenError> {
+        let st = self.struct_types[struct_id as usize];
+        // Snapshot (index, field type) so we don't hold a borrow of `self.structs` across the
+        // builder/recursion calls (`Ty` is `Copy`).
+        let fields: Vec<(u32, Ty)> = self.structs[struct_id as usize].fields.iter().enumerate().map(|(i, f)| (i as u32, f.ty)).collect();
+        for (i, fty) in fields {
+            match fty {
+                // An owned `string` field — free its heap buffer (field 0 of the `{ptr,len}`).
+                Ty::String => {
+                    let fp = self.builder.build_struct_gep(st, base, i, "dropfld").map_err(|e| self.err(e))?;
+                    let agg = self
+                        .builder
+                        .build_load(slice_struct_type(self.ctx), fp, "dropfldv")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "dropfldptr").map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+                }
+                // A nested Move struct — recurse into it (a plain-data nested struct is Copy → skip).
+                Ty::Struct(nid) if struct_is_move(nid, self.structs) => {
+                    let fp = self.builder.build_struct_gep(st, base, i, "dropnest").map_err(|e| self.err(e))?;
+                    self.drop_struct_fields(fp, nid)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// The type of the innermost field reached by `path` from `slot`'s struct.
