@@ -35,10 +35,19 @@ fn main_fn(text: &str) -> &str {
 }
 
 /// `drop _N` (the slot free) is distinct from `drop_init _N` (the null-initialise); only the former
-/// contains the substring `"drop _N"` (the latter is `"drop_init _N"`). Counting it within `fn main`
-/// gives the number of real frees of that slot.
+/// contains `"drop _N"` (the latter is `"drop_init _N"`). Counting it within `fn main` gives the
+/// number of real frees of that slot. The match requires a non-digit (or end-of-line) right after
+/// the slot id, so `"drop _1"` does not also count `drop _10` / `_11` (one statement per line, so a
+/// per-line count equals the occurrence count).
 fn count_slot_drops(text: &str, slot: &str) -> usize {
-    main_fn(text).matches(&format!("drop {slot}")).count()
+    let target = format!("drop {slot}");
+    main_fn(text)
+        .lines()
+        .filter(|line| match line.find(&target) {
+            Some(idx) => line.as_bytes().get(idx + target.len()).is_none_or(|&c| !c.is_ascii_digit()),
+            None => false,
+        })
+        .count()
 }
 
 #[test]
