@@ -359,11 +359,14 @@ the return type first** — done here.
   `where(.active)`; the following reduction names the value field. First slice: exactly one key field
   + one `sum` aggregate. (Later: `min`/`max`/`count` aggregates, multiple aggregates → more result
   columns, a `group_by(.key)` with a lambda key.)
-- **Mechanism = arena open-addressing hash-aggregate.** A primitive-key, no-boxing, linear-probing
-  table allocated in the enclosing arena (the win lever vs std HashMap): hash the key, probe, insert
-  `(key, acc=0)` or accumulate. Inputs are soa columns read sequentially. A runtime helper
-  `align_rt_group_sum_i64(keys_ptr, vals_ptr, len, out_keys, out_vals, cap) -> count` for the first
-  slice (i64 key + i64 sum). Emits distinct keys + sums into two fresh owned arrays.
+- **Mechanism = open-addressing hash-aggregate.** A primitive-key, no-boxing, linear-probing table
+  (the win lever vs std HashMap): hash the key, probe, insert or accumulate. Inputs are soa columns
+  read sequentially. Runtime helper `align_rt_group_sum_i64(keys_ptr, vals_ptr, len, out_keys,
+  out_vals, cap) -> count` for the first slice (i64 key + i64 sum); emits distinct keys + sums into
+  two caller arrays. **Table allocation:** the first-slice primitive uses an internal heap `Vec`
+  (one `malloc` per call, amortized over all elements) to stay self-contained + unit-testable;
+  allocating the table in the caller's arena (to drop that one `malloc` when `group_by` runs in a hot
+  loop) is a **refinement** for once the wiring threads an arena — secondary to the aggregate itself.
 - **First slice scope:** `i64` key + `i64` value + `sum`, source = `soa<Struct>` or `array<Struct>`
   (read the key + value columns). Output `(array<i64>, array<i64>)`. Requires an arena (the hash
   table is arena-allocated, like `to_soa`); the result arrays are owned (heap, `Drop`-freed) so they

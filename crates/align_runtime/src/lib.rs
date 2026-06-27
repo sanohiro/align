@@ -960,7 +960,10 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
 /// Mechanism: an internal open-addressing (linear-probe) table sized to the next power of two ≥ 2·len
 /// — a primitive-key, no-boxing, cache-tight aggregate, the lever vs Rust's generic `HashMap`. Sums
 /// wrap on overflow (Align's defined two's-complement wrap). Output order is table order (groups are
-/// unordered). The keys/values are read sequentially (soa columns).
+/// unordered). The keys/values are read sequentially (soa columns). The table is a heap `Vec` (one
+/// allocation per call, amortized over all `len` elements) — keeping this primitive self-contained
+/// and unit-testable; allocating it in the caller's arena (to drop even that one `malloc` when
+/// `group_by` runs in a hot loop) is a recorded refinement once the language wiring threads an arena.
 ///
 /// # Safety
 /// `keys`/`vals` must be valid for `len` `i64`s; `out_keys`/`out_vals` for `cap` `i64`s.
@@ -973,7 +976,7 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(
     out_vals: *mut i64,
     cap: i64,
 ) -> i64 {
-    let n = if len <= 0 || keys.is_null() { 0 } else { len as usize };
+    let n = if len <= 0 || keys.is_null() || vals.is_null() { 0 } else { len as usize };
     if n == 0 {
         return 0;
     }
@@ -1009,7 +1012,7 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(
         }
     }
 
-    if cap < 0 || count > cap as usize {
+    if cap < 0 || count > cap as usize || out_keys.is_null() || out_vals.is_null() {
         return -1;
     }
     let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
