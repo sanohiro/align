@@ -287,9 +287,9 @@ JSON→SoA is then a thin wiring on top.
    is **(a) a SIMD/structural JSON parser** (the big, dedicated, library-layer effort — runtime
    CPU-dispatch / simdjson-class; what it takes to actually *beat* serde's optimized scalar parser).
    Secondary: (b) **two-pass count-then-direct-column-fill** (drops the transpose — small, the
-   decomposition showed it cheap; note that for a *light* single aggregate decode→AoS is already
-   ≈parity and beats decode→soa, so soa's transpose only pays off under heavy/repeated column scans);
-   (c) **field-skip / narrow struct** (already available). Bottom line: json→soa is a PARSER problem;
+   decomposition showed it cheap; note that for a *light* single aggregate, decode→AoS is already
+   ≈parity and beats decode→SoA, so SoA's transpose only pays off under heavy/repeated column scans);
+   (c) **field-skip / narrow struct** (already available). Bottom line: json→SoA is a PARSER problem;
    the cheap scalar win is banked (#168), and beating serde now needs the SIMD slice.
 3. **Known-schema field-skip / projection decode — DEFERRED 2026-06-27 (the perf is already
    available; the remaining delta is ergonomic-only and safety-sensitive).** KEY FINDING (verified
