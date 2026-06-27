@@ -11,3 +11,16 @@ pub fn build(s: slice<i64>) -> i64 {
   res := b.to_string()
   return res.len()
 }
+
+// Same, but pre-size the builder (~16 bytes/element) so its buffer doesn't reallocate — closes the
+// gap to capacity-preallocated Rust (Gap C).
+pub fn build_cap(s: slice<i64>) -> i64 {
+  b := s.reduce(builder(s.len() * 16), fn b, x {
+    b.write("item-")
+    b.write_int(x)
+    b.write("-status ")
+    b
+  })
+  res := b.to_string()
+  return res.len()
+}

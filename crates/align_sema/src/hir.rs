@@ -352,9 +352,10 @@ pub enum ExprKind {
     /// and is `Drop`-freed by its owner); the view borrows it, so it is `Frame`-regioned and
     /// must not outlive the frame holding the `string`.
     StrBorrow(Box<Expr>),
-    /// `builder()` — open an append-oriented string builder (MMv2 slice 7c). The `ty` is
-    /// [`crate::Ty::Builder`] (an owned, Move handle).
-    BuilderNew,
+    /// `builder()` / `builder(capacity)` — open an append-oriented string builder (MMv2 slice 7c).
+    /// The `ty` is [`crate::Ty::Builder`] (an owned, Move handle). `capacity` (an `i64` expr, if
+    /// given) pre-sizes the backing buffer so appends don't reallocate as it grows.
+    BuilderNew { capacity: Option<Box<Expr>> },
     /// `b.write(s)` / `b.write_int(n)` — append to a builder, mutating it through its handle.
     /// The builder is borrowed (not consumed); the `ty` is `Unit`.
     BuilderWrite { builder: Box<Expr>, arg: Box<Expr>, kind: BuilderWriteKind },

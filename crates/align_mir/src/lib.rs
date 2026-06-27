@@ -265,8 +265,9 @@ pub enum Rvalue {
     /// `str.clone()` — deep-copy a `str` operand's bytes into a fresh heap buffer, yielding an
     /// owned `string` `{ptr,len}`. The buffer is freed by a later [`Stmt::Drop`] of its slot.
     StrClone(Operand),
-    /// `builder()` — open a builder, yielding an opaque handle (MMv2 slice 7c).
-    BuilderNew,
+    /// `builder()` / `builder(capacity)` — open a builder, yielding an opaque handle (MMv2 slice 7c).
+    /// `capacity` (bytes) pre-sizes the backing buffer; 0 = default.
+    BuilderNew { capacity: Operand },
     /// `b.write(s)` — append a `str` operand's bytes to the builder. Side-effecting; yields unit.
     BuilderWriteStr(Operand, Operand),
     /// `b.write_int(n)` — append a decimal integer (widened to `i64`) to the builder. Yields unit.
@@ -977,9 +978,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // the `{ptr,len}` layout, so the loaded value is the view. The `string` is not moved (no
         // `null_moved_source`), so its owner still `Drop`-frees it.
         hir::ExprKind::StrBorrow(inner) => lower_expr(b, inner),
-        hir::ExprKind::BuilderNew => {
+        hir::ExprKind::BuilderNew { capacity } => {
+            let cap = match capacity {
+                Some(c) => lower_expr(b, c),
+                None => Operand::Const(Const::Int(0, i64_ty())),
+            };
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BuilderNew));
+            b.push(Stmt::Let(v, Rvalue::BuilderNew { capacity: cap }));
             Operand::Value(v)
         }
         hir::ExprKind::BuilderWrite { builder, arg, kind } => {

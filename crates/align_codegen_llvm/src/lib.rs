@@ -333,7 +333,7 @@ fn build_module<'c>(
     let i64t2 = ctx.i64_type();
     funcs.insert(
         "builder_new".to_string(),
-        module.add_function("align_rt_builder_new", ptr.fn_type(&[ptr.into()], false), None),
+        module.add_function("align_rt_builder_new", ptr.fn_type(&[ptr.into(), i64t2.into()], false), None),
     );
     funcs.insert(
         "builder_write".to_string(),
@@ -2270,12 +2270,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("str_clone returns a {ptr,len}")
             }
-            Rvalue::BuilderNew => {
+            Rvalue::BuilderNew { capacity } => {
                 // Open a builder with a null arena: the finished `string` is heap-owned
-                // (`into_string` copies into a fresh malloc'd buffer), not arena-tied.
+                // (`into_string` copies into a fresh malloc'd buffer), not arena-tied. `capacity`
+                // pre-sizes the backing buffer so appends don't reallocate (0 = default).
                 let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
+                let cap = self.operand(capacity);
                 self.builder
-                    .build_call(self.funcs["builder_new"], &[null.into()], "builder")
+                    .build_call(self.funcs["builder_new"], &[null.into(), cap.into()], "builder")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
@@ -2925,9 +2927,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Some(op) => self.operand(op),
             None => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
         };
+        // A template/json.encode builder uses the default capacity (0) — static-part presizing is a
+        // separate future opt; the user-facing `builder(capacity)` is the capacity surface.
+        let zero = self.ctx.i64_type().const_zero();
         let bptr = self
             .builder
-            .build_call(self.funcs["builder_new"], &[arena_ptr.into()], "b")
+            .build_call(self.funcs["builder_new"], &[arena_ptr.into(), zero.into()], "b")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
