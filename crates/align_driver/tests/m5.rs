@@ -1330,3 +1330,28 @@ fn str_find_on_owned_string() {
     let out = build_and_run("str-find-owned", src);
     assert_eq!(out.status.code(), Some(8)); // index 2 + len 6
 }
+
+#[test]
+fn str_rfind_returns_last_index() {
+    if !backend_available() {
+        return;
+    }
+    // `rfind` is the from-the-end sibling: last occurrence, or None (→ -1 via else). Classic use:
+    // the final "." of a filename. Empty needle matches at the end (len).
+    let src = "fn main() -> i32 {\n  s := \"a.b.c\"\n  print(s.rfind(\".\") else { -1 })\n  print(s.find(\".\") else { -1 })\n  print(s.rfind(\"x\") else { -1 })\n  print(s.rfind(\"\") else { -1 })\n  return 0\n}\n";
+    let out = build_and_run("str-rfind", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n1\n-1\n5\n");
+}
+
+#[test]
+fn str_eq_ignore_ascii_case() {
+    if !backend_available() {
+        return;
+    }
+    // ASCII case-insensitive equality (for headers/protocols). Different lengths never match; a
+    // non-ASCII byte compares exactly (so "é" upper vs lower would differ — here all-ASCII cases).
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn main() -> i32 {\n  a := b2i(\"Content-Type\".eq_ignore_ascii_case(\"content-type\"))\n  b := b2i(\"GET\".eq_ignore_ascii_case(\"get\"))\n  c := b2i(\"abc\".eq_ignore_ascii_case(\"abd\"))\n  d := b2i(\"abc\".eq_ignore_ascii_case(\"abcd\"))\n  return a + b * 2 + c * 4 + d * 8\n}\n";
+    let out = build_and_run("str-eq-ic", src);
+    assert_eq!(out.status.code(), Some(3)); // a=1, b=1, c=0, d=0 → 1 + 2 = 3
+}

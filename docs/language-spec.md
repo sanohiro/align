@@ -233,8 +233,10 @@ builder
 
 `str` carries `.len()` (byte length), `==`/`!=` (byte equality), the byte-oriented
 predicates `.contains(n)` / `.starts_with(p)` / `.ends_with(s)` (all `bool`),
-`.find(n)` → `Option<i64>` (the first byte index, the index sibling of `contains`;
-pairs with range slicing — `i := s.find("=") else …; s[..i]`), and the
+`.find(n)` / `.rfind(n)` → `Option<i64>` (the first / last byte index, the index
+siblings of `contains`; pair with range slicing — `i := s.find("=") else …; s[..i]`),
+`.eq_ignore_ascii_case(o)` → `bool` (ASCII-case-insensitive byte equality, for
+headers/protocols), and the
 ASCII-whitespace trims `.trim()` / `.trim_start()` / `.trim_end()` (each yields
 a **borrowed sub-`str`**, no allocation). All take a `str` (an owned `string` is
 auto-borrowed) and work on bytes — UTF-8 is the representation, but the scan is
