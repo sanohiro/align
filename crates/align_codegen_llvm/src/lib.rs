@@ -559,6 +559,19 @@ fn build_module<'c>(
             None,
         ),
     );
+    funcs.insert(
+        // group_by(.str_key).sum(.i64_value) over an AoS array<Struct> — the dictionary-id rail:
+        // (base, n, stride, key_off, val_off, out_keys, out_vals, cap) -> group count.
+        "group_sum_str".to_string(),
+        module.add_function(
+            "align_rt_group_sum_str",
+            ctx.i64_type().fn_type(
+                &[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()],
+                false,
+            ),
+            None,
+        ),
+    );
     // `str.clone()` → deep-copy into a heap-owned `string` `{ptr,len}` (MMv2 slice 7).
     funcs.insert(
         "str_clone".to_string(),
@@ -1058,7 +1071,10 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::String => unreachable!("an owned string is not a box payload"),
         Scalar::DynArray(_) => unreachable!("an owned array is not a box payload"),
         Scalar::DynStructArray(_) => unreachable!("an owned struct array is not a box payload"),
-        Scalar::Str => unreachable!("a str view is not a box payload"),
+        // A `str` view is never a `box` payload (`box<str>` is rejected), but it *is* a valid
+        // `array<str>` element — a `{ptr,len}` view, 16 bytes (the established str size, as in the
+        // json field descriptor). Used to size a `group_by(.str_key)` output key buffer.
+        Scalar::Str => 16,
         Scalar::Soa(_) => unreachable!("a soa view is not a box payload"),
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
@@ -2332,6 +2348,43 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .expect("group aggregate returns the group count (i64)")
+            }
+            Rvalue::GroupAggStr { base, struct_id, key_field, value_field, out_keys, out_vals } => {
+                // Load the AoS array `{ptr,len}`, derive the per-row stride (= the struct's alloc
+                // size, LLVM's `[%Struct]` element stride) and the key/value byte offsets from the
+                // struct layout, and call the runtime dictionary-encoding aggregate. `cap` = the row
+                // count (an upper bound on the group count).
+                let st = self.struct_types[*struct_id as usize];
+                let store = self.target_data.get_store_size(&st);
+                let align = self.target_data.get_abi_alignment(&st) as u64;
+                let stride = store.div_ceil(align) * align; // alloc size = align_up(store, align)
+                let key_off = self.target_data.offset_of_element(&st, *key_field).unwrap_or(0);
+                let val_off = self.target_data.offset_of_element(&st, *value_field).unwrap_or(0);
+                let agg = self.builder.build_load(slice_struct_type(self.ctx), self.slots[base], "aosbase").map_err(|e| self.err(e))?.into_struct_value();
+                let bptr = self.builder.build_extract_value(agg, 0, "bptr").map_err(|e| self.err(e))?;
+                let blen = self.builder.build_extract_value(agg, 1, "blen").map_err(|e| self.err(e))?;
+                let i64t = self.ctx.i64_type();
+                let ok = self.operand(out_keys);
+                let ov = self.operand(out_vals);
+                self.builder
+                    .build_call(
+                        self.funcs["group_sum_str"],
+                        &[
+                            bptr.into(),
+                            blen.into(),
+                            i64t.const_int(stride, false).into(),
+                            i64t.const_int(key_off, false).into(),
+                            i64t.const_int(val_off, false).into(),
+                            ok.into(),
+                            ov.into(),
+                            blen.into(),
+                        ],
+                        "groupstr",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("str group aggregate returns the group count (i64)")
             }
             Rvalue::Chunks { src, n, elem } => {
                 // Split the `{ptr,len}` `src` into length-`n` slices via the runtime; the result is

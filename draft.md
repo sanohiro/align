@@ -807,7 +807,14 @@ totals := orders.group_by(.customer).sum(.amount)   // (array<Customer>, array<A
 
 `group_by(.key).sum(.value)` yields two parallel arrays — the distinct keys and their per-key sums —
 not a hash map; idiomatic Rust reaches for a generic `HashMap<K, Acc>`, while Align reads the two
-columns sequentially into a primitive-key aggregate. (First cut: `i64` key + `i64` sum over a `soa`.)
+columns sequentially into a primitive-key aggregate. An **integer** key over a `soa` runs as a
+primitive-key open-addressing aggregate, and when the keys fall in a tight range it skips hashing
+entirely (direct-index accumulation — ~5× a `std::HashMap`, beating even `ahash`). A **string** key
+over an `array<Struct>` (a `soa` can't hold a `str` column) is **dictionary-encoded**: the runtime
+interns each key to a dense id once, then aggregates by id — yielding `(array<str>, array<Acc>)` whose
+key views borrow the source. The surface is identical (`group_by(.key).sum(.value)`); the strategy is
+the runtime's concern. (First cut: `i64` key + `i64` sum over a `soa`, or a `str` key + `i64` sum over
+an `array<Struct>`.)
 
 This is the layout lever that lets Align *beat* an array-of-structs (what a hand-written `Vec<User>`
 gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags
