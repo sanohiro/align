@@ -15,6 +15,7 @@ use serde::Deserialize;
 use std::time::Instant;
 
 /// Align passes a `str` as a `{ ptr, len }` value (SysV two-register), matching this `repr(C)`.
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct AlignStr {
     ptr: *const u8,
@@ -92,15 +93,15 @@ fn main() {
         let astr = AlignStr { ptr: json.as_ptr(), len: json.len() as i64 };
 
         // Correctness: every path agrees with the generator before we trust the timing.
-        assert_eq!(unsafe { decode_full(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align full wrong");
-        assert_eq!(unsafe { decode_proj(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align proj wrong");
+        assert_eq!(unsafe { decode_full(astr) }, expected, "align full wrong");
+        assert_eq!(unsafe { decode_proj(astr) }, expected, "align proj wrong");
         assert_eq!(rust_full(&json), expected, "rust full wrong");
         assert_eq!(rust_proj(&json), expected, "rust proj wrong");
 
         let (mut af, mut ap, mut rf, mut rp) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
         for _ in 0..rounds {
             let t = Instant::now();
-            std::hint::black_box(unsafe { decode_full(AlignStr { ptr: astr.ptr, len: astr.len }) });
+            std::hint::black_box(unsafe { decode_full(astr) });
             af = af.min(t.elapsed().as_secs_f64() * 1e3);
 
             let t = Instant::now();
@@ -108,7 +109,7 @@ fn main() {
             rf = rf.min(t.elapsed().as_secs_f64() * 1e3);
 
             let t = Instant::now();
-            std::hint::black_box(unsafe { decode_proj(AlignStr { ptr: astr.ptr, len: astr.len }) });
+            std::hint::black_box(unsafe { decode_proj(astr) });
             ap = ap.min(t.elapsed().as_secs_f64() * 1e3);
 
             let t = Instant::now();
