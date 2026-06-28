@@ -555,8 +555,9 @@ pub enum StrPredKind {
 
 /// Which end(s) a `StrTrim` strips ASCII whitespace from (`core.string`). The result is a
 /// borrowed sub-`str` of the receiver (no allocation) — UTF-8 stays the representation, but the
-/// trim is byte-level over the ASCII whitespace set (` \t\n\r\x0b\x0c`); Unicode whitespace
-/// trimming is deliberately package-level, not core.
+/// trim is byte-level over the WHATWG ASCII whitespace set (space, `\t`, `\n`, `\x0c`, `\r` — *not*
+/// vertical tab `\x0b`, matching Rust's `[u8]::trim_ascii`); Unicode whitespace trimming is
+/// deliberately package-level, not core.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrTrimKind {
     /// `s.trim()` — strip leading and trailing ASCII whitespace.
