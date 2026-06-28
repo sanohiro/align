@@ -1884,6 +1884,16 @@ pub extern "C" fn align_rt_bounds_fail(index: i64, len: i64) -> ! {
     std::process::abort();
 }
 
+/// Out-of-bounds range slice (`xs[start..end]`): report the whole `start..end` against `len` and
+/// abort. Unlike an element index, a range has three ways to fail — a negative `start`, an inverted
+/// `start > end`, or an over-length `end` — so all three values are reported together, avoiding the
+/// `(index, len)` form's ambiguity (e.g. for an inverted range both bounds are individually valid).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_range_fail(start: i64, end: i64, len: i64) -> ! {
+    eprintln!("align: panic: slice range out of bounds: {start}..{end} is not within length {len}");
+    std::process::abort();
+}
+
 /// A bump allocator (`docs/impl/06-runtime-std.md` §3). Memory is carved from a list of
 /// fixed-size chunks; individual allocations are never freed — the whole arena is
 /// released at once by [`align_rt_arena_end`]. Chunk buffers are heap-stable (the outer

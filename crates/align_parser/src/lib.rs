@@ -713,10 +713,29 @@ impl<'a> Parser<'a> {
                 e = Expr { kind: ExprKind::TupleIndex { recv: Box::new(e), index }, span };
             } else if self.at(&TokKind::LBracket) {
                 self.bump(); // '['
-                let index = self.parse_expr(0)?;
-                self.expect(&TokKind::RBracket, "']'");
-                let span = e.span.merge(self.prev_span());
-                e = Expr { kind: ExprKind::Index { recv: Box::new(e), index: Box::new(index) }, span };
+                // `recv[a..b]` (range slice) vs `recv[i]` (element index). A leading `..` means the
+                // start is omitted (`[..b]` / `[..]`); otherwise parse the first expr, and a `..`
+                // after it makes this a slice (`[a..b]` / `[a..]`), else a plain index (`[i]`).
+                if self.at(&TokKind::DotDot) {
+                    self.bump(); // '..'
+                    let end = if self.at(&TokKind::RBracket) { None } else { Some(Box::new(self.parse_expr(0)?)) };
+                    self.expect(&TokKind::RBracket, "']'");
+                    let span = e.span.merge(self.prev_span());
+                    e = Expr { kind: ExprKind::SliceRange { recv: Box::new(e), start: None, end }, span };
+                } else {
+                    let first = self.parse_expr(0)?;
+                    if self.at(&TokKind::DotDot) {
+                        self.bump(); // '..'
+                        let end = if self.at(&TokKind::RBracket) { None } else { Some(Box::new(self.parse_expr(0)?)) };
+                        self.expect(&TokKind::RBracket, "']'");
+                        let span = e.span.merge(self.prev_span());
+                        e = Expr { kind: ExprKind::SliceRange { recv: Box::new(e), start: Some(Box::new(first)), end }, span };
+                    } else {
+                        self.expect(&TokKind::RBracket, "']'");
+                        let span = e.span.merge(self.prev_span());
+                        e = Expr { kind: ExprKind::Index { recv: Box::new(e), index: Box::new(first) }, span };
+                    }
+                }
             } else {
                 break;
             }
@@ -1190,6 +1209,37 @@ mod tests {
         assert_eq!(f.items.len(), 1);
         let Item::Fn(fd) = &f.items[0] else { panic!() };
         assert_eq!(fd.name.name, "main");
+    }
+
+    #[test]
+    fn slice_range_forms_parse() {
+        // `a[i]` stays an Index; the four range shapes parse into SliceRange with the right
+        // present/omitted bounds. Inspect the returned expression of each.
+        let ret_expr = |src: &str| -> ExprKind {
+            let (f, err) = parse(src);
+            assert!(!err, "parse error in: {src}");
+            let Item::Fn(fd) = &f.items[0] else { panic!() };
+            let FnBody::Block(b) = &fd.body else { panic!() };
+            let Stmt::Return(Some(e)) = &b.stmts[b.stmts.len() - 1] else { panic!() };
+            e.kind.clone()
+        };
+        assert!(matches!(ret_expr("fn f() -> i64 { return a[2] }\n"), ExprKind::Index { .. }));
+        match ret_expr("fn f() -> i64 { return a[1..5] }\n") {
+            ExprKind::SliceRange { start: Some(_), end: Some(_), .. } => {}
+            other => panic!("a[1..5] → {other:?}"),
+        }
+        match ret_expr("fn f() -> i64 { return a[1..] }\n") {
+            ExprKind::SliceRange { start: Some(_), end: None, .. } => {}
+            other => panic!("a[1..] → {other:?}"),
+        }
+        match ret_expr("fn f() -> i64 { return a[..5] }\n") {
+            ExprKind::SliceRange { start: None, end: Some(_), .. } => {}
+            other => panic!("a[..5] → {other:?}"),
+        }
+        match ret_expr("fn f() -> i64 { return a[..] }\n") {
+            ExprKind::SliceRange { start: None, end: None, .. } => {}
+            other => panic!("a[..] → {other:?}"),
+        }
     }
 
     #[test]

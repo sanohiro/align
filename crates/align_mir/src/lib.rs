@@ -268,6 +268,11 @@ pub enum Rvalue {
     SlicePtr(Operand),
     /// `slice[index]` — load a slice element (scalar).
     SliceIndex(Operand, Operand),
+    /// `recv[start..end]` — build a borrowed sub-view `{ base.ptr + start, len }` of the `{ptr,len}`
+    /// `base` (a `str` / `slice` / owned-array value). `start` offsets the base pointer by whole
+    /// `elem`-sized steps (`u8` bytes for a `str`); `len` is the sub-view length (`end - start`,
+    /// computed by the caller). The bounds (`0 <= start <= end <= base.len`) are checked before this.
+    SubSlice { base: Operand, start: Operand, len: Operand, elem: Ty },
     /// A string literal — a `str` view `{ &bytes, len }` over a constant.
     StrLit(String),
     /// `str.clone()` — deep-copy a `str` operand's bytes into a fresh heap buffer, yielding an
@@ -1205,6 +1210,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::Index { recv, index } => lower_index(b, recv, index, e.ty),
+        hir::ExprKind::SliceRange { recv, start, end } => lower_slice_range(b, recv, start.as_deref(), end.as_deref(), e.ty),
         hir::ExprKind::ElemField { recv, index, path, struct_id } => {
             lower_index_field(b, recv, index, path, *struct_id, e.ty)
         }
@@ -1292,6 +1298,72 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         Src::Slice(sv) => b.push(Stmt::Let(v, Rvalue::SliceIndex(sv, idx))),
         Src::Slot(slot) => b.push(Stmt::Let(v, Rvalue::Index(slot, idx))),
     }
+    Operand::Value(v)
+}
+
+/// Bounds for `start..end`: `0 <= start`, `start <= end`, `end <= len`. Any violation aborts via
+/// `range_fail(start, end, len)` (`-> !`), which reports the whole range — a single (index, len)
+/// pair can't describe an inverted range whose bounds are each individually valid.
+fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len: Operand) {
+    let neg = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(neg, Rvalue::Bin(BinOp::Lt, start.clone(), Operand::Const(Const::Int(0, i64_ty())))));
+    let inv = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(inv, Rvalue::Bin(BinOp::Gt, start.clone(), end.clone())));
+    let over = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(over, Rvalue::Bin(BinOp::Gt, end.clone(), len.clone())));
+    let e1 = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(e1, Rvalue::Bin(BinOp::Or, Operand::Value(neg), Operand::Value(inv))));
+    let oob = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(oob, Rvalue::Bin(BinOp::Or, Operand::Value(e1), Operand::Value(over))));
+
+    let fail = b.new_block();
+    let ok = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(oob), fail, ok));
+
+    b.cur = fail;
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(t, Rvalue::Call("range_fail".to_string(), vec![start.clone(), end.clone(), len])));
+    b.terminate(Term::Unreachable);
+
+    b.cur = ok;
+}
+
+/// `recv[start..end]` → a borrowed sub-view `{ ptr + start, end - start }` with a range bounds
+/// check. The base `{ptr,len}` comes from the receiver (a fixed `array<T>` borrows to a slice
+/// first; `str`/`slice`/owned-array are already `{ptr,len}`). `result_ty` is the view type — `str`
+/// (byte-stride pointer offset) or `slice<T>` (element-stride).
+fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr>, end: Option<&hir::Expr>, result_ty: Ty) -> Operand {
+    // The element type driving the pointer-offset stride: a `u8` byte for a `str`, else the element.
+    let elem = match result_ty {
+        Ty::Str => Ty::Int(IntTy { bits: 8, signed: false }),
+        Ty::Slice(s) => align_sema::scalar_to_ty(s),
+        _ => unreachable!("slice range result is str or slice"),
+    };
+    // Base `{ptr,len}` value.
+    let base = match recv.ty {
+        Ty::Array(s, _) => {
+            let (slot, n) = array_source_slot(b, recv);
+            let v = b.fresh_value(Ty::Slice(s));
+            b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
+            Operand::Value(v)
+        }
+        _ => lower_expr(b, recv),
+    };
+    let base_len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(base_len, Rvalue::SliceLen(base.clone())));
+    let start_op = match start {
+        Some(s) => lower_expr(b, s),
+        None => Operand::Const(Const::Int(0, i64_ty())),
+    };
+    let end_op = match end {
+        Some(e) => lower_expr(b, e),
+        None => Operand::Value(base_len),
+    };
+    emit_range_bounds_check(b, &start_op, &end_op, Operand::Value(base_len));
+    let new_len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(new_len, Rvalue::Bin(BinOp::Sub, end_op, start_op.clone())));
+    let v = b.fresh_value(result_ty);
+    b.push(Stmt::Let(v, Rvalue::SubSlice { base, start: start_op, len: Operand::Value(new_len), elem }));
     Operand::Value(v)
 }
 

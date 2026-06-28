@@ -602,6 +602,19 @@ x := xs[i]
 `xs[i]` reads element `i` of an array / slice / owned `array<T>`. The index is bounds-checked;
 an out-of-range index is a hard runtime error (abort), never a silent out-of-bounds read.
 
+A half-open **range** `start..end` slices instead of indexing: `xs[start..end]` borrows a
+sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — the same backing storage, no
+allocation, region-tied to the source so it cannot outlive it. Either bound may be omitted —
+`xs[start..]` runs to the length, `xs[..end]` from `0`, `xs[..]` is the whole thing. The bounds
+`0 <= start <= end <= len` are checked at runtime; a violation aborts like an out-of-range index.
+`..` is a slicing construct only — there is no first-class range value (the language has no
+counting loops; iteration is the array pipeline).
+
+```align
+head := s[0..5]        // a borrowed sub-str
+rest := xs[1..]        // a slice<T> view of the tail
+```
+
 A field of a struct-array element is read directly:
 
 ```align

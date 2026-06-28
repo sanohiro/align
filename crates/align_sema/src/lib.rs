@@ -1863,6 +1863,11 @@ impl EffectScan {
                 self.expr(recv);
                 self.expr(index);
             }
+            ExprKind::SliceRange { recv, start, end } => {
+                self.expr(recv);
+                if let Some(s) = start { self.expr(s); }
+                if let Some(e) = end { self.expr(e); }
+            }
             ExprKind::ElemField { recv, index, .. } => {
                 self.expr(recv);
                 self.expr(index);
@@ -2087,6 +2092,10 @@ impl<'a> EscapeCheck<'a> {
             // inherits the array's region (it must not outlive it). A scalar element is Copy and
             // not region-tracked, so inheriting the array's region is harmless (never checked).
             ExprKind::Index { recv, .. } => self.region_of(recv, depth),
+            // A range slice is a borrowed view into the receiver's storage (a sub-`str` or a
+            // sub-`slice`), so it lives exactly as long as the receiver — inherit its region (the
+            // same rule as `Index` / `StrTrim`; the bounds are scalar `i64`, never region-tracked).
+            ExprKind::SliceRange { recv, .. } => self.region_of(recv, depth),
             // An array literal lives as long as its shortest-lived element — a `[str]` of arena
             // `str` views is arena-regioned (the same rule as a struct literal over its fields).
             ExprKind::ArrayLit { elems, .. } => elems
@@ -2399,6 +2408,11 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.walk(recv, depth);
                 self.walk(index, depth);
+            }
+            ExprKind::SliceRange { recv, start, end } => {
+                self.walk(recv, depth);
+                if let Some(s) = start { self.walk(s, depth); }
+                if let Some(e) = end { self.walk(e, depth); }
             }
             ExprKind::BuilderWrite { builder, arg, .. } => {
                 self.walk(builder, depth);
@@ -2803,6 +2817,12 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.expr(recv, moved, false, false);
                 self.expr(index, moved, false, false);
+            }
+            // A range slice borrows the receiver (a view, never consumed) and reads the bounds.
+            ExprKind::SliceRange { recv, start, end } => {
+                self.expr(recv, moved, false, false);
+                if let Some(s) = start { self.expr(s, moved, false, false); }
+                if let Some(e) = end { self.expr(e, moved, false, false); }
             }
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.expr(source, moved, false, false);
@@ -3666,6 +3686,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, None, e.span),
             ast::ExprKind::Index { recv, index } => self.check_index(recv, index, e.span),
+            ast::ExprKind::SliceRange { recv, start, end } => self.check_slice_range(recv, start.as_deref(), end.as_deref(), e.span),
             ast::ExprKind::Template(parts) => self.check_template(parts, expected, e.span),
             ast::ExprKind::FieldShorthand(_) => {
                 self.diags.error(
@@ -7016,6 +7037,83 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty: elem, span }
     }
 
+    /// `recv[start..end]` — a half-open range slice of a `str` / `array<T>` / `slice<T>`. Yields a
+    /// borrowed view (a sub-`str`, or a `slice<T>`) into the receiver's storage, region-inherited
+    /// from `recv` (see `region_of`) so it cannot outlive it. `start`/`end` (each an `i64`) default
+    /// to `0` / the receiver's length; bounds (`0 <= start <= end <= len`) are checked at runtime.
+    fn check_slice_range(&mut self, recv: &ast::Expr, start: Option<&ast::Expr>, end: Option<&ast::Expr>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let r = self.check_expr(recv, None);
+        if r.ty == Ty::Error {
+            return err;
+        }
+        // The result view type: a `str` slices to a `str`; an array / slice of `T` slices to a
+        // `slice<T>`. Owned (`string`/`array<T>`) receivers auto-borrow to their view first.
+        let (recv_expr, result_ty) = match r.ty {
+            Ty::Str => (r, Ty::Str),
+            Ty::String => {
+                let rspan = r.span;
+                (Expr { kind: ExprKind::StrBorrow(Box::new(r)), ty: Ty::Str, span: rspan }, Ty::Str)
+            }
+            Ty::Slice(s) | Ty::Array(s, _) | Ty::DynArray(s) => {
+                // A Move element would let the sub-slice alias an owned buffer the source still
+                // frees — same double-free reasoning as `check_index`. Slices are read-only views,
+                // so a `slice<scalar>` is fine; reject Move-element collections until a borrow design.
+                let elem = scalar_to_ty(s);
+                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder) || payload_is_move(elem) {
+                    self.diags.error(
+                        format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
+                        span,
+                    );
+                    return err;
+                }
+                (r, Ty::Slice(s))
+            }
+            other => {
+                self.diags.error(
+                    format!("cannot slice {} with `[a..b]` (only str / array / slice)", ty_name(other)),
+                    span,
+                );
+                return err;
+            }
+        };
+        // A slot-backed fixed array must be a literal or a variable (same restriction as indexing /
+        // pipeline sources — MIR addresses it through its slot to take a base pointer).
+        if matches!(recv_expr.ty, Ty::Array(..)) && !matches!(recv_expr.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+            self.diags.error(
+                "slicing a fixed array requires an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                span,
+            );
+            return err;
+        }
+        // Both bounds are `i64` (like `.len()` and element indices). An omitted bound is filled in
+        // at lowering (0 / len), so only present bounds are type-checked here.
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let check_bound = |this: &mut Self, b: Option<&ast::Expr>| -> Option<Option<Box<Expr>>> {
+            match b {
+                None => Some(None),
+                Some(e) => {
+                    let be = this.check_expr(e, Some(i64_ty));
+                    if be.ty == Ty::Error {
+                        return None;
+                    }
+                    if !be.ty.is_int_like() {
+                        this.diags.error(format!("a slice bound must be an integer, got {}", ty_name(be.ty)), e.span);
+                        return None;
+                    }
+                    Some(Some(Box::new(be)))
+                }
+            }
+        };
+        let Some(start_h) = check_bound(self, start) else { return err };
+        let Some(end_h) = check_bound(self, end) else { return err };
+        Expr {
+            kind: ExprKind::SliceRange { recv: Box::new(recv_expr), start: start_h, end: end_h },
+            ty: result_ty,
+            span,
+        }
+    }
+
     /// `fs.read_file(path)` — read the whole file at `path` (a `str`) into a freshly heap-allocated
     /// owned `string`, yielding `Result<string, Error>`. The returned `string` owns its buffer
     /// (freed by the binding's `Drop`); an I/O error is `Err`. The first `std.fs` surface (the
@@ -7796,6 +7894,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(recv);
                 self.finalize_expr(index);
             }
+            ExprKind::SliceRange { recv, start, end } => {
+                self.finalize_expr(recv);
+                if let Some(s) = start { self.finalize_expr(s); }
+                if let Some(e) = end { self.finalize_expr(e); }
+            }
             ExprKind::BuilderWrite { builder, arg, .. } => {
                 self.finalize_expr(builder);
                 self.finalize_expr(arg);
@@ -8050,6 +8153,11 @@ fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
         K::Index { recv, index } => {
             walk_expr(recv, out);
             walk_expr(index, out);
+        }
+        K::SliceRange { recv, start, end } => {
+            walk_expr(recv, out);
+            if let Some(s) = start { walk_expr(s, out); }
+            if let Some(en) = end { walk_expr(en, out); }
         }
         K::Lambda { params, body } => {
             for p in params {

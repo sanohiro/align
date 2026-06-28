@@ -1215,3 +1215,81 @@ fn io_stdout_and_stderr_buffered_are_independent_sinks() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "to-out\n");
     assert_eq!(String::from_utf8_lossy(&out.stderr), "to-err\n");
 }
+
+#[test]
+fn str_range_slice_all_forms() {
+    if !backend_available() {
+        return;
+    }
+    // `s[a..b]` / `s[a..]` / `s[..b]` / `s[..]` all yield a borrowed sub-`str` (no allocation).
+    let src = "fn main() -> i32 {\n  s := \"hello world\"\n  print(s[0..5])\n  print(s[6..])\n  print(s[..5])\n  print(s[..])\n  print(s[0..5].len())\n  return 0\n}\n";
+    let out = build_and_run("str-range-forms", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\nworld\nhello\nhello world\n5\n");
+}
+
+#[test]
+fn str_range_slice_of_owned_string() {
+    if !backend_available() {
+        return;
+    }
+    // An owned `string` receiver auto-borrows to a `str`; the sub-slice views it without moving it,
+    // so the string stays usable (its full len is 8). The slice "ooba" feeds an equality.
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"foob\", \"arxx\")\n  hit := b2i(s[2..6] == \"obar\")\n  return hit + b2i(s.len() == 8) * 2\n}\n";
+    let out = build_and_run("str-range-owned", src);
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn array_range_slice_yields_slice() {
+    if !backend_available() {
+        return;
+    }
+    // `a[1..4]` borrows a `slice<i64>` over elements [20,30,40]; index + len work on the sub-slice.
+    let src = "fn main() -> i32 {\n  a := [10, 20, 30, 40, 50]\n  s := a[1..4]\n  if s.len() == 3 {\n    return (s[0] + s[1] + s[2]) as i32\n  }\n  return 0\n}\n";
+    let out = build_and_run("array-range", src);
+    assert_eq!(out.status.code(), Some(90)); // 20 + 30 + 40
+}
+
+#[test]
+fn slice_reslice_composes() {
+    if !backend_available() {
+        return;
+    }
+    // Re-slicing a slice: `a[1..5]` = [20,30,40,50], then `[1..3]` = [30,40].
+    let src = "fn main() -> i32 {\n  a := [10, 20, 30, 40, 50]\n  s := a[1..5]\n  t := s[1..3]\n  return (t[0] + t[1]) as i32\n}\n";
+    let out = build_and_run("slice-reslice", src);
+    assert_eq!(out.status.code(), Some(70)); // 30 + 40
+}
+
+#[test]
+fn str_range_slice_out_of_bounds_aborts() {
+    if !backend_available() {
+        return;
+    }
+    // `end > len` fails the range bounds check and aborts (no silent OOB read).
+    let src = "fn main() -> i32 {\n  s := \"abc\"\n  print(s[1..10])\n  return 0\n}\n";
+    let out = build_and_run("str-range-oob", src);
+    assert_ne!(out.status.code(), Some(0), "an out-of-range slice must not exit cleanly");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("out of bounds"),
+        "expected a bounds panic, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn array_range_slice_inverted_bounds_aborts() {
+    if !backend_available() {
+        return;
+    }
+    // `start > end` also fails the range check and aborts. Both 3 and 1 are individually valid
+    // indices for length 4, so the message must report the whole range (`3..1`), not a misleading
+    // single (index, len) pair.
+    let src = "fn main() -> i32 {\n  a := [1, 2, 3, 4]\n  s := a[3..1]\n  return s.len() as i32\n}\n";
+    let out = build_and_run("array-range-inverted", src);
+    assert_ne!(out.status.code(), Some(0), "inverted bounds must not exit cleanly");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("out of bounds"), "got: {err}");
+    assert!(err.contains("3..1"), "the range failure must report the offending range, got: {err}");
+}
