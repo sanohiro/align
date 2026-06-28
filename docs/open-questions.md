@@ -690,6 +690,28 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
     portable" policy. First targets: JSON structural scan, `memchr`-class find, UTF-8 / quote /
     backslash masks. (NEON/SVE expected to win too per 2024–2025 SIMD-parsing papers; AVX-512 untested
     — CPU lacks it.)
+    - **Runtime CPU-dispatch *architecture* (codex advice 2026-06-28, explicitly "do not implement
+      immediately").** A `RuntimeFns` table behind a `OnceLock`, populated once by
+      `is_x86_feature_detected!`/`is_aarch64_feature_detected!`, selecting per-CPU backends for
+      hot std/runtime functions (scalar / AVX2 / NEON). Rules (all consistent with this repo's
+      stance): generated user code stays portable-baseline; `--target-cpu native|x86-64-v3` is the
+      only whole-program opt-in; **never call a `#[target_feature]` fn without the matching detect**;
+      detect once, not per inner loop; **every SIMD path tested for scalar-equivalence + benched
+      before adoption**; NEON is first-class on arm64/Apple Silicon (no Apple-private accel
+      dependency); AVX-512 only later with real hardware. Priority: P0 JSON/string scan → P1
+      bitset count/any/all + SwissTable control-byte probing / dictionary-id grouping → P2 LLM
+      primitives (tokenizer scan, quantized CPU matvec fallback, KV-cache copy/scan).
+      - **Timing assessment (build-deferred-until-a-consumer):** the scaffold's *only* current
+        candidate, `find_quote_or_escape`, is **already runtime-dispatched by the `memchr` crate**
+        (its own AVX2/NEON detection), so wrapping it in a `RuntimeFns` table is architecture ahead
+        of a real consumer. The scaffold earns its place with the **first hand-written SIMD function
+        not covered by a crate** — `json_structural_scan` or `bitset_count` — and should be built
+        *together with* that function (so the dispatch + a scalar backend + the scalar-equivalence
+        test all land with a measurable win). That first hand-SIMD consumer in turn wants the
+        simdjson-style two-stage parser (a large, separately-deferred rewrite — the current
+        recursive-descent parser has no structural-scan stage to accelerate). So: **record now,
+        build with the first crate-uncovered SIMD kernel, not standalone.** Full advice in
+        `work/runtime-cpu-dispatch-advice-for-claude-2026-06-28.md` (gitignored scratch).
   - **SoA column scan / filtered aggregate** re-confirmed: col_sum **9.4–12.2×**, `where(.active).
     pay.sum()` **3.7–7×** vs Rust `Vec<Struct>` AoS. The shipped headline; unchanged.
   - **Bitset bool/Option columns** re-confirmed with the **caveat already recorded**: `count`/`any`/
