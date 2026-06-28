@@ -46,6 +46,11 @@ bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
   (`str::from_utf8(..).parse` → a single-pass digit accumulation) moved it ≈0.61× → ≈0.82–0.85×
   (AoS ≈parity at 1M). Remaining gap → more scalar tuning + a SIMD/structural parser. See
   `bench/json_soa/README.md` + `docs/open-questions.md`.
+- **JSON decode-throughput tracker (`bench/json_decode/`):** the regression harness for the parser
+  rewrite (recursive-descent → simdjson-style two-stage SIMD). The recursive-descent baseline ≈ties
+  `serde_json` (full ≈1.03×, projecting ≈1.09×); a validated `work/` probe (SIMD structural index +
+  projecting two-stage) reaches **~3.4–4.1×** over `serde_json` (~3.2–3.9× into soa columns). The
+  rewrite lands that here — watch the `align/serde` ratios climb per slice.
 - **Grouped aggregation (`bench/group_by/`): Align beats the *default* `std::HashMap` everywhere
   (1.2–3.6×) and beats `ahash` for low-cardinality grouping (1.31×).** `s.group_by(.k).sum(.v)` is a
   primitive-key columnar hash-aggregate vs Rust's generic map. It loses to `ahash` at high cardinality

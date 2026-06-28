@@ -1,0 +1,38 @@
+// Benchmark kernel: JSON decode throughput. Two shapes feed the SAME aggregate
+// (`where(.active).pay.sum()`) so the time is dominated by the parser, not the fold:
+//
+//   decode_full — decode all four record fields into `array<Full>` (full parse).
+//   decode_proj — decode only the two used fields into `array<Proj>`; the decoder SKIPS the
+//                 undeclared `score`/`extra` (the projection rail — declare only what you read).
+//
+// Both are compared against idiomatic Rust `serde_json → Vec<_>` in the harness. This is the
+// regression tracker for the JSON parser rewrite (recursive-descent → simdjson-style two-stage).
+import core.json
+
+Full { active: bool, pay: i64, score: i64, extra: i64 }
+Proj { active: bool, pay: i64 }
+
+fn r_full(d: str) -> Result<i64, Error> {
+  xs: array<Full> := json.decode(d)?
+  return Ok(xs.where(.active).pay.sum())
+}
+
+// Exported C-ABI entry: returns the aggregate, or -1 on a parse error (so the harness detects it).
+pub fn decode_full(d: str) -> i64 {
+  match r_full(d) {
+    Ok(v) => v,
+    Err(_) => 0 - 1,
+  }
+}
+
+fn r_proj(d: str) -> Result<i64, Error> {
+  xs: array<Proj> := json.decode(d)?
+  return Ok(xs.where(.active).pay.sum())
+}
+
+pub fn decode_proj(d: str) -> i64 {
+  match r_proj(d) {
+    Ok(v) => v,
+    Err(_) => 0 - 1,
+  }
+}
