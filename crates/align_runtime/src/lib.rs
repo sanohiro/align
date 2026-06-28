@@ -1287,14 +1287,23 @@ impl<'a> JsonParser<'a> {
         }
         if neg { Some(v) } else { v.checked_neg() }
     }
-    /// Read a JSON number (`-?digits(.digits)?([eE][+-]?digits)?`) as `f64`.
-    fn number(&mut self) -> Option<f64> {
+    /// Advance the cursor over a JSON number token (`-?int(.digits)?([eE][+-]?digits)?`, with a
+    /// mandatory integer digit per the JSON grammar), returning its byte span. Returns `None`
+    /// (leaving the cursor put) when the cursor is not at a number. Shared by [`number`] (which
+    /// parses the span) and [`skip_number`] (which discards it).
+    fn number_span(&mut self) -> Option<&'a [u8]> {
         let start = self.pos;
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
+        let int_start = self.pos;
         while matches!(self.peek(), Some(b'0'..=b'9')) {
             self.pos += 1;
+        }
+        if self.pos == int_start {
+            // No integer digit (e.g. a lone `-`, or `.5`): not a valid JSON number.
+            self.pos = start;
+            return None;
         }
         if self.peek() == Some(b'.') {
             self.pos += 1;
@@ -1311,10 +1320,18 @@ impl<'a> JsonParser<'a> {
                 self.pos += 1;
             }
         }
-        if self.pos == start {
-            return None;
-        }
-        std::str::from_utf8(&self.src[start..self.pos]).ok()?.parse::<f64>().ok()
+        Some(&self.src[start..self.pos])
+    }
+    /// Read a JSON number as `f64`.
+    fn number(&mut self) -> Option<f64> {
+        let span = self.number_span()?;
+        std::str::from_utf8(span).ok()?.parse::<f64>().ok()
+    }
+    /// Skip a JSON number **lexically** — advance over the token without parsing it to `f64`.
+    /// Used by [`skip_value`] for unknown numeric fields, whose value is discarded; lexical skip
+    /// is ~3x faster than a full parse (verified by `work/skip_number_probe.rs`).
+    fn skip_number(&mut self) -> Option<()> {
+        self.number_span().map(|_| ())
     }
     fn boolean(&mut self) -> Option<bool> {
         if self.src[self.pos..].starts_with(b"true") {
@@ -1331,7 +1348,7 @@ impl<'a> JsonParser<'a> {
     fn skip_value(&mut self) -> Option<()> {
         match self.peek() {
             Some(b't' | b'f') => self.boolean().map(|_| ()),
-            Some(b'-' | b'0'..=b'9') => self.number().map(|_| ()),
+            Some(b'-' | b'0'..=b'9') => self.skip_number(),
             Some(b'"') => self.string().map(|_| ()),
             _ => None,
         }
@@ -1733,6 +1750,37 @@ mod tests {
         let (mut ok2, mut ov2) = (vec![0i64; 3], vec![0i64; 3]);
         let nn = unsafe { align_rt_group_min_i64(nk.as_ptr(), nv.as_ptr(), 3, ok2.as_mut_ptr(), ov2.as_mut_ptr(), 3) };
         assert_eq!((nn, ov2[0]), (1, -5));
+    }
+
+    #[test]
+    fn json_number_parse_and_lexical_skip_agree_on_span() {
+        // `skip_number` must advance the cursor over exactly the same token `number` parses, so
+        // an unknown numeric field is skipped lexically without a float parse (work/ probe: ~3x).
+        for s in ["0", "-1", "42", "3.14", "-0.5", "1e3", "6.022e23", "-2.5E-4", "1000000000000"] {
+            let mut p = JsonParser { src: s.as_bytes(), pos: 0 };
+            let parsed = p.number();
+            let after_parse = p.pos;
+            assert!(parsed.is_some(), "number() should parse {s:?}");
+
+            let mut q = JsonParser { src: s.as_bytes(), pos: 0 };
+            assert_eq!(q.skip_number(), Some(()), "skip_number() should accept {s:?}");
+            assert_eq!(q.pos, after_parse, "skip and parse must consume the same span for {s:?}");
+            assert_eq!(q.pos, s.len(), "whole token consumed for {s:?}");
+        }
+
+        // A trailing non-number byte bounds the token (number followed by `}`); only digits move.
+        let mut p = JsonParser { src: b"12,3", pos: 0 };
+        assert_eq!(p.skip_number(), Some(()));
+        assert_eq!(p.pos, 2, "stops at the comma");
+
+        // Not a number: a lone `-` or a leading `.` (invalid JSON) consumes nothing and fails.
+        for bad in ["-", ".5", "x"] {
+            let mut p = JsonParser { src: bad.as_bytes(), pos: 0 };
+            assert_eq!(p.skip_number(), None, "{bad:?} is not a JSON number");
+            assert_eq!(p.pos, 0, "cursor restored for {bad:?}");
+            let mut q = JsonParser { src: bad.as_bytes(), pos: 0 };
+            assert_eq!(q.number(), None, "number() also rejects {bad:?}");
+        }
     }
 
     #[test]
