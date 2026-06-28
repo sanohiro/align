@@ -212,10 +212,13 @@ fn newest_rs_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|x| x == "rs") {
+            // `file_type()` comes from the `read_dir` iterator with no extra `stat`, and (unlike
+            // `path.is_dir()`) does not follow symlinks — so a symlinked dir is not traversed,
+            // avoiding cycles / escaping the source tree. We `stat` only actual `.rs` files.
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() && entry.path().extension().is_some_and(|x| x == "rs") {
                 if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
                     newest = Some(newest.map_or(t, |n| n.max(t)));
                 }
