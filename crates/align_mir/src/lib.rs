@@ -1302,7 +1302,8 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
 }
 
 /// Bounds for `start..end`: `0 <= start`, `start <= end`, `end <= len`. Any violation aborts via
-/// `bounds_fail` (`-> !`), reporting `end` against `len` (the dominant out-of-range case).
+/// `range_fail(start, end, len)` (`-> !`), which reports the whole range — a single (index, len)
+/// pair can't describe an inverted range whose bounds are each individually valid.
 fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len: Operand) {
     let neg = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(neg, Rvalue::Bin(BinOp::Lt, start.clone(), Operand::Const(Const::Int(0, i64_ty())))));
@@ -1321,7 +1322,7 @@ fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len:
 
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::Call("bounds_fail".to_string(), vec![end.clone(), len])));
+    b.push(Stmt::Let(t, Rvalue::Call("range_fail".to_string(), vec![start.clone(), end.clone(), len])));
     b.terminate(Term::Unreachable);
 
     b.cur = ok;

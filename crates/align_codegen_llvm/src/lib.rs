@@ -198,6 +198,15 @@ fn build_module<'c>(
             None,
         ),
     );
+    // Out-of-bounds range-slice failure: report `(start, end, len)` and abort (`-> !`).
+    funcs.insert(
+        "range_fail".to_string(),
+        module.add_function(
+            "align_rt_range_fail",
+            ctx.void_type().fn_type(&[ctx.i64_type().into(), ctx.i64_type().into(), ctx.i64_type().into()], false),
+            None,
+        ),
+    );
     // Arena allocator (M3).
     let ptr = ctx.ptr_type(AddressSpace::default());
     let i64t = ctx.i64_type();

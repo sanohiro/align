@@ -1272,7 +1272,7 @@ fn str_range_slice_out_of_bounds_aborts() {
     let out = build_and_run("str-range-oob", src);
     assert_ne!(out.status.code(), Some(0), "an out-of-range slice must not exit cleanly");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("index out of bounds"),
+        String::from_utf8_lossy(&out.stderr).contains("out of bounds"),
         "expected a bounds panic, got: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -1283,9 +1283,13 @@ fn array_range_slice_inverted_bounds_aborts() {
     if !backend_available() {
         return;
     }
-    // `start > end` also fails the range check and aborts.
+    // `start > end` also fails the range check and aborts. Both 3 and 1 are individually valid
+    // indices for length 4, so the message must report the whole range (`3..1`), not a misleading
+    // single (index, len) pair.
     let src = "fn main() -> i32 {\n  a := [1, 2, 3, 4]\n  s := a[3..1]\n  return s.len() as i32\n}\n";
     let out = build_and_run("array-range-inverted", src);
     assert_ne!(out.status.code(), Some(0), "inverted bounds must not exit cleanly");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("index out of bounds"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("out of bounds"), "got: {err}");
+    assert!(err.contains("3..1"), "the range failure must report the offending range, got: {err}");
 }
