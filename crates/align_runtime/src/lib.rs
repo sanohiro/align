@@ -583,18 +583,24 @@ pub unsafe extern "C" fn align_rt_builder_write_json_str(b: *mut Builder, ptr: *
         let mut start = 0;
         for (i, &c) in bytes.iter().enumerate() {
             if c == b'"' || c == b'\\' || c < 0x20 {
-                b.buf.extend_from_slice(&bytes[start..i]);
+                if start < i {
+                    // Skip an empty copy when escapes are adjacent (e.g. `\r\n`).
+                    b.buf.extend_from_slice(&bytes[start..i]);
+                }
                 write_json_escape(&mut b.buf, c);
                 start = i + 1;
             }
         }
-        b.buf.extend_from_slice(&bytes[start..]);
+        if start < bytes.len() {
+            b.buf.extend_from_slice(&bytes[start..]);
+        }
     }
     b.buf.push(b'"');
 }
 
 /// Append the JSON escape for one byte that needs escaping (`"`, `\`, or a C0 control), per
 /// RFC 8259 — the short forms where defined, else `\u00XX`. Caller guarantees `c` needs escaping.
+#[inline]
 fn write_json_escape(buf: &mut Vec<u8>, c: u8) {
     match c {
         b'"' => buf.extend_from_slice(b"\\\""),
