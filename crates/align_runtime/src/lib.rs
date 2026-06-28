@@ -1160,9 +1160,17 @@ unsafe fn group_agg_i64(
     if n == 0 {
         return 0;
     }
+    // The output is the same regardless of strategy, so reject an invalid output up front — before
+    // any pre-scan or table/accumulator allocation (a null out always returns -1, never a count).
+    if cap < 0 || out_keys.is_null() || out_vals.is_null() {
+        return -1;
+    }
 
     // Pre-scan for the key range, bailing out of the dense path the instant the span reaches `n`
-    // (so a sparse key set pays only a partial scan before falling through to the hash table).
+    // (so a sparse key set pays only a partial scan before falling through to the hash table). The
+    // span is only checked when `kmin`/`kmax` actually move — a key already inside `[kmin, kmax]`
+    // costs nothing. `i128` is required here: before density is established the span can exceed
+    // `i64` (e.g. keys at both `i64::MIN` and `i64::MAX`).
     let mut kmin = keys[0];
     let mut kmax = keys[0];
     let limit = n as i128; // dense requires span + 1 <= n, i.e. span < n.
@@ -1170,23 +1178,29 @@ unsafe fn group_agg_i64(
     for &k in &keys[1..] {
         if k < kmin {
             kmin = k;
+            if (kmax as i128 - kmin as i128) >= limit {
+                dense = false;
+                break;
+            }
         } else if k > kmax {
             kmax = k;
-        }
-        if (kmax as i128 - kmin as i128) >= limit {
-            dense = false;
-            break;
+            if (kmax as i128 - kmin as i128) >= limit {
+                dense = false;
+                break;
+            }
         }
     }
 
     if dense {
         // span = kmax - kmin < n, so `slots` fits and the accumulator is no larger than the keys.
-        let slots = (kmax as i128 - kmin as i128) as usize + 1;
+        // Density guarantees `kmin <= k <= kmax` with span < n, so `k - kmin` is in `[0, n)` — it
+        // never overflows `i64`, so the hot loop stays in `i64` (no `i128` per element).
+        let slots = (kmax - kmin) as usize + 1;
         let mut acc = vec![0i64; slots];
         let mut occ = vec![false; slots];
         let mut count: usize = 0;
         for (i, &k) in keys.iter().enumerate() {
-            let idx = (k as i128 - kmin as i128) as usize;
+            let idx = (k - kmin) as usize;
             let v = per_row(i);
             if occ[idx] {
                 acc[idx] = combine(acc[idx], v);
@@ -1196,7 +1210,7 @@ unsafe fn group_agg_i64(
                 count += 1;
             }
         }
-        if cap < 0 || count > cap as usize || out_keys.is_null() || out_vals.is_null() {
+        if count > cap as usize {
             return -1;
         }
         let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
@@ -1261,7 +1275,7 @@ unsafe fn group_agg_i64(
         }
     }
 
-    if cap < 0 || count > cap as usize || out_keys.is_null() || out_vals.is_null() {
+    if count > cap as usize {
         return -1;
     }
     let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };

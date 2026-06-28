@@ -462,9 +462,9 @@ bounded by the input (a sparse-but-wide key set falls back rather than allocatin
 array), and the pre-scan bails the instant the span reaches `n`, so sparse data pays only a partial
 scan. **No surface / return-type change** — a pure runtime mechanism (one op, the runtime picks the
 strategy, like an adaptive sort). **RE-BENCHED (`bench/group_by`, 1M rows, native): now beats BOTH std
-SipHash (4.45–4.89×) AND `ahash` (1.77× / 2.02× / 2.45× at 100 / 10k / 632k groups)** — the previous
+SipHash (5.0–5.7×) AND `ahash` (2.06× / 2.32× / 2.74× at 100 / 10k / 632k groups)** — the previous
 hash path *lost* to `ahash` at 10k/1M groups (0.52–0.72×); the dense path flips those to clean wins and
-roughly halves the 1M-group time (≈52→10 ms). The bench's keys are `LCG % groups` (range `[0, groups)`),
+cuts the 1M-group time ~7× (≈54→7.9 ms). The bench's keys are `LCG % groups` (range `[0, groups)`),
 so all three configs are dense — exactly the dense-id workload this targets. The remaining "beat ahash
 on a *genuinely sparse* high-cardinality key set" case still wants the full SwissTable (deferred above).
 Still open: string keys (intern), AoS source, multiple aggregates in one pass → more result columns, a

@@ -21,17 +21,17 @@ cargo project (own `[workspace]`).
 
 ```
    groups   distinct    align ms      std ms    ahash ms      vs std    vs ahash
-      100        100       1.504        6.690       2.660       4.45x       1.77x
-    10000      10000       1.666        8.152       3.364       4.89x       2.02x
-  1000000     632390      10.129       47.911      24.863       4.73x       2.45x
+      100        100       1.306        6.729       2.694       5.15x       2.06x
+    10000      10000       1.468        8.390       3.400       5.72x       2.32x
+  1000000     632390       7.882       39.511      21.590       5.01x       2.74x
 ```
 
-- **Beats the default `std::HashMap` (SipHash) everywhere — 4.5–4.9×.** The idiomatic-Rust comparison:
+- **Beats the default `std::HashMap` (SipHash) everywhere — 5.0–5.7×.** The idiomatic-Rust comparison:
   a direct-index columnar aggregate vs a generic SipHash map.
-- **Now beats even `ahash` everywhere — 1.77× / 2.02× / 2.45×.** The dense-id path skips hashing
+- **Now beats even `ahash` everywhere — 2.06× / 2.32× / 2.74×.** The dense-id path skips hashing
   entirely (`acc[key - min]`), so it wins across the cardinality range — including the high-cardinality
   regime where the older hash path *lost* to `ahash` (see history below).
-- **~5× faster than the previous hash path at high cardinality** (≈52 → 10 ms at 632k groups): direct
+- **~7× faster than the previous hash path at high cardinality** (≈54 → 7.9 ms at 632k groups): direct
   indexing replaces the probe chains + rehashes a wide key set used to pay.
 
 ### History — the hash path (2026-06-27, superseded for dense keys)
