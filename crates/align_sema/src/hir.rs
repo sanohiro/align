@@ -451,6 +451,12 @@ pub enum ExprKind {
     /// is the scalar element). Lowering emits a bounds check (`0 <= index < len`) that aborts on
     /// an out-of-range index (the settled panic model). `index` is an `i64`.
     Index { recv: Box<Expr>, index: Box<Expr> },
+    /// `recv[start..end]` — a half-open range slice of a `str` / `array<T>` / `slice<T>`. The result
+    /// is a borrowed view (`ty` = `str` for a `str` receiver, else `slice<T>`) into the receiver's
+    /// storage — no allocation, region inherited from `recv` (it cannot outlive it). `start` defaults
+    /// to `0` and `end` to the receiver's length when omitted (both `i64`). Lowering emits a bounds
+    /// check (`0 <= start <= end <= len`) that aborts on an out-of-range slice (the panic model).
+    SliceRange { recv: Box<Expr>, start: Option<Box<Expr>>, end: Option<Box<Expr>> },
     /// `recv[index].f0.f1…` — field access on an element of a struct array (`recv` is a fixed
     /// `array<Struct>` or an owned dynamic `array<Struct>`) with a *runtime* index, MMv2 slice 8f.
     /// `path` is the chain of field indices into the element struct (length ≥ 1); `struct_id`

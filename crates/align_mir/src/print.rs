@@ -232,6 +232,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
         Rvalue::SlicePtr(op) => format!("slice_ptr({})", operand_str(op)),
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
+        Rvalue::SubSlice { base, start, len, elem } => {
+            format!("subslice({}, +{}, len={} : {})", operand_str(base), operand_str(start), operand_str(len), ty_name(*elem))
+        }
         Rvalue::StrLit(s) => format!("{s:?}"),
         Rvalue::StrClone(op) => format!("str_clone({})", operand_str(op)),
         Rvalue::StrPredicate { kind, haystack, needle } => {

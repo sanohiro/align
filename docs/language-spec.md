@@ -215,6 +215,12 @@ layout, so a field-wise pipeline streams only the columns it touches (the cache 
 AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`) or decode straight into
 it (`s: soa<User> := json.decode(d)?`), both arena-allocated. See `draft.md` §9.
 
+`xs[i]` reads a bounds-checked element. A half-open range `xs[start..end]` slices instead: a
+borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no
+allocation, region-tied to the source. Bounds may be omitted (`xs[a..]`, `xs[..b]`, `xs[..]`);
+`0 <= start <= end <= len` is checked at runtime (a violation aborts). `..` is slicing-only — not a
+first-class value (the language has no counting loops). See `draft.md` §8.
+
 ### Strings
 
 ```text

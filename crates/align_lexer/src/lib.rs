@@ -53,6 +53,7 @@ pub enum TokKind {
     Comma,
     Colon,
     Dot,
+    DotDot,  // .. (half-open range, only inside `[]` for slicing)
     Plus,
     Minus,
     Star,
@@ -495,6 +496,7 @@ impl<'a> Lexer<'a> {
             (b']', _) => (TokKind::RBracket, 1),
             (b',', _) => (TokKind::Comma, 1),
             (b':', _) => (TokKind::Colon, 1),
+            (b'.', Some(b'.')) => (TokKind::DotDot, 2),
             (b'.', _) => (TokKind::Dot, 1),
             (b'+', _) => (TokKind::Plus, 1),
             (b'-', _) => (TokKind::Minus, 1),
@@ -623,6 +625,21 @@ mod tests {
                 TokKind::Ident("p".into()),
                 TokKind::Dot,
                 TokKind::Ident("x".into()),
+                TokKind::End,
+                TokKind::Eof,
+            ]
+        );
+        // `..` is a single DotDot token (slicing range); `1..5` keeps the int boundaries intact —
+        // the `.` is not greedily eaten as a decimal point (it is only one when followed by a digit).
+        assert_eq!(
+            kinds("a[1..5]"),
+            vec![
+                TokKind::Ident("a".into()),
+                TokKind::LBracket,
+                TokKind::Int(1),
+                TokKind::DotDot,
+                TokKind::Int(5),
+                TokKind::RBracket,
                 TokKind::End,
                 TokKind::Eof,
             ]

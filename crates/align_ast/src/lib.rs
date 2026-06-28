@@ -331,6 +331,16 @@ pub enum ExprKind {
         recv: Box<Expr>,
         index: Box<Expr>,
     },
+    /// `recv[start..end]` — a half-open range slice of a `str` / `array<T>` / `slice<T>`, yielding a
+    /// borrowed view (a sub-`str`, or a `slice<T>`) into the receiver's storage (no allocation).
+    /// `start` defaults to `0` and `end` to the receiver's length when omitted (`a..`, `..b`, `..`).
+    /// Out-of-range bounds (`0 <= start <= end <= len`) are a hard runtime error (abort). The range
+    /// `..` is a slicing construct, valid only here — it is not a first-class value.
+    SliceRange {
+        recv: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+    },
     /// `.field` — element-field shorthand, valid only as a pipeline stage argument
     /// (e.g. `where(.active)`); refers to a field of the current pipeline element.
     FieldShorthand(Ident),

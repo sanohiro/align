@@ -2572,6 +2572,32 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 self.builder.build_load(ty, ep, "slcload").map_err(|e| self.err(e))?
             }
+            Rvalue::SubSlice { base, start, len, elem } => {
+                // Offset the base pointer by `start` elements (the `elem` type sets the GEP stride —
+                // `i8` bytes for a `str`) and pair it with the precomputed `len`, yielding a borrowed
+                // `{ptr,len}` view of the same backing storage (no allocation).
+                let agg = self.operand(base).into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "subptr").map_err(|e| self.err(e))?.into_pointer_value();
+                let ety = scalar_type(self.ctx, *elem, self.struct_types, self.enum_types);
+                let start_v = self.operand(start).into_int_value();
+                let newptr = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(ety, ptr, &[start_v], "subgep")
+                        .map_err(|e| self.err(e))?
+                };
+                let l = self.operand(len);
+                let sty = slice_struct_type(self.ctx);
+                let s0 = self
+                    .builder
+                    .build_insert_value(sty.get_undef(), newptr, 0, "subvptr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(s0, l, 1, "subvlen")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
             Rvalue::BoxClone(handle, src) => {
                 let Ty::Box(s) = result_ty else {
                     return Err(self.err("clone result is not a box"));
