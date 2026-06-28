@@ -1368,7 +1368,7 @@ unsafe fn group_agg_str(
     out_keys: *mut AlignStr,
     out_vals: *mut i64,
     cap: i64,
-    value_at: impl Fn(usize) -> i64,
+    value_at: impl Fn(*const u8) -> i64,
     combine: impl Fn(i64, i64) -> i64,
 ) -> i64 {
     use std::collections::HashMap;
@@ -1391,7 +1391,8 @@ unsafe fn group_agg_str(
         // Read unaligned: the field address is byte-offset pointer arithmetic, so don't assume the
         // type's alignment (free on x86; correct everywhere).
         let ks = unsafe { (row.add(key_off) as *const AlignStr).read_unaligned() };
-        let v = value_at(i);
+        // `value_at` reads from the already-computed `row` (no re-deriving `base + i*stride`).
+        let v = value_at(row);
         // The key bytes borrow the source, which outlives this call — so the map can key on them.
         let bytes: &[u8] = if ks.ptr.is_null() || ks.len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) } };
         match ids.get(bytes) {
@@ -1415,12 +1416,12 @@ unsafe fn group_agg_str(
     count as i64
 }
 
-/// `value_at` reading the strided i64 value column at `val_off` — for sum/min/max (count uses `1`).
-/// `base`/`stride`/`val_off` are the same row geometry as [`group_agg_str`].
+/// `value_at` reading the i64 value at `val_off` from a row pointer — for sum/min/max (count
+/// uses `1`). The caller passes the per-row pointer, so this just offsets to the value column.
 #[inline]
-unsafe fn str_value_reader(base: *const u8, stride: i64, val_off: i64) -> impl Fn(usize) -> i64 {
-    let (stride, val_off) = (stride as usize, val_off as usize);
-    move |i| unsafe { (base.add(i * stride + val_off) as *const i64).read_unaligned() }
+fn str_value_reader(val_off: i64) -> impl Fn(*const u8) -> i64 {
+    let val_off = val_off as usize;
+    move |row| unsafe { (row.add(val_off) as *const i64).read_unaligned() }
 }
 
 /// `group_by(.str_key).sum(.i64_value)` over an AoS `array<Struct>`.
@@ -1429,7 +1430,7 @@ unsafe fn str_value_reader(base: *const u8, stride: i64, val_off: i64) -> impl F
 /// See [`group_agg_str`]; `val_off` must address a valid `i64` in each row.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_sum_str(base: *const u8, n: i64, stride: i64, key_off: i64, val_off: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
-    let read = unsafe { str_value_reader(base, stride, val_off) };
+    let read = str_value_reader(val_off);
     unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, read, |a, b| a.wrapping_add(b)) }
 }
 
@@ -1439,7 +1440,7 @@ pub unsafe extern "C" fn align_rt_group_sum_str(base: *const u8, n: i64, stride:
 /// See [`align_rt_group_sum_str`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_min_str(base: *const u8, n: i64, stride: i64, key_off: i64, val_off: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
-    let read = unsafe { str_value_reader(base, stride, val_off) };
+    let read = str_value_reader(val_off);
     unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, read, |a, b| a.min(b)) }
 }
 
@@ -1449,7 +1450,7 @@ pub unsafe extern "C" fn align_rt_group_min_str(base: *const u8, n: i64, stride:
 /// See [`align_rt_group_sum_str`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_max_str(base: *const u8, n: i64, stride: i64, key_off: i64, val_off: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
-    let read = unsafe { str_value_reader(base, stride, val_off) };
+    let read = str_value_reader(val_off);
     unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, read, |a, b| a.max(b)) }
 }
 
