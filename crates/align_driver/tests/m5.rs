@@ -105,6 +105,23 @@ fn json_decode_skips_unknown_numeric_fields() {
 }
 
 #[test]
+fn json_decode_skips_unknown_nested_objects_arrays_and_null() {
+    if !backend_available() {
+        return;
+    }
+    // The projection rail: a narrow struct (`id` only) decodes from an object whose other fields
+    // are a nested object, an array, `null`, and a string with structural bytes (`}`/`]`/escaped
+    // quote) inside it — all skipped without breaking the parse. `id` still decodes to 7.
+    let json = r#"{"meta": {"a": 1, "b": [2, 3]}, "id": 7, "tags": [1, [2], {"c": 4}], "note": null, "s": "has } and ] and \" inside"}"#;
+    let src = format!(
+        "import core.json\nUser {{ id: i64 }}\nfn parse(s: str) -> Result<User, Error> {{\n  u: User := json.decode(s)?\n  return Ok(u)\n}}\nfn main() -> Result<(), Error> {{\n  u := parse({json:?})?\n  print(u.id)\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-skip-nested", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+#[test]
 fn str_clone_escapes_arena_as_owned_string() {
     if !backend_available() {
         return;
