@@ -216,6 +216,34 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
     let Ok(path_str) = std::str::from_utf8(path_bytes) else {
         return 1;
     };
+    use std::io::Read;
+    // Fast path: a regular file with a known nonzero length — allocate the owned buffer once and
+    // read straight into it, skipping the `std::fs::read` Vec and the second copy into the runtime
+    // allocator (~1.8× on a 128 MiB file; `work/io_perf_probe.rs`). Special / streaming files
+    // (length 0, `/proc`, pipes, char devices) and any file that shrinks or grows under us fall
+    // back to the copy path below — which re-opens by path, so a partial read here is harmless.
+    if let Ok(mut file) = std::fs::File::open(path_str) {
+        if let Ok(meta) = file.metadata() {
+            let flen = meta.len();
+            // Regular files only (`is_file`), nonzero length (skips empty / size-unknown special
+            // files), and a length that fits `usize` (always true on 64-bit; guards a 32-bit target).
+            if meta.is_file() && flen > 0 {
+                if let Ok(len_u) = usize::try_from(flen) {
+                    let dst = align_rt_alloc(flen as i64);
+                    let buf = unsafe { core::slice::from_raw_parts_mut(dst, len_u) };
+                    // `read_exact` fills the whole buffer (a shorter file errors). On success one
+                    // more read must hit EOF — otherwise the file grew past the snapshot and the
+                    // buffer would silently truncate, so fall back. Any failure frees and falls back.
+                    if file.read_exact(buf).is_ok() && matches!(file.read(&mut [0u8; 1]), Ok(0)) {
+                        unsafe { *out = AlignStr { ptr: dst, len: flen as i64 } };
+                        return 0;
+                    }
+                    unsafe { align_rt_free(dst) };
+                }
+            }
+        }
+    }
+    // Fallback (empty / special / changed file): read into a Vec, then copy into the owned buffer.
     let data = match std::fs::read(path_str) {
         Ok(d) => d,
         Err(_) => return 1,
@@ -1796,6 +1824,59 @@ mod tests {
             assert_eq!(p.pos, 0, "cursor restored for {bad:?}");
             let mut q = JsonParser { src: bad.as_bytes(), pos: 0 };
             assert_eq!(q.number(), None, "number() also rejects {bad:?}");
+        }
+    }
+
+    #[test]
+    fn fs_read_file_fast_path_and_fallbacks() {
+        // Build a unique temp path so concurrent test runs don't collide (no Date/rand in the
+        // crate, but the test binary's pid + a counter address suffice for uniqueness here).
+        let dir = std::env::temp_dir();
+        let uniq = format!("align-rt-readfile-{}-{:p}", std::process::id(), &dir as *const _);
+
+        let read = |path: &str| -> (i32, Option<Vec<u8>>) {
+            let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+            let rc = unsafe { align_rt_fs_read_file(path.as_ptr(), path.len() as i64, &mut out) };
+            let bytes = if rc == 0 && out.len > 0 {
+                let v = unsafe { core::slice::from_raw_parts(out.ptr, out.len as usize) }.to_vec();
+                unsafe { align_rt_free(out.ptr as *mut u8) };
+                Some(v)
+            } else {
+                // rc==0 with len 0 owns no buffer (null ptr) — nothing to free.
+                if rc == 0 { Some(Vec::new()) } else { None }
+            };
+            (rc, bytes)
+        };
+
+        // Fast path: a regular file larger than one read buffer — the whole content comes back
+        // intact (exercises `read_exact` filling the owned buffer + the EOF guard).
+        let big_path = dir.join(format!("{uniq}-big.bin"));
+        let content: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&big_path, &content).expect("write big temp file");
+        let (rc, got) = read(big_path.to_str().unwrap());
+        assert_eq!(rc, 0);
+        assert_eq!(got.as_deref(), Some(content.as_slice()), "fast path reads the whole file");
+
+        // Empty file: `flen == 0` skips the fast path; the fallback yields an owned null/0 view.
+        let empty_path = dir.join(format!("{uniq}-empty.bin"));
+        std::fs::write(&empty_path, b"").expect("write empty temp file");
+        assert_eq!(read(empty_path.to_str().unwrap()), (0, Some(Vec::new())));
+
+        // Missing file: both `File::open` (fast path) and `std::fs::read` (fallback) fail → rc 1.
+        let missing = dir.join(format!("{uniq}-missing.bin"));
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(read(missing.to_str().unwrap()).0, 1);
+
+        std::fs::remove_file(&big_path).ok();
+        std::fs::remove_file(&empty_path).ok();
+
+        // Special file whose metadata length is 0 but which yields bytes on read (`/proc`): must
+        // hit the fallback and return non-empty content. Linux-only.
+        #[cfg(target_os = "linux")]
+        {
+            let (rc, got) = read("/proc/self/stat");
+            assert_eq!(rc, 0, "/proc/self/stat readable via fallback");
+            assert!(got.is_some_and(|b| !b.is_empty()), "/proc file returns content");
         }
     }
 
