@@ -327,6 +327,24 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `core.string` byte predicates — all share the `i32 (ptr, i64, ptr, i64)` signature of `str_eq`.
+    for (key, sym) in [
+        ("str_contains", "align_rt_str_contains"),
+        ("str_starts_with", "align_rt_str_starts_with"),
+        ("str_ends_with", "align_rt_str_ends_with"),
+    ] {
+        funcs.insert(
+            key.to_string(),
+            module.add_function(
+                sym,
+                ctx.i32_type().fn_type(
+                    &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
+                    false,
+                ),
+                None,
+            ),
+        );
+    }
     // String builder (M5: `template` desugaring).
     let i64t2 = ctx.i64_type();
     funcs.insert(
@@ -2346,6 +2364,35 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .expect("str_clone returns a {ptr,len}")
+            }
+            Rvalue::StrPredicate { kind, haystack, needle } => {
+                // Extract both `{ptr,len}` views and call the matching runtime scan, returning the
+                // `i32` (0/1) as a `bool` (`i1`).
+                let fk = match kind {
+                    align_sema::hir::StrPredKind::Contains => "str_contains",
+                    align_sema::hir::StrPredKind::StartsWith => "str_starts_with",
+                    align_sema::hir::StrPredKind::EndsWith => "str_ends_with",
+                };
+                let ha = self.operand(haystack).into_struct_value();
+                let ne = self.operand(needle).into_struct_value();
+                let hp = self.builder.build_extract_value(ha, 0, "hp").map_err(|e| self.err(e))?;
+                let hl = self.builder.build_extract_value(ha, 1, "hl").map_err(|e| self.err(e))?;
+                let np = self.builder.build_extract_value(ne, 0, "np").map_err(|e| self.err(e))?;
+                let nl = self.builder.build_extract_value(ne, 1, "nl").map_err(|e| self.err(e))?;
+                let r = self
+                    .builder
+                    .build_call(self.funcs[fk], &[hp.into(), hl.into(), np.into(), nl.into()], "strpred")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("str predicate returns i32")
+                    .into_int_value();
+                // r != 0  ⇒  true.
+                let zero = self.ctx.i32_type().const_zero();
+                self.builder
+                    .build_int_compare(IntPredicate::NE, r, zero, "strpredb")
+                    .map_err(|e| self.err(e))?
+                    .into()
             }
             Rvalue::BuilderNew { capacity } => {
                 // Open a builder with a null arena: the finished `string` is heap-owned

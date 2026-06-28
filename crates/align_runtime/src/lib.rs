@@ -1732,6 +1732,73 @@ pub unsafe extern "C" fn align_rt_str_eq(a: *const u8, alen: i64, b: *const u8, 
     (x == y) as i32
 }
 
+/// `s.contains(needle)` (M5, `core.string`) — 1 if `needle`'s bytes occur in `s`, else 0. An
+/// empty needle is always present. Backed by `memchr::memmem` (its own AVX2/NEON dispatch), the
+/// byte-oriented scan the spec mandates over a `chars()` walk.
+///
+/// # Safety
+/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_contains(hptr: *const u8, hlen: i64, nptr: *const u8, nlen: i64) -> i32 {
+    if nlen <= 0 {
+        return 1;
+    }
+    if nlen > hlen {
+        return 0;
+    }
+    let (hay, needle) = unsafe {
+        (
+            std::slice::from_raw_parts(hptr, hlen as usize),
+            std::slice::from_raw_parts(nptr, nlen as usize),
+        )
+    };
+    memchr::memmem::find(hay, needle).is_some() as i32
+}
+
+/// `s.starts_with(prefix)` (M5, `core.string`) — 1 if `s` begins with `prefix`'s bytes, else 0.
+///
+/// # Safety
+/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_starts_with(hptr: *const u8, hlen: i64, pptr: *const u8, plen: i64) -> i32 {
+    if plen <= 0 {
+        return 1;
+    }
+    if plen > hlen {
+        return 0;
+    }
+    let (hay, pre) = unsafe {
+        (
+            std::slice::from_raw_parts(hptr, plen as usize),
+            std::slice::from_raw_parts(pptr, plen as usize),
+        )
+    };
+    (hay == pre) as i32
+}
+
+/// `s.ends_with(suffix)` (M5, `core.string`) — 1 if `s` ends with `suffix`'s bytes, else 0.
+///
+/// # Safety
+/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_ends_with(hptr: *const u8, hlen: i64, sptr: *const u8, slen: i64) -> i32 {
+    if slen <= 0 {
+        return 1;
+    }
+    if slen > hlen {
+        return 0;
+    }
+    // Compare the trailing `slen` bytes of the haystack against the suffix.
+    let tail = unsafe { hptr.add((hlen - slen) as usize) };
+    let (hay, suf) = unsafe {
+        (
+            std::slice::from_raw_parts(tail, slen as usize),
+            std::slice::from_raw_parts(sptr, slen as usize),
+        )
+    };
+    (hay == suf) as i32
+}
+
 /// Report an `Err` returned from `main` (`docs/impl/06-runtime-std.md` §9). M2's `Error`
 /// is an i32 code; the original code is reported, and the returned value is the process
 /// exit code — clamped to a nonzero `u8` so a failure never looks like success (exit 0)
@@ -2383,5 +2450,41 @@ mod tests {
         }
         assert_eq!(unsafe { *first }, 42, "earlier allocation must remain valid");
         align_rt_arena_end(a);
+    }
+
+    #[test]
+    fn str_predicates_match_byte_semantics() {
+        // Drive the FFI entry points exactly as codegen does ({ptr,len} pairs), and check each
+        // against the equivalent Rust `&[u8]` predicate across a spread of cases incl. UTF-8,
+        // empty needles, and over-long needles.
+        let contains = |h: &[u8], n: &[u8]| unsafe {
+            align_rt_str_contains(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+        };
+        let starts = |h: &[u8], n: &[u8]| unsafe {
+            align_rt_str_starts_with(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+        };
+        let ends = |h: &[u8], n: &[u8]| unsafe {
+            align_rt_str_ends_with(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+        };
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"hello, align", b"align"),
+            (b"hello, align", b"hello"),
+            (b"hello, align", b"xyz"),
+            (b"abc", b""),          // empty needle: always present / prefix / suffix
+            (b"", b""),             // both empty
+            (b"abc", b"abcd"),      // needle longer than haystack
+            (b"abc", b"abc"),       // whole-string
+            ("café みかん".as_bytes(), "みかん".as_bytes()),
+            ("café みかん".as_bytes(), "café".as_bytes()),
+            ("café みかん".as_bytes(), "ん".as_bytes()),
+        ];
+        for (h, n) in cases {
+            // Independent reference: an empty needle is always present; otherwise a sliding-window
+            // scan (`h.windows` is empty when the needle is longer than the haystack → false).
+            let expect_contains = n.is_empty() || h.windows(n.len()).any(|w| w == *n);
+            assert_eq!(contains(h, n), expect_contains as i32, "contains({h:?}, {n:?})");
+            assert_eq!(starts(h, n), h.starts_with(n) as i32, "starts_with({h:?}, {n:?})");
+            assert_eq!(ends(h, n), h.ends_with(n) as i32, "ends_with({h:?}, {n:?})");
+        }
     }
 }

@@ -1090,3 +1090,49 @@ fn string_escapes() {
     let out = build_and_run("str-escape", src);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a\tb\n");
 }
+
+#[test]
+fn str_predicates_basic() {
+    if !backend_available() {
+        return;
+    }
+    // contains/starts_with/ends_with on a `str` literal. Bits: c1=1 c2=0 s1=4 s2=0 e1=16 e2=0 → 21.
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn main() -> i32 {\n  s := \"hello, align\"\n  c1 := b2i(s.contains(\"align\"))\n  c2 := b2i(s.contains(\"xyz\"))\n  s1 := b2i(s.starts_with(\"hello\"))\n  s2 := b2i(s.starts_with(\"align\"))\n  e1 := b2i(s.ends_with(\"align\"))\n  e2 := b2i(s.ends_with(\"hello\"))\n  return c1 + c2 * 2 + s1 * 4 + s2 * 8 + e1 * 16 + e2 * 32\n}\n";
+    let out = build_and_run("str-pred-basic", src);
+    assert_eq!(out.status.code(), Some(21));
+}
+
+#[test]
+fn str_predicates_edge_cases() {
+    if !backend_available() {
+        return;
+    }
+    // Empty needle is always present (1+2+4); a needle longer than the haystack is absent (0). → 7.
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn main() -> i32 {\n  s := \"abc\"\n  empty := b2i(s.contains(\"\"))\n  estart := b2i(s.starts_with(\"\"))\n  eend := b2i(s.ends_with(\"\"))\n  toolong := b2i(s.contains(\"abcd\"))\n  return empty + estart * 2 + eend * 4 + toolong * 8\n}\n";
+    let out = build_and_run("str-pred-edge", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn str_predicates_on_owned_string_dont_consume() {
+    if !backend_available() {
+        return;
+    }
+    // The receiver is an owned `string` (auto-borrowed): the predicate reads bytes, never moves it,
+    // so `s` is still usable afterwards (s.len() == 6). Bits 1+2+4+8 → 15.
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"foo\", \"bar\")\n  r := b2i(s.contains(\"oba\")) + b2i(s.starts_with(\"foo\")) * 2 + b2i(s.ends_with(\"bar\")) * 4\n  return r + b2i(s.len() == 6) * 8\n}\n";
+    let out = build_and_run("str-pred-owned", src);
+    assert_eq!(out.status.code(), Some(15));
+}
+
+#[test]
+fn str_predicates_are_byte_oriented_utf8() {
+    if !backend_available() {
+        return;
+    }
+    // Multi-byte UTF-8: contains/starts_with/ends_with operate on bytes, so whole-character
+    // needles match. Bits 1+2+4 → 7.
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn main() -> i32 {\n  s := \"café みかん\"\n  c1 := b2i(s.contains(\"みかん\"))\n  c2 := b2i(s.ends_with(\"ん\"))\n  c3 := b2i(s.starts_with(\"café\"))\n  return c1 + c2 * 2 + c3 * 4\n}\n";
+    let out = build_and_run("str-pred-utf8", src);
+    assert_eq!(out.status.code(), Some(7));
+}

@@ -234,6 +234,14 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
         Rvalue::StrLit(s) => format!("{s:?}"),
         Rvalue::StrClone(op) => format!("str_clone({})", operand_str(op)),
+        Rvalue::StrPredicate { kind, haystack, needle } => {
+            let name = match kind {
+                align_sema::hir::StrPredKind::Contains => "str_contains",
+                align_sema::hir::StrPredKind::StartsWith => "str_starts_with",
+                align_sema::hir::StrPredKind::EndsWith => "str_ends_with",
+            };
+            format!("{name}({}, {})", operand_str(haystack), operand_str(needle))
+        }
         Rvalue::BuilderNew { capacity } => format!("builder_new(cap={})", operand_str(capacity)),
         Rvalue::BuilderWriteStr(b, s) => format!("builder_write({}, {})", operand_str(b), operand_str(s)),
         Rvalue::BuilderWriteInt(b, n) => format!("builder_write_int({}, {})", operand_str(b), operand_str(n)),

@@ -352,6 +352,11 @@ pub enum ExprKind {
     /// slice 7). The result owns its buffer (`Drop`-freed), so it can escape its source's
     /// region — the explicit escape hatch out of a zero-copy view.
     StrClone(Box<Expr>),
+    /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` — a byte-oriented `str` predicate
+    /// (`core.string`), `ty` = `bool`. Both operands are `str` views (an owned `string` operand is
+    /// auto-borrowed via [`ExprKind::StrBorrow`]); the comparison reads bytes only, so neither is
+    /// moved. Backed by the runtime's `memchr`-class scans.
+    StrPredicate { kind: StrPredKind, haystack: Box<Expr>, needle: Box<Expr> },
     /// Borrow an owned `string` as a `str` view (MMv2 slice 7b). The two share the `{ptr,len}`
     /// layout, so this is a zero-cost, allocation-free read-only view — an implicit coercion at
     /// a `str`-parameter call site. The `string` is **not** moved (it stays owned by its slot
@@ -528,6 +533,19 @@ pub enum BuilderWriteKind {
     Char,
     /// `b.write_float(x)` — append an `f32`/`f64`'s shortest round-trip decimal.
     Float,
+}
+
+/// Which byte-oriented `str` predicate a `StrPredicate` tests (`core.string`). All three are
+/// pure byte comparisons (UTF-8 is the representation, but the scan is byte-level) returning
+/// `bool`; the standard runtime backs them with `memchr::memmem` / slice prefix-suffix checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrPredKind {
+    /// `s.contains(needle)` — `needle`'s bytes occur somewhere in `s`.
+    Contains,
+    /// `s.starts_with(prefix)` — `s` begins with `prefix`'s bytes.
+    StartsWith,
+    /// `s.ends_with(suffix)` — `s` ends with `suffix`'s bytes.
+    EndsWith,
 }
 
 #[derive(Clone, Debug)]
