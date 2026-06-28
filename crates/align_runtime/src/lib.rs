@@ -576,26 +576,41 @@ pub unsafe extern "C" fn align_rt_builder_write_json_str(b: *mut Builder, ptr: *
     b.buf.push(b'"');
     if len > 0 {
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        for &c in bytes {
-            match c {
-                b'"' => b.buf.extend_from_slice(b"\\\""),
-                b'\\' => b.buf.extend_from_slice(b"\\\\"),
-                0x08 => b.buf.extend_from_slice(b"\\b"),
-                0x0c => b.buf.extend_from_slice(b"\\f"),
-                b'\n' => b.buf.extend_from_slice(b"\\n"),
-                b'\r' => b.buf.extend_from_slice(b"\\r"),
-                b'\t' => b.buf.extend_from_slice(b"\\t"),
-                c if c < 0x20 => {
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    b.buf.extend_from_slice(b"\\u00");
-                    b.buf.push(HEX[(c >> 4) as usize]);
-                    b.buf.push(HEX[(c & 0xf) as usize]);
-                }
-                c => b.buf.push(c),
+        // Only `"`, `\`, and the C0 control set need escaping; every other byte (including all
+        // multi-byte UTF-8 continuations) passes through verbatim. Copy each clean run in bulk
+        // (`extend_from_slice`) instead of pushing byte by byte — ~1.9–3× on typical text
+        // (`work/json_str_simd_probe.rs`), with byte-identical output.
+        let mut start = 0;
+        for (i, &c) in bytes.iter().enumerate() {
+            if c == b'"' || c == b'\\' || c < 0x20 {
+                b.buf.extend_from_slice(&bytes[start..i]);
+                write_json_escape(&mut b.buf, c);
+                start = i + 1;
             }
         }
+        b.buf.extend_from_slice(&bytes[start..]);
     }
     b.buf.push(b'"');
+}
+
+/// Append the JSON escape for one byte that needs escaping (`"`, `\`, or a C0 control), per
+/// RFC 8259 — the short forms where defined, else `\u00XX`. Caller guarantees `c` needs escaping.
+fn write_json_escape(buf: &mut Vec<u8>, c: u8) {
+    match c {
+        b'"' => buf.extend_from_slice(b"\\\""),
+        b'\\' => buf.extend_from_slice(b"\\\\"),
+        0x08 => buf.extend_from_slice(b"\\b"),
+        0x0c => buf.extend_from_slice(b"\\f"),
+        b'\n' => buf.extend_from_slice(b"\\n"),
+        b'\r' => buf.extend_from_slice(b"\\r"),
+        b'\t' => buf.extend_from_slice(b"\\t"),
+        c => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            buf.extend_from_slice(b"\\u00");
+            buf.push(HEX[(c >> 4) as usize]);
+            buf.push(HEX[(c & 0xf) as usize]);
+        }
+    }
 }
 
 /// One field descriptor for `json.decode` (matches the codegen layout):
@@ -1842,6 +1857,61 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_json_str_bulk_copy_matches_byte_by_byte_reference() {
+        // The old per-byte implementation, used as the oracle: the bulk-copy rewrite must produce
+        // byte-identical output for every input.
+        fn reference(s: &[u8]) -> Vec<u8> {
+            let mut out = vec![b'"'];
+            for &c in s {
+                match c {
+                    b'"' => out.extend_from_slice(b"\\\""),
+                    b'\\' => out.extend_from_slice(b"\\\\"),
+                    0x08 => out.extend_from_slice(b"\\b"),
+                    0x0c => out.extend_from_slice(b"\\f"),
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    c if c < 0x20 => {
+                        const HEX: &[u8; 16] = b"0123456789abcdef";
+                        out.extend_from_slice(b"\\u00");
+                        out.push(HEX[(c >> 4) as usize]);
+                        out.push(HEX[(c & 0xf) as usize]);
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push(b'"');
+            out
+        }
+        let encode = |s: &[u8]| -> Vec<u8> {
+            let mut b = Builder { buf: Vec::new(), arena: core::ptr::null_mut() };
+            unsafe { align_rt_builder_write_json_str(&mut b, s.as_ptr(), s.len() as i64) };
+            b.buf
+        };
+
+        let mut cases: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"plain ascii text".to_vec(),
+            b"with \"quotes\" and \\ backslash".to_vec(),
+            b"tabs\tnewlines\nand\rreturns".to_vec(),
+            "UTF-8: \u{e9} \u{672c} \u{1f600} mixed".as_bytes().to_vec(),
+            b"trailing quote\"".to_vec(),
+            b"\"leading quote".to_vec(),
+            vec![b'a'; 1000], // long clean run
+        ];
+        // Every C0 control byte (0x00..=0x1f), each surrounded by clean bytes.
+        for c in 0u8..0x20 {
+            cases.push(vec![b'x', c, b'y']);
+        }
+        // One string containing all control bytes in a row.
+        cases.push((0u8..0x20).collect());
+
+        for s in &cases {
+            assert_eq!(encode(s), reference(s), "mismatch encoding {s:?}");
+        }
+    }
 
     #[test]
     fn find_quote_or_escape_prefix_and_simd_paths_agree() {
