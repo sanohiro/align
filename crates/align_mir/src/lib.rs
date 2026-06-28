@@ -277,6 +277,10 @@ pub enum Rvalue {
     /// yielding `bool` (`i1`). Both operands are `str` `{ptr,len}` views; backed by a runtime
     /// `memchr`-class scan. Pure read, no allocation.
     StrPredicate { kind: hir::StrPredKind, haystack: Operand, needle: Operand },
+    /// `s.trim()` / `s.trim_start()` / `s.trim_end()` — yield a borrowed sub-`str` `{ptr,len}` of
+    /// the receiver with ASCII whitespace stripped from one or both ends. Pure read, no allocation;
+    /// the result aliases the receiver's bytes.
+    StrTrim { kind: hir::StrTrimKind, recv: Operand },
     /// `builder()` / `builder(capacity)` — open a builder, yielding an opaque handle (MMv2 slice 7c).
     /// `capacity` (bytes) pre-sizes the backing buffer; 0 = default.
     BuilderNew { capacity: Operand },
@@ -1031,6 +1035,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let n = lower_expr(b, needle);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::StrPredicate { kind: *kind, haystack: h, needle: n }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::StrTrim { kind, recv } => {
+            let r = lower_expr(b, recv);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::StrTrim { kind: *kind, recv: r }));
             Operand::Value(v)
         }
         // Borrowing an owned `string` as a `str` (slice 7b) is a no-op at runtime: the two share

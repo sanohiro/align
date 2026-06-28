@@ -533,6 +533,21 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `core.string` trims → a borrowed sub-`str` `{ptr,len}` of the receiver (no allocation).
+    for (key, sym) in [
+        ("str_trim", "align_rt_str_trim"),
+        ("str_trim_start", "align_rt_str_trim_start"),
+        ("str_trim_end", "align_rt_str_trim_end"),
+    ] {
+        funcs.insert(
+            key.to_string(),
+            module.add_function(
+                sym,
+                slice_struct_type(ctx).fn_type(&[ptr.into(), ctx.i64_type().into()], false),
+                None,
+            ),
+        );
+    }
     // Surface `builder` (MMv2 slice 7c): `to_string()` finishes into an owned `string`; `free`
     // drops an unfinished builder at scope exit.
     funcs.insert(
@@ -2364,6 +2379,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .expect("str_clone returns a {ptr,len}")
+            }
+            Rvalue::StrTrim { kind, recv } => {
+                // Extract the receiver `{ptr,len}` and call the trim; the runtime returns a sub-view
+                // `{ptr,len}` aliasing the same bytes (no allocation).
+                let fk = match kind {
+                    align_sema::hir::StrTrimKind::Both => "str_trim",
+                    align_sema::hir::StrTrimKind::Start => "str_trim_start",
+                    align_sema::hir::StrTrimKind::End => "str_trim_end",
+                };
+                let agg = self.operand(recv).into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "trimptr").map_err(|e| self.err(e))?;
+                let len = self.builder.build_extract_value(agg, 1, "trimlen").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs[fk], &[ptr.into(), len.into()], "strtrim")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("str trim returns a {ptr,len}")
             }
             Rvalue::StrPredicate { kind, haystack, needle } => {
                 // Extract both `{ptr,len}` views and call the matching runtime scan, returning the
