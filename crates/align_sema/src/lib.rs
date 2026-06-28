@@ -5240,7 +5240,7 @@ impl<'a, 't> Checker<'a, 't> {
         match method {
             "get" => self.check_box_get(recv_expr, recv_ty, args, span),
             "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
-            "contains" | "starts_with" | "ends_with" if matches!(recv_ty, Ty::Str | Ty::String) => {
+            "contains" | "starts_with" | "ends_with" | "find" if matches!(recv_ty, Ty::Str | Ty::String) => {
                 self.check_str_predicate(recv_expr, method, args, span)
             }
             "trim" | "trim_start" | "trim_end" if matches!(recv_ty, Ty::Str | Ty::String) => {
@@ -6542,10 +6542,11 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` — byte-oriented `str` predicates
-    /// (`core.string`, draft.md §18). The receiver (`recv`, already a `str`/`string`) and the single
-    /// argument are both treated as `str` views: an owned `string` is auto-borrowed (`StrBorrow`), so
-    /// neither operand is moved — the predicate only reads bytes and yields `bool`.
+    /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` / `s.find(n)` — byte-oriented `str`
+    /// scans (`core.string`, draft.md §18). The receiver (`recv`, already a `str`/`string`) and the
+    /// single argument are both treated as `str` views: an owned `string` is auto-borrowed
+    /// (`StrBorrow`), so neither operand is moved — the scan only reads bytes. The predicates yield
+    /// `bool`; `find` yields `Option<i64>` (the first byte index, `None` if absent).
     fn check_str_predicate(&mut self, recv: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // Borrow an owned `string` receiver as a `str` view; a `str` receiver passes through.
@@ -6565,15 +6566,16 @@ impl<'a, 't> Checker<'a, 't> {
         if haystack.ty == Ty::Error || needle.ty == Ty::Error {
             return err;
         }
-        let kind = match method {
-            "contains" => hir::StrPredKind::Contains,
-            "starts_with" => hir::StrPredKind::StartsWith,
-            "ends_with" => hir::StrPredKind::EndsWith,
-            _ => unreachable!("check_str_predicate called with non-predicate method"),
+        let (kind, ty) = match method {
+            "contains" => (hir::StrPredKind::Contains, Ty::Bool),
+            "starts_with" => (hir::StrPredKind::StartsWith, Ty::Bool),
+            "ends_with" => (hir::StrPredKind::EndsWith, Ty::Bool),
+            "find" => (hir::StrPredKind::Find, Ty::Option(Scalar::Int(IntTy { bits: 64, signed: true }))),
+            _ => unreachable!("check_str_predicate called with non-scan method"),
         };
         Expr {
             kind: ExprKind::StrPredicate { kind, haystack: Box::new(haystack), needle: Box::new(needle) },
-            ty: Ty::Bool,
+            ty,
             span,
         }
     }

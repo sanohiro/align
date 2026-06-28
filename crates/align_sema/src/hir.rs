@@ -558,6 +558,10 @@ pub enum StrPredKind {
     StartsWith,
     /// `s.ends_with(suffix)` — `s` ends with `suffix`'s bytes.
     EndsWith,
+    /// `s.find(needle)` — the byte index of `needle`'s first occurrence in `s`, as `Option<i64>`
+    /// (`None` if absent). Unlike the others this yields `Option<i64>`, not `bool`; it is the index
+    /// sibling of `contains` (`contains == find(..).is_some()`), now useful with range slicing.
+    Find,
 }
 
 /// Which end(s) a `StrTrim` strips ASCII whitespace from (`core.string`). The result is a
