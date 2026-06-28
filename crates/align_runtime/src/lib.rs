@@ -1287,37 +1287,51 @@ impl<'a> JsonParser<'a> {
         }
         if neg { Some(v) } else { v.checked_neg() }
     }
-    /// Advance the cursor over a JSON number token (`-?int(.digits)?([eE][+-]?digits)?`, with a
-    /// mandatory integer digit per the JSON grammar), returning its byte span. Returns `None`
-    /// (leaving the cursor put) when the cursor is not at a number. Shared by [`number`] (which
-    /// parses the span) and [`skip_number`] (which discards it).
+    /// Advance the cursor over a JSON number token (`-?int(.digits)?([eE][+-]?digits)?`),
+    /// returning its byte span, or `None` (restoring the cursor) when the cursor is not at a valid
+    /// number. Enforces the JSON grammar's mandatory digits — at least one in the integer part, and
+    /// at least one after a `.` or in an exponent — so malformed forms (`-`, `.5`, `1.`, `1e`,
+    /// `1e+`) are rejected rather than half-consumed. Shared by [`number`] (which parses the span)
+    /// and [`skip_number`] (which discards it), so the two accept exactly the same language.
     fn number_span(&mut self) -> Option<&'a [u8]> {
         let start = self.pos;
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
+        // Integer part: at least one digit (else a lone `-`, or a leading `.`).
         let int_start = self.pos;
         while matches!(self.peek(), Some(b'0'..=b'9')) {
             self.pos += 1;
         }
         if self.pos == int_start {
-            // No integer digit (e.g. a lone `-`, or `.5`): not a valid JSON number.
             self.pos = start;
             return None;
         }
+        // Fraction: a `.` must be followed by at least one digit (rejects `1.`).
         if self.peek() == Some(b'.') {
             self.pos += 1;
+            let frac_start = self.pos;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
             }
+            if self.pos == frac_start {
+                self.pos = start;
+                return None;
+            }
         }
+        // Exponent: `[eE][+-]?` must be followed by at least one digit (rejects `1e`, `1e+`).
         if matches!(self.peek(), Some(b'e' | b'E')) {
             self.pos += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.pos += 1;
             }
+            let exp_start = self.pos;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
+            }
+            if self.pos == exp_start {
+                self.pos = start;
+                return None;
             }
         }
         Some(&self.src[start..self.pos])
@@ -1773,8 +1787,10 @@ mod tests {
         assert_eq!(p.skip_number(), Some(()));
         assert_eq!(p.pos, 2, "stops at the comma");
 
-        // Not a number: a lone `-` or a leading `.` (invalid JSON) consumes nothing and fails.
-        for bad in ["-", ".5", "x"] {
+        // Not a valid JSON number: a lone `-`, a leading `.`, a dangling fraction (`1.`) or
+        // exponent (`1e`, `1e+`) — each consumes nothing and fails, in BOTH `skip_number` and
+        // `number` (so the two agree on the accepted language, the point of sharing `number_span`).
+        for bad in ["-", ".5", "x", "1.", "1e", "1e+"] {
             let mut p = JsonParser { src: bad.as_bytes(), pos: 0 };
             assert_eq!(p.skip_number(), None, "{bad:?} is not a JSON number");
             assert_eq!(p.pos, 0, "cursor restored for {bad:?}");
