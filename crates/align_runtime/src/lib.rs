@@ -1505,6 +1505,7 @@ fn find_quote_or_escape(hay: &[u8]) -> Option<usize> {
 #[cfg_attr(not(test), allow(dead_code))]
 fn json_structural_index_scalar(src: &[u8], out: &mut Vec<u32>) {
     out.clear();
+    out.reserve(src.len() / 8); // structural tokens are a fraction of the bytes; reuse keeps it a no-op
     // `esc` = the current byte is escaped (preceded by an odd-length backslash run). It suppresses
     // only a `"` (an escaped quote is not a delimiter) — NOT the punctuation, matching the SIMD's
     // `real_quote = quote & ~escaped` / `op & ~in_string` (escapes touch quotes, not `op`). This is
@@ -1560,6 +1561,7 @@ fn find_escaped(backslash: u64, prev_escaped: &mut u64) -> u64 {
 unsafe fn json_structural_index_avx2(src: &[u8], out: &mut Vec<u32>) {
     use core::arch::x86_64::*;
     out.clear();
+    out.reserve(src.len() / 8); // structural tokens are a fraction of the bytes; reuse keeps it a no-op
     let n = src.len();
 
     // Closures inherit the enclosing fn's enabled features, so the intrinsics are available; they
@@ -1614,6 +1616,11 @@ unsafe fn json_structural_index_avx2(src: &[u8], out: &mut Vec<u32>) {
 /// reference. Wired into the decoder in a later slice.
 #[cfg_attr(not(test), allow(dead_code))]
 fn json_structural_index(src: &[u8], out: &mut Vec<u32>) {
+    // Positions are `u32`, so a 4 GiB+ input would silently truncate/wrap — corrupting stage 2.
+    // Reject it up front (simdjson has the same limit); a real document never approaches this.
+    if src.len() > u32::MAX as usize {
+        panic_abort("JSON input exceeds the 4 GiB structural-index limit");
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("pclmulqdq") {
