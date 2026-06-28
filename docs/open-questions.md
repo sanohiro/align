@@ -693,7 +693,7 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
   - **SoA column scan / filtered aggregate** re-confirmed: col_sum **9.4–12.2×**, `where(.active).
     pay.sum()` **3.7–7×** vs Rust `Vec<Struct>` AoS. The shipped headline; unchanged.
   - **Bitset bool/Option columns** re-confirmed with the **caveat already recorded**: `count`/`any`/
-    `all` **45–48×** (popcnt), but dense `where(flag).value.sum()` **0.36–0.67× (LOSES)** — value
+    `all` **45–48×** (popcnt), but dense `where(.flag).value.sum()` **0.36–0.67× (LOSES)** — value
     loads dominate. So generate *different* kernels: bitmap+POPCNT for cardinality terminals;
     byte/select masks for dense filtered value sums; sparse bit-iteration only at low selectivity.
   - **CAUTION — hand-SIMD is not a free win.** int8 dot (64M elems): scalar Rust 6.31 ms, manual
@@ -709,11 +709,15 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
     integer-column work. Fits `json/csv decode selected str field → id column → group_by`. Strong fit
     for the column-oriented `group_by` runway; output needs an id→string map. Distinct from the
     SwissTable lever (which is for *high-cardinality* primitive-key grouping).
-  - **★ Streaming / projected scanner terminals** (`csv.scan<Row>(view).where(.active).pay.sum()`,
-    NDJSON `json.scan`). Streaming projected scan beat materializing all rows **2.7–2.9×** at 1–5M
-    rows; if the terminal is a single aggregate, beats even building columns. A `line` must be a
-    borrowed `str` view into a chunk (region-bounded, cannot escape). Pairs with mmap views; the
-    "don't materialize `array<string>`" rail. Std-layer.
+  - **★ Streaming / projected scanner terminals** (a typed scanner bound to its row schema, then a
+    fused terminal: `rows: csv.scanner<Row> := csv.scan(view); rows.where(.active).pay.sum()?`;
+    likewise NDJSON `json.scan`). The row type comes from the **binding annotation**, never an
+    expression-position `scan<Row>(…)` turbofish (Settled "no turbofish"); the scanner's schema is in
+    neither args nor result, so it is exactly the open **schema-selector** residual noted there.
+    Streaming projected scan beat materializing all rows **2.7–2.9×** at 1–5M rows; if the terminal
+    is a single aggregate, beats even building columns. A `line` must be a borrowed `str` view into a
+    chunk (region-bounded, cannot escape). Pairs with mmap views; the "don't materialize
+    `array<string>`" rail. Std-layer.
   - **Network std rails — connection/batching shape dominates.** Local 20k-request probe: connect-
     per-request 1.0×, keepalive 1.48×, **pipelined write-then-read 19.1×**. The network analogue of the
     stdout-flush result: the std `http`/`socket` API should reuse connections by default, expose
