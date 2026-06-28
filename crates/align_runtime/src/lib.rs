@@ -1760,6 +1760,32 @@ pub unsafe extern "C" fn align_rt_str_contains(hptr: *const u8, hlen: i64, nptr:
     memchr::memmem::find(hay, needle).is_some() as i32
 }
 
+/// `s.find(needle)` (M5, `core.string`) — the byte index of `needle`'s first occurrence in `s`, or
+/// `-1` if absent (codegen turns the sentinel into `Option<i64>`: `None` for `-1`, else `Some(i)`).
+/// An empty needle is found at index 0. Backed by `memchr::memmem`.
+///
+/// # Safety
+/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_find(hptr: *const u8, hlen: i64, nptr: *const u8, nlen: i64) -> i64 {
+    if nlen <= 0 {
+        return 0;
+    }
+    if nlen > hlen {
+        return -1;
+    }
+    let (hay, needle) = unsafe {
+        (
+            std::slice::from_raw_parts(hptr, hlen as usize),
+            std::slice::from_raw_parts(nptr, nlen as usize),
+        )
+    };
+    match memchr::memmem::find(hay, needle) {
+        Some(i) => i as i64,
+        None => -1,
+    }
+}
+
 /// `s.starts_with(prefix)` (M5, `core.string`) — 1 if `s` begins with `prefix`'s bytes, else 0.
 ///
 /// # Safety
@@ -2556,6 +2582,17 @@ mod tests {
             assert_eq!(contains(h, n), expect_contains as i32, "contains({h:?}, {n:?})");
             assert_eq!(starts(h, n), h.starts_with(n) as i32, "starts_with({h:?}, {n:?})");
             assert_eq!(ends(h, n), h.ends_with(n) as i32, "ends_with({h:?}, {n:?})");
+
+            // `find` returns the first index or -1; an empty needle is 0. Reference: a window scan.
+            let find = unsafe {
+                align_rt_str_find(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+            };
+            let expect_find: i64 = if n.is_empty() {
+                0
+            } else {
+                h.windows(n.len()).position(|w| w == *n).map_or(-1, |i| i as i64)
+            };
+            assert_eq!(find, expect_find, "find({h:?}, {n:?})");
         }
     }
 

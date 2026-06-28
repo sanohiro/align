@@ -354,6 +354,18 @@ fn build_module<'c>(
             ),
         );
     }
+    // `s.find(needle)` → the byte index (i64) or -1; same arg shape, but an i64 return (→ Option<i64>).
+    funcs.insert(
+        "str_find".to_string(),
+        module.add_function(
+            "align_rt_str_find",
+            ctx.i64_type().fn_type(
+                &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
+                false,
+            ),
+            None,
+        ),
+    );
     // String builder (M5: `template` desugaring).
     let i64t2 = ctx.i64_type();
     funcs.insert(
@@ -2408,33 +2420,75 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .expect("str trim returns a {ptr,len}")
             }
             Rvalue::StrPredicate { kind, haystack, needle } => {
-                // Extract both `{ptr,len}` views and call the matching runtime scan, returning the
-                // `i32` (0/1) as a `bool` (`i1`).
-                let fk = match kind {
-                    align_sema::hir::StrPredKind::Contains => "str_contains",
-                    align_sema::hir::StrPredKind::StartsWith => "str_starts_with",
-                    align_sema::hir::StrPredKind::EndsWith => "str_ends_with",
-                };
+                use align_sema::hir::StrPredKind;
+                // Extract both `{ptr,len}` views; the runtime call + result shaping differ per kind.
                 let ha = self.operand(haystack).into_struct_value();
                 let ne = self.operand(needle).into_struct_value();
                 let hp = self.builder.build_extract_value(ha, 0, "hp").map_err(|e| self.err(e))?;
                 let hl = self.builder.build_extract_value(ha, 1, "hl").map_err(|e| self.err(e))?;
                 let np = self.builder.build_extract_value(ne, 0, "np").map_err(|e| self.err(e))?;
                 let nl = self.builder.build_extract_value(ne, 1, "nl").map_err(|e| self.err(e))?;
-                let r = self
-                    .builder
-                    .build_call(self.funcs[fk], &[hp.into(), hl.into(), np.into(), nl.into()], "strpred")
-                    .map_err(|e| self.err(e))?
-                    .try_as_basic_value()
-                    .basic()
-                    .expect("str predicate returns i32")
-                    .into_int_value();
-                // r != 0  ⇒  true.
-                let zero = self.ctx.i32_type().const_zero();
-                self.builder
-                    .build_int_compare(IntPredicate::NE, r, zero, "strpredb")
-                    .map_err(|e| self.err(e))?
-                    .into()
+                let args = [hp.into(), hl.into(), np.into(), nl.into()];
+                match kind {
+                    // The three predicates: an `i32` (0/1) returned as a `bool` (`i1`).
+                    StrPredKind::Contains | StrPredKind::StartsWith | StrPredKind::EndsWith => {
+                        let fk = match kind {
+                            StrPredKind::Contains => "str_contains",
+                            StrPredKind::StartsWith => "str_starts_with",
+                            StrPredKind::EndsWith => "str_ends_with",
+                            StrPredKind::Find => unreachable!(),
+                        };
+                        let r = self
+                            .builder
+                            .build_call(self.funcs[fk], &args, "strpred")
+                            .map_err(|e| self.err(e))?
+                            .try_as_basic_value()
+                            .basic()
+                            .expect("str predicate returns i32")
+                            .into_int_value();
+                        let zero = self.ctx.i32_type().const_zero();
+                        self.builder
+                            .build_int_compare(IntPredicate::NE, r, zero, "strpredb")
+                            .map_err(|e| self.err(e))?
+                            .into()
+                    }
+                    // `find`: an `i64` index (`-1` = absent) shaped into an `Option<i64>`.
+                    StrPredKind::Find => {
+                        let Ty::Option(s) = result_ty else {
+                            return Err(self.err("find result is not an Option"));
+                        };
+                        let idx = self
+                            .builder
+                            .build_call(self.funcs["str_find"], &args, "strfind")
+                            .map_err(|e| self.err(e))?
+                            .try_as_basic_value()
+                            .basic()
+                            .expect("str_find returns i64")
+                            .into_int_value();
+                        let i64t = self.ctx.i64_type();
+                        // found = idx >= 0; tag = found as i8; payload = found ? idx : 0.
+                        let found = self
+                            .builder
+                            .build_int_compare(IntPredicate::SGE, idx, i64t.const_zero(), "found")
+                            .map_err(|e| self.err(e))?;
+                        let tag = self.builder.build_int_z_extend(found, self.ctx.i8_type(), "tag").map_err(|e| self.err(e))?;
+                        let payload = self
+                            .builder
+                            .build_select(found, idx, i64t.const_zero(), "fpayload")
+                            .map_err(|e| self.err(e))?;
+                        let oty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
+                        let agg = self
+                            .builder
+                            .build_insert_value(oty.const_zero(), tag, 0, "ftag")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                        self.builder
+                            .build_insert_value(agg, payload, 1, "fsome")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value()
+                            .into()
+                    }
+                }
             }
             Rvalue::BuilderNew { capacity } => {
                 // Open a builder with a null arena: the finished `string` is heap-owned

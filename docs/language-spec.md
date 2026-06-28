@@ -232,8 +232,10 @@ builder
 ```
 
 `str` carries `.len()` (byte length), `==`/`!=` (byte equality), the byte-oriented
-predicates `.contains(n)` / `.starts_with(p)` / `.ends_with(s)` (all `bool`), and
-the ASCII-whitespace trims `.trim()` / `.trim_start()` / `.trim_end()` (each yields
+predicates `.contains(n)` / `.starts_with(p)` / `.ends_with(s)` (all `bool`),
+`.find(n)` → `Option<i64>` (the first byte index, the index sibling of `contains`;
+pairs with range slicing — `i := s.find("=") else …; s[..i]`), and the
+ASCII-whitespace trims `.trim()` / `.trim_start()` / `.trim_end()` (each yields
 a **borrowed sub-`str`**, no allocation). All take a `str` (an owned `string` is
 auto-borrowed) and work on bytes — UTF-8 is the representation, but the scan is
 byte-level (the SIMD-friendly default the spec mandates over a `chars()` walk); the

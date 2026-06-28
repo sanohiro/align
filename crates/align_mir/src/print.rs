@@ -242,6 +242,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 align_sema::hir::StrPredKind::Contains => "str_contains",
                 align_sema::hir::StrPredKind::StartsWith => "str_starts_with",
                 align_sema::hir::StrPredKind::EndsWith => "str_ends_with",
+                align_sema::hir::StrPredKind::Find => "str_find",
             };
             format!("{name}({}, {})", operand_str(haystack), operand_str(needle))
         }

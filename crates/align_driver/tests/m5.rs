@@ -1293,3 +1293,40 @@ fn array_range_slice_inverted_bounds_aborts() {
     assert!(err.contains("out of bounds"), "got: {err}");
     assert!(err.contains("3..1"), "the range failure must report the offending range, got: {err}");
 }
+
+#[test]
+fn str_find_returns_byte_index_option() {
+    if !backend_available() {
+        return;
+    }
+    // `find` yields Option<i64>: the first byte index, or None (here unwrapped to -1 via `else`).
+    // An empty needle matches at 0.
+    let src = "fn main() -> i32 {\n  s := \"hello world\"\n  print(s.find(\"world\") else { -1 })\n  print(s.find(\"xyz\") else { -1 })\n  print(s.find(\"hello\") else { -1 })\n  print(s.find(\"\") else { -1 })\n  return 0\n}\n";
+    let out = build_and_run("str-find", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "6\n-1\n0\n0\n");
+}
+
+#[test]
+fn str_find_then_slice_splits_key_value() {
+    if !backend_available() {
+        return;
+    }
+    // The motivating composition: find the separator, then slice around it (zero-copy) — `find`
+    // returning an index is useful precisely because range slicing exists.
+    let src = "fn main() -> i32 {\n  s := \"key=value\"\n  i := s.find(\"=\") else { return 1 }\n  print(s[..i])\n  print(s[i+1..])\n  return 0\n}\n";
+    let out = build_and_run("str-find-slice", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "key\nvalue\n");
+}
+
+#[test]
+fn str_find_on_owned_string() {
+    if !backend_available() {
+        return;
+    }
+    // An owned `string` receiver auto-borrows; `find` reads it without moving it (still usable).
+    let src = "fn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\"abc\", \"def\")\n  i := s.find(\"cd\") else { return 9 }\n  return (i + s.len()) as i32\n}\n";
+    let out = build_and_run("str-find-owned", src);
+    assert_eq!(out.status.code(), Some(8)); // index 2 + len 6
+}
