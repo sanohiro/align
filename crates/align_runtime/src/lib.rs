@@ -1720,7 +1720,9 @@ pub unsafe extern "C" fn align_rt_io_buf_free(w: *mut BufferedWriter) {
 /// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_str_eq(a: *const u8, alen: i64, b: *const u8, blen: i64) -> i32 {
-    if alen != blen {
+    // `alen < 0` guards the FFI boundary the same way as `eq_ignore_case`: an equal-and-negative
+    // length would otherwise wrap to a huge `usize` in `from_raw_parts` (UB). Real lengths are >= 0.
+    if alen != blen || alen < 0 {
         return 0;
     }
     // Same view, or both empty: equal without touching memory. This also avoids
@@ -1784,6 +1786,58 @@ pub unsafe extern "C" fn align_rt_str_find(hptr: *const u8, hlen: i64, nptr: *co
         Some(i) => i as i64,
         None => -1,
     }
+}
+
+/// `s.rfind(needle)` (M5, `core.string`) — the byte index of `needle`'s **last** occurrence in `s`,
+/// or `-1` if absent (codegen turns the sentinel into `Option<i64>`). An empty needle matches at the
+/// end (`hlen`). Backed by `memchr::memmem::rfind`.
+///
+/// # Safety
+/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_rfind(hptr: *const u8, hlen: i64, nptr: *const u8, nlen: i64) -> i64 {
+    if nlen <= 0 {
+        return hlen;
+    }
+    if nlen > hlen {
+        return -1;
+    }
+    let (hay, needle) = unsafe {
+        (
+            std::slice::from_raw_parts(hptr, hlen as usize),
+            std::slice::from_raw_parts(nptr, nlen as usize),
+        )
+    };
+    match memchr::memmem::rfind(hay, needle) {
+        Some(i) => i as i64,
+        None => -1,
+    }
+}
+
+/// `s.eq_ignore_ascii_case(other)` (M5, `core.string`) — 1 if the two byte runs are equal with ASCII
+/// letters compared case-insensitively (non-ASCII bytes compare exactly), else 0. Not Unicode
+/// case-folding (that stays package-level). Backed by `[u8]::eq_ignore_ascii_case`.
+///
+/// # Safety
+/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_eq_ignore_case(aptr: *const u8, alen: i64, bptr: *const u8, blen: i64) -> i32 {
+    // `alen < 0` guards the FFI boundary: a (never-expected) negative length would otherwise survive
+    // the `alen != blen` check when both are equal-and-negative, then wrap to a huge `usize` in
+    // `from_raw_parts` (UB). Real `str` lengths are always >= 0; this is pure defense in depth.
+    if alen != blen || alen < 0 {
+        return 0;
+    }
+    if aptr == bptr || alen == 0 {
+        return 1;
+    }
+    let (a, b) = unsafe {
+        (
+            std::slice::from_raw_parts(aptr, alen as usize),
+            std::slice::from_raw_parts(bptr, blen as usize),
+        )
+    };
+    a.eq_ignore_ascii_case(b) as i32
 }
 
 /// `s.starts_with(prefix)` (M5, `core.string`) — 1 if `s` begins with `prefix`'s bytes, else 0.
@@ -2593,6 +2647,36 @@ mod tests {
                 h.windows(n.len()).position(|w| w == *n).map_or(-1, |i| i as i64)
             };
             assert_eq!(find, expect_find, "find({h:?}, {n:?})");
+
+            // `rfind` is the last occurrence; an empty needle is the end (`hlen`).
+            let rfind = unsafe {
+                align_rt_str_rfind(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+            };
+            let expect_rfind: i64 = if n.is_empty() {
+                h.len() as i64
+            } else {
+                h.windows(n.len()).rposition(|w| w == *n).map_or(-1, |i| i as i64)
+            };
+            assert_eq!(rfind, expect_rfind, "rfind({h:?}, {n:?})");
+        }
+    }
+
+    #[test]
+    fn str_eq_ignore_case_matches_reference() {
+        let eq = |a: &[u8], b: &[u8]| unsafe {
+            align_rt_str_eq_ignore_case(a.as_ptr(), a.len() as i64, b.as_ptr(), b.len() as i64)
+        };
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"Content-Type", b"content-type"),
+            (b"GET", b"get"),
+            (b"abc", b"abd"),
+            (b"abc", b"abcd"),  // different length
+            (b"", b""),
+            (b"MiXeD123", b"mixed123"),
+            ("café".as_bytes(), "CAFÉ".as_bytes()), // non-ASCII 'é' compares exactly → not equal
+        ];
+        for (a, b) in cases {
+            assert_eq!(eq(a, b), a.eq_ignore_ascii_case(b) as i32, "eq_ignore_case({a:?}, {b:?})");
         }
     }
 

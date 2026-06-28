@@ -5240,7 +5240,9 @@ impl<'a, 't> Checker<'a, 't> {
         match method {
             "get" => self.check_box_get(recv_expr, recv_ty, args, span),
             "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
-            "contains" | "starts_with" | "ends_with" | "find" if matches!(recv_ty, Ty::Str | Ty::String) => {
+            "contains" | "starts_with" | "ends_with" | "find" | "rfind" | "eq_ignore_ascii_case"
+                if matches!(recv_ty, Ty::Str | Ty::String) =>
+            {
                 self.check_str_predicate(recv_expr, method, args, span)
             }
             "trim" | "trim_start" | "trim_end" if matches!(recv_ty, Ty::Str | Ty::String) => {
@@ -6566,11 +6568,14 @@ impl<'a, 't> Checker<'a, 't> {
         if haystack.ty == Ty::Error || needle.ty == Ty::Error {
             return err;
         }
+        let opt_i64 = Ty::Option(Scalar::Int(IntTy { bits: 64, signed: true }));
         let (kind, ty) = match method {
             "contains" => (hir::StrPredKind::Contains, Ty::Bool),
             "starts_with" => (hir::StrPredKind::StartsWith, Ty::Bool),
             "ends_with" => (hir::StrPredKind::EndsWith, Ty::Bool),
-            "find" => (hir::StrPredKind::Find, Ty::Option(Scalar::Int(IntTy { bits: 64, signed: true }))),
+            "eq_ignore_ascii_case" => (hir::StrPredKind::EqIgnoreCase, Ty::Bool),
+            "find" => (hir::StrPredKind::Find, opt_i64),
+            "rfind" => (hir::StrPredKind::Rfind, opt_i64),
             _ => unreachable!("check_str_predicate called with non-scan method"),
         };
         Expr {

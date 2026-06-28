@@ -1286,12 +1286,14 @@ bytes
 buffer
 builder
 find
+rfind
 find_any
 split
 trim
 contains
 starts_with
 ends_with
+eq_ignore_ascii_case
 ```
 
 Has a SIMD fast path in the standard implementation.

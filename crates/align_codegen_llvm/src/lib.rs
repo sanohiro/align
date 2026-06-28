@@ -354,12 +354,26 @@ fn build_module<'c>(
             ),
         );
     }
-    // `s.find(needle)` → the byte index (i64) or -1; same arg shape, but an i64 return (→ Option<i64>).
+    // `s.find(needle)` / `s.rfind(needle)` → the byte index (i64) or -1 (→ Option<i64>); same args.
+    for (key, sym) in [("str_find", "align_rt_str_find"), ("str_rfind", "align_rt_str_rfind")] {
+        funcs.insert(
+            key.to_string(),
+            module.add_function(
+                sym,
+                ctx.i64_type().fn_type(
+                    &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
+                    false,
+                ),
+                None,
+            ),
+        );
+    }
+    // `s.eq_ignore_ascii_case(other)` → i32 (0/1), the predicate arg shape.
     funcs.insert(
-        "str_find".to_string(),
+        "str_eq_ignore_case".to_string(),
         module.add_function(
-            "align_rt_str_find",
-            ctx.i64_type().fn_type(
+            "align_rt_str_eq_ignore_case",
+            ctx.i32_type().fn_type(
                 &[ptr.into(), ctx.i64_type().into(), ptr.into(), ctx.i64_type().into()],
                 false,
             ),
@@ -2430,13 +2444,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let nl = self.builder.build_extract_value(ne, 1, "nl").map_err(|e| self.err(e))?;
                 let args = [hp.into(), hl.into(), np.into(), nl.into()];
                 match kind {
-                    // The three predicates: an `i32` (0/1) returned as a `bool` (`i1`).
-                    StrPredKind::Contains | StrPredKind::StartsWith | StrPredKind::EndsWith => {
+                    // The bool scans: an `i32` (0/1) returned as a `bool` (`i1`).
+                    StrPredKind::Contains | StrPredKind::StartsWith | StrPredKind::EndsWith | StrPredKind::EqIgnoreCase => {
                         let fk = match kind {
                             StrPredKind::Contains => "str_contains",
                             StrPredKind::StartsWith => "str_starts_with",
                             StrPredKind::EndsWith => "str_ends_with",
-                            StrPredKind::Find => unreachable!(),
+                            StrPredKind::EqIgnoreCase => "str_eq_ignore_case",
+                            StrPredKind::Find | StrPredKind::Rfind => unreachable!(),
                         };
                         let r = self
                             .builder
@@ -2452,14 +2467,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|e| self.err(e))?
                             .into()
                     }
-                    // `find`: an `i64` index (`-1` = absent) shaped into an `Option<i64>`.
-                    StrPredKind::Find => {
+                    // `find` / `rfind`: an `i64` index (`-1` = absent) shaped into an `Option<i64>`.
+                    StrPredKind::Find | StrPredKind::Rfind => {
                         let Ty::Option(s) = result_ty else {
                             return Err(self.err("find result is not an Option"));
                         };
+                        let fk = if matches!(kind, StrPredKind::Rfind) { "str_rfind" } else { "str_find" };
                         let idx = self
                             .builder
-                            .build_call(self.funcs["str_find"], &args, "strfind")
+                            .build_call(self.funcs[fk], &args, "strfind")
                             .map_err(|e| self.err(e))?
                             .try_as_basic_value()
                             .basic()

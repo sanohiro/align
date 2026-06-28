@@ -562,6 +562,13 @@ pub enum StrPredKind {
     /// (`None` if absent). Unlike the others this yields `Option<i64>`, not `bool`; it is the index
     /// sibling of `contains` (`contains == find(..).is_some()`), now useful with range slicing.
     Find,
+    /// `s.rfind(needle)` — the byte index of `needle`'s **last** occurrence in `s`, as `Option<i64>`
+    /// (`None` if absent). The from-the-end sibling of `find` (e.g. `path.rfind(".")` for a suffix).
+    Rfind,
+    /// `s.eq_ignore_ascii_case(other)` — byte equality with ASCII letters compared case-insensitively
+    /// (`bool`). For protocol/header parsing where case is insignificant; non-ASCII bytes compare
+    /// exactly, so it is not Unicode case-folding (that stays package-level).
+    EqIgnoreCase,
 }
 
 /// Which end(s) a `StrTrim` strips ASCII whitespace from (`core.string`). The result is a

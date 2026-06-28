@@ -243,6 +243,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 align_sema::hir::StrPredKind::StartsWith => "str_starts_with",
                 align_sema::hir::StrPredKind::EndsWith => "str_ends_with",
                 align_sema::hir::StrPredKind::Find => "str_find",
+                align_sema::hir::StrPredKind::Rfind => "str_rfind",
+                align_sema::hir::StrPredKind::EqIgnoreCase => "str_eq_ignore_case",
             };
             format!("{name}({}, {})", operand_str(haystack), operand_str(needle))
         }
