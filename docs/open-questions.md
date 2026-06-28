@@ -725,9 +725,9 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         double-scan fallback). **This is the first *real consumer* of the dispatch table** (P0: ship
         byte-first APIs **backed by `memchr`/`memmem` now** — no scaffold needed; P1: move them
         behind the dispatch table + AVX2 `find_any`/structural classifier + NEON + UTF-8 validator,
-        reused across JSON/HTTP/CSV/HTML/tokenizer since they share one byte-classifier). Keep
+        reused across JSON/HTTP/CSV/HTML/tokenizers since they share one byte-classifier). Keep
         Unicode (`chars`/grapheme/normalization/case-fold) explicit and mostly package-level, out of
-        core v1. Builder is ~0.55× of optimized Rust — batch adjacent static/template appends into
+        core v1. Builder is ~0.55× of optimized Rust — batching adjacent static/template appends into
         fewer runtime calls (a `write_many` internal ABI) is the lever. Probe:
         `work/string_processing_probe.rs`; advice `work/string-processing-findings-2026-06-28.md`.
       - **LLVM-version gap + upgrade as a perf-roadmap item (codex modern-CPU advice 2026-06-28).**
