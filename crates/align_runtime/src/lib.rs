@@ -1246,6 +1246,28 @@ pub unsafe extern "C" fn align_rt_group_count_i64(keys: *const i64, len: i64, ou
     unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
+/// Find the first `"` or `\` in `hay` (the two bytes that bound or interrupt a JSON string body),
+/// returning its index, or `None` if neither occurs.
+///
+/// A scalar prefix scan handles the common short string (field names, small values) with no SIMD
+/// setup cost; only when the body runs past the prefix does it escalate to a runtime-dispatched
+/// `memchr2` (AVX2/NEON via the `memchr` crate). On long string bodies the SIMD scan is several×
+/// to ~30× faster than the byte-at-a-time loop (`work/json_str_simd_probe.rs`), while the prefix
+/// keeps short keys from regressing.
+fn find_quote_or_escape(hay: &[u8]) -> Option<usize> {
+    const PREFIX: usize = 16;
+    let head = hay.len().min(PREFIX);
+    for (i, &c) in hay[..head].iter().enumerate() {
+        if c == b'"' || c == b'\\' {
+            return Some(i);
+        }
+    }
+    if hay.len() <= PREFIX {
+        return None;
+    }
+    memchr::memchr2(b'"', b'\\', &hay[PREFIX..]).map(|i| i + PREFIX)
+}
+
 /// A minimal JSON scanner over a byte slice (just what `json.decode` needs: objects with
 /// integer / boolean values; strings only as keys).
 struct JsonParser<'a> {
@@ -1271,22 +1293,20 @@ impl<'a> JsonParser<'a> {
         }
     }
     /// Read a `"..."` string key (no escapes for the M5 cut). Borrows the input (`&'a`), so
-    /// it does not hold `self`, and the parser can keep advancing after.
+    /// it does not hold `self`, and the parser can keep advancing after. The body is located with
+    /// [`find_quote_or_escape`] (a SIMD scan for long strings).
     fn string(&mut self) -> Option<&'a [u8]> {
         self.expect(b'"')?;
         let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c == b'"' {
-                let s = &self.src[start..self.pos];
-                self.pos += 1;
-                return Some(s);
-            }
-            if c == b'\\' {
-                return None; // escapes in keys unsupported (M5 cut)
-            }
-            self.pos += 1;
+        let rest = &self.src[self.pos..];
+        let off = find_quote_or_escape(rest)?;
+        if rest[off] == b'\\' {
+            return None; // escapes in keys unsupported (M5 cut)
         }
-        None
+        self.pos += off; // at the closing quote
+        let s = &self.src[start..self.pos];
+        self.pos += 1; // consume `"`
+        Some(s)
     }
     fn integer(&mut self) -> Option<i64> {
         let neg = self.peek() == Some(b'-');
@@ -1394,22 +1414,26 @@ impl<'a> JsonParser<'a> {
     /// Skip a `"..."` string, honoring `\` escapes so an embedded `\"` does not end it early
     /// (unlike [`string`], which is for zero-copy *keys* and rejects escapes). Used only to
     /// discard an unknown value, so the escape bytes need not be decoded — just stepped over.
+    /// Each clean run is found with [`find_quote_or_escape`] (a SIMD scan for long strings).
     fn skip_string(&mut self) -> Option<()> {
         self.expect(b'"')?;
-        while let Some(c) = self.peek() {
-            self.pos += 1;
-            match c {
-                b'"' => return Some(()),
-                b'\\' => {
-                    // Step over the escaped byte (`\"`, `\\`, `\n`, or the `u` of `\uXXXX` — the
-                    // four hex digits are then skipped as ordinary chars, fine for discarding).
+        loop {
+            let off = find_quote_or_escape(&self.src[self.pos..])?;
+            self.pos += off;
+            match self.src[self.pos] {
+                b'"' => {
+                    self.pos += 1;
+                    return Some(());
+                }
+                // `\`: step over the backslash and the escaped byte (`\"`, `\\`, the `u` of
+                // `\uXXXX` — the four hex digits are then skipped as ordinary clean bytes).
+                _ => {
+                    self.pos += 1;
                     self.peek()?;
                     self.pos += 1;
                 }
-                _ => {}
             }
         }
-        None
     }
     fn skip_null(&mut self) -> Option<()> {
         if self.src[self.pos..].starts_with(b"null") {
@@ -1818,6 +1842,41 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_quote_or_escape_prefix_and_simd_paths_agree() {
+        // A trivial scalar reference: index of the first `"` or `\`, else None.
+        let reference = |h: &[u8]| h.iter().position(|&c| c == b'"' || c == b'\\');
+
+        // Cover the scalar prefix (< 16), the prefix boundary, and well past it (the memchr path),
+        // with the delimiter at the start, middle, end, and absent — and both `"` and `\`.
+        let bodies: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"short",
+            b"created_at", // 10B: pure prefix scan, no match
+            b"0123456789abcde",  // 15B, no match (just under PREFIX)
+            b"0123456789abcdef",  // 16B == PREFIX, no match
+            b"0123456789abcdefg", // 17B, no match → memchr tail returns None
+            b"0123456789abcdef\"",  // delimiter exactly past the prefix → memchr finds it
+            b"0123456789abcde\"",   // delimiter at the prefix's last byte (scalar)
+            b"a long clean run of bytes with the quote way out here -> \" <- there",
+            b"escape in the tail 0123456789abcdef\\xyz",
+            b"\"", // immediate quote
+            b"\\", // immediate backslash
+        ];
+        for h in bodies {
+            assert_eq!(find_quote_or_escape(h), reference(h), "mismatch on {h:?}");
+        }
+
+        // A long (> prefix) all-clean body: None, and a long body with a deep delimiter: exact index.
+        let long_clean = vec![b'x'; 10_000];
+        assert_eq!(find_quote_or_escape(&long_clean), None);
+        let mut long_hit = vec![b'y'; 5000];
+        long_hit.push(b'"');
+        long_hit.extend_from_slice(&[b'z'; 100]);
+        assert_eq!(find_quote_or_escape(&long_hit), Some(5000));
+    }
 
     #[test]
     fn group_sum_i64_aggregates_by_key() {

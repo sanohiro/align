@@ -12,3 +12,6 @@ license.workspace = true
 # bundles its own std) into another std binary duplicates std symbols, but a cdylib hides its std.
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+memchr = "2.8.2"

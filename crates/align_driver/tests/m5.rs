@@ -105,6 +105,24 @@ fn json_decode_skips_unknown_numeric_fields() {
 }
 
 #[test]
+fn json_decode_long_str_field_via_simd_scan() {
+    if !backend_available() {
+        return;
+    }
+    // A `str` value longer than the scalar prefix (16B) exercises the memchr2 SIMD scan in
+    // `string()`; the zero-copy view must still be byte-exact. The 64-char name (len 64) is
+    // printed back verbatim and its length checked.
+    let name = "abcdefghijklmnopqrstuvwxyz-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 63 chars
+    let json = format!(r#"{{"id": 7, "name": "{name}"}}"#);
+    let src = format!(
+        "import core.json\nUser {{ id: i64, name: str }}\nfn parse(s: str) -> Result<User, Error> {{\n  u: User := json.decode(s)?\n  return Ok(u)\n}}\nfn main() -> Result<(), Error> {{\n  u := parse({json:?})?\n  print(u.name)\n  print(u.name.len())\n  return Ok(())\n}}\n",
+    );
+    let out = build_and_run("json-long-str", &src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{name}\n{}\n", name.len()));
+}
+
+#[test]
 fn json_decode_skips_unknown_nested_objects_arrays_and_null() {
     if !backend_available() {
         return;
