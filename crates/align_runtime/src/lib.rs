@@ -1131,10 +1131,19 @@ fn group_slot(k: i64, mask: usize) -> usize {
 /// keys + their accumulators into `out_keys`/`out_vals`. Returns the group count, or -1 if it would
 /// exceed `cap`. Monomorphized per op so `per_row`/`combine` inline (no per-element branch).
 ///
-/// Mechanism: an open-addressing (linear-probe) table that grows to track the live group count
-/// (doubling past a 0.75 load) — a primitive-key, no-boxing, cache-tight aggregate, the lever vs
-/// Rust's generic `HashMap`. Three dense parallel arrays (key / acc / used) probe-scan well (a naive
-/// interleaved-slot layout measured *worse*; `docs/open-questions.md`).
+/// Mechanism: two strategies, picked by the key range (one O(n) min/max pre-scan decides).
+/// - **Dense path** — when the keys span a tight integer range (`max - min < n`, so a direct-indexed
+///   accumulator never exceeds the key column itself), aggregate by `acc[key - min]`: no hashing, no
+///   probing, keys emitted already sorted. This is the big win on dense-id columns (enum / category /
+///   small-int keys) — direct indexing beats a hash table by ~an order of magnitude (`bench/group_by`).
+/// - **Hash path** — otherwise, an open-addressing (linear-probe) table that grows to track the live
+///   group count (doubling past a 0.75 load) — a primitive-key, no-boxing, cache-tight aggregate, the
+///   lever vs Rust's generic `HashMap`. Three dense parallel arrays (key / acc / used) probe-scan well
+///   (a naive interleaved-slot layout measured *worse*; `docs/open-questions.md`).
+///
+/// The `max - min < n` guard keeps the dense array bounded by the input (so a sparse-but-wide key set
+/// — e.g. a few keys at the extremes of a huge range — falls back to the hash table rather than
+/// allocating a giant mostly-empty array); the pre-scan bails early the moment the span exceeds `n`.
 ///
 /// # Safety
 /// `out_keys`/`out_vals` must each be valid for `cap` `i64` writes (they're written for the emitted
@@ -1151,6 +1160,72 @@ unsafe fn group_agg_i64(
     if n == 0 {
         return 0;
     }
+    // The output is the same regardless of strategy, so reject an invalid output up front — before
+    // any pre-scan or table/accumulator allocation (a null out always returns -1, never a count).
+    if cap < 0 || out_keys.is_null() || out_vals.is_null() {
+        return -1;
+    }
+
+    // Pre-scan for the key range, bailing out of the dense path the instant the span reaches `n`
+    // (so a sparse key set pays only a partial scan before falling through to the hash table). The
+    // span is only checked when `kmin`/`kmax` actually move — a key already inside `[kmin, kmax]`
+    // costs nothing. `i128` is required here: before density is established the span can exceed
+    // `i64` (e.g. keys at both `i64::MIN` and `i64::MAX`).
+    let mut kmin = keys[0];
+    let mut kmax = keys[0];
+    let limit = n as i128; // dense requires span + 1 <= n, i.e. span < n.
+    let mut dense = true;
+    for &k in &keys[1..] {
+        if k < kmin {
+            kmin = k;
+            if (kmax as i128 - kmin as i128) >= limit {
+                dense = false;
+                break;
+            }
+        } else if k > kmax {
+            kmax = k;
+            if (kmax as i128 - kmin as i128) >= limit {
+                dense = false;
+                break;
+            }
+        }
+    }
+
+    if dense {
+        // span = kmax - kmin < n, so `slots` fits and the accumulator is no larger than the keys.
+        // Density guarantees `kmin <= k <= kmax` with span < n, so `k - kmin` is in `[0, n)` — it
+        // never overflows `i64`, so the hot loop stays in `i64` (no `i128` per element).
+        let slots = (kmax - kmin) as usize + 1;
+        let mut acc = vec![0i64; slots];
+        let mut occ = vec![false; slots];
+        let mut count: usize = 0;
+        for (i, &k) in keys.iter().enumerate() {
+            let idx = (k - kmin) as usize;
+            let v = per_row(i);
+            if occ[idx] {
+                acc[idx] = combine(acc[idx], v);
+            } else {
+                occ[idx] = true;
+                acc[idx] = v;
+                count += 1;
+            }
+        }
+        if count > cap as usize {
+            return -1;
+        }
+        let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
+        let out_vals = unsafe { std::slice::from_raw_parts_mut(out_vals, count) };
+        let mut g = 0;
+        for s in 0..slots {
+            if occ[s] {
+                out_keys[g] = kmin + s as i64; // kmin + span = kmax, so this never overflows i64.
+                out_vals[g] = acc[s];
+                g += 1;
+            }
+        }
+        return count as i64;
+    }
+
     let mut tsize = 16usize;
     let mut mask = tsize - 1;
     let mut tkey = vec![0i64; tsize];
@@ -1200,7 +1275,7 @@ unsafe fn group_agg_i64(
         }
     }
 
-    if cap < 0 || count > cap as usize || out_keys.is_null() || out_vals.is_null() {
+    if count > cap as usize {
         return -1;
     }
     let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
@@ -2354,6 +2429,48 @@ mod tests {
         for k in 0..200i64 {
             assert_eq!(got2.get(&k), Some(&(2 * k)), "group {k} after rehash");
         }
+    }
+
+    #[test]
+    fn group_sum_dense_and_sparse_paths_agree() {
+        // The dense path (tight key range) and the hash path (wide/sparse range) must produce the
+        // same per-key aggregate. Drive both with the same logical data, only the key offset differs.
+        let run = |keys: &[i64], vals: &[i64]| -> std::collections::HashMap<i64, i64> {
+            let (mut ok, mut ov) = (vec![0i64; keys.len()], vec![0i64; keys.len()]);
+            let n = unsafe {
+                align_rt_group_sum_i64(keys.as_ptr(), vals.as_ptr(), keys.len() as i64, ok.as_mut_ptr(), ov.as_mut_ptr(), keys.len() as i64)
+            } as usize;
+            ok[..n].iter().copied().zip(ov[..n].iter().copied()).collect()
+        };
+
+        // Dense: 1000 rows, keys a contiguous 0..250 range → span (249) < n (1000) → dense path.
+        let mut dk = Vec::new();
+        let mut dv = Vec::new();
+        for i in 0..1000i64 {
+            dk.push(i % 250);
+            dv.push(i);
+        }
+        let dense = run(&dk, &dv);
+        assert_eq!(dense.len(), 250, "250 dense groups");
+        // group g = keys ≡ g (mod 250): rows g, g+250, g+500, g+750 → sum 4g + 1500.
+        for g in 0..250i64 {
+            assert_eq!(dense[&g], 4 * g + 1500, "dense group {g}");
+        }
+
+        // Sparse: the SAME groups but keys spread far apart (× 1_000_000) → span ≫ n → hash path.
+        // The aggregate per logical group must be identical (only the key labels are scaled).
+        let sk: Vec<i64> = dk.iter().map(|k| k * 1_000_000).collect();
+        let sparse = run(&sk, &dv);
+        assert_eq!(sparse.len(), 250, "250 sparse groups");
+        for g in 0..250i64 {
+            assert_eq!(sparse[&(g * 1_000_000)], 4 * g + 1500, "sparse group {g}");
+        }
+
+        // Negative keys: dense indexing must offset by min, not assume a 0 base.
+        let nk = [-3i64, -1, -3, -2, -1];
+        let nv = [10i64, 20, 30, 40, 50];
+        let neg = run(&nk, &nv);
+        assert_eq!(neg, std::collections::HashMap::from([(-3, 40), (-1, 70), (-2, 40)]));
     }
 
     #[test]

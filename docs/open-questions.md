@@ -452,9 +452,23 @@ a bigger footprint). So the current 3-array layout stays; beating `ahash` needs 
 (SIMD control-byte group probing + AES-class hash), not a naive interleave — a big, bounded-value
 effort, deferred. **`min`/`max`/`count` aggregates — DONE 2026-06-27** (`group_by(.key).min/max(.value)`
 and `.count()`; `ArrayGroupAgg{op}` + a monomorphized runtime `group_agg_i64` over per-op
-`per_row`/`combine`, `align_rt_group_{sum,min,max,count}_i64`). Still open: string keys (intern), AoS
-source, multiple aggregates in one pass → more result columns, a `group_by(.key)` with a lambda key.
-Design ↓.
+`per_row`/`combine`, `align_rt_group_{sum,min,max,count}_i64`).
+**Dense-id path — DONE 2026-06-29 (the codex P0 win; beats the *fast* baseline everywhere now).**
+`group_agg_i64` now picks one of two strategies from an O(n) min/max pre-scan: when the keys span a
+tight integer range (`max - min < n`, so a direct-indexed accumulator is never larger than the key
+column), it aggregates by `acc[key - min]` — no hashing, no probing, keys emitted already sorted —
+otherwise it falls back to the existing linear-probe hash table. The `< n` guard keeps the dense array
+bounded by the input (a sparse-but-wide key set falls back rather than allocating a giant mostly-empty
+array), and the pre-scan bails the instant the span reaches `n`, so sparse data pays only a partial
+scan. **No surface / return-type change** — a pure runtime mechanism (one op, the runtime picks the
+strategy, like an adaptive sort). **RE-BENCHED (`bench/group_by`, 1M rows, native): now beats BOTH std
+SipHash (5.0–5.7×) AND `ahash` (2.06× / 2.32× / 2.74× at 100 / 10k / 632k groups)** — the previous
+hash path *lost* to `ahash` at 10k/1M groups (0.52–0.72×); the dense path flips those to clean wins and
+cuts the 1M-group time ~7× (≈54→7.9 ms). The bench's keys are `LCG % groups` (range `[0, groups)`),
+so all three configs are dense — exactly the dense-id workload this targets. The remaining "beat ahash
+on a *genuinely sparse* high-cardinality key set" case still wants the full SwissTable (deferred above).
+Still open: string keys (intern), AoS source, multiple aggregates in one pass → more result columns, a
+`group_by(.key)` with a lambda key. Design ↓.
 
 ### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
 The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped
@@ -490,8 +504,9 @@ the return type first** — done here.
   — only a win over the *fast* baseline is honest. Measure right after the first slice; if the
   specialized table doesn't beat `ahash`, reconsider the mechanism (radix partition? two-pass?) before
   building more.
-- **Deferred within group_by:** string keys (intern/dictionary-encode → an id column), `min`/`max`/
-  `count`/multiple aggregates, lambda keys, and parallel (per-chunk partial tables + merge).
+- **Deferred within group_by:** string keys (intern/dictionary-encode → an id column), multiple
+  aggregates in one pass, lambda keys, and parallel (per-chunk partial tables + merge). (`min`/`max`/
+  `count` and the **dense-id fast path** are DONE — see above.)
 - **Why design-first, not rushed:** per "ideal form or defer" + roadmap #5 — the return-type and
   mechanism are the load-bearing decisions; the above fixes them so implementation PRs are mechanical.
 
