@@ -418,6 +418,53 @@ consistency
 
 ---
 
+## The resource-oriented north star
+
+A sharpening of the AI philosophy, not a new direction (recorded 2026-06-28 from the `work/`
+research sweep; benchmarks in `open-questions.md`).
+
+AI can now write a lot of code. That shifts the language's job. The question is no longer only
+"can a skilled human express this?" but:
+
+```text
+when AI writes ordinary code, does it land on a fast, predictable, resource-aware shape by default?
+when the user's CPU / GPU / RAM / VRAM / SSD is limited, does the language help use what they have?
+when code is slow, can the toolchain explain why before days are wasted?
+```
+
+This is the Rust contrast, stated as a different bet:
+
+```text
+Rust:  a skilled human can write very fast, very safe systems code.
+Align: AI-written ordinary code should fall into fast, safe-enough, resource-aware rails.
+```
+
+Rust rewards expertise. Align reduces the expertise required to *avoid the obvious resource mistake*.
+The win is not "a stronger optimizer than Rust" — flat scalar loops hit parity, same LLVM. The win
+is that **the slow shape is hard to write**: SoA over `Vec<Struct>`, fused pipelines over intermediate
+arrays, arena over per-object alloc, zero-copy views over `read_file` copies, sink-first buffered I/O
+over flush-per-write, dictionary ids over hot-loop string hashing. The benchmarks bear this out (SoA
+column scan ~11×, mmap view ~12×, buffered stdout ~355×, dictionary-id reuse ~21× — all measured).
+
+Consequences already in the design:
+
+```text
+- fast data layout is the default rail (soa<T>, fusion, columnar group_by)
+- cost is visible (no hidden alloc / copy / async / thread)
+- memory layout is a first-class, explicit choice (type- and scope-driven, never whole-program inferred)
+- I/O is sink-first, buffered, region-scoped (mmap views, writev, io.copy)
+- the std library encodes performance rails, not only convenience APIs
+- diagnostics explain resource mistakes in plain terms (the perf-rail lints)
+```
+
+The north star, plainly: *a constrained person, on constrained hardware, should be able to ask AI to
+write systems code that lands on the fast path by default.* This is not a claim that weak hardware
+beats expensive hardware — it is a claim that the floor rises. Local LLM inference is the headline
+long-term instance of this pressure (recorded as a Future direction in `open-questions.md`); it is a
+direction, not a v1 commitment, and it must not distort the language into a GPU-only ML framework.
+
+---
+
 ## In one sentence
 
 Align is a data-oriented language that aligns human intent, AI generation, compiler optimization, and modern hardware.

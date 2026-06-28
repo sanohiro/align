@@ -638,6 +638,126 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
 (Both external reports are idea-generation; the convergent + on-philosophy items above are recorded
 as unverified candidates. Current soa/decode work takes priority; benchmark before shipping any.)
 
+### Codex perf / I/O / LLM research sweep (2026-06-28, BENCHMARKED) — verifies prior candidates + new rails
+A second Codex pass that **ran probes** (host: AMD Ryzen 9 5950X, 32 logical CPUs, x86_64 AVX2),
+upgrading several previously-UNVERIFIED candidates above to measured numbers, and adding new ones.
+Raw memos + probe sources live under `work/` (gitignored; the durable signal is captured here). Each
+number is a Rust micro-probe, not yet an Align `bench/`; treat as direction + magnitude, re-bench in
+Align before shipping.
+
+**Independently re-run on this host (2026-06-28) — claims reproduced, NOT just transcribed.** The
+Align-vs-Rust `bench/` suite (both sides pinned to the same `--target-cpu=native`, alternating-min
+timing) and the `work/` probes were re-executed here; magnitudes vary run-to-run (cache warmth /
+frequency scaling) but every conclusion held:
+```text
+Align-vs-Rust (bench/, head-to-head):
+  sum_sq_pos (flat pipeline)        1.00x  = parity (same LLVM; not the win lever)
+  col_sum  soa vs Rust Vec AoS     ~11-12x Align faster (0.084-0.093 ratio)
+  total_pay soa where().sum() AoS   ~3.5x  Align faster (native; 7x seen only at baseline tier)
+  group_by vs std HashMap           4.4x / 1.4x / 1.9x  (100 / 10k / 1M groups) — beats std everywhere
+  group_by vs ahash                 1.8x / 0.59x / 0.93x — wins low-card, loses high-card (→ SwissTable)
+  json decode soa vs serde_json     ~0.89x (parse-bound; SoA transpose loses, AoS ~parity at 1M)
+  par_map heavy vs Rust seq         2.1x / 8.4x / 15.9x — heavy fn wins; cheap fn LOSES to seq (0.2-0.9x)
+Rust-only runtime probes (justify the runtime-level levers):
+  skip_number lexical               3.13x   mmap view 12.3x   stdout buffered 374x
+  fs.read_file direct read 1.84x    AVX2 structural scan 6.6x   dictionary-id reuse ~21x
+  I/O overlap (task_group) 17x
+```
+So the numbers below are verified on this machine, not transcribed from a memo. **License/patent posture:** the references checked (Arrow, simdjson, Abseil
+SwissTables, Velox, io_uring, GGUF/llama.cpp) are **design references only** — implement any adopted
+idea from scratch; do not vendor their code; keep compression/codec choices pluggable and conservative.
+
+- **SHIPPED from this sweep:**
+  - **JSON unknown-numeric lexical skip — DONE (#191).** `skip_value` parsed unknown numeric fields
+    to `f64` only to discard them; now `number_span` is shared and `skip_number` advances without
+    parsing. **~3.1×** unknown-number skip (87.6→28.1 ms / 1M records, 6M skips); makes narrow /
+    projected struct decode reliably faster. (Closes the "narrow-struct field skip" follow-up.)
+
+- **Upgraded to BENCHMARKED (raises priority of items already recorded above / in Future):**
+  - **`fs.read_file` extra copy → direct read — ~1.8×** (150.8→83.9 ms / 128 MiB). Runtime does
+    `std::fs::read` then `copy_nonoverlapping` into an `align_rt_alloc` buffer (`align_runtime/src/
+    lib.rs:~219`); allocate the owned buffer first and `read_exact` into it. Small bounded next slice
+    (the natural #191 follow-up). Zeroing was not a measurable cost on this host.
+  - **Buffered / sink-first stdout — ~355×** vs flush-each-line (30.1 ms→0.085 ms / 100k lines; one
+    big write 8000×; `writev` 120×). Confirms the "view-first / sink-first std + buffered I/O" Codex
+    candidate above: `print` is the debug path (locks+flushes every call); the fast rail is
+    `builder → io.stdout.buffered() → write → flush`. Std-layer, M5+.
+  - **Scoped `mmap` view — ~13×** vs owned read+scan (195→14.7 ms / 256 MiB). Directly validates the
+    **Transparent zero-copy I/O (std.io)** Future entry; the mapping handle must dominate all views
+    (region model). Biggest single I/O lever measured.
+  - **Runtime-dispatched AVX2 structural scan — ~5×** vs scalar (34.1→6.85 ms / 128 MiB JSON-ish).
+    Confirms the already-SETTLED "wide SIMD in runtime-dispatched library, baseline binary stays
+    portable" policy. First targets: JSON structural scan, `memchr`-class find, UTF-8 / quote /
+    backslash masks. (NEON/SVE expected to win too per 2024–2025 SIMD-parsing papers; AVX-512 untested
+    — CPU lacks it.)
+  - **SoA column scan / filtered aggregate** re-confirmed: col_sum **9.4–12.2×**, `where(.active).
+    pay.sum()` **3.7–7×** vs Rust `Vec<Struct>` AoS. The shipped headline; unchanged.
+  - **Bitset bool/Option columns** re-confirmed with the **caveat already recorded**: `count`/`any`/
+    `all` **45–48×** (popcnt), but dense `where(.flag).value.sum()` **0.36–0.67× (LOSES)** — value
+    loads dominate. So generate *different* kernels: bitmap+POPCNT for cardinality terminals;
+    byte/select masks for dense filtered value sums; sparse bit-iteration only at low selectivity.
+  - **CAUTION — hand-SIMD is not a free win.** int8 dot (64M elems): scalar Rust 6.31 ms, manual
+    unroll **0.54× (worse)**, AVX2 intrinsics only **1.35×**. LLVM `-O2` already vectorizes the scalar
+    loop well. Lesson: every hand-SIMD path must earn its place against the O2 baseline with a bench —
+    do not assume Align-native kernels beat mature backends. (Reinforces "bind backends via FFI
+    first.")
+
+- **New candidates worth carrying (unverified-in-Align / future):**
+  - **★ Dictionary-id rail for string-key analytics.** Intern a string column to integer ids, then
+    `group_by(id)`: **3.0×** first use, **~19–21× when ids are reused** across multiple aggregations
+    (vs `HashMap<&str,_>×3`). The first aggregation pays for dictionary construction; repeats become
+    integer-column work. Fits `json/csv decode selected str field → id column → group_by`. Strong fit
+    for the column-oriented `group_by` runway; output needs an id→string map. Distinct from the
+    SwissTable lever (which is for *high-cardinality* primitive-key grouping).
+  - **★ Streaming / projected scanner terminals** (a typed scanner bound to its row schema, then a
+    fused terminal: `rows: csv.scanner<Row> := csv.scan(view); rows.where(.active).pay.sum()?`;
+    likewise NDJSON `json.scan`). The row type comes from the **binding annotation**, never an
+    expression-position `scan<Row>(…)` turbofish (Settled "no turbofish"); the scanner's schema is in
+    neither args nor result, so it is exactly the open **schema-selector** residual noted there.
+    Streaming projected scan beat materializing all rows **2.7–2.9×** at 1–5M rows; if the terminal
+    is a single aggregate, beats even building columns. A `line` must be a borrowed `str` view into a
+    chunk (region-bounded, cannot escape). Pairs with mmap views; the "don't materialize
+    `array<string>`" rail. Std-layer.
+  - **Network std rails — connection/batching shape dominates.** Local 20k-request probe: connect-
+    per-request 1.0×, keepalive 1.48×, **pipelined write-then-read 19.1×**. The network analogue of the
+    stdout-flush result: the std `http`/`socket` API should reuse connections by default, expose
+    batched/pipelined send-receive + bounded-concurrency `get_many`, and **lint connect-per-request
+    loops to a static host**. `task_group` + blocking pool hides I/O wait (earlier probe: 64 reqs
+    ×10 ms → **12.8×**) — structured concurrency first, **not** a general async runtime; `io_uring` is
+    a later *Linux backend*, not the semantic model.
+  - **Cache-aware shaped ops.** 512² f32 matmul: naive `i-j-k` vs `i-k-j` loop order = **33.8×** (a
+    simple tile was 8–15×). Lesson is not "always tile" but "traversal/layout is a first-order semantic
+    rail": offer shaped ops (`tensor.matmul(..., policy: .cache_aware)`, `rows.chunks(tile)`) and a
+    diagnostic for strided hot loops over row-major data, rather than asking AI to hand-pick loop order.
+    Future / tensor-kernel territory.
+  - **Velox-style string layout** (short string inline-or-prefix, long string in region-owned backing
+    buffers, compare by length+prefix before full bytes). Feeds the Open **String representation (SSO)**
+    item; columnar string views want this.
+  - **Data-oriented error accumulation** (`ok, errs := rows.validate_all(rule)`) — batch parse/validate
+    wants "process all rows, collect bad rows into a column", complementing fail-fast `Result`/`?`. Keep
+    explicit (no exception-like hidden accumulation).
+  - **Deterministic parallel-reduce modes** (`xs.par_sum()` vs `xs.par_sum(deterministic)`) — make the
+    reproducibility/perf tradeoff visible for float/log/analytics reductions. Start with integers (order
+    unobservable under wrapping).
+  - **Profile-guided perf lints** (`alignc run --profile` → diagnostics like "this field scan ran 10M
+    times; consider `soa<T>`") — runtime evidence reduces false positives for the perf-rail lints; must
+    improve *diagnostics*, never *semantics*, and never be required for good performance.
+  - **`io.copy` zero-copy transfer** (`sendfile`/`copy_file_range`/`splice`) — already folded into the
+    Transparent zero-copy I/O Future entry; the network/static-file-serving probes reinforce it.
+  - **Deadlines / cancellation as structured scope** (`deadline(200.ms) { task_group { … } }`) — bound
+    runaway I/O without a general async model; std-layer, after the structured-concurrency I/O slice.
+
+- **Anti-recommendations (consistent with existing non-goals):** general async/await as the first I/O
+  story (task_group + blocking batch pool first); hidden auto-SoA / hidden per-request arenas (explicit
+  type/scope + lint); a general `HashMap` as the headline (columnar/dictionary/group_by rails); a
+  hand-written SIMD library before the O2 baseline is measured; chasing load *alignment* before data
+  shape + copy elimination (unaligned AVX2 loads were within ~0.95–1.0× on this host).
+
+(All probes are Rust micro-benchmarks under `work/`; the convergent + on-philosophy items are recorded
+for later. Re-bench in Align (`bench/`) before shipping any. The local-LLM-inference direction these
+memos also explore is recorded in the Future section, "Resource-oriented north star + local LLM
+inference".)
+
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
 opt-in; wide SIMD on a varied fleet comes from runtime dispatch in the library, not a fixed high
@@ -1091,3 +1211,49 @@ framework concerns into the core (per `non-goals.md` and `draft.md` §18 layerin
 These ride on the core capabilities (arena, views, FFI, task_group, zero-copy I/O); they
 are downstream consumers, scheduled after the core + std foundations, and are recorded here
 only so the vision is not lost when `work/proposals/` is discarded.
+
+### Resource-oriented north star + local LLM inference (Future / direction, not a v1 commitment)
+
+The headline long-term instance of the resource-oriented north star (design-notes "The
+resource-oriented north star"). Recorded 2026-06-28 from the `work/` LLM memos; a *direction*
+that must not distort the language into a GPU-only ML framework, and must not become a core
+dependency. **License posture:** GGUF / llama.cpp / vLLM / FlexGen / FlashAttention are design
+references only — no kernel / scheduler / quant / format code vendored; model licenses are
+separate from engine licenses.
+
+The bet: not "beat a datacenter GPU" but **"given the CPU/GPU/RAM/SSD/power the user already has,
+find the largest useful model and the least-bad execution plan, and say so honestly."** Align owns
+the *systems layer* of inference, not the math kernels (a local int8-dot probe beat scalar by only
+1.35× — hand-SIMD does not beat mature backends; bind them via FFI first).
+
+```text
+Where Align fits (all are existing core strengths, not new language surface):
+- model file as a scoped mmap view + typed tensor descriptors (GGUF is mmap-designed)   [zero-copy I/O]
+- memory planner: tensor sizes x quant x VRAM/RAM/disk/PCIe -> inspectable placement plan [the strongest native fit]
+- KV cache as a first-class planned region resource (paged blocks, prefix sharing)
+- tokenizer / sampling / streaming server I/O (mmap vocab, SIMD UTF-8, sink-first token output, task_group)
+- diagnostics that tell the truth: "fits VRAM" / "18 GPU layers, slow tokens" / "32k context impossible, try 8k"
+
+Probe evidence (work/kv_cache_planner_probe.rs, 100k mixed-length requests):
+  naive contiguous next-pow2   +38.9% memory waste
+  paged block 16 / 64          +0.08% / +0.36% waste
+  shared-prefix block          -5.2% (below per-request exact sum; shared prompt stored once)
+  -> KV cache should be a planned resource, not a hidden vector allocation.
+
+Honest positioning (no overclaim): full VRAM = fastest; partial offload = usable; RAM+mmap+prefetch =
+large-model fallback; disk paging during hot decode = last resort unless heavily batched/pipelined.
+Main memory cannot replace VRAM bandwidth — each decoded token touches many weights.
+```
+
+Realistic milestone shape (far future, after core + std + FFI): a `pkg` that wraps a llama.cpp/Ollama-
+class backend, adds zero-copy GGUF metadata inspection + a memory planner, and a local inference server
+written in Align (requests, streaming, batching, scheduling). Align-native kernels only for bounded,
+benchmarked components (tokenizer, sampling, KV-cache manager, quantized CPU matvec, planner). The
+probe-backed std prerequisites (mmap views, buffered/`writev` sink-first I/O, runtime-dispatched SIMD
+scan, `task_group` I/O overlap, network pipelining) are exactly the P0/P1 rails above — so this
+direction does not add core work, it *consumes* it.
+
+**Mining-adjacent tooling** (profiler / autotuner / energy-aware scheduler / pool client) shares the
+"make cost visible" instinct but is a **weaker** north star: ASIC/electricity economics dominate, mature
+GPU miners are hard to beat, and the hot loop is tiny/specialized. Acceptable as a side experiment;
+**not** a core language driver. Do not optimize the language around speculative profitability.
