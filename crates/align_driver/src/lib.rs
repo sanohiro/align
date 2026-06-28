@@ -144,6 +144,11 @@ pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path) -> Result<(
     }
 }
 
+/// The in-tree `align_runtime` source directory, baked in at build time (relative to this
+/// crate's manifest). Present only when `alignc` runs from inside the workspace; an installed
+/// binary has no source tree, so the staleness check below simply no-ops there.
+const RUNTIME_SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../align_runtime/src");
+
 /// Locate `libalign_runtime.a`, built by `cargo build` alongside the `alignc` binary.
 /// The integration tests run from `target/<profile>/deps/`, so the parent is checked too.
 fn runtime_archive() -> Result<std::path::PathBuf, String> {
@@ -153,6 +158,7 @@ fn runtime_archive() -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| "executable has no parent directory".to_string())?;
     for cand in [dir.join("libalign_runtime.a"), dir.join("../libalign_runtime.a")] {
         if cand.exists() {
+            ensure_archive_fresh(&cand)?;
             return Ok(cand);
         }
     }
@@ -160,6 +166,66 @@ fn runtime_archive() -> Result<std::path::PathBuf, String> {
         "cannot find libalign_runtime.a near {}; run `cargo build` first",
         dir.display()
     ))
+}
+
+/// Fail loudly if `libalign_runtime.a` is older than the `align_runtime` source.
+///
+/// `align_driver` has no cargo dependency edge to the runtime *staticlib*, and a unit-test
+/// build (`cargo test -p align_runtime`) recompiles only the test harness — neither refreshes
+/// the `.a`. So editing the runtime and re-running the driver/tests without a full `cargo build`
+/// would silently link a *stale* archive: wrong behavior and baffling test failures (this has
+/// bitten development; see `open-questions.md`). Converting that into an actionable error is the
+/// stable-toolchain fix (an artifact dependency, the clean edge, is still nightly-only).
+///
+/// No-ops when the source tree is absent (an installed `alignc`) or unreadable — it only ever
+/// turns a definitely-stale link into an error, never blocks a legitimate one.
+fn ensure_archive_fresh(archive: &std::path::Path) -> Result<(), String> {
+    let src = std::path::Path::new(RUNTIME_SRC_DIR);
+    if !src.is_dir() {
+        return Ok(()); // installed binary: no source tree to compare against
+    }
+    let Ok(archive_mtime) = archive.metadata().and_then(|m| m.modified()) else {
+        return Ok(()); // cannot stat the archive: do not block the build
+    };
+    if let Some(newest) = newest_rs_mtime(src) {
+        if newest > archive_mtime {
+            return Err(format!(
+                "libalign_runtime.a is stale: a source file under {} is newer than the archive \
+                 {}.\nThe driver has no cargo edge to the runtime staticlib, so run `cargo build` \
+                 to refresh it before linking.",
+                src.display(),
+                archive.display(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Newest modification time among `*.rs` files under `dir` (recursive); `None` if there are
+/// none or the tree is unreadable. Unreadable subdirectories are skipped, not fatal — the check
+/// must never disable itself silently on a single bad entry.
+fn newest_rs_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `file_type()` comes from the `read_dir` iterator with no extra `stat`, and (unlike
+            // `path.is_dir()`) does not follow symlinks — so a symlinked dir is not traversed,
+            // avoiding cycles / escaping the source tree. We `stat` only actual `.rs` files.
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() && entry.path().extension().is_some_and(|x| x == "rs") {
+                if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
+                    newest = Some(newest.map_or(t, |n| n.max(t)));
+                }
+            }
+        }
+    }
+    newest
 }
 
 /// Format diagnostics for humans (one per line, `file:line:col: severity: message`).
@@ -180,4 +246,48 @@ pub fn format_diagnostics(source_map: &SourceMap, diags: &Diagnostics) -> String
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newest_rs_mtime_scans_recursively_and_filters_extension() {
+        // Unique temp dir (no Date/rand in-crate; pid + a stack address suffice here).
+        let root = std::env::temp_dir().join(format!(
+            "align-driver-mtime-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const _
+        ));
+        let sub = root.join("nested");
+        std::fs::create_dir_all(&sub).expect("create temp tree");
+
+        // Empty (no `.rs`) → None.
+        assert_eq!(newest_rs_mtime(&root), None, "no .rs files yet");
+
+        // A non-`.rs` file is ignored.
+        std::fs::write(root.join("notes.txt"), b"x").unwrap();
+        assert_eq!(newest_rs_mtime(&root), None, ".txt is not counted");
+
+        // `.rs` files at the top level and in a subdir are both found; the result is their max
+        // mtime. Compare against an independent scan so the test does not depend on write timing.
+        std::fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
+        std::fs::write(sub.join("b.rs"), b"fn b() {}").unwrap();
+        let expect = [root.join("a.rs"), sub.join("b.rs")]
+            .iter()
+            .map(|p| p.metadata().unwrap().modified().unwrap())
+            .max()
+            .unwrap();
+        assert_eq!(
+            newest_rs_mtime(&root),
+            Some(expect),
+            "finds the newest .rs across the top level and the nested dir"
+        );
+
+        // A missing directory yields None (read_dir fails, skipped, not a panic).
+        assert_eq!(newest_rs_mtime(&root.join("does-not-exist")), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
