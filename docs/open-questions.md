@@ -712,6 +712,38 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         recursive-descent parser has no structural-scan stage to accelerate). So: **record now,
         build with the first crate-uncovered SIMD kernel, not standalone.** Full advice in
         `work/runtime-cpu-dispatch-advice-for-claude-2026-06-28.md` (gitignored scratch).
+      - **★ `core.string` byte-first APIs (codex string-processing advice 2026-06-28) — the
+        actionable consumer.** The string *model* is judged directionally right (`str` = `{ptr,len}`
+        UTF-8 view, `string` owned, `builder` construction, byte `len`, byte-equality, memchr scan,
+        run-copy escape #197). The gap is `core.string`: `find_byte` / `find_any` / `split_byte`
+        (return **borrowed `str` views**, never owned) / `trim_ascii` / `contains` / `starts_with`
+        / `ends_with`, plus a UTF-8 validator. Rule: **UTF-8 is the representation, but hot scans are
+        byte-oriented** — `chars()` is the *wrong* default for protocol/delimiter scanning (probe:
+        newline count via `chars()` 52.7 ms vs byte 11.4 ms (4.6×) vs AVX2 4.6 ms (11.6×); JSON
+        structural AVX2 6.4×; escape run-copy 3.0×, already shipped; UTF-8 ASCII fast-path only 1.28×
+        and the naive mixed fallback *loses* at 0.93× — a real SIMD validator is needed, not a
+        double-scan fallback). **This is the first *real consumer* of the dispatch table** (P0: ship
+        byte-first APIs **backed by `memchr`/`memmem` now** — no scaffold needed; P1: move them
+        behind the dispatch table + AVX2 `find_any`/structural classifier + NEON + UTF-8 validator,
+        reused across JSON/HTTP/CSV/HTML/tokenizers since they share one byte-classifier). Keep
+        Unicode (`chars`/grapheme/normalization/case-fold) explicit and mostly package-level, out of
+        core v1. Builder is ~0.55× of optimized Rust — batching adjacent static/template appends into
+        fewer runtime calls (a `write_many` internal ABI) is the lever. Probe:
+        `work/string_processing_probe.rs`; advice `work/string-processing-findings-2026-06-28.md`.
+      - **LLVM-version gap + upgrade as a perf-roadmap item (codex modern-CPU advice 2026-06-28).**
+        Align is pinned to **LLVM 19** (inkwell 0.9, `llvm19-1`); rustc 1.96 already rides **LLVM 22**,
+        so current Rust *sees* newer target features than Align's backend (x86 `avx10.1/.2`, `apxf`,
+        `amx-*`; aarch64 `sve2`, `sme2`, `i8mm`, `bf16`, `fp8`). Division of labor: **LLVM** does
+        instruction selection / new ISA legalization / vectorizer + cost model (so APX is "free" once
+        the backend targets it — just keep emitting clean optimizable IR); **the runtime** does
+        feature-detect + function-multiversioning like Rust crates. Plan: short-term AVX2+NEON runtime
+        dispatch on LLVM 19; **mid-term schedule an LLVM/inkwell upgrade checkpoint** before targeting
+        AVX10/APX/SME2 seriously (guarded by the existing bench + IR/behavior tests, since an LLVM
+        bump can shift codegen); long-term treat LLVM upgrade as part of the *performance* roadmap,
+        not just maintenance. Model **capabilities, not feature-names**, in the dispatch table (vector
+        width / mask / byte-permute / VNNI-int8) so fixed-width SIMD, scalable vectors (SVE/RVV), and
+        matrix engines (AMX/SME2, which stay behind the LLM/tensor backend, never core syntax) all
+        fit later. Advice `work/modern-cpu-features-align-2026-06-28.md`.
   - **SoA column scan / filtered aggregate** re-confirmed: col_sum **9.4–12.2×**, `where(.active).
     pay.sum()` **3.7–7×** vs Rust `Vec<Struct>` AoS. The shipped headline; unchanged.
   - **Bitset bool/Option columns** re-confirmed with the **caveat already recorded**: `count`/`any`/
