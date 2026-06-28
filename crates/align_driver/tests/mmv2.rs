@@ -176,3 +176,34 @@ fn to_array_map_only_keeps_all() {
     let out = build_and_run("to-array-map", src);
     assert_eq!(out.status.code(), Some(36));
 }
+
+#[test]
+fn move_in_diverging_if_branch_does_not_poison_fallthrough() {
+    if !backend_available() {
+        return;
+    }
+    // A move on a diverging (`return`) branch must not mark the value moved on the fall-through
+    // path: `if cond { return s }` leaves `s` usable below when `cond` is false. This is the
+    // diverging-branch fix in MoveCheck; before it, threading any Move value (string/array/writer)
+    // through a recursive loop was rejected. `pick` recurses 4 times then returns "kept" (len 4).
+    let src = concat!(
+        "fn pick(s: string, i: i64) -> string {\n",
+        "  if i >= 4 { return s }\n",     // diverging branch moves `s`
+        "  print(s.len())\n",            // ...but `s` is still live here on the fall-through
+        "  return pick(s, i + 1)\n",
+        "}\n",
+        "fn main() -> i32 {\n  k := pick(\"kept\".clone(), 0)\n  return k.len() as i32\n}\n",
+    );
+    let out = build_and_run("move-diverge", src);
+    assert_eq!(out.status.code(), Some(4));
+    // "kept".len() = 4, printed each of the 4 recursions before the guard fires.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "4\n4\n4\n4\n");
+}
+
+#[test]
+fn move_still_rejected_when_both_branches_fall_through() {
+    // The fix must NOT over-allow: a real use-after-move (no divergence) still errors. Here `s` is
+    // moved into `consume` and then used again — both reachable, so it is a move error.
+    let src = "fn consume(s: string) -> i64 = s.len()\nfn main() -> i32 {\n  s := \"x\".clone()\n  a := consume(s)\n  b := consume(s)\n  return (a + b) as i32\n}\n";
+    assert!(check_errs("move-no-diverge", src));
+}
