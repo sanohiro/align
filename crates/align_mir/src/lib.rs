@@ -323,8 +323,9 @@ pub enum Rvalue {
     /// `io.stdout.write(b)` for a `builder` `b`: write the builder's bytes to stdout (no newline),
     /// borrowing it. Yields an `i32` status (0 = ok).
     IoStdoutWriteBuilder { builder: Operand },
-    /// `io.stdout.buffered()` — open a buffered stdout writer, yielding an opaque handle (std.io).
-    BufWriterNew,
+    /// `io.stdout.buffered()` / `io.stderr.buffered()` — open a buffered writer over `fd` (1 =
+    /// stdout, 2 = stderr), yielding an opaque handle (std.io).
+    BufWriterNew { fd: i32 },
     /// `w.write(s)` — append a `str` operand's bytes to a buffered stdout writer (flushing to the
     /// OS only when the buffer fills). Side-effecting; yields unit.
     BufWriterWrite(Operand, Operand),
@@ -766,9 +767,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::IoStdoutWriteBuilder { builder } => {
             lower_io_stdout_write(b, builder, e.ty, |a| Rvalue::IoStdoutWriteBuilder { builder: a })
         }
-        hir::ExprKind::BufWriterNew => {
+        hir::ExprKind::BufWriterNew { fd } => {
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BufWriterNew));
+            b.push(Stmt::Let(v, Rvalue::BufWriterNew { fd: *fd }));
             Operand::Value(v)
         }
         hir::ExprKind::BufWriterWrite { writer, arg } => {

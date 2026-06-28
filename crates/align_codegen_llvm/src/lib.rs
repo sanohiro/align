@@ -462,9 +462,9 @@ fn build_module<'c>(
     );
     // io.stdout.buffered() — the buffered stdout writer (std.io).
     funcs.insert(
-        // io.stdout.buffered() () -> *StdoutWriter (opaque handle).
+        // io.stdout.buffered() / io.stderr.buffered(): (fd: i32) -> *BufferedWriter (opaque handle).
         "io_buf_new".to_string(),
-        module.add_function("align_rt_io_buf_new", ptr.fn_type(&[], false), None),
+        module.add_function("align_rt_io_buf_new", ptr.fn_type(&[ctx.i32_type().into()], false), None),
     );
     funcs.insert(
         // w.write(s) (w: *StdoutWriter, ptr, len) -> void; appends, flushing only when full.
@@ -2525,13 +2525,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 cs.try_as_basic_value().basic().expect("io_stdout_write_builder returns i32")
             }
-            Rvalue::BufWriterNew => self
-                .builder
-                .build_call(self.funcs["io_buf_new"], &[], "bufw")
-                .map_err(|e| self.err(e))?
-                .try_as_basic_value()
-                .basic()
-                .expect("io_buf_new returns a pointer"),
+            Rvalue::BufWriterNew { fd } => {
+                let fd = self.ctx.i32_type().const_int(*fd as u64, true);
+                self.builder
+                    .build_call(self.funcs["io_buf_new"], &[fd.into()], "bufw")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("io_buf_new returns a pointer")
+            }
             Rvalue::BufWriterWrite(w, s) => {
                 let wp = self.operand(w).into();
                 let agg = self.operand(s).into_struct_value();

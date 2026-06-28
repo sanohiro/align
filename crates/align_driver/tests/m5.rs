@@ -1175,3 +1175,43 @@ fn str_trim_on_owned_string_view_is_borrowed() {
     let out = build_and_run("str-trim-owned", src);
     assert_eq!(out.status.code(), Some(3));
 }
+
+#[test]
+fn io_stderr_buffered_writes_to_stderr_not_stdout() {
+    if !backend_available() {
+        return;
+    }
+    // `io.stderr.buffered()` opens the same buffered writer over fd 2. The bytes land on stderr
+    // (drained at `flush()?`), and stdout stays empty — the writer is fd-parameterized.
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  log := io.stderr.buffered()\n  log.write(\"warn: \")\n  log.write(\"disk low\\n\")\n  log.flush()?\n  return Ok(())\n}\n";
+    let out = build_and_run("io-stderr-buffered", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "warn: disk low\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "", "nothing leaks to stdout");
+}
+
+#[test]
+fn io_stderr_buffered_flushes_on_drop() {
+    if !backend_available() {
+        return;
+    }
+    // No explicit flush: the writer's Drop drains the buffer to fd 2 at scope exit.
+    let src = "import std.io\nfn main() -> i32 {\n  log := io.stderr.buffered()\n  log.write(\"dropped to stderr\\n\")\n  return 0\n}\n";
+    let out = build_and_run("io-stderr-drop", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "dropped to stderr\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn io_stdout_and_stderr_buffered_are_independent_sinks() {
+    if !backend_available() {
+        return;
+    }
+    // Two buffered writers over different fds in the same program route to the right streams.
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  err := io.stderr.buffered()\n  out.write(\"to-out\\n\")\n  err.write(\"to-err\\n\")\n  out.flush()?\n  err.flush()?\n  return Ok(())\n}\n";
+    let out = build_and_run("io-both-sinks", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "to-out\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "to-err\n");
+}

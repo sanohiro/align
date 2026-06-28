@@ -1746,7 +1746,7 @@ impl EffectScan {
             }
             // Opening a buffered writer is allocation only (no I/O → pure, like `BuilderNew`); its
             // `write`/`flush` may reach the OS, so those are impure.
-            ExprKind::BufWriterNew => {}
+            ExprKind::BufWriterNew { .. } => {}
             ExprKind::BufWriterWrite { writer, arg } => {
                 self.impure_direct = true;
                 self.expr(writer);
@@ -2459,7 +2459,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
-            | ExprKind::BufWriterNew
+            | ExprKind::BufWriterNew { .. }
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
@@ -2785,7 +2785,7 @@ impl<'a> MoveCheck<'a> {
                 self.expr(arg, moved, false, false);
             }
             ExprKind::BufWriterFlush { writer } => self.expr(writer, moved, false, false),
-            ExprKind::BufWriterNew => {}
+            ExprKind::BufWriterNew { .. } => {}
             // Both operands are borrowed (read for bytes), never consumed.
             ExprKind::StrPredicate { haystack, needle, .. } => {
                 self.expr(haystack, moved, false, false);
@@ -5051,18 +5051,25 @@ impl<'a, 't> Checker<'a, 't> {
                 return self.check_fs_read_file(args, span);
             }
         }
-        // `io.stdout.write(s)` / `io.stdout.buffered()` — the receiver is the 2-segment `io.stdout`,
-        // so it parses as a `FieldAccess` (`io` . `stdout`), not a single-name path.
+        // `io.stdout.write(s)` / `io.stdout.buffered()` / `io.stderr.buffered()` — the receiver is the
+        // 2-segment `io.stdout` / `io.stderr`, so it parses as a `FieldAccess` (`io` . `stdout`), not
+        // a single-name path.
         if method == "write" || method == "buffered" {
             if let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind {
                 if let ast::ExprKind::Path(p) = &inner.kind {
                     if single_name(p) == Some("io") && field.name == "stdout" {
                         if method == "buffered" {
                             self.require_import("std.io", "io.stdout.buffered", span);
-                            return self.check_io_stdout_buffered(args, span);
+                            return self.check_io_buffered("stdout", 1, args, span);
                         }
                         self.require_import("std.io", "io.stdout.write", span);
                         return self.check_io_stdout_write(args, span);
+                    }
+                    // `io.stderr.buffered()` — the buffered writer over fd 2 (logging/diagnostics).
+                    // Unbuffered `io.stderr.write` is a later, parallel addition.
+                    if single_name(p) == Some("io") && field.name == "stderr" && method == "buffered" {
+                        self.require_import("std.io", "io.stderr.buffered", span);
+                        return self.check_io_buffered("stderr", 2, args, span);
                     }
                 }
             }
@@ -7061,13 +7068,15 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `io.stdout.buffered()` — open a buffered stdout writer (the sink-first fast path), yielding a
     /// [`Ty::BufWriter`] owned handle. Takes no arguments; the writer is `Drop`-flushed at scope exit.
-    fn check_io_stdout_buffered(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+    /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — open a buffered writer over
+    /// the given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
+    fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
         if !args.is_empty() {
             self.diags
-                .error(format!("'io.stdout.buffered' takes no arguments, got {}", args.len()), span);
+                .error(format!("'io.{sink}.buffered' takes no arguments, got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        Expr { kind: ExprKind::BufWriterNew, ty: Ty::BufWriter, span }
+        Expr { kind: ExprKind::BufWriterNew { fd }, ty: Ty::BufWriter, span }
     }
 
     /// `w.write(s)` / `w.flush()` on a buffered stdout writer ([`Ty::BufWriter`]), the receiver
@@ -7857,7 +7866,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
-            | ExprKind::BufWriterNew
+            | ExprKind::BufWriterNew { .. }
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
