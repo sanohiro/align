@@ -226,16 +226,21 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
         if let Ok(meta) = file.metadata() {
             let flen = meta.len();
             // Regular files only (`is_file`), nonzero length (skips empty / size-unknown special
-            // files), and a length that fits `usize` (always true on 64-bit; guards a 32-bit target).
+            // files). `isize::try_from` is the single guard that keeps the rest sound on every
+            // target: a positive `isize` fits both `usize` (the slice len) and `i64` (the alloc
+            // size) losslessly, and is `<= isize::MAX` so `from_raw_parts_mut` is not UB. A larger
+            // file (only reachable on a 32-bit target) just takes the fallback path.
             if meta.is_file() && flen > 0 {
-                if let Ok(len_u) = usize::try_from(flen) {
-                    let dst = align_rt_alloc(flen as i64);
+                if let Ok(len_z) = isize::try_from(flen) {
+                    let len_i = len_z as i64;
+                    let len_u = len_z as usize;
+                    let dst = align_rt_alloc(len_i);
                     let buf = unsafe { core::slice::from_raw_parts_mut(dst, len_u) };
                     // `read_exact` fills the whole buffer (a shorter file errors). On success one
                     // more read must hit EOF — otherwise the file grew past the snapshot and the
                     // buffer would silently truncate, so fall back. Any failure frees and falls back.
                     if file.read_exact(buf).is_ok() && matches!(file.read(&mut [0u8; 1]), Ok(0)) {
-                        unsafe { *out = AlignStr { ptr: dst, len: flen as i64 } };
+                        unsafe { *out = AlignStr { ptr: dst, len: len_i } };
                         return 0;
                     }
                     unsafe { align_rt_free(dst) };
