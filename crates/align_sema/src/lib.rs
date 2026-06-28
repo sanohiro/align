@@ -8032,7 +8032,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Builder => "builder".to_string(),
-        Ty::BufWriter => "io.stdout.buffered".to_string(),
+        Ty::BufWriter => "bufwriter".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
