@@ -207,3 +207,22 @@ fn move_still_rejected_when_both_branches_fall_through() {
     let src = "fn consume(s: string) -> i64 = s.len()\nfn main() -> i32 {\n  s := \"x\".clone()\n  a := consume(s)\n  b := consume(s)\n  return (a + b) as i32\n}\n";
     assert!(check_errs("move-no-diverge", src));
 }
+
+#[test]
+fn move_in_arena_wrapped_diverging_branch_is_not_poisoned() {
+    if !backend_available() {
+        return;
+    }
+    // Divergence through a block-wrapping expr (`arena { return … }`) must also be recognized, so a
+    // move inside it does not poison the fall-through. With `c=false` the `if` is skipped and `s`
+    // is consumed below; "hello".len() = 5.
+    let src = concat!(
+        "fn consume(s: string) -> i64 = s.len()\n",
+        "fn f(s: string, c: bool) -> i64 {\n",
+        "  if c {\n    arena {\n      return consume(s)\n    }\n  }\n",
+        "  return consume(s)\n}\n",
+        "fn main() -> i32 {\n  return f(\"hello\".clone(), false) as i32\n}\n",
+    );
+    let out = build_and_run("move-arena-diverge", src);
+    assert_eq!(out.status.code(), Some(5));
+}

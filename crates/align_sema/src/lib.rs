@@ -2454,27 +2454,41 @@ impl<'a> EscapeCheck<'a> {
     }
 }
 
+/// Whether a single HIR statement always diverges (control never proceeds to the next statement).
+/// A `return` always diverges; a `let`/assignment/expression statement diverges iff the value it
+/// evaluates does.
+fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
+    match s {
+        hir::Stmt::Return(_) => true,
+        hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
+        hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
+        hir::Stmt::AssignIndex { index, value, .. } => hir_expr_diverges(index) || hir_expr_diverges(value),
+        hir::Stmt::Expr(e) => hir_expr_diverges(e),
+    }
+}
+
 /// Whether a HIR block **always diverges** (never falls through to its end) — used by `MoveCheck`
 /// to drop a diverging branch's moves at an `if` join (they happen on a path that never reaches
-/// past the `if`). Conservative: only `true` when divergence is certain (a top-level `return`, or a
-/// tail `if`/block that itself diverges); anything else is `false`, falling back to the safe union.
+/// past the `if`). Conservative: only `true` when divergence is certain (any statement that always
+/// diverges — including an intermediate one, after which the rest is dead — or a tail `if`/block
+/// that itself diverges); anything else is `false`, falling back to the safe union.
 fn hir_block_diverges(b: &hir::Block) -> bool {
-    if b.stmts.iter().any(|s| matches!(s, hir::Stmt::Return(_))) {
+    if b.stmts.iter().any(hir_stmt_diverges) {
         return true;
     }
     if let Some(v) = &b.value {
         return hir_expr_diverges(v);
     }
-    b.stmts.last().is_some_and(|s| matches!(s, hir::Stmt::Expr(e) if hir_expr_diverges(e)))
+    false
 }
 
 /// Whether a HIR expression in tail position always diverges. An `if` diverges only when **both**
-/// arms do; a nested block defers to [`hir_block_diverges`]. (A `match` / `?` may fall through, so
-/// they are conservatively non-diverging here.)
+/// arms do; a block-wrapping expr (`{…}` / `arena {…}` / `task_group {…}`) defers to its block.
+/// (A `match` / `?` may fall through, so they are conservatively non-diverging here.)
 fn hir_expr_diverges(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::If { then, els, .. } => hir_block_diverges(then) && hir_block_diverges(els),
-        ExprKind::Block(b) => hir_block_diverges(b),
+        ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => hir_block_diverges(b),
         _ => false,
     }
 }
@@ -8065,7 +8079,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Builder => "builder".to_string(),
-        Ty::BufWriter => "bufwriter".to_string(),
+        // The surface type name (`fn f(w: writer)`), so diagnostics match what the user writes.
+        Ty::BufWriter => "writer".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
