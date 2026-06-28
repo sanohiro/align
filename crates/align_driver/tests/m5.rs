@@ -686,6 +686,59 @@ fn io_stdout_write_has_no_newline() {
 }
 
 #[test]
+fn io_stdout_buffered_writes_then_explicit_flush() {
+    if !backend_available() {
+        return;
+    }
+    // std.io: `io.stdout.buffered()` opens a buffered writer; `.write(s)` appends without a
+    // syscall, `.flush()?` drains the buffer to the OS in one write. The three appends concatenate.
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  out.write(\"hello \")\n  out.write(\"buffered \")\n  out.write(\"world\\n\")\n  out.flush()?\n  return Ok(())\n}\n";
+    let out = build_and_run("io-buffered-flush", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello buffered world\n");
+}
+
+#[test]
+fn io_stdout_buffered_flushes_on_drop() {
+    if !backend_available() {
+        return;
+    }
+    // Without an explicit `flush()`, the writer's `Drop` flushes any buffered bytes best-effort at
+    // scope exit — so the output still appears.
+    let src = "import std.io\nfn main() -> i32 {\n  out := io.stdout.buffered()\n  out.write(\"flushed on drop\\n\")\n  return 0\n}\n";
+    let out = build_and_run("io-buffered-drop", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "flushed on drop\n");
+}
+
+#[test]
+fn io_stdout_buffered_writes_owned_string_without_consuming_it() {
+    if !backend_available() {
+        return;
+    }
+    // `out.write(owned_string)` auto-borrows the `string` as a `str` (zero-cost, non-consuming), so
+    // the owned string stays usable afterwards (`s.len()` = 10). The buffered "owned-text\n" is
+    // flushed at `out.flush()`; `print` flushes immediately, so the length (10) prints first.
+    let src = "import std.io\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  s := mk(\"owned-\", \"text\")\n  out.write(s)\n  out.write(\"\\n\")\n  print(s.len())\n  out.flush()?\n  return Ok(())\n}\n";
+    let out = build_and_run("io-buffered-owned", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "10\nowned-text\n");
+}
+
+#[test]
+fn io_stdout_buffered_rejects_args_and_bad_methods() {
+    // `io.stdout.buffered()` takes no arguments; `.flush()` is writer-only (not on an int).
+    assert!(check_errs(
+        "io-buffered-args",
+        "import std.io\nfn main() -> i32 {\n  out := io.stdout.buffered(5)\n  return 0\n}\n",
+    ));
+    assert!(check_errs(
+        "io-flush-non-writer",
+        "import std.io\nfn main() -> i32 {\n  x := 7\n  x.flush()\n  return 0\n}\n",
+    ));
+}
+
+#[test]
 fn s19_full_flow_read_decode_aggregate_write() {
     if !backend_available() {
         return;

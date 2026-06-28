@@ -488,6 +488,18 @@ pub enum ExprKind {
     /// stdout directly (no `to_string()` materialization), borrowing it (not consumed). `ty` is
     /// `Result<(), Error>`.
     IoStdoutWriteBuilder { builder: Box<Expr> },
+    /// `io.stdout.buffered()` — open a buffered stdout writer (the sink-first fast path). The `ty`
+    /// is [`crate::Ty::BufWriter`] (an owned, Move handle). Bytes accumulate in a buffer and reach
+    /// the OS only when it fills or on `flush` / drop — so writes do no syscall and memory stays
+    /// O(buffer). I/O-effecting (Impure), unlike the pure string `BuilderNew`.
+    BufWriterNew,
+    /// `w.write(s)` — append a `str` to a buffered stdout writer, borrowing it (not consumed). The
+    /// `ty` is `Unit`; an internal flush failure is latched and surfaced by the next `flush`.
+    /// Impure (it may flush to stdout).
+    BufWriterWrite { writer: Box<Expr>, arg: Box<Expr> },
+    /// `w.flush()` — flush a buffered stdout writer's bytes to the OS, borrowing it. The `ty` is
+    /// `Result<(), Error>`. Impure.
+    BufWriterFlush { writer: Box<Expr> },
 }
 
 /// The aggregate of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).

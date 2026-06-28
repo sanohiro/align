@@ -274,6 +274,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::IoStdoutWriteBuilder { builder } => {
             format!("io_stdout_write_builder({})", operand_str(builder))
         }
+        Rvalue::BufWriterNew => "io_buf_new()".to_string(),
+        Rvalue::BufWriterWrite(w, s) => format!("io_buf_write({}, {})", operand_str(w), operand_str(s)),
+        Rvalue::BufWriterFlush(w) => format!("io_buf_flush({})", operand_str(w)),
     }
 }
 
