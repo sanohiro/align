@@ -808,8 +808,9 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
   shape + copy elimination (unaligned AVX2 loads were within ~0.95–1.0× on this host).
 
 - **Recheck + sharpened conclusions (codex re-run 2026-06-28, three new probes verified on this host).**
-  A second pass re-ran the Align-vs-Rust suite (parity zone, SoA, JSON, group_by, builder, par_map all
-  reproduced) and added three focused probes. The new durable conclusions, beyond the bullets above:
+  A second pass re-ran the Align-vs-Rust suite (parity zone, SoA, JSON, group_by, builder, and par_map,
+  all of which reproduced) and added three focused probes. The new durable conclusions, beyond the
+  bullets above:
   - **Builder: the lever is *inlining*, not a batched ABI — so the ideal form is cross-runtime LTO,
     deferred (NOT a `write_many` call).** `work/builder_batch_probe.rs` (verified): folding three
     `write` calls into one batched call is only **~1.2–1.6×** here (codex host: 2.4–3.2×), and
