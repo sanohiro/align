@@ -1391,13 +1391,104 @@ impl<'a> JsonParser<'a> {
             None
         }
     }
-    /// Skip a value of an unknown key (number / bool / string for the M5 cut).
+    /// Skip a `"..."` string, honoring `\` escapes so an embedded `\"` does not end it early
+    /// (unlike [`string`], which is for zero-copy *keys* and rejects escapes). Used only to
+    /// discard an unknown value, so the escape bytes need not be decoded — just stepped over.
+    fn skip_string(&mut self) -> Option<()> {
+        self.expect(b'"')?;
+        while let Some(c) = self.peek() {
+            self.pos += 1;
+            match c {
+                b'"' => return Some(()),
+                b'\\' => {
+                    // Step over the escaped byte (`\"`, `\\`, `\n`, or the `u` of `\uXXXX` — the
+                    // four hex digits are then skipped as ordinary chars, fine for discarding).
+                    self.peek()?;
+                    self.pos += 1;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    fn skip_null(&mut self) -> Option<()> {
+        if self.src[self.pos..].starts_with(b"null") {
+            self.pos += 4;
+            Some(())
+        } else {
+            None
+        }
+    }
+    /// Skip a value of an unknown key — number / string / bool / null / nested object / nested
+    /// array — so a narrow struct decodes from JSON carrying fields it does not declare (the
+    /// "declare only what you need" projection rail). Recursion is depth-bounded so adversarially
+    /// nested input is rejected rather than overflowing the stack.
     fn skip_value(&mut self) -> Option<()> {
+        self.skip_value_depth(0)
+    }
+    fn skip_value_depth(&mut self, depth: u32) -> Option<()> {
+        // Bound nesting so a pathological `[[[[…` cannot exhaust the native stack.
+        const MAX_DEPTH: u32 = 128;
+        if depth > MAX_DEPTH {
+            return None;
+        }
         match self.peek() {
             Some(b't' | b'f') => self.boolean().map(|_| ()),
+            Some(b'n') => self.skip_null(),
             Some(b'-' | b'0'..=b'9') => self.skip_number(),
-            Some(b'"') => self.string().map(|_| ()),
+            Some(b'"') => self.skip_string(),
+            Some(b'{') => self.skip_object(depth),
+            Some(b'[') => self.skip_array(depth),
             _ => None,
+        }
+    }
+    /// Skip a `{ "key": value, ... }` object, discarding every member (keys via [`skip_string`],
+    /// values recursively). Mirrors the whitespace handling of the real object parser.
+    fn skip_object(&mut self, depth: u32) -> Option<()> {
+        self.expect(b'{')?;
+        self.ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Some(());
+        }
+        loop {
+            self.ws();
+            self.skip_string()?; // member key
+            self.ws();
+            self.expect(b':')?;
+            self.ws();
+            self.skip_value_depth(depth + 1)?; // member value
+            self.ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+    /// Skip a `[ value, ... ]` array, discarding every element recursively.
+    fn skip_array(&mut self, depth: u32) -> Option<()> {
+        self.expect(b'[')?;
+        self.ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Some(());
+        }
+        loop {
+            self.ws();
+            self.skip_value_depth(depth + 1)?; // element
+            self.ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
+                    self.pos += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
         }
     }
 }
@@ -1830,6 +1921,54 @@ mod tests {
             let mut q = JsonParser { src: bad.as_bytes(), pos: 0 };
             assert_eq!(q.number(), None, "number() also rejects {bad:?}");
         }
+    }
+
+    #[test]
+    fn json_skip_value_handles_nested_objects_arrays_null_and_escapes() {
+        // Each whole value is skipped end-to-end (cursor lands at EOF). Covers null, escaped
+        // strings, nested objects/arrays, whitespace, and the `\"`/`\\` cases that a naive
+        // string skip would terminate on early.
+        for s in [
+            "null",
+            "true",
+            "-12.5e3",
+            r#""plain""#,
+            r#""a\"b\\c\n""#,                 // escaped quote, backslash, newline
+            r#""x\u00e9y""#,              // `\uXXXX` escape: stepped over, not decoded
+            r#""é本""#,                       // multibyte UTF-8 literal content
+            "{}",
+            "[]",
+            r#"{ "a": 1, "b": [1, 2, {"c": 3}], "d": null }"#,
+            r#"[1, "x", true, null, {"k": [false]}, [[]]]"#,
+            r#"{"s":"has } and ] and \" inside"}"#, // structural bytes inside a string must not end it
+        ] {
+            let mut p = JsonParser { src: s.as_bytes(), pos: 0 };
+            assert_eq!(p.skip_value(), Some(()), "skip_value should accept {s:?}");
+            assert_eq!(p.pos, s.len(), "whole value consumed for {s:?}");
+        }
+
+        // A skipped value bounded by a following member: `{"u":<obj>,"id":7}` — after skipping the
+        // object value the cursor sits on the comma, ready for the next key.
+        let s = r#"{"a":1},rest"#;
+        let mut p = JsonParser { src: s.as_bytes(), pos: 0 };
+        assert_eq!(p.skip_value(), Some(()));
+        assert_eq!(&s.as_bytes()[p.pos..], b",rest", "stops at the object's close");
+
+        // Malformed / truncated values fail (no panic, no run-off): unterminated string, object,
+        // and array; a bare `}`/`]`; an unterminated escape.
+        for bad in [r#""no end"#, "{", "[", "}", "]", r#""x\"#, r#"{"k":}"#, "[,]"] {
+            let mut p = JsonParser { src: bad.as_bytes(), pos: 0 };
+            assert_eq!(p.skip_value(), None, "{bad:?} must not skip cleanly");
+        }
+
+        // Depth guard: 200 nested arrays exceed MAX_DEPTH (128) → rejected, not a stack overflow.
+        let deep = "[".repeat(200) + &"]".repeat(200);
+        let mut p = JsonParser { src: deep.as_bytes(), pos: 0 };
+        assert_eq!(p.skip_value(), None, "over-deep nesting is rejected");
+        // Just within the limit skips fine.
+        let ok_depth = "[".repeat(100) + &"]".repeat(100);
+        let mut p = JsonParser { src: ok_depth.as_bytes(), pos: 0 };
+        assert_eq!(p.skip_value(), Some(()), "depth 100 is within the limit");
     }
 
     #[test]
