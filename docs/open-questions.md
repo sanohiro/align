@@ -477,11 +477,13 @@ interning is direct-index, not per-step string hashing/probing like `HashMap<&st
 views **borrow `base`** (region-tied; the owned key/value buffers are `Drop`-freed, their `str` elements
 are not). New machinery: `ArrayGroupAgg.key_str`, MIR `GroupAggStr` (codegen derives the per-row stride +
 key/value byte offsets from the struct layout via `target_data`), `PrimScalar::Str` (so `array<str>` is a
-payload/tuple element). First cut: AoS source, `str` key + `i64` value, **`sum` only**. The *exposed*
+payload/tuple element). Source = AoS, `str` key + `i64` value, **`sum`/`min`/`max`/`count`** (the runtime
+`group_agg_str` is generic over `value_at`/`combine`, monomorphized per op into
+`align_rt_group_{sum,min,max,count}_str`; `count` reads no value column). The *exposed*
 dictionary-encode / id-column reuse rail (the ~19–21× multi-aggregation reuse) stays deferred — it needs
 a new id-column/dictionary data model (a separate, bigger surface), whereas the hidden form is the ideal
-single-`group_by` shape. Still open: min/max/count over a `str` key, multiple aggregates in one pass →
-more result columns, a `group_by(.key)` with a lambda key, AoS source for *i64* keys. Design ↓.
+single-`group_by` shape. Still open: multiple aggregates in one pass → more result columns, a
+`group_by(.key)` with a lambda key, AoS source for *i64* keys. Design ↓.
 
 ### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
 The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped
@@ -518,10 +520,10 @@ the return type first** — done here.
   specialized table doesn't beat `ahash`, reconsider the mechanism (radix partition? two-pass?) before
   building more.
 - **Deferred within group_by:** the *exposed* dictionary-encode / id-column reuse rail (the ~19–21×
-  multi-aggregation reuse — needs a new id-column/dictionary data model), `min`/`max`/`count` over a
-  `str` key, multiple aggregates in one pass, lambda keys, and parallel (per-chunk partial tables +
-  merge). (`min`/`max`/`count` for i64 keys, the **dense-id fast path**, and **string keys (hidden
-  dictionary-id form, `sum`)** are DONE — see above.)
+  multi-aggregation reuse — needs a new id-column/dictionary data model), multiple aggregates in one
+  pass, lambda keys, and parallel (per-chunk partial tables + merge). (`min`/`max`/`count` for i64
+  keys, the **dense-id fast path**, and **string keys (hidden dictionary-id form,
+  `sum`/`min`/`max`/`count`)** are DONE — see above.)
 - **Why design-first, not rushed:** per "ideal form or defer" + roadmap #5 — the return-type and
   mechanism are the load-bearing decisions; the above fixes them so implementation PRs are mechanical.
 

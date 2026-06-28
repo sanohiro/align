@@ -223,9 +223,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 operand_str(out_vals)
             )
         }
-        Rvalue::GroupAggStr { base, struct_id, key_field, value_field, out_keys, out_vals } => {
+        Rvalue::GroupAggStr { base, struct_id, key_field, value_field, op, out_keys, out_vals } => {
+            let val = value_field.map(|v| format!(".val{v}")).unwrap_or_default();
             format!(
-                "group_sum_str(base=slot{base} struct#{struct_id}.key{key_field}.val{value_field} -> {}, {})",
+                "group_{op:?}_str(base=slot{base} struct#{struct_id}.key{key_field}{val} -> {}, {})",
                 operand_str(out_keys),
                 operand_str(out_vals)
             )
