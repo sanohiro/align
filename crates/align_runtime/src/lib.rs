@@ -1720,7 +1720,9 @@ pub unsafe extern "C" fn align_rt_io_buf_free(w: *mut BufferedWriter) {
 /// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_str_eq(a: *const u8, alen: i64, b: *const u8, blen: i64) -> i32 {
-    if alen != blen {
+    // `alen < 0` guards the FFI boundary the same way as `eq_ignore_case`: an equal-and-negative
+    // length would otherwise wrap to a huge `usize` in `from_raw_parts` (UB). Real lengths are >= 0.
+    if alen != blen || alen < 0 {
         return 0;
     }
     // Same view, or both empty: equal without touching memory. This also avoids
@@ -1820,7 +1822,10 @@ pub unsafe extern "C" fn align_rt_str_rfind(hptr: *const u8, hlen: i64, nptr: *c
 /// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_str_eq_ignore_case(aptr: *const u8, alen: i64, bptr: *const u8, blen: i64) -> i32 {
-    if alen != blen {
+    // `alen < 0` guards the FFI boundary: a (never-expected) negative length would otherwise survive
+    // the `alen != blen` check when both are equal-and-negative, then wrap to a huge `usize` in
+    // `from_raw_parts` (UB). Real `str` lengths are always >= 0; this is pure defense in depth.
+    if alen != blen || alen < 0 {
         return 0;
     }
     if aptr == bptr || alen == 0 {
