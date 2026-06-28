@@ -2358,8 +2358,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let store = self.target_data.get_store_size(&st);
                 let align = self.target_data.get_abi_alignment(&st) as u64;
                 let stride = store.div_ceil(align) * align; // alloc size = align_up(store, align)
-                let key_off = self.target_data.offset_of_element(&st, *key_field).unwrap_or(0);
-                let val_off = self.target_data.offset_of_element(&st, *value_field).unwrap_or(0);
+                // Field indices are sema-validated, so a missing offset is a compiler bug — panic
+                // loudly rather than defaulting to 0 (which would silently read the wrong field).
+                let key_off = self.target_data.offset_of_element(&st, *key_field).expect("valid key field offset");
+                let val_off = self.target_data.offset_of_element(&st, *value_field).expect("valid value field offset");
                 let agg = self.builder.build_load(slice_struct_type(self.ctx), self.slots[base], "aosbase").map_err(|e| self.err(e))?.into_struct_value();
                 let bptr = self.builder.build_extract_value(agg, 0, "bptr").map_err(|e| self.err(e))?;
                 let blen = self.builder.build_extract_value(agg, 1, "blen").map_err(|e| self.err(e))?;

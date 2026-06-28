@@ -5941,7 +5941,13 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
             let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
-            let Some(vi) = value_field.and_then(|v| resolve(self, v, "value", i64t)) else { return err };
+            // `sum` always carries a value field (the top-of-fn match requires it), but guard the
+            // `None` explicitly so it surfaces a diagnostic rather than silently returning `err`.
+            let Some(v) = value_field else {
+                self.diags.error("`group_by(.key).sum(.value)` needs a `.value` field".to_string(), span);
+                return err;
+            };
+            let Some(vi) = resolve(self, v, "value", i64t) else { return err };
             // Result: `(array<str>, array<i64>)` — distinct keys (views borrowing `base`), per-key sums.
             let karr = ty_to_scalar(Ty::DynArray(Scalar::Str)).expect("array<str> is a payload scalar");
             let varr = ty_to_scalar(Ty::DynArray(ty_to_scalar(i64t).unwrap())).expect("array<i64> is a payload scalar");

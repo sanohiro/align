@@ -1382,13 +1382,18 @@ pub unsafe extern "C" fn align_rt_group_sum_str(
     }
     let n = n as usize;
     let (stride, key_off, val_off) = (stride as usize, key_off as usize, val_off as usize);
-    let mut ids: HashMap<&[u8], usize> = HashMap::new();
-    let mut acc: Vec<i64> = Vec::new();
-    let mut reprs: Vec<AlignStr> = Vec::new();
+    // Reserve up front to avoid the early grow-and-rehash churn; the group count is unknown, so cap
+    // at a sane starting size (n is the worst case = all-distinct, but don't over-reserve for huge n).
+    let initial = n.min(cap as usize).min(1024);
+    let mut ids: HashMap<&[u8], usize> = HashMap::with_capacity(initial);
+    let mut acc: Vec<i64> = Vec::with_capacity(initial);
+    let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
     for i in 0..n {
         let row = unsafe { base.add(i * stride) };
-        let ks = unsafe { *(row.add(key_off) as *const AlignStr) };
-        let v = unsafe { *(row.add(val_off) as *const i64) };
+        // Read unaligned: the field address is byte-offset pointer arithmetic, so don't assume the
+        // type's alignment (free on x86; correct everywhere).
+        let ks = unsafe { (row.add(key_off) as *const AlignStr).read_unaligned() };
+        let v = unsafe { (row.add(val_off) as *const i64).read_unaligned() };
         // The key bytes borrow the source, which outlives this call — so the map can key on them.
         let bytes: &[u8] = if ks.ptr.is_null() || ks.len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) } };
         match ids.get(bytes) {
