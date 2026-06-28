@@ -807,6 +807,43 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
   hand-written SIMD library before the O2 baseline is measured; chasing load *alignment* before data
   shape + copy elimination (unaligned AVX2 loads were within ~0.95–1.0× on this host).
 
+- **Recheck + sharpened conclusions (codex re-run 2026-06-28, three new probes verified on this host).**
+  A second pass re-ran the Align-vs-Rust suite (parity zone, SoA, JSON, group_by, builder, par_map all
+  reproduced) and added three focused probes. The new durable conclusions, beyond the bullets above:
+  - **Builder: the lever is *inlining*, not a batched ABI — so the ideal form is cross-runtime LTO,
+    deferred (NOT a `write_many` call).** `work/builder_batch_probe.rs` (verified): folding three
+    `write` calls into one batched call is only **~1.2–1.6×** here (codex host: 2.4–3.2×), and
+    **pre-sized capacity is confirmed irrelevant** — the *fully-inlined* append column is what reaches
+    optimized Rust. Each `align_rt_builder_write*` is a non-inlinable FFI call across the
+    `libalign_runtime.a` boundary (no LTO today), so the per-element cost is the call, not the copy. A
+    `write_many`/template-fusion ABI would be **a second mechanism for something `write` already does**
+    (violates "One way") and still tops out at ~1.5×. The mechanism that actually closes the gap —
+    *and helps every `align_rt_*` call, not just the builder* — is link-time inlining of the runtime
+    (ship `align_runtime` as LLVM bitcode / link the hot module under lld LTO). One mechanism, nothing
+    hidden, reaches the LLVM ceiling. **Per "ideal form or defer", builder batching is deferred behind
+    the LTO infra slice**; the earlier "`write_many` is the lever" note is superseded by this.
+  - **`par_map` cost-threshold lint (P0 diagnostic).** `work/par_map_chunk_probe.rs` (verified):
+    cheap per-element `par_map` *loses* to sequential (**0.24–0.81× vs seq inline**; Rayon-style
+    scheduling only wins at ~1M+ elems / heavier bodies). Function indirection alone is a **~9–10×**
+    penalty for trivial bodies (seq inline vs seq indirect). So the rail is: lint a cheap `par_map`
+    toward sequential/vectorized, and (P1) specialize the chunk body in MIR/codegen so the per-element
+    thunk disappears. Reinforces the "make the fast shape the normal rail, warn when it falls off"
+    direction (and the Profile-guided perf-lints bullet above).
+  - **group_by wants *three* strategies, not one hash table.** `work/group_sort_probe.rs` (verified,
+    1M rows): **dense-id array aggregation 5.8 ms vs std HashMap 63 ms (~11×)** when keys are a dense
+    integer range; **sort-group (24 ms) beats hash (63 ms) at 1M distinct** (high cardinality / already
+    sorted). So the columnar `group_by` runway is: dense-id/dictionary path → SwissTable for general
+    high-cardinality primitive keys → sort-group for very-high-cardinality or pre-sorted, with
+    diagnostics ("key is a dense integer range — use dense group_by"; "string key in a hot group_by —
+    dictionary id"). Extends the Dictionary-id rail + SwissTable bullets with the sort-group third leg.
+  - **Codex's handed-over priority order** (for sequencing, not commitment): (1) builder inline/LTO,
+    (2) JSON SIMD structural scan + projected/column decode, (3) dense-id/dictionary group_by, (4)
+    `core.string` byte-first APIs + runtime CPU dispatch, (5) buffered/view-first I/O *(buffered stdout
+    shipped #198/#200)*, (6) cheap-`par_map` lint/threshold, (7) high-cardinality SwissTable/sort-group.
+    Reading: 1/2/3/7 are deep infra slices (LTO, simdjson-style two-stage rewrite, new aggregate
+    strategies); **4 and 6 are the clean bounded ideal-form wins to ship first** — byte-first string
+    predicates next, then the par_map cost lint. Probes are gitignored scratch under `work/`.
+
 (All probes are Rust micro-benchmarks under `work/`; the convergent + on-philosophy items are recorded
 for later. Re-bench in Align (`bench/`) before shipping any. The local-LLM-inference direction these
 memos also explore is recorded in the Future section, "Resource-oriented north star + local LLM
