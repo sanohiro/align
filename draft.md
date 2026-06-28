@@ -813,8 +813,8 @@ entirely (direct-index accumulation — ~5× a `std::HashMap`, beating even `aha
 over an `array<Struct>` (a `soa` can't hold a `str` column) is **dictionary-encoded**: the runtime
 interns each key to a dense id once, then aggregates by id — yielding `(array<str>, array<Acc>)` whose
 key views borrow the source. The surface is identical (`group_by(.key).sum(.value)`); the strategy is
-the runtime's concern. (First cut: `i64` key + `i64` sum over a `soa`, or a `str` key + `i64` sum over
-an `array<Struct>`.)
+the runtime's concern. (First cut: an `i64` key over a `soa`, or a `str` key over an `array<Struct>`,
+with an `i64` value and `sum`/`min`/`max`/`count`.)
 
 This is the layout lever that lets Align *beat* an array-of-structs (what a hand-written `Vec<User>`
 gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags

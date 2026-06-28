@@ -450,14 +450,32 @@ fn group_by_str_key_dictionary_encodes_and_sums() {
 }
 
 #[test]
-fn group_by_str_key_supports_sum_only_for_now() {
-    // The str-key dictionary rail is `sum`-only in the first cut; min/max/count stay i64-key only.
-    for agg in ["min(.score)", "max(.score)", "count()"] {
-        let src = format!(
-            "import core.json\nUser {{ name: str, score: i64 }}\nfn k(us: array<User>) -> i64 = us.group_by(.name).{agg}.0.len()\nfn main() -> i32 = 0\n",
-        );
-        assert!(!ok(&src), "str-key group_by .{agg} should be rejected (sum-only)");
+fn group_by_str_key_min_max_count_aggregate() {
+    if !backend_available() {
+        return;
     }
+    // Same rows as the sum test (a:[10,5], b:[20,3], c:[7]), now min/max/count per string key.
+    // Keys intern in first-occurrence order (a,b,c), so the output is deterministic.
+    let prog = |agg: &str| {
+        format!(
+            concat!(
+                "import core.json\n",
+                "User {{ name: str, score: i64 }}\n",
+                "fn main() -> Result<(), Error> {{\n  arena {{\n",
+                "    us: array<User> := json.decode(\"[{{\\\"name\\\":\\\"a\\\",\\\"score\\\":10}},{{\\\"name\\\":\\\"b\\\",\\\"score\\\":20}},{{\\\"name\\\":\\\"a\\\",\\\"score\\\":5}},{{\\\"name\\\":\\\"c\\\",\\\"score\\\":7}},{{\\\"name\\\":\\\"b\\\",\\\"score\\\":3}}]\")?\n",
+                "    g := us.group_by(.name).{agg}\n",
+                "    print(g.1[0])\n    print(g.1[1])\n    print(g.1[2])\n",
+                "  }}\n  return Ok(())\n}}\n",
+            ),
+            agg = agg,
+        )
+    };
+    // min: a:min(10,5)=5, b:min(20,3)=3, c:7
+    assert_eq!(String::from_utf8_lossy(&build_and_run("group-str-min", &prog("min(.score)")).stdout), "5\n3\n7\n");
+    // max: a:max(10,5)=10, b:max(20,3)=20, c:7
+    assert_eq!(String::from_utf8_lossy(&build_and_run("group-str-max", &prog("max(.score)")).stdout), "10\n20\n7\n");
+    // count: a:2, b:2, c:1 (no value field)
+    assert_eq!(String::from_utf8_lossy(&build_and_run("group-str-count", &prog("count()")).stdout), "2\n2\n1\n");
 }
 
 #[test]

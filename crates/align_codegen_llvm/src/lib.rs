@@ -559,19 +559,20 @@ fn build_module<'c>(
             None,
         ),
     );
-    funcs.insert(
-        // group_by(.str_key).sum(.i64_value) over an AoS array<Struct> — the dictionary-id rail:
-        // (base, n, stride, key_off, val_off, out_keys, out_vals, cap) -> group count.
-        "group_sum_str".to_string(),
-        module.add_function(
-            "align_rt_group_sum_str",
-            ctx.i64_type().fn_type(
-                &[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()],
-                false,
-            ),
-            None,
-        ),
+    // group_by(.str_key).{sum,min,max}(.i64_value) / .count() over an AoS array<Struct> — the
+    // dictionary-id rail: (base, n, stride, key_off, val_off, out_keys, out_vals, cap) -> group count.
+    let group_str_ty = ctx.i64_type().fn_type(
+        &[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()],
+        false,
     );
+    for (key, sym) in [
+        ("group_sum_str", "align_rt_group_sum_str"),
+        ("group_min_str", "align_rt_group_min_str"),
+        ("group_max_str", "align_rt_group_max_str"),
+        ("group_count_str", "align_rt_group_count_str"),
+    ] {
+        funcs.insert(key.to_string(), module.add_function(sym, group_str_ty, None));
+    }
     // `str.clone()` → deep-copy into a heap-owned `string` `{ptr,len}` (MMv2 slice 7).
     funcs.insert(
         "str_clone".to_string(),
@@ -2349,11 +2350,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("group aggregate returns the group count (i64)")
             }
-            Rvalue::GroupAggStr { base, struct_id, key_field, value_field, out_keys, out_vals } => {
+            Rvalue::GroupAggStr { base, struct_id, key_field, value_field, op, out_keys, out_vals } => {
                 // Load the AoS array `{ptr,len}`, derive the per-row stride (= the struct's alloc
                 // size, LLVM's `[%Struct]` element stride) and the key/value byte offsets from the
-                // struct layout, and call the runtime dictionary-encoding aggregate. `cap` = the row
-                // count (an upper bound on the group count).
+                // struct layout, and call the runtime dictionary-encoding aggregate for the op. `cap`
+                // = the row count (an upper bound on the group count).
+                use align_sema::hir::GroupOp;
                 let st = self.struct_types[*struct_id as usize];
                 let store = self.target_data.get_store_size(&st);
                 let align = self.target_data.get_abi_alignment(&st) as u64;
@@ -2361,7 +2363,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // Field indices are sema-validated, so a missing offset is a compiler bug — panic
                 // loudly rather than defaulting to 0 (which would silently read the wrong field).
                 let key_off = self.target_data.offset_of_element(&st, *key_field).expect("valid key field offset");
-                let val_off = self.target_data.offset_of_element(&st, *value_field).expect("valid value field offset");
+                // `count` has no value field; the runtime entry ignores `val_off`, so pass 0.
+                let val_off = value_field
+                    .map(|v| self.target_data.offset_of_element(&st, v).expect("valid value field offset"))
+                    .unwrap_or(0);
+                let f = match op {
+                    GroupOp::Sum => "group_sum_str",
+                    GroupOp::Min => "group_min_str",
+                    GroupOp::Max => "group_max_str",
+                    GroupOp::Count => "group_count_str",
+                };
                 let agg = self.builder.build_load(slice_struct_type(self.ctx), self.slots[base], "aosbase").map_err(|e| self.err(e))?.into_struct_value();
                 let bptr = self.builder.build_extract_value(agg, 0, "bptr").map_err(|e| self.err(e))?;
                 let blen = self.builder.build_extract_value(agg, 1, "blen").map_err(|e| self.err(e))?;
@@ -2370,7 +2381,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ov = self.operand(out_vals);
                 self.builder
                     .build_call(
-                        self.funcs["group_sum_str"],
+                        self.funcs[f],
                         &[
                             bptr.into(),
                             blen.into(),

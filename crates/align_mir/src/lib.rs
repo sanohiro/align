@@ -252,13 +252,14 @@ pub enum Rvalue {
     /// count (i64). `keys`/`vals` are `{ptr,len}` slices (soa columns; `vals` is unused for `count`);
     /// `out_keys`/`out_vals` are buffer pointers (from [`Rvalue::HeapAllocBuf`]).
     GroupAgg { keys: Operand, vals: Operand, out_keys: Operand, out_vals: Operand, op: hir::GroupOp },
-    /// `group_by(.str_key).sum(.i64_value)` over an AoS `array<Struct>` (the dictionary-id rail).
-    /// `base` is the source struct-array slot (a `{ptr,len}` over `[%Struct]`); codegen derives the
-    /// per-row stride and the `key_field`/`value_field` byte offsets from the struct layout and calls
-    /// `align_rt_group_sum_str`, which interns the `str` keys to dense ids and sums the values per
-    /// group. `out_keys` is a buffer of `str` views (`AlignStr`s borrowing `base`), `out_vals` a
-    /// buffer of i64 sums; yields the group count (i64).
-    GroupAggStr { base: Slot, struct_id: u32, key_field: u32, value_field: u32, out_keys: Operand, out_vals: Operand },
+    /// `group_by(.str_key).{sum,min,max}(.i64_value)` / `.count()` over an AoS `array<Struct>` (the
+    /// dictionary-id rail). `base` is the source struct-array slot (a `{ptr,len}` over `[%Struct]`);
+    /// codegen derives the per-row stride and the `key_field`/`value_field` byte offsets from the
+    /// struct layout and calls `align_rt_group_{sum,min,max,count}_str`, which interns the `str` keys
+    /// to dense ids and aggregates the values per group. `out_keys` is a buffer of `str` views
+    /// (`AlignStr`s borrowing `base`), `out_vals` a buffer of i64 aggregates; yields the group count
+    /// (i64). `value_field` is `None` for `count` (no value column); `op` selects the runtime entry.
+    GroupAggStr { base: Slot, struct_id: u32, key_field: u32, value_field: Option<u32>, op: hir::GroupOp, out_keys: Operand, out_vals: Operand },
     /// `chunks(n)`: split the `{ptr,len}` slice `src` (element size `elem`) into length-`n`
     /// sub-slices, yielding an owned `array<slice<T>>` value `{ chunk_buf, count }` (via the
     /// runtime `align_rt_chunks`). The element slices borrow `src`.
@@ -1142,7 +1143,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 _ => unreachable!("group_by aggregate result is a tuple"),
             };
             if *key_str {
-                lower_array_group_str(b, *base, *struct_id, *key_field, value_field.expect("str-key group_by has a value field"), tuple_id)
+                lower_array_group_str(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id)
             } else {
                 lower_array_group_agg(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id)
             }
@@ -2321,7 +2322,7 @@ fn lower_array_group_agg(b: &mut Builder, base: u32, struct_id: u32, key_field: 
 /// buffer (each sized at the row count), interns + sums via [`Rvalue::GroupAggStr`], and builds the
 /// result tuple `(array<str>, array<i64>)`. The key buffer is owned (heap, `Drop`-freed) but its
 /// elements are `str` views borrowing `base`, so the tuple is region-tied to the source (sema).
-fn lower_array_group_str(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, value_field: u32, tuple_id: u32) -> Operand {
+fn lower_array_group_str(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, value_field: Option<u32>, op: hir::GroupOp, tuple_id: u32) -> Operand {
     let strs = scalar_of(Ty::Str);
     let i64s = scalar_of(i64_ty());
     // Load the AoS array to get its length (an upper bound on the group count).
@@ -2343,6 +2344,7 @@ fn lower_array_group_str(b: &mut Builder, base: u32, struct_id: u32, key_field: 
             struct_id,
             key_field,
             value_field,
+            op,
             out_keys: Operand::Value(out_keys),
             out_vals: Operand::Value(out_vals),
         },

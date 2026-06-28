@@ -5932,28 +5932,22 @@ impl<'a, 't> Checker<'a, 't> {
         };
 
         if key_str {
-            // str key + i64 value, `sum` only — the dictionary-id rail's first slice.
-            if op != hir::GroupOp::Sum {
-                self.diags.error(
-                    "`group_by` over a `str` key supports `.sum(.value)` only (first cut); `min`/`max`/`count` are i64-key only for now".to_string(),
-                    span,
-                );
-                return err;
-            }
+            // str key (dictionary-encoded) + i64 value, `sum`/`min`/`max`/`count`. `count` reads no
+            // value column; the others require an i64 value field (resolved per the top-of-fn match).
             let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
-            // `sum` always carries a value field (the top-of-fn match requires it), but guard the
-            // `None` explicitly so it surfaces a diagnostic rather than silently returning `err`.
-            let Some(v) = value_field else {
-                self.diags.error("`group_by(.key).sum(.value)` needs a `.value` field".to_string(), span);
-                return err;
+            let vi = match value_field {
+                Some(v) => match resolve(self, v, "value", i64t) {
+                    Some(idx) => Some(idx),
+                    None => return err,
+                },
+                None => None, // `count` — no value field
             };
-            let Some(vi) = resolve(self, v, "value", i64t) else { return err };
-            // Result: `(array<str>, array<i64>)` — distinct keys (views borrowing `base`), per-key sums.
+            // Result: `(array<str>, array<i64>)` — distinct keys (views borrowing `base`), per-key aggregate.
             let karr = ty_to_scalar(Ty::DynArray(Scalar::Str)).expect("array<str> is a payload scalar");
             let varr = ty_to_scalar(Ty::DynArray(ty_to_scalar(i64t).unwrap())).expect("array<i64> is a payload scalar");
             let tuple_id = intern_tuple(self.tuples, vec![karr, varr]);
             return Expr {
-                kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: Some(vi), op, key_str: true },
+                kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: vi, op, key_str: true },
                 ty: Ty::Tuple(tuple_id),
                 span,
             };
