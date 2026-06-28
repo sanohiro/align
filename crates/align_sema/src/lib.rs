@@ -2454,6 +2454,45 @@ impl<'a> EscapeCheck<'a> {
     }
 }
 
+/// Whether a single HIR statement always diverges (control never proceeds to the next statement).
+/// A `return` always diverges; a `let`/assignment/expression statement diverges iff the value it
+/// evaluates does.
+fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
+    match s {
+        hir::Stmt::Return(_) => true,
+        hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
+        hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
+        hir::Stmt::AssignIndex { index, value, .. } => hir_expr_diverges(index) || hir_expr_diverges(value),
+        hir::Stmt::Expr(e) => hir_expr_diverges(e),
+    }
+}
+
+/// Whether a HIR block **always diverges** (never falls through to its end) — used by `MoveCheck`
+/// to drop a diverging branch's moves at an `if` join (they happen on a path that never reaches
+/// past the `if`). Conservative: only `true` when divergence is certain (any statement that always
+/// diverges — including an intermediate one, after which the rest is dead — or a tail `if`/block
+/// that itself diverges); anything else is `false`, falling back to the safe union.
+fn hir_block_diverges(b: &hir::Block) -> bool {
+    if b.stmts.iter().any(hir_stmt_diverges) {
+        return true;
+    }
+    if let Some(v) = &b.value {
+        return hir_expr_diverges(v);
+    }
+    false
+}
+
+/// Whether a HIR expression in tail position always diverges. An `if` diverges only when **both**
+/// arms do; a block-wrapping expr (`{…}` / `arena {…}` / `task_group {…}`) defers to its block.
+/// (A `match` / `?` may fall through, so they are conservatively non-diverging here.)
+fn hir_expr_diverges(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::If { then, els, .. } => hir_block_diverges(then) && hir_block_diverges(els),
+        ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => hir_block_diverges(b),
+        _ => false,
+    }
+}
+
 /// Flow analysis that flags use-after-move. A Move-typed value (M3: `box<T>`) is
 /// consumed when bound/assigned/passed/returned by value; using it afterwards is an
 /// error. Borrowing positions (`.get()`/`.clone()` receiver, operands) do not consume.
@@ -2803,8 +2842,16 @@ impl<'a> MoveCheck<'a> {
                 self.block(then, &mut m1, consuming, false);
                 let mut m2 = moved.clone();
                 self.block(els, &mut m2, consuming, false);
-                // Conservative join: moved if moved on either path.
-                *moved = &m1 | &m2;
+                // Join the branch states — but a branch that always diverges (`return`) contributes
+                // nothing past the `if`, so its moves must not poison the fall-through. (Without this,
+                // `if c { return x }; use(x)` wrongly reports `x` moved.) When both diverge the code
+                // after is unreachable, so the post-state is immaterial.
+                *moved = match (hir_block_diverges(then), hir_block_diverges(els)) {
+                    (false, false) => &m1 | &m2,
+                    (true, false) => m2,
+                    (false, true) => m1,
+                    (true, true) => moved.clone(),
+                };
             }
             ExprKind::Template(parts) => {
                 for p in parts {
@@ -8032,7 +8079,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Builder => "builder".to_string(),
-        Ty::BufWriter => "bufwriter".to_string(),
+        // The surface type name (`fn f(w: writer)`), so diagnostics match what the user writes.
+        Ty::BufWriter => "writer".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -8319,6 +8367,15 @@ fn resolve_type(
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
+        // `writer` — the std.io buffered byte sink (`io.stdout.buffered()`). A surface type name so
+        // a writer can be threaded through functions (it is a Move handle; pass-and-return to loop).
+        "writer" => {
+            if !args.is_empty() {
+                diags.error("writer takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::BufWriter
+        }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {
             let inner = match args {

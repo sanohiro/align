@@ -726,6 +726,26 @@ fn io_stdout_buffered_writes_owned_string_without_consuming_it() {
 }
 
 #[test]
+fn io_stdout_buffered_threaded_through_functions() {
+    if !backend_available() {
+        return;
+    }
+    // A `writer` is a Move handle with a surface type name, so it can be passed to helpers and
+    // threaded through a loop by pass-and-return. `emit` writes a line and hands the writer back;
+    // `loop_n` recurses (the `if i >= n { return w }` guard relies on the diverging-branch move
+    // fix). Three lines are buffered, then flushed once.
+    let src = concat!(
+        "import std.io\n",
+        "fn emit(w: writer, msg: str) -> writer {\n  w.write(msg)\n  w.write(\"\\n\")\n  return w\n}\n",
+        "fn loop_n(w: writer, i: i64, n: i64) -> writer {\n  if i >= n { return w }\n  return loop_n(emit(w, \"line\"), i + 1, n)\n}\n",
+        "fn main() -> Result<(), Error> {\n  w := io.stdout.buffered()\n  w2 := loop_n(w, 0, 3)\n  w2.flush()?\n  return Ok(())\n}\n",
+    );
+    let out = build_and_run("io-buffered-thread", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "line\nline\nline\n");
+}
+
+#[test]
 fn io_stdout_buffered_rejects_args_and_bad_methods() {
     // `io.stdout.buffered()` takes no arguments; `.flush()` is writer-only (not on an int).
     assert!(check_errs(
