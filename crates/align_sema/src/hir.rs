@@ -493,7 +493,13 @@ pub enum ExprKind {
     /// `key` into two parallel owned arrays. The expression `ty` is a tuple `(array<i64>, array<i64>)`
     /// (distinct keys, per-key aggregate) — the data-oriented result (no `HashMap`), reusing
     /// `partition`'s tuple-of-two-owned-arrays shape. First slice: `i64` key + `i64` value.
-    ArrayGroupAgg { base: LocalId, struct_id: u32, key_field: u32, value_field: Option<u32>, op: GroupOp },
+    ///
+    /// When `key_str` is set, the key field is a `str` and `base` is instead an **AoS**
+    /// `array<Struct>` (a `soa` can't hold a `str` column): the keys are **dictionary-encoded**
+    /// (interned to dense ids) by the runtime, the `ty` is `(array<str>, array<i64>)`, and the result
+    /// key views **borrow `base`** (so the tuple inherits `base`'s region). Value is `i64`; `sum` only
+    /// for this first str-key slice.
+    ArrayGroupAgg { base: LocalId, struct_id: u32, key_field: u32, value_field: Option<u32>, op: GroupOp, key_str: bool },
     /// `fs.read_file(path)` — read the file at `path` (a `str`) into a freshly heap-allocated owned
     /// `string`; the expression `ty` is `Result<string, Error>`. The first `std.fs` surface.
     FsReadFile { path: Box<Expr> },

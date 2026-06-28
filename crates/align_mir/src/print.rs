@@ -223,6 +223,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 operand_str(out_vals)
             )
         }
+        Rvalue::GroupAggStr { base, struct_id, key_field, value_field, out_keys, out_vals } => {
+            format!(
+                "group_sum_str(base=slot{base} struct#{struct_id}.key{key_field}.val{value_field} -> {}, {})",
+                operand_str(out_keys),
+                operand_str(out_vals)
+            )
+        }
         Rvalue::Chunks { src, n, elem } => {
             format!("chunks({}, {} x {})", operand_str(src), operand_str(n), crate::ty_name(*elem))
         }

@@ -157,6 +157,7 @@ pub extern "C" fn align_rt_print_f32(x: f32) {
 
 /// A `str` view passed/returned across the ABI: `{ ptr, len }` (`06-runtime-std.md` §2).
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct AlignStr {
     pub ptr: *const u8,
     pub len: i64,
@@ -1342,6 +1343,80 @@ pub unsafe extern "C" fn align_rt_group_count_i64(keys: *const i64, len: i64, ou
     unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
+/// `group_by(.str_key).sum(.i64_value)` over an AoS `array<Struct>` — the **dictionary-id rail**.
+///
+/// The struct array is `base` (a `[%Struct]` buffer), `n` rows of `stride` bytes; each row's `str`
+/// key is an `AlignStr` (`{ptr,len}`) at `key_off` and its `i64` value at `val_off`. We **intern**
+/// each distinct key to a dense id while scanning (a hash over the key *bytes* assigning ids
+/// `0, 1, 2, …`), recording the first occurrence's view as the group's representative; the values
+/// then aggregate by id into a dense `Vec` (so the per-row work after interning is direct-index, not
+/// hashing — this is why it composes with, and reuses the spirit of, the dense-id `group_agg_i64`).
+/// Emits the representative key views into `out_keys` (`AlignStr`s borrowing the source) and the
+/// per-group sums into `out_vals`; returns the group count, or -1 if it exceeds `cap`.
+///
+/// The interning pays the string hash **once per row** (to get an id), versus a `HashMap<&str, Acc>`
+/// which hashes + probes a string for *every* aggregation step — the lever vs idiomatic Rust on a
+/// string-keyed grouped aggregate.
+///
+/// # Safety
+/// `base` must point to `n` valid `stride`-byte rows, each holding a valid `AlignStr` at `key_off`
+/// (its `ptr` valid for `len` bytes, or null/empty) and an `i64` at `val_off`. `out_keys`/`out_vals`
+/// must be valid for `cap` `AlignStr` / `i64` writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_sum_str(
+    base: *const u8,
+    n: i64,
+    stride: i64,
+    key_off: i64,
+    val_off: i64,
+    out_keys: *mut AlignStr,
+    out_vals: *mut i64,
+    cap: i64,
+) -> i64 {
+    use std::collections::HashMap;
+    if n <= 0 || base.is_null() {
+        return 0;
+    }
+    if cap < 0 || out_keys.is_null() || out_vals.is_null() {
+        return -1;
+    }
+    let n = n as usize;
+    let (stride, key_off, val_off) = (stride as usize, key_off as usize, val_off as usize);
+    // Reserve up front to avoid the early grow-and-rehash churn; the group count is unknown, so cap
+    // at a sane starting size (n is the worst case = all-distinct, but don't over-reserve for huge n).
+    let initial = n.min(cap as usize).min(1024);
+    let mut ids: HashMap<&[u8], usize> = HashMap::with_capacity(initial);
+    let mut acc: Vec<i64> = Vec::with_capacity(initial);
+    let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
+    for i in 0..n {
+        let row = unsafe { base.add(i * stride) };
+        // Read unaligned: the field address is byte-offset pointer arithmetic, so don't assume the
+        // type's alignment (free on x86; correct everywhere).
+        let ks = unsafe { (row.add(key_off) as *const AlignStr).read_unaligned() };
+        let v = unsafe { (row.add(val_off) as *const i64).read_unaligned() };
+        // The key bytes borrow the source, which outlives this call — so the map can key on them.
+        let bytes: &[u8] = if ks.ptr.is_null() || ks.len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) } };
+        match ids.get(bytes) {
+            Some(&id) => acc[id] = acc[id].wrapping_add(v),
+            None => {
+                let id = acc.len();
+                ids.insert(bytes, id);
+                acc.push(v);
+                reprs.push(ks);
+            }
+        }
+    }
+    let count = acc.len();
+    if count > cap as usize {
+        return -1;
+    }
+    let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
+    let out_vals = unsafe { std::slice::from_raw_parts_mut(out_vals, count) };
+    out_keys.copy_from_slice(&reprs);
+    out_vals.copy_from_slice(&acc);
+    count as i64
+}
+
 /// Find the first `"` or `\` in `hay` (the two bytes that bound or interrupt a JSON string body),
 /// returning its index, or `None` if neither occurs.
 ///
@@ -2471,6 +2546,58 @@ mod tests {
         let nv = [10i64, 20, 30, 40, 50];
         let neg = run(&nk, &nv);
         assert_eq!(neg, std::collections::HashMap::from([(-3, 40), (-1, 70), (-2, 40)]));
+    }
+
+    #[test]
+    fn group_sum_str_interns_and_aggregates_by_string_key() {
+        // An AoS row matching what codegen lays out: a `str` key view + an i64 value.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Row {
+            key: AlignStr,
+            val: i64,
+        }
+        let s = |b: &'static [u8]| AlignStr { ptr: b.as_ptr(), len: b.len() as i64 };
+        // keys: a a b c a b ; vals: 1 2 3 4 5 6 → {a:1+2+5=8, b:3+6=9, c:4}
+        let rows = [
+            Row { key: s(b"a"), val: 1 },
+            Row { key: s(b"a"), val: 2 },
+            Row { key: s(b"b"), val: 3 },
+            Row { key: s(b"c"), val: 4 },
+            Row { key: s(b"a"), val: 5 },
+            Row { key: s(b"b"), val: 6 },
+        ];
+        let stride = std::mem::size_of::<Row>() as i64;
+        let key_off = std::mem::offset_of!(Row, key) as i64;
+        let val_off = std::mem::offset_of!(Row, val) as i64;
+        let (mut ok, mut ov) = (vec![AlignStr { ptr: std::ptr::null(), len: 0 }; rows.len()], vec![0i64; rows.len()]);
+        let count = unsafe {
+            align_rt_group_sum_str(rows.as_ptr() as *const u8, rows.len() as i64, stride, key_off, val_off, ok.as_mut_ptr(), ov.as_mut_ptr(), rows.len() as i64)
+        } as usize;
+        assert_eq!(count, 3, "three distinct string keys");
+        // Collect (key bytes → sum); the representative view must point at real key bytes.
+        let got: std::collections::HashMap<&[u8], i64> = (0..count)
+            .map(|g| {
+                let k = unsafe { std::slice::from_raw_parts(ok[g].ptr, ok[g].len as usize) };
+                (k, ov[g])
+            })
+            .collect();
+        assert_eq!(got, std::collections::HashMap::from([(&b"a"[..], 8), (&b"b"[..], 9), (&b"c"[..], 4)]));
+
+        // Empty input → zero groups; a null base is also zero (degenerate, not -1).
+        assert_eq!(unsafe { align_rt_group_sum_str(rows.as_ptr() as *const u8, 0, stride, key_off, val_off, ok.as_mut_ptr(), ov.as_mut_ptr(), 0) }, 0);
+        assert_eq!(unsafe { align_rt_group_sum_str(std::ptr::null(), 6, stride, key_off, val_off, ok.as_mut_ptr(), ov.as_mut_ptr(), 6) }, 0);
+
+        // An empty-string key is a real, distinct key (not skipped).
+        let rows2 = [Row { key: s(b""), val: 10 }, Row { key: s(b"x"), val: 20 }, Row { key: s(b""), val: 5 }];
+        let (mut ok2, mut ov2) = (vec![AlignStr { ptr: std::ptr::null(), len: 0 }; 3], vec![0i64; 3]);
+        let c2 = unsafe {
+            align_rt_group_sum_str(rows2.as_ptr() as *const u8, 3, stride, key_off, val_off, ok2.as_mut_ptr(), ov2.as_mut_ptr(), 3)
+        } as usize;
+        let got2: std::collections::HashMap<&[u8], i64> = (0..c2)
+            .map(|g| (unsafe { std::slice::from_raw_parts(ok2[g].ptr, ok2[g].len as usize) }, ov2[g]))
+            .collect();
+        assert_eq!(got2, std::collections::HashMap::from([(&b""[..], 15), (&b"x"[..], 20)]));
     }
 
     #[test]

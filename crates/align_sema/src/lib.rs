@@ -110,6 +110,11 @@ pub enum PrimScalar {
     Float(FloatTy),
     Bool,
     Char,
+    /// A `str` **view** (`{ptr,len}`) — Copy and non-recursive (it borrows, owns nothing), so it
+    /// satisfies the `PrimScalar` contract even though it is not a number. Lets an owned
+    /// `array<str>` (`Scalar::DynArray(Str)`) be a payload / tuple element: a buffer of `str` views,
+    /// freed as a unit while its elements borrow their source. Produced by `group_by(.str_key)`.
+    Str,
 }
 
 /// A [`PrimScalar`] as a full [`Scalar`] (the array element type).
@@ -119,17 +124,19 @@ pub fn prim_to_scalar(p: PrimScalar) -> Scalar {
         PrimScalar::Float(ft) => Scalar::Float(ft),
         PrimScalar::Bool => Scalar::Bool,
         PrimScalar::Char => Scalar::Char,
+        PrimScalar::Str => Scalar::Str,
     }
 }
 
-/// A [`Scalar`] as a [`PrimScalar`] if it is a primitive (the only valid `array` element today);
-/// `None` for struct / string / array / unit / error elements.
+/// A [`Scalar`] as a [`PrimScalar`] if it is a primitive (or a `str` view); `None` for
+/// struct / string / array / soa / unit / error elements.
 pub fn scalar_to_prim(s: Scalar) -> Option<PrimScalar> {
     match s {
         Scalar::Int(it) => Some(PrimScalar::Int(it)),
         Scalar::Float(ft) => Some(PrimScalar::Float(ft)),
         Scalar::Bool => Some(PrimScalar::Bool),
         Scalar::Char => Some(PrimScalar::Char),
+        Scalar::Str => Some(PrimScalar::Str),
         _ => None,
     }
 }
@@ -2149,6 +2156,10 @@ impl<'a> EscapeCheck<'a> {
                 .fold(Region::Static, |acc, f| acc.shorter(self.region_of(f, depth))),
             // A field read inherits its base struct's region (the field may be a view into it).
             ExprKind::Field { root, .. } => self.region.get(root).copied().unwrap_or(Region::Static),
+            // A str-key `group_by` yields `(array<str>, array<i64>)` whose key views borrow `base`'s
+            // string storage, so the tuple inherits `base`'s region — it must not outlive the source.
+            // (An i64-key group_by yields owned arrays that borrow nothing → the default `Static`.)
+            ExprKind::ArrayGroupAgg { base, key_str: true, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
             // An `arena {}` *expression* yields its block value, evaluated one level deeper.
             // Without this, a binding that captures an arena's value (`p := arena { … }`) would
@@ -5877,48 +5888,81 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         };
-        // The source must be a `soa<Struct>` local (a param or a `to_soa`/`json.decode` binding) —
-        // its columns are contiguous, so they pass to the aggregate zero-copy.
+        // The source is a struct-collection local: either a `soa<Struct>` (contiguous columns, an
+        // i64 key) or — for a `str` key (a `soa` can't hold a `str` column) — an AoS `array<Struct>`,
+        // whose `str` keys the runtime dictionary-encodes.
         let base = match self.place_local(source) {
             Some((id, _)) => id,
             None => {
-                self.diags.error("`group_by` source must be a `soa<Struct>` local".to_string(), span);
+                self.diags.error("`group_by` source must be a `soa<Struct>` or `array<Struct>` local".to_string(), span);
                 return err;
             }
         };
-        let id = match self.locals[base as usize].ty {
-            Ty::Soa(id) => id,
+        let (id, key_str) = match self.locals[base as usize].ty {
+            Ty::Soa(id) => (id, false),
+            Ty::DynStructArray(id, Layout::Aos) => (id, true),
             Ty::Error => return err,
             other => {
                 self.diags.error(
-                    format!("`group_by` needs a `soa<Struct>` source (first cut), got {}", ty_name(other)),
+                    format!("`group_by` needs a `soa<Struct>` or `array<Struct>` source, got {}", ty_name(other)),
                     span,
                 );
                 return err;
             }
         };
         // Clone the field table so the field resolution below can also touch `self.diags`.
-        let name = self.structs[id as usize].name.clone();
+        let sname = self.structs[id as usize].name.clone();
         let fields = self.structs[id as usize].fields.clone();
         let i64t = Ty::Int(IntTy { bits: 64, signed: true });
-        // Resolve a field by name and require i64 (the first-slice aggregate type).
-        let resolve = |this: &mut Self, fld: &ast::Ident, role: &str| -> Option<u32> {
+        let src_kind = if key_str { "array" } else { "soa" };
+        // Resolve a field by name and require an exact type (the first-slice aggregate types).
+        let resolve = |this: &mut Self, fld: &ast::Ident, role: &str, want: Ty| -> Option<u32> {
             let Some(idx) = fields.iter().position(|f| f.name == fld.name) else {
-                this.diags.error(format!("no field '{}' on soa<{}>", fld.name, name), fld.span);
+                this.diags.error(format!("no field '{}' on {src_kind}<{sname}>", fld.name), fld.span);
                 return None;
             };
-            if fields[idx].ty != i64t {
+            if fields[idx].ty != want {
                 this.diags.error(
-                    format!("`group_by` {role} '{}' must be i64 (first cut), got {}", fld.name, ty_name(fields[idx].ty)),
+                    format!("`group_by` {role} '{}' must be {} (first cut), got {}", fld.name, ty_name(want), ty_name(fields[idx].ty)),
                     fld.span,
                 );
                 return None;
             }
             Some(idx as u32)
         };
-        let Some(ki) = resolve(self, key_field, "key") else { return err };
+
+        if key_str {
+            // str key + i64 value, `sum` only — the dictionary-id rail's first slice.
+            if op != hir::GroupOp::Sum {
+                self.diags.error(
+                    "`group_by` over a `str` key supports `.sum(.value)` only (first cut); `min`/`max`/`count` are i64-key only for now".to_string(),
+                    span,
+                );
+                return err;
+            }
+            let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
+            // `sum` always carries a value field (the top-of-fn match requires it), but guard the
+            // `None` explicitly so it surfaces a diagnostic rather than silently returning `err`.
+            let Some(v) = value_field else {
+                self.diags.error("`group_by(.key).sum(.value)` needs a `.value` field".to_string(), span);
+                return err;
+            };
+            let Some(vi) = resolve(self, v, "value", i64t) else { return err };
+            // Result: `(array<str>, array<i64>)` — distinct keys (views borrowing `base`), per-key sums.
+            let karr = ty_to_scalar(Ty::DynArray(Scalar::Str)).expect("array<str> is a payload scalar");
+            let varr = ty_to_scalar(Ty::DynArray(ty_to_scalar(i64t).unwrap())).expect("array<i64> is a payload scalar");
+            let tuple_id = intern_tuple(self.tuples, vec![karr, varr]);
+            return Expr {
+                kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: Some(vi), op, key_str: true },
+                ty: Ty::Tuple(tuple_id),
+                span,
+            };
+        }
+
+        // i64 key + i64 value (soa source).
+        let Some(ki) = resolve(self, key_field, "key", i64t) else { return err };
         let vi = match value_field {
-            Some(v) => match resolve(self, v, "value") {
+            Some(v) => match resolve(self, v, "value", i64t) {
                 Some(idx) => Some(idx),
                 None => return err,
             },
@@ -5928,7 +5972,7 @@ impl<'a, 't> Checker<'a, 't> {
         let arr = ty_to_scalar(Ty::DynArray(ty_to_scalar(i64t).unwrap())).expect("array<i64> is a payload scalar");
         let tuple_id = intern_tuple(self.tuples, vec![arr, arr]);
         Expr {
-            kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: vi, op },
+            kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: vi, op, key_str: false },
             ty: Ty::Tuple(tuple_id),
             span,
         }

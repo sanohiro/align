@@ -419,3 +419,54 @@ fn group_by_min_max_count_aggregate_by_key() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n35\n3\n");
 }
+
+#[test]
+fn group_by_str_key_dictionary_encodes_and_sums() {
+    if !backend_available() {
+        return;
+    }
+    // A str-keyed grouped sum over a decoded AoS `array<User>` (a `soa` can't hold a `str` column).
+    // Rows: (a,10),(b,20),(a,5),(c,7),(b,3). Groups {a:15, b:23, c:7}. The runtime interns keys in
+    // first-occurrence order (a,b,c), so the output is deterministic — assert keys + sums in order.
+    let out = build_and_run(
+        "group-str",
+        concat!(
+            "import core.json\n",
+            "User { name: str, score: i64 }\n",
+            "fn main() -> Result<(), Error> {\n  arena {\n",
+            "    us: array<User> := json.decode(\"[{\\\"name\\\":\\\"a\\\",\\\"score\\\":10},{\\\"name\\\":\\\"b\\\",\\\"score\\\":20},{\\\"name\\\":\\\"a\\\",\\\"score\\\":5},{\\\"name\\\":\\\"c\\\",\\\"score\\\":7},{\\\"name\\\":\\\"b\\\",\\\"score\\\":3}]\")?\n",
+            "    g := us.group_by(.name).sum(.score)\n",
+            "    print(g.0.len())\n", // distinct keys = 3
+            "    print(g.0[0])\n",    // a
+            "    print(g.1[0])\n",    // 15
+            "    print(g.0[1])\n",    // b
+            "    print(g.1[1])\n",    // 23
+            "    print(g.0[2])\n",    // c
+            "    print(g.1[2])\n",    // 7
+            "  }\n  return Ok(())\n}\n",
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\na\n15\nb\n23\nc\n7\n");
+}
+
+#[test]
+fn group_by_str_key_supports_sum_only_for_now() {
+    // The str-key dictionary rail is `sum`-only in the first cut; min/max/count stay i64-key only.
+    for agg in ["min(.score)", "max(.score)", "count()"] {
+        let src = format!(
+            "import core.json\nUser {{ name: str, score: i64 }}\nfn k(us: array<User>) -> i64 = us.group_by(.name).{agg}.0.len()\nfn main() -> i32 = 0\n",
+        );
+        assert!(!ok(&src), "str-key group_by .{agg} should be rejected (sum-only)");
+    }
+}
+
+#[test]
+fn group_by_str_key_requires_an_i64_value() {
+    // The value field must be i64 (first cut) even when the key is a str.
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "User { name: str, tag: str }\n",
+        "fn k(us: array<User>) -> i64 = us.group_by(.name).sum(.tag).1.len()\n",
+        "fn main() -> i32 = 0\n",
+    )));
+}
