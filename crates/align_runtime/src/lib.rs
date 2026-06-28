@@ -1590,6 +1590,125 @@ pub unsafe extern "C" fn align_rt_builder_free(b: *mut Builder) {
     }
 }
 
+/// A buffered stdout writer (`io.stdout.buffered()`): the sink-first fast path. Bytes accumulate
+/// in a fixed-capacity buffer and reach fd 1 in one `write(2)` only when the buffer fills or on an
+/// explicit `flush` / drop — so per-`write` calls do no syscall and memory stays O(buffer), not
+/// O(total output). Writes go straight to fd 1, skipping the `std::io::Stdout` lock + line buffer.
+pub struct StdoutWriter {
+    buf: Vec<u8>,
+    /// Sticky: an internal flush (on a full buffer) failed. `write` returns `()`, so the error is
+    /// latched here and surfaced by the next `flush` — matching `out.write(..); out.flush()?`.
+    err: bool,
+}
+
+/// 64 KiB — large enough to amortize the syscall over many small writes, small enough to stay in
+/// cache and bound memory.
+const STDOUT_WRITER_CAP: usize = 64 * 1024;
+
+/// Write all of `bytes` to `fd`, looping over partial writes and retrying `EINTR`. Returns false on
+/// any other error. An empty slice succeeds without a syscall.
+fn write_all_fd(fd: i32, mut bytes: &[u8]) -> bool {
+    while !bytes.is_empty() {
+        let n = unsafe { write(fd, bytes.as_ptr() as *const core::ffi::c_void, bytes.len()) };
+        if n > 0 {
+            bytes = &bytes[n as usize..];
+        } else if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue; // interrupted before writing: retry
+        } else {
+            return false; // error, or a 0-byte write (treat as failure rather than spin)
+        }
+    }
+    true
+}
+
+impl StdoutWriter {
+    /// Flush the buffer to fd 1, clearing it on success and latching `err` on failure.
+    fn flush_buf(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        if write_all_fd(1, &self.buf) {
+            self.buf.clear();
+        } else {
+            self.err = true;
+            self.buf.clear(); // drop the unwritten bytes; the latched error reports the loss
+        }
+    }
+}
+
+/// `io.stdout.buffered()` — open a buffered stdout writer. Freed (after a final flush) by the
+/// generated `Drop` via [`align_rt_io_buf_free`].
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_io_buf_new() -> *mut StdoutWriter {
+    Box::into_raw(Box::new(StdoutWriter { buf: Vec::with_capacity(STDOUT_WRITER_CAP), err: false }))
+}
+
+/// `w.write(s)` — append a `str`'s bytes, flushing to fd 1 only when the buffer would overflow.
+/// A chunk larger than the whole buffer is written straight through (no buffering, no double copy).
+/// Infallible at the surface; an internal flush failure is latched and surfaces at the next `flush`.
+///
+/// # Safety
+/// `w` must be a valid `StdoutWriter` pointer; `ptr`/`len` must describe a valid byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_buf_write(w: *mut StdoutWriter, ptr: *const u8, len: i64) {
+    if w.is_null() || len <= 0 || ptr.is_null() {
+        return;
+    }
+    let w = unsafe { &mut *w };
+    let Ok(n) = usize::try_from(len) else { return };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
+    // If it won't fit in the remaining space, flush what's buffered first.
+    if w.buf.len() + n > STDOUT_WRITER_CAP {
+        w.flush_buf();
+        if w.err {
+            return;
+        }
+        // A chunk at least as big as the buffer would just be copied in and flushed right back
+        // out — write it straight to fd 1 instead.
+        if n >= STDOUT_WRITER_CAP {
+            if !write_all_fd(1, bytes) {
+                w.err = true;
+            }
+            return;
+        }
+    }
+    w.buf.extend_from_slice(bytes);
+}
+
+/// `w.flush()` — write any buffered bytes to fd 1. Returns 0 on success, 1 if this flush or any
+/// earlier internal flush failed (the latched error is then cleared).
+///
+/// # Safety
+/// `w` must be a valid `StdoutWriter` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_buf_flush(w: *mut StdoutWriter) -> i32 {
+    if w.is_null() {
+        return 1;
+    }
+    let w = unsafe { &mut *w };
+    w.flush_buf();
+    if w.err {
+        w.err = false; // report once, then clear so the writer stays usable
+        1
+    } else {
+        0
+    }
+}
+
+/// Free a buffered stdout writer, flushing any remaining bytes best-effort first (a drop-time
+/// safety net; errors are not observable here — use an explicit `flush()?` to handle them).
+/// Null-safe, so a never-initialised owned slot drops harmlessly.
+///
+/// # Safety
+/// `w` must be null or a pointer returned by [`align_rt_io_buf_new`] and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_buf_free(w: *mut StdoutWriter) {
+    if !w.is_null() {
+        let mut w = unsafe { Box::from_raw(w) };
+        w.flush_buf();
+    }
+}
+
 /// Byte-equality of two `str` views (M5). Returns 1 if equal, else 0.
 ///
 /// # Safety
@@ -1833,6 +1952,9 @@ pub extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
     fn free(ptr: *mut core::ffi::c_void);
+    // POSIX `write(2)` — the buffered stdout writer streams straight to fd 1, bypassing the
+    // `std::io::Stdout` lock + line-buffering that `print` / `io.stdout.write` pay per call.
+    fn write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
 }
 
 /// Allocate `size` bytes on the heap (C `malloc`). Returns null for `size <= 0` (an empty
@@ -1863,6 +1985,24 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdout_writer_accumulates_small_writes_without_flushing() {
+        // Small writes stay buffered (no syscall, nothing reaches fd 1): the buffer holds exactly
+        // the concatenated bytes and no error is latched. The flush-to-fd-1 and large-chunk
+        // pass-through paths are covered end-to-end (they necessarily touch real stdout).
+        let w = align_rt_io_buf_new();
+        for part in [&b"hello "[..], b"world", b"!"] {
+            unsafe { align_rt_io_buf_write(w, part.as_ptr(), part.len() as i64) };
+        }
+        {
+            let wr = unsafe { &mut *w };
+            assert_eq!(wr.buf, b"hello world!", "small writes accumulate, unflushed");
+            assert!(!wr.err);
+            wr.buf.clear(); // so the drop-flush below emits nothing to fd 1
+        }
+        unsafe { align_rt_io_buf_free(w) };
+    }
 
     #[test]
     fn write_json_str_bulk_copy_matches_byte_by_byte_reference() {

@@ -442,6 +442,31 @@ fn build_module<'c>(
             None,
         ),
     );
+    // io.stdout.buffered() — the buffered stdout writer (std.io).
+    funcs.insert(
+        // io.stdout.buffered() () -> *StdoutWriter (opaque handle).
+        "io_buf_new".to_string(),
+        module.add_function("align_rt_io_buf_new", ptr.fn_type(&[], false), None),
+    );
+    funcs.insert(
+        // w.write(s) (w: *StdoutWriter, ptr, len) -> void; appends, flushing only when full.
+        "io_buf_write".to_string(),
+        module.add_function(
+            "align_rt_io_buf_write",
+            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // w.flush() (w: *StdoutWriter) -> i32 status; drains the buffer to the OS.
+        "io_buf_flush".to_string(),
+        module.add_function("align_rt_io_buf_flush", ctx.i32_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // drop(w) (w: *StdoutWriter) -> void; final flush + free.
+        "io_buf_free".to_string(),
+        module.add_function("align_rt_io_buf_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     funcs.insert(
         // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len},
         // phf, phf_len, phf_seed) -> i32 status (MMv2 slice 8d; trailing 3 = perfect-hash table).
@@ -921,7 +946,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::BufWriter => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -1382,7 +1407,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if ty == Ty::Builder {
+                    let z: BasicValueEnum = if ty == Ty::Builder || ty == Ty::BufWriter {
+                        // A builder / buffered-writer slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_) | Ty::Struct(_)) {
                         // Zero the whole aggregate so each owned field/element reads {null,0}. A Move
@@ -1433,6 +1459,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|e| self.err(e))?;
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    } else if ty == Ty::BufWriter {
+                        // A buffered stdout writer: flush any remaining bytes best-effort, then free
+                        // (null-safe). The drop-time flush is the safety net for output not explicitly
+                        // `flush()`ed.
+                        let p = self
+                            .builder
+                            .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropw")
+                            .map_err(|e| self.err(e))?;
+                        self.builder
+                            .build_call(self.funcs["io_buf_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if payload_is_move(ty) {
                         // An Option/Result owning a Move payload: free each owned payload field's
@@ -2408,6 +2445,31 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 cs.try_as_basic_value().basic().expect("io_stdout_write_builder returns i32")
             }
+            Rvalue::BufWriterNew => self
+                .builder
+                .build_call(self.funcs["io_buf_new"], &[], "bufw")
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value()
+                .basic()
+                .expect("io_buf_new returns a pointer"),
+            Rvalue::BufWriterWrite(w, s) => {
+                let wp = self.operand(w).into();
+                let agg = self.operand(s).into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "wptr").map_err(|e| self.err(e))?;
+                let len = self.builder.build_extract_value(agg, 1, "wlen").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["io_buf_write"], &[wp, ptr.into(), len.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::BufWriterFlush(w) => {
+                let wp = self.operand(w).into();
+                let cs = self
+                    .builder
+                    .build_call(self.funcs["io_buf_flush"], &[wp], "bufflush")
+                    .map_err(|e| self.err(e))?;
+                cs.try_as_basic_value().basic().expect("io_buf_flush returns i32")
+            }
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
                 self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -2546,7 +2608,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::BufWriter => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),

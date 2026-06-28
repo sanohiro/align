@@ -315,6 +315,14 @@ pub enum Rvalue {
     /// `io.stdout.write(b)` for a `builder` `b`: write the builder's bytes to stdout (no newline),
     /// borrowing it. Yields an `i32` status (0 = ok).
     IoStdoutWriteBuilder { builder: Operand },
+    /// `io.stdout.buffered()` — open a buffered stdout writer, yielding an opaque handle (std.io).
+    BufWriterNew,
+    /// `w.write(s)` — append a `str` operand's bytes to a buffered stdout writer (flushing to the
+    /// OS only when the buffer fills). Side-effecting; yields unit.
+    BufWriterWrite(Operand, Operand),
+    /// `w.flush()` — drain a buffered stdout writer to the OS, borrowing it. Yields an `i32` status
+    /// (0 = ok), lowered to a `Result<(), Error>` like the other std.io ops.
+    BufWriterFlush(Operand),
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -537,7 +545,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder)
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::BufWriter)
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -749,6 +757,23 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::IoStdoutWriteBuilder { builder } => {
             lower_io_stdout_write(b, builder, e.ty, |a| Rvalue::IoStdoutWriteBuilder { builder: a })
+        }
+        hir::ExprKind::BufWriterNew => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::BufWriterNew));
+            Operand::Value(v)
+        }
+        hir::ExprKind::BufWriterWrite { writer, arg } => {
+            let wop = lower_expr(b, writer);
+            let aop = lower_expr(b, arg);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::BufWriterWrite(wop, aop)));
+            Operand::Const(Const::Unit)
+        }
+        // `w.flush()` yields `Result<(), Error>` exactly like `io.stdout.write`: an i32 status
+        // wrapped into Ok(())/Err(code). The "arg" threaded through is the writer.
+        hir::ExprKind::BufWriterFlush { writer } => {
+            lower_io_stdout_write(b, writer, e.ty, Rvalue::BufWriterFlush)
         }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
@@ -3119,6 +3144,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Builder => "builder".to_string(),
+        Ty::BufWriter => "bufwriter".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

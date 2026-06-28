@@ -219,6 +219,11 @@ pub enum Ty {
     /// object (a Move type): `builder()` opens it, `.write(...)` appends, `.to_string()` consumes
     /// it into an owned `string`. An unfinished builder is `Drop`-freed at scope exit (MMv2 7c).
     Builder,
+    /// A buffered stdout writer (`io.stdout.buffered()`, std.io) — an opaque owned handle to a heap
+    /// writer object (a Move type, like [`Ty::Builder`]): `.write(s)` appends, `.flush()` drains to
+    /// the OS. `Drop`-freed (after a best-effort flush) at scope exit. Unlike a builder, its writes
+    /// are I/O-effecting (Impure).
+    BufWriter,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -330,7 +335,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::BufWriter)
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -362,7 +367,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -371,7 +376,7 @@ fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) ->
 /// and Move tuples; needs the struct/tuple tables to inspect composite members. The free-function
 /// form (vs `MoveCheck::is_move_ty`) is shared by the field-access checker.
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter)
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -442,7 +447,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter)
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -1739,6 +1744,18 @@ impl EffectScan {
                 self.impure_direct = true;
                 self.expr(builder);
             }
+            // Opening a buffered writer is allocation only (no I/O → pure, like `BuilderNew`); its
+            // `write`/`flush` may reach the OS, so those are impure.
+            ExprKind::BufWriterNew => {}
+            ExprKind::BufWriterWrite { writer, arg } => {
+                self.impure_direct = true;
+                self.expr(writer);
+                self.expr(arg);
+            }
+            ExprKind::BufWriterFlush { writer } => {
+                self.impure_direct = true;
+                self.expr(writer);
+            }
             ExprKind::FsReadFile { path } => {
                 self.impure_direct = true;
                 self.expr(path);
@@ -2410,6 +2427,11 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::FsReadFile { path } => self.walk(path, depth),
             ExprKind::IoStdoutWrite { arg } => self.walk(arg, depth),
             ExprKind::IoStdoutWriteBuilder { builder } => self.walk(builder, depth),
+            ExprKind::BufWriterWrite { writer, arg } => {
+                self.walk(writer, depth);
+                self.walk(arg, depth);
+            }
+            ExprKind::BufWriterFlush { writer } => self.walk(writer, depth),
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
                     self.walk(c, depth);
@@ -2423,6 +2445,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
+            | ExprKind::BufWriterNew
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
@@ -2702,6 +2725,14 @@ impl<'a> MoveCheck<'a> {
                     self.expr(c, moved, false, false);
                 }
             }
+            // `w.write(s)` / `w.flush()` borrow the writer (and the str arg); `io.stdout.buffered()`
+            // is a leaf. The writer is never consumed — it is `Drop`-flushed at scope exit.
+            ExprKind::BufWriterWrite { writer, arg } => {
+                self.expr(writer, moved, false, false);
+                self.expr(arg, moved, false, false);
+            }
+            ExprKind::BufWriterFlush { writer } => self.expr(writer, moved, false, false),
+            ExprKind::BufWriterNew => {}
             // The receiver is borrowed, not consumed.
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
@@ -4952,12 +4983,16 @@ impl<'a, 't> Checker<'a, 't> {
                 return self.check_fs_read_file(args, span);
             }
         }
-        // `io.stdout.write(s)` — the receiver is the 2-segment `io.stdout`, so it parses as a
-        // `FieldAccess` (`io` . `stdout`), not a single-name path.
-        if method == "write" {
+        // `io.stdout.write(s)` / `io.stdout.buffered()` — the receiver is the 2-segment `io.stdout`,
+        // so it parses as a `FieldAccess` (`io` . `stdout`), not a single-name path.
+        if method == "write" || method == "buffered" {
             if let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind {
                 if let ast::ExprKind::Path(p) = &inner.kind {
                     if single_name(p) == Some("io") && field.name == "stdout" {
+                        if method == "buffered" {
+                            self.require_import("std.io", "io.stdout.buffered", span);
+                            return self.check_io_stdout_buffered(args, span);
+                        }
                         self.require_import("std.io", "io.stdout.write", span);
                         return self.check_io_stdout_write(args, span);
                     }
@@ -5071,12 +5106,26 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "chunks" {
             return self.check_array_chunks(recv, args, span);
         }
-        // Builder methods (MMv2 slice 7c/7d): typed `write*` appends, `to_string` finishes.
-        if let Some(kind) = builder_write_kind(method) {
-            return self.check_builder_write(recv, args, kind, span);
-        }
-        if method == "to_string" {
-            return self.check_builder_to_string(recv, args, span);
+        // Writer methods: a `builder`'s typed `write*` / `to_string`, and a buffered stdout writer's
+        // `write` / `flush`. `.write` is shared, so evaluate the receiver once and dispatch on its
+        // type. (`write_int`/`to_string` are builder-only; `flush` is buffered-writer-only.)
+        if matches!(method, "write" | "write_int" | "write_bool" | "write_char" | "write_float" | "to_string" | "flush") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::BufWriter {
+                return self.check_bufwriter_method(recv_expr, method, args, span);
+            }
+            if let Some(kind) = builder_write_kind(method) {
+                return self.check_builder_write(recv_expr, args, kind, span);
+            }
+            if method == "to_string" {
+                return self.check_builder_to_string(recv_expr, args, span);
+            }
+            // `.flush()` on something that is neither a builder nor a buffered writer.
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.{method}()' is a buffered-writer method, got {}", ty_name(recv_expr.ty)), span);
+            }
+            return err;
         }
         // `.len()` of a `str`/`slice`/array — the element count (an `i64`).
         if method == "len" {
@@ -6423,10 +6472,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// takes a `str` (a `string` borrows as one — zero-cost, non-consuming, reuses the slice-7b
     /// borrow, so `b.write(owned_string)` keeps it usable). `write_int` widens to `i64` at codegen,
     /// like `print`; `write_float` accepts `f32`/`f64` (codegen picks the runtime fn by width).
-    fn check_builder_write(&mut self, recv: &ast::Expr, args: &[ast::Expr], kind: BuilderWriteKind, span: Span) -> Expr {
+    fn check_builder_write(&mut self, recv_expr: Expr, args: &[ast::Expr], kind: BuilderWriteKind, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let mname = builder_write_method_name(kind);
-        let recv_expr = self.check_expr(recv, None);
         if recv_expr.ty != Ty::Builder {
             if recv_expr.ty != Ty::Error {
                 self.diags
@@ -6469,9 +6517,8 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// `b.to_string()` — finish a builder into an **owned** `string`, consuming (moving) it.
-    fn check_builder_to_string(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+    fn check_builder_to_string(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let recv_expr = self.check_expr(recv, None);
         if recv_expr.ty != Ty::Builder {
             if recv_expr.ty != Ty::Error {
                 self.diags
@@ -6871,6 +6918,71 @@ impl<'a, 't> Checker<'a, 't> {
             }
         };
         Expr { kind, ty: result_ty, span }
+    }
+
+    /// `io.stdout.buffered()` — open a buffered stdout writer (the sink-first fast path), yielding a
+    /// [`Ty::BufWriter`] owned handle. Takes no arguments; the writer is `Drop`-flushed at scope exit.
+    fn check_io_stdout_buffered(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if !args.is_empty() {
+            self.diags
+                .error(format!("'io.stdout.buffered' takes no arguments, got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        Expr { kind: ExprKind::BufWriterNew, ty: Ty::BufWriter, span }
+    }
+
+    /// `w.write(s)` / `w.flush()` on a buffered stdout writer ([`Ty::BufWriter`]), the receiver
+    /// already evaluated. `write` appends a `str` (an owned `string` auto-borrows, staying usable)
+    /// and yields `Unit`; `flush` drains to the OS and yields `Result<(), Error>`. Both borrow the
+    /// writer (it is never consumed — `Drop`-flushed at scope exit).
+    fn check_bufwriter_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        match method {
+            "flush" => {
+                if !args.is_empty() {
+                    self.diags
+                        .error(format!("'.flush()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::BufWriterFlush { writer: Box::new(recv_expr) },
+                    ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
+            "write" => {
+                if args.len() != 1 {
+                    self.diags
+                        .error(format!("'.write()' takes 1 argument, got {}", args.len()), span);
+                    return err;
+                }
+                let mut arg = self.check_expr(&args[0], None);
+                if arg.ty == Ty::Error {
+                    return err;
+                }
+                // A `string` borrows as a `str` (zero-cost, non-consuming), so `w.write(owned)`
+                // keeps `owned` usable — mirrors `builder.write` / `io.stdout.write`.
+                if arg.ty == Ty::String {
+                    let s = arg.span;
+                    arg = Expr { kind: ExprKind::StrBorrow(Box::new(arg)), ty: Ty::Str, span: s };
+                }
+                if arg.ty != Ty::Str {
+                    self.diags
+                        .error(format!("'.write()' expects a str, got {}", ty_name(arg.ty)), arg.span);
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::BufWriterWrite { writer: Box::new(recv_expr), arg: Box::new(arg) },
+                    ty: Ty::Unit,
+                    span,
+                }
+            }
+            _ => {
+                self.diags
+                    .error(format!("'.{method}()' is not a method on a buffered writer (try write / flush)"), span);
+                err
+            }
+        }
     }
 
     /// `arr[index].field` — field access on a struct-array element (MMv2 slice 8f). Fused into one
@@ -7572,6 +7684,11 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::FsReadFile { path } => self.finalize_expr(path),
             ExprKind::IoStdoutWrite { arg } => self.finalize_expr(arg),
             ExprKind::IoStdoutWriteBuilder { builder } => self.finalize_expr(builder),
+            ExprKind::BufWriterWrite { writer, arg } => {
+                self.finalize_expr(writer);
+                self.finalize_expr(arg);
+            }
+            ExprKind::BufWriterFlush { writer } => self.finalize_expr(writer),
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
                     self.finalize_expr(el);
@@ -7596,6 +7713,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
+            | ExprKind::BufWriterNew
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
@@ -7914,6 +8032,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Builder => "builder".to_string(),
+        Ty::BufWriter => "bufwriter".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
