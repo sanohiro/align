@@ -225,6 +225,13 @@ buffer
 builder
 ```
 
+`str` carries `.len()` (byte length), `==`/`!=` (byte equality), and the
+byte-oriented predicates `.contains(n)` / `.starts_with(p)` / `.ends_with(s)`
+(all `bool`). The predicates take a `str` (an owned `string` is auto-borrowed)
+and compare bytes — UTF-8 is the representation, but the scan is byte-level (the
+SIMD-friendly default the spec mandates over a `chars()` walk); the standard
+runtime backs them with `memchr`-class scans.
+
 ### JSON
 
 ```text

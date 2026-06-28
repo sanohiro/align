@@ -273,6 +273,10 @@ pub enum Rvalue {
     /// `str.clone()` — deep-copy a `str` operand's bytes into a fresh heap buffer, yielding an
     /// owned `string` `{ptr,len}`. The buffer is freed by a later [`Stmt::Drop`] of its slot.
     StrClone(Operand),
+    /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` — a byte-oriented `str` predicate,
+    /// yielding `bool` (`i1`). Both operands are `str` `{ptr,len}` views; backed by a runtime
+    /// `memchr`-class scan. Pure read, no allocation.
+    StrPredicate { kind: hir::StrPredKind, haystack: Operand, needle: Operand },
     /// `builder()` / `builder(capacity)` — open a builder, yielding an opaque handle (MMv2 slice 7c).
     /// `capacity` (bytes) pre-sizes the backing buffer; 0 = default.
     BuilderNew { capacity: Operand },
@@ -1020,6 +1024,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let src = lower_expr(b, inner);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::StrClone(src)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::StrPredicate { kind, haystack, needle } => {
+            let h = lower_expr(b, haystack);
+            let n = lower_expr(b, needle);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::StrPredicate { kind: *kind, haystack: h, needle: n }));
             Operand::Value(v)
         }
         // Borrowing an owned `string` as a `str` (slice 7b) is a no-op at runtime: the two share

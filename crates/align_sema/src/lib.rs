@@ -1871,6 +1871,10 @@ impl EffectScan {
             | ExprKind::HeapNew(i) | ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i)
             | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::Len(i)
             | ExprKind::ArrayToSlice(i) => self.expr(i),
+            ExprKind::StrPredicate { haystack, needle, .. } => {
+                self.expr(haystack);
+                self.expr(needle);
+            }
             ExprKind::Template(parts) => {
                 for p in parts {
                     if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
@@ -2395,6 +2399,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(builder, depth);
                 self.walk(arg, depth);
             }
+            ExprKind::StrPredicate { haystack, needle, .. } => {
+                self.walk(haystack, depth);
+                self.walk(needle, depth);
+            }
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.walk(source, depth);
                 self.walk(init, depth);
@@ -2772,6 +2780,11 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::BufWriterFlush { writer } => self.expr(writer, moved, false, false),
             ExprKind::BufWriterNew => {}
+            // Both operands are borrowed (read for bytes), never consumed.
+            ExprKind::StrPredicate { haystack, needle, .. } => {
+                self.expr(haystack, moved, false, false);
+                self.expr(needle, moved, false, false);
+            }
             // The receiver is borrowed, not consumed.
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
@@ -5191,6 +5204,9 @@ impl<'a, 't> Checker<'a, 't> {
         match method {
             "get" => self.check_box_get(recv_expr, recv_ty, args, span),
             "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
+            "contains" | "starts_with" | "ends_with" if matches!(recv_ty, Ty::Str | Ty::String) => {
+                self.check_str_predicate(recv_expr, method, args, span)
+            }
             "map_err" if matches!(self.resolve(recv_ty), Ty::Result(..)) => {
                 self.check_map_err(recv_expr, args, expected, span)
             }
@@ -6487,6 +6503,42 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` — byte-oriented `str` predicates
+    /// (`core.string`, draft.md §18). The receiver (`recv`, already a `str`/`string`) and the single
+    /// argument are both treated as `str` views: an owned `string` is auto-borrowed (`StrBorrow`), so
+    /// neither operand is moved — the predicate only reads bytes and yields `bool`.
+    fn check_str_predicate(&mut self, recv: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // Borrow an owned `string` receiver as a `str` view; a `str` receiver passes through.
+        let haystack = if recv.ty == Ty::String {
+            let rspan = recv.span;
+            Expr { kind: ExprKind::StrBorrow(Box::new(recv)), ty: Ty::Str, span: rspan }
+        } else {
+            recv
+        };
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'.{method}()' takes exactly one str argument"), span);
+            return err;
+        }
+        // The needle: a `str`, or an owned `string` auto-borrowed; anything else is constrained to str.
+        let needle = self.check_str_init(&args[0]);
+        if haystack.ty == Ty::Error || needle.ty == Ty::Error {
+            return err;
+        }
+        let kind = match method {
+            "contains" => hir::StrPredKind::Contains,
+            "starts_with" => hir::StrPredKind::StartsWith,
+            "ends_with" => hir::StrPredKind::EndsWith,
+            _ => unreachable!("check_str_predicate called with non-predicate method"),
+        };
+        Expr {
+            kind: ExprKind::StrPredicate { kind, haystack: Box::new(haystack), needle: Box::new(needle) },
+            ty: Ty::Bool,
+            span,
+        }
+    }
+
     /// `builder()` — open an append-oriented string builder (MMv2 slice 7c, draft.md §12).
     fn check_builder_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         // `builder()` (default capacity) or `builder(n)` (pre-size the backing buffer to `n` bytes
@@ -7736,6 +7788,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(arg);
             }
             ExprKind::BufWriterFlush { writer } => self.finalize_expr(writer),
+            ExprKind::StrPredicate { haystack, needle, .. } => {
+                self.finalize_expr(haystack);
+                self.finalize_expr(needle);
+            }
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
                     self.finalize_expr(el);
