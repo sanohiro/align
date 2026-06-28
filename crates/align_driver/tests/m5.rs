@@ -91,6 +91,20 @@ fn json_decode_str_field_zero_copy() {
 }
 
 #[test]
+fn json_decode_skips_unknown_numeric_fields() {
+    if !backend_available() {
+        return;
+    }
+    // A narrow struct (`id` only) over an object carrying extra numeric fields the decoder does
+    // not store: the unknown `score`/`ratio`/`exp` values are skipped lexically (no float parse),
+    // and `id` still decodes. Exercises `skip_number` across int, fraction, and exponent forms.
+    let src = "import core.json\nUser { id: i64 }\nfn parse(s: str) -> Result<User, Error> {\n  u: User := json.decode(s)?\n  return Ok(u)\n}\nfn main() -> Result<(), Error> {\n  u := parse(\"{\\\"score\\\": -3.14, \\\"id\\\": 7, \\\"ratio\\\": 0.5, \\\"exp\\\": 6.022e23}\")?\n  print(u.id)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-skip-numbers", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+#[test]
 fn str_clone_escapes_arena_as_owned_string() {
     if !backend_available() {
         return;
