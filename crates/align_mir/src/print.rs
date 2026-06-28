@@ -242,6 +242,14 @@ fn rvalue_str(rv: &Rvalue) -> String {
             };
             format!("{name}({}, {})", operand_str(haystack), operand_str(needle))
         }
+        Rvalue::StrTrim { kind, recv } => {
+            let name = match kind {
+                align_sema::hir::StrTrimKind::Both => "str_trim",
+                align_sema::hir::StrTrimKind::Start => "str_trim_start",
+                align_sema::hir::StrTrimKind::End => "str_trim_end",
+            };
+            format!("{name}({})", operand_str(recv))
+        }
         Rvalue::BuilderNew { capacity } => format!("builder_new(cap={})", operand_str(capacity)),
         Rvalue::BuilderWriteStr(b, s) => format!("builder_write({}, {})", operand_str(b), operand_str(s)),
         Rvalue::BuilderWriteInt(b, n) => format!("builder_write_int({}, {})", operand_str(b), operand_str(n)),

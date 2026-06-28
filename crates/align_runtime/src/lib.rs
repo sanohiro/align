@@ -1799,6 +1799,59 @@ pub unsafe extern "C" fn align_rt_str_ends_with(hptr: *const u8, hlen: i64, sptr
     (hay == suf) as i32
 }
 
+/// Wrap a `&[u8]` sub-slice of an already-valid `str` buffer as an `AlignStr` view. The slice
+/// aliases the original bytes (no allocation); an empty slice may carry a dangling/one-past pointer,
+/// which is fine for a zero-length view (the generated code never dereferences it).
+#[inline]
+fn str_subview(s: &[u8]) -> AlignStr {
+    AlignStr { ptr: s.as_ptr(), len: s.len() as i64 }
+}
+
+/// `s.trim()` (M5, `core.string`) — return a borrowed sub-`str` `{ptr,len}` of `s` with leading
+/// and trailing ASCII whitespace removed. No allocation: the result points into the same buffer.
+/// The whitespace set is Rust's `[u8]::trim_ascii` (space, `\t`, `\n`, `\x0c`, `\r` — the WHATWG
+/// ASCII-whitespace set; vertical tab `\x0b` is *not* included). Unicode whitespace is deliberately
+/// out of core (package-level).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_trim(ptr: *const u8, len: i64) -> AlignStr {
+    if len <= 0 {
+        return AlignStr { ptr, len: 0 };
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    str_subview(bytes.trim_ascii())
+}
+
+/// `s.trim_start()` (M5, `core.string`) — borrowed sub-`str` with leading ASCII whitespace removed
+/// (same set as [`align_rt_str_trim`]).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_trim_start(ptr: *const u8, len: i64) -> AlignStr {
+    if len <= 0 {
+        return AlignStr { ptr, len: 0 };
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    str_subview(bytes.trim_ascii_start())
+}
+
+/// `s.trim_end()` (M5, `core.string`) — borrowed sub-`str` with trailing ASCII whitespace removed
+/// (same set as [`align_rt_str_trim`]).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_trim_end(ptr: *const u8, len: i64) -> AlignStr {
+    if len <= 0 {
+        return AlignStr { ptr, len: 0 };
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    str_subview(bytes.trim_ascii_end())
+}
+
 /// Report an `Err` returned from `main` (`docs/impl/06-runtime-std.md` §9). M2's `Error`
 /// is an i32 code; the original code is reported, and the returned value is the process
 /// exit code — clamped to a nonzero `u8` so a failure never looks like success (exit 0)
@@ -2485,6 +2538,41 @@ mod tests {
             assert_eq!(contains(h, n), expect_contains as i32, "contains({h:?}, {n:?})");
             assert_eq!(starts(h, n), h.starts_with(n) as i32, "starts_with({h:?}, {n:?})");
             assert_eq!(ends(h, n), h.ends_with(n) as i32, "ends_with({h:?}, {n:?})");
+        }
+    }
+
+    #[test]
+    fn str_trim_matches_byte_semantics_and_aliases() {
+        // Each trim must equal the equivalent `[u8]::trim_ascii*` and return a sub-view that still
+        // points *into* the original buffer (no allocation).
+        let view = |s: &AlignStr| -> &[u8] {
+            if s.len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) } }
+        };
+        let cases: &[&[u8]] = &[
+            b"  hi  ",
+            b"abc",            // no whitespace
+            b"   ",            // all whitespace
+            b"",               // empty
+            b"\t\n foo \r\x0b",
+            b"x ",
+            b" x",
+            "  café  ".as_bytes(), // multi-byte content is preserved; only ASCII ws is stripped
+        ];
+        for &h in cases {
+            let both = unsafe { align_rt_str_trim(h.as_ptr(), h.len() as i64) };
+            let start = unsafe { align_rt_str_trim_start(h.as_ptr(), h.len() as i64) };
+            let end = unsafe { align_rt_str_trim_end(h.as_ptr(), h.len() as i64) };
+            assert_eq!(view(&both), h.trim_ascii(), "trim({h:?})");
+            assert_eq!(view(&start), h.trim_ascii_start(), "trim_start({h:?})");
+            assert_eq!(view(&end), h.trim_ascii_end(), "trim_end({h:?})");
+            // The result must alias the input: its bytes lie within the original range.
+            let base = h.as_ptr() as usize;
+            for s in [&both, &start, &end] {
+                if s.len > 0 {
+                    let p = s.ptr as usize;
+                    assert!(p >= base && p + s.len as usize <= base + h.len(), "trim view aliases input");
+                }
+            }
         }
     }
 }

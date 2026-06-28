@@ -1136,3 +1136,42 @@ fn str_predicates_are_byte_oriented_utf8() {
     let out = build_and_run("str-pred-utf8", src);
     assert_eq!(out.status.code(), Some(7));
 }
+
+#[test]
+fn str_trim_strips_ascii_whitespace() {
+    if !backend_available() {
+        return;
+    }
+    // trim/trim_start/trim_end yield borrowed sub-str views. Print each (visible bounds) + length.
+    let src = "fn main() -> i32 {\n  s := \"  hi  \"\n  print(s.trim())\n  print(s.trim().len())\n  print(s.trim_start())\n  print(s.trim_start().len())\n  print(s.trim_end())\n  print(s.trim_end().len())\n  return 0\n}\n";
+    let out = build_and_run("str-trim", src);
+    assert_eq!(out.status.code(), Some(0));
+    // "hi"(2), "hi  "(4), "  hi"(4). The whitespace is visible in the start/end variants.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi\n2\nhi  \n4\n  hi\n4\n"
+    );
+}
+
+#[test]
+fn str_trim_edge_cases() {
+    if !backend_available() {
+        return;
+    }
+    // All-whitespace → empty (len 0); no-whitespace → unchanged; empty → empty. Bits 1+2+4 → 7.
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn main() -> i32 {\n  allws := \" \\t\\n \"\n  none := \"abc\"\n  empty := \"\"\n  r1 := b2i(allws.trim().len() == 0)\n  r2 := b2i(none.trim() == \"abc\")\n  r3 := b2i(empty.trim().len() == 0)\n  return r1 + r2 * 2 + r3 * 4\n}\n";
+    let out = build_and_run("str-trim-edge", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn str_trim_on_owned_string_view_is_borrowed() {
+    if !backend_available() {
+        return;
+    }
+    // The receiver is an owned `string`; trim borrows it (no move), so it stays usable after.
+    // The trimmed view ("foobar", len 6) feeds an equality, then s.len() (8, incl. the padding).
+    let src = "fn b2i(b: bool) -> i32 {\n  if b { return 1 }\n  return 0\n}\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> i32 {\n  s := mk(\" foobar \", \"\")\n  trimmed := b2i(s.trim() == \"foobar\")\n  return trimmed + b2i(s.len() == 8) * 2\n}\n";
+    let out = build_and_run("str-trim-owned", src);
+    assert_eq!(out.status.code(), Some(3));
+}

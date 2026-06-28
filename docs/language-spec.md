@@ -225,12 +225,15 @@ buffer
 builder
 ```
 
-`str` carries `.len()` (byte length), `==`/`!=` (byte equality), and the
-byte-oriented predicates `.contains(n)` / `.starts_with(p)` / `.ends_with(s)`
-(all `bool`). The predicates take a `str` (an owned `string` is auto-borrowed)
-and compare bytes — UTF-8 is the representation, but the scan is byte-level (the
-SIMD-friendly default the spec mandates over a `chars()` walk); the standard
-runtime backs them with `memchr`-class scans.
+`str` carries `.len()` (byte length), `==`/`!=` (byte equality), the byte-oriented
+predicates `.contains(n)` / `.starts_with(p)` / `.ends_with(s)` (all `bool`), and
+the ASCII-whitespace trims `.trim()` / `.trim_start()` / `.trim_end()` (each yields
+a **borrowed sub-`str`**, no allocation). All take a `str` (an owned `string` is
+auto-borrowed) and work on bytes — UTF-8 is the representation, but the scan is
+byte-level (the SIMD-friendly default the spec mandates over a `chars()` walk); the
+predicates are backed by `memchr`-class scans. The trim set is the WHATWG ASCII
+whitespace (space, `\t`, `\n`, `\x0c`, `\r`; not vertical tab); Unicode-whitespace
+trimming is deliberately package-level, out of core.
 
 ### JSON
 

@@ -357,6 +357,11 @@ pub enum ExprKind {
     /// auto-borrowed via [`ExprKind::StrBorrow`]); the comparison reads bytes only, so neither is
     /// moved. Backed by the runtime's `memchr`-class scans.
     StrPredicate { kind: StrPredKind, haystack: Box<Expr>, needle: Box<Expr> },
+    /// `s.trim()` / `s.trim_start()` / `s.trim_end()` — strip ASCII whitespace, yielding a
+    /// **borrowed sub-`str`** of `recv` (`ty` = `str`, no allocation). `recv` is a `str` view (an
+    /// owned `string` is auto-borrowed via [`ExprKind::StrBorrow`]); the result views the same
+    /// bytes, so it inherits `recv`'s region and must not outlive it. Backed by a runtime bounds scan.
+    StrTrim { kind: StrTrimKind, recv: Box<Expr> },
     /// Borrow an owned `string` as a `str` view (MMv2 slice 7b). The two share the `{ptr,len}`
     /// layout, so this is a zero-cost, allocation-free read-only view — an implicit coercion at
     /// a `str`-parameter call site. The `string` is **not** moved (it stays owned by its slot
@@ -546,6 +551,20 @@ pub enum StrPredKind {
     StartsWith,
     /// `s.ends_with(suffix)` — `s` ends with `suffix`'s bytes.
     EndsWith,
+}
+
+/// Which end(s) a `StrTrim` strips ASCII whitespace from (`core.string`). The result is a
+/// borrowed sub-`str` of the receiver (no allocation) — UTF-8 stays the representation, but the
+/// trim is byte-level over the ASCII whitespace set (` \t\n\r\x0b\x0c`); Unicode whitespace
+/// trimming is deliberately package-level, not core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrTrimKind {
+    /// `s.trim()` — strip leading and trailing ASCII whitespace.
+    Both,
+    /// `s.trim_start()` — strip leading ASCII whitespace.
+    Start,
+    /// `s.trim_end()` — strip trailing ASCII whitespace.
+    End,
 }
 
 #[derive(Clone, Debug)]

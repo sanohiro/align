@@ -1875,6 +1875,7 @@ impl EffectScan {
                 self.expr(haystack);
                 self.expr(needle);
             }
+            ExprKind::StrTrim { recv, .. } => self.expr(recv),
             ExprKind::Template(parts) => {
                 for p in parts {
                     if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
@@ -2127,6 +2128,10 @@ impl<'a> EscapeCheck<'a> {
             // arena-allocates a `string` (`Arena(k)`, shorter than `Frame`), the borrow must not
             // outlive that arena — taking the shorter keeps it sound for free.
             ExprKind::StrBorrow(inner) => Region::Frame.shorter(self.region_of(inner, depth)),
+            // A trim yields a sub-`str` of its receiver (same bytes), so the view lives exactly as
+            // long as the receiver — inherit its region directly. (The receiver is already a `str`:
+            // an owned `string` was auto-borrowed to a `Frame` view first, so this stays sound.)
+            ExprKind::StrTrim { recv, .. } => self.region_of(recv, depth),
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
@@ -2403,6 +2408,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(haystack, depth);
                 self.walk(needle, depth);
             }
+            ExprKind::StrTrim { recv, .. } => self.walk(recv, depth),
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.walk(source, depth);
                 self.walk(init, depth);
@@ -2785,6 +2791,8 @@ impl<'a> MoveCheck<'a> {
                 self.expr(haystack, moved, false, false);
                 self.expr(needle, moved, false, false);
             }
+            // The receiver is borrowed (the trimmed view aliases its bytes), never consumed.
+            ExprKind::StrTrim { recv, .. } => self.expr(recv, moved, false, false),
             // The receiver is borrowed, not consumed.
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
@@ -5207,6 +5215,9 @@ impl<'a, 't> Checker<'a, 't> {
             "contains" | "starts_with" | "ends_with" if matches!(recv_ty, Ty::Str | Ty::String) => {
                 self.check_str_predicate(recv_expr, method, args, span)
             }
+            "trim" | "trim_start" | "trim_end" if matches!(recv_ty, Ty::Str | Ty::String) => {
+                self.check_str_trim(recv_expr, method, args, span)
+            }
             "map_err" if matches!(self.resolve(recv_ty), Ty::Result(..)) => {
                 self.check_map_err(recv_expr, args, expected, span)
             }
@@ -6539,6 +6550,35 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `s.trim()` / `s.trim_start()` / `s.trim_end()` — strip ASCII whitespace, yielding a borrowed
+    /// sub-`str` of the receiver (`core.string`, draft.md §12). An owned `string` receiver is
+    /// auto-borrowed (`StrBorrow`); the result views the same bytes, so it inherits the receiver's
+    /// region (see `region_of`) and cannot escape it.
+    fn check_str_trim(&mut self, recv: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !args.is_empty() {
+            self.diags.error(format!("'.{method}()' takes no arguments"), span);
+            return err;
+        }
+        // Borrow an owned `string` receiver as a `str` view; a `str` receiver passes through.
+        let recv = if recv.ty == Ty::String {
+            let rspan = recv.span;
+            Expr { kind: ExprKind::StrBorrow(Box::new(recv)), ty: Ty::Str, span: rspan }
+        } else {
+            recv
+        };
+        if recv.ty == Ty::Error {
+            return err;
+        }
+        let kind = match method {
+            "trim" => hir::StrTrimKind::Both,
+            "trim_start" => hir::StrTrimKind::Start,
+            "trim_end" => hir::StrTrimKind::End,
+            _ => unreachable!("check_str_trim called with non-trim method"),
+        };
+        Expr { kind: ExprKind::StrTrim { kind, recv: Box::new(recv) }, ty: Ty::Str, span }
+    }
+
     /// `builder()` — open an append-oriented string builder (MMv2 slice 7c, draft.md §12).
     fn check_builder_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         // `builder()` (default capacity) or `builder(n)` (pre-size the backing buffer to `n` bytes
@@ -7792,6 +7832,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(haystack);
                 self.finalize_expr(needle);
             }
+            ExprKind::StrTrim { recv, .. } => self.finalize_expr(recv),
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
                     self.finalize_expr(el);
