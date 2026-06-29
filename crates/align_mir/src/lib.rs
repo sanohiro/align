@@ -491,7 +491,12 @@ fn fuse_builder_writes(f: &mut Function) {
                     continue;
                 }
             };
-            let key1 = builder_key(&b1, &loads);
+            // Bail unless the anchor builder resolves to a concrete key — never fuse on an unresolved
+            // (`None`) builder, which would otherwise let two distinct unresolved builders match.
+            let Some(key1) = builder_key(&b1, &loads) else {
+                i += 1;
+                continue;
+            };
             // Find the next `write_int` on the same builder, allowing only movable statements between.
             let int_idx = find_next_write(&block.stmts, i + 1, n, &loads, key1, WriteShape::Int);
             let Some((j, n_op)) = int_idx else {
@@ -548,16 +553,16 @@ fn find_next_write(
     start: usize,
     end: usize,
     loads: &std::collections::HashMap<ValueId, Slot>,
-    key: Option<BuilderKey>,
+    key: BuilderKey,
     shape: WriteShape,
 ) -> Option<(usize, Operand)> {
     for (offset, s) in stmts[start..end].iter().enumerate() {
         let idx = start + offset;
         match (shape, s) {
-            (WriteShape::Int, Stmt::Let(_, Rvalue::BuilderWriteInt(b, n))) if builder_key(b, loads) == key => {
+            (WriteShape::Int, Stmt::Let(_, Rvalue::BuilderWriteInt(b, n))) if builder_key(b, loads) == Some(key) => {
                 return Some((idx, n.clone()));
             }
-            (WriteShape::Str, Stmt::Let(_, Rvalue::BuilderWriteStr(b, s2))) if builder_key(b, loads) == key => {
+            (WriteShape::Str, Stmt::Let(_, Rvalue::BuilderWriteStr(b, s2))) if builder_key(b, loads) == Some(key) => {
                 return Some((idx, s2.clone()));
             }
             _ if is_movable_stmt(s) => continue,
