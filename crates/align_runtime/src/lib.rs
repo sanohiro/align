@@ -1751,7 +1751,9 @@ pub unsafe extern "C" fn align_rt_dict_lookup(ids: *const i64, n: i64, dict: *co
 /// `i64` writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_gather_i64(base: *const u8, n: i64, stride: i64, off: i64, out: *mut i64) {
-    if n <= 0 || base.is_null() || out.is_null() {
+    // A negative `stride`/`off` is meaningless and would wrap to a huge value through `as usize`
+    // (an out-of-bounds read); reject it defensively, like `align_rt_dict_lookup`'s `try_from` guards.
+    if n <= 0 || base.is_null() || out.is_null() || stride < 0 || off < 0 {
         return;
     }
     let n = n as usize;
@@ -3466,10 +3468,12 @@ mod tests {
         let mut out = vec![0i64; rows.len()];
         unsafe { align_rt_gather_i64(rows.as_ptr() as *const u8, rows.len() as i64, stride, off, out.as_mut_ptr()) };
         assert_eq!(out, vec![10, 20, 5]);
-        // Empty / null inputs gather nothing (leave `out` untouched).
+        // Empty / null / negative-stride / negative-offset inputs gather nothing (leave `out` untouched).
         let mut z = vec![-1i64; 3];
         unsafe { align_rt_gather_i64(rows.as_ptr() as *const u8, 0, stride, off, z.as_mut_ptr()) };
         unsafe { align_rt_gather_i64(std::ptr::null(), 3, stride, off, z.as_mut_ptr()) };
+        unsafe { align_rt_gather_i64(rows.as_ptr() as *const u8, 3, -1, off, z.as_mut_ptr()) };
+        unsafe { align_rt_gather_i64(rows.as_ptr() as *const u8, 3, stride, -1, z.as_mut_ptr()) };
         assert_eq!(z, vec![-1, -1, -1]);
     }
 
