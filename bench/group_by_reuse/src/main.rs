@@ -49,6 +49,8 @@ extern "C" {
     fn a1(us: Slice) -> Slice;
     /// `pub fn a2(us: array<Row>) -> array<Row>` — dict_encode once, four reused id group_bys; threads back.
     fn a2(us: Slice) -> Slice;
+    /// `pub fn a3(us: array<Row>) -> array<Row>` — fused one-pass `group_by(.name).agg(...)`; threads back.
+    fn a3(us: Slice) -> Slice;
     fn a2_encode(us: Slice) -> Slice;
     fn a2_one(us: Slice) -> Slice;
     fn a2_two(us: Slice) -> Slice;
@@ -142,11 +144,11 @@ fn main() {
     let rounds = 20;
     let profile = std::env::var_os("ALIGN_BENCH_PROFILE").is_some();
     println!("4 aggregates (sum a, sum b, max c, min d) over {n} rows by a str key — Align reuse vs Rust");
-    println!("  a1 = Align naive (4 str group_bys)   a2 = Align dict_encode reuse");
+    println!("  a1 = Align naive (4 str group_bys)   a2 = Align dict_encode reuse   a3 = Align fused .agg() one-pass");
     println!("  naive = Rust 4× HashMap<&str>   smart = Rust 1-pass HashMap<&str,[i64;4]> (ahash, hashes once)");
     println!(
-        "{:>8}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}  {:>9}",
-        "groups", "distinct", "a1 ms", "a2 ms", "naive ms", "smart ms", "a1/a2", "smart/a2"
+        "{:>8}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}  {:>9}",
+        "groups", "distinct", "a1 ms", "a2 ms", "a3 ms", "naive ms", "smart ms", "a1/a3", "smart/a3"
     );
     for &g in &group_counts {
         let (keys, rows, gidx, cols, distinct) = gen(n, g);
@@ -162,8 +164,10 @@ fn main() {
         assert!(r1.ptr == input.ptr && r1.len == input.len, "a1 threaded the array back unchanged");
         let r2 = unsafe { a2(input) };
         assert!(r2.ptr == input.ptr && r2.len == input.len, "a2 threaded the array back unchanged");
+        let r3 = unsafe { a3(input) };
+        assert!(r3.ptr == input.ptr && r3.len == input.len, "a3 threaded the array back unchanged");
 
-        let (mut t1, mut t2, mut tn, mut tsm) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+        let (mut t1, mut t2, mut t3, mut tn, mut tsm) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX, f64::MAX);
         for _ in 0..rounds {
             let t = Instant::now();
             std::hint::black_box(unsafe { a1(std::hint::black_box(input)) });
@@ -174,6 +178,10 @@ fn main() {
             t2 = t2.min(t.elapsed().as_secs_f64() * 1e3);
 
             let t = Instant::now();
+            std::hint::black_box(unsafe { a3(std::hint::black_box(input)) });
+            t3 = t3.min(t.elapsed().as_secs_f64() * 1e3);
+
+            let t = Instant::now();
             std::hint::black_box(rust_multi::<ahash::RandomState>(&keys, &gidx, &cols));
             tn = tn.min(t.elapsed().as_secs_f64() * 1e3);
 
@@ -182,8 +190,8 @@ fn main() {
             tsm = tsm.min(t.elapsed().as_secs_f64() * 1e3);
         }
         println!(
-            "{:>8}  {:>8}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {:>7.2}x  {:>8.2}x",
-            g, distinct, t1, t2, tn, tsm, t1 / t2, tsm / t2
+            "{:>8}  {:>8}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {:>7.2}x  {:>8.2}x",
+            g, distinct, t1, t2, t3, tn, tsm, t1 / t3, tsm / t3
         );
 
         if profile && g == 1_000_000 {

@@ -1937,6 +1937,163 @@ pub unsafe extern "C" fn align_rt_group_count_str(base: *const u8, n: i64, strid
     unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
+/// A fast non-cryptographic hasher (FxHash-style: rotate-xor-multiply over 8-byte chunks) for the
+/// hot str-key group-by interning. The default `std` `HashMap` uses SipHash (DoS-resistant but ~2–3×
+/// slower per key); aggregation keys are program-internal, not adversarial, so a fast hash is the
+/// right trade — matching idiomatic fast Rust's `ahash`. Keyed on key *bytes*, so equal keys collide
+/// deterministically.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        let mut h = self.hash;
+        let mut b = bytes;
+        while b.len() >= 8 {
+            let chunk = u64::from_le_bytes(b[..8].try_into().unwrap());
+            h = (h.rotate_left(5) ^ chunk).wrapping_mul(K);
+            b = &b[8..];
+        }
+        if !b.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..b.len()].copy_from_slice(b);
+            h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(K);
+        }
+        self.hash = h;
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        // Avalanche finalizer (murmur3 fmix64): the rotate-xor-multiply mixing leaves weak low bits,
+        // and `hashbrown`'s table derives both the bucket index and the control byte from the hash —
+        // without this, common-prefix keys (`key_000000`…) cluster into long probe chains (measured a
+        // >4× blow-up at high cardinality). The finalizer spreads entropy across all 64 bits.
+        let mut h = self.hash;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h ^= h >> 33;
+        h
+    }
+}
+
+type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+
+/// One aggregate of a fused multi-aggregate str group-by ([`align_rt_group_multi_str`]). `op` is
+/// `0`=sum, `1`=min, `2`=max, `3`=count; `val_off` is the i64 value field's byte offset in the row
+/// (ignored for `count`); `out_vals` is this aggregate's i64 output column.
+#[repr(C)]
+pub struct GroupMultiSpec {
+    pub val_off: i64,
+    pub op: i64,
+    pub out_vals: *mut i64,
+}
+
+/// `group_by(.str_key).agg(sum(.a), max(.b), count(), …)` over an AoS `array<Struct>` — the fused
+/// multi-aggregate str rail. **One pass**: intern each row's `str` key once (a `HashMap<&[u8], id>`),
+/// then fold every aggregate in `specs` into its own dense per-group column — the idiomatic-fast-Rust
+/// `HashMap<&str,[i64;K]>` shape, vs running one whole str group-by per aggregate. Emits the
+/// representative key views into `out_keys` (borrowing the source) and each aggregate `j`'s per-group
+/// result into `specs[j].out_vals`; returns the group count, or -1 if it exceeds `cap`. Empty / null
+/// input aggregates nothing (returns 0).
+///
+/// # Safety
+/// `base` points to `n` `stride`-byte rows, each with a valid `AlignStr` at `key_off` and a valid
+/// `i64` at every `specs[j].val_off` (for non-`count` ops). `out_keys` must be valid for `cap`
+/// `AlignStr` writes; each `specs[j].out_vals` for `cap` `i64` writes. `specs`/`k` describe a valid
+/// `GroupMultiSpec` range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_multi_str(
+    base: *const u8,
+    n: i64,
+    stride: i64,
+    key_off: i64,
+    specs: *const GroupMultiSpec,
+    k: i64,
+    out_keys: *mut AlignStr,
+    cap: i64,
+) -> i64 {
+    use std::collections::HashMap;
+    if n <= 0 || base.is_null() {
+        return 0;
+    }
+    if cap < 0 || k < 0 || out_keys.is_null() || (k > 0 && specs.is_null()) {
+        return -1;
+    }
+    let n = n as usize;
+    let k = k as usize;
+    let (stride, key_off) = (stride as usize, key_off as usize);
+    let specs: &[GroupMultiSpec] = if k == 0 { &[] } else { unsafe { std::slice::from_raw_parts(specs, k) } };
+    // Per aggregate: the value reader (a row pointer → i64; `count` reads `1`) and the combine op. The
+    // combine is selected once per aggregate (not per row) so the inner fold is a small fixed match.
+    let ops: Vec<i64> = specs.iter().map(|s| s.op).collect();
+    let val_offs: Vec<usize> = specs.iter().map(|s| s.val_off as usize).collect();
+
+    let initial = n.min(cap as usize).min(1024);
+    let mut ids: HashMap<&[u8], usize, FxBuildHasher> = HashMap::with_capacity_and_hasher(initial, FxBuildHasher::default());
+    // Accumulators, row-major per group: `acc[id*k + j]`. One contiguous buffer keeps a group's K
+    // accumulators adjacent (cache-friendly on the update).
+    let mut acc: Vec<i64> = Vec::with_capacity(initial.saturating_mul(k));
+    let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
+    // Read aggregate `j`'s value for the row at `row` (`count` contributes 1).
+    let read = |row: *const u8, j: usize| -> i64 {
+        if ops[j] == 3 {
+            1
+        } else {
+            unsafe { (row.add(val_offs[j]) as *const i64).read_unaligned() }
+        }
+    };
+    // Fold value `v` into accumulator `cur` per aggregate `j`'s op.
+    let combine = |cur: i64, v: i64, j: usize| -> i64 {
+        match ops[j] {
+            1 => cur.min(v),
+            2 => cur.max(v),
+            // sum (0) and count (3) both add (count's `v` is 1).
+            _ => cur.wrapping_add(v),
+        }
+    };
+    for i in 0..n {
+        let row = unsafe { base.add(i * stride) };
+        let ks = unsafe { (row.add(key_off) as *const AlignStr).read_unaligned() };
+        let bytes: &[u8] = if ks.ptr.is_null() || ks.len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) } };
+        match ids.get(bytes) {
+            Some(&id) => {
+                let g = id * k;
+                for j in 0..k {
+                    acc[g + j] = combine(acc[g + j], read(row, j), j);
+                }
+            }
+            None => {
+                let id = reprs.len();
+                ids.insert(bytes, id);
+                reprs.push(ks);
+                // Seed each accumulator with the group's first row value.
+                for j in 0..k {
+                    acc.push(read(row, j));
+                }
+            }
+        }
+    }
+    let count = reprs.len();
+    if count > cap as usize {
+        return -1;
+    }
+    let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
+    out_keys.copy_from_slice(&reprs);
+    // Scatter each aggregate's accumulators into its output column.
+    for (j, spec) in specs.iter().enumerate() {
+        let out = unsafe { std::slice::from_raw_parts_mut(spec.out_vals, count) };
+        for (g, slot) in out.iter_mut().enumerate() {
+            *slot = acc[g * k + j];
+        }
+    }
+    count as i64
+}
+
 /// **Dictionary-encode** a strided `str` column over an AoS `array<Struct>` — the A2 reuse rail.
 /// Assigns each distinct key a **dense id** in first-occurrence order: `out_ids[i]` = the id of row
 /// `i`, and `out_dict[id]` = that id's representative `str` view (borrowing the source). Returns the
@@ -3760,6 +3917,62 @@ mod tests {
         // Empty / null inputs encode nothing.
         assert_eq!(unsafe { align_rt_dict_encode_str(rows.as_ptr() as *const u8, 0, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 0) }, 0);
         assert_eq!(unsafe { align_rt_dict_encode_str(std::ptr::null(), 6, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 6) }, 0);
+    }
+
+    #[test]
+    fn group_multi_str_fuses_aggregates_in_one_pass() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Row {
+            key: AlignStr,
+            a: i64,
+            b: i64,
+        }
+        let s = |b: &'static [u8]| AlignStr { ptr: b.as_ptr(), len: b.len() as i64 };
+        // x:(a=10,b=1) y:(a=5,b=2) x:(a=7,b=3) → groups x (id0), y (id1).
+        let rows = [
+            Row { key: s(b"x"), a: 10, b: 1 },
+            Row { key: s(b"y"), a: 5, b: 2 },
+            Row { key: s(b"x"), a: 7, b: 3 },
+        ];
+        let stride = std::mem::size_of::<Row>() as i64;
+        let key_off = std::mem::offset_of!(Row, key) as i64;
+        let a_off = std::mem::offset_of!(Row, a) as i64;
+        let b_off = std::mem::offset_of!(Row, b) as i64;
+        let n = rows.len() as i64;
+        let (mut sa, mut mb, mut cnt) = (vec![0i64; rows.len()], vec![0i64; rows.len()], vec![0i64; rows.len()]);
+        // sum(.a) op=0, max(.b) op=2, count() op=3.
+        let specs = [
+            GroupMultiSpec { val_off: a_off, op: 0, out_vals: sa.as_mut_ptr() },
+            GroupMultiSpec { val_off: b_off, op: 2, out_vals: mb.as_mut_ptr() },
+            GroupMultiSpec { val_off: 0, op: 3, out_vals: cnt.as_mut_ptr() },
+        ];
+        let mut out_keys = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; rows.len()];
+        let count = unsafe {
+            align_rt_group_multi_str(rows.as_ptr() as *const u8, n, stride, key_off, specs.as_ptr(), specs.len() as i64, out_keys.as_mut_ptr(), n)
+        };
+        assert_eq!(count, 2, "two distinct keys");
+        let keys: Vec<&[u8]> = (0..count as usize).map(|i| unsafe { std::slice::from_raw_parts(out_keys[i].ptr, out_keys[i].len as usize) }).collect();
+        assert_eq!(keys, vec![&b"x"[..], &b"y"[..]], "first-occurrence key order");
+        assert_eq!(&sa[..2], &[17, 5], "sum(.a): x=10+7, y=5");
+        assert_eq!(&mb[..2], &[3, 2], "max(.b): x=max(1,3), y=2");
+        assert_eq!(&cnt[..2], &[2, 1], "count(): x=2, y=1");
+
+        // Each fused column matches the equivalent single-aggregate str group-by (the contract).
+        let mut single_sa = vec![0i64; rows.len()];
+        let mut single_keys = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; rows.len()];
+        unsafe { align_rt_group_sum_str(rows.as_ptr() as *const u8, n, stride, key_off, a_off, single_keys.as_mut_ptr(), single_sa.as_mut_ptr(), n) };
+        assert_eq!(&sa[..2], &single_sa[..2], "fused sum matches single-aggregate sum");
+
+        // Empty / null inputs aggregate nothing.
+        assert_eq!(
+            unsafe { align_rt_group_multi_str(rows.as_ptr() as *const u8, 0, stride, key_off, specs.as_ptr(), specs.len() as i64, out_keys.as_mut_ptr(), 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { align_rt_group_multi_str(std::ptr::null(), n, stride, key_off, specs.as_ptr(), specs.len() as i64, out_keys.as_mut_ptr(), n) },
+            0
+        );
     }
 
     #[test]

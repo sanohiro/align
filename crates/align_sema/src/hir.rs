@@ -499,6 +499,13 @@ pub enum ExprKind {
     /// array<i64>)`, key views **borrow `base`**), or a precomputed [`crate::Ty::DictEncoded`] value
     /// (reuse its dense-id column — the A2 rail). Value is `i64`; `sum`/`min`/`max`/`count`.
     ArrayGroupAgg { base: LocalId, struct_id: u32, key_field: u32, value_field: Option<u32>, op: GroupOp, source: GroupSource },
+    /// `s.group_by(.key).agg(sum(.a), max(.b), count(), …)` — **fused multi-aggregate**: one pass over
+    /// the key column computes every aggregate in `aggs` (in result order) into its own result column,
+    /// instead of one `group_by` pass per aggregate. The `key`-once / K-accumulator shape that matches
+    /// idiomatic fast Rust (`HashMap<K,[Acc;K]>`). The expression `ty` is a tuple
+    /// `(array<K>, array<i64>, …)` — distinct keys followed by one `array<i64>` per aggregate. First
+    /// cut: an AoS `str` key (`GroupSource::AosStr`), i64 values, `sum`/`min`/`max`/`count`.
+    ArrayGroupAggMulti { base: LocalId, struct_id: u32, key_field: u32, aggs: Vec<GroupAgg1>, source: GroupSource },
     /// `s.dict_encode(.key)` — intern the `str` `key_field` column of the AoS `array<Struct>` local
     /// `base` to a dense-id column + a dictionary, yielding a [`crate::Ty::DictEncoded`] value. The
     /// one-time transform (visible cost) of the A2 reuse rail; a later `e.group_by(.key).<agg>(.value)`
@@ -541,6 +548,14 @@ pub enum GroupSource {
     /// A precomputed [`crate::Ty::DictEncoded`] value — reuse its dense-id column via the i64
     /// group path, then label results back through its dictionary (A2 reuse rail).
     Encoded,
+}
+
+/// One aggregate of a fused multi-aggregate `group_by` ([`ExprKind::ArrayGroupAggMulti`]): an op and
+/// the i64 value field it folds (`None` for `count`, which reads no value column).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupAgg1 {
+    pub op: GroupOp,
+    pub value_field: Option<u32>,
 }
 
 /// The aggregate of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).

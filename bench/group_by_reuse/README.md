@@ -22,34 +22,40 @@ the same buffer across rounds (an `array<Struct>` is a Move type — a callee wo
 Value correctness is covered by the `dict_encode_reuse_matches_a1_string_group_by` unit test; this
 harness measures time and asserts the array threads back unchanged.
 
-## Result (2026-06-29, native, 1M rows, 4 aggregates)
+## Result (2026-06-29, native, 1M rows, 4 aggregates) — with the fused `a3`
 
 ```
-  groups  distinct      a1 ms      a2 ms   naive ms   smart ms     a1/a2   smart/a2
-     100       100     69.693     29.549     32.558      9.057     2.36x      0.31x
-   10000     10000    114.939     48.121     67.644     19.393     2.39x      0.40x
- 1000000    632390   1190.985    341.011    729.070    238.758     3.49x      0.70x
+  groups  distinct      a1 ms      a2 ms      a3 ms   naive ms   smart ms     a1/a3   smart/a3
+     100       100     70.13      30.14      21.83      33.41       9.23      3.21x      0.42x
+   10000     10000    112.21      47.29      39.75      65.92      19.29      2.82x      0.49x
+ 1000000    632390   1174.81     339.76     316.36     712.76     243.81      3.71x      0.77x
 ```
 
-**The honest verdict — the reuse helps, but the mechanism as built does not beat fast Rust:**
+`a3 = us.group_by(.name).agg(sum(.a), sum(.b), max(.c), min(.d))` — the **fused one-pass** rail (the
+"multiple aggregates in one pass" lever the earlier benches called for): one scan interns each key once
+(a fast FxHash-class hasher, not SipHash) and updates all four accumulators, exactly the
+`HashMap<&str,[i64;4]>` shape smart Rust uses. No `dict_encode`, no re-scan.
 
-- **a2 beats a1 (Align naive) by 2.4–3.5×.** The reuse is real: paying the string interning once and
-  running the four aggregates on the dense-id column is materially faster than four full str-key
-  group_bys. The win widens with cardinality (more distinct keys → more interning to amortize).
-- **a2 also beats the *naive* Rust baseline** (4× `HashMap<&str>`): ~1.1× (100 groups) to ~2.1× (632k).
-- **But a2 *loses* to the *smart* single-pass Rust** — `smart/a2` is **0.31–0.70×**, i.e. one-pass Rust
-  is **1.4–3.2× faster** than a2. The design mandate is explicit that only a win over the *fast*
-  baseline is honest, so this is the number that counts: **A2, as a batch of separate group_bys, does
-  not beat idiomatic fast Rust.**
-- The earlier **~19–21× projection was wrong** — it over-counted the interning cost relative to the
-  per-aggregate scan.
+**The honest verdict — fusion is the right lever; a3 is now the best Align path, but still trails fast Rust:**
 
-### Why, and what it changes
+- **a3 beats a1 (Align naive 4× group_by) by 3.2–3.7×** — the headline. Replacing four full str-key
+  group_bys with one fused pass (+ a fast hash) is the structural win.
+- **a3 also beats a2 (`dict_encode` reuse) everywhere** (~1.0–1.4×): one fused pass over the str key
+  beats encode-once-then-four-id-passes for a known batch — and skips the encode/gather entirely.
+- **But a3 still *loses* to smart single-pass Rust** — `smart/a3` is **0.42–0.77×** (Rust 1.3–2.4×
+  faster). Hashing is no longer the cause (the FxHash finalizer matches `ahash`); the remaining gap is
+  **(1)** the per-call `malloc` of `n`-sized output columns (5 × 8 MB at 1M rows — dominant at low
+  cardinality, where work is tiny) and **(2)** the dense-id indirection (`acc[id*K + j]`) vs smart
+  Rust's inline `[i64;K]` map value. Per the mandate (only a win over the *fast* baseline is honest),
+  a3 does not yet beat idiomatic fast Rust — but it is materially closer than a2 and is the right shape.
 
-Smart Rust hashes each key **once** and updates all four accumulators in a **single pass**. A2 hashes
-once too (`dict_encode`), but then makes **four more passes** — each aggregate gathers its value column
-and runs a full dense-id hash-aggregate (plus a per-call malloc). Five passes vs one. Reuse removes the
-*re-hashing*, not the *re-scanning*.
+### Why fusion was the lever, and what remains
+
+Smart Rust hashes each key **once** and updates all four accumulators in a **single pass**. a1 makes
+four full passes; a2 hashes once (`dict_encode`) but then makes four more id-passes. **a3 collapses
+that to one pass** — the structural fix (cause 1: N passes → 1). What's left is cause 2 (right-size /
+arena the output columns instead of `malloc`-ing `n`-sized scratch) and matching smart Rust's
+inline-value accumulator layout — both recorded follow-ups.
 
 So the benchmark redirects the roadmap (exactly its job, per the json→soa lesson): **the real lever is
 "multiple aggregates in one pass"** — fuse the K aggregates into a single scan of the encoded ids that
