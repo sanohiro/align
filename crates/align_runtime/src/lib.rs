@@ -37,10 +37,9 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     // pointer with `len == 0`; `from_raw_parts(null, 0)` is UB, so emit just the newline. `try_from`
     // avoids a truncating `len as usize` (a heap OOB) on a 32-bit target.
     if len > 0 {
-        if let Ok(n) = usize::try_from(len) {
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
-            let _ = out.write_all(bytes);
-        }
+        let n = len as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
+        let _ = out.write_all(bytes);
     }
     let _ = out.write_all(b"\n").and_then(|()| out.flush());
 }
@@ -223,31 +222,28 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
     // allocator (~1.8× on a 128 MiB file; `work/io_perf_probe.rs`). Special / streaming files
     // (length 0, `/proc`, pipes, char devices) and any file that shrinks or grows under us fall
     // back to the copy path below — which re-opens by path, so a partial read here is harmless.
-    if let Ok(mut file) = std::fs::File::open(path_str) {
-        if let Ok(meta) = file.metadata() {
-            let flen = meta.len();
-            // Regular files only (`is_file`), nonzero length (skips empty / size-unknown special
-            // files). `isize::try_from` is the single guard that keeps the rest sound on every
-            // target: a positive `isize` fits both `usize` (the slice len) and `i64` (the alloc
-            // size) losslessly, and is `<= isize::MAX` so `from_raw_parts_mut` is not UB. A larger
-            // file (only reachable on a 32-bit target) just takes the fallback path.
-            if meta.is_file() && flen > 0 {
-                if let Ok(len_z) = isize::try_from(flen) {
-                    let len_i = len_z as i64;
-                    let len_u = len_z as usize;
-                    let dst = align_rt_alloc(len_i);
-                    let buf = unsafe { core::slice::from_raw_parts_mut(dst, len_u) };
-                    // `read_exact` fills the whole buffer (a shorter file errors). On success one
-                    // more read must hit EOF — otherwise the file grew past the snapshot and the
-                    // buffer would silently truncate, so fall back. Any failure frees and falls back.
-                    if file.read_exact(buf).is_ok() && matches!(file.read(&mut [0u8; 1]), Ok(0)) {
-                        unsafe { *out = AlignStr { ptr: dst, len: len_i } };
-                        return 0;
-                    }
-                    unsafe { align_rt_free(dst) };
+    if let Ok((mut file, meta)) = std::fs::File::open(path_str).and_then(|f| f.metadata().map(|m| (f, m))) {
+        let flen = meta.len();
+        // Regular files only (`is_file`), nonzero length (skips empty / size-unknown special
+        // files). `isize::try_from` is the single guard that keeps the rest sound on every
+        // target: a positive `isize` fits both `usize` (the slice len) and `i64` (the alloc
+        // size) losslessly, and is `<= isize::MAX` so `from_raw_parts_mut` is not UB. A larger
+        // file (only reachable on a 32-bit target) just takes the fallback path.
+        if meta.is_file() && flen > 0
+            && let Ok(len_z) = isize::try_from(flen) {
+                let len_i = len_z as i64;
+                let len_u = len_z as usize;
+                let dst = align_rt_alloc(len_i);
+                let buf = unsafe { core::slice::from_raw_parts_mut(dst, len_u) };
+                // `read_exact` fills the whole buffer (a shorter file errors). On success one
+                // more read must hit EOF — otherwise the file grew past the snapshot and the
+                // buffer would silently truncate, so fall back. Any failure frees and falls back.
+                if file.read_exact(buf).is_ok() && matches!(file.read(&mut [0u8; 1]), Ok(0)) {
+                    unsafe { *out = AlignStr { ptr: dst, len: len_i } };
+                    return 0;
                 }
+                unsafe { align_rt_free(dst) };
             }
-        }
     }
     // Fallback (empty / special / changed file): read into a Vec, then copy into the owned buffer.
     let data = match std::fs::read(path_str) {
@@ -453,11 +449,10 @@ pub unsafe extern "C" fn align_rt_par_map(
             let (m, cv) = &*remaining;
             let mut st = m.lock().unwrap();
             st.0 -= 1;
-            if let Err(p) = res {
-                if st.1.is_none() {
+            if let Err(p) = res
+                && st.1.is_none() {
                     st.1 = Some(p);
                 }
-            }
             cv.notify_all();
         }));
     }
@@ -876,7 +871,7 @@ unsafe fn parse_object(
                     let width = (d.tag & 0xff) as i64;
                     // Defense in depth: never write outside the out struct, even if a
                     // descriptor offset/width were wrong (checked_add avoids i64 overflow).
-                    if d.offset < 0 || d.offset.checked_add(width).map_or(true, |end| end > out_size) {
+                    if d.offset < 0 || d.offset.checked_add(width).is_none_or(|end| end > out_size) {
                         return None;
                     }
                     let off = d.offset as usize;
@@ -999,7 +994,7 @@ struct AosDst {
 impl FieldDst for AosDst {
     #[inline]
     unsafe fn field_ptr(&self, _fi: usize, d: &JsonField, width: i64) -> Option<*mut u8> {
-        if d.offset < 0 || d.offset.checked_add(width).map_or(true, |end| end > self.esz) {
+        if d.offset < 0 || d.offset.checked_add(width).is_none_or(|end| end > self.esz) {
             return None;
         }
         Some(unsafe { self.eptr.add(d.offset as usize) })
@@ -1986,9 +1981,6 @@ pub unsafe extern "C" fn align_rt_group_max_str(base: *const u8, n: i64, stride:
 pub unsafe extern "C" fn align_rt_group_count_str(base: *const u8, n: i64, stride: i64, key_off: i64, _val_off: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
     unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b)) }
 }
-
-/// A fast non-cryptographic hasher (FxHash-style: rotate-xor-multiply over 8-byte chunks) for the
-
 
 /// One aggregate of a fused multi-aggregate str group-by ([`align_rt_group_multi_str`]). `op` is
 /// `0`=sum, `1`=min, `2`=max, `3`=count; `val_off` is the i64 value field's byte offset in the row
@@ -3797,7 +3789,7 @@ mod tests {
             let mut s = Vec::new();
             s.push(b'{');
             s.push(b'"');
-            s.extend(std::iter::repeat(b'x').take(pad));
+            s.extend(std::iter::repeat_n(b'x', pad));
             s.extend_from_slice(b"\\\"end"); // an escaped quote straddling/near the boundary
             s.extend_from_slice(b"\":1}");
             check(&s);
@@ -3806,8 +3798,8 @@ mod tests {
             for run in 1..6usize {
                 let mut t = Vec::new();
                 t.extend_from_slice(b"{\"k\":\"");
-                t.extend(std::iter::repeat(b'y').take(pad));
-                t.extend(std::iter::repeat(b'\\').take(run));
+                t.extend(std::iter::repeat_n(b'y', pad));
+                t.extend(std::iter::repeat_n(b'\\', run));
                 t.extend_from_slice(b"\"}"); // whether this " is escaped depends on run parity
                 check(&t);
             }
@@ -3875,15 +3867,15 @@ mod tests {
             let mut s = Vec::new();
             s.push(b'{');
             s.push(b'"');
-            s.extend(std::iter::repeat(b'x').take(pad));
+            s.extend(std::iter::repeat_n(b'x', pad));
             s.extend_from_slice(b"\\\"end");
             s.extend_from_slice(b"\":1}");
             check(&s);
             for run in 1..6usize {
                 let mut t = Vec::new();
                 t.extend_from_slice(b"{\"k\":\"");
-                t.extend(std::iter::repeat(b'y').take(pad));
-                t.extend(std::iter::repeat(b'\\').take(run));
+                t.extend(std::iter::repeat_n(b'y', pad));
+                t.extend(std::iter::repeat_n(b'\\', run));
                 t.extend_from_slice(b"\"}");
                 check(&t);
             }

@@ -2215,10 +2215,10 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } => true,
             ExprKind::Local(p) => self.local_backed_slice.contains(p),
             ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
-            ExprKind::Block(b) => b.value.as_ref().map_or(false, |v| self.slice_is_local(v)),
+            ExprKind::Block(b) => b.value.as_ref().is_some_and(|v| self.slice_is_local(v)),
             ExprKind::If { then, els, .. } => {
-                then.value.as_ref().map_or(false, |v| self.slice_is_local(v))
-                    || els.value.as_ref().map_or(false, |v| self.slice_is_local(v))
+                then.value.as_ref().is_some_and(|v| self.slice_is_local(v))
+                    || els.value.as_ref().is_some_and(|v| self.slice_is_local(v))
             }
             _ => false,
         }
@@ -2364,14 +2364,13 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::TaskGroup(b) => {
                 let inner = depth + 1;
                 self.block(b, inner);
-                if let Some(v) = &b.value {
-                    if self.tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
+                if let Some(v) = &b.value
+                    && self.tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
                         self.diags.error(
                             "a value from this task_group cannot escape as the block's value".to_string(),
                             v.span,
                         );
                     }
-                }
             }
             ExprKind::Spawn { closure, .. } => self.walk(closure, depth),
             ExprKind::EnumValue { payload, .. } => {
@@ -3416,11 +3415,10 @@ impl<'a, 't> Checker<'a, 't> {
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     // Record slice provenance (`s: slice<T> := a` → `s` borrows `a`'s buffer) so
                     // the `out` no-alias check can see through slice variables.
-                    if matches!(local_ty, Ty::Slice(_)) {
-                        if let Some(root) = self.expr_root_local(&init) {
+                    if matches!(local_ty, Ty::Slice(_))
+                        && let Some(root) = self.expr_root_local(&init) {
                             self.slice_bases.insert(local, root);
                         }
-                    }
                     stmts.push(Stmt::Let { local, init });
                 }
                 ast::Stmt::LetTuple { names, init, span } => {
@@ -3808,15 +3806,14 @@ impl<'a, 't> Checker<'a, 't> {
             }
             _ => None,
         };
-        if let Some(exp) = &expected_elems {
-            if exp.len() != elems.len() {
+        if let Some(exp) = &expected_elems
+            && exp.len() != elems.len() {
                 self.diags.error(
                     format!("expected a tuple of {} element(s), got {}", exp.len(), elems.len()),
                     span,
                 );
                 return err;
             }
-        }
         let mut checked = Vec::with_capacity(elems.len());
         let mut scalars = Vec::with_capacity(elems.len());
         let mut ok = true;
@@ -4098,13 +4095,11 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn place_local(&self, e: &ast::Expr) -> Option<(LocalId, Ty)> {
-        if let ast::ExprKind::Path(p) = &e.kind {
-            if let Some(name) = single_name(p) {
-                if let Some(id) = self.lookup(name) {
+        if let ast::ExprKind::Path(p) = &e.kind
+            && let Some(name) = single_name(p)
+                && let Some(id) = self.lookup(name) {
                     return Some((id, self.locals[id as usize].ty));
                 }
-            }
-        }
         None
     }
 
@@ -4187,11 +4182,10 @@ impl<'a, 't> Checker<'a, 't> {
             return Ok(None);
         }
         // Bare `Type` in the current module.
-        if let ast::ExprKind::Path(p) = &recv.kind {
-            if let Some(name) = single_name(p) {
+        if let ast::ExprKind::Path(p) = &recv.kind
+            && let Some(name) = single_name(p) {
                 return Ok(self.local_type(name));
             }
-        }
         // Qualified `mod.Type` — the receiver is itself a pure dotted name.
         let Some(flat) = flatten_module_path(recv) else { return Ok(None) };
         let Some((module, type_name)) = flat.rsplit_once('.') else { return Ok(None) };
@@ -4609,11 +4603,10 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             Expr { kind: ExprKind::Closure { lifted: name, captures }, ty: cty, span: arg.span }
         };
-        if fallible {
-            if let Some(f) = self.task_group_fallible.last_mut() {
+        if fallible
+            && let Some(f) = self.task_group_fallible.last_mut() {
                 *f = true;
             }
-        }
         // A new task is now pending and unjoined, so a prior `wait()` no longer covers everything.
         if let Some(w) = self.wait_state.last_mut() {
             *w = false;
@@ -4729,11 +4722,10 @@ impl<'a, 't> Checker<'a, 't> {
             return self.check_wait(args, span);
         }
         // An indirect call through a function-value local: `f(args)` where `f: Ty::Fn`.
-        if let Some(lid) = self.lookup(&name) {
-            if let Ty::Fn(fid) = self.resolve(self.locals[lid as usize].ty) {
+        if let Some(lid) = self.lookup(&name)
+            && let Ty::Fn(fid) = self.resolve(self.locals[lid as usize].ty) {
                 return self.check_call_fn_value(lid, fid, args, expected, span);
             }
-        }
         // A user function: a bare call resolves in the caller's own module (`module$fn` mangled
         // name); cross-module calls are written `mod.fn(...)` (handled in `check_method_call`).
         let Some(name) = self.resolve_local_fn(&name) else {
@@ -4958,8 +4950,8 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, Some(scalar_to_ty(ps)), a.span),
             _ => self.check_expr(a, None),
         };
-        if let Ty::Array(es, _) = e.ty {
-            if es == ps {
+        if let Ty::Array(es, _) = e.ty
+            && es == ps {
                 // The borrow lowers via the same slot-materialization as a pipeline source,
                 // so the same restriction applies: only a literal or a named local.
                 if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
@@ -4972,7 +4964,6 @@ impl<'a, 't> Checker<'a, 't> {
                 let span = e.span;
                 return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
             }
-        }
         // Already a slice, or a mismatch: let unification report any error.
         if e.ty != Ty::Slice(ps) {
             self.constrain(e.ty, Some(Ty::Slice(ps)), e.span);
@@ -5108,9 +5099,9 @@ impl<'a, 't> Checker<'a, 't> {
         // `io.stdout.write(s)` / `io.stdout.buffered()` / `io.stderr.buffered()` — the receiver is the
         // 2-segment `io.stdout` / `io.stderr`, so it parses as a `FieldAccess` (`io` . `stdout`), not
         // a single-name path.
-        if method == "write" || method == "buffered" {
-            if let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind {
-                if let ast::ExprKind::Path(p) = &inner.kind {
+        if (method == "write" || method == "buffered")
+            && let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind
+                && let ast::ExprKind::Path(p) = &inner.kind {
                     if single_name(p) == Some("io") && field.name == "stdout" {
                         if method == "buffered" {
                             self.require_import("std.io", "io.stdout.buffered", span);
@@ -5126,8 +5117,6 @@ impl<'a, 't> Checker<'a, 't> {
                         return self.check_io_buffered("stderr", 2, args, span);
                     }
                 }
-            }
-        }
         // `mod.fn(...)` / `a.b.fn(...)` — a cross-module call into an imported user module. The
         // receiver is a pure dotted name (`geom` or `util.math`); resolved + visibility-checked here.
         // `Ok(None)` (not an imported user module) falls through to the value-method dispatch below.
@@ -5140,15 +5129,14 @@ impl<'a, 't> Checker<'a, 't> {
                         || cap.enclosing.iter().any(|(n, _, _)| n == leftmost)
                 })
         });
-        if !leftmost_is_local {
-            if let Some(modpath) = flatten_module_path(recv) {
+        if !leftmost_is_local
+            && let Some(modpath) = flatten_module_path(recv) {
                 match self.resolve_qualified_fn(&modpath, method, span) {
                     Ok(Some(mangled)) => return self.check_named_call(mangled, args, expected, span),
                     Ok(None) => {}
                     Err(()) => return err,
                 }
             }
-        }
         // Explicit-overflow integer arithmetic (`core.math`): `x.{wrapping,saturating,checked}_{add,sub,mul}(y)`.
         if parse_int_arith(method).is_some() {
             return self.check_int_arith_method(recv, method, args, span);
@@ -5638,12 +5626,11 @@ impl<'a, 't> Checker<'a, 't> {
                         let arg = if args.len() == 1 { Some(&args[0]) } else { None };
                         let (src, mut stages) = self.collect_pipeline(recv);
                         // `where(.field)` — a field predicate.
-                        if is_where {
-                            if let Some(ast::Expr { kind: ast::ExprKind::FieldShorthand(f), .. }) = arg {
+                        if is_where
+                            && let Some(ast::Expr { kind: ast::ExprKind::FieldShorthand(f), .. }) = arg {
                                 stages.push(RawStage::WhereField(f.clone()));
                                 return (src, stages);
                             }
-                        }
                         // An inline lambda (`map(fn x { … })`) or a named function.
                         let stage_fn = match arg {
                             Some(a) => match &a.kind {
@@ -5680,11 +5667,10 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn pipeline_fn_name(&self, a: &ast::Expr) -> Option<ast::Ident> {
-        if let ast::ExprKind::Path(p) = &a.kind {
-            if p.segments.len() == 1 {
+        if let ast::ExprKind::Path(p) = &a.kind
+            && p.segments.len() == 1 {
                 return Some(p.segments[0].clone());
             }
-        }
         None
     }
 
@@ -5974,15 +5960,14 @@ impl<'a, 't> Checker<'a, 't> {
             let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
             // For an already-encoded source, the group key must be the field the dictionary was built
             // on — otherwise the precomputed ids don't correspond to this key.
-            if let Some(kf) = enc_key {
-                if ki != kf {
+            if let Some(kf) = enc_key
+                && ki != kf {
                     self.diags.error(
                         format!("`group_by` on a `dict_encode`d value must use the encoded key '{}', not '{}'", fields[kf as usize].name, key_field.name),
                         key_field.span,
                     );
                     return err;
                 }
-            }
             let vi = match value_field {
                 Some(v) => match resolve(self, v, "value", i64t) {
                     Some(idx) => Some(idx),
@@ -7697,11 +7682,10 @@ impl<'a, 't> Checker<'a, 't> {
         // binding the raw `Result` first and unwrapping the local later (`w := wait(); w?`) is a
         // sound over-restriction — `get()` would still be rejected. (Indirect unwrap is a later,
         // local-tracking refinement.)
-        if matches!(v.kind, ExprKind::Wait) {
-            if let Some(w) = self.wait_state.last_mut() {
+        if matches!(v.kind, ExprKind::Wait)
+            && let Some(w) = self.wait_state.last_mut() {
                 *w = true;
             }
-        }
         let (ok, err) = match self.resolve(v.ty) {
             Ty::Result(o, e) => (o, e),
             Ty::Error => return Expr { kind: ExprKind::Try(Box::new(v)), ty: Ty::Error, span },
@@ -8827,11 +8811,10 @@ fn resolve_type(
     }
     // A generic type parameter (`fn f<T>` → `T`): a bare name (no type arguments) matching a
     // declared parameter resolves to `Ty::Param(i)`.
-    if args.is_empty() {
-        if let Some(i) = type_params.iter().position(|p| p == name) {
+    if args.is_empty()
+        && let Some(i) = type_params.iter().position(|p| p == name) {
             return Ty::Param(i as u32);
         }
-    }
     match name {
         "bool" => Ty::Bool,
         "char" => Ty::Char,
@@ -8891,7 +8874,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match reject_move_struct_payload(scalar_arg(inner, "Option payload", true, span, diags), &cx.structs, "Option payload", span, diags) {
+            match reject_move_struct_payload(scalar_arg(inner, "Option payload", true, span, diags), cx.structs, "Option payload", span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,
             }
@@ -8973,8 +8956,8 @@ fn resolve_type(
                 }
             };
             match (
-                reject_move_struct_payload(scalar_arg(ok, "Result ok payload", true, span, diags), &cx.structs, "Result ok payload", span, diags),
-                reject_move_struct_payload(scalar_arg(err, "Result err payload", true, span, diags), &cx.structs, "Result err payload", span, diags),
+                reject_move_struct_payload(scalar_arg(ok, "Result ok payload", true, span, diags), cx.structs, "Result ok payload", span, diags),
+                reject_move_struct_payload(scalar_arg(err, "Result err payload", true, span, diags), cx.structs, "Result err payload", span, diags),
             ) {
                 (Some(o), Some(e)) => Ty::Result(o, e),
                 _ => Ty::Error,

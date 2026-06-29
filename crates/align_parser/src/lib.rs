@@ -1180,12 +1180,11 @@ impl<'a> Parser<'a> {
 
     /// Consume a weak keyword (one that appears as an `Ident`), like `out`.
     fn eat_ident_keyword(&mut self, kw: &str) -> bool {
-        if let TokKind::Ident(name) = self.peek() {
-            if name == kw {
+        if let TokKind::Ident(name) = self.peek()
+            && name == kw {
                 self.bump();
                 return true;
             }
-        }
         false
     }
 }

@@ -711,11 +711,10 @@ fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -
         // Fall-through end of the body: if the trailing value moves an owned local out (the
         // function returns it), null that local's slot so the exit cleanup frees null — the
         // caller now owns the buffer — then drop the remaining owned locals.
-        if f.ret != Ty::Unit {
-            if let Some(v) = &f.body.value {
+        if f.ret != Ty::Unit
+            && let Some(v) = &f.body.value {
                 null_moved_source(&mut b, v);
             }
-        }
         let tail = tail.filter(|_| f.ret != Ty::Unit);
         b.emit_exit_cleanup();
         match tail {
@@ -1361,8 +1360,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Ty::DynSliceArray(p) => Some(Ty::Slice(align_sema::prim_to_scalar(p))),
                 _ => None,
             };
-            if stages.is_empty() && captures.is_empty() {
-                if let Some(elem_in) = elem_in {
+            if stages.is_empty() && captures.is_empty()
+                && let Some(elem_in) = elem_in {
                     let src = match source.ty {
                         Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => lower_expr(b, source),
                         _ => {
@@ -1388,7 +1387,6 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                     }
                     return Operand::Value(v);
                 }
-            }
             // Sequential fallback: append a `map(f)` stage (carrying any captures) and materialize
             // via the collect loop.
             let mut stages2 = stages.clone();
