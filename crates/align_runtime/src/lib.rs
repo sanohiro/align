@@ -562,7 +562,7 @@ fn builder_push_i64(buf: &mut Vec<u8>, v: i64) {
 /// Append a decimal integer. Hand-rolled itoa straight into the buffer — no generic `write!`
 /// formatter (runtime format-string parsing + trait dispatch), the builder's hot path.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
+pub unsafe extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
     let b = unsafe { &mut *b };
     builder_push_i64(&mut b.buf, v);
 }
@@ -586,14 +586,14 @@ pub unsafe extern "C" fn align_rt_builder_write_str_int_str(b: *mut Builder, p1:
 
 /// Append `true`/`false`.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_write_bool(b: *mut Builder, v: i32) {
+pub unsafe extern "C" fn align_rt_builder_write_bool(b: *mut Builder, v: i32) {
     let b = unsafe { &mut *b };
     b.buf.extend_from_slice(if v != 0 { &b"true"[..] } else { &b"false"[..] });
 }
 
 /// Append a `char`'s UTF-8 encoding.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_write_char(b: *mut Builder, c: u32) {
+pub unsafe extern "C" fn align_rt_builder_write_char(b: *mut Builder, c: u32) {
     let b = unsafe { &mut *b };
     let ch = char::from_u32(c).unwrap_or('\u{FFFD}');
     let mut tmp = [0u8; 4];
@@ -602,14 +602,14 @@ pub extern "C" fn align_rt_builder_write_char(b: *mut Builder, c: u32) {
 
 /// Append an `f64`'s shortest round-trip decimal.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_write_f64(b: *mut Builder, x: f64) {
+pub unsafe extern "C" fn align_rt_builder_write_f64(b: *mut Builder, x: f64) {
     let b = unsafe { &mut *b };
     push_float(&mut b.buf, x);
 }
 
 /// Append an `f32`'s shortest round-trip decimal.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_write_f32(b: *mut Builder, x: f32) {
+pub unsafe extern "C" fn align_rt_builder_write_f32(b: *mut Builder, x: f32) {
     let b = unsafe { &mut *b };
     push_float(&mut b.buf, x);
 }
@@ -1424,7 +1424,7 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
     let Ok(total_i64) = i64::try_from(total) else {
         return 1; // size doesn't fit the i64 arena ABI
     };
-    let base = align_rt_arena_alloc(arena, total_i64, max_align.max(1) as i64);
+    let base = unsafe { align_rt_arena_alloc(arena, total_i64, max_align.max(1) as i64) };
     // The arena hands back zeroed chunks, but a missing field must still read 0 — zero defensively
     // (cheap relative to the parse) so a partial record leaves declared columns at 0, like the AoS
     // path's per-element `buf.resize(.., 0)`.
@@ -1683,10 +1683,10 @@ unsafe fn group_agg_i64(
                 occ[idx] = true;
                 acc[idx] = v;
                 count += 1;
+                if count > cap as usize {
+                    return -1;
+                }
             }
-        }
-        if count > cap as usize {
-            return -1;
         }
         let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
         let out_vals = unsafe { std::slice::from_raw_parts_mut(out_vals, count) };
@@ -1717,6 +1717,9 @@ unsafe fn group_agg_i64(
                 tkey[slot] = k;
                 tacc[slot] = v;
                 count += 1;
+                if count > cap as usize {
+                    return -1;
+                }
                 if count * 4 > tsize * 3 {
                     let ns = tsize * 2;
                     let nm = ns - 1;
@@ -1750,9 +1753,6 @@ unsafe fn group_agg_i64(
         }
     }
 
-    if count > cap as usize {
-        return -1;
-    }
     let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
     let out_vals = unsafe { std::slice::from_raw_parts_mut(out_vals, count) };
     let mut g = 0;
@@ -1834,6 +1834,60 @@ pub unsafe extern "C" fn align_rt_group_count_i64(keys: *const i64, len: i64, ou
 /// `base` must point to `n` valid `stride`-byte rows, each holding a valid `AlignStr` at `key_off`;
 /// `value_at` must read only within those rows. `out_keys`/`out_vals` must be valid for `cap`
 /// `AlignStr` / `i64` writes.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        let mut h = self.hash;
+        let mut b = bytes;
+        while b.len() >= 8 {
+            let chunk = u64::from_le_bytes(b[..8].try_into().unwrap());
+            h = (h.rotate_left(5) ^ chunk).wrapping_mul(K);
+            b = &b[8..];
+        }
+        if !b.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..b.len()].copy_from_slice(b);
+            h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(K);
+        }
+        self.hash = h;
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        let mut h = self.hash;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h ^= h >> 33;
+        h
+    }
+}
+
+type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+
+#[allow(dead_code)]
+const OP_SUM: i64 = 0;
+const OP_MIN: i64 = 1;
+const OP_MAX: i64 = 2;
+const OP_COUNT: i64 = 3;
+
+#[inline(always)]
+unsafe fn read_key_slice<'a>(row: *const u8, key_off: usize) -> (&'a [u8], AlignStr) {
+    let ks = unsafe { (row.add(key_off) as *const AlignStr).read_unaligned() };
+    let bytes = if ks.ptr.is_null() || ks.len <= 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) }
+    };
+    (bytes, ks)
+}
+
 unsafe fn group_agg_str(
     base: *const u8,
     n: i64,
@@ -1857,22 +1911,21 @@ unsafe fn group_agg_str(
     // Reserve up front to avoid the early grow-and-rehash churn; the group count is unknown, so cap
     // at a sane starting size (n is the worst case = all-distinct, but don't over-reserve for huge n).
     let initial = n.min(cap as usize).min(1024);
-    let mut ids: HashMap<&[u8], usize> = HashMap::with_capacity(initial);
+    let mut ids: HashMap<&[u8], usize, FxBuildHasher> = HashMap::with_capacity_and_hasher(initial, FxBuildHasher::default());
     let mut acc: Vec<i64> = Vec::with_capacity(initial);
     let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
     for i in 0..n {
         let row = unsafe { base.add(i * stride) };
-        // Read unaligned: the field address is byte-offset pointer arithmetic, so don't assume the
-        // type's alignment (free on x86; correct everywhere).
-        let ks = unsafe { (row.add(key_off) as *const AlignStr).read_unaligned() };
+        let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
         // `value_at` reads from the already-computed `row` (no re-deriving `base + i*stride`).
         let v = value_at(row);
-        // The key bytes borrow the source, which outlives this call — so the map can key on them.
-        let bytes: &[u8] = if ks.ptr.is_null() || ks.len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) } };
         match ids.get(bytes) {
             Some(&id) => acc[id] = combine(acc[id], v),
             None => {
                 let id = acc.len();
+                if id >= cap as usize {
+                    return -1;
+                }
                 ids.insert(bytes, id);
                 acc.push(v);
                 reprs.push(ks);
@@ -1880,9 +1933,6 @@ unsafe fn group_agg_str(
         }
     }
     let count = acc.len();
-    if count > cap as usize {
-        return -1;
-    }
     let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
     let out_vals = unsafe { std::slice::from_raw_parts_mut(out_vals, count) };
     out_keys.copy_from_slice(&reprs);
@@ -1938,50 +1988,7 @@ pub unsafe extern "C" fn align_rt_group_count_str(base: *const u8, n: i64, strid
 }
 
 /// A fast non-cryptographic hasher (FxHash-style: rotate-xor-multiply over 8-byte chunks) for the
-/// hot str-key group-by interning. The default `std` `HashMap` uses SipHash (DoS-resistant but ~2–3×
-/// slower per key); aggregation keys are program-internal, not adversarial, so a fast hash is the
-/// right trade — matching idiomatic fast Rust's `ahash`. Keyed on key *bytes*, so equal keys collide
-/// deterministically.
-#[derive(Default)]
-struct FxHasher {
-    hash: u64,
-}
 
-impl std::hash::Hasher for FxHasher {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-        let mut h = self.hash;
-        let mut b = bytes;
-        while b.len() >= 8 {
-            let chunk = u64::from_le_bytes(b[..8].try_into().unwrap());
-            h = (h.rotate_left(5) ^ chunk).wrapping_mul(K);
-            b = &b[8..];
-        }
-        if !b.is_empty() {
-            let mut buf = [0u8; 8];
-            buf[..b.len()].copy_from_slice(b);
-            h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(K);
-        }
-        self.hash = h;
-    }
-    #[inline]
-    fn finish(&self) -> u64 {
-        // Avalanche finalizer (murmur3 fmix64): the rotate-xor-multiply mixing leaves weak low bits,
-        // and `hashbrown`'s table derives both the bucket index and the control byte from the hash —
-        // without this, common-prefix keys (`key_000000`…) cluster into long probe chains (measured a
-        // >4× blow-up at high cardinality). The finalizer spreads entropy across all 64 bits.
-        let mut h = self.hash;
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        h ^= h >> 33;
-        h
-    }
-}
-
-type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
 
 /// One aggregate of a fused multi-aggregate str group-by ([`align_rt_group_multi_str`]). `op` is
 /// `0`=sum, `1`=min, `2`=max, `3`=count; `val_off` is the i64 value field's byte offset in the row
@@ -2043,7 +2050,7 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     // `ops`/`val_offs` have length `k`, so the unchecked index is in bounds — eliminating a bounds
     // check on every K-way per-row fold.
     let read = |row: *const u8, j: usize| -> i64 {
-        if unsafe { *ops.get_unchecked(j) } == 3 {
+        if unsafe { *ops.get_unchecked(j) } == OP_COUNT {
             1
         } else {
             unsafe { (row.add(*val_offs.get_unchecked(j)) as *const i64).read_unaligned() }
@@ -2052,16 +2059,15 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     // Fold value `v` into accumulator `cur` per aggregate `j`'s op (`j < k`, see `read`).
     let combine = |cur: i64, v: i64, j: usize| -> i64 {
         match unsafe { *ops.get_unchecked(j) } {
-            1 => cur.min(v),
-            2 => cur.max(v),
-            // sum (0) and count (3) both add (count's `v` is 1).
+            OP_MIN => cur.min(v),
+            OP_MAX => cur.max(v),
+            // sum (OP_SUM) and count (OP_COUNT) both add (count's `v` is 1).
             _ => cur.wrapping_add(v),
         }
     };
     for i in 0..n {
         let row = unsafe { base.add(i * stride) };
-        let ks = unsafe { (row.add(key_off) as *const AlignStr).read_unaligned() };
-        let bytes: &[u8] = if ks.ptr.is_null() || ks.len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) } };
+        let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
         match ids.get(bytes) {
             Some(&id) => {
                 // `id < reprs.len()` and `acc.len() == reprs.len() * k`, so `g + j < acc.len()`.
@@ -2134,12 +2140,11 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
     let (stride, key_off) = (stride as usize, key_off as usize);
     let out_ids = unsafe { std::slice::from_raw_parts_mut(out_ids, n) };
     let initial = n.min(cap as usize).min(1024);
-    let mut ids: HashMap<&[u8], i64> = HashMap::with_capacity(initial);
+    let mut ids: HashMap<&[u8], i64, FxBuildHasher> = HashMap::with_capacity_and_hasher(initial, FxBuildHasher::default());
     let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
     for i in 0..n {
         let row = unsafe { base.add(i * stride) };
-        let ks = unsafe { (row.add(key_off) as *const AlignStr).read_unaligned() };
-        let bytes: &[u8] = if ks.ptr.is_null() || ks.len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) } };
+        let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
         let id = match ids.get(bytes) {
             Some(&id) => id,
             None => {
@@ -2889,7 +2894,7 @@ impl<'a> JsonParser<'a> {
 /// Finish the builder, returning a `str` view over the (leaked) contents and freeing
 /// the builder object.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
+pub unsafe extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
     let b = unsafe { Box::from_raw(b) };
     let len = b.buf.len() as i64;
     if len == 0 {
@@ -2914,7 +2919,7 @@ pub extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
 /// finished string outlives the builder and any arena. An empty result owns no buffer (null
 /// ptr), so its `free(null)` drop is a harmless no-op.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_into_string(b: *mut Builder) -> AlignStr {
+pub unsafe extern "C" fn align_rt_builder_into_string(b: *mut Builder) -> AlignStr {
     let b = unsafe { Box::from_raw(b) };
     let len = b.buf.len() as i64;
     if len == 0 {
@@ -3374,14 +3379,14 @@ pub extern "C" fn align_rt_arena_begin() -> *mut Arena {
 
 /// Bump-allocate `size` bytes (with `align`) from the arena.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, align: i64) -> *mut u8 {
+pub unsafe extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, align: i64) -> *mut u8 {
     let arena = unsafe { &mut *arena };
     arena.alloc(size as usize, align as usize)
 }
 
 /// Bulk-release every allocation, keeping the arena for reuse.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_arena_reset(arena: *mut Arena) {
+pub unsafe extern "C" fn align_rt_arena_reset(arena: *mut Arena) {
     let arena = unsafe { &mut *arena };
     arena.chunks.clear();
     arena.off = 0;
@@ -3389,7 +3394,7 @@ pub extern "C" fn align_rt_arena_reset(arena: *mut Arena) {
 
 /// Release every allocation and the arena itself.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_arena_end(arena: *mut Arena) {
+pub unsafe extern "C" fn align_rt_arena_end(arena: *mut Arena) {
     drop(unsafe { Box::from_raw(arena) });
 }
 
@@ -3426,13 +3431,13 @@ pub extern "C" fn align_rt_tg_begin() -> *mut TaskGroup {
 
 /// Bump-allocate `size` bytes (with `align`) from the task group's region (envs + result slots).
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align: i64) -> *mut u8 {
+pub unsafe extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align: i64) -> *mut u8 {
     unsafe { &mut *tg }.arena.alloc(size as usize, align as usize)
 }
 
 /// Register a deferred task (its trampoline + closure pointer + env + result slot).
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_tg_register(
+pub unsafe extern "C" fn align_rt_tg_register(
     tg: *mut TaskGroup,
     tramp: extern "C" fn(*const u8, *mut u8, *mut u8, *mut u8) -> i32,
     thunk: *const u8,
@@ -3464,7 +3469,7 @@ unsafe impl Send for TgRun {}
 /// before this returns even if a later `spawn` panics — otherwise an unwinding panic would detach
 /// running threads and they would read the arena after `tg_end` frees it (a use-after-free).
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
+pub unsafe extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
     let tg = unsafe { &mut *tg };
     let tasks = std::mem::take(&mut tg.tasks);
     // The `err_slot` of the first task (in spawn order) that errored, or null if all succeeded.
@@ -3502,7 +3507,7 @@ pub extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
 
 /// Release the task group's region and the handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
+pub unsafe extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
     if !tg.is_null() {
         drop(unsafe { Box::from_raw(tg) });
     }
@@ -4281,7 +4286,7 @@ mod tests {
         // The hand-rolled itoa must equal `format!("{v}")` across the i64 range incl. edges.
         for v in [0i64, 7, -1, 42, -123, i64::MAX, i64::MIN, 1000000000000, -9999] {
             let mut b = Builder { buf: Vec::new(), arena: std::ptr::null_mut() };
-            align_rt_builder_write_int(&mut b, v);
+            unsafe { align_rt_builder_write_int(&mut b, v) };
             assert_eq!(String::from_utf8(b.buf).unwrap(), format!("{v}"), "write_int({v})");
         }
     }
@@ -4295,9 +4300,11 @@ mod tests {
             }
 
             let mut separate = Builder { buf: Vec::new(), arena: std::ptr::null_mut() };
-            unsafe { align_rt_builder_write(&mut separate, b"item-".as_ptr(), 5) };
-            align_rt_builder_write_int(&mut separate, v);
-            unsafe { align_rt_builder_write(&mut separate, b"-status ".as_ptr(), 8) };
+            unsafe {
+                align_rt_builder_write(&mut separate, b"item-".as_ptr(), 5);
+                align_rt_builder_write_int(&mut separate, v);
+                align_rt_builder_write(&mut separate, b"-status ".as_ptr(), 8);
+            }
 
             assert_eq!(batched.buf, separate.buf, "batched writes match separate writes for {v}");
         }
@@ -4369,14 +4376,14 @@ mod tests {
     fn arena_alloc_is_stable_across_chunks() {
         let a = align_rt_arena_begin();
         // Many allocations spanning multiple chunks; earlier pointers stay writable.
-        let first = align_rt_arena_alloc(a, 8, 8) as *mut i64;
+        let first = unsafe { align_rt_arena_alloc(a, 8, 8) } as *mut i64;
         unsafe { *first = 42 };
         for _ in 0..50_000 {
-            let p = align_rt_arena_alloc(a, 8, 8) as *mut i64;
+            let p = unsafe { align_rt_arena_alloc(a, 8, 8) } as *mut i64;
             unsafe { *p = 1 };
         }
         assert_eq!(unsafe { *first }, 42, "earlier allocation must remain valid");
-        align_rt_arena_end(a);
+        unsafe { align_rt_arena_end(a) };
     }
 
     #[test]
@@ -4427,7 +4434,7 @@ mod tests {
         };
         assert_eq!(read_i64(cols[1].0), 10);
         assert_eq!(read_i64(cols[1].0 + 8), 20);
-        align_rt_arena_end(arena);
+        unsafe { align_rt_arena_end(arena) };
     }
 
     #[test]
@@ -4461,7 +4468,7 @@ mod tests {
         );
         assert_eq!(out2.len, 0);
         assert!(out2.ptr.is_null());
-        align_rt_arena_end(arena);
+        unsafe { align_rt_arena_end(arena) };
     }
 
     #[test]

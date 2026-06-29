@@ -612,8 +612,8 @@ mod tests {
     fn float_and_char_literals() {
         // `1.5`, exponent, and a char with an escape; `p.x` keeps `.` as a separate token.
         assert_eq!(
-            kinds("3.14\n"),
-            vec![TokKind::Float(3.14), TokKind::End, TokKind::Eof]
+            kinds("3.15\n"),
+            vec![TokKind::Float(3.15), TokKind::End, TokKind::Eof]
         );
         assert_eq!(
             kinds("1e3\n"),
