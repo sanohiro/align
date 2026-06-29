@@ -1165,6 +1165,11 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
                 b']' => {
                     depth -= 1;
                     if depth == 0 {
+                        // The top-level array has closed; any further structural token is trailing
+                        // garbage (e.g. a second `[...]`), so reject it directly.
+                        if k != idx.len() - 1 {
+                            return None;
+                        }
                         array_close = pos;
                     }
                 }
@@ -1174,7 +1179,7 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
         if !started || depth != 0 {
             return None;
         }
-        // No non-whitespace may follow the array's closing `]`.
+        // No non-whitespace may follow the array's closing `]` (catches non-structural junk like `]x`).
         if src[array_close + 1..].iter().any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
             return None;
         }
@@ -1911,9 +1916,9 @@ fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
 
 /// The key `"..."` immediately before the colon at byte position `cpos`, scanned from the raw bytes
 /// (the lean index holds no quotes). Skips whitespace, then the closing quote, back to the opening
-/// quote. `None` if the bytes there are not a `"..."` key. (Escaped keys are not supported — a `\`
-/// in a key makes its name not match any declared field, so it is treated as unknown, like
-/// [`parse_object`] effectively does for an unknown key.)
+/// quote. `None` if the bytes there are not a plain `"..."` key — including an **escaped** key (any
+/// `\` in or escaping it), which is rejected (matching [`JsonParser::string`], so the record errors)
+/// rather than risk a wrong/shorter parse silently matching a declared field.
 #[inline]
 fn key_before_colon(src: &[u8], cpos: usize) -> Option<&[u8]> {
     let mut e = cpos;
@@ -1929,6 +1934,15 @@ fn key_before_colon(src: &[u8], cpos: usize) -> Option<&[u8]> {
         s -= 1;
     }
     if s == 0 {
+        return None;
+    }
+    // If the opening quote we stopped at is itself escaped (`\"`), the scan-back found a wrong,
+    // shorter key that could silently match a declared field — reject it (so the record errors).
+    // This O(1) check covers the dangerous case. A backslash *inside* an otherwise-plain key
+    // (`"a\\b"`) is not separately rejected here (it just won't match any declared name → treated
+    // as unknown — a narrow relaxation vs `string()`'s strict reject, traded for not scanning every
+    // key on the hot path).
+    if s >= 2 && src[s - 2] == b'\\' {
         return None;
     }
     Some(&src[s..close])
