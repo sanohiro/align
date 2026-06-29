@@ -545,6 +545,19 @@ nice-to-have. A2's honest niche is **sequential/interactive** reuse (aggregates 
 fusible into one pass), where reuse beats re-interning per query (the 2.4–3.5× a1/a2 gap). Still open
 (now reprioritized): **multiple aggregates in one pass (top priority)**, a `group_by(.key)` with a lambda
 key, AoS source for *i64* keys, and the `Scalar::DictEncoded` (return/wrap) follow-up. Design ↓.
+**Surface positioning — DECIDED 2026-06-29 (Codex overreach review).** `dict_encode` is an **advanced
+explicit escape-hatch**, NOT the way users learn `group_by`. The one-way user story stays
+`xs.group_by(.key).sum(.value)`. What is **decided** is the *positioning* (dict_encode = escape-hatch);
+the **intended** (not-yet-ratified) primary multi-aggregate surface is a fused
+`xs.group_by(.key).agg(sum(.revenue), max(.score), count())` (one pass, K result columns — the "multiple
+aggregates in one pass" lever above, given a user-facing form; the exact `.agg(...)` grammar is a
+proposal, not settled syntax). `dict_encode` then remains a lower-level
+reuse rail for the sequential/interactive niche, not a general dictionary/id-column API. Guardrails
+(Codex): keep first-class `group_by` narrow — columnar result `(array<K>, array<V>)` / small tuple of
+arrays, no exposed hash/table-strategy knobs, no arbitrary user aggregate lambdas; add multiple
+aggregates **before** arbitrary key/agg lambdas. `dict_encode` is **not** promoted in `draft.md` (the
+spec's group_by story is the clean `group_by(.key).sum(.value)`) — keep it that way; it stays an
+implementation-tracker rail until the `.agg(...)` surface lands.
 
 ### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
 The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped
@@ -824,6 +837,18 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         — a duplicate of a declared field at a position the learned pattern treats as unqueried is not
         re-detected on the speculative path (no test covers it; a dup at a *declared* position trips the
         colon-count gate → fallback → error).
+        **Duplicate-key semantics — DECIDED (SETTLED) 2026-06-29 (Codex overreach review).** The
+        `json.decode` field contract is **strict and exactly-once**: every declared field appears exactly
+        once; a missing *or duplicated* declared field is a `decode` `Err` (never a silent last-wins);
+        undeclared keys are skipped. This formalizes what the implementation already does on the fallback
+        path and is now written into the surface spec (`draft.md` §9 + `language-spec.md`). **Pre-freeze
+        gap to close:** the speculative path's narrow relaxation above (a duplicate of a declared field at
+        a position the learned pattern treats as *unqueried* is not re-detected) is now a known deviation
+        from the stated contract — it must be closed (or the contract re-decided) before JSON behavior is
+        frozen. Closing it costs a key-check on unqueried colons (partly against the projection win), so
+        it is its own slice, not bundled here. (Why strict, not serde-style last-wins: duplicate keys into
+        a fixed struct are a data error, and strict-reject matches Align's "nothing hidden / one error
+        model" — a malformed shape surfaces as a value, never a silent partial decode.)
         **Walk-optimization probe (2026-06-29) → NOT worth forcing.** Before pushing `proj` higher, a
         probe added each walk cost to the inline-positional floor and measured the delta (1M rows):
         `rec_cols` two-pass **+2 ms**, key-verify scan-back **+4 ms**, AoS materialize **+2 ms** — all

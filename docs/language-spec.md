@@ -212,8 +212,12 @@ is shorthand for a one-field lambda.
 
 `array<T>` is row-major (array-of-structs); `soa<T>` is the explicit column-major (struct-of-arrays)
 layout, so a field-wise pipeline streams only the columns it touches (the cache lever that beats an
-AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`) or decode straight into
-it (`s: soa<User> := json.decode(d)?`), both arena-allocated. See `draft.md` §9.
+AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`) or decode JSON into one
+(`s: soa<User> := json.decode(d)?` produces a column-major `soa<T>` result; the mechanism is currently
+decode-to-AoS-then-transpose), both arena-allocated. `json.decode`'s field contract is strict and
+exactly-once (a missing or duplicated declared field is an `Err`; undeclared keys are skipped) — the
+intended contract; the current decoder's speculative fast path has one known narrow deviation (a
+duplicate at an unqueried position), a pre-freeze gap tracked in `open-questions.md`. See `draft.md` §9.
 
 `xs[i]` reads a bounds-checked element. A half-open range `xs[start..end]` slices instead: a
 borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no

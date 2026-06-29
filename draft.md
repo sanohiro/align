@@ -779,12 +779,12 @@ predictable, while the field-wise lowering under the type is automatic. Crossing
 boundary (FFI, `json`, by-value) materializes to AoS explicitly. Use `array<T>` by default; reach
 for `soa<T>` on large, hot, field-wise-processed data.
 
-Build one with `.to_soa()` (transpose a row-major struct array) or decode JSON straight into it:
+Build one with `.to_soa()` (transpose a row-major struct array) or decode JSON into one:
 
 ```align
 arena {
   users := rows.to_soa()                       // rows: array<User> (AoS) → soa<User> (columns)
-  hot: soa<User> := json.decode(body)?         // decode straight into columns
+  hot: soa<User> := json.decode(body)?         // JSON → a column-major soa<User> result
   total := hot.where(.active).pay.sum()        // streams only the active + pay columns
 }
 ```
@@ -792,12 +792,22 @@ arena {
 The column buffer is arena-allocated (the `soa` view borrows it), so both forms live inside an
 `arena {}` — building once and then running several column scans amortizes the transpose. The JSON
 form is the analytics win: idiomatic Rust decodes to a `Vec<User>` (AoS) and deserializes every
-field, while Align lands the data column-major and a scan reads only the fields it touches.
+field, while Align produces a column-major `soa<User>` and a scan reads only the fields it touches.
+(The guarantee is the **result** — a `soa<T>` laid out column-major; the current mechanism decodes
+to AoS then transposes. Direct-into-columns decode is an optimization slice, not a surface promise.)
 
 `json.decode` only parses the fields you declare — any other key in the input is skipped
 structurally (no value conversion, no copy). To read just a few columns of a wide record, declare a
 struct with only those: `soa<{ active: bool, pay: i32 }>` over a JSON object with twenty keys parses
 two columns and skips the rest.
+
+The field contract is **strict and exactly-once**: every declared field must appear exactly once in
+the object — a missing declared field and a duplicate of a declared field are both `decode` errors
+(`Result` `Err`, not a silent last-wins). Undeclared keys are the only thing skipped. This is the one
+error model again: a malformed or unexpected shape surfaces as a value, never a silent partial decode.
+(This is the **intended contract**; the current decoder's speculative fast path has one known narrow
+deviation — a duplicate at an unqueried position may slip through — tracked as a pre-freeze gap in
+`open-questions.md`, to close before the JSON behavior is frozen.)
 
 Grouped aggregation reads as a column pipeline too:
 
