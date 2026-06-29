@@ -1865,6 +1865,134 @@ impl std::hash::Hasher for FxHasher {
 
 type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
 
+// ---------------------------------------------------------------------------
+// core.hash — wyhash (final v3), Align's one canonical non-cryptographic hash.
+//
+// Dependency-free, strong-avalanche, ~40 lines (vs an `ahash`/AES dependency or
+// FxHash's weaker mixing). This is THE non-crypto hash: the `hash64`/`hash128`
+// builtins call it, and over time the internal group_by / dict_encode / JSON-PHF
+// hashers converge here too. Fixed seed → deterministic within a build. NOT
+// cryptographic: not DoS-resistant, not a stable on-disk/wire format.
+// Reference (public domain): https://github.com/wangyi-fudan/wyhash
+// ---------------------------------------------------------------------------
+const WY_SECRET: [u64; 4] = [
+    0xa076_1d64_78bd_642f,
+    0xe703_7ed1_a0b4_28db,
+    0x8ebc_6af0_9c88_c6e3,
+    0x5899_65cc_7537_4cc3,
+];
+/// Fixed seed for the canonical hash — determinism within a build.
+const WY_SEED: u64 = 0;
+
+#[inline]
+fn wymum(a: u64, b: u64) -> (u64, u64) {
+    let r = (a as u128).wrapping_mul(b as u128);
+    (r as u64, (r >> 64) as u64)
+}
+#[inline]
+fn wymix(a: u64, b: u64) -> u64 {
+    let (lo, hi) = wymum(a, b);
+    lo ^ hi
+}
+#[inline]
+fn wyr8(p: &[u8]) -> u64 {
+    u64::from_le_bytes(p[..8].try_into().unwrap())
+}
+#[inline]
+fn wyr4(p: &[u8]) -> u64 {
+    u32::from_le_bytes(p[..4].try_into().unwrap()) as u64
+}
+/// Read 1..=3 trailing bytes into a 64-bit lane (wyhash `_wyr3`).
+#[inline]
+fn wyr3(p: &[u8], k: usize) -> u64 {
+    ((p[0] as u64) << 16) | ((p[k >> 1] as u64) << 8) | (p[k - 1] as u64)
+}
+
+/// wyhash final v3 over `key` with `seed`. Faithful port of the reference scalar path.
+fn wyhash(key: &[u8], seed: u64) -> u64 {
+    let len = key.len();
+    let mut seed = seed ^ wymix(seed ^ WY_SECRET[0], WY_SECRET[1]);
+    let (a, b);
+    if len <= 16 {
+        if len >= 4 {
+            let off = (len >> 3) << 2;
+            a = (wyr4(key) << 32) | wyr4(&key[off..]);
+            b = (wyr4(&key[len - 4..]) << 32) | wyr4(&key[len - 4 - off..]);
+        } else if len > 0 {
+            a = wyr3(key, len);
+            b = 0;
+        } else {
+            a = 0;
+            b = 0;
+        }
+    } else {
+        let mut i = len;
+        let mut p = 0usize;
+        if i > 48 {
+            let mut see1 = seed;
+            let mut see2 = seed;
+            while i > 48 {
+                seed = wymix(wyr8(&key[p..]) ^ WY_SECRET[1], wyr8(&key[p + 8..]) ^ seed);
+                see1 = wymix(wyr8(&key[p + 16..]) ^ WY_SECRET[2], wyr8(&key[p + 24..]) ^ see1);
+                see2 = wymix(wyr8(&key[p + 32..]) ^ WY_SECRET[3], wyr8(&key[p + 40..]) ^ see2);
+                p += 48;
+                i -= 48;
+            }
+            seed ^= see1 ^ see2;
+        }
+        while i > 16 {
+            seed = wymix(wyr8(&key[p..]) ^ WY_SECRET[1], wyr8(&key[p + 8..]) ^ seed);
+            i -= 16;
+            p += 16;
+        }
+        a = wyr8(&key[len - 16..]);
+        b = wyr8(&key[len - 8..]);
+    }
+    let (lo, hi) = wymum(a ^ WY_SECRET[1], b ^ seed);
+    wymix(lo ^ WY_SECRET[0] ^ (len as u64), hi ^ WY_SECRET[1])
+}
+
+/// `core.hash.hash64(data)` — 64-bit non-crypto hash of a byte view (`str` / `slice<u8>`).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call (`len == 0` ⇒ `ptr` unused).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_hash64(ptr: *const u8, len: i64) -> u64 {
+    let bytes: &[u8] = if len <= 0 || ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+    };
+    wyhash(bytes, WY_SEED)
+}
+
+/// 128-bit non-crypto hash result — two `u64` lanes (Align has no `u128`; this maps to the
+/// `(u64, u64)` tuple the `hash128` builtin returns). By-value `#[repr(C)]`, like [`AlignStr`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AlignHash128 {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+/// `core.hash.hash128(data)` — 128-bit non-crypto hash of a byte view. `lo` is the same value as
+/// [`align_rt_hash64`] (so `hash128(x).0 == hash64(x)`); `hi` is a decorrelated second wyhash pass
+/// seeded from `lo`.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call (`len == 0` ⇒ `ptr` unused).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_hash128(ptr: *const u8, len: i64) -> AlignHash128 {
+    let bytes: &[u8] = if len <= 0 || ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+    };
+    let lo = wyhash(bytes, WY_SEED);
+    let hi = wyhash(bytes, lo ^ WY_SECRET[2]);
+    AlignHash128 { lo, hi }
+}
+
 #[allow(dead_code)]
 const OP_SUM: i64 = 0;
 const OP_MIN: i64 = 1;
@@ -3544,6 +3672,34 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wyhash final v3 reference test vectors (default secret `_wyp`, the per-line seeds from the
+    /// upstream `test_vector` program). Matching these proves the port is byte-faithful.
+    #[test]
+    fn wyhash_matches_reference_vectors() {
+        assert_eq!(wyhash(b"", 0), 0x0409_638e_e2bd_e459);
+        assert_eq!(wyhash(b"a", 1), 0xa841_2d09_1b5f_e0a9);
+        assert_eq!(wyhash(b"abc", 2), 0x32dd_92e4_b291_5153);
+        assert_eq!(wyhash(b"message digest", 3), 0x8619_1240_89a3_a16b);
+        assert_eq!(wyhash(b"abcdefghijklmnopqrstuvwxyz", 4), 0x7a43_afb6_1d7f_5f40);
+    }
+
+    /// Boundary lengths around the 4/8/16/48-byte branch cuts must not panic and must differ.
+    #[test]
+    fn align_rt_hash64_boundaries_and_determinism() {
+        let mk = |n: usize| -> Vec<u8> { (0..n).map(|i| i as u8).collect() };
+        let mut seen = std::collections::HashSet::new();
+        for n in [0usize, 1, 3, 4, 7, 8, 15, 16, 17, 47, 48, 49, 96, 200] {
+            let v = mk(n);
+            let h = unsafe { align_rt_hash64(v.as_ptr(), v.len() as i64) };
+            // determinism: same bytes → same hash
+            assert_eq!(h, unsafe { align_rt_hash64(v.as_ptr(), v.len() as i64) });
+            assert!(seen.insert(h), "unexpected collision at len {n}");
+        }
+        // null / non-positive len is the empty hash, no UB.
+        assert_eq!(unsafe { align_rt_hash64(std::ptr::null(), 0) }, wyhash(b"", WY_SEED));
+        assert_eq!(unsafe { align_rt_hash64(std::ptr::null(), -5) }, wyhash(b"", WY_SEED));
+    }
 
     #[test]
     fn buffered_writer_accumulates_small_writes_without_flushing() {

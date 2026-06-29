@@ -4713,6 +4713,9 @@ impl<'a, 't> Checker<'a, 't> {
         if name == "print" {
             return self.check_print(args, span);
         }
+        if name == "hash64" || name == "hash128" {
+            return self.check_hash(&name, args, span);
+        }
         if name == "Some" {
             return self.check_some(args, expected, span);
         }
@@ -5002,6 +5005,48 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::Call { func: "print".to_string(), args: checked, type_args: Vec::new() },
             ty: Ty::Unit,
+            span,
+        }
+    }
+
+    /// `hash64(data)` / `hash128(data)` — the `core.hash` non-crypto hash over a byte view
+    /// (`str` / owned `string` / `slice<u8>`). `hash64` yields `u64`; `hash128` yields `(u64, u64)`.
+    /// An owned `string` is borrowed (not consumed), like `print` / `io.stdout.write`.
+    fn check_hash(&mut self, name: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'{name}' expects 1 argument, got {}", args.len()), span);
+            return err;
+        }
+        let mut arg = self.check_expr(&args[0], None);
+        let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
+        let ok = match self.resolve(arg.ty) {
+            Ty::Str => true,
+            Ty::String => {
+                let s = arg.span;
+                arg = Expr { kind: ExprKind::StrBorrow(Box::new(arg)), ty: Ty::Str, span: s };
+                true
+            }
+            Ty::Slice(el) => el == u8s,
+            _ => false,
+        };
+        if !ok {
+            if arg.ty != Ty::Error {
+                self.diags
+                    .error(format!("'{name}' expects a str, string, or slice<u8>, got {}", ty_name(arg.ty)), arg.span);
+            }
+            return err;
+        }
+        let u64s = Scalar::Int(IntTy { bits: 64, signed: false });
+        let ty = if name == "hash128" {
+            Ty::Tuple(intern_tuple(self.tuples, vec![u64s, u64s]))
+        } else {
+            Ty::Int(IntTy { bits: 64, signed: false })
+        };
+        Expr {
+            kind: ExprKind::Call { func: name.to_string(), args: vec![arg], type_args: Vec::new() },
+            ty,
             span,
         }
     }

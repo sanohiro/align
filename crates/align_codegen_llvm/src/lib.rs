@@ -647,6 +647,24 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `core.hash` — wyhash over a byte view `{ptr,len}`. `hash64` → u64; `hash128` → {u64,u64}
+    // returned by value (matching the `(u64,u64)` tuple struct, like `str_clone`'s `{ptr,len}`).
+    funcs.insert(
+        "hash64".to_string(),
+        module.add_function(
+            "align_rt_hash64",
+            i64t.fn_type(&[ptr.into(), i64t.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "hash128".to_string(),
+        module.add_function(
+            "align_rt_hash128",
+            ctx.struct_type(&[i64t.into(), i64t.into()], false).fn_type(&[ptr.into(), i64t.into()], false),
+            None,
+        ),
+    );
     // `core.string` trims → a borrowed sub-`str` `{ptr,len}` of the receiver (no allocation).
     for (key, sym) in [
         ("str_trim", "align_rt_str_trim"),
@@ -3025,6 +3043,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // `error(code)` is identity on the i32 code (the M2 Error repr).
             Rvalue::Call(name, args) if name == "error" => self.operand(&args[0]),
             Rvalue::Call(name, args) if name == "print" => return self.gen_print(args),
+            Rvalue::Call(name, args) if name == "hash64" || name == "hash128" => {
+                return self.gen_hash(name, args);
+            }
             Rvalue::Call(name, args) => {
                 let callee = self.funcs[name];
                 let argv: Vec<_> = args.iter().map(|o| self.operand(o).into()).collect();
@@ -3246,6 +3267,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// Builtin `print`: widen the integer argument to i64 and call the runtime.
+    /// `hash64(data)` / `hash128(data)` — split the byte view `{ptr,len}` and call the runtime.
+    /// `str`, `string`, and `slice<u8>` all lower to the same `{ptr, i64}` struct, so one path
+    /// serves every input type. `hash64` returns an i64; `hash128` returns a `{i64,i64}` tuple value.
+    fn gen_hash(&mut self, name: &str, args: &[Operand]) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        let agg = self.operand(&args[0]).into_struct_value();
+        let ptr = self.builder.build_extract_value(agg, 0, "hptr").map_err(|e| self.err(e))?;
+        let len = self.builder.build_extract_value(agg, 1, "hlen").map_err(|e| self.err(e))?;
+        let cs = self
+            .builder
+            .build_call(self.funcs[name], &[ptr.into(), len.into()], "hash")
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic())
+    }
+
     fn gen_print(&mut self, args: &[Operand]) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let arg = &args[0];
         let ty = self.f.operand_ty(arg);

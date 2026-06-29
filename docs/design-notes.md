@@ -472,6 +472,26 @@ direction, not a v1 commitment, and it must not distort the language into a GPU-
 
 ---
 
+## Why `core.hash` is one dependency-free mixer over bytes
+
+`core.hash` exposes a single canonical non-crypto hash (`wyhash`) over a byte view, not a generic
+`Hash` trait over arbitrary values. Three forces converge on that shape:
+
+- **One way.** A public `hash64` forces a decision the `group_by` perf work kept deferring — *which*
+  hash is Align's non-crypto hash (FxHash vs `ahash` vs hand-rolled AES). Picking one canonical mixer
+  and pointing every internal path (group_by, dict-encode, eventually the JSON PHF) at it is the
+  convergent answer; two "non-crypto hashes" would be the thing to avoid.
+- **Minimal-runtime identity over peak speed.** `ahash` (AES-NI) benched faster but adds a dependency
+  and a cross-arch fallback to a runtime whose whole identity is small/zero-dep/predictable. `wyhash`
+  is ~40 lines, dependency-free, strong-avalanche, and proven — the ideal fit. Speed that costs the
+  identity is the wrong trade here (it can still be revisited as a perf lever, isolated).
+- **No trait complexity.** Hashing arbitrary values needs a `Hash` derivation mechanism — a trait
+  system Align deliberately doesn't have. Hashing a *byte view* (`str`/`slice<u8>`) needs none: the
+  data-oriented core already hands you bytes. `hash128` returns a tuple, not a `u128`, for the same
+  reason group_by returns columns — the small, explicit, data-shaped value, no new scalar width.
+
+---
+
 ## In one sentence
 
 Align is a data-oriented language that aligns human intent, AI generation, compiler optimization, and modern hardware.

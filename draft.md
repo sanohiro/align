@@ -1345,14 +1345,17 @@ raw
 
 ### core.hash
 
-Hash for non-cryptographic use.
+Hash for non-cryptographic use. One canonical mixer (`wyhash`) over a **byte view** — `str` or
+`slice<u8>` (`bytes`). There is no `Hash` trait; you hash bytes, not arbitrary values.
 
 ```text
-hash64
-hash128
+hash64(data)  -> u64           // data: str | slice<u8>
+hash128(data) -> (u64, u64)    // 128-bit result as a tuple (no u128 type)
 ```
 
-Cryptographic hashes are in std.crypto.
+Deterministic for a given input within a build (fixed seed). **Non-cryptographic**: not
+DoS-resistant, not a stable on-disk/wire format, not for security. Cryptographic hashes are in
+std.crypto.
 
 ---
 

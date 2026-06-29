@@ -1,0 +1,22 @@
+// core.hash — wyhash, Align's one canonical non-cryptographic hash.
+// `hash64(data)` hashes a byte view (str / string / slice<u8>) to a u64;
+// `hash128(data)` returns a (u64, u64). Deterministic within a build; NOT
+// cryptographic (not DoS-resistant, not a stable on-disk format).
+fn main() -> i32 {
+  h := hash64("align")
+
+  // hash128's first lane is exactly hash64 of the same bytes.
+  pair := hash128("align")
+  same := pair.0 == h
+
+  // Determinism: the same bytes hash to the same value every time.
+  det := hash64("align") == hash64("align")
+
+  // Distinct inputs hash to distinct values (with overwhelming probability).
+  distinct := hash64("align") != hash64("rust")
+
+  if same && det && distinct {
+    return 0
+  }
+  return 1
+}

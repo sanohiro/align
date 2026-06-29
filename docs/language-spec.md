@@ -346,6 +346,10 @@ core.math
 core.arena
 ```
 
+`core.hash`: one canonical non-crypto mixer (`wyhash`) over a byte view — `hash64(str|slice<u8>) ->
+u64`, `hash128(...) -> (u64, u64)`. No `Hash` trait; deterministic within a build; not crypto/DoS-
+resistant (crypto → `std.crypto`). `core.bitset` is the M6 SIMD layer (`vec`/`mask`), not built yet.
+
 ## Standard library
 
 ```text
