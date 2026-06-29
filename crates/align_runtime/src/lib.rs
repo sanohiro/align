@@ -1714,6 +1714,32 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
     count as i64
 }
 
+/// Label a column of dictionary ids back to `str` views — the A2 result step. `ids[i]` (a dense id
+/// from [`align_rt_dict_encode_str`]) is mapped to `out[i] = dict[ids[i]]`. After a dense-id
+/// `group_by` on the encoded id column produces `(distinct_ids, aggregates)`, this turns the distinct
+/// ids back into the `(array<str>, …)` result keys. An id out of `dict_len` range yields an empty
+/// `str` (defensive; shouldn't happen for ids produced by `dict_encode`).
+///
+/// # Safety
+/// `ids` valid for `n` `i64`s; `dict` for `dict_len` `AlignStr`s; `out` for `n` `AlignStr` writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_dict_lookup(ids: *const i64, n: i64, dict: *const AlignStr, dict_len: i64, out: *mut AlignStr) {
+    if n <= 0 || ids.is_null() || out.is_null() {
+        return;
+    }
+    // `usize::try_from` (not `as usize`) so an out-of-range id can't truncate into a false in-bounds
+    // hit (Align is 64-bit, but a public C-ABI entry shouldn't depend on that).
+    let Ok(n) = usize::try_from(n) else { return };
+    let ids = unsafe { std::slice::from_raw_parts(ids, n) };
+    let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
+    let dict_len = usize::try_from(dict_len).unwrap_or(0);
+    let dict: &[AlignStr] = if dict_len == 0 || dict.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(dict, dict_len) } };
+    let empty = AlignStr { ptr: core::ptr::NonNull::dangling().as_ptr(), len: 0 };
+    for i in 0..n {
+        out[i] = usize::try_from(ids[i]).ok().and_then(|id| dict.get(id).copied()).unwrap_or(empty);
+    }
+}
+
 /// Find the first `"` or `\` in `hay` (the two bytes that bound or interrupt a JSON string body),
 /// returning its index, or `None` if neither occurs.
 ///
@@ -3219,6 +3245,57 @@ mod tests {
         // Empty / null inputs encode nothing.
         assert_eq!(unsafe { align_rt_dict_encode_str(rows.as_ptr() as *const u8, 0, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 0) }, 0);
         assert_eq!(unsafe { align_rt_dict_encode_str(std::ptr::null(), 6, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 6) }, 0);
+    }
+
+    #[test]
+    fn a2_dict_encode_then_id_groupby_then_label_matches_string_groupby() {
+        // The A2 reuse composition — dict_encode → dense-id group_by on the ids → dict_lookup label —
+        // must produce the SAME (key → sum) as the one-shot A1 string-key group_by on the same data.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Row {
+            key: AlignStr,
+            val: i64,
+        }
+        let s = |b: &'static [u8]| AlignStr { ptr: b.as_ptr(), len: b.len() as i64 };
+        let rows = [
+            Row { key: s(b"a"), val: 1 },
+            Row { key: s(b"b"), val: 2 },
+            Row { key: s(b"a"), val: 3 },
+            Row { key: s(b"c"), val: 4 },
+            Row { key: s(b"b"), val: 5 },
+            Row { key: s(b"a"), val: 6 },
+        ];
+        let n = rows.len() as i64;
+        let stride = std::mem::size_of::<Row>() as i64;
+        let key_off = std::mem::offset_of!(Row, key) as i64;
+        let val_off = std::mem::offset_of!(Row, val) as i64;
+        let to_map = |keys: &[AlignStr], vals: &[i64]| -> std::collections::HashMap<Vec<u8>, i64> {
+            keys.iter().zip(vals).map(|(k, &v)| (unsafe { std::slice::from_raw_parts(k.ptr, k.len as usize) }.to_vec(), v)).collect()
+        };
+
+        // A1 reference: one-shot string-key group sum.
+        let (mut a1k, mut a1v) = (vec![AlignStr { ptr: std::ptr::null(), len: 0 }; 6], vec![0i64; 6]);
+        let a1n = unsafe { align_rt_group_sum_str(rows.as_ptr() as *const u8, n, stride, key_off, val_off, a1k.as_mut_ptr(), a1v.as_mut_ptr(), n) } as usize;
+        let a1 = to_map(&a1k[..a1n], &a1v[..a1n]);
+
+        // A2: encode once → ids + dict.
+        let mut ids = vec![0i64; 6];
+        let mut dict = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; 6];
+        let dlen = unsafe { align_rt_dict_encode_str(rows.as_ptr() as *const u8, n, stride, key_off, ids.as_mut_ptr(), dict.as_mut_ptr(), n) };
+        assert!(dlen > 0);
+        // Project the value column (the encoded group_by reads values from the source struct array).
+        let vals: Vec<i64> = rows.iter().map(|r| r.val).collect();
+        // Reuse the dense-id i64 group_by on the (dense) ids.
+        let (mut gk, mut gv) = (vec![0i64; 6], vec![0i64; 6]);
+        let gn = unsafe { align_rt_group_sum_i64(ids.as_ptr(), vals.as_ptr(), n, gk.as_mut_ptr(), gv.as_mut_ptr(), n) } as usize;
+        // Label the distinct ids back to str keys via the dictionary.
+        let mut labels = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; gn];
+        unsafe { align_rt_dict_lookup(gk.as_ptr(), gn as i64, dict.as_ptr(), dlen, labels.as_mut_ptr()) };
+        let a2 = to_map(&labels, &gv[..gn]);
+
+        assert_eq!(a2, a1, "A2 (encode → id group_by → label) must equal A1 (string group_by)");
+        assert_eq!(a2, std::collections::HashMap::from([(b"a".to_vec(), 10), (b"b".to_vec(), 7), (b"c".to_vec(), 4)]));
     }
 
     #[test]
