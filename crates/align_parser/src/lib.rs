@@ -706,8 +706,7 @@ impl<'a> Parser<'a> {
                 // `recv.0` — positional tuple access.
                 self.bump(); // '.'
                 let ispan = self.span();
-                let TokKind::Int(v) = self.peek().clone() else { unreachable!() };
-                self.bump();
+                let TokKind::Int(v) = self.bump().kind else { unreachable!() };
                 let index = u32::try_from(v).unwrap_or(u32::MAX);
                 let span = e.span.merge(ispan);
                 e = Expr { kind: ExprKind::TupleIndex { recv: Box::new(e), index }, span };
@@ -745,8 +744,9 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Option<Expr> {
         let span = self.span();
-        match self.peek().clone() {
+        match self.peek() {
             TokKind::Int(v) => {
+                let v = *v;
                 self.bump();
                 Some(Expr {
                     kind: ExprKind::Int(v),
@@ -754,6 +754,7 @@ impl<'a> Parser<'a> {
                 })
             }
             TokKind::Float(v) => {
+                let v = *v;
                 self.bump();
                 Some(Expr {
                     kind: ExprKind::Float(v),
@@ -761,14 +762,16 @@ impl<'a> Parser<'a> {
                 })
             }
             TokKind::Char(v) => {
+                let v = *v;
                 self.bump();
                 Some(Expr {
                     kind: ExprKind::Char(v),
                     span,
                 })
             }
-            TokKind::Str(s) => {
-                self.bump();
+            TokKind::Str(_) => {
+                let token = self.bump();
+                let TokKind::Str(s) = token.kind else { unreachable!() };
                 Some(Expr {
                     kind: ExprKind::Str(s),
                     span,
@@ -815,11 +818,13 @@ impl<'a> Parser<'a> {
             TokKind::Template => {
                 self.bump();
                 let str_span = self.span();
-                let TokKind::Str(content) = self.peek().clone() else {
+                let content = if let TokKind::Str(_) = self.peek() {
+                    let TokKind::Str(c) = self.bump().kind else { unreachable!() };
+                    c
+                } else {
                     self.diags.error("expected a string literal after `template`", str_span);
                     return None;
                 };
-                self.bump();
                 let parts = split_template(&content)
                     .into_iter()
                     .map(|rp| match rp {
@@ -1169,8 +1174,8 @@ impl<'a> Parser<'a> {
 
     fn parse_ident(&mut self, what: &str) -> Option<Ident> {
         let span = self.span();
-        if let TokKind::Ident(name) = self.peek().clone() {
-            self.bump();
+        if let TokKind::Ident(_) = self.peek() {
+            let TokKind::Ident(name) = self.bump().kind else { unreachable!() };
             Some(Ident { name, span })
         } else {
             self.diags.error(format!("expected {what}"), span);
