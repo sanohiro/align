@@ -479,11 +479,25 @@ are not). New machinery: `ArrayGroupAgg.key_str`, MIR `GroupAggStr` (codegen der
 key/value byte offsets from the struct layout via `target_data`), `PrimScalar::Str` (so `array<str>` is a
 payload/tuple element). Source = AoS, `str` key + `i64` value, **`sum`/`min`/`max`/`count`** (the runtime
 `group_agg_str` is generic over `value_at`/`combine`, monomorphized per op into
-`align_rt_group_{sum,min,max,count}_str`; `count` reads no value column). The *exposed*
-dictionary-encode / id-column reuse rail (the ~19–21× multi-aggregation reuse) stays deferred — it needs
-a new id-column/dictionary data model (a separate, bigger surface), whereas the hidden form is the ideal
-single-`group_by` shape. Still open: multiple aggregates in one pass → more result columns, a
-`group_by(.key)` with a lambda key, AoS source for *i64* keys. Design ↓.
+`align_rt_group_{sum,min,max,count}_str`; `count` reads no value column).
+
+**A2 — the dictionary reuse rail (the ~19–21× multi-aggregation reuse) — DESIGN + foundation 2026-06-29.**
+Chosen surface form (user 2026-06-29): the **encoded-column** form (keeps One-Way), *not* an exposed
+id-column. `e := s.dict_encode(.name)` is an explicit one-time transform (visible cost) that interns the
+`.name` `str` column to a **dense id column** + a **dictionary** (`array<str>`, `dict[id] = str`),
+carried on the result; then `e.group_by(.name).sum(.v)` / `.max(.w)` / … reuse the *same surface as A1*
+but run on the **i64 id column** (the dense-id `align_rt_group_*_i64` from #209) and re-label results
+through the dictionary → still `(array<str>, array<Acc>)`. The win: the string interning is paid **once**
+(in `dict_encode`), so repeated group-bys on the same key are integer-column work (~19–21× vs
+re-interning per group-by, the A1 cost). Region: the dictionary's `str` views borrow the source, so the
+encoded value is region-tied to it. **Slices:** (1) **DONE** — the runtime primitive
+`align_rt_dict_encode_str` (intern a strided `str` column → `out_ids[n]` dense-id column +
+`out_dict[count]` dictionary; first-occurrence id order; tested). (2) the `dict_encode` surface + the
+encoded-column data model (sema/MIR/codegen — the load-bearing bit: a soa/array column that carries
+`(id i64 column, dictionary array<str>)`). (3) `group_by(.name)` on an encoded column (detect → id
+aggregate → dict-label). (4) bench (multi-aggregation reuse vs A1 / vs `HashMap<&str,_>×N`). Still open:
+multiple aggregates in one pass → more result columns, a `group_by(.key)` with a lambda key, AoS source
+for *i64* keys. Design ↓.
 
 ### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
 The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped

@@ -1660,6 +1660,60 @@ pub unsafe extern "C" fn align_rt_group_count_str(base: *const u8, n: i64, strid
     unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
+/// **Dictionary-encode** a strided `str` column over an AoS `array<Struct>` — the A2 reuse rail.
+/// Assigns each distinct key a **dense id** in first-occurrence order: `out_ids[i]` = the id of row
+/// `i`, and `out_dict[id]` = that id's representative `str` view (borrowing the source). Returns the
+/// dictionary size (distinct count), or -1 if it exceeds `cap` (the `out_dict` capacity). The id
+/// column can then be aggregated by the dense-id `align_rt_group_*_i64` **repeatedly**, with results
+/// labeled back to strings via `out_dict` — so the string interning is paid **once** and reused
+/// across many group-bys (vs re-interning per group-by, the A1 cost). The empty / null input encodes
+/// nothing (returns 0).
+///
+/// # Safety
+/// `base` points to `n` `stride`-byte rows, each with a valid `AlignStr` at `key_off`. `out_ids` must
+/// be valid for `n` `i64` writes; `out_dict` for `cap` `AlignStr` writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, stride: i64, key_off: i64, out_ids: *mut i64, out_dict: *mut AlignStr, cap: i64) -> i64 {
+    use std::collections::HashMap;
+    if n <= 0 || base.is_null() {
+        return 0;
+    }
+    // Fail fast on invalid output up front — before any O(n) work or partial mutation of `out_ids`.
+    if out_ids.is_null() || out_dict.is_null() || cap < 0 {
+        return -1;
+    }
+    let n = n as usize;
+    let (stride, key_off) = (stride as usize, key_off as usize);
+    let out_ids = unsafe { std::slice::from_raw_parts_mut(out_ids, n) };
+    let initial = n.min(cap as usize).min(1024);
+    let mut ids: HashMap<&[u8], i64> = HashMap::with_capacity(initial);
+    let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
+    for i in 0..n {
+        let row = unsafe { base.add(i * stride) };
+        let ks = unsafe { (row.add(key_off) as *const AlignStr).read_unaligned() };
+        let bytes: &[u8] = if ks.ptr.is_null() || ks.len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) } };
+        let id = match ids.get(bytes) {
+            Some(&id) => id,
+            None => {
+                let id = reprs.len() as i64;
+                // The dictionary would exceed `out_dict`'s capacity — abort early (don't grow the
+                // table for a result we can't return).
+                if id >= cap {
+                    return -1;
+                }
+                ids.insert(bytes, id);
+                reprs.push(ks);
+                id
+            }
+        };
+        out_ids[i] = id;
+    }
+    let count = reprs.len(); // <= cap (the loop aborts past it) and out_dict is non-null (checked up front)
+    let out_dict = unsafe { std::slice::from_raw_parts_mut(out_dict, count) };
+    out_dict.copy_from_slice(&reprs);
+    count as i64
+}
+
 /// Find the first `"` or `\` in `hay` (the two bytes that bound or interrupt a JSON string body),
 /// returning its index, or `None` if neither occurs.
 ///
@@ -3312,6 +3366,40 @@ mod tests {
                 check(&s);
             }
         }
+    }
+
+    #[test]
+    fn dict_encode_str_assigns_dense_ids_and_builds_the_dictionary() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Row {
+            key: AlignStr,
+        }
+        let s = |b: &'static [u8]| AlignStr { ptr: b.as_ptr(), len: b.len() as i64 };
+        // keys: a b a c b a → first-occurrence ids a=0, b=1, c=2; id column = [0,1,0,2,1,0].
+        let rows = [Row { key: s(b"a") }, Row { key: s(b"b") }, Row { key: s(b"a") }, Row { key: s(b"c") }, Row { key: s(b"b") }, Row { key: s(b"a") }];
+        let stride = std::mem::size_of::<Row>() as i64;
+        let key_off = std::mem::offset_of!(Row, key) as i64;
+        let mut out_ids = vec![0i64; rows.len()];
+        let mut out_dict = vec![AlignStr { ptr: std::ptr::null(), len: 0 }; rows.len()];
+        let count = unsafe {
+            align_rt_dict_encode_str(rows.as_ptr() as *const u8, rows.len() as i64, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), rows.len() as i64)
+        };
+        assert_eq!(count, 3, "three distinct keys");
+        assert_eq!(out_ids, vec![0, 1, 0, 2, 1, 0], "dense ids in first-occurrence order");
+        // The dictionary maps each id to its representative bytes.
+        let dict: Vec<&[u8]> = (0..count as usize).map(|i| unsafe { std::slice::from_raw_parts(out_dict[i].ptr, out_dict[i].len as usize) }).collect();
+        assert_eq!(dict, vec![&b"a"[..], &b"b"[..], &b"c"[..]]);
+
+        // The id column re-labels through the dict back to the original keys (the reuse contract).
+        for (i, r) in rows.iter().enumerate() {
+            let orig = unsafe { std::slice::from_raw_parts(r.key.ptr, r.key.len as usize) };
+            assert_eq!(dict[out_ids[i] as usize], orig, "row {i} round-trips via the dictionary");
+        }
+
+        // Empty / null inputs encode nothing.
+        assert_eq!(unsafe { align_rt_dict_encode_str(rows.as_ptr() as *const u8, 0, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 0) }, 0);
+        assert_eq!(unsafe { align_rt_dict_encode_str(std::ptr::null(), 6, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 6) }, 0);
     }
 
     #[test]
