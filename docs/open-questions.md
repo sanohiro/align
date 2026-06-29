@@ -752,9 +752,9 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         baseline-binary-safe) and a `bench/json_decode/` harness (PR #212; recursive-descent baseline
         ≈ ties `serde_json`: full ≈1.03×, proj ≈1.09×). A `work/json_simd_probe` validated the
         **mechanism**: a SIMD structural index + a *projecting* two-stage decode beats `serde_json`
-        **3.4–4.1×** (≈3.2–3.9× materialising into soa columns), correctness-checked. **But two
+        **3.4–4.1×** (≈3.2–3.9× materializing into soa columns), correctness-checked. **But two
         integration attempts into `align_rt_json_decode_struct_array` both REGRESSED** (0.67–0.93×):
-        a probe diagnostic (all building the SIMD index + materialising + projecting `active`+`pay`)
+        a probe diagnostic (all building the SIMD index + materializing + projecting `active`+`pay`)
         isolated why — **positional + soa-columns = 3.6×, positional + AoS-struct = 3.3×, but
         name-match (`find_field`) + columns = 2.4×**, and the *general* decoder (perfect-hash
         `find_field` paid even for unknown fields + `SeenSet` + AoS `buf.resize`-zero per element +
@@ -768,7 +768,7 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         Lemire, arXiv 1902.08318) and *Pison* (VLDB 2021, `vol14/p694-zhao.pdf`, leveled colon/comma
         index construction). **To actually win, the decode needs the full Mison stack, not a
         drop-in:** (1) **speculation/positional** field access (skip perfect-hash `find_field`),
-        (2) **two-pass exact materialisation** (count elements from the index, allocate the exact
+        (2) **two-pass exact materialization** (count elements from the index, allocate the exact
         output once, fill it directly — kills the Vec-grow + per-element zero + final copy), and
         ideally (3) **column (soa) output** (Align's selling point; the diagnostic's fastest path).
         A large, careful, benchmark-driven effort with real residual uncertainty — **deferred as a
