@@ -215,8 +215,9 @@ layout, so a field-wise pipeline streams only the columns it touches (the cache 
 AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`) or decode JSON into one
 (`s: soa<User> := json.decode(d)?` produces a column-major `soa<T>` result; the mechanism is currently
 decode-to-AoS-then-transpose), both arena-allocated. `json.decode`'s field contract is strict and
-exactly-once (a missing or duplicated declared field is an `Err`; undeclared keys are skipped). See
-`draft.md` §9.
+exactly-once (a missing or duplicated declared field is an `Err`; undeclared keys are skipped) — the
+intended contract; the current decoder's speculative fast path has one known narrow deviation (a
+duplicate at an unqueried position), a pre-freeze gap tracked in `open-questions.md`. See `draft.md` §9.
 
 `xs[i]` reads a bounds-checked element. A half-open range `xs[start..end]` slices instead: a
 borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no

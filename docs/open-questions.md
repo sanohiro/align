@@ -547,9 +547,11 @@ fusible into one pass), where reuse beats re-interning per query (the 2.4–3.5�
 key, AoS source for *i64* keys, and the `Scalar::DictEncoded` (return/wrap) follow-up. Design ↓.
 **Surface positioning — DECIDED 2026-06-29 (Codex overreach review).** `dict_encode` is an **advanced
 explicit escape-hatch**, NOT the way users learn `group_by`. The one-way user story stays
-`xs.group_by(.key).sum(.value)`, and the **primary** multi-aggregate surface is a fused
+`xs.group_by(.key).sum(.value)`. What is **decided** is the *positioning* (dict_encode = escape-hatch);
+the **intended** (not-yet-ratified) primary multi-aggregate surface is a fused
 `xs.group_by(.key).agg(sum(.revenue), max(.score), count())` (one pass, K result columns — the "multiple
-aggregates in one pass" lever above, given a user-facing form). `dict_encode` then remains a lower-level
+aggregates in one pass" lever above, given a user-facing form; the exact `.agg(...)` grammar is a
+proposal, not settled syntax). `dict_encode` then remains a lower-level
 reuse rail for the sequential/interactive niche, not a general dictionary/id-column API. Guardrails
 (Codex): keep first-class `group_by` narrow — columnar result `(array<K>, array<V>)` / small tuple of
 arrays, no exposed hash/table-strategy knobs, no arbitrary user aggregate lambdas; add multiple

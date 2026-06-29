@@ -369,6 +369,13 @@ ambiguity that pushed Go to `f[T](x)` and Rust to `::<>`. When context supplies 
 type, that is a hard error asking for an annotation, never a silently-defaulted type.
 (Settled 2026-06-22; see `open-questions.md`.)
 
+Decode is **strict and exactly-once**: every declared field must appear once; a missing *or duplicated*
+declared field is an `Err`, never a serde-style silent last-wins (undeclared keys are the only thing
+skipped). The reason is the one error model: decoding into a fixed struct, a duplicate key is a data
+error, and surfacing it as a value beats a silent partial decode — "nothing hidden". This is the
+intended contract; the current decoder's speculative fast-path has one known narrow deviation, tracked
+as a pre-freeze gap in `open-questions.md`. (Settled 2026-06-29.)
+
 ---
 
 ## The safety stance
