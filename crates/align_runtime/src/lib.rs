@@ -1727,14 +1727,16 @@ pub unsafe extern "C" fn align_rt_dict_lookup(ids: *const i64, n: i64, dict: *co
     if n <= 0 || ids.is_null() || out.is_null() {
         return;
     }
-    let n = n as usize;
+    // `usize::try_from` (not `as usize`) so an out-of-range id can't truncate into a false in-bounds
+    // hit (Align is 64-bit, but a public C-ABI entry shouldn't depend on that).
+    let Ok(n) = usize::try_from(n) else { return };
     let ids = unsafe { std::slice::from_raw_parts(ids, n) };
     let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
-    let dict: &[AlignStr] = if dict_len <= 0 || dict.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(dict, dict_len as usize) } };
+    let dict_len = usize::try_from(dict_len).unwrap_or(0);
+    let dict: &[AlignStr] = if dict_len == 0 || dict.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(dict, dict_len) } };
     let empty = AlignStr { ptr: core::ptr::NonNull::dangling().as_ptr(), len: 0 };
     for i in 0..n {
-        let id = ids[i];
-        out[i] = if id >= 0 && (id as usize) < dict.len() { dict[id as usize] } else { empty };
+        out[i] = usize::try_from(ids[i]).ok().and_then(|id| dict.get(id).copied()).unwrap_or(empty);
     }
 }
 
