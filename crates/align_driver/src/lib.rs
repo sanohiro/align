@@ -187,8 +187,8 @@ fn ensure_archive_fresh(archive: &std::path::Path) -> Result<(), String> {
     let Ok(archive_mtime) = archive.metadata().and_then(|m| m.modified()) else {
         return Ok(()); // cannot stat the archive: do not block the build
     };
-    if let Some(newest) = newest_rs_mtime(src) {
-        if newest > archive_mtime {
+    if let Some(newest) = newest_rs_mtime(src)
+        && newest > archive_mtime {
             return Err(format!(
                 "libalign_runtime.a is stale: a source file under {} is newer than the archive \
                  {}.\nThe driver has no cargo edge to the runtime staticlib, so run `cargo build` \
@@ -197,7 +197,6 @@ fn ensure_archive_fresh(archive: &std::path::Path) -> Result<(), String> {
                 archive.display(),
             ));
         }
-    }
     Ok(())
 }
 
@@ -218,11 +217,10 @@ fn newest_rs_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
             let Ok(ft) = entry.file_type() else { continue };
             if ft.is_dir() {
                 stack.push(entry.path());
-            } else if ft.is_file() && entry.path().extension().is_some_and(|x| x == "rs") {
-                if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
+            } else if ft.is_file() && entry.path().extension().is_some_and(|x| x == "rs")
+                && let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
                     newest = Some(newest.map_or(t, |n| n.max(t)));
                 }
-            }
         }
     }
     newest

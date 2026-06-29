@@ -380,10 +380,32 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some(_) => {
-                    let rest = std::str::from_utf8(&self.src[self.pos..]).unwrap_or("\u{FFFD}");
-                    let c = rest.chars().next().unwrap_or('\u{FFFD}');
-                    self.pos += c.len_utf8();
-                    s.push(c);
+                    let first_byte = self.src[self.pos];
+                    let char_len = if first_byte & 0x80 == 0 {
+                        1
+                    } else if first_byte & 0xE0 == 0xC0 {
+                        2
+                    } else if first_byte & 0xF0 == 0xE0 {
+                        3
+                    } else if first_byte & 0xF8 == 0xF0 {
+                        4
+                    } else {
+                        1
+                    };
+                    let max_len = char_len.min(self.src.len() - self.pos);
+                    // On an invalid byte sequence advance by exactly 1 byte (not
+                    // `'\u{FFFD}'.len_utf8() == 3`, which would over-consume good bytes).
+                    match std::str::from_utf8(&self.src[self.pos..self.pos + max_len]) {
+                        Ok(valid) => {
+                            let c = valid.chars().next().unwrap_or('\u{FFFD}');
+                            self.pos += c.len_utf8();
+                            s.push(c);
+                        }
+                        Err(_) => {
+                            self.pos += 1;
+                            s.push('\u{FFFD}');
+                        }
+                    }
                 }
             }
         }
@@ -416,10 +438,32 @@ impl<'a> Lexer<'a> {
             }
             Some(_) => {
                 // Decode one UTF-8 scalar from the remaining bytes.
-                let rest = std::str::from_utf8(&self.src[self.pos..]).unwrap_or("\u{FFFD}");
-                let c = rest.chars().next().unwrap_or('\u{FFFD}');
-                self.pos += c.len_utf8();
-                c
+                let first_byte = self.src[self.pos];
+                let char_len = if first_byte & 0x80 == 0 {
+                    1
+                } else if first_byte & 0xE0 == 0xC0 {
+                    2
+                } else if first_byte & 0xF0 == 0xE0 {
+                    3
+                } else if first_byte & 0xF8 == 0xF0 {
+                    4
+                } else {
+                    1
+                };
+                let max_len = char_len.min(self.src.len() - self.pos);
+                // On an invalid byte sequence advance by exactly 1 byte (not
+                // `'\u{FFFD}'.len_utf8() == 3`, which would over-consume good bytes).
+                match std::str::from_utf8(&self.src[self.pos..self.pos + max_len]) {
+                    Ok(valid) => {
+                        let c = valid.chars().next().unwrap_or('\u{FFFD}');
+                        self.pos += c.len_utf8();
+                        c
+                    }
+                    Err(_) => {
+                        self.pos += 1;
+                        '\u{FFFD}'
+                    }
+                }
             }
             None => {
                 diags.error("unterminated character literal".to_string(), self.span(start, self.pos));
@@ -612,8 +656,8 @@ mod tests {
     fn float_and_char_literals() {
         // `1.5`, exponent, and a char with an escape; `p.x` keeps `.` as a separate token.
         assert_eq!(
-            kinds("3.14\n"),
-            vec![TokKind::Float(3.14), TokKind::End, TokKind::Eof]
+            kinds("3.15\n"),
+            vec![TokKind::Float(3.15), TokKind::End, TokKind::Eof]
         );
         assert_eq!(
             kinds("1e3\n"),

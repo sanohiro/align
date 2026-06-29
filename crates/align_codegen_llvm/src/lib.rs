@@ -700,7 +700,7 @@ fn build_module<'c>(
             .ok_or_else(|| CodegenError::Lowering(format!("unknown function {name}")))?;
         let orig_ty = orig.get_type();
         let mut params: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
-        params.extend(orig_ty.get_param_types().iter().map(|t| BasicMetadataTypeEnum::from(*t)));
+        params.extend(orig_ty.get_param_types().iter().copied());
         let thunk_ty = match orig_ty.get_return_type() {
             Some(rt) => rt.fn_type(&params, false),
             None => ctx.void_type().fn_type(&params, false),
@@ -748,7 +748,7 @@ fn build_module<'c>(
             ))
         })?;
         let mut tparams: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
-        tparams.extend(all_params[..n_explicit].iter().map(|t| BasicMetadataTypeEnum::from(*t)));
+        tparams.extend(all_params[..n_explicit].iter().copied());
         let thunk_ty = match orig_ty.get_return_type() {
             Some(rt) => rt.fn_type(&tparams, false),
             None => ctx.void_type().fn_type(&tparams, false),

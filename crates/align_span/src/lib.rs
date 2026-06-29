@@ -42,8 +42,13 @@ impl SourceFile {
         let off = (offset as usize).min(self.src.len());
         let mut line = 1u32;
         let mut col = 1u32;
-        for &b in &self.src.as_bytes()[..off] {
-            if b == b'\n' {
+        let mut byte_idx = 0usize;
+        for c in self.src.chars() {
+            if byte_idx >= off {
+                break;
+            }
+            byte_idx += c.len_utf8();
+            if c == '\n' {
                 line += 1;
                 col = 1;
             } else {
@@ -77,5 +82,31 @@ impl SourceMap {
 
     pub fn get(&self, id: FileId) -> &SourceFile {
         &self.files[id as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_line_col_utf8() {
+        // "あ" is 3 bytes (UTF-8).
+        // Line 1: "あ\n" (length: 3 + 1 = 4 bytes)
+        // Line 2: "い" (length: 3 bytes)
+        let sf = SourceFile {
+            id: 0,
+            name: "test.rs".to_string(),
+            src: "あ\nい".to_string(),
+        };
+
+        // Offset 0 (before "あ"): line 1, col 1
+        assert_eq!(sf.line_col(0), (1, 1));
+        // Offset 3 (after "あ", before "\n"): line 1, col 2
+        assert_eq!(sf.line_col(3), (1, 2));
+        // Offset 4 (after "\n", before "い"): line 2, col 1
+        assert_eq!(sf.line_col(4), (2, 1));
+        // Offset 7 (after "い"): line 2, col 2
+        assert_eq!(sf.line_col(7), (2, 2));
     }
 }

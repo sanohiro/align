@@ -1530,7 +1530,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
 
     // Monomorphization worklist: `(generic_fn_mangled_name, concrete_type_args)`, collected from
     // every generic call and processed to a fixpoint below.
-    let mut worklist: Vec<(String, Vec<Ty>)> = Vec::new();
+    let mut worklist: std::collections::VecDeque<(String, Vec<Ty>)> = std::collections::VecDeque::new();
     for &(module, is_entry, f) in &all_fns {
         let mangled = mangle_fn(module, is_entry, &f.name.name);
         let is_template = !f.type_params.is_empty();
@@ -1555,7 +1555,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 );
             }
         } else {
-            worklist.append(&mut cx.instantiations);
+            worklist.extend(cx.instantiations);
             fns.push(checked);
             fns.extend(lifted);
         }
@@ -1564,10 +1564,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // scan each instance for further generic calls (transitive). `check_generic_call` already
     // rewrote every call target to the mangled name, so nothing else needs renaming.
     let mut generated: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut wi = 0;
-    while wi < worklist.len() {
-        let (oname, targs) = worklist[wi].clone();
-        wi += 1;
+    while let Some((oname, targs)) = worklist.pop_front() {
         let mangled = mangle_mono(&oname, &targs);
         if !generated.insert(mangled.clone()) {
             continue; // already instantiated
@@ -1580,7 +1577,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, imported, tmpl_module.to_string(), &mod_table, &type_table, user_imported, &const_table);
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
-        worklist.append(&mut cx.instantiations);
+        worklist.extend(cx.instantiations);
         // A lambda / pipeline inside a generic function is already rejected when the template is
         // checked in Pass 2, so a monomorph never has lifted helpers here.
         fns.push(checked);
@@ -1647,22 +1644,35 @@ fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
         calls.insert(f.name.as_str(), scan.calls);
         parmaps.extend(scan.parmaps);
     }
-    // Fixpoint: a function is impure if it has a direct effect or calls an impure function.
-    let mut impure: std::collections::HashSet<String> =
-        direct.iter().filter(|(_, d)| **d).map(|(n, _)| n.to_string()).collect();
-    loop {
-        let mut changed = false;
-        for f in &program.fns {
-            if impure.contains(&f.name) {
-                continue;
-            }
-            if calls[f.name.as_str()].iter().any(|c| impure.contains(c)) {
-                impure.insert(f.name.clone());
-                changed = true;
+    // Transitive propagation: build a reverse call graph (callee -> callers)
+    // and propagate impurity starting from directly impure functions using a worklist.
+    let mut reverse_calls: HashMap<&str, Vec<&str>> = HashMap::new();
+    for f in &program.fns {
+        if let Some(callees) = calls.get(f.name.as_str()) {
+            for callee in callees {
+                reverse_calls.entry(callee.as_str()).or_default().push(f.name.as_str());
             }
         }
-        if !changed {
-            break;
+    }
+
+    let mut impure = std::collections::HashSet::new();
+    let mut worklist = Vec::new();
+
+    for (name, &is_direct_impure) in &direct {
+        if is_direct_impure {
+            let n = name.to_string();
+            impure.insert(n.clone());
+            worklist.push(n);
+        }
+    }
+
+    while let Some(callee) = worklist.pop() {
+        if let Some(callers) = reverse_calls.get(callee.as_str()) {
+            for caller in callers {
+                if impure.insert(caller.to_string()) {
+                    worklist.push(caller.to_string());
+                }
+            }
         }
     }
     // The `par_map` function must be Pure.
@@ -2215,10 +2225,10 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } => true,
             ExprKind::Local(p) => self.local_backed_slice.contains(p),
             ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
-            ExprKind::Block(b) => b.value.as_ref().map_or(false, |v| self.slice_is_local(v)),
+            ExprKind::Block(b) => b.value.as_ref().is_some_and(|v| self.slice_is_local(v)),
             ExprKind::If { then, els, .. } => {
-                then.value.as_ref().map_or(false, |v| self.slice_is_local(v))
-                    || els.value.as_ref().map_or(false, |v| self.slice_is_local(v))
+                then.value.as_ref().is_some_and(|v| self.slice_is_local(v))
+                    || els.value.as_ref().is_some_and(|v| self.slice_is_local(v))
             }
             _ => false,
         }
@@ -2364,14 +2374,13 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::TaskGroup(b) => {
                 let inner = depth + 1;
                 self.block(b, inner);
-                if let Some(v) = &b.value {
-                    if self.tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
+                if let Some(v) = &b.value
+                    && self.tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
                         self.diags.error(
                             "a value from this task_group cannot escape as the block's value".to_string(),
                             v.span,
                         );
                     }
-                }
             }
             ExprKind::Spawn { closure, .. } => self.walk(closure, depth),
             ExprKind::EnumValue { payload, .. } => {
@@ -3416,11 +3425,10 @@ impl<'a, 't> Checker<'a, 't> {
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     // Record slice provenance (`s: slice<T> := a` → `s` borrows `a`'s buffer) so
                     // the `out` no-alias check can see through slice variables.
-                    if matches!(local_ty, Ty::Slice(_)) {
-                        if let Some(root) = self.expr_root_local(&init) {
+                    if matches!(local_ty, Ty::Slice(_))
+                        && let Some(root) = self.expr_root_local(&init) {
                             self.slice_bases.insert(local, root);
                         }
-                    }
                     stmts.push(Stmt::Let { local, init });
                 }
                 ast::Stmt::LetTuple { names, init, span } => {
@@ -3808,15 +3816,14 @@ impl<'a, 't> Checker<'a, 't> {
             }
             _ => None,
         };
-        if let Some(exp) = &expected_elems {
-            if exp.len() != elems.len() {
+        if let Some(exp) = &expected_elems
+            && exp.len() != elems.len() {
                 self.diags.error(
                     format!("expected a tuple of {} element(s), got {}", exp.len(), elems.len()),
                     span,
                 );
                 return err;
             }
-        }
         let mut checked = Vec::with_capacity(elems.len());
         let mut scalars = Vec::with_capacity(elems.len());
         let mut ok = true;
@@ -4098,13 +4105,11 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn place_local(&self, e: &ast::Expr) -> Option<(LocalId, Ty)> {
-        if let ast::ExprKind::Path(p) = &e.kind {
-            if let Some(name) = single_name(p) {
-                if let Some(id) = self.lookup(name) {
+        if let ast::ExprKind::Path(p) = &e.kind
+            && let Some(name) = single_name(p)
+                && let Some(id) = self.lookup(name) {
                     return Some((id, self.locals[id as usize].ty));
                 }
-            }
-        }
         None
     }
 
@@ -4187,11 +4192,10 @@ impl<'a, 't> Checker<'a, 't> {
             return Ok(None);
         }
         // Bare `Type` in the current module.
-        if let ast::ExprKind::Path(p) = &recv.kind {
-            if let Some(name) = single_name(p) {
+        if let ast::ExprKind::Path(p) = &recv.kind
+            && let Some(name) = single_name(p) {
                 return Ok(self.local_type(name));
             }
-        }
         // Qualified `mod.Type` — the receiver is itself a pure dotted name.
         let Some(flat) = flatten_module_path(recv) else { return Ok(None) };
         let Some((module, type_name)) = flat.rsplit_once('.') else { return Ok(None) };
@@ -4609,11 +4613,10 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             Expr { kind: ExprKind::Closure { lifted: name, captures }, ty: cty, span: arg.span }
         };
-        if fallible {
-            if let Some(f) = self.task_group_fallible.last_mut() {
+        if fallible
+            && let Some(f) = self.task_group_fallible.last_mut() {
                 *f = true;
             }
-        }
         // A new task is now pending and unjoined, so a prior `wait()` no longer covers everything.
         if let Some(w) = self.wait_state.last_mut() {
             *w = false;
@@ -4729,11 +4732,10 @@ impl<'a, 't> Checker<'a, 't> {
             return self.check_wait(args, span);
         }
         // An indirect call through a function-value local: `f(args)` where `f: Ty::Fn`.
-        if let Some(lid) = self.lookup(&name) {
-            if let Ty::Fn(fid) = self.resolve(self.locals[lid as usize].ty) {
+        if let Some(lid) = self.lookup(&name)
+            && let Ty::Fn(fid) = self.resolve(self.locals[lid as usize].ty) {
                 return self.check_call_fn_value(lid, fid, args, expected, span);
             }
-        }
         // A user function: a bare call resolves in the caller's own module (`module$fn` mangled
         // name); cross-module calls are written `mod.fn(...)` (handled in `check_method_call`).
         let Some(name) = self.resolve_local_fn(&name) else {
@@ -4958,8 +4960,8 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, Some(scalar_to_ty(ps)), a.span),
             _ => self.check_expr(a, None),
         };
-        if let Ty::Array(es, _) = e.ty {
-            if es == ps {
+        if let Ty::Array(es, _) = e.ty
+            && es == ps {
                 // The borrow lowers via the same slot-materialization as a pipeline source,
                 // so the same restriction applies: only a literal or a named local.
                 if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
@@ -4972,7 +4974,6 @@ impl<'a, 't> Checker<'a, 't> {
                 let span = e.span;
                 return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
             }
-        }
         // Already a slice, or a mismatch: let unification report any error.
         if e.ty != Ty::Slice(ps) {
             self.constrain(e.ty, Some(Ty::Slice(ps)), e.span);
@@ -5066,21 +5067,50 @@ impl<'a, 't> Checker<'a, 't> {
     /// (so the `mod.fn` shape is something else — a builtin namespace or a method); `Err` is a
     /// reported resolution error.
     fn resolve_qualified_fn(&mut self, module: &str, name: &str, span: Span) -> Result<Option<String>, ()> {
-        let here = self.mods.get(&self.cur_module);
-        if !here.is_some_and(|mi| mi.user_imports.contains(module)) {
-            return Ok(None); // not a `mod.fn` user-module call — let the caller try other shapes
+        let is_self = module == self.cur_module;
+        if !is_self {
+            let here = self.mods.get(&self.cur_module);
+            if !here.is_some_and(|mi| mi.user_imports.contains(module)) {
+                return Ok(None); // not a `mod.fn` user-module call — let the caller try other shapes
+            }
         }
         match self.mods.get(module).and_then(|mi| mi.fns.get(name)) {
-            Some((mangled, true)) => Ok(Some(mangled.clone())),
-            Some((_, false)) => {
-                self.diags.error(format!("'{name}' is private to module '{module}' (mark it `pub` to export it)"), span);
-                Err(())
+            Some((mangled, pub_exported)) => {
+                if *pub_exported || is_self {
+                    Ok(Some(mangled.clone()))
+                } else {
+                    self.diags.error(format!("'{name}' is private to module '{module}' (mark it `pub` to export it)"), span);
+                    Err(())
+                }
             }
             None => {
                 self.diags.error(format!("module '{module}' has no function '{name}'"), span);
                 Err(())
             }
         }
+    }
+
+    fn resolve_group_field(
+        &mut self,
+        sname: &str,
+        fields: &[FieldDef],
+        src_kind: &str,
+        fld: &ast::Ident,
+        role: &str,
+        want: Ty,
+    ) -> Option<u32> {
+        let Some(idx) = fields.iter().position(|f| f.name == fld.name) else {
+            self.diags.error(format!("no field '{}' on {}<{}>", fld.name, src_kind, sname), fld.span);
+            return None;
+        };
+        if fields[idx].ty != want {
+            self.diags.error(
+                format!("`group_by` {role} '{}' must be {} (first cut), got {}", fld.name, ty_name(want), ty_name(fields[idx].ty)),
+                fld.span,
+            );
+            return None;
+        }
+        Some(idx as u32)
     }
 
     /// A method call `recv.method(args)`: the `heap.new` builtin, or a method on a value
@@ -5108,9 +5138,9 @@ impl<'a, 't> Checker<'a, 't> {
         // `io.stdout.write(s)` / `io.stdout.buffered()` / `io.stderr.buffered()` — the receiver is the
         // 2-segment `io.stdout` / `io.stderr`, so it parses as a `FieldAccess` (`io` . `stdout`), not
         // a single-name path.
-        if method == "write" || method == "buffered" {
-            if let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind {
-                if let ast::ExprKind::Path(p) = &inner.kind {
+        if (method == "write" || method == "buffered")
+            && let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind
+                && let ast::ExprKind::Path(p) = &inner.kind {
                     if single_name(p) == Some("io") && field.name == "stdout" {
                         if method == "buffered" {
                             self.require_import("std.io", "io.stdout.buffered", span);
@@ -5126,8 +5156,6 @@ impl<'a, 't> Checker<'a, 't> {
                         return self.check_io_buffered("stderr", 2, args, span);
                     }
                 }
-            }
-        }
         // `mod.fn(...)` / `a.b.fn(...)` — a cross-module call into an imported user module. The
         // receiver is a pure dotted name (`geom` or `util.math`); resolved + visibility-checked here.
         // `Ok(None)` (not an imported user module) falls through to the value-method dispatch below.
@@ -5140,15 +5168,14 @@ impl<'a, 't> Checker<'a, 't> {
                         || cap.enclosing.iter().any(|(n, _, _)| n == leftmost)
                 })
         });
-        if !leftmost_is_local {
-            if let Some(modpath) = flatten_module_path(recv) {
+        if !leftmost_is_local
+            && let Some(modpath) = flatten_module_path(recv) {
                 match self.resolve_qualified_fn(&modpath, method, span) {
                     Ok(Some(mangled)) => return self.check_named_call(mangled, args, expected, span),
                     Ok(None) => {}
                     Err(()) => return err,
                 }
             }
-        }
         // Explicit-overflow integer arithmetic (`core.math`): `x.{wrapping,saturating,checked}_{add,sub,mul}(y)`.
         if parse_int_arith(method).is_some() {
             return self.check_int_arith_method(recv, method, args, span);
@@ -5638,12 +5665,11 @@ impl<'a, 't> Checker<'a, 't> {
                         let arg = if args.len() == 1 { Some(&args[0]) } else { None };
                         let (src, mut stages) = self.collect_pipeline(recv);
                         // `where(.field)` — a field predicate.
-                        if is_where {
-                            if let Some(ast::Expr { kind: ast::ExprKind::FieldShorthand(f), .. }) = arg {
+                        if is_where
+                            && let Some(ast::Expr { kind: ast::ExprKind::FieldShorthand(f), .. }) = arg {
                                 stages.push(RawStage::WhereField(f.clone()));
                                 return (src, stages);
                             }
-                        }
                         // An inline lambda (`map(fn x { … })`) or a named function.
                         let stage_fn = match arg {
                             Some(a) => match &a.kind {
@@ -5680,11 +5706,10 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn pipeline_fn_name(&self, a: &ast::Expr) -> Option<ast::Ident> {
-        if let ast::ExprKind::Path(p) = &a.kind {
-            if p.segments.len() == 1 {
+        if let ast::ExprKind::Path(p) = &a.kind
+            && p.segments.len() == 1 {
                 return Some(p.segments[0].clone());
             }
-        }
         None
     }
 
@@ -5952,39 +5977,22 @@ impl<'a, 't> Checker<'a, 't> {
         let fields = self.structs[id as usize].fields.clone();
         let i64t = Ty::Int(IntTy { bits: 64, signed: true });
         let src_kind = if key_str { "array" } else { "soa" };
-        // Resolve a field by name and require an exact type (the first-slice aggregate types).
-        let resolve = |this: &mut Self, fld: &ast::Ident, role: &str, want: Ty| -> Option<u32> {
-            let Some(idx) = fields.iter().position(|f| f.name == fld.name) else {
-                this.diags.error(format!("no field '{}' on {src_kind}<{sname}>", fld.name), fld.span);
-                return None;
-            };
-            if fields[idx].ty != want {
-                this.diags.error(
-                    format!("`group_by` {role} '{}' must be {} (first cut), got {}", fld.name, ty_name(want), ty_name(fields[idx].ty)),
-                    fld.span,
-                );
-                return None;
-            }
-            Some(idx as u32)
-        };
-
         if key_str {
             // str key (dictionary-encoded, inline or precomputed) + i64 value, `sum`/`min`/`max`/
             // `count`. `count` reads no value column; the others require an i64 value field.
-            let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
+            let Some(ki) = self.resolve_group_field(&sname, &fields, src_kind, key_field, "key", Ty::Str) else { return err };
             // For an already-encoded source, the group key must be the field the dictionary was built
             // on — otherwise the precomputed ids don't correspond to this key.
-            if let Some(kf) = enc_key {
-                if ki != kf {
+            if let Some(kf) = enc_key
+                && ki != kf {
                     self.diags.error(
                         format!("`group_by` on a `dict_encode`d value must use the encoded key '{}', not '{}'", fields[kf as usize].name, key_field.name),
                         key_field.span,
                     );
                     return err;
                 }
-            }
             let vi = match value_field {
-                Some(v) => match resolve(self, v, "value", i64t) {
+                Some(v) => match self.resolve_group_field(&sname, &fields, src_kind, v, "value", i64t) {
                     Some(idx) => Some(idx),
                     None => return err,
                 },
@@ -6002,9 +6010,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
 
         // i64 key + i64 value (soa source).
-        let Some(ki) = resolve(self, key_field, "key", i64t) else { return err };
+        let Some(ki) = self.resolve_group_field(&sname, &fields, src_kind, key_field, "key", i64t) else { return err };
         let vi = match value_field {
-            Some(v) => match resolve(self, v, "value", i64t) {
+            Some(v) => match self.resolve_group_field(&sname, &fields, src_kind, v, "value", i64t) {
                 Some(idx) => Some(idx),
                 None => return err,
             },
@@ -6099,25 +6107,11 @@ impl<'a, 't> Checker<'a, 't> {
         let sname = self.structs[id as usize].name.clone();
         let fields = self.structs[id as usize].fields.clone();
         let i64t = Ty::Int(IntTy { bits: 64, signed: true });
-        let resolve = |this: &mut Self, fld: &ast::Ident, role: &str, want: Ty| -> Option<u32> {
-            let Some(idx) = fields.iter().position(|f| f.name == fld.name) else {
-                this.diags.error(format!("no field '{}' on array<{sname}>", fld.name), fld.span);
-                return None;
-            };
-            if fields[idx].ty != want {
-                this.diags.error(
-                    format!("`group_by` {role} '{}' must be {} (first cut), got {}", fld.name, ty_name(want), ty_name(fields[idx].ty)),
-                    fld.span,
-                );
-                return None;
-            }
-            Some(idx as u32)
-        };
-        let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
+        let Some(ki) = self.resolve_group_field(&sname, &fields, "array", key_field, "key", Ty::Str) else { return err };
         let mut aggs: Vec<hir::GroupAgg1> = Vec::with_capacity(specs.len());
         for (op, vf) in specs {
             let value_field = match vf {
-                Some(v) => match resolve(self, v, "value", i64t) {
+                Some(v) => match self.resolve_group_field(&sname, &fields, "array", v, "value", i64t) {
                     Some(idx) => Some(idx),
                     None => return err,
                 },
@@ -7697,11 +7691,10 @@ impl<'a, 't> Checker<'a, 't> {
         // binding the raw `Result` first and unwrapping the local later (`w := wait(); w?`) is a
         // sound over-restriction — `get()` would still be rejected. (Indirect unwrap is a later,
         // local-tracking refinement.)
-        if matches!(v.kind, ExprKind::Wait) {
-            if let Some(w) = self.wait_state.last_mut() {
+        if matches!(v.kind, ExprKind::Wait)
+            && let Some(w) = self.wait_state.last_mut() {
                 *w = true;
             }
-        }
         let (ok, err) = match self.resolve(v.ty) {
             Ty::Result(o, e) => (o, e),
             Ty::Error => return Expr { kind: ExprKind::Try(Box::new(v)), ty: Ty::Error, span },
@@ -8827,11 +8820,10 @@ fn resolve_type(
     }
     // A generic type parameter (`fn f<T>` → `T`): a bare name (no type arguments) matching a
     // declared parameter resolves to `Ty::Param(i)`.
-    if args.is_empty() {
-        if let Some(i) = type_params.iter().position(|p| p == name) {
+    if args.is_empty()
+        && let Some(i) = type_params.iter().position(|p| p == name) {
             return Ty::Param(i as u32);
         }
-    }
     match name {
         "bool" => Ty::Bool,
         "char" => Ty::Char,
@@ -8891,7 +8883,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            match reject_move_struct_payload(scalar_arg(inner, "Option payload", true, span, diags), &cx.structs, "Option payload", span, diags) {
+            match reject_move_struct_payload(scalar_arg(inner, "Option payload", true, span, diags), cx.structs, "Option payload", span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,
             }
@@ -8973,8 +8965,8 @@ fn resolve_type(
                 }
             };
             match (
-                reject_move_struct_payload(scalar_arg(ok, "Result ok payload", true, span, diags), &cx.structs, "Result ok payload", span, diags),
-                reject_move_struct_payload(scalar_arg(err, "Result err payload", true, span, diags), &cx.structs, "Result err payload", span, diags),
+                reject_move_struct_payload(scalar_arg(ok, "Result ok payload", true, span, diags), cx.structs, "Result ok payload", span, diags),
+                reject_move_struct_payload(scalar_arg(err, "Result err payload", true, span, diags), cx.structs, "Result err payload", span, diags),
             ) {
                 (Some(o), Some(e)) => Ty::Result(o, e),
                 _ => Ty::Error,
