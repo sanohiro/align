@@ -1736,7 +1736,8 @@ unsafe fn prefix_xor(bitmask: u64) -> u64 {
 /// The escaped-character mask for a 64-bit `backslash` bitmap (simdjson's odd/even backslash-run
 /// analysis). A character is "escaped" iff it is preceded by an odd-length run of backslashes.
 /// `prev_escaped` carries a pending escape across the 64-byte block boundary (0 or 1).
-#[cfg(target_arch = "x86_64")]
+/// Pure bitwise — shared by the AVX2 and NEON indexers (no architecture intrinsics).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 fn find_escaped(backslash: u64, prev_escaped: &mut u64) -> u64 {
     let pe = *prev_escaped;
@@ -1898,8 +1899,94 @@ unsafe fn json_decode_index_avx2(src: &[u8], out: &mut Vec<u32>) {
     }
 }
 
-/// Fill `out` with the lean decode-index positions (`{ } [ ] :`). Runtime-dispatched like
-/// [`json_structural_index`].
+/// Inclusive prefix-XOR of a 64-bit mask (bit i = parity of bits 0..=i), via the Kogge-Stone
+/// shift-XOR ladder — six dependent `u64` ops, pure baseline (no PMULL). The AVX2 path uses
+/// `pclmulqdq` for the same result; the NEON path uses this because PMULL (`vmull_p64`) is the
+/// optional `aes` crypto feature, not ARMv8-A baseline, and the prefix-XOR is not the hot cost
+/// (the per-byte movemask dominates) — so a branch-free baseline ladder is the cleaner choice.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn prefix_xor_portable(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
+}
+
+/// NEON decode index — the aarch64 counterpart to [`json_decode_index_avx2`], emitting the same
+/// lean `{ } [ ] :` positions. NEON is ARMv8-A baseline, so this needs no runtime feature detection.
+/// It processes 64 bytes per block as four 16-byte vectors, builds a 16-bit movemask per vector
+/// (bit-weight AND + across-lane `vaddv`), combines them into the same 64-bit masks the AVX2 path
+/// uses, then shares [`find_escaped`] and uses [`prefix_xor_portable`] in place of `pclmulqdq`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn json_decode_index_neon(src: &[u8], out: &mut Vec<u32>) {
+    use core::arch::aarch64::*;
+    out.clear();
+    out.reserve(src.len() / 12);
+    let n = src.len();
+
+    // Per-lane bit weights 1,2,4,…,128 (repeated over the two 8-lane halves): AND a 0x00/0xFF compare
+    // mask with these, then `vaddv` each half → one byte whose bit i is set iff lane i matched.
+    let weights = [1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let bit_weights: uint8x16_t = unsafe { vld1q_u8(weights.as_ptr()) };
+    // Closures inherit the fn's `neon` feature, so the pure intrinsics are callable without `unsafe`
+    // (only the pointer loads below are `unsafe`).
+    let movemask16 = |cmp: uint8x16_t| -> u32 {
+        let masked = vandq_u8(cmp, bit_weights);
+        (vaddv_u8(vget_low_u8(masked)) as u32) | ((vaddv_u8(vget_high_u8(masked)) as u32) << 8)
+    };
+    let eqm = |v: uint8x16_t, c: u8| -> u32 { movemask16(vceqq_u8(v, vdupq_n_u8(c))) };
+    // Structure + field separators only — no `,`, and quotes are masking-only (never emitted).
+    let op_bits = |v: uint8x16_t| -> u32 { eqm(v, b'{') | eqm(v, b'}') | eqm(v, b'[') | eqm(v, b']') | eqm(v, b':') };
+
+    let mut string_carry: u64 = 0;
+    let mut escape_carry: u64 = 0;
+    let mut i = 0usize;
+    while i + 64 <= n {
+        let p = unsafe { src.as_ptr().add(i) };
+        let v0 = unsafe { vld1q_u8(p) };
+        let v1 = unsafe { vld1q_u8(p.add(16)) };
+        let v2 = unsafe { vld1q_u8(p.add(32)) };
+        let v3 = unsafe { vld1q_u8(p.add(48)) };
+        // Combine four 16-bit movemasks into one 64-bit mask, mirroring the AVX2 lo/hi packing.
+        let quote = (eqm(v0, b'"') as u64) | ((eqm(v1, b'"') as u64) << 16) | ((eqm(v2, b'"') as u64) << 32) | ((eqm(v3, b'"') as u64) << 48);
+        let backslash = (eqm(v0, b'\\') as u64) | ((eqm(v1, b'\\') as u64) << 16) | ((eqm(v2, b'\\') as u64) << 32) | ((eqm(v3, b'\\') as u64) << 48);
+        let op = (op_bits(v0) as u64) | ((op_bits(v1) as u64) << 16) | ((op_bits(v2) as u64) << 32) | ((op_bits(v3) as u64) << 48);
+
+        let escaped = find_escaped(backslash, &mut escape_carry);
+        let real_quote = quote & !escaped;
+        let in_string = prefix_xor_portable(real_quote) ^ string_carry;
+        string_carry = (in_string as i64 >> 63) as u64;
+
+        let mut bits = op & !in_string;
+        while bits != 0 {
+            out.push(i as u32 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+        i += 64;
+    }
+    // Scalar tail, continuing the carried state — identical semantics to `json_decode_index_scalar`.
+    let mut in_string = string_carry & 1 == 1;
+    let mut esc = escape_carry & 1 == 1;
+    while i < n {
+        let b = unsafe { *src.get_unchecked(i) };
+        if b == b'"' && !esc {
+            in_string = !in_string;
+        } else if !in_string && matches!(b, b'{' | b'}' | b'[' | b']' | b':') {
+            out.push(i as u32);
+        }
+        esc = b == b'\\' && !esc;
+        i += 1;
+    }
+}
+
+/// Fill `out` with the lean decode-index positions (`{ } [ ] :`). Runtime-dispatched: AVX2 +
+/// `pclmulqdq` on x86_64 when present, the always-baseline NEON path on aarch64, else the scalar
+/// reference.
 fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
     if src.len() > u32::MAX as usize {
         panic_abort("JSON input exceeds the 4 GiB decode-index limit");
@@ -1911,6 +1998,13 @@ fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is ARMv8-A baseline — unconditionally available on every aarch64 target.
+        unsafe { json_decode_index_neon(src, out) };
+        return;
+    }
+    #[allow(unreachable_code)]
     json_decode_index_scalar(src, out);
 }
 
@@ -3061,16 +3155,17 @@ mod tests {
     fn json_structural_index_simd_matches_scalar_oracle() {
         // The AVX2 indexer must emit byte-for-byte the same positions as the scalar reference, on
         // every shape that stresses the string/escape masking and the 64-byte block carry.
-        let avx2 = cfg!(target_arch = "x86_64") && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("pclmulqdq");
+        // (`is_x86_feature_detected!` can only be *named* on x86, so the detection lives inside the
+        // `#[cfg(target_arch = "x86_64")]` block, not in a cross-arch `let`.)
         let check = |src: &[u8]| {
             let mut want = Vec::new();
             json_structural_index_scalar(src, &mut want);
-            // The dispatch must equal the scalar oracle (it *is* the scalar path when no AVX2).
+            // The dispatch must equal the scalar oracle (it *is* the scalar path when no SIMD).
             let mut got = Vec::new();
             json_structural_index(src, &mut got);
             assert_eq!(got, want, "dispatch mismatch on {:?}", String::from_utf8_lossy(src));
             #[cfg(target_arch = "x86_64")]
-            if avx2 {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("pclmulqdq") {
                 let mut g2 = Vec::new();
                 unsafe { json_structural_index_avx2(src, &mut g2) };
                 assert_eq!(g2, want, "avx2 mismatch on {:?}", String::from_utf8_lossy(src));
@@ -3120,6 +3215,82 @@ mod tests {
 
         // Pseudo-random fuzz: bytes drawn from a JSON-ish alphabet (so strings/escapes actually form).
         let mut state: u64 = 0x1234_5678_9abc_def0;
+        let alpha = b"{}[]:,\"\\ ab12tfnul";
+        for len in [16usize, 64, 65, 200, 1000, 4096] {
+            for _ in 0..40 {
+                let mut s = Vec::with_capacity(len);
+                for _ in 0..len {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    s.push(alpha[((state >> 33) as usize) % alpha.len()]);
+                }
+                check(&s);
+            }
+        }
+    }
+
+    #[test]
+    fn json_decode_index_simd_matches_scalar_oracle() {
+        // The SIMD decode index (AVX2 on x86_64, NEON on aarch64) must emit byte-for-byte the same
+        // lean `{ } [ ] :` positions as the scalar reference, including the string/escape masking and
+        // the 64-byte block carry. Same oracle discipline as the structural-index test.
+        let check = |src: &[u8]| {
+            let mut want = Vec::new();
+            json_decode_index_scalar(src, &mut want);
+            let mut got = Vec::new();
+            json_decode_index(src, &mut got); // dispatch == oracle (it *is* the scalar path with no SIMD)
+            assert_eq!(got, want, "dispatch mismatch on {:?}", String::from_utf8_lossy(src));
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("pclmulqdq") {
+                let mut g2 = Vec::new();
+                unsafe { json_decode_index_avx2(src, &mut g2) };
+                assert_eq!(g2, want, "avx2 mismatch on {:?}", String::from_utf8_lossy(src));
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut g2 = Vec::new();
+                unsafe { json_decode_index_neon(src, &mut g2) }; // NEON is baseline — always exercised
+                assert_eq!(g2, want, "neon mismatch on {:?}", String::from_utf8_lossy(src));
+            }
+        };
+
+        let cases: &[&[u8]] = &[
+            b"",
+            b"{}",
+            b"[]",
+            b"{\"a\":1}",
+            b"[{\"active\":true,\"pay\":12},{\"active\":false,\"pay\":3}]",
+            b"{\"s\":\"a,b:c{}[]\"}",          // structural chars INSIDE a string — must be ignored
+            b"{\"s\":\"he said \\\"hi\\\"\"}", // escaped quotes \" inside the value
+            b"{\"s\":\"back\\\\slash\"}",      // escaped backslash \\
+            b"{\"a\":{\"b\":{\"c\":[1,2,3]}}}",
+            b"{\"k\":\"\"}",
+            b"\"\\\\\"",
+        ];
+        for c in cases {
+            check(c);
+        }
+
+        // Block-boundary stress across the first two 64-byte seams (escape + string carries).
+        for pad in 55..75usize {
+            let mut s = Vec::new();
+            s.push(b'{');
+            s.push(b'"');
+            s.extend(std::iter::repeat(b'x').take(pad));
+            s.extend_from_slice(b"\\\"end");
+            s.extend_from_slice(b"\":1}");
+            check(&s);
+            for run in 1..6usize {
+                let mut t = Vec::new();
+                t.extend_from_slice(b"{\"k\":\"");
+                t.extend(std::iter::repeat(b'y').take(pad));
+                t.extend(std::iter::repeat(b'\\').take(run));
+                t.extend_from_slice(b"\"}");
+                check(&t);
+            }
+        }
+
+        // Pseudo-random fuzz over a JSON-ish alphabet (so strings/escapes actually form).
+        let mut state: u64 = 0x0bad_c0de_dead_beef;
         let alpha = b"{}[]:,\"\\ ab12tfnul";
         for len in [16usize, 64, 65, 200, 1000, 4096] {
             for _ in 0..40 {
