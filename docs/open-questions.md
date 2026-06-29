@@ -490,14 +490,34 @@ but run on the **i64 id column** (the dense-id `align_rt_group_*_i64` from #209)
 through the dictionary → still `(array<str>, array<Acc>)`. The win: the string interning is paid **once**
 (in `dict_encode`), so repeated group-bys on the same key are integer-column work (~19–21× vs
 re-interning per group-by, the A1 cost). Region: the dictionary's `str` views borrow the source, so the
-encoded value is region-tied to it. **Slices:** (1) **DONE** — the runtime primitive
+encoded value is region-tied to it. **Slices:** (1) **DONE (#218)** — the runtime primitive
 `align_rt_dict_encode_str` (intern a strided `str` column → `out_ids[n]` dense-id column +
-`out_dict[count]` dictionary; first-occurrence id order; tested). (2) the `dict_encode` surface + the
-encoded-column data model (sema/MIR/codegen — the load-bearing bit: a soa/array column that carries
-`(id i64 column, dictionary array<str>)`). (3) `group_by(.name)` on an encoded column (detect → id
-aggregate → dict-label). (4) bench (multi-aggregation reuse vs A1 / vs `HashMap<&str,_>×N`). Still open:
-multiple aggregates in one pass → more result columns, a `group_by(.key)` with a lambda key, AoS source
-for *i64* keys. Design ↓.
+`out_dict[count]` dictionary; first-occurrence id order; tested). (1b) **DONE (#220)** — the label
+primitive `align_rt_dict_lookup` (ids → `dict[ids]`) + a runtime integration test proving the **full
+composition** (`dict_encode` → dense-id `align_rt_group_sum_i64` on the ids #209 → `dict_lookup`) equals
+the one-shot A1 string `group_by`. **So the entire A2 runtime mechanism is built and validated — the
+correctness is de-risked; what remains is purely the compiler surface.**
+(2) **NEXT (the big slice — a new type through all compiler layers, ≈ the string-key group_by PR #210
+in size).** Precise plan: **(a) type** — `Ty::DictEncoded(u32)` indexing a side table
+`{ struct_id, key_field }` (like `tuples`/`fn_types`); a Move, region-tracked value laid out as **three
+`{ptr,len}` slices** `{ source_aos (borrowed), ids (owned i64 buf), dict (owned str buf) }`. **First cut
+= a local used immediately by `group_by` (no `Scalar` variant).** A `Scalar::DictEncoded` is a follow-up,
+needed the moment a `DictEncoded` is **returned or wrapped** (e.g. `Result<DictEncoded, Error>` from a
+`dict_encode` that `?`s, or returning one whose AoS source is a parameter) — Align restricts
+`Option`/`Result` payloads to `Scalar`s, so add the variant then. **(b) `dict_encode` sema** —
+`check_dict_encode(recv: array<Struct> AoS, .key: str field)` → `Ty::DictEncoded`; HIR
+`ExprKind::ArrayDictEncode { source, struct_id, key_field }`; region = source's; thread the new
+ExprKind through the 4 HIR walkers (effect / escape / movecheck / finalize) + `region_of` + the AST
+import-walker (the documented 6 touch-points). **(c) `dict_encode` MIR/codegen** — load the AoS, derive
+stride + key byte offset (`target_data`), `HeapAllocBuf` the ids (i64×n) + dict (str×n), call
+`align_rt_dict_encode_str`, build the 3-slice value; **Drop** frees ids + dict (the AoS is borrowed).
+**(d) `group_by(.name)` on `DictEncoded`** — a third source arm in `check_group_agg` (alongside
+`Soa`/`DynStructArray`); MIR projects the value column from the borrowed AoS into a contiguous i64 buf,
+calls `align_rt_group_sum_i64` on `(ids, projected_vals)` (dense path), then `align_rt_dict_lookup` on
+the distinct ids → result `(array<str>, array<i64>)` (same shape as A1). **(e) bench** — multi-aggregation
+reuse vs A1 / `HashMap<&str,_>×N` (target ~19–21×). First cut: `str` key + `i64` value + `sum`, AoS
+source (mirror A1's first cut, then widen to min/max/count). Still open: multiple aggregates in one pass,
+a `group_by(.key)` with a lambda key, AoS source for *i64* keys. Design ↓.
 
 ### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
 The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped
