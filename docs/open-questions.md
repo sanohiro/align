@@ -745,8 +745,24 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         build with the first crate-uncovered SIMD kernel, not standalone.** Full advice in
         `work/runtime-cpu-dispatch-advice-for-claude-2026-06-28.md` (gitignored scratch).
 
-        **JSON two-stage SIMD decode — INVESTIGATED 2026-06-29 (mechanism validated, naive
-        integration regresses; the real win needs the full Mison stack).** Built the
+        **JSON two-stage SIMD decode — Mison speculation IMPLEMENTED 2026-06-29 (wins the projection
+        rail; full-decode at parity; remaining bottleneck = the walk).** The speculative decoder
+        (lean decode-index `{ } [ ] :` + Mison pattern: learn each declared field's colon ordinal from
+        the first record, then jump+verify per record — no `find_field` — falling back to a
+        `find_field` scan + relearn on a structure miss) ships in `align_rt_json_decode_struct_array`.
+        **`bench/json_decode` (1M rows, vs serde_json): proj 1.16–1.65× (was ≈1.09×), full 0.90–1.10×
+        (≈parity, was ≈1.03×)** — a real win on the **projection rail** (declare only the fields you
+        read, the Align idiom; the unqueried fields' colons are skipped entirely), parity when every
+        field is decoded. It does **not** reach the probe's 3.4× — an autopsy pinned the remaining cost
+        to the **walk** (index-build 18 ms for the lean 24 MB/6M-token index, down from 72 MB/47 ms with
+        the quote-heavy #213 index; + a 41 ms stage-2 walk = per-token `src[idx[k]]` gather + `rec_cols`
+        collection + key scan-back + per-value `JsonParser` parse), which the general decoder pays and
+        the probe's inlined positional sum did not. The lean index (vs #213's full structural index)
+        was the autopsy-identified first fix (idx-build 47→18 ms). **Strict semantics preserved** (62
+        tests green): missing/duplicate fields error via the fallback; one narrow documented relaxation
+        — a duplicate of a declared field at a position the learned pattern treats as unqueried is not
+        re-detected on the speculative path (no test covers it; a dup at a *declared* position trips the
+        colon-count gate → fallback → error). The historical investigation that led here ↓. Built the
         **stage-1 structural index** (PR #213: AVX2 + `pclmulqdq` prefix-XOR string mask + odd/even
         backslash-run escapes, block-carried, scalar oracle + exhaustive fuzz; runtime-dispatched,
         baseline-binary-safe) and a `bench/json_decode/` harness (PR #212; recursive-descent baseline

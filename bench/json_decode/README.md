@@ -30,10 +30,22 @@ linked as a **cdylib** (dynamic, over the C-ABI). Standalone cargo project (own 
 The current recursive-descent decoder is **parse-bound** and roughly ties `serde_json` (full ≈1.03×;
 proj ≈1.09×, a slight edge from skipping the two unused fields).
 
-## Target (the rewrite)
+## After Mison speculation (2026-06-29, native, 1M rows)
 
-A `work/` probe (a SIMD structural index + a projecting two-stage decode, validated for correctness
-and benchmarked against `serde_json` on this exact data) reaches **~3.4–4.1×** over `serde_json`
-(and **~3.2–3.9×** when the decode materializes into soa columns). The rewrite lands that here: the
-`proj×` / `full×` columns should climb from ~1× toward those figures as each slice merges. Run this
-before/after every parser change and watch the ratios.
+```
+  records  json KB |    A-full   rs-full     full× |    A-proj   rs-proj     proj×
+    10000      498 |    0.891    0.802     0.90x |    0.538    0.703     1.31x
+   100000     5083 |    7.040    7.717     1.10x |    4.415    7.280     1.65x
+  1000000    51814 |   97.160   92.301     0.95x |   63.759   73.907     1.16x
+```
+
+The speculative decoder (lean `{ } [ ] :` decode-index + a Mison pattern: learn each declared field's
+colon ordinal from the first record, then per record jump to it and verify the key — no `find_field`
+— falling back on a structure miss) **wins the projection rail: `proj×` ≈1.09× → 1.16–1.65×**, while
+full-decode stays at parity (≈0.9–1.1×). It does *not* reach the `work/` probe's **~3.4–4.1×** (SIMD
+index + projecting two-stage, soa columns) — an autopsy pinned the remaining cost to the **walk**
+(index build + per-token `src[idx[k]]` gather + `rec_cols` + key scan-back + per-value parse), which
+the general decoder pays and the probe's inlined positional sum did not. The lean index was the
+autopsy's first fix (index build 47→18 ms vs the quote-heavy structural index). Run this before/after
+every parser change and watch the ratios; when a result disappoints, autopsy — don't guess (see
+`bench/README.md` methodology).

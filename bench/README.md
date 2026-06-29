@@ -26,6 +26,14 @@ bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
   minimum. Timing *all* of A then *all* of B over a >cache working set produces wildly wrong ratios
   (the second kernel benefits from a warm-ish cache / settled clocks). This trap once made an
   identical-machine-code kernel look "20× slower" — it was a measurement artifact.
+- **When the result disappoints, autopsy — don't guess.** If a mechanism that *should* win comes back
+  flat or slower, do not reason about the cause from intuition: build an **absolute-ms breakdown** that
+  starts from the fast variant and adds one realistic cost at a time (stage-1 alone → + materialize →
+  + the real key matching → …), each measured. The delta that jumps is the bottleneck. This pinned the
+  JSON two-stage decode's real cost to per-field key matching (`find_field`), *not* the materialization
+  a first guess had blamed — buf-resize + final copy added only +1.6 ms (`docs/open-questions.md`
+  "JSON two-stage SIMD decode"). A wrong guess sends the next slice optimizing the wrong thing; the
+  autopsy is cheap insurance against that.
 
 ## What we've learned
 
