@@ -1016,9 +1016,8 @@ unsafe fn json_speculate(src: &[u8], idx: &[u32], rec_cols: &[usize], pat_field:
             continue; // an unqueried position — skip it entirely (projection)
         }
         let d = &descs[fi as usize];
-        match key_before_colon(src, idx[k] as usize) {
-            Some(key) if key == unsafe { field_name(d) } => {}
-            _ => return false, // structure drifted from the pattern — fall back
+        if !key_matches_before_colon(src, idx[k] as usize, unsafe { field_name(d) }) {
+            return false; // structure drifted from the pattern — fall back
         }
         if unsafe { write_field_indexed(src, idx, k, d, eptr, esz) }.is_none() {
             return false;
@@ -2130,6 +2129,38 @@ fn key_before_colon(src: &[u8], cpos: usize) -> Option<&[u8]> {
         return None;
     }
     Some(&src[s..close])
+}
+
+/// Speculation-path key verify: is the key right before the colon at `cpos` exactly `"name"`?
+/// Unlike [`key_before_colon`] (which *delimits* an unknown key by scanning back to its opening
+/// quote, then the caller compares), speculation already knows the expected `name`, so the opening
+/// quote's position is computed from `name.len()` — no backward key scan — and the bytes are matched
+/// against `name` directly. This collapses the two hottest verify costs (the scan-back loop and the
+/// generic `memcmp` dispatch) into a bounded, inlinable check. Same soundness as the original: returns
+/// `true` only when the bytes are `"<name>"` (closing quote at the trimmed end, matching key bytes, a
+/// non-escaped opening quote). On any drift it returns `false` → the caller falls back.
+#[inline]
+fn key_matches_before_colon(src: &[u8], cpos: usize, name: &[u8]) -> bool {
+    // Skip whitespace between the key string and the colon (`"k" :` is legal).
+    let mut e = cpos;
+    while e > 0 && matches!(src[e - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        e -= 1;
+    }
+    let nl = name.len();
+    // Need room for `"` + name + `"`; the closing quote sits at `e-1`, the key at `[ks..e-1]`, the
+    // opening quote at `ks-1`. `e >= nl + 2` keeps every index below in bounds (`ks >= 1`).
+    if e < nl + 2 || src[e - 1] != b'"' {
+        return false;
+    }
+    let ks = e - 1 - nl; // key start
+    if src[ks - 1] != b'"' {
+        return false; // no opening quote where a `"name"` key would put it (length drift)
+    }
+    if ks >= 2 && src[ks - 2] == b'\\' {
+        return false; // an escaped opening quote `\"` — reject (matches key_before_colon)
+    }
+    // Equal-length compare against the known `name`; short and bounded, so it inlines (no memcmp call).
+    src[ks..e - 1] == *name
 }
 
 /// A minimal JSON scanner over a byte slice (just what `json.decode` needs: objects with
