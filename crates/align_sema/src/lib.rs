@@ -1647,22 +1647,35 @@ fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
         calls.insert(f.name.as_str(), scan.calls);
         parmaps.extend(scan.parmaps);
     }
-    // Fixpoint: a function is impure if it has a direct effect or calls an impure function.
-    let mut impure: std::collections::HashSet<String> =
-        direct.iter().filter(|(_, d)| **d).map(|(n, _)| n.to_string()).collect();
-    loop {
-        let mut changed = false;
-        for f in &program.fns {
-            if impure.contains(&f.name) {
-                continue;
-            }
-            if calls[f.name.as_str()].iter().any(|c| impure.contains(c)) {
-                impure.insert(f.name.clone());
-                changed = true;
+    // Transitive propagation: build a reverse call graph (callee -> callers)
+    // and propagate impurity starting from directly impure functions using a worklist.
+    let mut reverse_calls: HashMap<&str, Vec<&str>> = HashMap::new();
+    for f in &program.fns {
+        if let Some(callees) = calls.get(f.name.as_str()) {
+            for callee in callees {
+                reverse_calls.entry(callee.as_str()).or_default().push(f.name.as_str());
             }
         }
-        if !changed {
-            break;
+    }
+
+    let mut impure = std::collections::HashSet::new();
+    let mut worklist = Vec::new();
+
+    for (name, &is_direct_impure) in &direct {
+        if is_direct_impure {
+            let n = name.to_string();
+            impure.insert(n.clone());
+            worklist.push(n);
+        }
+    }
+
+    while let Some(callee) = worklist.pop() {
+        if let Some(callers) = reverse_calls.get(callee.as_str()) {
+            for caller in callers {
+                if impure.insert(caller.to_string()) {
+                    worklist.push(caller.to_string());
+                }
+            }
         }
     }
     // The `par_map` function must be Pure.
