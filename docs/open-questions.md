@@ -763,7 +763,7 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         materialization is **NOT** the cost (correcting an earlier guess). The dominant avoidable cost
         is **per-field key matching (`find_field`), paid even for the unqueried fields** (positional
         3.6× → name-match 2.4×, and the runtime's *perfect-hash* `find_field` is heavier than the
-        diagnostic's two `==`), plus the per-field machinery (`SeenSet`, `vp` parser dispatch) and a
+        diagnostic's two `==`), plus the per-field machinery (`SeenSet`, per-value-`JsonParser` dispatch) and a
         **quote-heavy index** (the runtime emits key+value quotes, ~2× the probe's punctuation-only
         index — projection needs only colons + the queried fields). `integer()`/etc. are already lean,
         so value parsing is not the gap.
