@@ -319,6 +319,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecodeStructArray { struct_id, input, out } => {
             format!("json_decode_struct_array(struct#{struct_id}, {}, -> _{out})", operand_str(input))
         }
+        Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
+            format!("json_decode_soa(struct#{struct_id}, {}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
+        }
         Rvalue::FsReadFile { path, out } => {
             format!("fs_read_file({}, -> _{out})", operand_str(path))
         }

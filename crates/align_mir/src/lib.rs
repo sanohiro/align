@@ -351,6 +351,12 @@ pub enum Rvalue {
     /// count) into the `out` slot. Yields an `i32` status (0 = ok). codegen builds the same field
     /// table as [`JsonDecode`] plus the element stride, and calls the runtime parser.
     JsonDecodeStructArray { struct_id: u32, input: Operand, out: Slot },
+    /// `json.decode` straight into a column-major `soa<Struct>` (the direct-fill rail): parse a JSON
+    /// array of objects directly into arena-allocated columns — no AoS intermediate, no transpose —
+    /// and write the soa `{ptr,len}` view (len = row count) into the `out` slot. Yields an `i32`
+    /// status (0 = ok). `arena` is the enclosing arena handle the runtime bump-allocates the column
+    /// buffer from. codegen builds the same field table as [`JsonDecode`] and passes `arena`.
+    JsonDecodeSoa { struct_id: u32, input: Operand, out: Slot, arena: Operand },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
@@ -2393,17 +2399,20 @@ fn transpose_to_soa(
 }
 
 /// `json.decode(input)` into a `soa<Struct>` (runway step 2) — decode the JSON array of objects
-/// into a temporary AoS via the tested struct-array parser (the array length N is unknown until
-/// parsed, so a one-pass column-major decode isn't possible), then transpose to a column-major
-/// `soa<Struct>` and free the AoS temporary. Mirrors [`lower_json_decode_struct_array`]'s Ok/Err
-/// branch, with the transpose + free on the Ok edge. The soa columns are all primitive scalars
+/// **directly** into arena-allocated column-major buffers via [`Rvalue::JsonDecodeSoa`]: the runtime
+/// counts the rows (so the column offsets can be computed), allocates the columns from the enclosing
+/// arena, and fills them in one value-parse pass — no AoS intermediate, no transpose. Mirrors
+/// [`lower_json_decode_struct_array`]'s Ok/Err branch. The soa columns are all primitive scalars
 /// (sema-enforced), so the result is self-contained — bound to the arena, not the input.
 fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
-    let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
-    let out = b.new_slot(arr_ty);
+    let soa_ty = Ty::Soa(struct_id);
+    let out = b.new_slot(soa_ty);
     let inp = lower_expr(b, input);
+    // The column buffer is arena-bump-allocated (sema requires `json.decode → soa` inside an arena),
+    // so the runtime needs the innermost arena handle.
+    let arena = *b.arenas.last().expect("json.decode → soa outside an arena (sema-checked)");
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, input: inp, out }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeSoa { struct_id, input: inp, out, arena: Operand::Value(arena) }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -2413,20 +2422,12 @@ fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, res
     let rslot = b.new_slot(result_ty);
     b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
 
-    // Ok: load the decoded AoS array, transpose it into an arena soa, then free the AoS temporary
-    // (its scalar columns were copied into the soa buffer; nothing else holds it).
+    // Ok: load the soa `{ptr,len}` view (the column buffer is arena-tied — no Drop) and wrap it.
     b.cur = ok_bb;
-    let a = b.fresh_value(arr_ty);
-    b.push(Stmt::Let(a, Rvalue::Load(out)));
-    let len = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(a))));
-    // `out` holds the decoded AoS array; pass it as the slot. An AoS struct-view addresses elements
-    // through `slice_val` (so the slot is unused here), but passing the real slot rather than a dummy
-    // `0` is not fragile if a future pass reads it.
-    let soa = transpose_to_soa(b, Some((struct_id, Layout::Aos)), &Some(Operand::Value(a)), out, Operand::Value(len), struct_id);
-    b.push(Stmt::DropValue(Operand::Value(a)));
+    let soa = b.fresh_value(soa_ty);
+    b.push(Stmt::Let(soa, Rvalue::Load(out)));
     let okv = b.fresh_value(result_ty);
-    b.push(Stmt::Let(okv, Rvalue::ResultOk(soa)));
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(soa))));
     b.push(Stmt::Store(rslot, Operand::Value(okv)));
     b.terminate(Term::Goto(join));
 
