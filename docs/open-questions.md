@@ -481,15 +481,17 @@ payload/tuple element). Source = AoS, `str` key + `i64` value, **`sum`/`min`/`ma
 `group_agg_str` is generic over `value_at`/`combine`, monomorphized per op into
 `align_rt_group_{sum,min,max,count}_str`; `count` reads no value column).
 
-**A2 — the dictionary reuse rail (the ~19–21× multi-aggregation reuse) — DESIGN + foundation 2026-06-29.**
+**A2 — the dictionary reuse rail — DESIGN + foundation 2026-06-29; SURFACE DONE + BENCHED 2026-06-29
+(verdict: reuse helps vs naive, but does NOT beat fast single-pass Rust — see the bench finding below).**
 Chosen surface form (user 2026-06-29): the **encoded-column** form (keeps One-Way), *not* an exposed
 id-column. `e := s.dict_encode(.name)` is an explicit one-time transform (visible cost) that interns the
 `.name` `str` column to a **dense id column** + a **dictionary** (`array<str>`, `dict[id] = str`),
 carried on the result; then `e.group_by(.name).sum(.v)` / `.max(.w)` / … reuse the *same surface as A1*
 but run on the **i64 id column** (the dense-id `align_rt_group_*_i64` from #209) and re-label results
-through the dictionary → still `(array<str>, array<Acc>)`. The win: the string interning is paid **once**
-(in `dict_encode`), so repeated group-bys on the same key are integer-column work (~19–21× vs
-re-interning per group-by, the A1 cost). Region: the dictionary's `str` views borrow the source, so the
+through the dictionary → still `(array<str>, array<Acc>)`. The intent: the string interning is paid
+**once** (in `dict_encode`), so repeated group-bys on the same key are integer-column work. (The
+original ~19–21× projection was **wrong** — the bench below measures **2.4–3.5× vs naive Align** and a
+**loss, 0.31–0.70×, to fast single-pass Rust**.) Region: the dictionary's `str` views borrow the source, so the
 encoded value is region-tied to it. **Slices:** (1) **DONE (#218)** — the runtime primitive
 `align_rt_dict_encode_str` (intern a strided `str` column → `out_ids[n]` dense-id column +
 `out_dict[count]` dictionary; first-occurrence id order; tested). (1b) **DONE (#220)** — the label
@@ -520,10 +522,20 @@ buffer (`align_rt_gather_i64`, the one tiny new runtime plumbing — see below),
 AoS source. End-to-end test `dict_encode_reuse_matches_a1_string_group_by` proves reuse across three
 aggregates equals the one-shot A1 str group_by. (New runtime: `align_rt_gather_i64` — gather a strided i64
 column to contiguous; the value projection of an encoded group_by. Trivial plumbing, unit-tested.)
-**(e) bench — REMAINING follow-up** (multi-aggregation reuse vs A1 / `HashMap<&str,_>×N`, target ~19–21×;
-mirror `bench/group_by` with a str-key AoS kernel). Deferred like #210's str surface, which also shipped
-without its own bench. Still open: multiple aggregates in one pass, a `group_by(.key)` with a lambda key,
-AoS source for *i64* keys, and the `Scalar::DictEncoded` (return/wrap) follow-up. Design ↓.
+**(e) bench — DONE (`bench/group_by_reuse`, 1M rows, 4 aggregates `sum a/sum b/max c/min d`).** Result
+(native): **a1/a2 = 2.4–3.5×** (a2 reuse beats Align's naive 4× str group_bys — the reuse is real and
+widens with cardinality), a2 also beats *naive* Rust (4× `HashMap<&str>`), **but a2 LOSES to fast
+single-pass Rust (`HashMap<&str,[i64;4]>`, one hash + 4 accumulators): `smart/a2` = 0.31–0.70×** (Rust is
+1.4–3.2× faster). Per the mandate (only a win over the *fast* baseline is honest), **A2 as a batch of
+separate group_bys does not beat idiomatic fast Rust.** Why: smart Rust makes **one pass** (hash once,
+update 4 accumulators); a2 hashes once via `dict_encode` but then makes **four more passes** (gather +
+dense-id aggregate + label, each with a malloc) — reuse removes the re-*hashing*, not the re-*scanning*.
+**Roadmap consequence (the bench's job): the real lever is "multiple aggregates in one pass"** — fuse K
+aggregates into one scan of the encoded ids filling K result columns — now the **primary** A2 work, not a
+nice-to-have. A2's honest niche is **sequential/interactive** reuse (aggregates arriving over time, not
+fusible into one pass), where reuse beats re-interning per query (the 2.4–3.5× a1/a2 gap). Still open
+(now reprioritized): **multiple aggregates in one pass (top priority)**, a `group_by(.key)` with a lambda
+key, AoS source for *i64* keys, and the `Scalar::DictEncoded` (return/wrap) follow-up. Design ↓.
 
 ### Column-oriented `group_by` — DESIGN / runway (the next analytics headline)
 The next "Align beats idiomatic Rust on a realistic workload" pillar after json→soa: grouped

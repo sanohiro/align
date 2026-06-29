@@ -1,0 +1,40 @@
+// A2 dictionary-reuse benchmark kernel. The workload is *multi-aggregation over a string key*: four
+// grouped aggregates (sum .a, sum .b, max .c, min .d) keyed by the same `.name` column of an AoS
+// `array<Row>`. Each function returns the summed distinct-key counts of the four aggregates (= 4×
+// the group count), forcing every group_by — and the value gather inside each — to run.
+//
+//   a1  — the naive path: four independent `group_by(.name)` calls, so the runtime *re-interns* the
+//         string key column four times (one string hash per row per aggregate). This mirrors an
+//         idiomatic `HashMap<&str, _>` built four times.
+//   a2  — the reuse path: `dict_encode(.name)` interns the key column *once* into a dense-id column,
+//         then the four `group_by`s run on integer ids (the dense `align_rt_group_*_i64`). The string
+//         hashing is paid once and amortized across all four aggregates.
+//
+// The harness times a1 vs a2 (the reuse speedup) and both against idiomatic Rust HashMap<&str,_>×4
+// (std SipHash + fast ahash).
+// The four aggregates' results are dropped (the runtime calls are opaque, so the work runs); each
+// function **returns the input array unchanged** so the harness can call it repeatedly. An
+// `array<Struct>` is a Move type — a callee normally drops its owned param — so returning `us`
+// moves it back out instead (the param slot is nulled, its exit drop frees null), letting the C-ABI
+// harness keep ownership and thread the same `{ptr,len}` across rounds. (Value correctness is proven
+// by the merged `dict_encode_reuse_matches_a1_string_group_by` test; this kernel measures time.)
+Row { name: str, a: i64, b: i64, c: i64, d: i64 }
+
+// Naive: four str-key group_bys (re-interns the key column each time).
+pub fn a1(us: array<Row>) -> array<Row> {
+  ga := us.group_by(.name).sum(.a)
+  gb := us.group_by(.name).sum(.b)
+  gc := us.group_by(.name).max(.c)
+  gd := us.group_by(.name).min(.d)
+  return us
+}
+
+// Reuse: dict_encode once, then four group_bys on the dense-id column.
+pub fn a2(us: array<Row>) -> array<Row> {
+  e := us.dict_encode(.name)
+  ga := e.group_by(.name).sum(.a)
+  gb := e.group_by(.name).sum(.b)
+  gc := e.group_by(.name).max(.c)
+  gd := e.group_by(.name).min(.d)
+  return us
+}
