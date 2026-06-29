@@ -25,8 +25,12 @@ struct AlignStr {
 extern "C" {
     /// `pub fn decode_full(d: str) -> i64` — decode all 4 fields → `where(.active).pay.sum()`.
     fn decode_full(data: AlignStr) -> i64;
+    /// `pub fn decode_full_len(d: str) -> i64` — decode all 4 fields, return row count.
+    fn decode_full_len(data: AlignStr) -> i64;
     /// `pub fn decode_proj(d: str) -> i64` — decode 2 fields (skip score/extra) → same aggregate.
     fn decode_proj(data: AlignStr) -> i64;
+    /// `pub fn decode_proj_len(d: str) -> i64` — decode 2 fields, return row count.
+    fn decode_proj_len(data: AlignStr) -> i64;
 }
 
 #[derive(Deserialize)]
@@ -83,6 +87,7 @@ fn gen_json(n: usize) -> (String, i64) {
 fn main() {
     let sizes = [10_000usize, 100_000, 1_000_000];
     let rounds = 40;
+    let profile = std::env::var_os("ALIGN_BENCH_PROFILE").is_some();
     println!("JSON decode throughput — Align json.decode vs serde_json (both fold where(.active).pay.sum())");
     println!(
         "{:>9} {:>8} | {:>9} {:>9} {:>9} | {:>9} {:>9} {:>9}",
@@ -127,5 +132,23 @@ fn main() {
             rp,
             rp / ap
         );
+
+        if profile && n == 1_000_000 {
+            assert_eq!(unsafe { decode_full_len(astr) }, n as i64, "align full len wrong");
+            assert_eq!(unsafe { decode_proj_len(astr) }, n as i64, "align proj len wrong");
+            let (mut fl, mut pl) = (f64::MAX, f64::MAX);
+            for _ in 0..rounds {
+                let t = Instant::now();
+                std::hint::black_box(unsafe { decode_full_len(astr) });
+                fl = fl.min(t.elapsed().as_secs_f64() * 1e3);
+
+                let t = Instant::now();
+                std::hint::black_box(unsafe { decode_proj_len(astr) });
+                pl = pl.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!("profile 1M:");
+            println!("  full decode-only {:8.3} ms; aggregate delta {:8.3} ms", fl, af - fl);
+            println!("  proj decode-only {:8.3} ms; aggregate delta {:8.3} ms", pl, ap - pl);
+        }
     }
 }

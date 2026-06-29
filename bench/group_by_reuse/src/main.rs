@@ -49,6 +49,10 @@ extern "C" {
     fn a1(us: Slice) -> Slice;
     /// `pub fn a2(us: array<Row>) -> array<Row>` — dict_encode once, four reused id group_bys; threads back.
     fn a2(us: Slice) -> Slice;
+    fn a2_encode(us: Slice) -> Slice;
+    fn a2_one(us: Slice) -> Slice;
+    fn a2_two(us: Slice) -> Slice;
+    fn a2_three(us: Slice) -> Slice;
 }
 
 /// Build `groups` distinct string keys (kept alive by the returned `Vec<String>`) and `n` rows whose
@@ -136,6 +140,7 @@ fn main() {
     let n = 1_000_000usize;
     let group_counts = [100usize, 10_000, 1_000_000];
     let rounds = 20;
+    let profile = std::env::var_os("ALIGN_BENCH_PROFILE").is_some();
     println!("4 aggregates (sum a, sum b, max c, min d) over {n} rows by a str key — Align reuse vs Rust");
     println!("  a1 = Align naive (4 str group_bys)   a2 = Align dict_encode reuse");
     println!("  naive = Rust 4× HashMap<&str>   smart = Rust 1-pass HashMap<&str,[i64;4]> (ahash, hashes once)");
@@ -180,5 +185,40 @@ fn main() {
             "{:>8}  {:>8}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {:>7.2}x  {:>8.2}x",
             g, distinct, t1, t2, tn, tsm, t1 / t2, tsm / t2
         );
+
+        if profile && g == 1_000_000 {
+            for f in [
+                unsafe { a2_encode(input) },
+                unsafe { a2_one(input) },
+                unsafe { a2_two(input) },
+                unsafe { a2_three(input) },
+            ] {
+                assert!(f.ptr == input.ptr && f.len == input.len, "profile function threaded the array back unchanged");
+            }
+            let (mut te, mut t_one, mut t_two, mut t_three) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+            for _ in 0..rounds {
+                let t = Instant::now();
+                std::hint::black_box(unsafe { a2_encode(std::hint::black_box(input)) });
+                te = te.min(t.elapsed().as_secs_f64() * 1e3);
+
+                let t = Instant::now();
+                std::hint::black_box(unsafe { a2_one(std::hint::black_box(input)) });
+                t_one = t_one.min(t.elapsed().as_secs_f64() * 1e3);
+
+                let t = Instant::now();
+                std::hint::black_box(unsafe { a2_two(std::hint::black_box(input)) });
+                t_two = t_two.min(t.elapsed().as_secs_f64() * 1e3);
+
+                let t = Instant::now();
+                std::hint::black_box(unsafe { a2_three(std::hint::black_box(input)) });
+                t_three = t_three.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!("profile 1M groups:");
+            println!("  encode only {:8.3} ms", te);
+            println!("  + 1 aggregate {:8.3} ms  delta {:8.3} ms", t_one, t_one - te);
+            println!("  + 2 aggregate {:8.3} ms  delta {:8.3} ms", t_two, t_two - te);
+            println!("  + 3 aggregate {:8.3} ms  delta {:8.3} ms", t_three, t_three - te);
+            println!("  + 4 aggregate {:8.3} ms  delta {:8.3} ms", t2, t2 - te);
+        }
     }
 }

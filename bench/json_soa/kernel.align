@@ -13,9 +13,23 @@ fn run(data: str) -> Result<i64, Error> {
   }
 }
 
+fn run_len(data: str) -> Result<i64, Error> {
+  arena {
+    s: soa<Row> := json.decode(data)?
+    return Ok(s.pay.len())
+  }
+}
+
 // Exported C-ABI entry: returns the aggregate, or -1 on a parse error (so the harness can detect it).
 pub fn agg(data: str) -> i64 {
   match run(data) {
+    Ok(v) => v,
+    Err(_) => 0 - 1,
+  }
+}
+
+pub fn agg_len(data: str) -> i64 {
+  match run_len(data) {
     Ok(v) => v,
     Err(_) => 0 - 1,
   }
@@ -30,8 +44,20 @@ fn run_aos(data: str) -> Result<i64, Error> {
   return Ok(xs.where(.active).pay.sum())
 }
 
+fn run_aos_len(data: str) -> Result<i64, Error> {
+  xs: array<Row> := json.decode(data)?
+  return Ok(xs.len())
+}
+
 pub fn agg_aos(data: str) -> i64 {
   match run_aos(data) {
+    Ok(v) => v,
+    Err(_) => 0 - 1,
+  }
+}
+
+pub fn agg_aos_len(data: str) -> i64 {
+  match run_aos_len(data) {
     Ok(v) => v,
     Err(_) => 0 - 1,
   }

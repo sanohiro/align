@@ -38,3 +38,29 @@ pub fn a2(us: array<Row>) -> array<Row> {
   gd := e.group_by(.name).min(.d)
   return us
 }
+
+pub fn a2_encode(us: array<Row>) -> array<Row> {
+  e := us.dict_encode(.name)
+  return us
+}
+
+pub fn a2_one(us: array<Row>) -> array<Row> {
+  e := us.dict_encode(.name)
+  ga := e.group_by(.name).sum(.a)
+  return us
+}
+
+pub fn a2_two(us: array<Row>) -> array<Row> {
+  e := us.dict_encode(.name)
+  ga := e.group_by(.name).sum(.a)
+  gb := e.group_by(.name).sum(.b)
+  return us
+}
+
+pub fn a2_three(us: array<Row>) -> array<Row> {
+  e := us.dict_encode(.name)
+  ga := e.group_by(.name).sum(.a)
+  gb := e.group_by(.name).sum(.b)
+  gc := e.group_by(.name).max(.c)
+  return us
+}

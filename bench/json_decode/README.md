@@ -49,3 +49,16 @@ the general decoder pays and the probe's inlined positional sum did not. The lea
 autopsy's first fix (index build 47→18 ms vs the quote-heavy structural index). Run this before/after
 every parser change and watch the ratios; when a result disappoints, autopsy — don't guess (see
 `bench/README.md` methodology).
+
+## Profile finding (2026-06-29, native, 1M rows)
+
+`ALIGN_BENCH_PROFILE=1 bench/json_decode/run.sh native` adds decode-only entry points that return the
+row count after `json.decode`. Measured:
+
+```
+full decode-only   91.376 ms; aggregate delta    0.684 ms
+proj decode-only   60.780 ms; aggregate delta   -0.108 ms
+```
+
+The aggregate is below the noise floor at this scale; this benchmark is a parser/decoder benchmark.
+The next parser work should target the stage-2 walk and value parsing, not the folded aggregate.

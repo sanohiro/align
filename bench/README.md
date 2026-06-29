@@ -7,6 +7,7 @@ strong cases Align must match or beat Rust**.
 ```sh
 bench/run.sh            # native (both sides at the host CPU's best — AVX2 etc.)
 bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
+ALIGN_BENCH_PROFILE=1 bench/json_soa/run.sh native  # optional decomposition output
 ```
 
 ## How it works
@@ -50,28 +51,35 @@ bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
 - **End-to-end JSON→SoA is parse-bound (`bench/json_soa/`); ≈0.61× → ≈0.82× after one parser fix.**
   The column-layout win above is on the *aggregation*; the realistic `json.decode → soa → aggregate`
   pipeline is dominated by the **parse**. Decomposing (Align `→soa` vs Align `→array` AoS vs `serde →
-  Vec`) showed the transpose is cheap — the gap was the parser. Hand-rolling integer parsing
+  Vec`) first showed the gap was the parser. Hand-rolling integer parsing
   (`str::from_utf8(..).parse` → a single-pass digit accumulation) moved it ≈0.61× → ≈0.82–0.85×
-  (AoS ≈parity at 1M). Remaining gap → more scalar tuning + a SIMD/structural parser. See
-  `bench/json_soa/README.md` + `docs/open-questions.md`.
+  (AoS ≈parity at 1M). The latest profile mode shows the aggregate itself is <1 ms at 1M rows, while
+  the AoS→SoA materialization still costs ~10–25 ms at that size. Remaining gap → more scalar tuning
+  + direct column fill / SIMD structural parsing. See `bench/json_soa/README.md` +
+  `docs/open-questions.md`.
 - **JSON decode-throughput tracker (`bench/json_decode/`):** the regression harness for the parser
   rewrite (recursive-descent → simdjson-style two-stage SIMD). The recursive-descent baseline ≈ties
   `serde_json` (full ≈1.03×, projecting ≈1.09×); a validated `work/` probe (SIMD structural index +
   projecting two-stage) reaches **~3.4–4.1×** over `serde_json` (~3.2–3.9× into soa columns). The
   rewrite lands that here — watch the `align/serde` ratios climb per slice.
 - **Grouped aggregation (`bench/group_by/`): Align beats the *default* `std::HashMap` everywhere
-  (1.2–3.6×) and beats `ahash` for low-cardinality grouping (1.31×).** `s.group_by(.k).sum(.v)` is a
-  primitive-key columnar hash-aggregate vs Rust's generic map. It loses to `ahash` at high cardinality
-  (0.52–0.72×) — closing that needs a SwissTable layout. The benchmark caught a mechanism bug (a fixed
-  `2·n` table thrashed cache, 0.11× at 10k groups); growing the table to the live group count fixed it.
+  (≈5–6×) and beats `ahash` on dense integer-key analytics (≈2–3×).** `s.group_by(.k).sum(.v)` now
+  takes a dense-id direct-index path when the key range is tight (`acc[key - min]`, no hashing), which
+  is the shape used by the benchmark. The older open-addressing hash path still backs sparse /
+  wide-range keys; beating `ahash` there still wants a SwissTable-style layout. The benchmark caught
+  both the original table-sizing bug and the denser direct-index win.
 - **String building (`bench/string_builder/`): the `builder` reduce-append pattern ties/beats naive
   Rust and is ≈1.5× behind hand-optimized Rust.** Hand-rolling the runtime integer write (`write!` →
   itoa) halved the gap (Gemini measured the old builder ~2.8× behind optimized). The residual is
   **per-append FFI-call overhead** (3 runtime calls/element, not inlined) — measured, *not* the `Vec`
-  realloc: adding `builder(capacity)` did **not** close it (`+cap` ≈ `build`). The lever is inlining/
-  batching the appends. This is the string-accumulation tool the `str + str`-in-a-lambda error points to.
+  realloc: adding `builder(capacity)` did **not** close it (`+cap` ≈ `build`). Profile mode confirms
+  static writes and integer writes are both material costs; a runtime batch probe for
+  `literal + int + literal` cuts the 100k workload from ~1.48 ms to ~0.95–0.99 ms. The lever is
+  inlining/batching the appends. This is the string-accumulation tool the `str + str`-in-a-lambda
+  error points to.
 - **Data-parallel map (`bench/par_map/`): the persistent worker pool removed the spawn regression
-  (100k went ~7× slower → ≈parity with sequential).** Old `par_map` spawned OS threads per call; now
-  it submits chunks to a process-lifetime pool. It's ≈sequential parity but still behind `rayon`
-  (0.4–0.6×) for cheap maps — the ceiling is the per-element indirect `thunk` call (no vectorization,
-  same class as the builder per-write overhead); par_map wins on heavy/non-vectorizable per-element work.
+  (100k went ~7× slower → same order as sequential).** Old `par_map` spawned OS threads per call; now
+  it submits chunks to a process-lifetime pool. Chunk tuning helps, but profile mode shows cheap
+  arithmetic still loses to Align's own sequential/vectorized `map().sum()` because every element
+  crosses an indirect `thunk` call. Use `par_map` for heavier/non-vectorizable work; cheap maps need
+  sequential fallback or thunk specialization.

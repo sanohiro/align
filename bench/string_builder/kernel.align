@@ -24,3 +24,31 @@ pub fn build_cap(s: slice<i64>) -> i64 {
   res := b.to_string()
   return res.len()
 }
+
+pub fn build_static_one(s: slice<i64>) -> i64 {
+  b := s.reduce(builder(), fn b, x {
+    b.write("item--status ")
+    b
+  })
+  res := b.to_string()
+  return res.len()
+}
+
+pub fn build_static_two(s: slice<i64>) -> i64 {
+  b := s.reduce(builder(), fn b, x {
+    b.write("item-")
+    b.write("-status ")
+    b
+  })
+  res := b.to_string()
+  return res.len()
+}
+
+pub fn build_int_only(s: slice<i64>) -> i64 {
+  b := s.reduce(builder(), fn b, x {
+    b.write_int(x)
+    b
+  })
+  res := b.to_string()
+  return res.len()
+}

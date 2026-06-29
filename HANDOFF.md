@@ -5,7 +5,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-06-28._
+_Last updated: 2026-06-29._
 
 ## Setup on the new machine
 
@@ -34,6 +34,18 @@ end-to-end to native.
 Rust ~8–10×; `group_by(.key).sum/min/max/.count()` beats the default `std::HashMap` 1.4–4.2×;
 `par_map` uses a persistent worker pool; flat pipelines match idiomatic Rust (shared LLVM).
 
+**Perf profiling snapshot (2026-06-29):** benchmark harnesses now support
+`ALIGN_BENCH_PROFILE=1 .../run.sh native` decomposition output. The important measured bottlenecks:
+JSON decode is parser/decoder-bound (`bench/json_decode`: 1M full decode-only ≈91 ms vs
+decode+aggregate ≈92 ms); JSON→SoA still pays a real AoS→SoA materialization cost at 1M rows
+(`bench/json_soa`: AoS decode-only ≈88 ms, SoA decode+transpose ≈102–114 ms); `group_by_reuse` is
+dominated by high-cardinality string `dict_encode` (≈260 ms at 1M groups, with four reused
+aggregates adding ≈75 ms); `string_builder` is call-count/itoa-bound, not capacity-bound, and a
+runtime batch probe for `literal + int + literal` cuts the 100k workload from ~1.48 ms to
+~0.95–0.99 ms; cheap `par_map` loses to Align's own sequential/vectorized `map().sum()` because every
+element crosses an indirect thunk. See `bench/README.md` and the per-benchmark READMEs before
+changing perf code.
+
 **Active feature: nested struct fields** (`docs/impl/08-nested-structs.md`), the last big language gap:
 - **Slice 1 DONE** (PR #182): plain-data (scalar-only, acyclic) nested struct fields — `Line { a: Point }`,
   depth-N read/write (`l.a.x`), nested-literal construction.
@@ -47,6 +59,30 @@ Rust ~8–10×; `group_by(.key).sum/min/max/.count()` beats the default `std::Ha
   fields, reassign-drops-old (a pre-existing gap for all owned types).
 
 ## Next action
+
+Current dirty work is a perf/profile slice. Before resuming unrelated language work, either finish
+this slice or commit it as a measured benchmark/profiling checkpoint.
+
+**Best next action: implement builder batch lowering.** The runtime ABI and proof are already in this
+worktree: `align_rt_builder_write_str_int_str` appends `literal + int + literal` in one call, and
+`bench/string_builder`'s profile harness calls it directly. Measured at 100k rows, normal generated
+builder code is ~1.48–1.55 ms, while the runtime batch probe is ~0.95–0.99 ms. The remaining work is
+compiler-side lowering: detect the common sequence
+`b.write("literal"); b.write_int(x); b.write("literal"); b` in the builder-reduce body and emit the
+batched runtime call instead of three calls. Keep the first implementation narrow: literal + int +
+literal only; do not attempt a general builder-chain optimizer yet. Re-run:
+
+```bash
+ALIGN_BENCH_PROFILE=1 bench/string_builder/run.sh native
+cargo test -q
+```
+
+Then update `bench/string_builder/README.md`: replace "runtime batch probe" with "compiler lowering
+implemented" if `build` itself moves near the batch number.
+
+Secondary perf follow-ups, in measured priority order: JSON direct SoA decode / count-then-direct
+column fill; `group_by_reuse` multi-aggregate one-pass fuse plus faster string `dict_encode`; cheap
+`par_map` sequential fallback or thunk specialization.
 
 Continue `docs/impl/08-nested-structs.md`:
 - **Slice 4** — arrays/soa × nesting (`arr[i].a.x`, nested soa column) **and arrays of Move structs**
