@@ -500,8 +500,11 @@ correctness is de-risked; what remains is purely the compiler surface.**
 (2) **NEXT (the big slice — a new type through all compiler layers, ≈ the string-key group_by PR #210
 in size).** Precise plan: **(a) type** — `Ty::DictEncoded(u32)` indexing a side table
 `{ struct_id, key_field }` (like `tuples`/`fn_types`); a Move, region-tracked value laid out as **three
-`{ptr,len}` slices** `{ source_aos (borrowed), ids (owned i64 buf), dict (owned str buf) }`; `Scalar`
-variant for payloads only if needed (probably not — it's a local). **(b) `dict_encode` sema** —
+`{ptr,len}` slices** `{ source_aos (borrowed), ids (owned i64 buf), dict (owned str buf) }`. **First cut
+= a local used immediately by `group_by` (no `Scalar` variant).** A `Scalar::DictEncoded` is a follow-up,
+needed the moment a `DictEncoded` is **returned or wrapped** (e.g. `Result<DictEncoded, Error>` from a
+`dict_encode` that `?`s, or returning one whose AoS source is a parameter) — Align restricts
+`Option`/`Result` payloads to `Scalar`s, so add the variant then. **(b) `dict_encode` sema** —
 `check_dict_encode(recv: array<Struct> AoS, .key: str field)` → `Ty::DictEncoded`; HIR
 `ExprKind::ArrayDictEncode { source, struct_id, key_field }`; region = source's; thread the new
 ExprKind through the 4 HIR walkers (effect / escape / movecheck / finalize) + `region_of` + the AST
