@@ -40,9 +40,18 @@ pub fn format_source(file: FileId, src: &str) -> Option<String> {
     let tokens = tokenize(file, src, &mut Diagnostics::new());
     let out = Formatter::new(src, &ann).run(&tokens);
 
-    // Safety net: the formatted text must carry the exact same significant tokens, in order.
-    let out_tokens = tokenize(file, &out, &mut Diagnostics::new());
+    // Safety net, in two layers. (1) The formatted text must carry the exact same significant
+    // tokens, in order — catches a dropped/added/garbled token. (2) It must re-parse cleanly —
+    // catches a structural corruption the token check misses (e.g. losing a statement-separating
+    // `;`, which leaves the token sequence unchanged but changes the parse). If either fails, decline
+    // to format rather than risk changing the program's meaning.
+    let mut out_diags = Diagnostics::new();
+    let out_tokens = tokenize(file, &out, &mut out_diags);
     if sig_texts(&tokens, src) != sig_texts(&out_tokens, &out) {
+        return None;
+    }
+    align_parser::parse_file(out_tokens, &mut out_diags);
+    if out_diags.has_errors() {
         return None;
     }
     Some(out)
@@ -53,7 +62,15 @@ fn is_skipped(t: &Token) -> bool {
 }
 
 fn tok_text<'s>(src: &'s str, t: &Token) -> &'s str {
-    &src[t.span.lo as usize..t.span.hi as usize]
+    // Spans come from tokenizing this exact `src`, so they are in bounds — but clamp defensively so
+    // the formatter can never panic (a public entry point), e.g. on a synthetic/zero-width span.
+    let lo = (t.span.lo as usize).min(src.len());
+    let hi = (t.span.hi as usize).min(src.len());
+    if lo <= hi {
+        &src[lo..hi]
+    } else {
+        ""
+    }
 }
 
 /// The significant tokens' source texts, in order — the meaning-bearing fingerprint of a program
@@ -136,8 +153,9 @@ impl Annotations {
         let lo = first.name.span.lo;
         let hi = last.bound.as_ref().map(|b| b.span.hi).unwrap_or(last.name.span.hi);
         let b = src.as_bytes();
+        // Clamp defensively (these offsets are in-bounds for `src`, but never index past the end).
         // widen left to the `<`
-        let mut l = lo as usize;
+        let mut l = (lo as usize).min(b.len());
         while l > 0 && b[l - 1].is_ascii_whitespace() {
             l -= 1;
         }
@@ -145,7 +163,7 @@ impl Annotations {
             l -= 1;
         }
         // widen right to the `>`
-        let mut r = hi as usize;
+        let mut r = (hi as usize).min(b.len());
         while r < b.len() && b[r].is_ascii_whitespace() {
             r += 1;
         }
@@ -309,12 +327,14 @@ impl Annotations {
 
 enum Triv {
     Newline,
+    Semicolon,
     Comment(String),
 }
 
-/// Scan an inter-token gap into its meaningful trivia (newlines and `//` line comments). Whitespace
-/// and `;` carry no formatting information of their own and are dropped (a redundant `;` thus simply
-/// disappears; a comma/brace difference can never appear here because gaps hold only trivia).
+/// Scan an inter-token gap into its meaningful trivia: newlines, `;`, and `//` line comments.
+/// Whitespace carries no formatting information and is dropped. A `;` is kept because it is
+/// load-bearing when cramming statements on one line (`x := 1; y := 2`) — only a `;` immediately
+/// before a newline is redundant, and that is decided at emit time, not here.
 fn scan_gap(gap: &str) -> Vec<Triv> {
     let b = gap.as_bytes();
     let mut out = Vec::new();
@@ -325,6 +345,10 @@ fn scan_gap(gap: &str) -> Vec<Triv> {
                 out.push(Triv::Newline);
                 i += 1;
             }
+            b';' => {
+                out.push(Triv::Semicolon);
+                i += 1;
+            }
             b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
                 let start = i;
                 while i < b.len() && b[i] != b'\n' {
@@ -332,7 +356,7 @@ fn scan_gap(gap: &str) -> Vec<Triv> {
                 }
                 out.push(Triv::Comment(gap[start..i].trim_end().to_string()));
             }
-            _ => i += 1, // whitespace, `;`, `\r`
+            _ => i += 1, // whitespace, `\r`
         }
     }
     out
@@ -359,7 +383,10 @@ impl<'a> Formatter<'a> {
         let mut prev_hi = 0u32;
         let mut prev: Option<&Token> = None;
         for t in &sig {
-            let gap = &self.src[prev_hi as usize..t.span.lo as usize];
+            // Defensive clamp (spans are in-bounds for this `src`; a formatter must never panic).
+            let lo = (prev_hi as usize).min(self.src.len());
+            let hi = (t.span.lo as usize).min(self.src.len());
+            let gap = if lo <= hi { &self.src[lo..hi] } else { "" };
             self.emit(gap, prev, t);
             prev = Some(t);
             prev_hi = t.span.hi;
@@ -367,7 +394,7 @@ impl<'a> Formatter<'a> {
         // Trailing trivia (EOF comments). `self.src` is `&'a str` (Copy), so this slice doesn't
         // borrow `self`.
         let src = self.src;
-        self.emit_trailing(&src[prev_hi as usize..]);
+        self.emit_trailing(&src[(prev_hi as usize).min(src.len())..]);
         while self.out.ends_with('\n') {
             self.out.pop();
         }
@@ -402,9 +429,11 @@ impl<'a> Formatter<'a> {
 
     fn emit(&mut self, gap: &str, prev: Option<&Token>, t: &Token) {
         let mut pending_nl = 0usize;
+        let mut had_semi = false;
         for ev in scan_gap(gap) {
             match ev {
                 Triv::Newline => pending_nl += 1,
+                Triv::Semicolon => had_semi = true,
                 Triv::Comment(c) => {
                     if pending_nl == 0 && !self.at_line_start() {
                         // Trailing comment on the current line.
@@ -429,9 +458,13 @@ impl<'a> Formatter<'a> {
         }
 
         if pending_nl > 0 || self.at_line_start() {
+            // A `;` immediately before a newline is a redundant terminator → dropped (we break here).
             self.break_line(pending_nl);
             let cont = self.is_continuation(t);
             self.indent_line(self.depth, cont);
+        } else if had_semi {
+            // Cramming: `;` separates statements on one line — load-bearing, keep it.
+            self.out.push_str("; ");
         } else if let Some(p) = prev {
             self.out.push_str(self.sep(p, t));
         }
@@ -451,6 +484,8 @@ impl<'a> Formatter<'a> {
         for ev in scan_gap(tail) {
             match ev {
                 Triv::Newline => pending_nl += 1,
+                // A `;` after the last token is always redundant (nothing follows) → dropped.
+                Triv::Semicolon => {}
                 Triv::Comment(c) => {
                     if pending_nl == 0 && !self.at_line_start() {
                         self.out.push(' ');
@@ -585,6 +620,14 @@ mod tests {
         assert!(!out.contains(';'), "redundant ; not dropped:\n{out}");
         assert!(!out.contains("\n\n\n"), "blank run not collapsed:\n{out}");
         assert!(out.contains("x := 1\n"), "statement mangled:\n{out}");
+    }
+
+    #[test]
+    fn preserves_cramming_semicolons() {
+        // A `;` that separates statements on one line is load-bearing — it must survive (only a `;`
+        // immediately before a newline is redundant).
+        let out = fmt("fn main() -> i32 {\n  x := 1; y := 2\n  return x + y\n}\n");
+        assert!(out.contains("x := 1; y := 2"), "cramming ; dropped (corrupts code):\n{out}");
     }
 
     #[test]
