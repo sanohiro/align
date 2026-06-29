@@ -2039,17 +2039,19 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     // accumulators adjacent (cache-friendly on the update).
     let mut acc: Vec<i64> = Vec::with_capacity(initial.saturating_mul(k));
     let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
-    // Read aggregate `j`'s value for the row at `row` (`count` contributes 1).
+    // Read aggregate `j`'s value for the row at `row` (`count` contributes 1). `j < k` and
+    // `ops`/`val_offs` have length `k`, so the unchecked index is in bounds — eliminating a bounds
+    // check on every K-way per-row fold.
     let read = |row: *const u8, j: usize| -> i64 {
-        if ops[j] == 3 {
+        if unsafe { *ops.get_unchecked(j) } == 3 {
             1
         } else {
-            unsafe { (row.add(val_offs[j]) as *const i64).read_unaligned() }
+            unsafe { (row.add(*val_offs.get_unchecked(j)) as *const i64).read_unaligned() }
         }
     };
-    // Fold value `v` into accumulator `cur` per aggregate `j`'s op.
+    // Fold value `v` into accumulator `cur` per aggregate `j`'s op (`j < k`, see `read`).
     let combine = |cur: i64, v: i64, j: usize| -> i64 {
-        match ops[j] {
+        match unsafe { *ops.get_unchecked(j) } {
             1 => cur.min(v),
             2 => cur.max(v),
             // sum (0) and count (3) both add (count's `v` is 1).
@@ -2062,13 +2064,23 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
         let bytes: &[u8] = if ks.ptr.is_null() || ks.len <= 0 { &[] } else { unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) } };
         match ids.get(bytes) {
             Some(&id) => {
+                // `id < reprs.len()` and `acc.len() == reprs.len() * k`, so `g + j < acc.len()`.
                 let g = id * k;
                 for j in 0..k {
-                    acc[g + j] = combine(acc[g + j], read(row, j), j);
+                    unsafe {
+                        let slot = acc.get_unchecked_mut(g + j);
+                        *slot = combine(*slot, read(row, j), j);
+                    }
                 }
             }
             None => {
                 let id = reprs.len();
+                // Bail early if the group count would exceed the caller's output capacity, before
+                // growing the tables further (cap = the row count in generated code, so unreachable
+                // there, but keeps the function safe for any caller).
+                if id >= cap as usize {
+                    return -1;
+                }
                 ids.insert(bytes, id);
                 reprs.push(ks);
                 // Seed each accumulator with the group's first row value.
@@ -2079,16 +2091,18 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
         }
     }
     let count = reprs.len();
-    if count > cap as usize {
-        return -1;
-    }
     let out_keys = unsafe { std::slice::from_raw_parts_mut(out_keys, count) };
     out_keys.copy_from_slice(&reprs);
     // Scatter each aggregate's accumulators into its output column.
     for (j, spec) in specs.iter().enumerate() {
+        // A null output column would make `from_raw_parts_mut` UB even at len 0 — fail closed.
+        if spec.out_vals.is_null() {
+            return -1;
+        }
         let out = unsafe { std::slice::from_raw_parts_mut(spec.out_vals, count) };
         for (g, slot) in out.iter_mut().enumerate() {
-            *slot = acc[g * k + j];
+            // `g < count` and `g * k + j < count * k = acc.len()`.
+            *slot = unsafe { *acc.get_unchecked(g * k + j) };
         }
     }
     count as i64
