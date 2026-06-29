@@ -231,6 +231,19 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 operand_str(out_vals)
             )
         }
+        Rvalue::GroupAggMultiStr { base, struct_id, key_field, aggs, out_keys, out_vals } => {
+            let specs: Vec<String> = aggs
+                .iter()
+                .map(|(op, vf)| format!("{op:?}{}", vf.map(|v| format!("(.val{v})")).unwrap_or_default()))
+                .collect();
+            let outs: Vec<String> = out_vals.iter().map(operand_str).collect();
+            format!(
+                "group_multi_str(base=slot{base} struct#{struct_id}.key{key_field} [{}] -> keys={}, vals=[{}])",
+                specs.join(", "),
+                operand_str(out_keys),
+                outs.join(", ")
+            )
+        }
         Rvalue::DictEncode { base, struct_id, key_field, out_ids, out_dict } => {
             format!(
                 "dict_encode(base=slot{base} struct#{struct_id}.key{key_field} -> ids={}, dict={})",

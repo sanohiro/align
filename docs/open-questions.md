@@ -540,11 +540,19 @@ cardinality trend confirms it's fixed overhead: `smart/a2` worsens to 0.31× at 
 dominates) and eases to 0.70× at 632k (hashing dominates). Fixes map 1:1 to deferred items — fuse the K
 aggregates (cause 1+3), arena-allocate the scratch (cause 2).
 **Roadmap consequence (the bench's job): the real lever is "multiple aggregates in one pass"** — fuse K
-aggregates into one scan of the encoded ids filling K result columns — now the **primary** A2 work, not a
-nice-to-have. A2's honest niche is **sequential/interactive** reuse (aggregates arriving over time, not
-fusible into one pass), where reuse beats re-interning per query (the 2.4–3.5× a1/a2 gap). Still open
-(now reprioritized): **multiple aggregates in one pass (top priority)**, a `group_by(.key)` with a lambda
-key, AoS source for *i64* keys, and the `Scalar::DictEncoded` (return/wrap) follow-up. Design ↓.
+aggregates into one scan filling K result columns. **FIRST CUT DONE 2026-06-29** — the fused
+`group_by(.key).agg(sum(.a), max(.b), count(), …)` surface (parser interprets `sum(.f)`/`count()` args;
+sema `check_group_agg_multi` → `hir::ExprKind::ArrayGroupAggMulti`; MIR `Rvalue::GroupAggMultiStr`;
+runtime `align_rt_group_multi_str` does one pass — intern key once, fold K accumulators — with a fast
+FxHash-class hasher, not SipHash). Result: bench `a3` **beats a1 (naive) 3.2–3.7× and beats a2
+(dict_encode reuse) everywhere**, but **still loses to smart single-pass Rust (0.42–0.77×)**: hashing is
+no longer the cause (FxHash finalizer ≈ ahash), the remaining gap is the per-call `malloc` of `n`-sized
+output columns + the dense-id `acc[id*K+j]` indirection vs smart Rust's inline `[i64;K]` map value. So
+fusion landed the structural win (cause 1: N passes → 1); **still open** to beat fast Rust: right-size /
+arena the output columns (cause 2), an inline-value accumulator layout, plus the deferred non-headline
+sources (i64-key soa / precomputed `dict_encoded` multi-aggregate), a `group_by(.key)` lambda key, and
+the `Scalar::DictEncoded` (return/wrap) follow-up. A2's honest niche stays **sequential/interactive**
+reuse (aggregates arriving over time, not fusible into one pass). Design ↓.
 **Surface positioning — DECIDED 2026-06-29 (Codex overreach review).** `dict_encode` is an **advanced
 explicit escape-hatch**, NOT the way users learn `group_by`. The one-way user story stays
 `xs.group_by(.key).sum(.value)`. What is **decided** is the *positioning* (dict_encode = escape-hatch);

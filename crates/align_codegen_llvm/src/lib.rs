@@ -598,6 +598,19 @@ fn build_module<'c>(
     ] {
         funcs.insert(key.to_string(), module.add_function(sym, group_str_ty, None));
     }
+    // Fused multi-aggregate str group-by: (base, n, stride, key_off, specs, k, out_keys, cap) -> count.
+    // `specs` is a `[k x {i64 val_off, i64 op, ptr out_vals}]` table built at the call site.
+    funcs.insert(
+        "group_multi_str".to_string(),
+        module.add_function(
+            "align_rt_group_multi_str",
+            ctx.i64_type().fn_type(
+                &[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()],
+                false,
+            ),
+            None,
+        ),
+    );
     // A2 dictionary reuse rail. `dict_encode`: (base, n, stride, key_off, out_ids, out_dict, cap) ->
     // dict size. `gather_i64`: (base, n, stride, off, out) -> (). `dict_lookup`: (ids, n, dict,
     // dict_len, out) -> ().
@@ -2472,6 +2485,66 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .expect("str group aggregate returns the group count (i64)")
+            }
+            Rvalue::GroupAggMultiStr { base, struct_id, key_field, aggs, out_keys, out_vals } => {
+                // Like `GroupAggStr` but builds a `[k x {i64 val_off, i64 op, ptr out_vals}]` spec
+                // table on the stack and calls the one-pass fused runtime.
+                use align_sema::hir::GroupOp;
+                let st = self.struct_types[*struct_id as usize];
+                let store = self.target_data.get_store_size(&st);
+                let align = self.target_data.get_abi_alignment(&st) as u64;
+                let stride = store.div_ceil(align) * align;
+                let key_off = self.target_data.offset_of_element(&st, *key_field).expect("valid key field offset");
+                let i64t = self.ctx.i64_type();
+                let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+                let spec_ty = self.ctx.struct_type(&[i64t.into(), i64t.into(), ptr_ty.into()], false);
+                let k = aggs.len() as u64;
+                // One alloca for the whole spec array (hoisted to the entry block).
+                let specs_arr = self.alloca_at_entry(spec_ty.array_type(k as u32).into(), "gmspecs")?;
+                for (j, ((op, value_field), out)) in aggs.iter().zip(out_vals.iter()).enumerate() {
+                    let val_off = value_field
+                        .map(|v| self.target_data.offset_of_element(&st, v).expect("valid value field offset"))
+                        .unwrap_or(0);
+                    let op_tag = match op {
+                        GroupOp::Sum => 0,
+                        GroupOp::Min => 1,
+                        GroupOp::Max => 2,
+                        GroupOp::Count => 3,
+                    };
+                    let entry = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(spec_ty.array_type(k as u32), specs_arr, &[i64t.const_zero(), i64t.const_int(j as u64, false)], "gmspec")
+                            .map_err(|e| self.err(e))?
+                    };
+                    let mut spec_val = spec_ty.get_undef();
+                    spec_val = self.builder.build_insert_value(spec_val, i64t.const_int(val_off, false), 0, "gmvoff").map_err(|e| self.err(e))?.into_struct_value();
+                    spec_val = self.builder.build_insert_value(spec_val, i64t.const_int(op_tag, false), 1, "gmop").map_err(|e| self.err(e))?.into_struct_value();
+                    spec_val = self.builder.build_insert_value(spec_val, self.operand(out), 2, "gmout").map_err(|e| self.err(e))?.into_struct_value();
+                    self.builder.build_store(entry, spec_val).map_err(|e| self.err(e))?;
+                }
+                let agg = self.builder.build_load(slice_struct_type(self.ctx), self.slots[base], "aosbase").map_err(|e| self.err(e))?.into_struct_value();
+                let bptr = self.builder.build_extract_value(agg, 0, "bptr").map_err(|e| self.err(e))?;
+                let blen = self.builder.build_extract_value(agg, 1, "blen").map_err(|e| self.err(e))?;
+                let ok = self.operand(out_keys);
+                self.builder
+                    .build_call(
+                        self.funcs["group_multi_str"],
+                        &[
+                            bptr.into(),
+                            blen.into(),
+                            i64t.const_int(stride, false).into(),
+                            i64t.const_int(key_off, false).into(),
+                            specs_arr.into(),
+                            i64t.const_int(k, false).into(),
+                            ok.into(),
+                            blen.into(),
+                        ],
+                        "groupmultistr",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("multi-aggregate str group returns the group count (i64)")
             }
             Rvalue::DictEncode { base, struct_id, key_field, out_ids, out_dict } => {
                 // Load the AoS `{ptr,len}`, derive the per-row stride + key byte offset (like

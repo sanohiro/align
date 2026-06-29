@@ -1916,6 +1916,7 @@ impl EffectScan {
             ExprKind::Unit | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_)
             | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::OptionNone
             | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupAgg { .. }
+            | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. } => {}
         }
     }
@@ -2175,6 +2176,7 @@ impl<'a> EscapeCheck<'a> {
             // default `Static`.) `dict_encode` itself likewise borrows its source AoS (its `dict`/
             // `source` slices view it), so the encoded value inherits the source's region.
             ExprKind::ArrayGroupAgg { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded, .. }
+            | ExprKind::ArrayGroupAggMulti { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded, .. }
             | ExprKind::ArrayDictEncode { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
             // An `arena {}` *expression* yields its block value, evaluated one level deeper.
@@ -2504,6 +2506,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
+            | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. } => {}
         }
@@ -2768,6 +2771,7 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupAgg { base, .. }
+            | ExprKind::ArrayGroupAggMulti { base, .. }
             | ExprKind::ArrayDictEncode { base, .. } | ExprKind::IndexField { base, .. } => {
                 if whole_moved(moved, *base) {
                     let name = &self.f.locals[*base as usize].name;
@@ -5882,6 +5886,10 @@ impl<'a, 't> Checker<'a, 't> {
     /// aggregate. `method`/`args` are the aggregate call (`recv` was `X.group_by(.key)`).
     fn check_group_agg(&mut self, source: &ast::Expr, key_field: &ast::Ident, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // `.agg(sum(.a), max(.b), count(), …)` — the fused multi-aggregate terminal — is its own path.
+        if method == "agg" {
+            return self.check_group_agg_multi(source, key_field, args, span);
+        }
         // Resolve the aggregate op + its (optional) value field from the method + args.
         let (op, value_field): (hir::GroupOp, Option<&ast::Ident>) = match method {
             "count" => {
@@ -6007,6 +6015,124 @@ impl<'a, 't> Checker<'a, 't> {
         let tuple_id = intern_tuple(self.tuples, vec![arr, arr]);
         Expr {
             kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: vi, op, source },
+            ty: Ty::Tuple(tuple_id),
+            span,
+        }
+    }
+
+    /// `s.group_by(.key).agg(sum(.a), max(.b), count(), …)` — the fused multi-aggregate terminal. Each
+    /// argument is one aggregate, written as a call `sum(.field)` / `min(.field)` / `max(.field)` /
+    /// `count()` (parsed as an ordinary call whose `.field` argument is a `FieldShorthand`; this method
+    /// interprets it). Computes all K aggregates in one pass over the key column, yielding a tuple
+    /// `(array<key>, array<i64>, …)` — distinct keys + one column per aggregate. First cut: the AoS
+    /// `str` key (the idiomatic-fast-Rust `HashMap<&str,[i64;K]>` shape).
+    fn check_group_agg_multi(&mut self, source: &ast::Expr, key_field: &ast::Ident, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.is_empty() {
+            self.diags.error("`group_by(.key).agg(...)` needs at least one aggregate, e.g. `.agg(sum(.a), max(.b))`".to_string(), span);
+            return err;
+        }
+        // Interpret each argument as an aggregate spec: a call `sum(.f)`/`min(.f)`/`max(.f)`/`count()`.
+        // Returns `(op, value-field ident)` per aggregate; the field is resolved against the struct below.
+        let mut specs: Vec<(hir::GroupOp, Option<&ast::Ident>)> = Vec::with_capacity(args.len());
+        for a in args {
+            let ast::ExprKind::Call { callee, args: cargs } = &a.kind else {
+                self.diags.error("each `agg(...)` argument must be an aggregate call, e.g. `sum(.value)` or `count()`".to_string(), a.span);
+                return err;
+            };
+            let ast::ExprKind::Path(p) = &callee.kind else {
+                self.diags.error("an `agg(...)` aggregate must be `sum`/`min`/`max`/`count`".to_string(), a.span);
+                return err;
+            };
+            let [name] = p.segments.as_slice() else {
+                self.diags.error("an `agg(...)` aggregate must be `sum`/`min`/`max`/`count`".to_string(), a.span);
+                return err;
+            };
+            let spec = match name.name.as_str() {
+                "count" => {
+                    if !cargs.is_empty() {
+                        self.diags.error("`count()` in `agg(...)` takes no arguments".to_string(), a.span);
+                        return err;
+                    }
+                    (hir::GroupOp::Count, None)
+                }
+                m @ ("sum" | "min" | "max") => {
+                    let [ast::Expr { kind: ast::ExprKind::FieldShorthand(v), .. }] = cargs.as_slice() else {
+                        self.diags.error(format!("`{m}(.value)` in `agg(...)` needs a `.field` value argument"), a.span);
+                        return err;
+                    };
+                    let op = match m {
+                        "sum" => hir::GroupOp::Sum,
+                        "min" => hir::GroupOp::Min,
+                        _ => hir::GroupOp::Max,
+                    };
+                    (op, Some(v))
+                }
+                other => {
+                    self.diags.error(format!("`agg(...)` supports `sum`/`min`/`max(.value)` or `count()`, not `{other}(...)`"), a.span);
+                    return err;
+                }
+            };
+            specs.push(spec);
+        }
+
+        let base = match self.place_local(source) {
+            Some((id, _)) => id,
+            None => {
+                self.diags.error("`group_by` source must be a `soa<Struct>` or `array<Struct>` local".to_string(), span);
+                return err;
+            }
+        };
+        // First cut: the AoS `str` key (the one-pass `HashMap<&str,[i64;K]>` shape that matches fast
+        // Rust). i64-key soa / precomputed dict_encoded multi-aggregate are deferred follow-ups.
+        let id = match self.locals[base as usize].ty {
+            Ty::DynStructArray(id, Layout::Aos) => id,
+            Ty::Error => return err,
+            other => {
+                self.diags.error(
+                    format!("fused `group_by(.key).agg(...)` first cut needs an AoS `array<Struct>` with a `str` key, got {}", ty_name(other)),
+                    span,
+                );
+                return err;
+            }
+        };
+        let sname = self.structs[id as usize].name.clone();
+        let fields = self.structs[id as usize].fields.clone();
+        let i64t = Ty::Int(IntTy { bits: 64, signed: true });
+        let resolve = |this: &mut Self, fld: &ast::Ident, role: &str, want: Ty| -> Option<u32> {
+            let Some(idx) = fields.iter().position(|f| f.name == fld.name) else {
+                this.diags.error(format!("no field '{}' on array<{sname}>", fld.name), fld.span);
+                return None;
+            };
+            if fields[idx].ty != want {
+                this.diags.error(
+                    format!("`group_by` {role} '{}' must be {} (first cut), got {}", fld.name, ty_name(want), ty_name(fields[idx].ty)),
+                    fld.span,
+                );
+                return None;
+            }
+            Some(idx as u32)
+        };
+        let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
+        let mut aggs: Vec<hir::GroupAgg1> = Vec::with_capacity(specs.len());
+        for (op, vf) in specs {
+            let value_field = match vf {
+                Some(v) => match resolve(self, v, "value", i64t) {
+                    Some(idx) => Some(idx),
+                    None => return err,
+                },
+                None => None, // count — no value field
+            };
+            aggs.push(hir::GroupAgg1 { op, value_field });
+        }
+        // Result tuple: `(array<str>, array<i64> × K)` — distinct keys + one column per aggregate.
+        let karr = ty_to_scalar(Ty::DynArray(Scalar::Str)).expect("array<str> is a payload scalar");
+        let varr = ty_to_scalar(Ty::DynArray(ty_to_scalar(i64t).unwrap())).expect("array<i64> is a payload scalar");
+        let mut elems = vec![karr];
+        elems.extend(std::iter::repeat_n(varr, aggs.len()));
+        let tuple_id = intern_tuple(self.tuples, elems);
+        Expr {
+            kind: ExprKind::ArrayGroupAggMulti { base, struct_id: id, key_field: ki, aggs, source: hir::GroupSource::AosStr },
             ty: Ty::Tuple(tuple_id),
             span,
         }
@@ -8103,6 +8229,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
+            | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. } => {}
         }

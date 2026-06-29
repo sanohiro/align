@@ -357,6 +357,39 @@ fn group_by_non_i64_key_is_rejected() {
     assert!(!ok("P { k: i32, v: i64 }\nfn main() -> i32 { arena { s := [P{k:1,v:2}].to_soa()\n g := s.group_by(.k).sum(.v)\n return 0 } }\n"));
 }
 
+// ---- fused multi-aggregate `group_by(.key).agg(sum(.a), max(.b), count())` ----
+
+#[test]
+fn group_by_agg_multi_type_checks() {
+    // A str-key AoS array, multiple aggregates in one `.agg(...)`: keys + one i64 column per aggregate.
+    assert!(ok(concat!(
+        "Row { name: str, a: i64, b: i64 }\n",
+        "pub fn k(xs: array<Row>) -> i64 {\n  g := xs.group_by(.name).agg(sum(.a), max(.b), count())\n  return g.1.sum()\n}\n",
+    )));
+}
+
+#[test]
+fn group_by_agg_empty_is_rejected() {
+    assert!(!ok("Row { name: str, a: i64 }\npub fn k(xs: array<Row>) -> i64 = xs.group_by(.name).agg().1.sum()\n"));
+}
+
+#[test]
+fn group_by_agg_unknown_aggregate_is_rejected() {
+    assert!(!ok("Row { name: str, a: i64 }\npub fn k(xs: array<Row>) -> i64 = xs.group_by(.name).agg(median(.a)).1.sum()\n"));
+}
+
+#[test]
+fn group_by_agg_non_i64_value_is_rejected() {
+    // `sum(.name)` over a str field — values must be i64 (first cut).
+    assert!(!ok("Row { name: str, a: i64 }\npub fn k(xs: array<Row>) -> i64 = xs.group_by(.name).agg(sum(.name)).1.sum()\n"));
+}
+
+#[test]
+fn group_by_agg_soa_source_is_rejected() {
+    // First cut is the AoS str key; a soa i64-key multi-aggregate is a deferred follow-up.
+    assert!(!ok("P { k: i64, v: i64 }\nfn main() -> i32 { arena { s := [P{k:1,v:2}].to_soa()\n g := s.group_by(.k).agg(sum(.v))\n return 0 } }\n"));
+}
+
 #[test]
 fn group_by_sum_aggregates_by_key() {
     if !backend_available() {

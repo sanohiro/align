@@ -39,6 +39,13 @@ pub fn a2(us: array<Row>) -> array<Row> {
   return us
 }
 
+// Fused: all four aggregates in ONE pass over the str key (hash once, update 4 accumulators) — the
+// `HashMap<&str,[i64;4]>` shape that matches smart Rust. No dict_encode, no re-scan.
+pub fn a3(us: array<Row>) -> array<Row> {
+  g := us.group_by(.name).agg(sum(.a), sum(.b), max(.c), min(.d))
+  return us
+}
+
 pub fn a2_encode(us: array<Row>) -> array<Row> {
   e := us.dict_encode(.name)
   return us
