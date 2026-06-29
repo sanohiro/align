@@ -762,7 +762,18 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         tests green): missing/duplicate fields error via the fallback; one narrow documented relaxation
         — a duplicate of a declared field at a position the learned pattern treats as unqueried is not
         re-detected on the speculative path (no test covers it; a dup at a *declared* position trips the
-        colon-count gate → fallback → error). The historical investigation that led here ↓. Built the
+        colon-count gate → fallback → error).
+        **Walk-optimization probe (2026-06-29) → NOT worth forcing.** Before pushing `proj` higher, a
+        probe added each walk cost to the inline-positional floor and measured the delta (1M rows):
+        `rec_cols` two-pass **+2 ms**, key-verify scan-back **+4 ms**, AoS materialize **+2 ms** — all
+        small. So removing `rec_cols` (inline speculation) saves ~2 ms (not worth the fallback/nesting
+        complexity), and the verify is intrinsic to speculation (it's how `find_field` is skipped). The
+        rest of the gap to the probe's floor is diffuse, correctness-tied overhead (overflow-checked
+        value parse, descriptor-driven writes) with no single removable hotspot. Conclusion: `proj`
+        (1.16–1.61×) is good as-is; the better future lever — if pursued — is **soa-column direct
+        decode** (the probe's 3.6× path; materialization itself is cheap, so writing the projected
+        fields straight into columns is the real headroom), a separate slice, not walk micro-tuning.
+        The historical investigation that led here ↓. Built the
         **stage-1 structural index** (PR #213: AVX2 + `pclmulqdq` prefix-XOR string mask + odd/even
         backslash-run escapes, block-carried, scalar oracle + exhaustive fuzz; runtime-dispatched,
         baseline-binary-safe) and a `bench/json_decode/` harness (PR #212; recursive-descent baseline
