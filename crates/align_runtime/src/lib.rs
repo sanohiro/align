@@ -1930,18 +1930,28 @@ unsafe fn json_decode_index_neon(src: &[u8], out: &mut Vec<u32>) {
     let n = src.len();
 
     // Per-lane bit weights 1,2,4,…,128 (repeated over the two 8-lane halves): AND a 0x00/0xFF compare
-    // mask with these, then `vaddv` each half → one byte whose bit i is set iff lane i matched.
-    let weights = [1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-    let bit_weights: uint8x16_t = unsafe { vld1q_u8(weights.as_ptr()) };
-    // Closures inherit the fn's `neon` feature, so the pure intrinsics are callable without `unsafe`
-    // (only the pointer loads below are `unsafe`).
+    // mask with these, then `vaddv` each half → one byte whose bit i is set iff lane i matched. A
+    // `const` keeps it in `.rodata` (no per-call stack materialization).
+    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let bit_weights: uint8x16_t = unsafe { vld1q_u8(WEIGHTS.as_ptr()) };
+    // Closures inherit the fn's `neon` feature, so the pure (memory-free) intrinsics are callable
+    // without `unsafe` (only the pointer loads below are `unsafe`).
     let movemask16 = |cmp: uint8x16_t| -> u32 {
         let masked = vandq_u8(cmp, bit_weights);
         (vaddv_u8(vget_low_u8(masked)) as u32) | ((vaddv_u8(vget_high_u8(masked)) as u32) << 8)
     };
     let eqm = |v: uint8x16_t, c: u8| -> u32 { movemask16(vceqq_u8(v, vdupq_n_u8(c))) };
-    // Structure + field separators only — no `,`, and quotes are masking-only (never emitted).
-    let op_bits = |v: uint8x16_t| -> u32 { eqm(v, b'{') | eqm(v, b'}') | eqm(v, b'[') | eqm(v, b']') | eqm(v, b':') };
+    // Structure + field separators only — no `,`, and quotes are masking-only (never emitted). OR the
+    // five 0x00/0xFF compare masks lane-wise *before* the movemask → one `vaddv` pair per vector
+    // instead of five (the across-lane add is the cost); identical result, since a lane is set iff it
+    // matched any of the five.
+    let op_bits = |v: uint8x16_t| -> u32 {
+        let m = vorrq_u8(
+            vorrq_u8(vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'{')), vceqq_u8(v, vdupq_n_u8(b'}'))), vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'[')), vceqq_u8(v, vdupq_n_u8(b']')))),
+            vceqq_u8(v, vdupq_n_u8(b':')),
+        );
+        movemask16(m)
+    };
 
     let mut string_carry: u64 = 0;
     let mut escape_carry: u64 = 0;
