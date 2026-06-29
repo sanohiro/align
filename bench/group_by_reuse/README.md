@@ -43,19 +43,30 @@ harness measures time and asserts the array threads back unchanged.
 - **a3 also beats a2 (`dict_encode` reuse) everywhere** (~1.0–1.4×): one fused pass over the str key
   beats encode-once-then-four-id-passes for a known batch — and skips the encode/gather entirely.
 - **But a3 still *loses* to smart single-pass Rust** — `smart/a3` is **0.42–0.77×** (Rust 1.3–2.4×
-  faster). Hashing is no longer the cause (the FxHash finalizer matches `ahash`); the remaining gap is
-  **(1)** the per-call `malloc` of `n`-sized output columns (5 × 8 MB at 1M rows — dominant at low
-  cardinality, where work is tiny) and **(2)** the dense-id indirection (`acc[id*K + j]`) vs smart
-  Rust's inline `[i64;K]` map value. Per the mandate (only a win over the *fast* baseline is honest),
-  a3 does not yet beat idiomatic fast Rust — but it is materially closer than a2 and is the right shape.
+  faster). Per the mandate (only a win over the *fast* baseline is honest), a3 does not yet beat
+  idiomatic fast Rust — but it is materially closer than a2 and is the right shape.
 
-### Why fusion was the lever, and what remains
+### Why a3 still trails smart Rust — measured (corrects an earlier guess)
 
 Smart Rust hashes each key **once** and updates all four accumulators in a **single pass**. a1 makes
 four full passes; a2 hashes once (`dict_encode`) but then makes four more id-passes. **a3 collapses
-that to one pass** — the structural fix (cause 1: N passes → 1). What's left is cause 2 (right-size /
-arena the output columns instead of `malloc`-ing `n`-sized scratch) and matching smart Rust's
-inline-value accumulator layout — both recorded follow-ups.
+that to one pass** — the structural fix (cause 1: N passes → 1). The earlier note blamed the remaining
+gap on the `n`-sized output `malloc`; two probes show otherwise:
+
+- **Right-sizing the output buffers is a no-op.** A prototype that allocates the K+1 output columns at
+  the exact group count (not the row count) left the benchmark unchanged — the over-allocated buffers
+  are lazily paged, so only the `count` written entries ever fault in. Not the lever.
+- **The hasher is the real lever.** Swapping the dependency-free FxHash for `ahash` (AES) moved
+  `smart/a3` 0.77× → 0.92× at 632k groups and 0.41× → 0.61× at 100 — but even then a3 doesn't fully
+  win at low cardinality, and `ahash` is a new dependency on the minimal runtime.
+- **The smart baseline reads pre-extracted columns** (`gidx[i]` + contiguous `cols[j][i]`), while a3
+  reads the AoS struct array strided — part of the low-cardinality gap is columnar-vs-AoS, not the
+  aggregation.
+
+Beating smart Rust is a cross-cutting "smart" pass (we trail it in other benches too), deferred to be
+decided once: the hash strategy (`ahash` dep vs hand-rolled AES, across all str group paths), an
+inline-value accumulator, and possibly an AoS-reading (fair) smart baseline. See
+`docs/open-questions.md`.
 
 So the benchmark redirects the roadmap (exactly its job, per the json→soa lesson): **the real lever is
 "multiple aggregates in one pass"** — fuse the K aggregates into a single scan of the encoded ids that
