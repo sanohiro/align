@@ -545,14 +545,30 @@ aggregates into one scan filling K result columns. **FIRST CUT DONE 2026-06-29**
 sema `check_group_agg_multi` → `hir::ExprKind::ArrayGroupAggMulti`; MIR `Rvalue::GroupAggMultiStr`;
 runtime `align_rt_group_multi_str` does one pass — intern key once, fold K accumulators — with a fast
 FxHash-class hasher, not SipHash). Result: bench `a3` **beats a1 (naive) 3.2–3.7× and beats a2
-(dict_encode reuse) everywhere**, but **still loses to smart single-pass Rust (0.42–0.77×)**: hashing is
-no longer the cause (FxHash finalizer ≈ ahash), the remaining gap is the per-call `malloc` of `n`-sized
-output columns + the dense-id `acc[id*K+j]` indirection vs smart Rust's inline `[i64;K]` map value. So
-fusion landed the structural win (cause 1: N passes → 1); **still open** to beat fast Rust: right-size /
-arena the output columns (cause 2), an inline-value accumulator layout, plus the deferred non-headline
-sources (i64-key soa / precomputed `dict_encoded` multi-aggregate), a `group_by(.key)` lambda key, and
-the `Scalar::DictEncoded` (return/wrap) follow-up. A2's honest niche stays **sequential/interactive**
-reuse (aggregates arriving over time, not fusible into one pass). Design ↓.
+(dict_encode reuse) everywhere**, but **still loses to smart single-pass Rust (0.42–0.77×)**. Fusion
+landed the structural win (cause 1: N passes → 1).
+**Why a3 still trails smart Rust — measured 2026-06-29 (corrects the earlier guess).** Two probes:
+- **Output-buffer right-sizing is a *no-op* — NOT the lever the earlier note claimed.** A prototype
+  moved the K+1 output buffers from MIR-allocated `n`-sized (row count) to runtime-allocated, exactly
+  group-count-sized; the benchmark was unchanged (within noise) at every cardinality. Reason: the
+  over-allocated buffers are **lazily paged** — only the `count` written entries ever fault in, so the
+  oversize was already nearly free. (Don't re-try this in isolation.)
+- **The hasher *is* a real lever.** Swapping the dependency-free FxHash for `ahash` (AES) moved
+  `smart/a3` **0.77× → 0.92×** at 632k groups (244 ms for smart vs 264 ms for a3) and **0.41× → 0.61×**
+  at 100 groups — so
+  the FxHash↔ahash gap was material, not negligible. But even with `ahash`, a3 does not fully beat
+  smart Rust at low cardinality, and `ahash` is a **new dependency on the minimal runtime** (a tradeoff
+  to weigh, applies to all str group paths).
+- **The smart baseline reads pre-extracted columns.** The bench's `rust_single` reads `gidx[i]` +
+  contiguous `cols[j][i]`, while a3 reads the **AoS struct array strided** (key + K values per row).
+  Part of the low-cardinality gap is this columnar-vs-AoS advantage, not the aggregation itself.
+**So beating smart Rust is a cross-cutting "smart" pass, deferred** (we trail smart in other benches
+too — best decided once): pick the hash strategy (`ahash` dep vs hand-rolled AES, applied to **all**
+str group paths incl. `dict_encode`), an inline-value accumulator layout (vs the dense-id `acc[id*K+j]`
+indirection), and possibly an AoS-reading (fair) smart baseline. Plus the deferred non-headline sources
+(i64-key soa / precomputed `dict_encoded` multi-aggregate), a `group_by(.key)` lambda key, and the
+`Scalar::DictEncoded` (return/wrap) follow-up. A2's honest niche stays **sequential/interactive** reuse
+(aggregates arriving over time, not fusible into one pass). Design ↓.
 **Surface positioning — DECIDED 2026-06-29 (Codex overreach review).** `dict_encode` is an **advanced
 explicit escape-hatch**, NOT the way users learn `group_by`. The one-way user story stays
 `xs.group_by(.key).sum(.value)`. What is **decided** is the *positioning* (dict_encode = escape-hatch);

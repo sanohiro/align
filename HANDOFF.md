@@ -59,8 +59,10 @@ fold K accumulators — the `HashMap<&str,[i64;K]>` shape), instead of one group
 surface (`.agg(...)`, sema `check_group_agg_multi` → `hir::ArrayGroupAggMulti`), MIR
 `Rvalue::GroupAggMultiStr`, runtime `align_rt_group_multi_str` (with a fast FxHash-class hasher, not
 SipHash). Bench `a3` beats naive `a1` 3.2–3.7× and beats `a2` (dict_encode reuse); still loses to smart
-Rust 1.3–2.4× — hashing is no longer the cause, the gap is now the n-sized output `malloc` + dense-id
-indirection. Deferred: i64-key soa / `dict_encoded` multi-aggregate sources. See
+Rust 1.3–2.4×. **Measured (corrects an earlier guess):** right-sizing the output buffers is a *no-op*
+(over-allocation is lazily paged); the real lever is the **hasher** (`ahash` moved `smart/a3` 0.77×→0.92×
+at 632k), but it's a new runtime dependency; and the bench's smart baseline reads pre-extracted columns
+(a3 reads AoS strided). Deferred: i64-key soa / `dict_encoded` sources. See
 `bench/group_by_reuse/README.md` + `docs/open-questions.md`.
 
 **Builder batch lowering DONE (2026-06-29):** the compiler lowers `b.write("lit"); b.write_int(x);
@@ -88,14 +90,15 @@ shapes) is the recorded follow-up. See `bench/string_builder/README.md`.
 (`align_rt_json_decode_soa`), **and** the fused multi-aggregate `group_by(.key).agg(...)`
 (`align_rt_group_multi_str`) — all in the snapshot above, all with new tests, `cargo test` green.
 
-**Best next action: the remaining perf follow-ups**, in measured priority order: **finish beating smart
-Rust on `group_by_reuse`** — the fused `a3` is the right shape but still trails 1.3–2.4×; the levers are
-right-sizing/arena-allocating the n-sized output columns (dominant at low cardinality) and an inline
-`[i64;K]` accumulator layout (vs the dense-id `acc[id*K+j]` indirection), then extend the fused
-`.agg(...)` to i64-key soa / `dict_encoded` sources. Then: cheap `par_map` sequential fallback or thunk
-specialization; a SIMD/structural JSON parser (decode is still value-parse-bound, the lever for both
-`json_decode` and `json_soa`). Smaller recorded follow-ups: applying the fast FxHash-class hasher to the
-single-aggregate str group-by + `dict_encode` (currently SipHash); a general builder-chain batcher; fold
+**Best next action: the remaining perf follow-ups**, in measured priority order: a **cross-cutting
+"beat smart Rust" pass** (deferred on purpose — we trail smart in several benches, best decided once):
+the hash strategy (`ahash` dep vs hand-rolled AES, applied across **all** str group paths incl.
+`dict_encode`), an inline-value accumulator layout, and possibly a fair AoS-reading smart baseline — the
+right-size-the-output-buffers idea was probed and is a **no-op** (lazy paging), so don't re-try it in
+isolation. Also extend the fused `.agg(...)` to i64-key soa / `dict_encoded` sources. Then: cheap
+`par_map` sequential fallback or thunk specialization; a SIMD/structural JSON parser (decode is still
+value-parse-bound, the lever for both `json_decode` and `json_soa`). Smaller recorded follow-ups: a
+general builder-chain batcher; fold
 the SoA decode's count pass into the structural-index build. Re-run any perf change with:
 
 ```bash
