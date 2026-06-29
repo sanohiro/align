@@ -756,23 +756,32 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         integration attempts into `align_rt_json_decode_struct_array` both REGRESSED** (0.67–0.93×):
         a probe diagnostic (all building the SIMD index + materializing + projecting `active`+`pay`)
         isolated why — **positional + soa-columns = 3.6×, positional + AoS-struct = 3.3×, but
-        name-match (`find_field`) + columns = 2.4×**, and the *general* decoder (perfect-hash
-        `find_field` paid even for unknown fields + `SeenSet` + AoS `buf.resize`-zero per element +
-        a final `align_rt_alloc` copy + all-field parsing) drags 3–4× below the diagnostic. So the
-        probe's 3.4× relies on simplifications the correct general decoder can't trivially adopt; the
-        recursive-descent `integer()`/etc. are already lean, so value parsing is not the gap.
+        name-match (`find_field`) + columns = 2.4×**. **An absolute-ms autopsy (1M rows) pinned the
+        cost precisely:** stage-1 index build alone = **10.5 ms**; + positional stage-2 + materialize
+        (soa columns) = **23 ms** (3.4× serde's 84 ms); and materializing into an **AoS struct with
+        `buf.resize`-zero per element + a final whole-buffer copy adds only +1.6 ms** — so
+        materialization is **NOT** the cost (correcting an earlier guess). The dominant avoidable cost
+        is **per-field key matching (`find_field`), paid even for the unqueried fields** (positional
+        3.6× → name-match 2.4×, and the runtime's *perfect-hash* `find_field` is heavier than the
+        diagnostic's two `==`), plus the per-field machinery (`SeenSet`, per-value-`JsonParser` dispatch) and a
+        **quote-heavy index** (the runtime emits key+value quotes, ~2× the probe's punctuation-only
+        index — projection needs only colons + the queried fields). `integer()`/etc. are already lean,
+        so value parsing is not the gap.
         **The literature confirms the path (papers consulted):** *Mison* (Li et al., VLDB 2017,
         `vol10/p1118-li.pdf`) gets 3.6× with a structural index and **10.2× with speculation** — a
         pattern tree predicting each queried field's colon ordinal so it **jumps to the value and
         verifies the key, skipping `find_field` and unqueried fields**; *simdjson* (Langdale &
         Lemire, arXiv 1902.08318) and *Pison* (VLDB 2021, `vol14/p694-zhao.pdf`, leveled colon/comma
-        index construction). **To actually win, the decode needs the full Mison stack, not a
-        drop-in:** (1) **speculation/positional** field access (skip perfect-hash `find_field`),
-        (2) **two-pass exact materialization** (count elements from the index, allocate the exact
-        output once, fill it directly — kills the Vec-grow + per-element zero + final copy), and
-        ideally (3) **column (soa) output** (Align's selling point; the diagnostic's fastest path).
-        A large, careful, benchmark-driven effort with real residual uncertainty — **deferred as a
-        focused track**; the stage-1 index (#213) + harness (#212) are the merged foundation, and the
+        index construction). **To actually win, attack the measured cost (per-field key matching),
+        not materialization:** (1) **speculation/positional** field access — the Mison lever —
+        predicting each queried field's colon ordinal and verifying the key, so perfect-hash
+        `find_field` and the unqueried fields are skipped (the +1.2–1.5× the diagnostic showed, the
+        bulk of the gap); (2) a **leaner index** emitting only what projection needs (colons + the
+        queried fields' delimiters, not every key+value quote — ~½ the index size); (3) ideally
+        **column (soa) output** (Align's selling point; the diagnostic's fastest path).
+        Materialization is cheap (+1.6 ms), so a two-pass exact alloc is *not* needed. A careful,
+        benchmark-driven effort with residual uncertainty — **deferred as a focused track**; the
+        stage-1 index (#213) + harness (#212) are the merged foundation, and the
         recursive-descent decoder (≈serde parity) stays in place meanwhile. (Probe + diagnostics:
         `work/json_simd_probe/`, gitignored scratch.)
       - **★ `core.string` byte-first APIs (codex string-processing advice 2026-06-28) — the
