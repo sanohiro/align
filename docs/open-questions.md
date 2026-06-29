@@ -810,6 +810,24 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         `#[cfg(target_arch = "x86_64")]` block. `json_structural_index` itself stays scalar-only on
         aarch64 — it is still dead code, "wired in a later slice", so a NEON port waits for that
         consumer.)
+        **Speculation key-verify fused — IMPLEMENTED 2026-06-29 (full 0.80→0.90×, proj 1.25→1.35×
+        serde on Apple Silicon).** A sampling profile (`sample`, via the new
+        `crates/align_runtime/examples/profile_decode.rs` harness that loops the raw
+        `align_rt_json_decode_struct_array`) **refuted the static guess that the NEON index build is the
+        ARM bottleneck**: full and proj build the *identical* index, yet proj beats serde and full lost,
+        so the index can't be why full lags. Leaf self-time (1M-row full): walk ~37%, value-parse
+        (`write_field_indexed`) ~32%, **key-verify ~27%** (`key_before_colon` 16% + `memcmp` 11%), index
+        build only ~14%, memset/memmove ~4%. The largest *addressable* waste was the key-verify: the
+        speculation path already knows the expected field name, but it was scanning the key back to its
+        opening quote (`key_before_colon`) and then doing a generic slice `==`/`memcmp`. Replaced with
+        `key_matches_before_colon(src, cpos, name)` — computes the opening-quote position from
+        `name.len()` (no backward scan) and matches the bytes against the known `name` inline. In the
+        profile `key_before_colon` vanished from the hot leaves; full→0.90× (0.95× at 10k/100k, ≈parity),
+        proj→1.35×. **Tried and reverted**: lowering the per-byte value-write loops to constant-width
+        `copy_nonoverlapping` stores — perf-neutral (the write is ~4% of `write_field_indexed`; the cost
+        there is `integer()`, already lean), so not shipped (ideal-form-or-defer). Remaining full-rail
+        gap to serde is now the intrinsic walk + value-parse, the same x86 pays; the SoA-column direct
+        decode (above) is still the real lever if pursued.
         The historical investigation that led here ↓. Built the
         **stage-1 structural index** (PR #213: AVX2 + `pclmulqdq` prefix-XOR string mask + odd/even
         backslash-run escapes, block-carried, scalar oracle + exhaustive fuzz; runtime-dispatched,
