@@ -36,8 +36,7 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     // An empty owned `string` (from `str.clone()` / `builder().to_string()`) carries a *null*
     // pointer with `len == 0`; `from_raw_parts(null, 0)` is UB, so emit just the newline. `try_from`
     // avoids a truncating `len as usize` (a heap OOB) on a 32-bit target.
-    if len > 0 {
-        let n = len as usize;
+    if len > 0 && let Ok(n) = usize::try_from(len) {
         let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
         let _ = out.write_all(bytes);
     }

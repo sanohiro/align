@@ -393,10 +393,19 @@ impl<'a> Lexer<'a> {
                         1
                     };
                     let max_len = char_len.min(self.src.len() - self.pos);
-                    let rest = std::str::from_utf8(&self.src[self.pos..self.pos + max_len]).unwrap_or("\u{FFFD}");
-                    let c = rest.chars().next().unwrap_or('\u{FFFD}');
-                    self.pos += c.len_utf8();
-                    s.push(c);
+                    // On an invalid byte sequence advance by exactly 1 byte (not
+                    // `'\u{FFFD}'.len_utf8() == 3`, which would over-consume good bytes).
+                    match std::str::from_utf8(&self.src[self.pos..self.pos + max_len]) {
+                        Ok(valid) => {
+                            let c = valid.chars().next().unwrap_or('\u{FFFD}');
+                            self.pos += c.len_utf8();
+                            s.push(c);
+                        }
+                        Err(_) => {
+                            self.pos += 1;
+                            s.push('\u{FFFD}');
+                        }
+                    }
                 }
             }
         }
@@ -442,10 +451,19 @@ impl<'a> Lexer<'a> {
                     1
                 };
                 let max_len = char_len.min(self.src.len() - self.pos);
-                let rest = std::str::from_utf8(&self.src[self.pos..self.pos + max_len]).unwrap_or("\u{FFFD}");
-                let c = rest.chars().next().unwrap_or('\u{FFFD}');
-                self.pos += c.len_utf8();
-                c
+                // On an invalid byte sequence advance by exactly 1 byte (not
+                // `'\u{FFFD}'.len_utf8() == 3`, which would over-consume good bytes).
+                match std::str::from_utf8(&self.src[self.pos..self.pos + max_len]) {
+                    Ok(valid) => {
+                        let c = valid.chars().next().unwrap_or('\u{FFFD}');
+                        self.pos += c.len_utf8();
+                        c
+                    }
+                    Err(_) => {
+                        self.pos += 1;
+                        '\u{FFFD}'
+                    }
+                }
             }
             None => {
                 diags.error("unterminated character literal".to_string(), self.span(start, self.pos));
