@@ -510,22 +510,31 @@ pub unsafe extern "C" fn align_rt_builder_write(b: *mut Builder, ptr: *const u8,
 
 fn builder_push_i64(buf: &mut Vec<u8>, v: i64) {
     if (-999..=999).contains(&v) {
+        // Format into a stack buffer (max = sign + 3 digits) and append in one `extend_from_slice`,
+        // so the hot path pays a single capacity check / length update rather than one per digit.
         let mut n = v;
+        let mut tmp = [0u8; 4];
+        let mut len = 0;
         if n < 0 {
-            buf.push(b'-');
+            tmp[0] = b'-';
+            len = 1;
             n = -n;
         }
         let n = n as u16;
         if n >= 100 {
-            buf.push(b'0' + (n / 100) as u8);
-            buf.push(b'0' + ((n / 10) % 10) as u8);
-            buf.push(b'0' + (n % 10) as u8);
+            tmp[len] = b'0' + (n / 100) as u8;
+            tmp[len + 1] = b'0' + ((n / 10) % 10) as u8;
+            tmp[len + 2] = b'0' + (n % 10) as u8;
+            len += 3;
         } else if n >= 10 {
-            buf.push(b'0' + (n / 10) as u8);
-            buf.push(b'0' + (n % 10) as u8);
+            tmp[len] = b'0' + (n / 10) as u8;
+            tmp[len + 1] = b'0' + (n % 10) as u8;
+            len += 2;
         } else {
-            buf.push(b'0' + n as u8);
+            tmp[len] = b'0' + n as u8;
+            len += 1;
         }
+        buf.extend_from_slice(&tmp[..len]);
         return;
     }
     // 20 = the widest i64 decimal (`-9223372036854775808`). Emit digits back-to-front from the
