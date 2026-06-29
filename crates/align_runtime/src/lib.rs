@@ -1297,24 +1297,25 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
 
 /// Column-major layout for a `soa<Struct>` of `n` rows, given each field's byte `width` in field
 /// order. Returns `(cols, total_bytes, max_align)` where `cols[j] = (byte_offset, width)` for
-/// column `j`. **MUST match codegen's `soa_column_offset` / `SoaAlloc` in `align_codegen_llvm`**
-/// (`start_0 = 0`, `start_j = align_up(start_{j-1} + n*size_{j-1}, size_j)`), or a direct-filled
-/// column would land where a later `IndexColumn` scan does not read it.
-fn soa_layout(widths: &[usize], n: usize) -> (Vec<(usize, usize)>, usize, usize) {
+/// column `j`, or `None` if the byte size overflows `usize` (a pathological row count × width on a
+/// 32-bit target — checked because `n` comes from untrusted input). **MUST match codegen's
+/// `soa_column_offset` / `SoaAlloc` in `align_codegen_llvm`** (`start_0 = 0`,
+/// `start_j = align_up(start_{j-1} + n*size_{j-1}, size_j)`), or a direct-filled column would land
+/// where a later `IndexColumn` scan does not read it.
+fn soa_layout(widths: &[usize], n: usize) -> Option<(Vec<(usize, usize)>, usize, usize)> {
     let mut cols = Vec::with_capacity(widths.len());
     let mut off = 0usize;
     for (j, &w) in widths.iter().enumerate() {
-        if j > 0 {
+        if j > 0 && w > 1 {
             // align_up(off, w) — each column starts at its field's alignment (= its width).
-            if w > 1 {
-                off = (off + w - 1) & !(w - 1);
-            }
+            let mask = w - 1;
+            off = off.checked_add(mask)? & !mask;
         }
         cols.push((off, w));
-        off += n * w; // advance past this column's `n` elements
+        off = off.checked_add(n.checked_mul(w)?)?; // advance past this column's `n` elements
     }
     let max_align = widths.iter().copied().max().unwrap_or(1);
-    (cols, off, max_align)
+    Some((cols, off, max_align))
 }
 
 /// `json.decode(input)` straight into a column-major `soa<Struct>` (the direct-fill rail) — no AoS
@@ -1341,6 +1342,11 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
     phf_len: i64,
     phf_seed: i64,
 ) -> i32 {
+    // The arena (for the column buffer) and `out` (for the soa view) are dereferenced below; a null
+    // here is a caller bug, but fail closed rather than risk UB on untrusted-input-driven sizes.
+    if arena.is_null() || out.is_null() {
+        return 1;
+    }
     let src: &[u8] = if input_len <= 0 || input.is_null() {
         &[]
     } else {
@@ -1412,8 +1418,13 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
 
     // Lay out the columns for `n_rows` rows and bump-allocate the buffer from the arena.
     let widths: Vec<usize> = descs.iter().map(|d| (d.tag & 0xff) as usize).collect();
-    let (cols, total, max_align) = soa_layout(&widths, n_rows);
-    let base = align_rt_arena_alloc(arena, total as i64, max_align.max(1) as i64);
+    let Some((cols, total, max_align)) = soa_layout(&widths, n_rows) else {
+        return 1; // byte size overflowed usize — reject rather than under-allocate
+    };
+    let Ok(total_i64) = i64::try_from(total) else {
+        return 1; // size doesn't fit the i64 arena ABI
+    };
+    let base = align_rt_arena_alloc(arena, total_i64, max_align.max(1) as i64);
     // The arena hands back zeroed chunks, but a missing field must still read 0 — zero defensively
     // (cheap relative to the parse) so a partial record leaves declared columns at 0, like the AoS
     // path's per-element `buf.resize(.., 0)`.
@@ -4145,14 +4156,16 @@ mod tests {
     fn soa_layout_matches_codegen_formula() {
         // start_0 = 0; start_j = align_up(start_{j-1} + n*size_{j-1}, size_j); total = end of last.
         // widths [1, 8] (bool, i64), n = 2: col0 @0, align_up(0+2,8)=8 → col1 @8, total = 8+16 = 24.
-        let (cols, total, max_align) = soa_layout(&[1, 8], 2);
+        let (cols, total, max_align) = soa_layout(&[1, 8], 2).unwrap();
         assert_eq!(cols, vec![(0, 1), (8, 8)]);
         assert_eq!(total, 24);
         assert_eq!(max_align, 8);
         // widths [8, 1, 8], n = 3: col0 @0, col1 @24 (1-byte, no align), col2 align_up(24+3,8)=32.
-        let (cols, total, _) = soa_layout(&[8, 1, 8], 3);
+        let (cols, total, _) = soa_layout(&[8, 1, 8], 3).unwrap();
         assert_eq!(cols, vec![(0, 8), (24, 1), (32, 8)]);
         assert_eq!(total, 32 + 24);
+        // A pathological row count × width overflows `usize` → None (no under-allocation).
+        assert!(soa_layout(&[8], usize::MAX).is_none());
     }
 
     #[test]
@@ -4173,7 +4186,7 @@ mod tests {
         };
         assert_eq!(rc, 0, "valid input must decode");
         assert_eq!(out.len, 2, "two rows");
-        let (cols, _, _) = soa_layout(&[1, 8], 2);
+        let (cols, _, _) = soa_layout(&[1, 8], 2).unwrap();
         // active column (width 1) at cols[0].0: [true, false].
         assert_eq!(unsafe { *out.ptr.add(cols[0].0) }, 1);
         assert_eq!(unsafe { *out.ptr.add(cols[0].0 + 1) }, 0);
