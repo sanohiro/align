@@ -479,6 +479,65 @@ fn group_by_str_key_min_max_count_aggregate() {
 }
 
 #[test]
+fn dict_encode_reuse_matches_a1_string_group_by() {
+    if !backend_available() {
+        return;
+    }
+    // The A2 reuse rail: `dict_encode(.name)` once, then reuse the encoded value for several
+    // aggregates. Each `e.group_by(.name).<agg>(.score)` must equal the one-shot A1 str-key group_by.
+    // Rows: (a,10),(b,20),(a,5),(c,7),(b,3). Keys intern in first-occurrence order (a,b,c).
+    let out = build_and_run(
+        "dict-encode-reuse",
+        concat!(
+            "import core.json\n",
+            "User { name: str, score: i64 }\n",
+            "fn main() -> Result<(), Error> {\n  arena {\n",
+            "    us: array<User> := json.decode(\"[{\\\"name\\\":\\\"a\\\",\\\"score\\\":10},{\\\"name\\\":\\\"b\\\",\\\"score\\\":20},{\\\"name\\\":\\\"a\\\",\\\"score\\\":5},{\\\"name\\\":\\\"c\\\",\\\"score\\\":7},{\\\"name\\\":\\\"b\\\",\\\"score\\\":3}]\")?\n",
+            "    e := us.dict_encode(.name)\n",
+            "    s := e.group_by(.name).sum(.score)\n",
+            "    print(s.0.len())\n", // 3 distinct keys
+            "    print(s.0[0])\n    print(s.1[0])\n", // a 15
+            "    print(s.0[1])\n    print(s.1[1])\n", // b 23
+            "    print(s.0[2])\n    print(s.1[2])\n", // c 7
+            "    m := e.group_by(.name).max(.score)\n", // reuse the SAME encoded value
+            "    print(m.1[0])\n    print(m.1[1])\n    print(m.1[2])\n", // 10 20 7
+            "    c := e.group_by(.name).count()\n",
+            "    print(c.1[0])\n    print(c.1[1])\n    print(c.1[2])\n", // 2 2 1
+            "  }\n  return Ok(())\n}\n",
+        ),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3\na\n15\nb\n23\nc\n7\n10\n20\n7\n2\n2\n1\n"
+    );
+}
+
+#[test]
+fn dict_encode_group_by_key_must_match_encoded_key() {
+    // `dict_encode(.name)` builds ids for `.name`; grouping the encoded value by a different str
+    // field has no precomputed ids, so it is rejected.
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "User { name: str, tag: str, score: i64 }\n",
+        "fn k(us: array<User>) -> i64 {\n",
+        "  e := us.dict_encode(.name)\n",
+        "  return e.group_by(.tag).sum(.score).1.len()\n",
+        "}\n",
+        "fn main() -> i32 = 0\n",
+    )));
+}
+
+#[test]
+fn dict_encode_requires_a_str_key() {
+    // The encoded key must be a str field (first cut).
+    assert!(!ok(concat!(
+        "P { k: i64, v: i64 }\n",
+        "fn k(ps: array<P>) -> i64 = ps.dict_encode(.k).group_by(.k).sum(.v).1.len()\n",
+        "fn main() -> i32 = 0\n",
+    )));
+}
+
+#[test]
 fn group_by_str_key_requires_an_i64_value() {
     // The value field must be i64 (first cut) even when the key is a str.
     assert!(!ok(concat!(

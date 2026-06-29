@@ -246,6 +246,15 @@ pub enum Ty {
     /// `Task<R>` — a handle to a spawned task's result (`task_group`, slice ④). The payload is a
     /// scalar. ④a represents it identically to `R` (eager execution); ④b makes it a real future.
     Task(Scalar),
+    /// A **dictionary-encoded** AoS struct array (`s.dict_encode(.key)`, the A2 reuse rail). Carries
+    /// `(struct_id, key_field)`: the source struct and the interned `str` key field. A Move,
+    /// region-tracked value laid out as **three `{ptr,len}` slices** — `{ source_aos (borrowed),
+    /// ids (owned i64 dense-id column), dict (owned `str` dictionary) }`. `dict_encode` pays the
+    /// string interning once; a later `e.group_by(.key).<agg>(.value)` reuses the precomputed `ids`
+    /// (the dense-id `align_rt_group_*_i64` path) and labels results back through `dict` — so repeated
+    /// group-bys on the same key are integer-column work. Its `dict`/`source` slices borrow the source
+    /// AoS, so it is region-tied to it; `Drop` frees `ids` + `dict` (not the borrowed `source`).
+    DictEncoded(u32, u32),
     Unit,
     /// Type-checking error sentinel (bottom). Distinct from the `Error` *type*
     Error,
@@ -342,7 +351,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::BufWriter)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::BufWriter | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -383,7 +392,7 @@ fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) ->
 /// and Move tuples; needs the struct/tuple tables to inspect composite members. The free-function
 /// form (vs `MoveCheck::is_move_ty`) is shared by the field-access checker.
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter)
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -454,7 +463,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -1906,7 +1915,8 @@ impl EffectScan {
             // Leaves.
             ExprKind::Unit | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_)
             | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::OptionNone
-            | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupAgg { .. } | ExprKind::IndexField { .. } => {}
+            | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupAgg { .. }
+            | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. } => {}
         }
     }
 }
@@ -2024,6 +2034,9 @@ impl<'a> EscapeCheck<'a> {
     fn tracks_region(&self, ty: Ty) -> bool {
         match ty {
             Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => true,
+            // A `dict_encoded` value's `dict`/`source` slices borrow the source AoS, so it is
+            // region-tracked — it must not outlive the array it encodes.
+            Ty::DictEncoded(..) => true,
             // A `soa<Struct>` view borrows its column buffer (arena-allocated by `to_soa`), so it is
             // region-tracked — it must not outlive the arena that owns the buffer.
             Ty::Soa(_) => true,
@@ -2156,10 +2169,13 @@ impl<'a> EscapeCheck<'a> {
                 .fold(Region::Static, |acc, f| acc.shorter(self.region_of(f, depth))),
             // A field read inherits its base struct's region (the field may be a view into it).
             ExprKind::Field { root, .. } => self.region.get(root).copied().unwrap_or(Region::Static),
-            // A str-key `group_by` yields `(array<str>, array<i64>)` whose key views borrow `base`'s
-            // string storage, so the tuple inherits `base`'s region — it must not outlive the source.
-            // (An i64-key group_by yields owned arrays that borrow nothing → the default `Static`.)
-            ExprKind::ArrayGroupAgg { base, key_str: true, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
+            // A str-key (or dict-encoded) `group_by` yields `(array<str>, array<i64>)` whose key views
+            // borrow `base`'s string storage, so the tuple inherits `base`'s region — it must not
+            // outlive the source. (An i64-key group_by yields owned arrays that borrow nothing → the
+            // default `Static`.) `dict_encode` itself likewise borrows its source AoS (its `dict`/
+            // `source` slices view it), so the encoded value inherits the source's region.
+            ExprKind::ArrayGroupAgg { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded, .. }
+            | ExprKind::ArrayDictEncode { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
             // An `arena {}` *expression* yields its block value, evaluated one level deeper.
             // Without this, a binding that captures an arena's value (`p := arena { … }`) would
@@ -2488,6 +2504,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
+            | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. } => {}
         }
     }
@@ -2750,7 +2767,8 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupAgg { base, .. } | ExprKind::IndexField { base, .. } => {
+            ExprKind::SoaColumn { base, .. } | ExprKind::ArrayGroupAgg { base, .. }
+            | ExprKind::ArrayDictEncode { base, .. } | ExprKind::IndexField { base, .. } => {
                 if whole_moved(moved, *base) {
                     let name = &self.f.locals[*base as usize].name;
                     self.diags.error(format!("use of moved value '{name}'"), e.span);
@@ -5131,6 +5149,11 @@ impl<'a, 't> Checker<'a, 't> {
         if parse_int_arith(method).is_some() {
             return self.check_int_arith_method(recv, method, args, span);
         }
+        // `s.dict_encode(.key)` — the A2 reuse transform: intern the str key column once into a
+        // `dict_encoded<Struct>` value reused by later `group_by`s.
+        if method == "dict_encode" {
+            return self.check_dict_encode(recv, args, span);
+        }
         // `group_by(.key)` is only meaningful immediately before an aggregate; on its own it is an
         // error (there is no first-class "groups" value).
         if method == "group_by" {
@@ -5898,18 +5921,24 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         };
-        let (id, key_str) = match self.locals[base as usize].ty {
-            Ty::Soa(id) => (id, false),
-            Ty::DynStructArray(id, Layout::Aos) => (id, true),
+        // The source local is a `soa<Struct>` (i64 key), an AoS `array<Struct>` (str key, encoded
+        // inline), or a precomputed `dict_encoded<Struct>` (str key, reuse the encoded ids). For the
+        // encoded source, `enc_key` is the field the dictionary was built on — the group key must
+        // match it (grouping by a different field has no precomputed ids).
+        let (id, source, enc_key) = match self.locals[base as usize].ty {
+            Ty::Soa(id) => (id, hir::GroupSource::SoaI64, None),
+            Ty::DynStructArray(id, Layout::Aos) => (id, hir::GroupSource::AosStr, None),
+            Ty::DictEncoded(id, kf) => (id, hir::GroupSource::Encoded, Some(kf)),
             Ty::Error => return err,
             other => {
                 self.diags.error(
-                    format!("`group_by` needs a `soa<Struct>` or `array<Struct>` source, got {}", ty_name(other)),
+                    format!("`group_by` needs a `soa<Struct>`, `array<Struct>`, or `dict_encode`d source, got {}", ty_name(other)),
                     span,
                 );
                 return err;
             }
         };
+        let key_str = matches!(source, hir::GroupSource::AosStr | hir::GroupSource::Encoded);
         // Clone the field table so the field resolution below can also touch `self.diags`.
         let sname = self.structs[id as usize].name.clone();
         let fields = self.structs[id as usize].fields.clone();
@@ -5932,9 +5961,20 @@ impl<'a, 't> Checker<'a, 't> {
         };
 
         if key_str {
-            // str key (dictionary-encoded) + i64 value, `sum`/`min`/`max`/`count`. `count` reads no
-            // value column; the others require an i64 value field (resolved per the top-of-fn match).
+            // str key (dictionary-encoded, inline or precomputed) + i64 value, `sum`/`min`/`max`/
+            // `count`. `count` reads no value column; the others require an i64 value field.
             let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
+            // For an already-encoded source, the group key must be the field the dictionary was built
+            // on — otherwise the precomputed ids don't correspond to this key.
+            if let Some(kf) = enc_key {
+                if ki != kf {
+                    self.diags.error(
+                        format!("`group_by` on a `dict_encode`d value must use the encoded key '{}', not '{}'", fields[kf as usize].name, key_field.name),
+                        key_field.span,
+                    );
+                    return err;
+                }
+            }
             let vi = match value_field {
                 Some(v) => match resolve(self, v, "value", i64t) {
                     Some(idx) => Some(idx),
@@ -5947,7 +5987,7 @@ impl<'a, 't> Checker<'a, 't> {
             let varr = ty_to_scalar(Ty::DynArray(ty_to_scalar(i64t).unwrap())).expect("array<i64> is a payload scalar");
             let tuple_id = intern_tuple(self.tuples, vec![karr, varr]);
             return Expr {
-                kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: vi, op, key_str: true },
+                kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: vi, op, source },
                 ty: Ty::Tuple(tuple_id),
                 span,
             };
@@ -5966,8 +6006,53 @@ impl<'a, 't> Checker<'a, 't> {
         let arr = ty_to_scalar(Ty::DynArray(ty_to_scalar(i64t).unwrap())).expect("array<i64> is a payload scalar");
         let tuple_id = intern_tuple(self.tuples, vec![arr, arr]);
         Expr {
-            kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: vi, op, key_str: false },
+            kind: ExprKind::ArrayGroupAgg { base, struct_id: id, key_field: ki, value_field: vi, op, source },
             ty: Ty::Tuple(tuple_id),
+            span,
+        }
+    }
+
+    /// `s.dict_encode(.key)` — intern the AoS `array<Struct>` local `s`'s `str` `key` column to a
+    /// dense-id column + dictionary, yielding a `dict_encoded<Struct>` value (the A2 reuse rail). The
+    /// source must be an AoS `array<Struct>` local and `.key` a `str` field; the encoded value borrows
+    /// `s` (region-tied) and is consumed by a later `e.group_by(.key).<agg>(.value)`.
+    fn check_dict_encode(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [ast::Expr { kind: ast::ExprKind::FieldShorthand(key), .. }] = args else {
+            self.diags.error("`dict_encode(.key)` needs a single `.field` key argument".to_string(), span);
+            return err;
+        };
+        let base = match self.place_local(recv) {
+            Some((id, _)) => id,
+            None => {
+                self.diags.error("`dict_encode` source must be an `array<Struct>` local".to_string(), span);
+                return err;
+            }
+        };
+        let id = match self.locals[base as usize].ty {
+            Ty::DynStructArray(id, Layout::Aos) => id,
+            Ty::Error => return err,
+            other => {
+                self.diags.error(format!("`dict_encode` needs an `array<Struct>` source, got {}", ty_name(other)), span);
+                return err;
+            }
+        };
+        let sname = self.structs[id as usize].name.clone();
+        let fields = &self.structs[id as usize].fields;
+        let Some(ki) = fields.iter().position(|f| f.name == key.name) else {
+            self.diags.error(format!("no field '{}' on array<{sname}>", key.name), key.span);
+            return err;
+        };
+        if fields[ki].ty != Ty::Str {
+            self.diags.error(
+                format!("`dict_encode` key '{}' must be str (first cut), got {}", key.name, ty_name(fields[ki].ty)),
+                key.span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ArrayDictEncode { base, struct_id: id, key_field: ki as u32 },
+            ty: Ty::DictEncoded(id, ki as u32),
             span,
         }
     }
@@ -8018,6 +8103,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
+            | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. } => {}
         }
         if let Some(t) = recomputed {
@@ -8345,6 +8431,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Fn(id) => format!("fn#{id}"),
         Ty::Enum(id) => format!("enum#{id}"),
         Ty::Task(s) => format!("Task<{}>", scalar_name(s)),
+        Ty::DictEncoded(id, _) => format!("dict_encoded<struct#{id}>"),
         Ty::Param(i) => format!("<type param {i}>"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),

@@ -573,6 +573,33 @@ fn build_module<'c>(
     ] {
         funcs.insert(key.to_string(), module.add_function(sym, group_str_ty, None));
     }
+    // A2 dictionary reuse rail. `dict_encode`: (base, n, stride, key_off, out_ids, out_dict, cap) ->
+    // dict size. `gather_i64`: (base, n, stride, off, out) -> (). `dict_lookup`: (ids, n, dict,
+    // dict_len, out) -> ().
+    funcs.insert(
+        "dict_encode_str".to_string(),
+        module.add_function(
+            "align_rt_dict_encode_str",
+            ctx.i64_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "gather_i64".to_string(),
+        module.add_function(
+            "align_rt_gather_i64",
+            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "dict_lookup".to_string(),
+        module.add_function(
+            "align_rt_dict_lookup",
+            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
     // `str.clone()` → deep-copy into a heap-owned `string` `{ptr,len}` (MMv2 slice 7).
     funcs.insert(
         "str_clone".to_string(),
@@ -1013,6 +1040,13 @@ fn result_struct_type<'c>(ctx: &'c Context, ok: Scalar, err: Scalar, sx: &[Struc
 /// `slice<T>` lowers to `{ T* ptr, i64 len }`.
 fn slice_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
     ctx.struct_type(&[ctx.ptr_type(AddressSpace::default()).into(), ctx.i64_type().into()], false)
+}
+
+/// The LLVM representation of a `Ty::DictEncoded` value: three `{ptr,len}` slices `{ source (borrowed
+/// AoS), ids (owned i64 column), dict (owned str dictionary) }`. `Drop` frees `ids` + `dict`.
+fn dictenc_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
+    let s = slice_struct_type(ctx);
+    ctx.struct_type(&[s.into(), s.into(), s.into()], false)
 }
 
 /// The LLVM representation of a `Ty::Fn` value: a closure `{ fn_ptr, env_ptr }`. All closure
@@ -1495,7 +1529,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let z: BasicValueEnum = if ty == Ty::Builder || ty == Ty::BufWriter {
                         // A builder / buffered-writer slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
-                    } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_) | Ty::Struct(_)) {
+                    } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_) | Ty::Struct(_) | Ty::DictEncoded(..)) {
                         // Zero the whole aggregate so each owned field/element reads {null,0}. A Move
                         // struct is zeroed wholesale here; its recursive `Drop` then frees nulls on an
                         // unconstructed / moved-out path (no-op) — see `drop_struct_fields`.
@@ -1605,6 +1639,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // recursing into nested Move-struct fields (null-safe — a moved-out struct was
                         // zeroed, and Copy fields are skipped).
                         self.drop_struct_fields(self.slots[slot], sid)?;
+                    } else if let Ty::DictEncoded(..) = ty {
+                        // A `dict_encoded` value owns its `ids` (field 1) + `dict` (field 2) buffers;
+                        // free both (null-safe). Field 0 (`source`) borrows the AoS — never freed.
+                        let agg = self
+                            .builder
+                            .build_load(dictenc_struct_type(self.ctx), self.slots[slot], "dropenc")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                        for idx in [1u32, 2] {
+                            let sl = self.builder.build_extract_value(agg, idx, "dropencsl").map_err(|e| self.err(e))?.into_struct_value();
+                            let ptr = self.builder.build_extract_value(sl, 0, "dropencptr").map_err(|e| self.err(e))?;
+                            self.builder
+                                .build_call(self.funcs["free"], &[ptr.into()], "")
+                                .map_err(|e| self.err(e))?;
+                        }
                     } else {
                         // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
                         let agg = self
@@ -2399,6 +2448,81 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("str group aggregate returns the group count (i64)")
             }
+            Rvalue::DictEncode { base, struct_id, key_field, out_ids, out_dict } => {
+                // Load the AoS `{ptr,len}`, derive the per-row stride + key byte offset (like
+                // `GroupAggStr`), and intern the str key column → dense ids + dictionary. `cap` = the
+                // row count (an upper bound on the distinct count).
+                let st = self.struct_types[*struct_id as usize];
+                let store = self.target_data.get_store_size(&st);
+                let align = self.target_data.get_abi_alignment(&st) as u64;
+                let stride = store.div_ceil(align) * align;
+                let key_off = self.target_data.offset_of_element(&st, *key_field).expect("valid key field offset");
+                let agg = self.builder.build_load(slice_struct_type(self.ctx), self.slots[base], "encbase").map_err(|e| self.err(e))?.into_struct_value();
+                let bptr = self.builder.build_extract_value(agg, 0, "encptr").map_err(|e| self.err(e))?;
+                let blen = self.builder.build_extract_value(agg, 1, "enclen").map_err(|e| self.err(e))?;
+                let i64t = self.ctx.i64_type();
+                let oi = self.operand(out_ids);
+                let od = self.operand(out_dict);
+                self.builder
+                    .build_call(
+                        self.funcs["dict_encode_str"],
+                        &[bptr.into(), blen.into(), i64t.const_int(stride, false).into(), i64t.const_int(key_off, false).into(), oi.into(), od.into(), blen.into()],
+                        "dictenc",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("dict_encode returns the dictionary size (i64)")
+            }
+            Rvalue::MakeDictEncoded { source, ids, dict } => {
+                // Assemble the 3-slice `dict_encoded` aggregate `{ source, ids, dict }`.
+                let ty = dictenc_struct_type(self.ctx);
+                let s = self.operand(source);
+                let i = self.operand(ids);
+                let d = self.operand(dict);
+                let agg = self.builder.build_insert_value(ty.get_undef(), s, 0, "encsrc").map_err(|e| self.err(e))?.into_struct_value();
+                let agg = self.builder.build_insert_value(agg, i, 1, "encids").map_err(|e| self.err(e))?.into_struct_value();
+                self.builder.build_insert_value(agg, d, 2, "encdict").map_err(|e| self.err(e))?.into_struct_value().into()
+            }
+            Rvalue::DictField { base, idx } => {
+                // Extract one `{ptr,len}` slice (0 = source, 1 = ids, 2 = dict) from a `dict_encoded` slot.
+                let agg = self.builder.build_load(dictenc_struct_type(self.ctx), self.slots[base], "encfldload").map_err(|e| self.err(e))?.into_struct_value();
+                self.builder.build_extract_value(agg, *idx, "encfld").map_err(|e| self.err(e))?
+            }
+            Rvalue::GatherColumnI64 { source, struct_id, field, out } => {
+                // Copy the strided i64 `field` column of the AoS `source` into the contiguous `out`.
+                let st = self.struct_types[*struct_id as usize];
+                let store = self.target_data.get_store_size(&st);
+                let align = self.target_data.get_abi_alignment(&st) as u64;
+                let stride = store.div_ceil(align) * align;
+                let off = self.target_data.offset_of_element(&st, *field).expect("valid value field offset");
+                let agg = self.operand(source).into_struct_value();
+                let sptr = self.builder.build_extract_value(agg, 0, "gthptr").map_err(|e| self.err(e))?;
+                let slen = self.builder.build_extract_value(agg, 1, "gthlen").map_err(|e| self.err(e))?;
+                let i64t = self.ctx.i64_type();
+                let o = self.operand(out);
+                self.builder
+                    .build_call(
+                        self.funcs["gather_i64"],
+                        &[sptr.into(), slen.into(), i64t.const_int(stride, false).into(), i64t.const_int(off, false).into(), o.into()],
+                        "",
+                    )
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::DictLookup { ids, n, dict, out } => {
+                // Label a dense-id column back to str views: out[i] = dict[ids[i]].
+                let ids_ptr = self.operand(ids);
+                let nn = self.operand(n);
+                let dagg = self.operand(dict).into_struct_value();
+                let dptr = self.builder.build_extract_value(dagg, 0, "dictptr").map_err(|e| self.err(e))?;
+                let dlen = self.builder.build_extract_value(dagg, 1, "dictlen").map_err(|e| self.err(e))?;
+                let o = self.operand(out);
+                self.builder
+                    .build_call(self.funcs["dict_lookup"], &[ids_ptr.into(), nn.into(), dptr.into(), dlen.into(), o.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
             Rvalue::Chunks { src, n, elem } => {
                 // Split the `{ptr,len}` `src` into length-`n` slices via the runtime; the result is
                 // the chunk array's `{chunk_buf, count}` (also a `{ptr,len}`).
@@ -2868,6 +2992,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
             Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(self.ctx).into(),
+            Ty::DictEncoded(..) => dictenc_struct_type(self.ctx).into(),
             _ => scalar_type(self.ctx, ty, self.struct_types, self.enum_types),
         }
     }

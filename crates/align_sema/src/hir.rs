@@ -494,12 +494,17 @@ pub enum ExprKind {
     /// (distinct keys, per-key aggregate) — the data-oriented result (no `HashMap`), reusing
     /// `partition`'s tuple-of-two-owned-arrays shape. First slice: `i64` key + `i64` value.
     ///
-    /// When `key_str` is set, the key field is a `str` and `base` is instead an **AoS**
-    /// `array<Struct>` (a `soa` can't hold a `str` column): the keys are **dictionary-encoded**
-    /// (interned to dense ids) by the runtime, the `ty` is `(array<str>, array<i64>)`, and the result
-    /// key views **borrow `base`** (so the tuple inherits `base`'s region). Value is `i64`; `sum` only
-    /// for this first str-key slice.
-    ArrayGroupAgg { base: LocalId, struct_id: u32, key_field: u32, value_field: Option<u32>, op: GroupOp, key_str: bool },
+    /// The `source` selects the key/column path (see [`GroupSource`]): a `soa<Struct>` i64 key, an
+    /// **AoS** `array<Struct>` `str` key (dictionary-encoded inline, `ty` = `(array<str>,
+    /// array<i64>)`, key views **borrow `base`**), or a precomputed [`crate::Ty::DictEncoded`] value
+    /// (reuse its dense-id column — the A2 rail). Value is `i64`; `sum`/`min`/`max`/`count`.
+    ArrayGroupAgg { base: LocalId, struct_id: u32, key_field: u32, value_field: Option<u32>, op: GroupOp, source: GroupSource },
+    /// `s.dict_encode(.key)` — intern the `str` `key_field` column of the AoS `array<Struct>` local
+    /// `base` to a dense-id column + a dictionary, yielding a [`crate::Ty::DictEncoded`] value. The
+    /// one-time transform (visible cost) of the A2 reuse rail; a later `e.group_by(.key).<agg>(.value)`
+    /// reuses the encoded ids (integer-column work) instead of re-interning per group-by. Borrows
+    /// `base` (the `dict`/`source` slices view it), so the result is region-tied to it.
+    ArrayDictEncode { base: LocalId, struct_id: u32, key_field: u32 },
     /// `fs.read_file(path)` — read the file at `path` (a `str`) into a freshly heap-allocated owned
     /// `string`; the expression `ty` is `Result<string, Error>`. The first `std.fs` surface.
     FsReadFile { path: Box<Expr> },
@@ -523,6 +528,19 @@ pub enum ExprKind {
     /// `w.flush()` — flush a buffered stdout writer's bytes to the OS, borrowing it. The `ty` is
     /// `Result<(), Error>`. Impure.
     BufWriterFlush { writer: Box<Expr> },
+}
+
+/// The source/key path of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupSource {
+    /// `soa<Struct>`, contiguous columns, an **i64** key — the dense hash-aggregate path.
+    SoaI64,
+    /// AoS `array<Struct>`, a **str** key — interned to dense ids inline by the runtime, then
+    /// aggregated and labeled (A1, `align_rt_group_*_str`).
+    AosStr,
+    /// A precomputed [`crate::Ty::DictEncoded`] value — reuse its dense-id column via the i64
+    /// group path, then label results back through its dictionary (A2 reuse rail).
+    Encoded,
 }
 
 /// The aggregate of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).

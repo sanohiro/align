@@ -231,6 +231,23 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 operand_str(out_vals)
             )
         }
+        Rvalue::DictEncode { base, struct_id, key_field, out_ids, out_dict } => {
+            format!(
+                "dict_encode(base=slot{base} struct#{struct_id}.key{key_field} -> ids={}, dict={})",
+                operand_str(out_ids),
+                operand_str(out_dict)
+            )
+        }
+        Rvalue::MakeDictEncoded { source, ids, dict } => {
+            format!("dict_encoded{{source={}, ids={}, dict={}}}", operand_str(source), operand_str(ids), operand_str(dict))
+        }
+        Rvalue::DictField { base, idx } => format!("dict_field(slot{base}.{idx})"),
+        Rvalue::GatherColumnI64 { source, struct_id, field, out } => {
+            format!("gather_i64({} struct#{struct_id}.field{field} -> {})", operand_str(source), operand_str(out))
+        }
+        Rvalue::DictLookup { ids, n, dict, out } => {
+            format!("dict_lookup(ids={}, n={}, dict={} -> {})", operand_str(ids), operand_str(n), operand_str(dict), operand_str(out))
+        }
         Rvalue::Chunks { src, n, elem } => {
             format!("chunks({}, {} x {})", operand_str(src), operand_str(n), crate::ty_name(*elem))
         }
