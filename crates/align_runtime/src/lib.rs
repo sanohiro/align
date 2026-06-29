@@ -909,6 +909,165 @@ unsafe fn parse_object(
     }
 }
 
+/// The declared field's name bytes (for key verification + dispatch).
+#[inline]
+unsafe fn field_name<'a>(d: &JsonField) -> &'a [u8] {
+    if d.name_ptr.is_null() || d.name_len <= 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(d.name_ptr, d.name_len as usize) }
+    }
+}
+
+/// Skip JSON whitespace from `i` (a value may not start immediately after `:` in pretty JSON).
+#[inline]
+fn skip_ws_at(src: &[u8], mut i: usize) -> usize {
+    while i < src.len() && matches!(src[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// Write field `d`'s value into the element slot during the index-driven (Mison-style) decode. `k`
+/// is the colon's position in the structural index `idx`; a `str` value's delimiter quotes are
+/// `idx[k+1]`/`idx[k+2]`, a scalar is parsed from the first non-space byte after the `:`. Matches
+/// [`parse_object`]'s per-kind writes exactly.
+///
+/// # Safety
+/// `eptr` must point to `esz` writable bytes (the element slot).
+#[inline]
+unsafe fn write_field_indexed(src: &[u8], idx: &[u32], k: usize, d: &JsonField, eptr: *mut u8, esz: i64) -> Option<()> {
+    let kind = (d.tag >> 8) & 0xff;
+    let width = (d.tag & 0xff) as i64;
+    if d.offset < 0 || d.offset.checked_add(width).map_or(true, |end| end > esz) {
+        return None;
+    }
+    let off = d.offset as usize;
+    let w = width as usize;
+    let colon = idx[k] as usize;
+    let mut vp = JsonParser { src, pos: skip_ws_at(src, colon + 1) };
+    if kind == 3 {
+        // str: a zero-copy `{ptr,len}` view. The lean index holds no value quotes, so scan the
+        // string from the raw bytes via `string()` (which borrows the input and rejects escapes).
+        if w != 16 {
+            return None;
+        }
+        let s = vp.string()?;
+        let pb = (s.as_ptr() as usize as u64).to_le_bytes();
+        let lb = (s.len() as i64).to_le_bytes();
+        for j in 0..8 {
+            unsafe { *eptr.add(off + j) = pb[j] };
+            unsafe { *eptr.add(off + 8 + j) = lb[j] };
+        }
+        return Some(());
+    }
+    match kind {
+        1 => {
+            if w != 1 {
+                return None;
+            }
+            let v = vp.boolean()?;
+            unsafe { *eptr.add(off) = v as u8 };
+        }
+        2 => {
+            if w != 4 && w != 8 {
+                return None;
+            }
+            let v = vp.number()?;
+            if w == 4 {
+                let b = (v as f32).to_le_bytes();
+                for j in 0..4 {
+                    unsafe { *eptr.add(off + j) = b[j] };
+                }
+            } else {
+                let b = v.to_le_bytes();
+                for j in 0..8 {
+                    unsafe { *eptr.add(off + j) = b[j] };
+                }
+            }
+        }
+        _ => {
+            if w != 1 && w != 2 && w != 4 && w != 8 {
+                return None;
+            }
+            let v = vp.integer()?;
+            let b = v.to_le_bytes();
+            for j in 0..w {
+                unsafe { *eptr.add(off + j) = b[j] };
+            }
+        }
+    }
+    Some(())
+}
+
+/// Mison **speculation** fast path: the record's colon count matched the learned pattern, so for each
+/// declared field at its learned ordinal, **verify** the key (a byte compare) and write the value —
+/// no `find_field` hashing, and the unqueried fields' colons are never touched. Returns `false` on
+/// any key mismatch (the caller then falls back); a partial write is harmless (the fallback overwrites
+/// the slot or errors). `rec_cols[o]` is the index position of the record's o-th colon; `pat_field[o]`
+/// is the declared field at ordinal `o`, or `-1` for an unqueried position.
+///
+/// # Safety
+/// `eptr` must point to `esz` writable bytes.
+unsafe fn json_speculate(src: &[u8], idx: &[u32], rec_cols: &[usize], pat_field: &[i32], descs: &[JsonField], eptr: *mut u8, esz: i64) -> bool {
+    for (o, &k) in rec_cols.iter().enumerate() {
+        let fi = pat_field[o];
+        if fi < 0 {
+            continue; // an unqueried position — skip it entirely (projection)
+        }
+        let d = &descs[fi as usize];
+        match key_before_colon(src, idx[k] as usize) {
+            Some(key) if key == unsafe { field_name(d) } => {}
+            _ => return false, // structure drifted from the pattern — fall back
+        }
+        if unsafe { write_field_indexed(src, idx, k, d, eptr, esz) }.is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Mison fallback / learn path: scan the record's colons with `find_field` (enforcing unknown-skip,
+/// duplicate-reject, all-declared-present), writing each declared field, and **(re)learn** the
+/// pattern into `pat_field` (ordinal → declared field, `-1` for unqueried) for subsequent speculation.
+/// Returns `None` on a duplicate or a missing declared field (the strict decode semantics).
+///
+/// # Safety
+/// `eptr` must point to `esz` writable bytes.
+unsafe fn json_fallback(
+    src: &[u8],
+    idx: &[u32],
+    rec_cols: &[usize],
+    descs: &[JsonField],
+    eptr: *mut u8,
+    esz: i64,
+    phf: Option<&[i32]>,
+    phf_seed: u64,
+    seen: &mut SeenSet,
+    pat_field: &mut Vec<i32>,
+) -> Option<()> {
+    *seen = SeenSet::new(descs.len());
+    pat_field.clear();
+    pat_field.resize(rec_cols.len(), -1);
+    for (o, &k) in rec_cols.iter().enumerate() {
+        let Some(key) = key_before_colon(src, idx[k] as usize) else {
+            return None; // a `:` not preceded by a `"..."` key — malformed object
+        };
+        if let Some(fi) = unsafe { find_field(descs, key, phf, phf_seed) } {
+            if !seen.mark(fi) {
+                return None; // duplicate field
+            }
+            pat_field[o] = fi as i32;
+            unsafe { write_field_indexed(src, idx, k, &descs[fi], eptr, esz)? };
+        }
+    }
+    if seen.all_seen(descs.len()) {
+        Some(())
+    } else {
+        None // a declared field is missing
+    }
+}
+
 /// Parse the JSON array of objects in `input` into a freshly heap-allocated owned `array<Struct>`
 /// (AoS), writing the materialized `{ptr, len}` (len = element count) to `out` (MMv2 slice 8d,
 /// the draft.md §19 headline). Each object is decoded by [`parse_object`] per the `fields`
@@ -950,40 +1109,73 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     let mut buf: Vec<u8> = Vec::new();
     let mut count: i64 = 0;
 
-    let mut p = JsonParser { src, pos: 0 };
+    // Stage 1: index the whole input once (SIMD); stage 2 is a Mison-style speculative walk.
+    // Pre-reserve so per-element growth never reallocates; decoded `str` fields point into `src`,
+    // not `buf`, so a reallocation would not invalidate them anyway.
+    let mut idx: Vec<u32> = Vec::new();
+    json_decode_index(src, &mut idx);
+    if esz > 0 {
+        buf.reserve((src.len() / 24).saturating_mul(esz).min(1 << 30));
+    }
+
+    // Bracket depth tracks structure (1 = the array, 2 = a record, 3+ = a nested value). A record's
+    // colon index-positions accumulate in `rec_cols`; at its `}` the record decodes by **speculation**
+    // (jump to each declared field's learned colon ordinal, verify the key — no `find_field`) when its
+    // colon count matches the learned `pat`, else by the `find_field` fallback (which also relearns).
+    let mut pat_ncol: i64 = -1;
+    let mut pat_field: Vec<i32> = Vec::new();
+    let mut rec_cols: Vec<usize> = Vec::new();
+    let mut seen = SeenSet::new(descs.len());
+    let mut eoff = 0usize;
+    let mut depth: i32 = 0;
+    let mut started = false;
+    let mut array_close = 0usize;
     let ok = (|| -> Option<()> {
-        p.ws();
-        p.expect(b'[')?;
-        p.ws();
-        if p.peek() == Some(b']') {
-            p.pos += 1;
-        } else {
-            loop {
-                p.ws();
-                // Grow the buffer by one zeroed element and decode the object into it. The decoded
-                // `str` fields hold pointers into `src` (not `buf`), so reallocating `buf` on the
-                // next `resize` keeps them valid.
-                let base = buf.len();
-                buf.resize(base + esz, 0);
-                unsafe { parse_object(&mut p, descs, buf.as_mut_ptr().add(base), esz as i64, phf, phf_seed)? };
-                count += 1;
-                p.ws();
-                match p.peek() {
-                    Some(b',') => {
-                        p.pos += 1;
-                        continue;
+        for k in 0..idx.len() {
+            let pos = idx[k] as usize;
+            match src[pos] {
+                b'[' => {
+                    depth += 1;
+                    if depth == 1 {
+                        started = true;
                     }
-                    Some(b']') => {
-                        p.pos += 1;
-                        break;
-                    }
-                    _ => return None,
                 }
+                b'{' => {
+                    depth += 1;
+                    if depth == 2 {
+                        eoff = buf.len();
+                        buf.resize(eoff + esz, 0);
+                        rec_cols.clear();
+                    }
+                }
+                b':' if depth == 2 => rec_cols.push(k),
+                b'}' => {
+                    if depth == 2 {
+                        let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
+                        let spec = pat_ncol == rec_cols.len() as i64
+                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, eptr, esz as i64) };
+                        if !spec {
+                            unsafe { json_fallback(src, &idx, &rec_cols, descs, eptr, esz as i64, phf, phf_seed, &mut seen, &mut pat_field)? };
+                            pat_ncol = rec_cols.len() as i64;
+                        }
+                        count += 1;
+                    }
+                    depth -= 1;
+                }
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        array_close = pos;
+                    }
+                }
+                _ => {}
             }
         }
-        p.ws();
-        // Trailing garbage after the array is an error.
-        if p.pos != src.len() {
+        if !started || depth != 0 {
+            return None;
+        }
+        // No non-whitespace may follow the array's closing `]`.
+        if src[array_close + 1..].iter().any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
             return None;
         }
         Some(())
@@ -1629,6 +1821,117 @@ fn json_structural_index(src: &[u8], out: &mut Vec<u32>) {
         }
     }
     json_structural_index_scalar(src, out);
+}
+
+/// A **lean** decode index for the two-stage `array<Struct>` decoder: emits only `{ } [ ] :`
+/// (structure + field separators) outside strings — **not** quotes or commas. The decoder navigates
+/// records by the braces and fields by the colons, and recovers keys / `str` values by a short scan
+/// of the raw bytes around the colon (so the quotes need not be in the index). Roughly a third the
+/// size of [`json_structural_index`] for object-heavy input — and the index size dominates the decode
+/// (`docs/open-questions.md` "JSON two-stage SIMD decode" autopsy), so the smaller index is the win.
+#[cfg_attr(not(test), allow(dead_code))]
+fn json_decode_index_scalar(src: &[u8], out: &mut Vec<u32>) {
+    out.clear();
+    out.reserve(src.len() / 12);
+    let mut in_string = false;
+    let mut esc = false;
+    for (i, &b) in src.iter().enumerate() {
+        if b == b'"' && !esc {
+            in_string = !in_string;
+        } else if !in_string && matches!(b, b'{' | b'}' | b'[' | b']' | b':') {
+            out.push(i as u32);
+        }
+        esc = b == b'\\' && !esc;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,pclmulqdq")]
+unsafe fn json_decode_index_avx2(src: &[u8], out: &mut Vec<u32>) {
+    use core::arch::x86_64::*;
+    out.clear();
+    out.reserve(src.len() / 12);
+    let n = src.len();
+    let eqm = |v: __m256i, c: u8| -> u32 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 };
+    // Structure + field separators only — no `,`, and quotes are masking-only (never emitted).
+    let op_bits = |v: __m256i| -> u32 { eqm(v, b'{') | eqm(v, b'}') | eqm(v, b'[') | eqm(v, b']') | eqm(v, b':') };
+
+    let mut string_carry: u64 = 0;
+    let mut escape_carry: u64 = 0;
+    let mut i = 0usize;
+    while i + 64 <= n {
+        let p = unsafe { src.as_ptr().add(i) };
+        let lo = unsafe { _mm256_loadu_si256(p as *const __m256i) };
+        let hi = unsafe { _mm256_loadu_si256(p.add(32) as *const __m256i) };
+        let quote = (eqm(lo, b'"') as u64) | ((eqm(hi, b'"') as u64) << 32);
+        let backslash = (eqm(lo, b'\\') as u64) | ((eqm(hi, b'\\') as u64) << 32);
+        let op = (op_bits(lo) as u64) | ((op_bits(hi) as u64) << 32);
+
+        let escaped = find_escaped(backslash, &mut escape_carry);
+        let real_quote = quote & !escaped;
+        let in_string = unsafe { prefix_xor(real_quote) } ^ string_carry;
+        string_carry = (in_string as i64 >> 63) as u64;
+
+        let mut bits = op & !in_string;
+        while bits != 0 {
+            out.push(i as u32 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+        i += 64;
+    }
+    let mut in_string = string_carry & 1 == 1;
+    let mut esc = escape_carry & 1 == 1;
+    while i < n {
+        let b = unsafe { *src.get_unchecked(i) };
+        if b == b'"' && !esc {
+            in_string = !in_string;
+        } else if !in_string && matches!(b, b'{' | b'}' | b'[' | b']' | b':') {
+            out.push(i as u32);
+        }
+        esc = b == b'\\' && !esc;
+        i += 1;
+    }
+}
+
+/// Fill `out` with the lean decode-index positions (`{ } [ ] :`). Runtime-dispatched like
+/// [`json_structural_index`].
+fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
+    if src.len() > u32::MAX as usize {
+        panic_abort("JSON input exceeds the 4 GiB decode-index limit");
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("pclmulqdq") {
+            unsafe { json_decode_index_avx2(src, out) };
+            return;
+        }
+    }
+    json_decode_index_scalar(src, out);
+}
+
+/// The key `"..."` immediately before the colon at byte position `cpos`, scanned from the raw bytes
+/// (the lean index holds no quotes). Skips whitespace, then the closing quote, back to the opening
+/// quote. `None` if the bytes there are not a `"..."` key. (Escaped keys are not supported — a `\`
+/// in a key makes its name not match any declared field, so it is treated as unknown, like
+/// [`parse_object`] effectively does for an unknown key.)
+#[inline]
+fn key_before_colon(src: &[u8], cpos: usize) -> Option<&[u8]> {
+    let mut e = cpos;
+    while e > 0 && matches!(src[e - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        e -= 1;
+    }
+    if e == 0 || src[e - 1] != b'"' {
+        return None;
+    }
+    let close = e - 1;
+    let mut s = close;
+    while s > 0 && src[s - 1] != b'"' {
+        s -= 1;
+    }
+    if s == 0 {
+        return None;
+    }
+    Some(&src[s..close])
 }
 
 /// A minimal JSON scanner over a byte slice (just what `json.decode` needs: objects with
