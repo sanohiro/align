@@ -260,6 +260,26 @@ pub enum Rvalue {
     /// (`AlignStr`s borrowing `base`), `out_vals` a buffer of i64 aggregates; yields the group count
     /// (i64). `value_field` is `None` for `count` (no value column); `op` selects the runtime entry.
     GroupAggStr { base: Slot, struct_id: u32, key_field: u32, value_field: Option<u32>, op: hir::GroupOp, out_keys: Operand, out_vals: Operand },
+    /// `s.dict_encode(.key)` — intern the `str` `key_field` column of the AoS array-of-`struct_id` in
+    /// slot `base` (codegen derives the per-row stride + key byte offset) into the caller `out_ids`
+    /// (dense i64 ids, one per row) + `out_dict` (the `str` dictionary), via `align_rt_dict_encode_str`.
+    /// Yields the dictionary size (distinct count, i64). `out_ids`/`out_dict` are [`Rvalue::HeapAllocBuf`]
+    /// pointers.
+    DictEncode { base: Slot, struct_id: u32, key_field: u32, out_ids: Operand, out_dict: Operand },
+    /// Assemble a `dict_encoded` value from its three `{ptr,len}` slices `{ source, ids, dict }` (an
+    /// anonymous 3-slice LLVM struct, by value). `source` borrows the AoS; `ids`/`dict` are owned.
+    MakeDictEncoded { source: Operand, ids: Operand, dict: Operand },
+    /// Extract one of a `dict_encoded` slot's three `{ptr,len}` slices by index (`0` = source AoS,
+    /// `1` = ids `array<i64>`, `2` = dict `array<str>`) — a load + extract, yielding the slice value.
+    DictField { base: Slot, idx: u32 },
+    /// Gather the strided `i64` `field` column of the AoS array-of-`struct_id` `source` (`{ptr,len}`)
+    /// into the contiguous buffer `out` (`align_rt_gather_i64`) — the value projection of an encoded
+    /// `group_by`. Yields unit.
+    GatherColumnI64 { source: Operand, struct_id: u32, field: u32, out: Operand },
+    /// Label a dense-id column back to `str` views: `out[i] = dict[ids[i]]` over `n` ids
+    /// (`align_rt_dict_lookup`) — the A2 result step. `ids`/`dict` are `{ptr,len}` slices, `out` a
+    /// buffer pointer. Yields unit.
+    DictLookup { ids: Operand, n: Operand, dict: Operand, out: Operand },
     /// `chunks(n)`: split the `{ptr,len}` slice `src` (element size `elem`) into length-`n`
     /// sub-slices, yielding an owned `array<slice<T>>` value `{ chunk_buf, count }` (via the
     /// runtime `align_rt_chunks`). The element slices borrow `src`.
@@ -567,7 +587,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::BufWriter)
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::BufWriter | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -1137,17 +1157,18 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             };
             lower_array_partition(b, source, stages, *elem, func, captures, tuple_id)
         }
-        hir::ExprKind::ArrayGroupAgg { base, struct_id, key_field, value_field, op, key_str } => {
+        hir::ExprKind::ArrayGroupAgg { base, struct_id, key_field, value_field, op, source } => {
             let tuple_id = match e.ty {
                 Ty::Tuple(id) => id,
                 _ => unreachable!("group_by aggregate result is a tuple"),
             };
-            if *key_str {
-                lower_array_group_str(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id)
-            } else {
-                lower_array_group_agg(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id)
+            match source {
+                hir::GroupSource::SoaI64 => lower_array_group_agg(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id),
+                hir::GroupSource::AosStr => lower_array_group_str(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id),
+                hir::GroupSource::Encoded => lower_array_group_encoded(b, *base, *struct_id, *value_field, *op, tuple_id),
             }
         }
+        hir::ExprKind::ArrayDictEncode { base, struct_id, key_field } => lower_dict_encode(b, *base, *struct_id, *key_field),
         hir::ExprKind::ArrayParMap { source, stages, func, captures, elem } => {
             // With no prior stages, a `{ptr,len}` (or fixed scalar-array) source, and no captures,
             // run in parallel via the runtime; otherwise (prior stages, struct-array source, or a
@@ -2359,6 +2380,104 @@ fn lower_array_group_str(b: &mut Builder, base: u32, struct_id: u32, key_field: 
     Operand::Value(tup)
 }
 
+/// `s.dict_encode(.key)` — build a `dict_encoded` value (the A2 reuse rail). Loads `base`'s AoS
+/// `{ptr,len}` (the borrowed source slice + row count), heap-allocates a dense-id i64 buffer (one per
+/// row) + a `str` dictionary buffer, interns via [`Rvalue::DictEncode`], and assembles the 3-slice
+/// value `{ source, ids, dict }`. `source` borrows `base`; `ids`/`dict` are owned (freed by the
+/// value's `Drop`). The encoded value is region-tied to `base` (sema).
+fn lower_dict_encode(b: &mut Builder, base: u32, struct_id: u32, key_field: u32) -> Operand {
+    let strs = scalar_of(Ty::Str);
+    let i64s = scalar_of(i64_ty());
+    // Load the source AoS `{ptr,len}` (the borrowed source view + the row count).
+    let arr = b.fresh_value(Ty::DynStructArray(struct_id, Layout::Aos));
+    b.push(Stmt::Let(arr, Rvalue::Load(base)));
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(arr))));
+    // Owned outputs: a dense id per row, and the dictionary (<= row count distinct keys).
+    let out_ids = b.fresh_value(Ty::Box(i64s));
+    b.push(Stmt::Let(out_ids, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+    let out_dict = b.fresh_value(Ty::Box(strs));
+    b.push(Stmt::Let(out_dict, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: Ty::Str }));
+    // Intern → dictionary size (distinct count).
+    let count = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(count, Rvalue::DictEncode { base, struct_id, key_field, out_ids: Operand::Value(out_ids), out_dict: Operand::Value(out_dict) }));
+    // ids length = row count; dict length = distinct count.
+    let ids = b.fresh_value(Ty::DynArray(i64s));
+    b.push(Stmt::Let(ids, Rvalue::MakeDynArray { ptr: Operand::Value(out_ids), len: Operand::Value(len) }));
+    let dict = b.fresh_value(Ty::DynArray(strs));
+    b.push(Stmt::Let(dict, Rvalue::MakeDynArray { ptr: Operand::Value(out_dict), len: Operand::Value(count) }));
+    // Assemble the 3-slice `dict_encoded` value.
+    let enc = b.fresh_value(Ty::DictEncoded(struct_id, key_field));
+    b.push(Stmt::Let(enc, Rvalue::MakeDictEncoded { source: Operand::Value(arr), ids: Operand::Value(ids), dict: Operand::Value(dict) }));
+    Operand::Value(enc)
+}
+
+/// `e.group_by(.key).<op>(.value)` over a `dict_encoded` value `base` — the A2 reuse path. Extracts the
+/// encoded value's three slices, gathers the chosen i64 value column out of the borrowed AoS into a
+/// contiguous buffer, runs the dense-id [`Rvalue::GroupAgg`] over `(ids, vals)` (reusing the
+/// precomputed interning), then labels the distinct dense ids back to `str` keys through the dictionary
+/// ([`Rvalue::DictLookup`]). Builds the same result tuple `(array<str>, array<i64>)` as the A1 str-key
+/// path. The gathered value column and the distinct-id scratch buffer are freed in place.
+fn lower_array_group_encoded(b: &mut Builder, base: u32, struct_id: u32, value_field: Option<u32>, op: hir::GroupOp, tuple_id: u32) -> Operand {
+    let strs = scalar_of(Ty::Str);
+    let i64s = scalar_of(i64_ty());
+    // Extract the encoded value's slices: source AoS (borrowed), ids (dense column), dict.
+    let source = b.fresh_value(Ty::DynStructArray(struct_id, Layout::Aos));
+    b.push(Stmt::Let(source, Rvalue::DictField { base, idx: 0 }));
+    let ids = b.fresh_value(Ty::DynArray(i64s));
+    b.push(Stmt::Let(ids, Rvalue::DictField { base, idx: 1 }));
+    let dict = b.fresh_value(Ty::DynArray(strs));
+    b.push(Stmt::Let(dict, Rvalue::DictField { base, idx: 2 }));
+    // n = row count = ids length.
+    let n = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(n, Rvalue::SliceLen(Operand::Value(ids))));
+    // Gather the i64 value column from the borrowed AoS into a contiguous buffer. `count` has no
+    // value column → reuse the `ids` slice as the (codegen-ignored) `vals` operand and skip the gather.
+    let (vals_op, vals_scratch) = match value_field {
+        Some(vf) => {
+            let buf = b.fresh_value(Ty::Box(i64s));
+            b.push(Stmt::Let(buf, Rvalue::HeapAllocBuf { count: Operand::Value(n), elem: i64_ty() }));
+            let g = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(g, Rvalue::GatherColumnI64 { source: Operand::Value(source), struct_id, field: vf, out: Operand::Value(buf) }));
+            let varr = b.fresh_value(Ty::DynArray(i64s));
+            b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(buf), len: Operand::Value(n) }));
+            (Operand::Value(varr), Some(varr))
+        }
+        None => (Operand::Value(ids), None),
+    };
+    // Aggregate over the dense ids → distinct ids (scratch) + per-group aggregates (kept).
+    let out_ids = b.fresh_value(Ty::Box(i64s));
+    b.push(Stmt::Let(out_ids, Rvalue::HeapAllocBuf { count: Operand::Value(n), elem: i64_ty() }));
+    let out_vals = b.fresh_value(Ty::Box(i64s));
+    b.push(Stmt::Let(out_vals, Rvalue::HeapAllocBuf { count: Operand::Value(n), elem: i64_ty() }));
+    let count = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(
+        count,
+        Rvalue::GroupAgg { keys: Operand::Value(ids), vals: vals_op, out_keys: Operand::Value(out_ids), out_vals: Operand::Value(out_vals), op },
+    ));
+    // Label the distinct dense ids back to `str` keys through the dictionary.
+    let out_keys = b.fresh_value(Ty::Box(strs));
+    b.push(Stmt::Let(out_keys, Rvalue::HeapAllocBuf { count: Operand::Value(count), elem: Ty::Str }));
+    let lk = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(lk, Rvalue::DictLookup { ids: Operand::Value(out_ids), n: Operand::Value(count), dict: Operand::Value(dict), out: Operand::Value(out_keys) }));
+    // Build the result tuple `(array<str>, array<i64>)`.
+    let karr = b.fresh_value(Ty::DynArray(strs));
+    b.push(Stmt::Let(karr, Rvalue::MakeDynArray { ptr: Operand::Value(out_keys), len: Operand::Value(count) }));
+    let varr = b.fresh_value(Ty::DynArray(i64s));
+    b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(out_vals), len: Operand::Value(count) }));
+    let tup = b.fresh_value(Ty::Tuple(tuple_id));
+    b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(karr), Operand::Value(varr)] }));
+    // Free the transient buffers (the gathered value column + the distinct-id scratch); the result
+    // owns the labels + aggregate buffers (freed by the tuple's `Drop`).
+    if let Some(varr) = vals_scratch {
+        b.push(Stmt::DropValue(Operand::Value(varr)));
+    }
+    let dense = b.fresh_value(Ty::DynArray(i64s));
+    b.push(Stmt::Let(dense, Rvalue::MakeDynArray { ptr: Operand::Value(out_ids), len: Operand::Value(count) }));
+    b.push(Stmt::DropValue(Operand::Value(dense)));
+    Operand::Value(tup)
+}
+
 /// `source.….partition(p)` — one fused loop that splits the surviving scalar elements into two
 /// owned arrays (predicate true, then false) and returns them as a tuple `(array<T>, array<T>)`.
 /// Mirrors [`lower_array_collect`] but with two buffers + a per-element predicate branch at the
@@ -3298,6 +3417,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Fn(id) => format!("fn#{id}"),
         Ty::Enum(id) => format!("enum#{id}"),
         Ty::Task(_) => "Task".to_string(),
+        Ty::DictEncoded(id, _) => format!("dict_encoded<struct#{id}>"),
         // Monomorphization substitutes every `Ty::Param` before MIR; reaching here is a compiler bug.
         Ty::Param(_) => unreachable!("Ty::Param survived monomorphization"),
         Ty::Unit => "()".to_string(),

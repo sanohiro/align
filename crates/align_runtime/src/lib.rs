@@ -1739,6 +1739,31 @@ pub unsafe extern "C" fn align_rt_dict_lookup(ids: *const i64, n: i64, dict: *co
     }
 }
 
+/// Gather a strided `i64` column out of an AoS struct array into a contiguous buffer — the value
+/// projection for the A2 reuse rail. `out[i]` = the `i64` at byte `off` of row `i` (`base + i*stride`).
+/// After `dict_encode` yields a dense-id column, a `group_by(.key).<agg>(.value)` gathers the chosen
+/// `.value` column here, then runs the contiguous-input `align_rt_group_*_i64` over `(ids, out)`. The
+/// empty / null input writes nothing.
+///
+/// # Safety
+/// `base` points to `n` `stride`-byte rows, each with a valid `i64` at `off`; `out` is valid for `n`
+/// `i64` writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_gather_i64(base: *const u8, n: i64, stride: i64, off: i64, out: *mut i64) {
+    // A negative `stride`/`off` is meaningless and would wrap to a huge value through `as usize`
+    // (an out-of-bounds read); reject it defensively, like `align_rt_dict_lookup`'s `try_from` guards.
+    if n <= 0 || base.is_null() || out.is_null() || stride < 0 || off < 0 {
+        return;
+    }
+    let n = n as usize;
+    let (stride, off) = (stride as usize, off as usize);
+    let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
+    for (i, slot) in out.iter_mut().enumerate() {
+        let row = unsafe { base.add(i * stride) };
+        *slot = unsafe { (row.add(off) as *const i64).read_unaligned() };
+    }
+}
+
 /// Find the first `"` or `\` in `hay` (the two bytes that bound or interrupt a JSON string body),
 /// returning its index, or `None` if neither occurs.
 ///
@@ -3457,6 +3482,30 @@ mod tests {
         // Empty / null inputs encode nothing.
         assert_eq!(unsafe { align_rt_dict_encode_str(rows.as_ptr() as *const u8, 0, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 0) }, 0);
         assert_eq!(unsafe { align_rt_dict_encode_str(std::ptr::null(), 6, stride, key_off, out_ids.as_mut_ptr(), out_dict.as_mut_ptr(), 6) }, 0);
+    }
+
+    #[test]
+    fn gather_i64_projects_a_strided_column() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Row {
+            key: AlignStr,
+            val: i64,
+        }
+        let s = |b: &'static [u8]| AlignStr { ptr: b.as_ptr(), len: b.len() as i64 };
+        let rows = [Row { key: s(b"a"), val: 10 }, Row { key: s(b"b"), val: 20 }, Row { key: s(b"a"), val: 5 }];
+        let stride = std::mem::size_of::<Row>() as i64;
+        let off = std::mem::offset_of!(Row, val) as i64;
+        let mut out = vec![0i64; rows.len()];
+        unsafe { align_rt_gather_i64(rows.as_ptr() as *const u8, rows.len() as i64, stride, off, out.as_mut_ptr()) };
+        assert_eq!(out, vec![10, 20, 5]);
+        // Empty / null / negative-stride / negative-offset inputs gather nothing (leave `out` untouched).
+        let mut z = vec![-1i64; 3];
+        unsafe { align_rt_gather_i64(rows.as_ptr() as *const u8, 0, stride, off, z.as_mut_ptr()) };
+        unsafe { align_rt_gather_i64(std::ptr::null(), 3, stride, off, z.as_mut_ptr()) };
+        unsafe { align_rt_gather_i64(rows.as_ptr() as *const u8, 3, -1, off, z.as_mut_ptr()) };
+        unsafe { align_rt_gather_i64(rows.as_ptr() as *const u8, 3, stride, -1, z.as_mut_ptr()) };
+        assert_eq!(z, vec![-1, -1, -1]);
     }
 
     #[test]
