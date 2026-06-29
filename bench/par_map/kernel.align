@@ -9,3 +9,4 @@ fn work(x: i64) -> i64 {
   return a
 }
 pub fn pmap(s: slice<i64>) -> i64 = s.par_map(work).sum()
+pub fn smap(s: slice<i64>) -> i64 = s.map(work).sum()

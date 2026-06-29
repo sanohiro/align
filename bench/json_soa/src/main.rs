@@ -21,9 +21,13 @@ extern "C" {
     /// `pub fn agg(data: str) -> i64` — decode → `soa<Row>` → `where(.active).pay.sum()`, or -1 on
     /// a parse error.
     fn agg(data: AlignStr) -> i64;
+    /// `pub fn agg_len(data: str) -> i64` — decode → `soa<Row>`, return row count.
+    fn agg_len(data: AlignStr) -> i64;
     /// `pub fn agg_aos(data: str) -> i64` — decode → `array<Row>` (AoS, no transpose) → same
     /// aggregate. Isolates the transpose cost (vs `agg`) and the parser (vs the Rust baseline).
     fn agg_aos(data: AlignStr) -> i64;
+    /// `pub fn agg_aos_len(data: str) -> i64` — decode → `array<Row>`, return row count.
+    fn agg_aos_len(data: AlignStr) -> i64;
 }
 
 // `score`/`extra` are deserialized for fidelity (a fair 4-field record) but not read by the
@@ -72,6 +76,7 @@ fn gen_json(n: usize) -> (String, i64) {
 fn main() {
     let sizes = [10_000usize, 100_000, 1_000_000];
     let rounds = 30;
+    let profile = std::env::var_os("ALIGN_BENCH_PROFILE").is_some();
     println!("JSON decode + where(.active).pay.sum() — Align soa / Align AoS / Rust serde_json→Vec");
     println!(
         "{:>9}  {:>8}  {:>10}  {:>10}  {:>10}  {:>9}  {:>9}",
@@ -110,5 +115,24 @@ fn main() {
             rust_min / soa_min,
             rust_min / aos_min
         );
+
+        if profile && n == 1_000_000 {
+            assert_eq!(unsafe { agg_len(AlignStr { ptr: astr.ptr, len: astr.len }) }, n as i64, "align soa len wrong");
+            assert_eq!(unsafe { agg_aos_len(AlignStr { ptr: astr.ptr, len: astr.len }) }, n as i64, "align aos len wrong");
+            let (mut soa_len_min, mut aos_len_min) = (f64::MAX, f64::MAX);
+            for _ in 0..rounds {
+                let t = Instant::now();
+                std::hint::black_box(unsafe { agg_len(AlignStr { ptr: astr.ptr, len: astr.len }) });
+                soa_len_min = soa_len_min.min(t.elapsed().as_secs_f64() * 1e3);
+
+                let t = Instant::now();
+                std::hint::black_box(unsafe { agg_aos_len(AlignStr { ptr: astr.ptr, len: astr.len }) });
+                aos_len_min = aos_len_min.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!("profile 1M:");
+            println!("  soa decode+transpose-only {:8.3} ms; aggregate delta {:8.3} ms", soa_len_min, soa_min - soa_len_min);
+            println!("  aos decode-only           {:8.3} ms; aggregate delta {:8.3} ms", aos_len_min, aos_min - aos_len_min);
+            println!("  transpose/materialize delta vs aos-only {:8.3} ms", soa_len_min - aos_len_min);
+        }
     }
 }

@@ -172,12 +172,13 @@ v3 variants behind an ifunc-style selector) is a possible future refinement, def
 > Status note: the default build now targets the **portable per-arch baseline** (`x86-64-v2` on
 > amd64, `generic`/`armv8-a` on arm64) via `BuildTarget` in `align_codegen_llvm`; `--target-cpu
 > native` opts into the host CPU. The backend still builds **scalar** IR and leans on the LLVM `-O2`
-> pipeline (SLP / loop vectorizer) for the actual SIMD. In particular,
-> `where` / conditional reductions currently lower to a **per-element branch** (`Term::Branch` in
-> `align_mir`) — a naive placeholder, **not** the intended final form. The branchless mask + `select`
-> lowering above (`where(p).sum()` → masked reduce; materialize via stream-compaction) is M6 work
-> (`07-roadmap.md`). The design is fixed: **`where` is branchless**; no per-element `if` is part of
-> the source semantics. (`mask<T>` is the explicit hand-written form of the same.)
+> pipeline (SLP / loop vectorizer) for the actual SIMD. Branchless `where` is implemented for
+> identity-based reductions (`sum` / `count`): MIR folds predicates into a mask and emits
+> `Rvalue::Select` (`acc += mask ? value : 0`), so LLVM can vectorize the loop. `reduce` / `any` /
+> `all` / `min` / `max` and materializing terminals still use a per-element branch; extending the
+> mask form there remains M6 work. The design is fixed: **`where` is branchless** for the hot
+> reduction shapes; no per-element `if` is part of the intended source semantics. (`mask<T>` is the
+> explicit hand-written form of the same.)
 
 ---
 

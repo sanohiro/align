@@ -427,8 +427,8 @@ pub unsafe extern "C" fn align_rt_par_map(
     let (pool, workers) = par_pool();
     // Don't parallelize trivially-small work: a chunk must be at least `PAR_MIN_CHUNK` elements, so
     // tiny maps (where the pool round-trip would dwarf the work) fall to the single-chunk caller
-    // path. Standard parallel-runtime tuning (Rayon/OpenMP have an analogue); not thunk-cost-aware.
-    const PAR_MIN_CHUNK: usize = 4096;
+    // path. Keep chunks coarse because each element still crosses the indirect thunk boundary.
+    const PAR_MIN_CHUNK: usize = 32768;
     let per = count.div_ceil(workers).max(PAR_MIN_CHUNK);
     let nchunks = count.div_ceil(per); // ≤ workers, every chunk non-empty
     // Single-chunk fast path: run on the caller, no pool round-trip.
@@ -508,11 +508,35 @@ pub unsafe extern "C" fn align_rt_builder_write(b: *mut Builder, ptr: *const u8,
     }
 }
 
-/// Append a decimal integer. Hand-rolled itoa straight into the buffer — no generic `write!`
-/// formatter (runtime format-string parsing + trait dispatch), the builder's hot path.
-#[unsafe(no_mangle)]
-pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
-    let b = unsafe { &mut *b };
+fn builder_push_i64(buf: &mut Vec<u8>, v: i64) {
+    if (-999..=999).contains(&v) {
+        // Format into a stack buffer (max = sign + 3 digits) and append in one `extend_from_slice`,
+        // so the hot path pays a single capacity check / length update rather than one per digit.
+        let mut n = v;
+        let mut tmp = [0u8; 4];
+        let mut len = 0;
+        if n < 0 {
+            tmp[0] = b'-';
+            len = 1;
+            n = -n;
+        }
+        let n = n as u16;
+        if n >= 100 {
+            tmp[len] = b'0' + (n / 100) as u8;
+            tmp[len + 1] = b'0' + ((n / 10) % 10) as u8;
+            tmp[len + 2] = b'0' + (n % 10) as u8;
+            len += 3;
+        } else if n >= 10 {
+            tmp[len] = b'0' + (n / 10) as u8;
+            tmp[len + 1] = b'0' + (n % 10) as u8;
+            len += 2;
+        } else {
+            tmp[len] = b'0' + n as u8;
+            len += 1;
+        }
+        buf.extend_from_slice(&tmp[..len]);
+        return;
+    }
     // 20 = the widest i64 decimal (`-9223372036854775808`). Emit digits back-to-front from the
     // value's magnitude computed via `n % 10` / `unsigned_abs` (works for `i64::MIN` — never negates).
     let mut tmp = [0u8; 20];
@@ -532,7 +556,32 @@ pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
         i -= 1;
         tmp[i] = b'-';
     }
-    b.buf.extend_from_slice(&tmp[i..]);
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+/// Append a decimal integer. Hand-rolled itoa straight into the buffer — no generic `write!`
+/// formatter (runtime format-string parsing + trait dispatch), the builder's hot path.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
+    let b = unsafe { &mut *b };
+    builder_push_i64(&mut b.buf, v);
+}
+
+/// Append `prefix + decimal integer + suffix` in one runtime call. This is the batched form of the
+/// common generated pattern `b.write("..."); b.write_int(x); b.write("...")`.
+///
+/// # Safety
+/// `p1`/`l1` and `p2`/`l2` must describe valid byte ranges when their lengths are positive.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_write_str_int_str(b: *mut Builder, p1: *const u8, l1: i64, v: i64, p2: *const u8, l2: i64) {
+    let b = unsafe { &mut *b };
+    if l1 > 0 {
+        b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p1, l1 as usize) });
+    }
+    builder_push_i64(&mut b.buf, v);
+    if l2 > 0 {
+        b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p2, l2 as usize) });
+    }
 }
 
 /// Append `true`/`false`.
@@ -3778,6 +3827,23 @@ mod tests {
             let mut b = Builder { buf: Vec::new(), arena: std::ptr::null_mut() };
             align_rt_builder_write_int(&mut b, v);
             assert_eq!(String::from_utf8(b.buf).unwrap(), format!("{v}"), "write_int({v})");
+        }
+    }
+
+    #[test]
+    fn builder_write_str_int_str_matches_three_writes() {
+        for v in [0i64, 7, -1, 42, -123, 999, -999, i64::MAX, i64::MIN] {
+            let mut batched = Builder { buf: Vec::new(), arena: std::ptr::null_mut() };
+            unsafe {
+                align_rt_builder_write_str_int_str(&mut batched, b"item-".as_ptr(), 5, v, b"-status ".as_ptr(), 8);
+            }
+
+            let mut separate = Builder { buf: Vec::new(), arena: std::ptr::null_mut() };
+            unsafe { align_rt_builder_write(&mut separate, b"item-".as_ptr(), 5) };
+            align_rt_builder_write_int(&mut separate, v);
+            unsafe { align_rt_builder_write(&mut separate, b"-status ".as_ptr(), 8) };
+
+            assert_eq!(batched.buf, separate.buf, "batched writes match separate writes for {v}");
         }
     }
 

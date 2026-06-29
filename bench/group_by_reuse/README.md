@@ -56,6 +56,23 @@ So the benchmark redirects the roadmap (exactly its job, per the json→soa less
 fills K result columns — not `dict_encode` reuse on its own. That deferred sub-item is now the
 *primary* A2 work, not a nice-to-have.
 
+### Profile finding (2026-06-29, native, 1M groups)
+
+`ALIGN_BENCH_PROFILE=1 bench/group_by_reuse/run.sh native` adds A2 decomposition entry points:
+
+```
+encode only        260.349 ms
++ 1 aggregate      274.017 ms  delta  13.669 ms
++ 2 aggregates     301.142 ms  delta  40.793 ms
++ 3 aggregates     320.630 ms  delta  60.281 ms
++ 4 aggregates     335.050 ms  delta  74.702 ms
+```
+
+At high cardinality, string `dict_encode` is the dominant cost; the four reused dense-id aggregates
+are the secondary cost. So the roadmap has two measured levers: speed up string dictionary encoding,
+and fuse the K aggregate scans into one pass. The latter is still required to compete with the smart
+Rust baseline for a known batch.
+
 A2's remaining honest niche is **sequential / interactive** reuse: when the aggregates arrive over time
 (can't be fused into one pass), re-using the encoding beats re-interning per query (the 2.4–3.5× a1/a2
 gap). For a known batch, single-pass wins.

@@ -36,6 +36,28 @@ The earlier **itoa** fix (`align_rt_builder_write_int`: generic `write!` → a b
 now ~1.5×). `builder(capacity)` is still a legitimate primitive (it helps *realloc-bound* building,
 and it's nothing-hidden), it just isn't the lever for this per-write-call-bound workload.
 
+### Profile finding (2026-06-29, native, 100k rows)
+
+`ALIGN_BENCH_PROFILE=1 bench/string_builder/run.sh native` adds variants that isolate static writes
+from integer writes. After adding a small-integer fast path in `align_rt_builder_write_int`
+(`-999..999` writes directly into the buffer), the profile is:
+
+```
+static one write/row   0.551 ms
+static two writes/row  0.878 ms  extra call delta  0.327 ms
+int only write/row     0.773 ms
+full build             1.483 ms
+runtime batch          0.986 ms
+runtime batch +cap     0.954 ms
+```
+
+The fast path moved the benchmark's full build from ~1.58 ms to ~1.48 ms and `int only` from ~0.88 ms
+to ~0.77 ms. The runtime batch probe (`align_rt_builder_write_str_int_str`, called directly by the
+harness to model lowering `literal + int + literal` as one call) lands at ~0.95–0.99 ms, confirming
+the main lever: remove the three per-row runtime calls. Capacity is a small secondary effect, not the
+root cause. The next compiler change is to lower common append sequences (for example literal + int +
+literal) to the batched ABI, or inline the builder fast path in generated code.
+
 ### Remaining lever (recorded): inline / batch the builder appends
 Closing the last ~1.5× needs removing the per-`write` FFI boundary — inlining the common append, or a
 batched write API — a codegen/runtime concern, not capacity. (Float writing also still uses the

@@ -45,13 +45,22 @@ validation + a generic parse + a second pass over the digits; replaced with a si
 ≈0.61× → **≈0.82–0.85×** (AoS approaches parity at 1M). One clean scalar change closed most of the
 gap, confirming the parser is where the analytics workload is won or lost.
 
+**Profile finding (2026-06-29, native, 1M rows):**
+
+`ALIGN_BENCH_PROFILE=1 bench/json_soa/run.sh native` adds decode-only entry points. The AoS decode-only
+path measured ≈88 ms, while the SoA decode+transpose-only path measured ≈113–114 ms; the ordinary
+end-to-end table measured SoA ≈102–106 ms vs AoS ≈89 ms. Function-by-function minima are noisy, but
+the mechanism is clear: at 1M rows the AoS→SoA materialization is no longer free. The aggregate itself
+is tiny; the practical bottleneck is still decode plus materialization.
+
 **Remaining headroom to reach/beat `serde_json`** (recorded in `docs/open-questions.md`):
 
 - **More scalar-parser tuning** — avoid the per-element zeroing memset (all declared fields are
   required, so the AoS buffer is fully overwritten), tighten `peek`/whitespace/string scanning.
 - **A SIMD / structural JSON parser** — the bigger lever (runtime CPU-dispatch / simdjson-class).
-- **Two-pass count-then-direct-column-fill** — drops the AoS intermediate + transpose; small (the
-  transpose is cheap per the decomposition) but removes an alloc + pass at large N.
+- **Two-pass count-then-direct-column-fill** — drops the AoS intermediate + transpose. This is now a
+  first-class lever at large N, not just polish: the profile mode measured a 10–25 ms SoA
+  materialization penalty around 1M rows.
 - **Field-skip / narrow struct** — don't parse unread columns; already available.
 
 Honest takeaway: Align beats Rust on the *aggregation* layout (flat `bench/` `col_sum` ~8–10×); the

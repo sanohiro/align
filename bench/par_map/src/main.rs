@@ -16,6 +16,8 @@ struct Slice {
 extern "C" {
     /// `pub fn pmap(s: slice<i64>) -> i64` — `s.par_map(work).sum()`.
     fn pmap(s: Slice) -> i64;
+    /// `pub fn smap(s: slice<i64>) -> i64` — sequential `s.map(work).sum()`.
+    fn smap(s: Slice) -> i64;
 }
 
 /// Must match the Align kernel's `work` (wrapping arithmetic = Align's defined i64 overflow).
@@ -48,6 +50,7 @@ fn gen(n: usize) -> Vec<i64> {
 
 fn main() {
     let rounds = 50;
+    let profile = std::env::var_os("ALIGN_BENCH_PROFILE").is_some();
     println!("par_map(work).sum() — Align (pool) vs Rust sequential / rayon");
     println!("{:>9}  {:>10}  {:>10}  {:>10}  {:>9}  {:>9}", "n", "align ms", "seq ms", "rayon ms", "vs seq", "vs rayon");
     for &n in &[1_000usize, 10_000, 100_000, 1_000_000] {
@@ -58,12 +61,20 @@ fn main() {
         let a0 = unsafe { pmap(Slice { ptr: sl.ptr, len: sl.len }) };
         assert_eq!(a0, rust_seq(&data), "align vs sequential");
         assert_eq!(a0, rust_rayon(&data), "align vs rayon");
+        assert_eq!(unsafe { smap(Slice { ptr: sl.ptr, len: sl.len }) }, a0, "align sequential vs par_map");
 
         let (mut am, mut sm, mut rm) = (f64::MAX, f64::MAX, f64::MAX);
+        let mut align_seq = f64::MAX;
         for _ in 0..rounds {
             let t = Instant::now();
             std::hint::black_box(unsafe { pmap(Slice { ptr: sl.ptr, len: sl.len }) });
             am = am.min(t.elapsed().as_secs_f64() * 1e3);
+
+            if profile {
+                let t = Instant::now();
+                std::hint::black_box(unsafe { smap(Slice { ptr: sl.ptr, len: sl.len }) });
+                align_seq = align_seq.min(t.elapsed().as_secs_f64() * 1e3);
+            }
 
             let t = Instant::now();
             std::hint::black_box(rust_seq(&data));
@@ -74,5 +85,12 @@ fn main() {
             rm = rm.min(t.elapsed().as_secs_f64() * 1e3);
         }
         println!("{:>9}  {:>10.3}  {:>10.3}  {:>10.3}  {:>8.2}x  {:>8.2}x", n, am, sm, rm, sm / am, rm / am);
+        if profile {
+            println!(
+                "profile n={n}: align-seq {:8.3} ms; pmap is {:5.2}x align-seq",
+                align_seq,
+                am / align_seq
+            );
+        }
     }
 }
