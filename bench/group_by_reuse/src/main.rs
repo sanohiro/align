@@ -55,7 +55,7 @@ extern "C" {
 /// `.name` borrows them (key = LCG % groups). Returns the key storage, the AoS rows, the per-row group
 /// index + the four value columns (for the Rust baseline), and the distinct-key count.
 #[allow(clippy::type_complexity)]
-fn gen(n: usize, groups: i64) -> (Vec<String>, Vec<Row>, Vec<usize>, [Vec<i64>; 4], usize) {
+fn gen(n: usize, groups: usize) -> (Vec<String>, Vec<Row>, Vec<usize>, [Vec<i64>; 4], usize) {
     let keys: Vec<String> = (0..groups).map(|g| format!("key_{g:06}")).collect();
     let mut rows = Vec::with_capacity(n);
     let mut gidx = Vec::with_capacity(n);
@@ -63,7 +63,7 @@ fn gen(n: usize, groups: i64) -> (Vec<String>, Vec<Row>, Vec<usize>, [Vec<i64>; 
     let mut state: u64 = 0x9e3779b97f4a7c15;
     for _ in 0..n {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let g = ((state >> 33) % groups as u64) as usize;
+        let g = (state >> 33) as usize % groups;
         let (a, b, c, d) = (
             ((state >> 20) % 1000) as i64,
             ((state >> 24) % 1000) as i64,
@@ -134,7 +134,7 @@ fn rust_single<S: BuildHasher + Default>(keys: &[String], gidx: &[usize], cols: 
 
 fn main() {
     let n = 1_000_000usize;
-    let group_counts = [100i64, 10_000, 1_000_000];
+    let group_counts = [100usize, 10_000, 1_000_000];
     let rounds = 20;
     println!("4 aggregates (sum a, sum b, max c, min d) over {n} rows by a str key — Align reuse vs Rust");
     println!("  a1 = Align naive (4 str group_bys)   a2 = Align dict_encode reuse");
