@@ -5090,6 +5090,29 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    fn resolve_group_field(
+        &mut self,
+        sname: &str,
+        fields: &[FieldDef],
+        src_kind: &str,
+        fld: &ast::Ident,
+        role: &str,
+        want: Ty,
+    ) -> Option<u32> {
+        let Some(idx) = fields.iter().position(|f| f.name == fld.name) else {
+            self.diags.error(format!("no field '{}' on {}<{}>", fld.name, src_kind, sname), fld.span);
+            return None;
+        };
+        if fields[idx].ty != want {
+            self.diags.error(
+                format!("`group_by` {role} '{}' must be {} (first cut), got {}", fld.name, ty_name(want), ty_name(fields[idx].ty)),
+                fld.span,
+            );
+            return None;
+        }
+        Some(idx as u32)
+    }
+
     /// A method call `recv.method(args)`: the `heap.new` builtin, or a method on a value
     /// (`box.get()`, `box.clone()`).
     fn check_method_call(&mut self, recv: &ast::Expr, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
@@ -5954,26 +5977,10 @@ impl<'a, 't> Checker<'a, 't> {
         let fields = self.structs[id as usize].fields.clone();
         let i64t = Ty::Int(IntTy { bits: 64, signed: true });
         let src_kind = if key_str { "array" } else { "soa" };
-        // Resolve a field by name and require an exact type (the first-slice aggregate types).
-        let resolve = |this: &mut Self, fld: &ast::Ident, role: &str, want: Ty| -> Option<u32> {
-            let Some(idx) = fields.iter().position(|f| f.name == fld.name) else {
-                this.diags.error(format!("no field '{}' on {src_kind}<{sname}>", fld.name), fld.span);
-                return None;
-            };
-            if fields[idx].ty != want {
-                this.diags.error(
-                    format!("`group_by` {role} '{}' must be {} (first cut), got {}", fld.name, ty_name(want), ty_name(fields[idx].ty)),
-                    fld.span,
-                );
-                return None;
-            }
-            Some(idx as u32)
-        };
-
         if key_str {
             // str key (dictionary-encoded, inline or precomputed) + i64 value, `sum`/`min`/`max`/
             // `count`. `count` reads no value column; the others require an i64 value field.
-            let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
+            let Some(ki) = self.resolve_group_field(&sname, &fields, src_kind, key_field, "key", Ty::Str) else { return err };
             // For an already-encoded source, the group key must be the field the dictionary was built
             // on — otherwise the precomputed ids don't correspond to this key.
             if let Some(kf) = enc_key
@@ -5985,7 +5992,7 @@ impl<'a, 't> Checker<'a, 't> {
                     return err;
                 }
             let vi = match value_field {
-                Some(v) => match resolve(self, v, "value", i64t) {
+                Some(v) => match self.resolve_group_field(&sname, &fields, src_kind, v, "value", i64t) {
                     Some(idx) => Some(idx),
                     None => return err,
                 },
@@ -6003,9 +6010,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
 
         // i64 key + i64 value (soa source).
-        let Some(ki) = resolve(self, key_field, "key", i64t) else { return err };
+        let Some(ki) = self.resolve_group_field(&sname, &fields, src_kind, key_field, "key", i64t) else { return err };
         let vi = match value_field {
-            Some(v) => match resolve(self, v, "value", i64t) {
+            Some(v) => match self.resolve_group_field(&sname, &fields, src_kind, v, "value", i64t) {
                 Some(idx) => Some(idx),
                 None => return err,
             },
@@ -6100,25 +6107,11 @@ impl<'a, 't> Checker<'a, 't> {
         let sname = self.structs[id as usize].name.clone();
         let fields = self.structs[id as usize].fields.clone();
         let i64t = Ty::Int(IntTy { bits: 64, signed: true });
-        let resolve = |this: &mut Self, fld: &ast::Ident, role: &str, want: Ty| -> Option<u32> {
-            let Some(idx) = fields.iter().position(|f| f.name == fld.name) else {
-                this.diags.error(format!("no field '{}' on array<{sname}>", fld.name), fld.span);
-                return None;
-            };
-            if fields[idx].ty != want {
-                this.diags.error(
-                    format!("`group_by` {role} '{}' must be {} (first cut), got {}", fld.name, ty_name(want), ty_name(fields[idx].ty)),
-                    fld.span,
-                );
-                return None;
-            }
-            Some(idx as u32)
-        };
-        let Some(ki) = resolve(self, key_field, "key", Ty::Str) else { return err };
+        let Some(ki) = self.resolve_group_field(&sname, &fields, "array", key_field, "key", Ty::Str) else { return err };
         let mut aggs: Vec<hir::GroupAgg1> = Vec::with_capacity(specs.len());
         for (op, vf) in specs {
             let value_field = match vf {
-                Some(v) => match resolve(self, v, "value", i64t) {
+                Some(v) => match self.resolve_group_field(&sname, &fields, "array", v, "value", i64t) {
                     Some(idx) => Some(idx),
                     None => return err,
                 },
