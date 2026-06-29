@@ -1530,7 +1530,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
 
     // Monomorphization worklist: `(generic_fn_mangled_name, concrete_type_args)`, collected from
     // every generic call and processed to a fixpoint below.
-    let mut worklist: Vec<(String, Vec<Ty>)> = Vec::new();
+    let mut worklist: std::collections::VecDeque<(String, Vec<Ty>)> = std::collections::VecDeque::new();
     for &(module, is_entry, f) in &all_fns {
         let mangled = mangle_fn(module, is_entry, &f.name.name);
         let is_template = !f.type_params.is_empty();
@@ -1555,7 +1555,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 );
             }
         } else {
-            worklist.append(&mut cx.instantiations);
+            worklist.extend(cx.instantiations);
             fns.push(checked);
             fns.extend(lifted);
         }
@@ -1564,10 +1564,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // scan each instance for further generic calls (transitive). `check_generic_call` already
     // rewrote every call target to the mangled name, so nothing else needs renaming.
     let mut generated: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut wi = 0;
-    while wi < worklist.len() {
-        let (oname, targs) = worklist[wi].clone();
-        wi += 1;
+    while let Some((oname, targs)) = worklist.pop_front() {
         let mangled = mangle_mono(&oname, &targs);
         if !generated.insert(mangled.clone()) {
             continue; // already instantiated
@@ -1580,7 +1577,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         let mut cx = Checker::new(diags, &sigs, &struct_ids, &enum_ids, &mut enums, &enum_templates, &mut enum_mono, error_enum_id, &mut structs, &struct_templates, &mut struct_mono, &mut tuples, &mut fn_types, tparams, bounds, targs, imported, tmpl_module.to_string(), &mod_table, &type_table, user_imported, &const_table);
         let mut checked = cx.check_fn(decl);
         checked.name = mangled;
-        worklist.append(&mut cx.instantiations);
+        worklist.extend(cx.instantiations);
         // A lambda / pipeline inside a generic function is already rejected when the template is
         // checked in Pass 2, so a monomorph never has lifted helpers here.
         fns.push(checked);
