@@ -54,11 +54,30 @@ runtime batch +cap     0.954 ms
 The fast path moved the benchmark's full build from ~1.58 ms to ~1.48 ms and `int only` from ~0.88 ms
 to ~0.77 ms. The runtime batch probe (`align_rt_builder_write_str_int_str`, called directly by the
 harness to model lowering `literal + int + literal` as one call) lands at ~0.95–0.99 ms, confirming
-the main lever: remove the three per-row runtime calls. Capacity is a small secondary effect, not the
-root cause. The next compiler change is to lower common append sequences (for example literal + int +
-literal) to the batched ABI, or inline the builder fast path in generated code.
+the main lever: remove the three per-row runtime calls.
 
-### Remaining lever (recorded): inline / batch the builder appends
-Closing the last ~1.5× needs removing the per-`write` FFI boundary — inlining the common append, or a
-batched write API — a codegen/runtime concern, not capacity. (Float writing also still uses the
-generic formatter; `ryu` is the float analogue of the integer itoa.)
+### Batch lowering implemented (2026-06-29)
+
+The compiler now lowers the `b.write("literal"); b.write_int(x); b.write("literal")` sequence in a
+builder-reduce body to a single `align_rt_builder_write_str_int_str` call (a MIR peephole,
+`fuse_builder_writes` in `align_mir`, gated to exactly the `str,int,str` shape on one builder). Honest
+before/after on the same host (100k rows, native), with the batch probe as the floor:
+
+```
+                full build   runtime batch
+fusion off         ~1.65 ms       ~1.11 ms
+fusion on          ~1.30 ms       ~1.11 ms
+```
+
+So the lowering removes two of the three per-row FFI calls and moves generated `build` ~1.65 → ~1.30 ms
+(≈21%), closing most of the gap to the direct batch probe. `build` now beats Rust `naive` (~1.43 ms)
+and is ≈1.4× behind hand-optimized `opt` (~0.92 ms), down from ~1.5×. The residual ~0.19 ms over the
+batch probe is the reduce loop + `to_string`, not the per-write boundary. (Absolute numbers here are
+higher than the earlier profile block because that was measured in a faster host state; the within-run
+deltas are the honest signal.)
+
+### Remaining lever (recorded): the general append chain
+The peephole is deliberately narrow (`str,int,str` only). Other shapes (`int,str`, longer chains,
+non-literal strings interleaved with side effects) still pay per-`write` FFI; a general builder-chain
+batcher is the follow-up, not done here. (Float writing also still uses the generic formatter; `ryu`
+is the float analogue of the integer itoa.)
