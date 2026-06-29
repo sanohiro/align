@@ -445,7 +445,7 @@ A type declaration (`User { id: i64 }`) appears only at top-level item position.
 
 ## 9. AST (align_ast, Rust)
 
-Every node carries a `Span` (`align_span`). No desugaring (the written form is preserved, for use by formatter / lint). Excerpt:
+Every node carries a `Span` (`align_span`). No desugaring (the written form is preserved, for the lint and for the formatter's AST *assist* — the formatter is token-driven, re-emitting original token text and recovering trivia from source spans, and consults the AST only to disambiguate `<>`/unary spacing; see `open-questions.md` "Formatter"). Excerpt:
 
 ```rust
 struct File { module: Option<Path>, imports: Vec<Path>, items: Vec<Item> }

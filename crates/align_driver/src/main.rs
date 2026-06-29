@@ -32,6 +32,8 @@ fn main() -> ExitCode {
         // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
         // (a library / benchmark kernel). Default output is `<stem>.o`.
         (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target),
+        // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
+        (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
         (Some("build"), Some(p)) => run_build(p, target),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
         (Some("run"), Some(p)) => run_run(p, &args[3..], target),
@@ -83,6 +85,7 @@ fn usage() {
            emit-mir   print MIR as text\n  \
            emit-llvm  print LLVM IR as text\n  \
            emit-obj   write an object file (<file> [out.o]; no link, no `main` needed)\n  \
+           fmt        format source (prints to stdout; --write rewrites in place)\n  \
            build      build an executable\n  \
            run        build and run (returns the exit code)\n  \
          \n\
@@ -114,6 +117,28 @@ fn front_to_mir(path: &str) -> Option<align_mir::Program> {
         print!("{}", format_diagnostics(&sm, &checked.diags));
     }
     Some(lower_to_mir(&checked.hir))
+}
+
+/// `fmt <file> [--write]` — format the source. Without `--write`, print the formatted text to
+/// stdout (a read-only default); with `--write`/`-w`, rewrite the file in place only if it changed.
+/// If the source does not parse cleanly, it is left untouched (and `--write` is a no-op) — the
+/// formatter never emits from a partial parse.
+fn run_fmt(path: &str, flags: &[String]) -> ExitCode {
+    let write = flags.iter().any(|f| f == "--write" || f == "-w");
+    let Some(src) = read(path) else {
+        return ExitCode::FAILURE;
+    };
+    let Some(formatted) = align_fmt::format_source(0, &src) else {
+        eprintln!("alignc: cannot format '{path}' (it does not parse cleanly); left unchanged");
+        return ExitCode::FAILURE;
+    };
+    if !write {
+        print!("{formatted}");
+    } else if formatted != src && let Err(e) = std::fs::write(path, &formatted) {
+        eprintln!("alignc: cannot write '{path}': {e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_check(path: &str) -> ExitCode {

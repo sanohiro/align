@@ -37,10 +37,22 @@ dependencies = [
  "align_ast",
  "align_codegen_llvm",
  "align_diag",
+ "align_fmt",
  "align_lexer",
  "align_mir",
  "align_parser",
  "align_sema",
+ "align_span",
+]
+
+[[package]]
+name = "align_fmt"
+version = "0.1.0"
+dependencies = [
+ "align_ast",
+ "align_diag",
+ "align_lexer",
+ "align_parser",
  "align_span",
 ]
 

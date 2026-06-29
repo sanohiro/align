@@ -45,7 +45,7 @@ executable
 ### Parser (`align_parser`)
 - Token stream → AST. With error recovery (reports multiple errors within one file).
 - Absorbs syntax such as `:=` / `mut` / the `fn ... = expr` short form / struct literals / `?` / `else` / `arena {}` / `template` / `html` / `json` strings here.
-- **No desugaring.** Expansion of `?` and `template` is the MIR stage. The AST is kept as written (because the formatter/lint use the AST).
+- **No desugaring.** Expansion of `?` and `template` is the MIR stage. The AST is kept as written (the lint uses the AST; the formatter is token-driven with AST *assist* — it re-emits the original token text and recovers comments/newlines from source spans, consulting the AST only to disambiguate `<>`/unary spacing; see `open-questions.md` "Formatter").
 
 ### Sema (1) Name Resolution (`align_sema`)
 - Resolution of `module` / `import`, symbol table construction, binding references → definitions.

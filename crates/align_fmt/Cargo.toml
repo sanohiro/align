@@ -1,16 +1,8 @@
 [package]
-name = "align_driver"
+name = "align_fmt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[[bin]]
-name = "alignc"
-path = "src/main.rs"
-
-[lib]
-name = "align_driver"
-path = "src/lib.rs"
 
 [dependencies]
 align_span = { path = "../align_span" }
@@ -18,7 +10,3 @@ align_diag = { path = "../align_diag" }
 align_ast = { path = "../align_ast" }
 align_lexer = { path = "../align_lexer" }
 align_parser = { path = "../align_parser" }
-align_fmt = { path = "../align_fmt" }
-align_sema = { path = "../align_sema" }
-align_mir = { path = "../align_mir" }
-align_codegen_llvm = { path = "../align_codegen_llvm" }

@@ -782,9 +782,38 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     count pass for N, allocate columns, then fill columns directly — dropping the AoS intermediate +
     transpose (the shipped #161 path). `str` columns via an offset+len column borrowing the input, or
     a string arena. Refinement, not a redo.
-  - **Formatter (implement).** CONFIRMED not implemented (only `format_diagnostics`; the settled
-    source-formatter that normalizes spacing/`;`/trailing-comma is absent). Needed to converge
-    AI-generated code / docs / tests. Pairs with the perf-rail lints.
+  - **Formatter (implement).** In progress (M8). The *policy* was always settled (`draft.md` §4/§16:
+    normalize only meaningless variation — spacing / `;` placement / trailing comma / alignment — and
+    **preserve the author's one-line ↔ multi-line choice**). The **mechanism** is now settled too
+    (2026-06-29): a **hybrid token-reprint + AST-assist** formatter, crate `align_fmt`.
+    - **Why hybrid, not pure-AST or pure-token.** The lexer discards comments entirely and drops every
+      non-statement-terminating newline (continuation-line `\n`s leave no token), so neither the token
+      stream nor the AST alone can round-trip comments / blank lines / the author's line breaks. But
+      **spans + `SourceMap` retain the full source**, so the gap `src[prev_tok.hi .. cur_tok.lo]`
+      between adjacent significant tokens recovers exactly the comments, newlines, blank-line runs, and
+      any `;` that the lexer dropped. So the formatter **walks the significant tokens and re-emits each
+      token's text verbatim from its source span** (literals/escapes/radix preserved byte-for-byte),
+      deciding only the *whitespace* between tokens from canonical rules, and recovering trivia from the
+      gaps. The **AST is consulted only to disambiguate the few context-sensitive spacing cases**:
+      `<`/`>` are always `Lt`/`Gt` tokens (a type-arg bracket inside a `Type::Named{args}` span / a decl
+      generic-param list → no surrounding space; a comparison → spaced), and unary `-`/`~`/`!` (offset
+      == a `Unary` expr's `span.lo` → no trailing space) vs binary. (Getting these wrong is only
+      *cosmetic* — spaces around `<` or after unary `-` re-lex identically — so the AST assist is for
+      polish, not safety.)
+    - **Rules:** indent = 2 spaces × brace depth (matches the examples); a line starting with `.` or a
+      binary operator is a continuation (+1 indent); preserve line breaks; collapse 2+ blank lines → 1;
+      drop a `;` that is immediately followed by a newline (redundant terminator), keep it only when
+      cramming statements on one line; preserve `//` line comments (trailing vs own-line by whether a
+      newline precedes them in the gap). Format only parse-clean input; on any lex/parse error pass the
+      source through unchanged (never emit from a partial AST).
+    - **Deferred to a follow-up slice:** trailing-comma *insertion* on multi-line bracketed lists (needs
+      the AST to tell a comma-list `{}` from a block `{}`); for now an existing trailing comma is kept,
+      none is added. Block `/* */` comments (the lexer has none; only `//`). `--write` in-place / a
+      `--check` mode (slice 1 prints to stdout).
+    - This **supersedes the earlier impl-doc hint** that "the formatter uses the AST" (`01-pipeline.md`,
+      `02-frontend.md`): it is token-driven with AST assist, which is strictly more faithful (verbatim
+      token text, real line breaks). Those docs are updated to say so.
+    - Pairs with the perf-rail lints (next M8 item).
   - **FFI "borrow-engine" wrapping for heavy libs** (zstd / sqlite / simdjson-class) — don't reimplement
     in pure Align; wrap via FFI as borrow engines (FFI is the library layer per `non-goals`/memory).
   - **Expand `bench/`** beyond flat / col_sum / total_pay: AoS-vs-SoA, json→soa,
