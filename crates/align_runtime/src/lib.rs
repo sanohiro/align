@@ -1678,7 +1678,8 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
     if n <= 0 || base.is_null() {
         return 0;
     }
-    if out_ids.is_null() || cap < 0 {
+    // Fail fast on invalid output up front — before any O(n) work or partial mutation of `out_ids`.
+    if out_ids.is_null() || out_dict.is_null() || cap < 0 {
         return -1;
     }
     let n = n as usize;
@@ -1695,6 +1696,11 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
             Some(&id) => id,
             None => {
                 let id = reprs.len() as i64;
+                // The dictionary would exceed `out_dict`'s capacity — abort early (don't grow the
+                // table for a result we can't return).
+                if id >= cap {
+                    return -1;
+                }
                 ids.insert(bytes, id);
                 reprs.push(ks);
                 id
@@ -1702,10 +1708,7 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
         };
         out_ids[i] = id;
     }
-    let count = reprs.len();
-    if count > cap as usize || out_dict.is_null() {
-        return -1;
-    }
+    let count = reprs.len(); // <= cap (the loop aborts past it) and out_dict is non-null (checked up front)
     let out_dict = unsafe { std::slice::from_raw_parts_mut(out_dict, count) };
     out_dict.copy_from_slice(&reprs);
     count as i64
