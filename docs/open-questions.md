@@ -787,6 +787,29 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         (1.16–1.61×) is good as-is; the better future lever — if pursued — is **soa-column direct
         decode** (the probe's 3.6× path; materialization itself is cheap, so writing the projected
         fields straight into columns is the real headroom), a separate slice, not walk micro-tuning.
+        **ARM64 NEON decode-index — IMPLEMENTED 2026-06-29 (closes the aarch64 SIMD gap; projection
+        rail now wins on Apple Silicon too).** The lean decode-index was AVX2-only (`json_decode_index`
+        fell back to the scalar walk on aarch64), so on Apple Silicon stage-1 index build was scalar
+        and the whole decode ran ~2× *slower* than serde_json. Added `json_decode_index_neon`: 64 bytes
+        per block as four 16-byte vectors, a 16-bit movemask per vector via bit-weight `vand` +
+        across-lane `vaddv` (no x86 `movemask` equivalent on NEON), combined into the same 64-bit masks
+        the AVX2 path uses, then **sharing the arch-independent `find_escaped`** and a baseline
+        shift-XOR `prefix_xor_portable` (Kogge-Stone, 6 `u64` ops) **in place of `pclmulqdq`** — chosen
+        over PMULL (`vmull_p64`) deliberately: PMULL is the *optional* `aes` crypto feature, not ARMv8-A
+        baseline, and the prefix-XOR is not the hot cost (the per-byte movemask dominates), so a
+        branch-free baseline ladder keeps the whole NEON path detection-free (NEON *is* baseline → no
+        `is_aarch64_feature_detected!`, no scalar-fallback branch on aarch64). Same scalar-oracle +
+        exhaustive-fuzz differential test as the AVX2 path (`json_decode_index_simd_matches_scalar_oracle`,
+        green). **`bench/json_decode` on Apple Silicon (M-series), before→after: full 0.49–0.50×→0.75–0.79×
+        serde (1.55–1.57× faster), proj 0.62–0.63×→1.15–1.16× serde (1.85–1.86× faster — now BEATS
+        serde, matching the x86 projection win).** The residual full-rail ~1.3× gap is the same
+        per-field key-matching/walk cost x86 pays (autopsy above), not the index — the ARM64 index
+        bottleneck is closed. (Found while wiring this up: the existing `json_structural_index` AVX2
+        test named `is_x86_feature_detected!` cross-arch, which is a hard compile error on aarch64 — so
+        the runtime test suite had never built on aarch64; fixed by moving the detect inside the
+        `#[cfg(target_arch = "x86_64")]` block. `json_structural_index` itself stays scalar-only on
+        aarch64 — it is still dead code, "wired in a later slice", so a NEON port waits for that
+        consumer.)
         The historical investigation that led here ↓. Built the
         **stage-1 structural index** (PR #213: AVX2 + `pclmulqdq` prefix-XOR string mask + odd/even
         backslash-run escapes, block-carried, scalar oracle + exhaustive fuzz; runtime-dispatched,
