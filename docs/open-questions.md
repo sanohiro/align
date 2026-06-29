@@ -750,7 +750,7 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         (lean decode-index `{ } [ ] :` + Mison pattern: learn each declared field's colon ordinal from
         the first record, then jump+verify per record — no `find_field` — falling back to a
         `find_field` scan + relearn on a structure miss) ships in `align_rt_json_decode_struct_array`.
-        **`bench/json_decode` (1M rows, vs serde_json): proj 1.16–1.65× (was ≈1.09×), full 0.90–1.10×
+        **`bench/json_decode` (1M rows, vs serde_json): proj 1.16–1.61× (was ≈1.09×), full 0.88–1.06×
         (≈parity, was ≈1.03×)** — a real win on the **projection rail** (declare only the fields you
         read, the Align idiom; the unqueried fields' colons are skipped entirely), parity when every
         field is decoded. It does **not** reach the probe's 3.4× — an autopsy pinned the remaining cost
