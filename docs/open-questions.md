@@ -530,6 +530,15 @@ single-pass Rust (`HashMap<&str,[i64;4]>`, one hash + 4 accumulators): `smart/a2
 separate group_bys does not beat idiomatic fast Rust.** Why: smart Rust makes **one pass** (hash once,
 update 4 accumulators); a2 hashes once via `dict_encode` but then makes **four more passes** (gather +
 dense-id aggregate + label, each with a malloc) — reuse removes the re-*hashing*, not the re-*scanning*.
+**Root cause (understood, marked — not chased now):** it is structural (pass count × allocation), not
+hashing. Three culprits, in impact order: (1) **N passes vs 1** — a2 = `dict_encode` (1 hash pass, ≈ all
+of smart Rust's work) + 4×(gather pass + aggregate pass), while smart Rust does one pass; (2) **per-call
+`malloc`/`free` of n-sized scratch** (gather buf + out_ids + out_vals + labels, ~3–4 × 8 MB per
+aggregate); (3) **the gather pass is pure waste** — it materializes the strided value column to
+contiguous only to feed the contiguous-input `group_i64`; a fused design reads the value inline. The
+cardinality trend confirms it's fixed overhead: `smart/a2` worsens to 0.31× at 100 groups (overhead
+dominates) and eases to 0.70× at 632k (hashing dominates). Fixes map 1:1 to deferred items — fuse the K
+aggregates (cause 1+3), arena-allocate the scratch (cause 2).
 **Roadmap consequence (the bench's job): the real lever is "multiple aggregates in one pass"** — fuse K
 aggregates into one scan of the encoded ids filling K result columns — now the **primary** A2 work, not a
 nice-to-have. A2's honest niche is **sequential/interactive** reuse (aggregates arriving over time, not
