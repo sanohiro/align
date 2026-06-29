@@ -48,15 +48,14 @@ ALIGN_BENCH_PROFILE=1 bench/json_soa/run.sh native  # optional decomposition out
   - `col_sum` (`ps.a.sum()`): **≈8–10× faster** than the AoS field sum (pure bandwidth).
   - `total_pay` (`rs.where(.active).pay.sum()`, the filtered aggregate): **≈3× faster** — the `where`
     lowers branchless (mask + `select`) so it vectorizes; otherwise it is branch-bound and only ties.
-- **End-to-end JSON→SoA is parse-bound (`bench/json_soa/`); ≈0.61× → ≈0.82× after one parser fix.**
+- **End-to-end JSON→SoA now beats `serde_json` (`bench/json_soa/`); ≈0.61× → ≈0.82× → ≈1.03× at 1M.**
   The column-layout win above is on the *aggregation*; the realistic `json.decode → soa → aggregate`
-  pipeline is dominated by the **parse**. Decomposing (Align `→soa` vs Align `→array` AoS vs `serde →
-  Vec`) first showed the gap was the parser. Hand-rolling integer parsing
-  (`str::from_utf8(..).parse` → a single-pass digit accumulation) moved it ≈0.61× → ≈0.82–0.85×
-  (AoS ≈parity at 1M). The latest profile mode shows the aggregate itself is <1 ms at 1M rows, while
-  the AoS→SoA materialization still costs ~10–25 ms at that size. Remaining gap → more scalar tuning
-  + direct column fill / SIMD structural parsing. See `bench/json_soa/README.md` +
-  `docs/open-questions.md`.
+  pipeline is dominated by the **parse**. Hand-rolling integer parsing first moved it ≈0.61× →
+  ≈0.82–0.85×. Then **direct SoA decode** (`align_rt_json_decode_soa`: count rows → arena-allocate
+  columns → fill them in one value-parse pass, no AoS intermediate / heap copy / transpose) removed
+  the 10–25 ms AoS→SoA materialization the profile mode had isolated, taking the SoA path ≈0.82× →
+  **≈1.03×** (it now even edges the AoS decode-only path, which still heap-materializes). Remaining
+  gap → SIMD structural parsing. See `bench/json_soa/README.md` + `docs/open-questions.md`.
 - **JSON decode-throughput tracker (`bench/json_decode/`):** the regression harness for the parser
   rewrite (recursive-descent → simdjson-style two-stage SIMD). The recursive-descent baseline ≈ties
   `serde_json` (full ≈1.03×, projecting ≈1.09×); a validated `work/` probe (SIMD structural index +

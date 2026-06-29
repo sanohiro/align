@@ -977,21 +977,68 @@ fn skip_ws_at(src: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// Write field `d`'s value into the element slot during the index-driven (Mison-style) decode. `k`
-/// is the colon's position in the structural index `idx`; a `str` value's delimiter quotes are
-/// `idx[k+1]`/`idx[k+2]`, a scalar is parsed from the first non-space byte after the `:`. Matches
-/// [`parse_object`]'s per-kind writes exactly.
+/// Where a decoded field value is written. Abstracts the AoS (`eptr + d.offset`) and the SoA
+/// direct-fill (`base + col_off + row*width`) destinations so the index-driven decode
+/// ([`write_field_indexed`], [`json_speculate`], [`json_fallback`]) is single-sourced. Generic, so
+/// each impl monomorphizes — the AoS hot path keeps the exact code it had before.
+trait FieldDst {
+    /// Resolve the writable destination for field index `fi` (descriptor `d`, byte `width`), or
+    /// `None` if the field does not fit the layout. The returned pointer addresses `width` bytes.
+    ///
+    /// # Safety
+    /// The returned pointer must be valid for `width` writable bytes.
+    unsafe fn field_ptr(&self, fi: usize, d: &JsonField, width: i64) -> Option<*mut u8>;
+}
+
+/// AoS element slot of `esz` bytes; field `d` lands at `eptr + d.offset`.
+struct AosDst {
+    eptr: *mut u8,
+    esz: i64,
+}
+
+impl FieldDst for AosDst {
+    #[inline]
+    unsafe fn field_ptr(&self, _fi: usize, d: &JsonField, width: i64) -> Option<*mut u8> {
+        if d.offset < 0 || d.offset.checked_add(width).map_or(true, |end| end > self.esz) {
+            return None;
+        }
+        Some(unsafe { self.eptr.add(d.offset as usize) })
+    }
+}
+
+/// SoA direct fill: field `fi`'s column starts at `base + cols[fi].0` (the `align_up` column offset
+/// for the known row count) with element stride `cols[fi].1`; row `row` lands at `+ row*stride`.
+struct SoaDst<'a> {
+    base: *mut u8,
+    row: usize,
+    cols: &'a [(usize, usize)],
+}
+
+impl FieldDst for SoaDst<'_> {
+    #[inline]
+    unsafe fn field_ptr(&self, fi: usize, _d: &JsonField, width: i64) -> Option<*mut u8> {
+        let (off, stride) = self.cols[fi];
+        // The column stride must equal the field's declared width, or the schema and layout disagree.
+        if stride as i64 != width {
+            return None;
+        }
+        Some(unsafe { self.base.add(off + self.row * stride) })
+    }
+}
+
+/// Write field `d`'s value into `dst` during the index-driven (Mison-style) decode. `k` is the
+/// colon's position in the structural index `idx`; a `str` value's delimiter quotes are
+/// `idx[k+1]`/`idx[k+2]`, a scalar is parsed from the first non-space byte after the `:`. `fi` is the
+/// field's descriptor index (used by SoA to pick its column). Matches [`parse_object`]'s per-kind
+/// writes exactly.
 ///
 /// # Safety
-/// `eptr` must point to `esz` writable bytes (the element slot).
+/// `dst` must resolve to `width` writable bytes for the field.
 #[inline]
-unsafe fn write_field_indexed(src: &[u8], idx: &[u32], k: usize, d: &JsonField, eptr: *mut u8, esz: i64) -> Option<()> {
+unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi: usize, d: &JsonField, dst: &D) -> Option<()> {
     let kind = (d.tag >> 8) & 0xff;
     let width = (d.tag & 0xff) as i64;
-    if d.offset < 0 || d.offset.checked_add(width).map_or(true, |end| end > esz) {
-        return None;
-    }
-    let off = d.offset as usize;
+    let p = unsafe { dst.field_ptr(fi, d, width)? };
     let w = width as usize;
     let colon = idx[k] as usize;
     let mut vp = JsonParser { src, pos: skip_ws_at(src, colon + 1) };
@@ -1005,8 +1052,8 @@ unsafe fn write_field_indexed(src: &[u8], idx: &[u32], k: usize, d: &JsonField, 
         let pb = (s.as_ptr() as usize as u64).to_le_bytes();
         let lb = (s.len() as i64).to_le_bytes();
         for j in 0..8 {
-            unsafe { *eptr.add(off + j) = pb[j] };
-            unsafe { *eptr.add(off + 8 + j) = lb[j] };
+            unsafe { *p.add(j) = pb[j] };
+            unsafe { *p.add(8 + j) = lb[j] };
         }
         return Some(());
     }
@@ -1016,7 +1063,7 @@ unsafe fn write_field_indexed(src: &[u8], idx: &[u32], k: usize, d: &JsonField, 
                 return None;
             }
             let v = vp.boolean()?;
-            unsafe { *eptr.add(off) = v as u8 };
+            unsafe { *p = v as u8 };
         }
         2 => {
             if w != 4 && w != 8 {
@@ -1026,12 +1073,12 @@ unsafe fn write_field_indexed(src: &[u8], idx: &[u32], k: usize, d: &JsonField, 
             if w == 4 {
                 let b = (v as f32).to_le_bytes();
                 for j in 0..4 {
-                    unsafe { *eptr.add(off + j) = b[j] };
+                    unsafe { *p.add(j) = b[j] };
                 }
             } else {
                 let b = v.to_le_bytes();
                 for j in 0..8 {
-                    unsafe { *eptr.add(off + j) = b[j] };
+                    unsafe { *p.add(j) = b[j] };
                 }
             }
         }
@@ -1042,7 +1089,7 @@ unsafe fn write_field_indexed(src: &[u8], idx: &[u32], k: usize, d: &JsonField, 
             let v = vp.integer()?;
             let b = v.to_le_bytes();
             for j in 0..w {
-                unsafe { *eptr.add(off + j) = b[j] };
+                unsafe { *p.add(j) = b[j] };
             }
         }
     }
@@ -1057,8 +1104,8 @@ unsafe fn write_field_indexed(src: &[u8], idx: &[u32], k: usize, d: &JsonField, 
 /// is the declared field at ordinal `o`, or `-1` for an unqueried position.
 ///
 /// # Safety
-/// `eptr` must point to `esz` writable bytes.
-unsafe fn json_speculate(src: &[u8], idx: &[u32], rec_cols: &[usize], pat_field: &[i32], descs: &[JsonField], eptr: *mut u8, esz: i64) -> bool {
+/// `dst` must resolve to writable bytes for every written field.
+unsafe fn json_speculate<D: FieldDst>(src: &[u8], idx: &[u32], rec_cols: &[usize], pat_field: &[i32], descs: &[JsonField], dst: &D) -> bool {
     for (o, &k) in rec_cols.iter().enumerate() {
         let fi = pat_field[o];
         if fi < 0 {
@@ -1068,7 +1115,7 @@ unsafe fn json_speculate(src: &[u8], idx: &[u32], rec_cols: &[usize], pat_field:
         if !key_matches_before_colon(src, idx[k] as usize, unsafe { field_name(d) }) {
             return false; // structure drifted from the pattern — fall back
         }
-        if unsafe { write_field_indexed(src, idx, k, d, eptr, esz) }.is_none() {
+        if unsafe { write_field_indexed(src, idx, k, fi as usize, d, dst) }.is_none() {
             return false;
         }
     }
@@ -1081,14 +1128,13 @@ unsafe fn json_speculate(src: &[u8], idx: &[u32], rec_cols: &[usize], pat_field:
 /// Returns `None` on a duplicate or a missing declared field (the strict decode semantics).
 ///
 /// # Safety
-/// `eptr` must point to `esz` writable bytes.
-unsafe fn json_fallback(
+/// `dst` must resolve to writable bytes for every written field.
+unsafe fn json_fallback<D: FieldDst>(
     src: &[u8],
     idx: &[u32],
     rec_cols: &[usize],
     descs: &[JsonField],
-    eptr: *mut u8,
-    esz: i64,
+    dst: &D,
     phf: Option<&[i32]>,
     phf_seed: u64,
     seen: &mut SeenSet,
@@ -1106,7 +1152,7 @@ unsafe fn json_fallback(
                 return None; // duplicate field
             }
             pat_field[o] = fi as i32;
-            unsafe { write_field_indexed(src, idx, k, &descs[fi], eptr, esz)? };
+            unsafe { write_field_indexed(src, idx, k, fi, &descs[fi], dst)? };
         }
     }
     if seen.all_seen(descs.len()) {
@@ -1200,10 +1246,11 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
                 b'}' => {
                     if depth == 2 {
                         let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
+                        let dst = AosDst { eptr, esz: esz as i64 };
                         let spec = pat_ncol == rec_cols.len() as i64
-                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, eptr, esz as i64) };
+                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, &dst) };
                         if !spec {
-                            unsafe { json_fallback(src, &idx, &rec_cols, descs, eptr, esz as i64, phf, phf_seed, &mut seen, &mut pat_field)? };
+                            unsafe { json_fallback(src, &idx, &rec_cols, descs, &dst, phf, phf_seed, &mut seen, &mut pat_field)? };
                             pat_ncol = rec_cols.len() as i64;
                         }
                         count += 1;
@@ -1245,6 +1292,188 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
         unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
     }
     unsafe { *out = AlignStr { ptr: dst, len: count } };
+    0
+}
+
+/// Column-major layout for a `soa<Struct>` of `n` rows, given each field's byte `width` in field
+/// order. Returns `(cols, total_bytes, max_align)` where `cols[j] = (byte_offset, width)` for
+/// column `j`, or `None` if the byte size overflows `usize` (a pathological row count × width on a
+/// 32-bit target — checked because `n` comes from untrusted input). **MUST match codegen's
+/// `soa_column_offset` / `SoaAlloc` in `align_codegen_llvm`** (`start_0 = 0`,
+/// `start_j = align_up(start_{j-1} + n*size_{j-1}, size_j)`), or a direct-filled column would land
+/// where a later `IndexColumn` scan does not read it.
+fn soa_layout(widths: &[usize], n: usize) -> Option<(Vec<(usize, usize)>, usize, usize)> {
+    let mut cols = Vec::with_capacity(widths.len());
+    let mut off = 0usize;
+    for (j, &w) in widths.iter().enumerate() {
+        if j > 0 && w > 1 {
+            // align_up(off, w) — each column starts at its field's alignment (= its width).
+            let mask = w - 1;
+            off = off.checked_add(mask)? & !mask;
+        }
+        cols.push((off, w));
+        off = off.checked_add(n.checked_mul(w)?)?; // advance past this column's `n` elements
+    }
+    let max_align = widths.iter().copied().max().unwrap_or(1);
+    Some((cols, off, max_align))
+}
+
+/// `json.decode(input)` straight into a column-major `soa<Struct>` (the direct-fill rail) — no AoS
+/// intermediate, no transpose. Two passes over the SIMD structural index: pass 1 counts records (so
+/// the column offsets, which depend on the row count, can be computed) and validates the array
+/// structure; pass 2 decodes each record's values directly into its columns via the shared
+/// [`json_speculate`]/[`json_fallback`] writers with a [`SoaDst`]. The column buffer is bump-allocated
+/// from `arena` (so the result is region-tied and bulk-freed, like the transpose path it replaces).
+/// Writes the soa `{ptr, len}` view (len = row count) to `out`. Returns 0 on success, 1 on a parse
+/// error (leaving `out` as the caller-zeroed `{null,0}`). An empty array allocates nothing.
+///
+/// # Safety
+/// `input`/`fields` must describe valid ranges; `arena` must be a live arena handle; `out` must point
+/// to a writable `{ptr,len}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_decode_soa(
+    input: *const u8,
+    input_len: i64,
+    fields: *const JsonField,
+    n_fields: i64,
+    arena: *mut Arena,
+    out: *mut AlignStr,
+    phf: *const i32,
+    phf_len: i64,
+    phf_seed: i64,
+) -> i32 {
+    // The arena (for the column buffer) and `out` (for the soa view) are dereferenced below; a null
+    // here is a caller bug, but fail closed rather than risk UB on untrusted-input-driven sizes.
+    if arena.is_null() || out.is_null() {
+        return 1;
+    }
+    let src: &[u8] = if input_len <= 0 || input.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(input, input_len as usize) }
+    };
+    let descs: &[JsonField] = if n_fields <= 0 || fields.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(fields, n_fields as usize) }
+    };
+    let phf = unsafe { phf_slice(phf, phf_len) };
+    let phf_seed = phf_seed as u64;
+
+    let mut idx: Vec<u32> = Vec::new();
+    json_decode_index(src, &mut idx);
+
+    // Pass 1: validate the array structure and count records (no value parsing). The bracket-depth
+    // logic mirrors the AoS walk; a depth-2 `{` opens a record.
+    let mut depth: i32 = 0;
+    let mut started = false;
+    let mut n_rows: usize = 0;
+    let mut array_close = 0usize;
+    let count_ok = (|| -> Option<()> {
+        for k in 0..idx.len() {
+            let pos = idx[k] as usize;
+            match src[pos] {
+                b'[' => {
+                    depth += 1;
+                    if depth == 1 {
+                        started = true;
+                    }
+                }
+                b'{' => {
+                    depth += 1;
+                    if depth == 2 {
+                        n_rows += 1;
+                    }
+                }
+                b'}' => depth -= 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if k != idx.len() - 1 {
+                            return None; // trailing structural token after the array closed
+                        }
+                        array_close = pos;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !started || depth != 0 {
+            return None;
+        }
+        if src[array_close + 1..].iter().any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
+            return None;
+        }
+        Some(())
+    })();
+    if count_ok.is_none() {
+        return 1;
+    }
+
+    // An empty array allocates nothing — the soa view is `{null, 0}`.
+    if n_rows == 0 {
+        unsafe { *out = AlignStr { ptr: core::ptr::null_mut(), len: 0 } };
+        return 0;
+    }
+
+    // Lay out the columns for `n_rows` rows and bump-allocate the buffer from the arena.
+    let widths: Vec<usize> = descs.iter().map(|d| (d.tag & 0xff) as usize).collect();
+    let Some((cols, total, max_align)) = soa_layout(&widths, n_rows) else {
+        return 1; // byte size overflowed usize — reject rather than under-allocate
+    };
+    let Ok(total_i64) = i64::try_from(total) else {
+        return 1; // size doesn't fit the i64 arena ABI
+    };
+    let base = align_rt_arena_alloc(arena, total_i64, max_align.max(1) as i64);
+    // The arena hands back zeroed chunks, but a missing field must still read 0 — zero defensively
+    // (cheap relative to the parse) so a partial record leaves declared columns at 0, like the AoS
+    // path's per-element `buf.resize(.., 0)`.
+    if !base.is_null() && total > 0 {
+        unsafe { core::ptr::write_bytes(base, 0, total) };
+    }
+
+    // Pass 2: decode each record's values directly into its columns.
+    let mut pat_ncol: i64 = -1;
+    let mut pat_field: Vec<i32> = Vec::new();
+    let mut rec_cols: Vec<usize> = Vec::new();
+    let mut seen = SeenSet::new(descs.len());
+    let mut row: usize = 0;
+    let mut depth: i32 = 0;
+    let fill_ok = (|| -> Option<()> {
+        for k in 0..idx.len() {
+            let pos = idx[k] as usize;
+            match src[pos] {
+                b'[' => depth += 1,
+                b'{' => {
+                    depth += 1;
+                    if depth == 2 {
+                        rec_cols.clear();
+                    }
+                }
+                b':' if depth == 2 => rec_cols.push(k),
+                b'}' => {
+                    if depth == 2 {
+                        let dst = SoaDst { base, row, cols: &cols };
+                        let spec = pat_ncol == rec_cols.len() as i64
+                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, &dst) };
+                        if !spec {
+                            unsafe { json_fallback(src, &idx, &rec_cols, descs, &dst, phf, phf_seed, &mut seen, &mut pat_field)? };
+                            pat_ncol = rec_cols.len() as i64;
+                        }
+                        row += 1;
+                    }
+                    depth -= 1;
+                }
+                b']' => depth -= 1,
+                _ => {}
+            }
+        }
+        Some(())
+    })();
+    if fill_ok.is_none() {
+        return 1;
+    }
+    unsafe { *out = AlignStr { ptr: base, len: row as i64 } };
     0
 }
 
@@ -3921,6 +4150,91 @@ mod tests {
         }
         assert_eq!(unsafe { *first }, 42, "earlier allocation must remain valid");
         align_rt_arena_end(a);
+    }
+
+    #[test]
+    fn soa_layout_matches_codegen_formula() {
+        // start_0 = 0; start_j = align_up(start_{j-1} + n*size_{j-1}, size_j); total = end of last.
+        // widths [1, 8] (bool, i64), n = 2: col0 @0, align_up(0+2,8)=8 → col1 @8, total = 8+16 = 24.
+        let (cols, total, max_align) = soa_layout(&[1, 8], 2).unwrap();
+        assert_eq!(cols, vec![(0, 1), (8, 8)]);
+        assert_eq!(total, 24);
+        assert_eq!(max_align, 8);
+        // widths [8, 1, 8], n = 3: col0 @0, col1 @24 (1-byte, no align), col2 align_up(24+3,8)=32.
+        let (cols, total, _) = soa_layout(&[8, 1, 8], 3).unwrap();
+        assert_eq!(cols, vec![(0, 8), (24, 1), (32, 8)]);
+        assert_eq!(total, 32 + 24);
+        // A pathological row count × width overflows `usize` → None (no under-allocation).
+        assert!(soa_layout(&[8], usize::MAX).is_none());
+    }
+
+    #[test]
+    fn json_decode_soa_fills_columns() {
+        // Two fields (`active: bool`, `pay: i64`) in declaration order; decode a 2-row array directly
+        // into columns and verify each column holds the right values at the `soa_layout` offsets.
+        let active = b"active";
+        let pay = b"pay";
+        let descs = [
+            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0 },
+            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0 },
+        ];
+        let src = br#"[{"active":true,"pay":10},{"active":false,"pay":20}]"#;
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
+        let rc = unsafe {
+            align_rt_json_decode_soa(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, arena, &mut out, core::ptr::null(), 0, 0)
+        };
+        assert_eq!(rc, 0, "valid input must decode");
+        assert_eq!(out.len, 2, "two rows");
+        let (cols, _, _) = soa_layout(&[1, 8], 2).unwrap();
+        // active column (width 1) at cols[0].0: [true, false].
+        assert_eq!(unsafe { *out.ptr.add(cols[0].0) }, 1);
+        assert_eq!(unsafe { *out.ptr.add(cols[0].0 + 1) }, 0);
+        // pay column (width 8) at cols[1].0: [10, 20] as little-endian i64.
+        let read_i64 = |off: usize| -> i64 {
+            let mut b = [0u8; 8];
+            for j in 0..8 {
+                b[j] = unsafe { *out.ptr.add(off + j) };
+            }
+            i64::from_le_bytes(b)
+        };
+        assert_eq!(read_i64(cols[1].0), 10);
+        assert_eq!(read_i64(cols[1].0 + 8), 20);
+        align_rt_arena_end(arena);
+    }
+
+    #[test]
+    fn json_decode_soa_rejects_bad_input() {
+        let active = b"active";
+        let pay = b"pay";
+        let descs = [
+            JsonField { name_ptr: active.as_ptr(), name_len: active.len() as i64, tag: (1 << 8) | 1, offset: 0 },
+            JsonField { name_ptr: pay.as_ptr(), name_len: pay.len() as i64, tag: 8, offset: 0 },
+        ];
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
+        // Missing a declared field (`pay`) → strict decode rejects in the fill pass.
+        let missing = br#"[{"active":true}]"#;
+        assert_eq!(
+            unsafe { align_rt_json_decode_soa(missing.as_ptr(), missing.len() as i64, descs.as_ptr(), 2, arena, &mut out, core::ptr::null(), 0, 0) },
+            1
+        );
+        // Unterminated array → structural validation rejects in the count pass.
+        let unterminated = br#"[{"active":true,"pay":1}"#;
+        assert_eq!(
+            unsafe { align_rt_json_decode_soa(unterminated.as_ptr(), unterminated.len() as i64, descs.as_ptr(), 2, arena, &mut out, core::ptr::null(), 0, 0) },
+            1
+        );
+        // Empty array → ok, zero rows, null buffer (allocates nothing).
+        let empty = b"[]";
+        let mut out2 = AlignStr { ptr: core::ptr::null_mut(), len: 7 };
+        assert_eq!(
+            unsafe { align_rt_json_decode_soa(empty.as_ptr(), empty.len() as i64, descs.as_ptr(), 2, arena, &mut out2, core::ptr::null(), 0, 0) },
+            0
+        );
+        assert_eq!(out2.len, 0);
+        assert!(out2.ptr.is_null());
+        align_rt_arena_end(arena);
     }
 
     #[test]

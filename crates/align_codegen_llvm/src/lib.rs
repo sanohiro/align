@@ -545,6 +545,20 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        // json.decode directly into soa<Struct> (input, input_len, fields, n, arena, out: *{ptr,len},
+        // phf, phf_len, phf_seed) -> i32 status. Direct-fill rail: the runtime counts rows, arena-
+        // allocates the columns, and fills them (no AoS / transpose). `arena` replaces `elem_size`.
+        "json_decode_soa".to_string(),
+        module.add_function(
+            "align_rt_json_decode_soa",
+            ctx.i32_type().fn_type(
+                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), ptr.into(), ptr.into(), i64t2.into(), i64t2.into()],
+                false,
+            ),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_finish".to_string(),
         module.add_function(
             "align_rt_builder_finish",
@@ -2826,6 +2840,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeStructArray { struct_id, input, out } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
+            Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => self.gen_json_decode_soa(*struct_id, input, *out, arena)?,
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             Rvalue::IoStdoutWrite { arg } => self.gen_io_stdout_write(arg)?,
             Rvalue::IoStdoutWriteBuilder { builder } => {
@@ -3436,6 +3451,37 @@ impl<'c, 'a> FnGen<'c, 'a> {
             )
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_decode_struct_array returns i32"))
+    }
+
+    /// `json.decode` directly into a `soa<Struct>` (the direct-fill rail): zero the out `{ptr,len}`
+    /// soa-view slot, then call the runtime that counts rows, arena-allocates the columns, and fills
+    /// them — same field table as the AoS path, but it passes the arena handle (the column buffer is
+    /// region-tied) instead of an element stride. The returned soa view is arena-tied (no `Drop`).
+    /// Returns the i32 status.
+    fn gen_json_decode_soa(&mut self, struct_id: u32, input: &Operand, out: Slot, arena: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        // Zero the {ptr,len} so a failed decode reads {null,0}.
+        self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+
+        let agg = self.operand(input).into_struct_value();
+        let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
+        let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
+        let arena_v = self.operand(arena);
+
+        let i64t = self.ctx.i64_type();
+        let t = self.decode_field_table(struct_id);
+        let n = i64t.const_int(t.n_fields, false);
+        let phf_len = i64t.const_int(t.phf_len, false);
+        let phf_seed = i64t.const_int(t.phf_seed, false);
+        let cs = self
+            .builder
+            .build_call(
+                self.funcs["json_decode_soa"],
+                &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), arena_v.into(), out_ptr.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
+                "jdecsoa",
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(cs.try_as_basic_value().basic().expect("json_decode_soa returns i32"))
     }
 
     /// `json.decode` into an owned `array<elem>`: zero the out `{ptr,len}` slot, then call the

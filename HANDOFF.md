@@ -37,13 +37,21 @@ Rust ~8–10×; `group_by(.key).sum/min/max/.count()` beats the default `std::Ha
 **Perf profiling snapshot (2026-06-29):** benchmark harnesses now support
 `ALIGN_BENCH_PROFILE=1 .../run.sh native` decomposition output. The important measured bottlenecks:
 JSON decode is parser/decoder-bound (`bench/json_decode`: 1M full decode-only ≈91 ms vs
-decode+aggregate ≈92 ms); JSON→SoA still pays a real AoS→SoA materialization cost at 1M rows
-(`bench/json_soa`: AoS decode-only ≈88 ms, SoA decode+transpose ≈102–114 ms); `group_by_reuse` is
-dominated by high-cardinality string `dict_encode` (≈260 ms at 1M groups, with four reused
-aggregates adding ≈75 ms); `string_builder` is call-count/itoa-bound, not capacity-bound (the
-`literal + int + literal` batch lowering below now removes two of three per-row calls); cheap
-`par_map` loses to Align's own sequential/vectorized `map().sum()` because every element crosses an
-indirect thunk. See `bench/README.md` and the per-benchmark READMEs before changing perf code.
+decode+aggregate ≈92 ms); JSON→SoA **now beats serde** at 1M after the direct-decode work below
+(`bench/json_soa`: ≈1.03× of serde); `group_by_reuse` is dominated by high-cardinality string
+`dict_encode` (≈260 ms at 1M groups, with four reused aggregates adding ≈75 ms); `string_builder` is
+call-count/itoa-bound, not capacity-bound (the `literal + int + literal` batch lowering below now
+removes two of three per-row calls); cheap `par_map` loses to Align's own sequential/vectorized
+`map().sum()` because every element crosses an indirect thunk. See `bench/README.md` and the
+per-benchmark READMEs before changing perf code.
+
+**Direct SoA JSON decode DONE (2026-06-29):** `json.decode → soa<Struct>` parses straight into
+arena-allocated columns — no AoS intermediate, no transpose. New runtime `align_rt_json_decode_soa`
+(count rows → arena-allocate columns via the `soa_column_offset` layout → fill in one value-parse
+pass, sharing the AoS Mison speculation through a generic `FieldDst`); new `Rvalue::JsonDecodeSoa`;
+`lower_json_decode_soa` rewritten (no more `transpose_to_soa` for json — `.to_soa()` still uses it).
+At 1M rows the SoA path went ≈0.82× → **≈1.03× of serde_json** (~104 → ~83.5 ms), even edging the
+AoS decode-only path (which still heap-materializes). See `bench/json_soa/README.md`.
 
 **Builder batch lowering DONE (2026-06-29):** the compiler lowers `b.write("lit"); b.write_int(x);
 b.write("lit")` in a builder-reduce body to one `align_rt_builder_write_str_int_str` call — a MIR
@@ -66,20 +74,20 @@ shapes) is the recorded follow-up. See `bench/string_builder/README.md`.
 
 ## Next action
 
-**Builder batch lowering is DONE** (see the snapshot above + `bench/string_builder/README.md`): the
-`fuse_builder_writes` MIR peephole collapses `b.write("lit"); b.write_int(x); b.write("lit")` to one
-`align_rt_builder_write_str_int_str` call (narrow `str,int,str` shape only). `cargo test` green; new
-`align_mir` tests `builder_str_int_str_is_fused` / `builder_int_str_str_is_not_fused`.
+**Recently DONE (perf):** builder batch lowering (`fuse_builder_writes` MIR peephole) **and** direct
+SoA JSON decode (`align_rt_json_decode_soa` + `Rvalue::JsonDecodeSoa`) — both in the snapshot above,
+both with new tests, `cargo test` green.
 
-**Best next action: pick up the secondary perf follow-ups**, in measured priority order: JSON direct
-SoA decode / count-then-direct column fill (`bench/json_soa` measured a 10–25 ms AoS→SoA
-materialization penalty at 1M); `group_by_reuse` multi-aggregate one-pass fuse plus faster string
-`dict_encode`; cheap `par_map` sequential fallback or thunk specialization. A general builder-chain
-batcher (append shapes beyond `str,int,str`) is a smaller recorded follow-up. Re-run any perf change
-with:
+**Best next action: the remaining perf follow-ups**, in measured priority order: `group_by_reuse`
+multi-aggregate one-pass fuse plus faster string `dict_encode` (≈260 ms `dict_encode` dominates at 1M
+groups); cheap `par_map` sequential fallback or thunk specialization (loses to vectorized sequential
+`map().sum()`); a SIMD/structural JSON parser (the decode is still value-parse-bound, now the lever
+for both `json_decode` and `json_soa`). Smaller recorded follow-ups: a general builder-chain batcher
+(append shapes beyond `str,int,str`); fold the SoA decode's count pass into the structural-index
+build. Re-run any perf change with:
 
 ```bash
-ALIGN_BENCH_PROFILE=1 bench/string_builder/run.sh native
+ALIGN_BENCH_PROFILE=1 bench/json_soa/run.sh native
 cargo test -q
 ```
 
