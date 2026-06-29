@@ -56,6 +56,41 @@ so nested generic type args (`Pair<Pair<T>>`) still close; the shift is formed o
 position, where `<`/`>` are comparison-only (no turbofish). Folds in constant expressions.
 Record: `draft.md` §5, `docs/language-spec.md`, `examples/bitwise.align`, `tests/bitwise.rs`
 
+### `core.hash` + `core.bitset` (roadmap #6) — design SETTLED (2026-06-29)
+The roadmap pairs these two as "#6", but they split cleanly by their prerequisites:
+
+- **`core.bitset` stays deferred to M6** (no new decision — this re-confirms the Bitwise-operators
+  ruling above). The `bitset` type is "large, SIMD-friendly", so its layout *is* the M6 `vec`/`mask`/
+  SoA/`align(N)` model. Designing it before that model exists is exactly the premature design that
+  ruling parked. → not built in #6; it rides M6 (roadmap #7). Nothing to do now but record the split.
+
+- **`core.hash` is the buildable half of #6, and it is the forcing function that settles the
+  long-deferred "canonical non-crypto hash" question** (raised in the `group_by` perf notes: FxHash
+  vs `ahash`(AES dep) vs hand-rolled AES, "best decided once, applies to all str group paths").
+  **Decision: one dependency-free strong mixer — `wyhash` (final v3) — is Align's canonical
+  non-crypto hash.** Rationale: keeps the minimal/zero-dep runtime identity (no `ahash`/AES-NI
+  dependency, no cross-arch fallback), small (~40 lines), battle-tested (Zig std, V8-adjacent), strong
+  avalanche (good enough to expose as a public `hash64`, unlike FxHash whose weak avalanche is fine
+  only as a private bucketer). rapidhash (wyhash's successor) was considered and **not** adopted —
+  marginally faster but larger/newer for no identity gain. **No user-facing `Hash` trait** (the
+  "no trait complexity" non-goal): hashing is over a **byte view** only.
+  - **Surface** (`draft.md` §18.1): `hash64(data) -> u64` and `hash128(data) -> (u64, u64)` (Align has
+    no `u128`; the 128-bit result is a tuple — the data-oriented spelling). `data` is a byte view:
+    `str` or `slice<u8>` (`bytes`). Both are `{ptr,len}` at the ABI, so one runtime entry per width
+    serves both input types.
+  - **Guarantees:** deterministic for a given input within a build (fixed seed); **non-crypto** — not
+    DoS-resistant, not a stable on-disk/wire format, not for security (crypto hashes live in
+    `std.crypto`). Documented at the call site.
+  - **Convergence (One way), as a follow-up — not in the first slice:** the *public* `hash64` (stable
+    user API) and `group_by`/`dict_encode`'s *internal* hasher are different roles, but they should
+    converge on this same `wyhash`. The first slice ships the public API; **rewiring group_by's FxHash
+    and the JSON PHF (which has the codegen↔runtime byte-match constraint) to `wyhash` is a separate,
+    independently-risky follow-up** (tracked here, not bundled, to keep the byte-match change isolated).
+  - **Build plan:** runtime `align_rt_hash64`/`align_rt_hash128` (`{ptr,len}` → `u64` / `{u64,u64}`),
+    sema builtins `hash64`/`hash128` (like `print`/`error`), MIR rvalue + codegen call, `tests`,
+    `examples/hash.align`. Record on build: `draft.md` §18.1, `docs/language-spec.md`,
+    `docs/design-notes.md`, `examples/hash.align`, `tests/hash.rs`.
+
 ### Radix integer literals (DONE 2026-06-26)
 **Decision: base-prefixed integer literals `0x` (hex) / `0o` (octal) / `0b` (binary), `_` separators
 in any base.** A radix literal is an ordinary integer literal — same `i128` storage, width inferred

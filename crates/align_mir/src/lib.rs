@@ -1067,9 +1067,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Call { func, args, .. } => {
             let ops = args.iter().map(|a| lower_expr(b, a)).collect();
             // A by-value owned-array argument is moved into the callee: null the caller's slot.
-            // `print` only reads its argument (it borrows), so it must not null the source — it
-            // keeps living (matching the borrow in sema's MoveCheck).
-            if func != "print" {
+            // `print` / `hash64` / `hash128` only read their argument (they borrow the byte view),
+            // so they must not null the source — it keeps living (matching the borrow in sema).
+            if !matches!(func.as_str(), "print" | "hash64" | "hash128") {
                 for a in args {
                     null_moved_source(b, a);
                 }
