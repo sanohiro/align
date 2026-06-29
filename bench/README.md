@@ -68,15 +68,16 @@ ALIGN_BENCH_PROFILE=1 bench/json_soa/run.sh native  # optional decomposition out
   is the shape used by the benchmark. The older open-addressing hash path still backs sparse /
   wide-range keys; beating `ahash` there still wants a SwissTable-style layout. The benchmark caught
   both the original table-sizing bug and the denser direct-index win.
-- **String building (`bench/string_builder/`): the `builder` reduce-append pattern ties/beats naive
-  Rust and is ≈1.5× behind hand-optimized Rust.** Hand-rolling the runtime integer write (`write!` →
-  itoa) halved the gap (Gemini measured the old builder ~2.8× behind optimized). The residual is
-  **per-append FFI-call overhead** (3 runtime calls/element, not inlined) — measured, *not* the `Vec`
-  realloc: adding `builder(capacity)` did **not** close it (`+cap` ≈ `build`). Profile mode confirms
-  static writes and integer writes are both material costs; a runtime batch probe for
-  `literal + int + literal` cuts the 100k workload from ~1.48 ms to ~0.95–0.99 ms. The lever is
-  inlining/batching the appends. This is the string-accumulation tool the `str + str`-in-a-lambda
-  error points to.
+- **String building (`bench/string_builder/`): the `builder` reduce-append pattern beats naive Rust
+  and is ≈1.4× behind hand-optimized Rust (was ≈1.5×).** Hand-rolling the runtime integer write
+  (`write!` → itoa) halved the original gap (Gemini measured the old builder ~2.8× behind optimized).
+  The residual was **per-append FFI-call overhead** (3 runtime calls/element) — measured, *not* the
+  `Vec` realloc: adding `builder(capacity)` did **not** close it (`+cap` ≈ `build`). The compiler now
+  **batch-lowers** `literal + int + literal` to one `align_rt_builder_write_str_int_str` call
+  (`fuse_builder_writes` MIR peephole), which moved generated `build` ~1.65 → ~1.30 ms at 100k
+  (≈21%, same-host before/after), within ~0.19 ms of the direct batch probe. The recorded follow-up
+  is a general builder-chain batcher for shapes beyond `str,int,str`. This is the string-accumulation
+  tool the `str + str`-in-a-lambda error points to.
 - **Data-parallel map (`bench/par_map/`): the persistent worker pool removed the spawn regression
   (100k went ~7× slower → same order as sequential).** Old `par_map` spawned OS threads per call; now
   it submits chunks to a process-lifetime pool. Chunk tuning helps, but profile mode shows cheap

@@ -287,6 +287,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BuilderWriteBool(b, v) => format!("builder_write_bool({}, {})", operand_str(b), operand_str(v)),
         Rvalue::BuilderWriteChar(b, c) => format!("builder_write_char({}, {})", operand_str(b), operand_str(c)),
         Rvalue::BuilderWriteFloat(b, x) => format!("builder_write_float({}, {})", operand_str(b), operand_str(x)),
+        Rvalue::BuilderWriteStrIntStr(b, s1, n, s2) => format!(
+            "builder_write_str_int_str({}, {}, {}, {})",
+            operand_str(b),
+            operand_str(s1),
+            operand_str(n),
+            operand_str(s2)
+        ),
         Rvalue::BuilderToString(op) => format!("builder_to_string({})", operand_str(op)),
         Rvalue::Template(pieces, _arena) => {
             let ps: Vec<String> = pieces

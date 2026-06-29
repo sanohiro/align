@@ -327,6 +327,11 @@ pub enum Rvalue {
     BuilderWriteChar(Operand, Operand),
     /// `b.write_float(x)` — append an `f32`/`f64` (codegen picks the width). Yields unit.
     BuilderWriteFloat(Operand, Operand),
+    /// `b.write(s1); b.write_int(n); b.write(s2)` fused into one runtime call — the common
+    /// `literal + int + literal` append sequence (e.g. a `reduce`-builder body). Operands are
+    /// `(builder, str1, int, str2)`; codegen passes both `str`s as `ptr,len` and widens the int to
+    /// `i64`. Produced by the [`fuse_builder_writes`] peephole, never by direct lowering. Yields unit.
+    BuilderWriteStrIntStr(Operand, Operand, Operand, Operand),
     /// `b.to_string()` — finish the builder into an owned `string` `{ptr,len}` (a fresh heap
     /// buffer freed by a later [`Stmt::Drop`]), consuming the builder handle.
     BuilderToString(Operand),
@@ -410,11 +415,158 @@ pub enum Term {
 /// typed HIR -> MIR.
 pub fn lower_program(program: &hir::Program) -> Program {
     Program {
-        fns: program.fns.iter().map(|f| lower_fn(f, &program.tuples, &program.structs)).collect(),
+        fns: program
+            .fns
+            .iter()
+            .map(|f| {
+                let mut mf = lower_fn(f, &program.tuples, &program.structs);
+                fuse_builder_writes(&mut mf);
+                mf
+            })
+            .collect(),
         structs: program.structs.clone(),
         enums: program.enums.clone(),
         tuples: program.tuples.clone(),
     }
+}
+
+/// Identifies which builder a write targets, so a `write_str`/`write_int`/`write_str` triple can be
+/// confirmed to act on the *same* builder. Each `b.<write>` re-loads the builder from its slot, so
+/// the three writes carry distinct value ids that all resolve to the same `Load(slot)` — hence the
+/// slot identity rather than operand identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuilderKey {
+    Slot(Slot),
+    Arg(u32),
+    Value(ValueId),
+}
+
+/// Resolve a builder operand to a [`BuilderKey`]. `loads` maps a value id to the slot it loads (when
+/// the value was produced by `Load(slot)`), so repeated `Load(slot)` operands compare equal.
+fn builder_key(op: &Operand, loads: &std::collections::HashMap<ValueId, Slot>) -> Option<BuilderKey> {
+    match op {
+        Operand::Value(v) => Some(loads.get(v).map(|s| BuilderKey::Slot(*s)).unwrap_or(BuilderKey::Value(*v))),
+        Operand::Arg(i) => Some(BuilderKey::Arg(*i)),
+        Operand::Const(_) => None,
+    }
+}
+
+/// A statement is "movable" past the fused appends iff it has no observable side effect — only then
+/// is deferring the first two appends to the third write's position sound. The builder-append code
+/// only ever interleaves `Load`/`StrLit`/`Use` between the three writes, so this narrow whitelist
+/// covers the real generated shape while staying conservative (anything else blocks the fusion).
+fn is_movable_stmt(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::Let(_, Rvalue::Load(_)) | Stmt::Let(_, Rvalue::StrLit(_)) | Stmt::Let(_, Rvalue::Use(_))
+    )
+}
+
+/// Peephole: fuse `b.write(str1); b.write_int(n); b.write(str2)` into one
+/// [`Rvalue::BuilderWriteStrIntStr`] runtime call, removing two per-element FFI boundaries from the
+/// builder hot path (the `reduce`-builder body). Narrow on purpose — only the `str,int,str` shape on
+/// one builder, with nothing but pure operand materialization between the three writes.
+fn fuse_builder_writes(f: &mut Function) {
+    for block in &mut f.blocks {
+        let loads: std::collections::HashMap<ValueId, Slot> = block
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Let(v, Rvalue::Load(slot)) => Some((*v, *slot)),
+                _ => None,
+            })
+            .collect();
+
+        // Indices of the str writes and int writes, with their resolved builder + payload operands.
+        let mut removed: Vec<usize> = Vec::new();
+        let mut fused: Vec<(usize, Rvalue)> = Vec::new();
+        let n = block.stmts.len();
+        let mut i = 0;
+        while i < n {
+            // Anchor on a `write(str)`.
+            let (b1, s1) = match &block.stmts[i] {
+                Stmt::Let(_, Rvalue::BuilderWriteStr(b, s)) => (b.clone(), s.clone()),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            let key1 = builder_key(&b1, &loads);
+            // Find the next `write_int` on the same builder, allowing only movable statements between.
+            let int_idx = find_next_write(&block.stmts, i + 1, n, &loads, key1, WriteShape::Int);
+            let Some((j, n_op)) = int_idx else {
+                i += 1;
+                continue;
+            };
+            // Then a closing `write(str)` on the same builder, again only movable stmts between.
+            let str_idx = find_next_write(&block.stmts, j + 1, n, &loads, key1, WriteShape::Str);
+            let Some((k, s2_op)) = str_idx else {
+                i += 1;
+                continue;
+            };
+            // The builder operand of the third write is live at position `k` (where we emit the fused
+            // call); reuse it so the call's receiver is in scope.
+            let b3 = match &block.stmts[k] {
+                Stmt::Let(_, Rvalue::BuilderWriteStr(b, _)) => b.clone(),
+                _ => unreachable!("str_idx points at a BuilderWriteStr"),
+            };
+            fused.push((k, Rvalue::BuilderWriteStrIntStr(b3, s1, n_op, s2_op)));
+            removed.push(i);
+            removed.push(j);
+            i = k + 1;
+        }
+
+        if removed.is_empty() {
+            continue;
+        }
+        for (k, rv) in fused {
+            if let Stmt::Let(_, slot) = &mut block.stmts[k] {
+                *slot = rv;
+            }
+        }
+        let drop: std::collections::HashSet<usize> = removed.into_iter().collect();
+        let mut idx = 0;
+        block.stmts.retain(|_| {
+            let keep = !drop.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WriteShape {
+    Str,
+    Int,
+}
+
+/// Scan forward from `start` for the next builder write of `shape` on builder `key`, requiring every
+/// statement in between to be [movable](is_movable_stmt) (else the appends can't be safely reordered
+/// to one call). Returns the write's index and its payload operand (the str or the int).
+fn find_next_write(
+    stmts: &[Stmt],
+    start: usize,
+    end: usize,
+    loads: &std::collections::HashMap<ValueId, Slot>,
+    key: Option<BuilderKey>,
+    shape: WriteShape,
+) -> Option<(usize, Operand)> {
+    for (offset, s) in stmts[start..end].iter().enumerate() {
+        let idx = start + offset;
+        match (shape, s) {
+            (WriteShape::Int, Stmt::Let(_, Rvalue::BuilderWriteInt(b, n))) if builder_key(b, loads) == key => {
+                return Some((idx, n.clone()));
+            }
+            (WriteShape::Str, Stmt::Let(_, Rvalue::BuilderWriteStr(b, s2))) if builder_key(b, loads) == key => {
+                return Some((idx, s2.clone()));
+            }
+            _ if is_movable_stmt(s) => continue,
+            // Any non-movable statement (another write, a call, a store, …) ends the search: the
+            // pattern must be contiguous over movable statements only.
+            _ => return None,
+        }
+    }
+    None
 }
 
 struct BBuild {
@@ -3473,5 +3625,31 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// Count, across every function (incl. lifted lambdas), how many statements match `pred`.
+    fn count_stmts(p: &Program, pred: impl Fn(&Stmt) -> bool) -> usize {
+        p.fns.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.stmts).filter(|s| pred(s)).count()
+    }
+
+    const BUILDER_REDUCE_SRC: &str = "pub fn build(s: slice<i64>) -> i64 {\n  b := s.reduce(builder(), fn b, x {\n    b.write(\"item-\")\n    b.write_int(x)\n    b.write(\"-status \")\n    b\n  })\n  res := b.to_string()\n  return res.len()\n}\n";
+
+    #[test]
+    fn builder_str_int_str_is_fused() {
+        let p = lower(BUILDER_REDUCE_SRC);
+        // The `str,int,str` triple collapses to one fused write; the two component writes are gone.
+        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..)))), 1);
+        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStr(..)))), 0);
+        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteInt(..)))), 0);
+    }
+
+    #[test]
+    fn builder_int_str_str_is_not_fused() {
+        // Wrong shape (`int,str,str`): the peephole only fuses `str,int,str`, so nothing collapses.
+        let src = "pub fn build(s: slice<i64>) -> i64 {\n  b := s.reduce(builder(), fn b, x {\n    b.write_int(x)\n    b.write(\"-a-\")\n    b.write(\"-b-\")\n    b\n  })\n  res := b.to_string()\n  return res.len()\n}\n";
+        let p = lower(src);
+        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..)))), 0);
+        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteInt(..)))), 1);
+        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStr(..)))), 2);
     }
 }

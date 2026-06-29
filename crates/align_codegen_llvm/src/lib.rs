@@ -403,6 +403,17 @@ fn build_module<'c>(
         ),
     );
     funcs.insert(
+        "builder_write_str_int_str".to_string(),
+        module.add_function(
+            "align_rt_builder_write_str_int_str",
+            ctx.void_type().fn_type(
+                &[ptr.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into(), i64t2.into()],
+                false,
+            ),
+            None,
+        ),
+    );
+    funcs.insert(
         "builder_write_bool".to_string(),
         module.add_function(
             "align_rt_builder_write_bool",
@@ -2736,6 +2747,37 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 self.builder
                     .build_call(self.funcs["builder_write_int"], &[b, wide.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::BuilderWriteStrIntStr(bld, s1, n, s2) => {
+                // Fused `write(str1); write_int(n); write(str2)`: pass both `str`s as `ptr,len` (like
+                // BuilderWriteStr) and widen the int to i64 (like BuilderWriteInt).
+                let b = self.operand(bld).into();
+                let a1 = self.operand(s1).into_struct_value();
+                let p1 = self.builder.build_extract_value(a1, 0, "wptr1").map_err(|e| self.err(e))?;
+                let l1 = self.builder.build_extract_value(a1, 1, "wlen1").map_err(|e| self.err(e))?;
+                let ty = self.f.operand_ty(n);
+                let v = self.operand(n).into_int_value();
+                let i64t = self.ctx.i64_type();
+                let wide = if int_bits(ty) < 64 {
+                    if is_signed(ty) {
+                        self.builder.build_int_s_extend(v, i64t, "sext").map_err(|e| self.err(e))?
+                    } else {
+                        self.builder.build_int_z_extend(v, i64t, "zext").map_err(|e| self.err(e))?
+                    }
+                } else {
+                    v
+                };
+                let a2 = self.operand(s2).into_struct_value();
+                let p2 = self.builder.build_extract_value(a2, 0, "wptr2").map_err(|e| self.err(e))?;
+                let l2 = self.builder.build_extract_value(a2, 1, "wlen2").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(
+                        self.funcs["builder_write_str_int_str"],
+                        &[b, p1.into(), l1.into(), wide.into(), p2.into(), l2.into()],
+                        "",
+                    )
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
