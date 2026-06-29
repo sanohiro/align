@@ -550,11 +550,12 @@ landed the structural win (cause 1: N passes → 1).
 **Why a3 still trails smart Rust — measured 2026-06-29 (corrects the earlier guess).** Two probes:
 - **Output-buffer right-sizing is a *no-op* — NOT the lever the earlier note claimed.** A prototype
   moved the K+1 output buffers from MIR-allocated `n`-sized (row count) to runtime-allocated, exactly
-  group-count sized; the benchmark was unchanged (within noise) at every cardinality. Reason: the
+  group-count-sized; the benchmark was unchanged (within noise) at every cardinality. Reason: the
   over-allocated buffers are **lazily paged** — only the `count` written entries ever fault in, so the
   oversize was already nearly free. (Don't re-try this in isolation.)
 - **The hasher *is* a real lever.** Swapping the dependency-free FxHash for `ahash` (AES) moved
-  `smart/a3` **0.77× → 0.92×** at 632k groups (264 vs 244 ms) and **0.41× → 0.61×** at 100 groups — so
+  `smart/a3` **0.77× → 0.92×** at 632k groups (244 ms for smart vs 264 ms for a3) and **0.41× → 0.61×**
+  at 100 groups — so
   the FxHash↔ahash gap was material, not negligible. But even with `ahash`, a3 does not fully beat
   smart Rust at low cardinality, and `ahash` is a **new dependency on the minimal runtime** (a tradeoff
   to weigh, applies to all str group paths).
