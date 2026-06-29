@@ -380,7 +380,20 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some(_) => {
-                    let rest = std::str::from_utf8(&self.src[self.pos..]).unwrap_or("\u{FFFD}");
+                    let first_byte = self.src[self.pos];
+                    let char_len = if first_byte & 0x80 == 0 {
+                        1
+                    } else if first_byte & 0xE0 == 0xC0 {
+                        2
+                    } else if first_byte & 0xF0 == 0xE0 {
+                        3
+                    } else if first_byte & 0xF8 == 0xF0 {
+                        4
+                    } else {
+                        1
+                    };
+                    let max_len = char_len.min(self.src.len() - self.pos);
+                    let rest = std::str::from_utf8(&self.src[self.pos..self.pos + max_len]).unwrap_or("\u{FFFD}");
                     let c = rest.chars().next().unwrap_or('\u{FFFD}');
                     self.pos += c.len_utf8();
                     s.push(c);
@@ -416,7 +429,20 @@ impl<'a> Lexer<'a> {
             }
             Some(_) => {
                 // Decode one UTF-8 scalar from the remaining bytes.
-                let rest = std::str::from_utf8(&self.src[self.pos..]).unwrap_or("\u{FFFD}");
+                let first_byte = self.src[self.pos];
+                let char_len = if first_byte & 0x80 == 0 {
+                    1
+                } else if first_byte & 0xE0 == 0xC0 {
+                    2
+                } else if first_byte & 0xF0 == 0xE0 {
+                    3
+                } else if first_byte & 0xF8 == 0xF0 {
+                    4
+                } else {
+                    1
+                };
+                let max_len = char_len.min(self.src.len() - self.pos);
+                let rest = std::str::from_utf8(&self.src[self.pos..self.pos + max_len]).unwrap_or("\u{FFFD}");
                 let c = rest.chars().next().unwrap_or('\u{FFFD}');
                 self.pos += c.len_utf8();
                 c

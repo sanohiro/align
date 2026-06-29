@@ -5057,15 +5057,21 @@ impl<'a, 't> Checker<'a, 't> {
     /// (so the `mod.fn` shape is something else — a builtin namespace or a method); `Err` is a
     /// reported resolution error.
     fn resolve_qualified_fn(&mut self, module: &str, name: &str, span: Span) -> Result<Option<String>, ()> {
-        let here = self.mods.get(&self.cur_module);
-        if !here.is_some_and(|mi| mi.user_imports.contains(module)) {
-            return Ok(None); // not a `mod.fn` user-module call — let the caller try other shapes
+        let is_self = module == self.cur_module;
+        if !is_self {
+            let here = self.mods.get(&self.cur_module);
+            if !here.is_some_and(|mi| mi.user_imports.contains(module)) {
+                return Ok(None); // not a `mod.fn` user-module call — let the caller try other shapes
+            }
         }
         match self.mods.get(module).and_then(|mi| mi.fns.get(name)) {
-            Some((mangled, true)) => Ok(Some(mangled.clone())),
-            Some((_, false)) => {
-                self.diags.error(format!("'{name}' is private to module '{module}' (mark it `pub` to export it)"), span);
-                Err(())
+            Some((mangled, pub_exported)) => {
+                if *pub_exported || is_self {
+                    Ok(Some(mangled.clone()))
+                } else {
+                    self.diags.error(format!("'{name}' is private to module '{module}' (mark it `pub` to export it)"), span);
+                    Err(())
+                }
             }
             None => {
                 self.diags.error(format!("module '{module}' has no function '{name}'"), span);
