@@ -1,0 +1,10 @@
+// The vector dot product (draft.md §9). `dot(a, b)` multiplies two `vecN<T>` lane-wise and sums the
+// products into the element scalar — a fixed-width SIMD reduction (the free-function form, the
+// vector sibling of `select`; the array pipeline `xs.dot(ys)` is a separate terminal).
+
+fn main() -> i32 {
+  a: vec4<i32> := [1, 2, 3, 4]
+  b: vec4<i32> := [10, 20, 30, 40]
+  // 1*10 + 2*20 + 3*30 + 4*40 = 300 (the process exit code is the low byte: 300 mod 256 = 44).
+  return dot(a, b)
+}

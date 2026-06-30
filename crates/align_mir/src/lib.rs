@@ -219,6 +219,9 @@ pub enum Rvalue {
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): `select(mask, vec, 0)` then add all `n`
     /// lanes, yielding the element scalar `elem`.
     VecSumWhere { vec: Operand, mask: Operand, elem: Ty, n: u32 },
+    /// `dot(a, b)` — the dot product of two `vecN<T>` (M6): multiply lane-wise then add all `n`
+    /// lanes, yielding the element scalar `elem`.
+    VecDot { a: Operand, b: Operand, elem: Ty, n: u32 },
     /// `base[index].field` for a `{ptr,len}` view of struct `struct_id` (an owned, dynamic
     /// `array<Struct>`, MMv2 slice 8d-2). Like [`IndexField`] but addressed through the loaded
     /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
@@ -1458,6 +1461,19 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let mv = lower_expr(b, mask);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::VecSumWhere { vec: vv, mask: mv, elem: e.ty, n }));
+            Operand::Value(v)
+        }
+        // `dot(a, b)` → vector multiply then a lane reduction. `e.ty` is the element; the width comes
+        // from the operand vector type.
+        hir::ExprKind::VecDot { a, b: bexpr } => {
+            let n = match a.ty {
+                Ty::Vec(_, n) => n,
+                _ => unreachable!("sema types dot's operands as vectors"),
+            };
+            let av = lower_expr(b, a);
+            let bv = lower_expr(b, bexpr);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::VecDot { a: av, b: bv, elem: e.ty, n }));
             Operand::Value(v)
         }
         // A `vecN<T>` literal is a register value: build it via an insertelement chain (`MakeVec`).

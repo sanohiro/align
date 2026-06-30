@@ -215,8 +215,19 @@ the element (`vec4<i32> + 2.0` is rejected — int vector, float scalar). `vec.s
 **masked horizontal sum** (the first vec→scalar reduction): `select(mask, vec, 0)` then add all lanes
 → the element scalar, so `scores.sum_where(scores > 80)` runs (draft §9). Codegen splats via an
 all-lane insertelement chain (`operand_as_vector`) that folds to a hardware broadcast; `sum_where` is
-`hir::VecSumWhere` → `Rvalue::VecSumWhere`. Still deferred: `dot`/other reductions, scalar-on-the-left
-broadcast, array load/store, the generic `vec<N,T>` spelling, lane assignment. (`examples/vec_sum_where.align`.)
+`hir::VecSumWhere` → `Rvalue::VecSumWhere`. (`examples/vec_sum_where.align`.)
+
+**Slice 4 DONE — `dot`.** `dot(a, b)` is the dot product of two `vecN<T>` → the element scalar
+`sum(a[i] * b[i])`. Settled here: the vector `dot` is the **free-function** form `dot(a, b)` (the
+draft §9 spelling, the vector sibling of `select`), kept **distinct from the array pipeline terminal
+`xs.dot(ys)`** (a method — a fused loop over arbitrary-length arrays). They are different operations
+(a fixed-width register reduction vs an array pipeline) on different types, spelled differently, and
+never collide at parse time (a free call vs a method call) — so this is not a One-Way violation, the
+same way `select` (a vec primitive) coexists with `where` (a pipeline stage). Lowers to a vector
+multiply then a shared `horizontal_sum` lane reduction (the multiply dual of `sum_where`); int +
+float. Still deferred: other vector reductions (`min`/`max`/bare `sum`), scalar-on-the-left
+broadcast, array load/store, the generic `vec<N,T>` spelling, lane assignment, a written `mask<T>`
+annotation. (`examples/vec_dot.align`.)
 
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element
