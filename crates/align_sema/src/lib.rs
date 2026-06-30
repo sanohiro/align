@@ -3835,12 +3835,17 @@ impl<'a, 't> Checker<'a, 't> {
             // nested / owned field would need escape handling and is deferred.
             if let Ty::StructArray(sid, _) | Ty::Soa(sid) = local_ty {
                 let soa = matches!(local_ty, Ty::Soa(_));
-                let pod = self.structs[sid as usize].fields.iter().all(|f| {
-                    matches!(
-                        ty_to_scalar(f.ty).and_then(scalar_to_prim),
-                        Some(PrimScalar::Int(_) | PrimScalar::Float(_) | PrimScalar::Bool | PrimScalar::Char)
-                    )
-                });
+                let fields = &self.structs[sid as usize].fields;
+                // `!is_empty()` guards the vacuous-true on a zero-field struct: it must not count as
+                // POD here, since the soa lowering reads `fields.first()`. (Empty structs aren't
+                // constructible today, so this is defensive — but keeps the predicate honest.)
+                let pod = !fields.is_empty()
+                    && fields.iter().all(|f| {
+                        matches!(
+                            ty_to_scalar(f.ty).and_then(scalar_to_prim),
+                            Some(PrimScalar::Int(_) | PrimScalar::Float(_) | PrimScalar::Bool | PrimScalar::Char)
+                        )
+                    });
                 if !pod {
                     self.diags.error(
                         format!(

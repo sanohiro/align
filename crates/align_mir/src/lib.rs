@@ -974,18 +974,19 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 let len = b.fresh_value(i64_ty());
                 b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(sv))));
                 emit_bounds_check(b, &idx, Operand::Value(len));
-                let fields = &b.structs[*struct_id as usize].fields;
-                let first_scalar = align_sema::ty_to_scalar(fields.first().expect("a soa struct has at least one field").ty)
+                // Snapshot the field types once (each is Copy) so the scatter loop neither
+                // re-indexes `b.structs` nor holds a borrow of `b` across its `b.push` calls.
+                let field_tys: Vec<Ty> = b.structs[*struct_id as usize].fields.iter().map(|f| f.ty).collect();
+                let first_scalar = align_sema::ty_to_scalar(*field_tys.first().expect("a soa struct has at least one field"))
                     .expect("soa field is a scalar");
-                let nfields = fields.len();
                 let ptr = b.fresh_value(Ty::Box(first_scalar));
                 b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(sv))));
                 // Materialize the struct value into a temp slot, then read each field out and scatter
                 // it into its column (columns are non-contiguous, so no single aggregate store).
                 let tmp = b.new_slot(Ty::Struct(*struct_id));
                 b.push(Stmt::Store(tmp, val));
-                for field in 0..nfields as u32 {
-                    let fty = b.structs[*struct_id as usize].fields[field as usize].ty;
+                for (field, &fty) in field_tys.iter().enumerate() {
+                    let field = field as u32;
                     let fv = b.fresh_value(fty);
                     b.push(Stmt::Let(fv, Rvalue::Field(tmp, vec![field])));
                     b.push(Stmt::StoreColumn {
