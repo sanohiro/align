@@ -2234,6 +2234,10 @@ impl<'a> EscapeCheck<'a> {
             // scalar field is Copy → the default `Static` (handled below), but tying to the array
             // is conservatively correct for both.
             ExprKind::ElemField { recv, .. } => self.region_of(recv, depth),
+            // `s[i]` on a `soa` *gathers* a whole struct — it copies the primitive columns into a
+            // fresh value rather than borrowing the soa's buffer, so the result is `Static`
+            // (returnable), unlike an AoS element below which may carry a `str` view.
+            ExprKind::Index { recv, .. } if matches!(recv.ty, Ty::Soa(_)) => Region::Static,
             // `arr[i]` reads an element; a `str` element is a view into the array's storage, so it
             // inherits the array's region (it must not outlive it). A scalar element is Copy and
             // not region-tracked, so inheriting the array's region is harmless (never checked).
@@ -7861,6 +7865,10 @@ impl<'a, 't> Checker<'a, 't> {
             // `str` views, the value is region-tied to the array (handled by `region_of`, which
             // inherits the receiver's region for an `Index`). A Move struct is rejected just below.
             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Ty::Struct(id),
+            // `s[i]` on a `soa<Struct>` gathers a whole struct value from the columns at index `i`
+            // (M6). The struct is primitive-only (the soa rule), so the gather copies — the result is
+            // a free Copy value (`Static`), not a borrow of the soa.
+            Ty::Soa(id) => Ty::Struct(id),
             Ty::Error => return err,
             other => {
                 self.diags.error(format!("cannot index {} (only array / slice / owned array)", ty_name(other)), span);
