@@ -1944,6 +1944,15 @@ impl EffectScan {
             }
             ExprKind::VecMinMax { vec, .. } => self.expr(vec),
             ExprKind::VecSum { vec } => self.expr(vec),
+            ExprKind::VecLoad { src, index, .. } => {
+                self.expr(src);
+                self.expr(index);
+            }
+            ExprKind::VecStore { dst, index, value, .. } => {
+                self.expr(dst);
+                self.expr(index);
+                self.expr(value);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt);
                 self.expr(fallback);
@@ -2585,6 +2594,15 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::VecMinMax { vec, .. } => self.walk(vec, depth),
             ExprKind::VecSum { vec } => self.walk(vec, depth),
+            ExprKind::VecLoad { src, index, .. } => {
+                self.walk(src, depth);
+                self.walk(index, depth);
+            }
+            ExprKind::VecStore { dst, index, value, .. } => {
+                self.walk(dst, depth);
+                self.walk(index, depth);
+                self.walk(value, depth);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
                 self.walk(fallback, depth);
@@ -3005,6 +3023,15 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::VecMinMax { vec, .. } => self.expr(vec, moved, true, true),
             ExprKind::VecSum { vec } => self.expr(vec, moved, true, true),
+            ExprKind::VecLoad { src, index, .. } => {
+                self.expr(src, moved, true, true);
+                self.expr(index, moved, true, true);
+            }
+            ExprKind::VecStore { dst, index, value, .. } => {
+                self.expr(dst, moved, true, true);
+                self.expr(index, moved, true, true);
+                self.expr(value, moved, true, true);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
                 // The fallback is an arm value: it inherits this position's `consuming` but is
@@ -5466,6 +5493,12 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "sum_where" {
             return self.check_vec_sum_where(recv, args, span);
         }
+        if method == "load" {
+            return self.check_vec_load(recv, args, expected, span);
+        }
+        if method == "store" {
+            return self.check_vec_store(recv, args, span);
+        }
         if method == "sort" {
             return self.check_array_sort(recv, args, span);
         }
@@ -5658,6 +5691,91 @@ impl<'a, 't> Checker<'a, 't> {
         }
         self.diags.truncate(mark);
         None
+    }
+
+    /// `s.load(i)` — load `N` consecutive elements of a `slice<T>` starting at `i` into a `vecN<T>`
+    /// (M6). `N`/`T` come from the target annotation (like a vector literal); `i` is a runtime `i64`,
+    /// bounds-checked (`0 <= i && i + N <= len`). The source is a `slice<T>` (borrow a fixed array
+    /// with `xs[..]`).
+    fn check_vec_load(&mut self, recv: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some(Ty::Vec(s, n)) = expected.map(|t| self.resolve(t)) else {
+            self.diags.error("'load' needs a vector type annotation (e.g. `v: vec4<i32> := s.load(i)`)".to_string(), span);
+            return err;
+        };
+        let [i] = args else {
+            self.diags.error(format!("'load' takes 1 argument (the start index), got {}", args.len()), span);
+            return err;
+        };
+        let src = self.check_expr(recv, None);
+        if src.ty == Ty::Error {
+            return err;
+        }
+        let Ty::Slice(es) = self.resolve(src.ty) else {
+            self.diags.error(format!("'load' reads a slice<T>, got {} (borrow a fixed array with `xs[..]`)", ty_name(src.ty)), recv.span);
+            return err;
+        };
+        if es != s {
+            self.diags.error(
+                format!("'load' element type {} does not match the target vector element {}", scalar_name(es), scalar_name(s)),
+                span,
+            );
+            return err;
+        }
+        let idx = self.check_expr(i, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if !idx.ty.is_int_like() && idx.ty != Ty::Error {
+            self.diags.error(format!("a load index must be an integer, got {}", ty_name(idx.ty)), i.span);
+            return err;
+        }
+        Expr { kind: ExprKind::VecLoad { src: Box::new(src), index: Box::new(idx), elem: s, n }, ty: Ty::Vec(s, n), span }
+    }
+
+    /// `s.store(i, v)` — store the `N` lanes of `v: vecN<T>` into a writable `slice<T>` at `i..i+N`
+    /// (M6), bounds-checked. The destination must be a `mut` / `out` slice (the same writability rule
+    /// as `place[i] = v`). Yields `()`.
+    fn check_vec_store(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [i, v] = args else {
+            self.diags.error(format!("'store' takes 2 arguments (the start index and a vector), got {}", args.len()), span);
+            return err;
+        };
+        // The destination must be a writable slice place (a `mut` local or an `out` slice parameter).
+        let Some((id, dst_ty)) = self.place_local(recv) else {
+            self.diags.error("'store' needs a writable slice (a `mut` local or `out` parameter)".to_string(), recv.span);
+            return err;
+        };
+        let Ty::Slice(es) = self.resolve(dst_ty) else {
+            self.diags.error(format!("'store' writes a slice<T>, got {}", ty_name(dst_ty)), recv.span);
+            return err;
+        };
+        if !self.locals[id as usize].is_mut {
+            let name = self.locals[id as usize].name.clone();
+            self.diags.error(format!("cannot store into immutable '{name}' (declare with `mut`, or use an `out` parameter)"), recv.span);
+            return err;
+        }
+        let dst = self.check_expr(recv, None);
+        let idx = self.check_expr(i, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if !idx.ty.is_int_like() && idx.ty != Ty::Error {
+            self.diags.error(format!("a store index must be an integer, got {}", ty_name(idx.ty)), i.span);
+            return err;
+        }
+        let value = self.check_expr(v, None);
+        let (vs, n) = match self.resolve(value.ty) {
+            Ty::Vec(vs, n) => (vs, n),
+            Ty::Error => return err,
+            other => {
+                self.diags.error(format!("'store' takes a vector value, got {}", ty_name(other)), v.span);
+                return err;
+            }
+        };
+        if vs != es {
+            self.diags.error(
+                format!("'store' vector element {} does not match the slice element {}", scalar_name(vs), scalar_name(es)),
+                span,
+            );
+            return err;
+        }
+        Expr { kind: ExprKind::VecStore { dst: Box::new(dst), index: Box::new(idx), value: Box::new(value), elem: es, n }, ty: Ty::Unit, span }
     }
 
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): the sum of the lanes where the mask is
@@ -8597,6 +8715,15 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::VecMinMax { vec, .. } => self.finalize_expr(vec),
             ExprKind::VecSum { vec } => self.finalize_expr(vec),
+            ExprKind::VecLoad { src, index, .. } => {
+                self.finalize_expr(src);
+                self.finalize_expr(index);
+            }
+            ExprKind::VecStore { dst, index, value, .. } => {
+                self.finalize_expr(dst);
+                self.finalize_expr(index);
+                self.finalize_expr(value);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);

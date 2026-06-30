@@ -50,6 +50,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::PtrStore(ptr, idx, val) => {
                 let _ = writeln!(out, "    {}[{}] <- {}", operand_str(ptr), operand_str(idx), operand_str(val));
             }
+            Stmt::VecStore { slice, index, value, n, .. } => {
+                let _ = writeln!(out, "    {}[{}..+{n}] <- {}", operand_str(slice), operand_str(index), operand_str(value));
+            }
             Stmt::StoreColumn { base, len, index, field, struct_id, value } => {
                 let _ = writeln!(
                     out,
@@ -195,6 +198,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::VecDot { a, b, .. } => format!("dot({}, {})", operand_str(a), operand_str(b)),
         Rvalue::VecMinMax { vec, max, .. } => format!("{}({})", if *max { "vmax" } else { "vmin" }, operand_str(vec)),
         Rvalue::VecSum { vec, .. } => format!("vsum({})", operand_str(vec)),
+        Rvalue::VecLoad { slice, index, n, .. } => format!("{}[{}..+{n}]", operand_str(slice), operand_str(index)),
         Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
             format!("{}[{}].{field} (struct#{struct_id})", operand_str(base), operand_str(index))
         }

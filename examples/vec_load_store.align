@@ -1,0 +1,17 @@
+// Vector load/store — the bridge between array data and SIMD registers (M6). `s.load(i)` reads N
+// consecutive elements of a slice (N from the target annotation) into a `vecN<T>`, and
+// `s.store(i, v)` writes a vector's lanes back into a writable (`out`) slice — both bounds-checked
+// (`0 <= i && i + N <= len`). Borrow a fixed array into a slice by passing it where a slice is
+// expected (here `xs`/`ys` flow into the `slice<i64>` parameters).
+
+fn scale(src: slice<i64>, out dst: slice<i64>) {
+  v: vec4<i64> := src.load(0)   // load lanes 0..4
+  dst.store(0, v * 2)           // store the doubled vector back
+}
+
+fn main() -> i32 {
+  xs := [10, 20, 30, 40]
+  mut ys := [0, 0, 0, 0]
+  scale(xs, ys)                 // ys = [20, 40, 60, 80]
+  return (ys[0] + ys[3]) as i32 // 20 + 80 = 100
+}

@@ -1548,6 +1548,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     };
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
+                // `s.store(i, v)` — `<n x T>` store into `&buf[i]` at the element alignment.
+                Stmt::VecStore { slice, index, value, elem, n: _ } => {
+                    let sv = self.operand(slice).into_struct_value();
+                    let buf = self.builder.build_extract_value(sv, 0, "vsbuf").map_err(|e| self.err(e))?.into_pointer_value();
+                    let index = self.operand(index).into_int_value();
+                    let val = self.operand(value);
+                    let elem_lt = scalar_type(self.ctx, *elem, self.struct_types, self.enum_types);
+                    let ep = unsafe {
+                        self.builder.build_in_bounds_gep(elem_lt, buf, &[index], "vstoregep").map_err(|e| self.err(e))?
+                    };
+                    self.builder
+                        .build_store(ep, val)
+                        .map_err(|e| self.err(e))?
+                        .set_alignment(self.type_align(*elem))
+                        .map_err(|e| self.err(e))?;
+                }
                 Stmt::StoreColumn { base, len, index, field, struct_id, value } => {
                     // Scatter `value` into column `field` at row `index` of the soa buffer `base`:
                     // `column_base(field) + index*size_field`. The write counterpart of
@@ -2328,6 +2344,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::VecSum { vec, elem, n } => {
                 let v = self.operand(vec).into_vector_value();
                 self.horizontal_sum(v, matches!(elem, Ty::Float(_)), *n)?
+            }
+            // `s.load(i)` — `<n x T>` load from `&buf[i]` at the element alignment (the GEP yields an
+            // element-aligned pointer, so the vector load must NOT assume the wider vector alignment).
+            Rvalue::VecLoad { slice, index, elem, n } => {
+                let sv = self.operand(slice).into_struct_value();
+                let buf = self.builder.build_extract_value(sv, 0, "vlbuf").map_err(|e| self.err(e))?.into_pointer_value();
+                let index = self.operand(index).into_int_value();
+                let elem_lt = scalar_type(self.ctx, *elem, self.struct_types, self.enum_types);
+                let ep = unsafe {
+                    self.builder.build_in_bounds_gep(elem_lt, buf, &[index], "vloadgep").map_err(|e| self.err(e))?
+                };
+                let vty = vec_llvm_ty(self.ctx, *elem, *n).into_vector_type();
+                let loaded = self.builder.build_load(vty, ep, "vload").map_err(|e| self.err(e))?;
+                loaded
+                    .into_vector_value()
+                    .as_instruction()
+                    .ok_or_else(|| self.err("vector load is not an instruction"))?
+                    .set_alignment(self.type_align(*elem))
+                    .map_err(|e| self.err(e))?;
+                loaded
             }
             Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index, field`.
