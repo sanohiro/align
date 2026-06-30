@@ -106,6 +106,18 @@ fn invalid_width_is_rejected() {
 }
 
 #[test]
+fn comparison_on_vectors_is_rejected() {
+    // `==`/`<`/… on vectors produce a `mask` (a later slice). They must be rejected at sema, not
+    // reach codegen's `gen_vec_bin` (which only lowers `+`/`-`/`*`/`/`) and panic.
+    for opr in ["==", "!=", "<", "<=", ">", ">="] {
+        let src = format!(
+            "fn main() -> i32 {{\n  a: vec4<i32> := [1, 2, 3, 4]\n  b: vec4<i32> := [1, 2, 3, 4]\n  c := a {opr} b\n  return 0\n}}\n",
+        );
+        assert!(check_errs("vec-cmp", &src), "`{opr}` on vectors should be rejected");
+    }
+}
+
+#[test]
 fn remainder_on_vectors_is_rejected() {
     let src = concat!(
         "fn main() -> i32 {\n",

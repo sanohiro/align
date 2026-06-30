@@ -3816,23 +3816,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let l = self.operand(a).into_vector_value();
         let r = self.operand(b).into_vector_value();
         let bld = self.builder;
+        // sema restricts vector ops to `+`/`-`/`*`/`/`; guard here too so any future sema hole is a
+        // clean codegen error, never a panic.
+        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+            return Err(self.err("unsupported vector operator (only + - * / are lowered)"));
+        }
         let v = if matches!(elem, Ty::Float(_)) {
             match op {
-                BinOp::Add => bld.build_float_add(l, r, "vfadd"),
                 BinOp::Sub => bld.build_float_sub(l, r, "vfsub"),
                 BinOp::Mul => bld.build_float_mul(l, r, "vfmul"),
                 BinOp::Div => bld.build_float_div(l, r, "vfdiv"),
-                _ => unreachable!("sema restricts vector ops to + - * /"),
+                _ => bld.build_float_add(l, r, "vfadd"),
             }
         } else {
             let signed = is_signed(elem);
             match op {
-                BinOp::Add => bld.build_int_add(l, r, "vadd"),
                 BinOp::Sub => bld.build_int_sub(l, r, "vsub"),
                 BinOp::Mul => bld.build_int_mul(l, r, "vmul"),
                 BinOp::Div if signed => bld.build_int_signed_div(l, r, "vsdiv"),
                 BinOp::Div => bld.build_int_unsigned_div(l, r, "vudiv"),
-                _ => unreachable!("sema restricts vector ops to + - * /"),
+                _ => bld.build_int_add(l, r, "vadd"),
             }
         };
         Ok(v.map_err(|e| self.err(e))?.into())

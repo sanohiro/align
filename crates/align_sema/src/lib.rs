@@ -4467,8 +4467,10 @@ impl<'a, 't> Checker<'a, 't> {
                 } else if t == Ty::Str && op != BinOp::Add {
                     self.diags.error("str supports only `+` (concatenation)", span);
                 } else if is_vec {
-                    if op == BinOp::Rem {
-                        self.diags.error("vectors support elementwise `+` `-` `*` `/` (not `%`)".to_string(), span);
+                    // Vectors support only elementwise `+` `-` `*` `/`. Reject everything else (today
+                    // just `%`) — an unsupported op would otherwise reach codegen's `gen_vec_bin`.
+                    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                        self.diags.error("vectors support elementwise `+` `-` `*` `/` only".to_string(), span);
                     }
                 } else if t != Ty::Str && !t.is_numeric() && t != Ty::Error {
                     self.diags.error("arithmetic expects numbers (int or float)", span);
@@ -4498,6 +4500,11 @@ impl<'a, 't> Checker<'a, 't> {
                     // `str` supports only equality (no ordering yet).
                     self.diags
                         .error("str supports only == and != (ordering is not available)".to_string(), span);
+                } else if matches!(t, Ty::Vec(..)) {
+                    // Vector comparisons (`==`/`<`/…) produce a `mask` — a later M6 slice. Reject
+                    // them now: a `Ty::Vec` operand here would otherwise reach `gen_vec_bin`, which
+                    // only handles `+`/`-`/`*`/`/`, and panic in codegen.
+                    self.diags.error("vector comparisons are not supported yet (they produce a `mask`, a later slice)".to_string(), span);
                 }
                 ty = Ty::Bool;
             }
