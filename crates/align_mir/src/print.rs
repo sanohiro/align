@@ -191,6 +191,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("vec{n}<{}>[{}]", ty_name(*elem), parts.join(", "))
         }
         Rvalue::VecExtract { vec, lane, .. } => format!("{}[{lane}]", operand_str(vec)),
+        Rvalue::VecSumWhere { vec, mask, .. } => format!("sum_where({}, {})", operand_str(vec), operand_str(mask)),
         Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
             format!("{}[{}].{field} (struct#{struct_id})", operand_str(base), operand_str(index))
         }

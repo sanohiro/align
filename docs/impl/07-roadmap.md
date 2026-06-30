@@ -665,6 +665,17 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     *vector* cond) blends two same-type vectors lane-wise. Comparisons reuse `ExprKind::Binary`
     (`gen_bin` routes a vec operand + comparison op to `gen_vec_cmp` → vector `icmp`/`fcmp`); width is
     checked between the mask and the vectors. (`tests/vec_simd.rs`, `examples/vec_mask.align`.)
+  - **scalar broadcast + `sum_where` slice 3 — DONE.** A **scalar on the right** of a vector op
+    broadcasts across the lanes (`a + 5`, `scores > 80` — the draft §9 spelling), so `vec OP scalar`
+    is elementwise against the splatted scalar. (`check_binary` defers the rhs type when the lhs is a
+    vector and reconciles in `vec_binop`; codegen `operand_as_vector` splats a scalar operand via an
+    all-lane insertelement chain that folds to a hardware broadcast. The vector must be on the
+    **left** — scalar-on-the-left and a vector-literal right operand are deferred.)
+    **`vec.sum_where(mask)`** (`hir::VecSumWhere` → `Rvalue::VecSumWhere`) is the masked horizontal
+    sum: `select(mask, vec, 0)` then add all lanes → the element scalar (so the draft §9
+    `scores.sum_where(scores > 80)` runs). (`examples/vec_sum_where.align`.) Still deferred: `dot`/
+    other reductions, scalar-on-the-left broadcast, array load/store, the generic `vec<N,T>` spelling,
+    lane assignment, a written `mask<T>` annotation.
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.

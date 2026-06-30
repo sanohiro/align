@@ -1934,6 +1934,10 @@ impl EffectScan {
                 self.expr(a);
                 self.expr(b);
             }
+            ExprKind::VecSumWhere { vec, mask } => {
+                self.expr(vec);
+                self.expr(mask);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt);
                 self.expr(fallback);
@@ -2565,6 +2569,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(a, depth);
                 self.walk(b, depth);
             }
+            ExprKind::VecSumWhere { vec, mask } => {
+                self.walk(vec, depth);
+                self.walk(mask, depth);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
                 self.walk(fallback, depth);
@@ -2974,6 +2982,10 @@ impl<'a> MoveCheck<'a> {
                 self.expr(mask, moved, true, true);
                 self.expr(a, moved, true, true);
                 self.expr(b, moved, true, true);
+            }
+            ExprKind::VecSumWhere { vec, mask } => {
+                self.expr(vec, moved, true, true);
+                self.expr(mask, moved, true, true);
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
@@ -4467,66 +4479,82 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::StructLit { struct_id: id, fields: out }, ty: Ty::Struct(id), span }
     }
 
+    /// A binary op with a **vector** left operand: returns its `(element, width)` after broadcasting
+    /// a scalar right operand across the lanes (M6 — `a + 2.0`, `scores > 80`). The scalar's type is
+    /// unified with the element type; a vector right operand must match the left exactly. The vector
+    /// must be on the **left** (scalar-on-the-left and a vector-literal right operand are deferred).
+    /// `None` when the left operand is not a vector (the ordinary scalar path runs).
+    fn vec_binop(&mut self, l: &Expr, r: &Expr, span: Span) -> Option<(Scalar, u32)> {
+        let Ty::Vec(s, n) = self.resolve(l.ty) else { return None };
+        match self.resolve(r.ty) {
+            Ty::Vec(..) => self.unify(l.ty, r.ty, span),          // vec OP vec — element + width match
+            _ => self.unify(scalar_to_ty(s), r.ty, span),         // vec OP scalar — broadcast to the element
+        };
+        Some((s, n))
+    }
+
     fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
         let ty;
         let (l, r);
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 l = self.check_expr(lhs, expected);
-                r = self.check_expr(rhs, Some(l.ty));
-                let t = self.unify(l.ty, r.ty, span);
-                // `str + str` is concatenation; other ops on str are errors.
-                // A `vecN<T>` operand: elementwise SIMD arithmetic (M6). `+`/`-`/`*`/`/` only — `%`
-                // (rem) on vectors is deferred. Both operands unify to the same vector type already.
-                let is_vec = matches!(t, Ty::Vec(e, _) if scalar_to_ty(e).is_numeric());
-                if let Ty::Param(i) = t {
-                    // A generic value: arithmetic needs the `Num` bound.
-                    if !self.param_bound(i).grants_arith() {
-                        self.diags.error(self.bound_needed_msg(i, "arithmetic", Bound::Num), span);
-                    }
-                } else if t == Ty::Str && op != BinOp::Add {
-                    self.diags.error("str supports only `+` (concatenation)", span);
-                } else if is_vec {
-                    // Vectors support only elementwise `+` `-` `*` `/`. Reject everything else (today
-                    // just `%`) — an unsupported op would otherwise reach codegen's `gen_vec_bin`.
+                // A vector left operand lets a scalar right operand broadcast, so don't force the rhs
+                // to the (vector) lhs type — let it self-type and reconcile in `vec_binop`.
+                r = self.check_expr(rhs, if matches!(self.resolve(l.ty), Ty::Vec(..)) { None } else { Some(l.ty) });
+                if let Some((s, n)) = self.vec_binop(&l, &r, span) {
+                    // Vectors support only elementwise `+` `-` `*` `/` (no `%`).
                     if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
                         self.diags.error("vectors support elementwise `+` `-` `*` `/` only".to_string(), span);
                     }
-                } else if t != Ty::Str && !t.is_numeric() && t != Ty::Error {
-                    self.diags.error("arithmetic expects numbers (int or float)", span);
+                    ty = Ty::Vec(s, n);
+                } else {
+                    let t = self.unify(l.ty, r.ty, span);
+                    // `str + str` is concatenation; other ops on str are errors.
+                    if let Ty::Param(i) = t {
+                        // A generic value: arithmetic needs the `Num` bound.
+                        if !self.param_bound(i).grants_arith() {
+                            self.diags.error(self.bound_needed_msg(i, "arithmetic", Bound::Num), span);
+                        }
+                    } else if t == Ty::Str && op != BinOp::Add {
+                        self.diags.error("str supports only `+` (concatenation)", span);
+                    } else if t != Ty::Str && !t.is_numeric() && t != Ty::Error {
+                        self.diags.error("arithmetic expects numbers (int or float)", span);
+                    }
+                    if t == Ty::Str && op == BinOp::Add {
+                        self.guard_lambda_alloc_leak("string concatenation (`str + str`)", span);
+                    }
+                    ty = t;
                 }
-                if t == Ty::Str && op == BinOp::Add {
-                    self.guard_lambda_alloc_leak("string concatenation (`str + str`)", span);
-                }
-                ty = t;
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 l = self.check_expr(lhs, None);
-                r = self.check_expr(rhs, Some(l.ty));
-                let t = self.unify(l.ty, r.ty, span);
-                let is_eq = matches!(op, BinOp::Eq | BinOp::Ne);
-                if let Ty::Param(i) = t {
-                    // A generic value: equality needs `Eq`, ordering needs `Ord`.
-                    let (ok, needed) = if is_eq {
-                        (self.param_bound(i).grants_eq(), Bound::Eq)
-                    } else {
-                        (self.param_bound(i).grants_ord(), Bound::Ord)
-                    };
-                    if !ok {
-                        let what = if is_eq { "equality" } else { "ordering" };
-                        self.diags.error(self.bound_needed_msg(i, what, needed), span);
+                r = self.check_expr(rhs, if matches!(self.resolve(l.ty), Ty::Vec(..)) { None } else { Some(l.ty) });
+                // A `vecN<T>` comparison (`==`/`<`/…, incl. against a broadcast scalar like
+                // `scores > 80`) is elementwise and yields a `mask` of width N (M6).
+                if let Some((_, n)) = self.vec_binop(&l, &r, span) {
+                    ty = Ty::Mask(n);
+                } else {
+                    let t = self.unify(l.ty, r.ty, span);
+                    let is_eq = matches!(op, BinOp::Eq | BinOp::Ne);
+                    if let Ty::Param(i) = t {
+                        // A generic value: equality needs `Eq`, ordering needs `Ord`.
+                        let (ok, needed) = if is_eq {
+                            (self.param_bound(i).grants_eq(), Bound::Eq)
+                        } else {
+                            (self.param_bound(i).grants_ord(), Bound::Ord)
+                        };
+                        if !ok {
+                            let what = if is_eq { "equality" } else { "ordering" };
+                            self.diags.error(self.bound_needed_msg(i, what, needed), span);
+                        }
+                    } else if t == Ty::Str && !is_eq {
+                        // `str` supports only equality (no ordering yet).
+                        self.diags
+                            .error("str supports only == and != (ordering is not available)".to_string(), span);
                     }
-                } else if t == Ty::Str && !is_eq {
-                    // `str` supports only equality (no ordering yet).
-                    self.diags
-                        .error("str supports only == and != (ordering is not available)".to_string(), span);
+                    ty = Ty::Bool;
                 }
-                // A `vecN<T>` comparison (`==`/`<`/…) is elementwise and yields a `mask` of width N
-                // (M6 slice 2); every other comparison yields `bool`.
-                ty = match t {
-                    Ty::Vec(_, n) => Ty::Mask(n),
-                    _ => Ty::Bool,
-                };
             }
             BinOp::And | BinOp::Or => {
                 l = self.check_expr(lhs, Some(Ty::Bool));
@@ -5408,6 +5436,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "dot" {
             return self.check_array_dot(recv, args, expected, span);
         }
+        if method == "sum_where" {
+            return self.check_vec_sum_where(recv, args, span);
+        }
         if method == "sort" {
             return self.check_array_sort(recv, args, span);
         }
@@ -5546,6 +5577,37 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(Ty::Str, expected, span);
         self.guard_lambda_alloc_leak("a `template` string", span);
         Expr { kind: ExprKind::Template(hparts), ty: Ty::Str, span }
+    }
+
+    /// `vec.sum_where(mask)` — masked horizontal sum (M6): the sum of the lanes where the mask is
+    /// set, as the element scalar. The mask's width must match the vector's.
+    fn check_vec_sum_where(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [m] = args else {
+            self.diags.error(format!("'sum_where' takes 1 argument (a mask), got {}", args.len()), span);
+            return err;
+        };
+        let v = self.check_expr(recv, None);
+        let mc = self.check_expr(m, None);
+        if v.ty == Ty::Error || mc.ty == Ty::Error {
+            return err;
+        }
+        let Ty::Vec(s, n) = self.resolve(v.ty) else {
+            self.diags.error(format!("'sum_where' is a vector reduction, but the receiver is {}", ty_name(v.ty)), span);
+            return err;
+        };
+        match self.resolve(mc.ty) {
+            Ty::Mask(mn) if mn == n => {}
+            Ty::Mask(mn) => {
+                self.diags.error(format!("'sum_where' mask width {mn} does not match the vector width {n}"), m.span);
+                return err;
+            }
+            other => {
+                self.diags.error(format!("'sum_where' needs a mask (a vector comparison result), got {}", ty_name(other)), m.span);
+                return err;
+            }
+        }
+        Expr { kind: ExprKind::VecSumWhere { vec: Box::new(v), mask: Box::new(mc) }, ty: scalar_to_ty(s), span }
     }
 
     /// `select(mask, a, b)` — lane-wise blend of two `vecN<T>` by a `mask` (M6 slice 2). The mask's
@@ -8443,6 +8505,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(mask);
                 self.finalize_expr(a);
                 self.finalize_expr(b);
+            }
+            ExprKind::VecSumWhere { vec, mask } => {
+                self.finalize_expr(vec);
+                self.finalize_expr(mask);
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);

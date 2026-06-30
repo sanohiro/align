@@ -203,8 +203,20 @@ else `b[i]` (so `select(a > b, a, b)` is elementwise max). Comparisons reuse `Ex
 (codegen `gen_bin` routes a vec operand + comparison op to `gen_vec_cmp` → vector `icmp`/`fcmp`);
 `select` is `hir::Select` lowering to the existing `Rvalue::Select`, **extended to accept a vector
 cond** (reused from branchless `where`'s scalar select). Width is checked between the mask and the two
-vectors. Still deferred: `sum_where`, `dot`/reductions, broadcast, array load/store, the generic
-`vec<N,T>` spelling, lane assignment. (`examples/vec_mask.align`.)
+vectors. (`examples/vec_mask.align`.)
+
+**Slice 3 DONE — scalar broadcast + `sum_where`.** A **scalar on the right** of a vector op
+broadcasts across the lanes (`a + 5`, `scores > 80` — the draft §9 spelling). Settled here: broadcast
+is **implicit in `vec OP scalar`** (a cheap, lossless splat implied by the operand types — not a
+hidden allocation or a lossy coercion, so it stays within "nothing hidden"), and the **vector must be
+on the left** (scalar-on-the-left and a vector-literal right operand are deferred — they need
+bidirectional inference the one-pass checker doesn't do cleanly yet). The scalar's type unifies with
+the element (`vec4<i32> + 2.0` is rejected — int vector, float scalar). `vec.sum_where(mask)` is the
+**masked horizontal sum** (the first vec→scalar reduction): `select(mask, vec, 0)` then add all lanes
+→ the element scalar, so `scores.sum_where(scores > 80)` runs (draft §9). Codegen splats via an
+all-lane insertelement chain (`operand_as_vector`) that folds to a hardware broadcast; `sum_where` is
+`hir::VecSumWhere` → `Rvalue::VecSumWhere`. Still deferred: `dot`/other reductions, scalar-on-the-left
+broadcast, array load/store, the generic `vec<N,T>` spelling, lane assignment. (`examples/vec_sum_where.align`.)
 
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element

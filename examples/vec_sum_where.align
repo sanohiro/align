@@ -1,0 +1,11 @@
+// Scalar broadcast and masked reduction (draft.md §9). In a vector op a scalar on the right
+// broadcasts across the lanes (`scores > 80` compares every lane to 80), and `vec.sum_where(mask)`
+// sums the lanes where the mask is set — a branchless masked reduction.
+
+fn main() -> i32 {
+  scores: vec4<i32> := [70, 90, 60, 85]
+  // `> 80` broadcasts the scalar 80 to all lanes, yielding a mask [false, true, false, true].
+  passing := scores > 80
+  // Sum only the passing lanes: 90 + 85 = 175.
+  return scores.sum_where(passing)
+}
