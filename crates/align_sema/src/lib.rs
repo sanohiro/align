@@ -5447,14 +5447,10 @@ impl<'a, 't> Checker<'a, 't> {
         // `sum` / `reduce` are the terminals of a fused pipeline.
         if method == "sum" {
             // A `vecN<T>` receiver makes this the SIMD horizontal sum (the same surface as the array
-            // reduction `arr.sum()`). A pipeline-shaped receiver (`xs.map(f)`) routes to the array
-            // reduction; any other receiver is a value, routed to the vector reduction when it is a
-            // vector. (Mirrors the `min`/`max` dispatch.)
-            if args.is_empty() && !is_array_pipeline_recv(recv) {
-                let rv = self.check_expr(recv, None);
-                if let Ty::Vec(s, _) = self.resolve(rv.ty) {
-                    return Expr { kind: ExprKind::VecSum { vec: Box::new(rv) }, ty: scalar_to_ty(s), span };
-                }
+            // reduction `arr.sum()`); otherwise the array path runs. (Mirrors `min`/`max`.)
+            if args.is_empty()
+                && let Some((rv, s)) = self.try_vec_recv(recv) {
+                return Expr { kind: ExprKind::VecSum { vec: Box::new(rv) }, ty: scalar_to_ty(s), span };
             }
             return self.check_array_sum(recv, args, expected, span);
         }
@@ -5486,17 +5482,9 @@ impl<'a, 't> Checker<'a, 't> {
         // (one arg) is the pairwise scalar math op.
         if (method == "min" || method == "max") && args.is_empty() {
             // A `vecN<T>` receiver makes this the SIMD horizontal min/max reduction (the same surface
-            // as the array reduction `arr.min()`). Only an **array-pipeline-shaped** receiver — a
-            // `.map()`/`.where()` stage or a `.field` projection — can't be type-checked here (a
-            // pipeline without a terminal is an error); every other receiver (a local, a call, an
-            // arithmetic expression) is a value, safe to check, and routes to the vector reduction
-            // when it is a vector. (Struct fields are never vectors, so a `FieldAccess` receiver is
-            // always an array projection.)
-            if !is_array_pipeline_recv(recv) {
-                let rv = self.check_expr(recv, None);
-                if let Ty::Vec(s, _) = self.resolve(rv.ty) {
-                    return Expr { kind: ExprKind::VecMinMax { vec: Box::new(rv), max: method == "max" }, ty: scalar_to_ty(s), span };
-                }
+            // as the array reduction `arr.min()`); otherwise the array path runs.
+            if let Some((rv, s)) = self.try_vec_recv(recv) {
+                return Expr { kind: ExprKind::VecMinMax { vec: Box::new(rv), max: method == "max" }, ty: scalar_to_ty(s), span };
             }
             return self.check_array_min_max(recv, args, expected, method == "max", span);
         }
@@ -5651,6 +5639,25 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         Expr { kind: ExprKind::VecDot { a: Box::new(ac), b: Box::new(bc) }, ty: scalar_to_ty(s), span }
+    }
+
+    /// For a no-arg reduction (`recv.sum()`/`.min()`/`.max()`) whose surface is shared with the array
+    /// pipeline: if `recv` is a **vector value**, return its checked form + element scalar (→ the SIMD
+    /// reduction); otherwise `None` (→ the array path). An array-pipeline-shaped receiver
+    /// (`xs.map(f)`, a `.field` projection) is never type-checked here — a pipeline without a terminal
+    /// is an error. Any other receiver is checked **speculatively**: if it is not a vector, the check's
+    /// diagnostics are rolled back so the array path re-checks and reports the single, clean error.
+    fn try_vec_recv(&mut self, recv: &ast::Expr) -> Option<(Expr, Scalar)> {
+        if is_array_pipeline_recv(recv) {
+            return None;
+        }
+        let mark = self.diags.len();
+        let rv = self.check_expr(recv, None);
+        if let Ty::Vec(s, _) = self.resolve(rv.ty) {
+            return Some((rv, s));
+        }
+        self.diags.truncate(mark);
+        None
     }
 
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): the sum of the lanes where the mask is

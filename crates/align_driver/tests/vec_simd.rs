@@ -163,6 +163,20 @@ fn vector_sum_reduction() {
 }
 
 #[test]
+fn an_invalid_reduction_receiver_reports_one_error() {
+    // The speculative vec-vs-array receiver check rolls back its diagnostics when the receiver is
+    // not a vector, so an undefined receiver yields exactly one error (not a duplicate from the
+    // array path re-checking it).
+    for m in ["sum", "min", "max"] {
+        let src = format!("fn main() -> i32 {{\n  return undefinedthing.{m}() as i32\n}}\n");
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, "vec-dup", &src);
+        let n = align_driver::format_diagnostics(&sm, &checked.diags).matches("error:").count();
+        assert_eq!(n, 1, "`.{m}()` on an undefined receiver should report exactly one error, got {n}");
+    }
+}
+
+#[test]
 fn array_pipeline_sum_still_works() {
     if !backend_available() {
         return;

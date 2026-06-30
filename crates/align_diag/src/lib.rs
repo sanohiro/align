@@ -64,6 +64,17 @@ impl Diagnostics {
         self.items.is_empty()
     }
 
+    /// The number of diagnostics so far — a checkpoint for a speculative check (see [`Self::truncate`]).
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Roll the diagnostics back to a checkpoint from [`Self::len`], discarding any emitted since —
+    /// used to undo a speculative type-check whose errors would otherwise duplicate a later pass.
+    pub fn truncate(&mut self, len: usize) {
+        self.items.truncate(len);
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Diagnostic> {
         self.items.iter()
     }
