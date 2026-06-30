@@ -2507,9 +2507,8 @@ fn json_structural_index(src: &[u8], out: &mut Vec<u32>) {
     {
         // NEON is ARMv8-A baseline — unconditionally available on every aarch64 target.
         unsafe { json_structural_index_neon(src, out) };
-        return;
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(target_arch = "aarch64"))]
     json_structural_index_scalar(src, out);
 }
 
@@ -2615,8 +2614,9 @@ unsafe fn json_decode_index_neon(src: &[u8], out: &mut Vec<u32>) {
 
     // Per-lane bit weights 1,2,4,…,128 (repeated over the two 8-lane halves): AND a 0x00/0xFF compare
     // mask with these, then `vaddv` each half → one byte whose bit i is set iff lane i matched. A
-    // `const` keeps it in `.rodata` (no per-call stack materialization).
-    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    // local `static` guarantees a single `.rodata` instance (a `const` could be re-materialized on
+    // the stack per call; `static` + `as_ptr()` cannot).
+    static WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
     let bit_weights: uint8x16_t = unsafe { vld1q_u8(WEIGHTS.as_ptr()) };
     // Closures inherit the fn's `neon` feature, so the pure (memory-free) intrinsics are callable
     // without `unsafe` (only the pointer loads below are `unsafe`).
@@ -2690,7 +2690,8 @@ unsafe fn json_structural_index_neon(src: &[u8], out: &mut Vec<u32>) {
     out.reserve(src.len() / 8);
     let n = src.len();
 
-    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    // A local `static` guarantees a single `.rodata` instance (see `json_decode_index_neon`).
+    static WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
     let bit_weights: uint8x16_t = unsafe { vld1q_u8(WEIGHTS.as_ptr()) };
     let movemask16 = |cmp: uint8x16_t| -> u32 {
         let masked = vandq_u8(cmp, bit_weights);
@@ -2769,9 +2770,8 @@ fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
     {
         // NEON is ARMv8-A baseline — unconditionally available on every aarch64 target.
         unsafe { json_decode_index_neon(src, out) };
-        return;
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(target_arch = "aarch64"))]
     json_decode_index_scalar(src, out);
 }
 
