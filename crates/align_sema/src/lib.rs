@@ -4790,7 +4790,10 @@ impl<'a, 't> Checker<'a, 't> {
                 Ty::Vec(..) if matches!(fn_, Pow) => {
                     format!("'{name}' is not supported on a vector (it lowers to a libcall, not a lane-wise instruction), got {}", ty_name(r.ty))
                 }
-                Ty::Vec(..) => format!("'{name}' on a vector needs a float vector (it is float-only), got {}", ty_name(r.ty)),
+                // The reachable case is a float-only op (`sqrt`/`floor`/…) on an integer vector
+                // (`abs`/`min`/`max` are accepted on int vectors); the fallback is defensive.
+                Ty::Vec(..) if float_only => format!("'{name}' on a vector needs a float vector (it is float-only), got {}", ty_name(r.ty)),
+                Ty::Vec(..) => format!("'{name}' on a vector needs a float or integer vector, got {}", ty_name(r.ty)),
                 _ => {
                     let want = if float_only { "a float (or float-vector)" } else { "a numeric" };
                     format!("'{name}' needs {want} receiver, got {}", ty_name(r.ty))
