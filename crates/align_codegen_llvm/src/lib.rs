@@ -1062,6 +1062,8 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
+        // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane).
+        Ty::Mask(n) => ctx.bool_type().vec_type(n).into(),
         _ => int_type(ctx, ty).into(),
     }
 }
@@ -1925,10 +1927,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
             Rvalue::Select { cond, a, b } => {
-                let c = self.operand(cond).into_int_value();
-                let av = self.operand(a);
-                let bv = self.operand(b);
-                self.builder.build_select(c, av, bv, "sel").map_err(|e| self.err(e))?
+                // A `mask` cond (`<N x i1>`, from `select(mask, a, b)`) blends two vectors lane-wise;
+                // a scalar `i1` cond (branchless `where`) blends two scalars.
+                if matches!(self.f.operand_ty(cond), Ty::Mask(_)) {
+                    let c = self.operand(cond).into_vector_value();
+                    let av = self.operand(a).into_vector_value();
+                    let bv = self.operand(b).into_vector_value();
+                    self.builder.build_select(c, av, bv, "vsel").map_err(|e| self.err(e))?.into()
+                } else {
+                    let c = self.operand(cond).into_int_value();
+                    let av = self.operand(a);
+                    let bv = self.operand(b);
+                    self.builder.build_select(c, av, bv, "sel").map_err(|e| self.err(e))?
+                }
             }
             Rvalue::Field(slot, path) => {
                 let fty = abi_type(self.ctx, self.field_path_ty(*slot, path), self.struct_types, self.enum_types);
@@ -3411,9 +3422,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if self.f.operand_ty(a) == Ty::Str {
             return self.gen_str_eq(op, a, b);
         }
-        // Elementwise SIMD arithmetic on a `vecN<T>` (M6) — `+`/`-`/`*`/`/` over a vector value.
+        // A `vecN<T>` operand (M6): a comparison yields a `<N x i1>` mask, arithmetic stays a vector.
         if let Ty::Vec(elem, _) = self.f.operand_ty(a) {
-            return self.gen_vec_bin(op, a, b, scalar_to_ty(elem));
+            let et = scalar_to_ty(elem);
+            if is_comparison(op) {
+                return self.gen_vec_cmp(op, a, b, et);
+            }
+            return self.gen_vec_bin(op, a, b, et);
         }
         if matches!(self.f.operand_ty(a), Ty::Float(_)) {
             return self.gen_float_bin(op, a, b);
@@ -3841,6 +3856,39 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(v.map_err(|e| self.err(e))?.into())
     }
 
+    /// A `vecN<T>` comparison (M6) → a `<N x i1>` mask. The element `Ty` selects integer vs float
+    /// comparison; inkwell's `build_int_compare`/`build_float_compare` accept `VectorValue`, so the
+    /// predicate applies lane-wise. (Reuses the scalar predicate mapping — `pred`/`FloatPredicate`.)
+    fn gen_vec_cmp(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let l = self.operand(a).into_vector_value();
+        let r = self.operand(b).into_vector_value();
+        let bld = self.builder;
+        let v = if matches!(elem, Ty::Float(_)) {
+            let p = match op {
+                BinOp::Eq => FloatPredicate::OEQ,
+                // UNE (not ONE): IEEE 754 requires `NaN != x` to be true.
+                BinOp::Ne => FloatPredicate::UNE,
+                BinOp::Lt => FloatPredicate::OLT,
+                BinOp::Le => FloatPredicate::OLE,
+                BinOp::Gt => FloatPredicate::OGT,
+                _ => FloatPredicate::OGE,
+            };
+            bld.build_float_compare(p, l, r, "vfcmp")
+        } else {
+            let signed = is_signed(elem);
+            let p = match op {
+                BinOp::Eq => IntPredicate::EQ,
+                BinOp::Ne => IntPredicate::NE,
+                BinOp::Lt => pred(signed, Cmp::Lt),
+                BinOp::Le => pred(signed, Cmp::Le),
+                BinOp::Gt => pred(signed, Cmp::Gt),
+                _ => pred(signed, Cmp::Ge),
+            };
+            bld.build_int_compare(p, l, r, "vicmp")
+        };
+        Ok(v.map_err(|e| self.err(e))?.into())
+    }
+
     fn gen_float_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
         let l = self.operand(a).into_float_value();
         let r = self.operand(b).into_float_value();
@@ -3886,6 +3934,12 @@ enum Cmp {
     Le,
     Gt,
     Ge,
+}
+
+/// Whether `op` is a comparison (`==`/`!=`/`<`/`<=`/`>`/`>=`) — used to route a `vecN<T>` operand to
+/// the mask-producing comparison path instead of vector arithmetic.
+fn is_comparison(op: BinOp) -> bool {
+    matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
 }
 
 fn pred(signed: bool, c: Cmp) -> IntPredicate {

@@ -191,6 +191,11 @@ pub enum Ty {
     /// vector arithmetic; `dot(a, b)` reduces to the element scalar. Constructed from an array
     /// literal under a `vecN<T>` annotation. `mask`/comparisons/`select`/lanes are later slices.
     Vec(Scalar, u32),
+    /// A SIMD comparison mask — `<N x i1>`, one bool lane per vector lane (M6 slice 2). Produced by a
+    /// comparison of two `vecN<T>` (`a > b`), consumed by `select(mask, a, b)`. Carries only the
+    /// width `N` (the lane count) — it is element-agnostic, so a width-`N` mask selects between any
+    /// two `vecN<T>` of width `N`. Copy/`Static`; produced/consumed inline (no written annotation).
+    Mask(u32),
     /// A fixed-length array of structs (AoS); `(struct_id, length)`. M4.
     StructArray(u32, u32),
     /// An *owned*, dynamic-length array of structs, laid out like a slice
@@ -1924,6 +1929,11 @@ impl EffectScan {
                     self.expr(el);
                 }
             }
+            ExprKind::Select { mask, a, b } => {
+                self.expr(mask);
+                self.expr(a);
+                self.expr(b);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt);
                 self.expr(fallback);
@@ -2550,6 +2560,11 @@ impl<'a> EscapeCheck<'a> {
                     self.walk(e, depth);
                 }
             }
+            ExprKind::Select { mask, a, b } => {
+                self.walk(mask, depth);
+                self.walk(a, depth);
+                self.walk(b, depth);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
                 self.walk(fallback, depth);
@@ -2954,6 +2969,11 @@ impl<'a> MoveCheck<'a> {
                 for e in elems {
                     self.expr(e, moved, true, true);
                 }
+            }
+            ExprKind::Select { mask, a, b } => {
+                self.expr(mask, moved, true, true);
+                self.expr(a, moved, true, true);
+                self.expr(b, moved, true, true);
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
@@ -4500,13 +4520,13 @@ impl<'a, 't> Checker<'a, 't> {
                     // `str` supports only equality (no ordering yet).
                     self.diags
                         .error("str supports only == and != (ordering is not available)".to_string(), span);
-                } else if matches!(t, Ty::Vec(..)) {
-                    // Vector comparisons (`==`/`<`/…) produce a `mask` — a later M6 slice. Reject
-                    // them now: a `Ty::Vec` operand here would otherwise reach `gen_vec_bin`, which
-                    // only handles `+`/`-`/`*`/`/`, and panic in codegen.
-                    self.diags.error("vector comparisons are not supported yet (they produce a `mask`, a later slice)".to_string(), span);
                 }
-                ty = Ty::Bool;
+                // A `vecN<T>` comparison (`==`/`<`/…) is elementwise and yields a `mask` of width N
+                // (M6 slice 2); every other comparison yields `bool`.
+                ty = match t {
+                    Ty::Vec(_, n) => Ty::Mask(n),
+                    _ => Ty::Bool,
+                };
             }
             BinOp::And | BinOp::Or => {
                 l = self.check_expr(lhs, Some(Ty::Bool));
@@ -4854,6 +4874,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if name == "builder" {
             return self.check_builder_new(args, span);
+        }
+        if name == "select" {
+            return self.check_select(args, span);
         }
         if name == "spawn" {
             return self.check_spawn(args, span);
@@ -5523,6 +5546,48 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(Ty::Str, expected, span);
         self.guard_lambda_alloc_leak("a `template` string", span);
         Expr { kind: ExprKind::Template(hparts), ty: Ty::Str, span }
+    }
+
+    /// `select(mask, a, b)` — lane-wise blend of two `vecN<T>` by a `mask` (M6 slice 2). The mask's
+    /// width must match the vectors' width; the result is the vectors' type.
+    fn check_select(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [m, a, b] = args else {
+            self.diags.error(format!("'select' takes 3 arguments (a mask and two vectors), got {}", args.len()), span);
+            return err;
+        };
+        let mc = self.check_expr(m, None);
+        let ac = self.check_expr(a, None);
+        let bc = self.check_expr(b, Some(ac.ty));
+        if mc.ty == Ty::Error || ac.ty == Ty::Error || bc.ty == Ty::Error {
+            return err;
+        }
+        let Ty::Vec(s, n) = self.resolve(ac.ty) else {
+            self.diags.error(format!("'select' picks between two vectors, got {}", ty_name(ac.ty)), a.span);
+            return err;
+        };
+        if self.resolve(bc.ty) != Ty::Vec(s, n) {
+            self.diags.error(
+                format!("'select' vectors must have the same type, got {} and {}", ty_name(ac.ty), ty_name(bc.ty)),
+                b.span,
+            );
+            return err;
+        }
+        match self.resolve(mc.ty) {
+            Ty::Mask(mn) if mn == n => {}
+            Ty::Mask(mn) => {
+                self.diags.error(format!("'select' mask width {mn} does not match the vector width {n}"), m.span);
+                return err;
+            }
+            other => {
+                self.diags.error(
+                    format!("'select' needs a mask (a vector comparison result) as its first argument, got {}", ty_name(other)),
+                    m.span,
+                );
+                return err;
+            }
+        }
+        Expr { kind: ExprKind::Select { mask: Box::new(mc), a: Box::new(ac), b: Box::new(bc) }, ty: Ty::Vec(s, n), span }
     }
 
     /// `[e0, …, e(N-1)]` under a `vecN<T>` annotation — a fixed-width SIMD vector literal. Exactly
@@ -8374,6 +8439,11 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(e);
                 }
             }
+            ExprKind::Select { mask, a, b } => {
+                self.finalize_expr(mask);
+                self.finalize_expr(a);
+                self.finalize_expr(b);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);
@@ -8740,6 +8810,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Box(s) => format!("box<{}>", scalar_name(s)),
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::Vec(s, n) => format!("vec{n}<{}>", scalar_name(s)),
+        Ty::Mask(n) => format!("mask[{n}]"),
         Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(p) => format!("array<slice<{}>>", scalar_name(prim_to_scalar(p))),

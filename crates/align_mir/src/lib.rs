@@ -1435,6 +1435,15 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayLit { .. } => {
             unreachable!("array literal only appears as a let initializer or pipeline source")
         }
+        // `select(mask, a, b)` → a vector `select` (`Rvalue::Select` with a vector mask cond).
+        hir::ExprKind::Select { mask, a, b: bexpr } => {
+            let cond = lower_expr(b, mask);
+            let av = lower_expr(b, a);
+            let bv = lower_expr(b, bexpr);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::Select { cond, a: av, b: bv }));
+            Operand::Value(v)
+        }
         // A `vecN<T>` literal is a register value: build it via an insertelement chain (`MakeVec`).
         hir::ExprKind::VecLit { elems, elem } => {
             let ops: Vec<Operand> = elems.iter().map(|el| lower_expr(b, el)).collect();
@@ -3656,6 +3665,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
         Ty::Vec(_, n) => format!("vec{n}"),
+        Ty::Mask(n) => format!("mask{n}"),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
         Ty::DynArray(_) => "array".to_string(),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
