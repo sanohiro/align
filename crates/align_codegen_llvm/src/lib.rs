@@ -2319,6 +2319,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 self.horizontal_sum(prod, is_float, *n)?
             }
+            // `v.min()` / `v.max()` — fold the lanes with the scalar min/max intrinsic.
+            Rvalue::VecMinMax { vec, elem, n, max } => {
+                let v = self.operand(vec).into_vector_value();
+                self.horizontal_minmax(v, *elem, *n, *max)?
+            }
             Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index, field`.
                 let agg = self.operand(base).into_struct_value();
@@ -3879,6 +3884,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
             } else {
                 self.builder.build_int_add(acc.into_int_value(), lane.into_int_value(), "hsadd").map_err(|e| self.err(e))?.into()
             };
+        }
+        Ok(acc)
+    }
+
+    /// Fold the `n` lanes of a vector into the element scalar with the scalar min/max intrinsic
+    /// (M6 `v.min()`/`v.max()`) — the same `llvm.{s,u}{min,max}` / `llvm.{minimum,maximum}` as the
+    /// `core.math` scalar `a.min(b)`/`a.max(b)`, so the reduction matches that semantics exactly.
+    fn horizontal_minmax(&self, v: inkwell::values::VectorValue<'c>, elem: Ty, n: u32, max: bool) -> Result<BasicValueEnum<'c>, CodegenError> {
+        assert!(n > 0, "vector width must be at least 1");
+        let (name, overload): (&str, BasicTypeEnum<'c>) = if matches!(elem, Ty::Float(_)) {
+            (if max { "llvm.maximum" } else { "llvm.minimum" }, float_type(self.ctx, elem).into())
+        } else if is_signed(elem) {
+            (if max { "llvm.smax" } else { "llvm.smin" }, int_type(self.ctx, elem).into())
+        } else {
+            (if max { "llvm.umax" } else { "llvm.umin" }, int_type(self.ctx, elem).into())
+        };
+        let mut acc = self.builder.build_extract_element(v, self.ctx.i32_type().const_zero(), "hm0").map_err(|e| self.err(e))?;
+        for i in 1..n {
+            let idx = self.ctx.i32_type().const_int(i as u64, false);
+            let lane = self.builder.build_extract_element(v, idx, "hml").map_err(|e| self.err(e))?;
+            acc = self.call_intrinsic(name, &[overload], &[acc.into(), lane.into()])?;
         }
         Ok(acc)
     }

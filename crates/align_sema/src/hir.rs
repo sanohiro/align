@@ -390,6 +390,9 @@ pub enum ExprKind {
     /// `dot(a, b)` — the dot product of two `vecN<T>` (M6): the element scalar `sum(a[i] * b[i])`.
     /// Lowers to a vector multiply then a lane reduction (the multiply dual of [`VecSumWhere`]).
     VecDot { a: Box<Expr>, b: Box<Expr> },
+    /// `v.min()` / `v.max()` — the horizontal min/max of a `vecN<T>` (M6): the smallest/largest lane,
+    /// as the element scalar. `max` selects max vs min. Folded with the scalar min/max intrinsic.
+    VecMinMax { vec: Box<Expr>, max: bool },
     /// `[e0, e1, …]` under a `vecN<T>` annotation — a fixed-width SIMD vector value (M6 slice 1).
     /// Unlike [`ArrayLit`] (slot/memory), a vector is a **register value**: it lowers to a single
     /// `Rvalue::MakeVec` (an insertelement chain), so it flows through value positions like a scalar.

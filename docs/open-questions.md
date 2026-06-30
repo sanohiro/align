@@ -225,9 +225,20 @@ draft §9 spelling, the vector sibling of `select`), kept **distinct from the ar
 never collide at parse time (a free call vs a method call) — so this is not a One-Way violation, the
 same way `select` (a vec primitive) coexists with `where` (a pipeline stage). Lowers to a vector
 multiply then a shared `horizontal_sum` lane reduction (the multiply dual of `sum_where`); int +
-float. Still deferred: other vector reductions (`min`/`max`/bare `sum`), scalar-on-the-left
-broadcast, array load/store, the generic `vec<N,T>` spelling, lane assignment, a written `mask<T>`
-annotation. (`examples/vec_dot.align`.)
+float. (`examples/vec_dot.align`.)
+
+**Slice 5 DONE — `min` / `max`.** `v.min()` / `v.max()` — the horizontal min/max of a `vecN<T>` →
+the smallest/largest lane, as the element scalar. Settled here: it shares the **array-reduction
+surface** `arr.min()`/`arr.max()` (a no-arg method, "one way"), disambiguated by a **non-destructive
+receiver peek** — `is_vec_local_recv` checks whether the receiver is a *local of vector type* without
+`check_expr`-ing it, so a vector local routes to the SIMD reduction while an array source / pipeline
+(`xs.where(p).min()`) still routes to the array path (which `check_expr`-ing the receiver would have
+broken — a pipeline-without-terminal is an error). Lowers (`hir::VecMinMax` → `Rvalue::VecMinMax`) by
+folding the lanes with the **same `llvm.{s,u}{min,max}` / `llvm.{minimum,maximum}` intrinsics as the
+`core.math` scalar `a.min(b)`/`a.max(b)`**, so the reduction matches that semantics exactly (incl. the
+IEEE `minimum`/`maximum` NaN/signed-zero behavior for floats); int / unsigned / float. Still deferred:
+a bare `v.sum()` reduction, scalar-on-the-left broadcast, array load/store, the generic `vec<N,T>`
+spelling, lane assignment, a written `mask<T>` annotation. (`examples/vec_minmax.align`.)
 
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element

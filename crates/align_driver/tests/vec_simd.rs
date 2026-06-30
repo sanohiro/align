@@ -145,6 +145,87 @@ fn float_comparison_select_is_elementwise() {
 }
 
 #[test]
+fn vector_min_and_max_reductions() {
+    if !backend_available() {
+        return;
+    }
+    // a.max() = 40, a.min() = 10, difference = 30.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [30, 10, 40, 20]\n",
+        "  return a.max() - a.min()\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-minmax", src);
+    assert_eq!(out.status.code(), Some(30));
+}
+
+#[test]
+fn float_and_unsigned_min_max() {
+    if !backend_available() {
+        return;
+    }
+    // float max = 9.0 → 9; and an unsigned vector min = 7 → exercises the umin intrinsic. 9 + 7 = 16.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  f: vec4<f32> := [3.5, 1.5, 9.0, 2.0]\n",
+        "  u: vec4<u32> := [42, 7, 100, 13]\n",
+        "  return (f.max() as i32) + (u.min() as i32)\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-minmax-fu", src);
+    assert_eq!(out.status.code(), Some(16));
+}
+
+#[test]
+fn min_max_on_a_non_local_vector_receiver() {
+    if !backend_available() {
+        return;
+    }
+    // The reduction works on any vector-valued receiver, not just a local: an arithmetic expression
+    // and a function return. (a + b).max() = [41,32,23,14].max() = 41; mk().min() = 2; sum = 43.
+    let src = concat!(
+        "fn mk() -> vec4<i32> = [5, 8, 2, 9]\n",
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [1, 2, 3, 4]\n",
+        "  b: vec4<i32> := [40, 30, 20, 10]\n",
+        "  return (a + b).max() + mk().min()\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-minmax-recv", src);
+    assert_eq!(out.status.code(), Some(43));
+}
+
+#[test]
+fn array_pipeline_min_still_routes_to_the_array_reduction() {
+    if !backend_available() {
+        return;
+    }
+    // A `.where(p)` pipeline receiver must still reach the array reduction (not be mis-checked as a
+    // vector). Keep values > 2 → [5, 9]; min = 5.
+    let src = concat!(
+        "fn busy(x: i64) -> bool = x > 2\n",
+        "fn main() -> i32 {\n",
+        "  a := [1, 5, 2, 9]\n",
+        "  return a.where(busy).min() as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("arr-where-min", src);
+    assert_eq!(out.status.code(), Some(5));
+}
+
+#[test]
+fn array_min_max_still_works() {
+    if !backend_available() {
+        return;
+    }
+    // The array reduction `arr.min()` (a separate path) is unaffected: min([5,2,8,1]) = 1.
+    let src = "fn main() -> i32 {\n  a := [5, 2, 8, 1]\n  return a.min() as i32\n}\n";
+    let out = build_and_run("arr-min", src);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn dot_is_the_vector_dot_product() {
     if !backend_available() {
         return;

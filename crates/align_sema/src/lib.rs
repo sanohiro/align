@@ -1942,6 +1942,7 @@ impl EffectScan {
                 self.expr(a);
                 self.expr(b);
             }
+            ExprKind::VecMinMax { vec, .. } => self.expr(vec),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt);
                 self.expr(fallback);
@@ -2581,6 +2582,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(a, depth);
                 self.walk(b, depth);
             }
+            ExprKind::VecMinMax { vec, .. } => self.walk(vec, depth),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
                 self.walk(fallback, depth);
@@ -2999,6 +3001,7 @@ impl<'a> MoveCheck<'a> {
                 self.expr(a, moved, true, true);
                 self.expr(b, moved, true, true);
             }
+            ExprKind::VecMinMax { vec, .. } => self.expr(vec, moved, true, true),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
                 // The fallback is an arm value: it inherits this position's `consuming` but is
@@ -5469,6 +5472,19 @@ impl<'a, 't> Checker<'a, 't> {
         // `arr.min()` / `arr.max()` (no args) is the array reduction; `a.min(b)` / `a.max(b)`
         // (one arg) is the pairwise scalar math op.
         if (method == "min" || method == "max") && args.is_empty() {
+            // A `vecN<T>` receiver makes this the SIMD horizontal min/max reduction (the same surface
+            // as the array reduction `arr.min()`). Only an **array-pipeline-shaped** receiver — a
+            // `.map()`/`.where()` stage or a `.field` projection — can't be type-checked here (a
+            // pipeline without a terminal is an error); every other receiver (a local, a call, an
+            // arithmetic expression) is a value, safe to check, and routes to the vector reduction
+            // when it is a vector. (Struct fields are never vectors, so a `FieldAccess` receiver is
+            // always an array projection.)
+            if !is_array_pipeline_recv(recv) {
+                let rv = self.check_expr(recv, None);
+                if let Ty::Vec(s, _) = self.resolve(rv.ty) {
+                    return Expr { kind: ExprKind::VecMinMax { vec: Box::new(rv), max: method == "max" }, ty: scalar_to_ty(s), span };
+                }
+            }
             return self.check_array_min_max(recv, args, expected, method == "max", span);
         }
         if method == "abs" {
@@ -8559,6 +8575,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(a);
                 self.finalize_expr(b);
             }
+            ExprKind::VecMinMax { vec, .. } => self.finalize_expr(vec),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);
@@ -8633,6 +8650,22 @@ fn ast_block_diverges(b: &ast::Block) -> bool {
 fn block_diverges(e: &ast::Expr) -> bool {
     match &e.kind {
         ast::ExprKind::Block(b) => ast_block_diverges(b),
+        _ => false,
+    }
+}
+
+/// Whether `recv` is an **array-pipeline-shaped** receiver — a `.map()`/`.where()` stage call or a
+/// `.field` projection. Such a receiver is an array pipeline and must NOT be type-checked as a value
+/// (a pipeline without a terminal is an error); every other receiver (a local, a call, an arithmetic
+/// expression) is a value that may be a vector. Used to route `recv.min()`/`recv.max()`. (Struct
+/// fields are never vectors, so a `FieldAccess` is always an array projection, not a vector value.)
+fn is_array_pipeline_recv(recv: &ast::Expr) -> bool {
+    match &recv.kind {
+        ast::ExprKind::FieldAccess { .. } => true,
+        ast::ExprKind::Call { callee, .. } => matches!(
+            &callee.kind,
+            ast::ExprKind::FieldAccess { field, .. } if field.name == "map" || field.name == "where"
+        ),
         _ => false,
     }
 }

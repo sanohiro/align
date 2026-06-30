@@ -679,9 +679,18 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     `select`; `hir::VecDot` → `Rvalue::VecDot`), kept distinct from the array-pipeline terminal
     `xs.dot(ys)` (a method — a fused loop over arbitrary-length arrays); the two never collide (free
     call vs method call). Lowers to a vector multiply then the shared `horizontal_sum` reduction (the
-    multiply dual of `sum_where`); int + float. (`examples/vec_dot.align`.) Still deferred: other
-    reductions (`min`/`max`/`sum`), scalar-on-the-left broadcast, array load/store, the generic
-    `vec<N,T>` spelling, lane assignment, a written `mask<T>` annotation.
+    multiply dual of `sum_where`); int + float. (`examples/vec_dot.align`.)
+  - **`min` / `max` slice 5 — DONE.** `v.min()` / `v.max()` — the horizontal min/max of a `vecN<T>`
+    → the smallest/largest lane, as the element scalar. **Same surface as the array reduction**
+    `arr.min()`/`arr.max()` (a no-arg method); the `(min|max) && args.is_empty()` dispatch peeks the
+    receiver — a **vector local** routes to the SIMD reduction (`is_vec_local_recv` — a non-destructive
+    type peek, so a pipeline source like `xs.where(p).min()` still routes to the array reduction), else
+    the array path runs unchanged. `hir::VecMinMax` → `Rvalue::VecMinMax` folds the lanes with the
+    **same `llvm.{s,u}{min,max}` / `llvm.{minimum,maximum}` intrinsics as the `core.math` scalar
+    `a.min(b)`** (so the reduction matches that semantics exactly); int / unsigned / float.
+    (`examples/vec_minmax.align`.) Still deferred: a bare `v.sum()` reduction, scalar-on-the-left
+    broadcast, array load/store, the generic `vec<N,T>` spelling, lane assignment, a written `mask<T>`
+    annotation.
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.
