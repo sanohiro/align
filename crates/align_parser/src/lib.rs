@@ -194,11 +194,17 @@ impl<'a> Parser<'a> {
             self.diags
                 .error("a top-level constant is immutable; `mut` is not allowed here", self.span());
             None
+        } else if matches!(self.peek(), TokKind::Ident(s) if s == "align")
+            && matches!(self.peek_at(1), TokKind::LParen)
+        {
+            // `align(N) Name { … }` — an over-alignment attribute on a type declaration.
+            let align = self.parse_align_attr();
+            self.parse_type_decl(vis, align)
         } else if matches!(self.peek(), TokKind::Ident(_))
             && matches!(self.peek_at(1), TokKind::LBrace | TokKind::Lt)
         {
             // `Name { … }` or a generic `Name<T> { … }` type declaration.
-            self.parse_type_decl(vis)
+            self.parse_type_decl(vis, None)
         } else if matches!(self.peek(), TokKind::Ident(_))
             && matches!(self.peek_at(1), TokKind::ColonEq | TokKind::Colon)
         {
@@ -231,7 +237,37 @@ impl<'a> Parser<'a> {
     /// A keyword-less type declaration `Name { … }`, disambiguated by content: a body of
     /// `field: Type` is a struct; a body of bare `Variant` names is a sum type. (S1a: tag-only
     /// variants.)
-    fn parse_type_decl(&mut self, vis: Vis) -> Option<Item> {
+    /// Parse an `align(N)` attribute prefix → the byte alignment `N` (a positive power of two).
+    /// Returns `None` (with a diagnostic) on a malformed / non-power-of-two / too-large value, so the
+    /// type declaration still parses — just without the over-alignment.
+    fn parse_align_attr(&mut self) -> Option<u32> {
+        self.bump(); // `align`
+        self.expect(&TokKind::LParen, "'(' after `align`");
+        let span = self.span();
+        let n = if let TokKind::Int(v) = self.peek() {
+            let v = *v;
+            self.bump();
+            v
+        } else {
+            self.diags.error("`align(N)` needs an integer alignment", span);
+            self.eat(&TokKind::RParen);
+            return None;
+        };
+        self.expect(&TokKind::RParen, "')'");
+        if n <= 0 || !(n as u128).is_power_of_two() {
+            self.diags.error(format!("an alignment must be a positive power of two, got {n}"), span);
+            return None;
+        }
+        match u32::try_from(n) {
+            Ok(v) if v <= (1 << 29) => Some(v),
+            _ => {
+                self.diags.error(format!("alignment {n} is too large"), span);
+                None
+            }
+        }
+    }
+
+    fn parse_type_decl(&mut self, vis: Vis, align: Option<u32>) -> Option<Item> {
         let start = self.span();
         let name = self.parse_ident("type name")?;
         // Optional generic type parameters: `Pair<T, U: Ord>` (same form as a function's).
@@ -271,8 +307,11 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokKind::RBrace, "'}'");
             let span = start.merge(self.prev_span());
-            Some(Item::Struct(StructDecl { vis, name, type_params, fields, span }))
+            Some(Item::Struct(StructDecl { vis, name, type_params, fields, align, span }))
         } else {
+            if align.is_some() {
+                self.diags.error("`align(N)` applies to a struct, not a sum type", start);
+            }
             let mut variants = Vec::new();
             loop {
                 self.skip_ends();

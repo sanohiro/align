@@ -3287,7 +3287,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Struct(id) | Ty::StructArray(id, _) => self.structs[id as usize].align,
             _ => None,
         };
-        custom.unwrap_or_else(|| self.target_data.get_abi_alignment(&self.llvm_type(ty)))
+        // `align(N)` only ever *over*-aligns: take the max of the declared and the natural ABI
+        // alignment, so a too-small `align(N)` can never under-align a value (which would be UB).
+        let natural = self.target_data.get_abi_alignment(&self.llvm_type(ty));
+        custom.map_or(natural, |c| c.max(natural))
     }
 
     /// `&slot[index].field` — GEP `[0, index, field]` into a `[N x %Struct]` alloca.

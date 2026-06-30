@@ -88,6 +88,9 @@ pub struct StructDecl {
     /// name matches one resolves to `Ty::Param(i)`; the struct is monomorphized per instantiation.
     pub type_params: Vec<TypeParam>,
     pub fields: Vec<FieldDef>,
+    /// A declared over-alignment in bytes from an `align(N)` attribute (`align(16) Node { … }`), or
+    /// `None` for the type's natural alignment. `N` is a validated power of two (M6).
+    pub align: Option<u32>,
     pub span: Span,
 }
 

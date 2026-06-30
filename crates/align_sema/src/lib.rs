@@ -1249,7 +1249,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 let ty = resolve_type(&f.ty, build_cx!(module), &tparams, diags);
                 fields.push(hir::FieldDef { name: f.name.name.clone(), ty });
             }
-            struct_templates.insert(mangle_fn(module, *is_entry, &s.name.name), StructTemplate { type_params: tparams, fields });
+            struct_templates.insert(mangle_fn(module, *is_entry, &s.name.name), StructTemplate { type_params: tparams, fields, align: s.align });
         }
         for (module, is_entry, e) in &generic_enum_decls {
             let tparams: Vec<String> = e.type_params.iter().map(|t| t.name.name.clone()).collect();
@@ -1318,10 +1318,9 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             }
             fields.push(FieldDef { name: f.name.name.clone(), ty });
         }
-        // `align`: natural alignment today — the `align(N)` surface syntax + custom value
-        // arrive at M6 (`open-questions.md`); the field is reserved so that is an additive
-        // change at the alignment seam, not a retrofit.
-        structs[i] = StructDef { name: mangle_fn(module, *_is_entry, &s.name.name), fields, align: None };
+        // `align(N)` over-alignment (M6): honored at the one `type_align` codegen seam (the slot
+        // alloca / struct-array element). `None` = the type's natural alignment.
+        structs[i] = StructDef { name: mangle_fn(module, *_is_entry, &s.name.name), fields, align: s.align };
     }
 
     // Pass 0b-2: now that every struct's fields are populated, validate **nested** struct fields. A
@@ -1332,6 +1331,16 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     for (i, (_m, _e, s)) in struct_decls.iter().enumerate() {
         for (fi, f) in s.fields.iter().enumerate() {
             let Ty::Struct(nid) = structs[i].fields[fi].ty else { continue };
+            // An `align(N)` struct embedded as a field is not honored yet — embedding needs the
+            // struct's size padded up to its alignment (deferred), so the over-alignment would be
+            // silently dropped. Reject it cleanly rather than mislead (only a standalone value is
+            // over-aligned today).
+            if structs[nid as usize].align.is_some() {
+                diags.error(
+                    format!("an `align(N)` struct ('{}') cannot be a struct field yet — its over-alignment is only honored for a standalone value", structs[nid as usize].name),
+                    f.span,
+                );
+            }
             // Seed the visiting path with the containing struct `i`, so a cycle back to it (even at
             // depth 1, `Node { next: Node }`) is detected.
             if !struct_acyclic(nid, &structs, &mut vec![i as u32]) {
@@ -5967,6 +5976,14 @@ impl<'a, 't> Checker<'a, 't> {
                     );
                     Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
                 }
+                // An `align(N)` struct element is not honored in an array yet (stride padding deferred).
+                Some(id) if self.structs[id as usize].align.is_some() => {
+                    self.diags.error(
+                        format!("an array of the `align(N)` struct '{}' is not supported yet (its over-alignment is not honored when embedded)", self.structs[id as usize].name),
+                        span,
+                    );
+                    Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
+                }
                 Some(id) => Expr {
                     kind: ExprKind::ArrayLit { elems: checked, elem: Ty::Struct(id) },
                     ty: Ty::StructArray(id, n),
@@ -9343,6 +9360,8 @@ fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scala
 struct StructTemplate {
     type_params: Vec<String>,
     fields: Vec<hir::FieldDef>,
+    /// An `align(N)` over-alignment carried from the template to every monomorph (M6).
+    align: Option<u32>,
 }
 
 /// A generic sum-type declaration (`Opt<T> { Some(T), None }`): its type-parameter names and its
@@ -9578,6 +9597,12 @@ fn resolve_type(
             // An `array<Struct>` is a dynamic AoS (its own owned type); only a primitive
             // element resolves to the scalar `array<T>` (`DynArray`).
             match inner {
+                // An `align(N)` struct element would need its size padded to its alignment for a
+                // tight, aligned stride (deferred) — reject embedding it in an array for now.
+                Ty::Struct(id) if cx.structs.get(id as usize).and_then(|s| s.align).is_some() => {
+                    diags.error(format!("an `align(N)` struct cannot be an `array` element yet (its over-alignment is not honored when embedded)"), span);
+                    Ty::Error
+                }
                 Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
                 _ => match scalar_arg(inner, "array element", false, span, diags) {
                     Some(s) => Ty::DynArray(s),
@@ -9754,7 +9779,7 @@ fn instantiate_struct(name: &str, tmpl: &StructTemplate, args: &[Ty], cx: &mut T
         fields.push(hir::FieldDef { name: f.name.clone(), ty: fty });
     }
     let id = cx.structs.len() as u32;
-    cx.structs.push(StructDef { name: mangled.clone(), fields, align: None });
+    cx.structs.push(StructDef { name: mangled.clone(), fields, align: tmpl.align });
     cx.struct_mono.insert(mangled, id);
     id
 }
