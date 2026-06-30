@@ -5608,13 +5608,15 @@ impl<'a, 't> Checker<'a, 't> {
         if ac.ty == Ty::Error || bc.ty == Ty::Error {
             return err;
         }
-        let Ty::Vec(s, n) = self.resolve(ac.ty) else {
-            self.diags.error(format!("'dot' takes two vectors, got {}", ty_name(ac.ty)), a.span);
+        // Resolve before reporting so a diagnostic never prints an unresolved inference variable.
+        let (resolved_a, resolved_b) = (self.resolve(ac.ty), self.resolve(bc.ty));
+        let Ty::Vec(s, n) = resolved_a else {
+            self.diags.error(format!("'dot' takes two vectors, got {}", ty_name(resolved_a)), a.span);
             return err;
         };
-        if self.resolve(bc.ty) != Ty::Vec(s, n) {
+        if resolved_b != Ty::Vec(s, n) {
             self.diags.error(
-                format!("'dot' operands must have the same vector type, got {} and {}", ty_name(ac.ty), ty_name(bc.ty)),
+                format!("'dot' operands must have the same vector type, got {} and {}", ty_name(resolved_a), ty_name(resolved_b)),
                 b.span,
             );
             return err;

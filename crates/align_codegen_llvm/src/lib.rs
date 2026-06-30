@@ -3868,6 +3868,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// Sum the `n` lanes of a vector into the element scalar (M6 reductions — `sum_where`, `dot`).
     /// An extract-and-add chain; the optimizer turns it into a hardware reduction.
     fn horizontal_sum(&self, v: inkwell::values::VectorValue<'c>, is_float: bool, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {
+        // A vector type always has width ≥ 1 (`vecN` is 2/4/8/16) — guard the lane-0 extract below.
+        assert!(n > 0, "vector width must be at least 1");
         let mut acc = self.builder.build_extract_element(v, self.ctx.i32_type().const_zero(), "hs0").map_err(|e| self.err(e))?;
         for i in 1..n {
             let idx = self.ctx.i32_type().const_int(i as u64, false);
