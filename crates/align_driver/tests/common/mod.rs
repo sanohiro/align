@@ -55,6 +55,19 @@ pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::pro
     std::process::Command::new(&exe).args(prog_args).output().expect("run")
 }
 
+/// The LLVM IR text for `src` (for asserting on the generated instructions).
+pub fn emit_llvm(src: &str) -> String {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "ir", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline).expect("emit llvm ir")
+}
+
 /// Whether checking `src` produces any error (for negative tests).
 pub fn check_errs(name: &str, src: &str) -> bool {
     let mut sm = SourceMap::new();
