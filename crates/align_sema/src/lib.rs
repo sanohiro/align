@@ -1942,6 +1942,7 @@ impl EffectScan {
                 self.expr(a);
                 self.expr(b);
             }
+            ExprKind::VecMinMax { vec, .. } => self.expr(vec),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt);
                 self.expr(fallback);
@@ -2581,6 +2582,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(a, depth);
                 self.walk(b, depth);
             }
+            ExprKind::VecMinMax { vec, .. } => self.walk(vec, depth),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
                 self.walk(fallback, depth);
@@ -2999,6 +3001,7 @@ impl<'a> MoveCheck<'a> {
                 self.expr(a, moved, true, true);
                 self.expr(b, moved, true, true);
             }
+            ExprKind::VecMinMax { vec, .. } => self.expr(vec, moved, true, true),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
                 // The fallback is an arm value: it inherits this position's `consuming` but is
@@ -5469,6 +5472,12 @@ impl<'a, 't> Checker<'a, 't> {
         // `arr.min()` / `arr.max()` (no args) is the array reduction; `a.min(b)` / `a.max(b)`
         // (one arg) is the pairwise scalar math op.
         if (method == "min" || method == "max") && args.is_empty() {
+            // A `vecN<T>` receiver (a local) makes this the SIMD horizontal min/max reduction. The
+            // receiver is checked as a *local* (not via the array pipeline), so a pipeline source
+            // like `xs.where(p).min()` still routes to the array reduction below.
+            if self.is_vec_local_recv(recv) {
+                return self.check_vec_minmax(recv, method == "max", span);
+            }
             return self.check_array_min_max(recv, args, expected, method == "max", span);
         }
         if method == "abs" {
@@ -5622,6 +5631,28 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         Expr { kind: ExprKind::VecDot { a: Box::new(ac), b: Box::new(bc) }, ty: scalar_to_ty(s), span }
+    }
+
+    /// Whether `recv` is a **local of vector type** — a cheap, non-destructive peek (it does not
+    /// `check_expr` the receiver, so an array pipeline like `xs.where(p)` is not misread or
+    /// double-checked). Used to route `recv.min()`/`recv.max()` to the vector reduction.
+    fn is_vec_local_recv(&self, recv: &ast::Expr) -> bool {
+        let ast::ExprKind::Path(p) = &recv.kind else { return false };
+        let Some(name) = single_name(p) else { return false };
+        let Some(lid) = self.lookup(name) else { return false };
+        matches!(self.resolve(self.locals[lid as usize].ty), Ty::Vec(..))
+    }
+
+    /// `v.min()` / `v.max()` — the horizontal min/max of a `vecN<T>` (M6): the smallest/largest lane,
+    /// as the element scalar. The caller has confirmed `recv` is a vector local.
+    fn check_vec_minmax(&mut self, recv: &ast::Expr, max: bool, span: Span) -> Expr {
+        let rv = self.check_expr(recv, None);
+        let Ty::Vec(s, _) = self.resolve(rv.ty) else {
+            // Unreachable in practice (the caller checked), but stay a diagnostic, never a panic.
+            self.diags.error(format!("'{}' on a vector takes no arguments", if max { "max" } else { "min" }), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        };
+        Expr { kind: ExprKind::VecMinMax { vec: Box::new(rv), max }, ty: scalar_to_ty(s), span }
     }
 
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): the sum of the lanes where the mask is
@@ -8559,6 +8590,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(a);
                 self.finalize_expr(b);
             }
+            ExprKind::VecMinMax { vec, .. } => self.finalize_expr(vec),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);

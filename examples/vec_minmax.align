@@ -1,0 +1,9 @@
+// Horizontal min/max reductions over a vector (draft.md §9). `v.min()` / `v.max()` fold the lanes
+// of a `vecN<T>` to the smallest / largest, as the element scalar — the same surface as the array
+// reduction `arr.min()`, and the same min/max semantics as the scalar `a.min(b)`.
+
+fn main() -> i32 {
+  a: vec4<i32> := [30, 10, 40, 20]
+  // max lane = 40, min lane = 10.
+  return a.max() - a.min()   // 30
+}
