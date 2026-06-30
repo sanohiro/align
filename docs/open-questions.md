@@ -373,6 +373,14 @@ soa's borrowed region), so it can escape the arena the soa was built in. The who
 column per element; for one field use `s.field[i]` (project then index) or gather then read
 (`r := s[i]; r.field`). Still deferred: `str`/owned columns (the Move-field gather), `soa_slice<T>`
 sub-views, bitset/bool packed columns. (`tests/soa.rs`, `examples/soa.align`.)
+
+**Scalar-accessor slice DONE — `s.len()` + `s[i].field`.** A soa now answers `s.len()` (its row
+count — the `{ptr,len}` length, via `ExprKind::Len` → `SliceLen`) and `s[i].field` (one column's
+element directly, the column-major analogue of AoS `arr[i].field`). `s[i].field` reuses the fused
+`check_index_field` / `lower_index_field` path: a soa receiver sets `struct_view = (id, Layout::Soa)`,
+so the shared `lower_field_access` seam emits `IndexColumn` (one column read, **not** a whole-struct
+gather — verified in MIR). soa fields are scalar, so the field path is always length 1 and the leaf is
+Copy (no region/move concern). (`tests/soa.rs`, `examples/soa.align`.)
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
 
 ### Branchless `where` (sum/count) — DONE (2026-06-27)
@@ -490,8 +498,22 @@ compare means an unknown key colliding into an occupied slot is still skipped). 
 (wide struct, unknown keys, reordered fields → correct sums), codegen +3, runtime +2.
 
 **Deferred soa / decode sub-items (after the above):**
-- **bitset** bool columns (count/any/all 8–64× via popcnt; `where(.flag).sum()` only ~1.1–2× — both
+- **bitset** bool columns (count/any/all via popcnt; `where(.flag).sum()` only ~1.1–2× — both
   reviewers warn against over-crediting the filtered-sum case, since the value column read dominates).
+  **Investigated + deferred (2026-06-30).** A bit-packed bool column (1 bit/elem) is a larger,
+  higher-risk change than it looks, and the win is **density-only**: the existing byte-column count is
+  *already* compute-optimal — the branchless `count` = `sum(select(mask,1,0))` over a byte column
+  auto-vectorizes to `psadbw` (popcnt-of-bytes) on x86. Packing buys 8× memory **bandwidth**, not
+  compute. The cost: the packed layout must agree **bit-for-bit across two languages** — the LLVM
+  codegen helpers (`soa_field_sizes`/`soa_column_offset`/`IndexColumn`/`SoaGather`/`StoreColumn`/
+  `SoaAlloc`) **and** the Rust runtime (`align_rt_json_decode_soa`'s `soa_layout(widths, n_rows)` + its
+  column writes), because `json.decode → soa` is a single runtime call (not the codegen transpose) and
+  `json → soa` **with a `bool` field is already a tested path** (`soa.rs`), so it can't be scoped out.
+  Plus a popcnt pattern-match in `lower_array_reduce` and a rejection of explicit `s.boolfield`
+  projection (a packed bitset can't be a byte-addressed `slice<bool>`). This is Gate-4 (cross-stage
+  ABI) territory, cross-*language* — defer until the density win is actually needed, and ideally design
+  it as a first-class `bitset` *type* (draft §13) so the bool-column projection becomes a `bitset`
+  view rather than an outright rejection.
 - **`soa_slice<T>`** (a per-column-pointer view, so a function can take a borrowed soa slice —
   `slice<T>` is `{ptr,len}` AoS and can't); `str`/Move columns.
 - **`map_into(out dst)`** pipeline terminal — the minimal construct that makes `out` `noalias`/`nonnull`

@@ -16,7 +16,9 @@ fn main() -> i32 {
 
     total := s.where(.active).score.sum()    // streams only the active + score columns: 10 + 20 = 30
     u := s[2]                                // gather a whole struct: { active: true, score: 20, age: 25 }
+    n := s.len()                             // row count: 3
+    first := s[0].score                      // one column's element (IndexColumn): 10
 
-    return (total + u.age) as i32            // 30 + 25 = 55
+    return (total + u.age - n + first) as i32 // 30 + 25 - 3 + 10 = 62
   }
 }

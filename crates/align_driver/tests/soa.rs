@@ -648,3 +648,48 @@ fn out_of_range_gather_is_bounds_checked() {
         "}\n",
     )));
 }
+
+#[test]
+fn soa_len_is_the_row_count() {
+    if !backend_available() {
+        return;
+    }
+    // `s.len()` is the soa's row count (its `{ptr,len}` length), like a slice's `.len()`.
+    let out = build_and_run(
+        "soa-len",
+        concat!(
+            "R { a: i64, b: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [R { a: 1, b: 9 }, R { a: 2, b: 8 }, R { a: 3, b: 7 }]\n",
+            "    s := rows.to_soa()\n",
+            "    return s.len() as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn soa_indexed_field_reads_one_column() {
+    if !backend_available() {
+        return;
+    }
+    // `s[i].field` reads one column's element directly (lowered to `IndexColumn`), the column-major
+    // analogue of AoS `arr[i].field`. s[1].a + s[2].b = 7 + 9 = 16.
+    let out = build_and_run(
+        "soa-elem-field",
+        concat!(
+            "R { a: i64, b: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [R { a: 3, b: 1 }, R { a: 7, b: 2 }, R { a: 5, b: 9 }]\n",
+            "    s := rows.to_soa()\n",
+            "    return (s[1].a + s[2].b) as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(16));
+}

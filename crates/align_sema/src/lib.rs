@@ -7812,8 +7812,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let r = self.check_expr(recv, None);
         match r.ty {
-            // `str`/`slice` carry a runtime length in their `{ ptr, len }` view.
-            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            // `str`/`slice`/`soa` carry a runtime length in their `{ ptr, len }` view (a `soa`'s
+            // length is its row count).
+            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::Soa(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
@@ -8112,6 +8113,11 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let struct_id = match r.ty {
             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
+            // `s[i].field` on a soa reads one column's element directly (lowered via the shared
+            // `lower_field_access` seam → `IndexColumn`) — cheaper than gathering the whole struct.
+            // soa fields are scalar, so the path is always length 1 (a nested `.field.sub` fails in
+            // `field_of` below, since the field isn't a struct).
+            Ty::Soa(id) => id,
             Ty::Error => return err,
             other => {
                 self.diags.error(format!("'arr[i].{}' needs a struct array, got {}", fields[0].name, ty_name(other)), span);
