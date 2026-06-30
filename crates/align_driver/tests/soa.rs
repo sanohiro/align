@@ -634,14 +634,15 @@ fn a_gathered_struct_is_a_free_copy_returnable_from_its_arena() {
 
 #[test]
 fn out_of_range_gather_is_bounds_checked() {
-    // A constant out-of-range gather still type-checks (the bound is a runtime check, like any index).
+    // A constant out-of-range gather still type-checks (the bound is a runtime check, like any
+    // index) — `s[1]` is out of range for a 1-element soa, but the type checker accepts it.
     assert!(ok(concat!(
         "Rec { a: i64 }\n",
         "fn main() -> i32 {\n",
         "  arena {\n",
         "    rows := [Rec { a: 1 }]\n",
         "    s := rows.to_soa()\n",
-        "    r := s[0]\n",
+        "    r := s[1]\n",
         "    return r.a as i32\n",
         "  }\n",
         "}\n",

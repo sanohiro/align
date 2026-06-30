@@ -2418,13 +2418,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let index = self.operand(index).into_int_value();
                 let sizes = self.soa_field_sizes(*struct_id);
                 let st = self.struct_types[*struct_id as usize];
+                let fields = &self.structs[*struct_id as usize].fields;
                 let mut acc = st.get_undef();
-                for f in 0..self.structs[*struct_id as usize].fields.len() {
+                for f in 0..fields.len() {
                     let off = self.soa_column_offset(len, &sizes, f)?;
                     let col_base = unsafe {
                         self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "gcolbase").map_err(|e| self.err(e))?
                     };
-                    let fty = scalar_type(self.ctx, self.structs[*struct_id as usize].fields[f].ty, self.struct_types, self.enum_types);
+                    let fty = scalar_type(self.ctx, fields[f].ty, self.struct_types, self.enum_types);
                     let ep = unsafe {
                         self.builder.build_in_bounds_gep(fty, col_base, &[index], "gcolelem").map_err(|e| self.err(e))?
                     };
