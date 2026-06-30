@@ -395,9 +395,11 @@ fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) ->
 /// not frequency-dependent, so unlike the allocation/clone perf lints it needs no `--profile` data.
 const HUGE_STRUCT_BYTES: u64 = 128;
 
-/// Round `n` up to the next multiple of alignment `a` (`a` a power of two, ≥ 1).
+/// Round `n` up to the next multiple of alignment `a` (`a` a power of two, ≥ 1). The bitwise form
+/// (vs `div_ceil`) is the standard branch-free align-up; the `a <= 1` guard also avoids the `a - 1`
+/// underflow a stray `a == 0` would cause.
 fn align_up(n: u64, a: u64) -> u64 {
-    if a <= 1 { n } else { n.div_ceil(a) * a }
+    if a <= 1 { n } else { (n + a - 1) & !(a - 1) }
 }
 
 /// Natural-alignment `(size, align)` in bytes of `ty`, matching the default (non-packed) layout
