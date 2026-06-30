@@ -732,13 +732,16 @@ vec8<i32>
 vec16<u8>
 ```
 
-Example.
+A vector is built from an array literal under the annotation (the annotation picks the SIMD
+representation — no separate constructor), elementwise `+` `-` `*` `/` map to one lane-wise hardware
+instruction each, and `v[i]` reads lane `i` (a constant index).
 
 ```align
-a: vec4<f32>
-b: vec4<f32>
-c := a + b
-d := dot(a, b)
+a: vec4<f32> := [1.0, 2.0, 3.0, 4.0]
+b: vec4<f32> := [10.0, 20.0, 30.0, 40.0]
+c := a + b                 // elementwise, one instruction
+x := c[0]                  // lane 0
+d := dot(a, b)             // reduction to a scalar
 ```
 
 ### Array Expressions

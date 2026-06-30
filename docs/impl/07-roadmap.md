@@ -641,9 +641,24 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
 `array<slice<T>>` (for `chunks`), `array<Struct>.clone()`, and a bare whole-struct element value
 `users[i]` (no field) — see `08-memory-model-v2.md` §11 and `open-questions.md`.
 
-## M6 — SIMD / vec / mask — NOT STARTED (perf tier; needs the optimizer + LLVM upgrade)
+## M6 — SIMD / vec / mask — STARTED (explicit `vecN<T>` slice 1 landed)
 
 - `vec2/4/8/16<T>`, `mask<T>`, `bitset`.
+  - **`vecN<T>` slice 1 — DONE.** The explicit fixed-width vector type `vec2`/`vec4`/`vec8`/`vec16`
+    of a numeric scalar (`Ty::Vec(Scalar, N)`, a Copy/`Static` register value lowering to the LLVM
+    `<N x T>`). **Construction** reuses the array literal under a `vecN<T>` annotation (the annotation
+    picks the SIMD representation — no new syntax, "Nothing hidden"; a dedicated `hir::VecLit` that
+    lowers to a value `Rvalue::MakeVec` insertelement chain, unlike the slot-based `ArrayLit`).
+    **Elementwise `+`/`-`/`*`/`/`** route through `gen_bin` to inkwell's vector `build_int_*`/
+    `build_float_*` (one lane-wise instruction; `%` deferred). **Lane read `v[i]`** (a constant lane,
+    reusing `ExprKind::Index` → `Rvalue::VecExtract`/extractelement). The N-in-name form (`vec4<f32>`)
+    needs zero lexer/parser/AST change — `resolve_type` derives N from the name. Completion condition
+    met: the IR carries real `<N x T>` types + `add <N x i32>` (verified via `emit-llvm`); per-lane
+    run tests confirm correct lane-wise arithmetic. (`tests/vec_simd.rs`, `examples/vec_simd.align`.)
+    **Deferred (later M6 slices):** `mask<T>` + comparisons → mask, `select`/`sum_where`, `dot`/
+    horizontal reductions, scalar broadcast/splat, load/store from an `array`/`slice`, the `vec<N,T>`
+    generic-arg spelling, and lane *assignment* `v[i] = x`. The LLVM-version upgrade is not needed
+    for this slice (LLVM 19 has full vector support).
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.

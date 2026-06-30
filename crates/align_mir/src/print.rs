@@ -186,6 +186,11 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BoxClone(h, src) => format!("box_clone({}, {})", operand_str(h), operand_str(src)),
         Rvalue::Index(slot, idx) => format!("_{slot}[{}]", operand_str(idx)),
         Rvalue::IndexField(slot, idx, field) => format!("_{slot}[{}].{field}", operand_str(idx)),
+        Rvalue::MakeVec { elems, elem, n } => {
+            let parts: Vec<String> = elems.iter().map(operand_str).collect();
+            format!("vec{n}<{}>[{}]", ty_name(*elem), parts.join(", "))
+        }
+        Rvalue::VecExtract { vec, lane, .. } => format!("{}[{lane}]", operand_str(vec)),
         Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
             format!("{}[{}].{field} (struct#{struct_id})", operand_str(base), operand_str(index))
         }

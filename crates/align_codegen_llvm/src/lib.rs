@@ -1060,7 +1060,19 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
+        // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
+        Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         _ => int_type(ctx, ty).into(),
+    }
+}
+
+/// The LLVM vector type `<N x T>` for a `vecN<T>` value (M6). `elem` is a numeric scalar `Ty`
+/// (int or float); the element decides whether to build a float or integer vector.
+fn vec_llvm_ty<'c>(ctx: &'c Context, elem: Ty, n: u32) -> BasicTypeEnum<'c> {
+    if matches!(elem, Ty::Float(_)) {
+        float_type(ctx, elem).vec_type(n).into()
+    } else {
+        int_type(ctx, elem).vec_type(n).into()
     }
 }
 
@@ -2259,6 +2271,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 self.builder.build_load(ty, ep, "idxfld").map_err(|e| self.err(e))?
             }
+            // Build `<n x elem>` via an insertelement chain over a poison vector (M6).
+            Rvalue::MakeVec { elems, elem, n } => {
+                let vty = vec_llvm_ty(self.ctx, *elem, *n).into_vector_type();
+                let mut acc = vty.get_undef();
+                for (i, op) in elems.iter().enumerate() {
+                    let val = self.operand(op);
+                    let idx = self.ctx.i32_type().const_int(i as u64, false);
+                    acc = self.builder.build_insert_element(acc, val, idx, "vins").map_err(|e| self.err(e))?;
+                }
+                acc.into()
+            }
+            // Read lane `lane` of a vector (`extractelement`).
+            Rvalue::VecExtract { vec, lane, .. } => {
+                let v = self.operand(vec).into_vector_value();
+                let idx = self.ctx.i32_type().const_int(*lane as u64, false);
+                self.builder.build_extract_element(v, idx, "vext").map_err(|e| self.err(e))?
+            }
             Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index, field`.
                 let agg = self.operand(base).into_struct_value();
@@ -3382,6 +3411,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if self.f.operand_ty(a) == Ty::Str {
             return self.gen_str_eq(op, a, b);
         }
+        // Elementwise SIMD arithmetic on a `vecN<T>` (M6) — `+`/`-`/`*`/`/` over a vector value.
+        if let Ty::Vec(elem, _) = self.f.operand_ty(a) {
+            return self.gen_vec_bin(op, a, b, scalar_to_ty(elem));
+        }
         if matches!(self.f.operand_ty(a), Ty::Float(_)) {
             return self.gen_float_bin(op, a, b);
         }
@@ -3774,6 +3807,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
             _ => return Err(self.err("str supports only == / !=")),
         };
         Ok(v.into())
+    }
+
+    /// Elementwise vector arithmetic for `vecN<T>` (M6). The element `Ty` selects the float or
+    /// integer LLVM builder; inkwell's `build_int_*`/`build_float_*` accept a `VectorValue`, so the
+    /// op applies lane-wise. sema restricts vector ops to `+`/`-`/`*`/`/`.
+    fn gen_vec_bin(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let l = self.operand(a).into_vector_value();
+        let r = self.operand(b).into_vector_value();
+        let bld = self.builder;
+        // sema restricts vector ops to `+`/`-`/`*`/`/`; guard here too so any future sema hole is a
+        // clean codegen error, never a panic.
+        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+            return Err(self.err("unsupported vector operator (only + - * / are lowered)"));
+        }
+        let v = if matches!(elem, Ty::Float(_)) {
+            match op {
+                BinOp::Sub => bld.build_float_sub(l, r, "vfsub"),
+                BinOp::Mul => bld.build_float_mul(l, r, "vfmul"),
+                BinOp::Div => bld.build_float_div(l, r, "vfdiv"),
+                _ => bld.build_float_add(l, r, "vfadd"),
+            }
+        } else {
+            let signed = is_signed(elem);
+            match op {
+                BinOp::Sub => bld.build_int_sub(l, r, "vsub"),
+                BinOp::Mul => bld.build_int_mul(l, r, "vmul"),
+                BinOp::Div if signed => bld.build_int_signed_div(l, r, "vsdiv"),
+                BinOp::Div => bld.build_int_unsigned_div(l, r, "vudiv"),
+                _ => bld.build_int_add(l, r, "vadd"),
+            }
+        };
+        Ok(v.map_err(|e| self.err(e))?.into())
     }
 
     fn gen_float_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
