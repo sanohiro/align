@@ -580,3 +580,71 @@ fn group_by_str_key_requires_an_i64_value() {
         "fn main() -> i32 = 0\n",
     )));
 }
+
+#[test]
+fn soa_whole_element_gather() {
+    if !backend_available() {
+        return;
+    }
+    // `s[i]` gathers a whole struct value from the soa columns at index `i` (a Copy of primitives).
+    // r = s[1] = {2, 20, 200}; r.a + r.b + r.c = 222.
+    let out = build_and_run(
+        "soa-gather",
+        concat!(
+            "Rec { a: i64, b: i64, c: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [Rec { a: 1, b: 10, c: 100 }, Rec { a: 2, b: 20, c: 200 }, Rec { a: 3, b: 30, c: 300 }]\n",
+            "    s := rows.to_soa()\n",
+            "    r := s[1]\n",
+            "    return (r.a + r.b + r.c) as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(222));
+}
+
+#[test]
+fn a_gathered_struct_is_a_free_copy_returnable_from_its_arena() {
+    if !backend_available() {
+        return;
+    }
+    // The gather copies the primitive columns, so the result does not borrow the soa — it can
+    // escape the arena it was built in (unlike the borrowed soa view itself). pick() returns s[1].
+    let out = build_and_run(
+        "soa-gather-escape",
+        concat!(
+            "Rec { a: i64, b: i64 }\n",
+            "fn pick() -> Rec {\n",
+            "  arena {\n",
+            "    rows := [Rec { a: 1, b: 10 }, Rec { a: 2, b: 20 }]\n",
+            "    s := rows.to_soa()\n",
+            "    return s[1]\n",
+            "  }\n",
+            "}\n",
+            "fn main() -> i32 {\n",
+            "  r := pick()\n",
+            "  return (r.a + r.b) as i32\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(22));
+}
+
+#[test]
+fn out_of_range_gather_is_bounds_checked() {
+    // A constant out-of-range gather still type-checks (the bound is a runtime check, like any
+    // index) — `s[1]` is out of range for a 1-element soa, but the type checker accepts it.
+    assert!(ok(concat!(
+        "Rec { a: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  arena {\n",
+        "    rows := [Rec { a: 1 }]\n",
+        "    s := rows.to_soa()\n",
+        "    r := s[1]\n",
+        "    return r.a as i32\n",
+        "  }\n",
+        "}\n",
+    )));
+}

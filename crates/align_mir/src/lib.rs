@@ -249,6 +249,10 @@ pub enum Rvalue {
     /// `column_base + index*field_size`. The SoA counterpart of [`Rvalue::IndexFieldPtr`] — a scan
     /// reads only the columns it touches.
     IndexColumn { base: Operand, index: Operand, field: u32, struct_id: u32 },
+    /// `s[index]` — gather a **whole** `struct_id` value from a `soa<Struct>` (`{ptr,len}`
+    /// column-major view) at `index`: load every column's element and build the struct aggregate (M6).
+    /// The soa is primitive-only, so the gather copies — the result is a free Copy value.
+    SoaGather { base: Operand, index: Operand, struct_id: u32 },
     /// `base[index]` — load a **whole** struct element of `struct_id` from a `{ptr,len}` view of
     /// an owned, dynamic `array<Struct>` (GEP `%Struct, ptr, index`, then load the aggregate). The
     /// field-less analogue of [`Rvalue::IndexFieldPtr`]; emitted by `map(f)` whose `f` consumes a
@@ -1613,6 +1617,17 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         };
         let v = b.fresh_value(elem_ty);
         b.push(Stmt::Let(v, Rvalue::VecExtract { vec: vv, lane, elem: elem_ty }));
+        return Operand::Value(v);
+    }
+    // `s[i]` on a `soa<Struct>` → gather the whole struct from the columns at `i` (bounds-checked).
+    if let Ty::Soa(struct_id) = recv.ty {
+        let sv = lower_expr(b, recv);
+        let idx = lower_expr(b, index);
+        let len = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+        emit_bounds_check(b, &idx, Operand::Value(len));
+        let v = b.fresh_value(elem_ty);
+        b.push(Stmt::Let(v, Rvalue::SoaGather { base: sv, index: idx, struct_id }));
         return Operand::Value(v);
     }
     let idx = lower_expr(b, index);

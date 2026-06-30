@@ -744,7 +744,11 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   over-aligns); the slot alloca / AoS struct-array element pick it up (`tests/align_attr.rs`,
   `examples/align_attr.align`, `draft.md` §9). Deferred: the `align(N) data := …` binding form over a
   scalar array (the aligned-vector-load enabler), arena/heap over-alignment, and over-aligned-struct
-  size padding for a tight array stride. **SoA surface** + SoA codegen still wire into the SoA seam.
+  size padding for a tight array stride. **SoA surface — largely DONE:** the `soa<T>` borrowed view,
+  field projection (`s.field` → column slice), multi-column / mixed-width pipelines, `.to_soa()` +
+  `json.decode → soa` construction, `group_by` over a soa, soa params/returns, and now **whole-element
+  gather `s[i]`** (→ a Copy struct via `Rvalue::SoaGather`; `tests/soa.rs`, `examples/soa.align`) all
+  ship. Deferred: `str`/owned columns, `soa_slice<T>` sub-views, bitset/bool packed columns.
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 

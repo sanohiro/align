@@ -1,0 +1,22 @@
+// Struct-of-arrays (`soa<T>`, draft.md §9). A `soa<User>` stores one contiguous column per field,
+// so a field-wise scan streams only the columns it touches. Build one with `.to_soa()` (transpose a
+// row-major struct array); project a column with `s.field` (a `slice`), feed it to the pipeline, or
+// gather a whole struct value with `s[i]`.
+
+User { active: bool, score: i64, age: i64 }
+
+fn main() -> i32 {
+  arena {
+    rows := [
+      User { active: true, score: 10, age: 30 },
+      User { active: false, score: 99, age: 40 },
+      User { active: true, score: 20, age: 25 },
+    ]
+    s := rows.to_soa()                       // AoS -> column-major soa<User>
+
+    total := s.where(.active).score.sum()    // streams only the active + score columns: 10 + 20 = 30
+    u := s[2]                                // gather a whole struct: { active: true, score: 20, age: 25 }
+
+    return (total + u.age) as i32            // 30 + 25 = 55
+  }
+}

@@ -361,6 +361,18 @@ allowed** — each column's start is padded to the field's alignment in codegen 
 `soa<{active: bool, pay: i64}>` is well-formed and aligned for any `len`. A whole-struct stage over
 soa (`where(fn)`/`map(fn)` taking the struct) is rejected cleanly (it would gather every column —
 field projection / `where(.field)` only).
+
+**Whole-element gather slice DONE — `s[i]`.** Indexing a `soa<Struct>` now gathers a **whole struct
+value** from the columns at `i` (`check_index` gains a `Ty::Soa(id) => Ty::Struct(id)` arm; MIR
+`lower_index` → `Rvalue::SoaGather`, which loads every column's element via the shared
+`soa_column_offset` and builds the struct via insert-value). This resolves the **"Move fields in
+`soa<T>`" sub-question for the Copy case**: a soa is primitive-only, so the gather **copies** — the
+result is a free `Static` Copy value (`region_of` special-cases a soa `Index` to `Static`, not the
+soa's borrowed region), so it can escape the arena the soa was built in. The whole-struct pipeline
+*stage* over a soa (`map(fn)`/`where(fn)` taking the struct) stays rejected — that would gather every
+column per element; for one field use `s.field[i]` (project then index) or gather then read
+(`r := s[i]; r.field`). Still deferred: `str`/owned columns (the Move-field gather), `soa_slice<T>`
+sub-views, bitset/bool packed columns. (`tests/soa.rs`, `examples/soa.align`.)
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
 
 ### Branchless `where` (sum/count) — DONE (2026-06-27)

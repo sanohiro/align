@@ -2409,6 +2409,31 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 self.builder.build_load(ty, ep, "idxcol").map_err(|e| self.err(e))?
             }
+            // `s[index]` — gather a whole struct from a soa: load every column's element at `index`
+            // and build the struct aggregate (the multi-column counterpart of `IndexColumn`).
+            Rvalue::SoaGather { base, index, struct_id } => {
+                let agg = self.operand(base).into_struct_value();
+                let buf = self.builder.build_extract_value(agg, 0, "soaptr").map_err(|e| self.err(e))?.into_pointer_value();
+                let len = self.builder.build_extract_value(agg, 1, "soalen").map_err(|e| self.err(e))?.into_int_value();
+                let index = self.operand(index).into_int_value();
+                let sizes = self.soa_field_sizes(*struct_id);
+                let st = self.struct_types[*struct_id as usize];
+                let fields = &self.structs[*struct_id as usize].fields;
+                let mut acc = st.get_undef();
+                for f in 0..fields.len() {
+                    let off = self.soa_column_offset(len, &sizes, f)?;
+                    let col_base = unsafe {
+                        self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "gcolbase").map_err(|e| self.err(e))?
+                    };
+                    let fty = scalar_type(self.ctx, fields[f].ty, self.struct_types, self.enum_types);
+                    let ep = unsafe {
+                        self.builder.build_in_bounds_gep(fty, col_base, &[index], "gcolelem").map_err(|e| self.err(e))?
+                    };
+                    let val = self.builder.build_load(fty, ep, "gload").map_err(|e| self.err(e))?;
+                    acc = self.builder.build_insert_value(acc, val, f as u32, "ginsert").map_err(|e| self.err(e))?.into_struct_value();
+                }
+                acc.into()
+            }
             Rvalue::IndexPtr { base, index, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index` and load
                 // the whole element (a `map(f)` consuming the struct by value).
