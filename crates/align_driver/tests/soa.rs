@@ -855,3 +855,67 @@ fn soa_elem_field_assign_immutable_rejected() {
         "}\n",
     )));
 }
+
+#[test]
+fn soa_whole_elem_assign_scatters_columns() {
+    if !backend_available() {
+        return;
+    }
+    // `s[i] = structval` — the write counterpart of the `s[i]` gather: the value's fields scatter
+    // into their columns (`StoreColumn` per field) at row `i`. s[1]={70,80}, s[0]/s[2] untouched →
+    // 70 + 80 + (s[0].a=1) + (s[2].b=6) = 157.
+    let out = build_and_run(
+        "soa-whole-elem-assign",
+        concat!(
+            "P { a: i64, b: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [P { a: 1, b: 2 }, P { a: 3, b: 4 }, P { a: 5, b: 6 }]\n",
+            "    mut s := rows.to_soa()\n",
+            "    s[1] = P { a: 70, b: 80 }\n",
+            "    return (s[1].a + s[1].b + s[0].a + s[2].b) as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(157));
+}
+
+#[test]
+fn soa_whole_elem_assign_from_gather() {
+    if !backend_available() {
+        return;
+    }
+    // The value can be another gathered element: `s[0] = s[1]` (gather row 1, scatter into row 0).
+    let out = build_and_run(
+        "soa-whole-elem-assign-gather",
+        concat!(
+            "P { a: i64, b: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [P { a: 1, b: 2 }, P { a: 9, b: 9 }]\n",
+            "    mut s := rows.to_soa()\n",
+            "    s[0] = s[1]\n",
+            "    return (s[0].a + s[0].b) as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(18));
+}
+
+#[test]
+fn soa_whole_elem_assign_immutable_rejected() {
+    // Scattering a whole element through a soa view requires the view local to be `mut`.
+    assert!(!ok(concat!(
+        "P { a: i64, b: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  arena {\n",
+        "    rows := [P { a: 1, b: 2 }]\n",
+        "    s := rows.to_soa()\n",
+        "    s[0] = P { a: 9, b: 9 }\n",
+        "    return 0\n",
+        "  }\n",
+        "}\n",
+    )));
+}

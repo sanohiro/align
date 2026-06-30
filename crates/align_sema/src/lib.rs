@@ -656,6 +656,10 @@ enum Place {
     /// struct-array or soa local. `soa` selects the lowering (`StoreColumn` vs `StoreElemField`);
     /// `ty` is the (scalar) field type the value is checked against.
     ElemField { base: LocalId, index: Expr, field: u32, struct_id: u32, soa: bool, ty: Ty },
+    /// `base[index] = value` — store a whole struct value into element `index` of a `mut`
+    /// struct-array or soa local. `soa` selects the lowering (per-column scatter vs aggregate slot
+    /// store); the value is checked against `Ty::Struct(struct_id)`.
+    Elem { base: LocalId, index: Expr, struct_id: u32, soa: bool },
     Err,
 }
 
@@ -1810,7 +1814,9 @@ impl EffectScan {
         for s in &b.stmts {
             match s {
                 Stmt::Let { init, .. } | Stmt::Assign { value: init, .. } | Stmt::AssignField { value: init, .. } | Stmt::LetTuple { init, .. } => self.expr(init),
-                Stmt::AssignIndex { index, value, .. } | Stmt::AssignElemField { index, value, .. } => {
+                Stmt::AssignIndex { index, value, .. }
+                | Stmt::AssignElemField { index, value, .. }
+                | Stmt::AssignElem { index, value, .. } => {
                     self.expr(index);
                     self.expr(value);
                 }
@@ -2379,9 +2385,11 @@ impl<'a> EscapeCheck<'a> {
                     self.local_backed_slice.insert(*local);
                 }
             }
-            // `base[index] = value` / `base[index].field = value` — primitive (scalar) stores, so no
-            // region to track; just recurse into the index and value for nested escapes.
-            Stmt::AssignIndex { index, value, .. } | Stmt::AssignElemField { index, value, .. } => {
+            // `base[index] = value` / `base[index].field = value` — primitive (scalar / POD-struct)
+            // stores, so no region to track; just recurse into the index and value for nested escapes.
+            Stmt::AssignIndex { index, value, .. }
+            | Stmt::AssignElemField { index, value, .. }
+            | Stmt::AssignElem { index, value, .. } => {
                 self.walk(index, depth);
                 self.walk(value, depth);
             }
@@ -2678,9 +2686,9 @@ fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
         hir::Stmt::Return(_) => true,
         hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
         hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
-        hir::Stmt::AssignIndex { index, value, .. } | hir::Stmt::AssignElemField { index, value, .. } => {
-            hir_expr_diverges(index) || hir_expr_diverges(value)
-        }
+        hir::Stmt::AssignIndex { index, value, .. }
+        | hir::Stmt::AssignElemField { index, value, .. }
+        | hir::Stmt::AssignElem { index, value, .. } => hir_expr_diverges(index) || hir_expr_diverges(value),
         hir::Stmt::AssignVecLane { value, .. } => hir_expr_diverges(value),
         hir::Stmt::Expr(e) => hir_expr_diverges(e),
     }
@@ -2810,7 +2818,9 @@ impl<'a> MoveCheck<'a> {
                 // `base[index] = value` / `base[index].field = value` — writing an element is a use
                 // of `base` (an owned array could have been moved away), so flag use-after-move on
                 // it; index and value are read (not moved; Copy).
-                Stmt::AssignIndex { base, index, value } | Stmt::AssignElemField { base, index, value, .. } => {
+                Stmt::AssignIndex { base, index, value }
+                | Stmt::AssignElemField { base, index, value, .. }
+                | Stmt::AssignElem { base, index, value, .. } => {
                     if whole_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), index.span);
@@ -3737,6 +3747,10 @@ impl<'a, 't> Checker<'a, 't> {
                         let v = self.check_expr(value, Some(ty));
                         stmts.push(Stmt::AssignElemField { base, index, field, struct_id, soa, value: v });
                     }
+                    Place::Elem { base, index, struct_id, soa } => {
+                        let v = self.check_expr(value, Some(Ty::Struct(struct_id)));
+                        stmts.push(Stmt::AssignElem { base, index, struct_id, soa, value: v });
+                    }
                     Place::Err => {
                         let v = self.check_expr(value, None);
                         stmts.push(Stmt::Expr(v));
@@ -3814,6 +3828,43 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 };
                 return Place::VecLane { local: id, lane, elem: scalar_to_ty(s) };
+            }
+            // `arr[i] = structval` / `s[i] = structval` — store a whole struct element (the write
+            // counterpart of the `arr[i]` read / `s[i]` gather). First cut: plain-old-data structs
+            // (flat primitive numeric/bool/char fields), so the value is Copy with no region; a str /
+            // nested / owned field would need escape handling and is deferred.
+            if let Ty::StructArray(sid, _) | Ty::Soa(sid) = local_ty {
+                let soa = matches!(local_ty, Ty::Soa(_));
+                let fields = &self.structs[sid as usize].fields;
+                // `!is_empty()` guards the vacuous-true on a zero-field struct: it must not count as
+                // POD here, since the soa lowering reads `fields.first()`. (Empty structs aren't
+                // constructible today, so this is defensive — but keeps the predicate honest.)
+                let pod = !fields.is_empty()
+                    && fields.iter().all(|f| {
+                        matches!(
+                            ty_to_scalar(f.ty).and_then(scalar_to_prim),
+                            Some(PrimScalar::Int(_) | PrimScalar::Float(_) | PrimScalar::Bool | PrimScalar::Char)
+                        )
+                    });
+                if !pod {
+                    self.diags.error(
+                        format!(
+                            "whole-element assignment of {} is not supported yet (the struct must have only numeric/bool/char fields — no str, nested, or owned fields for now)",
+                            ty_name(local_ty)
+                        ),
+                        place.span,
+                    );
+                    return Place::Err;
+                }
+                let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                if i.ty == Ty::Error {
+                    return Place::Err;
+                }
+                if !i.ty.is_int_like() {
+                    self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
+                    return Place::Err;
+                }
+                return Place::Elem { base: id, index: i, struct_id: sid, soa };
             }
             let elem = match local_ty {
                 Ty::Slice(s) | Ty::Array(s, _) | Ty::DynArray(s) => scalar_to_ty(s),
@@ -8765,7 +8816,9 @@ impl<'a, 't> Checker<'a, 't> {
                 Stmt::Let { init, .. } => self.finalize_expr(init),
                 Stmt::Assign { value, .. } => self.finalize_expr(value),
                 Stmt::AssignField { value, .. } => self.finalize_expr(value),
-                Stmt::AssignIndex { index, value, .. } | Stmt::AssignElemField { index, value, .. } => {
+                Stmt::AssignIndex { index, value, .. }
+                | Stmt::AssignElemField { index, value, .. }
+                | Stmt::AssignElem { index, value, .. } => {
                     self.finalize_expr(index);
                     self.finalize_expr(value);
                 }

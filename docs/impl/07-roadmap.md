@@ -778,11 +778,17 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   (`hir::Stmt::AssignElemField`, new `Place::ElemField`) that lowers by layout — `Stmt::StoreColumn`
   for a soa, slot `Stmt::StoreElemField` for a fixed struct array (both already existed for `.to_soa()`
   construction; now reachable from user assignment), bounds-checked, `mut`-gated. The stored value is a
-  scalar field, so no move/region concern. Deferred: `str`/owned columns, the multi-column
-  `soa_slice<T>` sub-view (`s[a..b]` over *every* column — needs a `{ptr,total_len,start,count}` view
-  repr since column stride depends on the *original* row count; see `open-questions.md`), the dynamic
-  `array<Struct>` (`DynStructArray`) element-field write (needs a pointer-based `StoreElemFieldPtr`,
-  the write dual of `IndexFieldPtr`), bitset/bool packed columns.
+  scalar field, so no move/region concern. **Whole-element write `s[i] = value` / `arr[i] = value`**
+  also ships (`hir::Stmt::AssignElem`, new `Place::Elem`): the write counterpart of the `s[i]` gather /
+  `arr[i]` whole-element read — a soa scatters the value's fields into their columns (`StoreColumn` per
+  field), a fixed struct array stores the whole aggregate into the element (`StoreIndex`, a `[0,index]`
+  GEP). First cut is plain-old-data structs (flat numeric/bool/char fields), so the value is a Copy
+  aggregate with no region/move — `str`/nested/owned-bearing structs are gated off and deferred.
+  Deferred: `str`/owned columns, the multi-column `soa_slice<T>` sub-view (`s[a..b]` over *every*
+  column — needs a `{ptr,total_len,start,count}` view repr since column stride depends on the
+  *original* row count; see `open-questions.md`), the dynamic `array<Struct>` (`DynStructArray`)
+  element-field write (needs a pointer-based `StoreElemFieldPtr`, the write dual of `IndexFieldPtr`),
+  whole-element write of `str`/nested/owned structs (region/move handling), bitset/bool packed columns.
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 

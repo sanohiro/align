@@ -158,3 +158,59 @@ fn elem_field_assign_immutable_rejected() {
         "P { a: i64, b: i64 }\nfn main() -> i32 {\n  arr := [P{a: 1, b: 2}]\n  arr[0].a = 9\n  return 0\n}\n",
     ));
 }
+
+#[test]
+fn whole_elem_assign_struct_value() {
+    if !backend_available() {
+        return;
+    }
+    // `arr[i] = structval` — the write counterpart of the `arr[i]` whole-element read: one element
+    // is replaced (a single aggregate store), others untouched. arr[0]={7,8}, arr[1] stays {3,4} →
+    // 7 + 8 + 3 = 18.
+    let src = concat!(
+        "P { a: i64, b: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut arr := [P{a: 1, b: 2}, P{a: 3, b: 4}]\n",
+        "  arr[0] = P{a: 7, b: 8}\n",
+        "  return (arr[0].a + arr[0].b + arr[1].a) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("whole-elem-assign", src).status.code(), Some(18));
+}
+
+#[test]
+fn whole_elem_assign_from_struct_local() {
+    if !backend_available() {
+        return;
+    }
+    // The value can be any POD-struct expression, not just a literal: copy element 1 over element 0.
+    let src = concat!(
+        "P { a: i64, b: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut arr := [P{a: 1, b: 2}, P{a: 3, b: 4}]\n",
+        "  u := arr[1]\n",
+        "  arr[0] = u\n",
+        "  return (arr[0].a + arr[0].b) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("whole-elem-assign-var", src).status.code(), Some(7));
+}
+
+#[test]
+fn whole_elem_assign_immutable_rejected() {
+    // Replacing an element requires the array local to be `mut`.
+    assert!(check_errs(
+        "whole-elem-assign-immut",
+        "P { a: i64, b: i64 }\nfn main() -> i32 {\n  arr := [P{a: 1, b: 2}]\n  arr[0] = P{a: 9, b: 9}\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn whole_elem_assign_str_field_rejected() {
+    // First cut: whole-element assignment is plain-old-data only — a `str` field (region-tied) is
+    // a deferred case, rejected cleanly rather than silently storing a dangling view.
+    assert!(check_errs(
+        "whole-elem-assign-str",
+        "Pt { x: i64, s: str }\nfn main() -> i32 {\n  mut arr := [Pt{x: 1, s: \"a\"}]\n  arr[0] = Pt{x: 2, s: \"b\"}\n  return 0\n}\n",
+    ));
+}

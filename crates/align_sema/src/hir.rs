@@ -194,6 +194,12 @@ pub enum Stmt {
     /// (`StoreElemField`) for a fixed `array<Struct>`. Lowering emits a bounds check. `field` is the
     /// (scalar) field index; soa/struct fields are primitive, so no whole-element copy or drop.
     AssignElemField { base: LocalId, index: Expr, field: u32, struct_id: u32, soa: bool, value: Expr },
+    /// `base[index] = value` — store a whole struct value into element `index` (the write
+    /// counterpart of the `base[index]` whole-element read / `s[i]` gather). `soa` picks the
+    /// lowering: a per-column scatter (`StoreColumn` per field) for a `soa<Struct>`, else a single
+    /// aggregate slot store (`StoreIndex`) for a fixed `array<Struct>`. First cut: the struct is
+    /// plain-old-data (flat primitive-scalar fields), so the value is Copy — no region/move/drop.
+    AssignElem { base: LocalId, index: Expr, struct_id: u32, soa: bool, value: Expr },
     Return(Option<Expr>),
     Expr(Expr),
 }

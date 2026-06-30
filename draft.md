@@ -856,7 +856,9 @@ and decode-direct-to-`soa` (`s: soa<User> := json.decode(d)?`, decode-AoS-then-t
 feeding the normal pipeline. A projected column is an ordinary `slice<FieldTy>`, so it **windows**
 like any slice — `s.pay[a..b].sum()` scans rows `a..b` of one column. A field of one element is
 **writable in place** through a `mut` view — `s[i].pay = v` stores one column (the write counterpart
-of the `s[i].pay` read, the soa analogue of AoS `arr[i].pay = v`). The plain column scan beats AoS
+of the `s[i].pay` read, the soa analogue of AoS `arr[i].pay = v`); a **whole element** is replaceable
+too — `s[i] = value` scatters a struct value's fields into their columns (the write counterpart of
+the `s[i]` gather / AoS `arr[i] = value`), for plain-data structs. The plain column scan beats AoS
 ≈7×. The remaining slices are known-schema field-skip decode (parse only the used columns),
 `str`/owned columns, and a multi-column `soa_slice<T>` sub-view (`s[a..b]` over every column).)*
 
