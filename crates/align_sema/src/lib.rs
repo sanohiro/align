@@ -388,6 +388,69 @@ fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) ->
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
 
+/// Byte threshold for the **huge struct copy** lint (`draft.md` §16): a struct passed/returned **by
+/// value** above this many bytes is flagged. Two cache lines — deliberately conservative so the lint
+/// prefers silence to noise and fires only on genuinely large records (≈16+ `i64` fields, or 8+
+/// `str` fields). The cost it warns about is structural (a fixed-size copy at every call boundary),
+/// not frequency-dependent, so unlike the allocation/clone perf lints it needs no `--profile` data.
+const HUGE_STRUCT_BYTES: u64 = 128;
+
+/// Round `n` up to the next multiple of alignment `a` (`a` a power of two, ≥ 1).
+fn align_up(n: u64, a: u64) -> u64 {
+    if a <= 1 { n } else { n.div_ceil(a) * a }
+}
+
+/// Natural-alignment `(size, align)` in bytes of `ty`, matching the default (non-packed) layout
+/// codegen emits via LLVM. Scalars are their machine width; a `{ptr, len}` view or owned handle
+/// (`str`/`string`/array/slice/soa/box/builder/…) is two 64-bit words. Used only by the huge-struct-
+/// copy lint, which consults it for a [`Ty::Struct`]; the `_ => (16, 8)` fallback is a safe default
+/// for any composite that is not a current struct-field type. Cycle-safe (`visiting`), like
+/// [`struct_is_move`].
+fn ty_size_align(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64, u64) {
+    match ty {
+        Ty::Int(it) => {
+            let b = (it.bits / 8).max(1) as u64;
+            (b, b)
+        }
+        Ty::Float(ft) => {
+            let b = (ft.bits / 8).max(1) as u64;
+            (b, b)
+        }
+        Ty::Bool => (1, 1),
+        Ty::Char => (4, 4),
+        Ty::Unit => (0, 1),
+        Ty::Struct(id) => struct_size_align(id, structs, visiting),
+        // Two 64-bit words: a `{ptr, len}` view/owned-handle, an opaque heap handle, or a fn pointer.
+        // (A struct can hold only scalar / `str` fields today; the rest are a defensive default.)
+        _ => (16, 8),
+    }
+}
+
+/// Natural-alignment `(size, align)` of a struct laid out AoS in declaration order (the dual of
+/// [`struct_is_move`]). Honors a declared over-alignment (`align(N)`, reserved for M6). Cycle-safe.
+fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64, u64) {
+    if visiting.contains(&id) {
+        return (0, 1); // a cycle (already reported by `struct_acyclic`) — stop the recursion
+    }
+    let Some(def) = structs.get(id as usize) else {
+        return (0, 1);
+    };
+    visiting.push(id);
+    let mut size = 0u64;
+    let mut align = 1u64;
+    for f in &def.fields {
+        let (fsz, fal) = ty_size_align(f.ty, structs, visiting);
+        let fal = fal.max(1);
+        size = align_up(size, fal) + fsz;
+        align = align.max(fal);
+    }
+    if let Some(a) = def.align {
+        align = align.max(a as u64);
+    }
+    visiting.pop();
+    (align_up(size, align), align)
+}
+
 /// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs
 /// and Move tuples; needs the struct/tuple tables to inspect composite members. The free-function
 /// form (vs `MoveCheck::is_move_ty`) is shared by the field-access checker.
@@ -3354,6 +3417,43 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         self.ret_hint = ret;
+
+        // "huge struct copy" lint (`draft.md` §16): a struct passed or returned **by value** is
+        // copied in full at every call boundary; above `HUGE_STRUCT_BYTES` that is a data-oriented
+        // smell — narrow the struct (split hot/cold fields, `draft.md` §9) or pass a `slice`/view.
+        // A **warning** (a perf hint, not a hard error). Emitted only for a source signature
+        // (`mono_args` empty) — a monomorph would duplicate it, and a generic template's params are
+        // the opaque `Ty::Param` (never a `Ty::Struct`), so a generic instantiated *with* a huge
+        // struct is not flagged here (the source signature does not name it).
+        if self.mono_args.is_empty() {
+            let mut visiting = Vec::new();
+            // The struct name for the message — `.get()` (not direct indexing) so a stray id can
+            // never panic; `sz > 0` already implies the struct exists (a missing one sizes to 0).
+            let huge = |structs: &[StructDef], id: u32, visiting: &mut Vec<u32>| {
+                let (sz, _) = struct_size_align(id, structs, visiting);
+                (sz > HUGE_STRUCT_BYTES)
+                    .then(|| structs.get(id as usize).map(|d| (sz, d.name.clone())))
+                    .flatten()
+            };
+            for (p, ty) in f.params.iter().zip(&param_tys) {
+                if let Ty::Struct(id) = *ty
+                    && let Some((sz, name)) = huge(self.structs, id, &mut visiting)
+                {
+                    self.diags.push(align_diag::Diagnostic::warning(
+                        format!("huge struct copy: `{name}` ({sz} bytes) is passed by value — every call copies it; narrow the struct (split hot/cold fields) or pass a `slice`/view"),
+                        p.ty.span(),
+                    ));
+                }
+            }
+            if let (Ty::Struct(id), Some(rty)) = (ret, &f.ret)
+                && let Some((sz, name)) = huge(self.structs, id, &mut visiting)
+            {
+                self.diags.push(align_diag::Diagnostic::warning(
+                    format!("huge struct copy: returning `{name}` ({sz} bytes) by value copies it out; narrow the struct (split hot/cold fields) or return a handle"),
+                    rty.span(),
+                ));
+            }
+        }
 
         let mut params = Vec::new();
         for (p, ty) in f.params.iter().zip(param_tys) {
