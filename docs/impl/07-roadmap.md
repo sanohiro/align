@@ -673,9 +673,15 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     **left** — scalar-on-the-left and a vector-literal right operand are deferred.)
     **`vec.sum_where(mask)`** (`hir::VecSumWhere` → `Rvalue::VecSumWhere`) is the masked horizontal
     sum: `select(mask, vec, 0)` then add all lanes → the element scalar (so the draft §9
-    `scores.sum_where(scores > 80)` runs). (`examples/vec_sum_where.align`.) Still deferred: `dot`/
-    other reductions, scalar-on-the-left broadcast, array load/store, the generic `vec<N,T>` spelling,
-    lane assignment, a written `mask<T>` annotation.
+    `scores.sum_where(scores > 80)` runs). (`examples/vec_sum_where.align`.)
+  - **`dot` slice 4 — DONE.** `dot(a, b)` — the dot product of two `vecN<T>` → the element scalar
+    `sum(a[i] * b[i])`. A **free-function** builtin (the draft §9 spelling, the vector sibling of
+    `select`; `hir::VecDot` → `Rvalue::VecDot`), kept distinct from the array-pipeline terminal
+    `xs.dot(ys)` (a method — a fused loop over arbitrary-length arrays); the two never collide (free
+    call vs method call). Lowers to a vector multiply then the shared `horizontal_sum` reduction (the
+    multiply dual of `sum_where`); int + float. (`examples/vec_dot.align`.) Still deferred: other
+    reductions (`min`/`max`/`sum`), scalar-on-the-left broadcast, array load/store, the generic
+    `vec<N,T>` spelling, lane assignment, a written `mask<T>` annotation.
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.

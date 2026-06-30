@@ -145,6 +145,68 @@ fn float_comparison_select_is_elementwise() {
 }
 
 #[test]
+fn dot_is_the_vector_dot_product() {
+    if !backend_available() {
+        return;
+    }
+    // dot([1,2,3,4], [10,20,30,40]) = 10+40+90+160 = 300; the process exit code is 300 % 256 = 44.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [1, 2, 3, 4]\n",
+        "  b: vec4<i32> := [10, 20, 30, 40]\n",
+        "  return dot(a, b)\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-dot", src);
+    assert_eq!(out.status.code(), Some(44));
+}
+
+#[test]
+fn float_dot_product() {
+    if !backend_available() {
+        return;
+    }
+    // dot([1.5, 2.0], [4.0, 3.0]) = 6.0 + 6.0 = 12.0; as i32 = 12.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec2<f32> := [1.5, 2.0]\n",
+        "  b: vec2<f32> := [4.0, 3.0]\n",
+        "  return dot(a, b) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-dotf", src);
+    assert_eq!(out.status.code(), Some(12));
+}
+
+#[test]
+fn dot_on_mismatched_or_non_vectors_is_rejected() {
+    // Different widths.
+    let m = "fn main() -> i32 {\n  a: vec4<i32> := [1, 2, 3, 4]\n  b: vec2<i32> := [1, 2]\n  return dot(a, b)\n}\n";
+    assert!(check_errs("vec-dot-width", m));
+    // A non-vector operand.
+    let s = "fn main() -> i32 {\n  a: vec4<i32> := [1, 2, 3, 4]\n  return dot(a, 5)\n}\n";
+    assert!(check_errs("vec-dot-scalar", s));
+}
+
+#[test]
+fn array_dot_still_works() {
+    if !backend_available() {
+        return;
+    }
+    // The array-pipeline `xs.dot(ys)` (a separate method terminal) is unaffected by the vector
+    // free-function `dot(a, b)`. dot([1,2,3],[4,5,6]) = 4+10+18 = 32 (i64 array elements → cast).
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a := [1, 2, 3]\n",
+        "  b := [4, 5, 6]\n",
+        "  return a.dot(b) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("arr-dot", src);
+    assert_eq!(out.status.code(), Some(32));
+}
+
+#[test]
 fn scalar_broadcasts_in_vector_arithmetic() {
     if !backend_available() {
         return;

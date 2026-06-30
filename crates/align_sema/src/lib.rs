@@ -1938,6 +1938,10 @@ impl EffectScan {
                 self.expr(vec);
                 self.expr(mask);
             }
+            ExprKind::VecDot { a, b } => {
+                self.expr(a);
+                self.expr(b);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt);
                 self.expr(fallback);
@@ -2573,6 +2577,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(vec, depth);
                 self.walk(mask, depth);
             }
+            ExprKind::VecDot { a, b } => {
+                self.walk(a, depth);
+                self.walk(b, depth);
+            }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
                 self.walk(fallback, depth);
@@ -2986,6 +2994,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::VecSumWhere { vec, mask } => {
                 self.expr(vec, moved, true, true);
                 self.expr(mask, moved, true, true);
+            }
+            ExprKind::VecDot { a, b } => {
+                self.expr(a, moved, true, true);
+                self.expr(b, moved, true, true);
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
@@ -4906,6 +4918,9 @@ impl<'a, 't> Checker<'a, 't> {
         if name == "select" {
             return self.check_select(args, span);
         }
+        if name == "dot" {
+            return self.check_vec_dot(args, span);
+        }
         if name == "spawn" {
             return self.check_spawn(args, span);
         }
@@ -5577,6 +5592,36 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(Ty::Str, expected, span);
         self.guard_lambda_alloc_leak("a `template` string", span);
         Expr { kind: ExprKind::Template(hparts), ty: Ty::Str, span }
+    }
+
+    /// `dot(a, b)` — the dot product of two `vecN<T>` (M6): the element scalar `sum(a[i] * b[i])`.
+    /// Both operands must be the same vector type. (The free-function form per `draft.md` §9, the
+    /// vector sibling of `select`; the array pipeline `xs.dot(ys)` is a separate method terminal.)
+    fn check_vec_dot(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [a, b] = args else {
+            self.diags.error(format!("'dot' takes 2 arguments (two vectors), got {}", args.len()), span);
+            return err;
+        };
+        let ac = self.check_expr(a, None);
+        let bc = self.check_expr(b, Some(ac.ty));
+        if ac.ty == Ty::Error || bc.ty == Ty::Error {
+            return err;
+        }
+        // Resolve before reporting so a diagnostic never prints an unresolved inference variable.
+        let (resolved_a, resolved_b) = (self.resolve(ac.ty), self.resolve(bc.ty));
+        let Ty::Vec(s, n) = resolved_a else {
+            self.diags.error(format!("'dot' takes two vectors, got {}", ty_name(resolved_a)), a.span);
+            return err;
+        };
+        if resolved_b != Ty::Vec(s, n) {
+            self.diags.error(
+                format!("'dot' operands must have the same vector type, got {} and {}", ty_name(resolved_a), ty_name(resolved_b)),
+                b.span,
+            );
+            return err;
+        }
+        Expr { kind: ExprKind::VecDot { a: Box::new(ac), b: Box::new(bc) }, ty: scalar_to_ty(s), span }
     }
 
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): the sum of the lanes where the mask is
@@ -8509,6 +8554,10 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::VecSumWhere { vec, mask } => {
                 self.finalize_expr(vec);
                 self.finalize_expr(mask);
+            }
+            ExprKind::VecDot { a, b } => {
+                self.finalize_expr(a);
+                self.finalize_expr(b);
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);

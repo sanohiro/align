@@ -387,6 +387,9 @@ pub enum ExprKind {
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): sum of the lanes where the mask is set,
     /// yielding the element scalar. Lowers to `select(mask, vec, 0)` then a lane reduction.
     VecSumWhere { vec: Box<Expr>, mask: Box<Expr> },
+    /// `dot(a, b)` — the dot product of two `vecN<T>` (M6): the element scalar `sum(a[i] * b[i])`.
+    /// Lowers to a vector multiply then a lane reduction (the multiply dual of [`VecSumWhere`]).
+    VecDot { a: Box<Expr>, b: Box<Expr> },
     /// `[e0, e1, …]` under a `vecN<T>` annotation — a fixed-width SIMD vector value (M6 slice 1).
     /// Unlike [`ArrayLit`] (slot/memory), a vector is a **register value**: it lowers to a single
     /// `Rvalue::MakeVec` (an insertelement chain), so it flows through value positions like a scalar.

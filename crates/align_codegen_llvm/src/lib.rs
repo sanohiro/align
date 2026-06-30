@@ -2305,19 +2305,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let m = self.operand(mask).into_vector_value();
                 let zero = vec_llvm_ty(self.ctx, *elem, *n).into_vector_type().const_zero();
                 let masked = self.builder.build_select(m, v, zero, "swsel").map_err(|e| self.err(e))?.into_vector_value();
+                self.horizontal_sum(masked, matches!(elem, Ty::Float(_)), *n)?
+            }
+            // `dot(a, b)` — multiply lane-wise, then a horizontal sum.
+            Rvalue::VecDot { a, b, elem, n } => {
+                let av = self.operand(a).into_vector_value();
+                let bv = self.operand(b).into_vector_value();
                 let is_float = matches!(elem, Ty::Float(_));
-                // Horizontal sum: accumulate the N lanes (the optimizer turns this into a reduction).
-                let mut acc = self.builder.build_extract_element(masked, self.ctx.i32_type().const_zero(), "sw0").map_err(|e| self.err(e))?;
-                for i in 1..*n {
-                    let idx = self.ctx.i32_type().const_int(i as u64, false);
-                    let lane = self.builder.build_extract_element(masked, idx, "swl").map_err(|e| self.err(e))?;
-                    acc = if is_float {
-                        self.builder.build_float_add(acc.into_float_value(), lane.into_float_value(), "swfadd").map_err(|e| self.err(e))?.into()
-                    } else {
-                        self.builder.build_int_add(acc.into_int_value(), lane.into_int_value(), "swadd").map_err(|e| self.err(e))?.into()
-                    };
-                }
-                acc
+                let prod = if is_float {
+                    self.builder.build_float_mul(av, bv, "dotmul").map_err(|e| self.err(e))?
+                } else {
+                    self.builder.build_int_mul(av, bv, "dotmul").map_err(|e| self.err(e))?
+                };
+                self.horizontal_sum(prod, is_float, *n)?
             }
             Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index, field`.
@@ -3863,6 +3863,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let init = self.builder.build_insert_element(undef, scalar, self.ctx.i32_type().const_zero(), "splat_init").map_err(|e| self.err(e))?;
         let mask = self.ctx.i32_type().vec_type(n).const_zero();
         Ok(self.builder.build_shuffle_vector(init, undef, mask, "splat").map_err(|e| self.err(e))?)
+    }
+
+    /// Sum the `n` lanes of a vector into the element scalar (M6 reductions — `sum_where`, `dot`).
+    /// An extract-and-add chain; the optimizer turns it into a hardware reduction.
+    fn horizontal_sum(&self, v: inkwell::values::VectorValue<'c>, is_float: bool, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {
+        // A vector type always has width ≥ 1 (`vecN` is 2/4/8/16) — guard the lane-0 extract below.
+        assert!(n > 0, "vector width must be at least 1");
+        let mut acc = self.builder.build_extract_element(v, self.ctx.i32_type().const_zero(), "hs0").map_err(|e| self.err(e))?;
+        for i in 1..n {
+            let idx = self.ctx.i32_type().const_int(i as u64, false);
+            let lane = self.builder.build_extract_element(v, idx, "hsl").map_err(|e| self.err(e))?;
+            acc = if is_float {
+                self.builder.build_float_add(acc.into_float_value(), lane.into_float_value(), "hsfadd").map_err(|e| self.err(e))?.into()
+            } else {
+                self.builder.build_int_add(acc.into_int_value(), lane.into_int_value(), "hsadd").map_err(|e| self.err(e))?.into()
+            };
+        }
+        Ok(acc)
     }
 
     fn gen_vec_bin(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {
