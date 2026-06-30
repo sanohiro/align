@@ -4753,6 +4753,8 @@ impl<'a, 't> Checker<'a, 't> {
             Round => "round",
             Trunc => "trunc",
             Pow => "pow",
+            // `fma` is a free builtin (`check_fma`), never a method — listed only for exhaustiveness.
+            Fma => "fma",
         };
         // `(want_args, float_only)`: `abs`/`min`/`max` accept any numeric; the rest are float-only.
         // `min`/`max`/`pow` take one operand; the others take none.
@@ -4761,6 +4763,7 @@ impl<'a, 't> Checker<'a, 't> {
             Min | Max => (1, false),
             Sqrt | Floor | Ceil | Round | Trunc => (0, true),
             Pow => (1, true),
+            Fma => (2, true), // free builtin; never reached here
         };
         let r = self.check_expr(recv, None);
         if r.ty == Ty::Error {
@@ -5047,6 +5050,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if name == "dot" {
             return self.check_vec_dot(args, span);
+        }
+        if name == "fma" {
+            return self.check_fma(args, span);
         }
         if name == "spawn" {
             return self.check_spawn(args, span);
@@ -5911,6 +5917,41 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `select(mask, a, b)` — lane-wise blend of two `vecN<T>` by a `mask` (M6 slice 2). The mask's
     /// width must match the vectors' width; the result is the vectors' type.
+    /// `fma(a, b, c)` — fused multiply-add `a*b + c` with a single rounding. A free builtin (like
+    /// `dot`/`select`). Float-only (scalar `f32`/`f64` or `vecN<f32>`/`vecN<f64>`); the three
+    /// operands share the type. Lowers to one `llvm.fma` (a `vfmadd`/`fmla` instruction).
+    fn check_fma(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [a, b, c] = args else {
+            self.diags.error(format!("'fma' takes 3 arguments (the fused `a*b + c`), got {}", args.len()), span);
+            return err;
+        };
+        let ac = self.check_expr(a, None);
+        if ac.ty == Ty::Error {
+            return err;
+        }
+        // Check b/c with `a`'s type as context, then unify all three to one type — so a float
+        // literal in *any* position can constrain the others before the float-only check below
+        // (checking `a` alone could prematurely reject an as-yet-unresolved var).
+        let bc = self.check_expr(b, Some(ac.ty));
+        let cc = self.check_expr(c, Some(ac.ty));
+        if bc.ty == Ty::Error || cc.ty == Ty::Error {
+            return err;
+        }
+        if self.unify(ac.ty, bc.ty, b.span) == Ty::Error || self.unify(ac.ty, cc.ty, c.span) == Ty::Error {
+            return err;
+        }
+        // Float-only: a fused float multiply-add. A scalar float (incl. an undetermined float
+        // literal) or a float vector.
+        let ty = ac.ty;
+        let rt = self.resolve(ty);
+        if !(rt.is_float_like() || matches!(rt, Ty::Vec(Scalar::Float(_), _))) {
+            self.diags.error(format!("'fma' needs a float or float-vector (it is a fused float multiply-add), got {}", ty_name(rt)), span);
+            return err;
+        }
+        Expr { kind: ExprKind::MathOp { fn_: hir::MathFn::Fma, operands: vec![ac, bc, cc] }, ty, span }
+    }
+
     fn check_select(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [m, a, b] = args else {

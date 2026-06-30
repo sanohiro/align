@@ -740,8 +740,13 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     slice 11's codegen was already element-aware with a vector overload, so `check_scalar_math` just
     accepts the vector cases (float vec: unary float ops + min/max; int vec: abs + min/max). `pow` is
     excluded — it lowers to a libcall, not a lane-wise instruction — so it (and `a.min()` with no arg,
-    which is the reduction) stays as before. Still deferred: the generic `vec<N,T>` / numeric-type-arg
-    spelling, an aligned-load fast path, a SIMD-unit tree reduction, `fma`.
+    which is the reduction) stays as before.
+  - **`fma` slice 13 — DONE.** `fma(a, b, c)` = `a*b + c` with a single rounding — a **free builtin**
+    (like `dot`/`select`, not a method), float scalar or vector, lowering to one `llvm.fma`
+    (`vfmadd`/`fmla`). The classic SIMD numeric kernel (dot products, FIR filters, Horner polynomials).
+    Reuses `MathOp` via a new `MathFn::Fma` (ternary); `check_fma` dispatched alongside `select`/`dot`.
+    (`examples/vec_fma.align`.) Still deferred: the generic `vec<N,T>` / numeric-type-arg spelling, an
+    aligned-load fast path, a SIMD-unit tree reduction.
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.

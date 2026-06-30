@@ -44,6 +44,9 @@ pub enum MathFn {
     Trunc,
     /// `b.pow(e)` — `b` raised to `e` (float).
     Pow,
+    /// `fma(a, b, c)` — fused multiply-add `a*b + c` with a single rounding (float scalar or
+    /// vector). A free builtin (like `dot`/`select`), not a method; one `vfmadd`/`fmla` instruction.
+    Fma,
 }
 
 #[derive(Clone, Debug)]

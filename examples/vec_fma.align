@@ -1,0 +1,13 @@
+// Fused multiply-add (M6). `fma(a, b, c)` computes `a*b + c` with a single rounding — more precise
+// and faster than a separate multiply then add (which rounds twice). It is a free builtin (like
+// `dot` and `select`), works on a scalar float or a float vector, and lowers to one `vfmadd`/`fmla`
+// instruction (`llvm.fma`). The classic SIMD numeric kernel: dot products, FIR filters, and
+// polynomial evaluation (Horner's method) are all chains of `fma`.
+
+fn main() -> i32 {
+  a: vec4<f32> := [1.0, 2.0, 3.0, 4.0]
+  b: vec4<f32> := [10.0, 10.0, 10.0, 10.0]
+  c: vec4<f32> := [1.0, 1.0, 1.0, 1.0]
+  r := fma(a, b, c)                          // a*b + c = [11, 21, 31, 41]
+  return (r[0] + r[1] + r[2] + r[3]) as i32  // 104
+}

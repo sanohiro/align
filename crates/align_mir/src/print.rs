@@ -137,6 +137,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 align_sema::MathFn::Round => "round",
                 align_sema::MathFn::Trunc => "trunc",
                 align_sema::MathFn::Pow => "pow",
+                align_sema::MathFn::Fma => "fma",
             };
             let a: Vec<String> = operands.iter().map(operand_str).collect();
             format!("{f}({}) : {}", a.join(", "), ty_name(*ty))
