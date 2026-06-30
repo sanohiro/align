@@ -5851,10 +5851,11 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'sum_where' is a vector reduction, but the receiver is {}", ty_name(v.ty)), span);
             return err;
         };
-        match self.resolve(mc.ty) {
+        let mc_ty = self.resolve(mc.ty);
+        match mc_ty {
             Ty::Mask(ms, mn) if ms == s && mn == n => {}
             Ty::Mask(..) => {
-                self.diags.error(format!("'sum_where' mask {} does not match the vector {}", ty_name(self.resolve(mc.ty)), ty_name(self.resolve(v.ty))), m.span);
+                self.diags.error(format!("'sum_where' mask {} does not match the vector {}", ty_name(mc_ty), ty_name(self.resolve(v.ty))), m.span);
                 return err;
             }
             other => {
@@ -5890,10 +5891,11 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        match self.resolve(mc.ty) {
+        let mc_ty = self.resolve(mc.ty);
+        match mc_ty {
             Ty::Mask(ms, mn) if ms == s && mn == n => {}
             Ty::Mask(..) => {
-                self.diags.error(format!("'select' mask {} does not match the vectors {}", ty_name(self.resolve(mc.ty)), ty_name(Ty::Vec(s, n))), m.span);
+                self.diags.error(format!("'select' mask {} does not match the vectors {}", ty_name(mc_ty), ty_name(Ty::Vec(s, n))), m.span);
                 return err;
             }
             other => {
