@@ -766,7 +766,16 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   field projection (`s.field` → column slice), multi-column / mixed-width pipelines, `.to_soa()` +
   `json.decode → soa` construction, `group_by` over a soa, soa params/returns, and now **whole-element
   gather `s[i]`** (→ a Copy struct via `Rvalue::SoaGather`; `tests/soa.rs`, `examples/soa.align`) all
-  ship. Deferred: `str`/owned columns, `soa_slice<T>` sub-views, bitset/bool packed columns.
+  ship. **Single-column windowing `s.field[a..b]`** also ships: a projected column is an ordinary
+  `slice<FieldTy>`, so the existing slice sub-range (`SubSlice`) applies unchanged — no new type. This
+  slice also fixed a latent `Rvalue::SoaColumn` correctness bug: materialising a column as a *value*
+  (`c := s.field`, or sub-ranging it) used a flat `len*prefix` byte offset instead of the
+  `align_up`-padded `soa_column_offset` that the per-element `IndexColumn`/`StoreColumn`/`SoaAlloc`
+  paths use, so a column after a narrower one (e.g. `i64` after `bool`) read mid-padding (a silent
+  wrong answer; the pipeline-source path went through `IndexColumn` and was correct, which masked it).
+  Deferred: `str`/owned columns, the multi-column `soa_slice<T>` sub-view (`s[a..b]` over *every*
+  column — needs a `{ptr,total_len,start,count}` view repr since column stride depends on the
+  *original* row count; see `open-questions.md`), bitset/bool packed columns.
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 

@@ -381,6 +381,27 @@ element directly, the column-major analogue of AoS `arr[i].field`). `s[i].field`
 so the shared `lower_field_access` seam emits `IndexColumn` (one column read, **not** a whole-struct
 gather — verified in MIR). soa fields are scalar, so the field path is always length 1 and the leaf is
 Copy (no region/move concern). (`tests/soa.rs`, `examples/soa.align`.)
+**Column-windowing slice DONE — `s.field[a..b]` (+ a `SoaColumn` offset bug fix).** A projected
+column `s.field` is an ordinary `slice<FieldTy>`, so it **windows** with the existing slice sub-range:
+`s.pay[1..3].sum()` scans rows `1..3` of one column. No new type, no sema arm — the SubSlice path
+applies as-is once the column base is correct. Fixing that base was the real work: `Rvalue::SoaColumn`
+(the **value-materialization** path — `c := s.field`, passing a column, or sub-ranging it) computed
+the column byte offset as a **flat `len * prefix_bytes`**, while the per-element
+`IndexColumn`/`StoreColumn`/`SoaAlloc` paths use the `align_up`-padded `soa_column_offset`. The
+mixed-width `align_up` work (the "Second slice" note above) had only been applied to the per-element
+path, so a materialized column after a *narrower* one (`i64` after `bool`) pointed mid-padding and read
+garbage — a **silent wrong answer** that the example/tests missed because they only used the
+pipeline-source (`IndexColumn`) path. `SoaColumn` now calls the same `soa_column_offset`, so all four
+soa addressing sites agree. Regression + window tests in `tests/soa.rs`; `examples/soa.align`.
+**Multi-column `soa_slice<T>` (`s[a..b]` over *every* column) stays deferred** (and remains the open
+shape from the "Views/borrows of `soa<T>`" sub-question above): unlike a single column, a multi-column
+sub-view cannot reuse the `{ptr,len}` repr, because each column's stride is `align_up(total_rows *
+prefix, …)` — a function of the **original** row count, not the window length. A correct view needs
+`{ptr, total_len, start, count}` (threaded into `soa_column_offset` + a `+start` element bias at every
+access site, plus a 4-field runtime `json.decode → soa` out-write) — a cross-stage view-repr change of
+the same weight class as the deferred `bitset`. The single-column window covers the primary use
+(windowed column reduction) with none of that cost, so the multi-column view waits until a concrete
+need (e.g. a function taking a windowed multi-field view) justifies the repr change.
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
 
 ### Branchless `where` (sum/count) — DONE (2026-06-27)
