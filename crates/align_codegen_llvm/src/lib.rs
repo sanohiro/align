@@ -3855,14 +3855,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if matches!(self.f.operand_ty(op), Ty::Vec(..)) {
             return Ok(self.operand(op).into_vector_value());
         }
+        // The canonical splat: insert the scalar into lane 0, then `shufflevector` with an all-zero
+        // mask broadcasts lane 0 to every lane — two instructions regardless of width `N`.
         let scalar = self.operand(op);
         let vty = vec_llvm_ty(self.ctx, elem, n).into_vector_type();
-        let mut acc = vty.get_undef();
-        for i in 0..n {
-            let idx = self.ctx.i32_type().const_int(i as u64, false);
-            acc = self.builder.build_insert_element(acc, scalar, idx, "splat").map_err(|e| self.err(e))?;
-        }
-        Ok(acc)
+        let undef = vty.get_undef();
+        let init = self.builder.build_insert_element(undef, scalar, self.ctx.i32_type().const_zero(), "splat_init").map_err(|e| self.err(e))?;
+        let mask = self.ctx.i32_type().vec_type(n).const_zero();
+        Ok(self.builder.build_shuffle_vector(init, undef, mask, "splat").map_err(|e| self.err(e))?)
     }
 
     fn gen_vec_bin(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {
