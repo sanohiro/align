@@ -4779,8 +4779,21 @@ impl<'a, 't> Checker<'a, 't> {
             r.ty.is_numeric()
         };
         if !ok_ty {
-            let want = if float_only { "a float (or float-vector)" } else { "a numeric" };
-            self.diags.error(format!("'{name}' needs {want} receiver, got {}", ty_name(r.ty)), span);
+            // A vector receiver that didn't qualify gets a vector-specific reason (it *is* a vector,
+            // so "needs a float-vector" would be confusing): either a binary op (vector math is the
+            // unary ops only) or a non-float element (vector math is float-only).
+            let msg = match r.ty {
+                Ty::Vec(..) if want_args > 0 => format!(
+                    "'{name}' is not supported on a vector yet — vector math is the unary ops (abs/sqrt/floor/ceil/round/trunc), got {}",
+                    ty_name(r.ty)
+                ),
+                Ty::Vec(..) => format!("'{name}' on a vector needs a float vector (vector math is float-only), got {}", ty_name(r.ty)),
+                _ => {
+                    let want = if float_only { "a float (or float-vector)" } else { "a numeric" };
+                    format!("'{name}' needs {want} receiver, got {}", ty_name(r.ty))
+                }
+            };
+            self.diags.error(msg, span);
             return err;
         }
         if args.len() != want_args {
