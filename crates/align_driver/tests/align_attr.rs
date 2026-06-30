@@ -58,6 +58,18 @@ fn an_alignment_on_a_sum_type_is_rejected() {
 }
 
 #[test]
+fn an_aligned_struct_embedded_in_a_field_or_array_is_rejected() {
+    // The over-alignment is honored only for a standalone value (size-padding for embedding is
+    // deferred), so embedding it must be a clean error rather than a silently-dropped alignment.
+    let nested = "align(16) Inner {\n  x: i32,\n}\nOuter {\n  i: Inner,\n}\nfn main() -> i32 = 0\n";
+    assert!(check_errs("align-nested", nested));
+    let array = "align(16) S {\n  x: i32,\n}\nfn f(a: array<S>) -> i32 = 0\nfn main() -> i32 = 0\n";
+    assert!(check_errs("align-array", array));
+    let lit = "align(16) S {\n  x: i32,\n}\nfn main() -> i32 {\n  xs := [S { x: 1 }, S { x: 2 }]\n  return 0\n}\n";
+    assert!(check_errs("align-arraylit", lit));
+}
+
+#[test]
 fn a_too_large_alignment_is_rejected() {
     let src = "align(4294967296) Huge {\n  x: i32,\n}\nfn main() -> i32 = 0\n";
     assert!(check_errs("align-huge", src));

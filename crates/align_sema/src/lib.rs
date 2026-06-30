@@ -1331,6 +1331,16 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     for (i, (_m, _e, s)) in struct_decls.iter().enumerate() {
         for (fi, f) in s.fields.iter().enumerate() {
             let Ty::Struct(nid) = structs[i].fields[fi].ty else { continue };
+            // An `align(N)` struct embedded as a field is not honored yet — embedding needs the
+            // struct's size padded up to its alignment (deferred), so the over-alignment would be
+            // silently dropped. Reject it cleanly rather than mislead (only a standalone value is
+            // over-aligned today).
+            if structs[nid as usize].align.is_some() {
+                diags.error(
+                    format!("an `align(N)` struct ('{}') cannot be a struct field yet — its over-alignment is only honored for a standalone value", structs[nid as usize].name),
+                    f.span,
+                );
+            }
             // Seed the visiting path with the containing struct `i`, so a cycle back to it (even at
             // depth 1, `Node { next: Node }`) is detected.
             if !struct_acyclic(nid, &structs, &mut vec![i as u32]) {
@@ -5966,6 +5976,14 @@ impl<'a, 't> Checker<'a, 't> {
                     );
                     Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
                 }
+                // An `align(N)` struct element is not honored in an array yet (stride padding deferred).
+                Some(id) if self.structs[id as usize].align.is_some() => {
+                    self.diags.error(
+                        format!("an array of the `align(N)` struct '{}' is not supported yet (its over-alignment is not honored when embedded)", self.structs[id as usize].name),
+                        span,
+                    );
+                    Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
+                }
                 Some(id) => Expr {
                     kind: ExprKind::ArrayLit { elems: checked, elem: Ty::Struct(id) },
                     ty: Ty::StructArray(id, n),
@@ -9579,6 +9597,12 @@ fn resolve_type(
             // An `array<Struct>` is a dynamic AoS (its own owned type); only a primitive
             // element resolves to the scalar `array<T>` (`DynArray`).
             match inner {
+                // An `align(N)` struct element would need its size padded to its alignment for a
+                // tight, aligned stride (deferred) — reject embedding it in an array for now.
+                Ty::Struct(id) if cx.structs.get(id as usize).and_then(|s| s.align).is_some() => {
+                    diags.error(format!("an `align(N)` struct cannot be an `array` element yet (its over-alignment is not honored when embedded)"), span);
+                    Ty::Error
+                }
                 Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
                 _ => match scalar_arg(inner, "array element", false, span, diags) {
                     Some(s) => Ty::DynArray(s),

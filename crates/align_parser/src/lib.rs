@@ -254,7 +254,7 @@ impl<'a> Parser<'a> {
             return None;
         };
         self.expect(&TokKind::RParen, "')'");
-        if n <= 0 || (n & (n - 1)) != 0 {
+        if n <= 0 || !(n as u128).is_power_of_two() {
             self.diags.error(format!("an alignment must be a positive power of two, got {n}"), span);
             return None;
         }
