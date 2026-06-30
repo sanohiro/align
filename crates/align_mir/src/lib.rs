@@ -1754,6 +1754,14 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
             (Some((struct_id, layout)), Some(sv), 0, Operand::Value(len))
         }
+        // `s[i].field` on a soa — a column-major `{ptr,len}` view; the shared seam reads the one
+        // column directly as `IndexColumn`, no whole-struct gather.
+        Ty::Soa(_) => {
+            let sv = lower_expr(b, recv);
+            let len = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+            (Some((struct_id, Layout::Soa)), Some(sv), 0, Operand::Value(len))
+        }
         _ => {
             // A fixed `array<Struct>` slot (sema restricted `recv` to a literal / local).
             let (slot, n) = array_source_slot(b, recv);
