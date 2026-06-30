@@ -705,14 +705,26 @@ Completion condition: confirm that the vectorized code contains vector instructi
 
 ## M8 — Tooling and Quality — STARTED (first lint landed)
 
-- the official formatter (mandatory, `draft.md` §16). — not started
+- the official formatter (mandatory, `draft.md` §16). — **DONE** (`alignc fmt`, the `align_fmt`
+  crate; normalizes only meaningless variation, idempotent + meaning-preserving over every example).
 - the standard lints (allocation in loop / huge struct copy / unnecessary clone / unnecessary heap /
   unhandled Result / branch in hot loop / string re-scan / implicit copy).
   - **unhandled `Result` — DONE.** Discarding a `Result` as a statement is a compile **error** (not
     a warning — it fits "errors are visible / handled"): propagate with `?`, branch with `match` /
     `else`, or bind it (`r := …`). Checked inline in `check_block` (a `Stmt::Expr` of `Result` type).
-    (`tests/lint_unhandled_result.rs`, `examples/unhandled_result.align`.) The rest of the lint set
-    is not started.
+    (`tests/lint_unhandled_result.rs`, `examples/unhandled_result.align`.)
+  - **huge struct copy — DONE.** A struct passed or returned **by value** above a threshold (two
+    cache lines, `HUGE_STRUCT_BYTES = 128`) is a **warning** (a perf hint, not a hard error — the
+    program still compiles/runs): "narrow the struct (split hot/cold fields, `draft.md` §9) or pass a
+    `slice`/view." Chosen as the first *perf* lint because it is the only one in the set that is
+    **deterministic and profile-independent** — a fixed-size copy at every call boundary, not a
+    frequency-dependent cost — so it needs no `--profile` data and never false-positives (unlike the
+    allocation/clone/hot-loop lints, which depend on input size and are deferred under the perf-lint
+    principle that parked the `par_map` cost lint). Emitted in `check_fn` for a source signature only
+    (`mono_args` empty — a monomorph would duplicate it; a generic template's params are the opaque
+    `Ty::Param`, never a struct). Struct byte size is a faithful natural-alignment layout computed in
+    sema (`struct_size_align`, matching LLVM's default non-packed layout). (`tests/lint_huge_struct_copy.rs`,
+    `examples/huge_struct_copy.align`.) The remaining lints are not started.
 - `unsafe` blocks and `raw.*`. — not started
 
 ## Design Issues to Settle in Parallel

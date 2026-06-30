@@ -1,0 +1,23 @@
+// The "huge struct copy" lint (draft.md §16): passing or returning a large struct BY VALUE copies
+// every byte at each call boundary. Align passes structs by value (there are no references), so a
+// wide record is copied in full on every call. The data-oriented fix (draft.md §9) is to keep the
+// struct narrow — split the rarely-touched ("cold") fields out — so the value on the hot path is
+// small. This program stays under the lint's threshold: `Hot` is four words, copied cheaply, so it
+// emits no warning. A struct large enough (≈16+ `i64` fields, or 8+ `str` fields) passed by value
+// would warn: "huge struct copy: `…` (N bytes) is passed by value — narrow the struct or pass a view".
+
+// Narrow, hot record — cheap to pass by value (well under the lint threshold).
+Hot {
+  x: f64,
+  y: f64,
+  vx: f64,
+  vy: f64,
+}
+
+fn step(p: Hot) -> f64 = p.x + p.vx + (p.y + p.vy)
+
+fn main() -> i32 {
+  p := Hot { x: 1.0, y: 2.0, vx: 0.5, vy: 0.5 }
+  r := step(p)
+  return r as i32
+}
