@@ -2324,6 +2324,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let v = self.operand(vec).into_vector_value();
                 self.horizontal_minmax(v, *elem, *n, *max)?
             }
+            // `v.sum()` — add all lanes (the shared horizontal sum).
+            Rvalue::VecSum { vec, elem, n } => {
+                let v = self.operand(vec).into_vector_value();
+                self.horizontal_sum(v, matches!(elem, Ty::Float(_)), *n)?
+            }
             Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index, field`.
                 let agg = self.operand(base).into_struct_value();

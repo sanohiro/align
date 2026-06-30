@@ -194,6 +194,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::VecSumWhere { vec, mask, .. } => format!("sum_where({}, {})", operand_str(vec), operand_str(mask)),
         Rvalue::VecDot { a, b, .. } => format!("dot({}, {})", operand_str(a), operand_str(b)),
         Rvalue::VecMinMax { vec, max, .. } => format!("{}({})", if *max { "vmax" } else { "vmin" }, operand_str(vec)),
+        Rvalue::VecSum { vec, .. } => format!("vsum({})", operand_str(vec)),
         Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
             format!("{}[{}].{field} (struct#{struct_id})", operand_str(base), operand_str(index))
         }

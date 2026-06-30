@@ -1943,6 +1943,7 @@ impl EffectScan {
                 self.expr(b);
             }
             ExprKind::VecMinMax { vec, .. } => self.expr(vec),
+            ExprKind::VecSum { vec } => self.expr(vec),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt);
                 self.expr(fallback);
@@ -2583,6 +2584,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(b, depth);
             }
             ExprKind::VecMinMax { vec, .. } => self.walk(vec, depth),
+            ExprKind::VecSum { vec } => self.walk(vec, depth),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.walk(opt, depth);
                 self.walk(fallback, depth);
@@ -3002,6 +3004,7 @@ impl<'a> MoveCheck<'a> {
                 self.expr(b, moved, true, true);
             }
             ExprKind::VecMinMax { vec, .. } => self.expr(vec, moved, true, true),
+            ExprKind::VecSum { vec } => self.expr(vec, moved, true, true),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
                 // The fallback is an arm value: it inherits this position's `consuming` but is
@@ -5443,6 +5446,16 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // `sum` / `reduce` are the terminals of a fused pipeline.
         if method == "sum" {
+            // A `vecN<T>` receiver makes this the SIMD horizontal sum (the same surface as the array
+            // reduction `arr.sum()`). A pipeline-shaped receiver (`xs.map(f)`) routes to the array
+            // reduction; any other receiver is a value, routed to the vector reduction when it is a
+            // vector. (Mirrors the `min`/`max` dispatch.)
+            if args.is_empty() && !is_array_pipeline_recv(recv) {
+                let rv = self.check_expr(recv, None);
+                if let Ty::Vec(s, _) = self.resolve(rv.ty) {
+                    return Expr { kind: ExprKind::VecSum { vec: Box::new(rv) }, ty: scalar_to_ty(s), span };
+                }
+            }
             return self.check_array_sum(recv, args, expected, span);
         }
         if method == "reduce" {
@@ -8576,6 +8589,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(b);
             }
             ExprKind::VecMinMax { vec, .. } => self.finalize_expr(vec),
+            ExprKind::VecSum { vec } => self.finalize_expr(vec),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);
