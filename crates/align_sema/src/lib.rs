@@ -652,6 +652,10 @@ enum Place {
     /// `v[lane] = value` — write one lane of a `mut vecN<T>` local (M6). `lane` is a constant in
     /// `0..N`; `elem` is the element scalar. Lowers to `v = insertelement(v, value, lane)`.
     VecLane { local: LocalId, lane: u32, elem: Ty },
+    /// `base[index].field = value` — store one scalar field of element `index` of a `mut`
+    /// struct-array or soa local. `soa` selects the lowering (`StoreColumn` vs `StoreElemField`);
+    /// `ty` is the (scalar) field type the value is checked against.
+    ElemField { base: LocalId, index: Expr, field: u32, struct_id: u32, soa: bool, ty: Ty },
     Err,
 }
 
@@ -1806,7 +1810,7 @@ impl EffectScan {
         for s in &b.stmts {
             match s {
                 Stmt::Let { init, .. } | Stmt::Assign { value: init, .. } | Stmt::AssignField { value: init, .. } | Stmt::LetTuple { init, .. } => self.expr(init),
-                Stmt::AssignIndex { index, value, .. } => {
+                Stmt::AssignIndex { index, value, .. } | Stmt::AssignElemField { index, value, .. } => {
                     self.expr(index);
                     self.expr(value);
                 }
@@ -2375,9 +2379,9 @@ impl<'a> EscapeCheck<'a> {
                     self.local_backed_slice.insert(*local);
                 }
             }
-            // `base[index] = value` — primitive element store (first cut), so no region to track;
-            // just recurse into the index and value for nested escapes.
-            Stmt::AssignIndex { index, value, .. } => {
+            // `base[index] = value` / `base[index].field = value` — primitive (scalar) stores, so no
+            // region to track; just recurse into the index and value for nested escapes.
+            Stmt::AssignIndex { index, value, .. } | Stmt::AssignElemField { index, value, .. } => {
                 self.walk(index, depth);
                 self.walk(value, depth);
             }
@@ -2674,7 +2678,9 @@ fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
         hir::Stmt::Return(_) => true,
         hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
         hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
-        hir::Stmt::AssignIndex { index, value, .. } => hir_expr_diverges(index) || hir_expr_diverges(value),
+        hir::Stmt::AssignIndex { index, value, .. } | hir::Stmt::AssignElemField { index, value, .. } => {
+            hir_expr_diverges(index) || hir_expr_diverges(value)
+        }
         hir::Stmt::AssignVecLane { value, .. } => hir_expr_diverges(value),
         hir::Stmt::Expr(e) => hir_expr_diverges(e),
     }
@@ -2801,10 +2807,10 @@ impl<'a> MoveCheck<'a> {
                     clear_moved(moved, *local);
                 }
                 Stmt::AssignField { value, .. } => self.expr(value, moved, true, true),
-                // `base[index] = value` — writing an element is a use of `base` (an owned array
-                // could have been moved away), so flag use-after-move on it; index and value are
-                // read (not moved; Copy).
-                Stmt::AssignIndex { base, index, value } => {
+                // `base[index] = value` / `base[index].field = value` — writing an element is a use
+                // of `base` (an owned array could have been moved away), so flag use-after-move on
+                // it; index and value are read (not moved; Copy).
+                Stmt::AssignIndex { base, index, value } | Stmt::AssignElemField { base, index, value, .. } => {
                     if whole_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
                         self.diags.error(format!("use of moved value '{name}'"), index.span);
@@ -3727,6 +3733,10 @@ impl<'a, 't> Checker<'a, 't> {
                         let v = self.check_expr(value, Some(elem));
                         stmts.push(Stmt::AssignVecLane { local, lane, value: v });
                     }
+                    Place::ElemField { base, index, field, struct_id, soa, ty } => {
+                        let v = self.check_expr(value, Some(ty));
+                        stmts.push(Stmt::AssignElemField { base, index, field, struct_id, soa, value: v });
+                    }
                     Place::Err => {
                         let v = self.check_expr(value, None);
                         stmts.push(Stmt::Expr(v));
@@ -3835,6 +3845,41 @@ impl<'a, 't> Checker<'a, 't> {
                 return Place::Err;
             }
             return Place::Index { base: id, index: i, elem };
+        }
+        // `local[index].field = v` — store one scalar field of a struct-array / soa element (the
+        // write counterpart of the `c[i].field` read). One field is written, no whole-element copy.
+        if let ast::ExprKind::FieldAccess { recv, field } = &place.kind {
+            if let ast::ExprKind::Index { recv: irecv, index } = &recv.kind {
+                if let Some((id, local_ty)) = self.place_local(irecv) {
+                    let soa = match local_ty {
+                        Ty::Soa(sid) => Some((sid, true)),
+                        Ty::StructArray(sid, _) => Some((sid, false)),
+                        _ => None,
+                    };
+                    if let Some((struct_id, soa)) = soa {
+                        if !self.locals[id as usize].is_mut {
+                            let name = self.locals[id as usize].name.clone();
+                            self.diags.error(
+                                format!("cannot assign to a field of an element of immutable '{name}' (declare with `mut`)"),
+                                place.span,
+                            );
+                        }
+                        let (field_idx, ty) = match self.field_of(Ty::Struct(struct_id), &field.name, place.span) {
+                            Some(f) => f,
+                            None => return Place::Err,
+                        };
+                        let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                        if i.ty == Ty::Error {
+                            return Place::Err;
+                        }
+                        if !i.ty.is_int_like() {
+                            self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
+                            return Place::Err;
+                        }
+                        return Place::ElemField { base: id, index: i, field: field_idx, struct_id, soa, ty };
+                    }
+                }
+            }
         }
         // `local.f0.f1.… = v` — a (possibly nested) field path rooted at a mutable local.
         if let ast::ExprKind::FieldAccess { recv, field } = &place.kind {
@@ -8720,7 +8765,7 @@ impl<'a, 't> Checker<'a, 't> {
                 Stmt::Let { init, .. } => self.finalize_expr(init),
                 Stmt::Assign { value, .. } => self.finalize_expr(value),
                 Stmt::AssignField { value, .. } => self.finalize_expr(value),
-                Stmt::AssignIndex { index, value, .. } => {
+                Stmt::AssignIndex { index, value, .. } | Stmt::AssignElemField { index, value, .. } => {
                     self.finalize_expr(index);
                     self.finalize_expr(value);
                 }

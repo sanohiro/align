@@ -188,6 +188,12 @@ pub enum Stmt {
     /// `root.f0.f1.… = value` — store into a (possibly nested) field of a struct local. `path` is
     /// the chain of field indices (length ≥ 1).
     AssignField { root: LocalId, path: Vec<u32>, value: Expr },
+    /// `base[index].field = value` — store one scalar field of element `index` of a struct-array or
+    /// soa local (the write counterpart of the `base[index].field` read). `soa` picks the lowering:
+    /// a column store (`StoreColumn`) for a `soa<Struct>`, else a slot element-field store
+    /// (`StoreElemField`) for a fixed `array<Struct>`. Lowering emits a bounds check. `field` is the
+    /// (scalar) field index; soa/struct fields are primitive, so no whole-element copy or drop.
+    AssignElemField { base: LocalId, index: Expr, field: u32, struct_id: u32, soa: bool, value: Expr },
     Return(Option<Expr>),
     Expr(Expr),
 }

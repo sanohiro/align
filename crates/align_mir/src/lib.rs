@@ -920,6 +920,45 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 other => unreachable!("element assignment into non-array/slice {other:?}"),
             }
         }
+        hir::Stmt::AssignElemField { base, index, field, struct_id, soa, value } => {
+            // `base[index].field = value` — bounds-checked element-field store (the write
+            // counterpart of the `base[index].field` read). A `soa<Struct>` writes one column
+            // (`StoreColumn`, the column-major `align_up` offset chain); a fixed `array<Struct>`
+            // writes its slot element-field directly (`StoreElemField`, a `[0,index,field]` GEP).
+            let idx = lower_expr(b, index);
+            let val = lower_expr(b, value);
+            if *soa {
+                let soa_ty = b.slots[*base as usize];
+                let sv = b.fresh_value(soa_ty);
+                b.push(Stmt::Let(sv, Rvalue::Load(*base)));
+                let len = b.fresh_value(i64_ty());
+                b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(sv))));
+                emit_bounds_check(b, &idx, Operand::Value(len));
+                // The column buffer's element-pointer type is opaque, so the `Box` scalar is
+                // irrelevant (matches `transpose_to_soa`) — use the first field's. A soa struct
+                // always has ≥1 field (sema enforces non-empty).
+                let first_field = b.structs[*struct_id as usize].fields.first().expect("a soa struct has at least one field");
+                let first_scalar = align_sema::ty_to_scalar(first_field.ty).expect("soa field is a scalar");
+                let ptr = b.fresh_value(Ty::Box(first_scalar));
+                b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(sv))));
+                b.push(Stmt::StoreColumn {
+                    base: Operand::Value(ptr),
+                    len: Operand::Value(len),
+                    index: idx,
+                    field: *field,
+                    struct_id: *struct_id,
+                    value: val,
+                });
+            } else {
+                // A fixed `array<Struct>` slot (sema restricts the receiver to a `mut` local).
+                let n = match b.slots[*base as usize] {
+                    Ty::StructArray(_, n) => n,
+                    other => unreachable!("soa=false element-field assignment into {other:?}"),
+                };
+                emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
+                b.push(Stmt::StoreElemField(*base, idx, *field, val));
+            }
+        }
         // `v[lane] = value` → `v = insertelement(v, value, lane)` (a vector is a register value).
         hir::Stmt::AssignVecLane { local, lane, value } => {
             let val = lower_expr(b, value);
