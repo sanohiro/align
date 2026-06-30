@@ -853,8 +853,10 @@ primitive-scalar struct is implemented — field-column projection `ps.field`, m
 (each padded to its alignment), a column-spanning `rs.where(.active).pay.sum()` (branchless, ≈3× an
 AoS filtered aggregate), `.to_soa()` construction (transpose an `array<Struct>`, arena-allocated),
 and decode-direct-to-`soa` (`s: soa<User> := json.decode(d)?`, decode-AoS-then-transpose) all work,
-feeding the normal pipeline. The plain column scan beats AoS ≈7×. The remaining slices are
-known-schema field-skip decode (parse only the used columns) and `str`/owned columns.)*
+feeding the normal pipeline. A projected column is an ordinary `slice<FieldTy>`, so it **windows**
+like any slice — `s.pay[a..b].sum()` scans rows `a..b` of one column. The plain column scan beats
+AoS ≈7×. The remaining slices are known-schema field-skip decode (parse only the used columns),
+`str`/owned columns, and a multi-column `soa_slice<T>` sub-view (`s[a..b]` over every column).)*
 
 ### Over-alignment (`align(N)`)
 

@@ -693,3 +693,94 @@ fn soa_indexed_field_reads_one_column() {
     );
     assert_eq!(out.status.code(), Some(16));
 }
+
+#[test]
+fn soa_materialized_column_uses_padded_offset() {
+    if !backend_available() {
+        return;
+    }
+    // Regression: materialising a column as a value (`c := s.field`) lowers to `Rvalue::SoaColumn`,
+    // which must use the SAME `align_up`-padded column offset as the per-element `IndexColumn` read.
+    // Here `score`/`age` sit after a 1-byte `bool` column, so a flat `len*prefix` offset (the old
+    // bug) would land mid-padding and read garbage. score: 10+99+20 = 129; age: 30+40+25 = 95.
+    let out = build_and_run(
+        "soa-mat-col",
+        concat!(
+            "User { active: bool, score: i64, age: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [\n",
+            "      User { active: true, score: 10, age: 30 },\n",
+            "      User { active: false, score: 99, age: 40 },\n",
+            "      User { active: true, score: 20, age: 25 },\n",
+            "    ]\n",
+            "    s := rows.to_soa()\n",
+            "    sc := s.score\n",
+            "    ag := s.age\n",
+            "    return (sc.sum() + ag.sum()) as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(224)); // (129 + 95) & 0xff
+}
+
+#[test]
+fn soa_column_window_sums_a_subrange() {
+    if !backend_available() {
+        return;
+    }
+    // `s.field[a..b]` windows one column (the column projection is a `slice<FieldTy>`, so the
+    // existing slice sub-range applies). `score[1..3]` = {99, 20}, sum = 119. The window is over a
+    // padded column (after a `bool`), so this also exercises the corrected `SoaColumn` offset.
+    let out = build_and_run(
+        "soa-col-window",
+        concat!(
+            "User { active: bool, score: i64, age: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [\n",
+            "      User { active: true, score: 10, age: 30 },\n",
+            "      User { active: false, score: 99, age: 40 },\n",
+            "      User { active: true, score: 20, age: 25 },\n",
+            "      User { active: true, score: 5, age: 50 },\n",
+            "    ]\n",
+            "    s := rows.to_soa()\n",
+            "    return s.score[1..3].sum() as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(119));
+}
+
+#[test]
+fn soa_column_window_len_and_open_ends() {
+    if !backend_available() {
+        return;
+    }
+    // A windowed column keeps a correct `{ptr,len}`: `score[1..3].len()` = 2, `score[2..].sum()` =
+    // 20 + 5 = 25, `score[..2].sum()` = 10 + 99 = 109. Returns 2 + 25 + 109 = 136.
+    let out = build_and_run(
+        "soa-col-window-ends",
+        concat!(
+            "User { active: bool, score: i64, age: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [\n",
+            "      User { active: true, score: 10, age: 30 },\n",
+            "      User { active: false, score: 99, age: 40 },\n",
+            "      User { active: true, score: 20, age: 25 },\n",
+            "      User { active: true, score: 5, age: 50 },\n",
+            "    ]\n",
+            "    s := rows.to_soa()\n",
+            "    n := s.score[1..3].len()\n",
+            "    tail := s.score[2..].sum()\n",
+            "    head := s.score[..2].sum()\n",
+            "    return (n + tail + head) as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(136));
+}

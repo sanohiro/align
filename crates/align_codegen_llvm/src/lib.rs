@@ -1975,8 +1975,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::SoaColumn { base, struct_id, field } => {
                 // Load the soa `{ ptr, len }`, then view the `field`-th column: the buffer is
-                // column-major, so column `field` begins at `ptr + len * prefix_bytes` (the sizes
-                // of the preceding fields) and has the same `len`.
+                // column-major, so column `field` begins at `ptr + soa_column_offset(len, …)` (the
+                // `align_up`-padded prefix of the preceding columns) and has the same `len`. This
+                // MUST match the offset math used by `IndexColumn` / `StoreColumn` / `SoaAlloc`,
+                // otherwise a materialized column slice and a per-element column read disagree.
                 let sty = slice_struct_type(self.ctx);
                 let soa = self
                     .builder
@@ -1985,12 +1987,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into_struct_value();
                 let ptr = self.builder.build_extract_value(soa, 0, "soaptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let len = self.builder.build_extract_value(soa, 1, "soalen").map_err(|e| self.err(e))?.into_int_value();
-                let prefix: u64 = self.structs[*struct_id as usize].fields[..*field as usize]
-                    .iter()
-                    .map(|f| scalar_bytes(align_sema::ty_to_scalar(f.ty).expect("soa field is a scalar")))
-                    .sum();
-                let i64t = self.ctx.i64_type();
-                let byte_off = self.builder.build_int_mul(len, i64t.const_int(prefix, false), "coloff").map_err(|e| self.err(e))?;
+                let sizes = self.soa_field_sizes(*struct_id);
+                let byte_off = self.soa_column_offset(len, &sizes, *field as usize)?;
                 let new_ptr = unsafe {
                     self.builder
                         .build_in_bounds_gep(self.ctx.i8_type(), ptr, &[byte_off], "colptr")
