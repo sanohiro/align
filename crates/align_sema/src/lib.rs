@@ -8120,7 +8120,7 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::Soa(id) => id,
             Ty::Error => return err,
             other => {
-                self.diags.error(format!("'arr[i].{}' needs a struct array, got {}", fields[0].name, ty_name(other)), span);
+                self.diags.error(format!("'arr[i].{}' needs a struct array or soa, got {}", fields[0].name, ty_name(other)), span);
                 return err;
             }
         };
