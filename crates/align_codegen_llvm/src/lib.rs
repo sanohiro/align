@@ -2315,6 +2315,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let idx = self.ctx.i32_type().const_int(*lane as u64, false);
                 self.builder.build_extract_element(v, idx, "vext").map_err(|e| self.err(e))?
             }
+            // Write `value` into lane `lane` (`insertelement`), yielding the new vector.
+            Rvalue::VecInsert { vec, value, lane } => {
+                let v = self.operand(vec).into_vector_value();
+                let val = self.operand(value);
+                let idx = self.ctx.i32_type().const_int(*lane as u64, false);
+                self.builder.build_insert_element(v, val, idx, "vins").map_err(|e| self.err(e))?.into()
+            }
             // `vec.sum_where(mask)` — `select(mask, vec, 0)` then add all N lanes (M6).
             Rvalue::VecSumWhere { vec, mask, elem, n } => {
                 let v = self.operand(vec).into_vector_value();

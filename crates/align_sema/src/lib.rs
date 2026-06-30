@@ -648,6 +648,9 @@ enum Place {
     /// `base[index] = value` — an element store into a `mut` array local or an `out` slice
     /// parameter. `index` is the checked (`i64`) subscript; `elem` is the element type.
     Index { base: LocalId, index: Expr, elem: Ty },
+    /// `v[lane] = value` — write one lane of a `mut vecN<T>` local (M6). `lane` is a constant in
+    /// `0..N`; `elem` is the element scalar. Lowers to `v = insertelement(v, value, lane)`.
+    VecLane { local: LocalId, lane: u32, elem: Ty },
     Err,
 }
 
@@ -1797,6 +1800,7 @@ impl EffectScan {
                     self.expr(index);
                     self.expr(value);
                 }
+                Stmt::AssignVecLane { value, .. } => self.expr(value),
                 Stmt::Return(Some(e)) | Stmt::Expr(e) => self.expr(e),
                 Stmt::Return(None) => {}
             }
@@ -2363,6 +2367,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(index, depth);
                 self.walk(value, depth);
             }
+            Stmt::AssignVecLane { value, .. } => self.walk(value, depth),
             Stmt::Assign { local, value, .. } => {
                 self.walk(value, depth);
                 // Conservative without a dataflow join: a binding that is *ever* assigned a
@@ -2656,6 +2661,7 @@ fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
         hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
         hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
         hir::Stmt::AssignIndex { index, value, .. } => hir_expr_diverges(index) || hir_expr_diverges(value),
+        hir::Stmt::AssignVecLane { value, .. } => hir_expr_diverges(value),
         hir::Stmt::Expr(e) => hir_expr_diverges(e),
     }
 }
@@ -2792,6 +2798,7 @@ impl<'a> MoveCheck<'a> {
                     self.expr(index, moved, false, false);
                     self.expr(value, moved, false, false);
                 }
+                Stmt::AssignVecLane { value, .. } => self.expr(value, moved, false, false),
                 Stmt::Return(Some(e)) => self.expr(e, moved, true, true),
                 Stmt::Return(None) => {}
                 Stmt::Expr(e) => self.expr(e, moved, false, false),
@@ -3702,6 +3709,10 @@ impl<'a, 't> Checker<'a, 't> {
                         let v = self.check_expr(value, Some(elem));
                         stmts.push(Stmt::AssignIndex { base, index, value: v });
                     }
+                    Place::VecLane { local, lane, elem } => {
+                        let v = self.check_expr(value, Some(elem));
+                        stmts.push(Stmt::AssignVecLane { local, lane, value: v });
+                    }
                     Place::Err => {
                         let v = self.check_expr(value, None);
                         stmts.push(Stmt::Expr(v));
@@ -3768,6 +3779,17 @@ impl<'a, 't> Checker<'a, 't> {
                     format!("cannot assign to an element of immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                     place.span,
                 );
+            }
+            // `v[lane] = x` — write one lane of a `mut` vector (a constant lane in `0..N`, M6).
+            if let Ty::Vec(s, n) = local_ty {
+                let lane = match &index.kind {
+                    ast::ExprKind::Int(v) if *v >= 0 && (*v as u128) < n as u128 => *v as u32,
+                    _ => {
+                        self.diags.error(format!("a vector lane index must be a constant in 0..{n}"), index.span);
+                        return Place::Err;
+                    }
+                };
+                return Place::VecLane { local: id, lane, elem: scalar_to_ty(s) };
             }
             let elem = match local_ty {
                 Ty::Slice(s) | Ty::Array(s, _) | Ty::DynArray(s) => scalar_to_ty(s),
@@ -8569,6 +8591,7 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(index);
                     self.finalize_expr(value);
                 }
+                Stmt::AssignVecLane { value, .. } => self.finalize_expr(value),
                 Stmt::Return(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
                 Stmt::Return(None) => {}
                 Stmt::LetTuple { init, .. } => self.finalize_expr(init),

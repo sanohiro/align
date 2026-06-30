@@ -261,9 +261,18 @@ hidden). Both are **bounds-checked** (`0 <= i && i + N <= len`, reusing the rang
 store reuses the `out`-slice writability rule (`place[i] = v`). Codegen GEPs `&buf[i]` and emits the
 `<N x T>` load/store **at the element alignment** — the GEP yields only an element-aligned pointer, so
 assuming the wider vector alignment would be UB on strict-alignment targets (an unaligned-but-valid
-vector access). `hir::VecLoad`/`hir::VecStore` → `Rvalue::VecLoad` / `Stmt::VecStore`. Still deferred:
-scalar-on-the-left broadcast, the generic `vec<N,T>` spelling, lane assignment, a written `mask<T>`
-annotation, an aligned-load fast path, the tree reduction. (`examples/vec_load_store.align`.)
+vector access). `hir::VecLoad`/`hir::VecStore` → `Rvalue::VecLoad` / `Stmt::VecStore`.
+(`examples/vec_load_store.align`.)
+
+**Slice 8 DONE — lane assignment `v[i] = x`.** Writes one lane `i` (a constant in `0..N`) of a `mut
+vecN<T>` local to the scalar `x` — the write counterpart of the lane read `v[i]`. A vector is a
+register value (not memory), so it lowers to `v = insertelement(v, x, i)`: a new `Place::VecLane`
+(detected in `check_place` when the index target is a vector local) → `hir::Stmt::AssignVecLane` →
+`Rvalue::VecInsert`, which re-stores the updated vector into the local. Reuses the mutable-place
+writability rule (a `mut` local; an immutable vector, or a dynamic / out-of-range lane, is rejected,
+matching the lane read). Still deferred: scalar-on-the-left broadcast, the generic `vec<N,T>`
+spelling, a written `mask<T>` annotation, an aligned-load fast path, the SIMD-unit tree reduction.
+(`examples/vec_lane_set.align`.)
 
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element

@@ -145,6 +145,38 @@ fn float_comparison_select_is_elementwise() {
 }
 
 #[test]
+fn lane_assignment_writes_one_lane() {
+    if !backend_available() {
+        return;
+    }
+    // `v[i] = x` writes a single lane: v = [10, 99, 30, 1]; sum = 140.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  mut v: vec4<i32> := [10, 20, 30, 40]\n",
+        "  v[1] = 99\n",
+        "  v[3] = 1\n",
+        "  return v[0] + v[1] + v[2] + v[3]\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-laneset", src);
+    assert_eq!(out.status.code(), Some(140));
+}
+
+#[test]
+fn lane_assignment_to_an_immutable_vector_is_rejected() {
+    let src = "fn main() -> i32 {\n  v: vec4<i32> := [1, 2, 3, 4]\n  v[0] = 9\n  return v[0]\n}\n";
+    assert!(check_errs("vec-laneset-immut", src));
+}
+
+#[test]
+fn lane_assignment_with_a_non_constant_or_oob_lane_is_rejected() {
+    let dyn_lane = "fn main() -> i32 {\n  mut v: vec4<i32> := [1, 2, 3, 4]\n  mut i := 0\n  v[i] = 9\n  return v[0]\n}\n";
+    assert!(check_errs("vec-laneset-dyn", dyn_lane));
+    let oob = "fn main() -> i32 {\n  mut v: vec4<i32> := [1, 2, 3, 4]\n  v[4] = 9\n  return v[0]\n}\n";
+    assert!(check_errs("vec-laneset-oob", oob));
+}
+
+#[test]
 fn vector_load_and_store_roundtrip() {
     if !backend_available() {
         return;

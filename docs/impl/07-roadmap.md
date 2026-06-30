@@ -704,9 +704,14 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     element-aligned pointer, so the vector access must not assume the wider vector alignment — an
     unaligned-but-valid access). The store reuses the `out`-slice writability rule (`place[i] = v`).
     This is the bridge between bulk array data and SIMD registers. (`examples/vec_load_store.align`.)
-    Still deferred: scalar-on-the-left broadcast, the generic `vec<N,T>` spelling, lane assignment, a
-    written `mask<T>` annotation, a SIMD-unit tree reduction (the reductions extract-and-fold; -O2
-    reshapes them).
+  - **lane assignment slice 8 — DONE.** `v[i] = x` writes one lane `i` (a constant in `0..N`) of a
+    `mut vecN<T>` local to the scalar `x` — the write counterpart of the lane read `v[i]`. A vector is
+    a register value, so it lowers to `v = insertelement(v, x, i)` (a new `Place::VecLane` →
+    `hir::Stmt::AssignVecLane` → `Rvalue::VecInsert`, re-storing the local). Reuses the mutable-place
+    writability rule (a `mut` local; an immutable vector / dynamic or out-of-range lane is rejected).
+    (`examples/vec_lane_set.align`.) Still deferred: scalar-on-the-left broadcast, the generic
+    `vec<N,T>` spelling, a written `mask<T>` annotation, a SIMD-unit tree reduction (the reductions
+    extract-and-fold; -O2 reshapes them).
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.
