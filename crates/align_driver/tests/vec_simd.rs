@@ -145,6 +145,57 @@ fn float_comparison_select_is_elementwise() {
 }
 
 #[test]
+fn scalar_broadcasts_in_vector_arithmetic() {
+    if !backend_available() {
+        return;
+    }
+    // A scalar on the right of a vector op broadcasts across the lanes:
+    // c = a + 5 = [15, 25, 35, 45]; d = c * 2 = [30, 50, 70, 90]; d[1] + d[3] = 50 + 90 = 140.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [10, 20, 30, 40]\n",
+        "  c := a + 5\n",
+        "  d := c * 2\n",
+        "  return d[1] + d[3]\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-bcast", src);
+    assert_eq!(out.status.code(), Some(140));
+}
+
+#[test]
+fn sum_where_is_a_masked_horizontal_sum() {
+    if !backend_available() {
+        return;
+    }
+    // The draft §9 example: sum the lanes above 80. scores = [70,90,60,85]; >80 → 90 + 85 = 175.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  scores: vec4<i32> := [70, 90, 60, 85]\n",
+        "  m := scores > 80\n",
+        "  return scores.sum_where(m)\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-sumwhere", src);
+    assert_eq!(out.status.code(), Some(175));
+}
+
+#[test]
+fn broadcasting_a_mismatched_scalar_type_is_rejected() {
+    // A float scalar cannot broadcast into an int vector.
+    let src = "fn main() -> i32 {\n  a: vec4<i32> := [1, 2, 3, 4]\n  c := a + 2.0\n  return c[0]\n}\n";
+    assert!(check_errs("vec-bcast-mismatch", src));
+}
+
+#[test]
+fn scalar_on_the_left_of_a_vector_is_rejected() {
+    // Broadcast requires the vector on the left (`a + 5`, not `5 + a`) — the scalar-left form is
+    // deferred, and must be a clean error, not a panic.
+    let src = "fn main() -> i32 {\n  a: vec4<i32> := [1, 2, 3, 4]\n  c := 5 + a\n  return c[0]\n}\n";
+    assert!(check_errs("vec-scalar-left", src));
+}
+
+#[test]
 fn select_with_a_non_mask_first_arg_is_rejected() {
     // `select`'s first argument must be a mask (a vector comparison result), not a vector.
     let src = concat!(

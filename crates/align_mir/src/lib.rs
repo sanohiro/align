@@ -216,6 +216,9 @@ pub enum Rvalue {
     MakeVec { elems: Vec<Operand>, elem: Ty, n: u32 },
     /// Read lane `lane` of a vector operand (`extractelement`); the result is the element `elem`.
     VecExtract { vec: Operand, lane: u32, elem: Ty },
+    /// `vec.sum_where(mask)` — masked horizontal sum (M6): `select(mask, vec, 0)` then add all `n`
+    /// lanes, yielding the element scalar `elem`.
+    VecSumWhere { vec: Operand, mask: Operand, elem: Ty, n: u32 },
     /// `base[index].field` for a `{ptr,len}` view of struct `struct_id` (an owned, dynamic
     /// `array<Struct>`, MMv2 slice 8d-2). Like [`IndexField`] but addressed through the loaded
     /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
@@ -1442,6 +1445,19 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let bv = lower_expr(b, bexpr);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Select { cond, a: av, b: bv }));
+            Operand::Value(v)
+        }
+        // `vec.sum_where(mask)` → masked horizontal sum. `e.ty` is the element scalar; the width is
+        // recovered from the receiver's vector type.
+        hir::ExprKind::VecSumWhere { vec, mask } => {
+            let n = match vec.ty {
+                Ty::Vec(_, n) => n,
+                _ => unreachable!("sema types sum_where's receiver as a vector"),
+            };
+            let vv = lower_expr(b, vec);
+            let mv = lower_expr(b, mask);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::VecSumWhere { vec: vv, mask: mv, elem: e.ty, n }));
             Operand::Value(v)
         }
         // A `vecN<T>` literal is a register value: build it via an insertelement chain (`MakeVec`).

@@ -2299,6 +2299,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let idx = self.ctx.i32_type().const_int(*lane as u64, false);
                 self.builder.build_extract_element(v, idx, "vext").map_err(|e| self.err(e))?
             }
+            // `vec.sum_where(mask)` — `select(mask, vec, 0)` then add all N lanes (M6).
+            Rvalue::VecSumWhere { vec, mask, elem, n } => {
+                let v = self.operand(vec).into_vector_value();
+                let m = self.operand(mask).into_vector_value();
+                let zero = vec_llvm_ty(self.ctx, *elem, *n).into_vector_type().const_zero();
+                let masked = self.builder.build_select(m, v, zero, "swsel").map_err(|e| self.err(e))?.into_vector_value();
+                let is_float = matches!(elem, Ty::Float(_));
+                // Horizontal sum: accumulate the N lanes (the optimizer turns this into a reduction).
+                let mut acc = self.builder.build_extract_element(masked, self.ctx.i32_type().const_zero(), "sw0").map_err(|e| self.err(e))?;
+                for i in 1..*n {
+                    let idx = self.ctx.i32_type().const_int(i as u64, false);
+                    let lane = self.builder.build_extract_element(masked, idx, "swl").map_err(|e| self.err(e))?;
+                    acc = if is_float {
+                        self.builder.build_float_add(acc.into_float_value(), lane.into_float_value(), "swfadd").map_err(|e| self.err(e))?.into()
+                    } else {
+                        self.builder.build_int_add(acc.into_int_value(), lane.into_int_value(), "swadd").map_err(|e| self.err(e))?.into()
+                    };
+                }
+                acc
+            }
             Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index, field`.
                 let agg = self.operand(base).into_struct_value();
@@ -3423,12 +3443,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
             return self.gen_str_eq(op, a, b);
         }
         // A `vecN<T>` operand (M6): a comparison yields a `<N x i1>` mask, arithmetic stays a vector.
-        if let Ty::Vec(elem, _) = self.f.operand_ty(a) {
+        // The vector is the left operand (sema); a scalar right operand is broadcast to the lanes.
+        if let Ty::Vec(elem, n) = self.f.operand_ty(a) {
             let et = scalar_to_ty(elem);
             if is_comparison(op) {
-                return self.gen_vec_cmp(op, a, b, et);
+                return self.gen_vec_cmp(op, a, b, et, n);
             }
-            return self.gen_vec_bin(op, a, b, et);
+            return self.gen_vec_bin(op, a, b, et, n);
         }
         if matches!(self.f.operand_ty(a), Ty::Float(_)) {
             return self.gen_float_bin(op, a, b);
@@ -3827,9 +3848,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// Elementwise vector arithmetic for `vecN<T>` (M6). The element `Ty` selects the float or
     /// integer LLVM builder; inkwell's `build_int_*`/`build_float_*` accept a `VectorValue`, so the
     /// op applies lane-wise. sema restricts vector ops to `+`/`-`/`*`/`/`.
-    fn gen_vec_bin(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty) -> Result<BasicValueEnum<'c>, CodegenError> {
-        let l = self.operand(a).into_vector_value();
-        let r = self.operand(b).into_vector_value();
+    /// Fetch an operand as a `<N x elem>` vector — a vector value as-is, or a **scalar broadcast**
+    /// across all N lanes (M6: `a + 2.0`, `scores > 80`). The all-lane insertelement chain folds to a
+    /// hardware broadcast at `-O2`.
+    fn operand_as_vector(&mut self, op: &Operand, elem: Ty, n: u32) -> Result<inkwell::values::VectorValue<'c>, CodegenError> {
+        if matches!(self.f.operand_ty(op), Ty::Vec(..)) {
+            return Ok(self.operand(op).into_vector_value());
+        }
+        // The canonical splat: insert the scalar into lane 0, then `shufflevector` with an all-zero
+        // mask broadcasts lane 0 to every lane — two instructions regardless of width `N`.
+        let scalar = self.operand(op);
+        let vty = vec_llvm_ty(self.ctx, elem, n).into_vector_type();
+        let undef = vty.get_undef();
+        let init = self.builder.build_insert_element(undef, scalar, self.ctx.i32_type().const_zero(), "splat_init").map_err(|e| self.err(e))?;
+        let mask = self.ctx.i32_type().vec_type(n).const_zero();
+        Ok(self.builder.build_shuffle_vector(init, undef, mask, "splat").map_err(|e| self.err(e))?)
+    }
+
+    fn gen_vec_bin(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let l = self.operand_as_vector(a, elem, n)?;
+        let r = self.operand_as_vector(b, elem, n)?;
         let bld = self.builder;
         // sema restricts vector ops to `+`/`-`/`*`/`/`; guard here too so any future sema hole is a
         // clean codegen error, never a panic.
@@ -3859,9 +3897,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// A `vecN<T>` comparison (M6) → a `<N x i1>` mask. The element `Ty` selects integer vs float
     /// comparison; inkwell's `build_int_compare`/`build_float_compare` accept `VectorValue`, so the
     /// predicate applies lane-wise. (Reuses the scalar predicate mapping — `pred`/`FloatPredicate`.)
-    fn gen_vec_cmp(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty) -> Result<BasicValueEnum<'c>, CodegenError> {
-        let l = self.operand(a).into_vector_value();
-        let r = self.operand(b).into_vector_value();
+    fn gen_vec_cmp(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let l = self.operand_as_vector(a, elem, n)?;
+        let r = self.operand_as_vector(b, elem, n)?;
         let bld = self.builder;
         let v = if matches!(elem, Ty::Float(_)) {
             let p = match op {
