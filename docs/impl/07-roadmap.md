@@ -773,9 +773,16 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   `align_up`-padded `soa_column_offset` that the per-element `IndexColumn`/`StoreColumn`/`SoaAlloc`
   paths use, so a column after a narrower one (e.g. `i64` after `bool`) read mid-padding (a silent
   wrong answer; the pipeline-source path went through `IndexColumn` and was correct, which masked it).
-  Deferred: `str`/owned columns, the multi-column `soa_slice<T>` sub-view (`s[a..b]` over *every*
-  column — needs a `{ptr,total_len,start,count}` view repr since column stride depends on the
-  *original* row count; see `open-questions.md`), bitset/bool packed columns.
+  **In-place element-field write `s[i].field = v`** also ships (with the AoS counterpart `arr[i].field
+  = v` for a `mut array<Struct>`): the write counterpart of the `c[i].field` read, a single surface
+  (`hir::Stmt::AssignElemField`, new `Place::ElemField`) that lowers by layout — `Stmt::StoreColumn`
+  for a soa, slot `Stmt::StoreElemField` for a fixed struct array (both already existed for `.to_soa()`
+  construction; now reachable from user assignment), bounds-checked, `mut`-gated. The stored value is a
+  scalar field, so no move/region concern. Deferred: `str`/owned columns, the multi-column
+  `soa_slice<T>` sub-view (`s[a..b]` over *every* column — needs a `{ptr,total_len,start,count}` view
+  repr since column stride depends on the *original* row count; see `open-questions.md`), the dynamic
+  `array<Struct>` (`DynStructArray`) element-field write (needs a pointer-based `StoreElemFieldPtr`,
+  the write dual of `IndexFieldPtr`), bitset/bool packed columns.
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 

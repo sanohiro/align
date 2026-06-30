@@ -784,3 +784,74 @@ fn soa_column_window_len_and_open_ends() {
     );
     assert_eq!(out.status.code(), Some(136));
 }
+
+#[test]
+fn soa_elem_field_assign_writes_one_column() {
+    if !backend_available() {
+        return;
+    }
+    // `s[i].field = v` — the write counterpart of the `s[i].field` read: a column store
+    // (`StoreColumn`) at row `i`, the soa analogue of AoS `arr[i].field = v`. The padded `score`/
+    // `age` columns (after a `bool`) exercise the `align_up` offset on the write side too.
+    // s[0].score=77, s[1].age=5, s[0].active stays true(1) → 77 + 5 + 1 = 83.
+    let out = build_and_run(
+        "soa-elem-field-assign",
+        concat!(
+            "User { active: bool, score: i64, age: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [\n",
+            "      User { active: true, score: 1, age: 9 },\n",
+            "      User { active: false, score: 3, age: 7 },\n",
+            "    ]\n",
+            "    mut s := rows.to_soa()\n",
+            "    s[0].score = 77\n",
+            "    s[1].age = 5\n",
+            "    active0 := s[0].active\n",
+            "    return (s[0].score + s[1].age + (if active0 { 1 } else { 0 })) as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(83));
+}
+
+#[test]
+fn soa_elem_field_assign_dynamic_index() {
+    if !backend_available() {
+        return;
+    }
+    // A runtime row index into the column store, bounds-checked at the write.
+    let out = build_and_run(
+        "soa-elem-field-assign-dyn",
+        concat!(
+            "P { a: i64, b: i64 }\n",
+            "fn main() -> i32 {\n",
+            "  arena {\n",
+            "    rows := [P { a: 1, b: 2 }, P { a: 3, b: 4 }, P { a: 5, b: 6 }]\n",
+            "    mut s := rows.to_soa()\n",
+            "    mut i := 2\n",
+            "    s[i].a = 40\n",
+            "    return s[2].a as i32\n",
+            "  }\n",
+            "}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(40));
+}
+
+#[test]
+fn soa_elem_field_assign_immutable_rejected() {
+    // Writing a column through a soa view requires the view local to be `mut`.
+    assert!(!ok(concat!(
+        "P { a: i64, b: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  arena {\n",
+        "    rows := [P { a: 1, b: 2 }]\n",
+        "    s := rows.to_soa()\n",
+        "    s[0].a = 9\n",
+        "    return 0\n",
+        "  }\n",
+        "}\n",
+    )));
+}

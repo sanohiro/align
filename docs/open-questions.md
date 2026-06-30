@@ -402,6 +402,24 @@ access site, plus a 4-field runtime `json.decode → soa` out-write) — a cross
 the same weight class as the deferred `bitset`. The single-column window covers the primary use
 (windowed column reduction) with none of that cost, so the multi-column view waits until a concrete
 need (e.g. a function taking a windowed multi-field view) justifies the repr change.
+
+**In-place element-field write slice DONE — `s[i].field = v` (+ AoS `arr[i].field = v`).** The write
+counterpart of the `c[i].field` read, closing the read/write symmetry: you could read a struct-array /
+soa element's field but not store it (`invalid assignment target`). One surface — `c[i].field = v` —
+over both layouts, dispatched by the receiver local's type: a `soa<Struct>` lowers to a column store
+(`Stmt::StoreColumn`, the `align_up` column offset), a fixed `array<Struct>` to a slot element-field
+store (`Stmt::StoreElemField`, a `[0,index,field]` GEP). Both store ops already existed (emitted by
+`.to_soa()` construction); this slice just makes them reachable from a user assignment. New
+`hir::Stmt::AssignElemField` + `Place::ElemField`; the `check_place` `FieldAccess{ Index{ local, i },
+field }` branch resolves it, `mut`-gated (writing through a soa view requires a `mut` view binding, the
+slice-mutability precedent). Bounds-checked at the write (same `index_fail` path as a read). The stored
+value is a **scalar** field, so MoveCheck/EscapeCheck treat it exactly like `AssignIndex` (Copy value +
+index, base is a use) — no move/region/drop concern, so the new Stmt needed no new analysis logic, only
+an or-pattern next to `AssignIndex` at each exhaustive `Stmt` match (the compiler forced all five).
+**Deferred: the dynamic `array<Struct>` (`DynStructArray`) element-field write** — its read uses the
+pointer-based `Rvalue::IndexFieldPtr`, so the write needs a `StoreElemFieldPtr` dual that does not yet
+exist (the fixed `StructArray` and `soa` both had a store op already, which is why they ship now).
+Tests: `tests/struct_index.rs` (AoS), `tests/soa.rs` (soa); `examples/soa.align`.
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
 
 ### Branchless `where` (sum/count) — DONE (2026-06-27)

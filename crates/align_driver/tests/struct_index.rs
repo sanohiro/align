@@ -112,3 +112,49 @@ fn elem_field_through_scalar_rejected() {
         "Line { a: i64 }\nfn main() -> i32 {\n  ls := [Line{a: 5}]\n  return ls[0].a.z as i32\n}\n",
     ));
 }
+
+#[test]
+fn elem_field_assign_writes_one_field() {
+    if !backend_available() {
+        return;
+    }
+    // `arr[i].field = v` — the write counterpart of the `arr[i].field` read: one field of one
+    // element is stored, others untouched. arr[0].a=77, arr[1].b=8, arr[0].b still 2 → 77+8+2 = 87.
+    let src = concat!(
+        "P { a: i64, b: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut arr := [P{a: 1, b: 2}, P{a: 3, b: 4}]\n",
+        "  arr[0].a = 77\n",
+        "  arr[1].b = 8\n",
+        "  return (arr[0].a + arr[1].b + arr[0].b) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("elem-field-assign", src).status.code(), Some(87));
+}
+
+#[test]
+fn elem_field_assign_dynamic_index() {
+    if !backend_available() {
+        return;
+    }
+    // A runtime index into the element-field store (not a constant), bounds-checked at the write.
+    let src = concat!(
+        "P { a: i64, b: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut arr := [P{a: 1, b: 2}, P{a: 3, b: 4}, P{a: 5, b: 6}]\n",
+        "  mut i := 2\n",
+        "  arr[i].a = 40\n",
+        "  return arr[2].a as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("elem-field-assign-dyn", src).status.code(), Some(40));
+}
+
+#[test]
+fn elem_field_assign_immutable_rejected() {
+    // Writing a field of an element requires the array local to be `mut`.
+    assert!(check_errs(
+        "elem-field-assign-immut",
+        "P { a: i64, b: i64 }\nfn main() -> i32 {\n  arr := [P{a: 1, b: 2}]\n  arr[0].a = 9\n  return 0\n}\n",
+    ));
+}
