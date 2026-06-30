@@ -270,9 +270,20 @@ register value (not memory), so it lowers to `v = insertelement(v, x, i)`: a new
 (detected in `check_place` when the index target is a vector local) → `hir::Stmt::AssignVecLane` →
 `Rvalue::VecInsert`, which re-stores the updated vector into the local. Reuses the mutable-place
 writability rule (a `mut` local; an immutable vector, or a dynamic / out-of-range lane, is rejected,
-matching the lane read). Still deferred: scalar-on-the-left broadcast, the generic `vec<N,T>`
-spelling, a written `mask<T>` annotation, an aligned-load fast path, the SIMD-unit tree reduction.
-(`examples/vec_lane_set.align`.)
+matching the lane read). (`examples/vec_lane_set.align`.)
+
+**Slice 9 DONE — scalar-on-the-left broadcast.** A scalar on the **left** of a vector op broadcasts
+too (`10 + a`, `2 < scores`), completing the broadcast symmetry (slice 3 settled implicit `vec OP
+scalar`; this lifts the "vector must be on the left" cut). The operand order is preserved for the
+non-commutative ops (`20 - a` = `[20 - a0, …]`). Settled mechanism: the one-pass checker handles the
+ambiguity with a **speculative rhs check + diagnostic rollback** (`check_binop_rhs`) — the rhs is
+hinted with the lhs type as usual, but if the lhs is a scalar and the rhs is a vector, that hint
+mis-constrains, so its diagnostics are rolled back (`Diagnostics::truncate`) and the rhs re-checked
+unhinted, letting the scalar broadcast. This regresses nothing: a scalar+scalar or generic-call rhs
+still gets the lhs hint (no rollback). `vec_binop` gained the `(scalar, vec)` case; codegen detects
+the vector in either operand and `operand_as_vector` splats the scalar. Still deferred: the generic
+`vec<N,T>` spelling, a written `mask<T>` annotation, an aligned-load fast path, the SIMD-unit tree
+reduction. (`examples/vec_broadcast.align`.)
 
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element

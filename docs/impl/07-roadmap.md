@@ -709,9 +709,18 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     a register value, so it lowers to `v = insertelement(v, x, i)` (a new `Place::VecLane` →
     `hir::Stmt::AssignVecLane` → `Rvalue::VecInsert`, re-storing the local). Reuses the mutable-place
     writability rule (a `mut` local; an immutable vector / dynamic or out-of-range lane is rejected).
-    (`examples/vec_lane_set.align`.) Still deferred: scalar-on-the-left broadcast, the generic
-    `vec<N,T>` spelling, a written `mask<T>` annotation, a SIMD-unit tree reduction (the reductions
-    extract-and-fold; -O2 reshapes them).
+    (`examples/vec_lane_set.align`.)
+  - **scalar-on-the-left broadcast slice 9 — DONE.** A scalar on the **left** of a vector op
+    broadcasts too (`10 + a`, `2 < scores`), completing the broadcast symmetry (slice 3 did vector-on-
+    the-left). The operand order is preserved for the non-commutative ops (`20 - a` = `[20-a0, …]`).
+    The one-pass checker handles it via a **speculative rhs check with diagnostic rollback**
+    (`check_binop_rhs`): the rhs is hinted with the lhs type as usual, but if the lhs is a scalar and
+    the rhs is a vector, that hint is rolled back (`Diagnostics::truncate`) and the rhs re-checked
+    unhinted, so the scalar broadcasts — no regression to ordinary scalar arithmetic (a generic-call
+    rhs still gets the lhs hint). `vec_binop` gained the `(scalar, vec)` case; codegen detects the
+    vector in either operand (`operand_as_vector` already splats the scalar). (`examples/vec_broadcast.align`.)
+    Still deferred: the generic `vec<N,T>` spelling, a written `mask<T>` annotation, a SIMD-unit tree
+    reduction (the reductions extract-and-fold; -O2 reshapes them).
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.

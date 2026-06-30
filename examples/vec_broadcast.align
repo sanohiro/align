@@ -1,0 +1,12 @@
+// Scalar broadcast in a vector op works in either operand order (M6): a scalar — whether on the
+// left or the right of a vector — is splatted across the lanes. The operand order is preserved for
+// the non-commutative ops, so `20 - a` is `[20 - a0, 20 - a1, ...]`.
+
+fn main() -> i32 {
+  a: vec4<i32> := [1, 2, 3, 4]
+  s := 10 + a                 // scalar left:  [11, 12, 13, 14]
+  d := 20 - a                 // non-commutative, order preserved: [19, 18, 17, 16]
+  m := 2 < a                  // scalar-left comparison -> mask [false, false, true, true]
+  picked := select(m, s, d)   // [19, 18, 13, 14]
+  return picked[0] + picked[1] + picked[2] + picked[3]   // 64
+}
