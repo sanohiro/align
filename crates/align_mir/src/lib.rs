@@ -959,6 +959,54 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 b.push(Stmt::StoreElemField(*base, idx, *field, val));
             }
         }
+        hir::Stmt::AssignElem { base, index, struct_id, soa, value } => {
+            // `base[index] = value` — bounds-checked whole-element store (the write counterpart of
+            // the `base[index]` read / `s[i]` gather). A `soa<Struct>` scatters the value's fields
+            // into their columns (`StoreColumn` per field); a fixed `array<Struct>` stores the whole
+            // struct aggregate into element `index` (`StoreIndex`, a `[0,index]` GEP). The struct is
+            // plain-old-data (sema gate), so the value is a Copy aggregate — no per-field drop.
+            let idx = lower_expr(b, index);
+            let val = lower_expr(b, value);
+            if *soa {
+                let soa_ty = b.slots[*base as usize];
+                let sv = b.fresh_value(soa_ty);
+                b.push(Stmt::Let(sv, Rvalue::Load(*base)));
+                let len = b.fresh_value(i64_ty());
+                b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(sv))));
+                emit_bounds_check(b, &idx, Operand::Value(len));
+                let fields = &b.structs[*struct_id as usize].fields;
+                let first_scalar = align_sema::ty_to_scalar(fields.first().expect("a soa struct has at least one field").ty)
+                    .expect("soa field is a scalar");
+                let nfields = fields.len();
+                let ptr = b.fresh_value(Ty::Box(first_scalar));
+                b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(sv))));
+                // Materialize the struct value into a temp slot, then read each field out and scatter
+                // it into its column (columns are non-contiguous, so no single aggregate store).
+                let tmp = b.new_slot(Ty::Struct(*struct_id));
+                b.push(Stmt::Store(tmp, val));
+                for field in 0..nfields as u32 {
+                    let fty = b.structs[*struct_id as usize].fields[field as usize].ty;
+                    let fv = b.fresh_value(fty);
+                    b.push(Stmt::Let(fv, Rvalue::Field(tmp, vec![field])));
+                    b.push(Stmt::StoreColumn {
+                        base: Operand::Value(ptr),
+                        len: Operand::Value(len),
+                        index: idx.clone(),
+                        field,
+                        struct_id: *struct_id,
+                        value: Operand::Value(fv),
+                    });
+                }
+            } else {
+                // A fixed `array<Struct>` slot: one aggregate store into element `index`.
+                let n = match b.slots[*base as usize] {
+                    Ty::StructArray(_, n) => n,
+                    other => unreachable!("soa=false whole-element assignment into {other:?}"),
+                };
+                emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
+                b.push(Stmt::StoreIndex(*base, idx, val));
+            }
+        }
         // `v[lane] = value` → `v = insertelement(v, value, lane)` (a vector is a register value).
         hir::Stmt::AssignVecLane { local, lane, value } => {
             let val = lower_expr(b, value);

@@ -420,6 +420,22 @@ an or-pattern next to `AssignIndex` at each exhaustive `Stmt` match (the compile
 pointer-based `Rvalue::IndexFieldPtr`, so the write needs a `StoreElemFieldPtr` dual that does not yet
 exist (the fixed `StructArray` and `soa` both had a store op already, which is why they ship now).
 Tests: `tests/struct_index.rs` (AoS), `tests/soa.rs` (soa); `examples/soa.align`.
+
+**Whole-element write slice DONE — `s[i] = value` (+ AoS `arr[i] = value`).** The write counterpart of
+the `s[i]` gather / `arr[i]` whole-element read, completing the element read/write matrix (read whole /
+read field / write field / **write whole**). One surface — `c[i] = structval` — over both layouts via
+`hir::Stmt::AssignElem` + `Place::Elem`: a `soa<Struct>` materializes the value into a temp slot and
+**scatters** each field into its column (`StoreColumn` per field; columns are non-contiguous, so no
+single store), a fixed `array<Struct>` does **one aggregate `StoreIndex`** into the element (`[0,index]`
+GEP). `mut`-gated, bounds-checked. **First cut is plain-old-data structs** — the sema gate requires
+every field to be a flat numeric/bool/char scalar (not `str`, not nested, not owned), so the value is a
+Copy aggregate with **no region/move/drop**: the new `Stmt` again rides the `AssignIndex` or-pattern at
+every exhaustive `Stmt` match (index + value walked, base is a use). A `str`-bearing struct would store
+a borrowed view into the element (an escape concern) — deferred with the nested/owned cases. The
+plain-data gate matches what soa already enforces on its columns, so `soa<Struct>` always qualifies;
+the restriction only bites AoS arrays of `str`/nested structs. Tests: `tests/struct_index.rs` (AoS:
+literal value, struct-local value, `mut`-required, `str`-field rejected), `tests/soa.rs` (soa: scatter,
+gather→scatter `s[0]=s[1]`, `mut`-required); `examples/soa.align`.
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
 
 ### Branchless `where` (sum/count) — DONE (2026-06-27)
