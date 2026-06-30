@@ -1,0 +1,15 @@
+// Fixed-width SIMD vectors (draft.md §9). `vecN<T>` (`vec2`/`vec4`/`vec8`/`vec16` of a numeric
+// scalar) is an explicit SIMD register value. Build one from an array literal under a `vecN<T>`
+// annotation; elementwise `+` `-` `*` `/` map to one lane-wise hardware instruction each, and
+// `v[i]` reads lane `i` (a constant). This is the explicit form of the data-oriented core's
+// automatic vectorization — the pipeline (`map`/`where`/`sum`) already vectorizes the same way.
+
+fn main() -> i32 {
+  a: vec4<i32> := [1, 2, 3, 4]
+  b: vec4<i32> := [10, 20, 30, 40]
+  // Two lane-wise instructions: c = [11, 22, 33, 44], then d = [110, 440, 990, 1760].
+  c := a + b
+  d := c * b
+  // Read lane 2 → 990. (The process exit code is the low byte: 990 mod 256 = 222.)
+  return d[2]
+}

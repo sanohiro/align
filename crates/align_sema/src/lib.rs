@@ -184,6 +184,13 @@ pub enum Ty {
     /// `array<T>` of a fixed length — contiguous scalars. M4 (length known from the
     /// literal; dynamic-length arrays/slices come later).
     Array(Scalar, u32),
+    /// `vecN<T>` — a fixed-width SIMD vector (`vec2`/`vec4`/`vec8`/`vec16` of a numeric scalar).
+    /// M6 slice 1. A **Copy**, `Static` register value (no heap, borrows nothing) laid out as the
+    /// LLVM vector `<N x T>`. The element is a numeric [`Scalar`] (int or float); the width `N` is
+    /// part of the type (like [`Ty::Array`]'s length). Elementwise `+`/`-`/`*`/`/` map to LLVM
+    /// vector arithmetic; `dot(a, b)` reduces to the element scalar. Constructed from an array
+    /// literal under a `vecN<T>` annotation. `mask`/comparisons/`select`/lanes are later slices.
+    Vec(Scalar, u32),
     /// A fixed-length array of structs (AoS); `(struct_id, length)`. M4.
     StructArray(u32, u32),
     /// An *owned*, dynamic-length array of structs, laid out like a slice
@@ -1912,7 +1919,7 @@ impl EffectScan {
                     self.expr(o);
                 }
             }
-            ExprKind::ArrayLit { elems, .. } => {
+            ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for el in elems {
                     self.expr(el);
                 }
@@ -2538,7 +2545,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(source, depth);
                 self.walk(n, depth);
             }
-            ExprKind::ArrayLit { elems, .. } => {
+            ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for e in elems {
                     self.walk(e, depth);
                 }
@@ -2943,7 +2950,7 @@ impl<'a> MoveCheck<'a> {
                 self.expr(source, moved, false, false);
                 self.expr(n, moved, false, false);
             }
-            ExprKind::ArrayLit { elems, .. } => {
+            ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for e in elems {
                     self.expr(e, moved, true, true);
                 }
@@ -3827,7 +3834,11 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::FieldAccess { recv, field } => {
                 self.check_field_access(recv, field, expected, e.span)
             }
-            ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, None, e.span),
+            ast::ExprKind::ArrayLit(elems) => match self.resolve(expected.unwrap_or(Ty::Error)) {
+                // `[…]` under a `vecN<T>` annotation builds a SIMD vector, not an array.
+                Ty::Vec(s, n) => self.check_vec_lit(elems, s, n, e.span),
+                _ => self.check_array_lit(elems, None, e.span),
+            },
             ast::ExprKind::Index { recv, index } => self.check_index(recv, index, e.span),
             ast::ExprKind::SliceRange { recv, start, end } => self.check_slice_range(recv, start.as_deref(), end.as_deref(), e.span),
             ast::ExprKind::Template(parts) => self.check_template(parts, expected, e.span),
@@ -4445,6 +4456,9 @@ impl<'a, 't> Checker<'a, 't> {
                 r = self.check_expr(rhs, Some(l.ty));
                 let t = self.unify(l.ty, r.ty, span);
                 // `str + str` is concatenation; other ops on str are errors.
+                // A `vecN<T>` operand: elementwise SIMD arithmetic (M6). `+`/`-`/`*`/`/` only — `%`
+                // (rem) on vectors is deferred. Both operands unify to the same vector type already.
+                let is_vec = matches!(t, Ty::Vec(e, _) if scalar_to_ty(e).is_numeric());
                 if let Ty::Param(i) = t {
                     // A generic value: arithmetic needs the `Num` bound.
                     if !self.param_bound(i).grants_arith() {
@@ -4452,6 +4466,10 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 } else if t == Ty::Str && op != BinOp::Add {
                     self.diags.error("str supports only `+` (concatenation)", span);
+                } else if is_vec {
+                    if op == BinOp::Rem {
+                        self.diags.error("vectors support elementwise `+` `-` `*` `/` (not `%`)".to_string(), span);
+                    }
                 } else if t != Ty::Str && !t.is_numeric() && t != Ty::Error {
                     self.diags.error("arithmetic expects numbers (int or float)", span);
                 }
@@ -5498,6 +5516,25 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(Ty::Str, expected, span);
         self.guard_lambda_alloc_leak("a `template` string", span);
         Expr { kind: ExprKind::Template(hparts), ty: Ty::Str, span }
+    }
+
+    /// `[e0, …, e(N-1)]` under a `vecN<T>` annotation — a fixed-width SIMD vector literal. Exactly
+    /// `n` elements, each of the element type `s` (M6 slice 1). The element is a numeric scalar.
+    fn check_vec_lit(&mut self, elems: &[ast::Expr], s: Scalar, n: u32, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let elem_ty = scalar_to_ty(s);
+        if elems.len() as u32 != n {
+            self.diags.error(
+                format!("a vec{n}<{}> literal needs exactly {n} elements, got {}", scalar_name(s), elems.len()),
+                span,
+            );
+            return err;
+        }
+        let checked: Vec<Expr> = elems.iter().map(|e| self.check_expr(e, Some(elem_ty))).collect();
+        if checked.iter().any(|e| e.ty == Ty::Error) {
+            return err;
+        }
+        Expr { kind: ExprKind::VecLit { elems: checked, elem: s }, ty: Ty::Vec(s, n), span }
     }
 
     fn check_array_lit(&mut self, elems: &[ast::Expr], elem_expected: Option<Ty>, span: Span) -> Expr {
@@ -7382,6 +7419,20 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_index(&mut self, recv: &ast::Expr, index: &ast::Expr, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let r = self.check_expr(recv, None);
+        // `v[i]` on a vector reads lane `i`. The lane must be a **constant** literal in `0..N` (a SIMD
+        // lane index is a fixed position; a dynamic lane would risk an out-of-range poison value). It
+        // lowers to `extractelement`, reusing this `Index` node (MIR branches on the receiver type).
+        if let Ty::Vec(s, n) = r.ty {
+            let lane = match &index.kind {
+                ast::ExprKind::Int(v) if *v >= 0 && (*v as u128) < n as u128 => *v,
+                _ => {
+                    self.diags.error(format!("a vector lane index must be a constant in 0..{n}"), index.span);
+                    return err;
+                }
+            };
+            let idx = Expr { kind: ExprKind::Int(lane), ty: Ty::Int(IntTy { bits: 64, signed: true }), span: index.span };
+            return Expr { kind: ExprKind::Index { recv: Box::new(r), index: Box::new(idx) }, ty: scalar_to_ty(s), span };
+        }
         // The index is an `i64` (matching `.len()` and loop counters). A non-integer index must
         // bail with `Ty::Error` — returning a typed `Index` node with a bad index would feed a
         // non-int operand into the MIR bounds-check `icmp` and panic codegen.
@@ -8311,7 +8362,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(source);
                 self.finalize_expr(n);
             }
-            ExprKind::ArrayLit { elems, .. } => {
+            ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
                 for e in elems {
                     self.finalize_expr(e);
                 }
@@ -8681,6 +8732,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Result(o, e) => format!("Result<{}, {}>", scalar_name(o), scalar_name(e)),
         Ty::Box(s) => format!("box<{}>", scalar_name(s)),
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
+        Ty::Vec(s, n) => format!("vec{n}<{}>", scalar_name(s)),
         Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(p) => format!("array<slice<{}>>", scalar_name(prim_to_scalar(p))),
@@ -9120,6 +9172,24 @@ fn resolve_type(
             }
         }
         _ => {
+            // `vec2`/`vec4`/`vec8`/`vec16`<T> — a fixed-width SIMD vector of a numeric scalar (M6).
+            if let Some(n) = parse_vec_name(name) {
+                let inner = match args {
+                    [a] => resolve_type(a, cx, type_params, diags),
+                    _ => {
+                        diags.error(format!("{name} takes exactly one type argument (the element type)"), span);
+                        return Ty::Error;
+                    }
+                };
+                return match scalar_arg(inner, "vector element", false, span, diags) {
+                    Some(s @ (Scalar::Int(_) | Scalar::Float(_))) => Ty::Vec(s, n),
+                    Some(_) => {
+                        diags.error("a vector element must be a numeric scalar (an int or float)".to_string(), span);
+                        Ty::Error
+                    }
+                    None => Ty::Error,
+                };
+            }
             // A builtin sized integer (`i8`..`u64`) wins over any user type of the same name.
             if let Some(it) = parse_int_name(name) {
                 return Ty::Int(it);
@@ -9304,6 +9374,15 @@ fn parse_int_name(name: &str) -> Option<IntTy> {
     };
     let bits: u8 = rest.parse().ok()?;
     matches!(bits, 8 | 16 | 32 | 64).then_some(IntTy { bits, signed })
+}
+
+/// The width `N` of a fixed vector type name `vecN` (`vec2`/`vec4`/`vec8`/`vec16`), else `None`.
+/// Only powers-of-two 2..16 are valid SIMD widths; any other `vec…` name falls through to a user
+/// type (which then errors as unknown).
+fn parse_vec_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("vec")?;
+    let n: u32 = rest.parse().ok()?;
+    matches!(n, 2 | 4 | 8 | 16).then_some(n)
 }
 
 #[cfg(test)]

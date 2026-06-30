@@ -211,6 +211,11 @@ pub enum Rvalue {
     Index(Slot, Operand),
     /// `slot[index].field` — load a field of a struct-array element.
     IndexField(Slot, Operand, u32),
+    /// Build a `vecN<T>` register value `<n x elem>` from its lane operands — an `insertelement`
+    /// chain over a poison vector (M6). `elem`/`n` give the vector type.
+    MakeVec { elems: Vec<Operand>, elem: Ty, n: u32 },
+    /// Read lane `lane` of a vector operand (`extractelement`); the result is the element `elem`.
+    VecExtract { vec: Operand, lane: u32, elem: Ty },
     /// `base[index].field` for a `{ptr,len}` view of struct `struct_id` (an owned, dynamic
     /// `array<Struct>`, MMv2 slice 8d-2). Like [`IndexField`] but addressed through the loaded
     /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
@@ -1430,6 +1435,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ArrayLit { .. } => {
             unreachable!("array literal only appears as a let initializer or pipeline source")
         }
+        // A `vecN<T>` literal is a register value: build it via an insertelement chain (`MakeVec`).
+        hir::ExprKind::VecLit { elems, elem } => {
+            let ops: Vec<Operand> = elems.iter().map(|el| lower_expr(b, el)).collect();
+            let n = ops.len() as u32;
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::MakeVec { elems: ops, elem: align_sema::scalar_to_ty(*elem), n }));
+            Operand::Value(v)
+        }
         // A struct literal in value position (return/arg/assign): materialize it into a
         // temp slot field by field, then load the whole struct. (A `let` initializer stores
         // straight into its own slot — see `lower_stmt` — avoiding this copy.)
@@ -1483,6 +1496,17 @@ fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) {
 /// through its `{ptr,len}` value (`SliceIndex`); a fixed stack `array` loads through its slot
 /// (`Index`).
 fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty) -> Operand {
+    // `v[lane]` on a vector → `extractelement` (no bounds check: sema validated a constant lane).
+    if let Ty::Vec(_, _) = recv.ty {
+        let vv = lower_expr(b, recv);
+        let lane = match &index.kind {
+            hir::ExprKind::Int(v) => *v as u32,
+            _ => unreachable!("sema requires a constant vector lane index"),
+        };
+        let v = b.fresh_value(elem_ty);
+        b.push(Stmt::Let(v, Rvalue::VecExtract { vec: vv, lane, elem: elem_ty }));
+        return Operand::Value(v);
+    }
     let idx = lower_expr(b, index);
     // The length, and whether the element loads from a `{ptr,len}` value or a stack slot.
     enum Src {
@@ -3631,6 +3655,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Box(_) => "box".to_string(),
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
+        Ty::Vec(_, n) => format!("vec{n}"),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
         Ty::DynArray(_) => "array".to_string(),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),

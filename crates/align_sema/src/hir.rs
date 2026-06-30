@@ -381,6 +381,11 @@ pub enum ExprKind {
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
     ArrayLit { elems: Vec<Expr>, elem: crate::Ty },
+    /// `[e0, e1, …]` under a `vecN<T>` annotation — a fixed-width SIMD vector value (M6 slice 1).
+    /// Unlike [`ArrayLit`] (slot/memory), a vector is a **register value**: it lowers to a single
+    /// `Rvalue::MakeVec` (an insertelement chain), so it flows through value positions like a scalar.
+    /// `elem` is the numeric element scalar; the width is `elems.len()` (validated == N in sema).
+    VecLit { elems: Vec<Expr>, elem: crate::Scalar },
     /// A fused array pipeline ending in `sum`: `source.map(f).where(p)….sum()`. The
     /// stages and the reduction lower to a single loop (no intermediate arrays).
     ArraySum { source: Box<Expr>, stages: Vec<Stage> },

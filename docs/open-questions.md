@@ -179,6 +179,21 @@ Record: `draft.md` §12, `impl/07-roadmap.md`.
 Record: `impl/03-types.md` §6–§7
 
 ### SIMD exposure (basic policy)
+**First slice DONE (M6 slice 1) — explicit `vecN<T>`.** The fixed-width vector type
+`vec2`/`vec4`/`vec8`/`vec16` of a numeric scalar (`Ty::Vec(Scalar, N)`, Copy/`Static`, LLVM
+`<N x T>`). Two design points were **settled here** (the spec was silent on them):
+- **Construction = an array literal under a `vecN<T>` annotation** (`a: vec4<f32> := [1.0, 2.0, 3.0,
+  4.0]`), not a separate constructor/splat. Rationale: `[…]` is already the language's fixed-sequence
+  literal; the annotation picks the SIMD representation, exactly as a literal int's width comes from
+  context — one way, nothing hidden. (A scalar broadcast `vecN<T>(x)` is a later, additive form.)
+- **Lane read = `v[i]` with a constant index** (extractelement). A SIMD lane is a fixed position, so
+  the index must be a compile-time constant in `0..N` (a dynamic lane would risk an out-of-range
+  poison value); lane *assignment* `v[i] = x` is deferred.
+Elementwise `+`/`-`/`*`/`/` lower to one lane-wise hardware instruction each. The `vec4<f32>`
+N-in-name spelling needs no lexer/parser/AST change. Deferred to later M6 slices: `mask<T>` +
+comparisons, `select`/`sum_where`, `dot`/reductions, broadcast, array load/store, and the generic
+`vec<N,T>` arg spelling. (`crates/align_*`, `tests/vec_simd.rs`, `examples/vec_simd.align`.)
+
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element
 branch — `impl/05` §5), which is what keeps hot loops vectorizable and branch-predictor-friendly.
