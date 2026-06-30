@@ -480,11 +480,34 @@ fn broadcasting_a_mismatched_scalar_type_is_rejected() {
 }
 
 #[test]
-fn scalar_on_the_left_of_a_vector_is_rejected() {
-    // Broadcast requires the vector on the left (`a + 5`, not `5 + a`) — the scalar-left form is
-    // deferred, and must be a clean error, not a panic.
-    let src = "fn main() -> i32 {\n  a: vec4<i32> := [1, 2, 3, 4]\n  c := 5 + a\n  return c[0]\n}\n";
-    assert!(check_errs("vec-scalar-left", src));
+fn scalar_on_the_left_of_a_vector_broadcasts() {
+    if !backend_available() {
+        return;
+    }
+    // A scalar on the LEFT broadcasts too, with operand order preserved for non-commutative ops:
+    // s = 10 + a = [11,12,13,14]; d = 20 - a = [19,18,17,16]; m = 2 < a = [F,F,T,T];
+    // select(m, s, d) = [19, 18, 13, 14]; sum = 64.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [1, 2, 3, 4]\n",
+        "  s := 10 + a\n",
+        "  d := 20 - a\n",
+        "  m := 2 < a\n",
+        "  picked := select(m, s, d)\n",
+        "  return picked[0] + picked[1] + picked[2] + picked[3]\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-scalar-left", src);
+    assert_eq!(out.status.code(), Some(64));
+}
+
+#[test]
+fn a_mismatched_scalar_type_broadcasting_into_a_vector_is_rejected() {
+    // A float scalar cannot broadcast into an int vector — in either operand order.
+    let left = "fn main() -> i32 {\n  a: vec4<i32> := [1, 2, 3, 4]\n  c := 2.0 + a\n  return c[0]\n}\n";
+    assert!(check_errs("vec-bcast-left-mismatch", left));
+    let right = "fn main() -> i32 {\n  a: vec4<i32> := [1, 2, 3, 4]\n  c := a + 2.0\n  return c[0]\n}\n";
+    assert!(check_errs("vec-bcast-right-mismatch", right));
 }
 
 #[test]

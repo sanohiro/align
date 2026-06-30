@@ -4546,18 +4546,44 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::StructLit { struct_id: id, fields: out }, ty: Ty::Struct(id), span }
     }
 
-    /// A binary op with a **vector** left operand: returns its `(element, width)` after broadcasting
-    /// a scalar right operand across the lanes (M6 — `a + 2.0`, `scores > 80`). The scalar's type is
-    /// unified with the element type; a vector right operand must match the left exactly. The vector
-    /// must be on the **left** (scalar-on-the-left and a vector-literal right operand are deferred).
-    /// `None` when the left operand is not a vector (the ordinary scalar path runs).
+    /// A binary op with a **vector** operand: returns its `(element, width)` after broadcasting a
+    /// scalar operand across the lanes (M6 — `a + 2.0`, `scores > 80`, and `2.0 + a`, `80 < scores`).
+    /// The scalar's type is unified with the element type; a vector–vector op must match exactly.
+    /// `None` when neither operand is a vector (the ordinary scalar path runs).
     fn vec_binop(&mut self, l: &Expr, r: &Expr, span: Span) -> Option<(Scalar, u32)> {
-        let Ty::Vec(s, n) = self.resolve(l.ty) else { return None };
-        match self.resolve(r.ty) {
-            Ty::Vec(..) => self.unify(l.ty, r.ty, span),          // vec OP vec — element + width match
-            _ => self.unify(scalar_to_ty(s), r.ty, span),         // vec OP scalar — broadcast to the element
-        };
-        Some((s, n))
+        match (self.resolve(l.ty), self.resolve(r.ty)) {
+            (Ty::Vec(s, n), Ty::Vec(..)) => {
+                self.unify(l.ty, r.ty, span); // vec OP vec — element + width match
+                Some((s, n))
+            }
+            (Ty::Vec(s, n), _) => {
+                self.unify(scalar_to_ty(s), r.ty, span); // vec OP scalar — broadcast the rhs
+                Some((s, n))
+            }
+            (_, Ty::Vec(s, n)) => {
+                self.unify(scalar_to_ty(s), l.ty, span); // scalar OP vec — broadcast the lhs
+                Some((s, n))
+            }
+            _ => None,
+        }
+    }
+
+    /// Check the right operand of a binary op, supporting a scalar–vector broadcast in either order.
+    /// Normally the rhs is hinted with the lhs type (so a literal adopts it). But if the lhs is a
+    /// scalar and the rhs turns out to be a vector (`2.0 + a`), that hint mis-constrains, so the
+    /// speculative diagnostics are rolled back and the rhs is re-checked unhinted (the scalar then
+    /// broadcasts against the vector in [`Self::vec_binop`]).
+    fn check_binop_rhs(&mut self, lhs_ty: Ty, rhs: &ast::Expr) -> Expr {
+        if matches!(self.resolve(lhs_ty), Ty::Vec(..)) {
+            return self.check_expr(rhs, None); // vec lhs: rhs self-types
+        }
+        let mark = self.diags.len();
+        let r = self.check_expr(rhs, Some(lhs_ty));
+        if matches!(self.resolve(r.ty), Ty::Vec(..)) {
+            self.diags.truncate(mark);
+            return self.check_expr(rhs, None);
+        }
+        r
     }
 
     fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
@@ -4566,9 +4592,7 @@ impl<'a, 't> Checker<'a, 't> {
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 l = self.check_expr(lhs, expected);
-                // A vector left operand lets a scalar right operand broadcast, so don't force the rhs
-                // to the (vector) lhs type — let it self-type and reconcile in `vec_binop`.
-                r = self.check_expr(rhs, if matches!(self.resolve(l.ty), Ty::Vec(..)) { None } else { Some(l.ty) });
+                r = self.check_binop_rhs(l.ty, rhs);
                 if let Some((s, n)) = self.vec_binop(&l, &r, span) {
                     // Vectors support only elementwise `+` `-` `*` `/` (no `%`).
                     if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
@@ -4596,9 +4620,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 l = self.check_expr(lhs, None);
-                r = self.check_expr(rhs, if matches!(self.resolve(l.ty), Ty::Vec(..)) { None } else { Some(l.ty) });
-                // A `vecN<T>` comparison (`==`/`<`/…, incl. against a broadcast scalar like
-                // `scores > 80`) is elementwise and yields a `mask` of width N (M6).
+                r = self.check_binop_rhs(l.ty, rhs);
+                // A `vecN<T>` comparison (`==`/`<`/…, incl. against a broadcast scalar in either
+                // order like `scores > 80` / `80 < scores`) is elementwise and yields a `mask` (M6).
                 if let Some((_, n)) = self.vec_binop(&l, &r, span) {
                     ty = Ty::Mask(n);
                 } else {

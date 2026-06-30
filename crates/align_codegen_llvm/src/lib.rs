@@ -3496,9 +3496,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
             return self.gen_str_eq(op, a, b);
         }
         // A `vecN<T>` operand (M6): a comparison yields a `<N x i1>` mask, arithmetic stays a vector.
-        // The vector is the left operand (sema); a scalar right operand is broadcast to the lanes.
-        if let Ty::Vec(elem, n) = self.f.operand_ty(a) {
-            let et = scalar_to_ty(elem);
+        // Either operand may be the vector — `operand_as_vector` splats the scalar one (broadcast),
+        // and the operand order (lhs, rhs) is preserved for the non-commutative ops.
+        let vt = match (self.f.operand_ty(a), self.f.operand_ty(b)) {
+            (Ty::Vec(e, n), _) | (_, Ty::Vec(e, n)) => Some((scalar_to_ty(e), n)),
+            _ => None,
+        };
+        if let Some((et, n)) = vt {
             if is_comparison(op) {
                 return self.gen_vec_cmp(op, a, b, et, n);
             }
