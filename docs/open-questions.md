@@ -281,9 +281,22 @@ hinted with the lhs type as usual, but if the lhs is a scalar and the rhs is a v
 mis-constrains, so its diagnostics are rolled back (`Diagnostics::truncate`) and the rhs re-checked
 unhinted, letting the scalar broadcast. This regresses nothing: a scalar+scalar or generic-call rhs
 still gets the lhs hint (no rollback). `vec_binop` gained the `(scalar, vec)` case; codegen detects
-the vector in either operand and `operand_as_vector` splats the scalar. Still deferred: the generic
-`vec<N,T>` spelling, a written `mask<T>` annotation, an aligned-load fast path, the SIMD-unit tree
-reduction. (`examples/vec_broadcast.align`.)
+the vector in either operand and `operand_as_vector` splats the scalar. (`examples/vec_broadcast.align`.)
+
+**Slice 10 DONE — written `maskN<T>` annotation.** A comparison mask is now a **nameable type**, so it
+can be a `let` annotation, a function parameter, or a return type (threading a mask through code).
+Settled here: the spelling is **`maskN<T>`** — N-in-name like `vecN<T>`, with the same width and
+element as the compared vectors (`mask4<i32>` = the result of comparing `vec4<i32>`s). This amends the
+spec's `mask<T>` (draft §13) exactly as `vec<N,T>` → `vecN<T>`: the **width must be in the type**, and
+the spec's lone `<T>` left it ambiguous. `Ty::Mask(u32)` became `Ty::Mask(Scalar, u32)` (element +
+width) so the type is fully meaningful and type-safe — `select`/`sum_where` now require the mask's
+**element and width** to match the vectors (operationally a mask is still `<N x i1>`, element-
+independent; the element is part of the *type*, not the repr). `resolve_type` gained the `maskN<T>`
+arm (`parse_mask_name`). The decision to make the mask element-aware (vs the previous width-only
+`Ty::Mask(u32)`) is the type-safe choice and matches the spec's element-parameterized intent; the
+minor flexibility loss (an `i32`-comparison mask can no longer select `f32` vectors) is acceptable and
+arguably more correct. Still deferred: the generic `vec<N,T>` / numeric-type-arg spelling, an aligned-
+load fast path, the SIMD-unit tree reduction. (`examples/vec_mask_annot.align`.)
 
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element
