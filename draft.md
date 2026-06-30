@@ -746,7 +746,10 @@ r := a.sqrt()              // elementwise float math: one vector instruction
 ```
 
 The unary float math functions — `sqrt`, `abs`, `floor`, `ceil`, `round`, `trunc` — apply lane-wise
-to a float vector (the same names as on a scalar float), each one lane-wise hardware instruction.
+to a float vector (the same names as on a scalar float), each one lane-wise hardware instruction. The
+element-wise `a.min(b)` / `a.max(b)` of two vectors, and `abs`, also work on integer vectors (`a.min()`
+with no argument is the reduction instead). Each maps to one SIMD instruction; `pow` (a libcall) stays
+scalar-only.
 
 ### Array Expressions
 

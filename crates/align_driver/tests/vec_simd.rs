@@ -644,3 +644,71 @@ fn integer_vector_math_is_rejected() {
         "fn main() -> i32 {\n  v: vec4<i32> := [1, 4, 9, 16]\n  w := v.sqrt()\n  return w[0]\n}\n",
     ));
 }
+
+#[test]
+fn element_wise_binary_vector_min_max() {
+    if !backend_available() {
+        return;
+    }
+    // `a.min(b)` / `a.max(b)` with a vector argument are element-wise (one SIMD instruction each),
+    // distinct from the no-arg reduction `v.min()`. Works on float and integer vectors.
+    let fmin = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<f32> := [1.0, 5.0, 3.0, 8.0]\n",
+        "  b: vec4<f32> := [4.0, 2.0, 6.0, 7.0]\n",
+        "  lo := a.min(b)\n",
+        "  return (lo[0] + lo[1] + lo[2] + lo[3]) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("vec-bin-min", fmin).status.code(), Some(13)); // [1,2,3,7]
+    let imax = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [1, 5, 3, 8]\n",
+        "  b: vec4<i32> := [4, 2, 6, 7]\n",
+        "  hi := a.max(b)\n",
+        "  return hi[0] + hi[1] + hi[2] + hi[3]\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("vec-bin-max", imax).status.code(), Some(23)); // [4,5,6,8]
+}
+
+#[test]
+fn integer_vector_abs() {
+    if !backend_available() {
+        return;
+    }
+    // abs vectorizes for integer vectors too (one `pabsd`-style instruction). |[-3,5,-2,4]| → 14.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  v: vec4<i32> := [0 - 3, 5, 0 - 2, 4]\n",
+        "  w := v.abs()\n",
+        "  return w[0] + w[1] + w[2] + w[3]\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("vec-int-abs", src).status.code(), Some(14));
+}
+
+#[test]
+fn binary_vector_min_max_lowers_to_the_vector_intrinsic() {
+    if !backend_available() {
+        return;
+    }
+    let ir = emit_llvm(concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [1, 5, 3, 8]\n",
+        "  b: vec4<i32> := [4, 2, 6, 7]\n",
+        "  hi := a.max(b)\n",
+        "  return hi[0] as i32\n",
+        "}\n",
+    ));
+    assert!(ir.contains("llvm.smax.v4i32"), "expected vector smax intrinsic, got:\n{ir}");
+}
+
+#[test]
+fn pow_on_a_vector_is_rejected() {
+    // `pow` lowers to a libcall, not a lane-wise instruction, so it stays scalar-only.
+    assert!(check_errs(
+        "vec-pow",
+        "fn main() -> i32 {\n  a: vec4<f32> := [1.0, 2.0, 3.0, 4.0]\n  w := a.pow(a)\n  return w[0] as i32\n}\n",
+    ));
+}

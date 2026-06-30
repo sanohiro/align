@@ -733,9 +733,15 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     as the scalar versions — "one way"), each lowering to the LLVM **vector** intrinsic
     (`llvm.sqrt.v4f32` etc.) via `call_intrinsic`. Sema accepts a float-vector receiver for the unary
     (`want_args == 0`) ops; codegen classifies `is_float`/`signed` by the element but keeps the vector
-    as the intrinsic overload. Binary ops (`min`/`max`/`pow`) and integer vectors stay scalar-only.
-    (`examples/vec_math.align`.) Still deferred: the generic `vec<N,T>` / numeric-type-arg spelling, an
-    aligned-load fast path, a SIMD-unit tree reduction, `fma`, integer-vector `abs`.
+    as the intrinsic overload. (`examples/vec_math.align`.)
+  - **binary + integer vector math slice 12 — DONE.** Element-wise `a.min(b)`/`a.max(b)` of two
+    vectors (any numeric element) and integer-vector `abs` now vectorize too — each maps to one
+    lane-wise instruction (`llvm.smax.v4i32`, `pabsd`, …). This was a pure **sema gate** broadening:
+    slice 11's codegen was already element-aware with a vector overload, so `check_scalar_math` just
+    accepts the vector cases (float vec: unary float ops + min/max; int vec: abs + min/max). `pow` is
+    excluded — it lowers to a libcall, not a lane-wise instruction — so it (and `a.min()` with no arg,
+    which is the reduction) stays as before. Still deferred: the generic `vec<N,T>` / numeric-type-arg
+    spelling, an aligned-load fast path, a SIMD-unit tree reduction, `fma`.
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.

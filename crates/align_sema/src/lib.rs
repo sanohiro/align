@@ -4766,13 +4766,17 @@ impl<'a, 't> Checker<'a, 't> {
         if r.ty == Ty::Error {
             return err;
         }
-        // A float vector receiver: the **unary** ops (`abs`/`sqrt`/`floor`/`ceil`/`round`/`trunc`)
-        // apply element-wise to a `vecN<f32>`/`vecN<f64>`, yielding the same vector (M6), lowered to
-        // the LLVM vector intrinsic. Binary ops (`min`/`max`/`pow`) and integer vectors stay
-        // scalar-only for now.
-        let vec_float = matches!(r.ty, Ty::Vec(Scalar::Float(_), _));
-        let ok_ty = if vec_float {
-            want_args == 0
+        // Element-wise vector math (M6): every op below maps to **one lane-wise hardware
+        // instruction**, so it vectorizes. A float vector takes the unary float ops + min/max; an
+        // integer vector takes abs + min/max (the float-only ops don't apply). `pow` is excluded —
+        // it lowers to a libcall, not a lane-wise instruction, so it stays scalar-only.
+        let vec_ok = match r.ty {
+            Ty::Vec(Scalar::Float(_), _) => matches!(fn_, Abs | Sqrt | Floor | Ceil | Round | Trunc | Min | Max),
+            Ty::Vec(Scalar::Int(_), _) => matches!(fn_, Abs | Min | Max),
+            _ => false,
+        };
+        let ok_ty = if matches!(r.ty, Ty::Vec(..)) {
+            vec_ok
         } else if float_only {
             r.ty.is_float_like()
         } else {
@@ -4780,14 +4784,16 @@ impl<'a, 't> Checker<'a, 't> {
         };
         if !ok_ty {
             // A vector receiver that didn't qualify gets a vector-specific reason (it *is* a vector,
-            // so "needs a float-vector" would be confusing): either a binary op (vector math is the
-            // unary ops only) or a non-float element (vector math is float-only).
+            // so "needs a float-vector" would be confusing): `pow` is a libcall (not lane-wise), or a
+            // float-only op was applied to an integer vector.
             let msg = match r.ty {
-                Ty::Vec(..) if want_args > 0 => format!(
-                    "'{name}' is not supported on a vector yet — vector math is the unary ops (abs/sqrt/floor/ceil/round/trunc), got {}",
-                    ty_name(r.ty)
-                ),
-                Ty::Vec(..) => format!("'{name}' on a vector needs a float vector (vector math is float-only), got {}", ty_name(r.ty)),
+                Ty::Vec(..) if matches!(fn_, Pow) => {
+                    format!("'{name}' is not supported on a vector (it lowers to a libcall, not a lane-wise instruction), got {}", ty_name(r.ty))
+                }
+                // The reachable case is a float-only op (`sqrt`/`floor`/…) on an integer vector
+                // (`abs`/`min`/`max` are accepted on int vectors); the fallback is defensive.
+                Ty::Vec(..) if float_only => format!("'{name}' on a vector needs a float vector (it is float-only), got {}", ty_name(r.ty)),
+                Ty::Vec(..) => format!("'{name}' on a vector needs a float or integer vector, got {}", ty_name(r.ty)),
                 _ => {
                     let want = if float_only { "a float (or float-vector)" } else { "a numeric" };
                     format!("'{name}' needs {want} receiver, got {}", ty_name(r.ty))
