@@ -719,8 +719,16 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     unhinted, so the scalar broadcasts — no regression to ordinary scalar arithmetic (a generic-call
     rhs still gets the lhs hint). `vec_binop` gained the `(scalar, vec)` case; codegen detects the
     vector in either operand (`operand_as_vector` already splats the scalar). (`examples/vec_broadcast.align`.)
-    Still deferred: the generic `vec<N,T>` spelling, a written `mask<T>` annotation, a SIMD-unit tree
-    reduction (the reductions extract-and-fold; -O2 reshapes them).
+  - **written `maskN<T>` annotation slice 10 — DONE.** A comparison mask is now a **nameable type**
+    `maskN<T>` (spelled like `vecN<T>` — `mask4<i32>` is the result of comparing `vec4<i32>`s), so a
+    mask can be a `let` annotation, a **function parameter**, or a return type — threading a mask
+    through code (`fn blend(m: mask4<i32>, a, b) = select(m, a, b)`). `Ty::Mask(u32)` became
+    `Ty::Mask(Scalar, u32)` (element + width): a comparison yields `Ty::Mask(elem, n)`, and
+    `select`/`sum_where` now require the mask's element **and** width to match the vectors (the repr
+    stays `<N x i1>`, element-independent). `resolve_type` gained the `maskN<T>` arm (mirroring
+    `vecN<T>`, via `parse_mask_name`). `draft.md` §9/§13 amended (`mask<T>` → `maskN<T>`, as `vec<N,T>`
+    → `vecN<T>`). (`examples/vec_mask_annot.align`.) Still deferred: the generic `vec<N,T>` /
+    numeric-type-arg spelling, an aligned-load fast path, a SIMD-unit tree reduction.
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.

@@ -106,6 +106,37 @@ fn invalid_width_is_rejected() {
 }
 
 #[test]
+fn a_mask_can_be_annotated_and_threaded_through_a_function() {
+    if !backend_available() {
+        return;
+    }
+    // A written `maskN<T>` type: a `let` annotation and a function parameter. The mask threads
+    // through `blend`. select(a > b, a, b) = elementwise max [4, 5, 6, 8]; sum = 23.
+    let src = concat!(
+        "fn blend(m: mask4<i32>, a: vec4<i32>, b: vec4<i32>) -> vec4<i32> = select(m, a, b)\n",
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [1, 5, 3, 8]\n",
+        "  b: vec4<i32> := [4, 2, 6, 7]\n",
+        "  m: mask4<i32> := a > b\n",
+        "  hi := blend(m, a, b)\n",
+        "  return hi[0] + hi[1] + hi[2] + hi[3]\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-mask-annot", src);
+    assert_eq!(out.status.code(), Some(23));
+}
+
+#[test]
+fn a_mask_with_a_mismatched_element_or_width_is_rejected() {
+    // The annotation element must match the compared vectors' element.
+    let elem = "fn main() -> i32 {\n  a: vec4<i32> := [1, 2, 3, 4]\n  m: mask4<f32> := a > a\n  return 0\n}\n";
+    assert!(check_errs("vec-mask-elem", elem));
+    // Only 2/4/8/16 are valid mask widths.
+    let width = "fn main() -> i32 {\n  a: vec4<i32> := [1, 2, 3, 4]\n  m: mask3<i32> := a > a\n  return 0\n}\n";
+    assert!(check_errs("vec-mask-width", width));
+}
+
+#[test]
 fn comparison_and_select_compute_elementwise_max() {
     if !backend_available() {
         return;

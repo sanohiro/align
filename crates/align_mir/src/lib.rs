@@ -3774,7 +3774,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
         Ty::Vec(_, n) => format!("vec{n}"),
-        Ty::Mask(n) => format!("mask{n}"),
+        Ty::Mask(_, n) => format!("mask{n}"),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
         Ty::DynArray(_) => "array".to_string(),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),

@@ -1062,8 +1062,8 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
-        // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane).
-        Ty::Mask(n) => ctx.bool_type().vec_type(n).into(),
+        // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
+        Ty::Mask(_, n) => ctx.bool_type().vec_type(n).into(),
         _ => int_type(ctx, ty).into(),
     }
 }
@@ -1945,7 +1945,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::Select { cond, a, b } => {
                 // A `mask` cond (`<N x i1>`, from `select(mask, a, b)`) blends two vectors lane-wise;
                 // a scalar `i1` cond (branchless `where`) blends two scalars.
-                if matches!(self.f.operand_ty(cond), Ty::Mask(_)) {
+                if matches!(self.f.operand_ty(cond), Ty::Mask(..)) {
                     let c = self.operand(cond).into_vector_value();
                     let av = self.operand(a).into_vector_value();
                     let bv = self.operand(b).into_vector_value();

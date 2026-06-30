@@ -760,12 +760,14 @@ Comparing two vectors elementwise yields a **mask** (one bool lane per vector la
 `b[i]`:
 
 ```align
-m := a > b                 // mask: one lane per comparison
+m: mask4<i32> := a > b     // mask: one bool lane per comparison
 hi := select(m, a, b)      // elementwise max (a where a > b, else b)
-total := scores.sum_where(m)   // masked reduction (a later form)
+total := scores.sum_where(m)   // masked reduction
 ```
 
-A mask is a first-class concept for SIMD / branchless / GPU. The pipeline's `where` is the implicit
+A mask has the type `maskN<T>` — spelled like `vecN<T>`, with the same width and element as the
+vectors it compares (the type is usually inferred; name it to thread a mask through a function). A
+mask is a first-class concept for SIMD / branchless / GPU. The pipeline's `where` is the implicit
 form: `xs.where(p).sum()` lowers **branchless** (mask + `select`, a masked reduction), not a
 per-element `if` — so a filtered hot loop stays vectorizable and does not fight the branch predictor.
 
@@ -1294,8 +1296,8 @@ group_by
 ### core.vec / core.mask
 
 ```text
-vec<N,T>
-mask<T>
+vecN<T>      // vec2/vec4/vec8/vec16 (the width is in the name)
+maskN<T>     // a comparison mask over a vecN<T>
 bitset
 dot
 sum_where

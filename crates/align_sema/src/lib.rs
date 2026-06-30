@@ -191,11 +191,12 @@ pub enum Ty {
     /// vector arithmetic; `dot(a, b)` reduces to the element scalar. Constructed from an array
     /// literal under a `vecN<T>` annotation. `mask`/comparisons/`select`/lanes are later slices.
     Vec(Scalar, u32),
-    /// A SIMD comparison mask — `<N x i1>`, one bool lane per vector lane (M6 slice 2). Produced by a
-    /// comparison of two `vecN<T>` (`a > b`), consumed by `select(mask, a, b)`. Carries only the
-    /// width `N` (the lane count) — it is element-agnostic, so a width-`N` mask selects between any
-    /// two `vecN<T>` of width `N`. Copy/`Static`; produced/consumed inline (no written annotation).
-    Mask(u32),
+    /// A SIMD comparison mask — `<N x i1>`, one bool lane per vector lane (M6). Produced by a
+    /// comparison of two `vecN<T>` (`a > b`), consumed by `select(mask, a, b)` / `v.sum_where(mask)`.
+    /// Carries the source element scalar + the width `N` — i.e. it is tied to a `vecN<T>`, so the
+    /// written annotation `maskN<T>` mirrors `vecN<T>`. Copy/`Static`. The repr (`<N x i1>`) is
+    /// element-independent; the element is part of the *type* for `select`/`sum_where` matching.
+    Mask(Scalar, u32),
     /// A fixed-length array of structs (AoS); `(struct_id, length)`. M4.
     StructArray(u32, u32),
     /// An *owned*, dynamic-length array of structs, laid out like a slice
@@ -4627,8 +4628,8 @@ impl<'a, 't> Checker<'a, 't> {
                 r = self.check_binop_rhs(l.ty, rhs);
                 // A `vecN<T>` comparison (`==`/`<`/…, incl. against a broadcast scalar in either
                 // order like `scores > 80` / `80 < scores`) is elementwise and yields a `mask` (M6).
-                if let Some((_, n)) = self.vec_binop(&l, &r, span) {
-                    ty = Ty::Mask(n);
+                if let Some((s, n)) = self.vec_binop(&l, &r, span) {
+                    ty = Ty::Mask(s, n);
                 } else {
                     let t = self.unify(l.ty, r.ty, span);
                     let is_eq = matches!(op, BinOp::Eq | BinOp::Ne);
@@ -5850,10 +5851,11 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'sum_where' is a vector reduction, but the receiver is {}", ty_name(v.ty)), span);
             return err;
         };
-        match self.resolve(mc.ty) {
-            Ty::Mask(mn) if mn == n => {}
-            Ty::Mask(mn) => {
-                self.diags.error(format!("'sum_where' mask width {mn} does not match the vector width {n}"), m.span);
+        let mc_ty = self.resolve(mc.ty);
+        match mc_ty {
+            Ty::Mask(ms, mn) if ms == s && mn == n => {}
+            Ty::Mask(..) => {
+                self.diags.error(format!("'sum_where' mask {} does not match the vector {}", ty_name(mc_ty), ty_name(self.resolve(v.ty))), m.span);
                 return err;
             }
             other => {
@@ -5889,10 +5891,11 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        match self.resolve(mc.ty) {
-            Ty::Mask(mn) if mn == n => {}
-            Ty::Mask(mn) => {
-                self.diags.error(format!("'select' mask width {mn} does not match the vector width {n}"), m.span);
+        let mc_ty = self.resolve(mc.ty);
+        match mc_ty {
+            Ty::Mask(ms, mn) if ms == s && mn == n => {}
+            Ty::Mask(..) => {
+                self.diags.error(format!("'select' mask {} does not match the vectors {}", ty_name(mc_ty), ty_name(Ty::Vec(s, n))), m.span);
                 return err;
             }
             other => {
@@ -9162,7 +9165,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Box(s) => format!("box<{}>", scalar_name(s)),
         Ty::Array(s, n) => format!("array<{}>[{n}]", scalar_name(s)),
         Ty::Vec(s, n) => format!("vec{n}<{}>", scalar_name(s)),
-        Ty::Mask(n) => format!("mask[{n}]"),
+        Ty::Mask(s, n) => format!("mask{n}<{}>", scalar_name(s)),
         Ty::StructArray(id, n) => format!("array<struct#{id}>[{n}]"),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(p) => format!("array<slice<{}>>", scalar_name(prim_to_scalar(p))),
@@ -9620,6 +9623,25 @@ fn resolve_type(
                     None => Ty::Error,
                 };
             }
+            // `mask2`/`mask4`/`mask8`/`mask16`<T> — a comparison mask over a `vecN<T>` (M6), the
+            // result type of `a > b`. Spelled like `vecN<T>`; the element matches the source vectors.
+            if let Some(n) = parse_mask_name(name) {
+                let inner = match args {
+                    [a] => resolve_type(a, cx, type_params, diags),
+                    _ => {
+                        diags.error(format!("{name} takes exactly one type argument (the element type)"), span);
+                        return Ty::Error;
+                    }
+                };
+                return match scalar_arg(inner, "mask element", false, span, diags) {
+                    Some(s @ (Scalar::Int(_) | Scalar::Float(_))) => Ty::Mask(s, n),
+                    Some(_) => {
+                        diags.error("a mask element must be a numeric scalar (it mirrors the compared `vecN<T>`)".to_string(), span);
+                        Ty::Error
+                    }
+                    None => Ty::Error,
+                };
+            }
             // A builtin sized integer (`i8`..`u64`) wins over any user type of the same name.
             if let Some(it) = parse_int_name(name) {
                 return Ty::Int(it);
@@ -9811,6 +9833,14 @@ fn parse_int_name(name: &str) -> Option<IntTy> {
 /// type (which then errors as unknown).
 fn parse_vec_name(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("vec")?;
+    let n: u32 = rest.parse().ok()?;
+    matches!(n, 2 | 4 | 8 | 16).then_some(n)
+}
+
+/// The width `N` of a fixed mask type name `maskN` (`mask2`/`mask4`/`mask8`/`mask16`), else `None`
+/// — the mask analogue of [`parse_vec_name`] (a mask mirrors the `vecN<T>` it came from).
+fn parse_mask_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("mask")?;
     let n: u32 = rest.parse().ok()?;
     matches!(n, 2 | 4 | 8 | 16).then_some(n)
 }
