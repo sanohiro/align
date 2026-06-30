@@ -145,6 +145,55 @@ fn float_comparison_select_is_elementwise() {
 }
 
 #[test]
+fn vector_sum_reduction() {
+    if !backend_available() {
+        return;
+    }
+    // v.sum() = 10+20+30+40 = 100; and a non-local float receiver: (a+b).sum() = (2.5+3.5) = 6.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  v: vec4<i32> := [10, 20, 30, 40]\n",
+        "  a: vec2<f32> := [1.5, 2.5]\n",
+        "  b: vec2<f32> := [1.0, 1.0]\n",
+        "  return v.sum() + ((a + b).sum() as i32)\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-sum", src);
+    assert_eq!(out.status.code(), Some(106));
+}
+
+#[test]
+fn an_invalid_reduction_receiver_reports_one_error() {
+    // The speculative vec-vs-array receiver check rolls back its diagnostics when the receiver is
+    // not a vector, so an undefined receiver yields exactly one error (not a duplicate from the
+    // array path re-checking it).
+    for m in ["sum", "min", "max"] {
+        let src = format!("fn main() -> i32 {{\n  return undefinedthing.{m}() as i32\n}}\n");
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, "vec-dup", &src);
+        let n = align_driver::format_diagnostics(&sm, &checked.diags).matches("error:").count();
+        assert_eq!(n, 1, "`.{m}()` on an undefined receiver should report exactly one error, got {n}");
+    }
+}
+
+#[test]
+fn array_pipeline_sum_still_works() {
+    if !backend_available() {
+        return;
+    }
+    // The fused array pipeline `xs.map(f).sum()` (a separate path) is unaffected: 2*(1+2+3+4) = 20.
+    let src = concat!(
+        "fn dbl(x: i64) -> i64 = x * 2\n",
+        "fn main() -> i32 {\n",
+        "  a := [1, 2, 3, 4]\n",
+        "  return a.map(dbl).sum() as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("arr-map-sum", src);
+    assert_eq!(out.status.code(), Some(20));
+}
+
+#[test]
 fn vector_min_and_max_reductions() {
     if !backend_available() {
         return;

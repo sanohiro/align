@@ -236,9 +236,20 @@ receiver peek** — `is_vec_local_recv` checks whether the receiver is a *local 
 broken — a pipeline-without-terminal is an error). Lowers (`hir::VecMinMax` → `Rvalue::VecMinMax`) by
 folding the lanes with the **same `llvm.{s,u}{min,max}` / `llvm.{minimum,maximum}` intrinsics as the
 `core.math` scalar `a.min(b)`/`a.max(b)`**, so the reduction matches that semantics exactly (incl. the
-IEEE `minimum`/`maximum` NaN/signed-zero behavior for floats); int / unsigned / float. Still deferred:
-a bare `v.sum()` reduction, scalar-on-the-left broadcast, array load/store, the generic `vec<N,T>`
-spelling, lane assignment, a written `mask<T>` annotation. (`examples/vec_minmax.align`.)
+IEEE `minimum`/`maximum` NaN/signed-zero behavior for floats); int / unsigned / float. The receiver
+is generalized to **any vector value** (not just a local): the dispatch routes to the array reduction
+only for a syntactically pipeline-shaped receiver (`is_array_pipeline_recv` — a `.map()`/`.where()`
+stage or a `.field` projection), and type-checks every other receiver to detect a vector. (`examples/vec_minmax.align`.)
+
+**Slice 6 DONE — bare `v.sum()`.** `v.sum()` — the horizontal sum of a `vecN<T>` → the sum of all
+lanes, as the element scalar (the unmasked sibling of `sum_where`). Same dispatch shape as `min`/`max`
+(a vector receiver → the SIMD reduction; an array pipeline `xs.map(f).sum()` → the fused array path).
+`hir::VecSum` → `Rvalue::VecSum`, reusing the shared `horizontal_sum`; int + float. **The vector
+reduction surface (`sum`/`sum_where`/`dot`/`min`/`max`) is now complete.** Still deferred:
+scalar-on-the-left broadcast, array load/store, the generic `vec<N,T>` spelling, lane assignment, a
+written `mask<T>` annotation, and a SIMD-unit **tree reduction** (the reductions extract-and-fold
+today — semantics-exact and -O2-reshaped, but a shuffle tree would keep it on the vector units).
+(`examples/vec_sum.align`.)
 
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element

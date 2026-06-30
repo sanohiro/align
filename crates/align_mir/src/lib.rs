@@ -225,6 +225,9 @@ pub enum Rvalue {
     /// `v.min()` / `v.max()` — the horizontal min/max of a `vecN<T>` (M6): fold the `n` lanes with
     /// the scalar min/max intrinsic, yielding the element scalar `elem`. `max` selects max vs min.
     VecMinMax { vec: Operand, elem: Ty, n: u32, max: bool },
+    /// `v.sum()` — the horizontal sum of a `vecN<T>` (M6): add all `n` lanes, yielding the element
+    /// scalar `elem` (the unmasked sibling of [`VecSumWhere`]).
+    VecSum { vec: Operand, elem: Ty, n: u32 },
     /// `base[index].field` for a `{ptr,len}` view of struct `struct_id` (an owned, dynamic
     /// `array<Struct>`, MMv2 slice 8d-2). Like [`IndexField`] but addressed through the loaded
     /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
@@ -1488,6 +1491,17 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let vv = lower_expr(b, vec);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::VecMinMax { vec: vv, elem: e.ty, n, max: *max }));
+            Operand::Value(v)
+        }
+        // `v.sum()` → add all lanes (the shared horizontal sum).
+        hir::ExprKind::VecSum { vec } => {
+            let n = match vec.ty {
+                Ty::Vec(_, n) => n,
+                _ => unreachable!("sema types sum's receiver as a vector"),
+            };
+            let vv = lower_expr(b, vec);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::VecSum { vec: vv, elem: e.ty, n }));
             Operand::Value(v)
         }
         // A `vecN<T>` literal is a register value: build it via an insertelement chain (`MakeVec`).
