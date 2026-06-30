@@ -743,13 +743,15 @@ c := a + b                 // elementwise, one instruction
 x := c[0]                  // lane 0
 d := dot(a, b)             // reduction to a scalar
 r := a.sqrt()              // elementwise float math: one vector instruction
+f := fma(a, b, c)          // fused a*b + c, one rounding (one vfmadd/fmla)
 ```
 
 The unary float math functions — `sqrt`, `abs`, `floor`, `ceil`, `round`, `trunc` — apply lane-wise
 to a float vector (the same names as on a scalar float), each one lane-wise hardware instruction. The
 element-wise `a.min(b)` / `a.max(b)` of two vectors, and `abs`, also work on integer vectors (`a.min()`
 with no argument is the reduction instead). Each maps to one SIMD instruction; `pow` (a libcall) stays
-scalar-only.
+scalar-only. `fma(a, b, c)` is the fused multiply-add `a*b + c` with a single rounding (a free builtin,
+float scalar or vector) — the kernel of dot products, FIR filters, and Horner-method polynomials.
 
 ### Array Expressions
 

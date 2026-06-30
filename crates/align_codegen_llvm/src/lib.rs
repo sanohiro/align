@@ -1947,6 +1947,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::MathFn::Trunc => self.call_intrinsic("llvm.trunc", &[overload], &[ops[0].into()])?,
                     // `pow(base, exp)`.
                     align_sema::MathFn::Pow => self.call_intrinsic("llvm.pow", &[overload], &[ops[0].into(), ops[1].into()])?,
+                    // `fma(a, b, c)` = a*b + c, one rounding (scalar or vector overload).
+                    align_sema::MathFn::Fma => self.call_intrinsic("llvm.fma", &[overload], &[ops[0].into(), ops[1].into(), ops[2].into()])?,
                 }
             }
             Rvalue::Select { cond, a, b } => {

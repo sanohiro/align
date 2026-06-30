@@ -712,3 +712,50 @@ fn pow_on_a_vector_is_rejected() {
         "fn main() -> i32 {\n  a: vec4<f32> := [1.0, 2.0, 3.0, 4.0]\n  w := a.pow(a)\n  return w[0] as i32\n}\n",
     ));
 }
+
+#[test]
+fn fused_multiply_add_scalar_and_vector() {
+    if !backend_available() {
+        return;
+    }
+    // `fma(a, b, c)` = a*b + c with one rounding, a free builtin (like `dot`/`select`).
+    // Scalar: 2*3 + 1 = 7.
+    let scalar = "fn main() -> i32 {\n  return fma(2.0, 3.0, 1.0) as i32\n}\n";
+    assert_eq!(build_and_run("fma-scalar", scalar).status.code(), Some(7));
+    // Vector: [1,2,3,4]*10 + 1 = [11,21,31,41] → 104.
+    let vec = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<f32> := [1.0, 2.0, 3.0, 4.0]\n",
+        "  b: vec4<f32> := [10.0, 10.0, 10.0, 10.0]\n",
+        "  c: vec4<f32> := [1.0, 1.0, 1.0, 1.0]\n",
+        "  r := fma(a, b, c)\n",
+        "  return (r[0] + r[1] + r[2] + r[3]) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("fma-vec", vec).status.code(), Some(104));
+}
+
+#[test]
+fn fma_lowers_to_the_vector_intrinsic() {
+    if !backend_available() {
+        return;
+    }
+    let ir = emit_llvm(concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<f32> := [1.0, 2.0, 3.0, 4.0]\n",
+        "  b: vec4<f32> := [10.0, 10.0, 10.0, 10.0]\n",
+        "  c: vec4<f32> := [1.0, 1.0, 1.0, 1.0]\n",
+        "  r := fma(a, b, c)\n",
+        "  return r[0] as i32\n",
+        "}\n",
+    ));
+    assert!(ir.contains("llvm.fma.v4f32"), "expected vector fma intrinsic, got:\n{ir}");
+}
+
+#[test]
+fn fma_is_float_only_and_takes_three_args() {
+    // Integer operands have no fused multiply-add here (float-only).
+    assert!(check_errs("fma-int", "fn main() -> i32 {\n  return fma(2, 3, 1)\n}\n"));
+    // It needs exactly three operands.
+    assert!(check_errs("fma-arity", "fn main() -> i32 {\n  return fma(2.0, 3.0) as i32\n}\n"));
+}
