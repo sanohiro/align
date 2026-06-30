@@ -742,7 +742,11 @@ b: vec4<f32> := [10.0, 20.0, 30.0, 40.0]
 c := a + b                 // elementwise, one instruction
 x := c[0]                  // lane 0
 d := dot(a, b)             // reduction to a scalar
+r := a.sqrt()              // elementwise float math: one vector instruction
 ```
+
+The unary float math functions — `sqrt`, `abs`, `floor`, `ceil`, `round`, `trunc` — apply lane-wise
+to a float vector (the same names as on a scalar float), each one lane-wise hardware instruction.
 
 ### Array Expressions
 

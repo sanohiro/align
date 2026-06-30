@@ -1899,8 +1899,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
             Rvalue::MathOp { fn_, ty, operands } => {
-                let is_float = matches!(ty, Ty::Float(_));
-                let signed = is_signed(*ty);
+                // For an element-wise float vector (`vecN<f32>`), classify by the element type but
+                // keep the **vector** as the intrinsic overload, so `call_intrinsic` emits the
+                // vector form (e.g. `llvm.sqrt.v4f32`). Scalar `ty` classifies as itself.
+                let elem = match ty {
+                    Ty::Vec(s, _) => scalar_to_ty(*s),
+                    t => *t,
+                };
+                let is_float = matches!(elem, Ty::Float(_));
+                let signed = is_signed(elem);
                 let overload = scalar_type(self.ctx, *ty, self.struct_types, self.enum_types);
                 let ops: Vec<BasicValueEnum> = operands.iter().map(|o| self.operand(o)).collect();
                 match fn_ {

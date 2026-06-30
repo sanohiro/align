@@ -584,3 +584,63 @@ fn remainder_on_vectors_is_rejected() {
     );
     assert!(check_errs("vec-rem", src));
 }
+
+#[test]
+fn element_wise_float_vector_math() {
+    if !backend_available() {
+        return;
+    }
+    // The unary float math ops apply lane-wise to a float vector, via the LLVM vector intrinsic.
+    // sqrt([1,4,9,16]) = [1,2,3,4] → sum 10.
+    let sqrt = concat!(
+        "fn main() -> i32 {\n",
+        "  v: vec4<f32> := [1.0, 4.0, 9.0, 16.0]\n",
+        "  w := v.sqrt()\n",
+        "  return (w[0] + w[1] + w[2] + w[3]) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("vec-sqrt", sqrt).status.code(), Some(10));
+    // abs([-3,5,-2,4]) = [3,5,2,4] → sum 14.
+    let abs = concat!(
+        "fn main() -> i32 {\n",
+        "  v: vec4<f32> := [0.0 - 3.0, 5.0, 0.0 - 2.0, 4.0]\n",
+        "  w := v.abs()\n",
+        "  return (w[0] + w[1] + w[2] + w[3]) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("vec-abs", abs).status.code(), Some(14));
+    // floor([1.7,2.2,3.9,4.5]) = [1,2,3,4] → sum 10.
+    let floor = concat!(
+        "fn main() -> i32 {\n",
+        "  v: vec4<f64> := [1.7, 2.2, 3.9, 4.5]\n",
+        "  w := v.floor()\n",
+        "  return (w[0] + w[1] + w[2] + w[3]) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("vec-floor", floor).status.code(), Some(10));
+}
+
+#[test]
+fn vector_math_lowers_to_the_vector_intrinsic() {
+    if !backend_available() {
+        return;
+    }
+    // The element-wise op must emit the *vector* intrinsic (`llvm.sqrt.v4f32`), not a per-lane loop.
+    let ir = emit_llvm(concat!(
+        "fn main() -> i32 {\n",
+        "  v: vec4<f32> := [1.0, 4.0, 9.0, 16.0]\n",
+        "  w := v.sqrt()\n",
+        "  return w[0] as i32\n",
+        "}\n",
+    ));
+    assert!(ir.contains("llvm.sqrt.v4f32"), "expected vector sqrt intrinsic, got:\n{ir}");
+}
+
+#[test]
+fn integer_vector_math_is_rejected() {
+    // The unary float ops are float-only; an integer vector has no `sqrt`.
+    assert!(check_errs(
+        "vec-int-sqrt",
+        "fn main() -> i32 {\n  v: vec4<i32> := [1, 4, 9, 16]\n  w := v.sqrt()\n  return w[0]\n}\n",
+    ));
+}

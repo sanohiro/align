@@ -4766,9 +4766,20 @@ impl<'a, 't> Checker<'a, 't> {
         if r.ty == Ty::Error {
             return err;
         }
-        let ok_ty = if float_only { r.ty.is_float_like() } else { r.ty.is_numeric() };
+        // A float vector receiver: the **unary** ops (`abs`/`sqrt`/`floor`/`ceil`/`round`/`trunc`)
+        // apply element-wise to a `vecN<f32>`/`vecN<f64>`, yielding the same vector (M6), lowered to
+        // the LLVM vector intrinsic. Binary ops (`min`/`max`/`pow`) and integer vectors stay
+        // scalar-only for now.
+        let vec_float = matches!(r.ty, Ty::Vec(Scalar::Float(_), _));
+        let ok_ty = if vec_float {
+            want_args == 0
+        } else if float_only {
+            r.ty.is_float_like()
+        } else {
+            r.ty.is_numeric()
+        };
         if !ok_ty {
-            let want = if float_only { "a float" } else { "a numeric" };
+            let want = if float_only { "a float (or float-vector)" } else { "a numeric" };
             self.diags.error(format!("'{name}' needs {want} receiver, got {}", ty_name(r.ty)), span);
             return err;
         }

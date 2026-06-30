@@ -727,8 +727,15 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     `select`/`sum_where` now require the mask's element **and** width to match the vectors (the repr
     stays `<N x i1>`, element-independent). `resolve_type` gained the `maskN<T>` arm (mirroring
     `vecN<T>`, via `parse_mask_name`). `draft.md` §9/§13 amended (`mask<T>` → `maskN<T>`, as `vec<N,T>`
-    → `vecN<T>`). (`examples/vec_mask_annot.align`.) Still deferred: the generic `vec<N,T>` /
-    numeric-type-arg spelling, an aligned-load fast path, a SIMD-unit tree reduction.
+    → `vecN<T>`). (`examples/vec_mask_annot.align`.)
+  - **element-wise float-vector math slice 11 — DONE.** The unary float math ops `abs`/`sqrt`/`floor`/
+    `ceil`/`round`/`trunc` now apply lane-wise to a `vecN<f32>`/`vecN<f64>` (the same `MathFn` surface
+    as the scalar versions — "one way"), each lowering to the LLVM **vector** intrinsic
+    (`llvm.sqrt.v4f32` etc.) via `call_intrinsic`. Sema accepts a float-vector receiver for the unary
+    (`want_args == 0`) ops; codegen classifies `is_float`/`signed` by the element but keeps the vector
+    as the intrinsic overload. Binary ops (`min`/`max`/`pow`) and integer vectors stay scalar-only.
+    (`examples/vec_math.align`.) Still deferred: the generic `vec<N,T>` / numeric-type-arg spelling, an
+    aligned-load fast path, a SIMD-unit tree reduction, `fma`, integer-vector `abs`.
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.
