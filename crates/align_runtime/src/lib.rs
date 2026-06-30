@@ -2503,6 +2503,12 @@ fn json_structural_index(src: &[u8], out: &mut Vec<u32>) {
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is ARMv8-A baseline — unconditionally available on every aarch64 target.
+        unsafe { json_structural_index_neon(src, out) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     json_structural_index_scalar(src, out);
 }
 
@@ -2608,8 +2614,9 @@ unsafe fn json_decode_index_neon(src: &[u8], out: &mut Vec<u32>) {
 
     // Per-lane bit weights 1,2,4,…,128 (repeated over the two 8-lane halves): AND a 0x00/0xFF compare
     // mask with these, then `vaddv` each half → one byte whose bit i is set iff lane i matched. A
-    // `const` keeps it in `.rodata` (no per-call stack materialization).
-    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    // local `static` guarantees a single `.rodata` instance (a `const` could be re-materialized on
+    // the stack per call; `static` + `as_ptr()` cannot).
+    static WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
     let bit_weights: uint8x16_t = unsafe { vld1q_u8(WEIGHTS.as_ptr()) };
     // Closures inherit the fn's `neon` feature, so the pure (memory-free) intrinsics are callable
     // without `unsafe` (only the pointer loads below are `unsafe`).
@@ -2671,6 +2678,80 @@ unsafe fn json_decode_index_neon(src: &[u8], out: &mut Vec<u32>) {
     }
 }
 
+/// NEON structural index — the aarch64 counterpart to [`json_structural_index_avx2`], emitting the
+/// full simdjson-style structural set (`{ } [ ] : ,` outside strings, plus every real delimiter
+/// quote). Same 64-byte-block shape as [`json_decode_index_neon`]; the only deltas are that `op`
+/// includes `,` and the emitted mask is `(op & !in_string) | real_quote`. NEON is ARMv8-A baseline.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn json_structural_index_neon(src: &[u8], out: &mut Vec<u32>) {
+    use core::arch::aarch64::*;
+    out.clear();
+    out.reserve(src.len() / 8);
+    let n = src.len();
+
+    // A local `static` guarantees a single `.rodata` instance (see `json_decode_index_neon`).
+    static WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let bit_weights: uint8x16_t = unsafe { vld1q_u8(WEIGHTS.as_ptr()) };
+    let movemask16 = |cmp: uint8x16_t| -> u32 {
+        let masked = vandq_u8(cmp, bit_weights);
+        (vaddv_u8(vget_low_u8(masked)) as u32) | ((vaddv_u8(vget_high_u8(masked)) as u32) << 8)
+    };
+    let eqm = |v: uint8x16_t, c: u8| -> u32 { movemask16(vceqq_u8(v, vdupq_n_u8(c))) };
+    // Punctuation: `{ } [ ] : ,` (the structural set includes the comma; the decode index does not).
+    let op_bits = |v: uint8x16_t| -> u32 {
+        let m = vorrq_u8(
+            vorrq_u8(
+                vorrq_u8(vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'{')), vceqq_u8(v, vdupq_n_u8(b'}'))), vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'[')), vceqq_u8(v, vdupq_n_u8(b']')))),
+                vceqq_u8(v, vdupq_n_u8(b':')),
+            ),
+            vceqq_u8(v, vdupq_n_u8(b',')),
+        );
+        movemask16(m)
+    };
+
+    let mut string_carry: u64 = 0;
+    let mut escape_carry: u64 = 0;
+    let mut i = 0usize;
+    while i + 64 <= n {
+        let p = unsafe { src.as_ptr().add(i) };
+        let v0 = unsafe { vld1q_u8(p) };
+        let v1 = unsafe { vld1q_u8(p.add(16)) };
+        let v2 = unsafe { vld1q_u8(p.add(32)) };
+        let v3 = unsafe { vld1q_u8(p.add(48)) };
+        let quote = (eqm(v0, b'"') as u64) | ((eqm(v1, b'"') as u64) << 16) | ((eqm(v2, b'"') as u64) << 32) | ((eqm(v3, b'"') as u64) << 48);
+        let backslash = (eqm(v0, b'\\') as u64) | ((eqm(v1, b'\\') as u64) << 16) | ((eqm(v2, b'\\') as u64) << 32) | ((eqm(v3, b'\\') as u64) << 48);
+        let op = (op_bits(v0) as u64) | ((op_bits(v1) as u64) << 16) | ((op_bits(v2) as u64) << 32) | ((op_bits(v3) as u64) << 48);
+
+        let escaped = find_escaped(backslash, &mut escape_carry);
+        let real_quote = quote & !escaped;
+        let in_string = prefix_xor_portable(real_quote) ^ string_carry;
+        string_carry = (in_string as i64 >> 63) as u64;
+
+        // Structural = punctuation outside strings, plus every real delimiter quote.
+        let mut bits = (op & !in_string) | real_quote;
+        while bits != 0 {
+            out.push(i as u32 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+        i += 64;
+    }
+    // Scalar tail, continuing the carried state — identical semantics to `json_structural_index_scalar`.
+    let mut in_string = string_carry & 1 == 1;
+    let mut esc = escape_carry & 1 == 1;
+    while i < n {
+        let b = unsafe { *src.get_unchecked(i) };
+        if b == b'"' && !esc {
+            in_string = !in_string;
+            out.push(i as u32);
+        } else if !in_string && matches!(b, b'{' | b'}' | b'[' | b']' | b':' | b',') {
+            out.push(i as u32);
+        }
+        esc = b == b'\\' && !esc;
+        i += 1;
+    }
+}
+
 /// Fill `out` with the lean decode-index positions (`{ } [ ] :`). Runtime-dispatched: AVX2 +
 /// `pclmulqdq` on x86_64 when present, the always-baseline NEON path on aarch64, else the scalar
 /// reference.
@@ -2689,9 +2770,8 @@ fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
     {
         // NEON is ARMv8-A baseline — unconditionally available on every aarch64 target.
         unsafe { json_decode_index_neon(src, out) };
-        return;
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(target_arch = "aarch64"))]
     json_decode_index_scalar(src, out);
 }
 
@@ -3916,6 +3996,12 @@ mod tests {
                 let mut g2 = Vec::new();
                 unsafe { json_structural_index_avx2(src, &mut g2) };
                 assert_eq!(g2, want, "avx2 mismatch on {:?}", String::from_utf8_lossy(src));
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut g2 = Vec::new();
+                unsafe { json_structural_index_neon(src, &mut g2) }; // NEON is baseline — always exercised
+                assert_eq!(g2, want, "neon mismatch on {:?}", String::from_utf8_lossy(src));
             }
         };
 

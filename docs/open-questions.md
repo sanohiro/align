@@ -607,6 +607,32 @@ the core codegen/ABI is solid cross-arch; nothing to fix. group_by (1.4–4.2× 
 sole remaining open item it re-flags is the **par_map OS-thread-spawn** gap above (3rd time) — still
 the one perf lever in this set, std/runtime layer.
 
+### First-party arm64 benchmark — Apple Silicon, in-repo harness (2026-06-30)
+The authoritative `bench/` numbers had been x86 (linux); arm64 was only external (Gemini, below) +
+spot-checks. Ran the in-repo harness natively on **Apple Silicon (aarch64-apple-darwin, `--target-cpu
+native`, alternating-min timing)** — so arm64 is now a first-party tracked tier. Ratios are
+Align/Rust unless noted (< 1 = Align faster). The documented x86 wins **hold on arm64**:
+
+```text
+math pipeline  sum_sq_pos (map→where→sum)   0.80×    (Align 1.25× faster)   ~ x86 parity / M2 1.15–1.27×
+SoA col scan   col_sum (soa vs Rust AoS)    0.127×   (Align 7.9× faster)    ← the SoA flagship win, arm64
+filtered agg   total_pay (soa where.sum)    0.32×    (Align 3.1× faster)
+group_by       .sum(.v), 1M rows            vs std HashMap 4.0–6.0× · vs ahash 2.2–2.4×   (Align faster)
+par_map        vs Rust seq / rayon          vs seq 0.47×(small)→1.39×(1M) · vs rayon 3.45×→0.41×(1M)
+json full      decode all fields            0.86× — serde a touch faster (full decode; matches x86)
+json projected decode only needed fields    1.28× (Align faster) — the projection/SoA advantage
+string builder reduce-append                vs naive Rust String 1.6–1.8× · vs hand-tuned Rust 0.58×
+```
+
+Reading: the columnar/data-oriented wins (SoA scan, group_by, projected decode, math fusion) are
+**large on arm64** — the SoA column scan is 7.9× here. The not-wins are the same as x86 (serde beats
+full JSON decode; a hand-tuned Rust `String` with `with_capacity` beats the builder; rayon wins
+`par_map` at scale). SIMD parity audit (2026-06-30): every **live** hand-written SIMD routine has an
+x86 (AVX2/`pclmulqdq`) **and** an arm64 (NEON/PMULL) path plus a scalar fallback — `json_decode_index`,
+the carry-less in-string fold, and (newly) `json_structural_index` now have NEON; `memchr`/`memmem`
+dispatch per-arch via the crate; auto-vectorized loops and the `vec`/`mask` surface go through LLVM
+for the target arch. No x86-only SIMD remains on a live path.
+
 ### External benchmark report — Gemini on M2/arm64 (2026-06-27, claims VERIFIED against code)
 Gemini ran a 3-workload bench on Apple Silicon (arm64) and filed a gap report. Can't reproduce the
 arm64 *numbers* here (linux x86), but every *code* claim was verified against the source. Not urgent
