@@ -5472,11 +5472,18 @@ impl<'a, 't> Checker<'a, 't> {
         // `arr.min()` / `arr.max()` (no args) is the array reduction; `a.min(b)` / `a.max(b)`
         // (one arg) is the pairwise scalar math op.
         if (method == "min" || method == "max") && args.is_empty() {
-            // A `vecN<T>` receiver (a local) makes this the SIMD horizontal min/max reduction. The
-            // receiver is checked as a *local* (not via the array pipeline), so a pipeline source
-            // like `xs.where(p).min()` still routes to the array reduction below.
-            if self.is_vec_local_recv(recv) {
-                return self.check_vec_minmax(recv, method == "max", span);
+            // A `vecN<T>` receiver makes this the SIMD horizontal min/max reduction (the same surface
+            // as the array reduction `arr.min()`). Only an **array-pipeline-shaped** receiver — a
+            // `.map()`/`.where()` stage or a `.field` projection — can't be type-checked here (a
+            // pipeline without a terminal is an error); every other receiver (a local, a call, an
+            // arithmetic expression) is a value, safe to check, and routes to the vector reduction
+            // when it is a vector. (Struct fields are never vectors, so a `FieldAccess` receiver is
+            // always an array projection.)
+            if !is_array_pipeline_recv(recv) {
+                let rv = self.check_expr(recv, None);
+                if let Ty::Vec(s, _) = self.resolve(rv.ty) {
+                    return Expr { kind: ExprKind::VecMinMax { vec: Box::new(rv), max: method == "max" }, ty: scalar_to_ty(s), span };
+                }
             }
             return self.check_array_min_max(recv, args, expected, method == "max", span);
         }
@@ -5631,28 +5638,6 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         Expr { kind: ExprKind::VecDot { a: Box::new(ac), b: Box::new(bc) }, ty: scalar_to_ty(s), span }
-    }
-
-    /// Whether `recv` is a **local of vector type** — a cheap, non-destructive peek (it does not
-    /// `check_expr` the receiver, so an array pipeline like `xs.where(p)` is not misread or
-    /// double-checked). Used to route `recv.min()`/`recv.max()` to the vector reduction.
-    fn is_vec_local_recv(&self, recv: &ast::Expr) -> bool {
-        let ast::ExprKind::Path(p) = &recv.kind else { return false };
-        let Some(name) = single_name(p) else { return false };
-        let Some(lid) = self.lookup(name) else { return false };
-        matches!(self.resolve(self.locals[lid as usize].ty), Ty::Vec(..))
-    }
-
-    /// `v.min()` / `v.max()` — the horizontal min/max of a `vecN<T>` (M6): the smallest/largest lane,
-    /// as the element scalar. The caller has confirmed `recv` is a vector local.
-    fn check_vec_minmax(&mut self, recv: &ast::Expr, max: bool, span: Span) -> Expr {
-        let rv = self.check_expr(recv, None);
-        let Ty::Vec(s, _) = self.resolve(rv.ty) else {
-            // Unreachable in practice (the caller checked), but stay a diagnostic, never a panic.
-            self.diags.error(format!("'{}' on a vector takes no arguments", if max { "max" } else { "min" }), span);
-            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        };
-        Expr { kind: ExprKind::VecMinMax { vec: Box::new(rv), max }, ty: scalar_to_ty(s), span }
     }
 
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): the sum of the lanes where the mask is
@@ -8665,6 +8650,22 @@ fn ast_block_diverges(b: &ast::Block) -> bool {
 fn block_diverges(e: &ast::Expr) -> bool {
     match &e.kind {
         ast::ExprKind::Block(b) => ast_block_diverges(b),
+        _ => false,
+    }
+}
+
+/// Whether `recv` is an **array-pipeline-shaped** receiver — a `.map()`/`.where()` stage call or a
+/// `.field` projection. Such a receiver is an array pipeline and must NOT be type-checked as a value
+/// (a pipeline without a terminal is an error); every other receiver (a local, a call, an arithmetic
+/// expression) is a value that may be a vector. Used to route `recv.min()`/`recv.max()`. (Struct
+/// fields are never vectors, so a `FieldAccess` is always an array projection, not a vector value.)
+fn is_array_pipeline_recv(recv: &ast::Expr) -> bool {
+    match &recv.kind {
+        ast::ExprKind::FieldAccess { .. } => true,
+        ast::ExprKind::Call { callee, .. } => matches!(
+            &callee.kind,
+            ast::ExprKind::FieldAccess { field, .. } if field.name == "map" || field.name == "where"
+        ),
         _ => false,
     }
 }
