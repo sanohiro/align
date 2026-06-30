@@ -5739,13 +5739,19 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'store' takes 2 arguments (the start index and a vector), got {}", args.len()), span);
             return err;
         };
-        // The destination must be a writable slice place (a `mut` local or an `out` slice parameter).
-        let Some((id, dst_ty)) = self.place_local(recv) else {
-            self.diags.error("'store' needs a writable slice (a `mut` local or `out` parameter)".to_string(), recv.span);
+        // Type-check the receiver first, so an error *inside* it (an undefined name, a bad field)
+        // surfaces cleanly rather than being masked by the writability/slice checks below.
+        let dst = self.check_expr(recv, None);
+        if dst.ty == Ty::Error {
+            return err;
+        }
+        let Ty::Slice(es) = self.resolve(dst.ty) else {
+            self.diags.error(format!("'store' writes a slice<T>, got {}", ty_name(dst.ty)), recv.span);
             return err;
         };
-        let Ty::Slice(es) = self.resolve(dst_ty) else {
-            self.diags.error(format!("'store' writes a slice<T>, got {}", ty_name(dst_ty)), recv.span);
+        // The destination must be a writable slice place (a `mut` local or an `out` slice parameter).
+        let Some((id, _)) = self.place_local(recv) else {
+            self.diags.error("'store' needs a writable slice (a `mut` local or `out` parameter)".to_string(), recv.span);
             return err;
         };
         if !self.locals[id as usize].is_mut {
@@ -5753,7 +5759,6 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("cannot store into immutable '{name}' (declare with `mut`, or use an `out` parameter)"), recv.span);
             return err;
         }
-        let dst = self.check_expr(recv, None);
         let idx = self.check_expr(i, Some(Ty::Int(IntTy { bits: 64, signed: true })));
         if !idx.ty.is_int_like() && idx.ty != Ty::Error {
             self.diags.error(format!("a store index must be an integer, got {}", ty_name(idx.ty)), i.span);
