@@ -5930,23 +5930,25 @@ impl<'a, 't> Checker<'a, 't> {
         if ac.ty == Ty::Error {
             return err;
         }
-        // Float-only: a fused float multiply-add. A scalar float (incl. an undetermined float
-        // literal) or a float vector; the other two operands take `a`'s type as their context.
-        let at = self.resolve(ac.ty);
-        if !(at.is_float_like() || matches!(at, Ty::Vec(Scalar::Float(_), _))) {
-            self.diags.error(format!("'fma' needs a float or float-vector (it is a fused float multiply-add), got {}", ty_name(ac.ty)), a.span);
-            return err;
-        }
+        // Check b/c with `a`'s type as context, then unify all three to one type — so a float
+        // literal in *any* position can constrain the others before the float-only check below
+        // (checking `a` alone could prematurely reject an as-yet-unresolved var).
         let bc = self.check_expr(b, Some(ac.ty));
         let cc = self.check_expr(c, Some(ac.ty));
         if bc.ty == Ty::Error || cc.ty == Ty::Error {
             return err;
         }
-        // All three share one type (the result type); `unify` reports a mismatch.
         if self.unify(ac.ty, bc.ty, b.span) == Ty::Error || self.unify(ac.ty, cc.ty, c.span) == Ty::Error {
             return err;
         }
+        // Float-only: a fused float multiply-add. A scalar float (incl. an undetermined float
+        // literal) or a float vector.
         let ty = ac.ty;
+        let rt = self.resolve(ty);
+        if !(rt.is_float_like() || matches!(rt, Ty::Vec(Scalar::Float(_), _))) {
+            self.diags.error(format!("'fma' needs a float or float-vector (it is a fused float multiply-add), got {}", ty_name(rt)), span);
+            return err;
+        }
         Expr { kind: ExprKind::MathOp { fn_: hir::MathFn::Fma, operands: vec![ac, bc, cc] }, ty, span }
     }
 
