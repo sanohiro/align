@@ -251,6 +251,20 @@ written `mask<T>` annotation, and a SIMD-unit **tree reduction** (the reductions
 today — semantics-exact and -O2-reshaped, but a shuffle tree would keep it on the vector units).
 (`examples/vec_sum.align`.)
 
+**Slice 7 DONE — array load/store (the array ↔ vector bridge).** `s.load(i) -> vecN<T>` reads `N`
+consecutive elements of a `slice<T>` from runtime index `i` into a vector (`N`/`T` from the target
+annotation, like a vector literal); `s.store(i, v)` writes a vector's lanes into a **writable**
+(`mut`/`out`) `slice<T>` at `i..i+N`. Settled here: the surface is **method-form on a `slice<T>`**
+(`s.load(i)` / `s.store(i, v)`), with the width from the annotation and a runtime offset — a fixed
+array is loaded/stored by passing it where a slice is expected (the array→slice borrow; nothing
+hidden). Both are **bounds-checked** (`0 <= i && i + N <= len`, reusing the range-fail path); the
+store reuses the `out`-slice writability rule (`place[i] = v`). Codegen GEPs `&buf[i]` and emits the
+`<N x T>` load/store **at the element alignment** — the GEP yields only an element-aligned pointer, so
+assuming the wider vector alignment would be UB on strict-alignment targets (an unaligned-but-valid
+vector access). `hir::VecLoad`/`hir::VecStore` → `Rvalue::VecLoad` / `Stmt::VecStore`. Still deferred:
+scalar-on-the-left broadcast, the generic `vec<N,T>` spelling, lane assignment, a written `mask<T>`
+annotation, an aligned-load fast path, the tree reduction. (`examples/vec_load_store.align`.)
+
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element
 branch — `impl/05` §5), which is what keeps hot loops vectorizable and branch-predictor-friendly.

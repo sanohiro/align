@@ -693,9 +693,20 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     lanes, as the element scalar (the unmasked sibling of `sum_where`). Same dispatch shape as
     `min`/`max` (a vector receiver → the SIMD reduction, an array pipeline `xs.map(f).sum()` → the
     fused array path). `hir::VecSum` → `Rvalue::VecSum` reuses the shared `horizontal_sum`; int +
-    float. (`examples/vec_sum.align`.) Still deferred: scalar-on-the-left broadcast, array load/store,
-    the generic `vec<N,T>` spelling, lane assignment, a written `mask<T>` annotation, a SIMD-unit tree
-    reduction (the reductions currently extract-and-fold; -O2 reshapes them).
+    float. (`examples/vec_sum.align`.)
+  - **array load/store slice 7 — DONE.** `s.load(i) -> vecN<T>` reads `N` consecutive elements of a
+    `slice<T>` starting at the runtime index `i` into a vector (`N`/`T` from the target annotation,
+    like a vector literal); `s.store(i, v)` writes a vector's lanes back into a **writable** (`mut`/
+    `out`) `slice<T>` at `i..i+N`. Both **bounds-checked** (`0 <= i && i + N <= len`, reusing the
+    range-fail path). A fixed array is loaded/stored by passing it where a `slice<T>` is expected (the
+    array→slice borrow). `hir::VecLoad`/`hir::VecStore` → `Rvalue::VecLoad` / `Stmt::VecStore`: codegen
+    GEPs `&buf[i]` and emits a `<N x T>` load/store **at the element alignment** (the GEP yields an
+    element-aligned pointer, so the vector access must not assume the wider vector alignment — an
+    unaligned-but-valid access). The store reuses the `out`-slice writability rule (`place[i] = v`).
+    This is the bridge between bulk array data and SIMD registers. (`examples/vec_load_store.align`.)
+    Still deferred: scalar-on-the-left broadcast, the generic `vec<N,T>` spelling, lane assignment, a
+    written `mask<T>` annotation, a SIMD-unit tree reduction (the reductions extract-and-fold; -O2
+    reshapes them).
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.

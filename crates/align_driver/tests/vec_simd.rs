@@ -145,6 +145,74 @@ fn float_comparison_select_is_elementwise() {
 }
 
 #[test]
+fn vector_load_and_store_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    // Load 4 lanes from `src`, double them, store back into the `out` slice. xs = [10,20,30,40];
+    // doubled = [20,40,60,80]; ys[0] + ys[3] = 20 + 80 = 100.
+    let src = concat!(
+        "fn scale(src: slice<i64>, out dst: slice<i64>) {\n",
+        "  v: vec4<i64> := src.load(0)\n",
+        "  dst.store(0, v * 2)\n",
+        "}\n",
+        "fn main() -> i32 {\n",
+        "  xs := [10, 20, 30, 40]\n",
+        "  mut ys := [0, 0, 0, 0]\n",
+        "  scale(xs, ys)\n",
+        "  return (ys[0] + ys[3]) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-loadstore", src);
+    assert_eq!(out.status.code(), Some(100));
+}
+
+#[test]
+fn vector_load_at_an_offset() {
+    if !backend_available() {
+        return;
+    }
+    // Load starting at index 2: [30, 40, 50, 60].sum() = 180.
+    let src = concat!(
+        "fn tail(src: slice<i64>) -> i64 {\n",
+        "  v: vec4<i64> := src.load(2)\n",
+        "  return v.sum()\n",
+        "}\n",
+        "fn main() -> i32 {\n",
+        "  xs := [10, 20, 30, 40, 50, 60]\n",
+        "  return tail(xs) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-loadoff", src);
+    assert_eq!(out.status.code(), Some(180));
+}
+
+#[test]
+fn load_without_a_vector_annotation_is_rejected() {
+    let src = "fn f(s: slice<i64>) -> i64 {\n  v := s.load(0)\n  return v.sum()\n}\nfn main() -> i32 = 0\n";
+    assert!(check_errs("vec-load-noann", src));
+}
+
+#[test]
+fn store_into_an_immutable_slice_is_rejected() {
+    // A plain (non-`out`, non-`mut`) slice cannot be stored into.
+    let src = concat!(
+        "fn f(s: slice<i64>, v: vec4<i64>) {\n",
+        "  s.store(0, v)\n",
+        "}\n",
+        "fn main() -> i32 = 0\n",
+    );
+    assert!(check_errs("vec-store-immut", src));
+}
+
+#[test]
+fn load_store_element_type_mismatch_is_rejected() {
+    // The slice element type must match the vector element type.
+    let src = "fn f(s: slice<i32>) -> i64 {\n  v: vec4<i64> := s.load(0)\n  return v.sum()\n}\nfn main() -> i32 = 0\n";
+    assert!(check_errs("vec-load-elem", src));
+}
+
+#[test]
 fn vector_sum_reduction() {
     if !backend_available() {
         return;

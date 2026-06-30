@@ -86,6 +86,10 @@ pub enum Stmt {
     /// `ptr[index] <- value` — store into a raw element pointer (the buffer of an owned
     /// `array<T>` being filled). The element type comes from `value`.
     PtrStore(Operand, Operand, Operand),
+    /// `s.store(i, v)` — store the `n` lanes of vector `value` into a `slice<T>` (`{ptr,len}`) at
+    /// `index..index+n` (M6). Codegen GEPs the slice buffer to `&buf[index]` and emits a `<n x T>`
+    /// store at the element alignment. Bounds are checked before this statement is emitted.
+    VecStore { slice: Operand, index: Operand, value: Operand, elem: Ty, n: u32 },
     /// `slot[index].field <- value` (struct-array element field store).
     StoreElemField(Slot, Operand, u32, Operand),
     /// Store `value` into column `field` at row `index` of a `soa<Struct>` column-major buffer
@@ -228,6 +232,10 @@ pub enum Rvalue {
     /// `v.sum()` — the horizontal sum of a `vecN<T>` (M6): add all `n` lanes, yielding the element
     /// scalar `elem` (the unmasked sibling of [`VecSumWhere`]).
     VecSum { vec: Operand, elem: Ty, n: u32 },
+    /// `s.load(i)` — load `n` consecutive elements of a `slice<T>` (`{ptr,len}`) starting at `index`
+    /// into a `<n x T>` vector (M6). Codegen GEPs `&buf[index]` and emits a `<n x T>` load at the
+    /// element alignment. Bounds are checked before this rvalue.
+    VecLoad { slice: Operand, index: Operand, elem: Ty, n: u32 },
     /// `base[index].field` for a `{ptr,len}` view of struct `struct_id` (an owned, dynamic
     /// `array<Struct>`, MMv2 slice 8d-2). Like [`IndexField`] but addressed through the loaded
     /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
@@ -1504,6 +1512,24 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::VecSum { vec: vv, elem: e.ty, n }));
             Operand::Value(v)
         }
+        // `s.load(i)` → bounds-checked `<n x T>` load from the slice buffer at `i..i+n`.
+        hir::ExprKind::VecLoad { src, index, elem, n } => {
+            let sv = lower_expr(b, src);
+            let idx = lower_expr(b, index);
+            emit_vec_bounds_check(b, &sv, &idx, *n);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::VecLoad { slice: sv, index: idx, elem: align_sema::scalar_to_ty(*elem), n: *n }));
+            Operand::Value(v)
+        }
+        // `s.store(i, v)` → bounds-checked `<n x T>` store into the slice buffer at `i..i+n`. Unit.
+        hir::ExprKind::VecStore { dst, index, value, elem, n } => {
+            let sv = lower_expr(b, dst);
+            let idx = lower_expr(b, index);
+            let val = lower_expr(b, value);
+            emit_vec_bounds_check(b, &sv, &idx, *n);
+            b.push(Stmt::VecStore { slice: sv, index: idx, value: val, elem: align_sema::scalar_to_ty(*elem), n: *n });
+            Operand::Const(Const::Unit)
+        }
         // A `vecN<T>` literal is a register value: build it via an insertelement chain (`MakeVec`).
         hir::ExprKind::VecLit { elems, elem } => {
             let ops: Vec<Operand> = elems.iter().map(|el| lower_expr(b, el)).collect();
@@ -1610,6 +1636,16 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
 /// Bounds for `start..end`: `0 <= start`, `start <= end`, `end <= len`. Any violation aborts via
 /// `range_fail(start, end, len)` (`-> !`), which reports the whole range — a single (index, len)
 /// pair can't describe an inverted range whose bounds are each individually valid.
+/// Bounds for a vector load/store of `n` lanes at `idx`: `0 <= idx` and `idx + n <= len`. Reuses
+/// the range check with `start = idx`, `end = idx + n` (the slice's length is its `SliceLen`).
+fn emit_vec_bounds_check(b: &mut Builder, slice: &Operand, idx: &Operand, n: u32) {
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::SliceLen(slice.clone())));
+    let end = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(end, Rvalue::Bin(BinOp::Add, idx.clone(), Operand::Const(Const::Int(n as i128, i64_ty())))));
+    emit_range_bounds_check(b, idx, &Operand::Value(end), Operand::Value(len));
+}
+
 fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len: Operand) {
     let neg = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(neg, Rvalue::Bin(BinOp::Lt, start.clone(), Operand::Const(Const::Int(0, i64_ty())))));

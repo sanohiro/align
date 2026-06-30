@@ -396,6 +396,12 @@ pub enum ExprKind {
     /// `v.sum()` — the horizontal sum of a `vecN<T>` (M6): the sum of all lanes, as the element
     /// scalar (the unmasked sibling of [`VecSumWhere`]). Lowers via the shared lane reduction.
     VecSum { vec: Box<Expr> },
+    /// `s.load(i)` — load `N` consecutive elements of a `slice<T>` starting at index `i` into a
+    /// `vecN<T>` (M6): a bounds-checked vector load. `N`/`elem` come from the target annotation.
+    VecLoad { src: Box<Expr>, index: Box<Expr>, elem: crate::Scalar, n: u32 },
+    /// `s.store(i, v)` — store the `N` lanes of `v` into a writable `slice<T>` at `i..i+N` (M6): a
+    /// bounds-checked vector store. Yields `()`. `dst` is a `mut`/`out` slice place.
+    VecStore { dst: Box<Expr>, index: Box<Expr>, value: Box<Expr>, elem: crate::Scalar, n: u32 },
     /// `[e0, e1, …]` under a `vecN<T>` annotation — a fixed-width SIMD vector value (M6 slice 1).
     /// Unlike [`ArrayLit`] (slot/memory), a vector is a **register value**: it lowers to a single
     /// `Rvalue::MakeVec` (an insertelement chain), so it flows through value positions like a scalar.
