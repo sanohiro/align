@@ -179,6 +179,9 @@ pub enum Stmt {
     /// `base[index] = value` — element store into a `mut` array local or `out` slice parameter.
     /// Lowering emits a bounds check (abort on out-of-range), like an element read.
     AssignIndex { base: LocalId, index: Expr, value: Expr },
+    /// `v[lane] = value` — write one lane of a `mut vecN<T>` local (M6): `v = insertelement(v,
+    /// value, lane)`. `lane` is a constant in `0..N`.
+    AssignVecLane { local: LocalId, lane: u32, value: Expr },
     /// `root.f0.f1.… = value` — store into a (possibly nested) field of a struct local. `path` is
     /// the chain of field indices (length ≥ 1).
     AssignField { root: LocalId, path: Vec<u32>, value: Expr },

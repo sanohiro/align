@@ -220,6 +220,9 @@ pub enum Rvalue {
     MakeVec { elems: Vec<Operand>, elem: Ty, n: u32 },
     /// Read lane `lane` of a vector operand (`extractelement`); the result is the element `elem`.
     VecExtract { vec: Operand, lane: u32, elem: Ty },
+    /// Write `value` into lane `lane` of vector `vec` (`insertelement`), yielding the new vector
+    /// (M6 `v[lane] = x`, which then re-stores into the vector local).
+    VecInsert { vec: Operand, value: Operand, lane: u32 },
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): `select(mask, vec, 0)` then add all `n`
     /// lanes, yielding the element scalar `elem`.
     VecSumWhere { vec: Operand, mask: Operand, elem: Ty, n: u32 },
@@ -912,6 +915,16 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 }
                 other => unreachable!("element assignment into non-array/slice {other:?}"),
             }
+        }
+        // `v[lane] = value` → `v = insertelement(v, value, lane)` (a vector is a register value).
+        hir::Stmt::AssignVecLane { local, lane, value } => {
+            let val = lower_expr(b, value);
+            let vty = b.slots[*local as usize];
+            let cur = b.fresh_value(vty);
+            b.push(Stmt::Let(cur, Rvalue::Load(*local)));
+            let newv = b.fresh_value(vty);
+            b.push(Stmt::Let(newv, Rvalue::VecInsert { vec: Operand::Value(cur), value: val, lane: *lane }));
+            b.push(Stmt::Store(*local, Operand::Value(newv)));
         }
         hir::Stmt::Return(value) => {
             let op = value.as_ref().map(|e| lower_expr(b, e));
