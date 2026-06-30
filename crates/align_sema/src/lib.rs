@@ -1249,7 +1249,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 let ty = resolve_type(&f.ty, build_cx!(module), &tparams, diags);
                 fields.push(hir::FieldDef { name: f.name.name.clone(), ty });
             }
-            struct_templates.insert(mangle_fn(module, *is_entry, &s.name.name), StructTemplate { type_params: tparams, fields });
+            struct_templates.insert(mangle_fn(module, *is_entry, &s.name.name), StructTemplate { type_params: tparams, fields, align: s.align });
         }
         for (module, is_entry, e) in &generic_enum_decls {
             let tparams: Vec<String> = e.type_params.iter().map(|t| t.name.name.clone()).collect();
@@ -1318,10 +1318,9 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             }
             fields.push(FieldDef { name: f.name.name.clone(), ty });
         }
-        // `align`: natural alignment today — the `align(N)` surface syntax + custom value
-        // arrive at M6 (`open-questions.md`); the field is reserved so that is an additive
-        // change at the alignment seam, not a retrofit.
-        structs[i] = StructDef { name: mangle_fn(module, *_is_entry, &s.name.name), fields, align: None };
+        // `align(N)` over-alignment (M6): honored at the one `type_align` codegen seam (the slot
+        // alloca / struct-array element). `None` = the type's natural alignment.
+        structs[i] = StructDef { name: mangle_fn(module, *_is_entry, &s.name.name), fields, align: s.align };
     }
 
     // Pass 0b-2: now that every struct's fields are populated, validate **nested** struct fields. A
@@ -9343,6 +9342,8 @@ fn intern_fn_type(fn_types: &mut Vec<hir::FnTy>, params: Vec<Scalar>, ret: Scala
 struct StructTemplate {
     type_params: Vec<String>,
     fields: Vec<hir::FieldDef>,
+    /// An `align(N)` over-alignment carried from the template to every monomorph (M6).
+    align: Option<u32>,
 }
 
 /// A generic sum-type declaration (`Opt<T> { Some(T), None }`): its type-parameter names and its
@@ -9754,7 +9755,7 @@ fn instantiate_struct(name: &str, tmpl: &StructTemplate, args: &[Ty], cx: &mut T
         fields.push(hir::FieldDef { name: f.name.clone(), ty: fty });
     }
     let id = cx.structs.len() as u32;
-    cx.structs.push(StructDef { name: mangled.clone(), fields, align: None });
+    cx.structs.push(StructDef { name: mangled.clone(), fields, align: tmpl.align });
     cx.struct_mono.insert(mangled, id);
     id
 }

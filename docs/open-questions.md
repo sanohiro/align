@@ -1506,7 +1506,20 @@ In addition to auto-vectorization, whether to place explicit intrinsics in std (
 **Groundwork landed (pre-M6):** `Ty::DynStructArray(id, Layout)` now carries a `Layout` (only `Aos` today; `Soa` joins at M6) — layout is a property of the array *type*, so adding `Layout::Soa` makes every site that must handle it a compile error (it can't be silently forgotten). All struct-array element-field addressing is funneled through one MIR seam (`lower_field_access`), where the SoA column-index branch will hook in — localized, not a cross-cutting retrofit. (`Scalar::DynStructArray` stays layout-free — an SoA array as an Option/Result payload is a later concern.)
 Record: `impl/05-backend-llvm.md` §2, `design-notes.md` (hardware-friendly).
 
-### Struct/array alignment attribute `align(N)` — design reserved, implement ~M6
+### Struct/array alignment attribute `align(N)` — struct form DONE (M6)
+**DONE (struct form, M6):** `align(N) Name { … }` over-aligns a struct's storage to `N` bytes (a
+validated power of two). Parsed as a prefix attribute (`parse_align_attr` → `StructDecl.align`,
+threaded to `StructDef.align`, carried through generic monomorphs via `StructTemplate.align`); honored
+at the one `type_align` codegen seam (the slot alloca / AoS struct-array element), which now returns
+`max(declared, natural)` so a too-small `align(N)` can never *under*-align (UB). A non-power-of-two /
+too-large value, or `align(N)` on a sum type, is a clean error. `draft.md` §9 documents it;
+`tests/align_attr.rs`, `examples/align_attr.align`. **Still deferred:** the `align(N) data := …`
+binding/allocation form over a scalar array (which, with a multiple-of-N index, is what would unblock
+an **aligned vector-load fast path** — vec load/store currently uses the always-safe element
+alignment); arena/heap-buffer over-alignment; and padding an over-aligned struct's **size** up to its
+alignment for a tight `[N x %S]` array stride (the slot alloca is correctly aligned; the array stride
+uses the natural size today). Original design note follows.
+
 A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) data := …`) for GPU/DMA/page-aligned zero-copy interop. **Retrofit-sensitive**: it modifies struct field-offset math and the arena bump allocator's alignment, so reserve room in the layout model now; the surface + LLVM `align N` emission + arena honoring it can land at M6 alongside SoA. (Digested from `work/proposals/next-draft.md` §1.1.)
 **Groundwork landed (pre-M6):** `StructDef` carries `align: Option<u32>` (always `None` today — no surface syntax), and codegen routes all allocation alignment through one seam, `type_align(ty)` (natural ABI alignment today; a struct's custom `align` if set). M6 work is then "parse `align(N)` → set `StructDef.align`" + the seam returns it — the stack-slot alloca already calls the seam; the arena bump allocator already takes an explicit `align` argument. (Retrofit risk was low — a custom alignment is largely *additive* at the alloca/global/alloc sites — so this groundwork is a light reservation, unlike the SoA field-access seam.)
 

@@ -847,6 +847,22 @@ and decode-direct-to-`soa` (`s: soa<User> := json.decode(d)?`, decode-AoS-then-t
 feeding the normal pipeline. The plain column scan beats AoS ≈7×. The remaining slices are
 known-schema field-skip decode (parse only the used columns) and `str`/owned columns.)*
 
+### Over-alignment (`align(N)`)
+
+A struct may declare an over-alignment with `align(N)` (a power of two), for SIMD / GPU / DMA /
+page-aligned zero-copy interop:
+
+```align
+align(64) CacheLine {       // 64-byte aligned storage
+  a: i64, b: i64, c: i64, d: i64
+}
+
+align(4096) Page { data: i64 }   // page-aligned
+```
+
+The attribute only ever *over*-aligns — it is the max of `N` and the type's natural alignment, so it
+can never under-align. It changes the value's **storage alignment**, not its bytes or semantics.
+
 ---
 
 ## 10. Branch and Hot Path

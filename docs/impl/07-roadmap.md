@@ -738,9 +738,13 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   M6 (see `open-questions.md` Open "SoA layout" / "`align(N)`"). **Groundwork landed:** SoA —
   `Ty::DynStructArray` carries a `Layout` (AoS today) and all struct-array element-field addressing
   routes through one MIR seam (`lower_field_access`) where the SoA branch hooks in; `align(N)` —
-  `StructDef` carries `align: Option<u32>` (None today) and codegen routes all allocation alignment
-  through one `type_align` seam. M6 then wires the `soa`/`align(N)` surface syntax + SoA codegen
-  into those seams.
+  `StructDef` carries `align: Option<u32>` and codegen routes all allocation alignment through one
+  `type_align` seam. **`align(N)` struct form DONE** — `align(N) Name { … }` parses to
+  `StructDecl.align` → `StructDef.align`, and `type_align` returns `max(declared, natural)` (so it only
+  over-aligns); the slot alloca / AoS struct-array element pick it up (`tests/align_attr.rs`,
+  `examples/align_attr.align`, `draft.md` §9). Deferred: the `align(N) data := …` binding form over a
+  scalar array (the aligned-vector-load enabler), arena/heap over-alignment, and over-aligned-struct
+  size padding for a tight array stride. **SoA surface** + SoA codegen still wire into the SoA seam.
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 
