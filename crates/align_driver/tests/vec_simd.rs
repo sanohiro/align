@@ -106,15 +106,73 @@ fn invalid_width_is_rejected() {
 }
 
 #[test]
-fn comparison_on_vectors_is_rejected() {
-    // `==`/`<`/… on vectors produce a `mask` (a later slice). They must be rejected at sema, not
-    // reach codegen's `gen_vec_bin` (which only lowers `+`/`-`/`*`/`/`) and panic.
-    for opr in ["==", "!=", "<", "<=", ">", ">="] {
-        let src = format!(
-            "fn main() -> i32 {{\n  a: vec4<i32> := [1, 2, 3, 4]\n  b: vec4<i32> := [1, 2, 3, 4]\n  c := a {opr} b\n  return 0\n}}\n",
-        );
-        assert!(check_errs("vec-cmp", &src), "`{opr}` on vectors should be rejected");
+fn comparison_and_select_compute_elementwise_max() {
+    if !backend_available() {
+        return;
     }
+    // m = a > b = [F, T, F, T]; select(m, a, b) = elementwise max = [4, 5, 6, 8]; sum = 23.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [1, 5, 3, 8]\n",
+        "  b: vec4<i32> := [4, 2, 6, 7]\n",
+        "  m := a > b\n",
+        "  c := select(m, a, b)\n",
+        "  return c[0] + c[1] + c[2] + c[3]\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-mask-max", src);
+    assert_eq!(out.status.code(), Some(23));
+}
+
+#[test]
+fn float_comparison_select_is_elementwise() {
+    if !backend_available() {
+        return;
+    }
+    // m = a < b = [T, F]; select(m, a, b) picks the smaller lane → [1.0, 2.0]; lane 0 = 1.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec2<f32> := [1.0, 9.0]\n",
+        "  b: vec2<f32> := [4.0, 2.0]\n",
+        "  m := a < b\n",
+        "  c := select(m, a, b)\n",
+        "  return c[1] as i32\n",
+        "}\n",
+    );
+    // lane 1: a[1]=9 < b[1]=2 is false → b[1]=2.
+    let out = build_and_run("vec-mask-fmin", src);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn select_with_a_non_mask_first_arg_is_rejected() {
+    // `select`'s first argument must be a mask (a vector comparison result), not a vector.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [1, 2, 3, 4]\n",
+        "  b: vec4<i32> := [4, 3, 2, 1]\n",
+        "  c := select(a, a, b)\n",
+        "  return c[0]\n",
+        "}\n",
+    );
+    assert!(check_errs("vec-sel-nomask", src));
+}
+
+#[test]
+fn select_width_mismatch_is_rejected() {
+    // The mask width must match the vectors' width.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [1, 2, 3, 4]\n",
+        "  b: vec4<i32> := [4, 3, 2, 1]\n",
+        "  p: vec2<i32> := [1, 2]\n",
+        "  q: vec2<i32> := [2, 1]\n",
+        "  m := p > q\n",
+        "  c := select(m, a, b)\n",
+        "  return c[0]\n",
+        "}\n",
+    );
+    assert!(check_errs("vec-sel-width", src));
 }
 
 #[test]

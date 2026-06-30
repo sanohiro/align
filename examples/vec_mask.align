@@ -1,0 +1,12 @@
+// SIMD masks and select (draft.md §9). Comparing two vectors elementwise yields a `mask` (one bool
+// lane per vector lane), and `select(mask, a, b)` blends two vectors lane-wise — lane i is a[i]
+// where the mask is set, else b[i]. So `select(a > b, a, b)` is the elementwise maximum: a branchless,
+// vectorizable form with no per-lane `if`.
+
+fn main() -> i32 {
+  a: vec4<i32> := [1, 5, 3, 8]
+  b: vec4<i32> := [4, 2, 6, 7]
+  m := a > b                 // [false, true, false, true]
+  hi := select(m, a, b)      // elementwise max -> [4, 5, 6, 8]
+  return hi[0] + hi[1] + hi[2] + hi[3]   // 23
+}

@@ -190,9 +190,21 @@ Record: `impl/03-types.md` §6–§7
   the index must be a compile-time constant in `0..N` (a dynamic lane would risk an out-of-range
   poison value); lane *assignment* `v[i] = x` is deferred.
 Elementwise `+`/`-`/`*`/`/` lower to one lane-wise hardware instruction each. The `vec4<f32>`
-N-in-name spelling needs no lexer/parser/AST change. Deferred to later M6 slices: `mask<T>` +
-comparisons, `select`/`sum_where`, `dot`/reductions, broadcast, array load/store, and the generic
-`vec<N,T>` arg spelling. (`crates/align_*`, `tests/vec_simd.rs`, `examples/vec_simd.align`.)
+N-in-name spelling needs no lexer/parser/AST change. (`crates/align_*`, `tests/vec_simd.rs`,
+`examples/vec_simd.align`.)
+
+**Slice 2 DONE — `mask` + comparison + `select`.** A `vecN<T>` comparison (`==`/`!=`/`<`/`<=`/`>`/
+`>=`) is elementwise and yields a **`mask`** — `Ty::Mask(N)` → LLVM `<N x i1>`, one bool lane per
+vector lane. Settled here: the mask is **width-only / element-agnostic** (a width-`N` mask blends any
+two `vecN<T>`) and **produced/consumed inline** — no written `mask<T>` annotation yet (the surface
+spelling `mask<T>` carries no width, so the annotation is deferred until a use needs it).
+`select(mask, a, b)` (a `core.vec` builtin) is the consumer: lane `i` is `a[i]` where the mask is set,
+else `b[i]` (so `select(a > b, a, b)` is elementwise max). Comparisons reuse `ExprKind::Binary`
+(codegen `gen_bin` routes a vec operand + comparison op to `gen_vec_cmp` → vector `icmp`/`fcmp`);
+`select` is `hir::Select` lowering to the existing `Rvalue::Select`, **extended to accept a vector
+cond** (reused from branchless `where`'s scalar select). Width is checked between the mask and the two
+vectors. Still deferred: `sum_where`, `dot`/reductions, broadcast, array load/store, the generic
+`vec<N,T>` spelling, lane assignment. (`examples/vec_mask.align`.)
 
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused
 pipeline lowers `where` / conditional reductions **branchless** (mask + `select`, not a per-element

@@ -381,6 +381,9 @@ pub enum ExprKind {
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
     ArrayLit { elems: Vec<Expr>, elem: crate::Ty },
+    /// `select(mask, a, b)` — lane-wise blend of two `vecN<T>` by a `mask` (M6 slice 2): lane `i`
+    /// is `a[i]` where `mask[i]`, else `b[i]`. Lowers to `Rvalue::Select` (an LLVM vector `select`).
+    Select { mask: Box<Expr>, a: Box<Expr>, b: Box<Expr> },
     /// `[e0, e1, …]` under a `vecN<T>` annotation — a fixed-width SIMD vector value (M6 slice 1).
     /// Unlike [`ArrayLit`] (slot/memory), a vector is a **register value**: it lowers to a single
     /// `Rvalue::MakeVec` (an insertelement chain), so it flows through value positions like a scalar.

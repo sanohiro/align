@@ -755,9 +755,14 @@ Loop-fused without creating temporary arrays.
 
 ### Mask
 
+Comparing two vectors elementwise yields a **mask** (one bool lane per vector lane), and
+`select(mask, a, b)` blends two vectors lane-wise — lane `i` is `a[i]` where the mask is set, else
+`b[i]`:
+
 ```align
-m := scores > 80
-total := scores.sum_where(m)
+m := a > b                 // mask: one lane per comparison
+hi := select(m, a, b)      // elementwise max (a where a > b, else b)
+total := scores.sum_where(m)   // masked reduction (a later form)
 ```
 
 A mask is a first-class concept for SIMD / branchless / GPU. The pipeline's `where` is the implicit

@@ -655,10 +655,16 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     needs zero lexer/parser/AST change — `resolve_type` derives N from the name. Completion condition
     met: the IR carries real `<N x T>` types + `add <N x i32>` (verified via `emit-llvm`); per-lane
     run tests confirm correct lane-wise arithmetic. (`tests/vec_simd.rs`, `examples/vec_simd.align`.)
-    **Deferred (later M6 slices):** `mask<T>` + comparisons → mask, `select`/`sum_where`, `dot`/
-    horizontal reductions, scalar broadcast/splat, load/store from an `array`/`slice`, the `vec<N,T>`
-    generic-arg spelling, and lane *assignment* `v[i] = x`. The LLVM-version upgrade is not needed
-    for this slice (LLVM 19 has full vector support).
+    **Deferred (later M6 slices):** `sum_where`, `dot`/horizontal reductions, scalar broadcast/splat,
+    load/store from an `array`/`slice`, the `vec<N,T>` generic-arg spelling, and lane *assignment*
+    `v[i] = x`. The LLVM-version upgrade is not needed for this slice (LLVM 19 has full vector support).
+  - **`mask` + comparison + `select` slice 2 — DONE.** A `vecN<T>` comparison (`==`/`!=`/`<`/`<=`/`>`/
+    `>=`) is elementwise and yields a **`mask`** (`Ty::Mask(N)` → LLVM `<N x i1>`, one bool lane per
+    vector lane; element-agnostic, width-only — produced/consumed inline, no written annotation).
+    `select(mask, a, b)` (a `core.vec` builtin, `hir::Select` → the existing `Rvalue::Select` with a
+    *vector* cond) blends two same-type vectors lane-wise. Comparisons reuse `ExprKind::Binary`
+    (`gen_bin` routes a vec operand + comparison op to `gen_vec_cmp` → vector `icmp`/`fcmp`); width is
+    checked between the mask and the vectors. (`tests/vec_simd.rs`, `examples/vec_mask.align`.)
 - temporary-array-free fusion of the array expression `a = (b+c)*d - e`.
 - deterministic lowering of MIR mask to LLVM vector select.
 - `sum_where` / `dot` / `select`.
