@@ -2010,26 +2010,26 @@ unsafe fn read_key_slice<'a>(row: *const u8, key_off: usize) -> (&'a [u8], Align
     (bytes, ks)
 }
 
-unsafe fn group_agg_str(
-    base: *const u8,
-    n: i64,
-    stride: i64,
-    key_off: i64,
+/// Core of the str-key group-by: intern each row's `str` key to a dense id in **first-occurrence
+/// order** (a `HashMap<&[u8], id>`), accumulate `value_at(i)` per id with `combine`, then emit the
+/// distinct keys (first-occurrence view as representative) + their accumulators. Key and value are
+/// **index closures** over `0..n`, so the same core serves both a strided AoS record
+/// (`align_rt_group_*_str`, key+value in one row) and two separate contiguous soa columns
+/// (`align_rt_group_*_str_cols`). Returns the group count, or -1 on a null/cap error. `out_keys` /
+/// `out_vals` must hold at least `cap` elements. (Callers validate their own input pointers + `n`.)
+unsafe fn group_agg_str<'a>(
+    n: usize,
     out_keys: *mut AlignStr,
     out_vals: *mut i64,
     cap: i64,
-    value_at: impl Fn(*const u8) -> i64,
+    key_at: impl Fn(usize) -> (&'a [u8], AlignStr),
+    value_at: impl Fn(usize) -> i64,
     combine: impl Fn(i64, i64) -> i64,
 ) -> i64 {
     use std::collections::HashMap;
-    if n <= 0 || base.is_null() {
-        return 0;
-    }
     if cap < 0 || out_keys.is_null() || out_vals.is_null() {
         return -1;
     }
-    let n = n as usize;
-    let (stride, key_off) = (stride as usize, key_off as usize);
     // Reserve up front to avoid the early grow-and-rehash churn; the group count is unknown, so cap
     // at a sane starting size (n is the worst case = all-distinct, but don't over-reserve for huge n).
     let initial = n.min(cap as usize).min(1024);
@@ -2037,10 +2037,8 @@ unsafe fn group_agg_str(
     let mut acc: Vec<i64> = Vec::with_capacity(initial);
     let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
     for i in 0..n {
-        let row = unsafe { base.add(i * stride) };
-        let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
-        // `value_at` reads from the already-computed `row` (no re-deriving `base + i*stride`).
-        let v = value_at(row);
+        let (bytes, ks) = key_at(i);
+        let v = value_at(i);
         match ids.get(bytes) {
             Some(&id) => acc[id] = combine(acc[id], v),
             None => {
@@ -2062,51 +2060,145 @@ unsafe fn group_agg_str(
     count as i64
 }
 
-/// `value_at` reading the i64 value at `val_off` from a row pointer — for sum/min/max (count
-/// uses `1`). The caller passes the per-row pointer, so this just offsets to the value column.
-#[inline]
-fn str_value_reader(val_off: i64) -> impl Fn(*const u8) -> i64 {
-    let val_off = val_off as usize;
-    move |row| unsafe { (row.add(val_off) as *const i64).read_unaligned() }
+/// Read the i64 value at `base + i*stride + val_off` — the AoS value-column index closure.
+#[inline(always)]
+unsafe fn aos_value_at(base: *const u8, stride: usize, val_off: usize) -> impl Fn(usize) -> i64 {
+    move |i| unsafe { (base.add(i * stride).add(val_off) as *const i64).read_unaligned() }
 }
 
-/// `group_by(.str_key).sum(.i64_value)` over an AoS `array<Struct>`.
+/// The AoS key-column index closure: the `AlignStr` at `base + i*stride + key_off` (the strided
+/// record's key field). The sibling of [`soa_key_at`] for the strided-record layout.
+#[inline(always)]
+unsafe fn aos_key_at<'a>(base: *const u8, stride: usize, key_off: usize) -> impl Fn(usize) -> (&'a [u8], AlignStr) {
+    move |i| unsafe { read_key_slice(base.add(i * stride), key_off) }
+}
+
+/// `group_by(.str_key).sum(.i64_value)` over an AoS `array<Struct>` (key + value in one strided row).
 ///
 /// # Safety
-/// See [`group_agg_str`]; `val_off` must address a valid `i64` in each row.
+/// `base` addresses `n` records of `stride` bytes; `key_off`/`val_off` are valid field offsets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_sum_str(base: *const u8, n: i64, stride: i64, key_off: i64, val_off: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
-    let read = str_value_reader(val_off);
-    unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, read, |a, b| a.wrapping_add(b)) }
+    if n <= 0 || base.is_null() {
+        return 0;
+    }
+    let (n, stride, key_off, val_off) = (n as usize, stride as usize, key_off as usize, val_off as usize);
+    unsafe {
+        group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.wrapping_add(b))
+    }
 }
 
-/// `group_by(.str_key).min(.i64_value)` — per-group minimum.
+/// `group_by(.str_key).min(.i64_value)` over an AoS array — per-group minimum.
 ///
 /// # Safety
 /// See [`align_rt_group_sum_str`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_min_str(base: *const u8, n: i64, stride: i64, key_off: i64, val_off: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
-    let read = str_value_reader(val_off);
-    unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, read, |a, b| a.min(b)) }
+    if n <= 0 || base.is_null() {
+        return 0;
+    }
+    let (n, stride, key_off, val_off) = (n as usize, stride as usize, key_off as usize, val_off as usize);
+    unsafe {
+        group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.min(b))
+    }
 }
 
-/// `group_by(.str_key).max(.i64_value)` — per-group maximum.
+/// `group_by(.str_key).max(.i64_value)` over an AoS array — per-group maximum.
 ///
 /// # Safety
 /// See [`align_rt_group_sum_str`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_max_str(base: *const u8, n: i64, stride: i64, key_off: i64, val_off: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
-    let read = str_value_reader(val_off);
-    unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, read, |a, b| a.max(b)) }
+    if n <= 0 || base.is_null() {
+        return 0;
+    }
+    let (n, stride, key_off, val_off) = (n as usize, stride as usize, key_off as usize, val_off as usize);
+    unsafe {
+        group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.max(b))
+    }
 }
 
-/// `group_by(.str_key).count()` — per-group row count (no value column; `val_off` is unused).
+/// `group_by(.str_key).count()` over an AoS array — per-group row count (no value column).
 ///
 /// # Safety
-/// See [`group_agg_str`].
+/// See [`align_rt_group_sum_str`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_count_str(base: *const u8, n: i64, stride: i64, key_off: i64, _val_off: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
-    unsafe { group_agg_str(base, n, stride, key_off, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b)) }
+    if n <= 0 || base.is_null() {
+        return 0;
+    }
+    let (n, stride, key_off) = (n as usize, stride as usize, key_off as usize);
+    unsafe { group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), |_| 1, |a, b| a.wrapping_add(b)) }
+}
+
+// ---- soa two-contiguous-column variants: `key_col` is an `AlignStr` column, `val_col` an i64 column
+// (separate buffers, not a strided record). `n` is the row count. Count ignores `val_col`. ----
+
+/// The soa key-column index closure: the i-th `AlignStr` at `key_col + i*16` (`read_key_slice` with
+/// offset 0 reads the `AlignStr` at the given address).
+#[inline(always)]
+unsafe fn soa_key_at<'a>(key_col: *const AlignStr) -> impl Fn(usize) -> (&'a [u8], AlignStr) {
+    move |i| unsafe { read_key_slice(key_col.add(i) as *const u8, 0) }
+}
+
+/// The soa value-column index closure: the i-th i64 at `val_col + i*8`.
+#[inline(always)]
+unsafe fn soa_value_at(val_col: *const i64) -> impl Fn(usize) -> i64 {
+    move |i| unsafe { val_col.add(i).read_unaligned() }
+}
+
+/// `group_by(.str_key).sum(.i64_value)` over a `soa<Struct>` — key and value are SEPARATE contiguous
+/// columns (`key_col`: `AlignStr` elements, `val_col`: `i64`), the columnar counterpart of
+/// [`align_rt_group_sum_str`].
+///
+/// # Safety
+/// `key_col` addresses `n` `AlignStr`s, `val_col` `n` `i64`s; `out_keys`/`out_vals` hold ≥`cap`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_sum_str_cols(key_col: *const AlignStr, val_col: *const i64, n: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
+    if n <= 0 || key_col.is_null() || val_col.is_null() {
+        return 0;
+    }
+    let n = n as usize;
+    unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), soa_value_at(val_col), |a, b| a.wrapping_add(b)) }
+}
+
+/// `group_by(.str_key).min(.i64_value)` over a soa — per-group minimum (two-column form).
+///
+/// # Safety
+/// See [`align_rt_group_sum_str_cols`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_min_str_cols(key_col: *const AlignStr, val_col: *const i64, n: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
+    if n <= 0 || key_col.is_null() || val_col.is_null() {
+        return 0;
+    }
+    let n = n as usize;
+    unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), soa_value_at(val_col), |a, b| a.min(b)) }
+}
+
+/// `group_by(.str_key).max(.i64_value)` over a soa — per-group maximum (two-column form).
+///
+/// # Safety
+/// See [`align_rt_group_sum_str_cols`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_max_str_cols(key_col: *const AlignStr, val_col: *const i64, n: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
+    if n <= 0 || key_col.is_null() || val_col.is_null() {
+        return 0;
+    }
+    let n = n as usize;
+    unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), soa_value_at(val_col), |a, b| a.max(b)) }
+}
+
+/// `group_by(.str_key).count()` over a soa — per-group row count (two-column form; `val_col` unused).
+///
+/// # Safety
+/// See [`align_rt_group_sum_str_cols`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_group_count_str_cols(key_col: *const AlignStr, _val_col: *const i64, n: i64, out_keys: *mut AlignStr, out_vals: *mut i64, cap: i64) -> i64 {
+    if n <= 0 || key_col.is_null() {
+        return 0;
+    }
+    let n = n as usize;
+    unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
 /// One aggregate of a fused multi-aggregate str group-by ([`align_rt_group_multi_str`]). `op` is
@@ -4090,6 +4182,35 @@ mod tests {
             .map(|g| (unsafe { std::slice::from_raw_parts(ok2[g].ptr, ok2[g].len as usize) }, ov2[g]))
             .collect();
         assert_eq!(got2, std::collections::HashMap::from([(&b""[..], 15), (&b"x"[..], 20)]));
+    }
+
+    #[test]
+    fn group_str_cols_aggregates_two_separate_columns() {
+        // The soa form: the key and value live in SEPARATE contiguous column buffers (not a strided
+        // record). Same data as the AoS test → same groups: keys a a b c a b, vals 1 2 3 4 5 6.
+        let s = |b: &'static [u8]| AlignStr { ptr: b.as_ptr(), len: b.len() as i64 };
+        let key_col = [s(b"a"), s(b"a"), s(b"b"), s(b"c"), s(b"a"), s(b"b")];
+        let val_col = [1i64, 2, 3, 4, 5, 6];
+        let n = key_col.len() as i64;
+        type ColsFn = unsafe extern "C" fn(*const AlignStr, *const i64, i64, *mut AlignStr, *mut i64, i64) -> i64;
+        let collect = |f: ColsFn| -> std::collections::HashMap<&[u8], i64> {
+            let (mut ok, mut ov) = (vec![AlignStr { ptr: std::ptr::null(), len: 0 }; key_col.len()], vec![0i64; key_col.len()]);
+            let count = unsafe { f(key_col.as_ptr(), val_col.as_ptr(), n, ok.as_mut_ptr(), ov.as_mut_ptr(), n) } as usize;
+            (0..count).map(|g| (unsafe { std::slice::from_raw_parts(ok[g].ptr, ok[g].len as usize) }, ov[g])).collect()
+        };
+        // sum {a:8, b:9, c:4}; min {a:1, b:3, c:4}; max {a:5, b:6, c:4}; count {a:3, b:2, c:1}.
+        assert_eq!(collect(align_rt_group_sum_str_cols), std::collections::HashMap::from([(&b"a"[..], 8), (&b"b"[..], 9), (&b"c"[..], 4)]));
+        assert_eq!(collect(align_rt_group_min_str_cols), std::collections::HashMap::from([(&b"a"[..], 1), (&b"b"[..], 3), (&b"c"[..], 4)]));
+        assert_eq!(collect(align_rt_group_max_str_cols), std::collections::HashMap::from([(&b"a"[..], 5), (&b"b"[..], 6), (&b"c"[..], 4)]));
+        // count passes a null value column (unused) — must not deref it.
+        let (mut ok, mut ov) = (vec![AlignStr { ptr: std::ptr::null(), len: 0 }; key_col.len()], vec![0i64; key_col.len()]);
+        let cc = unsafe { align_rt_group_count_str_cols(key_col.as_ptr(), std::ptr::null(), n, ok.as_mut_ptr(), ov.as_mut_ptr(), n) } as usize;
+        let counts: std::collections::HashMap<&[u8], i64> = (0..cc).map(|g| (unsafe { std::slice::from_raw_parts(ok[g].ptr, ok[g].len as usize) }, ov[g])).collect();
+        assert_eq!(counts, std::collections::HashMap::from([(&b"a"[..], 3), (&b"b"[..], 2), (&b"c"[..], 1)]));
+
+        // Degenerate: empty input and a null key column both yield zero groups (not -1).
+        assert_eq!(unsafe { align_rt_group_sum_str_cols(key_col.as_ptr(), val_col.as_ptr(), 0, ok.as_mut_ptr(), ov.as_mut_ptr(), 0) }, 0);
+        assert_eq!(unsafe { align_rt_group_sum_str_cols(std::ptr::null(), val_col.as_ptr(), n, ok.as_mut_ptr(), ov.as_mut_ptr(), n) }, 0);
     }
 
     #[test]

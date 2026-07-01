@@ -838,13 +838,13 @@ totals := orders.group_by(.customer).sum(.amount)   // (array<Customer>, array<A
 not a hash map; idiomatic Rust reaches for a generic `HashMap<K, Acc>`, while Align reads the two
 columns sequentially into a primitive-key aggregate. An **integer** key over a `soa` runs as a
 primitive-key open-addressing aggregate, and when the keys fall in a tight range it skips hashing
-entirely (direct-index accumulation — ~5× a `std::HashMap`, beating even `ahash`). A **string** key
-over an `array<Struct>` (a `soa` keys grouping on an `i64` column) is **dictionary-encoded**: the runtime
-interns each key to a dense id once, then aggregates by id — yielding `(array<str>, array<Acc>)` whose
-key views borrow the source. The surface is identical (`group_by(.key).sum(.value)`); the strategy is
-the runtime's concern. (First cut: an `i64` key over a `soa`, or a `str` key over an `array<Struct>`,
-with an `i64` value and `sum`/`min`/`max`/`count`. A `soa` may hold `str` columns, but grouping a
-`soa` still keys on an `i64` column — a str-key soa `group_by` is not yet wired.)
+entirely (direct-index accumulation — ~5× a `std::HashMap`, beating even `ahash`). A **string** key is
+**interned** to a dense id once, then aggregated by id — yielding `(array<str>, array<Acc>)` whose key
+views borrow the source. This works both over an AoS `array<Struct>` (the key + value read from one
+strided record) and over a `soa<Struct>` **str key column** (the key column and value column read as
+two separate contiguous columns). The surface is identical either way (`group_by(.key).sum(.value)`);
+the layout picks the runtime path. (First cut: an `i64` or `str` key over a `soa`, or a `str` key over
+an `array<Struct>`, with an `i64` value and `sum`/`min`/`max`/`count`.)
 
 This is the layout lever that lets Align *beat* an array-of-structs (what a hand-written `Vec<User>`
 gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags

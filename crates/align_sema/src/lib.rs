@@ -2344,7 +2344,7 @@ impl<'a> EscapeCheck<'a> {
             // outlive the source. (An i64-key group_by yields owned arrays that borrow nothing → the
             // default `Static`.) `dict_encode` itself likewise borrows its source AoS (its `dict`/
             // `source` slices view it), so the encoded value inherits the source's region.
-            ExprKind::ArrayGroupAgg { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded, .. }
+            ExprKind::ArrayGroupAgg { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded | hir::GroupSource::SoaStr, .. }
             | ExprKind::ArrayGroupAggMulti { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded, .. }
             | ExprKind::ArrayDictEncode { base, .. }
             // A `soa` column projection `s.field` is a `{ptr,len}` slice into the soa's buffer; for a
@@ -6742,10 +6742,9 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         };
-        // The source is a struct-collection local: either a `soa<Struct>` (contiguous columns,
-        // grouped on an i64 key column) or — for a `str` key — an AoS `array<Struct>`, whose `str`
-        // keys the runtime dictionary-encodes. (A soa may now hold a `str` column, but a str-*key*
-        // soa group_by is not yet wired — soa grouping keys on an i64 column.)
+        // The source is a struct-collection local: a `soa<Struct>` (contiguous columns, grouped on an
+        // i64 OR a `str` key column — decided below by the key field's type), an AoS `array<Struct>`
+        // (a `str` key, dictionary-encoded inline), or a precomputed `dict_encode`d value.
         let base = match self.place_local(source) {
             Some((id, _)) => id,
             None => {
@@ -6758,7 +6757,18 @@ impl<'a, 't> Checker<'a, 't> {
         // encoded source, `enc_key` is the field the dictionary was built on — the group key must
         // match it (grouping by a different field has no precomputed ids).
         let (id, source, enc_key) = match self.locals[base as usize].ty {
-            Ty::Soa(id) => (id, hir::GroupSource::SoaI64, None),
+            // A soa keys on an i64 column (SoaI64) or a `str` column (SoaStr) — decided by the key
+            // field's declared type. A str key column is interned like the AoS str key, but read from
+            // its own contiguous column (the two-column runtime path).
+            Ty::Soa(id) => {
+                let is_str_key = self.structs[id as usize]
+                    .fields
+                    .iter()
+                    .find(|f| f.name == key_field.name)
+                    .is_some_and(|f| f.ty == Ty::Str);
+                let src = if is_str_key { hir::GroupSource::SoaStr } else { hir::GroupSource::SoaI64 };
+                (id, src, None)
+            }
             Ty::DynStructArray(id, Layout::Aos) => (id, hir::GroupSource::AosStr, None),
             Ty::DictEncoded(id, kf) => (id, hir::GroupSource::Encoded, Some(kf)),
             Ty::Error => return err,
@@ -6770,12 +6780,16 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         };
-        let key_str = matches!(source, hir::GroupSource::AosStr | hir::GroupSource::Encoded);
+        let key_str = matches!(source, hir::GroupSource::AosStr | hir::GroupSource::Encoded | hir::GroupSource::SoaStr);
         // Clone the field table so the field resolution below can also touch `self.diags`.
         let sname = self.structs[id as usize].name.clone();
         let fields = self.structs[id as usize].fields.clone();
         let i64t = Ty::Int(IntTy { bits: 64, signed: true });
-        let src_kind = if key_str { "array" } else { "soa" };
+        // Diagnostic label for the physical source (a soa str-key is still a `soa`, not an `array`).
+        let src_kind = match source {
+            hir::GroupSource::SoaI64 | hir::GroupSource::SoaStr => "soa",
+            hir::GroupSource::AosStr | hir::GroupSource::Encoded => "array",
+        };
         if key_str {
             // str key (dictionary-encoded, inline or precomputed) + i64 value, `sum`/`min`/`max`/
             // `count`. `count` reads no value column; the others require an i64 value field.

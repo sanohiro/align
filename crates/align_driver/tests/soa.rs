@@ -603,6 +603,74 @@ fn group_by_str_key_min_max_count_aggregate() {
     assert_eq!(String::from_utf8_lossy(&build_and_run("group-str-count", &prog("count()")).stdout), "2\n2\n1\n");
 }
 
+// ---- str-KEY group_by over a `soa<Struct>` (columnar; the two-contiguous-column runtime path) ----
+
+#[test]
+fn soa_str_key_group_by_all_aggregates() {
+    if !backend_available() {
+        return;
+    }
+    // The soa counterpart of the AoS str-key test: the same rows decoded straight into a `soa<User>`
+    // (a `str` name column + an i64 score column), grouped by the str column. Keys intern in
+    // first-occurrence order (a,b,c). Must match the AoS results exactly.
+    let prog = |agg: &str| {
+        format!(
+            concat!(
+                "import core.json\n",
+                "User {{ name: str, score: i64 }}\n",
+                "fn main() -> Result<(), Error> {{\n  arena {{\n",
+                "    us: soa<User> := json.decode(\"[{{\\\"name\\\":\\\"a\\\",\\\"score\\\":10}},{{\\\"name\\\":\\\"b\\\",\\\"score\\\":20}},{{\\\"name\\\":\\\"a\\\",\\\"score\\\":5}},{{\\\"name\\\":\\\"c\\\",\\\"score\\\":7}},{{\\\"name\\\":\\\"b\\\",\\\"score\\\":3}}]\")?\n",
+                "    g := us.group_by(.name).{agg}\n",
+                "    print(g.1[0])\n    print(g.1[1])\n    print(g.1[2])\n",
+                "  }}\n  return Ok(())\n}}\n",
+            ),
+            agg = agg,
+        )
+    };
+    // sum: a:15, b:23, c:7 ; min: a:5, b:3, c:7 ; max: a:10, b:20, c:7 ; count: a:2, b:2, c:1.
+    assert_eq!(String::from_utf8_lossy(&build_and_run("soa-group-str-sum", &prog("sum(.score)")).stdout), "15\n23\n7\n");
+    assert_eq!(String::from_utf8_lossy(&build_and_run("soa-group-str-min", &prog("min(.score)")).stdout), "5\n3\n7\n");
+    assert_eq!(String::from_utf8_lossy(&build_and_run("soa-group-str-max", &prog("max(.score)")).stdout), "10\n20\n7\n");
+    assert_eq!(String::from_utf8_lossy(&build_and_run("soa-group-str-count", &prog("count()")).stdout), "2\n2\n1\n");
+}
+
+#[test]
+fn soa_str_key_group_by_type_checks_and_selects_by_key_column() {
+    // A str key column routes to the str path (SoaStr); an i64 key column stays on the i64 path.
+    // (Bind the result tuple before `.1` — reading `.1` off a temporary tuple would move it, an
+    // unrelated rule; binding keeps the check about key/value type resolution.)
+    assert!(ok(concat!(
+        "P { name: str, v: i64 }\n",
+        "fn k(s: soa<P>) -> i64 {\n  g := s.group_by(.name).sum(.v)\n  return g.1.len()\n}\n",
+    )));
+    assert!(ok(concat!(
+        "P { id: i64, v: i64 }\n",
+        "fn k(s: soa<P>) -> i64 {\n  g := s.group_by(.id).sum(.v)\n  return g.1.len()\n}\n",
+    )));
+    // A str key still needs an i64 value (same rule as the AoS str key).
+    assert!(!ok(concat!(
+        "P { name: str, tag: str }\n",
+        "fn k(s: soa<P>) -> i64 {\n  g := s.group_by(.name).sum(.tag)\n  return g.1.len()\n}\n",
+    )));
+}
+
+#[test]
+fn soa_str_key_group_by_result_cannot_escape_the_arena() {
+    // The str keys of the result `(array<str>, array<i64>)` borrow the soa's string storage, so the
+    // owned key array cannot be returned out of the arena (its `str` elements would dangle). The
+    // i64-key soa group_by, by contrast, yields owned i64 keys that borrow nothing and CAN escape.
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "Rec { name: str, pay: i64 }\n",
+        "fn keys_of(data: str) -> Result<array<str>, Error> {\n  arena {\n    s: soa<Rec> := json.decode(data)?\n    g := s.group_by(.name).sum(.pay)\n    return Ok(g.0)\n  }\n}\n",
+    )));
+    assert!(ok(concat!(
+        "import core.json\n",
+        "Rec { id: i64, pay: i64 }\n",
+        "fn keys_of(data: str) -> Result<array<i64>, Error> {\n  arena {\n    s: soa<Rec> := json.decode(data)?\n    g := s.group_by(.id).sum(.pay)\n    return Ok(g.0)\n  }\n}\n",
+    )));
+}
+
 #[test]
 fn dict_encode_reuse_matches_a1_string_group_by() {
     if !backend_available() {

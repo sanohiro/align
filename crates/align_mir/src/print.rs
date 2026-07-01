@@ -241,6 +241,16 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 operand_str(out_vals)
             )
         }
+        Rvalue::GroupAggStrCols { keys, vals, out_keys, out_vals, op } => {
+            format!(
+                "group_{:?}_str_cols(keys={}, vals={} -> {}, {})",
+                op,
+                operand_str(keys),
+                operand_str(vals),
+                operand_str(out_keys),
+                operand_str(out_vals)
+            )
+        }
         Rvalue::GroupAggStr { base, struct_id, key_field, value_field, op, out_keys, out_vals } => {
             let val = value_field.map(|v| format!(".val{v}")).unwrap_or_default();
             format!(
