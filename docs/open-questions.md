@@ -1893,6 +1893,23 @@ Backend / codegen lowering (MIR -> LLVM, source unchanged):
   predictor assumes Ok. NOT a few lines — it touches the MIR Term, hence backlog not a quick fix.
 - Scalable-vector (VLA) loops: emit <vscale x N x T> + predication for ARM SVE /
   RISC-V V, eliminating the scalar remainder loop. (Baseline = fixed-width vec<N> at M6.)
+- Matrix engines — ARM SME/SME2 AND x86 AMX (deferred; the migration foundation is the point, not the
+  implementation; the foundation is cross-ISA — same shaped-op surface lowers to SME, AMX, or a
+  scalar fallback, picked by the capability dispatch above, never named in source). Taking SME as the
+  worked example. SME is NOT another wider NEON — it is a 2D tile accumulator (ZA register,
+  outer-product-accumulate → matmul) requiring streaming-SVE mode (PSTATE.SM) and a streaming-
+  function ABI, so it lands in codegen's ABI layer, not as a loop-vectorization tweak. Hard
+  constraints that keep the door open WITHOUT building it now: (1) never expose SME (or any fixed
+  width) in source — the only surface is a high-level shaped op (`tensor.matmul`, batched
+  outer-product/reduce) that lowers to SME with a NEON fallback, per "SIMD comes from map/reduce
+  lowering well, not intrinsics" + Nothing hidden; the language stays width-/engine-agnostic.
+  (2) Keep MIR free of baked-in vector width / NEON-128 assumptions so the same IR can target
+  NEON today and SME/SVE2 later (already the "capabilities, not feature-names" dispatch rule above).
+  (3) The prerequisite is a 2D/tensor abstraction — design the M4 array model so a 2D extension +
+  reduce-over-2D is reachable, don't make `array`/pipeline fundamentally 1D-only. Trigger: a tensor
+  surface lands AND SME hardware is testable (Apple M4+ has SME but no SVE; cloud Graviton/A64FX for
+  SVE2 — none testable on the M1 dev host, so verification is rent-cloud-briefly, not a blocker).
+  Needs the LLVM/inkwell upgrade checkpoint first (LLVM 19 predates serious `sme2` codegen).
 - Non-temporal stores: tag large materializing writes with !nontemporal to bypass cache.
 - Fast-math flags on float ops (opt-in): unlock float reassociation / autovectorization.
 - -march=native / host CPU feature detection (opt-in; breaks portable "predictable").
