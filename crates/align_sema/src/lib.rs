@@ -234,6 +234,11 @@ pub enum Ty {
     String,
     /// An arena handle (internal; produced by `arena {}`, never written by the user).
     ArenaHandle,
+    /// `raw` — an opaque, untyped raw byte pointer, the unsafe escape hatch (`raw.alloc` yields one;
+    /// `raw.free` consumes one). Copy, `Static` region (not arena/region-tracked), never auto-dropped
+    /// — the memory is manually managed, which is why `raw.*` ops are confined to an `unsafe {}` block.
+    /// Lowers to an LLVM `ptr`, like the other opaque-pointer types.
+    Raw,
     /// `builder` — an append-oriented string writer (draft.md §12), the canonical way to
     /// construct a `string` (over `a + b` concat). An opaque owned handle to a heap builder
     /// object (a Move type): `builder()` opens it, `.write(...)` appends, `.to_string()` consumes
@@ -1987,6 +1992,17 @@ impl EffectScan {
                 self.expr(arg);
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b),
+            // An `unsafe {}` block (and any `raw.*` op) makes the function impure — it can never be a
+            // Pure `par_map` callee. This is the "unsafe must be visible/traceable" rule, reusing the
+            // existing binary purity flag (unsafe is conflated with I/O-impure for now).
+            ExprKind::Unsafe(b) => {
+                self.impure_direct = true;
+                self.block(b);
+            }
+            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => {
+                self.impure_direct = true;
+                self.expr(e);
+            }
             // Spawning / joining concurrent work is an observable effect (the enclosing function
             // is not pure); the spawned closure's own effects live in its lifted function.
             ExprKind::Spawn { closure, .. } => {
@@ -2353,6 +2369,10 @@ impl<'a> EscapeCheck<'a> {
             // so inheriting is harmless — never checked.)
             | ExprKind::SoaColumn { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
+            // `unsafe {}` is a plain marker block — its value's region is the tail value's region (no
+            // new region opened, unlike `arena {}`). Explicit so an arena value returned from an
+            // unsafe block isn't silently inferred `Static` via the wildcard below and allowed to escape.
+            ExprKind::Unsafe(b) => self.region_of_block(b, depth),
             // An `arena {}` *expression* yields its block value, evaluated one level deeper.
             // Without this, a binding that captures an arena's value (`p := arena { … }`) would
             // be inferred `Static` and could then escape undetected (a use-after-free across
@@ -2536,6 +2556,8 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::Block(b) => self.block(b, depth),
+            // `unsafe {}` is a plain marker block for escape purposes — walk it at the same depth.
+            ExprKind::Unsafe(b) => self.block(b, depth),
             // ④b: `task_group` opens a region (its task boxes live there), like `arena {}` — so a
             // region value (e.g. a `Task` handle) cannot escape as the block's value.
             ExprKind::TaskGroup(b) => {
@@ -2607,7 +2629,7 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
-            | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::BoxGet(i)
+            | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i) | ExprKind::BoxGet(i)
             | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
@@ -3113,7 +3135,9 @@ impl<'a> MoveCheck<'a> {
                 self.expr(fallback, moved, consuming, false);
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b, moved, consuming, direct),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.block(b, moved, consuming, direct),
+            // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
+            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.expr(e, moved, false, false),
             ExprKind::Spawn { closure, .. } => self.expr(closure, moved, false, false),
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
@@ -3257,6 +3281,8 @@ struct Checker<'a, 't> {
     ret_hint: Ty,
     /// Nesting depth of `arena {}` blocks (0 = not in an arena).
     arena_depth: u32,
+    /// Nesting depth of `unsafe {}` blocks (0 = in safe code). `raw.*` ops are valid only inside one.
+    unsafe_depth: u32,
     /// Nesting depth of `task_group {}` blocks (0 = not in one). `spawn`/`wait` are valid only
     /// inside a `task_group` scope (slice ④).
     task_group_depth: u32,
@@ -3383,6 +3409,7 @@ impl<'a, 't> Checker<'a, 't> {
             scope: Vec::new(),
             ret_hint: Ty::Unit,
             arena_depth: 0,
+            unsafe_depth: 0,
             task_group_depth: 0,
             wait_state: Vec::new(),
             task_group_fallible: Vec::new(),
@@ -4114,6 +4141,23 @@ impl<'a, 't> Checker<'a, 't> {
                     t
                 };
                 Expr { kind: ExprKind::Arena(block), ty, span: e.span }
+            }
+            ast::ExprKind::Unsafe(b) => {
+                // A marker block — no region, no runtime effect. It only raises `unsafe_depth` so the
+                // `raw.*` ops inside are permitted, and (via the effect scan) marks the fn impure. The
+                // block value passes through exactly like a plain block / `arena {}`.
+                let diverges = ast_block_diverges(b);
+                self.unsafe_depth += 1;
+                let block = self.check_block(b, if diverges { None } else { expected });
+                self.unsafe_depth -= 1;
+                let ty = if diverges {
+                    expected.unwrap_or(Ty::Unit)
+                } else {
+                    let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
+                    self.constrain(t, expected, e.span);
+                    t
+                };
+                Expr { kind: ExprKind::Unsafe(block), ty, span: e.span }
             }
             ast::ExprKind::TaskGroup(b) => {
                 let diverges = ast_block_diverges(b);
@@ -5623,6 +5667,11 @@ impl<'a, 't> Checker<'a, 't> {
         if let ast::ExprKind::Path(p) = &recv.kind {
             if single_name(p) == Some("heap") && method == "new" {
                 return self.check_heap_new(args, expected, span);
+            }
+            // `raw.alloc(size)` / `raw.free(p)` — the unsafe raw-pointer ops (`raw` is a module name,
+            // not a value). Only valid inside an `unsafe {}` block.
+            if single_name(p) == Some("raw") && (method == "alloc" || method == "free") {
+                return self.check_raw_op(method, args, span);
             }
             if single_name(p) == Some("json") && method == "encode" {
                 self.require_import("core.json", "json.encode", span);
@@ -7803,6 +7852,45 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::HeapNew(Box::new(arg)), ty: Ty::Box(scalar), span }
     }
 
+    /// `raw.alloc(size)` / `raw.free(p)` — the unsafe raw-pointer ops (draft.md §6.5). Valid only
+    /// inside an `unsafe {}` block. `alloc` takes an integer byte size and yields a `raw` pointer;
+    /// `free` takes a `raw` pointer and yields unit. The memory is manually managed (no auto-drop),
+    /// which is exactly why these are confined to `unsafe`.
+    fn check_raw_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if self.unsafe_depth == 0 {
+            self.diags.error(
+                format!("'raw.{method}' is an unsafe operation — use it inside an `unsafe {{}}` block"),
+                span,
+            );
+        }
+        if args.len() != 1 {
+            self.diags.error(format!("'raw.{method}' takes 1 argument, got {}", args.len()), span);
+            return err;
+        }
+        match method {
+            "alloc" => {
+                // `size` is a byte count — an integer (an unconstrained literal defaults to i64, and
+                // codegen widens any narrower width to the i64 runtime signature).
+                let size = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                if !matches!(size.ty, Ty::Int(_) | Ty::IntVar(_) | Ty::Error) {
+                    self.diags.error(format!("'raw.alloc' size must be an integer, got {}", ty_name(size.ty)), args[0].span);
+                    return err;
+                }
+                Expr { kind: ExprKind::RawAlloc(Box::new(size)), ty: Ty::Raw, span }
+            }
+            "free" => {
+                let p = self.check_expr(&args[0], Some(Ty::Raw));
+                if !matches!(p.ty, Ty::Raw | Ty::Error) {
+                    self.diags.error(format!("'raw.free' takes a `raw` pointer, got {}", ty_name(p.ty)), args[0].span);
+                    return err;
+                }
+                Expr { kind: ExprKind::RawFree(Box::new(p)), ty: Ty::Unit, span }
+            }
+            _ => unreachable!("check_raw_op is only dispatched for alloc/free"),
+        }
+    }
+
     /// `json.encode(s)` — encode a flat struct into a JSON object `str`. Desugars to the
     /// string-builder `template` machinery: static JSON syntax interleaved with per-field
     /// value holes (`str` fields are emitted as JSON-escaped string literals). M5: fields
@@ -8958,7 +9046,8 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(f);
                 }
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.finalize_block(b),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.finalize_block(b),
+            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.finalize_expr(e),
             ExprKind::Spawn { closure, .. } => self.finalize_expr(closure),
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
@@ -9273,7 +9362,7 @@ fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
                 walk_expr(e, out);
             }
         }
-        K::Block(b) | K::Arena(b) | K::TaskGroup(b) => walk_block(b, out),
+        K::Block(b) | K::Arena(b) | K::TaskGroup(b) | K::Unsafe(b) => walk_block(b, out),
         K::StructLit { name, fields } => {
             if let Some(prefix) = path_module_prefix(name) {
                 out.insert(prefix);
@@ -9429,6 +9518,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
+        Ty::Raw => "raw".to_string(),
         Ty::Builder => "builder".to_string(),
         // The surface type name (`fn f(w: writer)`), so diagnostics match what the user writes.
         Ty::BufWriter => "writer".to_string(),
@@ -9717,6 +9807,9 @@ fn resolve_type(
         "char" => Ty::Char,
         "str" => Ty::Str,
         "string" => Ty::String,
+        // `raw` — an opaque raw byte pointer (`raw.alloc` yields one). Nameable so it can be a `let`
+        // annotation / function parameter (holding a `raw` is safe; only `raw.*` ops need `unsafe`).
+        "raw" => Ty::Raw,
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,

@@ -322,6 +322,10 @@ pub enum ExprKind {
     Try(Box<Expr>),
     /// `arena { ... }` — a region whose allocations are freed in bulk at block end.
     Arena(Block),
+    /// `unsafe { ... }` — a block in which `raw.*` operations (raw allocation, unchecked casts,
+    /// manual free) are permitted. A plain marker block otherwise (no runtime effect); a function
+    /// containing one is inferred impure (so it can never be a `par_map` callee).
+    Unsafe(Block),
     /// `task_group { ... }` — a structured concurrency scope: `spawn(fn { … })` defers work and
     /// returns a `Task<R>`; `wait()` joins; `t.get()` reads a result. (`spawn`/`wait`/`get` are
     /// name-based builtins, like `print`/`heap.new`, valid only inside this scope.)

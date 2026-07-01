@@ -1104,6 +1104,24 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
       `02-frontend.md`): it is token-driven with AST assist, which is strictly more faithful (verbatim
       token text, real line breaks). Those docs are updated to say so.
     - Pairs with the perf-rail lints (next M8 item).
+  - **`unsafe {}` + `raw.*` — first slice DONE (2026-07-01).** The M8 unsafe escape hatch (draft.md
+    §6.5 / §15). `unsafe {}` is a block **expression** modeled on `arena` but strictly simpler — a
+    plain marker block (no region, no runtime effect); the only new mechanism is an `unsafe_depth`
+    counter that gates the `raw.*` ops (exactly like `arena_depth` gates `heap.new`). Shipped:
+    `unsafe {}` + `raw.alloc(size)` (→ `Ty::Raw`, an opaque byte pointer: Copy, `Static`, never
+    auto-dropped, LLVM `ptr` like `ArenaHandle`) + `raw.free(p)`, calling the existing flat
+    `align_rt_alloc`/`align_rt_free`. A `raw.*` op outside `unsafe` errors; a function containing
+    `unsafe` is inferred **impure** (reusing the single Pure/Impure `EffectScan` flag → never a
+    `par_map` callee; "unsafe is visible/traceable"). `raw` is a nameable type (`fn f(p: raw)`).
+    **Soundness note (Gate 1):** `unsafe {}` opens no region, but `region_of(Unsafe)` returns the
+    block's tail-value region (NOT the `Static` wildcard) so an arena value returned through an unsafe
+    block is still escape-checked; `null_moved_source` also treats an unsafe block's tail like a plain
+    block (move-null through it). `raw` is Copy so no Drop/Move analysis needed. **Design flag (first
+    cut):** the effect model is binary, so `unsafe` is conflated with I/O-impure — fine for now (both
+    are par_map-ineligible); a distinct "unsafe" effect is a second flag if ever needed. **Remaining
+    (widen):** `raw.ptr_cast<T>(x)`, typed raw load/store, then FFI — the real consumer. `Ty::Raw`,
+    `hir::ExprKind::{Unsafe,RawAlloc,RawFree}`, `mir::{Rvalue::RawAlloc, Stmt::RawFree}`.
+    (`tests/unsafe_raw.rs`, `examples/unsafe_raw.align`, `impl/07-roadmap.md` M8.)
   - **FFI "borrow-engine" wrapping for heavy libs** (zstd / sqlite / simdjson-class) — don't reimplement
     in pure Align; wrap via FFI as borrow engines (FFI is the library layer per `non-goals`/memory).
   - **Expand `bench/`** beyond flat / col_sum / total_pay: AoS-vs-SoA, json→soa,

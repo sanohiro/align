@@ -257,7 +257,7 @@ impl Annotations {
                     self.visit_expr(e);
                 }
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.visit_block(b),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.visit_block(b),
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
                     self.visit_expr(&f.value);
