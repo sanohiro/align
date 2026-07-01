@@ -1186,6 +1186,39 @@ cast / reinterpret is a later `raw.*` op; the flat load/store above is the first
 containing `unsafe` is inferred impure, so it can never be a `par_map` callee — the danger stays
 visible and traceable.
 
+### Foreign functions (FFI)
+
+A C function is declared `extern "C"` and called like any other function — but only inside `unsafe`,
+because foreign code is outside the safe core and can violate every invariant (ownership, no-alias,
+non-null):
+
+```align
+extern "C" fn abs(x: i32) -> i32       // one declaration
+extern "C" {                           // or a braced group
+  fn sqrt(x: f64) -> f64
+  fn memset(p: raw, c: i32, n: i64) -> raw
+}
+
+fn main() -> i32 {
+  unsafe {
+    p := raw.alloc(4)
+    memset(p, 0, 4)        // hand the `raw` pointer straight to C
+    raw.free(p)
+    return abs(-7)         // 7 — a direct native call into libc
+  }
+}
+```
+
+The declaration is **bodyless** and bound to the C symbol `name` (never mangled). Because Align is
+AOT-compiled via LLVM with no GC, a foreign call is a direct native `call` — no marshaling, pinning,
+or stack-switch — and a `slice`/`str`/`raw` hands its pointer straight to C. Only `extern "C"` is
+supported; the FFI-safe signature types are the primitive scalars (integers, floats) and `raw` (an
+opaque byte pointer), plus a `()` (void) return — aggregates (`str`/`array`/struct via `layout(C)`)
+are a later slice. A function that calls an extern is inferred impure (it contains `unsafe`), so it
+can never be a `par_map` callee. This is the keystone of the library strategy: `std`/`pkg` **own the
+memory wrappers and borrow the mathematical engines** (wrapping `libzstd`, `sqlite`, … via FFI)
+rather than reimplementing assembly-tuned algorithms in Align.
+
 Rust-style lifetimes are not exposed on the surface.
 However, an obvious lifetime violation, such as a view escaping an arena, is a compile error.
 

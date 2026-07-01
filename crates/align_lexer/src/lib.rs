@@ -39,6 +39,8 @@ pub enum TokKind {
     Template,
     /// `unsafe` — introduces an `unsafe { ... }` block, the only place `raw.*` ops are allowed.
     Unsafe,
+    /// `extern` — introduces a foreign (C-ABI) function declaration (`extern "C" fn f(...) -> T`).
+    Extern,
     /// `as` — the explicit numeric/char conversion operator (`x as T`).
     As,
     // Symbols / operators
@@ -508,6 +510,7 @@ impl<'a> Lexer<'a> {
             "match" => TokKind::Match,
             "template" => TokKind::Template,
             "unsafe" => TokKind::Unsafe,
+            "extern" => TokKind::Extern,
             "as" => TokKind::As,
             _ => TokKind::Ident(text.to_string()),
         };

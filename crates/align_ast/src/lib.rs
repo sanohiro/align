@@ -39,6 +39,32 @@ pub enum Item {
     Struct(StructDecl),
     Enum(EnumDecl),
     Const(ConstDecl),
+    Extern(ExternBlock),
+}
+
+/// A foreign-function-interface declaration: `extern "C" fn name(params) -> ret` (or a braced group
+/// `extern "C" { fn ...; fn ... }`). A single `extern "C" fn` is modeled as a block with one
+/// signature — one item shape for both forms. The functions are **bodyless**: only a signature is
+/// declared, and codegen emits an external LLVM declaration bound to the C symbol `name`. A call to
+/// one is only valid inside an `unsafe {}` block (foreign code can violate every safe-core
+/// invariant), exactly like a `raw.*` op.
+#[derive(Clone, Debug)]
+pub struct ExternBlock {
+    /// The ABI string (`"C"`). Only `"C"` is accepted today; sema rejects any other.
+    pub abi: String,
+    pub fns: Vec<ExternSig>,
+    pub span: Span,
+}
+
+/// One bodyless foreign signature inside an [`ExternBlock`]. The `name` is the literal C symbol
+/// (never mangled). Parameter/return types are restricted to FFI-safe scalars (integers, floats,
+/// `raw`) plus a `()` return; sema validates this.
+#[derive(Clone, Debug)]
+pub struct ExternSig {
+    pub name: Ident,
+    pub params: Vec<Param>,
+    pub ret: Option<Type>,
+    pub span: Span,
 }
 
 /// A top-level named constant: `NAME := expr` or `NAME: Type := expr` (keyword-less, like every

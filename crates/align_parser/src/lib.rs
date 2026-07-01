@@ -187,7 +187,15 @@ impl<'a> Parser<'a> {
         } else {
             Vis::Private
         };
-        if self.at(&TokKind::Fn) {
+        if self.at(&TokKind::Extern) {
+            // `extern "C" fn ...` — a foreign declaration is inherently a global C symbol, so `pub`
+            // is meaningless here (an extern is never a module export).
+            if matches!(vis, Vis::Pub) {
+                self.diags
+                    .error("`pub` is not allowed on an `extern` declaration (a foreign symbol is already global)", self.span());
+            }
+            self.parse_extern().map(Item::Extern)
+        } else if self.at(&TokKind::Fn) {
             self.parse_fn(vis).map(Item::Fn)
         } else if self.at(&TokKind::Mut) {
             // A top-level constant is immutable; `mut` is only for local bindings.
@@ -410,6 +418,69 @@ impl<'a> Parser<'a> {
             body,
             span,
         })
+    }
+
+    /// `extern "C" fn f(...) -> T` or a braced group `extern "C" { fn ...\n fn ... }`. Both forms
+    /// produce one [`ExternBlock`] carrying one-or-more bodyless [`ExternSig`]s.
+    fn parse_extern(&mut self) -> Option<ExternBlock> {
+        let start = self.span();
+        self.bump(); // extern
+        // The ABI string (`"C"`). Kept as a string here; sema validates it is `"C"`.
+        let abi = match self.peek() {
+            TokKind::Str(_) => {
+                let TokKind::Str(s) = self.bump().kind else { unreachable!() };
+                s
+            }
+            _ => {
+                self.diags.error("expected an ABI string after `extern` (e.g. `extern \"C\"`)", self.span());
+                return None;
+            }
+        };
+        let mut fns = Vec::new();
+        if self.eat(&TokKind::LBrace) {
+            // Braced group: any number of `fn` signatures, one per line.
+            loop {
+                self.skip_ends();
+                if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
+                    break;
+                }
+                fns.push(self.parse_extern_sig()?);
+            }
+            self.expect(&TokKind::RBrace, "'}'");
+        } else {
+            // Single-signature form: `extern "C" fn f(...) -> T`.
+            fns.push(self.parse_extern_sig()?);
+        }
+        let span = start.merge(self.prev_span());
+        Some(ExternBlock { abi, fns, span })
+    }
+
+    /// One bodyless foreign signature `fn name(params) -> ret` (no generics, no body). Shares the
+    /// parameter/return shape with [`Self::parse_fn`].
+    fn parse_extern_sig(&mut self) -> Option<ExternSig> {
+        let start = self.span();
+        self.expect(&TokKind::Fn, "'fn'");
+        let name = self.parse_ident("function name")?;
+        self.expect(&TokKind::LParen, "'('");
+        let mut params = Vec::new();
+        while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
+            let pname = self.parse_ident("parameter name")?;
+            self.expect(&TokKind::Colon, "':'");
+            let ty = self.parse_type()?;
+            params.push(Param { is_out: false, name: pname, ty });
+            if !self.eat(&TokKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokKind::RParen, "')'");
+        let ret = if self.eat(&TokKind::Arrow) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.eat(&TokKind::End);
+        let span = start.merge(self.prev_span());
+        Some(ExternSig { name, params, ret, span })
     }
 
     fn parse_block(&mut self) -> Option<Block> {

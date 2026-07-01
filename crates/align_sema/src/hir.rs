@@ -49,9 +49,23 @@ pub enum MathFn {
     Fma,
 }
 
+/// A resolved foreign-function declaration (`extern "C" fn name(params) -> ret`). Bodyless: it
+/// carries only the C symbol and its FFI-safe signature types, which codegen turns into an external
+/// LLVM declaration. A call to it lowers to an ordinary [`ExprKind::Call`] keyed by `name`.
+#[derive(Clone, Debug)]
+pub struct ExternFn {
+    /// The literal C symbol (never mangled).
+    pub name: String,
+    pub params: Vec<crate::Ty>,
+    /// The return type; [`crate::Ty::Unit`] for a `void` return.
+    pub ret: crate::Ty,
+}
+
 #[derive(Clone, Debug)]
 pub struct Program {
     pub fns: Vec<Fn>,
+    /// Foreign (C-ABI) function declarations, surfaced to codegen as external LLVM declarations.
+    pub externs: Vec<ExternFn>,
     /// Struct definitions, indexed by the id carried in [`crate::Ty::Struct`].
     pub structs: Vec<StructDef>,
     /// Sum-type definitions, indexed by the id carried in [`crate::Ty::Enum`].

@@ -183,6 +183,20 @@ fn build_module<'c>(
         let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types, &enum_types, &tuple_types);
         funcs.insert(f.name.clone(), fv);
     }
+    // Declare foreign (`extern "C"`) functions under their C symbol, so a `Rvalue::Call` keyed by
+    // that name resolves. FFI-safe params/returns are scalars or `raw` (an opaque pointer) — all
+    // covered by `abi_type`. No `mark_nounwind`: unlike an Align function, foreign code is outside
+    // our control, so we do not assert it never unwinds.
+    for ext in &program.externs {
+        let param_types: Vec<BasicMetadataTypeEnum> =
+            ext.params.iter().map(|&ty| abi_type(ctx, ty, &struct_types, &enum_types).into()).collect();
+        let fn_ty = if ext.ret == Ty::Unit {
+            ctx.void_type().fn_type(&param_types, false)
+        } else {
+            abi_type(ctx, ext.ret, &struct_types, &enum_types).fn_type(&param_types, false)
+        };
+        funcs.insert(ext.name.clone(), module.add_function(&ext.name, fn_ty, None));
+    }
     // Declare runtime builtins, keyed by the MIR call name they back.
     let print_ty = ctx.void_type().fn_type(&[ctx.i64_type().into()], false);
     funcs.insert(
