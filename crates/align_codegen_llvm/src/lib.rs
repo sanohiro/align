@@ -185,11 +185,15 @@ fn build_module<'c>(
     }
     // Declare foreign (`extern "C"`) functions under their C symbol, so a `Rvalue::Call` keyed by
     // that name resolves. FFI-safe params/returns are scalars or `raw` (an opaque pointer) — all
-    // covered by `abi_type`. No `mark_nounwind`: unlike an Align function, foreign code is outside
-    // our control, so we do not assert it never unwinds.
+    // covered by `abi_type`; a `str`/`slice` view param is passed as its data `ptr` (C `char*`).
+    // No `mark_nounwind`: unlike an Align function, foreign code is outside our control, so we do not
+    // assert it never unwinds.
     for ext in &program.externs {
-        let param_types: Vec<BasicMetadataTypeEnum> =
-            ext.params.iter().map(|&ty| abi_type(ctx, ty, &struct_types, &enum_types).into()).collect();
+        let param_types: Vec<BasicMetadataTypeEnum> = ext
+            .params
+            .iter()
+            .map(|&ty| ffi_param_type(ctx, ty, &struct_types, &enum_types).into())
+            .collect();
         let fn_ty = if ext.ret == Ty::Unit {
             ctx.void_type().fn_type(&param_types, false)
         } else {
@@ -913,6 +917,11 @@ fn build_module<'c>(
         funcs.insert(format!("tramp${key}"), tramp);
     }
 
+    // Extern parameter types by C symbol — so a call to an extern can coerce a `str`/`slice` arg to
+    // its data pointer (the declaration already uses `ptr` for those params).
+    let extern_params: HashMap<String, Vec<Ty>> =
+        program.externs.iter().map(|e| (e.name.clone(), e.params.clone())).collect();
+
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
@@ -921,6 +930,7 @@ fn build_module<'c>(
             module,
             builder: &builder,
             funcs: &funcs,
+            extern_params: &extern_params,
             structs: &program.structs,
             struct_types: &struct_types,
             enum_types: &enum_types,
@@ -1149,6 +1159,22 @@ fn dictenc_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
     ctx.struct_type(&[s.into(), s.into(), s.into()], false)
 }
 
+/// Whether an FFI type is a `{ptr,len}` view (`str`/`slice<T>`, incl. `bytes` = `slice<u8>`). Such a
+/// value is handed to C as its **data pointer** alone — the length travels separately (`s.len()`).
+fn is_ffi_view(ty: Ty) -> bool {
+    matches!(ty, Ty::Str | Ty::Slice(_))
+}
+
+/// The LLVM type of an `extern "C"` parameter: a `str`/`slice` view is passed as its data pointer
+/// (C `char*`/`void*`); everything else keeps its normal ABI type.
+fn ffi_param_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> BasicTypeEnum<'c> {
+    if is_ffi_view(ty) {
+        ctx.ptr_type(AddressSpace::default()).into()
+    } else {
+        abi_type(ctx, ty, sx, ex)
+    }
+}
+
 /// The LLVM representation of a `Ty::Fn` value: a closure `{ fn_ptr, env_ptr }`. All closure
 /// `fn_ptr`s use the env-ABI `fn(env, args)`; `env_ptr` is null for a non-capturing function.
 fn closure_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
@@ -1340,6 +1366,9 @@ struct FnGen<'c, 'a> {
     module: &'a Module<'c>,
     builder: &'a Builder<'c>,
     funcs: &'a HashMap<String, FunctionValue<'c>>,
+    /// Extern parameter types by C symbol — to coerce a `str`/`slice` call argument to its data
+    /// pointer when calling a foreign function.
+    extern_params: &'a HashMap<String, Vec<Ty>>,
     structs: &'a [StructDef],
     struct_types: &'a [StructType<'c>],
     /// Sum-type LLVM structs, indexed by the id in [`Ty::Enum`].
@@ -3333,7 +3362,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::Call(name, args) => {
                 let callee = self.funcs[name];
-                let argv: Vec<_> = args.iter().map(|o| self.operand(o).into()).collect();
+                // A foreign call passes a `str`/`slice` argument as its data pointer (the extern's
+                // declared param type is `ptr`); every other argument passes as its value.
+                let argv: Vec<inkwell::values::BasicMetadataValueEnum> = match self.extern_params.get(name) {
+                    Some(param_tys) => {
+                        let mut v = Vec::with_capacity(args.len());
+                        for (i, o) in args.iter().enumerate() {
+                            let val = self.operand(o);
+                            let coerced = if param_tys.get(i).copied().is_some_and(is_ffi_view) {
+                                self.builder
+                                    .build_extract_value(val.into_struct_value(), 0, "ffiptr")
+                                    .map_err(|e| self.err(e))?
+                            } else {
+                                val
+                            };
+                            v.push(coerced.into());
+                        }
+                        v
+                    }
+                    None => args.iter().map(|o| self.operand(o).into()).collect(),
+                };
                 let cs = self
                     .builder
                     .build_call(callee, &argv, "call")

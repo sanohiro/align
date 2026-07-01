@@ -489,6 +489,20 @@ fn is_ffi_safe(ty: Ty) -> bool {
     matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Raw)
 }
 
+/// FFI-safe as an extern **parameter**: everything [`is_ffi_safe`] accepts, plus a `str` and a
+/// `slice<T>` **whose element is an FFI-safe scalar** (int/float — so `bytes` = `slice<u8>` qualifies,
+/// but `slice<str>` / `slice<Struct>` do not: their element layout has no settled C representation,
+/// and handing C a pointer to such a buffer would misinterpret it). A view is passed to C as its
+/// **data pointer** (a `char*`/`void*`); the length is passed separately by the caller (`s.len()`)
+/// when the C function needs it — matching the C idiom of adjacent `(ptr, len)` arguments, without
+/// hiding an argument. A view is *not* FFI-safe as a **return** type (a bare C pointer carries no
+/// length), so returns stay scalar-only.
+fn is_ffi_safe_param(ty: Ty) -> bool {
+    is_ffi_safe(ty)
+        || ty == Ty::Str
+        || matches!(ty, Ty::Slice(elem) if matches!(elem, Scalar::Int(_) | Scalar::Float(_)))
+}
+
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter | Ty::DictEncoded(..))
         || payload_is_move(ty)
@@ -1672,10 +1686,12 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 for p in &sig.params {
                     let ty = resolve_type(&p.ty, tcx!(m.path.as_str(), imports), &[], diags);
                     // `Ty::Error` already produced a diagnostic in `resolve_type` — don't pile a
-                    // second "not FFI-safe" error on the same root cause.
-                    if ty != Ty::Error && !is_ffi_safe(ty) {
+                    // second "not FFI-safe" error on the same root cause. A parameter also accepts a
+                    // `str`/`slice`/`bytes` view — passed to C as its data pointer (see
+                    // `is_ffi_safe_param`).
+                    if ty != Ty::Error && !is_ffi_safe_param(ty) {
                         diags.error(
-                            format!("'{}' is not an FFI-safe type for an extern parameter (use an integer, float, or `raw`)", ty_name(ty)),
+                            format!("'{}' is not an FFI-safe type for an extern parameter (use an integer, float, `raw`, or a `str`/`slice` view)", ty_name(ty)),
                             p.ty.span(),
                         );
                     }

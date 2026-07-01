@@ -311,6 +311,11 @@ struct may be written to / read from `raw` memory (`raw.store`/`raw.load` of a w
 pointer-based FFI pattern. Its fields must be FFI-mappable scalars; by-value struct passing is a
 later slice.
 
+A `str`/`slice`/`bytes` view is FFI-safe as a **parameter**: it lowers to its data pointer (C
+`char*`/`void*`), the length passed separately by the caller (`s.len()`) — the C `(ptr, len)` idiom.
+A view is not a valid return type (a bare pointer has no length), and it is not NUL-terminated (only
+hand it to length-based C functions).
+
 ### Modules / imports
 
 A prefix-accessed library namespace must be `import`ed before use — a file's header lists the

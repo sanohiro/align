@@ -1,0 +1,33 @@
+// FFI views (M8, draft.md §15) — passing an Align `str`/`slice`/`bytes` to a C function.
+//
+// An Align view is a `{ptr, len}` pair. Across the C boundary it lowers to just the **data pointer**
+// (a C `char*`/`void*`); the length is passed separately by the caller (`s.len()`) when the C
+// function needs it. This matches the C `(ptr, len)` idiom exactly — one Align argument becomes one C
+// pointer argument, nothing hidden. (A view is not a valid *return* type: a bare C pointer has no
+// length. A C function that returns a pointer maps to `raw`.)
+//
+// CAVEAT: an Align `str`/`slice` is NOT NUL-terminated (it is a length-bounded view). Only hand it to
+// length-based C functions (`memcmp`, `memcpy`, `fwrite`, `write`, …). Passing it to a NUL-terminated
+// API (`strlen`, `printf("%s")`, `strcpy`) would read past the end — the programmer's `unsafe`
+// responsibility, as with any FFI.
+
+extern "C" {
+  fn write(fd: i32, buf: str, count: i64) -> i64
+  fn memcmp(a: str, b: str, n: i64) -> i32
+}
+
+fn main() -> i32 {
+  msg := "hello, C!\n"
+  unsafe {
+    // Write the string's bytes to stdout (fd 1) — pointer + explicit length.
+    write(1, msg, msg.len())
+
+    // Compare two strings by length (no NUL needed).
+    a := "match"
+    b := "match"
+    if memcmp(a, b, a.len()) == 0 {
+      return 0
+    }
+    return 1
+  }
+}

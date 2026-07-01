@@ -890,12 +890,19 @@ Completion condition: confirm that the vectorized code contains vector instructi
   load/store — no new IR variant). Fields must be int/float (their C mapping is settled). This is the
   pointer-based FFI pattern (hand C a buffer, read/write structs in it). `ast::StructDecl.c_repr`,
   `hir::StructDef.c_repr`. (`tests/layout_c.rs`, `examples/layout_c.align`.)
+  **FFI views — DONE.** A `str`/`slice`/`bytes` view is FFI-safe as an extern **parameter**: it
+  lowers to its data pointer (C `char*`/`void*`), the length passed separately by the caller
+  (`s.len()`) — the C `(ptr, len)` idiom, no hidden arg. Codegen declares such a param as `ptr`
+  (`ffi_param_type`) and coerces the `{ptr,len}` argument to element 0 at the call site (keyed by an
+  `extern_params` map). A view is *not* a valid return type (a bare pointer has no length) and is not
+  NUL-terminated (length-based C fns only). `is_ffi_safe_param`. (`tests/ffi_views.rs`,
+  `examples/ffi_views.align`.)
   **Remaining (widen):** the draft's `raw.ptr_cast<T>` (unchecked cast / reinterpret) is still
   deferred — with only `raw` (opaque bytes) a typed cast has nothing to reinterpret *to*; it earns
   meaning once FFI grows typed/external pointers. Later FFI slices: **by-value `layout(C)` struct
-  passing** (SysV/AAPCS register + `byval`/`sret` ABI classification), passing `str`/`slice`/`bytes`
-  as pointer+len, an explicit external-library link directive (`-l<lib>`), and `bool`/`char` params —
-  the widening the `std`/`pkg` C-engine wrappers need.
+  passing** (SysV/AAPCS register + `byval`/`sret` ABI classification), an explicit external-library
+  link directive (`-l<lib>`), and `bool`/`char` params — the widening the `std`/`pkg` C-engine
+  wrappers need.
 
 ## Design Issues to Settle in Parallel
 
