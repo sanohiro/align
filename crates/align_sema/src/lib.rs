@@ -2202,7 +2202,6 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
     /// Whether struct `id` has any `str` column — the field that turns a `soa<Struct>` from a
     /// self-contained, arena-only value into one whose columns hold zero-copy `str` views borrowing
     /// the decode input (or `to_soa` source). A str-bearing soa must be region-tied to that borrow;
@@ -2211,6 +2210,7 @@ impl<'a> EscapeCheck<'a> {
         self.structs[id as usize].fields.iter().any(|f| f.ty == Ty::Str)
     }
 
+    /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
     /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
     /// it can't slip out via an `if`/block value.
     fn region_of(&self, e: &Expr, depth: u32) -> Region {
