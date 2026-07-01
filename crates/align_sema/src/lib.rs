@@ -1275,13 +1275,20 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             };
         }
         for (module, is_entry, s) in &generic_struct_decls {
+            // `layout(C)` on a generic struct is meaningless — each monomorph is a distinct C type,
+            // there is no generic C struct — and it would bypass the concrete-struct FFI-safe field
+            // check (which never runs for a template), letting e.g. `Pair<str>` become a `layout(C)`
+            // struct. Reject it here rather than validating per-monomorph.
+            if s.c_repr {
+                diags.error("a generic struct cannot be marked `layout(C)`".to_string(), s.span);
+            }
             let tparams: Vec<String> = s.type_params.iter().map(|t| t.name.name.clone()).collect();
             let mut fields = Vec::with_capacity(s.fields.len());
             for f in &s.fields {
                 let ty = resolve_type(&f.ty, build_cx!(module), &tparams, diags);
                 fields.push(hir::FieldDef { name: f.name.name.clone(), ty });
             }
-            struct_templates.insert(mangle_fn(module, *is_entry, &s.name.name), StructTemplate { type_params: tparams, fields, align: s.align, c_repr: s.c_repr });
+            struct_templates.insert(mangle_fn(module, *is_entry, &s.name.name), StructTemplate { type_params: tparams, fields, align: s.align, c_repr: false });
         }
         for (module, is_entry, e) in &generic_enum_decls {
             let tparams: Vec<String> = e.type_params.iter().map(|t| t.name.name.clone()).collect();

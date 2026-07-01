@@ -95,3 +95,11 @@ fn unknown_layout_kind_is_rejected() {
     // `layout(C)` is the only supported layout attribute.
     assert!(!ok("layout(packed) Pair { a: i32, b: i32 }\nfn main() -> i32 {\n  return 0\n}\n"));
 }
+
+#[test]
+fn layout_c_on_generic_struct_is_rejected() {
+    // A generic struct has no single C representation (each monomorph is a distinct C type), and its
+    // fields never pass the concrete FFI-safe check — so `layout(C)` on it is rejected outright.
+    // (Without this, `Pair<str>` could become a `layout(C)` struct and reach `raw.store`/`raw.load`.)
+    assert!(!ok("layout(C) Pair<T> { a: i32, b: T }\nfn main() -> i32 {\n  return 0\n}\n"));
+}
