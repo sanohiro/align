@@ -520,8 +520,17 @@ impl<'a> Parser<'a> {
                 let TokKind::Str(s) = self.bump().kind else { unreachable!() };
                 Some(s)
             }
+            // Empty `link()` — error but leave the `)` for `expect` below (clean recovery).
+            TokKind::RParen => {
+                self.diags.error("`link(\"name\")` needs a library-name string (e.g. `link(\"z\")`)", self.span());
+                None
+            }
+            // Any other token — error and consume it so the `)` below still matches (no cascade).
             _ => {
                 self.diags.error("`link(\"name\")` needs a library-name string (e.g. `link(\"z\")`)", self.span());
+                if !self.at(&TokKind::Eof) {
+                    self.bump();
+                }
                 None
             }
         };

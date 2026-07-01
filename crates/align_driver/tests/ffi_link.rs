@@ -68,6 +68,8 @@ fn invalid_library_name_is_rejected() {
     // A name with a space / flag-like content (an injection attempt) is rejected in sema.
     assert!(!ok("extern \"C\" link(\"foo -Wl,bad\") fn f(x: i32) -> i32\nfn main() -> i32 {\n  return 0\n}\n"));
     assert!(!ok("extern \"C\" link(\"\") fn f(x: i32) -> i32\nfn main() -> i32 {\n  return 0\n}\n"));
+    // A leading `-` (a flag-looking name) is rejected even though every character is otherwise valid.
+    assert!(!ok("extern \"C\" link(\"-lfoo\") fn f(x: i32) -> i32\nfn main() -> i32 {\n  return 0\n}\n"));
 }
 
 #[test]

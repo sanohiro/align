@@ -1681,9 +1681,15 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             // A `link("name")` clause names an external library to link (`-lname`). Validate the
             // name (a linker gets it verbatim) and dedupe into `link_libs`.
             if let Some(lib) = &blk.link {
-                if lib.is_empty() || !lib.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-')) {
+                // A leading `-` is never a real library name; reject it so a name can never look
+                // like a linker flag (defense in depth — it is already passed as a single `-l<name>`
+                // argv, so it cannot inject a separate flag).
+                if lib.is_empty()
+                    || lib.starts_with('-')
+                    || !lib.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
+                {
                     diags.error(
-                        format!("invalid library name '{lib}' in `link(...)` — use letters, digits, and `._+-`"),
+                        format!("invalid library name '{lib}' in `link(...)` — use letters, digits, and `._+-` (not starting with `-`)"),
                         blk.span,
                     );
                 } else if !link_libs.contains(lib) {
