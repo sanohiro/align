@@ -388,10 +388,20 @@ predicate gates it), `s[i]` gather inherits the soa's region instead of `Static`
 projection inherits its base's region (closing a `slice<str>` escape hole). A primitive-only soa is
 unchanged — still arena-regioned and free to escape the input (`s[i]` gather returns a Copy POD).
 Reads only (`s[i].name`, `s.name` projection, `s[i]` gather); str-column **writes** (`s[i].name = v`,
-`s[i] = value` with a str field) stay rejected — a stored view would be a fresh escape concern. `to_soa`
-with str columns also stays deferred (its source-borrow region needs the same tie). Escape-checked
-end to end (`str_column_view_cannot_escape_the_arena`; `primitive_soa_stays_self_contained` guards the
-non-regression). `tests/soa.rs` (+3), `examples/soa_json_str.align`, `draft.md` §9.
+`s[i] = value` with a str field) stay rejected — a stored view would be a fresh escape concern.
+Escape-checked end to end (`str_column_view_cannot_escape_the_arena`; `primitive_soa_stays_self_contained`
+guards the non-regression). `tests/soa.rs`, `examples/soa_json_str.align`, `draft.md` §9.
+
+**`.to_soa()` with str columns — DONE (2026-07-01).** The transpose analogue: `arr.to_soa()` over an
+AoS `array<Struct>` with a `str` field now copies each element's `str` view into a view column. The
+MIR transpose (`transpose_to_soa`: a fused loop of `lower_field_access` reads + `StoreColumn` writes)
+and its codegen (`StoreColumn`/`SoaAlloc` via the str-aware `soa_field_sizes`/`soa_column_offset`, a
+16-byte aggregate store) were **already str-capable** — same as the json path — so this too is
+sema-only: relax the `check_array_to_soa` guard to accept `Ty::Str`, and tie the region to the
+**source** (not the input): `region_of(ArrayToSoa)` becomes `region_of(source).shorter(arena(depth))`
+when the struct has a str field (a primitive-only `to_soa` stays purely arena-regioned). Reads only,
+like the decode path. `tests/soa.rs` (`to_soa_transposes_a_str_column`,
+`to_soa_str_column_view_cannot_escape_the_arena`, `to_soa_with_a_nested_field_struct_is_rejected`).
 
 **Scalar-accessor slice DONE — `s.len()` + `s[i].field`.** A soa now answers `s.len()` (its row
 count — the `{ptr,len}` length, via `ExprKind::Len` → `SliceLen`) and `s[i].field` (one column's
