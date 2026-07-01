@@ -2309,16 +2309,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::RawAlloc(size) => {
                 // `raw.alloc(size)` → `align_rt_alloc(size) -> ptr` (a flat libc `malloc`). The size
-                // is widened to i64 (the runtime signature); the result `raw` is an opaque `ptr`.
+                // is a byte count (a non-negative quantity), so widen it to the i64 runtime signature
+                // **zero-extending** — a narrower unsigned size with its MSB set (e.g. a `u32` ≥ 2 GiB)
+                // must not become negative. `build_int_cast_sign_flag(.., false)` is a no-op at i64,
+                // zero-extends narrower widths, and truncates wider ones. The result `raw` is a `ptr`.
                 let sz = self.operand(size);
                 let i64t = self.ctx.i64_type();
-                let sz64 = if sz.into_int_value().get_type() == i64t {
-                    sz.into_int_value()
-                } else {
-                    self.builder
-                        .build_int_s_extend(sz.into_int_value(), i64t, "sizew")
-                        .map_err(|e| self.err(e))?
-                };
+                let sz64 = self
+                    .builder
+                    .build_int_cast_sign_flag(sz.into_int_value(), i64t, false, "sizew")
+                    .map_err(|e| self.err(e))?;
                 self.builder
                     .build_call(self.funcs["alloc"], &[sz64.into()], "rawptr")
                     .map_err(|e| self.err(e))?
