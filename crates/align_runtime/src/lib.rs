@@ -2066,6 +2066,13 @@ unsafe fn aos_value_at(base: *const u8, stride: usize, val_off: usize) -> impl F
     move |i| unsafe { (base.add(i * stride).add(val_off) as *const i64).read_unaligned() }
 }
 
+/// The AoS key-column index closure: the `AlignStr` at `base + i*stride + key_off` (the strided
+/// record's key field). The sibling of [`soa_key_at`] for the strided-record layout.
+#[inline(always)]
+unsafe fn aos_key_at<'a>(base: *const u8, stride: usize, key_off: usize) -> impl Fn(usize) -> (&'a [u8], AlignStr) {
+    move |i| unsafe { read_key_slice(base.add(i * stride), key_off) }
+}
+
 /// `group_by(.str_key).sum(.i64_value)` over an AoS `array<Struct>` (key + value in one strided row).
 ///
 /// # Safety
@@ -2077,7 +2084,7 @@ pub unsafe extern "C" fn align_rt_group_sum_str(base: *const u8, n: i64, stride:
     }
     let (n, stride, key_off, val_off) = (n as usize, stride as usize, key_off as usize, val_off as usize);
     unsafe {
-        group_agg_str(n, out_keys, out_vals, cap, |i| read_key_slice(base.add(i * stride), key_off), aos_value_at(base, stride, val_off), |a, b| a.wrapping_add(b))
+        group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.wrapping_add(b))
     }
 }
 
@@ -2092,7 +2099,7 @@ pub unsafe extern "C" fn align_rt_group_min_str(base: *const u8, n: i64, stride:
     }
     let (n, stride, key_off, val_off) = (n as usize, stride as usize, key_off as usize, val_off as usize);
     unsafe {
-        group_agg_str(n, out_keys, out_vals, cap, |i| read_key_slice(base.add(i * stride), key_off), aos_value_at(base, stride, val_off), |a, b| a.min(b))
+        group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.min(b))
     }
 }
 
@@ -2107,7 +2114,7 @@ pub unsafe extern "C" fn align_rt_group_max_str(base: *const u8, n: i64, stride:
     }
     let (n, stride, key_off, val_off) = (n as usize, stride as usize, key_off as usize, val_off as usize);
     unsafe {
-        group_agg_str(n, out_keys, out_vals, cap, |i| read_key_slice(base.add(i * stride), key_off), aos_value_at(base, stride, val_off), |a, b| a.max(b))
+        group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.max(b))
     }
 }
 
@@ -2121,7 +2128,7 @@ pub unsafe extern "C" fn align_rt_group_count_str(base: *const u8, n: i64, strid
         return 0;
     }
     let (n, stride, key_off) = (n as usize, stride as usize, key_off as usize);
-    unsafe { group_agg_str(n, out_keys, out_vals, cap, |i| read_key_slice(base.add(i * stride), key_off), |_| 1, |a, b| a.wrapping_add(b)) }
+    unsafe { group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
 // ---- soa two-contiguous-column variants: `key_col` is an `AlignStr` column, `val_col` an i64 column
