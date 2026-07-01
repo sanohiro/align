@@ -2370,6 +2370,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 inst.ok_or_else(|| self.err("raw load is not an instruction"))?.set_alignment(1).map_err(|e| self.err(e))?;
                 loaded
             }
+            Rvalue::RawOffset { ptr, offset } => {
+                // `raw.offset(p, n)` → `p + n` bytes, as a new `raw` pointer (a plain i8 GEP, no
+                // `inbounds` — unsafe pointer arithmetic must stay well-defined out of bounds).
+                self.raw_elem_ptr(ptr, offset)?.into()
+            }
             Rvalue::BoxGet(op) => {
                 let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 let ptr = self.operand(op).into_pointer_value();

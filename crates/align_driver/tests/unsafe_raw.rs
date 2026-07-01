@@ -110,3 +110,25 @@ fn raw_load_store_are_unsafe_only() {
     // Both are confined to an `unsafe {}` block, like alloc/free.
     assert!(!ok("fn main() -> i32 {\n  mut p := unsafe { raw.alloc(8) }\n  raw.store(p, 0, 7)\n  a: i64 := raw.load(p, 0)\n  unsafe { raw.free(p) }\n  return a as i32\n}\n"));
 }
+
+#[test]
+fn raw_offset_advances_a_pointer() {
+    if !backend_available() {
+        return;
+    }
+    // `raw.offset(p, 8)` yields a new `raw` pointing 8 bytes in; storing/loading through it hits the
+    // same bytes as `p` at offset 8. 40 (at p+0) + 60 (at q+0 == p+8) = 100.
+    let out = build_and_run(
+        "unsafe-offset",
+        "fn main() -> i32 {\n  unsafe {\n    p := raw.alloc(16)\n    raw.store(p, 0, 40)\n    q := raw.offset(p, 8)\n    raw.store(q, 0, 60)\n    a: i64 := raw.load(p, 0)\n    b: i64 := raw.load(q, 0)\n    raw.free(p)\n    return (a + b) as i32\n  }\n}\n",
+    );
+    assert_eq!(out.status.code(), Some(100));
+}
+
+#[test]
+fn raw_offset_is_unsafe_only_and_needs_a_raw_pointer() {
+    // Confined to `unsafe`, like the other raw ops.
+    assert!(!ok("fn f(p: raw) -> raw {\n  return raw.offset(p, 8)\n}\nfn main() -> i32 = 0\n"));
+    // The receiver must be a `raw` pointer, not an integer.
+    assert!(!ok("fn main() -> i32 {\n  unsafe {\n    q := raw.offset(8, 8)\n    raw.free(q)\n  }\n  return 0\n}\n"));
+}

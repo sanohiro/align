@@ -870,9 +870,13 @@ Completion condition: confirm that the vectorized code contains vector instructi
   Region: `unsafe {}` opens no region (an arena value returned through it is still escape-checked —
   `region_of(Unsafe)` = the block's tail region, not the `Static` fallback). `raw` calls the existing
   flat `align_rt_alloc`/`align_rt_free`. (`tests/unsafe_raw.rs`, `examples/unsafe_raw.align`.)
-  **Remaining (widen):** an unchecked pointer cast / reinterpret (the draft's `ptr_cast`, respelled
-  to fit no-turbofish), pointer arithmetic if needed, and — the real consumer — FFI (`layout(C)` ABI,
-  extern decls), the reason unsafe/raw lands before the `std`/`pkg` C-engine wrappers.
+  Pointer arithmetic is also done — **`raw.offset(p, n)`** advances a `raw` by `n` bytes (a plain,
+  non-`inbounds` i8 GEP, so out-of-bounds arithmetic stays well-defined). **Remaining (widen):** the
+  draft's `raw.ptr_cast<T>` (unchecked cast / reinterpret) is **deferred until FFI** — with only one
+  pointer type (`raw`, an opaque byte pointer) a typed cast has nothing to reinterpret *to*; it earns
+  its meaning once FFI introduces typed/external pointers, so building it now would be a premature
+  special case (ideal-form-or-defer). The real consumer is **FFI** (`layout(C)` ABI, extern decls) —
+  the reason unsafe/raw lands before the `std`/`pkg` C-engine wrappers.
 
 ## Design Issues to Settle in Parallel
 

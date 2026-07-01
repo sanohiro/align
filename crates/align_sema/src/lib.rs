@@ -2009,7 +2009,7 @@ impl EffectScan {
                 self.impure_direct = true;
                 self.expr(e);
             }
-            ExprKind::RawLoad { ptr, offset, .. } => {
+            ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
                 self.impure_direct = true;
                 self.expr(ptr);
                 self.expr(offset);
@@ -2653,7 +2653,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(recv, depth);
                 self.walk(index, depth);
             }
-            ExprKind::RawLoad { ptr, offset, .. } => {
+            ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
                 self.walk(ptr, depth);
                 self.walk(offset, depth);
             }
@@ -3165,7 +3165,7 @@ impl<'a> MoveCheck<'a> {
             // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.expr(e, moved, false, false),
             // `raw.load`/`raw.store` operands are Copy (raw ptr + int offset + scalar value), never moved.
-            ExprKind::RawLoad { ptr, offset, .. } => {
+            ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
                 self.expr(ptr, moved, false, false);
                 self.expr(offset, moved, false, false);
             }
@@ -5704,9 +5704,10 @@ impl<'a, 't> Checker<'a, 't> {
             if single_name(p) == Some("heap") && method == "new" {
                 return self.check_heap_new(args, expected, span);
             }
-            // `raw.alloc(size)` / `raw.free(p)` / `raw.load(p, off)` / `raw.store(p, off, v)` — the
-            // unsafe raw-pointer ops (`raw` is a module name, not a value). `unsafe {}`-only.
-            if single_name(p) == Some("raw") && matches!(method, "alloc" | "free" | "load" | "store") {
+            // `raw.alloc(size)` / `raw.free(p)` / `raw.load(p, off)` / `raw.store(p, off, v)` /
+            // `raw.offset(p, n)` — the unsafe raw-pointer ops (`raw` is a module name, not a value).
+            // `unsafe {}`-only.
+            if single_name(p) == Some("raw") && matches!(method, "alloc" | "free" | "load" | "store" | "offset") {
                 return self.check_raw_op(method, args, expected, span);
             }
             if single_name(p) == Some("json") && method == "encode" {
@@ -7902,9 +7903,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let nargs = match method {
             "alloc" | "free" => 1,
-            "load" => 2,
+            "load" | "offset" => 2,
             "store" => 3,
-            _ => unreachable!("check_raw_op is only dispatched for alloc/free/load/store"),
+            _ => unreachable!("check_raw_op is only dispatched for alloc/free/load/store/offset"),
         };
         if args.len() != nargs {
             self.diags.error(format!("'raw.{method}' takes {nargs} argument(s), got {}", args.len()), span);
@@ -7967,7 +7968,16 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::RawStore { ptr: Box::new(p), offset: Box::new(off), value: Box::new(v) }, ty: Ty::Unit, span }
             }
-            _ => unreachable!("check_raw_op is only dispatched for alloc/free/load/store"),
+            // `raw.offset(p, n)` advances a `raw` pointer by `n` bytes, yielding a new `raw` pointer
+            // (unsafe pointer arithmetic — for stepping through a buffer or passing an interior
+            // pointer). Distinct from `load`/`store`'s inline offset: this returns the pointer itself.
+            "offset" => {
+                let p = self.check_expr(&args[0], Some(Ty::Raw));
+                let n = self.check_expr(&args[1], Some(i64t));
+                self.check_raw_ptr_offset(&p, &n, "offset", args[0].span, args[1].span);
+                Expr { kind: ExprKind::RawOffset { ptr: Box::new(p), offset: Box::new(n) }, ty: Ty::Raw, span }
+            }
+            _ => unreachable!("check_raw_op is only dispatched for alloc/free/load/store/offset"),
         }
     }
 
@@ -9139,7 +9149,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.finalize_block(b),
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.finalize_expr(e),
-            ExprKind::RawLoad { ptr, offset, .. } => {
+            ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
                 self.finalize_expr(ptr);
                 self.finalize_expr(offset);
             }
