@@ -1283,7 +1283,8 @@ floats).
   / `sret`) — the one FFI corner where a wrong rule silently miscompiles. It is deferred rather than
   shipped half-right; struct-by-pointer already covers the dominant C-API shape.
 - **`bool` / `char` as FFI types.** Use the integer types, which map to C unambiguously: a C `_Bool`
-  is a `u8` (0/1), a C `char` is an `i8`/`u8`, a `char32_t`/`wchar_t` is an `i32`/`u32`. Align's
+  is a `u8` (0/1), a C `char` is an `i8`/`u8`, a `char32_t` is a `u32` (a `wchar_t` is platform-sized
+  — pick the matching integer width). Align's
   `char` is a 32-bit Unicode scalar (**not** a C `char`), so admitting it as an FFI type would invite
   the wrong mapping; `bool` is kept out for the same "one unambiguous way" reason (and to avoid the
   `i1`-`zeroext` ABI subtlety).
