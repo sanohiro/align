@@ -20,7 +20,7 @@ fn build_run_with(name: &str, src: &str, target: BuildTarget) -> Option<i32> {
     let obj: PathBuf = dir.join(format!("align-bt-{pid}-{name}.o"));
     let exe: PathBuf = dir.join(format!("align-bt-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
     emit_object_file(&mir, &obj, target).expect("codegen");
-    link_executable(&obj, &exe).expect("link");
+    link_executable(&obj, &exe, &mir.link_libs).expect("link");
     let code = std::process::Command::new(&exe).status().expect("run").code();
     let _ = std::fs::remove_file(&obj);
     let _ = std::fs::remove_file(&exe);

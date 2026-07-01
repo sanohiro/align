@@ -66,6 +66,10 @@ pub struct Program {
     pub fns: Vec<Fn>,
     /// Foreign (C-ABI) function declarations, surfaced to codegen as external LLVM declarations.
     pub externs: Vec<ExternFn>,
+    /// External libraries to link (`-l<name>`), from `extern "C" link("name")` clauses — deduped,
+    /// in first-seen order. Consumed by the driver's link step (libc/libm are always linked and are
+    /// not listed here).
+    pub link_libs: Vec<String>,
     /// Struct definitions, indexed by the id carried in [`crate::Ty::Struct`].
     pub structs: Vec<StructDef>,
     /// Sum-type definitions, indexed by the id carried in [`crate::Ty::Enum`].

@@ -483,6 +483,15 @@ impl<'a> Parser<'a> {
                 return None;
             }
         };
+        // Optional `link("name")` clause naming the external library to link (`-lname`). `link` is a
+        // contextual identifier here (like `align`/`layout`), so no keyword is reserved.
+        let link = if matches!(self.peek(), TokKind::Ident(s) if s == "link")
+            && matches!(self.peek_at(1), TokKind::LParen)
+        {
+            self.parse_link_clause()
+        } else {
+            None
+        };
         let mut fns = Vec::new();
         if self.eat(&TokKind::LBrace) {
             // Braced group: any number of `fn` signatures, one per line.
@@ -499,7 +508,25 @@ impl<'a> Parser<'a> {
             fns.push(self.parse_extern_sig()?);
         }
         let span = start.merge(self.prev_span());
-        Some(ExternBlock { abi, fns, span })
+        Some(ExternBlock { abi, link, fns, span })
+    }
+
+    /// `link("name")` — the external library for an `extern` block. The name is validated in sema.
+    fn parse_link_clause(&mut self) -> Option<String> {
+        self.bump(); // `link`
+        self.expect(&TokKind::LParen, "'(' after `link`");
+        let name = match self.peek() {
+            TokKind::Str(_) => {
+                let TokKind::Str(s) = self.bump().kind else { unreachable!() };
+                Some(s)
+            }
+            _ => {
+                self.diags.error("`link(\"name\")` needs a library-name string (e.g. `link(\"z\")`)", self.span());
+                None
+            }
+        };
+        self.expect(&TokKind::RParen, "')'");
+        name
     }
 
     /// One bodyless foreign signature `fn name(params) -> ret` (no generics, no body). Shares the

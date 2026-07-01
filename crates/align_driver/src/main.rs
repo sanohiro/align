@@ -216,7 +216,7 @@ fn build_to(path: &str, mir: &align_mir::Program, exe: &PathBuf, target: BuildTa
         eprintln!("alignc: codegen failed: {e}");
         return Err(ExitCode::FAILURE);
     }
-    if let Err(e) = link_executable(&obj, exe) {
+    if let Err(e) = link_executable(&obj, exe, &mir.link_libs) {
         eprintln!("alignc: {e}");
         return Err(ExitCode::FAILURE);
     }
