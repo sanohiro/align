@@ -1273,9 +1273,13 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         descriptor-free, verify-free single-pass positional walk (the `rec_cols` two-pass + `FieldDst`/
         `JsonParser` indirection + intrinsic key-verify), whose pieces were each measured small (+2/+4/+2
         ms) and judged not-worth-forcing. `bench/json_soa` is now the instrument to revisit that with data.
-        Note (dead code): the heavier `json_structural_index` (#213/#254 AVX2+NEON, quote+comma) is still
-        `allow(dead_code)` — the live decode uses the lean `json_decode_index`; #213's index has no live
-        consumer and is a candidate for removal unless a future full-structural pass needs it.
+        Note (dead code): the heavier `json_structural_index` (#213/#254 AVX2+NEON, quote+comma) was
+        **removed 2026-07-01** — it never had a live consumer (the live decode uses the lean
+        `json_decode_index`, which emits only `{ } [ ] :`). The shared bit-twiddling helpers it used —
+        `prefix_xor` (x86 pclmulqdq), `prefix_xor_portable` (NEON), `find_escaped` — stay: the lean
+        index's AVX2/NEON paths use them. If a future full-structural pass ever needs the quote+comma
+        index, it is in git history (#213/#254). The differential SIMD-vs-scalar-oracle test now covers
+        only the live lean index (`json_decode_index_simd_matches_scalar_oracle`).
         The historical investigation that led here ↓. Built the
         **stage-1 structural index** (PR #213: AVX2 + `pclmulqdq` prefix-XOR string mask + odd/even
         backslash-run escapes, block-carried, scalar oracle + exhaustive fuzz; runtime-dispatched,

@@ -2359,44 +2359,23 @@ fn find_quote_or_escape(hay: &[u8]) -> Option<usize> {
     memchr::memchr2(b'"', b'\\', &hay[PREFIX..]).map(|i| i + PREFIX)
 }
 
-// ===================== JSON structural index (simdjson-style stage 1) =====================
+// ===================== JSON SIMD index (simdjson-style stage 1) =====================
 //
-// Stage 1 of a two-stage JSON parser: scan the input and emit the byte positions of the
-// **structural** tokens — the punctuation `{ } [ ] : ,` that lies OUTSIDE string literals, plus
-// every string-delimiter `"`. String interiors are masked so a `:` or `,` inside `"a,b"` is not
-// mistaken for structure, and `\"` / `\\` escapes are handled (an escaped quote is not a delimiter).
-// Stage 2 (a later slice) walks this index instead of stepping byte-by-byte — the lever that beat
-// `serde_json` ~3.4–4.1× in the `work/` probe. This slice is the indexer + its correctness harness;
-// it is wired into the decoder in the next slice.
+// Stage 1 of the two-stage JSON decoder: scan the input and emit the byte positions of the
+// structural punctuation that lies OUTSIDE string literals. String interiors are masked (a `:`
+// inside `"a:b"` is not structure) via a carry-less-multiply prefix-XOR of the quote bitmap, and
+// `\"` / `\\` escapes are handled (an escaped quote is not a delimiter). Stage 2 (the decoder) walks
+// this index instead of stepping byte-by-byte.
 //
-// The fast path is AVX2 + carry-less multiply (runtime-detected, baseline-binary-safe — a CPU
-// without AVX2 falls back to the scalar reference, which is also the oracle the SIMD is tested
-// against). The scalar reference is the source of truth for the emitted set.
-
-/// Scalar reference / fallback: emit structural-token positions (escape-aware). The SIMD path must
-/// produce byte-for-byte the same `out`. The emitted set: each unescaped `"` (string delimiter), and
-/// each `{ } [ ] : ,` that occurs outside a string.
-#[cfg_attr(not(test), allow(dead_code))]
-fn json_structural_index_scalar(src: &[u8], out: &mut Vec<u32>) {
-    out.clear();
-    out.reserve(src.len() / 8); // structural tokens are a fraction of the bytes; reuse keeps it a no-op
-    // `esc` = the current byte is escaped (preceded by an odd-length backslash run). It suppresses
-    // only a `"` (an escaped quote is not a delimiter) — NOT the punctuation, matching the SIMD's
-    // `real_quote = quote & ~escaped` / `op & ~in_string` (escapes touch quotes, not `op`). This is
-    // the exact spec the AVX2 path is tested against, so it is defined for any bytes (incl. invalid
-    // JSON with a stray backslash); on valid JSON, backslashes only occur inside strings anyway.
-    let mut in_string = false;
-    let mut esc = false;
-    for (i, &b) in src.iter().enumerate() {
-        if b == b'"' && !esc {
-            in_string = !in_string;
-            out.push(i as u32);
-        } else if !in_string && matches!(b, b'{' | b'}' | b'[' | b']' | b':' | b',') {
-            out.push(i as u32);
-        }
-        esc = b == b'\\' && !esc;
-    }
-}
+// The live indexer is the **lean** `json_decode_index` below — it emits only `{ } [ ] :` (no quotes,
+// no commas), ~⅓ the tokens for object-heavy input, and keys / string values are recovered by a short
+// raw-byte scan-back. The fast paths are AVX2 (x86_64, carry-less-multiply prefix-XOR) and NEON
+// (aarch64, baseline shift-XOR), each runtime-safe with a scalar reference / fallback that is also the
+// oracle the SIMD is differentially tested against. (The earlier quote+comma `json_structural_index`
+// was removed once the lean index superseded it — it never had a live consumer.)
+//
+// `prefix_xor` (AVX2) / `prefix_xor_portable` (NEON) and `find_escaped` are the shared bit-twiddling
+// helpers used by both SIMD index paths.
 
 /// prefix-XOR of a 64-bit mask: bit i = XOR of bits 0..=i. Via carry-less multiply by all-ones — the
 /// classic simdjson trick for turning a quote bitmap into an "inside string" mask.
@@ -2429,95 +2408,12 @@ fn find_escaped(backslash: u64, prev_escaped: &mut u64) -> u64 {
     (EVEN ^ invert) & follows_escape
 }
 
-/// AVX2 structural index. Processes 64 bytes per iteration (two 32-byte vectors); a scalar tail
-/// finishes the remainder continuing the carried string/escape state.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,pclmulqdq")]
-unsafe fn json_structural_index_avx2(src: &[u8], out: &mut Vec<u32>) {
-    use core::arch::x86_64::*;
-    out.clear();
-    out.reserve(src.len() / 8); // structural tokens are a fraction of the bytes; reuse keeps it a no-op
-    let n = src.len();
-
-    // Closures inherit the enclosing fn's enabled features, so the intrinsics are available; they
-    // are `unsafe`, hence the inner `unsafe {}` (edition-2024 `unsafe_op_in_unsafe_fn`).
-    let eqm = |v: __m256i, c: u8| -> u32 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 };
-    let op_bits = |v: __m256i| -> u32 { eqm(v, b'{') | eqm(v, b'}') | eqm(v, b'[') | eqm(v, b']') | eqm(v, b':') | eqm(v, b',') };
-
-    let mut string_carry: u64 = 0; // 0 or all-ones: in-string parity at the end of the prev block
-    let mut escape_carry: u64 = 0; // 0 or 1: a pending escape crossing the block boundary
-    let mut i = 0usize;
-    while i + 64 <= n {
-        let p = unsafe { src.as_ptr().add(i) };
-        let lo = unsafe { _mm256_loadu_si256(p as *const __m256i) };
-        let hi = unsafe { _mm256_loadu_si256(p.add(32) as *const __m256i) };
-        let quote = (eqm(lo, b'"') as u64) | ((eqm(hi, b'"') as u64) << 32);
-        let backslash = (eqm(lo, b'\\') as u64) | ((eqm(hi, b'\\') as u64) << 32);
-        let op = (op_bits(lo) as u64) | ((op_bits(hi) as u64) << 32);
-
-        let escaped = find_escaped(backslash, &mut escape_carry);
-        let real_quote = quote & !escaped; // an escaped \" is not a string delimiter
-        let in_string = unsafe { prefix_xor(real_quote) } ^ string_carry;
-        string_carry = (in_string as i64 >> 63) as u64; // sign-extend the top bit → 0 / all-ones
-
-        // Structural = punctuation outside strings, plus every real delimiter quote.
-        let mut bits = (op & !in_string) | real_quote;
-        while bits != 0 {
-            out.push(i as u32 + bits.trailing_zeros());
-            bits &= bits - 1;
-        }
-        i += 64;
-    }
-
-    // Scalar tail, continuing the carried state (low bit of each carry is the live parity / flag).
-    // Same semantics as `json_structural_index_scalar`: `esc` suppresses only a `"`, not `op`.
-    let mut in_string = string_carry & 1 == 1;
-    let mut esc = escape_carry & 1 == 1;
-    while i < n {
-        let b = unsafe { *src.get_unchecked(i) };
-        if b == b'"' && !esc {
-            in_string = !in_string;
-            out.push(i as u32);
-        } else if !in_string && matches!(b, b'{' | b'}' | b'[' | b']' | b':' | b',') {
-            out.push(i as u32);
-        }
-        esc = b == b'\\' && !esc;
-        i += 1;
-    }
-}
-
-/// Fill `out` with the JSON structural-token positions (see [`json_structural_index_scalar`]).
-/// Runtime-dispatched: AVX2 + `pclmulqdq` when present (baseline-binary-safe), else the scalar
-/// reference. Wired into the decoder in a later slice.
-#[cfg_attr(not(test), allow(dead_code))]
-fn json_structural_index(src: &[u8], out: &mut Vec<u32>) {
-    // Positions are `u32`, so a 4 GiB+ input would silently truncate/wrap — corrupting stage 2.
-    // Reject it up front (simdjson has the same limit); a real document never approaches this.
-    if src.len() > u32::MAX as usize {
-        panic_abort("JSON input exceeds the 4 GiB structural-index limit");
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("pclmulqdq") {
-            unsafe { json_structural_index_avx2(src, out) };
-            return;
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        // NEON is ARMv8-A baseline — unconditionally available on every aarch64 target.
-        unsafe { json_structural_index_neon(src, out) };
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    json_structural_index_scalar(src, out);
-}
-
 /// A **lean** decode index for the two-stage `array<Struct>` decoder: emits only `{ } [ ] :`
 /// (structure + field separators) outside strings — **not** quotes or commas. The decoder navigates
 /// records by the braces and fields by the colons, and recovers keys / `str` values by a short scan
-/// of the raw bytes around the colon (so the quotes need not be in the index). Roughly a third the
-/// size of [`json_structural_index`] for object-heavy input — and the index size dominates the decode
-/// (`docs/open-questions.md` "JSON two-stage SIMD decode" autopsy), so the smaller index is the win.
+/// of the raw bytes around the colon (so the quotes need not be in the index). Emitting only colons
+/// (~⅓ the tokens of a quote+comma index) is the win — the index size dominates the decode
+/// (`docs/open-questions.md` "JSON two-stage SIMD decode" autopsy), so the smaller index is faster.
 #[cfg_attr(not(test), allow(dead_code))]
 fn json_decode_index_scalar(src: &[u8], out: &mut Vec<u32>) {
     out.clear();
@@ -2671,80 +2567,6 @@ unsafe fn json_decode_index_neon(src: &[u8], out: &mut Vec<u32>) {
         if b == b'"' && !esc {
             in_string = !in_string;
         } else if !in_string && matches!(b, b'{' | b'}' | b'[' | b']' | b':') {
-            out.push(i as u32);
-        }
-        esc = b == b'\\' && !esc;
-        i += 1;
-    }
-}
-
-/// NEON structural index — the aarch64 counterpart to [`json_structural_index_avx2`], emitting the
-/// full simdjson-style structural set (`{ } [ ] : ,` outside strings, plus every real delimiter
-/// quote). Same 64-byte-block shape as [`json_decode_index_neon`]; the only deltas are that `op`
-/// includes `,` and the emitted mask is `(op & !in_string) | real_quote`. NEON is ARMv8-A baseline.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn json_structural_index_neon(src: &[u8], out: &mut Vec<u32>) {
-    use core::arch::aarch64::*;
-    out.clear();
-    out.reserve(src.len() / 8);
-    let n = src.len();
-
-    // A local `static` guarantees a single `.rodata` instance (see `json_decode_index_neon`).
-    static WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-    let bit_weights: uint8x16_t = unsafe { vld1q_u8(WEIGHTS.as_ptr()) };
-    let movemask16 = |cmp: uint8x16_t| -> u32 {
-        let masked = vandq_u8(cmp, bit_weights);
-        (vaddv_u8(vget_low_u8(masked)) as u32) | ((vaddv_u8(vget_high_u8(masked)) as u32) << 8)
-    };
-    let eqm = |v: uint8x16_t, c: u8| -> u32 { movemask16(vceqq_u8(v, vdupq_n_u8(c))) };
-    // Punctuation: `{ } [ ] : ,` (the structural set includes the comma; the decode index does not).
-    let op_bits = |v: uint8x16_t| -> u32 {
-        let m = vorrq_u8(
-            vorrq_u8(
-                vorrq_u8(vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'{')), vceqq_u8(v, vdupq_n_u8(b'}'))), vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'[')), vceqq_u8(v, vdupq_n_u8(b']')))),
-                vceqq_u8(v, vdupq_n_u8(b':')),
-            ),
-            vceqq_u8(v, vdupq_n_u8(b',')),
-        );
-        movemask16(m)
-    };
-
-    let mut string_carry: u64 = 0;
-    let mut escape_carry: u64 = 0;
-    let mut i = 0usize;
-    while i + 64 <= n {
-        let p = unsafe { src.as_ptr().add(i) };
-        let v0 = unsafe { vld1q_u8(p) };
-        let v1 = unsafe { vld1q_u8(p.add(16)) };
-        let v2 = unsafe { vld1q_u8(p.add(32)) };
-        let v3 = unsafe { vld1q_u8(p.add(48)) };
-        let quote = (eqm(v0, b'"') as u64) | ((eqm(v1, b'"') as u64) << 16) | ((eqm(v2, b'"') as u64) << 32) | ((eqm(v3, b'"') as u64) << 48);
-        let backslash = (eqm(v0, b'\\') as u64) | ((eqm(v1, b'\\') as u64) << 16) | ((eqm(v2, b'\\') as u64) << 32) | ((eqm(v3, b'\\') as u64) << 48);
-        let op = (op_bits(v0) as u64) | ((op_bits(v1) as u64) << 16) | ((op_bits(v2) as u64) << 32) | ((op_bits(v3) as u64) << 48);
-
-        let escaped = find_escaped(backslash, &mut escape_carry);
-        let real_quote = quote & !escaped;
-        let in_string = prefix_xor_portable(real_quote) ^ string_carry;
-        string_carry = (in_string as i64 >> 63) as u64;
-
-        // Structural = punctuation outside strings, plus every real delimiter quote.
-        let mut bits = (op & !in_string) | real_quote;
-        while bits != 0 {
-            out.push(i as u32 + bits.trailing_zeros());
-            bits &= bits - 1;
-        }
-        i += 64;
-    }
-    // Scalar tail, continuing the carried state — identical semantics to `json_structural_index_scalar`.
-    let mut in_string = string_carry & 1 == 1;
-    let mut esc = escape_carry & 1 == 1;
-    while i < n {
-        let b = unsafe { *src.get_unchecked(i) };
-        if b == b'"' && !esc {
-            in_string = !in_string;
-            out.push(i as u32);
-        } else if !in_string && matches!(b, b'{' | b'}' | b'[' | b']' | b':' | b',') {
             out.push(i as u32);
         }
         esc = b == b'\\' && !esc;
@@ -3979,93 +3801,10 @@ mod tests {
     }
 
     #[test]
-    fn json_structural_index_simd_matches_scalar_oracle() {
-        // The AVX2 indexer must emit byte-for-byte the same positions as the scalar reference, on
-        // every shape that stresses the string/escape masking and the 64-byte block carry.
-        // (`is_x86_feature_detected!` can only be *named* on x86, so the detection lives inside the
-        // `#[cfg(target_arch = "x86_64")]` block, not in a cross-arch `let`.)
-        let check = |src: &[u8]| {
-            let mut want = Vec::new();
-            json_structural_index_scalar(src, &mut want);
-            // The dispatch must equal the scalar oracle (it *is* the scalar path when no SIMD).
-            let mut got = Vec::new();
-            json_structural_index(src, &mut got);
-            assert_eq!(got, want, "dispatch mismatch on {:?}", String::from_utf8_lossy(src));
-            #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("pclmulqdq") {
-                let mut g2 = Vec::new();
-                unsafe { json_structural_index_avx2(src, &mut g2) };
-                assert_eq!(g2, want, "avx2 mismatch on {:?}", String::from_utf8_lossy(src));
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                let mut g2 = Vec::new();
-                unsafe { json_structural_index_neon(src, &mut g2) }; // NEON is baseline — always exercised
-                assert_eq!(g2, want, "neon mismatch on {:?}", String::from_utf8_lossy(src));
-            }
-        };
-
-        // Hand-written shapes: objects, arrays, nesting, and every escape interaction.
-        let cases: &[&[u8]] = &[
-            b"",
-            b"{}",
-            b"[]",
-            b"{\"a\":1}",
-            b"[{\"active\":true,\"pay\":12},{\"active\":false,\"pay\":3}]",
-            b"{\"s\":\"a,b:c{}[]\"}",          // structural chars INSIDE a string — must be ignored
-            b"{\"s\":\"he said \\\"hi\\\"\"}", // escaped quotes \" inside the value
-            b"{\"s\":\"back\\\\slash\"}",      // escaped backslash \\
-            b"{\"s\":\"\\\\\\\"\"}",           // \\ then \" — the second quote is a real delimiter... no, escaped
-            b"{\"a\":{\"b\":{\"c\":[1,2,3]}}}",
-            b"{\"k\":\"\"}",                   // empty string value
-            b"\"\\\\\"",                       // a string that is just an escaped backslash
-        ];
-        for c in cases {
-            check(c);
-        }
-
-        // Block-boundary stress: place an escaped quote / backslash run at each offset across the
-        // first two 64-byte blocks, so the escape + string carries are exercised at the seam.
-        for pad in 55..75usize {
-            let mut s = Vec::new();
-            s.push(b'{');
-            s.push(b'"');
-            s.extend(std::iter::repeat_n(b'x', pad));
-            s.extend_from_slice(b"\\\"end"); // an escaped quote straddling/near the boundary
-            s.extend_from_slice(b"\":1}");
-            check(&s);
-
-            // A run of backslashes of varying length right at the boundary (parity matters).
-            for run in 1..6usize {
-                let mut t = Vec::new();
-                t.extend_from_slice(b"{\"k\":\"");
-                t.extend(std::iter::repeat_n(b'y', pad));
-                t.extend(std::iter::repeat_n(b'\\', run));
-                t.extend_from_slice(b"\"}"); // whether this " is escaped depends on run parity
-                check(&t);
-            }
-        }
-
-        // Pseudo-random fuzz: bytes drawn from a JSON-ish alphabet (so strings/escapes actually form).
-        let mut state: u64 = 0x1234_5678_9abc_def0;
-        let alpha = b"{}[]:,\"\\ ab12tfnul";
-        for len in [16usize, 64, 65, 200, 1000, 4096] {
-            for _ in 0..40 {
-                let mut s = Vec::with_capacity(len);
-                for _ in 0..len {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                    s.push(alpha[((state >> 33) as usize) % alpha.len()]);
-                }
-                check(&s);
-            }
-        }
-    }
-
-    #[test]
     fn json_decode_index_simd_matches_scalar_oracle() {
         // The SIMD decode index (AVX2 on x86_64, NEON on aarch64) must emit byte-for-byte the same
         // lean `{ } [ ] :` positions as the scalar reference, including the string/escape masking and
-        // the 64-byte block carry. Same oracle discipline as the structural-index test.
+        // the 64-byte block carry (the same oracle discipline).
         let check = |src: &[u8]| {
             let mut want = Vec::new();
             json_decode_index_scalar(src, &mut want);
