@@ -2226,11 +2226,11 @@ impl<'a> EscapeCheck<'a> {
             // it. `arena(depth)` is the shortest-lived (most restrictive) region anything allocated
             // at this depth can have, so it conservatively covers an accumulator that instead just
             // forwards `init` or borrows a source element (both outlive `arena(depth)`).
-            // `to_soa` bump-allocates the column buffer in the enclosing arena; the returned view
+            // These allocating producers bump-allocate in the enclosing arena; the returned value
             // borrows it, so it is arena-regioned and cannot escape (like `to_array`'s buffer).
-            // (`to_soa` rejects `str` columns for now, so its columns never borrow the source.)
-            ExprKind::ArrayToSoa { .. }
-            | ExprKind::ArrayToArray { .. }
+            // (`to_soa` and `json.decode → soa` are handled separately below — a `str`-bearing soa
+            // also borrows its source/input, so it needs the shorter of the two regions.)
+            ExprKind::ArrayToArray { .. }
             | ExprKind::ArrayPartition { .. }
             | ExprKind::ArrayParMap { .. }
             | ExprKind::ArrayScan { .. }
@@ -2256,6 +2256,15 @@ impl<'a> EscapeCheck<'a> {
                 self.region_of(input, depth).shorter(Region::arena(depth))
             }
             ExprKind::JsonDecodeSoa { .. } => Region::arena(depth),
+            // `to_soa` transposes an AoS `array<Struct>` into an arena-allocated column buffer. A
+            // `str` column copies the source elements' `str` views into the column, so a str-bearing
+            // soa borrows the source's string storage — it is bound to BOTH the arena buffer and the
+            // source (the shorter of the two). A primitive-only `to_soa` borrows nothing → the group
+            // arm below binds it purely to the arena (self-contained, like `to_array`'s buffer).
+            ExprKind::ArrayToSoa { source, struct_id } if self.struct_has_str(*struct_id) => {
+                self.region_of(source, depth).shorter(Region::arena(depth))
+            }
+            ExprKind::ArrayToSoa { .. } => Region::arena(depth),
             // `arr[i].field` reads a field of a struct-array element; a `str` field is a view into
             // the array's storage, so it inherits the array's region (it must not outlive it). A
             // scalar field is Copy → the default `Static` (handled below), but tying to the array
@@ -7065,12 +7074,14 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
-        // The struct must satisfy the `soa<T>` field rule (all primitive scalars), so each column is
-        // a flat scalar array — the same check `resolve_type` makes for the `soa<Struct>` type.
+        // The struct must satisfy the `soa<T>` field rule (primitive scalars and/or `str`) — the same
+        // check `resolve_type` makes for the `soa<Struct>` type. A `str` column transposes the source
+        // elements' `str` views into a view column (16-byte `{ptr,len}`), so a str-bearing soa is
+        // region-tied to the source array (see the `ArrayToSoa` arm of `region_of`).
         let fields = &self.structs[id as usize].fields;
-        if fields.is_empty() || !fields.iter().all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)) {
+        if fields.is_empty() || !fields.iter().all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str)) {
             self.diags.error(
-                format!("'to_soa' needs a non-empty struct of primitive scalar fields (no `str`/owned fields yet), '{}' has other fields", self.structs[id as usize].name),
+                format!("'to_soa' needs a non-empty struct of primitive-scalar or `str` fields (no nested/owned fields), '{}' has other fields", self.structs[id as usize].name),
                 span,
             );
             return err;

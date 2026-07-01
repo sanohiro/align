@@ -165,10 +165,40 @@ fn to_soa_over_a_non_struct_array_is_rejected() {
 }
 
 #[test]
-fn to_soa_over_a_str_field_struct_is_rejected() {
+fn to_soa_transposes_a_str_column() {
+    if !backend_available() {
+        return;
+    }
+    // Transpose an AoS array with a `str` field into a `soa` — the str views copy into a view
+    // column. age.sum() = 30 + 25 = 55; "alice".len() = 5 → exit 60.
+    let out = build_and_run(
+        "to-soa-str",
+        concat!(
+            "User { name: str, age: i64 }\n",
+            "fn main() -> i32 {\n  arena {\n    rows := [User { name: \"alice\", age: 30 }, User { name: \"bob\", age: 25 }]\n    s := rows.to_soa()\n    return (s.age.sum() + s[0].name.len()) as i32\n  }\n}\n",
+        ),
+    );
+    assert_eq!(out.status.code(), Some(60));
+}
+
+#[test]
+fn to_soa_with_a_nested_field_struct_is_rejected() {
+    // A `str` column is allowed; a nested/owned column (a struct field) is not.
     assert!(!ok(concat!(
-        "Rec { id: i32, name: str }\n",
-        "fn main() -> i32 {\n  arena {\n    s := [Rec { id: 1, name: \"x\" }].to_soa()\n    return 0\n  }\n}\n",
+        "Inner { a: i32 }\n",
+        "Rec { id: i32, sub: Inner }\n",
+        "fn main() -> i32 {\n  arena {\n    s := [Rec { id: 1, sub: Inner { a: 2 } }].to_soa()\n    return 0\n  }\n}\n",
+    )));
+}
+
+#[test]
+fn to_soa_str_column_view_cannot_escape_the_arena() {
+    // A str-bearing `to_soa` soa borrows the source's string storage and the arena buffer, so a str
+    // element read is region-tied and must not escape to an outer binding.
+    assert!(!ok(concat!(
+        "User { name: str, age: i64 }\n",
+        "fn get() -> i64 {\n  mut out: str := \"\"\n  arena {\n    rows := [User { name: \"alice\", age: 30 }]\n    s := rows.to_soa()\n    out = s[0].name\n  }\n  return out.len()\n}\n",
+        "fn main() -> i32 = 0\n",
     )));
 }
 

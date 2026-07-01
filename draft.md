@@ -860,9 +860,10 @@ element is **writable in place** through a `mut` view — `s[i].pay = v` stores 
 counterpart of the `s[i].pay` read, the soa analogue of AoS `arr[i].pay = v`); a **whole element** is
 replaceable too — `s[i] = value` scatters a struct value's fields into their columns (the write
 counterpart of the `s[i]` gather / AoS `arr[i] = value`), for plain-data structs. A struct may also
-carry **`str` columns** — a `str` field decodes as a 16-byte `{ptr,len}` view column borrowing the
-JSON input, so a str-bearing `soa` is region-tied to that input (it cannot escape it) while primitive
-columns still scan and reduce as usual; str columns are read-only after decode (no `s[i].name = v`).
+carry **`str` columns** — a `str` field lands in a 16-byte `{ptr,len}` view column, whether decoded
+(`json.decode`, the views borrowing the JSON input) or transposed (`.to_soa()`, the views borrowing
+the source array), so a str-bearing `soa` is region-tied to that borrow (it cannot escape it) while
+primitive columns still scan and reduce as usual; str columns are read-only (no `s[i].name = v`).
 The plain column scan beats AoS ≈7×. The remaining slices are known-schema field-skip decode (parse
 only the used columns), owned/nested columns, and a multi-column `soa_slice<T>` sub-view (`s[a..b]`
 over every column).)*
