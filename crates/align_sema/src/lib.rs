@@ -480,6 +480,15 @@ fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) ->
 /// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs
 /// and Move tuples; needs the struct/tuple tables to inspect composite members. The free-function
 /// form (vs `MoveCheck::is_move_ty`) is shared by the field-access checker.
+/// Whether a type may cross the C ABI boundary in an `extern "C"` signature (first FFI slice). A
+/// plain primitive scalar (integer or float) or the opaque `raw` byte pointer — the types with an
+/// obvious, stable C representation. `bool`/`char`, aggregates, and the owning collection types
+/// (`str`/`string`/`array`/…) are deferred: their C mapping needs a settled layout/marshaling rule
+/// (`bool` ABI width, `str`→pointer+len split, struct `layout(C)`), a later slice.
+fn is_ffi_safe(ty: Ty) -> bool {
+    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Raw)
+}
+
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter | Ty::DictEncoded(..))
         || payload_is_move(ty)
@@ -636,6 +645,10 @@ struct FnSig {
     type_params: Vec<String>,
     /// The builtin bound declared for each type parameter (parallel to `type_params`).
     bounds: Vec<Bound>,
+    /// Whether this is a foreign (`extern "C"`) declaration. A call to an extern is only valid
+    /// inside an `unsafe {}` block (foreign code can violate every safe-core invariant), so
+    /// `check_named_call` gates it on `unsafe_depth`.
+    is_extern: bool,
 }
 
 /// A pipeline stage as collected from the AST (before type checking).
@@ -1143,7 +1156,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             let (bare, vis, type_params, span) = match item {
                 ast::Item::Struct(s) => (&s.name.name, s.vis, s.type_params.len(), s.span),
                 ast::Item::Enum(e) => (&e.name.name, e.vis, e.type_params.len(), e.span),
-                ast::Item::Fn(_) | ast::Item::Const(_) => continue,
+                ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => continue,
             };
             if bare == "Error" {
                 diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), span);
@@ -1169,7 +1182,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                     enum_decls.push((m.path.as_str(), m.is_entry, e));
                 }
                 ast::Item::Enum(e) => generic_enum_decls.push((m.path.as_str(), m.is_entry, e)),
-                ast::Item::Fn(_) | ast::Item::Const(_) => unreachable!(),
+                ast::Item::Fn(_) | ast::Item::Const(_) | ast::Item::Extern(_) => unreachable!(),
             }
         }
     }
@@ -1618,7 +1631,76 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             None => Ty::Unit,
         };
         let out = f.params.iter().map(|p| p.is_out).collect();
-        sigs.insert(mangled, FnSig { params, out, ret, type_params: tparams, bounds });
+        sigs.insert(mangled, FnSig { params, out, ret, type_params: tparams, bounds, is_extern: false });
+    }
+
+    // Extern (`extern "C"`) declarations: resolve + FFI-validate each foreign signature, register it
+    // in `sigs` under its bare C symbol (never mangled — a C symbol is global), make it resolvable
+    // from every module (like a builtin), and collect it for codegen's external-declaration pass.
+    let mut externs: Vec<hir::ExternFn> = Vec::new();
+    for m in modules {
+        for it in &m.file.items {
+            let ast::Item::Extern(blk) = it else { continue };
+            if blk.abi != "C" {
+                diags.error(
+                    format!("unsupported ABI '{}' — only `extern \"C\"` is supported", blk.abi),
+                    blk.span,
+                );
+            }
+            // Extern signatures see the top-level type namespace with no module imports (an FFI type
+            // is a primitive/`raw`, never an imported user type); the entry module's context suffices.
+            let imports = &no_imports;
+            for sig in &blk.fns {
+                let cname = sig.name.name.clone();
+                let mut params: Vec<Ty> = Vec::with_capacity(sig.params.len());
+                for p in &sig.params {
+                    let ty = resolve_type(&p.ty, tcx!(m.path.as_str(), imports), &[], diags);
+                    // `Ty::Error` already produced a diagnostic in `resolve_type` — don't pile a
+                    // second "not FFI-safe" error on the same root cause.
+                    if ty != Ty::Error && !is_ffi_safe(ty) {
+                        diags.error(
+                            format!("'{}' is not an FFI-safe type for an extern parameter (use an integer, float, or `raw`)", ty_name(ty)),
+                            p.ty.span(),
+                        );
+                    }
+                    params.push(ty);
+                }
+                let ret = match &sig.ret {
+                    Some(t) => {
+                        let r = resolve_type(t, tcx!(m.path.as_str(), imports), &[], diags);
+                        // A `()` (void) return is allowed; otherwise it must be an FFI-safe scalar.
+                        // (`Ty::Error` already reported — don't double up, see the param note above.)
+                        if r != Ty::Unit && r != Ty::Error && !is_ffi_safe(r) {
+                            diags.error(
+                                format!("'{}' is not an FFI-safe return type for an extern (use an integer, float, `raw`, or `()`)", ty_name(r)),
+                                t.span(),
+                            );
+                        }
+                        r
+                    }
+                    None => Ty::Unit,
+                };
+                // Re-declaring the same C symbol is fine as long as the signature agrees — a C
+                // symbol is global, so two modules may each declare the extern they use (like
+                // repeating a C header). It is registered/collected exactly once; a *conflicting*
+                // re-declaration (different signature, or a clash with a non-extern user function of
+                // the same name) is an error.
+                if let Some(existing) = sigs.get(&cname) {
+                    if !existing.is_extern {
+                        diags.error(format!("extern '{cname}' conflicts with a function of the same name"), sig.span);
+                    } else if existing.params != params || existing.ret != ret {
+                        diags.error(format!("extern '{cname}' re-declared with a different signature"), sig.span);
+                    }
+                } else {
+                    sigs.insert(cname.clone(), FnSig { params: params.clone(), out: vec![false; params.len()], ret, type_params: Vec::new(), bounds: Vec::new(), is_extern: true });
+                    // Make the C symbol resolvable as a bare call from every module.
+                    for info in mod_table.values_mut() {
+                        info.fns.entry(cname.clone()).or_insert((cname.clone(), true));
+                    }
+                    externs.push(hir::ExternFn { name: cname, params, ret });
+                }
+            }
+        }
     }
 
     // Pass 2: check each function body. A function's inline lambdas are lifted to synthetic
@@ -1691,7 +1773,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         // checked in Pass 2, so a monomorph never has lifted helpers here.
         fns.push(checked);
     }
-    let mut program = Program { fns, structs, enums, tuples, fn_types };
+    let mut program = Program { fns, externs, structs, enums, tuples, fn_types };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
@@ -5293,6 +5375,14 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         };
+        // A foreign (`extern "C"`) call can violate every safe-core invariant, so it is confined to
+        // an `unsafe {}` block — exactly like a `raw.*` op (draft.md §15).
+        if sig.is_extern && self.unsafe_depth == 0 {
+            self.diags.error(
+                format!("calling the extern function '{name}' requires an `unsafe {{ }}` block (foreign code is outside the safe core)"),
+                span,
+            );
+        }
         let (param_tys, ret, out) = (sig.params.clone(), sig.ret, sig.out.clone());
         // A generic function: infer the concrete type arguments from the call, then take its own
         // dedicated path (the result type and `type_args` come from the substitution).
@@ -9389,6 +9479,16 @@ fn collect_refs(items: &[ast::Item], out: &mut std::collections::HashSet<String>
                     walk_type(t, out);
                 }
                 walk_expr(&c.value, out);
+            }
+            ast::Item::Extern(blk) => {
+                for sig in &blk.fns {
+                    for p in &sig.params {
+                        walk_type(&p.ty, out);
+                    }
+                    if let Some(t) = &sig.ret {
+                        walk_type(t, out);
+                    }
+                }
             }
         }
     }

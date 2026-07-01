@@ -871,12 +871,21 @@ Completion condition: confirm that the vectorized code contains vector instructi
   `region_of(Unsafe)` = the block's tail region, not the `Static` fallback). `raw` calls the existing
   flat `align_rt_alloc`/`align_rt_free`. (`tests/unsafe_raw.rs`, `examples/unsafe_raw.align`.)
   Pointer arithmetic is also done — **`raw.offset(p, n)`** advances a `raw` by `n` bytes (a plain,
-  non-`inbounds` i8 GEP, so out-of-bounds arithmetic stays well-defined). **Remaining (widen):** the
-  draft's `raw.ptr_cast<T>` (unchecked cast / reinterpret) is **deferred until FFI** — with only one
-  pointer type (`raw`, an opaque byte pointer) a typed cast has nothing to reinterpret *to*; it earns
-  its meaning once FFI introduces typed/external pointers, so building it now would be a premature
-  special case (ideal-form-or-defer). The real consumer is **FFI** (`layout(C)` ABI, extern decls) —
-  the reason unsafe/raw lands before the `std`/`pkg` C-engine wrappers.
+  non-`inbounds` i8 GEP, so out-of-bounds arithmetic stays well-defined).
+  **FFI first slice — DONE.** `extern "C" fn name(params) -> ret` (and the braced group
+  `extern "C" { fn … }`) declares a bodyless foreign function bound to the C symbol; a call is only
+  valid inside `unsafe {}` (foreign code is outside the safe core — reuses the `unsafe_depth` gate
+  and the `unsafe`→impure inference, exactly like `raw.*`). FFI-safe signature types are primitive
+  scalars (int/float) and `raw`, plus a `()` (void) return; `bool`/`char`/aggregates are deferred.
+  Threaded as a bodyless `hir::ExternFn`/`mir::ExternFn` list (never lowered as a body); codegen
+  declares each into the module under its C symbol (mirroring the `align_rt_*` external-decl
+  pattern), so a `Rvalue::Call` keyed by that name resolves to a direct native `call`. libc/libm
+  symbols resolve with no extra `-l` flag. (`tests/ffi.rs`, `examples/ffi.align`.)
+  **Remaining (widen):** the draft's `raw.ptr_cast<T>` (unchecked cast / reinterpret) is still
+  deferred — with only `raw` (opaque bytes) a typed cast has nothing to reinterpret *to*; it earns
+  meaning once FFI grows typed/external pointers. Later FFI slices: `layout(C)` struct ABI, passing
+  `str`/`slice`/`bytes` as pointer+len, an explicit external-library link directive (`-l<lib>`), and
+  `bool`/`char` params — the widening the `std`/`pkg` C-engine wrappers need.
 
 ## Design Issues to Settle in Parallel
 

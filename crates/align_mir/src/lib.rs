@@ -24,6 +24,9 @@ pub type BlockId = u32;
 #[derive(Clone, Debug)]
 pub struct Program {
     pub fns: Vec<Function>,
+    /// Foreign (`extern "C"`) declarations, passed through from HIR unchanged; codegen emits an
+    /// external LLVM declaration for each, keyed by the C symbol so a `Rvalue::Call` resolves.
+    pub externs: Vec<hir::ExternFn>,
     /// Struct layouts, indexed by the id in [`Ty::Struct`]; codegen builds LLVM struct
     /// types from these.
     pub structs: Vec<hir::StructDef>,
@@ -489,6 +492,7 @@ pub fn lower_program(program: &hir::Program) -> Program {
                 mf
             })
             .collect(),
+        externs: program.externs.clone(),
         structs: program.structs.clone(),
         enums: program.enums.clone(),
         tuples: program.tuples.clone(),

@@ -1127,10 +1127,19 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     **Pointer arithmetic — `raw.offset(p, n)` DONE (2026-07-01):** advances a `raw` by `n` bytes →
     a new `raw` (a plain, non-`inbounds` i8 GEP, so out-of-bounds arithmetic stays well-defined — the
     same GEP the load/store address uses). `hir::ExprKind::RawOffset` / `mir::Rvalue::RawOffset`.
-    **Remaining (widen):** `raw.ptr_cast<T>` (unchecked cast) is **deferred until FFI** — with only one
-    pointer type (`raw`, opaque bytes) a typed cast has nothing to reinterpret to; it earns meaning
-    once FFI adds typed/external pointers, so building it now is a premature special case
-    (ideal-form-or-defer). Then **FFI** — the real consumer. `Ty::Raw`,
+    **FFI first slice — DONE (2026-07-01):** `extern "C" fn name(params) -> ret` (and the braced group
+    `extern "C" { fn … }`) declares a bodyless foreign function bound to the C symbol; a call is only
+    valid inside `unsafe {}` (reuses the `unsafe_depth` gate + `unsafe`→impure inference, exactly like
+    `raw.*` — decided over Zig-style always-allowed because foreign code can violate every invariant).
+    FFI-safe types = int/float scalars + `raw`, plus a `()` return; libc/libm resolve with no extra
+    `-l`. Threaded as a bodyless `hir::ExternFn`/`mir::ExternFn` list; codegen declares each under its
+    C symbol (mirroring the `align_rt_*` external decls), so a `Rvalue::Call` resolves to a direct
+    native `call`. `TokKind::Extern`, `ast::Item::Extern(ExternBlock)`, `FnSig.is_extern`.
+    (`tests/ffi.rs`, `examples/ffi.align`.) **Remaining (widen):** `raw.ptr_cast<T>` (unchecked cast)
+    is still deferred — with only `raw` (opaque bytes) a typed cast has nothing to reinterpret to; it
+    earns meaning once FFI adds typed/external pointers (ideal-form-or-defer). Later FFI slices:
+    `layout(C)` struct ABI, `str`/`slice`/`bytes` as pointer+len, an explicit `-l<lib>` link
+    directive, `bool`/`char` params. `Ty::Raw`,
     `hir::ExprKind::{Unsafe,RawAlloc,RawFree,RawLoad,RawStore,RawOffset}`,
     `mir::{Rvalue::{RawAlloc,RawLoad,RawOffset}, Stmt::{RawFree,RawStore}}`.
     (`tests/unsafe_raw.rs`, `examples/unsafe_raw.align`, `impl/07-roadmap.md` M8.)
@@ -1782,8 +1791,10 @@ A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-
 ### Build system / package layout
 Visibility (`pub`), import, and module are decided (`impl/02-frontend.md`). What remains is the design of the build system, package layout, and dependency resolution.
 
-### FFI (foreign function interface) — after M8 (keystone for the library strategy)
+### FFI (foreign function interface) — first slice DONE (keystone for the library strategy)
 Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLVM with no GC, an external C call is a direct LLVM `call` at native speed (no pinning / stack-switch / marshaling), and an Align `slice`/`str`/`bytes` hands its raw pointer straight to C. **This gates a deliberate library strategy: "own the memory wrappers, borrow the mathematical engines"** — `std.compress` wraps `libzstd`/`zlib-ng`, `pkg` DB drivers wrap `libpq`/`sqlite`, etc., rather than re-implementing assembly-tuned algorithms in Align. So FFI's design should land before those `std`/`pkg` libraries are built, even though it stays out of the v1 *language* core. (Digested from `work/proposals/ffi-optimization.md`, `compression-strategy.md`, `rdb-optimization.md`.)
+
+**First slice SHIPPED (2026-07-01):** `extern "C"` bodyless declarations + `unsafe`-gated direct calls; FFI-safe scalars (int/float) + `raw` + `()` return; libc/libm resolve with no extra `-l`. See the `unsafe`/`raw` Settled entry above for the full record. **Remaining FFI work** (later slices, each unblocking a piece of the `std`/`pkg` wrapper strategy): `layout(C)` struct ABI, passing `str`/`slice`/`bytes` as pointer+len, an explicit external-library link directive (`-l<lib>` / linker search path), `bool`/`char` params, and `raw.ptr_cast<T>` (a typed reinterpret, meaningful once external/typed pointers exist).
 
 ### Details (settled during implementation)
 ```text

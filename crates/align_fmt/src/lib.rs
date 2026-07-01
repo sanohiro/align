@@ -140,6 +140,16 @@ impl Annotations {
                 }
                 self.visit_expr(&d.value);
             }
+            Item::Extern(blk) => {
+                for sig in &blk.fns {
+                    for p in &sig.params {
+                        self.visit_type(&p.ty);
+                    }
+                    if let Some(r) = &sig.ret {
+                        self.visit_type(r);
+                    }
+                }
+            }
         }
     }
 

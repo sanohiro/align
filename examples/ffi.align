@@ -1,0 +1,33 @@
+// FFI — foreign function interface (M8, draft.md §15). Align is AOT-compiled via LLVM with no GC, so
+// a C call is a direct native `call` (no marshaling / pinning / stack-switch), and a `raw` pointer is
+// handed straight to C. This is the keystone of the library strategy — "own the memory wrappers,
+// borrow the mathematical engines": `std`/`pkg` wrap battle-tested C engines (zstd, sqlite, …) rather
+// than reimplementing assembly-tuned algorithms in Align.
+//
+//   - `extern "C" fn name(params) -> ret` declares a foreign function — bodyless, bound to the C
+//     symbol `name`. A braced group `extern "C" { fn ...\n fn ... }` declares several at once.
+//   - Only `extern "C"` is supported; parameter/return types are FFI-safe scalars (integers, floats,
+//     `raw`) or a `()` (void) return. Aggregates (`str`/`array`/struct) are a later slice.
+//   - A call is only valid inside an `unsafe {}` block: foreign code sits outside the safe core and
+//     can violate every invariant (ownership, no-alias, non-null), so the danger stays visible —
+//     exactly like a `raw.*` op. A function that calls an extern is therefore inferred impure.
+//   - libc / libm symbols resolve with no extra link flag (they are already linked).
+
+extern "C" {
+  fn abs(x: i32) -> i32
+  fn labs(x: i64) -> i64
+}
+
+extern "C" fn memset(p: raw, c: i32, n: i64) -> raw
+
+fn main() -> i32 {
+  unsafe {
+    a := abs(-7)               // 7 — a direct call into libc
+    p := raw.alloc(4)
+    memset(p, 0, 4)            // hand the `raw` pointer straight to C
+    memset(p, 1, 4)            // set every byte to 1
+    x: i8 := raw.load(p, 2)    // read one back: 1
+    raw.free(p)
+    return a + (x as i32)      // 8
+  }
+}
