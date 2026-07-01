@@ -1123,9 +1123,16 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     block is still escape-checked; `null_moved_source` also treats an unsafe block's tail like a plain
     block (move-null through it). `raw` is Copy so no Drop/Move analysis needed. **Design flag (first
     cut):** the effect model is binary, so `unsafe` is conflated with I/O-impure — fine for now (both
-    are par_map-ineligible); a distinct "unsafe" effect is a second flag if ever needed. **Remaining
-    (widen):** `raw.ptr_cast<T>(x)`, typed raw load/store, then FFI — the real consumer. `Ty::Raw`,
-    `hir::ExprKind::{Unsafe,RawAlloc,RawFree}`, `mir::{Rvalue::RawAlloc, Stmt::RawFree}`.
+    are par_map-ineligible); a distinct "unsafe" effect is a second flag if ever needed.
+    **Pointer arithmetic — `raw.offset(p, n)` DONE (2026-07-01):** advances a `raw` by `n` bytes →
+    a new `raw` (a plain, non-`inbounds` i8 GEP, so out-of-bounds arithmetic stays well-defined — the
+    same GEP the load/store address uses). `hir::ExprKind::RawOffset` / `mir::Rvalue::RawOffset`.
+    **Remaining (widen):** `raw.ptr_cast<T>` (unchecked cast) is **deferred until FFI** — with only one
+    pointer type (`raw`, opaque bytes) a typed cast has nothing to reinterpret to; it earns meaning
+    once FFI adds typed/external pointers, so building it now is a premature special case
+    (ideal-form-or-defer). Then **FFI** — the real consumer. `Ty::Raw`,
+    `hir::ExprKind::{Unsafe,RawAlloc,RawFree,RawLoad,RawStore,RawOffset}`,
+    `mir::{Rvalue::{RawAlloc,RawLoad,RawOffset}, Stmt::{RawFree,RawStore}}`.
     (`tests/unsafe_raw.rs`, `examples/unsafe_raw.align`, `impl/07-roadmap.md` M8.)
   - **FFI "borrow-engine" wrapping for heavy libs** (zstd / sqlite / simdjson-class) — don't reimplement
     in pure Align; wrap via FFI as borrow engines (FFI is the library layer per `non-goals`/memory).

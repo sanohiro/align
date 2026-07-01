@@ -6,6 +6,7 @@
 //   - `raw.store(p, offset, v)` writes a primitive scalar at a byte offset; `raw.load(p, offset)`
 //     reads one back. No turbofish: the stored type follows the value, and the loaded type is taken
 //     from the expected type (a binding annotation), exactly like `json.decode`.
+//   - `raw.offset(p, n)` advances the pointer by `n` bytes, yielding a new `raw` (pointer arithmetic).
 //   - `raw.free(p)` releases it. The memory is manually managed — a `raw` is Copy and is never
 //     auto-dropped, so the free is the programmer's responsibility (which is why it needs `unsafe`).
 //

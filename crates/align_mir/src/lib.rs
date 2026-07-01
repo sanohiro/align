@@ -215,6 +215,8 @@ pub enum Rvalue {
     RawAlloc(Operand),
     /// `raw.load(p, offset)` (unsafe): read the primitive `scalar` at `ptr + offset` bytes.
     RawLoad { ptr: Operand, offset: Operand, scalar: align_sema::Scalar },
+    /// `raw.offset(p, n)` (unsafe): a new `raw` pointer `ptr + offset` bytes (pointer arithmetic).
+    RawOffset { ptr: Operand, offset: Operand },
     /// Read (copy) the value out of a `box` operand.
     BoxGet(Operand),
     /// Deep-copy a `box` into a fresh allocation. First operand is the arena handle,
@@ -1296,6 +1298,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let val = lower_expr(b, value);
             b.push(Stmt::RawStore { ptr: p, offset: off, value: val });
             Operand::Const(Const::Unit)
+        }
+        // `raw.offset(p, n)` → a new `raw` pointer `p + n` bytes.
+        hir::ExprKind::RawOffset { ptr, offset } => {
+            let p = lower_expr(b, ptr);
+            let off = lower_expr(b, offset);
+            let v = b.fresh_value(Ty::Raw);
+            b.push(Stmt::Let(v, Rvalue::RawOffset { ptr: p, offset: off }));
+            Operand::Value(v)
         }
         // ④b: `task_group` opens a region owning each task's env + result slot, plus a deferred
         // task list. `spawn`/`wait` use the handle; the region is freed at scope end.

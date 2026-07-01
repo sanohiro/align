@@ -373,6 +373,8 @@ pub enum ExprKind {
     /// `raw.store(p, offset, v)` — write the primitive scalar `value` at byte `offset` of `p`. Yields
     /// unit. `unsafe`-only.
     RawStore { ptr: Box<Expr>, offset: Box<Expr>, value: Box<Expr> },
+    /// `raw.offset(p, n)` — advance a `raw` pointer by `n` bytes, yielding a new `raw`. `unsafe`-only.
+    RawOffset { ptr: Box<Expr>, offset: Box<Expr> },
     /// `heap.new(x)` — allocate a `box<T>` in the enclosing arena.
     HeapNew(Box<Expr>),
     /// `b.get()` — read (copy) the value out of a `box<T>`.
