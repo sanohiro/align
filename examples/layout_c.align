@@ -1,0 +1,30 @@
+// `layout(C)` struct ABI (M8, draft.md §15). A struct's layout is normally the compiler's business
+// (declaration order today, but Align reserves the right to reorder for packing). A `layout(C)`
+// attribute pins it to a **stable, C-compatible flat byte layout** — declaration-order fields,
+// natural alignment, no reordering — so the struct can cross the FFI boundary.
+//
+// This first slice enables the pointer-based pattern: hand C a `raw` buffer and read/write
+// `layout(C)` structs in it. Only a `layout(C)` struct may be moved through a `raw` pointer, because
+// only it promises a fixed representation. (By-value register passing is a later slice.) `layout(C)`
+// composes with `align(N)`, and its fields must be FFI-mappable scalars (integers/floats).
+
+layout(C) Point { x: i32, y: i32 }
+
+extern "C" fn memset(p: raw, c: i32, n: i64) -> raw
+
+fn main() -> i32 {
+  unsafe {
+    p := raw.alloc(8)
+
+    // Write a struct into raw memory, then read it straight back — the flat bytes round-trip.
+    raw.store(p, 0, Point { x: 30, y: 12 })
+    a: Point := raw.load(p, 0)
+
+    // C can write the same buffer: memset it to zero, then read it as a `Point` again.
+    memset(p, 0, 8)
+    z: Point := raw.load(p, 0)   // { 0, 0 }
+
+    raw.free(p)
+    return a.x + a.y + z.x + z.y  // 42
+  }
+}

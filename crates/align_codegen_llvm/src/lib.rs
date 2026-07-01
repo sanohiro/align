@@ -2379,11 +2379,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let ep = self.raw_elem_ptr(ptr, offset)?;
                 let lty = scalar_type(self.ctx, align_sema::scalar_to_ty(*scalar), self.struct_types, self.enum_types);
                 let loaded = self.builder.build_load(lty, ep, "rawval").map_err(|e| self.err(e))?;
-                // A raw scalar is int (int/bool/char) or float; set the load's alignment to 1 via the
-                // concrete value's instruction (an arbitrary byte offset may be misaligned).
+                // The loaded type is a raw scalar (int/bool/char or float) or a `layout(C)` struct;
+                // set the load's alignment to 1 (an arbitrary byte offset may be misaligned) via the
+                // concrete value's instruction.
                 let inst = match loaded {
                     inkwell::values::BasicValueEnum::IntValue(v) => v.as_instruction(),
                     inkwell::values::BasicValueEnum::FloatValue(v) => v.as_instruction(),
+                    inkwell::values::BasicValueEnum::StructValue(v) => v.as_instruction(),
                     _ => None,
                 };
                 inst.ok_or_else(|| self.err("raw load is not an instruction"))?.set_alignment(1).map_err(|e| self.err(e))?;

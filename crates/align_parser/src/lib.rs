@@ -202,17 +202,18 @@ impl<'a> Parser<'a> {
             self.diags
                 .error("a top-level constant is immutable; `mut` is not allowed here", self.span());
             None
-        } else if matches!(self.peek(), TokKind::Ident(s) if s == "align")
+        } else if matches!(self.peek(), TokKind::Ident(s) if s == "align" || s == "layout")
             && matches!(self.peek_at(1), TokKind::LParen)
         {
-            // `align(N) Name { … }` — an over-alignment attribute on a type declaration.
-            let align = self.parse_align_attr();
-            self.parse_type_decl(vis, align)
+            // A leading run of type attributes: `align(N)` (over-alignment) and/or `layout(C)`
+            // (C-compatible flat layout), in any order, before a type declaration.
+            let (align, c_repr) = self.parse_type_attrs();
+            self.parse_type_decl(vis, align, c_repr)
         } else if matches!(self.peek(), TokKind::Ident(_))
             && matches!(self.peek_at(1), TokKind::LBrace | TokKind::Lt)
         {
             // `Name { … }` or a generic `Name<T> { … }` type declaration.
-            self.parse_type_decl(vis, None)
+            self.parse_type_decl(vis, None, false)
         } else if matches!(self.peek(), TokKind::Ident(_))
             && matches!(self.peek_at(1), TokKind::ColonEq | TokKind::Colon)
         {
@@ -248,6 +249,49 @@ impl<'a> Parser<'a> {
     /// Parse an `align(N)` attribute prefix → the byte alignment `N` (a positive power of two).
     /// Returns `None` (with a diagnostic) on a malformed / non-power-of-two / too-large value, so the
     /// type declaration still parses — just without the over-alignment.
+    /// A leading run of type-declaration attributes — `align(N)` and/or `layout(C)`, in any order.
+    /// Returns the collected over-alignment and whether `layout(C)` was present.
+    fn parse_type_attrs(&mut self) -> (Option<u32>, bool) {
+        let mut align = None;
+        let mut c_repr = false;
+        loop {
+            match self.peek() {
+                TokKind::Ident(s) if s == "align" && matches!(self.peek_at(1), TokKind::LParen) => {
+                    if let Some(a) = self.parse_align_attr() {
+                        align = Some(a);
+                    }
+                }
+                TokKind::Ident(s) if s == "layout" && matches!(self.peek_at(1), TokKind::LParen) => {
+                    self.parse_layout_attr(&mut c_repr);
+                }
+                _ => break,
+            }
+        }
+        (align, c_repr)
+    }
+
+    /// `layout(C)` — the only supported layout attribute. Sets `c_repr`.
+    fn parse_layout_attr(&mut self, c_repr: &mut bool) {
+        self.bump(); // `layout`
+        self.expect(&TokKind::LParen, "'(' after `layout`");
+        let span = self.span();
+        match self.peek() {
+            TokKind::Ident(s) if s == "C" => {
+                self.bump();
+                *c_repr = true;
+            }
+            _ => {
+                self.diags.error("`layout(C)` is the only supported layout attribute", span);
+                // Consume the offending kind (if any) so the `)` below still matches — one clean
+                // error, no cascade.
+                if !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
+                    self.bump();
+                }
+            }
+        }
+        self.expect(&TokKind::RParen, "')'");
+    }
+
     fn parse_align_attr(&mut self) -> Option<u32> {
         self.bump(); // `align`
         self.expect(&TokKind::LParen, "'(' after `align`");
@@ -275,7 +319,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_type_decl(&mut self, vis: Vis, align: Option<u32>) -> Option<Item> {
+    fn parse_type_decl(&mut self, vis: Vis, align: Option<u32>, c_repr: bool) -> Option<Item> {
         let start = self.span();
         let name = self.parse_ident("type name")?;
         // Optional generic type parameters: `Pair<T, U: Ord>` (same form as a function's).
@@ -315,10 +359,13 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokKind::RBrace, "'}'");
             let span = start.merge(self.prev_span());
-            Some(Item::Struct(StructDecl { vis, name, type_params, fields, align, span }))
+            Some(Item::Struct(StructDecl { vis, name, type_params, fields, align, c_repr, span }))
         } else {
             if align.is_some() {
                 self.diags.error("`align(N)` applies to a struct, not a sum type", start);
+            }
+            if c_repr {
+                self.diags.error("`layout(C)` applies to a struct, not a sum type", start);
             }
             let mut variants = Vec::new();
             loop {

@@ -301,9 +301,15 @@ Only inside an unsafe block: the `raw.*` flat-memory ops (`alloc`/`free`/`load`/
 a foreign call. A C function is declared `extern "C" fn name(params) -> ret` (or a braced group) and
 called like any other function, but only inside `unsafe` — foreign code is outside the safe core. The
 declaration is bodyless and bound to the C symbol; FFI-safe signature types are primitive scalars and
-`raw`, plus a `()` return (aggregates via `layout(C)` are a later slice). A foreign call is a direct
-native `call` (no marshaling — Align is AOT-via-LLVM with no GC), which is the keystone of the library
-strategy: `std`/`pkg` own the memory wrappers and borrow C engines via FFI.
+`raw`, plus a `()` return. A foreign call is a direct native `call` (no marshaling — Align is
+AOT-via-LLVM with no GC), which is the keystone of the library strategy: `std`/`pkg` own the memory
+wrappers and borrow C engines via FFI.
+
+A `layout(C)` attribute (`layout(C) Point { … }`, composes with `align(N)`) pins a struct to a
+stable, C-compatible flat layout (declaration order, natural alignment, no reordering). Only such a
+struct may be written to / read from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the
+pointer-based FFI pattern. Its fields must be FFI-mappable scalars; by-value struct passing is a
+later slice.
 
 ### Modules / imports
 
