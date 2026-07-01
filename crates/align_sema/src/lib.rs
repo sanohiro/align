@@ -1196,7 +1196,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // tables grow.
     let mut structs: Vec<StructDef> = struct_decls
         .iter()
-        .map(|(m, e, s)| StructDef { name: mangle_fn(m, *e, &s.name.name), fields: Vec::new(), align: None })
+        .map(|(m, e, s)| StructDef { name: mangle_fn(m, *e, &s.name.name), fields: Vec::new(), align: None, c_repr: false })
         .collect();
     let mut struct_mono: HashMap<String, u32> = HashMap::new();
     let mut enums: Vec<hir::EnumDef> = enum_decls
@@ -1281,7 +1281,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 let ty = resolve_type(&f.ty, build_cx!(module), &tparams, diags);
                 fields.push(hir::FieldDef { name: f.name.name.clone(), ty });
             }
-            struct_templates.insert(mangle_fn(module, *is_entry, &s.name.name), StructTemplate { type_params: tparams, fields, align: s.align });
+            struct_templates.insert(mangle_fn(module, *is_entry, &s.name.name), StructTemplate { type_params: tparams, fields, align: s.align, c_repr: s.c_repr });
         }
         for (module, is_entry, e) in &generic_enum_decls {
             let tparams: Vec<String> = e.type_params.iter().map(|t| t.name.name.clone()).collect();
@@ -1348,11 +1348,20 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                     f.span,
                 );
             }
+            // A `layout(C)` struct promises a C-compatible flat layout, so its fields must be the
+            // FFI-mappable scalars (integers/floats). `bool`/`char`, `str`, and nested structs are
+            // deferred (their C representation is a later slice).
+            if s.c_repr && !matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Error) {
+                diags.error(
+                    format!("a `layout(C)` struct field must be an integer or float (got {}) — other field types are a later FFI slice", ty_name(ty)),
+                    f.span,
+                );
+            }
             fields.push(FieldDef { name: f.name.name.clone(), ty });
         }
         // `align(N)` over-alignment (M6): honored at the one `type_align` codegen seam (the slot
         // alloca / struct-array element). `None` = the type's natural alignment.
-        structs[i] = StructDef { name: mangle_fn(module, *_is_entry, &s.name.name), fields, align: s.align };
+        structs[i] = StructDef { name: mangle_fn(module, *_is_entry, &s.name.name), fields, align: s.align, c_repr: s.c_repr };
     }
 
     // Pass 0b-2: now that every struct's fields are populated, validate **nested** struct fields. A
@@ -7979,6 +7988,14 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::HeapNew(Box::new(arg)), ty: Ty::Box(scalar), span }
     }
 
+    /// Whether a value of this type may be stored to / loaded from `raw` memory: a primitive scalar
+    /// (int/float/bool/char) or a `layout(C)` struct (which alone promises a stable flat byte
+    /// layout). A non-`layout(C)` struct has a compiler-private layout, so it is not raw-storable.
+    fn is_raw_storable(&self, ty: Ty) -> bool {
+        is_raw_scalar(ty)
+            || matches!(ty, Ty::Struct(id) if self.structs.get(id as usize).is_some_and(|s| s.c_repr))
+    }
+
     /// `raw.alloc(size)` / `raw.free(p)` — the unsafe raw-pointer ops (draft.md §6.5). Valid only
     /// inside an `unsafe {}` block. `alloc` takes an integer byte size and yields a `raw` pointer;
     /// `free` takes a `raw` pointer and yields unit. The memory is manually managed (no auto-drop),
@@ -8029,14 +8046,14 @@ impl<'a, 't> Checker<'a, 't> {
                 let p = self.check_expr(&args[0], Some(Ty::Raw));
                 let off = self.check_expr(&args[1], Some(i64t));
                 self.check_raw_ptr_offset(&p, &off, "load", args[0].span, args[1].span);
-                let Some(ty) = expected.filter(|t| is_raw_scalar(*t)) else {
+                let Some(ty) = expected.filter(|t| self.is_raw_storable(*t)) else {
                     self.diags.error(
-                        "'raw.load' needs a primitive-scalar result type — annotate it, e.g. `x: i64 := raw.load(p, 0)`".to_string(),
+                        "'raw.load' needs a primitive-scalar or `layout(C)` struct result type — annotate it, e.g. `x: i64 := raw.load(p, 0)`".to_string(),
                         span,
                     );
                     return err;
                 };
-                let scalar = ty_to_scalar(ty).expect("a primitive scalar has a Scalar");
+                let scalar = ty_to_scalar(ty).expect("a raw-storable type has a Scalar");
                 Expr { kind: ExprKind::RawLoad { ptr: Box::new(p), offset: Box::new(off), scalar }, ty, span }
             }
             // `raw.store(p, offset, v)` writes `v` at byte `offset`. The stored type is `v`'s type; it
@@ -8047,11 +8064,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_raw_ptr_offset(&p, &off, "store", args[0].span, args[1].span);
                 let v = self.check_expr(&args[2], None);
                 // Accept a still-unresolved int/float literal (it defaults to i64/f64, which codegen
-                // reads after finalization); reject non-scalars (str/struct/etc.).
-                let store_ok = is_raw_scalar(v.ty) || matches!(v.ty, Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error);
+                // reads after finalization) or a `layout(C)` struct; reject everything else (a
+                // non-`layout(C)` struct, str, slice, …).
+                let store_ok = self.is_raw_storable(v.ty) || matches!(v.ty, Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error);
                 if !store_ok {
                     self.diags.error(
-                        format!("'raw.store' stores a primitive scalar (int/float/bool/char), got {}", ty_name(v.ty)),
+                        format!("'raw.store' stores a primitive scalar or a `layout(C)` struct, got {}", ty_name(v.ty)),
                         args[2].span,
                     );
                     return err;
@@ -9899,6 +9917,8 @@ struct StructTemplate {
     fields: Vec<hir::FieldDef>,
     /// An `align(N)` over-alignment carried from the template to every monomorph (M6).
     align: Option<u32>,
+    /// A `layout(C)` marker carried from the template to every monomorph.
+    c_repr: bool,
 }
 
 /// A generic sum-type declaration (`Opt<T> { Some(T), None }`): its type-parameter names and its
@@ -10321,7 +10341,7 @@ fn instantiate_struct(name: &str, tmpl: &StructTemplate, args: &[Ty], cx: &mut T
         fields.push(hir::FieldDef { name: f.name.clone(), ty: fty });
     }
     let id = cx.structs.len() as u32;
-    cx.structs.push(StructDef { name: mangled.clone(), fields, align: tmpl.align });
+    cx.structs.push(StructDef { name: mangled.clone(), fields, align: tmpl.align, c_repr: tmpl.c_repr });
     cx.struct_mono.insert(mangled, id);
     id
 }

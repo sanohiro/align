@@ -881,11 +881,21 @@ Completion condition: confirm that the vectorized code contains vector instructi
   declares each into the module under its C symbol (mirroring the `align_rt_*` external-decl
   pattern), so a `Rvalue::Call` keyed by that name resolves to a direct native `call`. libc/libm
   symbols resolve with no extra `-l` flag. (`tests/ffi.rs`, `examples/ffi.align`.)
+  **`layout(C)` struct ABI — slice 1 DONE.** A `layout(C)` attribute (`layout(C) Point { … }`,
+  composes with `align(N)` in any order) pins a struct to a stable, C-compatible flat layout
+  (declaration order, natural alignment, no reordering — Align's default, so the marker *locks* it
+  and opts the struct into FFI). Only a `layout(C)` struct may be moved through a `raw` pointer:
+  `raw.store`/`raw.load` are widened to accept a `layout(C)` struct value (the existing
+  `Scalar::Struct` flows through `RawLoad`/`RawStore` unchanged; codegen does an unaligned aggregate
+  load/store — no new IR variant). Fields must be int/float (their C mapping is settled). This is the
+  pointer-based FFI pattern (hand C a buffer, read/write structs in it). `ast::StructDecl.c_repr`,
+  `hir::StructDef.c_repr`. (`tests/layout_c.rs`, `examples/layout_c.align`.)
   **Remaining (widen):** the draft's `raw.ptr_cast<T>` (unchecked cast / reinterpret) is still
   deferred — with only `raw` (opaque bytes) a typed cast has nothing to reinterpret *to*; it earns
-  meaning once FFI grows typed/external pointers. Later FFI slices: `layout(C)` struct ABI, passing
-  `str`/`slice`/`bytes` as pointer+len, an explicit external-library link directive (`-l<lib>`), and
-  `bool`/`char` params — the widening the `std`/`pkg` C-engine wrappers need.
+  meaning once FFI grows typed/external pointers. Later FFI slices: **by-value `layout(C)` struct
+  passing** (SysV/AAPCS register + `byval`/`sret` ABI classification), passing `str`/`slice`/`bytes`
+  as pointer+len, an explicit external-library link directive (`-l<lib>`), and `bool`/`char` params —
+  the widening the `std`/`pkg` C-engine wrappers need.
 
 ## Design Issues to Settle in Parallel
 

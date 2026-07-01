@@ -129,11 +129,14 @@ pub struct StructDef {
     /// Fields in declaration order; the position is the field index used by MIR/codegen.
     pub fields: Vec<FieldDef>,
     /// A declared over-alignment in bytes (`align(N) Node { … }`, for GPU/DMA/page-aligned
-    /// zero-copy interop), or `None` for the type's natural alignment. **Reserved for M6** — there
-    /// is no surface syntax yet, so this is always `None` today (`open-questions.md` Open
-    /// "`align(N)`"). Carrying it on the type now means the M6 work is "parse `align(N)` → set this
-    /// field" + "honor it in the one alignment seam" rather than a cross-cutting retrofit.
+    /// zero-copy interop), or `None` for the type's natural alignment. Populated from the parsed
+    /// `align(N)` attribute; honored at the one storage-alignment seam (`type_align`).
     pub align: Option<u32>,
+    /// Set by a `layout(C)` attribute: the struct has a stable, C-compatible flat byte layout
+    /// (declaration-order fields, natural alignment, no reordering — which is Align's default
+    /// layout, so the marker *locks* it and opts the struct into FFI). Only a `layout(C)` struct may
+    /// be read/written through a `raw` pointer, because only it promises a fixed flat representation.
+    pub c_repr: bool,
 }
 
 impl StructDef {

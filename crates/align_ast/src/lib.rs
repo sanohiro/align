@@ -117,6 +117,11 @@ pub struct StructDecl {
     /// A declared over-alignment in bytes from an `align(N)` attribute (`align(16) Node { … }`), or
     /// `None` for the type's natural alignment. `N` is a validated power of two (M6).
     pub align: Option<u32>,
+    /// Set by a `layout(C)` attribute (`layout(C) Point { … }`): the struct has a stable,
+    /// C-compatible flat byte layout (declaration-order fields, natural alignment, no reordering),
+    /// so it may be handed to/from C — this slice: read/written through a `raw` pointer. Fields must
+    /// be FFI-safe scalars.
+    pub c_repr: bool,
     pub span: Span,
 }
 

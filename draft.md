@@ -1213,11 +1213,34 @@ The declaration is **bodyless** and bound to the C symbol `name` (never mangled)
 AOT-compiled via LLVM with no GC, a foreign call is a direct native `call` — no marshaling, pinning,
 or stack-switch — and a `slice`/`str`/`raw` hands its pointer straight to C. Only `extern "C"` is
 supported; the FFI-safe signature types are the primitive scalars (integers, floats) and `raw` (an
-opaque byte pointer), plus a `()` (void) return — aggregates (`str`/`array`/struct via `layout(C)`)
-are a later slice. A function that calls an extern is inferred impure (it contains `unsafe`), so it
-can never be a `par_map` callee. This is the keystone of the library strategy: `std`/`pkg` **own the
-memory wrappers and borrow the mathematical engines** (wrapping `libzstd`, `sqlite`, … via FFI)
-rather than reimplementing assembly-tuned algorithms in Align.
+opaque byte pointer), plus a `()` (void) return — passing a `str`/`slice`/`bytes` (as pointer + len)
+or a struct **by value** is a later slice. A function that calls an extern is inferred impure (it
+contains `unsafe`), so it can never be a `par_map` callee. This is the keystone of the library
+strategy: `std`/`pkg` **own the memory wrappers and borrow the mathematical engines** (wrapping
+`libzstd`, `sqlite`, … via FFI) rather than reimplementing assembly-tuned algorithms in Align.
+
+### `layout(C)` — a C-compatible struct layout
+
+A struct's memory layout is normally the compiler's own business (Align may reorder fields for
+packing). A `layout(C)` attribute pins it to a **stable, C-compatible flat layout** — declaration
+order, natural alignment, no reordering — so the struct can cross the FFI boundary:
+
+```align
+layout(C) Point { x: i32, y: i32 }   // composes with align(N), in any order
+
+unsafe {
+  p := raw.alloc(8)
+  raw.store(p, 0, Point { x: 30, y: 12 })   // write a struct into raw memory
+  a: Point := raw.load(p, 0)                // …and read it back (or read one C wrote)
+  raw.free(p)
+}
+```
+
+Only a `layout(C)` struct may be moved through a `raw` pointer (`raw.store`/`raw.load` of a whole
+struct), because only it promises a fixed representation — this is the pointer-based FFI pattern
+(hand C a buffer, read/write structs in it). Its fields must be FFI-mappable scalars (integers,
+floats). Passing a `layout(C)` struct **by value** to a C function (register/`byval` ABI) is a later
+slice.
 
 Rust-style lifetimes are not exposed on the surface.
 However, an obvious lifetime violation, such as a view escaping an arena, is a compile error.
