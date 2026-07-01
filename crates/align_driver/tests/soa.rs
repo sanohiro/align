@@ -47,10 +47,17 @@ fn soa_of_a_non_struct_is_rejected() {
 }
 
 #[test]
-fn soa_with_a_str_field_is_rejected() {
-    // First cut is primitive-scalar fields only (no owned/str columns yet).
-    assert!(!ok(concat!(
+fn soa_with_a_str_field_is_allowed() {
+    // A `str` column is a 16-byte `{ptr,len}` view column (zero-copy into the decode input); the
+    // soa is well-formed, and a primitive column still projects/reduces as before.
+    assert!(ok(concat!(
         "Rec { id: i64, name: str }\n",
+        "pub fn k(r: soa<Rec>) -> i64 = r.id.sum()\n",
+    )));
+    // Nested/owned columns (a struct field) stay rejected — only scalars and `str`.
+    assert!(!ok(concat!(
+        "Inner { a: i64 }\n",
+        "Rec { id: i64, sub: Inner }\n",
         "pub fn k(r: soa<Rec>) -> i64 = r.id.sum()\n",
     )));
 }
@@ -227,7 +234,7 @@ fn a_built_soa_feeds_a_filtered_multi_column_aggregate() {
     assert_eq!(out.status.code(), Some(15));
 }
 
-// ---- `json.decode` → `soa<Struct>` (decode-direct-to-columns; AoS-then-transpose) ----
+// ---- `json.decode` → `soa<Struct>` (decode straight into columns — no AoS intermediate, #228) ----
 
 #[test]
 fn json_decode_into_soa_type_checks() {
@@ -262,7 +269,7 @@ fn json_decode_into_soa_sums_a_column() {
     if !backend_available() {
         return;
     }
-    // Decode the JSON array of objects to AoS, transpose to columns, then scan one column:
+    // Decode the JSON array of objects straight into columns, then scan one column:
     // age.sum() = 30 + 40 + 5 = 75.
     let out = build_and_run(
         "soa-json-sum",
@@ -330,6 +337,61 @@ fn json_decode_resolves_fields_via_perfect_hash() {
         ),
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n15\n5\n");
+}
+
+// ---- `str` columns in `soa<T>` — a 16-byte `{ptr,len}` view column borrowing the JSON input ----
+
+#[test]
+fn json_decode_into_soa_with_a_str_column() {
+    if !backend_available() {
+        return;
+    }
+    // A `str` column decodes as a zero-copy view into the input. Read a str element field
+    // (`s[1].name` = "bob" → len 3) alongside an int column reduction (age 30+25 = 55) to prove
+    // both the str view and the mixed str/int column layout are correct.
+    let out = build_and_run(
+        "soa-json-str",
+        concat!(
+            "import core.json\n",
+            "User { name: str, age: i64 }\n",
+            "fn main() -> Result<(), Error> {\n  arena {\n    s: soa<User> := json.decode(\"[{\\\"name\\\":\\\"alice\\\",\\\"age\\\":30},{\\\"name\\\":\\\"bob\\\",\\\"age\\\":25}]\")?\n    print(s[1].name.len())\n    print(s.age.sum())\n  }\n  return Ok(())\n}\n",
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n55\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn str_column_view_cannot_escape_the_arena() {
+    // A `str` column holds views borrowing the JSON input / arena buffer, so a str element read
+    // (`s[0].name`) is region-tied and must not escape to an outer binding — else use-after-free.
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "User { name: str, age: i64 }\n",
+        "fn get(data: str) -> Result<i64, Error> {\n  mut out: str := \"\"\n  arena {\n    s: soa<User> := json.decode(data)?\n    out = s[0].name\n  }\n  return Ok(out.len())\n}\n",
+    )));
+}
+
+#[test]
+fn str_struct_gather_cannot_escape_the_arena() {
+    // A whole-element gather `s[0]` of a str-bearing struct carries the `str` view, so the gathered
+    // struct is region-tied too (the `Index`-on-soa region arm, distinct from the `s[i].field` path).
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "User { name: str, age: i64 }\n",
+        "fn get(data: str) -> Result<i64, Error> {\n  mut out: User := User { name: \"\", age: 0 }\n  arena {\n    s: soa<User> := json.decode(data)?\n    out = s[0]\n  }\n  return Ok(out.age)\n}\n",
+    )));
+}
+
+#[test]
+fn primitive_soa_stays_self_contained() {
+    // Regression guard: a primitive-only soa borrows nothing, so an `i64` element field read still
+    // escapes freely (no over-restriction from the str-column region tie).
+    assert!(ok(concat!(
+        "import core.json\n",
+        "P { x: i64, y: i64 }\n",
+        "fn get(data: str) -> Result<i64, Error> {\n  mut out: i64 := 0\n  arena {\n    s: soa<P> := json.decode(data)?\n    out = s[0].x\n  }\n  return Ok(out)\n}\n",
+    )));
 }
 
 // ---- `group_by(.key).sum(.value)` — column-oriented grouped sum over a soa ----

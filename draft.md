@@ -812,8 +812,8 @@ The column buffer is arena-allocated (the `soa` view borrows it), so both forms 
 `arena {}` — building once and then running several column scans amortizes the transpose. The JSON
 form is the analytics win: idiomatic Rust decodes to a `Vec<User>` (AoS) and deserializes every
 field, while Align produces a column-major `soa<User>` and a scan reads only the fields it touches.
-(The guarantee is the **result** — a `soa<T>` laid out column-major; the current mechanism decodes
-to AoS then transposes. Direct-into-columns decode is an optimization slice, not a surface promise.)
+(The guarantee is the **result** — a `soa<T>` laid out column-major; the decoder parses straight
+into the columns, with no AoS intermediate or transpose pass.)
 
 `json.decode` only parses the fields you declare — any other key in the input is skipped
 structurally (no value conversion, no copy). To read just a few columns of a wide record, declare a
@@ -839,11 +839,12 @@ not a hash map; idiomatic Rust reaches for a generic `HashMap<K, Acc>`, while Al
 columns sequentially into a primitive-key aggregate. An **integer** key over a `soa` runs as a
 primitive-key open-addressing aggregate, and when the keys fall in a tight range it skips hashing
 entirely (direct-index accumulation — ~5× a `std::HashMap`, beating even `ahash`). A **string** key
-over an `array<Struct>` (a `soa` can't hold a `str` column) is **dictionary-encoded**: the runtime
+over an `array<Struct>` (a `soa` keys grouping on an `i64` column) is **dictionary-encoded**: the runtime
 interns each key to a dense id once, then aggregates by id — yielding `(array<str>, array<Acc>)` whose
 key views borrow the source. The surface is identical (`group_by(.key).sum(.value)`); the strategy is
 the runtime's concern. (First cut: an `i64` key over a `soa`, or a `str` key over an `array<Struct>`,
-with an `i64` value and `sum`/`min`/`max`/`count`.)
+with an `i64` value and `sum`/`min`/`max`/`count`. A `soa` may hold `str` columns, but grouping a
+`soa` still keys on an `i64` column — a str-key soa `group_by` is not yet wired.)
 
 This is the layout lever that lets Align *beat* an array-of-structs (what a hand-written `Vec<User>`
 gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags
@@ -852,15 +853,19 @@ memory-bound workload (`bench/`, `col_sum`). *(Status: a borrowed `soa<T>` of a
 primitive-scalar struct is implemented — field-column projection `ps.field`, mixed-width columns
 (each padded to its alignment), a column-spanning `rs.where(.active).pay.sum()` (branchless, ≈3× an
 AoS filtered aggregate), `.to_soa()` construction (transpose an `array<Struct>`, arena-allocated),
-and decode-direct-to-`soa` (`s: soa<User> := json.decode(d)?`, decode-AoS-then-transpose) all work,
-feeding the normal pipeline. A projected column is an ordinary `slice<FieldTy>`, so it **windows**
-like any slice — `s.pay[a..b].sum()` scans rows `a..b` of one column. A field of one element is
-**writable in place** through a `mut` view — `s[i].pay = v` stores one column (the write counterpart
-of the `s[i].pay` read, the soa analogue of AoS `arr[i].pay = v`); a **whole element** is replaceable
-too — `s[i] = value` scatters a struct value's fields into their columns (the write counterpart of
-the `s[i]` gather / AoS `arr[i] = value`), for plain-data structs. The plain column scan beats AoS
-≈7×. The remaining slices are known-schema field-skip decode (parse only the used columns),
-`str`/owned columns, and a multi-column `soa_slice<T>` sub-view (`s[a..b]` over every column).)*
+and decode-direct-to-`soa` (`s: soa<User> := json.decode(d)?`, parsed straight into columns) all
+work, feeding the normal pipeline. A projected column is an ordinary `slice<FieldTy>`, so it
+**windows** like any slice — `s.pay[a..b].sum()` scans rows `a..b` of one column. A field of one
+element is **writable in place** through a `mut` view — `s[i].pay = v` stores one column (the write
+counterpart of the `s[i].pay` read, the soa analogue of AoS `arr[i].pay = v`); a **whole element** is
+replaceable too — `s[i] = value` scatters a struct value's fields into their columns (the write
+counterpart of the `s[i]` gather / AoS `arr[i] = value`), for plain-data structs. A struct may also
+carry **`str` columns** — a `str` field decodes as a 16-byte `{ptr,len}` view column borrowing the
+JSON input, so a str-bearing `soa` is region-tied to that input (it cannot escape it) while primitive
+columns still scan and reduce as usual; str columns are read-only after decode (no `s[i].name = v`).
+The plain column scan beats AoS ≈7×. The remaining slices are known-schema field-skip decode (parse
+only the used columns), owned/nested columns, and a multi-column `soa_slice<T>` sub-view (`s[a..b]`
+over every column).)*
 
 ### Over-alignment (`align(N)`)
 
