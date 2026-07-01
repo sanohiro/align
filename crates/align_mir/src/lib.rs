@@ -99,6 +99,8 @@ pub enum Stmt {
     StoreColumn { base: Operand, len: Operand, index: Operand, field: u32, struct_id: u32, value: Operand },
     /// End an arena, freeing all its allocations (the operand is the arena handle).
     ArenaEnd(Operand),
+    /// `raw.free(p)` (unsafe): free a `raw` pointer from [`Rvalue::RawAlloc`]. Side-effecting, unit.
+    RawFree(Operand),
     /// Run all deferred tasks of a `task_group` and clear the list (`wait()`). Operand = the
     /// task-group handle. ④b-1 runs them sequentially; ④b-2 joins threads.
     TgWait(Operand),
@@ -206,6 +208,9 @@ pub enum Rvalue {
     /// `heap.new(init)` in an arena: bump-allocate, store `init`, yield the `box` pointer.
     /// First operand is the arena handle, second is the initial value.
     HeapAlloc(Operand, Operand),
+    /// `raw.alloc(size)` (unsafe): flat-heap-allocate `size` bytes, yield a `raw` byte pointer.
+    /// Manually managed (freed by [`Stmt::RawFree`]); no arena handle, no auto-drop.
+    RawAlloc(Operand),
     /// Read (copy) the value out of a `box` operand.
     BoxGet(Operand),
     /// Deep-copy a `box` into a fresh allocation. First operand is the arena handle,
@@ -812,7 +817,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                 b.push(Stmt::DropFlagInit(*id));
             }
         }
-        hir::ExprKind::Block(blk) | hir::ExprKind::Arena(blk) => {
+        hir::ExprKind::Block(blk) | hir::ExprKind::Arena(blk) | hir::ExprKind::Unsafe(blk) => {
             if let Some(v) = &blk.value {
                 null_moved_source(b, v);
             }
@@ -1255,6 +1260,22 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::Block(blk) => {
             lower_block(b, blk).unwrap_or(Operand::Const(Const::Bool(false)))
+        }
+        // `unsafe {}` is a plain marker block at MIR level — no handle, no region. It lowers to its
+        // inner block; the enforcement + impurity were handled in sema.
+        hir::ExprKind::Unsafe(blk) => lower_block(b, blk).unwrap_or(Operand::Const(Const::Unit)),
+        // `raw.alloc(size)` → a flat heap allocation yielding a `raw` byte pointer.
+        hir::ExprKind::RawAlloc(size) => {
+            let sz = lower_expr(b, size);
+            let v = b.fresh_value(Ty::Raw);
+            b.push(Stmt::Let(v, Rvalue::RawAlloc(sz)));
+            Operand::Value(v)
+        }
+        // `raw.free(p)` → free the pointer (a side-effecting statement, like `ArenaEnd`); yields unit.
+        hir::ExprKind::RawFree(ptr) => {
+            let p = lower_expr(b, ptr);
+            b.push(Stmt::RawFree(p));
+            Operand::Const(Const::Unit)
         }
         // ④b: `task_group` opens a region owning each task's env + result slot, plus a deferred
         // task list. `spawn`/`wait` use the handle; the region is freed at scope end.
@@ -3941,6 +3962,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Option(_) => "Option".to_string(),
         Ty::Result(..) => "Result".to_string(),
         Ty::Box(_) => "box".to_string(),
+        Ty::Raw => "raw".to_string(),
         Ty::Array(_, n) | Ty::StructArray(_, n) => format!("array[{n}]"),
         Ty::Slice(_) => "slice".to_string(),
         Ty::Vec(_, n) => format!("vec{n}"),

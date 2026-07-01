@@ -858,7 +858,19 @@ Completion condition: confirm that the vectorized code contains vector instructi
     `Ty::Param`, never a struct). Struct byte size is a faithful natural-alignment layout computed in
     sema (`struct_size_align`, matching LLVM's default non-packed layout). (`tests/lint_huge_struct_copy.rs`,
     `examples/huge_struct_copy.align`.) The remaining lints are not started.
-- `unsafe` blocks and `raw.*`. — not started
+- `unsafe` blocks and `raw.*`. — **first slice DONE.** `unsafe {}` is a block expression (a plain
+  marker block — no region, no runtime effect, strictly simpler than `arena`); the only new mechanism
+  is an `unsafe_depth` counter that gates the `raw.*` ops. Shipped: `unsafe {}` + `raw.alloc(size)`
+  (→ a `raw` opaque byte pointer, `Ty::Raw`, Copy/`Static`, never auto-dropped) + `raw.free(p)`
+  (draft.md §6.5's exact example). A `raw.*` op outside `unsafe` is a compile error; a function
+  containing `unsafe` is inferred **impure** (reusing the binary purity flag, so it can never be a
+  `par_map` callee — the danger stays traceable). `raw` is a nameable type (parameter / `let`).
+  Region: `unsafe {}` opens no region (an arena value returned through it is still escape-checked —
+  `region_of(Unsafe)` = the block's tail region, not the `Static` fallback). `raw` calls the existing
+  flat `align_rt_alloc`/`align_rt_free`. (`tests/unsafe_raw.rs`, `examples/unsafe_raw.align`.)
+  **Remaining (widen):** `raw.ptr_cast<T>(x)` (unchecked cast), typed raw load/store, and — the real
+  consumer — FFI (`layout(C)` ABI, extern decls), the reason unsafe/raw lands before the `std`/`pkg`
+  C-engine wrappers.
 
 ## Design Issues to Settle in Parallel
 

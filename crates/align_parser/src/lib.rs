@@ -906,6 +906,13 @@ impl<'a> Parser<'a> {
                 let span = start.merge(self.prev_span());
                 Some(Expr { kind: ExprKind::Arena(block), span })
             }
+            TokKind::Unsafe => {
+                let start = self.span();
+                self.bump();
+                let block = self.parse_block()?;
+                let span = start.merge(self.prev_span());
+                Some(Expr { kind: ExprKind::Unsafe(block), span })
+            }
             TokKind::TaskGroup => {
                 let start = self.span();
                 self.bump();

@@ -37,6 +37,8 @@ pub enum TokKind {
     TaskGroup,
     Match,
     Template,
+    /// `unsafe` — introduces an `unsafe { ... }` block, the only place `raw.*` ops are allowed.
+    Unsafe,
     /// `as` — the explicit numeric/char conversion operator (`x as T`).
     As,
     // Symbols / operators
@@ -505,6 +507,7 @@ impl<'a> Lexer<'a> {
             "task_group" => TokKind::TaskGroup,
             "match" => TokKind::Match,
             "template" => TokKind::Template,
+            "unsafe" => TokKind::Unsafe,
             "as" => TokKind::As,
             _ => TokKind::Ident(text.to_string()),
         };

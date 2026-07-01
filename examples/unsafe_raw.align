@@ -1,0 +1,18 @@
+// `unsafe {}` + `raw.*` (M8, draft.md §6.5 / §15). Ordinary Align code has no raw pointers and never
+// manually frees — the safe core forbids use-after-free, manual free, and unchecked casts. The escape
+// hatch is an `unsafe {}` block, the only place `raw.*` operations are allowed:
+//
+//   - `raw.alloc(size)` bump-allocates `size` bytes on the flat heap, yielding a `raw` byte pointer.
+//   - `raw.free(p)` releases it. The memory is manually managed — a `raw` is Copy and is never
+//     auto-dropped, so the free is the programmer's responsibility (which is why it needs `unsafe`).
+//
+// A function containing an `unsafe {}` block is inferred impure, so it can never be a `par_map`
+// callee — the danger stays visible and traceable.
+
+fn main() -> i32 {
+  unsafe {
+    p := raw.alloc(64)      // p: raw
+    raw.free(p)
+  }
+  return 0
+}

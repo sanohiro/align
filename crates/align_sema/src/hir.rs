@@ -360,6 +360,14 @@ pub enum ExprKind {
     Try(Box<Expr>),
     /// `arena { ... }` — a region; allocations inside are bulk-freed at block end.
     Arena(Block),
+    /// `unsafe { ... }` — a marker block permitting `raw.*` ops. No runtime effect; lowers to its
+    /// inner block. (Enforcement + impurity are handled in sema.)
+    Unsafe(Block),
+    /// `raw.alloc(size)` — allocate `size` bytes on the flat heap, yielding a `raw` byte pointer.
+    /// `unsafe`-only; the caller owns the memory and must `raw.free` it (no auto-drop).
+    RawAlloc(Box<Expr>),
+    /// `raw.free(p)` — free a `raw` pointer previously returned by `raw.alloc`. `unsafe`-only.
+    RawFree(Box<Expr>),
     /// `heap.new(x)` — allocate a `box<T>` in the enclosing arena.
     HeapNew(Box<Expr>),
     /// `b.get()` — read (copy) the value out of a `box<T>`.

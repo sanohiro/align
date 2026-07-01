@@ -1143,7 +1143,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::BufWriter => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::BufWriter | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -1604,6 +1604,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let handle = self.operand(op).into();
                     self.builder
                         .build_call(self.funcs["arena_end"], &[handle], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                Stmt::RawFree(op) => {
+                    // `raw.free(p)` → `align_rt_free(p)` (a null-safe libc `free`).
+                    let p = self.operand(op).into();
+                    self.builder
+                        .build_call(self.funcs["free"], &[p], "")
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::TgWait(op) => {
@@ -2299,6 +2306,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_store(ptr, self.operand(init))
                     .map_err(|e| self.err(e))?;
                 ptr.into()
+            }
+            Rvalue::RawAlloc(size) => {
+                // `raw.alloc(size)` → `align_rt_alloc(size) -> ptr` (a flat libc `malloc`). The size
+                // is widened to i64 (the runtime signature); the result `raw` is an opaque `ptr`.
+                let sz = self.operand(size);
+                let i64t = self.ctx.i64_type();
+                let sz64 = if sz.into_int_value().get_type() == i64t {
+                    sz.into_int_value()
+                } else {
+                    self.builder
+                        .build_int_s_extend(sz.into_int_value(), i64t, "sizew")
+                        .map_err(|e| self.err(e))?
+                };
+                self.builder
+                    .build_call(self.funcs["alloc"], &[sz64.into()], "rawptr")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("align_rt_alloc returns a pointer")
             }
             Rvalue::BoxGet(op) => {
                 let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
@@ -3325,7 +3351,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::BufWriter => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::BufWriter | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
