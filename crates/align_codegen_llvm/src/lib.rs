@@ -195,7 +195,12 @@ fn build_module<'c>(
         } else {
             abi_type(ctx, ext.ret, &struct_types, &enum_types).fn_type(&param_types, false)
         };
-        funcs.insert(ext.name.clone(), module.add_function(&ext.name, fn_ty, None));
+        // Defensive: if the symbol is already in the module (e.g. it coincides with a symbol
+        // declared earlier), reuse that declaration. A fresh `add_function` on a duplicate name
+        // makes LLVM silently rename it (`@abs.1`), which then fails to link against the real
+        // external symbol.
+        let fv = module.get_function(&ext.name).unwrap_or_else(|| module.add_function(&ext.name, fn_ty, None));
+        funcs.insert(ext.name.clone(), fv);
     }
     // Declare runtime builtins, keyed by the MIR call name they back.
     let print_ty = ctx.void_type().fn_type(&[ctx.i64_type().into()], false);

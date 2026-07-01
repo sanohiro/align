@@ -1680,14 +1680,25 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                     }
                     None => Ty::Unit,
                 };
-                if sigs.insert(cname.clone(), FnSig { params: params.clone(), out: vec![false; params.len()], ret, type_params: Vec::new(), bounds: Vec::new(), is_extern: true }).is_some() {
-                    diags.error(format!("duplicate extern declaration '{cname}'"), sig.span);
+                // Re-declaring the same C symbol is fine as long as the signature agrees — a C
+                // symbol is global, so two modules may each declare the extern they use (like
+                // repeating a C header). It is registered/collected exactly once; a *conflicting*
+                // re-declaration (different signature, or a clash with a non-extern user function of
+                // the same name) is an error.
+                if let Some(existing) = sigs.get(&cname) {
+                    if !existing.is_extern {
+                        diags.error(format!("extern '{cname}' conflicts with a function of the same name"), sig.span);
+                    } else if existing.params != params || existing.ret != ret {
+                        diags.error(format!("extern '{cname}' re-declared with a different signature"), sig.span);
+                    }
+                } else {
+                    sigs.insert(cname.clone(), FnSig { params: params.clone(), out: vec![false; params.len()], ret, type_params: Vec::new(), bounds: Vec::new(), is_extern: true });
+                    // Make the C symbol resolvable as a bare call from every module.
+                    for info in mod_table.values_mut() {
+                        info.fns.entry(cname.clone()).or_insert((cname.clone(), true));
+                    }
+                    externs.push(hir::ExternFn { name: cname, params, ret });
                 }
-                // Make the C symbol resolvable as a bare call from every module.
-                for info in mod_table.values_mut() {
-                    info.fns.entry(cname.clone()).or_insert((cname.clone(), true));
-                }
-                externs.push(hir::ExternFn { name: cname, params, ret });
             }
         }
     }

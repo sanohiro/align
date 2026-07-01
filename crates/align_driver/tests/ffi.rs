@@ -83,8 +83,30 @@ fn non_ffi_safe_return_is_rejected() {
 }
 
 #[test]
-fn duplicate_extern_is_rejected() {
-    assert!(!ok("extern \"C\" fn abs(x: i32) -> i32\nextern \"C\" fn abs(x: i32) -> i32\nfn main() -> i32 {\n  return 0\n}\n"));
+fn identical_extern_redeclaration_is_allowed() {
+    // A C symbol is global, so re-declaring it with the *same* signature is fine (like repeating a C
+    // header in two translation units) — registered once, no error.
+    assert!(ok("extern \"C\" fn abs(x: i32) -> i32\nextern \"C\" fn abs(x: i32) -> i32\nfn main() -> i32 {\n  unsafe {\n    return abs(-7)\n  }\n}\n"));
+}
+
+#[test]
+fn identical_extern_redeclaration_links_and_runs() {
+    if !backend_available() {
+        return;
+    }
+    // The re-declaration must also survive codegen+link: it is declared once in the LLVM module, so
+    // the symbol is not renamed to `@abs.1` (which would fail to link against libc). Exit 7 confirms.
+    let out = build_and_run(
+        "ffi-dup",
+        "extern \"C\" fn abs(x: i32) -> i32\nextern \"C\" fn abs(x: i32) -> i32\n\nfn main() -> i32 {\n  unsafe {\n    return abs(-7)\n  }\n}\n",
+    );
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn conflicting_extern_redeclaration_is_rejected() {
+    // A re-declaration with a *different* signature is a genuine conflict.
+    assert!(!ok("extern \"C\" fn abs(x: i32) -> i32\nextern \"C\" fn abs(x: i64) -> i64\nfn main() -> i32 {\n  return 0\n}\n"));
 }
 
 #[test]
