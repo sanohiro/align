@@ -1791,7 +1791,7 @@ A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-
 ### Build system / package layout
 Visibility (`pub`), import, and module are decided (`impl/02-frontend.md`). What remains is the design of the build system, package layout, and dependency resolution.
 
-### FFI (foreign function interface) — first slice DONE (keystone for the library strategy)
+### FFI (foreign function interface) — v1 COMPLETE (keystone for the library strategy)
 Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLVM with no GC, an external C call is a direct LLVM `call` at native speed (no pinning / stack-switch / marshaling), and an Align `slice`/`str`/`bytes` hands its raw pointer straight to C. **This gates a deliberate library strategy: "own the memory wrappers, borrow the mathematical engines"** — `std.compress` wraps `libzstd`/`zlib-ng`, `pkg` DB drivers wrap `libpq`/`sqlite`, etc., rather than re-implementing assembly-tuned algorithms in Align. So FFI's design should land before those `std`/`pkg` libraries are built, even though it stays out of the v1 *language* core. (Digested from `work/proposals/ffi-optimization.md`, `compression-strategy.md`, `rdb-optimization.md`.)
 
 **First slice SHIPPED (2026-07-01):** `extern "C"` bodyless declarations + `unsafe`-gated direct calls; FFI-safe scalars (int/float) + `raw` + `()` return; libc/libm resolve with no extra `-l`. See the `unsafe`/`raw` Settled entry above for the full record.
@@ -1802,7 +1802,12 @@ Detailed design of C / Rust / Zig interoperability. Because Align is AOT-via-LLV
 
 **External library linking — SHIPPED (2026-07-01):** an `extern "C" link("name")` clause names a library to link (`-lname`); sema validates + dedupes into `hir`/`mir::Program.link_libs`, and the driver's `link_executable` appends `-l<name>` after the objects/runtime (libc/libm stay auto-linked). The name is charset-validated (`[A-Za-z0-9._+-]`) and passed as a single `-l<name>` argv (no flag/shell injection). `ast::ExternBlock.link`.
 
-**Remaining FFI work**: **by-value `layout(C)` struct passing** — the harder register-classification ABI (SysV AMD64 eightbyte INTEGER/SSE + `byval`/`sret`; AAPCS64 differs), deliberately split off from the layout guarantee since it risks miscompiles if the classification is wrong (ideal-form-or-defer); `bool`/`char` params; and `raw.ptr_cast<T>` (a typed reinterpret, meaningful once external/typed pointers exist).
+**FFI v1 — COMPLETE (2026-07-01).** The shipped surface: `extern "C"` decls + `unsafe`-gated calls; scalar/`raw`/`()` signatures; `layout(C)` struct-by-pointer (`raw.load`/`store`); `str`/`slice`/`bytes` views (data-pointer + separate length); `link("name")` external libraries. That is a coherent, tested v1 — the `std`/`pkg` C-engine wrapper strategy (zstd/sqlite/…) can be built on it (own the memory wrappers, borrow the engines, pass buffers by pointer+len).
+
+**Deliberately out of FFI v1** (draft §15 "Not in FFI v1", decided 2026-07-01 — defer over ship-half-right):
+- **A struct by value** — needs per-target register classification (SysV AMD64 eightbyte INTEGER/SSE, AAPCS64 differs, `byval`/`sret`), the one FFI corner where a wrong rule *silently miscompiles*. Struct-by-pointer already covers the dominant C-API shape, and struct-*param* by-value can't even be tested against the libc-only harness. Revisit if a concrete wrapper needs it (then add a compiled-C-helper test + isolate the classifier per arch).
+- **`bool` / `char` as FFI types** — use the integer types (C `_Bool` = `u8`, `char` = `i8`/`u8`, `char32_t` = `u32`; a `wchar_t` is platform-sized — pick the matching integer width). Align `char` is a 32-bit Unicode scalar (**not** a C `char`), so admitting it would invite the wrong mapping; `bool` stays out for the same one-unambiguous-way reason (and dodges the `i1`-`zeroext` ABI subtlety). Note: there is no `bool as int` cast today, so a `bool` reaches C as `if b { 1 } else { 0 }`.
+- **`raw.ptr_cast<T>`** — a *typed* reinterpret has nothing to reinterpret to while `raw` (opaque bytes) is the only pointer type; it earns meaning once FFI grows typed/external pointers.
 
 ### Details (settled during implementation)
 ```text

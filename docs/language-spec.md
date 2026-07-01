@@ -320,6 +320,11 @@ An `extern "C" link("name")` clause names an external library to link (`-lname`)
 always-linked libc/libm — the visible dependency the `std`/`pkg` C-engine wrappers ride on. A block
 names one library; a repeated name links once.
 
+Deliberately out of FFI v1 (draft §15): a struct **by value** (register/`byval` ABI — struct-by-pointer
+covers the common case), `bool`/`char` as FFI types (use the integer types — a C `char` is `i8`/`u8`, a `char32_t` is `u32`;
+Align `char` is a Unicode scalar, not a C `char`), and a typed pointer cast `raw.ptr_cast<T>` (waits
+on typed pointers).
+
 ### Modules / imports
 
 A prefix-accessed library namespace must be `import`ed before use — a file's header lists the
