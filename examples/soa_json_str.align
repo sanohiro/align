@@ -1,0 +1,20 @@
+// `str` columns in `soa<T>` (M6). `json.decode` parses a JSON array of objects straight into a
+// column-major `soa<Struct>`; a `str` field becomes a column of 16-byte `{ptr,len}` views that
+// borrow the JSON input (zero-copy). So a str-bearing soa is region-tied to the input — it cannot
+// outlive the arena/input — while primitive columns scan as usual.
+import core.json
+
+User { name: str, age: i64, active: bool }
+
+fn main() -> Result<(), Error> {
+  data := "[{\"name\":\"alice\",\"age\":30,\"active\":true},{\"name\":\"bob\",\"age\":25,\"active\":false},{\"name\":\"carol\",\"age\":41,\"active\":true}]"
+  arena {
+    s: soa<User> := json.decode(data)?
+
+    print(s.len())                 // row count: 3
+    print(s.age.sum())             // scan one column: 30 + 25 + 41 = 96
+    print(s[0].name.len())         // read a str element view ("alice"): 5
+    print(s.where(.active).age.sum()) // filtered column scan: 30 + 41 = 71
+  }
+  return Ok(())
+}

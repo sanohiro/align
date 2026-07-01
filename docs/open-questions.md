@@ -371,8 +371,27 @@ result is a free `Static` Copy value (`region_of` special-cases a soa `Index` to
 soa's borrowed region), so it can escape the arena the soa was built in. The whole-struct pipeline
 *stage* over a soa (`map(fn)`/`where(fn)` taking the struct) stays rejected — that would gather every
 column per element; for one field use `s.field[i]` (project then index) or gather then read
-(`r := s[i]; r.field`). Still deferred: `str`/owned columns (the Move-field gather), `soa_slice<T>`
+(`r := s[i]; r.field`). Still deferred: owned/nested columns, `soa_slice<T>`
 sub-views, bitset/bool packed columns. (`tests/soa.rs`, `examples/soa.align`.)
+
+**`str` columns in `soa<T>` — DONE (2026-07-01).** A `soa<Struct>` may now hold `str` columns. A
+`str` field decodes (via `json.decode → soa`) as a column of 16-byte `{ptr,len}` views borrowing the
+JSON input — the whole runtime/codegen path was **already str-aware** (`scalar_bytes(Str)=16`, the
+descriptor `tag`'s `(3<<8)|16`, the `write_field_indexed` `kind==3` AlignStr write feeding `SoaDst`,
+the `soa_column_offset`/`soa_layout` width-as-alignment walk, and the `IndexColumn`/`SoaGather` loads
+that go through `scalar_type`/`abi_type` and so load the 16-byte aggregate). The slice was therefore
+**sema-only**: relax the primitive-only guards on the `soa<T>` type and the `json.decode → soa` decode
+(both now accept `Ty::Str`), and — the soundness core — the **region tie**. A str-bearing soa's
+columns borrow the input, so it is no longer arena-self-contained: `region_of(JsonDecodeSoa)` becomes
+`region_of(input).shorter(arena(depth))` when the struct has a str field (a new `struct_has_str`
+predicate gates it), `s[i]` gather inherits the soa's region instead of `Static`, and the `SoaColumn`
+projection inherits its base's region (closing a `slice<str>` escape hole). A primitive-only soa is
+unchanged — still arena-regioned and free to escape the input (`s[i]` gather returns a Copy POD).
+Reads only (`s[i].name`, `s.name` projection, `s[i]` gather); str-column **writes** (`s[i].name = v`,
+`s[i] = value` with a str field) stay rejected — a stored view would be a fresh escape concern. `to_soa`
+with str columns also stays deferred (its source-borrow region needs the same tie). Escape-checked
+end to end (`str_column_view_cannot_escape_the_arena`; `primitive_soa_stays_self_contained` guards the
+non-regression). `tests/soa.rs` (+3), `examples/soa_json_str.align`, `draft.md` §9.
 
 **Scalar-accessor slice DONE — `s.len()` + `s[i].field`.** A soa now answers `s.len()` (its row
 count — the `{ptr,len}` length, via `ExprKind::Len` → `SliceLen`) and `s[i].field` (one column's

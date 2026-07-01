@@ -1695,6 +1695,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 f,
                 diags,
                 tuples,
+                structs,
                 region: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
                 local_backed_slice: std::collections::HashSet::new(),
@@ -2121,6 +2122,8 @@ struct EscapeCheck<'a> {
     diags: &'a mut Diagnostics,
     /// Tuple defs (to decide whether a `Ty::Tuple` is region-tracked — true iff an element is).
     tuples: &'a [hir::TupleDef],
+    /// Struct defs (to decide whether a `soa<Struct>` has a `str` column — see `struct_has_str`).
+    structs: &'a [StructDef],
     /// For each box/str local, the region at which its current value was allocated.
     region: std::collections::HashMap<LocalId, Region>,
     /// For each local, the arena depth at which it was declared.
@@ -2200,6 +2203,14 @@ impl<'a> EscapeCheck<'a> {
     }
 
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
+    /// Whether struct `id` has any `str` column — the field that turns a `soa<Struct>` from a
+    /// self-contained, arena-only value into one whose columns hold zero-copy `str` views borrowing
+    /// the decode input (or `to_soa` source). A str-bearing soa must be region-tied to that borrow;
+    /// a primitive-only one is free to escape the arena (`s[i]` gather returns a Copy POD value).
+    fn struct_has_str(&self, id: u32) -> bool {
+        self.structs[id as usize].fields.iter().any(|f| f.ty == Ty::Str)
+    }
+
     /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
     /// it can't slip out via an `if`/block value.
     fn region_of(&self, e: &Expr, depth: u32) -> Region {
@@ -2217,11 +2228,8 @@ impl<'a> EscapeCheck<'a> {
             // forwards `init` or borrows a source element (both outlive `arena(depth)`).
             // `to_soa` bump-allocates the column buffer in the enclosing arena; the returned view
             // borrows it, so it is arena-regioned and cannot escape (like `to_array`'s buffer).
+            // (`to_soa` rejects `str` columns for now, so its columns never borrow the source.)
             ExprKind::ArrayToSoa { .. }
-            // `json.decode → soa` transposes into an arena-allocated column buffer (all-scalar
-            // fields, so the result does not borrow the input — it is bound to the arena, like
-            // `to_soa`), unlike the AoS decode below which is tied to the input via its `str` views.
-            | ExprKind::JsonDecodeSoa { .. }
             | ExprKind::ArrayToArray { .. }
             | ExprKind::ArrayPartition { .. }
             | ExprKind::ArrayParMap { .. }
@@ -2239,15 +2247,28 @@ impl<'a> EscapeCheck<'a> {
             // A decoded `array<Struct>` (slice 8d) likewise carries the input's region — its
             // elements' `str` fields are zero-copy views into the input; `.clone()` to escape.
             ExprKind::JsonDecodeStructArray { input, .. } => self.region_of(input, depth),
+            // `json.decode → soa`: the column buffer is arena-allocated, and a `str` column holds
+            // zero-copy views into the JSON input (like the AoS decode). So a str-bearing soa is
+            // bound to BOTH — the arena buffer and the input — i.e. the shorter of the two regions.
+            // (A primitive-only soa borrows nothing and stays purely arena-regioned via the group
+            // arm above, so it is self-contained and free to escape the input.)
+            ExprKind::JsonDecodeSoa { input, struct_id } if self.struct_has_str(*struct_id) => {
+                self.region_of(input, depth).shorter(Region::arena(depth))
+            }
+            ExprKind::JsonDecodeSoa { .. } => Region::arena(depth),
             // `arr[i].field` reads a field of a struct-array element; a `str` field is a view into
             // the array's storage, so it inherits the array's region (it must not outlive it). A
             // scalar field is Copy → the default `Static` (handled below), but tying to the array
             // is conservatively correct for both.
             ExprKind::ElemField { recv, .. } => self.region_of(recv, depth),
-            // `s[i]` on a `soa` *gathers* a whole struct — it copies the primitive columns into a
-            // fresh value rather than borrowing the soa's buffer, so the result is `Static`
-            // (returnable), unlike an AoS element below which may carry a `str` view.
-            ExprKind::Index { recv, .. } if matches!(recv.ty, Ty::Soa(_)) => Region::Static,
+            // `s[i]` on a `soa` *gathers* a whole struct. A primitive-only struct is copied
+            // column-by-column into a fresh POD value that borrows nothing → `Static` (returnable).
+            // A struct with a `str` column gathers `str` views that borrow the soa's buffer/input,
+            // so the gathered value inherits the soa's region (it must not outlive it).
+            ExprKind::Index { recv, .. } if matches!(recv.ty, Ty::Soa(_)) => match recv.ty {
+                Ty::Soa(sid) if self.struct_has_str(sid) => self.region_of(recv, depth),
+                _ => Region::Static,
+            },
             // `arr[i]` reads an element; a `str` element is a view into the array's storage, so it
             // inherits the array's region (it must not outlive it). A scalar element is Copy and
             // not region-tracked, so inheriting the array's region is harmless (never checked).
@@ -2316,7 +2337,12 @@ impl<'a> EscapeCheck<'a> {
             // `source` slices view it), so the encoded value inherits the source's region.
             ExprKind::ArrayGroupAgg { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded, .. }
             | ExprKind::ArrayGroupAggMulti { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded, .. }
-            | ExprKind::ArrayDictEncode { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
+            | ExprKind::ArrayDictEncode { base, .. }
+            // A `soa` column projection `s.field` is a `{ptr,len}` slice into the soa's buffer; for a
+            // `str` column it is a `slice<str>` whose views borrow the soa's buffer/input, so it
+            // inherits the soa local's region. (A primitive column `slice<i64>` is not region-tracked,
+            // so inheriting is harmless — never checked.)
+            | ExprKind::SoaColumn { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
             ExprKind::Block(b) => self.region_of_block(b, depth),
             // An `arena {}` *expression* yields its block value, evaluated one level deeper.
             // Without this, a binding that captures an arena's value (`p := arena { … }`) would
@@ -6707,9 +6733,10 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         };
-        // The source is a struct-collection local: either a `soa<Struct>` (contiguous columns, an
-        // i64 key) or — for a `str` key (a `soa` can't hold a `str` column) — an AoS `array<Struct>`,
-        // whose `str` keys the runtime dictionary-encodes.
+        // The source is a struct-collection local: either a `soa<Struct>` (contiguous columns,
+        // grouped on an i64 key column) or — for a `str` key — an AoS `array<Struct>`, whose `str`
+        // keys the runtime dictionary-encodes. (A soa may now hold a `str` column, but a str-*key*
+        // soa group_by is not yet wired — soa grouping keys on an i64 column.)
         let base = match self.place_local(source) {
             Some((id, _)) => id,
             None => {
@@ -7863,15 +7890,15 @@ impl<'a, 't> Checker<'a, 't> {
             // `soa<Struct>` target (the cache-optimal decode, #228): parse the JSON array of objects
             // **directly** into a column-major `soa<Struct>` — a structural count pass discovers N,
             // then values are written straight into their columns (no AoS intermediate, no
-            // transpose). The column buffer is arena-allocated, so this needs an `arena {}` and the
-            // result is region-tied to it (escape-checked). The struct's fields must be primitive
-            // scalars (the `soa<T>` rule) — which also means no `str` columns, so the decoded soa is
-            // fully self-contained (no zero-copy tie to the input).
+            // transpose). The column buffer is arena-allocated, so this needs an `arena {}`. Fields
+            // are primitive scalars or `str`: a `str` column holds zero-copy views into the JSON
+            // input, so a str-bearing soa is region-tied to BOTH the arena and the input (see
+            // `region_of` / `struct_has_str`); a primitive-only soa is self-contained (arena-only).
             Some(Ty::Result(Scalar::Soa(id), _)) => {
                 let fields = &self.structs[id as usize].fields;
-                if fields.is_empty() || !fields.iter().all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)) {
+                if fields.is_empty() || !fields.iter().all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str)) {
                     self.diags.error(
-                        format!("'json.decode' into soa<{}> needs a non-empty struct of primitive scalar fields (no `str`/owned columns yet)", self.structs[id as usize].name),
+                        format!("'json.decode' into soa<{}> needs a non-empty struct of primitive-scalar or `str` fields (no nested/owned columns)", self.structs[id as usize].name),
                         span,
                     );
                     return err;
@@ -8035,8 +8062,9 @@ impl<'a, 't> Checker<'a, 't> {
             // inherits the receiver's region for an `Index`). A Move struct is rejected just below.
             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Ty::Struct(id),
             // `s[i]` on a `soa<Struct>` gathers a whole struct value from the columns at index `i`
-            // (M6). The struct is primitive-only (the soa rule), so the gather copies — the result is
-            // a free Copy value (`Static`), not a borrow of the soa.
+            // (M6). A primitive-only struct is copied field-by-field into a free Copy value
+            // (`Static`); a struct with a `str` column gathers `str` views borrowing the soa's
+            // buffer/input, so `region_of` ties the gathered value to the soa's region.
             Ty::Soa(id) => Ty::Struct(id),
             Ty::Error => return err,
             other => {
@@ -9736,8 +9764,9 @@ fn resolve_type(
                 None => Ty::Error,
             }
         }
-        // `soa<Struct>` — a struct-of-arrays view (column-major). First cut: the element must be a
-        // struct of primitive scalars (no `str`/Move fields), so each column is a flat scalar array.
+        // `soa<Struct>` — a struct-of-arrays view (column-major). The element is a struct of
+        // primitive scalars and/or `str` columns (no nested/Move fields); a scalar column is a flat
+        // array, a `str` column is a flat array of 16-byte `{ptr,len}` views into the decode input.
         "soa" => {
             let inner = match args {
                 [a] => resolve_type(a, cx, type_params, diags),
@@ -9748,16 +9777,17 @@ fn resolve_type(
             };
             match inner {
                 Ty::Struct(id) => {
-                    // Fields must be primitive scalars (no `str`/owned columns yet). Mixed widths are
-                    // fine: each column's start is padded to the field's alignment in codegen, so
-                    // `soa<{active: bool, pay: i64}>` is well-formed.
+                    // Fields must be primitive scalars or `str`. Mixed widths are fine: each column's
+                    // start is padded to the field's alignment in codegen, so `soa<{active: bool,
+                    // pay: i64}>` is well-formed. A `str` column is a 16-byte `{ptr,len}` view column
+                    // (zero-copy into the decode input); the soa is then region-tied to that input.
                     let fields = &cx.structs[id as usize].fields;
                     if !fields.is_empty()
-                        && fields.iter().all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char))
+                        && fields.iter().all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str))
                     {
                         Ty::Soa(id)
                     } else {
-                        diags.error("soa<T> requires a non-empty struct of primitive scalar fields (no `str`/owned fields yet)".to_string(), span);
+                        diags.error("soa<T> requires a non-empty struct of primitive-scalar or `str` fields (no nested/owned fields)".to_string(), span);
                         Ty::Error
                     }
                 }

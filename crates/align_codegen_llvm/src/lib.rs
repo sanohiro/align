@@ -1334,12 +1334,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// The byte size of each field (= column element size) of a `soa<Struct>`, in declaration
-    /// order. Fields are primitive scalars (sema-enforced).
+    /// order. Fields are primitive scalars or `str` (sema-enforced); a `str` column element is the
+    /// 16-byte `{ptr,len}` view (`scalar_bytes(Scalar::Str) == 16`).
     fn soa_field_sizes(&self, struct_id: u32) -> Vec<u64> {
         self.structs[struct_id as usize]
             .fields
             .iter()
-            .map(|f| scalar_bytes(align_sema::ty_to_scalar(f.ty).expect("soa field is a scalar")))
+            .map(|f| scalar_bytes(align_sema::ty_to_scalar(f.ty).expect("soa field is a scalar or str")))
             .collect()
     }
 
