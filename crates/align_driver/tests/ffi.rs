@@ -73,8 +73,9 @@ fn non_c_abi_is_rejected() {
 
 #[test]
 fn non_ffi_safe_param_is_rejected() {
-    // `str` (and other aggregates/owned collections) have no settled C mapping yet — deferred.
-    assert!(!ok("extern \"C\" fn f(s: str) -> i32\nfn main() -> i32 {\n  return 0\n}\n"));
+    // An `Option` payload (and other aggregates without a settled C mapping) is not FFI-safe. (A
+    // `str`/`slice` view IS accepted as a parameter — see the `ffi_views` tests.)
+    assert!(!ok("extern \"C\" fn f(s: Option<i32>) -> i32\nfn main() -> i32 {\n  return 0\n}\n"));
 }
 
 #[test]

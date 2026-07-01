@@ -1213,11 +1213,31 @@ The declaration is **bodyless** and bound to the C symbol `name` (never mangled)
 AOT-compiled via LLVM with no GC, a foreign call is a direct native `call` — no marshaling, pinning,
 or stack-switch — and a `slice`/`str`/`raw` hands its pointer straight to C. Only `extern "C"` is
 supported; the FFI-safe signature types are the primitive scalars (integers, floats) and `raw` (an
-opaque byte pointer), plus a `()` (void) return — passing a `str`/`slice`/`bytes` (as pointer + len)
-or a struct **by value** is a later slice. A function that calls an extern is inferred impure (it
-contains `unsafe`), so it can never be a `par_map` callee. This is the keystone of the library
+opaque byte pointer), plus a `()` (void) return. A function that calls an extern is inferred impure
+(it contains `unsafe`), so it can never be a `par_map` callee. This is the keystone of the library
 strategy: `std`/`pkg` **own the memory wrappers and borrow the mathematical engines** (wrapping
 `libzstd`, `sqlite`, … via FFI) rather than reimplementing assembly-tuned algorithms in Align.
+
+### Passing a view (`str` / `slice` / `bytes`)
+
+An Align view is a `{ptr, len}` pair; as an extern **parameter** it lowers to just its **data
+pointer** (a C `char*` / `void*`). The length is passed separately by the caller when the C function
+needs it — matching the C `(ptr, len)` idiom, one Align argument becoming one C pointer argument:
+
+```align
+extern "C" fn write(fd: i32, buf: str, count: i64) -> i64
+
+unsafe {
+  msg := "hello\n"
+  write(1, msg, msg.len())   // buf → char*, length passed explicitly
+}
+```
+
+A view is **not** a valid return type (a bare C pointer carries no length — a C function returning a
+pointer maps to `raw`). And an Align `str`/`slice` is **not NUL-terminated** (it is a length-bounded
+view), so only hand it to length-based C functions (`memcmp`/`memcpy`/`write`/…); a NUL-terminated
+API (`strlen`, `printf "%s"`) would read past the end — the programmer's `unsafe` responsibility.
+Passing a struct **by value** (register/`byval` ABI) is a later slice.
 
 ### `layout(C)` — a C-compatible struct layout
 
