@@ -3,6 +3,9 @@
 // hatch is an `unsafe {}` block, the only place `raw.*` operations are allowed:
 //
 //   - `raw.alloc(size)` bump-allocates `size` bytes on the flat heap, yielding a `raw` byte pointer.
+//   - `raw.store(p, offset, v)` writes a primitive scalar at a byte offset; `raw.load(p, offset)`
+//     reads one back. No turbofish: the stored type follows the value, and the loaded type is taken
+//     from the expected type (a binding annotation), exactly like `json.decode`.
 //   - `raw.free(p)` releases it. The memory is manually managed — a `raw` is Copy and is never
 //     auto-dropped, so the free is the programmer's responsibility (which is why it needs `unsafe`).
 //
@@ -11,8 +14,12 @@
 
 fn main() -> i32 {
   unsafe {
-    p := raw.alloc(64)      // p: raw
+    p := raw.alloc(16)         // p: raw — 16 bytes
+    raw.store(p, 0, 42)        // store an i64 at byte 0 (type from the value)
+    raw.store(p, 8, 99)        // and another at byte 8
+    a: i64 := raw.load(p, 0)   // load them back (type from the annotation)
+    b: i64 := raw.load(p, 8)
     raw.free(p)
+    return (a + b) as i32      // 141
   }
-  return 0
 }

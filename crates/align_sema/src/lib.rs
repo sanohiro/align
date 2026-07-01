@@ -279,6 +279,12 @@ pub enum Ty {
 }
 
 /// Convert a concrete scalar [`Ty`] to a [`Scalar`]; `None` for vars/composites/structs.
+/// A primitive scalar type (int/float/bool/char) — the only values `raw.load`/`raw.store` move
+/// through raw memory soundly in the first cut (no `str` views, no structs/aggregates).
+fn is_raw_scalar(ty: Ty) -> bool {
+    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)
+}
+
 pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
     match ty {
         Ty::Int(it) => Some(Scalar::Int(it)),
@@ -2003,6 +2009,17 @@ impl EffectScan {
                 self.impure_direct = true;
                 self.expr(e);
             }
+            ExprKind::RawLoad { ptr, offset, .. } => {
+                self.impure_direct = true;
+                self.expr(ptr);
+                self.expr(offset);
+            }
+            ExprKind::RawStore { ptr, offset, value } => {
+                self.impure_direct = true;
+                self.expr(ptr);
+                self.expr(offset);
+                self.expr(value);
+            }
             // Spawning / joining concurrent work is an observable effect (the enclosing function
             // is not pure); the spawned closure's own effects live in its lifted function.
             ExprKind::Spawn { closure, .. } => {
@@ -2636,6 +2653,15 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(recv, depth);
                 self.walk(index, depth);
             }
+            ExprKind::RawLoad { ptr, offset, .. } => {
+                self.walk(ptr, depth);
+                self.walk(offset, depth);
+            }
+            ExprKind::RawStore { ptr, offset, value } => {
+                self.walk(ptr, depth);
+                self.walk(offset, depth);
+                self.walk(value, depth);
+            }
             ExprKind::SliceRange { recv, start, end } => {
                 self.walk(recv, depth);
                 if let Some(s) = start { self.walk(s, depth); }
@@ -3138,6 +3164,16 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.block(b, moved, consuming, direct),
             // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.expr(e, moved, false, false),
+            // `raw.load`/`raw.store` operands are Copy (raw ptr + int offset + scalar value), never moved.
+            ExprKind::RawLoad { ptr, offset, .. } => {
+                self.expr(ptr, moved, false, false);
+                self.expr(offset, moved, false, false);
+            }
+            ExprKind::RawStore { ptr, offset, value } => {
+                self.expr(ptr, moved, false, false);
+                self.expr(offset, moved, false, false);
+                self.expr(value, moved, false, false);
+            }
             ExprKind::Spawn { closure, .. } => self.expr(closure, moved, false, false),
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
@@ -5668,10 +5704,10 @@ impl<'a, 't> Checker<'a, 't> {
             if single_name(p) == Some("heap") && method == "new" {
                 return self.check_heap_new(args, expected, span);
             }
-            // `raw.alloc(size)` / `raw.free(p)` — the unsafe raw-pointer ops (`raw` is a module name,
-            // not a value). Only valid inside an `unsafe {}` block.
-            if single_name(p) == Some("raw") && (method == "alloc" || method == "free") {
-                return self.check_raw_op(method, args, span);
+            // `raw.alloc(size)` / `raw.free(p)` / `raw.load(p, off)` / `raw.store(p, off, v)` — the
+            // unsafe raw-pointer ops (`raw` is a module name, not a value). `unsafe {}`-only.
+            if single_name(p) == Some("raw") && matches!(method, "alloc" | "free" | "load" | "store") {
+                return self.check_raw_op(method, args, expected, span);
             }
             if single_name(p) == Some("json") && method == "encode" {
                 self.require_import("core.json", "json.encode", span);
@@ -7856,7 +7892,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// inside an `unsafe {}` block. `alloc` takes an integer byte size and yields a `raw` pointer;
     /// `free` takes a `raw` pointer and yields unit. The memory is manually managed (no auto-drop),
     /// which is exactly why these are confined to `unsafe`.
-    fn check_raw_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+    fn check_raw_op(&mut self, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if self.unsafe_depth == 0 {
             self.diags.error(
@@ -7864,15 +7900,23 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             );
         }
-        if args.len() != 1 {
-            self.diags.error(format!("'raw.{method}' takes 1 argument, got {}", args.len()), span);
+        let nargs = match method {
+            "alloc" | "free" => 1,
+            "load" => 2,
+            "store" => 3,
+            _ => unreachable!("check_raw_op is only dispatched for alloc/free/load/store"),
+        };
+        if args.len() != nargs {
+            self.diags.error(format!("'raw.{method}' takes {nargs} argument(s), got {}", args.len()), span);
             return err;
         }
+        let i64t = Ty::Int(IntTy { bits: 64, signed: true });
+        // Helper: check a `raw`-pointer argument.
         match method {
             "alloc" => {
                 // `size` is a byte count — an integer (an unconstrained literal defaults to i64, and
                 // codegen widens any narrower width to the i64 runtime signature).
-                let size = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                let size = self.check_expr(&args[0], Some(i64t));
                 if !matches!(size.ty, Ty::Int(_) | Ty::IntVar(_) | Ty::Error) {
                     self.diags.error(format!("'raw.alloc' size must be an integer, got {}", ty_name(size.ty)), args[0].span);
                     return err;
@@ -7887,7 +7931,54 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::RawFree(Box::new(p)), ty: Ty::Unit, span }
             }
-            _ => unreachable!("check_raw_op is only dispatched for alloc/free"),
+            // `raw.load(p, offset)` reads a value at byte `offset` from `p`. The value type is inferred
+            // from the expected type (no turbofish — like `json.decode`); it must be a primitive
+            // scalar (int/float/bool/char), the only thing raw memory holds soundly in this first cut.
+            "load" => {
+                let p = self.check_expr(&args[0], Some(Ty::Raw));
+                let off = self.check_expr(&args[1], Some(i64t));
+                self.check_raw_ptr_offset(&p, &off, "load", args[0].span, args[1].span);
+                let Some(ty) = expected.filter(|t| is_raw_scalar(*t)) else {
+                    self.diags.error(
+                        "'raw.load' needs a primitive-scalar result type — annotate it, e.g. `x: i64 := raw.load(p, 0)`".to_string(),
+                        span,
+                    );
+                    return err;
+                };
+                let scalar = ty_to_scalar(ty).expect("a primitive scalar has a Scalar");
+                Expr { kind: ExprKind::RawLoad { ptr: Box::new(p), offset: Box::new(off), scalar }, ty, span }
+            }
+            // `raw.store(p, offset, v)` writes `v` at byte `offset`. The stored type is `v`'s type; it
+            // must be a primitive scalar.
+            "store" => {
+                let p = self.check_expr(&args[0], Some(Ty::Raw));
+                let off = self.check_expr(&args[1], Some(i64t));
+                self.check_raw_ptr_offset(&p, &off, "store", args[0].span, args[1].span);
+                let v = self.check_expr(&args[2], None);
+                // Accept a still-unresolved int/float literal (it defaults to i64/f64, which codegen
+                // reads after finalization); reject non-scalars (str/struct/etc.).
+                let store_ok = is_raw_scalar(v.ty) || matches!(v.ty, Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error);
+                if !store_ok {
+                    self.diags.error(
+                        format!("'raw.store' stores a primitive scalar (int/float/bool/char), got {}", ty_name(v.ty)),
+                        args[2].span,
+                    );
+                    return err;
+                }
+                Expr { kind: ExprKind::RawStore { ptr: Box::new(p), offset: Box::new(off), value: Box::new(v) }, ty: Ty::Unit, span }
+            }
+            _ => unreachable!("check_raw_op is only dispatched for alloc/free/load/store"),
+        }
+    }
+
+    /// Type-check a `raw` pointer + i64 offset pair for `raw.load`/`raw.store`, emitting a diagnostic
+    /// on a mismatch (but not bailing — the caller still produces a typed node).
+    fn check_raw_ptr_offset(&mut self, p: &Expr, off: &Expr, method: &str, pspan: Span, ospan: Span) {
+        if !matches!(p.ty, Ty::Raw | Ty::Error) {
+            self.diags.error(format!("'raw.{method}' takes a `raw` pointer, got {}", ty_name(p.ty)), pspan);
+        }
+        if !matches!(off.ty, Ty::Int(_) | Ty::IntVar(_) | Ty::Error) {
+            self.diags.error(format!("'raw.{method}' offset must be an integer, got {}", ty_name(off.ty)), ospan);
         }
     }
 
@@ -9048,6 +9139,15 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.finalize_block(b),
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.finalize_expr(e),
+            ExprKind::RawLoad { ptr, offset, .. } => {
+                self.finalize_expr(ptr);
+                self.finalize_expr(offset);
+            }
+            ExprKind::RawStore { ptr, offset, value } => {
+                self.finalize_expr(ptr);
+                self.finalize_expr(offset);
+                self.finalize_expr(value);
+            }
             ExprKind::Spawn { closure, .. } => self.finalize_expr(closure),
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {

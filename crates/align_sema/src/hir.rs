@@ -368,6 +368,11 @@ pub enum ExprKind {
     RawAlloc(Box<Expr>),
     /// `raw.free(p)` — free a `raw` pointer previously returned by `raw.alloc`. `unsafe`-only.
     RawFree(Box<Expr>),
+    /// `raw.load(p, offset)` — read a primitive `scalar` value at byte `offset` from `p`. `unsafe`-only.
+    RawLoad { ptr: Box<Expr>, offset: Box<Expr>, scalar: crate::Scalar },
+    /// `raw.store(p, offset, v)` — write the primitive scalar `value` at byte `offset` of `p`. Yields
+    /// unit. `unsafe`-only.
+    RawStore { ptr: Box<Expr>, offset: Box<Expr>, value: Box<Expr> },
     /// `heap.new(x)` — allocate a `box<T>` in the enclosing arena.
     HeapNew(Box<Expr>),
     /// `b.get()` — read (copy) the value out of a `box<T>`.

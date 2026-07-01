@@ -1344,6 +1344,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
         CodegenError::Lowering(e.to_string())
     }
 
+    /// The address `ptr + offset` bytes, for `raw.load`/`raw.store` — an `i8` (byte-granular) GEP off
+    /// the `raw` pointer by the i64 byte `offset`. The result is an opaque `ptr` (LLVM opaque
+    /// pointers); the caller loads/stores it at **alignment 1** (an arbitrary byte offset may be
+    /// misaligned for the scalar). A plain (non-`inbounds`) GEP is used deliberately: a raw pointer
+    /// carries no allocation-bounds guarantee, and an `inbounds` GEP that steps outside the object
+    /// would be poison — letting the optimizer assume in-bounds and drop later checks. Plain `gep`
+    /// keeps unsafe pointer arithmetic well-defined (wrapping) as the caller intends.
+    fn raw_elem_ptr(&mut self, ptr: &align_mir::Operand, offset: &align_mir::Operand) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let base = self.operand(ptr).into_pointer_value();
+        let off = self.operand(offset).into_int_value();
+        unsafe {
+            self.builder
+                .build_gep(self.ctx.i8_type(), base, &[off], "rawelem")
+                .map_err(|e| self.err(e))
+        }
+    }
+
     /// The byte size of each field (= column element size) of a `soa<Struct>`, in declaration
     /// order. Fields are primitive scalars or `str` (sema-enforced); a `str` column element is the
     /// 16-byte `{ptr,len}` view (`scalar_bytes(Scalar::Str) == 16`).
@@ -1612,6 +1629,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder
                         .build_call(self.funcs["free"], &[p], "")
                         .map_err(|e| self.err(e))?;
+                }
+                Stmt::RawStore { ptr, offset, value } => {
+                    // `raw.store(p, off, v)` → store `v` at `p + off` bytes. GEP by the i8 (byte)
+                    // offset yields a `ptr`; the store's value type fixes the width. An arbitrary byte
+                    // offset may be misaligned for the scalar, so force alignment 1 (an unaligned
+                    // store) — always correct, never LLVM-UB, at a possible perf cost on some targets.
+                    let ep = self.raw_elem_ptr(ptr, offset)?;
+                    let val = self.operand(value);
+                    let st = self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                    st.set_alignment(1).map_err(|e| self.err(e))?;
                 }
                 Stmt::TgWait(op) => {
                     let handle = self.operand(op).into();
@@ -2325,6 +2352,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .expect("align_rt_alloc returns a pointer")
+            }
+            Rvalue::RawLoad { ptr, offset, scalar } => {
+                // `raw.load(p, off)` → load the scalar at `p + off` bytes. GEP by the byte offset,
+                // then load `scalar_type(scalar)`. An arbitrary byte offset may be misaligned for the
+                // scalar, so force alignment 1 (an unaligned load) — always correct, never LLVM-UB.
+                let ep = self.raw_elem_ptr(ptr, offset)?;
+                let lty = scalar_type(self.ctx, align_sema::scalar_to_ty(*scalar), self.struct_types, self.enum_types);
+                let loaded = self.builder.build_load(lty, ep, "rawval").map_err(|e| self.err(e))?;
+                // A raw scalar is int (int/bool/char) or float; set the load's alignment to 1 via the
+                // concrete value's instruction (an arbitrary byte offset may be misaligned).
+                let inst = match loaded {
+                    inkwell::values::BasicValueEnum::IntValue(v) => v.as_instruction(),
+                    inkwell::values::BasicValueEnum::FloatValue(v) => v.as_instruction(),
+                    _ => None,
+                };
+                inst.ok_or_else(|| self.err("raw load is not an instruction"))?.set_alignment(1).map_err(|e| self.err(e))?;
+                loaded
             }
             Rvalue::BoxGet(op) => {
                 let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
