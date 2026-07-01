@@ -1668,6 +1668,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     // in `sigs` under its bare C symbol (never mangled — a C symbol is global), make it resolvable
     // from every module (like a builtin), and collect it for codegen's external-declaration pass.
     let mut externs: Vec<hir::ExternFn> = Vec::new();
+    let mut link_libs: Vec<String> = Vec::new();
     for m in modules {
         for it in &m.file.items {
             let ast::Item::Extern(blk) = it else { continue };
@@ -1676,6 +1677,24 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                     format!("unsupported ABI '{}' — only `extern \"C\"` is supported", blk.abi),
                     blk.span,
                 );
+            }
+            // A `link("name")` clause names an external library to link (`-lname`). Validate the
+            // name (a linker gets it verbatim) and dedupe into `link_libs`.
+            if let Some(lib) = &blk.link {
+                // A leading `-` is never a real library name; reject it so a name can never look
+                // like a linker flag (defense in depth — it is already passed as a single `-l<name>`
+                // argv, so it cannot inject a separate flag).
+                if lib.is_empty()
+                    || lib.starts_with('-')
+                    || !lib.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
+                {
+                    diags.error(
+                        format!("invalid library name '{lib}' in `link(...)` — use letters, digits, and `._+-` (not starting with `-`)"),
+                        blk.span,
+                    );
+                } else if !link_libs.contains(lib) {
+                    link_libs.push(lib.clone());
+                }
             }
             // Extern signatures see the top-level type namespace with no module imports (an FFI type
             // is a primitive/`raw`, never an imported user type); the entry module's context suffices.
@@ -1805,7 +1824,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
         // checked in Pass 2, so a monomorph never has lifted helpers here.
         fns.push(checked);
     }
-    let mut program = Program { fns, externs, structs, enums, tuples, fn_types };
+    let mut program = Program { fns, externs, link_libs, structs, enums, tuples, fn_types };
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it

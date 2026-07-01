@@ -52,6 +52,10 @@ pub enum Item {
 pub struct ExternBlock {
     /// The ABI string (`"C"`). Only `"C"` is accepted today; sema rejects any other.
     pub abi: String,
+    /// The external library to link, from an optional `link("name")` clause (`extern "C" link("z")
+    /// { … }` → `-lz`). `None` means the symbols resolve against the already-linked C runtime
+    /// (libc/libm). The name is validated in sema.
+    pub link: Option<String>,
     pub fns: Vec<ExternSig>,
     pub span: Span,
 }

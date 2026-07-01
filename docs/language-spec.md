@@ -316,6 +316,10 @@ A `str`/`slice`/`bytes` view is FFI-safe as a **parameter**: it lowers to its da
 A view is not a valid return type (a bare pointer has no length), and it is not NUL-terminated (only
 hand it to length-based C functions).
 
+An `extern "C" link("name")` clause names an external library to link (`-lname`), beyond the
+always-linked libc/libm — the visible dependency the `std`/`pkg` C-engine wrappers ride on. A block
+names one library; a repeated name links once.
+
 ### Modules / imports
 
 A prefix-accessed library namespace must be `import`ed before use — a file's header lists the

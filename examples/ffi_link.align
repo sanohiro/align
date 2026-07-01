@@ -1,0 +1,30 @@
+// FFI external libraries (M8, draft.md §15) — `extern "C" link("name")`.
+//
+// libc and libm symbols resolve with no extra flag (they are always linked). To call any *other* C
+// library, a `link("name")` clause on the extern block names it — the driver passes `-lname` to the
+// linker. The dependency is visible right at the declaration ("nothing hidden"): a reader sees both
+// the foreign functions and the library they come from.
+//
+//   extern "C" link("z") {           // links libz (zlib)
+//     fn compress(dest: raw, destlen: raw, src: str, srclen: i64) -> i32
+//   }
+//
+// This is the mechanism the library-wrapper strategy rides on: `std`/`pkg` own thin Align wrappers
+// and `link(...)` the mature C engines (zstd, sqlite, …) rather than reimplementing them.
+//
+// Here we use libm (`link("m")`) so the example runs anywhere — the same clause that would name any
+// third-party library. A block may name one library; several blocks may share or differ, and a
+// repeated name links once.
+
+extern "C" link("m") {
+  fn sqrt(x: f64) -> f64
+  fn cbrt(x: f64) -> f64
+}
+
+fn main() -> i32 {
+  unsafe {
+    a := sqrt(16.0)    // 4
+    b := cbrt(27.0)    // 3
+    return (a + b) as i32   // 7
+  }
+}

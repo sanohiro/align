@@ -127,14 +127,21 @@ pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget) -> Result<Str
 ///
 /// The thin runtime (`libalign_runtime.a`, e.g. the builtin `print`) is linked in too.
 /// Being a Rust staticlib, it needs the usual std support libraries (`pthread`/`dl`/`m`).
-pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path) -> Result<(), String> {
+pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: &[String]) -> Result<(), String> {
     let runtime = runtime_archive()?;
-    let status = std::process::Command::new("cc")
-        .arg(obj)
+    let mut cmd = std::process::Command::new("cc");
+    cmd.arg(obj)
         .arg(&runtime)
         .arg("-o")
         .arg(exe)
-        .args(["-lpthread", "-ldl", "-lm"])
+        .args(["-lpthread", "-ldl", "-lm"]);
+    // User-declared external libraries (`extern "C" link("name")`) go after the objects that
+    // reference them (`-l` resolves left-to-right against preceding objects). Each name is validated
+    // in sema and passed as a single `-l<name>` argument (no shell/flag injection).
+    for lib in link_libs {
+        cmd.arg(format!("-l{lib}"));
+    }
+    let status = cmd
         .status()
         .map_err(|e| format!("cannot launch cc: {e}"))?;
     if status.success() {

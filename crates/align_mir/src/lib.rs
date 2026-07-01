@@ -27,6 +27,8 @@ pub struct Program {
     /// Foreign (`extern "C"`) declarations, passed through from HIR unchanged; codegen emits an
     /// external LLVM declaration for each, keyed by the C symbol so a `Rvalue::Call` resolves.
     pub externs: Vec<hir::ExternFn>,
+    /// External libraries to link (`-l<name>`), passed through from HIR; consumed by the driver.
+    pub link_libs: Vec<String>,
     /// Struct layouts, indexed by the id in [`Ty::Struct`]; codegen builds LLVM struct
     /// types from these.
     pub structs: Vec<hir::StructDef>,
@@ -493,6 +495,7 @@ pub fn lower_program(program: &hir::Program) -> Program {
             })
             .collect(),
         externs: program.externs.clone(),
+        link_libs: program.link_libs.clone(),
         structs: program.structs.clone(),
         enums: program.enums.clone(),
         tuples: program.tuples.clone(),

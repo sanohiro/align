@@ -897,12 +897,16 @@ Completion condition: confirm that the vectorized code contains vector instructi
   `extern_params` map). A view is *not* a valid return type (a bare pointer has no length) and is not
   NUL-terminated (length-based C fns only). `is_ffi_safe_param`. (`tests/ffi_views.rs`,
   `examples/ffi_views.align`.)
+  **External library linking — DONE.** An `extern "C" link("name")` clause names a library to link;
+  sema validates + dedupes the names into `hir::Program.link_libs` → `mir::Program.link_libs`, and
+  the driver's `link_executable` appends `-l<name>` after the objects/runtime (libc/libm stay
+  auto-linked). `ast::ExternBlock.link`, parser `parse_link_clause`. (`tests/ffi_link.rs`,
+  `examples/ffi_link.align`.)
   **Remaining (widen):** the draft's `raw.ptr_cast<T>` (unchecked cast / reinterpret) is still
   deferred — with only `raw` (opaque bytes) a typed cast has nothing to reinterpret *to*; it earns
   meaning once FFI grows typed/external pointers. Later FFI slices: **by-value `layout(C)` struct
-  passing** (SysV/AAPCS register + `byval`/`sret` ABI classification), an explicit external-library
-  link directive (`-l<lib>`), and `bool`/`char` params — the widening the `std`/`pkg` C-engine
-  wrappers need.
+  passing** (SysV/AAPCS register + `byval`/`sret` ABI classification) and `bool`/`char` params — the
+  last widening the `std`/`pkg` C-engine wrappers need.
 
 ## Design Issues to Settle in Parallel
 
