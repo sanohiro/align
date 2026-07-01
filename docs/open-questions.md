@@ -1257,8 +1257,25 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         proj→1.35×. **Tried and reverted**: lowering the per-byte value-write loops to constant-width
         `copy_nonoverlapping` stores — perf-neutral (the write is ~4% of `write_field_indexed`; the cost
         there is `integer()`, already lean), so not shipped (ideal-form-or-defer). Remaining full-rail
-        gap to serde is now the intrinsic walk + value-parse, the same x86 pays; the SoA-column direct
-        decode (above) is still the real lever if pursued.
+        gap to serde is now the intrinsic walk + value-parse, the same x86 pays.
+        **SoA-column direct decode is SHIPPED, and the SoA projection rail is now MEASURED (2026-07-01).**
+        Verified in code: `align_rt_json_decode_soa` already runs the lean `json_decode_index` + Mison
+        `json_speculate`/`json_fallback` over a `SoaDst` (direct-to-column write, no AoS intermediate) —
+        i.e. the "soa-column direct decode" the notes above called "the real lever if pursued" is not a
+        pending slice, it landed with #228 + the `FieldDst` generalization. What was genuinely missing was
+        a **measurement**: `bench/json_soa` declared all 4 fields (full decode, no skip). Added an
+        `agg_proj` variant — the same 4-field JSON decoded into a narrow `soa<Row2 {active, pay}>` vs a
+        fair `serde_json::<Vec<Row2>>` baseline (both skip the two unknown keys). **Result (native): soa
+        projection = 1.29–1.61× serde** (vs ≈1.12× full), matching the AoS `json_decode` proj number; the
+        profile shows the columnar scan is ~free (agg delta 0.2–0.4 ms) so the win is almost entirely
+        **decode-projection** — skipping the unqueried columns' colons saves ~25 ms / ~30% of the
+        4-column decode at 1M. It does **not** reach the probe's 3.4–4.1×: that gap is the inlined,
+        descriptor-free, verify-free single-pass positional walk (the `rec_cols` two-pass + `FieldDst`/
+        `JsonParser` indirection + intrinsic key-verify), whose pieces were each measured small (+2/+4/+2
+        ms) and judged not-worth-forcing. `bench/json_soa` is now the instrument to revisit that with data.
+        Note (dead code): the heavier `json_structural_index` (#213/#254 AVX2+NEON, quote+comma) is still
+        `allow(dead_code)` — the live decode uses the lean `json_decode_index`; #213's index has no live
+        consumer and is a candidate for removal unless a future full-structural pass needs it.
         The historical investigation that led here ↓. Built the
         **stage-1 structural index** (PR #213: AVX2 + `pclmulqdq` prefix-XOR string mask + odd/even
         backslash-run escapes, block-carried, scalar oracle + exhaustive fuzz; runtime-dispatched,
