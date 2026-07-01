@@ -64,6 +64,13 @@ fn slice_param_is_accepted() {
 }
 
 #[test]
+fn slice_of_non_scalar_element_is_rejected() {
+    // A `slice<str>` element (a `{ptr,len}` view) has no settled C representation, so handing C a
+    // pointer to that buffer would misinterpret it — rejected. Only int/float element slices qualify.
+    assert!(!ok("extern \"C\" fn f(s: slice<str>, n: i64) -> i32\nfn main() -> i32 {\n  return 0\n}\n"));
+}
+
+#[test]
 fn str_return_is_rejected() {
     // A bare C pointer carries no length, so a view is not a valid return type.
     assert!(!ok("extern \"C\" fn f(x: i32) -> str\nfn main() -> i32 {\n  return 0\n}\n"));

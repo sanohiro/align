@@ -489,13 +489,18 @@ fn is_ffi_safe(ty: Ty) -> bool {
     matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Raw)
 }
 
-/// FFI-safe as an extern **parameter**: everything [`is_ffi_safe`] accepts, plus a `str`/`slice<T>`
-/// view (`bytes` = `slice<u8>`). A view is passed to C as its **data pointer** (a `char*`/`void*`);
-/// the length is passed separately by the caller (`s.len()`) when the C function needs it — matching
-/// the C idiom of adjacent `(ptr, len)` arguments, without hiding an argument. A view is *not*
-/// FFI-safe as a **return** type (a bare C pointer carries no length), so returns stay scalar-only.
+/// FFI-safe as an extern **parameter**: everything [`is_ffi_safe`] accepts, plus a `str` and a
+/// `slice<T>` **whose element is an FFI-safe scalar** (int/float — so `bytes` = `slice<u8>` qualifies,
+/// but `slice<str>` / `slice<Struct>` do not: their element layout has no settled C representation,
+/// and handing C a pointer to such a buffer would misinterpret it). A view is passed to C as its
+/// **data pointer** (a `char*`/`void*`); the length is passed separately by the caller (`s.len()`)
+/// when the C function needs it — matching the C idiom of adjacent `(ptr, len)` arguments, without
+/// hiding an argument. A view is *not* FFI-safe as a **return** type (a bare C pointer carries no
+/// length), so returns stay scalar-only.
 fn is_ffi_safe_param(ty: Ty) -> bool {
-    is_ffi_safe(ty) || matches!(ty, Ty::Str | Ty::Slice(_))
+    is_ffi_safe(ty)
+        || ty == Ty::Str
+        || matches!(ty, Ty::Slice(elem) if matches!(elem, Scalar::Int(_) | Scalar::Float(_)))
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
