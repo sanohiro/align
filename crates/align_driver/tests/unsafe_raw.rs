@@ -68,3 +68,45 @@ fn unsafe_block_is_a_transparent_marker_for_regions() {
 fn raw_alloc_size_must_be_an_integer() {
     assert!(!ok("fn main() -> i32 {\n  unsafe {\n    p := raw.alloc(true)\n    raw.free(p)\n  }\n  return 0\n}\n"));
 }
+
+#[test]
+fn raw_store_load_roundtrips_at_byte_offsets() {
+    if !backend_available() {
+        return;
+    }
+    // Store two i64s at byte offsets 0 and 8, load them back, sum → 42 + 99 = 141. Exercises the
+    // typed store (type from the value), typed load (type from the annotation), and byte offsets.
+    let out = build_and_run(
+        "unsafe-load-store",
+        "fn main() -> i32 {\n  unsafe {\n    p := raw.alloc(16)\n    raw.store(p, 0, 42)\n    raw.store(p, 8, 99)\n    a: i64 := raw.load(p, 0)\n    b: i64 := raw.load(p, 8)\n    raw.free(p)\n    return (a + b) as i32\n  }\n}\n",
+    );
+    assert_eq!(out.status.code(), Some(141));
+}
+
+#[test]
+fn raw_store_load_roundtrips_a_float() {
+    if !backend_available() {
+        return;
+    }
+    // A float roundtrips too (the store width follows the value type): 3.5 + 0.5 → 4.
+    let out = build_and_run(
+        "unsafe-load-store-f64",
+        "fn main() -> i32 {\n  unsafe {\n    p := raw.alloc(8)\n    raw.store(p, 0, 3.5)\n    x: f64 := raw.load(p, 0)\n    raw.free(p)\n    return (x + 0.5) as i32\n  }\n}\n",
+    );
+    assert_eq!(out.status.code(), Some(4));
+}
+
+#[test]
+fn raw_load_needs_a_scalar_result_type() {
+    // `raw.load` infers its type from the expected type (no turbofish) — without an annotation it
+    // cannot be resolved and is an error.
+    assert!(!ok("fn main() -> i32 {\n  unsafe {\n    p := raw.alloc(8)\n    raw.store(p, 0, 7)\n    x := raw.load(p, 0)\n    raw.free(p)\n    return 0\n  }\n}\n"));
+    // A `str` (a view, not a flat scalar) cannot be stored into raw memory.
+    assert!(!ok("fn main() -> i32 {\n  unsafe {\n    p := raw.alloc(16)\n    raw.store(p, 0, \"hi\")\n    raw.free(p)\n  }\n  return 0\n}\n"));
+}
+
+#[test]
+fn raw_load_store_are_unsafe_only() {
+    // Both are confined to an `unsafe {}` block, like alloc/free.
+    assert!(!ok("fn main() -> i32 {\n  mut p := unsafe { raw.alloc(8) }\n  raw.store(p, 0, 7)\n  a: i64 := raw.load(p, 0)\n  unsafe { raw.free(p) }\n  return a as i32\n}\n"));
+}

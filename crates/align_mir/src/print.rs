@@ -84,6 +84,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::RawFree(op) => {
                 let _ = writeln!(out, "    raw_free {}", operand_str(op));
             }
+            Stmt::RawStore { ptr, offset, value } => {
+                let _ = writeln!(out, "    raw_store {}[{}] <- {}", operand_str(ptr), operand_str(offset), operand_str(value));
+            }
             Stmt::TgWait(op) => {
                 let _ = writeln!(out, "    tg_wait {}", operand_str(op));
             }
@@ -190,6 +193,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::HeapAlloc(h, init) => format!("heap_alloc({}, {})", operand_str(h), operand_str(init)),
         Rvalue::RawAlloc(size) => format!("raw_alloc({})", operand_str(size)),
+        Rvalue::RawLoad { ptr, offset, .. } => format!("raw_load({}[{}])", operand_str(ptr), operand_str(offset)),
         Rvalue::BoxGet(op) => format!("box_get({})", operand_str(op)),
         Rvalue::BoxClone(h, src) => format!("box_clone({}, {})", operand_str(h), operand_str(src)),
         Rvalue::Index(slot, idx) => format!("_{slot}[{}]", operand_str(idx)),

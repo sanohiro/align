@@ -1110,7 +1110,12 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     counter that gates the `raw.*` ops (exactly like `arena_depth` gates `heap.new`). Shipped:
     `unsafe {}` + `raw.alloc(size)` (→ `Ty::Raw`, an opaque byte pointer: Copy, `Static`, never
     auto-dropped, LLVM `ptr` like `ArenaHandle`) + `raw.free(p)`, calling the existing flat
-    `align_rt_alloc`/`align_rt_free`. A `raw.*` op outside `unsafe` errors; a function containing
+    `align_rt_alloc`/`align_rt_free`; plus **`raw.store(p, off, v)` / `raw.load(p, off)`** — typed
+    flat load/store at a byte offset (an i8 GEP + a scalar load/store, element-aligned). **No
+    turbofish** (settled convention): the stored type follows the value, the loaded type the expected
+    annotation (`x: i64 := raw.load(p, 0)`, like `json.decode`). Primitive scalars only (int/float/
+    bool/char) — `str`/struct through raw memory is deferred. draft.md §15 was respelled off the old
+    `raw.ptr_cast<T>` turbofish example to this inference form. A `raw.*` op outside `unsafe` errors; a function containing
     `unsafe` is inferred **impure** (reusing the single Pure/Impure `EffectScan` flag → never a
     `par_map` callee; "unsafe is visible/traceable"). `raw` is a nameable type (`fn f(p: raw)`).
     **Soundness note (Gate 1):** `unsafe {}` opens no region, but `region_of(Unsafe)` returns the

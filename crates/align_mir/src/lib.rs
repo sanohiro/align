@@ -101,6 +101,8 @@ pub enum Stmt {
     ArenaEnd(Operand),
     /// `raw.free(p)` (unsafe): free a `raw` pointer from [`Rvalue::RawAlloc`]. Side-effecting, unit.
     RawFree(Operand),
+    /// `raw.store(p, offset, v)` (unsafe): write the primitive scalar `value` at `ptr + offset` bytes.
+    RawStore { ptr: Operand, offset: Operand, value: Operand },
     /// Run all deferred tasks of a `task_group` and clear the list (`wait()`). Operand = the
     /// task-group handle. ④b-1 runs them sequentially; ④b-2 joins threads.
     TgWait(Operand),
@@ -211,6 +213,8 @@ pub enum Rvalue {
     /// `raw.alloc(size)` (unsafe): flat-heap-allocate `size` bytes, yield a `raw` byte pointer.
     /// Manually managed (freed by [`Stmt::RawFree`]); no arena handle, no auto-drop.
     RawAlloc(Operand),
+    /// `raw.load(p, offset)` (unsafe): read the primitive `scalar` at `ptr + offset` bytes.
+    RawLoad { ptr: Operand, offset: Operand, scalar: align_sema::Scalar },
     /// Read (copy) the value out of a `box` operand.
     BoxGet(Operand),
     /// Deep-copy a `box` into a fresh allocation. First operand is the arena handle,
@@ -1275,6 +1279,22 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::RawFree(ptr) => {
             let p = lower_expr(b, ptr);
             b.push(Stmt::RawFree(p));
+            Operand::Const(Const::Unit)
+        }
+        // `raw.load(p, offset)` → read `scalar` at `p + offset` bytes.
+        hir::ExprKind::RawLoad { ptr, offset, scalar } => {
+            let p = lower_expr(b, ptr);
+            let off = lower_expr(b, offset);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::RawLoad { ptr: p, offset: off, scalar: *scalar }));
+            Operand::Value(v)
+        }
+        // `raw.store(p, offset, v)` → write `v` at `p + offset` bytes (a side-effecting statement).
+        hir::ExprKind::RawStore { ptr, offset, value } => {
+            let p = lower_expr(b, ptr);
+            let off = lower_expr(b, offset);
+            let val = lower_expr(b, value);
+            b.push(Stmt::RawStore { ptr: p, offset: off, value: val });
             Operand::Const(Const::Unit)
         }
         // ④b: `task_group` opens a region owning each task's env + result slot, plus a deferred

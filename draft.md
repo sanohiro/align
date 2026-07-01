@@ -1168,13 +1168,23 @@ raw pointer
 unchecked cast
 ```
 
-Dangerous operations are only in an `unsafe` block.
+Dangerous operations are only in an `unsafe` block. The `raw.*` surface manages flat memory with a
+`raw` byte pointer:
 
 ```align
 unsafe {
-  p := raw.ptr_cast<T>(x)
+  p := raw.alloc(16)        // 16 bytes → a `raw` pointer
+  raw.store(p, 0, 42)       // write a primitive scalar at a byte offset (type from the value)
+  x: i64 := raw.load(p, 0)  // read it back (type from the annotation — no turbofish, like decode)
+  raw.free(p)               // manual free; a `raw` is Copy and never auto-dropped
 }
 ```
+
+The stored/loaded type is inferred (from the value for `store`, from the expected type for `load`) —
+Align has **no turbofish**, so an explicit `raw.op<T>(...)` is not the surface. (An unchecked pointer
+cast / reinterpret is a later `raw.*` op; the flat load/store above is the first cut.) A function
+containing `unsafe` is inferred impure, so it can never be a `par_map` callee — the danger stays
+visible and traceable.
 
 Rust-style lifetimes are not exposed on the surface.
 However, an obvious lifetime violation, such as a view escaping an arena, is a compile error.
