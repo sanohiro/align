@@ -7860,12 +7860,13 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 };
             }
-            // `soa<Struct>` target (the cache-optimal decode, runway step 2): parse the JSON array
-            // of objects into AoS (length N is unknown until parsed), then transpose to a
-            // column-major `soa<Struct>`. The column buffer is arena-allocated, so this needs an
-            // `arena {}` and the result is region-tied to it (escape-checked). The struct's fields
-            // must be primitive scalars (the `soa<T>` rule) — which also means no `str` columns, so
-            // the decoded soa is fully self-contained (no zero-copy tie to the input).
+            // `soa<Struct>` target (the cache-optimal decode, #228): parse the JSON array of objects
+            // **directly** into a column-major `soa<Struct>` — a structural count pass discovers N,
+            // then values are written straight into their columns (no AoS intermediate, no
+            // transpose). The column buffer is arena-allocated, so this needs an `arena {}` and the
+            // result is region-tied to it (escape-checked). The struct's fields must be primitive
+            // scalars (the `soa<T>` rule) — which also means no `str` columns, so the decoded soa is
+            // fully self-contained (no zero-copy tie to the input).
             Some(Ty::Result(Scalar::Soa(id), _)) => {
                 let fields = &self.structs[id as usize].fields;
                 if fields.is_empty() || !fields.iter().all(|f| matches!(f.ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)) {

@@ -520,6 +520,12 @@ JSON→SoA is then a thin wiring on top.
    ≈parity and beats decode→SoA, so SoA's transpose only pays off under heavy/repeated column scans);
    (c) **field-skip / narrow struct** (already available). Bottom line: json→SoA is a PARSER problem;
    the cheap scalar win is banked (#168), and beating serde now needs the SIMD slice.
+   **UPDATE — secondary (b) SHIPPED (#228, 2026-06-29):** the two-pass count-then-direct-column-fill
+   (`align_rt_json_decode_soa`) replaced decode→AoS→transpose. This flipped the SoA rail **≈0.82× →
+   ≈1.03× of serde** at 1M rows (now beats serde, and edges the AoS decode-only path which still
+   heap-materializes) — so lever (b) is done and the transpose penalty is gone. Lever (a) — the
+   SIMD/structural parser to reach the probe's 3.4–4.1× — remains the big open perf item (see the
+   Mison/two-stage record below); (c) narrow-struct field-skip is available as documented.
 3. **Known-schema field-skip / projection decode — DEFERRED 2026-06-27 (the perf is already
    available; the remaining delta is ergonomic-only and safety-sensitive).** KEY FINDING (verified
    2026-06-27): the runtime **already skips every JSON field not declared in the target struct**
@@ -1012,10 +1018,12 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     standard). Std should be `read_file_view`/`mmap`, `json.decode(view)`, `json.write(out, value)`,
     `csv.scan(view)`, `io.copy`/`writev` — never materialize an owned string in the hot path. (Std
     layer — after core; records the *direction*.)
-  - **Two-pass JSON→SoA (count then direct column fill).** The eventual form of json→soa: a structural
-    count pass for N, allocate columns, then fill columns directly — dropping the AoS intermediate +
-    transpose (the shipped #161 path). `str` columns via an offset+len column borrowing the input, or
-    a string arena. Refinement, not a redo.
+  - **Two-pass JSON→SoA (count then direct column fill) — SHIPPED (#228, 2026-06-29).** The eventual
+    form of json→soa landed: a structural count pass for N, allocate columns, then fill columns
+    directly (`align_rt_json_decode_soa`) — dropping the AoS intermediate + transpose of the earlier
+    #161 path. Result: full decode+aggregate ≈0.82× → ≈1.03× of `serde_json` at 1M rows (now beats
+    serde). Still open here: **`str` columns** via an offset+len column borrowing the input (or a
+    string arena) — the sema gate still rejects non-primitive-scalar soa fields. Refinement, not a redo.
   - **Formatter (implement).** In progress (M8). The *policy* was always settled (`draft.md` §4/§16:
     normalize only meaningless variation — spacing / `;` placement / trailing comma / alignment — and
     **preserve the author's one-line ↔ multi-line choice**). The **mechanism** is now settled too

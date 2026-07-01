@@ -526,8 +526,9 @@ pub enum ExprKind {
     /// expression `ty` is `Result<array<Struct>, Error>`.
     JsonDecodeStructArray { struct_id: u32, input: Box<Expr> },
     /// `json.decode(input)` targeting a `soa<Struct>` (the cache-optimal decode) — parse a JSON
-    /// array of objects into AoS (reusing the tested struct-array parser, since the array length N
-    /// is unknown until parsed) then transpose to a column-major `soa<Struct>`, arena-allocated.
+    /// array of objects **directly** into a column-major `soa<Struct>`, arena-allocated (the runtime
+    /// `align_rt_json_decode_soa`: a structural count pass discovers N, then values are written
+    /// straight into their columns — no AoS intermediate, no transpose; see #228).
     /// Fields must be primitive scalars (the `soa<T>` rule, so no `str` columns / input region tie),
     /// and it needs an enclosing `arena {}`. The expression `ty` is `Result<soa<Struct>, Error>`.
     JsonDecodeSoa { struct_id: u32, input: Box<Expr> },
