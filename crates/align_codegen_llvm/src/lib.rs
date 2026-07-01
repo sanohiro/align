@@ -1346,13 +1346,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     /// The address `ptr + offset` bytes, for `raw.load`/`raw.store` — an `i8` (byte-granular) GEP off
     /// the `raw` pointer by the i64 byte `offset`. The result is an opaque `ptr` (LLVM opaque
-    /// pointers), loaded/stored at the scalar's own (element) alignment.
+    /// pointers); the caller loads/stores it at **alignment 1** (an arbitrary byte offset may be
+    /// misaligned for the scalar). A plain (non-`inbounds`) GEP is used deliberately: a raw pointer
+    /// carries no allocation-bounds guarantee, and an `inbounds` GEP that steps outside the object
+    /// would be poison — letting the optimizer assume in-bounds and drop later checks. Plain `gep`
+    /// keeps unsafe pointer arithmetic well-defined (wrapping) as the caller intends.
     fn raw_elem_ptr(&mut self, ptr: &align_mir::Operand, offset: &align_mir::Operand) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let base = self.operand(ptr).into_pointer_value();
         let off = self.operand(offset).into_int_value();
         unsafe {
             self.builder
-                .build_in_bounds_gep(self.ctx.i8_type(), base, &[off], "rawelem")
+                .build_gep(self.ctx.i8_type(), base, &[off], "rawelem")
                 .map_err(|e| self.err(e))
         }
     }
