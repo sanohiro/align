@@ -587,6 +587,10 @@ pub enum ExprKind {
 pub enum GroupSource {
     /// `soa<Struct>`, contiguous columns, an **i64** key — the dense hash-aggregate path.
     SoaI64,
+    /// `soa<Struct>`, contiguous columns, a **str** key column — interned to dense ids by the runtime
+    /// reading the two separate contiguous columns (key + value), then aggregated and labeled
+    /// (`align_rt_group_*_str_cols`). The columnar counterpart of [`Self::AosStr`].
+    SoaStr,
     /// AoS `array<Struct>`, a **str** key — interned to dense ids inline by the runtime, then
     /// aggregated and labeled (A1, `align_rt_group_*_str`).
     AosStr,

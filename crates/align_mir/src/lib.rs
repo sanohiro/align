@@ -284,6 +284,14 @@ pub enum Rvalue {
     /// count (i64). `keys`/`vals` are `{ptr,len}` slices (soa columns; `vals` is unused for `count`);
     /// `out_keys`/`out_vals` are buffer pointers (from [`Rvalue::HeapAllocBuf`]).
     GroupAgg { keys: Operand, vals: Operand, out_keys: Operand, out_vals: Operand, op: hir::GroupOp },
+    /// `group_by(.str_key).{sum,min,max}(.i64_value)` / `.count()` over a `soa<Struct>` with a **str
+    /// key column** — the columnar counterpart of [`Self::GroupAggStr`]. `keys` is the `str` key
+    /// column (`{ptr,len}` over `[AlignStr]`), `vals` the i64 value column (both soa columns; `vals`
+    /// is ignored for `count`). codegen extracts the two column base pointers and calls
+    /// `align_rt_group_{sum,min,max,count}_str_cols`, which interns the `str` keys to dense ids and
+    /// aggregates. `out_keys` is a buffer of `str` views (borrowing the soa's string storage),
+    /// `out_vals` a buffer of i64 aggregates; yields the group count (i64).
+    GroupAggStrCols { keys: Operand, vals: Operand, out_keys: Operand, out_vals: Operand, op: hir::GroupOp },
     /// `group_by(.str_key).{sum,min,max}(.i64_value)` / `.count()` over an AoS `array<Struct>` (the
     /// dictionary-id rail). `base` is the source struct-array slot (a `{ptr,len}` over `[%Struct]`);
     /// codegen derives the per-row stride and the `key_field`/`value_field` byte offsets from the
@@ -1464,6 +1472,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             };
             match source {
                 hir::GroupSource::SoaI64 => lower_array_group_agg(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id),
+                hir::GroupSource::SoaStr => lower_array_group_str_cols(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id),
                 hir::GroupSource::AosStr => lower_array_group_str(b, *base, *struct_id, *key_field, *value_field, *op, tuple_id),
                 hir::GroupSource::Encoded => lower_array_group_encoded(b, *base, *struct_id, *value_field, *op, tuple_id),
             }
@@ -2758,6 +2767,56 @@ fn lower_array_group_agg(b: &mut Builder, base: u32, struct_id: u32, key_field: 
     ));
     // Build the two owned result arrays and the tuple.
     let karr = b.fresh_value(Ty::DynArray(i64s));
+    b.push(Stmt::Let(karr, Rvalue::MakeDynArray { ptr: Operand::Value(out_keys), len: Operand::Value(count) }));
+    let varr = b.fresh_value(Ty::DynArray(i64s));
+    b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(out_vals), len: Operand::Value(count) }));
+    let tup = b.fresh_value(Ty::Tuple(tuple_id));
+    b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(karr), Operand::Value(varr)] }));
+    Operand::Value(tup)
+}
+
+/// `s.group_by(.str_key).{sum,min,max}(.i64_value)` / `.count()` over a `soa<Struct>` with a **str
+/// key column**. The columnar counterpart of [`lower_array_group_str`]: it extracts the key column
+/// (a `slice<str>`) and value column (a `slice<i64>`) via [`Rvalue::SoaColumn`] like the i64-key soa
+/// path, but interns the `str` keys — the two contiguous columns feed [`Rvalue::GroupAggStrCols`]
+/// (`align_rt_group_*_str_cols`). Result tuple `(array<str>, array<i64>)`; the owned key buffer's
+/// `str` elements borrow the soa's string storage, so the tuple is region-tied to the source (sema).
+fn lower_array_group_str_cols(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, value_field: Option<u32>, op: hir::GroupOp, tuple_id: u32) -> Operand {
+    let strs = scalar_of(Ty::Str);
+    let i64s = scalar_of(i64_ty());
+    // The str key column (always) and the i64 value column (sum/min/max). `count` has no value
+    // column, so it reuses the key column as the (runtime-ignored) `vals` operand.
+    let key_col = b.fresh_value(Ty::Slice(strs));
+    b.push(Stmt::Let(key_col, Rvalue::SoaColumn { base, struct_id, field: key_field }));
+    let val_col = match value_field {
+        Some(vf) => {
+            let v = b.fresh_value(Ty::Slice(i64s));
+            b.push(Stmt::Let(v, Rvalue::SoaColumn { base, struct_id, field: vf }));
+            v
+        }
+        None => key_col,
+    };
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(key_col))));
+    // Output buffers (owned heap): `str`-view keys + i64 aggregates, each sized at the row count.
+    let out_keys = b.fresh_value(Ty::Box(strs));
+    b.push(Stmt::Let(out_keys, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: Ty::Str }));
+    let out_vals = b.fresh_value(Ty::Box(i64s));
+    b.push(Stmt::Let(out_vals, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+    // Intern + aggregate over the two columns → group count.
+    let count = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(
+        count,
+        Rvalue::GroupAggStrCols {
+            keys: Operand::Value(key_col),
+            vals: Operand::Value(val_col),
+            out_keys: Operand::Value(out_keys),
+            out_vals: Operand::Value(out_vals),
+            op,
+        },
+    ));
+    // Build the two owned result arrays and the tuple.
+    let karr = b.fresh_value(Ty::DynArray(strs));
     b.push(Stmt::Let(karr, Rvalue::MakeDynArray { ptr: Operand::Value(out_keys), len: Operand::Value(count) }));
     let varr = b.fresh_value(Ty::DynArray(i64s));
     b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(out_vals), len: Operand::Value(count) }));

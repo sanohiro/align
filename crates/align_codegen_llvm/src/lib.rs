@@ -598,6 +598,17 @@ fn build_module<'c>(
     ] {
         funcs.insert(key.to_string(), module.add_function(sym, group_str_ty, None));
     }
+    // group_by(.str_key).{sum,min,max}(.i64_value) / .count() over a soa<Struct> with a str key
+    // column — the two-contiguous-column form: (key_col, val_col, n, out_keys, out_vals, cap) ->
+    // count. Same 6-arg shape as the i64 `group_vty`; all four ops share it (count ignores val_col).
+    for (key, sym) in [
+        ("group_sum_str_cols", "align_rt_group_sum_str_cols"),
+        ("group_min_str_cols", "align_rt_group_min_str_cols"),
+        ("group_max_str_cols", "align_rt_group_max_str_cols"),
+        ("group_count_str_cols", "align_rt_group_count_str_cols"),
+    ] {
+        funcs.insert(key.to_string(), module.add_function(sym, group_vty, None));
+    }
     // Fused multi-aggregate str group-by: (base, n, stride, key_off, specs, k, out_keys, cap) -> count.
     // `specs` is a `[k x {i64 val_off, i64 op, ptr out_vals}]` table built at the call site.
     funcs.insert(
@@ -2597,6 +2608,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     )
                 };
                 call.map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .expect("group aggregate returns the group count (i64)")
+            }
+            Rvalue::GroupAggStrCols { keys, vals, out_keys, out_vals, op } => {
+                // The soa str-key form: extract the str key-column ptr + length and the i64
+                // value-column ptr from the two `{ptr,len}` column slices, and call the runtime
+                // two-column str aggregate. `cap` = column length (upper bound on groups). All four
+                // ops share one signature; `count` ignores the value ptr (which is the key column).
+                use align_sema::hir::GroupOp;
+                let kagg = self.operand(keys).into_struct_value();
+                let kptr = self.builder.build_extract_value(kagg, 0, "kptr").map_err(|e| self.err(e))?;
+                let klen = self.builder.build_extract_value(kagg, 1, "klen").map_err(|e| self.err(e))?;
+                let vptr = self
+                    .builder
+                    .build_extract_value(self.operand(vals).into_struct_value(), 0, "vptr")
+                    .map_err(|e| self.err(e))?;
+                let ok = self.operand(out_keys);
+                let ov = self.operand(out_vals);
+                let f = match op {
+                    GroupOp::Sum => "group_sum_str_cols",
+                    GroupOp::Min => "group_min_str_cols",
+                    GroupOp::Max => "group_max_str_cols",
+                    GroupOp::Count => "group_count_str_cols",
+                };
+                self.builder
+                    .build_call(
+                        self.funcs[f],
+                        &[kptr.into(), vptr.into(), klen.into(), ok.into(), ov.into(), klen.into()],
+                        "groupaggstrcols",
+                    )
+                    .map_err(|e| self.err(e))?
                     .try_as_basic_value()
                     .basic()
                     .expect("group aggregate returns the group count (i64)")

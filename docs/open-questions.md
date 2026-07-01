@@ -403,6 +403,25 @@ when the struct has a str field (a primitive-only `to_soa` stays purely arena-re
 like the decode path. `tests/soa.rs` (`to_soa_transposes_a_str_column`,
 `to_soa_str_column_view_cannot_escape_the_arena`, `to_soa_with_a_nested_field_struct_is_rejected`).
 
+**str-key `group_by` over a `soa<Struct>` — DONE (2026-07-01).** `s.group_by(.name).{sum,min,max}(.pay)`
+/ `.count()` now works when the key is a **`str` column** (previously a soa keyed only on an i64
+column; a str key required an AoS `array<Struct>`). Since a soa can hold str columns, this is the
+natural columnar counterpart of the AoS str-key rail. Same surface, same result `(array<str>,
+array<i64>)`. Implementation: a new `hir::GroupSource::SoaStr` (chosen in `check_group_agg` when the
+soa key field's type is `Ty::Str`, else `SoaI64`); MIR `lower_array_group_str_cols` extracts the key
+column (`slice<str>`) + value column (`slice<i64>`) via `SoaColumn` (like the i64-key soa path) and
+emits a new `Rvalue::GroupAggStrCols`; codegen extracts the two column base pointers and calls a new
+runtime `align_rt_group_{sum,min,max,count}_str_cols(key_col, val_col, n, out_keys, out_vals, cap)`.
+The runtime **shares one core** with the AoS str path: `group_agg_str` was refactored to take
+`key_at`/`value_at` **index closures** (mirroring `group_agg_i64`'s `per_row`), so the AoS wrapper
+feeds strided-record closures and the soa wrapper feeds two-contiguous-column closures — one interning
+implementation, two column layouts. **Region**: the str keys borrow the soa's string storage, so
+`region_of(ArrayGroupAgg{SoaStr})` inherits `base`'s region (added to the same arm as `AosStr`) —
+escape-checked (a str-key result can't leave the arena; an i64-key result's owned keys still can).
+`tests/soa.rs` (`soa_str_key_group_by_all_aggregates`, `…_type_checks_and_selects_by_key_column`,
+`…_result_cannot_escape_the_arena`), runtime `group_str_cols_aggregates_two_separate_columns`,
+`draft.md` §9. **Deferred:** fused multi-aggregate (`.agg(...)`) over a soa str key (still AoS-only).
+
 **Scalar-accessor slice DONE — `s.len()` + `s[i].field`.** A soa now answers `s.len()` (its row
 count — the `{ptr,len}` length, via `ExprKind::Len` → `SliceLen`) and `s[i].field` (one column's
 element directly, the column-major analogue of AoS `arr[i].field`). `s[i].field` reuses the fused
