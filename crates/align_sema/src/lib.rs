@@ -2226,8 +2226,10 @@ impl<'a> EscapeCheck<'a> {
             // it. `arena(depth)` is the shortest-lived (most restrictive) region anything allocated
             // at this depth can have, so it conservatively covers an accumulator that instead just
             // forwards `init` or borrows a source element (both outlive `arena(depth)`).
-            // `to_soa` bump-allocates the column buffer in the enclosing arena; the returned view
+            // These allocating producers bump-allocate in the enclosing arena; the returned value
             // borrows it, so it is arena-regioned and cannot escape (like `to_array`'s buffer).
+            // (`to_soa` and `json.decode → soa` are handled separately below — a `str`-bearing soa
+            // also borrows its source/input, so it needs the shorter of the two regions.)
             ExprKind::ArrayToArray { .. }
             | ExprKind::ArrayPartition { .. }
             | ExprKind::ArrayParMap { .. }
