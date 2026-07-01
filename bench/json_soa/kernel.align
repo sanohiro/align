@@ -62,3 +62,39 @@ pub fn agg_aos_len(data: str) -> i64 {
     Err(_) => 0 - 1,
   }
 }
+
+// Projection variant: the SAME 4-field JSON, but decoded into a NARROW `soa<Row2>` declaring only
+// the two fields the aggregate reads. The Mison speculation skips the undeclared `score`/`extra`
+// colons entirely (no key-verify, no value-parse) and only two columns are built — so this exercises
+// BOTH projection wins at once: decode-projection (skip unqueried fields) + columnar scan (touch only
+// the two columns). This is where the SIMD/positional decode should pull ahead of `serde` decoding
+// the same JSON into a narrow 2-field struct (serde also skips the other two keys).
+Row2 { active: bool, pay: i64 }
+
+fn run_proj(data: str) -> Result<i64, Error> {
+  arena {
+    s: soa<Row2> := json.decode(data)?
+    return Ok(s.where(.active).pay.sum())
+  }
+}
+
+fn run_proj_len(data: str) -> Result<i64, Error> {
+  arena {
+    s: soa<Row2> := json.decode(data)?
+    return Ok(s.pay.len())
+  }
+}
+
+pub fn agg_proj(data: str) -> i64 {
+  match run_proj(data) {
+    Ok(v) => v,
+    Err(_) => 0 - 1,
+  }
+}
+
+pub fn agg_proj_len(data: str) -> i64 {
+  match run_proj_len(data) {
+    Ok(v) => v,
+    Err(_) => 0 - 1,
+  }
+}

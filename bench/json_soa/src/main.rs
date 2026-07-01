@@ -28,6 +28,12 @@ extern "C" {
     fn agg_aos(data: AlignStr) -> i64;
     /// `pub fn agg_aos_len(data: str) -> i64` — decode → `array<Row>`, return row count.
     fn agg_aos_len(data: AlignStr) -> i64;
+    /// `pub fn agg_proj(data: str) -> i64` — decode the SAME 4-field JSON into a NARROW `soa<Row2>`
+    /// (only `active`+`pay` declared → the decoder skips `score`/`extra`), then the same aggregate.
+    /// The projection rail: decode-projection (skip unqueried fields) + columnar scan.
+    fn agg_proj(data: AlignStr) -> i64;
+    /// `pub fn agg_proj_len(data: str) -> i64` — decode → narrow `soa<Row2>`, return row count.
+    fn agg_proj_len(data: AlignStr) -> i64;
 }
 
 // `score`/`extra` are deserialized for fidelity (a fair 4-field record) but not read by the
@@ -44,6 +50,19 @@ struct Row {
 /// Idiomatic Rust: deserialize the whole array into a `Vec<Row>` (AoS), then filter + sum.
 fn rust_agg(data: &str) -> i64 {
     let rows: Vec<Row> = serde_json::from_str(data).expect("valid JSON");
+    rows.iter().filter(|r| r.active).map(|r| r.pay).sum()
+}
+
+/// The fair projection baseline: serde into a NARROW 2-field struct — serde skips the two undeclared
+/// keys (`score`/`extra`) just as Align's decoder does, so both sides "declare 2, skip 2".
+#[derive(Deserialize)]
+struct Row2 {
+    active: bool,
+    pay: i64,
+}
+
+fn rust_agg_proj(data: &str) -> i64 {
+    let rows: Vec<Row2> = serde_json::from_str(data).expect("valid JSON");
     rows.iter().filter(|r| r.active).map(|r| r.pay).sum()
 }
 
@@ -77,21 +96,25 @@ fn main() {
     let sizes = [10_000usize, 100_000, 1_000_000];
     let rounds = 30;
     let profile = std::env::var_os("ALIGN_BENCH_PROFILE").is_some();
-    println!("JSON decode + where(.active).pay.sum() — Align soa / Align AoS / Rust serde_json→Vec");
+    println!("JSON decode + where(.active).pay.sum() — Align soa / Align AoS / Align proj (narrow soa) vs serde_json");
     println!(
-        "{:>9}  {:>8}  {:>10}  {:>10}  {:>10}  {:>9}  {:>9}",
-        "records", "json KB", "soa ms", "aos ms", "rust ms", "soa/rust", "aos/rust"
+        "{:>9}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}  {:>8}  {:>9}",
+        "records", "json KB", "soa ms", "aos ms", "proj ms", "rust ms", "soa/rust", "aos/rust", "proj/rustP"
     );
     for &n in &sizes {
         let (json, expected) = gen_json(n);
         let astr = AlignStr { ptr: json.as_ptr(), len: json.len() as i64 };
 
-        // Correctness: all three must agree with the generator before we trust the timing.
+        // Correctness: all four must agree with the generator before we trust the timing (the
+        // projection variant reads the same two fields, so it must produce the same sum).
         assert_eq!(unsafe { agg(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align soa wrong");
         assert_eq!(unsafe { agg_aos(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align aos wrong");
+        assert_eq!(unsafe { agg_proj(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align proj wrong");
         assert_eq!(rust_agg(&json), expected, "rust wrong");
+        assert_eq!(rust_agg_proj(&json), expected, "rust proj wrong");
 
-        let (mut soa_min, mut aos_min, mut rust_min) = (f64::MAX, f64::MAX, f64::MAX);
+        let (mut soa_min, mut aos_min, mut proj_min, mut rust_min, mut rustp_min) =
+            (f64::MAX, f64::MAX, f64::MAX, f64::MAX, f64::MAX);
         for _ in 0..rounds {
             let t = Instant::now();
             std::hint::black_box(unsafe { agg(AlignStr { ptr: astr.ptr, len: astr.len }) });
@@ -102,24 +125,35 @@ fn main() {
             aos_min = aos_min.min(t.elapsed().as_secs_f64() * 1e3);
 
             let t = Instant::now();
+            std::hint::black_box(unsafe { agg_proj(AlignStr { ptr: astr.ptr, len: astr.len }) });
+            proj_min = proj_min.min(t.elapsed().as_secs_f64() * 1e3);
+
+            let t = Instant::now();
             std::hint::black_box(rust_agg(&json));
             rust_min = rust_min.min(t.elapsed().as_secs_f64() * 1e3);
+
+            let t = Instant::now();
+            std::hint::black_box(rust_agg_proj(&json));
+            rustp_min = rustp_min.min(t.elapsed().as_secs_f64() * 1e3);
         }
         println!(
-            "{:>9}  {:>8}  {:>10.3}  {:>10.3}  {:>10.3}  {:>8.2}x  {:>8.2}x",
+            "{:>9}  {:>8}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {:>7.2}x  {:>7.2}x  {:>8.2}x",
             n,
             json.len() / 1024,
             soa_min,
             aos_min,
+            proj_min,
             rust_min,
             rust_min / soa_min,
-            rust_min / aos_min
+            rust_min / aos_min,
+            rustp_min / proj_min
         );
 
         if profile && n == 1_000_000 {
             assert_eq!(unsafe { agg_len(AlignStr { ptr: astr.ptr, len: astr.len }) }, n as i64, "align soa len wrong");
             assert_eq!(unsafe { agg_aos_len(AlignStr { ptr: astr.ptr, len: astr.len }) }, n as i64, "align aos len wrong");
-            let (mut soa_len_min, mut aos_len_min) = (f64::MAX, f64::MAX);
+            assert_eq!(unsafe { agg_proj_len(AlignStr { ptr: astr.ptr, len: astr.len }) }, n as i64, "align proj len wrong");
+            let (mut soa_len_min, mut aos_len_min, mut proj_len_min) = (f64::MAX, f64::MAX, f64::MAX);
             for _ in 0..rounds {
                 let t = Instant::now();
                 std::hint::black_box(unsafe { agg_len(AlignStr { ptr: astr.ptr, len: astr.len }) });
@@ -128,11 +162,16 @@ fn main() {
                 let t = Instant::now();
                 std::hint::black_box(unsafe { agg_aos_len(AlignStr { ptr: astr.ptr, len: astr.len }) });
                 aos_len_min = aos_len_min.min(t.elapsed().as_secs_f64() * 1e3);
+
+                let t = Instant::now();
+                std::hint::black_box(unsafe { agg_proj_len(AlignStr { ptr: astr.ptr, len: astr.len }) });
+                proj_len_min = proj_len_min.min(t.elapsed().as_secs_f64() * 1e3);
             }
             println!("profile 1M:");
-            println!("  soa decode+transpose-only {:8.3} ms; aggregate delta {:8.3} ms", soa_len_min, soa_min - soa_len_min);
+            println!("  soa decode-only (4 cols)  {:8.3} ms; aggregate delta {:8.3} ms", soa_len_min, soa_min - soa_len_min);
             println!("  aos decode-only           {:8.3} ms; aggregate delta {:8.3} ms", aos_len_min, aos_min - aos_len_min);
-            println!("  transpose/materialize delta vs aos-only {:8.3} ms", soa_len_min - aos_len_min);
+            println!("  proj decode-only (2 cols) {:8.3} ms; aggregate delta {:8.3} ms", proj_len_min, proj_min - proj_len_min);
+            println!("  decode-projection saving (soa 4col -> proj 2col) {:8.3} ms", soa_len_min - proj_len_min);
         }
     }
 }
