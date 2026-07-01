@@ -1804,14 +1804,14 @@ Backend / codegen lowering (MIR -> LLVM, source unchanged):
   implementation; the foundation is cross-ISA — same shaped-op surface lowers to SME, AMX, or a
   scalar fallback, picked by the capability dispatch above, never named in source). Taking SME as the
   worked example. SME is NOT another wider NEON — it is a 2D tile accumulator (ZA register,
-  outer-product-accumulate -> matmul) requiring streaming-SVE mode (PSTATE.SM) and a streaming-
+  outer-product-accumulate → matmul) requiring streaming-SVE mode (PSTATE.SM) and a streaming-
   function ABI, so it lands in codegen's ABI layer, not as a loop-vectorization tweak. Hard
   constraints that keep the door open WITHOUT building it now: (1) never expose SME (or any fixed
   width) in source — the only surface is a high-level shaped op (`tensor.matmul`, batched
   outer-product/reduce) that lowers to SME with a NEON fallback, per "SIMD comes from map/reduce
-  lowering well, not intrinsics" + Nothing-hidden; the language stays width-/engine-agnostic.
+  lowering well, not intrinsics" + Nothing hidden; the language stays width-/engine-agnostic.
   (2) Keep MIR free of baked-in vector width / NEON-128 assumptions so the same IR can target
-  NEON today and SME/SVE2 later (already the "capabilities not feature-names" dispatch rule above).
+  NEON today and SME/SVE2 later (already the "capabilities, not feature-names" dispatch rule above).
   (3) The prerequisite is a 2D/tensor abstraction — design the M4 array model so a 2D extension +
   reduce-over-2D is reachable, don't make `array`/pipeline fundamentally 1D-only. Trigger: a tensor
   surface lands AND SME hardware is testable (Apple M4+ has SME but no SVE; cloud Graviton/A64FX for
