@@ -1237,7 +1237,6 @@ A view is **not** a valid return type (a bare C pointer carries no length — a 
 pointer maps to `raw`). And an Align `str`/`slice` is **not NUL-terminated** (it is a length-bounded
 view), so only hand it to length-based C functions (`memcmp`/`memcpy`/`write`/…); a NUL-terminated
 API (`strlen`, `printf "%s"`) would read past the end — the programmer's `unsafe` responsibility.
-Passing a struct **by value** (register/`byval` ABI) is a later slice.
 
 ### Linking an external library (`link("name")`)
 
@@ -1275,8 +1274,22 @@ unsafe {
 Only a `layout(C)` struct may be moved through a `raw` pointer (`raw.store`/`raw.load` of a whole
 struct), because only it promises a fixed representation — this is the pointer-based FFI pattern
 (hand C a buffer, read/write structs in it). Its fields must be FFI-mappable scalars (integers,
-floats). Passing a `layout(C)` struct **by value** to a C function (register/`byval` ABI) is a later
-slice.
+floats).
+
+### Not in FFI v1 (deliberate boundaries)
+
+- **A struct by value.** A `layout(C)` struct crosses the boundary by **pointer** (above). Passing or
+  returning one *by value* needs per-target register-classification (SysV eightbytes, AAPCS64, `byval`
+  / `sret`) — the one FFI corner where a wrong rule silently miscompiles. It is deferred rather than
+  shipped half-right; struct-by-pointer already covers the dominant C-API shape.
+- **`bool` / `char` as FFI types.** Use the integer types, which map to C unambiguously: a C `_Bool`
+  is a `u8` (0/1), a C `char` is an `i8`/`u8`, a `char32_t`/`wchar_t` is an `i32`/`u32`. Align's
+  `char` is a 32-bit Unicode scalar (**not** a C `char`), so admitting it as an FFI type would invite
+  the wrong mapping; `bool` is kept out for the same "one unambiguous way" reason (and to avoid the
+  `i1`-`zeroext` ABI subtlety).
+- **A typed pointer cast (`raw.ptr_cast<T>`).** With one opaque pointer type (`raw`) a *typed*
+  reinterpret has nothing to reinterpret to; it earns meaning only once FFI grows typed/external
+  pointers, so it is deferred until then.
 
 Rust-style lifetimes are not exposed on the surface.
 However, an obvious lifetime violation, such as a view escaping an arena, is a compile error.

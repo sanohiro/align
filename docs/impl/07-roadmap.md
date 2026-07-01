@@ -902,11 +902,15 @@ Completion condition: confirm that the vectorized code contains vector instructi
   the driver's `link_executable` appends `-l<name>` after the objects/runtime (libc/libm stay
   auto-linked). `ast::ExternBlock.link`, parser `parse_link_clause`. (`tests/ffi_link.rs`,
   `examples/ffi_link.align`.)
-  **Remaining (widen):** the draft's `raw.ptr_cast<T>` (unchecked cast / reinterpret) is still
-  deferred — with only `raw` (opaque bytes) a typed cast has nothing to reinterpret *to*; it earns
-  meaning once FFI grows typed/external pointers. Later FFI slices: **by-value `layout(C)` struct
-  passing** (SysV/AAPCS register + `byval`/`sret` ABI classification) and `bool`/`char` params — the
-  last widening the `std`/`pkg` C-engine wrappers need.
+  **FFI v1 is COMPLETE** (extern decls + unsafe-gating, scalar+`raw`+`()` signatures, `layout(C)`
+  struct-by-pointer, `str`/`slice`/`bytes` views, `link("name")`). **Deliberately out of v1** (draft
+  §15 "Not in FFI v1"): **by-value struct passing** — per-target register classification (SysV
+  eightbytes / AAPCS64 / `byval` / `sret`), the one corner where a wrong rule silently miscompiles;
+  deferred rather than shipped half-right (struct-by-pointer covers the dominant C-API shape).
+  `bool`/`char` as FFI types — use the integer types (a C `_Bool` = `u8`, `char` = `i8`/`u8`,
+  `char32_t` = `u32`; Align `char` is a Unicode scalar, not a C `char`), keeping one unambiguous way
+  and dodging the `i1`-`zeroext` subtlety. `raw.ptr_cast<T>` — a typed reinterpret is meaningless with
+  one opaque pointer type; it waits on typed/external pointers.
 
 ## Design Issues to Settle in Parallel
 
