@@ -3760,12 +3760,41 @@ impl<'a, 't> Checker<'a, 't> {
             _ if a == b => a,
             _ => {
                 self.diags.error(
-                    format!("type mismatch: {} vs {}", ty_name(a), ty_name(b)),
+                    format!("type mismatch: {} vs {}", self.ty_display(a), self.ty_display(b)),
                     span,
                 );
                 Ty::Error
             }
         }
+    }
+
+    /// A user-facing type name that resolves struct/enum ids to their declared source names —
+    /// unlike the free `ty_name`, which has no name tables and prints `struct#0` / `enum#0`. Used
+    /// in type-mismatch diagnostics so a user sees `Error`, not `enum#0`. Recurses into composite
+    /// payloads (a `Result<i32, Error>` shows `Error`, not `enum#0`).
+    fn ty_display(&self, ty: Ty) -> String {
+        match ty {
+            Ty::Struct(id) => self.structs.get(id as usize).map(|s| s.name.clone()).unwrap_or_else(|| ty_name(ty)),
+            Ty::Enum(id) => self.enums.get(id as usize).map(|e| e.name.clone()).unwrap_or_else(|| ty_name(ty)),
+            Ty::Option(s) => format!("Option<{}>", self.scalar_display(s)),
+            Ty::Result(o, e) => format!("Result<{}, {}>", self.scalar_display(o), self.scalar_display(e)),
+            Ty::Box(s) => format!("box<{}>", self.scalar_display(s)),
+            Ty::Task(s) => format!("Task<{}>", self.scalar_display(s)),
+            Ty::Array(s, n) => format!("array<{}>[{n}]", self.scalar_display(s)),
+            Ty::Slice(s) => format!("slice<{}>", self.scalar_display(s)),
+            Ty::DynArray(s) => format!("array<{}>", self.scalar_display(s)),
+            Ty::StructArray(id, n) => format!("array<{}>[{n}]", self.ty_display(Ty::Struct(id))),
+            Ty::DynStructArray(id, _) => format!("array<{}>", self.ty_display(Ty::Struct(id))),
+            Ty::Soa(id) => format!("soa<{}>", self.ty_display(Ty::Struct(id))),
+            Ty::DictEncoded(id, _) => format!("dict_encoded<{}>", self.ty_display(Ty::Struct(id))),
+            // No id (primitives), or no source name to resolve (tuple#, fn#) — the free form is fine.
+            _ => ty_name(ty),
+        }
+    }
+
+    /// [`ty_display`] for a scalar payload (an `Option`/`Result`/`box` element may itself be an enum).
+    fn scalar_display(&self, s: Scalar) -> String {
+        self.ty_display(scalar_to_ty(s))
     }
 
     /// Constrain `ty` to an expected type if one is given.
@@ -5408,7 +5437,7 @@ impl<'a, 't> Checker<'a, 't> {
             let e = self.check_expr(a, Some(pt));
             if e.ty != Ty::Error && self.resolve(e.ty) != pt {
                 self.diags.error(
-                    format!("argument type mismatch: expected {}, got {}", ty_name(pt), ty_name(e.ty)),
+                    format!("argument type mismatch: expected {}, got {}", self.ty_display(pt), self.ty_display(e.ty)),
                     e.span,
                 );
             }
@@ -9035,7 +9064,7 @@ impl<'a, 't> Checker<'a, 't> {
                 let pt = scalar_to_ty(s);
                 let e = self.check_expr(a, Some(pt));
                 if e.ty != Ty::Error && self.resolve(e.ty) != pt {
-                    self.diags.error(format!("payload type mismatch: expected {}, got {}", ty_name(pt), ty_name(e.ty)), e.span);
+                    self.diags.error(format!("payload type mismatch: expected {}, got {}", self.ty_display(pt), self.ty_display(e.ty)), e.span);
                 }
                 e
             })

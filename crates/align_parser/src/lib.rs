@@ -69,9 +69,17 @@ pub fn parse_file(tokens: Vec<Token>, diags: &mut Diagnostics) -> File {
         pos: 0,
         diags,
         no_struct_literal: false,
+        depth: 0,
     };
     p.parse_file()
 }
+
+/// Recursion-depth ceiling for expression parsing. Deeply nested input (`((((…))))`, a long unary
+/// chain `----…`) would otherwise overflow the native stack and abort the process; past this we
+/// emit one diagnostic and stop. Set well above any realistic hand-written or generated nesting
+/// (hundreds of levels), yet low enough to stay safe on a small (2 MB) worker/test stack — each
+/// nesting level costs several parser frames.
+const MAX_EXPR_DEPTH: u32 = 256;
 
 struct Parser<'a> {
     tokens: Vec<Token>,
@@ -82,6 +90,8 @@ struct Parser<'a> {
     /// (a struct literal there must be parenthesized, `if (P { x: 1 }).ok { … }`). Cleared inside
     /// any delimiter (`(...)`, `[...]`, call args) where the block ambiguity can't arise.
     no_struct_literal: bool,
+    /// Current expression-recursion depth (see [`MAX_EXPR_DEPTH`]).
+    depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -776,7 +786,7 @@ impl<'a> Parser<'a> {
                 span: d.span.map(remap),
             });
         }
-        let mut sub = Parser { tokens, pos: 0, diags: self.diags, no_struct_literal: false };
+        let mut sub = Parser { tokens, pos: 0, diags: self.diags, no_struct_literal: false, depth: 0 };
         let expr = sub.parse_expr(0);
         // The lexer appends an implicit `End` before `Eof`; skip it, then reject any
         // remaining tokens (e.g. `{x y}`): a hole must be exactly one expression.
@@ -792,6 +802,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self, min_bp: u8) -> Option<Expr> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            self.diags.error("expression nests too deeply".to_string(), self.span());
+            return None;
+        }
+        let r = self.parse_expr_inner(min_bp);
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_expr_inner(&mut self, min_bp: u8) -> Option<Expr> {
         let mut lhs = self.parse_cast()?;
         loop {
             let Some((op, bp, n)) = self.binop() else {
@@ -874,6 +896,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_prefix(&mut self) -> Option<Expr> {
+        // A long unary chain (`----…x`) recurses here without going through `parse_expr`, so guard
+        // depth here too (shared counter) — else it overflows the native stack and aborts.
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            self.diags.error("expression nests too deeply".to_string(), self.span());
+            return None;
+        }
+        let r = self.parse_prefix_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_prefix_inner(&mut self) -> Option<Expr> {
         let start = self.span();
         let op = match self.peek() {
             TokKind::Minus => Some(UnOp::Neg),
@@ -1606,6 +1642,27 @@ mod tests {
         // as a call argument in a condition is still a struct literal.
         let (_f, err) = parse("P { a: i32 }\nfn g(p: P) -> bool = true\nfn f() -> i32 {\n  if g(P { a: 1 }) { return 1 }\n  return 0\n}\n");
         assert!(!err);
+    }
+
+    #[test]
+    fn deeply_nested_input_errors_instead_of_overflowing_stack() {
+        // 2-4: pathological nesting used to overflow the native stack and abort the process. It must
+        // now report a bounded diagnostic and return. Run on an 8 MB stack (the compiler parses on
+        // the main thread, whose default stack is that large) — the default *test* thread stack is
+        // smaller, and the point is that the guard bounds recursion, not that it fits 2 MB.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let parens = format!("fn main() -> i32 {{ return {}1{} }}\n", "(".repeat(50_000), ")".repeat(50_000));
+                let (_f, err) = parse(&parens);
+                assert!(err, "deep parens should report an error, not crash");
+                let unary = format!("fn main() -> i32 {{ return {}1 }}\n", "-".repeat(100_000));
+                let (_f, err) = parse(&unary);
+                assert!(err, "deep unary chain should report an error, not crash");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

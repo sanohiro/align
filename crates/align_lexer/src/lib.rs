@@ -310,6 +310,12 @@ impl<'a> Lexer<'a> {
             .collect();
         if is_float {
             match text.parse::<f64>() {
+                // A finite magnitude too large for `f64` parses as `inf`; that is an overflow, not
+                // a valid literal (there is no infinity literal syntax) — diagnose it, like an
+                // out-of-range integer, instead of silently producing `inf`.
+                Ok(v) if v.is_infinite() => {
+                    diags.error(format!("float literal out of range (overflows to infinity): '{text}'"), self.span(start, self.pos));
+                }
                 Ok(v) => self.push(TokKind::Float(v), start),
                 Err(_) => {
                     diags.error(format!("invalid float literal: '{text}'"), self.span(start, self.pos));
@@ -366,6 +372,12 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b'\\') => {
                     self.pos += 1;
+                    // A `\` immediately before EOF or a newline: the string is unterminated. Report
+                    // that (once), rather than misreporting the absent escaped char as `'\?'`.
+                    if matches!(self.peek(), None | Some(b'\n')) {
+                        diags.error("unterminated string literal".to_string(), self.span(start, self.pos));
+                        break;
+                    }
                     let e = self.peek();
                     self.pos += 1;
                     match e {
@@ -556,9 +568,32 @@ impl<'a> Lexer<'a> {
             (b'?', _) => (TokKind::Question, 1),
             (b';', _) => (TokKind::End, 1),
             _ => {
-                self.pos += 1;
+                // Report the whole (possibly multi-byte) UTF-8 character once and advance past
+                // exactly its bytes — not one byte at a time, which mangles a non-ASCII glyph
+                // (`π` → `'Ï'` + a stray byte) and emits a spurious error per continuation byte.
+                let char_len = if c & 0x80 == 0 {
+                    1
+                } else if c & 0xE0 == 0xC0 {
+                    2
+                } else if c & 0xF0 == 0xE0 {
+                    3
+                } else if c & 0xF8 == 0xF0 {
+                    4
+                } else {
+                    1
+                };
+                let max_len = char_len.min(self.src.len() - self.pos);
+                let (display, adv) = match std::str::from_utf8(&self.src[self.pos..self.pos + max_len]) {
+                    Ok(valid) if !valid.is_empty() => {
+                        let ch = valid.chars().next().unwrap();
+                        (ch.to_string(), ch.len_utf8())
+                    }
+                    // Invalid UTF-8: consume exactly one byte (not `'\u{FFFD}'.len_utf8()`).
+                    _ => (format!("byte 0x{c:02x}"), 1),
+                };
+                self.pos += adv;
                 diags.error(
-                    format!("unexpected character: '{}'", c as char),
+                    format!("unexpected character: '{display}'"),
                     self.span(start, self.pos),
                 );
                 return;
@@ -609,6 +644,36 @@ mod tests {
             .into_iter()
             .map(|t| t.kind)
             .collect()
+    }
+
+    fn errs(src: &str) -> Vec<String> {
+        let mut d = Diagnostics::new();
+        tokenize(0, src, &mut d);
+        d.iter().map(|e| e.message.clone()).collect()
+    }
+
+    // 2-5: a float literal that overflows to infinity is diagnosed, not silently `inf`.
+    #[test]
+    fn float_overflow_to_inf_is_diagnosed() {
+        let es = errs("fn main() -> i32 {\n  x := 1e999\n  return 0\n}\n");
+        assert!(es.iter().any(|m| m.contains("overflows to infinity")), "got {es:?}");
+    }
+
+    // 2-6: a non-ASCII character is reported once with the correct glyph, not byte-by-byte.
+    #[test]
+    fn non_ascii_char_reported_once_with_correct_glyph() {
+        let es = errs("π");
+        let unexpected: Vec<_> = es.iter().filter(|m| m.starts_with("unexpected character")).collect();
+        assert_eq!(unexpected.len(), 1, "one error per char, got {es:?}");
+        assert!(unexpected[0].contains('π'), "should show the real glyph, got {unexpected:?}");
+    }
+
+    // 2-8: a backslash immediately before EOF reports only "unterminated", not a bogus `'\?'` escape.
+    #[test]
+    fn backslash_before_eof_is_only_unterminated() {
+        let es = errs("\"abc\\");
+        assert!(es.iter().any(|m| m.contains("unterminated string literal")), "got {es:?}");
+        assert!(!es.iter().any(|m| m.contains("unknown string escape")), "no bogus escape error, got {es:?}");
     }
 
     #[test]
