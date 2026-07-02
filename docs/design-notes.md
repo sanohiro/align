@@ -172,6 +172,21 @@ arena
 chunk processing
 ```
 
+### Why the default struct layout is unspecified (field reordering)
+
+A normal struct's field order is the compiler's business, not the source's: fields are laid out in
+descending alignment so padding disappears (`{ a: i8, b: i64, c: i8 }` is 16 bytes, not the 24 that
+declaration order would waste). This is the cache-density lever applied to the *element* level — a
+tighter struct means more elements per cache line, fewer bytes streamed, better use of every load —
+and it is exactly the reasoning behind `soa<T>` and the arena, one layer down. It costs nothing: safe
+Align has no field-address-taking, so the physical order is semantically unobservable (access is by
+name), and there is a well-worn precedent — Rust reorders struct fields by default for the same
+reason. The one place a fixed byte layout matters — crossing to C, `raw` memory, JSON's byte
+contract, by-value register passing — already has its marker, `layout(C)`, which pins declaration
+order. So the default optimizes for the machine, and the escape hatch is explicit and visible where a
+human or an ABI actually needs the bytes nailed down: hardware-friendly by default, "nothing hidden"
+where it counts.
+
 ---
 
 ## Memory model v2: one region lattice, explicit copies

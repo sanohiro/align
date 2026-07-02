@@ -452,8 +452,10 @@ fn ty_size_align(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64
     }
 }
 
-/// Natural-alignment `(size, align)` of a struct laid out AoS in declaration order (the dual of
-/// [`struct_is_move`]). Honors a declared over-alignment (`align(N)`, reserved for M6). Cycle-safe.
+/// Natural-alignment `(size, align)` of a struct as codegen lays it out (the dual of
+/// [`struct_is_move`]). A non-`layout(C)` struct's fields are **reordered by descending alignment** to
+/// eliminate padding (matching `logical_to_physical` in `align_codegen_llvm`); a `layout(C)` struct
+/// keeps declaration order. Honors a declared over-alignment (`align(N)`). Cycle-safe.
 fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64, u64) {
     if visiting.contains(&id) {
         return (0, 1); // a cycle (already reported by `struct_acyclic`) — stop the recursion
@@ -462,11 +464,23 @@ fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) ->
         return (0, 1);
     };
     visiting.push(id);
+    // Per-field `(size, align)` in declaration order.
+    let mut fields: Vec<(u64, u64)> = def
+        .fields
+        .iter()
+        .map(|f| {
+            let (fsz, fal) = ty_size_align(f.ty, structs, visiting);
+            (fsz, fal.max(1))
+        })
+        .collect();
+    // A non-`layout(C)` struct is laid out in descending alignment (stable → declaration order on
+    // ties), the same padding-eliminating order codegen emits. `layout(C)` keeps declaration order.
+    if !def.c_repr {
+        fields.sort_by_key(|&(_, fal)| std::cmp::Reverse(fal));
+    }
     let mut size = 0u64;
     let mut align = 1u64;
-    for f in &def.fields {
-        let (fsz, fal) = ty_size_align(f.ty, structs, visiting);
-        let fal = fal.max(1);
+    for (fsz, fal) in fields {
         size = align_up(size, fal) + fsz;
         align = align.max(fal);
     }
