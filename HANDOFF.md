@@ -19,7 +19,7 @@ division-by-zero/`INT_MIN÷-1` LLVM-UB guard — zero aborts via `align_rt_div_f
 wraps, constant divisors skip the guard (#294), `json.decode` out-of-range integers — sign bit added
 to the field tag, an ABI change across codegen+runtime (#295), the expression-depth ICE — post-parse
 `cap_expr_depths` with a measured 128 ceiling (#296), and the `chunks`-over-local-array region hole,
-including the str-array storage-vs-element-region case gemini caught on the PR (#297). **Still open:
+including the str-array storage-vs-element-region case Gemini caught on the PR (#297). **Still open:
 the perf backlog** — led by missing LLVM no-alias metadata on fused loops and `task_group` spawning a
 thread per task instead of reusing `ParPool` — and the design-decision Open items (out-of-range
 literals, `main() -> Result<(), E>` exit mapping). The
