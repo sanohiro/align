@@ -437,7 +437,9 @@ pub unsafe extern "C" fn align_rt_par_map(
     // pool worker or leave the barrier stuck (a deadlock) — it's recorded and re-raised on the caller
     // (Align thunks abort rather than unwind, so this is defensive, but a stuck pool is unacceptable).
     type PanicBox = Box<dyn std::any::Any + Send + 'static>;
-    let remaining: std::sync::Arc<(std::sync::Mutex<(usize, Option<PanicBox>)>, std::sync::Condvar)> =
+    // (remaining chunk count, first panic payload) guarded by a mutex, signaled via the condvar.
+    type Barrier = std::sync::Arc<(std::sync::Mutex<(usize, Option<PanicBox>)>, std::sync::Condvar)>;
+    let remaining: Barrier =
         std::sync::Arc::new((std::sync::Mutex::new((nchunks - 1, None)), std::sync::Condvar::new()));
     for t in 1..nchunks {
         let start = t * per;
@@ -555,6 +557,9 @@ fn builder_push_i64(buf: &mut Vec<u8>, v: i64) {
 
 /// Append a decimal integer. Hand-rolled itoa straight into the buffer — no generic `write!`
 /// formatter (runtime format-string parsing + trait dispatch), the builder's hot path.
+///
+/// # Safety
+/// `b` must be a valid `Builder` pointer for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
     let b = unsafe { &mut *b };
@@ -579,6 +584,9 @@ pub unsafe extern "C" fn align_rt_builder_write_str_int_str(b: *mut Builder, p1:
 }
 
 /// Append `true`/`false`.
+///
+/// # Safety
+/// `b` must be a valid `Builder` pointer for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_bool(b: *mut Builder, v: i32) {
     let b = unsafe { &mut *b };
@@ -586,6 +594,9 @@ pub unsafe extern "C" fn align_rt_builder_write_bool(b: *mut Builder, v: i32) {
 }
 
 /// Append a `char`'s UTF-8 encoding.
+///
+/// # Safety
+/// `b` must be a valid `Builder` pointer for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_char(b: *mut Builder, c: u32) {
     let b = unsafe { &mut *b };
@@ -595,6 +606,9 @@ pub unsafe extern "C" fn align_rt_builder_write_char(b: *mut Builder, c: u32) {
 }
 
 /// Append an `f64`'s shortest round-trip decimal.
+///
+/// # Safety
+/// `b` must be a valid `Builder` pointer for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_f64(b: *mut Builder, x: f64) {
     let b = unsafe { &mut *b };
@@ -602,6 +616,9 @@ pub unsafe extern "C" fn align_rt_builder_write_f64(b: *mut Builder, x: f64) {
 }
 
 /// Append an `f32`'s shortest round-trip decimal.
+///
+/// # Safety
+/// `b` must be a valid `Builder` pointer for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_f32(b: *mut Builder, x: f32) {
     let b = unsafe { &mut *b };
@@ -932,13 +949,13 @@ unsafe fn parse_object(
                             // Write the float repr at the field width (f32 / f64).
                             if w == 4 {
                                 let bytes = (v as f32).to_le_bytes();
-                                for k in 0..4 {
-                                    unsafe { *out.add(off + k) = bytes[k] };
+                                for (k, byte) in bytes.iter().enumerate() {
+                                    unsafe { *out.add(off + k) = *byte };
                                 }
                             } else {
                                 let bytes = v.to_le_bytes();
-                                for k in 0..8 {
-                                    unsafe { *out.add(off + k) = bytes[k] };
+                                for (k, byte) in bytes.iter().enumerate() {
+                                    unsafe { *out.add(off + k) = *byte };
                                 }
                             }
                         }
@@ -952,9 +969,9 @@ unsafe fn parse_object(
                             let s = p.string()?;
                             let ptr_bytes = (s.as_ptr() as usize as u64).to_le_bytes();
                             let len_bytes = (s.len() as i64).to_le_bytes();
-                            for k in 0..8 {
-                                unsafe { *out.add(off + k) = ptr_bytes[k] };
-                                unsafe { *out.add(off + 8 + k) = len_bytes[k] };
+                            for (k, (&pb, &lb)) in ptr_bytes.iter().zip(len_bytes.iter()).enumerate() {
+                                unsafe { *out.add(off + k) = pb };
+                                unsafe { *out.add(off + 8 + k) = lb };
                             }
                         }
                         _ => {
@@ -966,8 +983,8 @@ unsafe fn parse_object(
                             // writing the low `w` bytes and truncating/sign-wrapping.
                             let v = p.integer_field(w, (d.tag & 0x1_0000) != 0)?;
                             let bytes = v.to_le_bytes();
-                            for k in 0..w {
-                                unsafe { *out.add(off + k) = bytes[k] };
+                            for (k, byte) in bytes.iter().enumerate().take(w) {
+                                unsafe { *out.add(off + k) = *byte };
                             }
                         }
                     }
@@ -1064,6 +1081,16 @@ impl FieldDst for SoaDst<'_> {
     }
 }
 
+/// The decode-time constants shared by [`json_speculate`]/[`json_fallback`]: the field descriptors,
+/// the write destination, and the (optional) perfect-hash table used by `find_field`. Grouping these
+/// keeps both functions under the argument-count lint without losing any parameter.
+struct DecodeCtx<'a, D: FieldDst> {
+    descs: &'a [JsonField],
+    dst: &'a D,
+    phf: Option<&'a [i32]>,
+    phf_seed: u64,
+}
+
 /// Write field `d`'s value into `dst` during the index-driven (Mison-style) decode. `k` is the
 /// colon's position in the structural index `idx`; a `str` value's delimiter quotes are
 /// `idx[k+1]`/`idx[k+2]`, a scalar is parsed from the first non-space byte after the `:`. `fi` is the
@@ -1089,9 +1116,9 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
         let s = vp.string()?;
         let pb = (s.as_ptr() as usize as u64).to_le_bytes();
         let lb = (s.len() as i64).to_le_bytes();
-        for j in 0..8 {
-            unsafe { *p.add(j) = pb[j] };
-            unsafe { *p.add(8 + j) = lb[j] };
+        for (j, (&pbj, &lbj)) in pb.iter().zip(lb.iter()).enumerate() {
+            unsafe { *p.add(j) = pbj };
+            unsafe { *p.add(8 + j) = lbj };
         }
         return Some(());
     }
@@ -1110,13 +1137,13 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
             let v = vp.number()?;
             if w == 4 {
                 let b = (v as f32).to_le_bytes();
-                for j in 0..4 {
-                    unsafe { *p.add(j) = b[j] };
+                for (j, byte) in b.iter().enumerate() {
+                    unsafe { *p.add(j) = *byte };
                 }
             } else {
                 let b = v.to_le_bytes();
-                for j in 0..8 {
-                    unsafe { *p.add(j) = b[j] };
+                for (j, byte) in b.iter().enumerate() {
+                    unsafe { *p.add(j) = *byte };
                 }
             }
         }
@@ -1128,8 +1155,8 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
             // see `parse_object` / `JsonParser::integer_field`.
             let v = vp.integer_field(w, (d.tag & 0x1_0000) != 0)?;
             let b = v.to_le_bytes();
-            for j in 0..w {
-                unsafe { *p.add(j) = b[j] };
+            for (j, byte) in b.iter().enumerate().take(w) {
+                unsafe { *p.add(j) = *byte };
             }
         }
     }
@@ -1162,10 +1189,7 @@ unsafe fn json_speculate<D: FieldDst>(
     idx: &[u32],
     rec_cols: &[usize],
     pat_field: &[i32],
-    descs: &[JsonField],
-    dst: &D,
-    phf: Option<&[i32]>,
-    phf_seed: u64,
+    ctx: &DecodeCtx<D>,
 ) -> bool {
     for (o, &k) in rec_cols.iter().enumerate() {
         let fi = pat_field[o];
@@ -1173,15 +1197,15 @@ unsafe fn json_speculate<D: FieldDst>(
             // An unqueried position (projection): still confirm its key is a plain, *undeclared* key,
             // or fall back so the strict duplicate/missing/malformed contract is enforced there.
             match key_before_colon(src, idx[k] as usize) {
-                Some(key) if unsafe { find_field(descs, key, phf, phf_seed) }.is_none() => continue,
+                Some(key) if unsafe { find_field(ctx.descs, key, ctx.phf, ctx.phf_seed) }.is_none() => continue,
                 _ => return false,
             }
         }
-        let d = &descs[fi as usize];
+        let d = &ctx.descs[fi as usize];
         if !key_matches_before_colon(src, idx[k] as usize, unsafe { field_name(d) }) {
             return false; // structure drifted from the pattern — fall back
         }
-        if unsafe { write_field_indexed(src, idx, k, fi as usize, d, dst) }.is_none() {
+        if unsafe { write_field_indexed(src, idx, k, fi as usize, d, ctx.dst) }.is_none() {
             return false;
         }
     }
@@ -1199,29 +1223,26 @@ unsafe fn json_fallback<D: FieldDst>(
     src: &[u8],
     idx: &[u32],
     rec_cols: &[usize],
-    descs: &[JsonField],
-    dst: &D,
-    phf: Option<&[i32]>,
-    phf_seed: u64,
+    ctx: &DecodeCtx<D>,
     seen: &mut SeenSet,
     pat_field: &mut Vec<i32>,
 ) -> Option<()> {
-    *seen = SeenSet::new(descs.len());
+    *seen = SeenSet::new(ctx.descs.len());
     pat_field.clear();
     pat_field.resize(rec_cols.len(), -1);
     for (o, &k) in rec_cols.iter().enumerate() {
         let Some(key) = key_before_colon(src, idx[k] as usize) else {
             return None; // a `:` not preceded by a `"..."` key — malformed object
         };
-        if let Some(fi) = unsafe { find_field(descs, key, phf, phf_seed) } {
+        if let Some(fi) = unsafe { find_field(ctx.descs, key, ctx.phf, ctx.phf_seed) } {
             if !seen.mark(fi) {
                 return None; // duplicate field
             }
             pat_field[o] = fi as i32;
-            unsafe { write_field_indexed(src, idx, k, fi, &descs[fi], dst)? };
+            unsafe { write_field_indexed(src, idx, k, fi, &ctx.descs[fi], ctx.dst)? };
         }
     }
-    if seen.all_seen(descs.len()) {
+    if seen.all_seen(ctx.descs.len()) {
         Some(())
     } else {
         None // a declared field is missing
@@ -1313,10 +1334,11 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
                     if depth == 2 {
                         let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
                         let dst = AosDst { eptr, esz: esz as i64 };
+                        let ctx = DecodeCtx { descs, dst: &dst, phf, phf_seed };
                         let spec = pat_ncol == rec_cols.len() as i64
-                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, &dst, phf, phf_seed) };
+                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, &ctx) };
                         if !spec {
-                            unsafe { json_fallback(src, &idx, &rec_cols, descs, &dst, phf, phf_seed, &mut seen, &mut pat_field)? };
+                            unsafe { json_fallback(src, &idx, &rec_cols, &ctx, &mut seen, &mut pat_field)? };
                             pat_ncol = rec_cols.len() as i64;
                         }
                         count += 1;
@@ -1368,7 +1390,10 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
 /// `soa_column_offset` / `SoaAlloc` in `align_codegen_llvm`** (`start_0 = 0`,
 /// `start_j = align_up(start_{j-1} + n*size_{j-1}, size_j)`), or a direct-filled column would land
 /// where a later `IndexColumn` scan does not read it.
-fn soa_layout(widths: &[usize], n: usize) -> Option<(Vec<(usize, usize)>, usize, usize)> {
+/// A `soa<Struct>` column layout: `(cols, total_bytes, max_align)`, see [`soa_layout`].
+type SoaLayout = (Vec<(usize, usize)>, usize, usize);
+
+fn soa_layout(widths: &[usize], n: usize) -> Option<SoaLayout> {
     let mut cols = Vec::with_capacity(widths.len());
     let mut off = 0usize;
     for (j, &w) in widths.iter().enumerate() {
@@ -1520,10 +1545,11 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
                 b'}' => {
                     if depth == 2 {
                         let dst = SoaDst { base, row, cols: &cols };
+                        let ctx = DecodeCtx { descs, dst: &dst, phf, phf_seed };
                         let spec = pat_ncol == rec_cols.len() as i64
-                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, &dst, phf, phf_seed) };
+                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, &ctx) };
                         if !spec {
-                            unsafe { json_fallback(src, &idx, &rec_cols, descs, &dst, phf, phf_seed, &mut seen, &mut pat_field)? };
+                            unsafe { json_fallback(src, &idx, &rec_cols, &ctx, &mut seen, &mut pat_field)? };
                             pat_ncol = rec_cols.len() as i64;
                         }
                         row += 1;
@@ -2430,7 +2456,7 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
     let initial = n.min(cap as usize).min(1024);
     let mut ids: HashMap<&[u8], i64, FxBuildHasher> = HashMap::with_capacity_and_hasher(initial, FxBuildHasher::default());
     let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
-    for i in 0..n {
+    for (i, out_id) in out_ids.iter_mut().enumerate() {
         let row = unsafe { base.add(i * stride) };
         let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
         let id = match ids.get(bytes) {
@@ -2447,7 +2473,7 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
                 id
             }
         };
-        out_ids[i] = id;
+        *out_id = id;
     }
     let count = reprs.len(); // <= cap (the loop aborts past it) and out_dict is non-null (checked up front)
     let out_dict = unsafe { std::slice::from_raw_parts_mut(out_dict, count) };
@@ -3142,6 +3168,10 @@ impl<'a> JsonParser<'a> {
 
 /// Finish the builder, returning a `str` view over the (leaked) contents and freeing
 /// the builder object.
+///
+/// # Safety
+/// `b` must be a non-null pointer returned by [`align_rt_builder_new`] and not yet finished/freed;
+/// this call consumes it (frees the `Builder` object), so `b` must not be used again afterward.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
     let b = unsafe { Box::from_raw(b) };
@@ -3167,6 +3197,10 @@ pub unsafe extern "C" fn align_rt_builder_finish(b: *mut Builder) -> AlignStr {
 /// [`align_rt_alloc`] buffer, freed by the generated code's `Drop` of the owning slot — so the
 /// finished string outlives the builder and any arena. An empty result owns no buffer (null
 /// ptr), so its `free(null)` drop is a harmless no-op.
+///
+/// # Safety
+/// `b` must be a non-null pointer returned by [`align_rt_builder_new`] and not yet finished/freed;
+/// this call consumes it (frees the `Builder` object), so `b` must not be used again afterward.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_into_string(b: *mut Builder) -> AlignStr {
     let b = unsafe { Box::from_raw(b) };
@@ -3638,6 +3672,9 @@ pub extern "C" fn align_rt_arena_begin() -> *mut Arena {
 }
 
 /// Bump-allocate `size` bytes (with `align`) from the arena.
+///
+/// # Safety
+/// `arena` must be null or a valid pointer returned by [`align_rt_arena_begin`] and not yet ended.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, align: i64) -> *mut u8 {
     // Null-safe like every other runtime entry point: a null arena handle must not be dereferenced.
@@ -3660,6 +3697,10 @@ pub unsafe extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, alig
 }
 
 /// Bulk-release every allocation, keeping the arena for reuse.
+///
+/// # Safety
+/// `arena` must be a non-null, valid pointer returned by [`align_rt_arena_begin`] and not yet
+/// ended; no allocation from it may still be in use afterward (they are all released).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_arena_reset(arena: *mut Arena) {
     let arena = unsafe { &mut *arena };
@@ -3668,6 +3709,10 @@ pub unsafe extern "C" fn align_rt_arena_reset(arena: *mut Arena) {
 }
 
 /// Release every allocation and the arena itself.
+///
+/// # Safety
+/// `arena` must be a non-null pointer returned by [`align_rt_arena_begin`] and not yet ended; this
+/// call consumes it (frees the `Arena` object), so `arena` must not be used again afterward.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_arena_end(arena: *mut Arena) {
     drop(unsafe { Box::from_raw(arena) });
@@ -3705,12 +3750,21 @@ pub extern "C" fn align_rt_tg_begin() -> *mut TaskGroup {
 }
 
 /// Bump-allocate `size` bytes (with `align`) from the task group's region (envs + result slots).
+///
+/// # Safety
+/// `tg` must be a non-null, valid pointer returned by [`align_rt_tg_begin`] and not yet ended.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align: i64) -> *mut u8 {
     unsafe { &mut *tg }.arena.alloc(size as usize, align as usize)
 }
 
 /// Register a deferred task (its trampoline + closure pointer + env + result slot).
+///
+/// # Safety
+/// `tg` must be a non-null, valid pointer returned by [`align_rt_tg_begin`] and not yet ended.
+/// `thunk`/`env`/`slot`/`err_slot` (`err_slot` may be null for a non-fallible task) must be valid
+/// for `tramp` to read/write as documented on [`TgTask`], and must stay valid until the group's
+/// `wait()` (they are read only during the task's run, before `tg_end` frees the region).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_register(
     tg: *mut TaskGroup,
@@ -3784,6 +3838,11 @@ struct TgBarrier {
 /// A worker panic is caught, recorded, and re-raised on the caller (never swallowed — that would
 /// falsely report success and then read an unwritten slot). All tasks are guaranteed finished
 /// before this returns, so the region stays valid until `tg_end` (the join precedes the free).
+///
+/// # Safety
+/// `tg` must be a non-null, valid pointer returned by [`align_rt_tg_begin`] and not yet ended.
+/// Every task registered via [`align_rt_tg_register`] must still have its `env`/`slot`/`err_slot`
+/// valid for the duration of this call (per its own safety contract).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3865,6 +3924,11 @@ pub unsafe extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
 }
 
 /// Release the task group's region and the handle.
+///
+/// # Safety
+/// `tg` must be null or a pointer returned by [`align_rt_tg_begin`] and not yet ended, and every
+/// task must have already been joined (via [`align_rt_tg_wait`]) so none is still live. This call
+/// consumes `tg` (frees the `TaskGroup` object), so `tg` must not be used again afterward.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
     if !tg.is_null() {
@@ -4846,8 +4910,8 @@ mod tests {
         let descs = [JsonField { name_ptr: n.as_ptr(), name_len: 1, tag: 8, offset: 0 }]; // u64
         let read_u64 = |ptr: *const u8, off: usize| -> u64 {
             let mut b = [0u8; 8];
-            for j in 0..8 {
-                b[j] = unsafe { *ptr.add(off + j) };
+            for (j, byte) in b.iter_mut().enumerate() {
+                *byte = unsafe { *ptr.add(off + j) };
             }
             u64::from_le_bytes(b)
         };
@@ -4998,8 +5062,8 @@ mod tests {
         // pay column (width 8) at cols[1].0: [10, 20] as little-endian i64.
         let read_i64 = |off: usize| -> i64 {
             let mut b = [0u8; 8];
-            for j in 0..8 {
-                b[j] = unsafe { *out.ptr.add(off + j) };
+            for (j, byte) in b.iter_mut().enumerate() {
+                *byte = unsafe { *out.ptr.add(off + j) };
             }
             i64::from_le_bytes(b)
         };

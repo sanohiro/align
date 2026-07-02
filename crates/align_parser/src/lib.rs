@@ -249,6 +249,7 @@ fn cap_block_depth(b: &mut Block, depth: u32, diags: &mut Diagnostics) {
 ///      downstream pass walks that tree recursively. [`cap_expr_depths`] re-checks the finished AST
 ///      against this same ceiling and truncates anything deeper, so no over-deep tree ever reaches
 ///      sema / MIR / codegen.
+///
 /// Chosen from measured stack limits (debug, unoptimized): the heaviest downstream pass, MIR
 /// lowering, overflows at depth ~275 on the 8 MB main thread (where full builds run) and sema
 /// overflows at ~235 on a 2 MB worker/test thread (where the fuzz/test `parse→sema` path runs). 128
@@ -1002,10 +1003,7 @@ impl<'a> Parser<'a> {
 
     fn parse_expr_inner(&mut self, min_bp: u8) -> Option<Expr> {
         let mut lhs = self.parse_cast()?;
-        loop {
-            let Some((op, bp, n)) = self.binop() else {
-                break;
-            };
+        while let Some((op, bp, n)) = self.binop() {
             if bp < min_bp {
                 break;
             }
@@ -1243,10 +1241,10 @@ impl<'a> Parser<'a> {
                 // Distinguish from a block following a bare name (e.g. an `if` condition) by the
                 // `{ ident :` shape — no valid statement-block starts that way. The type name may
                 // be a dotted path (`geom.Point`), so skip over `(. ident)*` before the brace.
-                if !self.no_struct_literal {
-                    if let Some(segs) = self.struct_lit_path_len() {
-                        return self.parse_struct_lit(segs);
-                    }
+                if !self.no_struct_literal
+                    && let Some(segs) = self.struct_lit_path_len()
+                {
+                    return self.parse_struct_lit(segs);
                 }
                 // A single name; dotted access (`a.b`, method chains) is handled as a
                 // postfix in `parse_postfix`.
@@ -1349,7 +1347,7 @@ impl<'a> Parser<'a> {
                 self.expect(&TokKind::RParen, "')'");
                 let span = span.merge(self.prev_span());
                 Some(if elems.len() == 1 {
-                    elems.pop().unwrap()
+                    elems.pop().expect("guarded: len == 1")
                 } else {
                     Expr { kind: ExprKind::Tuple(elems), span }
                 })
@@ -1619,7 +1617,7 @@ impl<'a> Parser<'a> {
             let span = start.merge(self.prev_span());
             // `(T)` is just grouping; `(T, U, ...)` is a tuple.
             return Some(if elems.len() == 1 {
-                elems.pop().unwrap()
+                elems.pop().expect("guarded: len == 1")
             } else {
                 Type::Tuple { elems, span }
             });
