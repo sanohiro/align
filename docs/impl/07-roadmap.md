@@ -782,17 +782,24 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   (`hir::Stmt::AssignElemField`, new `Place::ElemField`) that lowers by layout — `Stmt::StoreColumn`
   for a soa, slot `Stmt::StoreElemField` for a fixed struct array (both already existed for `.to_soa()`
   construction; now reachable from user assignment), bounds-checked, `mut`-gated. The stored value is a
-  scalar field, so no move/region concern. **Whole-element write `s[i] = value` / `arr[i] = value`**
-  also ships (`hir::Stmt::AssignElem`, new `Place::Elem`): the write counterpart of the `s[i]` gather /
-  `arr[i]` whole-element read — a soa scatters the value's fields into their columns (`StoreColumn` per
-  field), a fixed struct array stores the whole aggregate into the element (`StoreIndex`, a `[0,index]`
-  GEP). First cut is plain-old-data structs (flat numeric/bool/char fields), so the value is a Copy
-  aggregate with no region/move — `str`/nested/owned-bearing structs are gated off and deferred.
+  scalar field, so no move/region concern. The **dynamic `array<Struct>` (`DynStructArray`)
+  element-field write** `arr[i].field = v` on an owned `{ptr,len}` view now ships too — the same
+  surface (`hir::Stmt::AssignElemField`) lowers by slot layout to the pointer-based
+  `Stmt::StoreElemFieldPtr` (the write dual of `Rvalue::IndexFieldPtr`: extract the buffer pointer,
+  GEP `%Struct, ptr, index, pfield(field)`), bounds-checked against the view's runtime length and
+  `mut`-gated. Scalar (POD) fields only — a `str`/owned field write is gated off in sema (the
+  pointer-based store has no per-element drop of the overwritten field), deferred below. **Whole-element
+  write `s[i] = value` / `arr[i] = value`** also ships (`hir::Stmt::AssignElem`, new `Place::Elem`): the
+  write counterpart of the `s[i]` gather / `arr[i]` whole-element read — a soa scatters the value's
+  fields into their columns (`StoreColumn` per field), a fixed struct array stores the whole aggregate
+  into the element (`StoreIndex`, a `[0,index]` GEP). First cut is plain-old-data structs (flat
+  numeric/bool/char fields), so the value is a Copy aggregate with no region/move — `str`/nested/
+  owned-bearing structs are gated off and deferred.
   Deferred: `str`/owned columns, the multi-column `soa_slice<T>` sub-view (`s[a..b]` over *every*
   column — needs a `{ptr,total_len,start,count}` view repr since column stride depends on the
-  *original* row count; see `open-questions.md`), the dynamic `array<Struct>` (`DynStructArray`)
-  element-field write (needs a pointer-based `StoreElemFieldPtr`, the write dual of `IndexFieldPtr`),
-  whole-element write of `str`/nested/owned structs (region/move handling), bitset/bool packed columns.
+  *original* row count; see `open-questions.md`), the dynamic `array<Struct>` element-field write of a
+  `str`/owned field (needs a pointer-based per-element drop of the overwritten field), whole-element
+  write of `str`/nested/owned structs (region/move handling), bitset/bool packed columns.
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR
 level; and extend the branchless `where` form beyond `sum`/`count` to every reducer —

@@ -214,3 +214,120 @@ fn whole_elem_assign_str_field_rejected() {
         "Pt { x: i64, s: str }\nfn main() -> i32 {\n  mut arr := [Pt{x: 1, s: \"a\"}]\n  arr[0] = Pt{x: 2, s: \"b\"}\n  return 0\n}\n",
     ));
 }
+
+// --- Dynamic `array<Struct>` element-field write: `arr[i].field = v` on an owned `{ptr,len}` view
+// (`DynStructArray`), lowered by the pointer-based `StoreElemFieldPtr` (the write dual of the
+// `IndexFieldPtr` read). Scalar fields only; str/owned fields are gated off. ---
+
+#[test]
+fn dyn_elem_field_assign_all_widths() {
+    if !backend_available() {
+        return;
+    }
+    // A json-decoded `array<Rec>` (dynamic AoS) written field-by-field across every scalar width,
+    // then read back. Also exercises `#307` field reordering: the physical layout is permuted, so a
+    // correct write/read must go through the logical→physical `pfield` map. `h` is set true so its
+    // `hv` term is 0; the integer fields sum to 9 + 99 + 999 + 9999 + 250 = 11356.
+    let src = concat!(
+        "import core.json\n",
+        "Rec { a: i8, b: i16, c: i32, d: i64, e: u8, h: bool }\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  mut rs: array<Rec> := json.decode(\"[{\\\"a\\\":1,\\\"b\\\":2,\\\"c\\\":3,\\\"d\\\":4,\\\"e\\\":5,\\\"h\\\":false}]\")?\n",
+        "  rs[0].a = 9\n",
+        "  rs[0].b = 99\n",
+        "  rs[0].c = 999\n",
+        "  rs[0].d = 9999\n",
+        "  rs[0].e = 250\n",
+        "  rs[0].h = true\n",
+        "  hv := if rs[0].h { 0 } else { 1000 }\n",
+        "  print((rs[0].a as i64) + (rs[0].b as i64) + (rs[0].c as i64) + rs[0].d + (rs[0].e as i64) + hv)\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("dyn-elem-field-widths", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "11356\n");
+}
+
+#[test]
+fn dyn_elem_field_assign_dynamic_index() {
+    if !backend_available() {
+        return;
+    }
+    // A runtime index (not a constant) into the dynamic-array element-field store; only the targeted
+    // element is written. arr[1].y = 77 → read arr[0].y (still 2) + arr[1].y (77) = 79.
+    let src = concat!(
+        "import core.json\n",
+        "Point { x: i64, y: i64 }\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  mut pts: array<Point> := json.decode(\"[{\\\"x\\\":1,\\\"y\\\":2},{\\\"x\\\":3,\\\"y\\\":4}]\")?\n",
+        "  mut i := 1\n",
+        "  pts[i].y = 77\n",
+        "  print(pts[0].y + pts[1].y)\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("dyn-elem-field-dyn-index", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "79\n");
+}
+
+#[test]
+fn dyn_elem_field_assign_out_of_bounds_aborts() {
+    if !backend_available() {
+        return;
+    }
+    // The write is bounds-checked against the view's runtime length: an out-of-range index aborts
+    // (never a clean exit), just like the scalar `arr[i] = v` store.
+    let src = concat!(
+        "import core.json\n",
+        "Point { x: i64, y: i64 }\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  mut pts: array<Point> := json.decode(\"[{\\\"x\\\":1,\\\"y\\\":2}]\")?\n",
+        "  pts[5].x = 99\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("dyn-elem-field-oob", src);
+    assert_ne!(out.status.code(), Some(0), "an out-of-bounds element-field store must abort");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("index out of bounds"),
+        "expected a bounds-check abort, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn dyn_elem_field_assign_immutable_rejected() {
+    // Writing a field of a dynamic-array element requires the array local to be `mut`.
+    assert!(check_errs(
+        "dyn-elem-field-immut",
+        "import core.json\nPoint { x: i64, y: i64 }\nfn main() -> Result<(), Error> {\n  pts: array<Point> := json.decode(\"[{\\\"x\\\":1,\\\"y\\\":2}]\")?\n  pts[0].x = 9\n  return Ok(())\n}\n",
+    ));
+}
+
+#[test]
+fn dyn_elem_field_assign_moved_array_rejected() {
+    // Writing an element field is a use of the array; if it has been moved away, that is caught as a
+    // use-after-move (the `whole_moved` check on the base local).
+    assert!(check_errs(
+        "dyn-elem-field-moved",
+        "import core.json\nPoint { x: i64, y: i64 }\nfn take(p: array<Point>) -> i64 = p.len()\nfn main() -> Result<(), Error> {\n  mut pts: array<Point> := json.decode(\"[{\\\"x\\\":1,\\\"y\\\":2}]\")?\n  n := take(pts)\n  pts[0].x = 9\n  print(n)\n  return Ok(())\n}\n",
+    ));
+}
+
+#[test]
+fn dyn_elem_field_assign_str_field_rejected() {
+    // The dynamic-array element-field write goes through a buffer pointer with no per-element drop
+    // of the overwritten field, so a `str`/owned field is gated off with a clear diagnostic (a
+    // scalar sibling field of the same struct still writes fine).
+    let mut sm = SourceMap::new();
+    let src = "import core.json\nUser { id: i64, name: str }\nfn main() -> Result<(), Error> {\n  mut us: array<User> := json.decode(\"[{\\\"id\\\":1,\\\"name\\\":\\\"ann\\\"}]\")?\n  us[0].name = \"bob\"\n  return Ok(())\n}\n";
+    let checked = check(&mut sm, "dyn-elem-field-str", src);
+    assert!(checked.diags.has_errors(), "a str element-field write must be rejected");
+    let msg = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        msg.contains("primitive fields only for now"),
+        "expected the deferred-str diagnostic, got:\n{msg}"
+    );
+}

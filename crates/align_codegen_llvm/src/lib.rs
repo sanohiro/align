@@ -1784,6 +1784,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let val = self.operand(op);
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
+                Stmt::StoreElemFieldPtr { base, index, field, struct_id, value } => {
+                    // `base[index].field <- value` for an owned dynamic `array<Struct>` view — the
+                    // write dual of `Rvalue::IndexFieldPtr`: extract the buffer pointer from the
+                    // `{ptr,len}` aggregate and GEP `%Struct, ptr, index, pfield(field)`.
+                    let agg = self.operand(base).into_struct_value();
+                    let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
+                    let st = self.struct_types[*struct_id as usize];
+                    let idx = self.operand(index).into_int_value();
+                    let f = self.ctx.i32_type().const_int(self.pfield(*struct_id, *field) as u64, false);
+                    let ep = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(st, buf, &[idx, f], "aosfieldst")
+                            .map_err(|e| self.err(e))?
+                    };
+                    let val = self.operand(value);
+                    self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                }
                 Stmt::PtrStore(ptr, idx, op) => {
                     // `ptr[idx] <- val` into a raw element buffer; the element LLVM type is
                     // the stored value's type (opaque pointers, so the ptr carries none).
