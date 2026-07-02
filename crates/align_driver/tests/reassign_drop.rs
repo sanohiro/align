@@ -157,3 +157,14 @@ fn struct_owned_field_reassign_no_leak_no_double_free() {
     let src = "User { name: string, age: i64 }\nfn main() -> i32 {\n  mut u := User{name: \"aaaa\".clone(), age: 1}\n  u.name = \"new\".clone()\n  return u.name.len() as i32\n}\n";
     assert_eq!(build_and_run("field-reassign", src).status.code(), Some(3));
 }
+
+#[test]
+fn struct_owned_field_reassign_from_variable_stores_value_not_null() {
+    if !backend_available() {
+        return;
+    }
+    // Regression (gemini #283): the RHS is a *variable* — `store_value_at` lowers it internally, so
+    // its moved source must be nulled *after* the store, not before (else null is stored). len = 3.
+    let src = "User { name: string, age: i64 }\nfn main() -> i32 {\n  mut u := User{name: \"aaaa\".clone(), age: 1}\n  v := \"bee\".clone()\n  u.name = v\n  return u.name.len() as i32\n}\n";
+    assert_eq!(build_and_run("field-reassign-var", src).status.code(), Some(3));
+}

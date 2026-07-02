@@ -932,13 +932,19 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // RHS's moved source so it isn't double-freed. (Slice 4b: an owned nested-struct value
             // `u.addr = Address{…}` still expands via `store_value_at` — its own owned fields are a
             // later slice; only a direct `string` leaf is drop-of-old'd here.)
-            if !matches!(value.kind, hir::ExprKind::StructLit { .. }) && field_ty_at(b, *root, path) == Ty::String {
+            let drop_old_field = !matches!(value.kind, hir::ExprKind::StructLit { .. }) && field_ty_at(b, *root, path) == Ty::String;
+            if drop_old_field {
                 let old = b.fresh_value(Ty::String);
                 b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
                 b.push(Stmt::DropValue(Operand::Value(old)));
-                null_moved_source(b, value);
             }
             store_value_at(b, *root, &mut path.clone(), value);
+            // Null the RHS's moved source *after* the store — `store_value_at` lowers `value`
+            // internally, so nulling a variable RHS beforehand would store null. (The old value was
+            // already freed above, before the overwrite.)
+            if drop_old_field {
+                null_moved_source(b, value);
+            }
         }
         hir::Stmt::AssignIndex { base, index, value } => {
             // `base[index] = value` — bounds-checked element store (abort on out-of-range, like a
