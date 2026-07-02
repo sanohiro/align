@@ -1785,12 +1785,17 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   decoder reads it) together**; the bit sits above the existing kind/width bytes so their decoders are
   unchanged. Every integer write path now range-checks the parsed `i64` against the field's
   `(width, signed)` `[min, max]` via `int_in_range` and routes an out-of-range value through the
-  existing bad-value path (`None` → decode error). **Remaining limitation:** `JsonParser::integer`
-  parses into `i64`, so a `u64` field accepts only `[0, i64::MAX]` — a JSON value in
-  `(i64::MAX, u64::MAX]` is still rejected (unrepresentable, as before; not a regression). Widening
-  the parser to full `u64` for `u64` fields is a small follow-up, not yet done. Tests:
-  `int_in_range_covers_widths_and_signs`, `json_decode_range_checks_integer_fields`,
-  `json_decode_array_range_checks_integers` (runtime); `json_decode_rejects_out_of_range_integers`
+  existing bad-value path (`None` → decode error). **Follow-up (fixed):** the earlier remaining
+  limitation — `JsonParser::integer` parses into `i64`, so a `u64` field accepted only `[0, i64::MAX]`
+  and rejected a representable JSON value in `(i64::MAX, u64::MAX]` — is now closed. `JsonParser`
+  gained `integer_unsigned` (full-range unsigned accumulate + `checked_*`) and `integer_field(w,
+  signed)`, which routes a width-8 *unsigned* (`u64`) field to the full `[0, u64::MAX]` path and every
+  other width / any signed field to the `i64` path + `int_in_range` (unchanged negative / overflow /
+  `i64::MIN`-edge handling). All three integer write sites (`parse_object` / `write_field_indexed` /
+  `decode_array`) call `integer_field`, so the routing is consistent everywhere. Tests:
+  `int_in_range_covers_widths_and_signs`, `integer_unsigned_parses_full_u64_range`,
+  `json_decode_range_checks_integer_fields`, `json_decode_array_range_checks_integers`,
+  `json_decode_soa_u64_full_range` (runtime); `json_decode_rejects_out_of_range_integers`
   (driver, `crates/align_driver/tests/m5.rs`).
 - **Status: fixed.** **Parser depth guard doesn't cover iteratively-parsed chains — sema
   stack-overflows (ICE).** `align_parser/src/lib.rs` capped `MAX_EXPR_DEPTH=256`, but that budget is
