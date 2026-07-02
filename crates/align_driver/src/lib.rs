@@ -128,10 +128,20 @@ pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget) -> Result<Str
 /// The thin runtime (`libalign_runtime.a`, e.g. the builtin `print`) is linked in too.
 /// Being a Rust staticlib, it needs the usual std support libraries (`pthread`/`dl`/`m`).
 pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: &[String]) -> Result<(), String> {
+    link_objects(&[obj], exe, link_libs)
+}
+
+/// Link one or more object files (plus the Align runtime and the always-linked C libraries) into an
+/// executable. The single-object [`link_executable`] is the common case; multiple objects are used
+/// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
+/// callee), and by any future multi-translation-unit build.
+pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String]) -> Result<(), String> {
     let runtime = runtime_archive()?;
     let mut cmd = std::process::Command::new("cc");
-    cmd.arg(obj)
-        .arg(&runtime)
+    for obj in objs {
+        cmd.arg(obj);
+    }
+    cmd.arg(&runtime)
         .arg("-o")
         .arg(exe)
         .args(["-lpthread", "-ldl", "-lm"]);

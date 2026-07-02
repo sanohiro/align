@@ -193,21 +193,115 @@ fn build_module<'c>(
         let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types, &enum_types, &tuple_types);
         funcs.insert(f.name.clone(), fv);
     }
+    // A by-value struct in an `extern "C"` signature uses the SysV AMD64 register ABI, which we
+    // implement for x86-64 Linux only. On any other target we refuse rather than guess a per-target
+    // register rule (that is the one FFI corner a wrong rule *silently miscompiles*) — the user must
+    // pass the struct by pointer (`raw`) instead. Scalar/`raw`/view externs are unaffected.
+    let triple = tm.get_triple();
+    let triple_s = triple.as_str().to_string_lossy().to_ascii_lowercase();
+    let x86_64_sysv = triple_s.starts_with("x86_64") && triple_s.contains("linux");
+    for ext in &program.externs {
+        let uses_byval_struct = matches!(ext.ret, Ty::Struct(_))
+            || ext.params.iter().any(|p| matches!(p, Ty::Struct(_)));
+        if uses_byval_struct && !x86_64_sysv {
+            return Err(CodegenError::Lowering(format!(
+                "extern '{}' passes or returns a struct by value, which is only supported on x86-64 SysV (Linux) — the target is '{}'; pass the struct by pointer (`raw`) instead",
+                ext.name, triple_s,
+            )));
+        }
+    }
+
+    // The SysV ABI plan for each `extern "C"` symbol: how every parameter and the return value cross
+    // the C boundary (a `layout(C)` struct by value flattens to `i64`/`double` register slots; a
+    // `str`/`slice` view passes as its data pointer; everything else is direct). Computed once and
+    // reused for both the declaration signature (here) and the coerced call site.
+    let extern_abi: HashMap<String, ExternAbi> = program
+        .externs
+        .iter()
+        .map(|e| {
+            let params = e
+                .params
+                .iter()
+                .map(|&ty| match ty {
+                    Ty::Struct(id) => {
+                        match classify_struct_abi(id, &struct_types[id as usize], &program.structs[id as usize], &target_data) {
+                            Some(abi) => ParamAbi::StructRegs(abi),
+                            None => ParamAbi::StructMemory,
+                        }
+                    }
+                    _ if is_ffi_view(ty) => ParamAbi::ViewPtr,
+                    _ => ParamAbi::Direct,
+                })
+                .collect();
+            let ret = match e.ret {
+                Ty::Struct(id) => {
+                    match classify_struct_abi(id, &struct_types[id as usize], &program.structs[id as usize], &target_data) {
+                        Some(abi) => ReturnAbi::StructRegs(abi),
+                        None => ReturnAbi::StructMemory,
+                    }
+                }
+                _ => ReturnAbi::Direct,
+            };
+            (e.name.clone(), ExternAbi { params, ret })
+        })
+        .collect();
+
     // Declare foreign (`extern "C"`) functions under their C symbol, so a `Rvalue::Call` keyed by
-    // that name resolves. FFI-safe params/returns are scalars or `raw` (an opaque pointer) — all
-    // covered by `abi_type`; a `str`/`slice` view param is passed as its data `ptr` (C `char*`).
+    // that name resolves. FFI-safe params/returns are scalars/`raw`/views/`layout(C)` structs — the
+    // signature reflects the SysV coerce plan above (flattened register slots for a by-value struct).
     // No `mark_nounwind`: unlike an Align function, foreign code is outside our control, so we do not
     // assert it never unwinds.
     for ext in &program.externs {
-        let param_types: Vec<BasicMetadataTypeEnum> = ext
-            .params
-            .iter()
-            .map(|&ty| ffi_param_type(ctx, ty, &struct_types, &enum_types).into())
-            .collect();
-        let fn_ty = if ext.ret == Ty::Unit {
-            ctx.void_type().fn_type(&param_types, false)
-        } else {
-            abi_type(ctx, ext.ret, &struct_types, &enum_types).fn_type(&param_types, false)
+        let abi = &extern_abi[&ext.name];
+        // Reject any signature where a by-value struct argument would fall to the MEMORY-class
+        // `byval` ABI because preceding arguments exhaust the class registers (the SysV all-or-
+        // nothing rule) — we cannot reproduce `byval` by flattening. See `check_sysv_struct_args_fit`.
+        check_sysv_struct_args_fit(&ext.name, abi, &ext.params, &program.structs)?;
+        let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(ext.params.len());
+        for (pa, &ty) in abi.params.iter().zip(&ext.params) {
+            match pa {
+                ParamAbi::Direct => param_types.push(abi_type(ctx, ty, &struct_types, &enum_types).into()),
+                ParamAbi::ViewPtr => param_types.push(ctx.ptr_type(AddressSpace::default()).into()),
+                // A by-value struct flattens to one `i64`/`double` per eightbyte — byte-identical to
+                // clang's own flattened parameter form. This is sound only because
+                // `check_sysv_struct_args_fit` has already rejected the register-exhaustion boundary
+                // where clang would switch to a `byval` pointer (which flattening cannot mimic).
+                ParamAbi::StructRegs(sabi) => {
+                    for &eb in &sabi.ebs {
+                        param_types.push(eb.llvm(ctx).into());
+                    }
+                }
+                ParamAbi::StructMemory => {
+                    let sname = match ty {
+                        Ty::Struct(id) => program.structs[id as usize].name.as_str(),
+                        _ => "?",
+                    };
+                    return Err(CodegenError::Lowering(format!(
+                        "extern '{}': passing struct '{sname}' by value needs the > 16-byte MEMORY-class ABI (a `byval` pointer), which is not supported in FFI v1 — pass it by pointer (`raw`) instead",
+                        ext.name,
+                    )));
+                }
+            }
+        }
+        let fn_ty = match &abi.ret {
+            ReturnAbi::Direct => {
+                if ext.ret == Ty::Unit {
+                    ctx.void_type().fn_type(&param_types, false)
+                } else {
+                    abi_type(ctx, ext.ret, &struct_types, &enum_types).fn_type(&param_types, false)
+                }
+            }
+            ReturnAbi::StructRegs(sabi) => struct_ret_type(ctx, sabi).fn_type(&param_types, false),
+            ReturnAbi::StructMemory => {
+                let sname = match ext.ret {
+                    Ty::Struct(id) => program.structs[id as usize].name.as_str(),
+                    _ => "?",
+                };
+                return Err(CodegenError::Lowering(format!(
+                    "extern '{}': returning struct '{sname}' by value needs the > 16-byte MEMORY-class ABI (an `sret` pointer), which is not supported in FFI v1 — return it through an out-pointer (`raw`) parameter instead",
+                    ext.name,
+                )));
+            }
         };
         // Defensive: if the symbol is already in the module (e.g. it coincides with a symbol
         // declared earlier), reuse that declaration. A fresh `add_function` on a duplicate name
@@ -943,11 +1037,6 @@ fn build_module<'c>(
         funcs.insert(format!("tramp${key}"), tramp);
     }
 
-    // Extern parameter types by C symbol — so a call to an extern can coerce a `str`/`slice` arg to
-    // its data pointer (the declaration already uses `ptr` for those params).
-    let extern_params: HashMap<String, Vec<Ty>> =
-        program.externs.iter().map(|e| (e.name.clone(), e.params.clone())).collect();
-
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
@@ -956,7 +1045,7 @@ fn build_module<'c>(
             module,
             builder: &builder,
             funcs: &funcs,
-            extern_params: &extern_params,
+            extern_abi: &extern_abi,
             structs: &program.structs,
             struct_types: &struct_types,
             field_perm: &field_perm,
@@ -1193,16 +1282,6 @@ fn is_ffi_view(ty: Ty) -> bool {
     matches!(ty, Ty::Str | Ty::Slice(_))
 }
 
-/// The LLVM type of an `extern "C"` parameter: a `str`/`slice` view is passed as its data pointer
-/// (C `char*`/`void*`); everything else keeps its normal ABI type.
-fn ffi_param_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructType<'c>]) -> BasicTypeEnum<'c> {
-    if is_ffi_view(ty) {
-        ctx.ptr_type(AddressSpace::default()).into()
-    } else {
-        abi_type(ctx, ty, sx, ex)
-    }
-}
-
 /// The LLVM representation of a `Ty::Fn` value: a closure `{ fn_ptr, env_ptr }`. All closure
 /// `fn_ptr`s use the env-ABI `fn(env, args)`; `env_ptr` is null for a non-capturing function.
 fn closure_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
@@ -1225,6 +1304,201 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty, sx, ex),
     }
+}
+
+// ── `extern "C"` by-value struct ABI (System V AMD64 only) ──────────────────────────────────────
+//
+// A `layout(C)` struct crosses the C boundary by value using the SysV AMD64 register convention
+// (ABI §3.2.3). We reproduce *exactly* the coerced IR types clang emits — flattened `i64`/`double`
+// arguments per eightbyte, an `{T0,T1}` aggregate return for two-register structs — so an Align call
+// is binary-compatible with a clang/gcc-compiled callee (both lower these same IR types identically).
+// This is SysV-AMD64-only; every other target is rejected in `build_module` (a wrong per-target
+// register rule is the one FFI corner that silently miscompiles, so we never guess).
+//
+// Completeness within our field domain: a `layout(C)` struct's fields are integer/float scalars
+// (`align_sema` enforces this), each naturally aligned, so no field straddles an eightbyte boundary
+// and the only classes are INTEGER and SSE — never X87/COMPLEX_X87. A struct larger than two
+// eightbytes (> 16 bytes) is MEMORY as a whole (no `__m256`/SSEUP in the domain), handled separately.
+
+/// SysV class of one eightbyte of a register-passed `layout(C)` struct.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Eb {
+    /// Passed/returned in a general-purpose register (integer scalar, or a mixed eightbyte —
+    /// INTEGER+SSE merges to INTEGER).
+    Integer,
+    /// Passed/returned in an SSE (XMM) register (all overlapping fields are float).
+    Sse,
+}
+
+impl Eb {
+    /// The LLVM type standing in for one eightbyte: `i64` for a GP register, `double` for an SSE
+    /// register. A wider-than-used integer (e.g. `i64` for an eightbyte holding one `i32`) is
+    /// ABI-safe — both land in the same GP register, and the caller-side padded slot keeps the load
+    /// in bounds — matching how clang's narrower coerce type occupies the identical register.
+    fn llvm<'c>(self, ctx: &'c Context) -> BasicTypeEnum<'c> {
+        match self {
+            Eb::Integer => ctx.i64_type().into(),
+            Eb::Sse => ctx.f64_type().into(),
+        }
+    }
+}
+
+/// The SysV AMD64 by-value plan for a register-passed `layout(C)` struct (≤ 16 bytes): its per-
+/// eightbyte classes, its byte size, and its struct id (to reconstruct the value at a call site).
+#[derive(Clone)]
+struct StructAbi {
+    /// One class per eightbyte, in ascending byte order (length 1 or 2).
+    ebs: Vec<Eb>,
+    /// The struct id, indexing the LLVM struct-type / struct-def tables.
+    id: u32,
+}
+
+/// Classify a `layout(C)` struct for SysV AMD64 by-value passing. Returns `Some(abi)` for a register
+/// struct (size ≤ 16 bytes) and `None` for a MEMORY struct (> 16 bytes — not register-passed;
+/// rejected in FFI v1). `st`/`def` are the struct's LLVM type and definition; `td` gives real field
+/// offsets, so the classification tracks the actual emitted layout. Only called for a `layout(C)`
+/// struct on an x86-64 SysV target.
+fn classify_struct_abi(
+    id: u32,
+    st: &StructType,
+    def: &StructDef,
+    td: &inkwell::targets::TargetData,
+) -> Option<StructAbi> {
+    let size = td.get_store_size(st);
+    if size > 16 {
+        return None; // MEMORY-class: not register-passed
+    }
+    // A zero-size (empty) struct has no C ABI representation; sema rejects it as an FFI type before
+    // codegen, so it never reaches here — but stay total (no eightbytes to classify).
+    if size == 0 {
+        return Some(StructAbi { ebs: Vec::new(), id });
+    }
+    let eb_count = size.div_ceil(8) as usize; // 1 or 2 eightbytes
+    let mut ebs: Vec<Option<Eb>> = vec![None; eb_count];
+    // `layout(C)` keeps declaration order (identity physical map), so field `i` sits at physical
+    // slot `i`; a naturally-aligned scalar ≤ 8 bytes lies wholly within one eightbyte.
+    for (i, f) in def.fields.iter().enumerate() {
+        let off = td.offset_of_element(st, i as u32).unwrap_or(0);
+        let eb = (off / 8) as usize;
+        let cls = if matches!(f.ty, Ty::Float(_)) { Eb::Sse } else { Eb::Integer };
+        // Merge within an eightbyte: INTEGER dominates SSE (SSE only if every field is float).
+        ebs[eb] = Some(match ebs[eb] {
+            Some(Eb::Integer) => Eb::Integer,
+            _ if cls == Eb::Integer => Eb::Integer,
+            Some(Eb::Sse) | None => cls,
+        });
+    }
+    // A pure-padding eightbyte cannot occur for a size-accounted struct; default to INTEGER (a
+    // valid GP register) so the function is total.
+    Some(StructAbi { ebs: ebs.into_iter().map(|c| c.unwrap_or(Eb::Integer)).collect(), id })
+}
+
+/// How one `extern "C"` parameter crosses the ABI boundary.
+#[derive(Clone)]
+enum ParamAbi {
+    /// A scalar / `raw`: passed as its own value.
+    Direct,
+    /// A `str`/`slice` view: passed as its data pointer (`C char*`/`void*`); length travels
+    /// separately via `s.len()`.
+    ViewPtr,
+    /// A `layout(C)` struct passed by value in registers: flattened to one `i64`/`double` argument
+    /// per eightbyte.
+    StructRegs(StructAbi),
+    /// A `layout(C)` struct too large for registers (> 16 bytes, MEMORY class). Rejected in FFI v1
+    /// — a `byval` pointer is semantically identical to the existing struct-by-pointer FFI, so we do
+    /// not add a redundant second mechanism.
+    StructMemory,
+}
+
+/// How an `extern "C"` return value crosses the ABI boundary.
+#[derive(Clone)]
+enum ReturnAbi {
+    /// void / scalar / `raw`.
+    Direct,
+    /// A `layout(C)` struct returned by value in registers (≤ 16 bytes).
+    StructRegs(StructAbi),
+    /// A `layout(C)` struct returned via a hidden `sret` pointer (> 16 bytes, MEMORY class).
+    /// Rejected in FFI v1 (deferred until a concrete C API needs a large by-value return).
+    StructMemory,
+}
+
+/// The full SysV ABI plan for one `extern "C"` symbol.
+#[derive(Clone)]
+struct ExternAbi {
+    params: Vec<ParamAbi>,
+    ret: ReturnAbi,
+}
+
+/// The LLVM return type for a register-passed struct: a single scalar for a one-eightbyte struct,
+/// an `{T0,T1}` aggregate for a two-eightbyte struct (matching clang: `i64` / `double` /
+/// `{i64,i64}` / `{double,double}` / `{i64,double}` …). The aggregate's field classes drive LLVM's
+/// two-register return assignment (GP vs XMM), so INTEGER→`i64` and SSE→`double` must be exact.
+fn struct_ret_type<'c>(ctx: &'c Context, abi: &StructAbi) -> BasicTypeEnum<'c> {
+    if abi.ebs.len() == 1 {
+        abi.ebs[0].llvm(ctx)
+    } else {
+        let fields: Vec<BasicTypeEnum> = abi.ebs.iter().map(|e| e.llvm(ctx)).collect();
+        ctx.struct_type(&fields, false).into()
+    }
+}
+
+/// The SysV AMD64 argument-register budget: 6 general-purpose (RDI, RSI, RDX, RCX, R8, R9) and 8 SSE
+/// (XMM0–XMM7).
+const SYSV_INT_ARG_REGS: u32 = 6;
+const SYSV_SSE_ARG_REGS: u32 = 8;
+
+/// Enforce the SysV **all-or-nothing** rule for by-value struct *arguments*: a struct is passed in
+/// registers only if *every* one of its eightbytes fits in the class registers still free after the
+/// preceding arguments; otherwise the ABI puts the whole struct in memory via a `byval` pointer.
+///
+/// We do not implement that `byval` path — and, crucially, cannot fake it by flattening. A flattened
+/// `{i64,i64}` argument at the exhaustion boundary makes LLVM assign one eightbyte to the last free
+/// register and spill the other to the stack, whereas a clang-compiled callee reading a `byval`
+/// argument expects the whole struct on the stack; the two disagree (verified: a `{i64,i64}` passed
+/// after five `i64` args round-trips to garbage). So we **reject** any signature where a by-value
+/// struct argument would fall to memory, rather than silently miscompile. In every *accepted* case
+/// the struct fits in registers, and per-eightbyte flattening is byte-identical to clang's own
+/// flattened parameter form, so the call is correct.
+///
+/// Only struct arguments consume the budget check: a scalar/pointer/view that itself spills to the
+/// stack is lowered identically on both sides (a single stack slot), so it never diverges.
+fn check_sysv_struct_args_fit(
+    ext_name: &str,
+    abi: &ExternAbi,
+    param_tys: &[Ty],
+    structs: &[StructDef],
+) -> Result<(), CodegenError> {
+    let mut gp = 0u32;
+    let mut sse = 0u32;
+    for (i, (pa, ty)) in abi.params.iter().zip(param_tys).enumerate() {
+        match pa {
+            ParamAbi::Direct => {
+                if matches!(ty, Ty::Float(_)) {
+                    sse += 1;
+                } else {
+                    gp += 1; // integer / `raw` pointer → a general-purpose register
+                }
+            }
+            ParamAbi::ViewPtr => gp += 1, // a `str`/`slice` passes as one data pointer
+            ParamAbi::StructRegs(sabi) => {
+                let need_int = sabi.ebs.iter().filter(|e| matches!(e, Eb::Integer)).count() as u32;
+                let need_sse = sabi.ebs.iter().filter(|e| matches!(e, Eb::Sse)).count() as u32;
+                if gp + need_int > SYSV_INT_ARG_REGS || sse + need_sse > SYSV_SSE_ARG_REGS {
+                    let sname = &structs[sabi.id as usize].name;
+                    return Err(CodegenError::Lowering(format!(
+                        "extern '{ext_name}': by-value struct '{sname}' (argument {n}) would be passed in memory — the preceding arguments exhaust the SysV class registers ({SYSV_INT_ARG_REGS} integer / {SYSV_SSE_ARG_REGS} SSE), so the struct falls to the MEMORY-class `byval` ABI, which is not supported in FFI v1. Reorder the parameters so the struct fits in registers, or pass it by pointer (`raw`).",
+                        n = i + 1,
+                    )));
+                }
+                gp += need_int;
+                sse += need_sse;
+            }
+            // A > 16-byte MEMORY struct consumes no registers and is rejected separately (with a size
+            // message) in the declaration loop.
+            ParamAbi::StructMemory => {}
+        }
+    }
+    Ok(())
 }
 
 /// Size/alignment (bytes) of a scalar's in-memory representation.
@@ -1540,9 +1814,9 @@ struct FnGen<'c, 'a> {
     module: &'a Module<'c>,
     builder: &'a Builder<'c>,
     funcs: &'a HashMap<String, FunctionValue<'c>>,
-    /// Extern parameter types by C symbol — to coerce a `str`/`slice` call argument to its data
-    /// pointer when calling a foreign function.
-    extern_params: &'a HashMap<String, Vec<Ty>>,
+    /// The SysV ABI plan for each `extern "C"` symbol — to coerce call arguments (view→data
+    /// pointer, `layout(C)` struct→register slots) and reconstruct a by-value struct return.
+    extern_abi: &'a HashMap<String, ExternAbi>,
     structs: &'a [StructDef],
     struct_types: &'a [StructType<'c>],
     /// Logical→physical field-index map per struct id (`field_perm[sid][logical] = physical`).
@@ -1697,6 +1971,26 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let p = self.builder.build_alloca(ty, name).map_err(|e| self.err(e))?;
         self.builder.position_at_end(saved);
         Ok(p)
+    }
+
+    /// An 8-byte-aligned entry-block scratch slot of `n` eightbytes (`[n x i64]`), used to coerce a
+    /// `layout(C)` struct to/from its SysV register form. Sizing to a multiple of 8 keeps every
+    /// per-eightbyte `i64`/`double` load in bounds even when the struct's last eightbyte is only
+    /// partially occupied (the padding bytes are ABI-irrelevant).
+    fn eightbyte_slot(&self, n: usize) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let arr = self.ctx.i64_type().array_type(n as u32);
+        self.alloca_at_entry(arr.into(), "sysv_slot")
+    }
+
+    /// The address of eightbyte `i` within an [`FnGen::eightbyte_slot`] — `slot + i * 8` bytes, via
+    /// an i64-strided GEP. In bounds by construction (`i < n`).
+    fn eightbyte_ptr(&self, slot: inkwell::values::PointerValue<'c>, i: usize) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let idx = self.ctx.i64_type().const_int(i as u64, false);
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(self.ctx.i64_type(), slot, &[idx], "ebp")
+                .map_err(|e| self.err(e))
+        }
     }
 
     /// Find + declare + call an overloaded LLVM intrinsic by name, with the given overload types
@@ -3706,21 +4000,41 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::Call(name, args) => {
                 let callee = self.funcs[name];
-                // A foreign call passes a `str`/`slice` argument as its data pointer (the extern's
-                // declared param type is `ptr`); every other argument passes as its value.
-                let argv: Vec<inkwell::values::BasicMetadataValueEnum> = match self.extern_params.get(name) {
-                    Some(param_tys) => {
-                        let mut v = Vec::with_capacity(args.len());
-                        for (i, o) in args.iter().enumerate() {
+                // A foreign call coerces each argument to its SysV form: a `str`/`slice` view → its
+                // data pointer; a `layout(C)` struct → one `i64`/`double` per eightbyte; everything
+                // else passes as its value. A non-extern call passes every argument directly.
+                let argv: Vec<inkwell::values::BasicMetadataValueEnum> = match self.extern_abi.get(name) {
+                    Some(abi) => {
+                        let mut v: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::with_capacity(args.len());
+                        for (o, pa) in args.iter().zip(&abi.params) {
                             let val = self.operand(o);
-                            let coerced = if param_tys.get(i).copied().is_some_and(is_ffi_view) {
-                                self.builder
-                                    .build_extract_value(val.into_struct_value(), 0, "ffiptr")
-                                    .map_err(|e| self.err(e))?
-                            } else {
-                                val
-                            };
-                            v.push(coerced.into());
+                            match pa {
+                                ParamAbi::Direct => v.push(val.into()),
+                                ParamAbi::ViewPtr => {
+                                    let ptr = self
+                                        .builder
+                                        .build_extract_value(val.into_struct_value(), 0, "ffiptr")
+                                        .map_err(|e| self.err(e))?;
+                                    v.push(ptr.into());
+                                }
+                                ParamAbi::StructRegs(sabi) => {
+                                    // Store the struct into a padded (eightbyte-multiple) slot, then
+                                    // load one `i64`/`double` per eightbyte — the SysV register form.
+                                    // The padded slot keeps every 8-byte load in bounds even when the
+                                    // last eightbyte is only partially occupied.
+                                    let slot = self.eightbyte_slot(sabi.ebs.len())?;
+                                    self.builder.build_store(slot, val.into_struct_value()).map_err(|e| self.err(e))?;
+                                    for (i, &eb) in sabi.ebs.iter().enumerate() {
+                                        let p = self.eightbyte_ptr(slot, i)?;
+                                        let lv = self.builder.build_load(eb.llvm(self.ctx), p, "eb").map_err(|e| self.err(e))?;
+                                        v.push(lv.into());
+                                    }
+                                }
+                                // `StructMemory` params were rejected at declaration time.
+                                ParamAbi::StructMemory => {
+                                    return Err(self.err(format!("extern '{name}': by-value MEMORY-class struct argument is unsupported")));
+                                }
+                            }
                         }
                         v
                     }
@@ -3730,6 +4044,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(callee, &argv, "call")
                     .map_err(|e| self.err(e))?;
+                // Reconstruct a by-value struct return from its register form.
+                if let Some(ExternAbi { ret: ReturnAbi::StructRegs(sabi), .. }) = self.extern_abi.get(name) {
+                    let rv = cs
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or_else(|| self.err(format!("extern '{name}' returns a struct by value but produced no value")))?;
+                    let slot = self.eightbyte_slot(sabi.ebs.len())?;
+                    self.builder.build_store(slot, rv).map_err(|e| self.err(e))?;
+                    let sty = self.struct_types[sabi.id as usize];
+                    let sv = self.builder.build_load(sty, slot, "ffiret").map_err(|e| self.err(e))?;
+                    return Ok(Some(sv));
+                }
                 return Ok(cs.try_as_basic_value().basic());
             }
             Rvalue::FnAddr(name) => {
