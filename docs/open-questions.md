@@ -1819,7 +1819,7 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   proven to remove the runtime overlap guard on a two-slice-param loop, but **no source construct
   generates such a loop today** (`map_into(out)` deferred; whole-slice `dst = a + b` unimplemented;
   the pipeline store-loops write fresh allocations LLVM already disambiguates — zero memchecks across
-  the whole example corpus at `-O2`), and the no-alias *check* has an untracked `SubSlice` provenance
+  the whole example corpus at `-O2`), and the no-alias *check* has an untracked `SliceRange` provenance
   hole that must be closed before any emission. Belongs with the `map_into(out)` slice, not now.
 - **`task_group` spawns one OS thread per task** (`align_runtime/src/lib.rs` ~:3585,
   `align_rt_tg_wait`, via `thread::scope` + a `spawn` per task) instead of reusing the **persistent**
@@ -2032,7 +2032,7 @@ because no metadata is emitted, but the emission gate must close them: (a) a sli
 function has unknown provenance and is treated as its own root; (b) **range-subslicing is NOT
 tracked** — `fill(a, a[0..2])` and `fill(s1, s2)` with `s1 := a[0..2]` / `s2 := a[1..3]` are
 currently **accepted** even though the buffers overlap, because `expr_root_local` only sees
-`Local`/`ArrayToSlice`, not `SubSlice`. The gate must track `SubSlice` and conservatively reject
+`Local`/`ArrayToSlice`, not `SliceRange`. The gate must track `SliceRange` and conservatively reject
 unknown-provenance `out` args — see the 2026-07-02 investigation note below.) **What remains is emitting the LLVM `noalias`** so loop vectorization can skip
 runtime overlap checks — blocked on the slice ABI: a slice is passed **by value** as a `{ptr,len}`
 aggregate, so its buffer pointer is not a standalone pointer parameter to attribute. Needs either a
@@ -2063,10 +2063,10 @@ reachable target today + a soundness gate to close first.** Findings:
   does **not** see through range-subslicing: `f(xs, xs[0..2])` and `f(s1, s2)` with `s1 := xs[0..2]`
   / `s2 := xs[1..3]` are **accepted** even though the `out` buffer overlaps an input. `expr_root_local`
   (`align_sema/src/lib.rs` ~:4915) only tracks `ExprKind::Local` and `ExprKind::ArrayToSlice`
-  (whole-array borrow, `s: slice := a`), not `SubSlice`; an inline `xs[0..2]` arg has no `place_local`
+  (whole-array borrow, `s: slice := a`), not `ExprKind::SliceRange`; an inline `xs[0..2]` arg has no `place_local`
   root at all. (The "`fill(s1,s2)` rejected" claim above holds **only** for the whole-array-borrow
   form; the subslice form was an untracked hole.) The emission gate must extend provenance through
-  `SubSlice` and conservatively reject unknown-provenance `out` args, else scope metadata is a
+  `SliceRange` and conservatively reject unknown-provenance `out` args, else scope metadata is a
   miscompile.
 - **Conclusion / who inherits this:** implement scope-metadata emission **as part of the
   `map_into(out dst)` slice** (the first real two-slice-param loop), after closing the subslice
