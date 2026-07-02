@@ -57,11 +57,11 @@ fn unsafe_block_is_a_transparent_marker_for_regions() {
     // still caught by the escape check (the block's value inherits the arena value's region, not the
     // `Static` fallback). This guards against a use-after-free hole the marker block could open.
     assert!(!ok(concat!(
-        "fn build() -> i32 {\n  mut out := 0\n  unsafe {\n    arena {\n      p := heap.new(5)\n      out = p.get()\n    }\n  }\n  return out\n}\n",
+        "fn build() -> i32 {\n  mut out: i32 := 0\n  unsafe {\n    arena {\n      p: box<i32> := heap.new(5)\n      out = p.get()\n    }\n  }\n  return out\n}\n",
         "fn escape() -> box<i64> {\n  unsafe {\n    arena {\n      return heap.new(5)\n    }\n  }\n}\n",
     )));
     // The plain in-arena use (no escape) is fine.
-    assert!(ok("fn build() -> i32 {\n  mut out := 0\n  unsafe {\n    arena {\n      p := heap.new(5)\n      out = p.get()\n    }\n  }\n  return out\n}\n"));
+    assert!(ok("fn build() -> i32 {\n  mut out: i32 := 0\n  unsafe {\n    arena {\n      p: box<i32> := heap.new(5)\n      out = p.get()\n    }\n  }\n  return out\n}\n"));
 }
 
 #[test]

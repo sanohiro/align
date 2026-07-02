@@ -20,7 +20,7 @@ fn fused_map_sum_correct_under_o2() {
         "fn run(xs: slice<i64>) -> i64 = xs.map(dbl).sum()\n",
         "fn main() -> i32 {\n",
         "  a := [1, 2, 3, 4, 5, 6, 7, 8]\n",
-        "  return run(a)\n",
+        "  return run(a) as i32\n",
         "}\n",
     );
     let out = build_and_run("opt-map-sum", src);
@@ -40,7 +40,7 @@ fn fused_map_where_sum_correct_under_o2() {
         "fn run(xs: slice<i64>) -> i64 = xs.map(dbl).where(big).sum()\n",
         "fn main() -> i32 {\n",
         "  a := [1, 2, 3, 4, 5, 6]\n",
-        "  return run(a)\n",
+        "  return run(a) as i32\n",
         "}\n",
     );
     let out = build_and_run("opt-map-where-sum", src);

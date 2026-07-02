@@ -2603,13 +2603,28 @@ individual review entries. None block anything; pick up when the lint suite is a
   new whole-function box-use scan: the escape pass (`EscapeCheck`) emits inline diagnostics and keeps
   **no reusable per-box "escaped?" fact** to piggyback on. Also note it would fire on the didactic
   arena/box examples/tests (all true positives, but worth pairing the scan with that judgment).
-  (Latent bug found while building this, orthogonal to the lint — recorded for a separate fix: the
-  inline `v: i32 := heap.new(7).get()` **miscompiles**. `heap.new`'s payload scalar is resolved eagerly
-  from the literal — defaulting to `i64` — and the outer `v: i32` annotation cannot flow back into it,
-  so an `i64` box is read into an `i32` slot and the `let`'s `i64`→`i32` mismatch is not caught. A box
-  bound with an explicit `box<i32>` annotation, or fed a typed variable, is correct. The soundness hole
-  is missing backward width inference / a missed `let`-annotation type check on the `heap.new(literal)`
-  path — not the lint.)
+  (Latent bug found while building this, orthogonal to the lint — **FIXED** (2026-07-03): the inline
+  `v: i32 := heap.new(7).get()` used to **miscompile**. `heap.new`'s payload scalar resolved eagerly
+  from the literal — defaulting to `i64` — the outer `v: i32` annotation did not flow back into it, so
+  an `i64` box was read into an `i32` slot (exit 160, not 7) and the `let`'s `i64`→`i32` mismatch was
+  not caught. Two root causes, both closed: **(1) soundness** — `check_expr` had *no single point*
+  reconciling a value's concrete type with its `expected` context type. Literal/constructor arms thread
+  `expected` inward (`constrain`), but value-producing arms — a call, a `box.get()`/`box.clone()`, an
+  `as` cast, a reduction terminal — return a *fixed* type and ignored `expected`, so the binding site
+  (`let` / assignment / struct field / `return` / call arg) silently took the annotation type while
+  codegen stored the value's real type. A `check_expr` wrapper now `constrain`s `result.ty` against
+  `expected` at the boundary — the single reconciliation point — gated on "this subtree reported no
+  error of its own" (via `Diagnostics::error_count`) so a terminal that already enforces its own result
+  type is not double-reported; a warning does not gate it, and skipping only defers a diagnostic since
+  any error halts codegen. This closed the whole class uniformly (verified across let/assign/struct-
+  field/return/call-arg and the sibling builtin results `box.clone`/`str.len`/`array.sum`/`task.get`),
+  and surfaced several latent i64→i32-through-i32-`main` returns in the test corpus (made type-correct
+  with a visible `as i32` narrowing — *Nothing hidden*). **(2) inference quality** — the expected type
+  now flows into a `heap.new(...)` receiver of `.get()`/`.clone()` (scoped to that receiver via
+  `is_heap_new_call`, so a box-typed *variable* is not double-constrained), so `v: i32 :=
+  heap.new(7).get()` infers `box<i32>` and *works* rather than merely erroring. Tests: `align_sema`
+  `heap_new_payload_infers_from_binding_annotation` / `box_get_result_width_mismatch_is_caught_once` /
+  `value_result_width_mismatch_is_caught_across_contexts`; e2e `m3::inline_heap_new_get_infers_payload_width`.)
 - Prefer-pipeline-over-vecN for bulk data: nudge bulk/array-shaped code from a hand-tuned fixed-width
   vecN<T> kernel toward the width-agnostic pipeline (map/where/reduce) when the data is a plain bulk
   scan — vecN<T> is the escape hatch for genuinely hand-tuned kernels, not the default, and pipeline

@@ -4631,7 +4631,34 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Type-check an expression against its `expected` context type.
+    ///
+    /// This wrapper adds the **single reconciliation point** between a value's concrete type and the
+    /// slot it flows into. Literal / path / constructor arms thread `expected` inward (so a bare `1`
+    /// takes the context width); but value-producing arms — a call, a `box.get()`, an `as` cast —
+    /// return a *fixed* type and ignore `expected`. Without a final `constrain`, a mismatch there is
+    /// silently accepted: the binding site (`let`, assignment, struct field, `return`, call arg) takes
+    /// the annotation type while codegen stores the value's real type — a miscompile (e.g. an `i64`
+    /// box read into an `i32` slot). Reconciling here catches it as one clean type error, uniformly,
+    /// for every context. `constrain` is a no-op when `expected` is `None`, when the arm already
+    /// unified with the same `expected` (idempotent), or when either side is `Ty::Error`.
+    ///
+    /// Gated on "checking this subtree reported no error of its own": an arm that already reported a
+    /// mismatch (a reduction terminal enforcing its own result type, or any erroring subexpression)
+    /// must not be double-reported. This never lets a real mismatch reach codegen — any error halts
+    /// compilation before lowering — so a skipped reconciliation only defers the diagnostic to the
+    /// recompile after the pre-existing error is fixed. A *warning* (e.g. the unnecessary-heap lint)
+    /// does not gate it: the error count, not the diagnostic count, is the checkpoint.
     fn check_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
+        let errors_before = self.diags.error_count();
+        let result = self.check_expr_inner(e, expected);
+        if self.diags.error_count() == errors_before {
+            self.constrain(result.ty, expected, e.span);
+        }
+        result
+    }
+
+    fn check_expr_inner(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
         match &e.kind {
             ast::ExprKind::Unit => {
                 self.constrain(Ty::Unit, expected, e.span);
@@ -6505,7 +6532,24 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let recv_expr = self.check_expr(recv, None);
+        // For `box.get()` / `box.clone()` whose receiver is a fresh `heap.new(...)`, thread the
+        // caller's expected type inward so the boxed literal's payload infers from context
+        // (`v: i32 := heap.new(7).get()` → `box<i32>`) instead of defaulting the literal to i64 and
+        // then failing the slot's width check. Scoped to a `heap.new` receiver: a box-typed *variable*
+        // already has a fixed payload, so threading a box-expected there would double-report a genuine
+        // mismatch that the `check_expr` reconciliation already catches once.
+        let recv_expected = if is_heap_new_call(recv) {
+            match method {
+                // `.get()` yields the payload scalar; the receiver is a `box<that scalar>`.
+                "get" => expected.and_then(|e| ty_to_scalar(self.resolve(e))).map(Ty::Box),
+                // `.clone()` yields a `box<T>`; pass the expected box straight through.
+                "clone" if matches!(expected, Some(Ty::Box(_))) => expected,
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let recv_expr = self.check_expr(recv, recv_expected);
         let recv_ty = recv_expr.ty;
         match method {
             "get" => self.check_box_get(recv_expr, recv_ty, args, span),
@@ -10078,6 +10122,16 @@ fn single_name(p: &ast::Path) -> Option<&str> {
     }
 }
 
+/// Whether `e` is syntactically a `heap.new(...)` call — the box-allocating builtin. A `heap.new`
+/// literal payload defaults to `i64` on its own; recognising the receiver lets `heap.new(x).get()` /
+/// `.clone()` thread the caller's expected type into the payload so it infers the right width.
+fn is_heap_new_call(e: &ast::Expr) -> bool {
+    matches!(&e.kind, ast::ExprKind::Call { callee, .. }
+        if matches!(&callee.kind, ast::ExprKind::FieldAccess { recv, field }
+            if field.name == "new"
+                && matches!(&recv.kind, ast::ExprKind::Path(p) if single_name(p) == Some("heap"))))
+}
+
 // --- unused-import lint -----------------------------------------------------------------------
 //
 // An `import` is **used** if the module's source contains a qualified reference whose dotted prefix
@@ -11404,7 +11458,7 @@ mod tests {
     #[test]
     fn array_index_checks_and_rejects() {
         // Indexing a scalar array / slice / owned array yields the element scalar.
-        let (_p, ok) = check("fn main() -> i32 {\n  xs := [10, 20, 30]\n  return xs[1]\n}\n");
+        let (_p, ok) = check("fn main() -> i32 {\n  xs := [10, 20, 30]\n  return xs[1] as i32\n}\n");
         assert!(!ok.has_errors(), "indexing a scalar array should check");
         let (_o, owned) = check("import core.json\nfn main() -> Result<(), Error> {\n  xs: array<i64> := json.decode(\"[1,2]\")?\n  print(xs[0])\n  return Ok(())\n}\n");
         assert!(!owned.has_errors(), "indexing an owned array<i64> should check");
@@ -11720,7 +11774,7 @@ mod tests {
     fn owned_string_is_move_use_after_move_rejected() {
         // A `string` is a Move type: binding it elsewhere moves it, so a later use is rejected
         // (whereas `print` borrows — covered by the e2e tests).
-        let (_p, d) = check("fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  t := s\n  return t.len()\n}\n");
+        let (_p, d) = check("fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  t := s\n  return t.len() as i32\n}\n");
         // `t := s` moves; but `t.len()` is fine. Now force a use-after-move:
         assert!(!d.has_errors(), "moving a string into a new binding and using the new one is fine");
         let (_q, d2) = check("fn mk(a: str) -> string = a.clone()\nfn main() -> i32 {\n  s := mk(\"x\")\n  t := s\n  return s.len()\n}\n");
@@ -12242,6 +12296,58 @@ mod tests {
     fn heap_new_outside_arena_errors() {
         let (_p, d) = check("fn main() -> i32 {\n  p: box<i32> := heap.new(5)\n  return p.get()\n}\n");
         assert!(d.has_errors(), "heap.new outside an arena must error");
+    }
+
+    #[test]
+    fn heap_new_payload_infers_from_binding_annotation() {
+        // The inline form `v: i32 := heap.new(7).get()` used to miscompile: the boxed literal
+        // defaulted to i64 (an i64 box read into an i32 slot), and the width mismatch was not caught.
+        // The binding annotation now flows into the `heap.new` payload, so the box is `box<i32>`.
+        for ann in ["i8", "u8", "i32", "u64", "i64"] {
+            let (_p, d) = check(&format!(
+                "fn main() -> i32 {{\n  arena {{\n    v: {ann} := heap.new(7).get()\n    return v as i32\n  }}\n}}\n"
+            ));
+            assert!(!d.has_errors(), "`v: {ann} := heap.new(7).get()` should infer the payload and check");
+        }
+        // A float payload infers likewise.
+        let (_f, df) = check("fn main() -> i32 {\n  arena {\n    v: f64 := heap.new(3.5).get()\n    return 0\n  }\n}\n");
+        assert!(!df.has_errors(), "a float box payload should infer from the annotation");
+        // `.clone()` on a fresh `heap.new` receiver threads the expected box type inward too.
+        let (_c, dc) = check("fn main() -> i32 {\n  arena {\n    q: box<i32> := heap.new(11).clone()\n    return q.get()\n  }\n}\n");
+        assert!(!dc.has_errors(), "`box<i32> := heap.new(11).clone()` should infer the payload and check");
+    }
+
+    #[test]
+    fn box_get_result_width_mismatch_is_caught_once() {
+        // A `box<i64>` variable read into an `i32` slot is a genuine mismatch — it must be a single
+        // clean type error (the reconciliation must not double-report alongside any inner check).
+        let (_p, d) = check("fn main() -> i32 {\n  arena {\n    p: box<i64> := heap.new(7)\n    v: i32 := p.get()\n    return v\n  }\n}\n");
+        assert!(d.has_errors(), "reading an i64 box into an i32 slot must be a type error");
+        assert_eq!(d.error_count(), 1, "the box-get width mismatch must be reported exactly once");
+    }
+
+    #[test]
+    fn value_result_width_mismatch_is_caught_across_contexts() {
+        // A value expression whose concrete type differs from its slot must be rejected in every
+        // context — not silently narrowed. Each case reports exactly one error (no double-report).
+        // let-binding:
+        let (_a, da) = check("fn r() -> i64 = 7\nfn main() -> i32 {\n  v: i32 := r()\n  return v\n}\n");
+        assert_eq!(da.error_count(), 1, "i64 value into an i32 let must be one error");
+        // return position:
+        let (_b, db) = check("fn r() -> i64 = 7\nfn main() -> i32 {\n  return r()\n}\n");
+        assert_eq!(db.error_count(), 1, "returning i64 from an i32 fn must be one error");
+        // call argument:
+        let (_c, dc) = check("fn r() -> i64 = 7\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return id(r())\n}\n");
+        assert_eq!(dc.error_count(), 1, "an i64 argument to an i32 param must be one error");
+        // struct field initializer:
+        let (_e, de) = check("S { x: i32 }\nfn r() -> i64 = 7\nfn main() -> i32 {\n  s := S { x: r() }\n  return s.x\n}\n");
+        assert_eq!(de.error_count(), 1, "an i64 struct-field value into an i32 field must be one error");
+        // assignment:
+        let (_f, df) = check("fn r() -> i64 = 7\nfn main() -> i32 {\n  mut v: i32 := 0\n  v = r()\n  return v\n}\n");
+        assert_eq!(df.error_count(), 1, "assigning an i64 value to an i32 var must be one error");
+        // a reduction terminal already enforces its result type — must stay a single report:
+        let (_g, dg) = check("fn main() -> i32 {\n  xs := [1, 2, 3]\n  s: i32 := xs.sum()\n  return s\n}\n");
+        assert_eq!(dg.error_count(), 1, "an i64 array-sum into an i32 slot must be reported exactly once");
     }
 
     #[test]
