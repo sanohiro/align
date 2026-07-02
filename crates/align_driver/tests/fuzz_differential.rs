@@ -241,6 +241,56 @@ fn typed_multiwidth_programs_compute_the_oracle_value() {
     }
 }
 
+// --- function-call variant: exercises the call ABI (params, args, return values) end-to-end ---
+
+#[test]
+fn function_calls_compute_the_oracle_value() {
+    if !backend_available() {
+        return;
+    }
+    for seed in 0..150u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(7));
+        let nfns = 1 + rng.below(3); // 1..3 helper functions
+        let mut decls = String::new();
+        let mut calls = String::new();
+        let mut last_val = 0i128;
+        let mut last_idx = 0usize;
+        for i in 0..nfns {
+            let ret = TYPES[rng.below(TYPES.len())];
+            let arity = 1 + rng.below(3); // 1..3 parameters, each its own type (mixed → casts in body)
+            let mut sig = String::new();
+            let mut args = Vec::new();
+            let mut pvars: Vec<(String, ITy, i128)> = Vec::new();
+            for p in 0..arity {
+                let pty = TYPES[rng.below(TYPES.len())];
+                let av = rng.below(10) as i128; // arg literal 0..9 (representable in every width)
+                if p > 0 {
+                    sig.push_str(", ");
+                }
+                sig.push_str(&format!("p{p}: {}", pty.name()));
+                args.push(av.to_string());
+                pvars.push((format!("p{p}"), pty, wrap(av, pty)));
+            }
+            // The body's oracle is computed with the params bound to *exactly* the args main passes,
+            // so each function is called once with those args and must return that value.
+            let (body, result) = gen_typed(&mut rng, 3, ret, &pvars);
+            decls.push_str(&format!("fn f{i}({sig}) -> {} = {body}\n", ret.name()));
+            calls.push_str(&format!("  c{i}: {} := f{i}({})\n", ret.name(), args.join(", ")));
+            last_val = result;
+            last_idx = i;
+        }
+        let final_val = wrap(last_val, ITy::I32);
+        let src = format!("{decls}fn main() -> i32 {{\n{calls}  return c{last_idx} as i32\n}}\n");
+        let expected = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
+        let out = build_and_run(&format!("difff-{seed}"), &src);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, expected,
+            "miscompile on seed {seed}: expected {expected} (oracle {last_val}), got {code}\n--- program ---\n{src}"
+        );
+    }
+}
+
 #[test]
 fn generated_programs_compute_the_oracle_value() {
     if !backend_available() {
