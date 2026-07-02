@@ -81,11 +81,26 @@ The roadmap pairs these two as "#6", but they split cleanly by their prerequisit
   - **Guarantees:** deterministic for a given input within a build (fixed seed); **non-crypto** — not
     DoS-resistant, not a stable on-disk/wire format, not for security (crypto hashes live in
     `std.crypto`). Documented at the call site.
-  - **Convergence (One way), as a follow-up — not in the first slice:** the *public* `hash64` (stable
-    user API) and `group_by`/`dict_encode`'s *internal* hasher are different roles, but they should
-    converge on this same `wyhash`. The first slice ships the public API; **rewiring group_by's FxHash
-    and the JSON PHF (which has the codegen↔runtime byte-match constraint) to `wyhash` is a separate,
-    independently-risky follow-up** (tracked here, not bundled, to keep the byte-match change isolated).
+  - **Convergence (One way) — DONE 2026-07-03:** the *public* `hash64` and `group_by`/`dict_encode`'s
+    *internal* hasher (was FxHash) and the JSON PHF (was FNV-1a, with the codegen↔runtime byte-match
+    constraint) now all route through the **one** `wyhash`. The single source of truth is a new
+    dependency-free crate **`align_hash`** (`crates/align_hash`, `#![forbid(unsafe_code)]`), depended on
+    by both `align_runtime` (`hash64`/`hash128`, `group_by`/`dict_encode`, the runtime PHF probe) and
+    `align_codegen_llvm` (the compile-time PHF table builder). This makes the PHF byte-match
+    **structural, not test-guarded**: codegen's `build_phf` and the runtime's `json_phf_hash` call the
+    same `align_hash::wyhash` with the same seed convention, so they *cannot* compute a different slot
+    for a field name. The pinned canary (`wyhash(b"score", 0) == 0x1300a50cfadb78d9`) is asserted on all
+    three sides (`align_hash::phf_pinned_vector`, codegen `phf_hash_is_pinned`, runtime
+    `phf_hash_matches_codegen`); an end-to-end differential test decodes an 8-field struct from JSON with
+    keys in reverse order and checks every field routes correctly
+    (`align_driver/tests/m5.rs::json_decode_phf_two_end_match_all_fields`). The internal string-interning
+    maps use a `WyKey` (pre-hashed with `wyhash`) + pass-through `IdentityHasher`, so each key is hashed
+    exactly once with the canonical hash. **Perf (measured before/after, `bench/`):** the JSON PHF path
+    (`bench/json_decode`) is neutral (±1.5%, within run-to-run noise — short field names hit wyhash's
+    ≤16-byte fast path); the string-keyed `group_by`/`dict_encode` path (`bench/group_by_reuse`) got
+    **~1.5–1.8× faster** (wyhash is a cheaper per-lookup hash than the old FxHash finalizer; the win is
+    largest when the group map fits in cache and hashing dominates). Integer-key `group_by`
+    (`bench/group_by`) is untouched (its dense-id direct-index path never hashes).
   - **Build plan:** runtime `align_rt_hash64`/`align_rt_hash128` (`{ptr,len}` → `u64` / `{u64,u64}`),
     sema builtins `hash64`/`hash128` (like `print`/`error`), MIR rvalue + codegen call, `tests`,
     `examples/hash.align`. Record on build: `draft.md` §18.1, `docs/language-spec.md`,
@@ -667,12 +682,14 @@ JSON→SoA is then a thin wiring on top.
 (`descs.iter().position(...)`); now codegen bakes a **compile-time perfect-hash table** from the
 (known) field names and the runtime does an O(1) `hash(key) & (m-1)` → slot → one confirming name
 compare. Implemented: `build_phf` in codegen finds a collision-free `(seed, power-of-two size)` by
-scanning seeds `0..4096` over sizes `next_pow2(n)..×8` (FNV-1a `phf_hash`); emits a `[i32]` slot→index
+scanning seeds `0..4096` over sizes `next_pow2(n)..×8` (`phf_hash` = the canonical `wyhash`, since
+2026-07-03; originally FNV-1a); emits a `[i32]` slot→index
 global (`jphf`, `-1` = empty) alongside the descriptor table; the two decode entry points gained
 `(phf_ptr, phf_len, phf_seed)` args. Runtime `find_field` uses the table (or linear-scans when
-`phf_len = 0` — empty/1-field structs, or no table found, so it degrades gracefully). The codegen and
-runtime hashes are pinned to the same constant by paired tests (`phf_hash_is_pinned` /
-`phf_hash_matches_codegen`) so they can't drift. ≈1.2–2.5× on wide-schema decode; sound (the confirming
+`phf_len = 0` — empty/1-field structs, or no table found, so it degrades gracefully). Codegen's
+`build_phf` and runtime's `json_phf_hash` now call the **same** `align_hash::wyhash`, so the byte-match
+is structural; the paired pinned tests (`phf_hash_is_pinned` / `phf_hash_matches_codegen`, plus
+`align_hash::phf_pinned_vector`) are a canary against an accidental algorithm edit. ≈1.2–2.5× on wide-schema decode; sound (the confirming
 compare means an unknown key colliding into an occupied slot is still skipped). `tests/soa.rs` +1
 (wide struct, unknown keys, reordered fields → correct sums), codegen +3, runtime +2.
 

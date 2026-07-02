@@ -830,17 +830,13 @@ impl SeenSet {
     }
 }
 
-/// FNV-1a over `bytes`, seeded — the hash behind the compile-time perfect-hash field dispatch.
-/// **MUST byte-for-byte match the codegen-side `phf_hash` in `align_codegen_llvm`**, which computes
-/// each field name's slot at compile time; if the two diverge, a field would hash to the wrong slot.
+/// The canonical `wyhash`, seeded — the hash behind the compile-time perfect-hash field dispatch.
+/// Codegen's `build_phf` and this runtime probe **both** call `align_hash::wyhash`, so the slot a
+/// field name maps to is byte-identical on the two ends by construction (see `align_codegen_llvm`'s
+/// `phf_hash`). A thin wrapper keeps the call sites reading intent-first (`json_phf_hash(key, seed)`).
 #[inline]
 fn json_phf_hash(bytes: &[u8], seed: u64) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
+    align_hash::wyhash(bytes, seed)
 }
 
 /// Rebuild the perfect-hash slot table from the C ABI `(ptr, len)`: `None` (→ linear scan) when the
@@ -1929,129 +1925,67 @@ pub unsafe extern "C" fn align_rt_group_count_i64(keys: *const i64, len: i64, ou
 /// `base` must point to `n` valid `stride`-byte rows, each holding a valid `AlignStr` at `key_off`;
 /// `value_at` must read only within those rows. `out_keys`/`out_vals` must be valid for `cap`
 /// `AlignStr` / `i64` writes.
-#[derive(Default)]
-struct FxHasher {
+/// A byte-slice map key **pre-hashed with the one canonical `wyhash`** — the string-interning maps in
+/// `group_by`/`dict_encode` key on this, so their hashing converges on the same `wyhash` as the
+/// `hash64` builtin and the JSON PHF (no separate FxHash). `Hash` just replays the precomputed hash
+/// into the (identity) hasher, so each key is `wyhash`'d exactly once (at construction), not restreamed
+/// on every probe; `Eq` still compares the *bytes*, so equal keys collide correctly.
+#[derive(Clone, Copy)]
+struct WyKey<'a> {
+    bytes: &'a [u8],
     hash: u64,
 }
-
-impl std::hash::Hasher for FxHasher {
+impl<'a> WyKey<'a> {
     #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-        let mut h = self.hash;
-        let mut b = bytes;
-        while b.len() >= 8 {
-            let chunk = u64::from_le_bytes(b[..8].try_into().unwrap());
-            h = (h.rotate_left(5) ^ chunk).wrapping_mul(K);
-            b = &b[8..];
-        }
-        if !b.is_empty() {
-            let mut buf = [0u8; 8];
-            buf[..b.len()].copy_from_slice(b);
-            h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(K);
-        }
-        self.hash = h;
+    fn new(bytes: &'a [u8]) -> Self {
+        WyKey { bytes, hash: wyhash(bytes, WY_SEED) }
     }
+}
+impl PartialEq for WyKey<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+impl Eq for WyKey<'_> {}
+impl std::hash::Hash for WyKey<'_> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        h.write_u64(self.hash);
+    }
+}
+
+/// Pass-through hasher for the already-`wyhash`'d [`WyKey`]: the key's `Hash` feeds one `write_u64`
+/// (the precomputed hash), which is returned as-is. wyhash already avalanches, so the map needs no
+/// further mixing. `write` is never reached (a `WyKey` only ever calls `write_u64`).
+#[derive(Default)]
+struct IdentityHasher(u64);
+impl std::hash::Hasher for IdentityHasher {
     #[inline]
     fn finish(&self) -> u64 {
-        let mut h = self.hash;
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        h ^= h >> 33;
-        h
+        self.0
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+    #[inline]
+    fn write(&mut self, _: &[u8]) {
+        // Unreachable: `WyKey::hash` only ever calls `write_u64`. Kept a no-op (not `unreachable!`)
+        // so a future non-`WyKey` key can't turn a wrong-hasher mistake into a runtime panic in the
+        // linked user binary — such a bug would surface as a test failure, never a crash in the field.
+        debug_assert!(false, "IdentityHasher only accepts pre-hashed WyKey (write_u64)");
     }
 }
 
-type FxBuildHasher = std::hash::BuildHasherDefault<FxHasher>;
+type WyBuildHasher = std::hash::BuildHasherDefault<IdentityHasher>;
 
-// ---------------------------------------------------------------------------
-// core.hash — wyhash (final v3), Align's one canonical non-cryptographic hash.
-//
-// Dependency-free, strong-avalanche, ~40 lines (vs an `ahash`/AES dependency or
-// FxHash's weaker mixing). This is THE non-crypto hash: the `hash64`/`hash128`
-// builtins call it, and over time the internal group_by / dict_encode / JSON-PHF
-// hashers converge here too. Fixed seed → deterministic within a build. NOT
-// cryptographic: not DoS-resistant, not a stable on-disk/wire format.
-// Reference (public domain): https://github.com/wangyi-fudan/wyhash
-// ---------------------------------------------------------------------------
-const WY_SECRET: [u64; 4] = [
-    0xa076_1d64_78bd_642f,
-    0xe703_7ed1_a0b4_28db,
-    0x8ebc_6af0_9c88_c6e3,
-    0x5899_65cc_7537_4cc3,
-];
-/// Fixed seed for the canonical hash — determinism within a build.
-const WY_SEED: u64 = 0;
-
-#[inline]
-fn wymum(a: u64, b: u64) -> (u64, u64) {
-    let r = (a as u128).wrapping_mul(b as u128);
-    (r as u64, (r >> 64) as u64)
-}
-#[inline]
-fn wymix(a: u64, b: u64) -> u64 {
-    let (lo, hi) = wymum(a, b);
-    lo ^ hi
-}
-#[inline]
-fn wyr8(p: &[u8]) -> u64 {
-    u64::from_le_bytes(p[..8].try_into().unwrap())
-}
-#[inline]
-fn wyr4(p: &[u8]) -> u64 {
-    u32::from_le_bytes(p[..4].try_into().unwrap()) as u64
-}
-/// Read 1..=3 trailing bytes into a 64-bit lane (wyhash `_wyr3`).
-#[inline]
-fn wyr3(p: &[u8], k: usize) -> u64 {
-    ((p[0] as u64) << 16) | ((p[k >> 1] as u64) << 8) | (p[k - 1] as u64)
-}
-
-/// wyhash final v3 over `key` with `seed`. Faithful port of the reference scalar path.
-fn wyhash(key: &[u8], seed: u64) -> u64 {
-    let len = key.len();
-    let mut seed = seed ^ wymix(seed ^ WY_SECRET[0], WY_SECRET[1]);
-    let (a, b);
-    if len <= 16 {
-        if len >= 4 {
-            let off = (len >> 3) << 2;
-            a = (wyr4(key) << 32) | wyr4(&key[off..]);
-            b = (wyr4(&key[len - 4..]) << 32) | wyr4(&key[len - 4 - off..]);
-        } else if len > 0 {
-            a = wyr3(key, len);
-            b = 0;
-        } else {
-            a = 0;
-            b = 0;
-        }
-    } else {
-        let mut i = len;
-        let mut p = 0usize;
-        if i > 48 {
-            let mut see1 = seed;
-            let mut see2 = seed;
-            while i > 48 {
-                seed = wymix(wyr8(&key[p..]) ^ WY_SECRET[1], wyr8(&key[p + 8..]) ^ seed);
-                see1 = wymix(wyr8(&key[p + 16..]) ^ WY_SECRET[2], wyr8(&key[p + 24..]) ^ see1);
-                see2 = wymix(wyr8(&key[p + 32..]) ^ WY_SECRET[3], wyr8(&key[p + 40..]) ^ see2);
-                p += 48;
-                i -= 48;
-            }
-            seed ^= see1 ^ see2;
-        }
-        while i > 16 {
-            seed = wymix(wyr8(&key[p..]) ^ WY_SECRET[1], wyr8(&key[p + 8..]) ^ seed);
-            i -= 16;
-            p += 16;
-        }
-        a = wyr8(&key[len - 16..]);
-        b = wyr8(&key[len - 8..]);
-    }
-    let (lo, hi) = wymum(a ^ WY_SECRET[1], b ^ seed);
-    wymix(lo ^ WY_SECRET[0] ^ (len as u64), hi ^ WY_SECRET[1])
-}
+// core.hash — Align's one canonical non-cryptographic hash lives in the shared `align_hash` crate
+// (wyhash final v3). The `hash64`/`hash128` builtins, the `group_by`/`dict_encode` interning
+// (`WyKey`, above), and the JSON perfect-hash probe (`json_phf_hash`, below) all route through the
+// same `align_hash::wyhash` — so codegen and runtime cannot compute a different hash for the same
+// bytes. NOT cryptographic (not DoS-resistant, not a stable on-disk/wire format).
+use align_hash::{WY_SECRET, WY_SEED, wyhash};
 
 /// `core.hash.hash64(data)` — 64-bit non-crypto hash of a byte view (`str` / `slice<u8>`).
 ///
@@ -2134,20 +2068,21 @@ unsafe fn group_agg_str<'a>(
     // Reserve up front to avoid the early grow-and-rehash churn; the group count is unknown, so cap
     // at a sane starting size (n is the worst case = all-distinct, but don't over-reserve for huge n).
     let initial = n.min(cap as usize).min(1024);
-    let mut ids: HashMap<&[u8], usize, FxBuildHasher> = HashMap::with_capacity_and_hasher(initial, FxBuildHasher::default());
+    let mut ids: HashMap<WyKey, usize, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
     let mut acc: Vec<i64> = Vec::with_capacity(initial);
     let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
     for i in 0..n {
         let (bytes, ks) = key_at(i);
         let v = value_at(i);
-        match ids.get(bytes) {
+        let key = WyKey::new(bytes);
+        match ids.get(&key) {
             Some(&id) => acc[id] = combine(acc[id], v),
             None => {
                 let id = acc.len();
                 if id >= cap as usize {
                     return -1;
                 }
-                ids.insert(bytes, id);
+                ids.insert(key, id);
                 acc.push(v);
                 reprs.push(ks);
             }
@@ -2353,7 +2288,7 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     let val_offs: Vec<usize> = specs.iter().map(|s| s.val_off as usize).collect();
 
     let initial = n.min(cap as usize).min(1024);
-    let mut ids: HashMap<&[u8], usize, FxBuildHasher> = HashMap::with_capacity_and_hasher(initial, FxBuildHasher::default());
+    let mut ids: HashMap<WyKey, usize, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
     // Accumulators, row-major per group: `acc[id*k + j]`. One contiguous buffer keeps a group's K
     // accumulators adjacent (cache-friendly on the update).
     let mut acc: Vec<i64> = Vec::with_capacity(initial.saturating_mul(k));
@@ -2380,7 +2315,8 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     for i in 0..n {
         let row = unsafe { base.add(i * stride) };
         let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
-        match ids.get(bytes) {
+        let key = WyKey::new(bytes);
+        match ids.get(&key) {
             Some(&id) => {
                 // `id < reprs.len()` and `acc.len() == reprs.len() * k`, so `g + j < acc.len()`.
                 let g = id * k;
@@ -2399,7 +2335,7 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
                 if id >= cap as usize {
                     return -1;
                 }
-                ids.insert(bytes, id);
+                ids.insert(key, id);
                 reprs.push(ks);
                 // Seed each accumulator with the group's first row value.
                 for j in 0..k {
@@ -2452,12 +2388,13 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
     let (stride, key_off) = (stride as usize, key_off as usize);
     let out_ids = unsafe { std::slice::from_raw_parts_mut(out_ids, n) };
     let initial = n.min(cap as usize).min(1024);
-    let mut ids: HashMap<&[u8], i64, FxBuildHasher> = HashMap::with_capacity_and_hasher(initial, FxBuildHasher::default());
+    let mut ids: HashMap<WyKey, i64, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
     let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
     for (i, out_id) in out_ids.iter_mut().enumerate() {
         let row = unsafe { base.add(i * stride) };
         let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
-        let id = match ids.get(bytes) {
+        let key = WyKey::new(bytes);
+        let id = match ids.get(&key) {
             Some(&id) => id,
             None => {
                 let id = reprs.len() as i64;
@@ -2466,7 +2403,7 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
                 if id >= cap {
                     return -1;
                 }
-                ids.insert(bytes, id);
+                ids.insert(key, id);
                 reprs.push(ks);
                 id
             }
@@ -3975,17 +3912,6 @@ pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
 mod tests {
     use super::*;
 
-    /// wyhash final v3 reference test vectors (default secret `_wyp`, the per-line seeds from the
-    /// upstream `test_vector` program). Matching these proves the port is byte-faithful.
-    #[test]
-    fn wyhash_matches_reference_vectors() {
-        assert_eq!(wyhash(b"", 0), 0x0409_638e_e2bd_e459);
-        assert_eq!(wyhash(b"a", 1), 0xa841_2d09_1b5f_e0a9);
-        assert_eq!(wyhash(b"abc", 2), 0x32dd_92e4_b291_5153);
-        assert_eq!(wyhash(b"message digest", 3), 0x8619_1240_89a3_a16b);
-        assert_eq!(wyhash(b"abcdefghijklmnopqrstuvwxyz", 4), 0x7a43_afb6_1d7f_5f40);
-    }
-
     /// Boundary lengths around the 4/8/16/48-byte branch cuts must not panic and must differ.
     #[test]
     fn align_rt_hash64_boundaries_and_determinism() {
@@ -4940,9 +4866,11 @@ mod tests {
 
     #[test]
     fn phf_hash_matches_codegen() {
-        // The same pinned value as `align_codegen_llvm`'s `phf_hash_is_pinned` test. If these two
-        // ever diverge, the compile-time perfect-hash table would route JSON keys to wrong slots.
-        assert_eq!(json_phf_hash(b"score", 0), 0xc10e_63fb_e7f6_24f5);
+        // The same pinned value as `align_codegen_llvm`'s `phf_hash_is_pinned` test and
+        // `align_hash`'s `phf_pinned_vector` — all three call the one `wyhash`, so this is now a
+        // structural identity (a canary against an accidental algorithm/seed edit). If these ever
+        // diverge, the compile-time perfect-hash table would route JSON keys to wrong slots.
+        assert_eq!(json_phf_hash(b"score", 0), 0x1300_a50c_fadb_78d9);
     }
 
     #[test]

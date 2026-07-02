@@ -14,4 +14,5 @@ license.workspace = true
 crate-type = ["lib", "staticlib", "cdylib"]
 
 [dependencies]
+align_hash = { path = "../align_hash" }
 memchr = "2.8.2"

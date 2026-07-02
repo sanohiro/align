@@ -8,14 +8,10 @@
 use align_runtime::{align_rt_free, align_rt_json_decode_struct_array, AlignStr, JsonField};
 use std::time::Instant;
 
-/// FNV-1a, seeded — byte-for-byte the runtime's private `json_phf_hash` (replicated; it is not pub).
+/// The canonical `wyhash`, seeded — the same `align_hash::wyhash` the runtime's `json_phf_hash` and
+/// codegen's `build_phf` call, so the table this harness builds routes identically to a real decode.
 fn phf_hash(bytes: &[u8], seed: u64) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
+    align_hash::wyhash(bytes, seed)
 }
 
 /// Brute-force a collision-free perfect-hash table (slot → field index, -1 empty) over `names`,

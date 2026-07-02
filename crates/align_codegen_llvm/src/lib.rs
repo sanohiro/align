@@ -1381,16 +1381,12 @@ struct DecodeTable<'c> {
     phf_seed: u64,
 }
 
-/// FNV-1a over `bytes`, seeded — the hash behind the compile-time perfect-hash field dispatch.
-/// **MUST byte-for-byte match the runtime-side `json_phf_hash` in `align_runtime`** (the runtime
-/// hashes each JSON key with this to find its slot; a divergence would mis-route a field).
+/// The canonical `wyhash`, seeded — the hash behind the compile-time perfect-hash field dispatch.
+/// This and the runtime-side `json_phf_hash` (`align_runtime`) **both** call `align_hash::wyhash`,
+/// so the slot a JSON key maps to is byte-identical on the two ends *by construction* — the shared
+/// crate makes the codegen↔runtime PHF byte-match structural rather than a hand-kept invariant.
 fn phf_hash(bytes: &[u8], seed: u64) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
+    align_hash::wyhash(bytes, seed)
 }
 
 /// Build a perfect-hash slot table for the field `names`: a power-of-two-sized `[i32]` where
@@ -4818,9 +4814,11 @@ mod tests {
 
     #[test]
     fn phf_hash_is_pinned() {
-        // Pins the hash of a known input so the codegen and runtime implementations can't silently
-        // drift apart (the runtime's `json_phf_hash` must produce the same value — see its test).
-        assert_eq!(phf_hash(b"score", 0), 0xc10e_63fb_e7f6_24f5);
+        // Pins the hash of a known input. Codegen (`phf_hash`), runtime (`json_phf_hash`) and the
+        // shared `align_hash::phf_pinned_vector` all assert this same value — since all three call
+        // the one `align_hash::wyhash`, the byte-match is structural; this canary just guards against
+        // an accidental algorithm/seed edit slipping past.
+        assert_eq!(phf_hash(b"score", 0), 0x1300_a50c_fadb_78d9);
     }
 
     #[test]
