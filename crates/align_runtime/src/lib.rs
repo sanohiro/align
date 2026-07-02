@@ -685,6 +685,11 @@ pub struct JsonField {
 /// `[0, i64::MAX]` here. Widening the parser to full `u64` is a separate follow-up (open-questions).
 #[inline]
 fn int_in_range(v: i64, w: usize, signed: bool) -> bool {
+    // Defense in depth: a zero width is caller-validated as unreachable, but guard it so the
+    // `bits - 1` below can never underflow (no width fits a zero-byte field anyway).
+    if w == 0 {
+        return false;
+    }
     if signed {
         if w >= 8 {
             return true;
@@ -957,7 +962,7 @@ unsafe fn parse_object(
                             let v = p.integer()?;
                             // Reject out-of-range values (per the field's width + sign) instead of
                             // silently writing the low `w` bytes and truncating/sign-wrapping.
-                            if !int_in_range(v, w, (d.tag >> 16) & 1 == 1) {
+                            if !int_in_range(v, w, (d.tag & 0x1_0000) != 0) {
                                 return None;
                             }
                             let bytes = v.to_le_bytes();
@@ -1121,7 +1126,7 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
             }
             let v = vp.integer()?;
             // Reject out-of-range values (per the field's width + sign) — see `parse_object`.
-            if !int_in_range(v, w, (d.tag >> 16) & 1 == 1) {
+            if !int_in_range(v, w, (d.tag & 0x1_0000) != 0) {
                 return None;
             }
             let b = v.to_le_bytes();
@@ -1540,7 +1545,7 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     };
     let kind = (elem_tag >> 8) & 0xff;
     let width = (elem_tag & 0xff) as usize;
-    let signed = (elem_tag >> 16) & 1 == 1;
+    let signed = (elem_tag & 0x1_0000) != 0;
     let mut bytes: Vec<u8> = Vec::new();
     let mut count: i64 = 0;
 
