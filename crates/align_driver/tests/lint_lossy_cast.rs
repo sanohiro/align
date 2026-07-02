@@ -92,8 +92,39 @@ fn narrow_int_to_char_does_not_warn() {
 
 #[test]
 fn literal_source_is_not_flagged() {
-    // `1 as i8` is an explicit annotation on an unconstrained literal, not a loss — stays silent.
-    assert!(!warns_lossy("lit-annot", "fn main() -> i32 {\n  x := 1 as i8\n  return 0\n}\n"));
+    // A bare numeric literal (incl. negated / float) cast is an explicit annotation on a constant,
+    // not a value being narrowed — stays silent regardless of the literal's default width.
+    assert!(!warns_lossy("lit-int", "fn main() -> i32 {\n  x := 1 as i8\n  return 0\n}\n"));
+    assert!(!warns_lossy("lit-neg", "fn main() -> i32 {\n  x := -1 as i8\n  return 0\n}\n"));
+    assert!(!warns_lossy("lit-float", "fn main() -> i32 {\n  x := 3.14 as f32\n  return 0\n}\n"));
+}
+
+#[test]
+fn variable_holding_a_defaulted_value_warns() {
+    // Regression (PR #313 gemini finding): a variable whose width is left to the i64 default is
+    // still an inference variable at `check_cast` time — the lint must classify it after inference
+    // (in `finalize_expr`), at its final `i64` type, so `x := 100000; x as i8` warns just like an
+    // annotated `x: i64`. (Before the fix this was silently missed.)
+    let d = diags("var-default", "fn main() -> i32 {\n  x := 100000\n  return x as i8 as i32\n}\n");
+    assert!(d.contains("lossy conversion"), "a defaulted variable's narrowing cast should warn:\n{d}");
+    assert!(d.contains("`i64 as i8`"), "message should report the final (defaulted) type:\n{d}");
+}
+
+#[test]
+fn forward_inferred_lossless_does_not_warn() {
+    // `x := 5` then later constrained to `i8` (via `take8(x)`), so `x as i8` is i8 → i8 — lossless.
+    // Classifying at `check_cast` (before the later unification) would finalize `x` to i64 and
+    // falsely warn; classifying in `finalize_expr` sees the real `i8` and stays silent.
+    let src = concat!(
+        "fn take8(v: i8) -> i8 = v\n",
+        "fn main() -> i32 {\n",
+        "  x := 5\n",
+        "  y := x as i8\n",
+        "  z := take8(x)\n",
+        "  return z as i32\n",
+        "}\n",
+    );
+    assert!(!warns_lossy("fwd-lossless", src));
 }
 
 // --- the lint is a warning, not a hard error --------------------------------------------------

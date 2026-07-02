@@ -9239,18 +9239,11 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 );
             }
-            // Lossy-conversion lint (`draft.md` §16): a narrowing / precision-losing / saturating
-            // `as` is **defined behavior** (not an error), but silent loss is worth surfacing — a
-            // **warning**, so the program still checks. Skipped for the `char`/float error above
-            // (no meaningful conversion) and for an unconstrained-literal source (still an inference
-            // variable, so not a concrete int/float — see `cast_loss`).
-            else if let Some(reason) = cast_loss(src, target) {
-                self.diags.push(align_diag::Diagnostic::warning(
-                    format!("lossy conversion: `{} as {}` {reason} — this is defined behavior, not an error", ty_name(src), ty_name(target)),
-                    span,
-                ));
-            }
         }
+        // The lossy-conversion lint is emitted later, in `finalize_expr` — only there are both the
+        // operand and target widths concrete (an unconstrained-default or forward-inferred source is
+        // still an inference variable here). Classifying now would miss those and could misreport a
+        // width later unified to something else (Gate 5: resolve fully before classifying).
         self.constrain(target, expected, span);
         Expr { kind: ExprKind::Cast(Box::new(inner)), ty: target, span }
     }
@@ -9708,7 +9701,33 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
-            ExprKind::Cast(expr) => self.finalize_expr(expr),
+            ExprKind::Cast(expr) => {
+                self.finalize_expr(expr);
+                // Lossy-conversion lint (`draft.md` §16): now that inference is complete, both the
+                // operand type (`expr.ty`, finalized above) and the target (`cur_ty`) are concrete —
+                // classify the conversion *here*, not in `check_cast`, so a value whose width is only
+                // fixed later (an unconstrained default like `x := 100000; x as i8`, or a
+                // forward-inferred local) is seen at its final type (Gate 5: resolve fully first). A
+                // narrowing / precision-losing / saturating `as` is defined behavior, so this is a
+                // **warning**. Skipped for the `char`↔float pair (already a hard error in
+                // `check_cast` — no cascade) and for a compile-time numeric-literal operand (an
+                // explicit constant annotation, `1 as i8`).
+                let (src, tgt) = (expr.ty, cur_ty);
+                let numeric_or_char = |t: Ty| matches!(t, Ty::Int(_) | Ty::Float(_) | Ty::Char);
+                let char_float = (src == Ty::Char && matches!(tgt, Ty::Float(_)))
+                    || (matches!(src, Ty::Float(_)) && tgt == Ty::Char);
+                if numeric_or_char(src)
+                    && numeric_or_char(tgt)
+                    && !char_float
+                    && !is_numeric_literal(expr)
+                    && let Some(reason) = cast_loss(src, tgt)
+                {
+                    self.diags.push(align_diag::Diagnostic::warning(
+                        format!("lossy conversion: `{} as {}` {reason} — this is defined behavior, not an error", ty_name(src), ty_name(tgt)),
+                        span,
+                    ));
+                }
+            }
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.finalize_expr(lhs);
                 self.finalize_expr(rhs);
@@ -10329,6 +10348,20 @@ fn cast_loss(from: Ty, to: Ty) -> Option<&'static str> {
             let (fb, tb) = (int_bits(from)?, int_bits(to)?);
             (tb < fb).then_some("truncates the high bits")
         }
+    }
+}
+
+/// Whether `e` is a compile-time numeric literal — an int/float literal, possibly behind a chain of
+/// unary `-` (`-1`, `--128`). Such an operand in `x as T` is an explicit annotation on a constant
+/// (`1 as i8`, `-1.0 as f32`), not a typed value being narrowed, so the lossy-conversion lint skips
+/// it: a bare literal always keeps its own default width and never carries a runtime value that a
+/// narrowing would silently lose (a provably-out-of-range constant is the separate out-of-range
+/// literal lint's concern, `open-questions.md` M8 lint candidates — not this one).
+fn is_numeric_literal(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) => true,
+        ExprKind::Unary { op: UnOp::Neg, expr } => is_numeric_literal(expr),
+        _ => false,
     }
 }
 
