@@ -26,7 +26,7 @@ heap memory model (v2). Beyond the core: **M6** SIMD (`vecN<T>`/`mask`, `dot`,
 horizontal reductions) and cache-optimal `soa<T>` + columnar `group_by`;
 **M7** `par_map`/`chunks` + inferred purity + first-class closures +
 `task_group`/`spawn`/`wait()?` on real threads (only fully-escaping fn values
-deferred); **M8** `unsafe {}` + `raw.*` and `extern "C"` FFI v1, plus the first lints.
+stay deferred); **M8** `unsafe {}` + `raw.*` and `extern "C"` FFI v1, plus the first lints.
 
 ```sh
 cargo build
