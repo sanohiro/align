@@ -21,7 +21,9 @@ but read the order from here.
 **M5** (strings, templates, `json.encode`/`decode`). Cross-cutting since: first-class **tuples**
 (incl. partial field moves); **lambdas** in every stage & reducer with **capture** (lifted,
 escape-driven design settled); **`sort_by_key`**; whole-struct **`arr[i]`** by value (struct fields
-enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` + purity inference.
+enforced Copy-only); and **M7** — `par_map` (real threads) + `chunks` + purity inference +
+first-class closures (①–③) + `task_group`/`spawn`/`wait()?` (real threads). Only **fully-escaping
+fn values** (return / struct-field / array-element) stay deferred.
 
 **Forward plan (ordered — finish the language, then std):**
 1. **core.math** — explicit-overflow arithmetic `checked_*` / `saturating_*` / `wrapping_*` for
@@ -35,8 +37,10 @@ enforced Copy-only); and most of **M7** — `par_map` (real threads) + `chunks` 
    Its real consumers are binary I/O (`std`) and `core.hash`, not yet built — building it ahead
    of them risks the wrong op set (premature). See `open-questions.md` "bytes / buffer". So the
    next *build* is #3.
-3. **first-class closures (escape-driven) → `task_group`** — M7 concurrency. Design SETTLED
-   (`open-questions.md`); closures are the foundation, `task_group` the consumer. Built in slices:
+3. **first-class closures (escape-driven) → `task_group`** — M7 concurrency. **DONE** (slices ①–③
+   + ④a–④c, PRs #104–117; only fully-escaping fn values — return / struct-field / array-element —
+   stay deferred, see the M7 section above). Design SETTLED (`open-questions.md`); closures are the
+   foundation, `task_group` the consumer. Built in slices:
    **① non-capturing function values DONE** — a top-level fn used as a value is a function pointer
    (`Ty::Fn`, Copy/`Static`, no env), and calling such a local is an indirect call (`f := double;
    f(5)`; scalar signatures). **②a lambda-as-value DONE** — a non-capturing lambda with typed
@@ -792,7 +796,7 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
 
-## M7 — Parallelism — IN PROGRESS (par_map/chunks/purity done; first-class closures → task_group remain)
+## M7 — Parallelism — DONE (par_map/chunks/purity, first-class closures ①–③, task_group ④a–④c; only fully-escaping fn values deferred)
 
 - [done] **purity / effect inference** (`align_sema` Pass 4, `check_parallelism`): a function is
   Impure iff it transitively performs an observable side effect (`print` / `io.stdout.write` /
@@ -823,17 +827,24 @@ Completion condition: confirm that the vectorized code contains vector instructi
   construction** — `f` is Pure (no shared mutable state) and the output ranges never overlap. A
   *staged* `par_map` (`where(p).par_map(f)`) still uses the sequential collect loop (a flat split
   can't see through a filter). Results are identical to the sequential lowering.
-- [todo] **first-class closures (escape-driven)** — the foundation for `task_group` and for
-  function values stored/returned. A lambda that *escapes* gets a heap closure environment; a
-  non-escaping pipeline lambda stays inlined (captures-as-params). The existing escape analysis
-  picks the representation, so the offload-ready pipeline path is untouched. (Design SETTLED, see
-  `open-questions.md` "First-class closures + task_group".)
-- [todo] **`task_group` / `spawn` / `wait` (I/O concurrency)** — a structured scope (like
-  `arena {}`): `spawn(fn { … })` takes a lambda (deferred work, visible), returns `Task<R>`;
-  `wait()?` joins all + propagates the first `Err`; `a.get()` reads a result after the join. Tasks
-  may be impure (I/O); safety from by-value capture. Built on first-class closures (above). The
-  walking skeleton runs the deferred tasks at `wait` (sequential first, real threads as the
-  widening — errors surface at `wait` either way, so the semantics match).
+- [done] **first-class closures (escape-driven)** — slices ①–③ (PRs #104–108): non-capturing
+  function values + indirect call (①), a lambda as a first-class value with typed parameters (②a),
+  the fat-pointer closure ABI (②b-1), capturing closures with a **frame-local** environment (②b-2),
+  and higher-order functions (fn-typed parameters, ③). A non-escaping pipeline lambda stays inlined
+  (captures-as-params); a lambda captured by `spawn` snapshots into the `task_group` region. Escape
+  analysis picks the representation, so the offload-ready pipeline path is untouched.
+- [done] **`task_group` / `spawn` / `wait` (I/O concurrency)** — slices ④a–④c (PRs #110–117; #117
+  "closures arc COMPLETE"). A structured scope like `arena {}`: `spawn(fn { … })` takes a lambda
+  (captures snapshotted into a fresh per-spawn **region env**), returns `Task<R>` (a region-tied
+  result slot); `wait()?` joins all on **real threads** (fork-join via `align_rt_tg_*` +
+  `std::thread::scope`) and propagates a failing task's `Err`; `t.get()` reads a result after the
+  join (a `get`-before-`wait` use is a compile-time flow error). Tasks may be impure (I/O); safety
+  from by-value capture. Runtime: `align_rt_tg_begin/alloc/register/wait/end`.
+- [deferred] **fully-escaping function values** — returning a fn value from a function, or storing
+  one in a struct field / array element, is **not** supported: it needs a **heap-owned** closure
+  environment with its own drop (the "escapes every region" model), whose design is not yet settled
+  and which has no consumer today (`task_group` uses the region env). Deliberately deferred — see
+  `open-questions.md` "First-class closures + task_group" (the escape-every-region note).
 - async/await is not included (`non-goals.md`).
 
 ## M8 — Tooling and Quality — STARTED (first lint landed)
