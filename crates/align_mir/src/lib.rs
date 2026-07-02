@@ -127,6 +127,10 @@ pub enum Stmt {
     NullStructField(Slot, u32),
     /// Drop a free-standing owned `array<T>` slot: free its buffer (null-safe).
     Drop(Slot),
+    /// Drop element `index` of a fixed Move-struct array slot: free that element's owned fields
+    /// (recursively), before it is overwritten by a whole-element store (`us[i] = new`, Slice 4b).
+    /// `u32` is the element struct id. Null-safe (a moved/unwritten element reads nulls).
+    DropElem(Slot, Operand, u32),
     /// Free the buffer of a free-standing owned `array<T>` *value* (a `{ptr,len}` operand that
     /// is not backed by a slot — an unbound `.to_array()` temporary consumed in place). Used to
     /// free the materialized buffer right after the loop that consumes it (null-safe).
@@ -1031,6 +1035,13 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     other => unreachable!("soa=false whole-element assignment into {other:?}"),
                 };
                 emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
+                // A Move-struct element: free the *old* element's owned fields before overwriting it
+                // (else its buffers leak), and null the RHS's moved source so its own drop is a no-op
+                // (no double-free). A POD element needs neither. (Slice 4b.)
+                if struct_is_move(*struct_id, &b.structs) {
+                    b.push(Stmt::DropElem(*base, idx.clone(), *struct_id));
+                    null_moved_source(b, value);
+                }
                 b.push(Stmt::StoreIndex(*base, idx, val));
             }
         }

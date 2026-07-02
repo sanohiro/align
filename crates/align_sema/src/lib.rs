@@ -4007,17 +4007,6 @@ impl<'a, 't> Checker<'a, 't> {
                         },
                     };
                     let local_ty = ann.unwrap_or(init.ty);
-                    // Slice 4a: a Move-struct array (owned fields, per-element drop) is **immutable**
-                    // for now — mutating it (reassign / element store) needs a per-element drop of the
-                    // overwritten value, deferred to Slice 4b. Reject a `mut` binding cleanly so those
-                    // paths (which would otherwise hit array-materialization gaps) stay unreachable.
-                    if *is_mut && matches!(local_ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs)) {
-                        let Ty::StructArray(sid, _) = local_ty else { unreachable!() };
-                        self.diags.error(
-                            format!("a `mut` array of the Move struct '{}' is not supported yet (mutating it needs per-element drop-of-old — a later slice); bind it immutably", self.structs[sid as usize].name),
-                            name.span,
-                        );
-                    }
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     // Record slice provenance (`s: slice<T> := a` → `s` borrows `a`'s buffer) so
                     // the `out` no-alias check can see through slice variables.
@@ -4096,13 +4085,25 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 ast::Stmt::Assign { place, value } => match self.check_place(place) {
                     Place::Local { id, ty } => {
-                        // Mirror the `let` path: a slice/str place borrows its source.
-                        let v = match ty {
-                            Ty::Slice(ps) => self.check_slice_init(value, ps),
-                            Ty::Str => self.check_str_init(value),
-                            _ => self.check_expr(value, Some(ty)),
-                        };
-                        stmts.push(Stmt::Assign { local: id, value: v, drop_old: std::cell::Cell::new(false) });
+                        // A fixed stack array (`Array` / `StructArray`) can't be *wholly* reassigned:
+                        // array values aren't materialized (only a `let` initializes one), and copying
+                        // a Move-struct array would double-own its elements. Reject cleanly — else an
+                        // array-literal RHS panics MIR lowering — and point at element assignment.
+                        if matches!(ty, Ty::Array(..) | Ty::StructArray(..)) {
+                            self.diags.error(
+                                format!("whole-array reassignment of {} is not supported yet (array values aren't materialized); assign elements individually, `a[i] = …`", ty_name(ty)),
+                                place.span,
+                            );
+                            let _ = self.check_expr(value, Some(ty)); // surface RHS errors; emit no store
+                        } else {
+                            // Mirror the `let` path: a slice/str place borrows its source.
+                            let v = match ty {
+                                Ty::Slice(ps) => self.check_slice_init(value, ps),
+                                Ty::Str => self.check_str_init(value),
+                                _ => self.check_expr(value, Some(ty)),
+                            };
+                            stmts.push(Stmt::Assign { local: id, value: v, drop_old: std::cell::Cell::new(false) });
+                        }
                     }
                     Place::Field { root, path, ty } => {
                         let v = self.check_expr(value, Some(ty));
@@ -4219,12 +4220,23 @@ impl<'a, 't> Checker<'a, 't> {
                             Some(PrimScalar::Int(_) | PrimScalar::Float(_) | PrimScalar::Bool | PrimScalar::Char)
                         )
                     });
-                if !pod {
+                // Allowed element-store shapes: a POD struct (a Copy aggregate store); or — for a
+                // *fixed* `array<Struct>` only — a **Move** struct (Slice 4b: the lowering drops the
+                // old element's owned fields, then moves the new value in). Still deferred: a str-view
+                // struct (borrowed `str` fields need a region/escape check), and a Move element into a
+                // `soa` (its columns would need per-column drop).
+                let is_move = struct_is_move(sid, self.structs);
+                if !(pod || (!soa && is_move)) {
+                    // We are in the error block, so `!(pod || (!soa && is_move))` held: either `soa`
+                    // is true, or (`soa` false and `is_move` false) — a str-view struct. There is no
+                    // third case (a fixed Move-struct array is allowed above).
+                    let why = if soa {
+                        "a soa element store needs only numeric/bool/char fields for now"
+                    } else {
+                        "the struct has borrowed `str`/view fields that need region handling — deferred (owned `string` fields are supported)"
+                    };
                     self.diags.error(
-                        format!(
-                            "whole-element assignment of {} is not supported yet (the struct must have only numeric/bool/char fields — no str, nested, or owned fields for now)",
-                            ty_name(local_ty)
-                        ),
+                        format!("whole-element assignment of {} is not supported yet ({why})", ty_name(local_ty)),
                         place.span,
                     );
                     return Place::Err;

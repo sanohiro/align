@@ -1607,6 +1607,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let val = self.operand(op);
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
+                Stmt::DropElem(slot, idx, sid) => {
+                    // Free the owned fields of element `idx` before it is overwritten (Slice 4b).
+                    let ep = self.elem_ptr(*slot, idx)?;
+                    self.drop_struct_fields(ep, *sid)?;
+                }
                 Stmt::StoreElemField(slot, idx, field, op) => {
                     let ep = self.elem_field_ptr(*slot, idx, *field)?;
                     let val = self.operand(op);
