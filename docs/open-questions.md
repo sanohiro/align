@@ -2443,7 +2443,23 @@ FFI-explainable (a null-or-valid pointer is exactly what C already does), proven
 decided before the ABI/layout freeze** — like the field-reordering item in Open above, it is a
 one-time representation choice. Does **not** extend to general pointer-tagging / NaN-boxing for other
 payloads — those stay rejected (arch-dependent, breaks layout predictability).
-Provenance: surfaced by an external idea review (2026-07-02); verified.
+**Blocked on target type — deferred (2026-07-02):** the sole single-pointer payload this decision
+targets, `box<T>`, is **not currently expressible as an `Option` payload**. `Ty::Option` carries a
+`Scalar`, and there is no `Scalar::Box` — `ty_to_scalar` returns `None` for `Ty::Box`, so
+`Option<box<T>>` is rejected at type resolution ("Option payload must be a scalar (composite payloads
+are not supported yet)"). The same holds for `Ty::Task` and `Ty::ArenaHandle` (also non-`Scalar`, and
+arena handles aren't even user-writable type names). The niche has no expressible target, so
+implementing it now would mean first widening the type system to admit a pointer-payload `Option` —
+out of scope for a representation-only change. **Revisit when `Option<box<T>>` becomes writable**
+(a `Scalar::Box` / pointer-payload `Option`): at that point add an `is_niche_option(scalar)` predicate
+and route Option type-lowering + the tag read/write sites (codegen `option_struct_type`,
+`Rvalue::OptionIsSome`/`OptionUnwrap` lowering in `align_mir`, and the `else`-unwrap / match-decompose
+paths) through it (Some = pointer, None = null, tag = 0 bytes). Note: the *fat*-pointer Move payloads
+that **can** already be `Option` payloads (`Scalar::String`, `Scalar::DynArray`, `Scalar::DynStructArray`
+— `{ptr,len}`) admit a related null-`ptr`-niche, but that is a **separate** design (a fat pointer is
+not the "single pointer, None = null" form decided here) and is intentionally left out of this item.
+Provenance: surfaced by an external idea review (2026-07-02); verified. Target-type block recorded
+after implementation attempt (2026-07-02).
 
 ### `f16` / `bf16` scalar and vector element types (external idea review, 2026-07-02)
 Add half-precision scalars (`f16` IEEE binary16, `bf16` brain float16) usable as `vecN<T>` element
