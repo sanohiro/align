@@ -181,13 +181,23 @@ a scalable ISA is handled by predicated scalable codegen instead, which is why M
 > Status note: the default build now targets the **portable per-arch baseline** (`x86-64-v2` on
 > amd64, `generic`/`armv8-a` on arm64) via `BuildTarget` in `align_codegen_llvm`; `--target-cpu
 > native` opts into the host CPU. The backend still builds **scalar** IR and leans on the LLVM `-O2`
-> pipeline (SLP / loop vectorizer) for the actual SIMD. Branchless `where` is implemented for
-> identity-based reductions (`sum` / `count`): MIR folds predicates into a mask and emits
-> `Rvalue::Select` (`acc += mask ? value : 0`), so LLVM can vectorize the loop. `reduce` / `any` /
-> `all` / `min` / `max` / `dot` and materializing terminals still use a per-element branch; extending the
-> identity-select form to them is M6 work (see the completion criterion in `07 §M6`). The design is
-> fixed: **`where` is branchless** for the hot reduction shapes; no per-element `if` is part of the
-> intended source semantics. (`maskN<T>` is the explicit hand-written form of the same.)
+> pipeline (SLP / loop vectorizer) for the actual SIMD. Branchless `where` is implemented for **every
+> reducing terminal**: MIR folds the predicates into a mask and each reducer emits `Rvalue::Select` —
+> identity-select where a fixed identity exists (`sum`/`count` → `0`, `min` → `+∞`, `max` → `−∞`,
+> `any` → `false`, `all` → `true`) and accumulator-select for generic `reduce`
+> (`acc = mask ? f(acc,v) : acc`, no identity for a user `f`). `min`/`max` further lower to the
+> `select(cur `cmp` acc, cur, acc)` idiom (`llvm.{s,u}{min,max}` / `llvm.{min,max}imum`) so the whole
+> loop is branch-free and vectorizes: e.g. `xs.where(p).min()` over a `slice<i32>` emits `pminsd`
+> over a `pcmpgtd` mask on x86-64-v2 (verified via `objdump`; before, the per-element branch blocked
+> it entirely). The materializing terminals (`to_array`/`scan`) still use a real skip-branch — they
+> must not *append* a masked-out element, which is not an identity operation. The design is fixed:
+> **`where` is branchless** for the reducing shapes; no per-element `if` is part of the intended
+> source semantics. (`maskN<T>` is the explicit hand-written form of the same.) NB: with the
+> branchless form a reducer's own `f`/predicate (and any post-`where` stage) runs on masked-out
+> elements too, its contribution discarded — the deliberate, long-standing cost of a vectorizable
+> loop (pipeline functions are pure, so a masked-out element cannot differ observably). `dot` has no
+> masked pipeline form (`a.dot(b)` is a two-array kernel with no `where`), so it is already a
+> branch-free `acc += a[i]*b[i]` loop.
 
 > **Why the identity-select shape matters beyond perf.** Selecting each reducer's identity for a
 > masked-out lane (`min` → `+∞`, `max` → `−∞`, `any` → `false`, `all` → `true`, `dot` → `0`, matching
