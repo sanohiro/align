@@ -426,12 +426,25 @@ fn align_up(n: u64, a: u64) -> u64 {
     if a <= 1 { n } else { (n + a - 1) & !(a - 1) }
 }
 
-/// Natural-alignment `(size, align)` in bytes of `ty`, matching the default (non-packed) layout
-/// codegen emits via LLVM. Scalars are their machine width; a `{ptr, len}` view or owned handle
-/// (`str`/`string`/array/slice/soa/box/builder/…) is two 64-bit words. Used only by the huge-struct-
-/// copy lint, which consults it for a [`Ty::Struct`]; the `_ => (16, 8)` fallback is a safe default
-/// for any composite that is not a current struct-field type. Cycle-safe (`visiting`), like
-/// [`struct_is_move`].
+/// Natural-alignment `(size, align)` in bytes of `ty`, matching the layout codegen emits via LLVM.
+/// Scalars are their machine width; a `{ptr, len}` view or owned handle
+/// (`str`/`string`/array/slice/soa/box/builder/…) is two 64-bit words. Used by the huge-struct-copy
+/// lint and by [`struct_size_align`], which consults it per field; the `_ => (16, 8)` fallback is a
+/// safe default for any composite that is not a current struct-field type. Cycle-safe (`visiting`),
+/// like [`struct_is_move`].
+///
+/// **Alignment parity with codegen's `field_abi_align`.** The per-field *alignment* this returns is
+/// the sort key both here and in `align_codegen_llvm::logical_to_physical` use to order fields by
+/// descending alignment, so the two must agree on the alignment of every **valid struct-field type**
+/// (`is_field_ok`: `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct`). They do — for that
+/// domain both give width-or-8-for-a-pointer, and both take a nested struct's alignment as the max of
+/// its members. The branches where they *differ* (`Unit` → here 1, there 4; `Array` → here 8, there
+/// `scalar_bytes.min(8)`) are all types `is_field_ok` **rejects**, so they never reach struct
+/// ordering; the divergence is unreachable, not a bug. `tests/…`/`layout_parity` (in the codegen
+/// crate) pins this against the real LLVM ABI size/align so any future drift — or a new wider-aligned
+/// field type (e.g. a `vecN<T>` field, 16-byte aligned) added to `is_field_ok` without updating
+/// **both** functions — fails loudly. Scalars top out at 64-bit (no `i128`/`f128`), so no field is
+/// wider than 8-byte aligned today.
 fn ty_size_align(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64, u64) {
     match ty {
         Ty::Int(it) => {
@@ -489,6 +502,15 @@ fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) ->
     }
     visiting.pop();
     (align_up(size, align), align)
+}
+
+/// The `(size, align)` of struct `id` as codegen lays it out (descending-alignment field order for a
+/// non-`layout(C)` struct; declaration order for `layout(C)`). Public wrapper over
+/// [`struct_size_align`] for the cross-crate layout-parity test in `align_codegen_llvm`, which checks
+/// this against the real LLVM ABI size/alignment so the two hand-written layout computations
+/// (`ty_size_align` here, `field_abi_align` there) can never silently drift.
+pub fn struct_abi_layout(id: u32, structs: &[StructDef]) -> (u64, u64) {
+    struct_size_align(id, structs, &mut Vec::new())
 }
 
 /// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs

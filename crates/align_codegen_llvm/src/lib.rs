@@ -1246,6 +1246,16 @@ fn task_tramp_key(ty: Ty) -> String {
 /// `offset_of_element`, so a slightly-off estimate can never miscompile, only leave padding. Scalars
 /// use their width; a nested aggregate takes the max of its members; pointer-like views (`str`,
 /// `slice`, `string`, `box`, `soa`, dynamic arrays, …) are pointer-aligned (8).
+///
+/// The *valid* struct-field domain (`is_field_ok` in `align_sema`) is
+/// `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct`; on that domain this **must** return the
+/// same alignment as `align_sema::ty_size_align` (the ordering must agree, or the sema huge-struct-copy
+/// lint's size would diverge from the real layout). It does. The `Unit` (→ 4, vs sema's 1) and `Array`
+/// (→ `scalar_bytes.min(8)`, vs sema's 8) arms below are for types `is_field_ok` **rejects**, so they
+/// never reach field ordering — kept only so the function is total. Scalars top out at 64-bit, so no
+/// field is wider than 8-byte aligned; a future wider-aligned field type (a `vecN<T>` field is
+/// 16-byte aligned) would need updating **both** this and `ty_size_align` **and** would be caught by
+/// the `layout_parity` test (which checks both against the real LLVM ABI alignment).
 fn field_abi_align(ty: Ty, structs: &[StructDef]) -> u64 {
     match ty {
         Ty::Int(it) => (it.bits / 8).max(1) as u64,
@@ -4562,6 +4572,88 @@ mod tests {
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
         emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline).unwrap()
+    }
+
+    /// Layout parity: the sema `(size, align)` computation (`align_sema::ty_size_align` /
+    /// `struct_size_align`, which the huge-struct-copy lint trusts) must equal the **real** LLVM ABI
+    /// size/alignment of the struct as codegen lays it out (descending-alignment field order via
+    /// `logical_to_physical`). This pins the two independent hand-written layout computations
+    /// (`field_abi_align` here vs `ty_size_align` in sema) against LLVM ground truth, so any future
+    /// drift — or a new wider-aligned field type added to `is_field_ok` without updating both — fails
+    /// loudly. Covers every valid struct-field type, mixed widths that force a reorder, `str`/`string`
+    /// views, nested structs, and `layout(C)` (declaration order preserved). `align(N)` over-alignment
+    /// is deliberately excluded: it is applied at the alloca seam (`type_align`), not baked into the
+    /// LLVM struct type, so it is an orthogonal concern.
+    #[test]
+    fn sema_and_codegen_struct_layout_agree() {
+        fn i(bits: u8, signed: bool) -> Ty {
+            Ty::Int(IntTy { bits, signed })
+        }
+        fn f(bits: u8) -> Ty {
+            Ty::Float(FloatTy { bits })
+        }
+        fn sdef(name: &str, c_repr: bool, fields: &[Ty]) -> StructDef {
+            StructDef {
+                name: name.to_string(),
+                fields: fields
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &ty)| align_sema::hir::FieldDef { name: format!("f{k}"), ty })
+                    .collect(),
+                align: None,
+                c_repr,
+            }
+        }
+
+        // Structs 0..=2 are nested targets referenced by later structs (ids are positional).
+        let structs = vec![
+            sdef("Inner0", false, &[i(8, false), i(64, true)]),          // 0: reorders internally
+            sdef("InnerC", true, &[i(8, false), i(64, true)]),           // 1: layout(C), decl order
+            sdef("Pair", false, &[i(32, true), i(32, true)]),            // 2
+            // every scalar alone
+            sdef("Si8", false, &[i(8, true)]),
+            sdef("Si16", false, &[i(16, true)]),
+            sdef("Si32", false, &[i(32, true)]),
+            sdef("Si64", false, &[i(64, true)]),
+            sdef("Su8", false, &[i(8, false)]),
+            sdef("Sf32", false, &[f(32)]),
+            sdef("Sf64", false, &[f(64)]),
+            sdef("Sbool", false, &[Ty::Bool]),
+            sdef("Schar", false, &[Ty::Char]),
+            sdef("Sstr", false, &[Ty::Str]),
+            sdef("Sstring", false, &[Ty::String]),
+            // mixed widths that force a reorder (the padding-elimination cases)
+            sdef("Mix1", false, &[i(8, true), i(64, true), i(8, true)]),
+            sdef("Mix2", false, &[Ty::Bool, f(64), i(16, true), i(8, true)]),
+            sdef("Mix3", false, &[i(8, true), Ty::Str, Ty::Bool, i(32, true)]),
+            sdef("Mix4", false, &[Ty::Char, i(8, false), i(64, false), Ty::Bool, f(32)]),
+            // the same field set with layout(C) — must NOT reorder
+            sdef("MixC", true, &[i(8, true), i(64, true), i(8, true)]),
+            // nested structs (reordered + layout(C) inner)
+            sdef("Nest1", false, &[i(8, true), Ty::Struct(0), i(16, true)]),
+            sdef("Nest2", false, &[Ty::Struct(1), Ty::Bool, Ty::Struct(2)]),
+        ];
+
+        let ctx = Context::create();
+        let tm = create_target_machine(&BuildTarget::Baseline).expect("target machine");
+        let td = tm.get_target_data();
+
+        // Build the LLVM struct types exactly as `codegen` does (opaque, then body in physical order).
+        let struct_types: Vec<StructType> = structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
+        for (s, st) in structs.iter().zip(&struct_types) {
+            let perm = logical_to_physical(s, &structs);
+            let order = physical_order(&perm);
+            let fields: Vec<BasicTypeEnum> =
+                order.iter().map(|&li| abi_type(&ctx, s.fields[li as usize].ty, &struct_types, &[])).collect();
+            st.set_body(&fields, false);
+        }
+
+        for (id, s) in structs.iter().enumerate() {
+            let st = struct_types[id];
+            let llvm = (td.get_abi_size(&st), td.get_abi_alignment(&st) as u64);
+            let sema = align_sema::struct_abi_layout(id as u32, &structs);
+            assert_eq!(sema, llvm, "layout parity mismatch on `{}` (sema {sema:?} vs LLVM {llvm:?})", s.name);
+        }
     }
 
     #[test]
