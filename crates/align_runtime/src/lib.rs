@@ -3493,11 +3493,19 @@ pub extern "C" fn align_rt_arena_begin() -> *mut Arena {
 /// Bump-allocate `size` bytes (with `align`) from the arena.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, align: i64) -> *mut u8 {
+    // Null-safe like every other runtime entry point: a null arena handle must not be dereferenced.
+    if arena.is_null() {
+        return core::ptr::null_mut();
+    }
     // Validate `size`/`align` fit a `usize` before bump-allocating, matching every other runtime
     // FFI boundary: a raw `as usize` cast would turn a negative input into a huge value, so
-    // `off + need` (`Arena::alloc`) could wrap in a release build. Not reachable today (codegen
-    // always passes a sound value), but guard it rather than trust the caller.
-    let (Ok(size), Ok(align)) = (usize::try_from(size), usize::try_from(align)) else {
+    // `off + need` (`Arena::alloc`) could wrap in a release build. `align` must also be a nonzero
+    // power of two (`is_power_of_two()` is false for 0, so this subsumes the nonzero check) —
+    // `Arena::alloc`'s aligned-address bit-trick assumes it. Not reachable today (codegen always
+    // passes a sound value), but guard it rather than trust the caller.
+    let (Ok(size), Some(align)) =
+        (usize::try_from(size), usize::try_from(align).ok().filter(|&a| a.is_power_of_two()))
+    else {
         return core::ptr::null_mut();
     };
     let arena = unsafe { &mut *arena };
@@ -4498,6 +4506,15 @@ mod tests {
             unsafe { align_rt_arena_alloc(a, i64::MIN, i64::MIN) }.is_null(),
             "i64::MIN size/align must yield null, not panic or wrap"
         );
+        // A null arena handle must not be dereferenced.
+        assert!(
+            unsafe { align_rt_arena_alloc(core::ptr::null_mut(), 8, 8) }.is_null(),
+            "a null arena handle must yield null"
+        );
+        // `align` must be a nonzero power of two — `Arena::alloc`'s aligned-address bit-trick is
+        // UB otherwise.
+        assert!(unsafe { align_rt_arena_alloc(a, 8, 0) }.is_null(), "align 0 must yield null");
+        assert!(unsafe { align_rt_arena_alloc(a, 8, 3) }.is_null(), "a non-power-of-two align must yield null");
         // A normal allocation still works afterwards (the guard doesn't corrupt arena state).
         let p = unsafe { align_rt_arena_alloc(a, 8, 8) } as *mut i64;
         assert!(!p.is_null());
