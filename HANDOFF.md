@@ -5,7 +5,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-03 (main @ PR #314)._
+_Last updated: 2026-07-03 (main @ PR #324)._
 
 ## Internal review (2026-07-02)
 
@@ -62,6 +62,26 @@ recorded in `docs/open-questions.md`): hot/cold field-split lint (heuristics nee
 (no recursive types yet), `f16`/`bf16` (arithmetic semantics decision needed). Tests grew ~1047 → ~1103;
 clippy is clean at `-D warnings`. **Next:** continue roadmap work (M6/M8 remainders) — the queue is
 derived from `docs/impl/07-roadmap.md`.
+
+## Roadmap-remainder wave (2026-07-03, PRs #316–#324)
+
+Continuing the same queue, all merged with reviews reflected: **#316** added dynamic `array<Struct>`
+element-field write (`StoreElemFieldPtr`, the write dual of `IndexFieldPtr`); **#318** shipped
+lane-wise `%` for `vecN<T>` and closed the unguarded vec-integer/UB residual alongside it (lane-wise
+zero-abort + `INT_MIN`/`-1` wrap, plus a broadcast-constant fast path); **#319** gave over-aligned
+struct arrays a padded stride (`round_up(size, align)`, C-style tail padding; dynamic
+`array<align(N)S>` stays rejected pending aligned heap alloc); **#320** added the `align(N)` binding
+form for numeric scalar arrays — the aligned-vector-load enabler (a proven-or-nothing aligned-load
+switch); **#321** converged canonical hashing into a new `align_hash` crate (wyhash) so the JSON PHF
+byte-match is now structural, with `group_by`/`dict_encode` 1.4–1.8× faster; **#322** shipped
+str-bearing `soa` element writes (read columns had already landed; the write path was the real gap);
+**#323** shipped M8 lint batch 2 (`unnecessary-heap`, narrow single-node form; `prefer-pipeline-over-vecN`
+held — no loop syntax exists yet to fire on); **#324** fixed a **class-closing miscompile**: `check_expr`
+now reconciles every value's type with its expected context at a single reconciliation point (found via
+#323's side discovery), surfacing ~10 latent silent-truncation spots in the test corpus, now explicit
+`as` casts. Tests grew ~1103 → ~1147. M6/M8 roadmap remainders are now essentially consumed;
+deferred-with-record: owned `soa` columns, dynamic over-aligned arrays, cross-function aligned slice
+loads, the `prefer-pipeline` lint (needs a kernel surface).
 
 ## Latest (2026-07-02, PRs #262–#290)
 
