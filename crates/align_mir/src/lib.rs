@@ -1223,6 +1223,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 ));
                 return Operand::Value(v);
             }
+            // Integer `/` / `%` need a divisor guard: division by zero aborts, and signed
+            // `INT_MIN / -1` (LLVM UB) wraps to the defined two's-complement result. `float`
+            // division is IEEE (no guard), and a `vecN<T>` divide (element type not scalar `Int`)
+            // is out of this path — both fall through to the plain `Rvalue::Bin` below.
+            if matches!(op, BinOp::Div | BinOp::Rem) && matches!(lhs.ty, Ty::Int(_)) {
+                return lower_int_div(b, *op, l, r, lhs.ty);
+            }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Bin(*op, l, r)));
             Operand::Value(v)
@@ -1776,6 +1783,90 @@ fn i64_ty() -> Ty {
 /// `Error.Code`.
 fn status_ty() -> Ty {
     Ty::Int(IntTy { bits: 32, signed: true })
+}
+
+/// `x / -1` / `x % -1` (a *known* `-1` divisor): fold to the defined two's-complement result
+/// directly — `x / -1 == 0 - x` (a wrapping negate, correct for every `x` including `INT_MIN`, which
+/// wraps back to `INT_MIN`) and `x % -1 == 0`. No guard, no `select`.
+fn fold_div_neg_one(b: &mut Builder, op: BinOp, l: Operand, ty: Ty) -> Operand {
+    match op {
+        BinOp::Div => {
+            let w = b.fresh_value(ty);
+            b.push(Stmt::Let(w, Rvalue::Bin(BinOp::Sub, Operand::Const(Const::Int(0, ty)), l)));
+            Operand::Value(w)
+        }
+        _ => Operand::Const(Const::Int(0, ty)),
+    }
+}
+
+/// Lower an integer `/` or `%` with its divisor guards (semantics live in MIR):
+/// - `divisor == 0` aborts via `div_fail` (`-> !`, a cold edge), the settled "division by zero is
+///   never silent" rule — a raw `sdiv`/`udiv` by zero is LLVM UB.
+/// - signed `INT_MIN / -1` (and `% -1`) would also be LLVM UB; instead it wraps to the defined
+///   two's-complement result (`x / -1 == -x`, `x % -1 == 0`), consistent with defined
+///   two's-complement overflow. The raw div/rem is fed a `-1 → 1` remapped divisor so it never
+///   hits the UB case, and a `select` restores the wrapped value on the `-1` path. Unsigned has
+///   neither overflow case, so it only carries the zero guard.
+///
+/// A *constant* non-zero divisor (`x / 2`, `x % 10`, `x / -1`, …) is the common case: it needs no
+/// runtime guard at all (the two UB cases are decidable at compile time), so it is lowered straight
+/// to the raw op — or, for `-1`, folded — keeping the MIR (and unoptimized IR) lean.
+fn lower_int_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, ty: Ty) -> Operand {
+    let signed = matches!(ty, Ty::Int(IntTy { signed: true, .. }));
+    // Constant-divisor fast path. `wrap_to_int` (sema) sign-extends signed constants, so a signed
+    // `-1` divisor is stored as `-1` here (not a width-masked `0xFF…`); unsigned constants are
+    // always `>= 0` (a negative literal under an unsigned type is a compile error).
+    if let Operand::Const(Const::Int(val, _)) = &r {
+        let val = *val;
+        if val != 0 {
+            if signed && val == -1 {
+                return fold_div_neg_one(b, op, l, ty);
+            }
+            // Any other non-zero constant divisor: no UB (divisor is neither 0 nor -1), so emit the
+            // raw div/rem with no guard.
+            let v = b.fresh_value(ty);
+            b.push(Stmt::Let(v, Rvalue::Bin(op, l, r)));
+            return Operand::Value(v);
+        }
+        // A constant `0` divisor falls through to the runtime guard, which aborts. (A literal `/0`
+        // is usually caught earlier by sema's constant folding; this keeps the abort semantics for
+        // any constant `0` that does reach here.)
+    }
+    // divisor == 0 → report and abort (cold edge), the same shape as `emit_bounds_check`.
+    let is_zero = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(is_zero, Rvalue::Bin(BinOp::Eq, r.clone(), Operand::Const(Const::Int(0, ty)))));
+    let fail = b.new_block();
+    let ok = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(is_zero), fail, ok));
+    b.cur = fail;
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(t, Rvalue::Call("div_fail".to_string(), vec![])));
+    b.terminate(Term::Unreachable);
+    b.cur = ok;
+
+    if !signed {
+        // Unsigned: no `INT_MIN / -1` case; the divisor is now known non-zero.
+        let v = b.fresh_value(ty);
+        b.push(Stmt::Let(v, Rvalue::Bin(op, l, r)));
+        return Operand::Value(v);
+    }
+    // Signed: fold away the `INT_MIN / -1` UB. `is_neg1` selects the wrapped result.
+    let is_neg1 = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(is_neg1, Rvalue::Bin(BinOp::Eq, r.clone(), Operand::Const(Const::Int(-1, ty)))));
+    // Divide by `1` instead of `-1` so the raw sdiv/srem never triggers UB; the select below
+    // replaces its result on the `-1` path regardless.
+    let safe = b.fresh_value(ty);
+    b.push(Stmt::Let(
+        safe,
+        Rvalue::Select { cond: Operand::Value(is_neg1), a: Operand::Const(Const::Int(1, ty)), b: r },
+    ));
+    let raw = b.fresh_value(ty);
+    b.push(Stmt::Let(raw, Rvalue::Bin(op, l.clone(), Operand::Value(safe))));
+    // Wrapped result on the `-1` path: `x / -1 == 0 - x` (wraps at INT_MIN); `x % -1 == 0`.
+    let wrapped = fold_div_neg_one(b, op, l, ty);
+    let v = b.fresh_value(ty);
+    b.push(Stmt::Let(v, Rvalue::Select { cond: Operand::Value(is_neg1), a: wrapped, b: Operand::Value(raw) }));
+    Operand::Value(v)
 }
 
 /// Emit the explicit bounds check for `recv[index]` (semantics live in MIR):

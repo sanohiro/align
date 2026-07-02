@@ -230,6 +230,12 @@ fn build_module<'c>(
             None,
         ),
     );
+    // Integer division/remainder by zero: report and abort (`-> !`). Codegen emits the
+    // `divisor == 0` guard inline (see MIR `lower_int_div`) and calls this on the failing path.
+    funcs.insert(
+        "div_fail".to_string(),
+        module.add_function("align_rt_div_fail", ctx.void_type().fn_type(&[], false), None),
+    );
     // Arena allocator (M3).
     let ptr = ctx.ptr_type(AddressSpace::default());
     let i64t = ctx.i64_type();
