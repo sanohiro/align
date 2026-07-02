@@ -173,16 +173,26 @@ m   = VecCmp(gt, scores, splat(80))   // mask<...>
 acc = MaskedReduceAdd(scores, m)       // no branch
 ```
 
-### Shape of a vectorized loop
-If the fused loop body is element-independent, shape it in MIR into two phases: **vector width + remainder**. codegen lowers this directly to vector instructions + a scalar remainder (`05`).
+### Vectorizable properties (width is a backend concern)
+**Invariant: MIR carries only the *properties* that let a loop vectorize; it never fixes a vector
+width.** A fused element-independent loop stays width-agnostic in MIR, tagged with the facts codegen
+needs:
 
 ```text
-Loop:
-  vector body   (width W)        // VecOp / Mask
-  remainder body(< W)            // scalar
+element independence   no inter-element dependence (scan is the exception)
+Effect = Pure          (03 §8)
+noalias                out-derived disjointness (03 §6)
+trip count             loop length / bound
+reduction monoid       identity + associative combine (for a reducer terminal)
+access plan            contiguous / known-stride
+predicate chain        the where/mask conditions, folded to a mask
 ```
 
-`select(mask, a, b)` / `dot` / `sum_where` are kept as dedicated rvalues. `// OPEN:` how to decide target width W (derived from a fixed vec<N> vs. from the target ISA).
+Turning those into a *width* is **permanently the backend's concern** (`05 §5`): fixed width + a
+scalar remainder on NEON/AVX, or `<vscale x N x T>` with active-lane predication on SVE/RVV — one MIR
+shape, a per-target strategy. Baking a concrete `W` into MIR would make the shape vary per target
+class and break "MIR is the backend-agnostic core" (this file's intro), so it is deliberately absent.
+`select(mask, a, b)` / `dot` / `sum_where` are kept as dedicated rvalues.
 
 ---
 
@@ -237,7 +247,7 @@ The body of `ParLoop` already requires `Effect=Pure` (`03 §8`). Because the par
 1. inline      small functions / selector closure expansion (set up the prerequisites for fusion)
 2. fuse        fuse map/where/project + reduction, fuse array expressions (§3)
 3. mask        where→mask, branchless-ization (§4)
-4. vectorize-shape  shape loops into vector width + remainder (§4)
+4. vectorize-tag    tag element-independent loops with their vectorizable properties (§4); width is chosen later, in the backend
 5. mem         dead clone elimination / unnecessary heap → stack / arena promotion
 6. const       const string pooling, constant folding, use of string meta
 7. simplify    cleanup of unreachable (cold) code, common subexpressions
@@ -257,7 +267,7 @@ Each pass is MIR→MIR. lint diagnostics reuse the analysis results of 2/3/5/6 (
 
 ```text
 - precise rules for fusion boundaries (how far to do partial fusion of scan / group_by)
-- policy for deciding SIMD target width W (fixed vec<N> vs. target ISA)
+- SIMD width is permanently a backend concern (§4): MIR stays width-agnostic and carries only vectorizable properties; the open part is what property set the backend needs to pick fixed-width+remainder vs. scalable predication
 - expressing associativity for par reduce (monoid specification vs. restricting to known reductions)
 - finalizing the optimization pass order and whether iteration (fixpoint) is needed
 - how far to push MIR toward SSA / handling of mut places

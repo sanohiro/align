@@ -262,6 +262,16 @@ pipeline walks memory sequentially (no random jumps), and `where` / conditional 
 branchless (mask + `select`, not a per-element `if`) — so the predictable shape, not hand-tuning, is
 what keeps hot loops vectorizable.
 
+SIMD lives in two layers, and the split is deliberate. **`vecN<T>` / `maskN<T>` are an escape hatch**
+for hand-tuned fixed-width register kernels (a dot product, an FMA loop, a FIR filter) — they are
+*always* a fixed size, so they can be a `Copy` register value with a constant `sizeof` and constant
+lane indices. **The pipeline (`map` / `where` / `reduce`) is the main road**, and it never names a
+width — which is exactly why a future scalable ISA (SVE/RVV) lives here invisibly: the same source
+lowers to a fixed-width loop on NEON/AVX or scalable predicated codegen on SVE/RVV, chosen in the
+backend. That a width is *not* in the source is consistent with "nothing hidden": a vector length,
+like the AVX-vs-NEON choice itself, is a hardware detail, not a semantic effect — so hiding it (unlike
+allocation, errors, or parallelism, which are real effects) is correct, not a leak.
+
 For the layout itself, Align takes the **explicit `soa<T>` over automatic inference** road. The safe
 core has no raw pointers or field-address-taking, so a struct array's physical layout is
 semantically unobservable — the compiler *could* silently turn `array<User>` into struct-of-arrays.
@@ -281,8 +291,11 @@ on some hosts. So the philosophy splits SIMD by layer:
 
 - **Generated code** is fixed at build time, so it targets a **safe, portable per-arch baseline by
   default** (`x86-64-v2` / `armv8-a`). `native` and higher baselines are **opt-in** — one good
-  default, visible opt-in, never hidden. This caps generated-loop SIMD at the baseline (128-bit) for
-  portability.
+  default, visible opt-in, never hidden. The right frame is a *portable per-arch vectorization
+  strategy*, not one fixed width: on fixed-width ISAs (AVX/NEON) the baseline is 128-bit + a scalar
+  remainder, but on a scalable ISA (SVE/RVV) it is scalable *predicated* codegen — one binary that
+  adapts its vector length at run time, not a 128-bit cap. MIR stays width-agnostic precisely so the
+  backend can make that per-arch choice (`impl/04 §4`, `impl/05 §5`).
 - **Wide SIMD on a varied fleet comes from the library**, via *runtime* CPU-feature dispatch (the
   binary detects AVX2/NEON at run time and falls back safely). This is why the library leans on
   portable dispatching crates rather than hand-written intrinsics: it adapts per-host *and* stays

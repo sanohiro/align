@@ -309,7 +309,7 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
 **Generics is CLOSED** (minimal by design — see `open-questions.md`). The implemented surface
 (functions + builtin bounds + generic structs + generic sum types) is the whole feature; it is not
 extended further. Not-generics leftovers moved to their tracks: generic **containers** → the
-`group_by` track (roadmap #5, if a consumer needs them); **`vec<N,T>`** → M6; a generic-def-inside-a-
+`group_by` track (roadmap #5, if a consumer needs them); **`vecN<T>`** → M6; a generic-def-inside-a-
 generic-fn / `Opt.None` expected-type decomposition → optional refinements, revisit only on demand.
 
 ---

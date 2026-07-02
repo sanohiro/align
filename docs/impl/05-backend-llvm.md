@@ -131,7 +131,13 @@ The arena pointer is acquired via the `align_rt_arena_begin()` equivalent at the
 
 ## 5. Loops and vectorization (the crux of Align's performance)
 
-MIR is already fused and has shaped element-independent loops into "vector width W + remainder" (`04 §4`). codegen lowers this **deterministically** to vector instructions—rather than "hoping" for LLVM's auto-vectorization, we build the IR with vector types ourselves.
+MIR is already fused and carries the **width-agnostic** vectorizable properties of each
+element-independent loop (`04 §4`) — it never fixes a vector width. **Choosing the width is the
+backend's job, chosen per target.** The current, working form emits clean IR (contiguous access,
+branchless `where`, `noalias`) and hands it to LLVM's `-O2` vectorizer, which picks the width from the
+target: this is the right split, not a fallback — MIR stays portable and each target gets its own
+strategy (fixed width + a scalar remainder on NEON/AVX; `<vscale x N x T>` + active-lane predication on
+SVE/RVV). On a fixed-width target the loop lowers to:
 
 ```text
 vector body   load <W x T> → VecOp/Mask → store. pointer advances by W
@@ -155,19 +161,22 @@ loop:
 - **no-alias** (`out`, `03 §6`) → `noalias` attribute on the pointer argument. Make explicit to LLVM the basis for dependence-free vectorization.
 - aligned load/store when already aligned.
 
-### Target width W
+### Choosing the width (a backend, per-target choice)
 ```text
-from vec<N,T>   N becomes the LLVM vector width directly
-inferred loops  the default build's safe baseline width (amd64 x86-64-v2 / arm64 NEON = 128bit);
-                wider (AVX2 256bit, …) only under an opt-in --target-cpu
+explicit vecN<T>   N is fixed in the type → the LLVM vector width directly (the fixed escape hatch)
+inferred loops     no width in MIR → the backend chooses it per target:
+                     fixed-width ISA (AVX/NEON)  a portable per-arch baseline + a scalar remainder
+                     scalable ISA (SVE/RVV)      <vscale x N x T> + active-lane predication (no fixed W)
 ```
-**SETTLED (`open-questions.md` "Build targets & portability"):** the default targets a portable
-per-arch baseline (`x86-64-v2` / `armv8-a`), so inferred-loop W is the baseline width (128-bit);
-`--target-cpu native` / higher baselines are opt-in. This keeps one binary runnable across a varied
-cloud/Docker fleet. **Wide SIMD on that fleet comes from runtime CPU-feature dispatch in the library
-layer** (`06 §1`), not from raising the generated-code baseline — one binary picks AVX2/NEON at
-runtime and falls back safely. Runtime-multiversioning the generated loops themselves (emitting v2 +
-v3 variants behind an ifunc-style selector) is a possible future refinement, deferred.
+**SETTLED (`open-questions.md` "Build targets & portability") — for fixed-width ISAs:** the default
+targets a portable per-arch baseline (`x86-64-v2` / `armv8-a`, i.e. 128-bit); `--target-cpu native` /
+higher baselines are opt-in. This keeps one binary runnable across a varied cloud/Docker fleet.
+**Wide SIMD on that fleet comes from runtime CPU-feature dispatch in the library layer** (`06 §1`),
+not from raising the generated-code baseline — one binary picks AVX2/NEON at runtime and falls back
+safely. Runtime-multiversioning the generated loops themselves (an ifunc-style v2 + v3 selector) is a
+possible future refinement, deferred. This is a *fixed-width-ISA* policy, not a universal 128-bit cap:
+a scalable ISA is handled by predicated scalable codegen instead, which is why MIR stays width-agnostic
+(`04 §4`).
 
 > Status note: the default build now targets the **portable per-arch baseline** (`x86-64-v2` on
 > amd64, `generic`/`armv8-a` on arm64) via `BuildTarget` in `align_codegen_llvm`; `--target-cpu
@@ -175,10 +184,21 @@ v3 variants behind an ifunc-style selector) is a possible future refinement, def
 > pipeline (SLP / loop vectorizer) for the actual SIMD. Branchless `where` is implemented for
 > identity-based reductions (`sum` / `count`): MIR folds predicates into a mask and emits
 > `Rvalue::Select` (`acc += mask ? value : 0`), so LLVM can vectorize the loop. `reduce` / `any` /
-> `all` / `min` / `max` and materializing terminals still use a per-element branch; extending the
-> mask form there remains M6 work. The design is fixed: **`where` is branchless** for the hot
-> reduction shapes; no per-element `if` is part of the intended source semantics. (`mask<T>` is the
-> explicit hand-written form of the same.)
+> `all` / `min` / `max` / `dot` and materializing terminals still use a per-element branch; extending the
+> identity-select form to them is M6 work (see the completion criterion in `07 §M6`). The design is
+> fixed: **`where` is branchless** for the hot reduction shapes; no per-element `if` is part of the
+> intended source semantics. (`maskN<T>` is the explicit hand-written form of the same.)
+
+> **Why the identity-select shape matters beyond perf.** Selecting each reducer's identity for a
+> masked-out lane (`min` → `+∞`, `max` → `−∞`, `any` → `false`, `all` → `true`, `dot` → `0`, matching
+> `sum`/`count` → `0`) makes *every* reduction **predication-ready**: a masked-out lane contributes the
+> identity and cannot change the result. Generic `reduce` is the one exception — its user-supplied
+> function has no known identity (`init` is the starting accumulator, not an identity), so it uses the
+> equally branchless accumulator-select form `acc = mask ? f(acc, v) : acc`: a masked-out lane leaves
+> the accumulator unchanged. That is exactly how a scalable ISA predicates a partial tail
+> vector (`04 §4`), so extending the identity-select form across all reducers keeps them
+> scalable-tail-ready for free — the branchless form is the forward-compatible one, not just the fast
+> one.
 
 ---
 
@@ -241,7 +261,7 @@ remains to be examined.
 ```text
 - finalize the LLVM representation of Option/Result (null-ization vs. tagged, niche optimization)
 - trigger for the SoA transform (automatic vs. annotation) and its impact on the array<T> ABI
-- deciding the vector width W and the scope of multi-ISA support (common with 04 §9)
+- the scope of multi-ISA support: the vector width is a backend, per-target choice (§5) — MIR stays width-agnostic (04 §4) — so the open part is how far to carry scalable-ISA (SVE/RVV) predicated codegen, not whether MIR fixes a W (common with 04 §9)
 - the scope of adopting the LLVM optimization pipeline (non-overlap with Align's optimizations)
 - by which M and how far to raise the precision of debug info
 - linking: static runtime, and how far to depend on libc (linked with 06)

@@ -7,6 +7,28 @@ Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-02 (main @ PR #290)._
 
+## Internal review (2026-07-02)
+
+A same-day multi-agent internal review (4 parallel deep-dive tracks — frontend soundness / MIR+LLVM
+codegen / runtime+library / language-design evaluation — plus the design-evaluation question put to
+Opus and Codex **independently**, which converged on the same conclusions). Distinct from, and no
+overlap with, the external soundness audit below. Findings recorded in `docs/open-questions.md` under
+"2026-07-02 internal review" (Open, near the external-audit section) — **all still open, none fixed
+yet**: a division-by-zero/`INT_MIN÷-1` LLVM-UB guard missing in codegen, `json.decode` silently
+wrapping out-of-range integers (needs a sign-bit ABI change), a parser depth guard that misses
+iteratively-parsed chains (sema stack-overflow ICE on ~1000-term expressions), a one-line MoveCheck
+gap (`AssignField` doesn't check `whole_moved`), plus a perf backlog led by missing LLVM no-alias
+metadata on fused loops and `task_group` spawning a thread per task instead of reusing `ParPool`. The
+design-facing conclusions from the same review (MIR must carry vectorization-enabling *properties*
+and never bake in a fixed vector width — vector width stays a permanent backend decision; a two-tier
+SIMD story where `vecN<T>`/`maskN<T>` stay the fixed-width kernel escape hatch and the pipeline is the
+width-agnostic main path where scalable ISAs live; `str + str` is now a hard error, not a lint
+candidate; unconstrained-literal defaults and `&&`/`||` short-circuit order are now explicit in the
+spec) were landed the same day in `draft.md` / `docs/design-notes.md` / `docs/impl/*` and recorded as
+Settled/Future entries in `docs/open-questions.md`. **Next-action priority for the open bugs:**
+division guard → json sign bit → `AssignField`/`arena_alloc` one-line fixes → AST depth ceiling →
+LLVM alias-scope metadata.
+
 ## Latest (2026-07-02, PRs #262–#290)
 
 Since the #183 snapshot below: **M8 unsafe/`raw.*` + `extern "C"` FFI v1 shipped** (#262–#269:

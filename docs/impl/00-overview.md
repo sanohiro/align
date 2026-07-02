@@ -20,7 +20,7 @@ The standard choice for compiler implementation. Lexer/parser generators, LLVM b
 
 A staged strategy of "C backend first → LLVM later" is **not** adopted. Reasons:
 
-- The core of Align is **deterministically lowering** `vec<N,T>` / `mask` / loop fusion **to vector instructions**. Going via C would depend on the host C compiler's auto-vectorization, which breaks the "predictably fast" identity.
+- The core of Align is **deterministically lowering** `vecN<T>` / `maskN<T>` / loop fusion **to vector instructions**. Going via C would depend on the host C compiler's auto-vectorization, which breaks the "predictably fast" identity.
 - Migrating to LLVM later would be a major rewrite.
 
 Instead, **a backend-agnostic intermediate representation, MIR, is always interposed**. All of Align's semantics (arena / move / fusion / SIMD-ization decisions) live on the MIR side, and `MIR → LLVM` is limited to a pure final-stage lowering. This means:
