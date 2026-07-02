@@ -365,6 +365,12 @@ zero-cost — the same "no UB, predictable" stance as the overflow-wrap rule abo
 (zero-filling) on an unsigned one. The higher-level `bitset` type (large bit sets, SIMD-friendly) is
 a separate `core` type built on these.
 
+The logical `&&` / `||` **short-circuit**: the right operand is evaluated only when the left does not
+already decide the result (`a && b` skips `b` when `a` is false; `a || b` skips `b` when `a` is
+true). This is what makes a guard like `i < xs.len() && xs[i] > 0` safe — the bounds-checked index
+`xs[i]` is never evaluated when `i` is out of range. (The bitwise `&` / `|` are unconditional — they
+always evaluate both integer operands; only the logical operators are lazy.)
+
 ### Optional
 
 ```align

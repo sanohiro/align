@@ -90,7 +90,10 @@ Integers have `&` `|` `^` `~` and the shifts `<<` / `>>` (integer-only — `bool
 no implicit coercion, so the shift amount shares the value's type). Precedence is Go's: `<< >> &`
 bind like `*`, `| ^` like `+`, so all of them bind tighter than comparison (`a & b == c` is
 `(a & b) == c`). A shift amount is masked mod the bit width (defined, zero-cost); `>>` is arithmetic
-on a signed value, logical on an unsigned one. The `bitset` type is built on these. (`draft.md` §5.)
+on a signed value, logical on an unsigned one. The `bitset` type is built on these. The logical
+`&&` / `||` **short-circuit** (the right operand runs only when the left doesn't decide the result),
+so a guard like `i < xs.len() && xs[i] > 0` never indexes out of range; the bitwise `& | ` always
+evaluate both operands. (`draft.md` §5.)
 
 ### Constants
 

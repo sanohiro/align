@@ -1167,6 +1167,12 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::Binary { op, lhs, rhs } => {
+            // `&&` / `||` short-circuit: the right operand is evaluated only when the left doesn't
+            // already decide the result. Lower to a branch (not a strict `Rvalue::Bin`), so a guard
+            // like `i < len && arr[i] > 0` doesn't evaluate `arr[i]` (and trap) when `i >= len`.
+            if matches!(op, BinOp::And | BinOp::Or) {
+                return lower_short_circuit(b, *op, lhs, rhs);
+            }
             let l = lower_expr(b, lhs);
             let r = lower_expr(b, rhs);
             // `str + str` is concatenation, built like a two-piece template.
@@ -3944,6 +3950,43 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     let r = b.fresh_value(out_ty);
     b.push(Stmt::Let(r, Rvalue::Load(rslot)));
     Operand::Value(r)
+}
+
+/// Lower a short-circuiting `&&` / `||`. The left operand is always evaluated; the right operand is
+/// evaluated only in the branch where it can still change the result — `a && b` skips `b` when `a`
+/// is false (result `false`), `a || b` skips `b` when `a` is true (result `true`). Structurally an
+/// `if` over `a` that yields either the constant short-circuit value or `b`.
+fn lower_short_circuit(b: &mut Builder, op: BinOp, lhs: &hir::Expr, rhs: &hir::Expr) -> Operand {
+    let slot = b.new_slot(Ty::Bool);
+    let l = lower_expr(b, lhs);
+    let rhs_bb = b.new_block();
+    let short_bb = b.new_block();
+    let join_bb = b.new_block();
+    // `&&`: if `a` is true, evaluate `b`; else short-circuit to `false`.
+    // `||`: if `a` is true, short-circuit to `true`; else evaluate `b`.
+    let (true_bb, false_bb) = match op {
+        BinOp::And => (rhs_bb, short_bb),
+        BinOp::Or => (short_bb, rhs_bb),
+        _ => unreachable!("lower_short_circuit called with a non-logical operator"),
+    };
+    b.terminate(Term::Branch(l, true_bb, false_bb));
+
+    // The right-operand branch: the result is `b`.
+    b.cur = rhs_bb;
+    let r = lower_expr(b, rhs);
+    b.push(Stmt::Store(slot, r));
+    b.terminate(Term::Goto(join_bb));
+
+    // The short-circuit branch: the result is the constant that `a` alone determines.
+    b.cur = short_bb;
+    let short_val = Const::Bool(matches!(op, BinOp::Or));
+    b.push(Stmt::Store(slot, Operand::Const(short_val)));
+    b.terminate(Term::Goto(join_bb));
+
+    b.cur = join_bb;
+    let v = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(v, Rvalue::Load(slot)));
+    Operand::Value(v)
 }
 
 fn lower_if(
