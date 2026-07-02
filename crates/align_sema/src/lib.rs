@@ -9894,8 +9894,26 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::TaskGet(inner) => self.finalize_expr(inner),
             ExprKind::Wait => {}
+            ExprKind::BoxGet(inner) => {
+                self.finalize_expr(inner);
+                // Unnecessary-heap lint (`draft.md` §16, `open-questions.md` M8 lint candidates):
+                // `heap.new(x).get()` bump-allocates a box in the arena only to immediately read the
+                // scalar straight back out — the allocation serves no purpose (a `box<T>` payload is a
+                // scalar in M3, so `.get()` is a plain copy-out). A **warning**: the code is correct,
+                // just wasteful. Detected purely locally — a `.get()` whose receiver is the allocating
+                // `heap.new` *itself* — so it reuses no escape-analysis state and cannot false-positive.
+                // The broader "box bound to a local, only ever `.get()`-ed, never escaping" case needs
+                // a whole-function box-use scan (the escape pass keeps no reusable per-box escape fact);
+                // it is deferred, recorded in `open-questions.md` under the M8 lint candidates.
+                if matches!(inner.kind, ExprKind::HeapNew(_)) {
+                    self.diags.push(align_diag::Diagnostic::warning(
+                        "unnecessary heap allocation: `heap.new(...).get()` boxes a value only to read it straight back — use the value directly (a stack value suffices)".to_string(),
+                        span,
+                    ));
+                }
+            }
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
-            | ExprKind::Try(inner) | ExprKind::HeapNew(inner) | ExprKind::BoxGet(inner)
+            | ExprKind::Try(inner) | ExprKind::HeapNew(inner)
             | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::BuilderToString(inner) | ExprKind::ArraySum { source: inner, .. } | ExprKind::ArrayCount { source: inner, .. } | ExprKind::ArrayAnyAll { source: inner, .. } | ExprKind::ArrayMinMax { source: inner, .. } | ExprKind::ArrayToArray { source: inner, .. } | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayPartition { source: inner, .. } | ExprKind::ArrayParMap { source: inner, .. } | ExprKind::ArraySort { source: inner, .. } | ExprKind::ArraySortBy { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
