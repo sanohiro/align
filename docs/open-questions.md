@@ -1711,13 +1711,24 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   untouched. The differential fuzzer's oracle (which forced positive divisors) now also generates
   negative divisors incl. `-1`, exercising the wrap at every width; direct integration tests in
   `crates/align_driver/tests/div_guard.rs` cover the abort + `INT_MIN/-1` cases.
-- **`json.decode` silently truncates/sign-wraps out-of-range integers.** `align_runtime/src/lib.rs`
-  (~:919, `parse_object`; same pattern ~:872-877, :996). `JsonField.tag` packs `(kind<<8)|width` with
-  **no sign bit**, so it structurally cannot range-check: `{"n": 300}` into `u8` silently becomes
-  `44`, `{"n": -1}` into `u32` becomes `0xFFFFFFFF`, `{"n": 200}` into `i8` becomes `-56`. Hidden
-  corruption from untrusted input, in a language whose flagship consumer is JSON. Fix needs a sign bit
-  added to the tag (an **ABI change spanning codegen + runtime together**) so the decoder can check
-  `[min,max]` before writing and route out-of-range values through the existing bad-value path.
+- **Status: fixed.** **`json.decode` silently truncates/sign-wraps out-of-range integers.**
+  `align_runtime/src/lib.rs` (`parse_object`; same pattern in `write_field_indexed` — AoS/columnar —
+  and `align_rt_json_decode_array` — scalar arrays). `JsonField.tag` packed `(kind<<8)|width` with
+  **no sign bit**, so it structurally could not range-check: `{"n": 300}` into `u8` silently became
+  `44`, `{"n": -1}` into `u32` became `0xFFFFFFFF`, `{"n": 200}` into `i8` became `-56`. Hidden
+  corruption from untrusted input, in a language whose flagship consumer is JSON. **Fixed** by adding
+  bit 16 to the tag as the int sign flag — `tag = (signed<<16)|(kind<<8)|width` — an **ABI change
+  applied to codegen (`decode_field_table` + `gen_json_decode_array` emit the flag) and runtime (the
+  decoder reads it) together**; the bit sits above the existing kind/width bytes so their decoders are
+  unchanged. Every integer write path now range-checks the parsed `i64` against the field's
+  `(width, signed)` `[min, max]` via `int_in_range` and routes an out-of-range value through the
+  existing bad-value path (`None` → decode error). **Remaining limitation:** `JsonParser::integer`
+  parses into `i64`, so a `u64` field accepts only `[0, i64::MAX]` — a JSON value in
+  `(i64::MAX, u64::MAX]` is still rejected (unrepresentable, as before; not a regression). Widening
+  the parser to full `u64` for `u64` fields is a small follow-up, not yet done. Tests:
+  `int_in_range_covers_widths_and_signs`, `json_decode_range_checks_integer_fields`,
+  `json_decode_array_range_checks_integers` (runtime); `json_decode_rejects_out_of_range_integers`
+  (driver, `crates/align_driver/tests/m5.rs`).
 - **Parser depth guard doesn't cover iteratively-parsed chains — sema stack-overflows (ICE).**
   `align_parser/src/lib.rs` (~:816-826) caps `MAX_EXPR_DEPTH=256`, but that budget is spent only by
   *recursive* parsing; the left-associative binary-operator loop and the postfix-chain loop build

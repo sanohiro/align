@@ -957,6 +957,26 @@ fn json_decode_errors_on_missing_or_malformed() {
 }
 
 #[test]
+fn json_decode_rejects_out_of_range_integers() {
+    if !backend_available() {
+        return;
+    }
+    // An integer that overflows the target field's width/sign must be rejected (Err → nonzero
+    // exit), never silently truncated or sign-wrapped: `300` into a `u8` was becoming `44`.
+    let parse = "import core.json\nBox { n: u8 }\nfn parse(s: str) -> Result<Box, Error> {\n  b: Box := json.decode(s)?\n  return Ok(b)\n}\n";
+    for bad in ["{\\\"n\\\": 300}", "{\\\"n\\\": -1}"] {
+        let src = format!("{parse}fn main() -> Result<(), Error> {{\n  b := parse(\"{bad}\")?\n  print(b.n)\n  return Ok(())\n}}\n");
+        let out = build_and_run("json-decode-u8-oor", &src);
+        assert_eq!(out.status.code(), Some(1), "out-of-range u8 value {bad} rejected");
+    }
+    // An in-range boundary value still decodes and reads back exactly.
+    let ok = format!("{parse}fn main() -> Result<(), Error> {{\n  b := parse(\"{{\\\"n\\\": 255}}\")?\n  print(b.n)\n  return Ok(())\n}}\n");
+    let out = build_and_run("json-decode-u8-ok", &ok);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "255\n");
+}
+
+#[test]
 fn json_decode_float_and_mixed_scalars() {
     if !backend_available() {
         return;
