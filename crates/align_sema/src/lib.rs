@@ -4435,18 +4435,45 @@ impl<'a, 't> Checker<'a, 't> {
                             Some(PrimScalar::Int(_) | PrimScalar::Float(_) | PrimScalar::Bool | PrimScalar::Char)
                         )
                     });
-                // Allowed element-store shapes: a POD struct (a Copy aggregate store); or — for a
-                // *fixed* `array<Struct>` only — a **Move** struct (Slice 4b: the lowering drops the
-                // old element's owned fields, then moves the new value in). Still deferred: a str-view
-                // struct (borrowed `str` fields need a region/escape check), and a Move element into a
-                // `soa` (its columns would need per-column drop).
+                // A view-Copy struct: every field is a Copy scalar — a primitive (numeric/bool/char)
+                // or a `str` **view** (16-byte `{ptr,len}`, borrowed, owns nothing). The aggregate is
+                // Copy, so the scatter (`StoreColumn` per field) needs no per-field drop; a stored
+                // `str` view's escape is caught by the `AssignElem` region rule (the value must
+                // outlive the soa). Restricted to a `soa`: the fixed `array<Struct>` str-element store
+                // (a whole-aggregate `StoreIndex`, plus a str-field read back) stays deferred with the
+                // rest of the AoS str element work. Owned columns (`string`/`array<T>`, which need a
+                // per-column drop of the overwritten value + soa drop) are not scalars, so they fall
+                // out of this set and stay rejected — the forward-safe default.
+                // Lazy: only walked when `pod` is false (short-circuited in the gate below), so a
+                // POD struct never pays the field scan twice.
+                let str_view = || {
+                    soa && !fields.is_empty()
+                        && fields.iter().all(|f| {
+                            matches!(
+                                ty_to_scalar(f.ty).and_then(scalar_to_prim),
+                                Some(
+                                    PrimScalar::Int(_)
+                                        | PrimScalar::Float(_)
+                                        | PrimScalar::Bool
+                                        | PrimScalar::Char
+                                        | PrimScalar::Str
+                                )
+                            )
+                        })
+                };
+                // Allowed element-store shapes: a POD or str-view struct into a `soa` (a Copy
+                // aggregate scatter; a stored `str` view is escape-checked below); a POD struct into a
+                // fixed `array<Struct>` (a Copy aggregate store); or — for a *fixed* `array<Struct>`
+                // only — a **Move** struct (Slice 4b: the lowering drops the old element's owned
+                // fields, then moves the new value in). Still deferred: a soa of *owned* columns
+                // (per-column drop), and a str-view struct into a *fixed* array.
                 let is_move = struct_is_move(sid, self.structs);
-                if !(pod || (!soa && is_move)) {
-                    // We are in the error block, so `!(pod || (!soa && is_move))` held: either `soa`
-                    // is true, or (`soa` false and `is_move` false) — a str-view struct. There is no
-                    // third case (a fixed Move-struct array is allowed above).
+                if !(pod || str_view() || (!soa && is_move)) {
+                    // In the error block: either `soa` is true (an owned-column soa — neither the POD
+                    // nor the str field set matched), or `soa` is false with a non-POD, non-Move
+                    // struct (a borrowed `str`/view field in a fixed array).
                     let why = if soa {
-                        "a soa element store needs only numeric/bool/char fields for now"
+                        "a soa element store needs scalar or `str` columns for now (owned `string`/array columns are deferred)"
                     } else {
                         "the struct has borrowed `str`/view fields that need region handling — deferred (owned `string` fields are supported)"
                     };

@@ -424,6 +424,81 @@ fn primitive_soa_stays_self_contained() {
     )));
 }
 
+// ---- writing a `str` column (`s[i].name = v` / `s[i] = value`) ----
+// A stored `str` view escapes if it does not outlive the soa, so every write is region-checked by
+// the `AssignElem`/`AssignElemField` store rule (a str view is Copy — no per-field drop needed).
+
+#[test]
+fn str_column_single_field_write() {
+    if !backend_available() {
+        return;
+    }
+    // `s[i].name = v` replaces one str column's element (`StoreColumn`). The `str` literal is
+    // `'static`, so it outlives the arena soa — the store is in-region. Read the new length back.
+    let out = build_and_run(
+        "soa-str-field-write",
+        concat!(
+            "import core.json\n",
+            "User { name: str, age: i64 }\n",
+            "fn main() -> Result<(), Error> {\n  arena {\n    mut s: soa<User> := json.decode(\"[{\\\"name\\\":\\\"alice\\\",\\\"age\\\":30}]\")?\n    s[0].name = \"changed\"\n    print(s[0].name.len())\n  }\n  return Ok(())\n}\n",
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn str_column_field_write_cannot_store_shorter_lived() {
+    // The escape dual of the read check: storing a str view from an *inner* arena into a soa that
+    // lives in an *outer* arena would leave a dangling view once the inner arena frees — rejected.
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "User { name: str, age: i64 }\n",
+        "fn get(inner: str) -> Result<i64, Error> {\n  arena {\n    mut s: soa<User> := json.decode(\"[{\\\"name\\\":\\\"a\\\",\\\"age\\\":1}]\")?\n    arena {\n      t: soa<User> := json.decode(inner)?\n      s[0].name = t[0].name\n    }\n    return Ok(s[0].name.len())\n  }\n}\n",
+    )));
+}
+
+#[test]
+fn str_column_whole_elem_write_scatters() {
+    if !backend_available() {
+        return;
+    }
+    // `s[0] = s[1]` on a str-bearing soa gathers row 1 and scatters every column (str + int) into
+    // row 0 (`StoreColumn` per field). Read the new str length (5 = "bobby") and int (25) back.
+    let out = build_and_run(
+        "soa-str-whole-elem-write",
+        concat!(
+            "import core.json\n",
+            "User { name: str, age: i64 }\n",
+            "fn main() -> Result<(), Error> {\n  arena {\n    mut s: soa<User> := json.decode(\"[{\\\"name\\\":\\\"alice\\\",\\\"age\\\":30},{\\\"name\\\":\\\"bobby\\\",\\\"age\\\":25}]\")?\n    s[0] = s[1]\n    print(s[0].name.len())\n    print(s[0].age)\n  }\n  return Ok(())\n}\n",
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n25\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn str_column_whole_elem_write_cannot_store_shorter_lived() {
+    // Whole-element store dual: a gathered struct from an inner arena carries str views that would
+    // dangle once the inner arena frees, so scattering it into the outer soa is rejected.
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "User { name: str, age: i64 }\n",
+        "fn get(inner: str) -> Result<i64, Error> {\n  arena {\n    mut s: soa<User> := json.decode(\"[{\\\"name\\\":\\\"a\\\",\\\"age\\\":1}]\")?\n    arena {\n      t: soa<User> := json.decode(inner)?\n      s[0] = t[0]\n    }\n    return Ok(s[0].name.len())\n  }\n}\n",
+    )));
+}
+
+#[test]
+fn str_column_whole_elem_write_via_literal_cannot_store_shorter_lived() {
+    // The same escape via a struct *literal* whose str field is a shorter-lived view — the value's
+    // region is the shortest of its fields (`StructLit` region fold), so the store is still rejected.
+    assert!(!ok(concat!(
+        "import core.json\n",
+        "User { name: str, age: i64 }\n",
+        "fn get(inner: str) -> Result<i64, Error> {\n  arena {\n    mut s: soa<User> := json.decode(\"[{\\\"name\\\":\\\"a\\\",\\\"age\\\":1}]\")?\n    arena {\n      t: soa<User> := json.decode(inner)?\n      s[0] = User { name: t[0].name, age: 9 }\n    }\n    return Ok(s[0].name.len())\n  }\n}\n",
+    )));
+}
+
 // ---- `group_by(.key).sum(.value)` — column-oriented grouped sum over a soa ----
 
 #[test]

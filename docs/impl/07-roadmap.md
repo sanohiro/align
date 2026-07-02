@@ -811,14 +811,35 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   write `s[i] = value` / `arr[i] = value`** also ships (`hir::Stmt::AssignElem`, new `Place::Elem`): the
   write counterpart of the `s[i]` gather / `arr[i]` whole-element read — a soa scatters the value's
   fields into their columns (`StoreColumn` per field), a fixed struct array stores the whole aggregate
-  into the element (`StoreIndex`, a `[0,index]` GEP). First cut is plain-old-data structs (flat
-  numeric/bool/char fields), so the value is a Copy aggregate with no region/move — `str`/nested/
-  owned-bearing structs are gated off and deferred.
-  Deferred: `str`/owned columns, the multi-column `soa_slice<T>` sub-view (`s[a..b]` over *every*
-  column — needs a `{ptr,total_len,start,count}` view repr since column stride depends on the
-  *original* row count; see `open-questions.md`), the dynamic `array<Struct>` element-field write of a
-  `str`/owned field (needs a pointer-based per-element drop of the overwritten field), whole-element
-  write of `str`/nested/owned structs (region/move handling), bitset/bool packed columns.
+  into the element (`StoreIndex`, a `[0,index]` GEP).
+  **`str` column WRITES — DONE.** A `str` view is a Copy 16-byte `{ptr,len}`, so a str-bearing soa is
+  still a view-Copy aggregate (no owned buffer, no per-field drop): both the single-field write
+  `s[i].name = v` and the whole-element scatter `s[i] = value` ride the *existing* store machinery
+  unchanged — the per-field `StoreColumn` scatter is already str-capable (it built the `to_soa` /
+  `json.decode → soa` str columns), and the store's escape is caught by the `AssignElemField` /
+  `AssignElem` region rule (`region_of(value).outlives(region_of(base_soa))`). A stored view that does
+  not outlive the soa (an inner-arena view scattered into an outer-arena soa, directly or via a
+  struct literal whose `StructLit` region folds to the shorter field) is a compile error — the dual of
+  the `s[i]`/`s[i].name` read escape check. Sema change was a one-predicate gate relax (`str_view`:
+  every field a Copy scalar incl. `str`, soa-only); MIR/codegen needed nothing. Tests:
+  `str_column_single_field_write`, `str_column_field_write_cannot_store_shorter_lived`,
+  `str_column_whole_elem_write_scatters`, `str_column_whole_elem_write_cannot_store_shorter_lived`,
+  `str_column_whole_elem_write_via_literal_cannot_store_shorter_lived` (`tests/soa.rs`).
+  Deferred — **owned columns** (`string`/`array<T>` fields): the real remaining SoA weight. A `string`
+  column is *owned* per element, so (a) `s[i] = value` / `s[i].name = v` must **drop the overwritten
+  element's owned field** before the store (`StoreColumn` has no drop today) and **move** the RHS in
+  (null its source, like the fixed-array Move path), (b) dropping the whole soa must free every owned
+  element of every owned column (no per-column drop exists), and (c) `region_of` must treat an owned
+  column as self-contained (arena/frame), not a borrow of the input — a gather `s[i]` of an owned
+  column stops being a free Copy (it would deep-copy or move). None of this is a *new analysis
+  mechanism* — it is drop-insertion + move-null wiring per owned column — but it is a real slice, so it
+  is deferred until pursued (see `open-questions.md`). Also still deferred: the multi-column
+  `soa_slice<T>` sub-view (`s[a..b]` over *every* column — needs a `{ptr,total_len,start,count}` view
+  repr since column stride depends on the *original* row count), the dynamic `array<Struct>`
+  element-field write of a `str`/owned field (needs a pointer-based per-element drop of the overwritten
+  field), the fixed `array<Struct>` whole-element write of a `str`/nested struct (region-checked
+  aggregate store — the soa path ships; the AoS path stays with the rest of the AoS str element work),
+  and bitset/bool packed columns.
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR
 level; and extend the branchless `where` form beyond `sum`/`count` to every reducer —

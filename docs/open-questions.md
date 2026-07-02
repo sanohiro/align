@@ -437,10 +437,36 @@ columns borrow the input, so it is no longer arena-self-contained: `region_of(Js
 predicate gates it), `s[i]` gather inherits the soa's region instead of `Static`, and the `SoaColumn`
 projection inherits its base's region (closing a `slice<str>` escape hole). A primitive-only soa is
 unchanged — still arena-regioned and free to escape the input (`s[i]` gather returns a Copy POD).
-Reads only (`s[i].name`, `s.name` projection, `s[i]` gather); str-column **writes** (`s[i].name = v`,
-`s[i] = value` with a str field) stay rejected — a stored view would be a fresh escape concern.
 Escape-checked end to end (`str_column_view_cannot_escape_the_arena`; `primitive_soa_stays_self_contained`
 guards the non-regression). `tests/soa.rs`, `examples/soa_json_str.align`, `draft.md` §9.
+
+**`str` column WRITES — DONE (2026-07-03).** `s[i].name = v` (single column) and `s[i] = value`
+(whole-element scatter) on a str-bearing soa now type-check and run. A `str` view is a **Copy**
+16-byte `{ptr,len}` — a str-bearing soa is a view-Copy aggregate (owns no buffer, needs no per-field
+drop), so both writes ride the *existing* store machinery: the per-field `StoreColumn` scatter is
+already str-capable (it built the `to_soa` / decode columns), and the store's escape is already
+guarded by the `AssignElemField` / `AssignElem` region rule
+(`region_of(value).outlives(region_of(base_soa))`). This is the exact **dual** of the read escape
+check: a stored view that does not outlive the soa (an inner-arena view scattered into an outer-arena
+soa — directly, via a gather, or via a struct literal whose `StructLit` region folds to the shorter
+field) is a compile error. The only code change was a one-predicate sema gate relax (`str_view`:
+every field a Copy scalar incl. `str`, soa-only) on the whole-element store; the single-field
+`s[i].name = v` was already reachable (the `AssignElemField` gate only restricts the *dynamic-array*
+pointer-store path) and is now locked by tests. MIR/codegen needed nothing. Tests:
+`str_column_single_field_write`, `str_column_field_write_cannot_store_shorter_lived`,
+`str_column_whole_elem_write_scatters`, `str_column_whole_elem_write_cannot_store_shorter_lived`,
+`str_column_whole_elem_write_via_literal_cannot_store_shorter_lived` (`tests/soa.rs`).
+
+**Owned columns (`string`/`array<T>`) — still deferred; this is the remaining "Move fields in
+`soa<T>`" open item above.** An owned column is *owned per element*, so it is a real slice (drop +
+move wiring, not a new analysis mechanism): (a) a write `s[i] = value` / `s[i].name = v` must **drop
+the overwritten element's owned field** before storing and **move** the RHS in (null its source,
+like the fixed-array Move element path) — `StoreColumn` has no drop today; (b) dropping the whole
+soa must **free every owned element of every owned column** (no per-column drop exists); (c)
+`region_of` must treat an owned column as **self-contained** (arena/frame, not a borrow of the
+input), and a gather `s[i]` of an owned column stops being a free Copy (it would deep-copy or move a
+field out of the column — the invalidation the "Move fields in `soa<T>`" note warns about). Defer
+until pursued.
 
 **`.to_soa()` with str columns — DONE (2026-07-01).** The transpose analogue: `arr.to_soa()` over an
 AoS `array<Struct>` with a `str` field now copies each element's `str` view into a view column. The
