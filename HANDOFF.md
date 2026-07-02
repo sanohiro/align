@@ -13,21 +13,24 @@ A same-day multi-agent internal review (4 parallel deep-dive tracks — frontend
 codegen / runtime+library / language-design evaluation — plus the design-evaluation question put to
 Opus and Codex **independently**, which converged on the same conclusions). Distinct from, and no
 overlap with, the external soundness audit below. Findings recorded in `docs/open-questions.md` under
-"2026-07-02 internal review" (Open, near the external-audit section) — **all still open, none fixed
-yet**: a division-by-zero/`INT_MIN÷-1` LLVM-UB guard missing in codegen, `json.decode` silently
-wrapping out-of-range integers (needs a sign-bit ABI change), a parser depth guard that misses
-iteratively-parsed chains (sema stack-overflow ICE on ~1000-term expressions), a one-line MoveCheck
-gap (`AssignField` doesn't check `whole_moved`), plus a perf backlog led by missing LLVM no-alias
-metadata on fused loops and `task_group` spawning a thread per task instead of reusing `ParPool`. The
+"2026-07-02 internal review" (Open, near the external-audit section). **All bug findings were fixed
+the same day, PRs #293–#297**: the `AssignField` MoveCheck gap + `arena_alloc` raw cast (#293), the
+division-by-zero/`INT_MIN÷-1` LLVM-UB guard — zero aborts via `align_rt_div_fail`, `INT_MIN/-1`
+wraps, constant divisors skip the guard (#294), `json.decode` out-of-range integers — sign bit added
+to the field tag, an ABI change across codegen+runtime (#295), the expression-depth ICE — post-parse
+`cap_expr_depths` with a measured 128 ceiling (#296), and the `chunks`-over-local-array region hole,
+including the str-array storage-vs-element-region case gemini caught on the PR (#297). **Still open:
+the perf backlog** — led by missing LLVM no-alias metadata on fused loops and `task_group` spawning a
+thread per task instead of reusing `ParPool` — and the design-decision Open items (out-of-range
+literals, `main() -> Result<(), E>` exit mapping). The
 design-facing conclusions from the same review (MIR must carry vectorization-enabling *properties*
 and never bake in a fixed vector width — vector width stays a permanent backend decision; a two-tier
 SIMD story where `vecN<T>`/`maskN<T>` stay the fixed-width kernel escape hatch and the pipeline is the
 width-agnostic main path where scalable ISAs live; `str + str` is now a hard error, not a lint
 candidate; unconstrained-literal defaults and `&&`/`||` short-circuit order are now explicit in the
 spec) were landed the same day in `draft.md` / `docs/design-notes.md` / `docs/impl/*` and recorded as
-Settled/Future entries in `docs/open-questions.md`. **Next-action priority for the open bugs:**
-division guard → json sign bit → `AssignField`/`arena_alloc` one-line fixes → AST depth ceiling →
-LLVM alias-scope metadata.
+Settled/Future entries in `docs/open-questions.md`. **Next action from this review: the perf
+backlog**, led by LLVM alias-scope metadata on fused loops, then `task_group` → `ParPool`.
 
 ## Latest (2026-07-02, PRs #262–#290)
 
