@@ -3971,11 +3971,14 @@ fn lower_short_circuit(b: &mut Builder, op: BinOp, lhs: &hir::Expr, rhs: &hir::E
     };
     b.terminate(Term::Branch(l, true_bb, false_bb));
 
-    // The right-operand branch: the result is `b`.
+    // The right-operand branch: the result is `b`. If `b` itself diverges (a `return` inside a
+    // block operand), it already terminated `rhs_bb` — don't push a dead store / second terminator.
     b.cur = rhs_bb;
     let r = lower_expr(b, rhs);
-    b.push(Stmt::Store(slot, r));
-    b.terminate(Term::Goto(join_bb));
+    if !b.is_terminated() {
+        b.push(Stmt::Store(slot, r));
+        b.terminate(Term::Goto(join_bb));
+    }
 
     // The short-circuit branch: the result is the constant that `a` alone determines.
     b.cur = short_bb;

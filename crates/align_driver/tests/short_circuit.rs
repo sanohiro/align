@@ -83,3 +83,21 @@ fn main() -> i32 {
     let out = build_and_run("sc-truth", src);
     assert_eq!(out.status.code(), Some(101001 % 256));
 }
+
+#[test]
+fn diverging_right_operand_does_not_break_cfg() {
+    // gemini #274: the rhs of `&&` can itself diverge (a `return` in a block operand), which
+    // terminates the rhs block. The lowering must not then push a dead store / second terminator.
+    // a=true → the rhs `{ return 5 }` runs and returns 5 from `f`.
+    let src = "\
+fn f(a: bool) -> i32 {
+  if a && { return 5 } {
+    return 1
+  }
+  return 0
+}
+fn main() -> i32 { return f(true) }
+";
+    let out = build_and_run("sc-diverge-rhs", src);
+    assert_eq!(out.status.code(), Some(5));
+}
