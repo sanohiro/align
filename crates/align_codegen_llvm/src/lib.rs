@@ -1269,7 +1269,7 @@ fn field_abi_align(ty: Ty, structs: &[StructDef]) -> u64 {
             .map(|f| field_abi_align(f.ty, structs))
             .max()
             .unwrap_or(1),
-        Ty::Array(s, _) => scalar_bytes(s).min(8).max(1),
+        Ty::Array(s, _) => scalar_bytes(s).clamp(1, 8),
         _ => 8,
     }
 }
@@ -2244,7 +2244,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let c = self.operand(cond).into_vector_value();
                     let av = self.operand(a).into_vector_value();
                     let bv = self.operand(b).into_vector_value();
-                    self.builder.build_select(c, av, bv, "vsel").map_err(|e| self.err(e))?.into()
+                    self.builder.build_select(c, av, bv, "vsel").map_err(|e| self.err(e))?
                 } else {
                     let c = self.operand(cond).into_int_value();
                     let av = self.operand(a);
@@ -2756,12 +2756,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let st = self.struct_types[*struct_id as usize];
                 let fields = &self.structs[*struct_id as usize].fields;
                 let mut acc = st.get_undef();
-                for f in 0..fields.len() {
+                for (f, field) in fields.iter().enumerate() {
                     let off = self.soa_column_offset(len, &sizes, f)?;
                     let col_base = unsafe {
                         self.builder.build_in_bounds_gep(self.ctx.i8_type(), buf, &[off], "gcolbase").map_err(|e| self.err(e))?
                     };
-                    let fty = scalar_type(self.ctx, fields[f].ty, self.struct_types, self.enum_types);
+                    let fty = scalar_type(self.ctx, field.ty, self.struct_types, self.enum_types);
                     let ep = unsafe {
                         self.builder.build_in_bounds_gep(fty, col_base, &[index], "gcolelem").map_err(|e| self.err(e))?
                     };
@@ -4369,7 +4369,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let undef = vty.get_undef();
         let init = self.builder.build_insert_element(undef, scalar, self.ctx.i32_type().const_zero(), "splat_init").map_err(|e| self.err(e))?;
         let mask = self.ctx.i32_type().vec_type(n).const_zero();
-        Ok(self.builder.build_shuffle_vector(init, undef, mask, "splat").map_err(|e| self.err(e))?)
+        self.builder.build_shuffle_vector(init, undef, mask, "splat").map_err(|e| self.err(e))
     }
 
     /// Sum the `n` lanes of a vector into the element scalar (M6 reductions — `sum_where`, `dot`).

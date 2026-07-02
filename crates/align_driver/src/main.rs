@@ -8,7 +8,7 @@
 //!   alignc build     <file>   Build an executable (<stem> in cwd)
 //!   alignc run       <file>   Build, run, and return its exit code
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use align_driver::{
@@ -210,7 +210,7 @@ fn stem(path: &str) -> String {
 }
 
 /// Turn MIR into an object and link it into an executable. Returns the `exe` path.
-fn build_to(path: &str, mir: &align_mir::Program, exe: &PathBuf, target: BuildTarget) -> Result<(), ExitCode> {
+fn build_to(path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarget) -> Result<(), ExitCode> {
     let obj = std::env::temp_dir().join(format!("align-{}.o", stem(path)));
     if let Err(e) = emit_object_file(mir, &obj, target) {
         eprintln!("alignc: codegen failed: {e}");

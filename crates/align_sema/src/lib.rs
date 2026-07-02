@@ -3185,6 +3185,9 @@ enum MovedKey {
 }
 
 type MovedSet = std::collections::HashSet<MovedKey>;
+/// A matchable type's variants: `(variant name, positional payload scalars)`, see
+/// `Sema::match_variants`.
+type VariantList = Vec<(String, Vec<Scalar>)>;
 
 /// `id` is unusable as a whole if it was wholly moved or *any* of its fields was moved.
 fn whole_moved(moved: &MovedSet, id: LocalId) -> bool {
@@ -4463,37 +4466,36 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // `local[index].field = v` — store one scalar field of a struct-array / soa element (the
         // write counterpart of the `c[i].field` read). One field is written, no whole-element copy.
-        if let ast::ExprKind::FieldAccess { recv, field } = &place.kind {
-            if let ast::ExprKind::Index { recv: irecv, index } = &recv.kind {
-                if let Some((id, local_ty)) = self.place_local(irecv) {
-                    let soa = match local_ty {
-                        Ty::Soa(sid) => Some((sid, true)),
-                        Ty::StructArray(sid, _) => Some((sid, false)),
-                        _ => None,
-                    };
-                    if let Some((struct_id, soa)) = soa {
-                        if !self.locals[id as usize].is_mut {
-                            let name = self.locals[id as usize].name.clone();
-                            self.diags.error(
-                                format!("cannot assign to a field of an element of immutable '{name}' (declare with `mut`)"),
-                                place.span,
-                            );
-                        }
-                        let (field_idx, ty) = match self.field_of(Ty::Struct(struct_id), &field.name, place.span) {
-                            Some(f) => f,
-                            None => return Place::Err,
-                        };
-                        let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
-                        if i.ty == Ty::Error {
-                            return Place::Err;
-                        }
-                        if !i.ty.is_int_like() {
-                            self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
-                            return Place::Err;
-                        }
-                        return Place::ElemField { base: id, index: i, field: field_idx, struct_id, soa, ty };
-                    }
+        if let ast::ExprKind::FieldAccess { recv, field } = &place.kind
+            && let ast::ExprKind::Index { recv: irecv, index } = &recv.kind
+            && let Some((id, local_ty)) = self.place_local(irecv)
+        {
+            let soa = match local_ty {
+                Ty::Soa(sid) => Some((sid, true)),
+                Ty::StructArray(sid, _) => Some((sid, false)),
+                _ => None,
+            };
+            if let Some((struct_id, soa)) = soa {
+                if !self.locals[id as usize].is_mut {
+                    let name = self.locals[id as usize].name.clone();
+                    self.diags.error(
+                        format!("cannot assign to a field of an element of immutable '{name}' (declare with `mut`)"),
+                        place.span,
+                    );
                 }
+                let (field_idx, ty) = match self.field_of(Ty::Struct(struct_id), &field.name, place.span) {
+                    Some(f) => f,
+                    None => return Place::Err,
+                };
+                let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                if i.ty == Ty::Error {
+                    return Place::Err;
+                }
+                if !i.ty.is_int_like() {
+                    self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
+                    return Place::Err;
+                }
+                return Place::ElemField { base: id, index: i, field: field_idx, struct_id, soa, ty };
             }
         }
         // `local.f0.f1.… = v` — a (possibly nested) field path rooted at a mutable local.
@@ -7229,9 +7231,7 @@ impl<'a, 't> Checker<'a, 't> {
                         self.diags.error("a whole-struct `map`/`where` over `soa<T>` is not supported (it would gather every column); project a field first (`s.field.…`) or filter a field (`where(.field)`)".to_string(), span);
                         return None;
                     }
-                    let Some((func, ret, captures)) = self.resolve_stage_fn(&sf, elem, false) else {
-                        return None;
-                    };
+                    let (func, ret, captures) = self.resolve_stage_fn(&sf, elem, false)?;
                     stages.push(Stage { kind: StageKind::Map { func, captures }, out_ty: ret });
                     elem = ret;
                     mapped = true;
@@ -7246,9 +7246,7 @@ impl<'a, 't> Checker<'a, 't> {
                         self.diags.error("a whole-struct `map`/`where` over `soa<T>` is not supported (it would gather every column); filter a field with `where(.field)`".to_string(), span);
                         return None;
                     }
-                    let Some((func, _, captures)) = self.resolve_stage_fn(&sf, elem, true) else {
-                        return None;
-                    };
+                    let (func, _, captures) = self.resolve_stage_fn(&sf, elem, true)?;
                     stages.push(Stage { kind: StageKind::Where { func, captures }, out_ty: elem });
                 }
                 RawStage::WhereField(field) => {
@@ -9437,7 +9435,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// The variants of a matchable type: a user sum type, or the builtin `Option`/`Result`
     /// (so `match` works on them too). Each variant is `(name, positional payload scalars)`, in
     /// the order the lowering expects (Option: 0 = Some, 1 = None; Result: 0 = Ok, 1 = Err).
-    fn match_variants(&self, ty: Ty) -> Option<(String, Vec<(String, Vec<Scalar>)>)> {
+    fn match_variants(&self, ty: Ty) -> Option<(String, VariantList)> {
         match ty {
             Ty::Enum(id) => {
                 let e = &self.enums[id as usize];
@@ -10765,7 +10763,10 @@ fn resolve_type(
                 // An `align(N)` struct element would need its size padded to its alignment for a
                 // tight, aligned stride (deferred) — reject embedding it in an array for now.
                 Ty::Struct(id) if cx.structs.get(id as usize).and_then(|s| s.align).is_some() => {
-                    diags.error(format!("an `align(N)` struct cannot be an `array` element yet (its over-alignment is not honored when embedded)"), span);
+                    diags.error(
+                        "an `align(N)` struct cannot be an `array` element yet (its over-alignment is not honored when embedded)".to_string(),
+                        span,
+                    );
                     Ty::Error
                 }
                 Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),

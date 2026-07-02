@@ -81,7 +81,7 @@ fn gen_expr(rng: &mut Rng, depth: u32) -> (String, i64) {
             let (op, cond) = if rng.below(2) == 0 {
                 ("&&", (av < bv) && (bv < av.wrapping_add(3)))
             } else {
-                ("||", (av > bv) || (av == bv))
+                ("||", av >= bv)
             };
             let cond_src = if op == "&&" {
                 format!("{a} < {b} && {b} < {a} + 3")
@@ -258,7 +258,7 @@ fn aggregates_compute_the_oracle_value() {
         return;
     }
     for seed in 0..150u64 {
-        let mut rng = Rng(seed.wrapping_mul(0xA0761D_6478BD_642F).wrapping_add(3));
+        let mut rng = Rng(seed.wrapping_mul(0xA076_1D64_78BD_642F).wrapping_add(3));
         let (src, oracle) = if rng.below(2) == 0 {
             // Struct: build with concrete field values, then read *every* field back and sum them.
             // Mixed field widths force the compiler's descending-alignment field reordering; summing

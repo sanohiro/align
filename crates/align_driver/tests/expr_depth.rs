@@ -26,7 +26,7 @@ fn too_deep_count(name: &str, src: &str) -> usize {
 #[test]
 fn long_binary_chain_is_rejected_cleanly_not_by_ice() {
     // 2000-term `+` chain: iteratively parsed to a 2000-deep AST, which overflowed sema pre-fix.
-    let chain = std::iter::repeat("1").take(2000).collect::<Vec<_>>().join("+");
+    let chain = std::iter::repeat_n("1", 2000).collect::<Vec<_>>().join("+");
     let src = format!("fn main() -> i32 {{\n  x := {chain}\n  return 0\n}}\n");
     // The test process merely *surviving* this call is the no-ICE assertion (a stack overflow aborts
     // the whole test binary, it is not catchable). Exactly one clean diagnostic — not one per
@@ -72,7 +72,7 @@ fn deeply_nested_parens_still_guarded() {
 fn deep_within_limit_expression_is_accepted() {
     // A 120-term chain is under the ceiling: it must type-check with no depth error (and no ICE),
     // proving the cap does not wrongly reject reasonably deep machine-generated expressions.
-    let chain = std::iter::repeat("1").take(120).collect::<Vec<_>>().join("+");
+    let chain = std::iter::repeat_n("1", 120).collect::<Vec<_>>().join("+");
     let src = format!("fn main() -> i32 {{\n  return {chain}\n}}\n");
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "within-limit", &src);
@@ -90,7 +90,7 @@ fn within_limit_chain_compiles_and_runs() {
     }
     // End-to-end: a 40-term chain (safe for the full codegen pipeline on the test thread) must
     // build and return the correct value — the truncation pass leaves in-limit trees untouched.
-    let chain = std::iter::repeat("1").take(40).collect::<Vec<_>>().join("+");
+    let chain = std::iter::repeat_n("1", 40).collect::<Vec<_>>().join("+");
     let src = format!("fn main() -> i32 {{\n  return {chain}\n}}\n");
     let out = build_and_run("within-limit-run", &src);
     assert_eq!(out.status.code(), Some(40));
