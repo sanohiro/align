@@ -1994,9 +1994,12 @@ impl EffectScan {
                     self.expr(a);
                 }
             }
-            // A function value (taking a fn's address) is not a call; an indirect call walks its
-            // callee + args (the target is not statically known — not used in `par_map` contexts).
-            ExprKind::FnValue(_) => {}
+            // Taking a function's address (`g := loud`) is not itself a call, but it exposes that
+            // function's effects to any later indirect call (`g(x)`) — which reaches `CallFnValue`
+            // with a `callee` whose target is not statically known. So record a call edge to the
+            // referenced function here: its impurity then propagates through the call graph, closing
+            // the `par_map`-purity bypass where an impure function is laundered through a fn value.
+            ExprKind::FnValue(name) => self.calls.push(name.clone()),
             ExprKind::Closure { captures, .. } => {
                 for c in captures {
                     self.expr(c);
@@ -2532,6 +2535,25 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::If { then, els, .. } => {
                 self.region_of_block(then, depth).shorter(self.region_of_block(els, depth))
             }
+            // A `match` yields one of its arms' values, so it lives only as long as the
+            // shortest-lived arm (the same rule as `if`/`else`). Without this, an arena value
+            // returned through a match arm is inferred `Static` and escapes undetected (a
+            // use-after-free — `region_of` otherwise falls to the `Static` wildcard below).
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .fold(Region::Static, |acc, a| acc.shorter(self.region_of(&a.body, depth))),
+            // An indirect call's result may borrow one of its arguments (`g := id; g(s)`), so it
+            // lives no longer than the shortest-lived argument — exactly like a direct `Call`.
+            // Without this, returning `g(arena_str)` out of an arena slips the escape check.
+            ExprKind::CallFnValue { args, .. } => args
+                .iter()
+                .fold(Region::Static, |acc, a| acc.shorter(self.region_of(a, depth))),
+            // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
+            // into the array's storage, so it inherits the array's region (like `ElemField`).
+            ExprKind::IndexField { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
+            // `t.get()` exposes the task's result; a region-tracked result borrows whatever the
+            // task closure did, so it inherits the inner value's region (conservative, never longer).
+            ExprKind::TaskGet(inner) => self.region_of(inner, depth),
             // A call's result may be a view borrowing one of its arguments (`fn id(s: str) -> str
             // = s`), so conservatively it lives no longer than the shortest-lived argument — the
             // region analogue of `slice_is_local`'s arg propagation. Without this, returning
@@ -2564,6 +2586,16 @@ impl<'a> EscapeCheck<'a> {
                 then.value.as_ref().is_some_and(|v| self.slice_is_local(v))
                     || els.value.as_ref().is_some_and(|v| self.slice_is_local(v))
             }
+            // A range slice `recv[a..b]` borrows the receiver's storage, so it is frame-local iff
+            // the receiver is (a sub-slice of a local array is still a view of that stack array).
+            // Without this, `return xs[0..2]` over a local array returns a dangling slice.
+            ExprKind::SliceRange { recv, .. } => self.slice_is_local(recv),
+            // A `match`/`else` yields one of its arms, so it is frame-local if any arm is (like the
+            // `if`/`else` arm above — a local-backed slice must not escape through either).
+            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.slice_is_local(&a.body)),
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.slice_is_local(opt) || self.slice_is_local(fallback)
+            }
             _ => false,
         }
     }
@@ -2589,14 +2621,32 @@ impl<'a> EscapeCheck<'a> {
                 if matches!(init.ty, Ty::Slice(_)) && self.slice_is_local(init) {
                     self.local_backed_slice.insert(*local);
                 }
+                // A local bound to a *fixed* array (`xs := [1, 2, 3]`) owns frame storage, so any
+                // slice viewing it (`xs[0..2]`, `xs` coerced) is frame-local and must not escape.
+                // Array *parameters* borrow the caller and are never `Let`-bound, so they stay out
+                // of this set (returnable), matching the slice-parameter convention above.
+                if matches!(init.ty, Ty::Array(..) | Ty::StructArray(..)) {
+                    self.local_backed_slice.insert(*local);
+                }
             }
-            // `base[index] = value` / `base[index].field = value` — primitive (scalar / POD-struct)
-            // stores, so no region to track; just recurse into the index and value for nested escapes.
-            Stmt::AssignIndex { index, value, .. }
-            | Stmt::AssignElemField { index, value, .. }
-            | Stmt::AssignElem { index, value, .. } => {
+            // `base[index] = value` / `base[index].field = value`. The store itself targets the
+            // element slot; recurse into the index/value for nested escapes, and — when the element
+            // is region-tracked (a `str` element) — reject storing a shorter-lived value into the
+            // longer-lived array (the `Assign`/`AssignField` region rule, extended to elements).
+            Stmt::AssignIndex { base, index, value }
+            | Stmt::AssignElemField { base, index, value, .. }
+            | Stmt::AssignElem { base, index, value, .. } => {
                 self.walk(index, depth);
                 self.walk(value, depth);
+                if self.tracks_region(value.ty) {
+                    let target = self.region.get(base).copied().unwrap_or(Region::Static);
+                    if !self.region_of(value, depth).outlives(target) {
+                        self.diags.error(
+                            "this value cannot be stored into a longer-lived array element (it would escape its region)".to_string(),
+                            value.span,
+                        );
+                    }
+                }
             }
             Stmt::AssignVecLane { value, .. } => self.walk(value, depth),
             Stmt::Assign { local, value, .. } => {
@@ -3315,8 +3365,26 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.expr(scrutinee, moved, false, false);
+                // Arms are mutually exclusive, so each is checked in the *same* incoming state:
+                // clone `moved` per arm and join, exactly like `if`/`else` generalised to N arms.
+                // Without this the arms share one set, so a value consumed in arm A is wrongly seen
+                // as already-moved in arm B (a false "use of moved value"). A diverging arm
+                // (`=> { return … }`) contributes nothing to the fall-through, so its moves must not
+                // poison the post-state; if every arm diverges the code after is unreachable.
+                let mut joined: Option<MovedSet> = None;
                 for a in arms {
-                    self.expr(&a.body, moved, consuming, direct);
+                    let mut m = moved.clone();
+                    self.expr(&a.body, &mut m, consuming, direct);
+                    if hir_expr_diverges(&a.body) {
+                        continue;
+                    }
+                    joined = Some(match joined {
+                        None => m,
+                        Some(j) => &j | &m,
+                    });
+                }
+                if let Some(j) = joined {
+                    *moved = j;
                 }
             }
             ExprKind::ResultMapErr { result, f } => {
