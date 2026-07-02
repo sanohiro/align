@@ -140,6 +140,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Require a statement terminator after a `let` / `return` / assignment: an `End` (a newline or
+    /// `;`) or the end of the enclosing block (`}` / EOF). Enforces the Go-style "a newline
+    /// terminates a statement" rule so two statements can't silently run together on one line
+    /// without a `;` (`x := 1 return x`). Consumes the `End` (and any run of them) when present.
+    fn expect_stmt_end(&mut self) {
+        if self.at(&TokKind::End) {
+            self.skip_ends();
+        } else if !self.at(&TokKind::RBrace) && !self.at(&TokKind::Eof) {
+            self.diags.error("expected a newline or `;` to separate statements".to_string(), self.span());
+        }
+    }
+
     fn parse_file(&mut self) -> File {
         self.skip_ends();
         let module = if self.at(&TokKind::Module) {
@@ -609,7 +621,7 @@ impl<'a> Parser<'a> {
             let e = self.parse_expr(0)?;
             if self.eat(&TokKind::Eq) {
                 let value = self.parse_expr(0)?;
-                self.eat(&TokKind::End);
+                self.expect_stmt_end();
                 stmts.push(Stmt::Assign { place: e, value });
             } else if self.at(&TokKind::End) {
                 self.bump();
@@ -681,7 +693,7 @@ impl<'a> Parser<'a> {
         }
         self.expect(&TokKind::ColonEq, "':='");
         let init = self.parse_expr(0)?;
-        self.eat(&TokKind::End);
+        self.expect_stmt_end();
         let span = start.merge(self.prev_span());
         Some(Stmt::LetTuple { names, init, span })
     }
@@ -696,7 +708,7 @@ impl<'a> Parser<'a> {
         };
         self.expect(&TokKind::ColonEq, "':='");
         let init = self.parse_expr(0)?;
-        self.eat(&TokKind::End);
+        self.expect_stmt_end();
         Some(Stmt::Let {
             is_mut,
             name,
@@ -712,7 +724,7 @@ impl<'a> Parser<'a> {
         } else {
             Some(self.parse_expr(0)?)
         };
-        self.eat(&TokKind::End);
+        self.expect_stmt_end();
         Some(Stmt::Return(value))
     }
 
@@ -1583,6 +1595,23 @@ mod tests {
         let ExprKind::FieldAccess { recv, field } = &callee.kind else { panic!("outer .g") };
         assert_eq!(field.name, "g");
         assert!(matches!(recv.kind, ExprKind::Call { .. }), "receiver is the inner call");
+    }
+
+    #[test]
+    fn statements_on_one_line_require_a_separator() {
+        // 2-3: two statements crammed onto one line without a `;` (or newline) must be rejected —
+        // the Go-style "a newline terminates a statement" rule.
+        let (_f, err) = parse("fn main() -> i32 { x := 1 return x }\n");
+        assert!(err, "`x := 1 return x` (no separator) must error");
+        // A `;` separator is fine.
+        let (_f, err) = parse("fn main() -> i32 { x := 1; return x }\n");
+        assert!(!err, "`;`-separated statements parse");
+        // A newline separator is fine.
+        let (_f, err) = parse("fn main() -> i32 {\n  x := 1\n  return x\n}\n");
+        assert!(!err, "newline-separated statements parse");
+        // The last statement needs no trailing separator before the closing brace.
+        let (_f, err) = parse("fn main() -> i32 { return 0 }\n");
+        assert!(!err, "a single statement before the closing brace needs no separator");
     }
 
     #[test]
