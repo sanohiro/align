@@ -680,9 +680,11 @@ pub struct JsonField {
 /// `signed` — the range-check that keeps `json.decode` from silently truncating/sign-wrapping
 /// out-of-range input (`{"n": 300}` into `u8`, `{"n": -1}` into `u32`, `{"n": 200}` into `i8`).
 /// `w` is 1/2/4/8 (caller-validated). A `w == 8` field spans the whole `i64`, so it always fits.
-/// **`u64` note:** `JsonParser::integer` parses into `i64`, so a JSON value in `(i64::MAX, u64::MAX]`
-/// is already rejected upstream as unrepresentable; a `u64` field therefore accepts exactly
-/// `[0, i64::MAX]` here. Widening the parser to full `u64` is a separate follow-up (open-questions).
+/// **`u64` note:** a width-8 *unsigned* (`u64`) field never reaches this function — the decode sites
+/// route it through [`JsonParser::integer_field`] → [`JsonParser::integer_unsigned`], which parses the
+/// full `[0, u64::MAX]` range directly (the `i64` [`JsonParser::integer`] path can't represent
+/// `(i64::MAX, u64::MAX]`). This function still handles `(w >= 8, unsigned)` defensively (any `v >= 0`
+/// fits), so it remains correct if ever called that way.
 #[inline]
 fn int_in_range(v: i64, w: usize, signed: bool) -> bool {
     // Defense in depth: a zero width is caller-validated as unreachable, but guard it so the
@@ -959,12 +961,10 @@ unsafe fn parse_object(
                             if w != 1 && w != 2 && w != 4 && w != 8 {
                                 return None;
                             }
-                            let v = p.integer()?;
-                            // Reject out-of-range values (per the field's width + sign) instead of
-                            // silently writing the low `w` bytes and truncating/sign-wrapping.
-                            if !int_in_range(v, w, (d.tag & 0x1_0000) != 0) {
-                                return None;
-                            }
+                            // Parse + range-check per the field's (width, sign); a `u64` field takes
+                            // the full-range unsigned path. Rejects out-of-range instead of silently
+                            // writing the low `w` bytes and truncating/sign-wrapping.
+                            let v = p.integer_field(w, (d.tag & 0x1_0000) != 0)?;
                             let bytes = v.to_le_bytes();
                             for k in 0..w {
                                 unsafe { *out.add(off + k) = bytes[k] };
@@ -1124,11 +1124,9 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
             if w != 1 && w != 2 && w != 4 && w != 8 {
                 return None;
             }
-            let v = vp.integer()?;
-            // Reject out-of-range values (per the field's width + sign) — see `parse_object`.
-            if !int_in_range(v, w, (d.tag & 0x1_0000) != 0) {
-                return None;
-            }
+            // Parse + range-check per the field's (width, sign); `u64` uses the full-range path —
+            // see `parse_object` / `JsonParser::integer_field`.
+            let v = vp.integer_field(w, (d.tag & 0x1_0000) != 0)?;
             let b = v.to_le_bytes();
             for j in 0..w {
                 unsafe { *p.add(j) = b[j] };
@@ -1608,12 +1606,10 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
                         if !matches!(width, 1 | 2 | 4 | 8) {
                             return None;
                         }
-                        let v = p.integer()?;
-                        // Reject out-of-range values (per the element's width + sign) instead of
-                        // silently truncating/sign-wrapping — see `parse_object`.
-                        if !int_in_range(v, width, signed) {
-                            return None;
-                        }
+                        // Parse + range-check per the element's (width, sign); `u64` uses the
+                        // full-range path — see `parse_object` / `JsonParser::integer_field`. Rejects
+                        // out-of-range instead of silently truncating/sign-wrapping.
+                        let v = p.integer_field(width, signed)?;
                         bytes.extend_from_slice(&v.to_le_bytes()[..width]);
                     }
                 }
@@ -2907,6 +2903,65 @@ impl<'a> JsonParser<'a> {
             return None;
         }
         if neg { Some(v) } else { v.checked_neg() }
+    }
+    /// Parse a non-negative JSON integer into the **full `u64` range** (unsigned accumulate +
+    /// `checked_*`). Used only for a width-8 *unsigned* (`u64`) field, where `[0, u64::MAX]` must all
+    /// be accepted — the `i64` [`integer`] path caps at `i64::MAX`, so a value in `(i64::MAX, u64::MAX]`
+    /// (e.g. `i64::MAX + 1`) is representable here but not there. A leading `-` (a `u64` rejects every
+    /// negative) or an overflow past `u64::MAX` is rejected (`None`); either way the cursor is left
+    /// past the whole number token (matching [`integer`]), so a failed parse aborts the record cleanly.
+    fn integer_unsigned(&mut self) -> Option<u64> {
+        // A `u64` field rejects any negative. Consume a leading `-` and its digits (so the cursor
+        // ends past the whole number token, matching `integer`'s overflow arm) and then reject.
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            return None;
+        }
+        let digits = self.pos;
+        let mut v: u64 = 0;
+        while let Some(c @ b'0'..=b'9') = self.peek() {
+            match v.checked_mul(10).and_then(|x| x.checked_add((c - b'0') as u64)) {
+                Some(nv) => {
+                    v = nv;
+                    self.pos += 1;
+                }
+                // Overflow past `u64::MAX`: consume the rest of the digits (so the cursor ends past
+                // the whole number, matching `integer`) and reject. Cold error edge.
+                None => {
+                    while matches!(self.peek(), Some(b'0'..=b'9')) {
+                        self.pos += 1;
+                    }
+                    return None;
+                }
+            }
+        }
+        if self.pos == digits {
+            return None;
+        }
+        Some(v)
+    }
+    /// Parse a JSON integer for a target field of `w` bytes and signedness `signed`, returning the
+    /// little-endian bit pattern to write as a `u64` (the caller stores its low `w` bytes). An
+    /// out-of-range value is rejected (`None`). A width-8 *unsigned* (`u64`) field routes to
+    /// [`integer_unsigned`] so the full `[0, u64::MAX]` range is accepted; every other width and every
+    /// signed field reuses the `i64` [`integer`] path + [`int_in_range`] (preserving the negative /
+    /// overflow / `i64::MIN`-edge handling), then reinterprets the `i64` as its `u64` bit pattern
+    /// (`i64 as u64` — the low `w` bytes are identical two's-complement). Single-sourced so the three
+    /// integer write sites (`parse_object` / `write_field_indexed` / `decode_array`) stay consistent.
+    #[inline]
+    fn integer_field(&mut self, w: usize, signed: bool) -> Option<u64> {
+        if !signed && w == 8 {
+            self.integer_unsigned()
+        } else {
+            let v = self.integer()?;
+            if !int_in_range(v, w, signed) {
+                return None;
+            }
+            Some(v as u64)
+        }
     }
     /// Advance the cursor over a JSON number token (`-?int(.digits)?([eE][+-]?digits)?`),
     /// returning its byte span, or `None` (restoring the cursor) when the cursor is not at a valid
@@ -4620,6 +4675,46 @@ mod tests {
     }
 
     #[test]
+    fn integer_unsigned_parses_full_u64_range() {
+        // The full-range unsigned parser for u64 fields: [0, u64::MAX] accepted, overflow + any
+        // negative rejected, and (like `integer`) the cursor is left past the whole token on failure.
+        let cases: &[(&[u8], Option<u64>)] = &[
+            (b"0", Some(0)),
+            (b"7", Some(7)),
+            (b"9223372036854775807", Some(i64::MAX as u64)),
+            (b"9223372036854775808", Some(1u64 << 63)), // i64::MAX + 1 — unrepresentable in i64
+            (b"18446744073709551615", Some(u64::MAX)),
+            (b"18446744073709551616", None), // u64::MAX + 1 → overflow, reject
+            (b"-1", None),                   // a u64 has no negatives
+            (b"x", None),                    // no digits
+        ];
+        for (input, want) in cases {
+            let mut p = JsonParser { src: input, pos: 0 };
+            assert_eq!(p.integer_unsigned(), *want, "integer_unsigned({:?})", std::str::from_utf8(input).unwrap());
+        }
+        // On overflow / negative the cursor ends past the whole token (so a failed parse aborts cleanly).
+        let mut p = JsonParser { src: b"18446744073709551616,", pos: 0 };
+        assert_eq!(p.integer_unsigned(), None);
+        assert_eq!(p.peek(), Some(b','), "overflow consumes all digits");
+        let mut p = JsonParser { src: b"-5,", pos: 0 };
+        assert_eq!(p.integer_unsigned(), None);
+        assert_eq!(p.peek(), Some(b','), "negative consumes the sign + digits");
+
+        // `integer_field` routes width-8 unsigned to the full-range path, everything else to i64 +
+        // range check. Spot-check the routing boundary (i64::MAX+1 into u64 vs i64, and truncation).
+        let mut p = JsonParser { src: b"9223372036854775808", pos: 0 };
+        assert_eq!(p.integer_field(8, false), Some(1u64 << 63), "i64::MAX+1 fits u64");
+        let mut p = JsonParser { src: b"9223372036854775808", pos: 0 };
+        assert_eq!(p.integer_field(8, true), None, "i64::MAX+1 overflows i64 (signed)");
+        let mut p = JsonParser { src: b"256", pos: 0 };
+        assert_eq!(p.integer_field(1, false), None, "256 out of u8 range");
+        let mut p = JsonParser { src: b"-1", pos: 0 };
+        assert_eq!(p.integer_field(8, false), None, "-1 out of u64 range");
+        let mut p = JsonParser { src: b"-1", pos: 0 };
+        assert_eq!(p.integer_field(8, true), Some(u64::MAX), "-1 into i64 = all-ones bit pattern");
+    }
+
+    #[test]
     fn int_in_range_covers_widths_and_signs() {
         // Unsigned: [0, 2^(8w)-1]; a w==8 field spans the whole i64 (only < 0 is rejected).
         assert!(int_in_range(0, 1, false));
@@ -4673,6 +4768,7 @@ mod tests {
         const U8: i32 = 1; // unsigned, width 1
         const U16: i32 = 2;
         const U32: i32 = 4;
+        const U64: i32 = 8; // unsigned, width 8
         const I8: i32 = (1 << 16) | 1; // signed, width 1
         const I16: i32 = (1 << 16) | 2;
         const I32: i32 = (1 << 16) | 4;
@@ -4702,6 +4798,18 @@ mod tests {
         assert_eq!((rc, i64::from_le_bytes(out)), (0, i64::MIN), "i64::MIN ok");
         let (rc, out) = decode(b"{\"n\": 9223372036854775807}", I64, 8);
         assert_eq!((rc, i64::from_le_bytes(out)), (0, i64::MAX), "i64::MAX ok");
+
+        // u64 fields accept the full [0, u64::MAX] range (the i64 parser capped at i64::MAX before).
+        let (rc, out) = decode(b"{\"n\": 18446744073709551615}", U64, 8);
+        assert_eq!((rc, u64::from_le_bytes(out)), (0, u64::MAX), "u64::MAX ok");
+        let (rc, out) = decode(b"{\"n\": 9223372036854775808}", U64, 8);
+        assert_eq!((rc, u64::from_le_bytes(out)), (0, 1u64 << 63), "i64::MAX+1 into u64 ok");
+        let (rc, out) = decode(b"{\"n\": 0}", U64, 8);
+        assert_eq!((rc, u64::from_le_bytes(out)), (0, 0), "u64 0 ok");
+        // u64::MAX + 1 overflows the u64 parser → rejected.
+        assert_eq!(decode(b"{\"n\": 18446744073709551616}", U64, 8).0, 1, "u64::MAX+1 rejected");
+        // A negative into a u64 field is rejected (regression — a u64 has no negatives).
+        assert_eq!(decode(b"{\"n\": -1}", U64, 8).0, 1, "-1 into u64 rejected");
     }
 
     #[test]
@@ -4717,11 +4825,56 @@ mod tests {
         }
         const U8: i32 = 1;
         const I8: i32 = (1 << 16) | 1;
+        const U64: i32 = 8;
         assert_eq!(decode(b"[1, 2, 300]", U8), 1, "300 in array<u8> rejected");
         assert_eq!(decode(b"[1, -1]", U8), 1, "-1 in array<u8> rejected");
         assert_eq!(decode(b"[200]", I8), 1, "200 in array<i8> rejected");
         assert_eq!(decode(b"[0, 255]", U8), 0, "in-range array<u8> ok");
         assert_eq!(decode(b"[-128, 127]", I8), 0, "in-range array<i8> ok");
+        // array<u64>: the full range decodes; u64::MAX+1 overflows and a negative is rejected.
+        assert_eq!(decode(b"[0, 9223372036854775808, 18446744073709551615]", U64), 0, "full-range array<u64> ok");
+        assert_eq!(decode(b"[18446744073709551616]", U64), 1, "u64::MAX+1 in array<u64> rejected");
+        assert_eq!(decode(b"[-1]", U64), 1, "-1 in array<u64> rejected");
+    }
+
+    #[test]
+    fn json_decode_soa_u64_full_range() {
+        // The indexed write site (`write_field_indexed`, reached via the SoA fill pass) must also
+        // accept the full u64 range and reject overflow / negatives — the third of the three integer
+        // write sites (Gate 1: same parse routing everywhere).
+        let n = b"n";
+        let descs = [JsonField { name_ptr: n.as_ptr(), name_len: 1, tag: 8, offset: 0 }]; // u64
+        let read_u64 = |ptr: *const u8, off: usize| -> u64 {
+            let mut b = [0u8; 8];
+            for j in 0..8 {
+                b[j] = unsafe { *ptr.add(off + j) };
+            }
+            u64::from_le_bytes(b)
+        };
+        // Two rows: i64::MAX+1 and u64::MAX — both representable only on the full-range path.
+        let src = br#"[{"n":9223372036854775808},{"n":18446744073709551615}]"#;
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
+        let rc = unsafe {
+            align_rt_json_decode_soa(src.as_ptr(), src.len() as i64, descs.as_ptr(), 1, arena, &mut out, core::ptr::null(), 0, 0)
+        };
+        assert_eq!(rc, 0, "full-range u64 rows must decode");
+        assert_eq!(out.len, 2, "two rows");
+        let (cols, _, _) = soa_layout(&[8], 2).unwrap();
+        assert_eq!(read_u64(out.ptr, cols[0].0), 1u64 << 63, "row 0 = i64::MAX+1");
+        assert_eq!(read_u64(out.ptr, cols[0].0 + 8), u64::MAX, "row 1 = u64::MAX");
+        // u64::MAX + 1 overflows → reject; a negative is rejected.
+        let overflow = br#"[{"n":18446744073709551616}]"#;
+        assert_eq!(
+            unsafe { align_rt_json_decode_soa(overflow.as_ptr(), overflow.len() as i64, descs.as_ptr(), 1, arena, &mut out, core::ptr::null(), 0, 0) },
+            1
+        );
+        let negative = br#"[{"n":-1}]"#;
+        assert_eq!(
+            unsafe { align_rt_json_decode_soa(negative.as_ptr(), negative.len() as i64, descs.as_ptr(), 1, arena, &mut out, core::ptr::null(), 0, 0) },
+            1
+        );
+        unsafe { align_rt_arena_end(arena) };
     }
 
     #[test]
