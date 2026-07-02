@@ -1821,18 +1821,52 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   the pipeline store-loops write fresh allocations LLVM already disambiguates — zero memchecks across
   the whole example corpus at `-O2`), and the no-alias *check* has an untracked `SliceRange` provenance
   hole that must be closed before any emission. Belongs with the `map_into(out)` slice, not now.
-- **`task_group` spawns one OS thread per task** (`align_runtime/src/lib.rs` ~:3585,
+- **Status: fixed.** **`task_group` spawned one OS thread per task** (`align_runtime/src/lib.rs`,
   `align_rt_tg_wait`, via `thread::scope` + a `spawn` per task) instead of reusing the **persistent**
-  `ParPool` that `par_map` already built for exactly this cost. Fix: route `task_group` through
-  `ParPool`, preserving the panic-collecting join barrier it needs (join must still happen before the
-  region is freed at `wait()`/scope end).
-- **Allocator-family runtime declarations lack `noalias`/`nofree`/`willreturn` return attributes** in
-  codegen's function declarations — cheap, additive hygiene next to where the alloc functions are
-  already declared.
-- **`emit-llvm` output sets a data layout but no target triple.** `align_codegen_llvm/src/lib.rs`
-  (~:135, `build_module`) — feeding that IR to an external `opt`/`llc` (as opposed to the driver's own
-  `write_object` path, which is unaffected) falls back to a generic cost model and vectorizes worse.
-  One-line fix: `module.set_triple(&tm.get_triple())`.
+  `ParPool` that `par_map` already built for exactly this cost. `tg_wait` now routes tasks through
+  `ParPool` with a **caller-participating work-claiming** loop: the tasks live in a shared claim-once
+  list (`TgTasks`, `Send + Sync` by construction — each index is claimed exactly once via an atomic
+  cursor, each `env`/`slot`/`err_slot` is a private disjoint region allocation) with a join barrier
+  (`TgBarrier`: done-count + first-panic + first-errored-slot by lowest index). `wait()` dispatches
+  `min(workers, n-1)` runners onto the pool **and runs the same claim loop on the calling thread**,
+  then blocks until every task is done (so the join still precedes the region free at `tg_end`). The
+  panic-collecting behaviour is preserved (a worker panic is re-raised on the caller — defensive: a
+  real Align task is `extern "C"` and *aborts* on panic rather than unwinding). **Nesting/deadlock
+  analysis (the crux):** a spawned closure is lifted to an ordinary fn, so its body may open its own
+  `task_group` — a pool worker *can* re-enter `tg_wait`. A finite pool would deadlock under a naive
+  "submit-all-then-wait" scheme (nested waits on busy workers wait for jobs no free worker can take).
+  The caller-participates loop removes that hazard: **every `wait()`'s calling thread drains its own
+  group to completion itself if no worker is free**, so an N-deep nest just runs sequentially (one
+  level per blocked thread) — no `wait()` ever waits on the pool for its *own* tasks. Late-scheduled
+  runner jobs that a worker picks up after the group drained find the cursor past the end and exit
+  without touching the (possibly-freed) region. Tests: `tg_wait_runs_all_tasks_pool_backed`,
+  `tg_wait_returns_first_errored_slot_by_index`, `tg_wait_nested_task_groups_do_not_deadlock` (the
+  last would hang on a deadlock) in `align_runtime`, plus the existing `align_driver` `task_group`
+  suite. (The `par_map` "still behind rayon" note above is unrelated and stands.)
+- **Status: fixed.** **Allocator-family runtime declarations lacked return/function attributes** in
+  codegen's declarations. Each attribute was verified against the function's *actual* Rust body
+  (over-declaration is a miscompile, so this split matters):
+  - `noalias` (return) on all of them — every one returns a *fresh* allocation disjoint from any
+    live pointer (compatible with the null `align_rt_alloc`/`arena_alloc` may return).
+  - `nounwind` on all of them — they `abort` on OOM, and a panic (e.g. `Vec` capacity overflow)
+    can't escape the `extern "C"` boundary, so no unwind ever leaves the call.
+  - `nofree` on the **single-shot** allocators only (`align_rt_alloc` = one `malloc`; the `*_begin`
+    handle allocators + `align_rt_builder_new` = one `Box::new`) — they never free. The **bump**
+    allocators `align_rt_arena_alloc` / `align_rt_tg_alloc` are pointedly **excluded**: growing the
+    region `Vec::push`es the chunk-index list, which can reallocate (free) before-the-call memory, so
+    `nofree` would be unsound there (the returned bump pointer is still `noalias` — only the index
+    vector moves, never the chunk buffers). `align_rt_par_map` gets `noalias` (fresh output buffer)
+    alone (it may `resume_unwind` and it invokes the user thunk).
+  - **Deliberately NOT added: `willreturn`/`mustprogress`** — the OOM `abort` path means asserting
+    they always return would be a miscompile.
+  Helpers: `mark_alloc_like` (single-shot) / `mark_bump_alloc` (region) / `mark_alloc_common`. Test:
+  `allocator_declarations_carry_noalias_and_hygiene_attrs` asserts `noalias` on each, that the bump
+  allocators are NOT `nofree` while a single-shot one is, and that the IR never claims `willreturn`.
+- **Status: fixed.** **`emit-llvm` output set a data layout but no target triple.**
+  `build_module` (`align_codegen_llvm/src/lib.rs`) now also calls `module.set_triple(&tm.get_triple())`
+  so emitted IR is self-describing: an external `opt`/`llc` uses the right cost model / vectorizer
+  instead of a generic one. The driver's own `write_object` path was unaffected either way. Test:
+  `emitted_ir_is_self_describing`.
 - **Low priority, deliberate design: `print` does a flushing `write(2)` per call.** An option is
   process-lifetime buffered stdout flushed via `align_rt_start` — the runtime's existing
   `BufferedWriter` already does this shape elsewhere, so it would be reuse, not new machinery. Noted
