@@ -3138,7 +3138,17 @@ impl<'a> MoveCheck<'a> {
                     drop_old.set(self.is_move(*local) && !consumed_by_rhs);
                     clear_moved(moved, *local);
                 }
-                Stmt::AssignField { value, .. } => self.expr(value, moved, true, true),
+                // `root.field = value` — writing a field is a use of `root` (an owned struct could
+                // have been moved away), so flag use-after-move on it, mirroring the `AssignIndex`
+                // check below (same diagnostic; the field write has no index expr to span, so it
+                // points at the RHS instead).
+                Stmt::AssignField { root, value, .. } => {
+                    if whole_moved(moved, *root) {
+                        let name = &self.f.locals[*root as usize].name;
+                        self.diags.error(format!("use of moved value '{name}'"), value.span);
+                    }
+                    self.expr(value, moved, true, true);
+                }
                 // `base[index] = value` / `base[index].field = value` — writing an element is a use
                 // of `base` (an owned array could have been moved away), so flag use-after-move on
                 // it; index and value are read (not moved; Copy).
@@ -11830,5 +11840,25 @@ mod tests {
         );
         let (_p, d) = check(&src);
         assert!(d.has_errors(), "assigning a field of an immutable struct must error");
+    }
+
+    #[test]
+    fn field_assign_after_whole_move_rejected() {
+        // `A` is a Move type (owns a `string` field); `t := p` moves it whole out of `p`, so
+        // writing into `p.s` afterwards is a use of a moved value — same as reading `p.s` would
+        // be. (`Stmt::AssignField` used to skip this check; `Stmt::AssignIndex` already had it.)
+        let (_p, d) = check(
+            "A { s: string }\nfn main() -> i32 {\n  mut p := A { s: \"x\".clone() }\n  t := p\n  p.s = \"y\".clone()\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "assigning a field of an already-moved struct must error");
+    }
+
+    #[test]
+    fn field_assign_without_move_still_checks() {
+        // Same shape, without the intervening whole-struct move: the field assignment is fine.
+        let (_p, d) = check(
+            "A { s: string }\nfn main() -> i32 {\n  mut p := A { s: \"x\".clone() }\n  p.s = \"y\".clone()\n  return 0\n}\n",
+        );
+        assert!(!d.has_errors(), "assigning a field of a not-yet-moved struct must check");
     }
 }
