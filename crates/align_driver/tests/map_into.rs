@@ -109,6 +109,26 @@ fn map_into_unknown_provenance_source_rejected() {
 }
 
 #[test]
+fn map_into_caller_alias_via_unknown_view_rejected() {
+    // CONFIRMED-miscompile regression: `scale(src, out dst)` runs `src.map(f).map_into(dst)` and
+    // emits `noalias` trusting its two slice *params* are disjoint (the caller's `out` contract).
+    // A caller that binds `src` to a fn-returned view of the same array as `dst`
+    // (`src := ident(ys[0..4])`, `dst := ys[1..5]`, overlapping) must be **rejected** — the source
+    // root is a slice local of unknown origin, so the caller check cannot prove it disjoint from the
+    // `out` buffer. (Before the fix this passed undiagnosed and the vectorizer reordered the
+    // aliasing write → wrong result.)
+    let src = "fn dbl(x: i64) -> i64 = x * 2\nfn ident(x: slice<i64>) -> slice<i64> = x\nfn scale(src: slice<i64>, out dst: slice<i64>) {\n  src.map(dbl).map_into(dst)\n}\nfn main() -> i32 {\n  mut ys := [1, 2, 3, 4, 5]\n  src : slice<i64> := ident(ys[0..4])\n  mut dst : slice<i64> := ys[1..5]\n  scale(src, dst)\n  return ys.sum() as i32\n}\n";
+    assert!(check_errs("mi-caller-unknown-alias", src));
+}
+
+#[test]
+fn map_into_caller_alias_inline_call_arg_rejected() {
+    // The same miscompile via an inline fn-call argument (unresolvable root) — also rejected.
+    let src = "fn dbl(x: i64) -> i64 = x * 2\nfn ident(x: slice<i64>) -> slice<i64> = x\nfn scale(src: slice<i64>, out dst: slice<i64>) {\n  src.map(dbl).map_into(dst)\n}\nfn main() -> i32 {\n  mut ys := [1, 2, 3, 4, 5]\n  mut dst : slice<i64> := ys[1..5]\n  scale(ident(ys[0..4]), dst)\n  return ys.sum() as i32\n}\n";
+    assert!(check_errs("mi-caller-inline-alias", src));
+}
+
+#[test]
 fn map_into_where_stage_rejected() {
     // v1 supports only length-preserving stages; a filtering `where` is deferred.
     let src = "fn dbl(x: i64) -> i64 = x * 2\nfn big(x: i64) -> bool = x > 1\nfn f(src: slice<i64>, out b: slice<i64>) {\n  src.where(big).map(dbl).map_into(b)\n}\nfn main() -> i32 = 0\n";

@@ -3132,7 +3132,13 @@ fn emit_len_eq_check(b: &mut Builder, have: Operand, want: Operand) {
 /// ([`Rvalue::SliceIndexNoalias`]/[`Stmt::PtrStoreNoalias`]) — sema proved `dst` is disjoint from the
 /// source — so the vectorizer drops its runtime overlap guard. Yields `()`.
 fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], dst: &hir::Expr, elem: Ty) -> Operand {
-    let SrcSetup { slot, slice_val, bound, scalar_slot, struct_view, temp_free: _ } = setup_source(b, source);
+    let SrcSetup { slot, slice_val, bound, scalar_slot, struct_view, temp_free } = setup_source(b, source);
+    // `map_into` reads its source (never consumes it), so there is never a fresh owned source
+    // buffer to free here. Sema's alias gate restricts the source to a named array/slice, a
+    // sub-slice of one, or a fixed array literal — never a fn-returned owned `array<T>` or a nested
+    // materializing terminal — so `setup_source` cannot hand back a `temp_free`. Assert the
+    // invariant rather than silently leak (or double-free) if that gate ever loosens.
+    debug_assert!(temp_free.is_none(), "map_into source must not own a fresh buffer (sema alias gate)");
     // The source load is scope-tagged only when it reads a runtime slice buffer (`SliceIndex`); a
     // fixed stack-array source (`Index`) can't alias a caller slice, so it needs no metadata.
     let emit_noalias = slice_val.is_some();

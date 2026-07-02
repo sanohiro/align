@@ -2196,7 +2196,13 @@ A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) d
    (`s1 := xs[0..2]; s2 := xs[1..3]; fill(s1, s2)`), and nested sub-slices (`xs[0..4][1..2]`) all
    resolve to the shared root buffer and are rejected (conservative: sub-slices of one array are
    rejected whether or not their ranges actually overlap — range analysis is a separate follow-up).
-   Tests: `crates/align_driver/tests/out_params.rs`.
+   **Conservatized for the `noalias` precondition (fix for a confirmed miscompile):** the check now
+   also requires each root to be a *known* backing buffer (`slice_root_is_known` — a slice/array
+   parameter or a real array local) and **rejects** an argument it cannot resolve (a fn-call / `if` /
+   block result) or one bound to a slice of unknown origin — instead of the earlier silent skip that
+   let `scale(ident(ys[0..4]), ys[1..5])` (an aliasing fn-returned view) through, whereupon the
+   callee's `map_into` `noalias` was a miscompile. A fresh array-literal argument is allowed (stack
+   storage); scalar arguments are not compared. Tests: `crates/align_driver/tests/out_params.rs`.
 3. **`map_into(out dst)` + scoped `!noalias` emission** — the first materializing terminal that
    writes a pipeline into a caller buffer (`src.map(f).map_into(dst)`), and the reachable target that
    makes the metadata worth emitting. The fused loop's source load and `dst` store carry the loop's

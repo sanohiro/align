@@ -5158,6 +5158,17 @@ impl<'a, 't> Checker<'a, 't> {
     /// struct-field slice) — its buffer could be anything, so it is *not* known and must not back a
     /// `noalias` claim. (A slice local borrowed from an array is provenance-tracked, so its root is
     /// the array local, a non-slice type, and is known.)
+    ///
+    /// **Why trusting a parameter is sound** (the `noalias` trust chain): a slice parameter's
+    /// buffer is distinct from the function's other slice arguments *only because every caller is
+    /// checked*. That holds because (1) the caller-side `out` no-alias check (in `check_named_call`)
+    /// now **rejects** any call it cannot prove disjoint (an unresolvable or unknown-origin
+    /// argument), not just same-named locals; (2) a function with an `out` parameter **cannot become
+    /// a first-class `fn` value** (rejected — see `resolve_local_fn`), so there is no unchecked
+    /// indirect call; and (3) `extern "C"` is **import-only** (bodyless declarations) — Align has no
+    /// C-ABI *export* of a function body, so no external, unchecked caller exists. If a
+    /// separate-compilation / C-export path is ever added, param-derived `map_into` `noalias`
+    /// emission must be re-gated (its callers would no longer be provably checked).
     fn slice_root_is_known(&self, root: LocalId) -> bool {
         let l = &self.locals[root as usize];
         l.is_param || !matches!(self.resolve(l.ty), Ty::Slice(_))
@@ -5969,27 +5980,58 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             );
         }
-        // No-alias check: an `out` argument must not share its root buffer with any other argument
-        // (the no-alias guarantee `out` lowers to LLVM `noalias`). A conservative root-buffer
-        // comparison via `arg_root_local`: it sees through slice provenance and sub-slices, so two
-        // sub-slices of the same array — even non-overlapping ranges like `xs[0..2]` / `xs[2..4]` —
-        // are rejected (whether their ranges *actually* overlap is a range analysis for another day;
-        // sharing a root buffer is treated as "may alias"). Distinct roots are genuinely distinct
-        // buffers, so different arrays / freshly allocated storage still pass.
+        // No-alias check: an `out` argument must be **provably disjoint** from every other argument
+        // (the no-alias guarantee `out` lowers to — and the precondition a callee's `map_into`
+        // scoped `noalias` metadata trusts). Disjointness is proven by root buffer: each root must
+        // resolve to a **known backing buffer** (a slice/array parameter — distinct from the other
+        // arguments by *this* caller's own `out` contract — or a real array local), and the roots
+        // must differ. An argument whose buffer cannot be proven distinct — an **unresolvable** root
+        // (a fn-call / `if` / block result) or a **slice of unknown origin** (bound to a fn-returned
+        // slice, a soa column, a struct field, all `slice_root_is_known == false`) — is **rejected,
+        // not silently skipped**: skipping it (the earlier behavior) let an aliasing pair through
+        // (`scale(ident(ys[0..4]), ys[1..5])`) and turned the callee's `noalias` into a miscompile.
+        // Sub-slices of the same array are rejected whether or not their ranges actually overlap
+        // (range analysis is a separate follow-up). A fresh array-literal argument is stack storage
+        // disjoint from any other buffer, so it is allowed; only slice-typed parameters can share
+        // storage, so scalar arguments are never compared.
         for (i, is_out) in out.iter().enumerate() {
             if !is_out {
                 continue;
             }
             let Some(arg_i) = args.get(i) else { continue };
-            let Some(base) = self.arg_root_local(arg_i) else { continue };
+            // The `out` argument's own root must be a known backing buffer, or nothing can be proven
+            // disjoint from it (an unknown-origin `out` view could itself alias an input).
+            let out_known = self.arg_root_local(arg_i).filter(|r| self.slice_root_is_known(*r));
             for (j, a) in args.iter().enumerate() {
-                if j != i && self.arg_root_local(a) == Some(base) {
-                    let lname = self.locals[base as usize].name.clone();
-                    self.diags.error(
-                        format!("the `out` argument also aliases '{lname}', another argument to '{name}' — an `out` buffer must not alias the other arguments"),
-                        arg_i.span,
-                    );
-                    break;
+                if j == i {
+                    continue;
+                }
+                // Only a slice-typed parameter can share storage with the `out` buffer.
+                if !matches!(param_tys.get(j).map(|t| self.resolve(*t)), Some(Ty::Slice(_))) {
+                    continue;
+                }
+                // A fresh array literal is disjoint stack storage.
+                if matches!(a.kind, ast::ExprKind::ArrayLit(_)) {
+                    continue;
+                }
+                match (out_known, self.arg_root_local(a)) {
+                    (Some(o), Some(p)) if o == p => {
+                        let lname = self.locals[o as usize].name.clone();
+                        self.diags.error(
+                            format!("the `out` argument also aliases '{lname}', another argument to '{name}' — an `out` buffer must not alias the other arguments"),
+                            arg_i.span,
+                        );
+                        break;
+                    }
+                    // Both roots are known, distinct backing buffers → provably disjoint.
+                    (Some(_), Some(p)) if self.slice_root_is_known(p) => {}
+                    _ => {
+                        self.diags.error(
+                            format!("cannot prove this argument is disjoint from the `out` buffer of '{name}' — pass a named slice/array (or a subslice of one) whose buffer is known, not a slice of unknown origin (a fn result, `if`/block value, soa column, or struct field)"),
+                            a.span,
+                        );
+                        break;
+                    }
                 }
             }
         }

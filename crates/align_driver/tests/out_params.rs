@@ -135,3 +135,40 @@ fn element_write_after_move_rejected() {
 fn out_on_non_slice_rejected() {
     assert!(check_errs("w-out-nonslice", "fn f(out x: i32) -> i32 = x\nfn main() -> i32 = 0\n"));
 }
+
+#[test]
+fn out_arg_unresolvable_root_rejected() {
+    // Soundness (noalias precondition): a coexisting argument whose root cannot be resolved — a
+    // fn-call result — cannot be proven disjoint from the `out` buffer, so the call is rejected
+    // (not silently skipped). `ident(xs)` could return a view of the same buffer as `dst`.
+    let src = "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  dst[0] = src[0]\n}\nfn ident(x: slice<i64>) -> slice<i64> = x\nfn main() -> i32 {\n  mut a := [1, 2, 3]\n  mut d : slice<i64> := a\n  fill(ident(a), d)\n  return 0\n}\n";
+    assert!(check_errs("na-unresolvable-root", src));
+}
+
+#[test]
+fn out_arg_unknown_provenance_local_rejected() {
+    // A coexisting argument bound to a fn-returned view (unknown origin) — its root is itself, not a
+    // known backing buffer — cannot be proven disjoint from the `out` buffer; rejected.
+    let src = "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  dst[0] = src[0]\n}\nfn ident(x: slice<i64>) -> slice<i64> = x\nfn main() -> i32 {\n  mut a := [1, 2, 3]\n  v : slice<i64> := ident(a)\n  mut d : slice<i64> := a\n  fill(v, d)\n  return 0\n}\n";
+    assert!(check_errs("na-unknown-local", src));
+}
+
+#[test]
+fn out_arg_fresh_array_literal_ok() {
+    if !backend_available() {
+        return;
+    }
+    // A fresh array-literal argument is stack storage disjoint from any other buffer — allowed.
+    // dst[0] = src[0] = 7.
+    let src = "fn fill(out dst: slice<i64>, src: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  mut ys := [0, 0, 0]\n  mut d : slice<i64> := ys\n  fill(d, [7, 8, 9])\n  return ys[0] as i32\n}\n";
+    let out = build_and_run("na-fresh-literal", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn out_param_fn_cannot_be_a_fn_value() {
+    // Trust-chain guard: a function with an `out` parameter cannot become a first-class `fn` value,
+    // so there is no unchecked indirect call that would bypass the caller-side no-alias check.
+    let src = "fn scale(src: slice<i64>, out dst: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  f := scale\n  return 0\n}\n";
+    assert!(check_errs("na-out-fn-value", src));
+}
