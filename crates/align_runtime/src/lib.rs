@@ -946,17 +946,15 @@ unsafe fn parse_object(
                                 return None;
                             }
                             let v = p.number()?;
-                            // Write the float repr at the field width (f32 / f64).
+                            // Write the float repr at the field width (f32 / f64). `bytes` is a local
+                            // (stack) array from `to_le_bytes()`, `out` is a distinct heap/arena
+                            // buffer — the two never alias, so a straight-line bulk copy is sound.
                             if w == 4 {
                                 let bytes = (v as f32).to_le_bytes();
-                                for (k, byte) in bytes.iter().enumerate() {
-                                    unsafe { *out.add(off + k) = *byte };
-                                }
+                                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(off), bytes.len()) };
                             } else {
                                 let bytes = v.to_le_bytes();
-                                for (k, byte) in bytes.iter().enumerate() {
-                                    unsafe { *out.add(off + k) = *byte };
-                                }
+                                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(off), bytes.len()) };
                             }
                         }
                         3 => {
@@ -969,9 +967,11 @@ unsafe fn parse_object(
                             let s = p.string()?;
                             let ptr_bytes = (s.as_ptr() as usize as u64).to_le_bytes();
                             let len_bytes = (s.len() as i64).to_le_bytes();
-                            for (k, (&pb, &lb)) in ptr_bytes.iter().zip(len_bytes.iter()).enumerate() {
-                                unsafe { *out.add(off + k) = pb };
-                                unsafe { *out.add(off + 8 + k) = lb };
+                            // Two disjoint 8-byte fields of the 16-byte `{ptr,len}` slot; `ptr_bytes`/
+                            // `len_bytes` are local arrays, `out` is a distinct heap/arena buffer.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(ptr_bytes.as_ptr(), out.add(off), 8);
+                                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), out.add(off + 8), 8);
                             }
                         }
                         _ => {
@@ -983,9 +983,9 @@ unsafe fn parse_object(
                             // writing the low `w` bytes and truncating/sign-wrapping.
                             let v = p.integer_field(w, (d.tag & 0x1_0000) != 0)?;
                             let bytes = v.to_le_bytes();
-                            for (k, byte) in bytes.iter().enumerate().take(w) {
-                                unsafe { *out.add(off + k) = *byte };
-                            }
+                            // `w <= 8 == bytes.len()` (checked above); `bytes` is a local array, `out`
+                            // a distinct heap/arena buffer.
+                            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(off), w) };
                         }
                     }
                 }
@@ -1116,9 +1116,11 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
         let s = vp.string()?;
         let pb = (s.as_ptr() as usize as u64).to_le_bytes();
         let lb = (s.len() as i64).to_le_bytes();
-        for (j, (&pbj, &lbj)) in pb.iter().zip(lb.iter()).enumerate() {
-            unsafe { *p.add(j) = pbj };
-            unsafe { *p.add(8 + j) = lbj };
+        // Two disjoint 8-byte fields of the 16-byte `{ptr,len}` slot; `pb`/`lb` are local arrays,
+        // `p` is the field's own destination (never aliases a local).
+        unsafe {
+            std::ptr::copy_nonoverlapping(pb.as_ptr(), p, 8);
+            std::ptr::copy_nonoverlapping(lb.as_ptr(), p.add(8), 8);
         }
         return Some(());
     }
@@ -1135,16 +1137,13 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
                 return None;
             }
             let v = vp.number()?;
+            // `b` is a local array from `to_le_bytes()`, `p` the field's own destination — disjoint.
             if w == 4 {
                 let b = (v as f32).to_le_bytes();
-                for (j, byte) in b.iter().enumerate() {
-                    unsafe { *p.add(j) = *byte };
-                }
+                unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len()) };
             } else {
                 let b = v.to_le_bytes();
-                for (j, byte) in b.iter().enumerate() {
-                    unsafe { *p.add(j) = *byte };
-                }
+                unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len()) };
             }
         }
         _ => {
@@ -1155,9 +1154,8 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
             // see `parse_object` / `JsonParser::integer_field`.
             let v = vp.integer_field(w, (d.tag & 0x1_0000) != 0)?;
             let b = v.to_le_bytes();
-            for (j, byte) in b.iter().enumerate().take(w) {
-                unsafe { *p.add(j) = *byte };
-            }
+            // `w <= 8 == b.len()` (checked above); `b` is a local array, `p` a distinct destination.
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, w) };
         }
     }
     Some(())
@@ -4910,9 +4908,8 @@ mod tests {
         let descs = [JsonField { name_ptr: n.as_ptr(), name_len: 1, tag: 8, offset: 0 }]; // u64
         let read_u64 = |ptr: *const u8, off: usize| -> u64 {
             let mut b = [0u8; 8];
-            for (j, byte) in b.iter_mut().enumerate() {
-                *byte = unsafe { *ptr.add(off + j) };
-            }
+            // `ptr` is the decoded-buffer source, `b` a distinct local array — disjoint.
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(off), b.as_mut_ptr(), 8) };
             u64::from_le_bytes(b)
         };
         // Two rows: i64::MAX+1 and u64::MAX — both representable only on the full-range path.
@@ -5062,9 +5059,8 @@ mod tests {
         // pay column (width 8) at cols[1].0: [10, 20] as little-endian i64.
         let read_i64 = |off: usize| -> i64 {
             let mut b = [0u8; 8];
-            for (j, byte) in b.iter_mut().enumerate() {
-                *byte = unsafe { *out.ptr.add(off + j) };
-            }
+            // `out.ptr` is the decoded-buffer source, `b` a distinct local array — disjoint.
+            unsafe { std::ptr::copy_nonoverlapping(out.ptr.add(off), b.as_mut_ptr(), 8) };
             i64::from_le_bytes(b)
         };
         assert_eq!(read_i64(cols[1].0), 10);
