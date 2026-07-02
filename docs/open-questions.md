@@ -2066,6 +2066,27 @@ design note follows.
 A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) data := …`) for GPU/DMA/page-aligned zero-copy interop. **Retrofit-sensitive**: it modifies struct field-offset math and the arena bump allocator's alignment, so reserve room in the layout model now; the surface + LLVM `align N` emission + arena honoring it can land at M6 alongside SoA. (Digested from `work/proposals/next-draft.md` §1.1.)
 **Groundwork landed (pre-M6):** `StructDef` carries `align: Option<u32>` (always `None` today — no surface syntax), and codegen routes all allocation alignment through one seam, `type_align(ty)` (natural ABI alignment today; a struct's custom `align` if set). M6 work is then "parse `align(N)` → set `StructDef.align`" + the seam returns it — the stack-slot alloca already calls the seam; the arena bump allocator already takes an explicit `align` argument. (Retrofit risk was low — a custom alignment is largely *additive* at the alloca/global/alloc sites — so this groundwork is a light reservation, unlike the SoA field-access seam.)
 
+### Default struct layout: field reordering — Open (external idea review, 2026-07-02)
+Current: the default (non-`layout(C)`) struct layout is **declaration order + natural alignment**
+(`impl/05-backend-llvm.md` §2); `layout(C)` pins that same order explicitly as the FFI/byte-layout-
+boundary marker (see "FFI" above — `layout(C)`'s decl-order/no-reordering guarantee is *today's*
+default, locked in place).
+Proposal: make the *default* (non-`layout(C)`) layout **unspecified field order**, letting the
+compiler reorder fields by descending alignment to eliminate padding (Rust's default). Source-level
+access is by name, so reordering is invisible; codegen keeps a logical→physical field-index map for
+GEP.
+Why it fits: a pure win for cache density (the language's stated center of gravity), zero
+source-visible change, and the escape hatch (`layout(C)` = decl order) already exists for every
+byte-layout boundary.
+Checks required before implementation: json decode offset tables, soa column offsets, `sizeof`/align
+computation, and the FFI boundary all read layout through one place today — audit that a reorder
+decision is threaded through (or explicitly excluded from) every one of them.
+Recommendation: adopt; needs a spec edit (`draft.md` §9's memory-layout note + `impl/05-backend-
+llvm.md` §2) plus a codegen field-index-mapping change. Decide any time; must land before the
+layout/ABI freeze.
+Provenance: surfaced by an external idea review (2026-07-02); verified against the current spec/code
+before recording here.
+
 ### `out` parameters + `noalias` — write mechanism + no-alias check DONE; LLVM metadata is the follow-up
 `out` params (`draft.md` §7) are a no-alias optimization. **Implemented:** (1) the write mechanism —
 `out dst: slice<T>` is a writable output buffer and `place[i] = v` (bounds-checked) writes a `mut`
@@ -2231,6 +2252,11 @@ Guardrails (a build is only "problem-free" if these hold):
 - This is a std-layer optimization (not core, not the walking skeleton). Add it after
   measurement; do not let it leak into core or block earlier milestones.
 ```
+Concrete Linux mechanisms (external idea review, 2026-07-02; verified): **io_uring**, including
+SQPOLL polling mode, and **Direct I/O into huge-page-backed arenas** are candidate fast paths behind
+the dispatch table above. The API-shaping constraint is unchanged either way: `std.fs`/`std.io`
+buffers are caller-owned (arena), so a zero-copy path drops in without an API change.
+
 Placement: `std.io` (OS boundary, `draft.md` §18.2), implemented in the Rust runtime
 with a portable fallback; cross-platform mmap via a crate (e.g. `memmap2`). Revisit
 around the string/JSON milestone (M5) and std build-out.
@@ -2383,6 +2409,45 @@ Library architecture principle (record before std is built, applies to all of st
   api-server-db.md; consistent with design-notes "string philosophy".)
 ```
 
+### Niche optimization for `Option` payloads (external idea review, 2026-07-02)
+Represent `Option<box<T>>` (and future non-null-pointer-like payloads) with the null niche: the tag
+occupies zero bytes, `None` = null. Semantically invisible (still plain `Option<T>`/`match`/`else`),
+FFI-explainable (a null-or-valid pointer is exactly what C already does), proven in Rust. **Must be
+decided before the ABI/layout freeze** — like the field-reordering item in Open above, it is a
+one-time representation choice. Does **not** extend to general pointer-tagging / NaN-boxing for other
+payloads — those stay rejected (arch-dependent, breaks layout predictability).
+Provenance: surfaced by an external idea review (2026-07-02); verified.
+
+### `f16` / `bf16` scalar and vector element types (external idea review, 2026-07-02)
+Add half-precision scalars (`f16` IEEE binary16, `bf16` brain float16) usable as `vecN<T>` element
+types, mapping to AVX-512 FP16/VNNI and NEON/SVE FP16/BF16. Needs one semantic decision before
+building: native f16/bf16 arithmetic vs. widen-to-f32-compute with narrow storage (most hardware
+converts on load/store rather than computing natively). Motivated by LLM/signal-processing workloads
+(ties to "Resource-oriented north star" below). Belongs after M6's SIMD layer, before any
+tensor/matrix backend — a scalar-width prerequisite for feeding the `mat<R,C,T>`/matrix-engine
+reservations in "Hardware & backend optimization backlog" above. Kept as its own entry rather than
+folded bodily into that backlog: a new scalar type touches the frontend/type-checker (a new `Scalar`
+variant), outside that backlog's stated "pure backend lowering" scope.
+Provenance: surfaced by an external idea review (2026-07-02); verified.
+
+### SIMD string search for `str` ops (external idea review, 2026-07-02)
+`str.contains`/`find`/`rfind`/`starts_with`/`ends_with` are scalar today. The JSON structural index
+already ships AVX2/NEON/scalar triple paths validated by a differential oracle
+(`json_decode_index_simd_matches_scalar_oracle` and the general differential-fuzz suite, #286–#290
+above) — apply the same pattern (memchr-style first-byte scan + verify) to the generic `str` search
+ops, with the same arch-parity rule as the existing SIMD entries (x86 + NEON + a scalar oracle test).
+Converges with the already-recorded `core.string` byte-first-APIs plan above (P0 memchr/memmem-backed,
+P1 dispatch-table + AVX2/NEON); this item's specific contribution is the differential-oracle test
+discipline, not a new API shape.
+Provenance: surfaced by an external idea review (2026-07-02); verified.
+
+### Relative (offset) pointers inside arenas (external idea review, 2026-07-02)
+When recursive/pointer-linked types are eventually designed (recursive enums are currently deferred —
+see the Sum-types Settled entry), the first-choice representation for intra-arena links should be a
+**32-bit self-relative offset**, not an 8-byte absolute pointer — halves node size and composes with
+zero-copy mmap of arena images. Record now so the recursive-types design starts from this default.
+Provenance: surfaced by an external idea review (2026-07-02); verified.
+
 ### M8 lint candidates (consolidated, gathered across reviews)
 The formatter is M8's first deliverable (in progress, see "Additional perf levers" above); these are
 the lint candidates that have accumulated around it, gathered here so they aren't scattered across
@@ -2409,6 +2474,10 @@ individual review entries. None block anything; pick up when the lint suite is a
   "Codex perf / I/O / LLM research sweep" — listed here only so it isn't missed in a lint-suite pass).
 - connect-per-request-to-a-static-host lint for the future std `http`/`socket` layer (already
   recorded above under the same sweep).
+- Hot/cold field-split suggestion (external idea review, 2026-07-02, verified): when a struct mixes
+  hot (scanned) and cold (rarely-read) fields under array/pipeline access, suggest `soa<T>` or a
+  manual struct split — suggestion only, never an automatic layout change (explicit-layout is
+  Settled).
 ```
 
 ### Domain libraries belong to `std`/`pkg`, not core (placement note)
