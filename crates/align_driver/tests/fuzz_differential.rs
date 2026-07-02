@@ -241,6 +241,63 @@ fn typed_multiwidth_programs_compute_the_oracle_value() {
     }
 }
 
+// --- aggregate variant: struct field read-back + fixed-array indexing (the audit's miscompile
+// class — an array index that returned garbage). Values are 0..9 literals; the oracle is the exact
+// field / element stored. ---
+
+#[test]
+fn aggregates_compute_the_oracle_value() {
+    if !backend_available() {
+        return;
+    }
+    for seed in 0..150u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xA0761D_6478BD_642F).wrapping_add(3));
+        let (src, oracle) = if rng.below(2) == 0 {
+            // Struct: build with concrete field values, read one field back.
+            let nf = 2 + rng.below(3); // 2..4 fields
+            let mut fields = String::new();
+            let mut inits = String::new();
+            let mut fvals = Vec::new();
+            for f in 0..nf {
+                let ty = TYPES[rng.below(TYPES.len())];
+                let v = rng.below(10) as i128;
+                if f > 0 {
+                    fields.push_str(", ");
+                    inits.push_str(", ");
+                }
+                fields.push_str(&format!("f{f}: {}", ty.name()));
+                inits.push_str(&format!("f{f}: {v}"));
+                fvals.push((ty, v));
+            }
+            let k = rng.below(nf); // field to read back
+            let (kty, kv) = fvals[k];
+            let src = format!(
+                "S {{ {fields} }}\nfn main() -> i32 {{\n  s := S {{ {inits} }}\n  return s.f{k} as i32\n}}\n"
+            );
+            (src, wrap(kv, kty))
+        } else {
+            // Fixed array of default-typed (i64) elements, indexed by a constant.
+            let n = 2 + rng.below(4); // 2..5 elements
+            let vals: Vec<i128> = (0..n).map(|_| rng.below(10) as i128).collect();
+            let idx = rng.below(n);
+            let elems: Vec<String> = vals.iter().map(|v| v.to_string()).collect();
+            let src = format!(
+                "fn main() -> i32 {{\n  xs := [{}]\n  return xs[{idx}] as i32\n}}\n",
+                elems.join(", ")
+            );
+            (src, wrap(vals[idx], ITy::I64))
+        };
+        let final_val = wrap(oracle, ITy::I32);
+        let expected = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
+        let out = build_and_run(&format!("diffa-{seed}"), &src);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, expected,
+            "miscompile on seed {seed}: expected {expected} (oracle {oracle}), got {code}\n--- program ---\n{src}"
+        );
+    }
+}
+
 // --- function-call variant: exercises the call ABI (params, args, return values) end-to-end ---
 
 #[test]
