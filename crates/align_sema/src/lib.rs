@@ -3999,6 +3999,7 @@ impl<'a, 't> Checker<'a, 't> {
             name: name.to_string(),
             ty,
             is_mut,
+            align: None,
         });
         self.scope.push((name.to_string(), id));
         id
@@ -4028,7 +4029,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A captured value becomes a synthetic parameter local (tracked in `captured`, *not* pushed
         // into the visible scope so a nested-block exit can't truncate it).
         let param_id = self.locals.len() as LocalId;
-        self.locals.push(Local { id: param_id, name: name.to_string(), ty, is_mut: false });
+        self.locals.push(Local { id: param_id, name: name.to_string(), ty, is_mut: false, align: None });
         cap.captured.push((name.to_string(), param_id, enc_id));
         Some(param_id)
     }
@@ -4181,7 +4182,7 @@ impl<'a, 't> Checker<'a, 't> {
 
         for s in &b.stmts {
             match s {
-                ast::Stmt::Let { is_mut, name, ty, init } => {
+                ast::Stmt::Let { is_mut, name, ty, init, align } => {
                     let ann = ty.as_ref().map(|t| self.resolve_type(t));
                     // A struct literal is only legal here, as a `let` initializer.
                     let init = match &init.kind {
@@ -4198,6 +4199,24 @@ impl<'a, 't> Checker<'a, 't> {
                     };
                     let local_ty = ann.unwrap_or(init.ty);
                     let local = self.declare(&name.name, local_ty, *is_mut);
+                    // An `align(N) data := [...]` over-alignment prefix: restricted to a scalar
+                    // fixed-array binding (the aligned-vector-load enabler). `N` is already a
+                    // validated power of two (parser). A struct's over-alignment is declared on the
+                    // type (`align(N) Name { … }`), not the binding, so reject it here.
+                    if let Some(n) = *align {
+                        let resolved = self.resolve(local_ty);
+                        if matches!(resolved, Ty::Array(_, _)) {
+                            self.locals[local as usize].align = Some(n);
+                        } else if resolved != Ty::Error {
+                            self.diags.error(
+                                format!(
+                                    "`align(N)` on a binding applies to a scalar fixed array, got {} (a struct's over-alignment is declared on the type: `align(N) Name {{ … }}`)",
+                                    ty_name(resolved)
+                                ),
+                                name.span,
+                            );
+                        }
+                    }
                     // Record slice provenance (`s: slice<T> := a` → `s` borrows `a`'s buffer) so
                     // the `out` no-alias check can see through slice variables.
                     if matches!(local_ty, Ty::Slice(_))

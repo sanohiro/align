@@ -2109,7 +2109,7 @@ In addition to auto-vectorization, whether to place explicit intrinsics in std (
 **Groundwork landed (pre-M6):** `Ty::DynStructArray(id, Layout)` now carries a `Layout` (only `Aos` today; `Soa` joins at M6) — layout is a property of the array *type*, so adding `Layout::Soa` makes every site that must handle it a compile error (it can't be silently forgotten). All struct-array element-field addressing is funneled through one MIR seam (`lower_field_access`), where the SoA column-index branch will hook in — localized, not a cross-cutting retrofit. (`Scalar::DynStructArray` stays layout-free — an SoA array as an Option/Result payload is a later concern.)
 Record: `impl/05-backend-llvm.md` §2, `design-notes.md` (hardware-friendly).
 
-### Struct/array alignment attribute `align(N)` — struct form DONE (M6)
+### Struct/array alignment attribute `align(N)` — struct + scalar-array-binding form DONE (M6)
 **DONE (struct form, M6):** `align(N) Name { … }` over-aligns a struct's storage to `N` bytes (a
 validated power of two). Parsed as a prefix attribute (`parse_align_attr` → `StructDecl.align`,
 threaded to `StructDef.align`, carried through generic monomorphs via `StructTemplate.align`); honored
@@ -2132,14 +2132,26 @@ including over-aligned cases). Composes with `layout(C)` (matches C's `__attribu
 which also pads `sizeof`). A *fixed* `[S{…}, …]` array literal of an `align(N)` struct now compiles;
 `draft.md` §9 documents the stride rule.
 
-**Still deferred:** the `align(N) data := …` binding/allocation form over a scalar array (which, with
-a multiple-of-N index, is what would unblock an **aligned vector-load fast path** — vec load/store
-currently uses the always-safe element alignment); arena/heap-buffer over-alignment — and, tied to it,
+**DONE (binding form + aligned load, M6):** `align(N) data := […]` over a scalar fixed array
+over-aligns its stack storage — the prefix flows `ast::Stmt::Let.align` → `hir::Local.align` →
+`mir::Function.slot_align`, and codegen over-aligns the alloca via the same `max(declared, natural)`
+rule as the struct form (a non-array binding target is a clean error; `N` is the parser-validated
+power of two). The **aligned vector-load fast path** rides on it: a `data[..].load(i)` on a whole
+borrow of the binding is emitted as an *aligned* `<n x T>` load when `(start+i)*sizeof(elem)` is a
+compile-time `N`-multiple (`proven_vec_load_align` in MIR, computed from the HIR receiver before it
+becomes an opaque slice temp). Everything else — a runtime/non-const index, a non-`N` offset, or a
+slice that crossed a function boundary (a `slice<T>` parameter, which carries no alignment
+provenance) — stays the always-safe element-aligned load; the alignment is **never over-stated**
+(that would be UB). `tests/aligned_binding.rs`, `examples/aligned_load.align`, `draft.md` §9.
+
+**Still deferred:** arena/heap-buffer over-alignment — and, tied to it,
 a **dynamic** `array<align(N)Struct>` (the stride is now correct, but its heap buffer can't be
-over-aligned yet, so it stays a clean error); and an `align(N)` struct as a **struct field** (honoring
+over-aligned yet, so it stays a clean error); an `align(N)` struct as a **struct field** (honoring
 it needs the aggregate type's ABI alignment to actually be `N`, which LLVM can't express for a struct
-type — it lives at the alloca, not the type — so field embedding stays rejected). Original design note
-follows.
+type — it lives at the alloca, not the type — so field embedding stays rejected); and the
+**cross-function** aligned-load path — a *fat* `slice<T>` that carries an alignment through a call
+would let a callee (`fn f(s: slice<T>)`) prove `s.load(i)` aligned, but that is a slice-type redesign
+kept out of this increment. Original design note follows.
 
 A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) data := …`) for GPU/DMA/page-aligned zero-copy interop. **Retrofit-sensitive**: it modifies struct field-offset math and the arena bump allocator's alignment, so reserve room in the layout model now; the surface + LLVM `align N` emission + arena honoring it can land at M6 alongside SoA. (Digested from `work/proposals/next-draft.md` §1.1.)
 **Groundwork landed (pre-M6):** `StructDef` carries `align: Option<u32>` (always `None` today — no surface syntax), and codegen routes all allocation alignment through one seam, `type_align(ty)` (natural ABI alignment today; a struct's custom `align` if set). M6 work is then "parse `align(N)` → set `StructDef.align`" + the seam returns it — the stack-slot alloca already calls the seam; the arena bump allocator already takes an explicit `align` argument. (Retrofit risk was low — a custom alignment is largely *additive* at the alloca/global/alloc sites — so this groundwork is a light reservation, unlike the SoA field-access seam.)

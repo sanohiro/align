@@ -339,7 +339,11 @@ FFI-mappable scalars; by-value struct passing is a later slice.
 An `align(N)` attribute (`align(N) S { … }`, a power of two, composes with `layout(C)`) over-aligns a
 struct's storage — the max of `N` and the natural alignment, so it never under-aligns — for SIMD /
 GPU / DMA / page-aligned interop. It also rounds the type's **size** up to `N` (as C does), so a fixed
-array `[align(64) S]` has a tight, over-aligned element stride (every element stays `align(N)`).
+array `[align(64) S]` has a tight, over-aligned element stride (every element stays `align(N)`). The
+same prefix on a **scalar-array binding** (`align(64) data := [...]`) over-aligns that array's storage
+— the aligned-vector-load enabler: a `vecN<T>` load of a whole borrow of the binding at a provably
+`N`-aligned offset (e.g. `data[..].load(0)`) is emitted as an aligned load; any other offset stays a
+plain element-aligned load (the alignment is never over-stated).
 
 A `str`/`slice`/`bytes` view is FFI-safe as a **parameter**: it lowers to its data pointer (C
 `char*`/`void*`), the length passed separately by the caller (`s.len()`) — the C `(ptr, len)` idiom.

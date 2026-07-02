@@ -772,10 +772,18 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   LLVM type is size-padded up to its alignment (an `[K x i8]` tail at the one `set_struct_body` seam),
   so a fixed `[align(N) S]` array has a tight, over-aligned element stride (`round_up(size, align)`,
   what C does); a fixed array literal of an `align(N)` struct now compiles, and the sema/codegen layout
-  parity test covers over-aligned cases. Deferred: the `align(N) data := …` binding form over a scalar
-  array (the aligned-vector-load enabler); arena/heap over-alignment — and, tied to it, a *dynamic*
-  `array<align(N)Struct>` (stride is correct, but the heap buffer can't be over-aligned yet); and an
-  `align(N)` struct as a *struct field* (needs a struct-type ABI alignment LLVM can't express).
+  parity test covers over-aligned cases. **`align(N) data := […]` binding form DONE** — the prefix
+  parses to `ast::Stmt::Let.align` → `hir::Local.align` → `mir::Function.slot_align`, and codegen
+  over-aligns the scalar-array alloca (`max(declared, natural)`, the same conservative rule). The
+  **aligned-vector-load fast path** rides on it: `data[..].load(i)` on a whole borrow of an `align(N)`
+  binding is emitted as an *aligned* `<n x T>` load whenever `(start+i)*sizeof(elem)` is a compile-time
+  `N`-multiple (`proven_vec_load_align`, MIR); every other case (non-const index, a cross-function
+  `slice<T>` param, a non-`N` offset) stays a plain element-aligned load — the alignment is never
+  over-stated (UB). (`tests/aligned_binding.rs`, `examples/aligned_load.align`, `draft.md` §9.)
+  Deferred: arena/heap over-alignment — and, tied to it, a *dynamic*
+  `array<align(N)Struct>` (stride is correct, but the heap buffer can't be over-aligned yet); an
+  `align(N)` struct as a *struct field* (needs a struct-type ABI alignment LLVM can't express); and
+  the *cross-function* aligned-load path (a fat `slice<T>` that carries an alignment through a call).
   **SoA surface — largely DONE:** the `soa<T>` borrowed view,
   field projection (`s.field` → column slice), multi-column / mixed-width pipelines, `.to_soa()` +
   `json.decode → soa` construction, `group_by` over a soa, soa params/returns, and now **whole-element

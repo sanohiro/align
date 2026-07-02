@@ -789,13 +789,22 @@ impl<'a> Parser<'a> {
                 stmts.push(s);
                 continue;
             }
+            // An over-aligned binding: `align(N) data := [...]` (the aligned-vector-load enabler,
+            // `draft.md` §9). Detected by lookahead so a bare `align(...)` call expression stays a
+            // plain statement. Parse the `align(N)` prefix, then the `let` it decorates.
+            if self.looks_like_aligned_binding() {
+                let align = self.parse_align_attr();
+                let s = self.parse_let(align)?;
+                stmts.push(s);
+                continue;
+            }
             // A `let`: `mut ...`, `name := ...`, or a type-annotated `name: T := ...`.
             // `name :` unambiguously starts a typed binding (no other statement does).
             if self.at(&TokKind::Mut)
                 || (matches!(self.peek(), TokKind::Ident(_))
                     && matches!(self.peek_at(1), TokKind::ColonEq | TokKind::Colon))
             {
-                let s = self.parse_let()?;
+                let s = self.parse_let(None)?;
                 stmts.push(s);
                 continue;
             }
@@ -828,6 +837,39 @@ impl<'a> Parser<'a> {
         self.expect(&TokKind::RBrace, "'}'");
         let span = start.merge(self.prev_span());
         Some(Block { stmts, tail, span })
+    }
+
+    /// Lookahead: does an `align(...)` prefix here decorate a `let` binding (`align(N) data := …`),
+    /// rather than begin a bare `align(...)` call-expression statement? Scans past the balanced
+    /// `(...)` and checks that a binding start (`mut`, or `name :=` / `name :`) follows.
+    fn looks_like_aligned_binding(&self) -> bool {
+        if !matches!(self.peek(), TokKind::Ident(s) if s == "align") {
+            return false;
+        }
+        if !matches!(self.peek_at(1), TokKind::LParen) {
+            return false;
+        }
+        // Walk past the balanced parenthesis group after `align`.
+        let mut i = 1;
+        let mut depth = 0usize;
+        loop {
+            match self.peek_at(i) {
+                TokKind::LParen => depth += 1,
+                TokKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                TokKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        matches!(self.peek_at(i), TokKind::Mut)
+            || (matches!(self.peek_at(i), TokKind::Ident(_))
+                && matches!(self.peek_at(i + 1), TokKind::ColonEq | TokKind::Colon))
     }
 
     /// Lookahead: does the current `(` begin a tuple-destructuring pattern `(a, b, ...) :=`?
@@ -884,7 +926,8 @@ impl<'a> Parser<'a> {
         Some(Stmt::LetTuple { names, init, span })
     }
 
-    fn parse_let(&mut self) -> Option<Stmt> {
+    /// `align` is an over-alignment prefix (`align(64) data := [...]`); `None` for a plain binding.
+    fn parse_let(&mut self, align: Option<u32>) -> Option<Stmt> {
         let is_mut = self.eat(&TokKind::Mut);
         let name = self.parse_ident("variable name")?;
         let ty = if self.eat(&TokKind::Colon) {
@@ -900,6 +943,7 @@ impl<'a> Parser<'a> {
             name,
             ty,
             init,
+            align,
         })
     }
 

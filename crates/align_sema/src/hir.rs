@@ -179,6 +179,10 @@ pub struct Local {
     pub name: String,
     pub ty: Ty,
     pub is_mut: bool,
+    /// A declared over-alignment (bytes, a validated power of two) from an `align(N) data := [...]`
+    /// binding, or `None` for the value's natural alignment. Set only for a scalar fixed-array
+    /// binding; propagated to the MIR slot's alloca alignment (the aligned-vector-load enabler).
+    pub align: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
