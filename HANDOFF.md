@@ -65,9 +65,10 @@ derived from `docs/impl/07-roadmap.md`.
 
 ## Roadmap-remainder wave (2026-07-03, PRs #316–#324)
 
-Continuing the same queue, all merged with reviews reflected: **#316** added dynamic `array<Struct>`
+Continuing the same queue, all merged with reviews reflected (#317 is absent below — closed
+unmerged after a branch mishap and re-landed as #318): **#316** added dynamic `array<Struct>`
 element-field write (`StoreElemFieldPtr`, the write dual of `IndexFieldPtr`); **#318** shipped
-lane-wise `%` for `vecN<T>` and closed the unguarded vec-integer/UB residual alongside it (lane-wise
+lane-wise `%` for `vecN<T>` and closed the unguarded vec integer-division UB residual alongside it (lane-wise
 zero-abort + `INT_MIN`/`-1` wrap, plus a broadcast-constant fast path); **#319** gave over-aligned
 struct arrays a padded stride (`round_up(size, align)`, C-style tail padding; dynamic
 `array<align(N)S>` stays rejected pending aligned heap alloc); **#320** added the `align(N)` binding
