@@ -1140,18 +1140,44 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
 
 /// Mison **speculation** fast path: the record's colon count matched the learned pattern, so for each
 /// declared field at its learned ordinal, **verify** the key (a byte compare) and write the value —
-/// no `find_field` hashing, and the unqueried fields' colons are never touched. Returns `false` on
+/// no `find_field` hashing, and the unqueried fields' *values* are never parsed. Returns `false` on
 /// any key mismatch (the caller then falls back); a partial write is harmless (the fallback overwrites
 /// the slot or errors). `rec_cols[o]` is the index position of the record's o-th colon; `pat_field[o]`
 /// is the declared field at ordinal `o`, or `-1` for an unqueried position.
 ///
+/// **Duplicate-key soundness (the strict `json.decode` contract, `docs/open-questions.md`):** at a
+/// queried ordinal a duplicated declared field displaces some declared field and trips its key verify
+/// → fallback → error, so those are already caught. The one gap was an *unqueried* position: the
+/// pattern learned it from an undeclared key, but a later record can put a **declared** field name
+/// there — a duplicate of the field already written at its own ordinal — which the strict contract
+/// must reject. So an unqueried position is not skipped blindly: its key is delimited and checked
+/// against the declared set, and on a declared hit (or a key that can't be cleanly delimited, which
+/// the fallback also rejects) speculation returns `false` so [`json_fallback`] surfaces it as a decode
+/// error. The projection win is preserved — an ordinary undeclared key delimits cleanly and
+/// `find_field` returns `None` (one PHF probe into an empty/mismatched slot), so the fast path
+/// continues without parsing that field's value.
+///
 /// # Safety
 /// `dst` must resolve to writable bytes for every written field.
-unsafe fn json_speculate<D: FieldDst>(src: &[u8], idx: &[u32], rec_cols: &[usize], pat_field: &[i32], descs: &[JsonField], dst: &D) -> bool {
+unsafe fn json_speculate<D: FieldDst>(
+    src: &[u8],
+    idx: &[u32],
+    rec_cols: &[usize],
+    pat_field: &[i32],
+    descs: &[JsonField],
+    dst: &D,
+    phf: Option<&[i32]>,
+    phf_seed: u64,
+) -> bool {
     for (o, &k) in rec_cols.iter().enumerate() {
         let fi = pat_field[o];
         if fi < 0 {
-            continue; // an unqueried position — skip it entirely (projection)
+            // An unqueried position (projection): still confirm its key is a plain, *undeclared* key,
+            // or fall back so the strict duplicate/missing/malformed contract is enforced there.
+            match key_before_colon(src, idx[k] as usize) {
+                Some(key) if unsafe { find_field(descs, key, phf, phf_seed) }.is_none() => continue,
+                _ => return false,
+            }
         }
         let d = &descs[fi as usize];
         if !key_matches_before_colon(src, idx[k] as usize, unsafe { field_name(d) }) {
@@ -1290,7 +1316,7 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
                         let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
                         let dst = AosDst { eptr, esz: esz as i64 };
                         let spec = pat_ncol == rec_cols.len() as i64
-                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, &dst) };
+                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, &dst, phf, phf_seed) };
                         if !spec {
                             unsafe { json_fallback(src, &idx, &rec_cols, descs, &dst, phf, phf_seed, &mut seen, &mut pat_field)? };
                             pat_ncol = rec_cols.len() as i64;
@@ -1497,7 +1523,7 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
                     if depth == 2 {
                         let dst = SoaDst { base, row, cols: &cols };
                         let spec = pat_ncol == rec_cols.len() as i64
-                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, &dst) };
+                            && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, descs, &dst, phf, phf_seed) };
                         if !spec {
                             unsafe { json_fallback(src, &idx, &rec_cols, descs, &dst, phf, phf_seed, &mut seen, &mut pat_field)? };
                             pat_ncol = rec_cols.len() as i64;
@@ -4861,6 +4887,89 @@ mod tests {
         assert_eq!(out2.len, 0);
         assert!(out2.ptr.is_null());
         unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_struct_array_speculative_duplicate_key_is_strict() {
+        // The strict `json.decode` contract (docs/open-questions.md "JSON two-stage SIMD decode" /
+        // "Duplicate-key semantics"): every declared field appears exactly once; a duplicate is a
+        // decode `Err`, never a silent last-wins. The fallback path already enforced this; the gap was
+        // the Mison *speculative* fast path, where a duplicate of a declared field landing at a colon
+        // position the learned pattern treats as *unqueried* (a projected-away slot) was skipped and
+        // never re-detected. All records here are decoded via `align_rt_json_decode_struct_array`,
+        // whose second-and-later records take the speculative path when their colon count matches the
+        // pattern learned from the first record.
+        fn decode(src: &[u8], descs: &[JsonField], esz: i64) -> (i32, i64, Vec<u8>) {
+            let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
+            let rc = unsafe {
+                align_rt_json_decode_struct_array(
+                    src.as_ptr(),
+                    src.len() as i64,
+                    descs.as_ptr(),
+                    descs.len() as i64,
+                    esz,
+                    &mut out,
+                    core::ptr::null(),
+                    0,
+                    0,
+                )
+            };
+            let mut buf = Vec::new();
+            if rc == 0 && !out.ptr.is_null() {
+                for j in 0..(out.len as usize) * esz as usize {
+                    buf.push(unsafe { *out.ptr.add(j) });
+                }
+            }
+            if !out.ptr.is_null() {
+                unsafe { align_rt_free(out.ptr as *mut u8) };
+            }
+            (rc, out.len, buf)
+        }
+        let read_i64 = |buf: &[u8], off: usize| -> i64 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[off..off + 8]);
+            i64::from_le_bytes(b)
+        };
+
+        let a = b"a";
+        let one = [JsonField { name_ptr: a.as_ptr(), name_len: 1, tag: 8, offset: 0 }]; // a: u64
+
+        // REPRODUCTION: record 1 (`{"a":1,"x":9}`) learns the pattern `[a, <unqueried x>]` (colon
+        // count 2). Record 2 (`{"a":1,"a":2}`) also has 2 colons, so speculation runs; its second
+        // colon is a duplicate `a` in the slot the pattern learned as unqueried. Before the fix this
+        // was silently accepted (rc 0, last-wins `a=2`); it must be a decode error.
+        assert_eq!(
+            decode(br#"[{"a":1,"x":9},{"a":1,"a":2}]"#, &one, 8).0,
+            1,
+            "duplicate of a declared field at an unqueried pattern position must error on the fast path"
+        );
+
+        // A duplicate at a *queried* pattern position stays rejected too (the key verify at that
+        // ordinal fails → fallback → duplicate error). Two declared fields so both colons are queried.
+        let ab = [
+            JsonField { name_ptr: b"a".as_ptr(), name_len: 1, tag: 8, offset: 0 },
+            JsonField { name_ptr: b"b".as_ptr(), name_len: 1, tag: 8, offset: 8 },
+        ];
+        assert_eq!(
+            decode(br#"[{"a":1,"b":2},{"a":1,"a":2}]"#, &ab, 16).0,
+            1,
+            "duplicate at a queried position must error"
+        );
+
+        // REGRESSION (no duplicates, projection rail): declaring only `a` while each record carries a
+        // *different* undeclared key still decodes — the speculative path continues on an undeclared
+        // key (find_field → None), so structural variation among undeclared keys does not force a
+        // fallback (fast-path usage is preserved). Values must be exactly [1, 2, 3].
+        let (rc, n, buf) = decode(br#"[{"a":1,"x":9},{"a":2,"y":8},{"a":3,"z":7}]"#, &one, 8);
+        assert_eq!((rc, n), (0, 3), "no-duplicate projection input decodes to three rows");
+        assert_eq!([read_i64(&buf, 0), read_i64(&buf, 8), read_i64(&buf, 16)], [1, 2, 3]);
+
+        // REGRESSION (full decode, no unqueried slots): every colon is a declared field, so there is
+        // no added cost and duplicates are caught by the queried-position verify.
+        let (rc, n, buf) = decode(br#"[{"a":1,"b":10},{"a":2,"b":20}]"#, &ab, 16);
+        assert_eq!((rc, n), (0, 2), "full-decode input still decodes");
+        assert_eq!([read_i64(&buf, 0), read_i64(&buf, 16)], [1, 2], "a column");
+        assert_eq!([read_i64(&buf, 8), read_i64(&buf, 24)], [10, 20], "b column");
     }
 
     #[test]

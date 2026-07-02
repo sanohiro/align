@@ -1278,23 +1278,33 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         the quote-heavy #213 index; + a 41 ms stage-2 walk = per-token `src[idx[k]]` gather + `rec_cols`
         collection + key scan-back + per-value `JsonParser` parse), which the general decoder pays and
         the probe's inlined positional sum did not. The lean index (vs #213's full structural index)
-        was the autopsy-identified first fix (idx-build 47→18 ms). **Strict semantics preserved** (62
-        tests green): missing/duplicate fields error via the fallback; one narrow documented relaxation
-        — a duplicate of a declared field at a position the learned pattern treats as unqueried is not
-        re-detected on the speculative path (no test covers it; a dup at a *declared* position trips the
-        colon-count gate → fallback → error).
+        was the autopsy-identified first fix (idx-build 47→18 ms). **Strict semantics preserved**:
+        missing/duplicate fields error via the fallback, and — since 2026-07-02 — also on the speculative
+        path (see the gap closure below), so both paths enforce the same exactly-once contract.
         **Duplicate-key semantics — DECIDED (SETTLED) 2026-06-29 (Codex overreach review).** The
         `json.decode` field contract is **strict and exactly-once**: every declared field appears exactly
         once; a missing *or duplicated* declared field is a `decode` `Err` (never a silent last-wins);
         undeclared keys are skipped. This formalizes what the implementation already does on the fallback
         path and is now written into the surface spec (`draft.md` §9 + `language-spec.md`). **Pre-freeze
-        gap to close:** the speculative path's narrow relaxation above (a duplicate of a declared field at
-        a position the learned pattern treats as *unqueried* is not re-detected) is now a known deviation
-        from the stated contract — it must be closed (or the contract re-decided) before JSON behavior is
-        frozen. Closing it costs a key-check on unqueried colons (partly against the projection win), so
-        it is its own slice, not bundled here. (Why strict, not serde-style last-wins: duplicate keys into
-        a fixed struct are a data error, and strict-reject matches Align's "nothing hidden / one error
-        model" — a malformed shape surfaces as a value, never a silent partial decode.)
+        gap — CLOSED (fixed) 2026-07-02 (`fix/json-duplicate-key-fast-path`):** the speculative path's
+        narrow relaxation (a duplicate of a declared field at a colon position the learned pattern treats
+        as *unqueried* was not re-detected) now conforms to the contract. Method: `json_speculate` no
+        longer skips an unqueried colon blindly — it delimits that colon's key (`key_before_colon`) and
+        checks it against the declared set (`find_field`); on a declared hit (or a key that can't be
+        cleanly delimited, which the fallback also rejects) it returns `false`, so `json_fallback`
+        re-scans and surfaces the duplicate/missing/malformed as a decode `Err`. Chosen over (a) a
+        per-record seen-bitmap on the fast path (the duplicate sits at an *unwritten* unqueried slot, so
+        a write-time bitmap never sees it unless the unqueried key is resolved anyway) and (b) demanding
+        a full key-set match (fallback on any extra key — that disables the projection win outright). Cost
+        lands only on records carrying undeclared extra colons (the projection rail) and is the minimal
+        key check for soundness — one PHF probe per unqueried colon that misses (empty/mismatched slot),
+        so an ordinary undeclared key still speculates and fast-path usage is preserved (no spurious
+        fallback on undeclared-key variation). Covered by the `align_runtime` test
+        `json_struct_array_speculative_duplicate_key_is_strict` (repro of the unqueried-slot duplicate +
+        queried-position duplicate + no-duplicate projection/full-decode regressions). (Why strict, not
+        serde-style last-wins: duplicate keys into a fixed struct are a data error, and strict-reject
+        matches Align's "nothing hidden / one error model" — a malformed shape surfaces as a value, never
+        a silent partial decode.)
         **Walk-optimization probe (2026-06-29) → NOT worth forcing.** Before pushing `proj` higher, a
         probe added each walk cost to the inline-positional floor and measured the delta (1M rows):
         `rec_cols` two-pass **+2 ms**, key-verify scan-back **+4 ms**, AoS materialize **+2 ms** — all

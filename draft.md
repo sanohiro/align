@@ -847,9 +847,9 @@ The field contract is **strict and exactly-once**: every declared field must app
 the object — a missing declared field and a duplicate of a declared field are both `decode` errors
 (`Result` `Err`, not a silent last-wins). Undeclared keys are the only thing skipped. This is the one
 error model again: a malformed or unexpected shape surfaces as a value, never a silent partial decode.
-(This is the **intended contract**; the current decoder's speculative fast path has one known narrow
-deviation — a duplicate at an unqueried position may slip through — tracked as a pre-freeze gap in
-`open-questions.md`, to close before the JSON behavior is frozen.)
+Both decode paths enforce this — the strict fallback and the Mison speculative fast path alike (a
+duplicate landing at a colon the learned pattern treats as unqueried is re-checked against the declared
+set and rejected; see `open-questions.md`).
 
 Grouped aggregation reads as a column pipeline too:
 
