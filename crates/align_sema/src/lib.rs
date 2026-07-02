@@ -5345,10 +5345,9 @@ impl<'a, 't> Checker<'a, 't> {
                 l = self.check_expr(lhs, expected);
                 r = self.check_binop_rhs(l.ty, rhs);
                 if let Some((s, n)) = self.vec_binop(&l, &r, span) {
-                    // Vectors support only elementwise `+` `-` `*` `/` (no `%`).
-                    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
-                        self.diags.error("vectors support elementwise `+` `-` `*` `/` only".to_string(), span);
-                    }
+                    // Vectors support all elementwise arithmetic `+` `-` `*` `/` `%` (M6). Integer
+                    // `/`/`%` carry the same lane-wise divisor guard as scalars (zero lane → abort,
+                    // signed `INT_MIN/-1` lane wraps); float `%` is IEEE `frem`, lane-wise.
                     ty = Ty::Vec(s, n);
                 } else {
                     let t = self.unify(l.ty, r.ty, span);

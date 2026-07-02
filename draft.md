@@ -773,8 +773,11 @@ vec16<u8>
 ```
 
 A vector is built from an array literal under the annotation (the annotation picks the SIMD
-representation — no separate constructor), elementwise `+` `-` `*` `/` map to one lane-wise hardware
-instruction each, and `v[i]` reads lane `i` (a constant index).
+representation — no separate constructor), elementwise `+` `-` `*` `/` `%` map to one lane-wise
+hardware instruction each, and `v[i]` reads lane `i` (a constant index). Integer `/` and `%` carry
+the same defined semantics as their scalar forms, applied per lane: a **zero divisor lane aborts**
+(never a silent poison lane), and a signed `INT_MIN / -1` lane wraps to the two's-complement result.
+Float `%` is the IEEE remainder (`frem`), with no guard.
 
 ```align
 a: vec4<f32> := [1.0, 2.0, 3.0, 4.0]
