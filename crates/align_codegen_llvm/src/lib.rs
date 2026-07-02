@@ -1754,11 +1754,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // Usually the natural ABI alignment (a no-op vs LLVM's default); for a struct (or fixed
             // struct array) declared `align(N)` it returns `N`, so the stack slot is over-aligned —
             // together with the `set_struct_body` size padding, a `[N x %S]` array's elements all stay
-            // over-aligned (`open-questions.md` "`align(N)`").
+            // over-aligned (`open-questions.md` "`align(N)`"). A per-slot binding override
+            // (`align(N) data := [...]`) over-aligns a scalar-array slot the same way — the max of the
+            // declared `N` and the natural alignment, so it can only ever *over*-align (never UB).
+            let natural = self.type_align(*ty);
+            let align = self.f.slot_align.get(i).copied().flatten().map_or(natural, |n| n.max(natural));
             let inst = ptr
                 .as_instruction()
                 .ok_or_else(|| self.err("alloca did not yield an instruction"))?;
-            inst.set_alignment(self.type_align(*ty)).map_err(|e| self.err(e))?;
+            inst.set_alignment(align).map_err(|e| self.err(e))?;
             self.slots.insert(i as Slot, ptr);
         }
 
@@ -2743,9 +2747,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let m = self.operand(mask).into_vector_value();
                 self.horizontal_or(m, *n)?.into()
             }
-            // `s.load(i)` — `<n x T>` load from `&buf[i]` at the element alignment (the GEP yields an
-            // element-aligned pointer, so the vector load must NOT assume the wider vector alignment).
-            Rvalue::VecLoad { slice, index, elem, n } => {
+            // `s.load(i)` — `<n x T>` load from `&buf[i]`. Default alignment is the element's (the GEP
+            // yields only an element-aligned pointer, so the load must NOT assume the wider vector
+            // alignment). `align = Some(N)` is a MIR-proven over-alignment (a whole borrow of an
+            // `align(N)` binding at an N-aligned offset — `proven_vec_load_align`); use the larger of
+            // it and the element alignment.
+            Rvalue::VecLoad { slice, index, elem, n, align } => {
                 let sv = self.operand(slice).into_struct_value();
                 let buf = self.builder.build_extract_value(sv, 0, "vlbuf").map_err(|e| self.err(e))?.into_pointer_value();
                 let index = self.operand(index).into_int_value();
@@ -2755,11 +2762,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 let vty = vec_llvm_ty(self.ctx, *elem, *n).into_vector_type();
                 let loaded = self.builder.build_load(vty, ep, "vload").map_err(|e| self.err(e))?;
+                let elem_align = self.type_align(*elem);
+                let load_align = align.map_or(elem_align, |n| n.max(elem_align));
                 loaded
                     .into_vector_value()
                     .as_instruction()
                     .ok_or_else(|| self.err("vector load is not an instruction"))?
-                    .set_alignment(self.type_align(*elem))
+                    .set_alignment(load_align)
                     .map_err(|e| self.err(e))?;
                 loaded
             }

@@ -235,6 +235,10 @@ pub enum Stmt {
         name: Ident,
         ty: Option<Type>,
         init: Expr,
+        /// A declared over-alignment from an `align(N) data := [...]` binding prefix (a validated
+        /// power of two), or `None` for the value's natural alignment. Sema restricts it to a
+        /// scalar fixed-array binding (the aligned-vector-load enabler). `draft.md` §9.
+        align: Option<u32>,
     },
     /// `(a, b, ...) := expr` — tuple destructuring. Each binder is a name or `_` (ignore).
     /// The element types are inferred from the tuple on the right (no annotation in this cut).

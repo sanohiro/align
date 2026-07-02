@@ -941,6 +941,21 @@ each element stays on a `64`-byte boundary. (This is the general rule — an arr
 always `round_up(element_size, element_align)` — made visible: `align(N)` is the only case that
 raises it above the natural size.)
 
+The same prefix over-aligns a **scalar array binding** — the aligned-vector-load enabler:
+
+```align
+align(64) data := [1, 2, 3, 4, 5, 6, 7, 8]   // storage on a 64-byte boundary
+v: vec4<i64> := data[..].load(0)             // an aligned vector load
+```
+
+Here `align(N)` is a property of the *binding's storage*, not of a type (a scalar has no room for a
+declared alignment), so it is written on the `:=`. It applies to a fixed array of a **numeric**
+scalar (int/float) — the element a vector load can target (`int` covers every byte-buffer / DMA
+case, `u8..u64`). A vector load of a whole borrow of such a binding is emitted as an *aligned* load
+whenever the address is provably an `N`-multiple (from the `N`-aligned base, e.g. `load(0)`); any
+other offset stays a plain element-aligned load — the alignment is never over-stated (that would be
+undefined behavior).
+
 ---
 
 ## 10. Branch and Hot Path

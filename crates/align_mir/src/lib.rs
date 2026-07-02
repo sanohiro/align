@@ -48,6 +48,10 @@ pub struct Function {
     pub ret: Ty,
     /// Type of every slot, indexed by [`Slot`].
     pub slots: Vec<Ty>,
+    /// Declared over-alignment of every slot (bytes, a validated power of two), indexed by
+    /// [`Slot`]; `None` = the type's natural alignment. Set for an `align(N) data := [...]`
+    /// binding (codegen over-aligns the alloca); temporary slots are always `None`.
+    pub slot_align: Vec<Option<u32>>,
     /// Type of every temporary, indexed by [`ValueId`].
     pub value_tys: Vec<Ty>,
     pub blocks: Vec<Block>,
@@ -271,9 +275,12 @@ pub enum Rvalue {
     /// `any(divisor == 0)` → abort. Yields `Ty::Bool`.
     MaskAny { mask: Operand, n: u32 },
     /// `s.load(i)` — load `n` consecutive elements of a `slice<T>` (`{ptr,len}`) starting at `index`
-    /// into a `<n x T>` vector (M6). Codegen GEPs `&buf[index]` and emits a `<n x T>` load at the
-    /// element alignment. Bounds are checked before this rvalue.
-    VecLoad { slice: Operand, index: Operand, elem: Ty, n: u32 },
+    /// into a `<n x T>` vector (M6). Codegen GEPs `&buf[index]` and emits a `<n x T>` load. `align`
+    /// is a *statically proven* load alignment in bytes (`Some(N)` only when the slice is a whole
+    /// borrow of an `align(N)` binding and the address is a multiple of `N` — see
+    /// `proven_vec_load_align`); `None` falls back to the element alignment. An over-stated `align`
+    /// would be UB, so it defaults conservatively. Bounds are checked before this rvalue.
+    VecLoad { slice: Operand, index: Operand, elem: Ty, n: u32, align: Option<u32> },
     /// `base[index].field` for a `{ptr,len}` view of struct `struct_id` (an owned, dynamic
     /// `array<Struct>`, MMv2 slice 8d-2). Like [`IndexField`] but addressed through the loaded
     /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
@@ -672,6 +679,8 @@ struct BBuild {
 
 struct Builder {
     slots: Vec<Ty>,
+    /// Per-slot over-alignment, parallel to `slots` (`None` for temporaries and plain locals).
+    slot_align: Vec<Option<u32>>,
     value_tys: Vec<Ty>,
     blocks: Vec<BBuild>,
     cur: BlockId,
@@ -733,6 +742,7 @@ impl Builder {
     fn new_slot(&mut self, ty: Ty) -> Slot {
         let s = self.slots.len() as Slot;
         self.slots.push(ty);
+        self.slot_align.push(None);
         s
     }
 
@@ -755,6 +765,7 @@ impl Builder {
 fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -> Function {
     let mut b = Builder {
         slots: f.locals.iter().map(|l| l.ty).collect(),
+        slot_align: f.locals.iter().map(|l| l.align).collect(),
         value_tys: Vec::new(),
         blocks: Vec::new(),
         cur: 0,
@@ -816,6 +827,7 @@ fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -
         params,
         ret: f.ret,
         slots: b.slots,
+        slot_align: b.slot_align,
         value_tys: b.value_tys,
         blocks,
         entry,
@@ -1772,13 +1784,17 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::VecSum { vec: vv, elem: e.ty, n }));
             Operand::Value(v)
         }
-        // `s.load(i)` → bounds-checked `<n x T>` load from the slice buffer at `i..i+n`.
+        // `s.load(i)` → bounds-checked `<n x T>` load from the slice buffer at `i..i+n`. If the slice
+        // is a whole borrow of an `align(N)` binding and the address is provably N-aligned, tag the
+        // load with that alignment (the aligned-vector-load fast path); else fall back to element
+        // alignment. Computed from the *HIR* receiver before it is lowered to an opaque slice temp.
         hir::ExprKind::VecLoad { src, index, elem, n } => {
+            let align = proven_vec_load_align(b, src, index, align_sema::scalar_to_ty(*elem));
             let sv = lower_expr(b, src);
             let idx = lower_expr(b, index);
             emit_vec_bounds_check(b, &sv, &idx, *n);
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::VecLoad { slice: sv, index: idx, elem: align_sema::scalar_to_ty(*elem), n: *n }));
+            b.push(Stmt::Let(v, Rvalue::VecLoad { slice: sv, index: idx, elem: align_sema::scalar_to_ty(*elem), n: *n, align }));
             Operand::Value(v)
         }
         // `s.store(i, v)` → bounds-checked `<n x T>` store into the slice buffer at `i..i+n`. Unit.
@@ -2223,6 +2239,67 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
 
 fn index_const(i: usize) -> Operand {
     Operand::Const(Const::Int(i as i128, i64_ty()))
+}
+
+/// The statically provable byte alignment of a `.load(index)` on `src` — the aligned-vector-load
+/// fast path unlocked by an `align(N) data := [...]` binding. Returns `Some(N)` only when we can
+/// prove the load address lands on an `N`-byte boundary; otherwise `None` (codegen then uses the
+/// element's natural alignment, always correct). Over-stating a load's alignment is UB, so every
+/// step is conservative:
+///   1. `src` is a *whole-array borrow* (`a[..]`, or an implicit array→slice coercion) of a **local**
+///      bound with `align(N)`, so the slice's buffer pointer *is* the `N`-aligned array base.
+///   2. the borrow's start offset (from an `a[start..]`) and the load `index` are both compile-time
+///      constants.
+///   3. `(start + index) * sizeof(elem)` is a non-negative multiple of `N`: element `start + index`
+///      lands on an `N`-boundary from the aligned base.
+///
+/// A slice that crossed a function boundary (a `slice<T>` parameter) carries no such provenance, so
+/// it always falls through to element alignment — never a wrong over-alignment.
+fn proven_vec_load_align(b: &Builder, src: &hir::Expr, index: &hir::Expr, elem: Ty) -> Option<u32> {
+    // Peel a whole-array borrow to (underlying array expr, element start offset).
+    let (arr, start): (&hir::Expr, i128) = match &src.kind {
+        hir::ExprKind::ArrayToSlice(inner) => (inner, 0),
+        hir::ExprKind::SliceRange { recv, start, end: _ } => {
+            let s = match start {
+                None => 0,
+                Some(e) => const_int_expr(e)?,
+            };
+            (recv, s)
+        }
+        _ => return None,
+    };
+    // Only a bare local carries a binding alignment (slot index == LocalId).
+    let hir::ExprKind::Local(id) = &arr.kind else { return None };
+    let n = (*b.slot_align.get(*id as usize)?)?;
+    let idx = const_int_expr(index)?;
+    let elem_bytes = ty_byte_size(elem)?;
+    let byte_off = start.checked_add(idx)?.checked_mul(elem_bytes)?;
+    // `n` is a validated power of two (so never 0), but guard the modulus anyway — a stray 0 here
+    // would panic, and the repo standard is defense-in-depth on divisor/width zero (cf. `w == 0`).
+    if n != 0 && byte_off >= 0 && byte_off % i128::from(n) == 0 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// A compile-time integer value of a HIR expression, if it is an integer literal (the only const
+/// form a `.load` index / slice start takes today). Anything else → `None` (conservative).
+fn const_int_expr(e: &hir::Expr) -> Option<i128> {
+    match &e.kind {
+        hir::ExprKind::Int(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Byte size of a primitive scalar type (int/float), for a vector element-offset computation. A
+/// non-primitive element is never a vector lane, so `None` (no fast path).
+fn ty_byte_size(ty: Ty) -> Option<i128> {
+    match ty {
+        Ty::Int(it) => Some(i128::from((it.bits / 8).max(1))),
+        Ty::Float(ft) => Some(i128::from(ft.bits / 8)),
+        _ => None,
+    }
 }
 
 /// Zero of a numeric scalar type (the additive identity for `sum`). `ty` is always `Int` or `Float`
