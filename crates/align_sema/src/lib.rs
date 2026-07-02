@@ -476,7 +476,9 @@ fn ty_size_align(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64
 /// Natural-alignment `(size, align)` of a struct as codegen lays it out (the dual of
 /// [`struct_is_move`]). A non-`layout(C)` struct's fields are **reordered by descending alignment** to
 /// eliminate padding (matching `logical_to_physical` in `align_codegen_llvm`); a `layout(C)` struct
-/// keeps declaration order. Honors a declared over-alignment (`align(N)`). Cycle-safe.
+/// keeps declaration order. An `align(N)` over-alignment pads the reported *size* up to `N` (a tight
+/// array stride), but the reported *alignment* stays natural — the over-alignment lives at the
+/// storage seam (`type_align`), not in the aggregate type. Cycle-safe.
 fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -> (u64, u64) {
     if visiting.contains(&id) {
         return (0, 1); // a cycle (already reported by `struct_acyclic`) — stop the recursion
@@ -505,11 +507,17 @@ fn struct_size_align(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) ->
         size = align_up(size, fal) + fsz;
         align = align.max(fal);
     }
-    if let Some(a) = def.align {
-        align = align.max(a as u64);
-    }
+    // Pad the type's *size* up to its **effective** alignment — the natural aggregate alignment,
+    // raised by any `align(N)` over-alignment. This is what C does, and matches codegen: an `align(N)`
+    // struct gets an `[K x i8]` size-padding tail so a tight `[N x %S]` array has an over-aligned
+    // element stride. Crucially the returned *alignment* stays the **natural** aggregate alignment
+    // (`align`, not `effective`): the `align(N)` over-alignment is applied at the storage seam
+    // (`type_align`, the alloca/global), never baked into the aggregate type, so the padding field is
+    // `align 1` and the LLVM type's ABI alignment is unchanged. Reporting the natural alignment here
+    // keeps this the exact dual of the LLVM type (pinned by `layout_parity`).
+    let effective = def.align.map_or(align, |a| align.max(a as u64));
     visiting.pop();
-    (align_up(size, align), align)
+    (align_up(size, effective), align)
 }
 
 /// The `(size, align)` of struct `id` as codegen lays it out (descending-alignment field order for a
@@ -6795,17 +6803,10 @@ impl<'a, 't> Checker<'a, 't> {
                 checked.push(lit);
             }
             return match sid {
-                // An array of a **Move struct** (one that owns a `string`/owned field) needs
-                // per-element drop and ownership-aware indexing — deferred to the arrays×nesting
-                // slice. Reject cleanly so the owned elements aren't silently leaked / double-freed.
-                // An `align(N)` struct element is not honored in an array yet (stride padding deferred).
-                Some(id) if self.structs[id as usize].align.is_some() => {
-                    self.diags.error(
-                        format!("an array of the `align(N)` struct '{}' is not supported yet (its over-alignment is not honored when embedded)", self.structs[id as usize].name),
-                        span,
-                    );
-                    Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
-                }
+                // A fixed `[S{…}, …]` array of an `align(N)` struct is supported: its stack slot is
+                // over-aligned (`type_align`) and the struct's LLVM size is padded up to `N`, so every
+                // element's stride keeps the alignment. (A *dynamic* `array<align(N)Struct>` stays
+                // rejected — its heap buffer over-alignment is a separate, still-deferred concern.)
                 Some(id) => Expr {
                     kind: ExprKind::ArrayLit { elems: checked, elem: Ty::Struct(id) },
                     ty: Ty::StructArray(id, n),

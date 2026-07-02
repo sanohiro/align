@@ -935,6 +935,12 @@ align(4096) Page { data: i64 }   // page-aligned
 The attribute only ever *over*-aligns — it is the max of `N` and the type's natural alignment, so it
 can never under-align. It changes the value's **storage alignment**, not its bytes or semantics.
 
+The type's **size** is rounded up to `N` as well (`round_up(size, align)` — exactly as C does), so a
+fixed array `[align(64) S]` has a tight, over-aligned element **stride**: from a `64`-aligned base,
+each element stays on a `64`-byte boundary. (This is the general rule — an array element's stride is
+always `round_up(element_size, element_align)` — made visible: `align(N)` is the only case that
+raises it above the natural size.)
+
 ---
 
 ## 10. Branch and Hot Path

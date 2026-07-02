@@ -2099,17 +2099,30 @@ threaded to `StructDef.align`, carried through generic monomorphs via `StructTem
 at the one `type_align` codegen seam (the slot alloca / AoS struct-array element), which now returns
 `max(declared, natural)` so a too-small `align(N)` can never *under*-align (UB). A non-power-of-two /
 too-large value, or `align(N)` on a sum type, is a clean error. `draft.md` §9 documents it;
-`tests/align_attr.rs`, `examples/align_attr.align`. **Still deferred:** the `align(N) data := …`
-binding/allocation form over a scalar array (which, with a multiple-of-N index, is what would unblock
-an **aligned vector-load fast path** — vec load/store currently uses the always-safe element
-alignment); arena/heap-buffer over-alignment; and padding an over-aligned struct's **size** up to its
-alignment for a tight `[N x %S]` array stride (the slot alloca is correctly aligned; the array stride
-uses the natural size today). **Proposal (2026-07-02, internal review):** close this by making the
-rule unconditional — **an array's element stride is always `round_up(element_size, element_align)`**
-(not just for `align(N)` structs; this is also just what C already does). Keeps `align(N)` visible in
-layout math without adding a second, conditional stride rule — every element access already goes
-through one seam (`type_align`/element-size computation), so the fix is confined there. Original
-design note follows.
+`tests/align_attr.rs`, `examples/align_attr.align`.
+
+**Fixed-array stride padding DONE (2026-07-03).** An over-aligned struct's LLVM type is now
+**size-padded** up to its alignment (an `[K x i8]` tail appended at the one struct-layout seam,
+`set_struct_body`), so `round_up(size, align)` holds — a fixed `[align(64) S]` array has a tight,
+over-aligned element **stride** (every element stays `align(N)`, since the array's stack slot is
+already over-aligned via `type_align`). This is the rule the proposal named made concrete: an array
+element's stride is always `round_up(element_size, element_align)`, and `align(N)` is simply the only
+case that raises it above the natural size. The over-alignment is applied only at the storage seam
+(alloca/global), never as a member alignment, so the aggregate type's own ABI alignment stays natural
+(the padding field is `align 1`); `align_sema::struct_size_align` reports `(padded_size,
+natural_align)` to match, pinned by the `sema_and_codegen_struct_layout_agree` parity test (now
+including over-aligned cases). Composes with `layout(C)` (matches C's `__attribute__((aligned(N)))`,
+which also pads `sizeof`). A *fixed* `[S{…}, …]` array literal of an `align(N)` struct now compiles;
+`draft.md` §9 documents the stride rule.
+
+**Still deferred:** the `align(N) data := …` binding/allocation form over a scalar array (which, with
+a multiple-of-N index, is what would unblock an **aligned vector-load fast path** — vec load/store
+currently uses the always-safe element alignment); arena/heap-buffer over-alignment — and, tied to it,
+a **dynamic** `array<align(N)Struct>` (the stride is now correct, but its heap buffer can't be
+over-aligned yet, so it stays a clean error); and an `align(N)` struct as a **struct field** (honoring
+it needs the aggregate type's ABI alignment to actually be `N`, which LLVM can't express for a struct
+type — it lives at the alloca, not the type — so field embedding stays rejected). Original design note
+follows.
 
 A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) data := …`) for GPU/DMA/page-aligned zero-copy interop. **Retrofit-sensitive**: it modifies struct field-offset math and the arena bump allocator's alignment, so reserve room in the layout model now; the surface + LLVM `align N` emission + arena honoring it can land at M6 alongside SoA. (Digested from `work/proposals/next-draft.md` §1.1.)
 **Groundwork landed (pre-M6):** `StructDef` carries `align: Option<u32>` (always `None` today — no surface syntax), and codegen routes all allocation alignment through one seam, `type_align(ty)` (natural ABI alignment today; a struct's custom `align` if set). M6 work is then "parse `align(N)` → set `StructDef.align`" + the seam returns it — the stack-slot alloca already calls the seam; the arena bump allocator already takes an explicit `align` argument. (Retrofit risk was low — a custom alignment is largely *additive* at the alloca/global/alloc sites — so this groundwork is a light reservation, unlike the SoA field-access seam.)
