@@ -5105,8 +5105,9 @@ mod tests {
         // (46) pad, so no window accidentally matches except the planted one.
         for needle_len in [1usize, 2, 3, 4, 7, 8, 15, 16, 17] {
             let needle: Vec<u8> = (0..needle_len).map(|k| b'A' + (k as u8 % 23)).collect();
+            let mut buf = vec![b'.'; 160];
             for off in 40..96 {
-                let mut buf = vec![b'.'; 160];
+                buf.fill(b'.'); // reset the reused buffer between offsets
                 for j in (0..off).step_by(5) {
                     buf[j] = needle[0]; // prefilter decoy
                 }
@@ -5133,7 +5134,7 @@ mod tests {
         let run = vec![b'a'; 200];
         check(&run, b"aa");
         check(&run, b"aaa");
-        check(&run, &vec![b'a'; 200]); // needle == whole haystack
+        check(&run, &run); // needle == whole haystack
         let mut tail = vec![b'x'; 300];
         tail[297..300].copy_from_slice(b"END");
         check(&tail, b"END");
