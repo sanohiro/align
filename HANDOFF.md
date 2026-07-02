@@ -5,7 +5,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-02 (main @ PR #290)._
+_Last updated: 2026-07-03 (main @ PR #314)._
 
 ## Internal review (2026-07-02)
 
@@ -40,6 +40,28 @@ output is self-describing (triple, #301); and the branchless identity-select `wh
 every reducer — the M6 completion criterion — with `where`+`min` demonstrably vectorizing (#303).
 **Remaining from the review: the design-decision Open items** (out-of-range literals,
 `main() -> Result<(), E>` exit mapping) and the deferred noalias emission gated on `map_into(out)`.
+
+## Improvement wave (2026-07-02–03, PRs #306–#314)
+
+A queue-driven improvement wave off the same review backlog, all merged same-day(-ish): **#306** closed
+the json speculative-path duplicate-key gap (zero new state; cost confined to records with undeclared
+colons); **#307** made default struct layout **unspecified order** — fields now reorder by descending
+alignment (Rust-style) while `layout(C)` stays fixed, sema/codegen parity pinned by a mutation-checked
+test; **#308** restricted `main`'s error type to the builtin `Error` and fixed a real ICE along the way
+(user-`E` `main` was reaching codegen's hard-coded `Error` layout); **#309** made out-of-range integer
+literals a hard error, including nested-negation effective values, while pattern literals keep wrap per
+spec; **#310** confirmed `str` search was already memchr-SIMD (AVX2+NEON+scalar) and added a
+differential SIMD-vs-scalar oracle; **#311** made json `u64` fields accept the full `u64` range (three
+write sites unified through one dispatcher); **#312** evaluated `Option` niche optimization and deferred
+it — no expressible target type today, since `Option` payloads are scalar-only — with the revisit plan
+recorded; **#313** shipped M8 lints batch 1 (lossy `as` conversions, unconstrained-default large array
+literals, both post-inference classification); **#314** was a clippy sweep, 50 warnings → 0 with zero
+`allow`s, and unified the runtime's byte-copy loops on `copy_nonoverlapping`. **Held/deferred** (reasons
+recorded in `docs/open-questions.md`): hot/cold field-split lint (heuristics need design), buffered
+`print` (deliberate), escape→MIR dataflow + purity-as-effect-bit (structural, big), relative pointers
+(no recursive types yet), `f16`/`bf16` (arithmetic semantics decision needed). Tests grew ~1047 → ~1103;
+clippy is clean at `-D warnings`. **Next:** continue roadmap work (M6/M8 remainders) — the queue is
+derived from `docs/impl/07-roadmap.md`.
 
 ## Latest (2026-07-02, PRs #262–#290)
 
