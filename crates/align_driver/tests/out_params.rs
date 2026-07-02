@@ -80,6 +80,39 @@ fn out_arg_two_slices_of_same_array_rejected() {
 }
 
 #[test]
+fn out_arg_inline_subslice_of_out_array_rejected() {
+    // Soundness (SubSlice hole): an inline sub-slice argument `xs[0..2]` shares `xs`'s root buffer,
+    // so passing it alongside `xs` as the `out` argument aliases — must be rejected.
+    let src = "fn fill(out dst: slice<i64>, src: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  mut xs := [1, 2, 3, 4]\n  fill(xs, xs[0..2])\n  return 0\n}\n";
+    assert!(check_errs("na-inline-subslice", src));
+}
+
+#[test]
+fn out_arg_two_overlapping_subslice_vars_rejected() {
+    // Two sub-slice bindings of the same array (overlapping ranges) alias — must be rejected.
+    let src = "fn fill(out dst: slice<i64>, src: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  mut xs := [1, 2, 3, 4]\n  s1 := xs[0..2]\n  s2 := xs[1..3]\n  fill(s1, s2)\n  return 0\n}\n";
+    assert!(check_errs("na-two-subslice-vars", src));
+}
+
+#[test]
+fn out_arg_nested_subslice_rejected() {
+    // A nested sub-slice `xs[0..4][1..2]` still roots at `xs`; aliasing `xs` as `out` is rejected.
+    let src = "fn fill(out dst: slice<i64>, src: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  mut xs := [1, 2, 3, 4, 5]\n  fill(xs, xs[0..4][1..2])\n  return 0\n}\n";
+    assert!(check_errs("na-nested-subslice", src));
+}
+
+#[test]
+fn out_arg_subslices_of_distinct_arrays_ok() {
+    if !backend_available() {
+        return;
+    }
+    // Sub-slices of *different* arrays are genuinely distinct buffers — must pass. dst[0]=src[0]=7.
+    let src = "fn fill(out dst: slice<i64>, src: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  xs := [7, 2, 3, 4]\n  mut ys := [0, 0, 0, 0]\n  fill(ys[0..2], xs[0..2])\n  return ys[0]\n}\n";
+    let out = build_and_run("na-distinct-subslices", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn out_arg_distinct_ok() {
     if !backend_available() {
         return;
