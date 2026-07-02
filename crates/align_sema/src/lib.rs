@@ -921,6 +921,27 @@ fn int_range(it: IntTy) -> (i128, i128) {
     }
 }
 
+/// If `operand` (the operand of a unary `-`) is an integer literal reached through a chain of
+/// further unary negations (`--128` → `Neg(Neg(Int))`; parentheses create no node, so `-(-128)`
+/// peels the same way), return `(count, value)` where `count` is the total number of `-` applied
+/// (including the outer one whose operand this is) and `value` is the literal's stored magnitude.
+/// The literal's *effective* value is `value` sign-flipped once per `-`, i.e. negated iff `count`
+/// is odd. Returns `None` when the chain bottoms out in a non-literal (a variable, a call, …).
+fn peel_neg_literal(operand: &Expr) -> Option<(u32, i128)> {
+    let mut count = 1u32; // the outer `-` whose operand `operand` is
+    let mut node = operand;
+    loop {
+        match &node.kind {
+            ExprKind::Unary { op: UnOp::Neg, expr } => {
+                count += 1;
+                node = expr;
+            }
+            ExprKind::Int(v) => return Some((count, *v)),
+            _ => return None,
+        }
+    }
+}
+
 /// Evaluates top-level constant initializers to folded values, resolving same-module references
 /// on demand (memoized) with cycle detection.
 struct ConstEval<'a, 'd> {
@@ -9596,37 +9617,56 @@ impl<'a, 't> Checker<'a, 't> {
         let mut recomputed: Option<Ty> = None;
         match &mut e.kind {
             ExprKind::Unary { op, expr } => {
-                // A negated integer *literal* (`-128`): its effective value is `-v`, so range-check
-                // *that* against the (signed) target here, and do NOT let the inner literal be
-                // range-checked on its own — its bare magnitude (`128`) can exceed the type's `+max`
-                // even though `-128` is in range (`-128: i8`, `i64::MIN`). For an unsigned target the
-                // unsigned-`-` error below already rejects it, so no range error is stacked on top.
-                let neg_lit = matches!(op, UnOp::Neg)
-                    .then(|| match &expr.kind {
-                        ExprKind::Int(v) => Some(*v),
-                        _ => None,
-                    })
+                // A negation applied to an integer *literal* — possibly through a *chain* of `-`
+                // (`--128`, `-(-128)`; parentheses create no node) — has a compile-time-known
+                // effective value: the literal with its sign flipped once per `-`, i.e. negated iff
+                // the chain length is odd. Range-check *that* effective value, once, at the outermost
+                // `-`, and do NOT recurse into the chain — otherwise only the innermost `-lit` is
+                // checked (accepting `-128: i8` while the true value of `--128` is `+128`, out of
+                // range) and a duplicate diagnostic is possible. `draft.md` §5.
+                let neg_chain = matches!(op, UnOp::Neg)
+                    .then(|| peel_neg_literal(expr))
                     .flatten();
-                match neg_lit {
-                    Some(v) => {
-                        expr.ty = self.finalize(expr.ty); // finalize the inner literal's type; skip its range check
-                        if matches!(cur_ty, Ty::Int(IntTy { signed: true, .. })) {
-                            self.check_int_lit_range(v.checked_neg().unwrap_or(v), cur_ty, span);
+                match neg_chain {
+                    Some((count, v)) => {
+                        // Finalize the `ty` of every node in the chain (the leaf literal + each `-`);
+                        // `Neg` preserves the operand type, so they all share `cur_ty`, but each
+                        // `Expr.ty` must be concrete (no inference variable) before MIR.
+                        let mut node: &mut Expr = expr;
+                        loop {
+                            node.ty = self.finalize(node.ty);
+                            match &mut node.kind {
+                                ExprKind::Unary { op: UnOp::Neg, expr } => node = expr,
+                                _ => break,
+                            }
+                        }
+                        // Unary negation is a *signed* operation. Applying it to an unsigned type —
+                        // by context (`x: u32 := -5`, `g(-5)` into a `u32` param), for any chain
+                        // length — would silently wrap and lose the sign; reject it once (and skip
+                        // the range check: `-` is illegal here regardless of the effective value).
+                        // An explicit `(-5) as u32` is unaffected: the inner `-5` is signed and the
+                        // cast does the intended conversion.
+                        if matches!(cur_ty, Ty::Int(IntTy { signed: false, .. })) {
+                            self.diags.error(
+                                format!("cannot apply unary `-` to the unsigned type `{}`: a negative value cannot have an unsigned type (it would silently wrap). Use a signed type, or convert explicitly with `as {}`.", ty_name(cur_ty), ty_name(cur_ty)),
+                                span,
+                            );
+                        } else {
+                            let effective = if count % 2 == 1 { v.checked_neg().unwrap_or(v) } else { v };
+                            self.check_int_lit_range(effective, cur_ty, span);
                         }
                     }
-                    None => self.finalize_expr(expr),
-                }
-                // Unary negation is a *signed* operation. Applying it to an unsigned type — a
-                // negative literal given an unsigned type by context (`x: u32 := -5`, `g(-5)` into a
-                // `u32` parameter) or a negated unsigned value — would silently two's-complement wrap
-                // and lose the sign (`-5` prints as `4294967291`). Reject it (checked here, after
-                // inference has resolved the operand's type). An explicit `(-5) as u32` is unaffected:
-                // the inner `-5` is signed (default `i64`), and the cast does the intended conversion.
-                if *op == UnOp::Neg && matches!(cur_ty, Ty::Int(IntTy { signed: false, .. })) {
-                    self.diags.error(
-                        format!("cannot apply unary `-` to the unsigned type `{}`: a negative value cannot have an unsigned type (it would silently wrap). Use a signed type, or convert explicitly with `as {}`.", ty_name(cur_ty), ty_name(cur_ty)),
-                        span,
-                    );
+                    None => {
+                        // The operand is not a literal (a variable, a call, an arithmetic expr, …):
+                        // finalize it normally, then apply the same unsigned-`-` rejection to this node.
+                        self.finalize_expr(expr);
+                        if *op == UnOp::Neg && matches!(cur_ty, Ty::Int(IntTy { signed: false, .. })) {
+                            self.diags.error(
+                                format!("cannot apply unary `-` to the unsigned type `{}`: a negative value cannot have an unsigned type (it would silently wrap). Use a signed type, or convert explicitly with `as {}`.", ty_name(cur_ty), ty_name(cur_ty)),
+                                span,
+                            );
+                        }
+                    }
                 }
             }
             ExprKind::Cast(expr) => self.finalize_expr(expr),

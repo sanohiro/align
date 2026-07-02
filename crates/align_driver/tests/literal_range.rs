@@ -108,6 +108,41 @@ fn negated_literal_below_signed_min_is_rejected() {
     assert!(check_errs("lit-i8-neg200", "fn main() -> i32 {\n  x: i8 := -200\n  return 0\n}\n"));
 }
 
+// --- negation chains: the effective value (sign flipped once per `-`) is what is range-checked ---
+
+#[test]
+fn double_negated_literal_is_checked_at_its_effective_value() {
+    // `--128` and `-(-128)` both have effective value +128, which overflows i8 (max 127) — the
+    // reviewer's hole: only the innermost `-128` (valid) used to be checked. Parentheses create no
+    // node, so both forms peel to `Neg(Neg(Int(128)))`.
+    assert!(check_errs("lit-dneg-128", "fn main() -> i32 {\n  x: i8 := --128\n  return 0\n}\n"));
+    assert!(check_errs("lit-pneg-128", "fn main() -> i32 {\n  x: i8 := -(-128)\n  return 0\n}\n"));
+}
+
+#[test]
+fn triple_negated_min_is_accepted() {
+    // `---128` = -(-(-128)) has effective value -128 = i8::MIN — accepted.
+    assert!(!check_errs("lit-tneg-128", "fn main() -> i32 {\n  x: i8 := ---128\n  return 0\n}\n"));
+}
+
+#[test]
+fn triple_negated_below_min_is_rejected() {
+    // `---129` has effective value -129 < i8::MIN.
+    assert!(check_errs("lit-tneg-129", "fn main() -> i32 {\n  x: i8 := ---129\n  return 0\n}\n"));
+}
+
+#[test]
+fn double_negated_into_range_is_accepted() {
+    // `-(-127)` has effective value +127, in range for i8.
+    assert!(!check_errs("lit-pneg-127", "fn main() -> i32 {\n  x: i8 := -(-127)\n  return 0\n}\n"));
+}
+
+#[test]
+fn negation_chain_into_unsigned_is_rejected() {
+    // `-` on an unsigned type is illegal regardless of chain length — one error, no wrap.
+    assert!(check_errs("lit-dneg-u8", "fn main() -> i32 {\n  x: u8 := --300\n  return 0\n}\n"));
+}
+
 // --- regression: the pre-existing negative-into-unsigned rejection still fires (and only once) ---
 
 #[test]
