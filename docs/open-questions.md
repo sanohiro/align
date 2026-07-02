@@ -527,6 +527,59 @@ the same weight class as the deferred `bitset`. The single-column window covers 
 (windowed column reduction) with none of that cost, so the multi-column view waits until a concrete
 need (e.g. a function taking a windowed multi-field view) justifies the repr change.
 
+**Design finalized (2026-07-03) — repr = unify, not a distinct type; implementation still deferred.**
+When picked up, do it as the **degenerate-form unification**, not a separate `soa_slice<T>` type:
+
+- **Repr decision: widen the *one* `soa<T>` view to 4 words `{base_ptr, total_rows, start, count}`.**
+  A full soa is the degenerate `{ptr, rows, 0, rows}`; `s[a..b]` is `{ptr, rows, start+a, (b-a)}`.
+  `soa_slice<T>` is then **spec-level sugar for a windowed `soa<T>`, not a new `Ty`** — exactly how
+  AoS `s[a..b]` is a view-adjustment of `slice<T>`, never a new type. This is forced, not optional: a
+  function parameter typed `soa<T>` must accept both a full and a windowed soa, so the two **must share
+  one ABI** → both carry the window state. Rejected alternatives: (B) a distinct `Ty::SoaSlice` with
+  `soa<T>` staying 2-word — duplicates *every* column-addressing site (a second mechanism for the same
+  thing, violates "one way") and needs a soa→soa_slice coercion; (C) per-column base pointers `+ len`
+  (the old "small struct of per-column pointers" lean) — variable-width repr per field count, non-
+  uniform LLVM type, precomputes all columns even for a one-column pipeline. (A) is fixed-width,
+  uniform (extend `slice_struct_type` from 2 to 4 fields), and keeps single-column projection cheap:
+  `s.field` still lowers to a plain 2-word `slice<FieldTy>` = `{base + col_off(total_rows) + start*sz,
+  count}`, so the whole downstream scalar pipeline is unchanged.
+
+- **Why still deferred:** the widening is the named defer trigger (large ABI ripple). It changes the
+  soa view from 16→32 bytes, which crosses the SysV register→memory boundary for by-value soa params
+  (internal-only, so still self-consistent, but every existing soa call site re-lowers), and it must be
+  landed *atomically* across all consuming sites + re-green the whole `tests/soa.rs` suite (162 fns).
+  With no in-tree consumer yet (the single-column `s.field[a..b]` window already covers windowed column
+  reduction), this stays gated on a concrete "function taking a windowed multi-field view" need.
+
+- **Consuming sites to touch (complete map), all currently assuming `total_rows == count == start-0`:**
+  1. `abi_type`/`llvm_type` `Ty::Soa` arm (×3) → a new 4-word `soa_view_type` (not `slice_struct_type`).
+  2. codegen `Rvalue::IndexColumn` (pipeline element read + `s[i].field`): stride from `total_rows`,
+     element at `(start + index)`.
+  3. codegen `Rvalue::SoaGather` (`s[i]` whole-struct gather): same, per column.
+  4. codegen `Rvalue::SoaColumn` (`s.field` projection → `slice<FieldTy>`): `{base + col_off(total_rows)
+     + start*size, count}` (result is a plain 2-word slice — the bridge that keeps pipelines unchanged).
+  5. `Stmt::StoreColumn` (`s[i].field = v` + `to_soa`/decode construction): add `total_rows` + `start`
+     (today it carries a single `len` operand; construction uses `start = 0`).
+  6. `Rvalue::SoaAlloc` — unchanged (allocates `total_rows` rows; stride math already uses that `len`).
+  7. `soa_column_offset` — signature unchanged (already takes `len` = `total_rows`); callers pass
+     `total_rows` and add the `+start` element bias themselves.
+  8. view construction: `transpose_to_soa` builds the view via `MakeDynArray {ptr,len}` today → needs a
+     4-word build (`{ptr, rows, 0, rows}`) — add a `Rvalue::MakeSoaView` (or extend the constructor).
+  9. `Rvalue::JsonDecodeSoa`: keep the runtime writing a 2-word `{ptr,len}` into a scratch slot, then
+     **codegen expands** it to `{ptr, len, 0, len}` in the out slot — **no runtime ABI change needed**
+     (cheaper than the "4-field runtime out-write" the note above imagined).
+  10. sema `check_slice_range`: add a `Ty::Soa(id) => Ty::Soa(id)` arm (currently the `other =>` reject);
+      `s[a..b]` reuses the existing `SliceRange` HIR/AST — **no grammar change** (same surface as AoS).
+  11. MIR `lower` `SliceRange` — add a `Ty::Soa` arm building the windowed 4-word view.
+  12. region/escape: **nothing** — `region_of(SliceRange) = region_of(recv)` already ties the sub-view
+      to the parent soa (str-bearing soas already carry the input-tied region); soa is Copy so no move
+      concern. This is the one part already done.
+  13. `s.len()` on a windowed soa → `count` (field 3, not field 1). `group_by` consumes columns via
+      `SoaColumn` (site 4), so it needs no direct change once the projection is window-aware.
+  Spec: `draft.md` §9 gains a windowed-view paragraph (result type `soa<T>`; `soa_slice<T>` named only
+  as the conceptual term for a windowed soa). Estimated ~330 LoC across sema/MIR/codegen + tests
+  (sub-view projection / gather / pipeline-source / `.len()` / escape).
+
 **In-place element-field write slice DONE — `s[i].field = v` (+ AoS `arr[i].field = v`).** The write
 counterpart of the `c[i].field` read, closing the read/write symmetry: you could read a struct-array /
 soa element's field but not store it (`invalid assignment target`). One surface — `c[i].field = v` —
