@@ -133,6 +133,11 @@ fn build_module<'c>(
     let tm = create_target_machine(target)?;
     let target_data = tm.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
+    // Pin the target triple too, so emitted IR (`alignc emit-llvm`) is self-describing: an external
+    // `opt`/`llc` reading it then knows the architecture and uses the right cost model / vectorizer
+    // instead of falling back to a generic one. The driver's own object emission is unaffected (it
+    // always drives `write_object` with the same TargetMachine).
+    module.set_triple(&tm.get_triple());
 
     // Struct layouts → LLVM struct types, indexed by struct id. Two phases so a **nested** struct
     // field (`Struct(id)`) can reference another struct's type: first create every struct as a named
@@ -239,18 +244,16 @@ fn build_module<'c>(
     // Arena allocator (M3).
     let ptr = ctx.ptr_type(AddressSpace::default());
     let i64t = ctx.i64_type();
-    funcs.insert(
-        "arena_begin".to_string(),
-        module.add_function("align_rt_arena_begin", ptr.fn_type(&[], false), None),
+    let arena_begin = module.add_function("align_rt_arena_begin", ptr.fn_type(&[], false), None);
+    mark_alloc_like(ctx, arena_begin);
+    funcs.insert("arena_begin".to_string(), arena_begin);
+    let arena_alloc = module.add_function(
+        "align_rt_arena_alloc",
+        ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false),
+        None,
     );
-    funcs.insert(
-        "arena_alloc".to_string(),
-        module.add_function(
-            "align_rt_arena_alloc",
-            ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false),
-            None,
-        ),
-    );
+    mark_bump_alloc(ctx, arena_alloc);
+    funcs.insert("arena_alloc".to_string(), arena_alloc);
     funcs.insert(
         "arena_end".to_string(),
         module.add_function(
@@ -260,14 +263,16 @@ fn build_module<'c>(
         ),
     );
     // `task_group` runtime (slice ④b).
-    funcs.insert(
-        "tg_begin".to_string(),
-        module.add_function("align_rt_tg_begin", ptr.fn_type(&[], false), None),
+    let tg_begin = module.add_function("align_rt_tg_begin", ptr.fn_type(&[], false), None);
+    mark_alloc_like(ctx, tg_begin);
+    funcs.insert("tg_begin".to_string(), tg_begin);
+    let tg_alloc = module.add_function(
+        "align_rt_tg_alloc",
+        ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false),
+        None,
     );
-    funcs.insert(
-        "tg_alloc".to_string(),
-        module.add_function("align_rt_tg_alloc", ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into()], false), None),
-    );
+    mark_bump_alloc(ctx, tg_alloc);
+    funcs.insert("tg_alloc".to_string(), tg_alloc);
     funcs.insert(
         "tg_register".to_string(),
         module.add_function(
@@ -287,10 +292,9 @@ fn build_module<'c>(
         module.add_function("align_rt_tg_end", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
     // Free-standing heap allocation for owned arrays (MMv2 slice 4).
-    funcs.insert(
-        "alloc".to_string(),
-        module.add_function("align_rt_alloc", ptr.fn_type(&[i64t.into()], false), None),
-    );
+    let alloc = module.add_function("align_rt_alloc", ptr.fn_type(&[i64t.into()], false), None);
+    mark_alloc_like(ctx, alloc);
+    funcs.insert("alloc".to_string(), alloc);
     funcs.insert(
         "free".to_string(),
         module.add_function("align_rt_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
@@ -306,14 +310,16 @@ fn build_module<'c>(
     );
     // `par_map`: (in_buf, count, in_stride, out_stride, thunk) -> out_buf. Allocates the output,
     // applies the per-function thunk to each element across threads, returns the owned buffer.
-    funcs.insert(
-        "par_map".to_string(),
-        module.add_function(
-            "align_rt_par_map",
-            ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
-            None,
-        ),
+    let par_map = module.add_function(
+        "align_rt_par_map",
+        ptr.fn_type(&[ptr.into(), i64t.into(), i64t.into(), i64t.into(), ptr.into()], false),
+        None,
     );
+    // Only `noalias` on the return: the output buffer is a fresh allocation disjoint from the inputs.
+    // NOT `nounwind` (it may `resume_unwind` a worker panic) and NOT `nofree` (it invokes the user
+    // thunk, so we don't assert anything about what that does).
+    add_enum_attr(ctx, par_map, inkwell::attributes::AttributeLoc::Return, "noalias");
+    funcs.insert("par_map".to_string(), par_map);
     funcs.insert(
         "print_str".to_string(),
         module.add_function(
@@ -411,10 +417,10 @@ fn build_module<'c>(
     );
     // String builder (M5: `template` desugaring).
     let i64t2 = ctx.i64_type();
-    funcs.insert(
-        "builder_new".to_string(),
-        module.add_function("align_rt_builder_new", ptr.fn_type(&[ptr.into(), i64t2.into()], false), None),
-    );
+    let builder_new =
+        module.add_function("align_rt_builder_new", ptr.fn_type(&[ptr.into(), i64t2.into()], false), None);
+    mark_alloc_like(ctx, builder_new);
+    funcs.insert("builder_new".to_string(), builder_new);
     funcs.insert(
         "builder_write".to_string(),
         module.add_function(
@@ -1362,9 +1368,53 @@ fn declare_fn<'c>(
 /// `main` wrapper, fn-value / closure thunks) — never the external `align_rt_*` runtime
 /// declarations, which are ordinary Rust functions and not promised `nounwind` here.
 fn mark_nounwind<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
-    let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("nounwind");
-    let attr = ctx.create_enum_attribute(kind, 0);
-    f.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
+    add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, "nounwind");
+}
+
+/// Add a named zero-valued enum attribute at `loc`.
+fn add_enum_attr<'c>(
+    ctx: &'c Context,
+    f: FunctionValue<'c>,
+    loc: inkwell::attributes::AttributeLoc,
+    name: &str,
+) {
+    let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
+    f.add_attribute(loc, ctx.create_enum_attribute(kind, 0));
+}
+
+/// Attributes shared by every allocator-family runtime declaration, verified per function:
+///
+/// - `noalias` (return): each returns a *fresh* allocation (C `malloc`, a bump-region slice never
+///   handed out before, or a `Box::into_raw`), disjoint from any pointer live before the call.
+///   `noalias` is compatible with a possible null return (`align_rt_alloc`/`arena_alloc` hand back
+///   null for an empty/invalid request), so the null-returning ones keep it.
+/// - `nounwind` (function): none unwind — on OOM (C `malloc` null, or a Rust global-alloc failure)
+///   they `abort`, and a panic (e.g. a `Vec` capacity overflow) can't escape the `extern "C"`
+///   boundary either (it aborts), so no unwind ever leaves the call.
+///
+/// Deliberately **NOT** added: `willreturn`/`mustprogress` — each of these can `abort` on OOM, so
+/// asserting it always returns to the caller would be unsound (a miscompile). Over-declaration on
+/// the allocator hot path is the dangerous direction, so we stay conservative.
+fn mark_alloc_common<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
+    add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Return, "noalias");
+    mark_nounwind(ctx, f);
+}
+
+/// A **single-shot** allocator that never frees memory reachable at entry (`align_rt_alloc` = one
+/// `malloc`; the `*_begin` handle allocators + `builder_new` = one `Box::new`) — so it additionally
+/// gets `nofree`.
+fn mark_alloc_like<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
+    mark_alloc_common(ctx, f);
+    add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, "nofree");
+}
+
+/// A **bump** allocator (`align_rt_arena_alloc` / `align_rt_tg_alloc`): like `mark_alloc_like` but
+/// **without `nofree`**. Growing the region does `Vec::push` on the chunk list, which can reallocate
+/// that list's backing buffer — freeing memory allocated *before* the call — so `nofree` would be
+/// unsound even though the returned bump pointer itself is fresh (`noalias` still holds: the chunk
+/// buffers the pointer aliases into are never moved, only the chunk-*index* vector is).
+fn mark_bump_alloc<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
+    mark_alloc_common(ctx, f);
 }
 
 struct FnGen<'c, 'a> {
@@ -4421,6 +4471,56 @@ mod tests {
         // ...but the external runtime declarations (ordinary Rust fns) are NOT promised nounwind.
         let out2 = ir("fn main() -> i32 {\n  print(1)\n  return 0\n}\n");
         assert!(out2.contains("declare void @align_rt_print_i64(i64)\n"));
+    }
+
+    #[test]
+    fn emitted_ir_is_self_describing() {
+        // `emit-llvm` output pins both the data layout AND the target triple, so an external
+        // `opt`/`llc` reading it uses the right cost model / vectorizer instead of a generic one.
+        let out = ir("fn main() -> i32 = 0\n");
+        assert!(out.contains("target datalayout = \""), "want a data layout:\n{out}");
+        assert!(out.contains("target triple = \""), "want a target triple:\n{out}");
+    }
+
+    #[test]
+    fn allocator_declarations_carry_noalias_and_hygiene_attrs() {
+        // Every runtime builtin is declared unconditionally, so a trivial program still emits them.
+        let out = ir("fn main() -> i32 = 0\n");
+        // The allocator family returns a fresh allocation → `noalias` on the return value.
+        for sym in [
+            "align_rt_alloc",
+            "align_rt_arena_alloc",
+            "align_rt_tg_alloc",
+            "align_rt_arena_begin",
+            "align_rt_tg_begin",
+            "align_rt_builder_new",
+            "align_rt_par_map", // fresh output buffer
+        ] {
+            assert!(out.contains(&format!("declare noalias ptr @{sym}")), "want noalias on {sym}:\n{out}");
+        }
+        // Single-shot allocators also get `nofree` + `nounwind` — but deliberately NOT `willreturn`
+        // (they `abort` on OOM, so asserting they always return would be a miscompile).
+        assert!(out.contains("nofree"), "want nofree on the single-shot alloc family:\n{out}");
+        assert!(!out.contains("willreturn"), "must NOT claim willreturn (alloc can abort):\n{out}");
+
+        // The **bump** allocators must NOT carry `nofree`: growing the region `Vec::push`es the
+        // chunk list, which can reallocate (free) memory allocated before the call. Resolve each
+        // one's attribute-group number and assert that group has no `nofree`.
+        let group_has_nofree = |sym: &str| -> bool {
+            let decl = out.lines().find(|l| l.contains(&format!("@{sym}("))).expect("decl present");
+            let n = decl.rsplit('#').next().and_then(|s| s.trim().parse::<u32>().ok());
+            match n {
+                None => false, // no attribute group at all → certainly no nofree
+                Some(n) => out
+                    .lines()
+                    .find(|l| l.starts_with(&format!("attributes #{n} = ")))
+                    .is_some_and(|l| l.contains("nofree")),
+            }
+        };
+        assert!(!group_has_nofree("align_rt_arena_alloc"), "bump alloc must not be nofree:\n{out}");
+        assert!(!group_has_nofree("align_rt_tg_alloc"), "bump alloc must not be nofree:\n{out}");
+        // ...while a single-shot one does.
+        assert!(group_has_nofree("align_rt_alloc"), "single-shot alloc should be nofree:\n{out}");
     }
 
     #[test]

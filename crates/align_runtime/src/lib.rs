@@ -3655,48 +3655,132 @@ struct TgRun {
 }
 unsafe impl Send for TgRun {}
 
-/// Run every registered task **in parallel** — spawn a worker thread per task, then join them all
-/// (fork-join). All allocations happened at `spawn` time (on this thread), so no thread mutates
-/// the region during the run; each worker only reads its own `env` and writes its own `slot`.
+/// A `task_group`'s registered tasks, shared across the runners of one `wait()`. Each index is
+/// **claimed exactly once** (an atomic fetch-add hands each index to a single runner), and every
+/// task's `env`/`slot`/`err_slot` is a fresh, private, disjoint region allocation that no other
+/// task touches (`env` read-only, `slot`/`err_slot` write-only) — so concurrent immutable reads of
+/// the list plus disjoint per-task writes are race-free. That is why this is `Send + Sync` despite
+/// holding raw pointers.
+struct TgTasks(Vec<TgTask>);
+unsafe impl Send for TgTasks {}
+unsafe impl Sync for TgTasks {}
+
+/// The join barrier shared by every runner of one `wait()`: how many tasks have finished, the
+/// first panic payload, and the first errored task's `err_slot`. "First" is by **lowest task
+/// index** (deterministic, unlike thread-completion order), so a re-run gives the same error.
+struct TgBarrier {
+    /// Tasks that have completed (ran to a return or panicked). The caller waits for this to reach
+    /// the task count before returning, so no task is still live when `tg_end` frees the region.
+    done: usize,
+    /// First panic (lowest index) — re-raised on the caller so a worker panic is never swallowed.
+    panic: Option<(usize, Box<dyn std::any::Any + Send + 'static>)>,
+    /// First errored task (lowest index): `(index, err_slot address)`. Stored as a `usize` address
+    /// because a raw pointer is not `Send`; converted back to `*mut u8` on return.
+    err: Option<(usize, usize)>,
+}
+
+/// Run every registered task and join them all before returning, reusing the process-lifetime
+/// [`ParPool`] (like `align_rt_par_map`) instead of spawning one OS thread per task.
 ///
-/// Uses `std::thread::scope` (like `align_rt_par_map`) so that *every* spawned thread is joined
-/// before this returns even if a later `spawn` panics — otherwise an unwinding panic would detach
-/// running threads and they would read the arena after `tg_end` frees it (a use-after-free).
+/// **Work-claiming, caller-participating design.** The tasks live in a shared claim-once list with
+/// an atomic cursor. A *runner* loops: claim the next index, run that task (under `catch_unwind`),
+/// record its outcome, repeat until the list is drained. `wait()` dispatches up to
+/// `min(workers, n-1)` runners onto the pool **and runs the same claim loop on the calling thread
+/// itself**, then blocks until every task has finished.
+///
+/// **Nesting / deadlock analysis (the crux).** A spawned closure is lifted to an ordinary function,
+/// so its body may open its own `task_group` — i.e. a pool worker can re-enter `tg_wait`. With a
+/// *finite* pool, a naive "submit all, then wait" scheme deadlocks: nested waits on busy workers
+/// would wait for jobs that no free worker can pick up. The caller-participates claim loop removes
+/// that hazard: **the calling thread of every `wait()` drains its own group to completion by
+/// itself if no pool worker is free.** So each nesting level always makes forward progress on its
+/// own thread — even with zero idle workers, an N-deep nest just runs sequentially, one level per
+/// blocked thread. No `wait()` can ever wait on the pool for its *own* group's tasks. (This is why
+/// the tasks are shared and claimed atomically rather than moved into per-task jobs.) Runner jobs
+/// that a worker only picks up *after* the group has drained find the cursor past the end and exit
+/// without touching any task — they never dereference the freed region.
+///
+/// A worker panic is caught, recorded, and re-raised on the caller (never swallowed — that would
+/// falsely report success and then read an unwritten slot). All tasks are guaranteed finished
+/// before this returns, so the region stays valid until `tg_end` (the join precedes the free).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
     let tg = unsafe { &mut *tg };
     let tasks = std::mem::take(&mut tg.tasks);
-    // The `err_slot` of the first task (in spawn order) that errored, or null if all succeeded.
-    let mut first_err: *mut u8 = std::ptr::null_mut();
-    std::thread::scope(|s| {
-        let handles: Vec<(_, *mut u8)> = tasks
-            .into_iter()
-            .map(|t| {
-                let run = TgRun { tramp: t.tramp, thunk: t.thunk, env: t.env, slot: t.slot, err_slot: t.err_slot };
-                let es = t.err_slot;
-                // Rebind the whole value so the closure captures the `Send` `TgRun` as a unit
-                // (edition-2021 disjoint capture would otherwise grab the non-`Send` raw fields).
-                (s.spawn(move || {
-                    let run = run;
-                    (run.tramp)(run.thunk, run.env, run.slot, run.err_slot)
-                }), es)
-            })
-            .collect();
-        // Join all (the scope joins even on panic); record the first errored task's `err_slot`.
-        // A worker panic must not be swallowed (that would falsely report success and then read an
-        // unwritten slot) — re-raise it on the joining thread.
-        for (h, es) in handles {
-            match h.join() {
+    let n = tasks.len();
+    if n == 0 {
+        return std::ptr::null_mut();
+    }
+
+    let tasks = Arc::new(TgTasks(tasks));
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let barrier: Arc<(Mutex<TgBarrier>, Condvar)> =
+        Arc::new((Mutex::new(TgBarrier { done: 0, panic: None, err: None }), Condvar::new()));
+
+    // One runner: claim indices until the list is drained, running each claimed task and recording
+    // its outcome. Cloned per pool worker and also run on the caller. (Closures capturing only
+    // `Clone` values — here three `Arc`s — are themselves `Clone` in edition 2021.)
+    let run_all = {
+        let tasks = tasks.clone();
+        let cursor = cursor.clone();
+        let barrier = barrier.clone();
+        move || loop {
+            let i = cursor.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            let t = &tasks.0[i];
+            // Copy the raw fields into a `Send` unit so `catch_unwind`'s closure captures them as a
+            // whole (edition-2021 disjoint capture would otherwise grab the non-`Send` raw fields).
+            let run = TgRun { tramp: t.tramp, thunk: t.thunk, env: t.env, slot: t.slot, err_slot: t.err_slot };
+            let es = t.err_slot as usize;
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let run = run;
+                (run.tramp)(run.thunk, run.env, run.slot, run.err_slot)
+            }));
+            let (m, cv) = &*barrier;
+            let mut st = m.lock().unwrap();
+            st.done += 1;
+            match res {
                 Ok(errored) => {
-                    if first_err.is_null() && errored != 0 {
-                        first_err = es;
+                    if errored != 0 && st.err.is_none_or(|(j, _)| i < j) {
+                        st.err = Some((i, es));
                     }
                 }
-                Err(payload) => std::panic::resume_unwind(payload),
+                Err(p) => {
+                    if st.panic.as_ref().is_none_or(|(j, _)| i < *j) {
+                        st.panic = Some((i, p));
+                    }
+                }
             }
+            cv.notify_all();
         }
-    });
-    first_err
+    };
+
+    let (pool, workers) = par_pool();
+    // Dispatch helper runners onto the pool (bounded by the pool size and by `n-1` — the caller is
+    // itself a runner), then run the claim loop on the caller. See the deadlock analysis above:
+    // even if every submitted helper is starved by busy workers, the caller drains the group.
+    for _ in 0..workers.min(n - 1) {
+        pool.submit(Box::new(run_all.clone()));
+    }
+    run_all();
+
+    // Block until every task has finished. The caller may have run them all itself (no worker was
+    // free), or workers hold some — either way the region must not be freed until all are done.
+    let (m, cv) = &*barrier;
+    let mut st = m.lock().unwrap();
+    while st.done < n {
+        st = cv.wait(st).unwrap();
+    }
+    if let Some((_, p)) = st.panic.take() {
+        drop(st);
+        std::panic::resume_unwind(p);
+    }
+    st.err.map_or(std::ptr::null_mut(), |(_, addr)| addr as *mut u8)
 }
 
 /// Release the task group's region and the handle.
@@ -4889,5 +4973,119 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- `task_group` `tg_wait` (pool-backed, caller-participating work-claiming) ---
+
+    /// A test trampoline: read `i64` from `env`, write `2*env` into `slot`, succeed. Matches the
+    /// `(thunk, env, slot, err_slot) -> i32` ABI the codegen emits for a spawned closure.
+    extern "C" fn double_tramp(_thunk: *const u8, env: *mut u8, slot: *mut u8, _err: *mut u8) -> i32 {
+        unsafe {
+            let v = *(env as *const i64);
+            *(slot as *mut i64) = v * 2;
+        }
+        0
+    }
+
+    /// A failing trampoline: write the code from `env` into `err_slot`, return 1 (errored).
+    extern "C" fn err_tramp(_thunk: *const u8, env: *mut u8, _slot: *mut u8, err: *mut u8) -> i32 {
+        unsafe { *(err as *mut i64) = *(env as *const i64) };
+        1
+    }
+
+    /// Register `n` `double` tasks (env = index) into a fresh group; return the group and slot ptrs.
+    fn build_double_group(n: i64) -> (*mut TaskGroup, Vec<*mut u8>) {
+        let tg = align_rt_tg_begin();
+        let mut slots = Vec::new();
+        for i in 0..n {
+            let env = unsafe { align_rt_tg_alloc(tg, 8, 8) };
+            unsafe { *(env as *mut i64) = i };
+            let slot = unsafe { align_rt_tg_alloc(tg, 8, 8) };
+            unsafe { align_rt_tg_register(tg, double_tramp, std::ptr::null(), env, slot, std::ptr::null_mut()) };
+            slots.push(slot);
+        }
+        (tg, slots)
+    }
+
+    #[test]
+    fn tg_wait_runs_all_tasks_pool_backed() {
+        // Many short tasks: every slot must be written (all tasks ran), and the join must complete
+        // (no deadlock) before we read the region. Repeat so the pool is exercised warm and cold.
+        for &n in &[1i64, 2, 5, 64, 1000] {
+            let (tg, slots) = build_double_group(n);
+            let err = unsafe { align_rt_tg_wait(tg) };
+            assert!(err.is_null(), "n={n}: no task errored");
+            for (i, s) in slots.iter().enumerate() {
+                assert_eq!(unsafe { *(*s as *const i64) }, (i as i64) * 2, "n={n} task {i}");
+            }
+            unsafe { align_rt_tg_end(tg) };
+        }
+    }
+
+    #[test]
+    fn tg_wait_returns_first_errored_slot_by_index() {
+        // Tasks 3 and 7 error (codes 30, 70); `wait` must return the lowest-index errored slot (3).
+        let tg = align_rt_tg_begin();
+        let mut err_slots = Vec::new();
+        for i in 0..10i64 {
+            let env = unsafe { align_rt_tg_alloc(tg, 8, 8) };
+            let slot = unsafe { align_rt_tg_alloc(tg, 8, 8) };
+            let err_slot = unsafe { align_rt_tg_alloc(tg, 8, 8) };
+            let (tramp, code): (extern "C" fn(*const u8, *mut u8, *mut u8, *mut u8) -> i32, i64) =
+                if i == 3 || i == 7 { (err_tramp, i * 10) } else { (double_tramp, 0) };
+            unsafe { *(env as *mut i64) = code };
+            unsafe { align_rt_tg_register(tg, tramp, std::ptr::null(), env, slot, err_slot) };
+            err_slots.push(err_slot);
+        }
+        let err = unsafe { align_rt_tg_wait(tg) };
+        assert_eq!(err, err_slots[3], "lowest-index errored slot");
+        assert_eq!(unsafe { *(err as *const i64) }, 30);
+        unsafe { align_rt_tg_end(tg) };
+    }
+
+    /// A nested trampoline: `env` holds a base; open a *sub* `task_group` of 16 `double` tasks over
+    /// `base..base+16`, `wait` on it (re-entering `tg_wait` on a pool worker), sum the results into
+    /// `slot`. Exercises the finite-pool re-entrancy path the caller-participating design protects.
+    extern "C" fn nested_tramp(_thunk: *const u8, env: *mut u8, slot: *mut u8, _err: *mut u8) -> i32 {
+        let base = unsafe { *(env as *const i64) };
+        let sub = align_rt_tg_begin();
+        let mut subslots = Vec::new();
+        for j in 0..16i64 {
+            let e = unsafe { align_rt_tg_alloc(sub, 8, 8) };
+            unsafe { *(e as *mut i64) = base + j };
+            let s = unsafe { align_rt_tg_alloc(sub, 8, 8) };
+            unsafe { align_rt_tg_register(sub, double_tramp, std::ptr::null(), e, s, std::ptr::null_mut()) };
+            subslots.push(s);
+        }
+        let err = unsafe { align_rt_tg_wait(sub) };
+        assert!(err.is_null());
+        let sum: i64 = subslots.iter().map(|s| unsafe { *(*s as *const i64) }).sum();
+        unsafe { *(slot as *mut i64) = sum };
+        unsafe { align_rt_tg_end(sub) };
+        0
+    }
+
+    #[test]
+    fn tg_wait_nested_task_groups_do_not_deadlock() {
+        // Enough outer tasks (> worker count) that some nested waits necessarily run on busy pool
+        // workers. If the finite pool could deadlock on re-entry, this test would hang (CI timeout);
+        // it passing proves the caller drains its own group. Each outer task's sum is
+        // sum_{j=0}^{15} 2*(base+j) = 32*base + 240.
+        let n = 64i64;
+        let tg = align_rt_tg_begin();
+        let mut slots = Vec::new();
+        for base in 0..n {
+            let env = unsafe { align_rt_tg_alloc(tg, 8, 8) };
+            unsafe { *(env as *mut i64) = base };
+            let slot = unsafe { align_rt_tg_alloc(tg, 8, 8) };
+            unsafe { align_rt_tg_register(tg, nested_tramp, std::ptr::null(), env, slot, std::ptr::null_mut()) };
+            slots.push(slot);
+        }
+        let err = unsafe { align_rt_tg_wait(tg) };
+        assert!(err.is_null());
+        for (base, s) in slots.iter().enumerate() {
+            assert_eq!(unsafe { *(*s as *const i64) }, 32 * base as i64 + 240, "outer base={base}");
+        }
+        unsafe { align_rt_tg_end(tg) };
     }
 }
