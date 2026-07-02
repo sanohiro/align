@@ -360,6 +360,303 @@ fn function_calls_compute_the_oracle_value() {
     }
 }
 
+// --- pipeline-reducer variant: fixed array + `.map`/`.where` stages + a reduction terminal, all
+// fused into one counted loop. Exercises the branchless identity-select `where` path (#303): every
+// `min`/`max`/`any`/`all`/`sum`/`count`/`reduce` must equal a Rust fold over the same elements in the
+// same order (wrapping i64), incl. empty selection (all filtered out) and the seed/identity endpoints.
+// Elements are 0..9 (representable at every width) and every stage uses a generated named function,
+// matching the call-generation style. ---
+
+/// A generated `.map(f)` element function `f: i64 -> i64` — its `align` body and matching oracle.
+#[derive(Clone, Copy)]
+enum MapOp {
+    AddK(i64),
+    SubK(i64),
+    MulK(i64),
+    Square,
+}
+impl MapOp {
+    fn pick(rng: &mut Rng) -> MapOp {
+        let k = rng.below(10) as i64;
+        match rng.below(4) {
+            0 => MapOp::AddK(k),
+            1 => MapOp::SubK(k),
+            2 => MapOp::MulK(k),
+            _ => MapOp::Square,
+        }
+    }
+    fn src(self) -> String {
+        match self {
+            MapOp::AddK(k) => format!("x + {k}"),
+            MapOp::SubK(k) => format!("x - {k}"),
+            MapOp::MulK(k) => format!("x * {k}"),
+            MapOp::Square => "x * x".to_string(),
+        }
+    }
+    fn eval(self, x: i64) -> i64 {
+        match self {
+            MapOp::AddK(k) => x.wrapping_add(k),
+            MapOp::SubK(k) => x.wrapping_sub(k),
+            MapOp::MulK(k) => x.wrapping_mul(k),
+            MapOp::Square => x.wrapping_mul(x),
+        }
+    }
+}
+
+/// A generated predicate `p: i64 -> bool` (for `.where` / `.any` / `.all`). `FilterAll` (`x > 1000`)
+/// deliberately drops every 0..9 element so the empty-selection identity path is exercised.
+#[derive(Clone, Copy)]
+enum Pred {
+    Gt(i64),
+    Lt(i64),
+    Ge(i64),
+    Eq(i64),
+    Mod(i64, i64),
+    FilterAll,
+}
+impl Pred {
+    fn pick(rng: &mut Rng) -> Pred {
+        match rng.below(6) {
+            0 => Pred::Gt(rng.below(10) as i64),
+            1 => Pred::Lt(rng.below(10) as i64),
+            2 => Pred::Ge(rng.below(10) as i64),
+            3 => Pred::Eq(rng.below(10) as i64),
+            4 => {
+                let m = 1 + rng.below(9) as i64;
+                Pred::Mod(m, rng.below(m as usize) as i64)
+            }
+            _ => Pred::FilterAll,
+        }
+    }
+    fn src(self) -> String {
+        match self {
+            Pred::Gt(k) => format!("x > {k}"),
+            Pred::Lt(k) => format!("x < {k}"),
+            Pred::Ge(k) => format!("x >= {k}"),
+            Pred::Eq(k) => format!("x == {k}"),
+            Pred::Mod(m, r) => format!("x % {m} == {r}"),
+            Pred::FilterAll => "x > 1000".to_string(),
+        }
+    }
+    fn eval(self, x: i64) -> bool {
+        match self {
+            Pred::Gt(k) => x > k,
+            Pred::Lt(k) => x < k,
+            Pred::Ge(k) => x >= k,
+            Pred::Eq(k) => x == k,
+            Pred::Mod(m, r) => x.wrapping_rem(m) == r,
+            Pred::FilterAll => false,
+        }
+    }
+}
+
+/// A generated fold function `f: (i64, i64) -> i64` for `.reduce(init, f)`.
+#[derive(Clone, Copy)]
+enum RedOp {
+    Add,
+    Mul,
+    Sub,
+}
+impl RedOp {
+    fn pick(rng: &mut Rng) -> RedOp {
+        match rng.below(3) {
+            0 => RedOp::Add,
+            1 => RedOp::Mul,
+            _ => RedOp::Sub,
+        }
+    }
+    fn src(self) -> &'static str {
+        match self {
+            RedOp::Add => "a + x",
+            RedOp::Mul => "a * x",
+            RedOp::Sub => "a - x",
+        }
+    }
+    fn eval(self, a: i64, x: i64) -> i64 {
+        match self {
+            RedOp::Add => a.wrapping_add(x),
+            RedOp::Mul => a.wrapping_mul(x),
+            RedOp::Sub => a.wrapping_sub(x),
+        }
+    }
+}
+
+#[test]
+fn pipeline_reductions_compute_the_oracle_value() {
+    if !backend_available() {
+        return;
+    }
+    for seed in 0..150u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x8EBC_6AF0_9C88_C6E1).wrapping_add(17));
+        // Source: an array of 3..8 elements (0..9, i64 default), then 0..2 map/where stages, then a
+        // reduction terminal. The oracle folds the *same* elements through the *same* stages in Rust.
+        let n = 3 + rng.below(6);
+        let elems: Vec<i64> = (0..n).map(|_| rng.below(10) as i64).collect();
+        let elems_src: Vec<String> = elems.iter().map(|v| v.to_string()).collect();
+        let mut pipeline = format!("[{}]", elems_src.join(", "));
+        let mut helpers = String::new();
+        let mut hid = 0usize;
+        let mut v = elems.clone();
+        for _ in 0..rng.below(3) {
+            if rng.below(2) == 0 {
+                let op = MapOp::pick(&mut rng);
+                let name = format!("mf{hid}");
+                hid += 1;
+                helpers.push_str(&format!("fn {name}(x: i64) -> i64 = {}\n", op.src()));
+                pipeline.push_str(&format!(".map({name})"));
+                v = v.iter().map(|&x| op.eval(x)).collect();
+            } else {
+                let p = Pred::pick(&mut rng);
+                let name = format!("wf{hid}");
+                hid += 1;
+                helpers.push_str(&format!("fn {name}(x: i64) -> bool = {}\n", p.src()));
+                pipeline.push_str(&format!(".where({name})"));
+                v.retain(|&x| p.eval(x));
+            }
+        }
+        // Terminal reduction. `min`/`max` use the branchless seed (i64::MAX / i64::MIN), so an empty
+        // selection returns the seed exactly as the compiler's identity-select does.
+        let (src, expected) = match rng.below(7) {
+            0 => {
+                let oracle = v.iter().fold(0i64, |a, &x| a.wrapping_add(x));
+                (format!("fn main() -> i32 {{\n  return {pipeline}.sum() as i32\n}}\n{helpers}"), oracle as i128)
+            }
+            1 => {
+                let oracle = v.len() as i128;
+                (format!("fn main() -> i32 {{\n  return {pipeline}.count() as i32\n}}\n{helpers}"), oracle)
+            }
+            2 => {
+                let oracle = v.iter().fold(i64::MAX, |a, &x| a.min(x));
+                (format!("fn main() -> i32 {{\n  return {pipeline}.min() as i32\n}}\n{helpers}"), oracle as i128)
+            }
+            3 => {
+                let oracle = v.iter().fold(i64::MIN, |a, &x| a.max(x));
+                (format!("fn main() -> i32 {{\n  return {pipeline}.max() as i32\n}}\n{helpers}"), oracle as i128)
+            }
+            4 => {
+                let p = Pred::pick(&mut rng);
+                let name = format!("af{hid}");
+                helpers.push_str(&format!("fn {name}(x: i64) -> bool = {}\n", p.src()));
+                let oracle = v.iter().any(|&x| p.eval(x));
+                let body = format!("fn main() -> i32 {{\n  b := {pipeline}.any({name})\n  return if b {{ 1 }} else {{ 0 }}\n}}\n{helpers}");
+                (body, if oracle { 1 } else { 0 })
+            }
+            5 => {
+                let p = Pred::pick(&mut rng);
+                let name = format!("lf{hid}");
+                helpers.push_str(&format!("fn {name}(x: i64) -> bool = {}\n", p.src()));
+                let oracle = v.iter().all(|&x| p.eval(x));
+                let body = format!("fn main() -> i32 {{\n  b := {pipeline}.all({name})\n  return if b {{ 1 }} else {{ 0 }}\n}}\n{helpers}");
+                (body, if oracle { 1 } else { 0 })
+            }
+            _ => {
+                let op = RedOp::pick(&mut rng);
+                let init = rng.below(10) as i64;
+                let name = format!("rf{hid}");
+                helpers.push_str(&format!("fn {name}(a: i64, x: i64) -> i64 = {}\n", op.src()));
+                let oracle = v.iter().fold(init, |a, &x| op.eval(a, x));
+                (format!("fn main() -> i32 {{\n  return {pipeline}.reduce({init}, {name}) as i32\n}}\n{helpers}"), oracle as i128)
+            }
+        };
+        // For the integer terminals `expected` is the i128 oracle → wrap to i32; for the bool terminals
+        // it is already 0/1 (an exit code that survives the low-byte truncation unchanged).
+        let final_val = wrap(expected, ITy::I32);
+        let want = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
+        let out = build_and_run(&format!("diffp-{seed}"), &src);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, want,
+            "miscompile on seed {seed}: expected {want} (oracle {expected}), got {code}\n--- program ---\n{src}"
+        );
+    }
+}
+
+// --- vecN elementwise-arithmetic variant: a chain of lane-wise `+ - * / %` over `vecN<T>` operands,
+// observed by a constant-lane read or `.sum()`. The oracle is a lane-wise wrap fold. Every divisor
+// operand is a fresh vector with lanes in 1..9, so no lane is zero (that abort semantics is covered by
+// `vec_simd.rs`) and — since dividends stay small and divisors are positive — the signed `INT_MIN/-1`
+// case never arises in the generated value range. ---
+
+const VEC_TYPES: [ITy; 6] = [ITy::I16, ITy::I32, ITy::I64, ITy::U16, ITy::U32, ITy::U64];
+
+/// Declare a fresh `vecN<T>` literal with `w` lanes each drawn from `lo..=hi`, appended to `body`.
+/// Returns its name and the per-lane oracle values (normalized into `t`).
+fn vec_leaf(rng: &mut Rng, body: &mut String, nid: &mut usize, t: ITy, w: usize, lo: i128, hi: i128) -> (String, Vec<i128>) {
+    let lanes: Vec<i128> =
+        (0..w).map(|_| wrap(lo + rng.below((hi - lo + 1) as usize) as i128, t)).collect();
+    let name = format!("v{}", *nid);
+    *nid += 1;
+    let elems: Vec<String> = lanes.iter().map(|v| v.to_string()).collect();
+    body.push_str(&format!("  {name}: vec{w}<{}> := [{}]\n", t.name(), elems.join(", ")));
+    (name, lanes)
+}
+
+#[test]
+fn vector_lane_arithmetic_computes_the_oracle_value() {
+    if !backend_available() {
+        return;
+    }
+    for seed in 0..150u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).wrapping_add(19));
+        let t = VEC_TYPES[rng.below(VEC_TYPES.len())];
+        let w = [2usize, 4, 8][rng.below(3)];
+        let mut body = String::new();
+        let mut nid = 0usize;
+        // Start with two leaf operands (lanes 0..9), then 1..3 lane-wise ops. A `/`/`%` right operand
+        // is always a fresh 1..9 divisor leaf (never a computed value), guaranteeing non-zero lanes.
+        let mut pool: Vec<(String, Vec<i128>)> = Vec::new();
+        pool.push(vec_leaf(&mut rng, &mut body, &mut nid, t, w, 0, 9));
+        pool.push(vec_leaf(&mut rng, &mut body, &mut nid, t, w, 0, 9));
+        let mut last = pool[pool.len() - 1].clone();
+        for _ in 0..(1 + rng.below(3)) {
+            let opc = rng.below(5);
+            let (ln, ll) = pool[rng.below(pool.len())].clone();
+            let (rn, rl) = if opc >= 3 {
+                vec_leaf(&mut rng, &mut body, &mut nid, t, w, 1, 9)
+            } else {
+                pool[rng.below(pool.len())].clone()
+            };
+            let op = ["+", "-", "*", "/", "%"][opc];
+            let lanes: Vec<i128> = (0..w)
+                .map(|i| {
+                    let (a, b) = (ll[i], rl[i]);
+                    let val = match opc {
+                        0 => a + b,
+                        1 => a - b,
+                        2 => a * b,
+                        3 => a / b, // b in 1..9 → non-zero; dividends small → no INT_MIN/-1
+                        _ => a % b,
+                    };
+                    wrap(val, t)
+                })
+                .collect();
+            let name = format!("r{}", nid);
+            nid += 1;
+            body.push_str(&format!("  {name} := {ln} {op} {rn}\n"));
+            pool.push((name.clone(), lanes.clone()));
+            last = (name, lanes);
+        }
+        // Observe either one lane (extractelement) or the horizontal `.sum()` (a lane-wise wrap fold).
+        let oracle = if rng.below(2) == 0 {
+            let i = rng.below(w);
+            body.push_str(&format!("  return {}[{i}] as i32\n", last.0));
+            last.1[i]
+        } else {
+            body.push_str(&format!("  return {}.sum() as i32\n", last.0));
+            last.1.iter().fold(0i128, |a, &x| wrap(a + x, t))
+        };
+        let src = format!("fn main() -> i32 {{\n{body}}}\n");
+        let final_val = wrap(oracle, ITy::I32);
+        let want = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
+        let out = build_and_run(&format!("diffv-{seed}"), &src);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, want,
+            "miscompile on seed {seed}: expected {want} (oracle {oracle}), got {code}\n--- program ---\n{src}"
+        );
+    }
+}
+
 #[test]
 fn generated_programs_compute_the_oracle_value() {
     if !backend_available() {
