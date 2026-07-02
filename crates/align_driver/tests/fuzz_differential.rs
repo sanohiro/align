@@ -103,8 +103,9 @@ fn generated_programs_compute_the_oracle_value() {
     for seed in 0..200u64 {
         let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(11));
         let (expr, oracle) = gen_expr(&mut rng, 4);
-        // `main` returns the value as `i32`; the process exit code is its low byte (unsigned).
-        let expected = (oracle as i32 as u8) as i32;
+        // `main` returns the value as `i32`. Unix truncates the process exit status to its low byte
+        // (unsigned); Windows preserves the full 32-bit value.
+        let expected = if cfg!(windows) { oracle as i32 } else { (oracle as i32 as u8) as i32 };
         let src = format!("fn main() -> i32 {{\n  r := {expr}\n  return r as i32\n}}\n");
         let out = build_and_run(&format!("diff-{seed}"), &src);
         let code = out.status.code().unwrap_or(-1);
