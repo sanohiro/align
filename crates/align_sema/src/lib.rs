@@ -5408,7 +5408,13 @@ impl<'a, 't> Checker<'a, 't> {
                 l = self.check_expr(lhs, expected);
                 r = self.check_expr(rhs, Some(l.ty));
                 let t = self.unify(l.ty, r.ty, span);
-                if let Ty::Param(_) = t {
+                if matches!(t, Ty::Vec(..)) {
+                    // Vectors carry only elementwise `+` `-` `*` `/` `%` (and comparisons → `mask`), not
+                    // the bitwise/shift family. Reject explicitly here — not by relying on `is_int_like()`
+                    // happening to be false for `Ty::Vec` — so the domain restriction is intentional and
+                    // can't silently regress into a codegen `unreachable!` (self-review Gate 3 / #235).
+                    self.diags.error("vectors do not support bitwise or shift operators (only `+` `-` `*` `/` `%` and comparisons)".to_string(), span);
+                } else if let Ty::Param(_) = t {
                     self.diags.error("bitwise and shift operators need a concrete integer (not a generic type parameter)".to_string(), span);
                 } else if !t.is_int_like() && t != Ty::Error {
                     self.diags.error("bitwise and shift operators expect integers".to_string(), span);

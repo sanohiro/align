@@ -74,6 +74,14 @@ pub fn check_errs(name: &str, src: &str) -> bool {
     check(&mut sm, name, src).diags.has_errors()
 }
 
+/// The rendered diagnostics from checking `src` (for negative tests that assert the *message*, not
+/// just that some error occurred).
+pub fn check_diagnostics(name: &str, src: &str) -> String {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, name, src);
+    align_driver::format_diagnostics(&sm, &checked.diags)
+}
+
 /// A temp directory written with the given `(filename, source)` files, removed on scope exit.
 /// Used by the multi-file (module-system) tests: the driver resolves `import`s from disk relative
 /// to the entry file, so the modules must be real files in one directory.

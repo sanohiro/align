@@ -588,6 +588,31 @@ fn remainder_on_vectors_is_accepted() {
 }
 
 #[test]
+fn bitwise_and_shift_on_vectors_is_rejected() {
+    // Vectors carry only elementwise `+ - * / %` and comparisons — the bitwise/shift family
+    // (`& | ^ << >>`) is an explicit sema error (a clear vec-specific diagnostic, not a codegen
+    // crash and not the generic "expect integers" message). Guards self-review Gate 3 / #235.
+    for op in ["&", "|", "^", "<<", ">>"] {
+        let src = format!(
+            concat!(
+                "fn main() -> i32 {{\n",
+                "  a: vec4<i32> := [1, 2, 3, 4]\n",
+                "  b: vec4<i32> := [5, 6, 7, 8]\n",
+                "  c := a {op} b\n",
+                "  return c[0]\n",
+                "}}\n",
+            ),
+            op = op,
+        );
+        let diags = check_diagnostics("vec-bitop", &src);
+        assert!(
+            diags.contains("vectors do not support bitwise or shift operators"),
+            "op `{op}` should give the vec-specific rejection, got:\n{diags}"
+        );
+    }
+}
+
+#[test]
 fn element_wise_float_vector_math() {
     if !backend_available() {
         return;
