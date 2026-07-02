@@ -3493,8 +3493,15 @@ pub extern "C" fn align_rt_arena_begin() -> *mut Arena {
 /// Bump-allocate `size` bytes (with `align`) from the arena.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, align: i64) -> *mut u8 {
+    // Validate `size`/`align` fit a `usize` before bump-allocating, matching every other runtime
+    // FFI boundary: a raw `as usize` cast would turn a negative input into a huge value, so
+    // `off + need` (`Arena::alloc`) could wrap in a release build. Not reachable today (codegen
+    // always passes a sound value), but guard it rather than trust the caller.
+    let (Ok(size), Ok(align)) = (usize::try_from(size), usize::try_from(align)) else {
+        return core::ptr::null_mut();
+    };
     let arena = unsafe { &mut *arena };
-    arena.alloc(size as usize, align as usize)
+    arena.alloc(size, align)
 }
 
 /// Bulk-release every allocation, keeping the arena for reuse.
@@ -4476,6 +4483,26 @@ mod tests {
             unsafe { *p = 1 };
         }
         assert_eq!(unsafe { *first }, 42, "earlier allocation must remain valid");
+        unsafe { align_rt_arena_end(a) };
+    }
+
+    #[test]
+    fn arena_alloc_rejects_negative_or_oversized_size_and_align() {
+        // A negative `size`/`align` (or one that overflows `usize` on a hypothetical narrower
+        // target) must not wrap into a huge `usize` via a raw `as` cast — it must return null
+        // instead, like every other runtime FFI boundary that validates its size arguments.
+        let a = align_rt_arena_begin();
+        assert!(unsafe { align_rt_arena_alloc(a, -1, 8) }.is_null(), "negative size must yield null");
+        assert!(unsafe { align_rt_arena_alloc(a, 8, -1) }.is_null(), "negative align must yield null");
+        assert!(
+            unsafe { align_rt_arena_alloc(a, i64::MIN, i64::MIN) }.is_null(),
+            "i64::MIN size/align must yield null, not panic or wrap"
+        );
+        // A normal allocation still works afterwards (the guard doesn't corrupt arena state).
+        let p = unsafe { align_rt_arena_alloc(a, 8, 8) } as *mut i64;
+        assert!(!p.is_null());
+        unsafe { *p = 7 };
+        assert_eq!(unsafe { *p }, 7);
         unsafe { align_rt_arena_end(a) };
     }
 

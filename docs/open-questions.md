@@ -1685,9 +1685,10 @@ Same-day, separate from the external soundness audit above (no overlap): 4 paral
 (frontend soundness / MIR+LLVM codegen / runtime+library / language-design evaluation), plus the
 design-evaluation question put to Opus and Codex **independently and cross-checked** (both converged
 on the same conclusions, folded into the Settled addendum above and the Future entries below).
-**Status: open** — none of the bugs below are fixed yet; recorded here so they aren't lost. Confidence
-follows the same convention as the external audit: **CONFIRMED** = read against the code (or
-reproduced), **PLAUSIBLE** = strong code-reading suspicion, not yet reproduced.
+**Status: open**, except the two items marked **fixed** below (`MoveCheck`'s `AssignField` gap and
+`align_rt_arena_alloc`'s raw cast); the rest are recorded here so they aren't lost. Confidence follows
+the same convention as the external audit: **CONFIRMED** = read against the code (or reproduced),
+**PLAUSIBLE** = strong code-reading suspicion, not yet reproduced.
 
 **Confirmed bugs:**
 - **Division has no zero / `INT_MIN ÷ -1` guard — immediate LLVM UB, not a clean abort.**
@@ -1717,13 +1718,16 @@ reproduced), **PLAUSIBLE** = strong code-reading suspicion, not yet reproduced.
   diagnostic. The existing "expression nests too deeply" guard never fires. Fix: a post-parse AST
   depth/size ceiling (counting binary-loop iterations and postfix-chain length toward the same cap),
   or make the sema walks iterative.
-- **`MoveCheck`'s `Stmt::AssignField` doesn't check `whole_moved(root)`.** `align_sema/src/lib.rs`
-  (~:3141) — writing into a field of an already-moved-out struct (`take(u); u.name =
-  "x".clone()`) is silently accepted, while *reading* a moved struct's field is correctly rejected.
-  `Stmt::AssignIndex` already has the matching `whole_moved(base)` check (~:3145-3151) — this is a
-  one-line fix mirroring it. MIR (~:935-947) drops the old value and stores the new one, but the
-  struct stays flagged moved and is excluded from `drop_locals`, so the freshly-stored value **leaks**
-  (confirmed no double-free under `MALLOC_CHECK_=3` — a leak, not UB, today).
+- **Status: fixed.** **`MoveCheck`'s `Stmt::AssignField` doesn't check `whole_moved(root)`.**
+  `align_sema/src/lib.rs` (~:3141) — writing into a field of an already-moved-out struct (`take(u);
+  u.name = "x".clone()`) is silently accepted, while *reading* a moved struct's field is correctly
+  rejected. `Stmt::AssignIndex` already has the matching `whole_moved(base)` check (~:3145-3151) —
+  this is a one-line fix mirroring it. MIR (~:935-947) drops the old value and stores the new one, but
+  the struct stays flagged moved and is excluded from `drop_locals`, so the freshly-stored value
+  **leaks** (confirmed no double-free under `MALLOC_CHECK_=3` — a leak, not UB, today). Fixed by adding
+  the same `whole_moved(root)` check to `Stmt::AssignField` (rejecting the write at compile time, so
+  the MIR leak path is unreachable for valid programs); see `field_assign_after_whole_move_rejected` /
+  `field_assign_without_move_still_checks` in `align_sema/src/lib.rs` tests.
 - **PLAUSIBLE / latent: `chunks` over a frame-local scalar array infers `Region::Static`.**
   `align_sema/src/lib.rs` (~:2529) — `region_of(Local)` falls back to `Static` for an unregistered
   local; `tracks_region` returns `false` for scalar arrays (~:2376), so a local scalar array is never
@@ -1734,13 +1738,15 @@ reproduced), **PLAUSIBLE** = strong code-reading suspicion, not yet reproduced.
   `cs := arena { xs := [1,2,3,4]; xs.chunks(2) }` already type-checks with no escape error, and would
   be a real use-after-free the moment that scalar-only restriction lifts. Fix before lifting it: give
   frame-local scalar arrays a `Frame` region, or extend `local_backed_slice` to cover `DynSliceArray`.
-- **`align_rt_arena_alloc` uses a raw `as usize` cast, unlike every other FFI entry point.**
-  `align_runtime/src/lib.rs` (~:3495-3498) — every other runtime FFI boundary normalizes an incoming
-  size via `usize::try_from(...)`; this one does `size as usize` directly, so a negative input becomes
-  a huge `usize` and `off + need` (~:3471) could wrap in a release build. Not reachable today (codegen
-  always passes a sound value) — but it is exactly the `i64 as usize` bug class this repo's own past
-  audits keep flagging (`align-self-review` Gate 1). Fix: `usize::try_from(...).ok()`, matching the
-  shape of `align_rt_alloc`.
+- **Status: fixed.** **`align_rt_arena_alloc` uses a raw `as usize` cast, unlike every other FFI entry
+  point.** `align_runtime/src/lib.rs` (~:3495-3498) — every other runtime FFI boundary normalizes an
+  incoming size via `usize::try_from(...)`; this one does `size as usize` directly, so a negative input
+  becomes a huge `usize` and `off + need` (~:3471) could wrap in a release build. Not reachable today
+  (codegen always passes a sound value) — but it is exactly the `i64 as usize` bug class this repo's
+  own past audits keep flagging (`align-self-review` Gate 1). Fixed via
+  `usize::try_from(...)` on both `size` and `align`, returning null on failure (matching the
+  null-on-invalid-input convention of `align_rt_alloc`/`align_rt_chunks`); see
+  `arena_alloc_rejects_negative_or_oversized_size_and_align` in `align_runtime/src/lib.rs` tests.
 
 **Perf backlog (non-blocking; recorded so none of it is re-discovered from scratch):**
 - **Top lever: no-alias information never reaches LLVM**, even though the language guarantees it (see
