@@ -1729,16 +1729,28 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   `int_in_range_covers_widths_and_signs`, `json_decode_range_checks_integer_fields`,
   `json_decode_array_range_checks_integers` (runtime); `json_decode_rejects_out_of_range_integers`
   (driver, `crates/align_driver/tests/m5.rs`).
-- **Parser depth guard doesn't cover iteratively-parsed chains — sema stack-overflows (ICE).**
-  `align_parser/src/lib.rs` (~:816-826) caps `MAX_EXPR_DEPTH=256`, but that budget is spent only by
-  *recursive* parsing; the left-associative binary-operator loop and the postfix-chain loop build
-  arbitrarily deep ASTs **iteratively**, consuming no depth budget. A ~1000-term chain
+- **Status: fixed.** **Parser depth guard doesn't cover iteratively-parsed chains — sema
+  stack-overflows (ICE).** `align_parser/src/lib.rs` capped `MAX_EXPR_DEPTH=256`, but that budget is
+  spent only by *recursive* parsing; the left-associative binary-operator loop and the postfix-chain
+  loop build arbitrarily deep ASTs **iteratively**, consuming no depth budget. A ~1000-term chain
   (`x := 1+1+1+...`, ~2KB source — a plausible size for machine-generated code, this project's target
-  authorship mode) parses cleanly and then blows the native stack in a downstream `align_sema`
-  recursive walk (`check_binary`/`MoveCheck`/`EscapeCheck`/`EffectScan`) — a process abort, not a
-  diagnostic. The existing "expression nests too deeply" guard never fires. Fix: a post-parse AST
-  depth/size ceiling (counting binary-loop iterations and postfix-chain length toward the same cap),
-  or make the sema walks iterative.
+  authorship mode) parsed cleanly and then blew the native stack in a downstream recursive walk
+  (`align_sema` `check_binary`/`MoveCheck`/`EscapeCheck`/`EffectScan`, then MIR lowering — the
+  heaviest) — a process abort, not a diagnostic. **Fixed** with a post-parse pass, `cap_expr_depths`
+  (`align_parser/src/lib.rs`): after `parse_file` it walks the finished AST and truncates any
+  expression nested deeper than the ceiling to a `Unit` placeholder, emitting the same "expression
+  nests too deeply" diagnostic the recursion guards use (one clean error per over-deep chain — a
+  leaf that lands one past the ceiling is left alone). The walk recurses at most `MAX_EXPR_DEPTH`
+  levels (it stops at a truncation point), so it is itself stack-safe. `MAX_EXPR_DEPTH` was lowered
+  256 → **128**, chosen from measured debug-build stack limits: the heaviest downstream pass, MIR
+  lowering, overflows at depth ~275 on the 8 MB main thread (where full builds run) and sema
+  overflows ~235 on a 2 MB worker/test thread — 128 leaves ~2x headroom on both. (Note: the
+  recursion guard's old 256 was itself unsafe on a 2 MB stack; 128 fixes that too.) Tests:
+  `crates/align_driver/tests/expr_depth.rs` (over-limit `+`/postfix chains rejected cleanly not by
+  ICE, deep parens still guarded, within-limit expressions still accepted + compiled/run).
+  **Residual (recorded, not blocking):** MIR-lowering/codegen frames are very stack-hungry in debug,
+  so the deeper long-term fix — as `rustc`/`clang` do — is to run the compile pipeline on a
+  dedicated large-stack thread, which would let the ceiling be far more generous; deferred.
 - **Status: fixed.** **`MoveCheck`'s `Stmt::AssignField` doesn't check `whole_moved(root)`.**
   `align_sema/src/lib.rs` (~:3141) — writing into a field of an already-moved-out struct (`take(u);
   u.name = "x".clone()`) is silently accepted, while *reading* a moved struct's field is correctly

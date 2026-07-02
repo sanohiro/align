@@ -64,22 +64,197 @@ fn split_template(content: &str) -> Vec<RawPart> {
 }
 
 pub fn parse_file(tokens: Vec<Token>, diags: &mut Diagnostics) -> File {
-    let mut p = Parser {
-        tokens,
-        pos: 0,
-        diags,
-        no_struct_literal: false,
-        depth: 0,
+    let mut file = {
+        let mut p = Parser {
+            tokens,
+            pos: 0,
+            diags,
+            no_struct_literal: false,
+            depth: 0,
+        };
+        p.parse_file()
     };
-    p.parse_file()
+    // Guard 2 (see MAX_EXPR_DEPTH): the recursion guards above only bound *recursively* parsed
+    // nesting; iteratively-built chains (`1+1+1+…`, `a.f().g()…`) can still be arbitrarily deep.
+    // Re-check the finished tree and truncate any over-deep expression so downstream recursive
+    // passes (sema/MIR/codegen) can't overflow the stack.
+    cap_expr_depths(&mut file, diags);
+    file
 }
 
-/// Recursion-depth ceiling for expression parsing. Deeply nested input (`((((…))))`, a long unary
-/// chain `----…`) would otherwise overflow the native stack and abort the process; past this we
-/// emit one diagnostic and stop. Set well above any realistic hand-written or generated nesting
-/// (hundreds of levels), yet low enough to stay safe on a small (2 MB) worker/test stack — each
-/// nesting level costs several parser frames.
-const MAX_EXPR_DEPTH: u32 = 256;
+/// Walk the finished AST and truncate any expression nested deeper than [`MAX_EXPR_DEPTH`],
+/// replacing the offending sub-tree with a `Unit` placeholder and emitting the same
+/// "expression nests too deeply" diagnostic the parser's recursion guards use. This is the second
+/// half of the depth ceiling: it catches trees the left-associative binary loop and the postfix
+/// loop grow *iteratively* (which consume no parser recursion budget). The walk itself recurses at
+/// most `MAX_EXPR_DEPTH` levels — it stops descending at a truncation point — so it is stack-safe
+/// on any input.
+fn cap_expr_depths(file: &mut File, diags: &mut Diagnostics) {
+    for item in &mut file.items {
+        match item {
+            Item::Fn(f) => match &mut f.body {
+                FnBody::Block(b) => cap_block_depth(b, 1, diags),
+                FnBody::Expr(e) => cap_expr_depth(e, 1, diags),
+            },
+            Item::Const(c) => cap_expr_depth(&mut c.value, 1, diags),
+            // Structs / enums / extern blocks carry no expression bodies.
+            Item::Struct(_) | Item::Enum(_) | Item::Extern(_) => {}
+        }
+    }
+}
+
+/// An expression node with no sub-expression children — descending never recurses through it.
+fn is_leaf_expr(k: &ExprKind) -> bool {
+    matches!(
+        k,
+        ExprKind::Unit
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Char(_)
+            | ExprKind::Str(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Path(_)
+            | ExprKind::FieldShorthand(_)
+    )
+}
+
+/// Truncate `e` (and its descendants) to at most `MAX_EXPR_DEPTH` levels, `depth` being `e`'s own
+/// nesting level (root = 1). Returns after truncating without descending, so recursion is bounded.
+fn cap_expr_depth(e: &mut Expr, depth: u32, diags: &mut Diagnostics) {
+    if depth > MAX_EXPR_DEPTH {
+        // A leaf that happens to land one past the ceiling is harmless — downstream visits it in a
+        // single frame with no recursion below it — so it needs neither truncation nor a
+        // diagnostic. Report + cut only the compound that actually carries the over-deep sub-tree,
+        // which yields exactly one clean diagnostic per over-deep chain (not one per sibling leaf).
+        if !is_leaf_expr(&e.kind) {
+            diags.error("expression nests too deeply", e.span);
+            e.kind = ExprKind::Unit;
+        }
+        return;
+    }
+    let d = depth + 1;
+    match &mut e.kind {
+        ExprKind::Unit
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Char(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Path(_)
+        | ExprKind::FieldShorthand(_) => {}
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Try(expr)
+        | ExprKind::FieldAccess { recv: expr, .. }
+        | ExprKind::TupleIndex { recv: expr, .. } => cap_expr_depth(expr, d, diags),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            cap_expr_depth(lhs, d, diags);
+            cap_expr_depth(rhs, d, diags);
+        }
+        ExprKind::Call { callee, args } => {
+            cap_expr_depth(callee, d, diags);
+            for a in args {
+                cap_expr_depth(a, d, diags);
+            }
+        }
+        ExprKind::If { cond, then, els } => {
+            cap_expr_depth(cond, d, diags);
+            cap_block_depth(then, d, diags);
+            if let Some(e) = els {
+                cap_expr_depth(e, d, diags);
+            }
+        }
+        ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
+            cap_block_depth(b, d, diags)
+        }
+        ExprKind::Lambda { body, .. } => cap_block_depth(body, d, diags),
+        ExprKind::StructLit { fields, .. } => {
+            for f in fields {
+                cap_expr_depth(&mut f.value, d, diags);
+            }
+        }
+        ExprKind::ElseUnwrap { opt, fallback } => {
+            cap_expr_depth(opt, d, diags);
+            cap_expr_depth(fallback, d, diags);
+        }
+        ExprKind::ArrayLit(es) | ExprKind::Tuple(es) => {
+            for x in es {
+                cap_expr_depth(x, d, diags);
+            }
+        }
+        ExprKind::Index { recv, index } => {
+            cap_expr_depth(recv, d, diags);
+            cap_expr_depth(index, d, diags);
+        }
+        ExprKind::SliceRange { recv, start, end } => {
+            cap_expr_depth(recv, d, diags);
+            if let Some(s) = start {
+                cap_expr_depth(s, d, diags);
+            }
+            if let Some(en) = end {
+                cap_expr_depth(en, d, diags);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            cap_expr_depth(scrutinee, d, diags);
+            for a in arms {
+                cap_expr_depth(&mut a.body, d, diags);
+            }
+        }
+        ExprKind::Template(parts) => {
+            for p in parts {
+                if let TemplatePart::Hole(h) = p {
+                    cap_expr_depth(h, d, diags);
+                }
+            }
+        }
+    }
+}
+
+/// Truncate the expressions inside a block to at most `MAX_EXPR_DEPTH` levels. A block deepens the
+/// nesting by one (downstream recurses block → statement → expression), so its statements/tail are
+/// checked at `depth + 1`. When the block itself is already at the ceiling, drop its contents.
+fn cap_block_depth(b: &mut Block, depth: u32, diags: &mut Diagnostics) {
+    if depth > MAX_EXPR_DEPTH {
+        diags.error("expression nests too deeply", b.span);
+        b.stmts.clear();
+        b.tail = None;
+        return;
+    }
+    let d = depth + 1;
+    for s in &mut b.stmts {
+        match s {
+            Stmt::Let { init, .. } => cap_expr_depth(init, d, diags),
+            Stmt::LetTuple { init, .. } => cap_expr_depth(init, d, diags),
+            Stmt::Assign { place, value } => {
+                cap_expr_depth(place, d, diags);
+                cap_expr_depth(value, d, diags);
+            }
+            Stmt::Return(Some(e)) => cap_expr_depth(e, d, diags),
+            Stmt::Return(None) => {}
+            Stmt::Expr(e) => cap_expr_depth(e, d, diags),
+        }
+    }
+    if let Some(t) = &mut b.tail {
+        cap_expr_depth(t, d, diags);
+    }
+}
+
+/// Maximum AST nesting depth of any one expression handed downstream. It bounds BOTH:
+///   1. parser recursion (`parse_expr`/`parse_prefix`) — deeply *recursive* input (`((((…))))`, a
+///      unary chain `----…`) would overflow the parser's own native stack mid-parse; the guards
+///      below stop at this ceiling and emit one diagnostic; and
+///   2. the depth of the *built* tree — the left-associative binary loop and the postfix-method loop
+///      grow the AST **iteratively** (no parser recursion, so they slip past guard 1), yet every
+///      downstream pass walks that tree recursively. [`cap_expr_depths`] re-checks the finished AST
+///      against this same ceiling and truncates anything deeper, so no over-deep tree ever reaches
+///      sema / MIR / codegen.
+/// Chosen from measured stack limits (debug, unoptimized): the heaviest downstream pass, MIR
+/// lowering, overflows at depth ~275 on the 8 MB main thread (where full builds run) and sema
+/// overflows at ~235 on a 2 MB worker/test thread (where the fuzz/test `parse→sema` path runs). 128
+/// leaves ~2x headroom on both while still admitting reasonably deep machine-generated code (a
+/// 128-term expression).
+const MAX_EXPR_DEPTH: u32 = 128;
 
 struct Parser<'a> {
     tokens: Vec<Token>,
