@@ -2505,10 +2505,18 @@ individual review entries. None block anything; pick up when the lint suite is a
   defaults to i64/f64 (Settled, "Numeric literal typing"), which is fine for a scalar but doubles
   memory bandwidth for a big data-oriented buffer that didn't need 64 bits. Flag it where it's most
   likely to matter — array/soa element types and pipeline literals — not every scalar `x := 1`.
+  DONE (2026-07-02, lint batch 1): a warning on a literal array of >= 64 elements whose element type
+  is left to the i64/f64 default (`check_array_lit`; threshold `DEFAULT_ELEM_LITERAL_ARRAY_LEN`).
+  Silent below threshold, when a context/annotation constrains the element, or when the element type
+  comes from a concrete value. `tests/lint_default_elem_array.rs`.
 - Lossy/saturating `as` diagnostic: `as` is the one conversion operator and deliberately covers
   lossless, truncating, and saturating conversions alike (Settled, "Numeric conversion — as"); a lint
   distinguishing narrowing / float→int / char<->int casts (silently lossy or saturating) from
   lossless ones gives back the visibility without adding a second conversion mechanism.
+  DONE (2026-07-02, lint batch 1): a warning on a narrowing int->int, float->int (saturating),
+  wide-int->float (past the mantissa), narrowing float->float, or char narrowing `as` (`cast_loss`
+  in `check_cast`). Same-width / widening / same-width sign-change and unconstrained-literal sources
+  stay silent. `tests/lint_lossy_cast.rs`.
 - Prefer-pipeline-over-vecN for bulk data: nudge bulk/array-shaped code from a hand-tuned fixed-width
   vecN<T> kernel toward the width-agnostic pipeline (map/where/reduce) when the data is a plain bulk
   scan — vecN<T> is the escape hatch for genuinely hand-tuned kernels, not the default, and pipeline

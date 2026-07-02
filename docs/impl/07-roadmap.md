@@ -891,7 +891,22 @@ predication-ready, the forward-compatible shape for scalable-ISA tails (`05 §5`
     (`mono_args` empty — a monomorph would duplicate it; a generic template's params are the opaque
     `Ty::Param`, never a struct). Struct byte size is a faithful natural-alignment layout computed in
     sema (`struct_size_align`, matching LLVM's default non-packed layout). (`tests/lint_huge_struct_copy.rs`,
-    `examples/huge_struct_copy.align`.) The remaining lints are not started.
+    `examples/huge_struct_copy.align`.) The remaining lints from the enumerated set are not started.
+  - **lossy conversion — DONE (lint batch 1).** A narrowing int→int, saturating float→int,
+    wide-int→float (past the target float's mantissa: f32 = 24, f64 = 53), narrowing float→float, or
+    `char`-narrowing `as` is a **warning** ("… — this is defined behavior, not an error"): the
+    conversion is zero-UB and never blocked (Settled, "Numeric conversion — as"), but the silent loss
+    is surfaced. Lossless conversions (widening, same-width, a same-width sign change like `u8 as i8`
+    that keeps every bit) and an unconstrained-literal source (`1 as i8`, still an inference variable —
+    an explicit annotation, not a value being narrowed) stay silent. `cast_loss` in `check_cast`.
+    (`tests/lint_lossy_cast.rs`.)
+  - **wasteful default element type — DONE (lint batch 1).** A literal array of at least
+    `DEFAULT_ELEM_LITERAL_ARRAY_LEN` (= 64) elements whose element type is left to the i64/f64 default
+    (Settled, "Numeric literal typing") is a **warning** suggesting a narrower annotation — the default
+    is correct but spends 8 bytes/element (an 8× cost vs an `i8` element at a cache-line scale). Silent
+    below the threshold, when a context/annotation constrains the element type (a typed pipeline stage),
+    or when the element type comes from a concrete value rather than a defaulted literal. Emitted in
+    `check_array_lit`. (`tests/lint_default_elem_array.rs`.)
 - `unsafe` blocks and `raw.*`. — **first slice DONE.** `unsafe {}` is a block expression (a plain
   marker block — no region, no runtime effect, strictly simpler than `arena`); the only new mechanism
   is an `unsafe_depth` counter that gates the `raw.*` ops. Shipped: `unsafe {}` + `raw.alloc(size)`
