@@ -1612,6 +1612,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ep = self.elem_ptr(*slot, idx)?;
                     self.drop_struct_fields(ep, *sid)?;
                 }
+                Stmt::DropElemField(slot, idx, field) => {
+                    // Free one owned `string` field of element `idx` before it is overwritten (4b).
+                    let Ty::StructArray(sid, _) = self.f.slots[*slot as usize] else {
+                        unreachable!("DropElemField on a non-struct-array slot");
+                    };
+                    let ep = self.elem_ptr(*slot, idx)?;
+                    let st = self.struct_types[sid as usize];
+                    let fp = self.builder.build_struct_gep(st, ep, *field, "dropelemfld").map_err(|e| self.err(e))?;
+                    let agg = self.builder.build_load(slice_struct_type(self.ctx), fp, "dropelemfldv").map_err(|e| self.err(e))?.into_struct_value();
+                    let ptr = self.builder.build_extract_value(agg, 0, "dropelemfldptr").map_err(|e| self.err(e))?;
+                    self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
+                }
                 Stmt::StoreElemField(slot, idx, field, op) => {
                     let ep = self.elem_field_ptr(*slot, idx, *field)?;
                     let val = self.operand(op);
