@@ -2452,15 +2452,20 @@ folded bodily into that backlog: a new scalar type touches the frontend/type-che
 variant), outside that backlog's stated "pure backend lowering" scope.
 Provenance: surfaced by an external idea review (2026-07-02); verified.
 
-### SIMD string search for `str` ops (external idea review, 2026-07-02)
-`str.contains`/`find`/`rfind`/`starts_with`/`ends_with` are scalar today. The JSON structural index
-already ships AVX2/NEON/scalar triple paths validated by a differential oracle
-(`json_decode_index_simd_matches_scalar_oracle` and the general differential-fuzz suite, #286–#290
-above) — apply the same pattern (memchr-style first-byte scan + verify) to the generic `str` search
-ops, with the same arch-parity rule as the existing SIMD entries (x86 + NEON + a scalar oracle test).
-Converges with the already-recorded `core.string` byte-first-APIs plan above (P0 memchr/memmem-backed,
-P1 dispatch-table + AVX2/NEON); this item's specific contribution is the differential-oracle test
-discipline, not a new API shape.
+### SIMD string search for `str` ops (external idea review, 2026-07-02) — Status: done (2026-07-02)
+`str.contains`/`find`/`rfind` are `memchr::memmem`-backed (since #203/#207), which already ships the
+AVX2 (x86_64) + NEON (aarch64) + scalar-fallback triple path with runtime feature detection — the
+reference form of the memchr-style first-byte-scan + verify this item asked for, satisfying the
+arch-parity rule by delegation. Re-implementing a hand-rolled parallel SIMD substring search was
+rejected as a strictly-worse duplicate mechanism (a second search path, more `unsafe`, no perf gain
+over the shipping ~29× vs naive-scalar throughput) — against "one way / ideal form". `starts_with`/
+`ends_with` stay scalar `==`/`memcmp` (bounded to the needle length; no worthwhile SIMD lever).
+The item's stated specific contribution — the **differential-oracle test discipline** — is now in
+place: `str_search_simd_matches_scalar_oracle` locks whichever SIMD path the host CPU selects against
+an independent scalar oracle across a 64-byte-boundary padding sweep, prefilter decoys, needle lengths
+0/1/large, multibyte UTF-8, overlapping repeats, tail matches, a multi-KB haystack, and a
+deterministic randomized cross-check (the JSON-index `json_decode_index_simd_matches_scalar_oracle`
+discipline). Converges with the `core.string` byte-first-APIs plan above (P0 memchr/memmem-backed).
 Provenance: surfaced by an external idea review (2026-07-02); verified.
 
 ### Relative (offset) pointers inside arenas (external idea review, 2026-07-02)
