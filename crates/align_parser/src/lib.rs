@@ -865,7 +865,8 @@ impl<'a> Parser<'a> {
     fn parse_cast_type(&mut self) -> Option<Type> {
         let path = self.parse_path();
         if path.segments.is_empty() {
-            self.diags.error("expected a type after `as`".to_string(), self.span());
+            // `parse_path` → `parse_ident` already emitted "expected identifier" at this span;
+            // just bail (don't double-report), matching `parse_type`.
             return None;
         }
         let span = path.span;
@@ -1232,9 +1233,12 @@ impl<'a> Parser<'a> {
         self.bump(); // match
         // The scrutinee parses like an `if` condition — a trailing `{` starts the arms, not a
         // struct literal (`match p { … }`, never `match (P { … })`-as-scrutinee without parens).
+        // Restore the flag *before* the `?` so a scrutinee parse error can't leave it stuck on
+        // (which would disable struct literals for the rest of the file → cascading errors).
         let saved = std::mem::replace(&mut self.no_struct_literal, true);
-        let scrutinee = Box::new(self.parse_expr(0)?);
+        let scrutinee = self.parse_expr(0);
         self.no_struct_literal = saved;
+        let scrutinee = Box::new(scrutinee?);
         self.expect(&TokKind::LBrace, "'{'");
         let mut arms = Vec::new();
         loop {
@@ -1300,9 +1304,12 @@ impl<'a> Parser<'a> {
         // The `{` after the condition opens the `if` body, so a bare `Name { … }` in the condition
         // is not a struct literal (it must be parenthesized). Suppress struct-literal recognition
         // at the condition's top level; delimiters inside it lift the restriction.
+        // Restore the flag *before* the `?` so a condition parse error can't leave it stuck on
+        // (which would disable struct literals for the rest of the file → cascading errors).
         let saved = std::mem::replace(&mut self.no_struct_literal, true);
-        let cond = self.parse_expr(0)?;
+        let cond = self.parse_expr(0);
         self.no_struct_literal = saved;
+        let cond = cond?;
         let then = self.parse_block()?;
         let els = if self.eat(&TokKind::Else) {
             if self.at(&TokKind::If) {
@@ -1583,5 +1590,42 @@ mod tests {
         // `if p { ... }` must parse `p` as the condition, not `p { ... }` as a literal.
         let (_f, err) = parse("fn f(p: bool) -> i32 {\n  if p { return 1 }\n  return 0\n}\n");
         assert!(!err);
+    }
+
+    #[test]
+    fn type_annotated_let_at_if_head_is_not_a_struct_literal() {
+        // `if flag { x: i32 := 5 … }` — the body's leading `ident :` used to be misread as a
+        // struct-literal field, breaking the condition. It must parse without error.
+        let (_f, err) = parse("fn f(flag: bool) -> i32 {\n  if flag { x: i32 := 5\n    return x }\n  return 0\n}\n");
+        assert!(!err);
+    }
+
+    #[test]
+    fn struct_literal_in_condition_call_args_still_parses() {
+        // The `no_struct_literal` restriction is lifted inside delimiters: a struct literal passed
+        // as a call argument in a condition is still a struct literal.
+        let (_f, err) = parse("P { a: i32 }\nfn g(p: P) -> bool = true\nfn f() -> i32 {\n  if g(P { a: 1 }) { return 1 }\n  return 0\n}\n");
+        assert!(!err);
+    }
+
+    #[test]
+    fn condition_parse_error_does_not_leak_no_struct_literal_flag() {
+        // Regression (gemini #272): if the condition itself fails to parse, the `no_struct_literal`
+        // flag must still be restored — otherwise every later struct literal in the file is
+        // misparsed. After a broken `if` condition, a subsequent struct literal must still be a
+        // `StructLit` in the AST.
+        let src = "fn bad() -> i32 {\n  if ) { return 1 }\n  return 0\n}\nP { a: i32 }\nfn good() -> i32 {\n  p := P { a: 5 }\n  return p.a\n}\n";
+        let (f, _err) = parse(src); // `bad` reports an error; that's expected.
+        let good = f.items.iter().find_map(|it| match it {
+            Item::Fn(fd) if fd.name.name == "good" => Some(fd),
+            _ => None,
+        }).expect("`good` function should still parse");
+        let FnBody::Block(b) = &good.body else { panic!() };
+        let Stmt::Let { init, .. } = &b.stmts[0] else { panic!("first stmt of `good` should be a let") };
+        assert!(
+            matches!(init.kind, ExprKind::StructLit { .. }),
+            "after a broken condition, `P {{ a: 5 }}` must still parse as a struct literal, got {:?}",
+            init.kind
+        );
     }
 }
