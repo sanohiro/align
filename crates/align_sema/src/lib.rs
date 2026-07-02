@@ -1868,11 +1868,19 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             .locals
             .iter()
             .filter(|l| is_owned_droppable(l.ty, structs) || ty_tuple_is_move(l.ty, tuples))
-            .map(|l| l.id)
             // Drop at function exit unless the value lives in an arena (region `Arena(k)`), which
             // bulk-frees it. A `Static` (heap-owned) *or* `Frame`-region owned local (a Move-struct
             // array, whose owned buffers die at this frame's exit — Slice 4b) is dropped here.
-            .filter(|id| !matches!(region.get(id).copied().unwrap_or(Region::Static), Region::Arena(_)))
+            // Exception: a `chunks` result (`DynSliceArray`) is *always* heap-`malloc`'d (never
+            // arena memory — `align_rt_chunks` uses the general allocator), so it must be dropped
+            // even when its **region** is `Arena(k)`. Its region tracks the *borrowed source* array
+            // (so it can't escape that arena), not where its own header buffer lives — decoupled
+            // here so a chunks bound inside an arena is freed rather than leaked.
+            .filter(|l| {
+                matches!(l.ty, Ty::DynSliceArray(_))
+                    || !matches!(region.get(&l.id).copied().unwrap_or(Region::Static), Region::Arena(_))
+            })
+            .map(|l| l.id)
             .collect();
         f.drop_locals = drops;
     }
@@ -2673,6 +2681,23 @@ impl<'a> EscapeCheck<'a> {
                 // of this set (returnable), matching the slice-parameter convention above.
                 if matches!(init.ty, Ty::Array(..) | Ty::StructArray(..)) {
                     self.local_backed_slice.insert(*local);
+                }
+                // A fixed **scalar** array (`array<i64>` etc.) is not element-region-tracked, so the
+                // `tracks_region` branch above leaves it out of the region map — yet it owns frame
+                // storage, and a region-tracked *view* derived from it borrows that storage. In
+                // particular `chunks` yields an `array<slice<T>>` (`DynSliceArray`, region-tracked)
+                // whose slice headers point into this array. Without a region here, `region_of`
+                // falls back to `Static` for the array `Local`, `chunks` inherits `Static`, and the
+                // single escape rule wrongly lets the chunks result be returned / escape its arena
+                // (a use-after-free of the frame slot). Give the array its storage region — `Frame`,
+                // capped at the arena it is declared in (`Frame.shorter(arena(depth))`) — so a
+                // borrowing producer that inherits `region_of(source)` (today `chunks`; any future
+                // one automatically) cannot outlive the array. A str/struct array is already
+                // region-tracked via the branch above (its element region is more precise), so it is
+                // excluded here to avoid clobbering it.
+                if matches!(init.ty, Ty::Array(..)) && !self.tracks_region(init.ty) {
+                    self.region
+                        .insert(*local, Region::Frame.shorter(Region::arena(depth)));
                 }
             }
             // `base[index] = value` / `base[index].field = value`. The store itself targets the
@@ -11860,5 +11885,68 @@ mod tests {
             "A { s: string }\nfn main() -> i32 {\n  mut p := A { s: \"x\".clone() }\n  p.s = \"y\".clone()\n  return 0\n}\n",
         );
         assert!(!d.has_errors(), "assigning a field of a not-yet-moved struct must check");
+    }
+
+    // `chunks` over a frame-local scalar array yields an `array<slice<T>>` (`DynSliceArray`) whose
+    // slice headers borrow the source array's frame storage. The single escape rule (`region_of` +
+    // `outlives`) must forbid that borrowing result from outliving the source — a frame-local scalar
+    // array is given a `Frame`/arena-depth region (see `EscapeCheck::stmt` `Let`) so the check fires.
+    // (Latent until the "array elements are scalar-only" restriction lifts, but reachable today via
+    // the arena block value / outer-assign paths, which do not require writing the `array<slice<T>>`
+    // type. Was silently accepted before the region was added — a use-after-free of the frame slot.)
+
+    #[test]
+    fn chunks_of_arena_local_cannot_escape_as_block_value() {
+        // (a) `cs := arena { xs := [...]; xs.chunks(2) }` — the chunks result borrows `xs`, declared
+        // inside the arena, so it must not escape as the arena block's value.
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  cs := arena { xs := [1, 2, 3, 4]\n    xs.chunks(2)\n  }\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "chunks of an arena-local array must not escape as the arena block value");
+    }
+
+    #[test]
+    fn chunks_of_arena_local_cannot_escape_via_outer_assign() {
+        // (b) assigning a chunks of an arena-declared array to an outer (shallower) binding escapes
+        // the arena, so it must be rejected.
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  mut cs := [9, 9].chunks(1)\n  arena { xs := [1, 2, 3, 4]\n    cs = xs.chunks(2)\n  }\n  print(cs.len())\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "chunks of an arena-local array must not escape via assignment to an outer binding");
+    }
+
+    #[test]
+    fn chunks_used_in_same_scope_ok() {
+        // (c) regression: the ordinary use — chunk and consume in the same scope — must still pass.
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  xs := [1, 2, 3, 4]\n  cs := xs.chunks(2)\n  print(cs.len())\n  return 0\n}\n",
+        );
+        assert!(!d.has_errors(), "same-scope chunks use must still type-check");
+    }
+
+    #[test]
+    fn chunks_bound_in_arena_used_locally_ok() {
+        // (c) regression: a chunks bound inside an arena and consumed there (a scalar result escapes)
+        // must pass — the borrowing result stays within the arena. Also guards the drop set: the
+        // chunks header buffer is heap-`malloc`'d, so it must still be freed (not leaked) even though
+        // its region is now `Arena(k)` (the drop-set filter drops `DynSliceArray` regardless).
+        let (_p, d) = check(
+            "fn chunk_sum(c: slice<i64>) -> i64 = c.sum()\nfn main() -> i32 {\n  t := arena { xs := [1, 2, 3, 4]\n    cs := xs.chunks(2)\n    cs.par_map(chunk_sum).sum()\n  }\n  print(t)\n  return 0\n}\n",
+        );
+        assert!(!d.has_errors(), "a chunks bound and consumed inside its arena must type-check");
+    }
+
+    #[test]
+    fn chunks_of_local_cannot_be_returned() {
+        // (d) the return path is now rejected by the escape check (in addition to the not-yet-liftable
+        // `array<slice<T>>` element restriction): the chunks result borrows the frame-local `xs`, so
+        // returning it is a use-after-free of the frame slot.
+        let (_p, d) = check(
+            "fn f() -> array<slice<i64>> {\n  xs := [1, 2, 3, 4]\n  return xs.chunks(2)\n}\nfn main() -> i32 { return 0 }\n",
+        );
+        assert!(
+            d.iter().any(|e| e.message.contains("borrows local storage")),
+            "returning a chunks of a local array must raise the escape (local-storage borrow) error"
+        );
     }
 }
