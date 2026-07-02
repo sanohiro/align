@@ -1698,12 +1698,16 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   entitled to assume the divisor is nonzero and can delete a surrounding `if b != 0` check, or delete
   the division itself if the quotient is dead (so it wouldn't even SIGFPE). This **directly violated**
   the Settled "division by zero ... is never silent, always an error" decision (see "Panic / unwinding"
-  above and `draft.md` §5). **Fix:** MIR `lower_int_div` (align_mir) now guards every integer `/`/`%`,
-  the same shape as `emit_bounds_check`: `divisor == 0` branches to a new `align_rt_div_fail` (`-> !`,
+  above and `draft.md` §5). **Fix:** MIR `lower_int_div` (align_mir) now guards every integer `/`/`%`
+  with a *runtime* divisor, the same shape as `emit_bounds_check`: `divisor == 0` branches to a new
+  `align_rt_div_fail` (`-> !`,
   cold edge, aborts with "division by zero"); the signed `INT_MIN / -1` overflow is folded away with a
   `select` (divide by `1` in place of `-1` so the raw sdiv/srem never sees the UB case, then select the
   wrapped result `0 - x` for `/` or `0` for `%`) so it wraps to `INT_MIN` per the defined
-  two's-complement overflow rule. `float` division (IEEE) and `vecN<T>` (SIMD, out of scope) are
+  two's-complement overflow rule. A *constant* non-zero divisor (`x / 2`, `x % 10`, `x / -1`) is the
+  common case and needs no guard — both UB cases are decidable at compile time — so it is lowered
+  straight to the raw op (or, for `-1`, folded to `0 - x` / `0`), keeping the MIR lean. `float`
+  division (IEEE) and `vecN<T>` (SIMD, out of scope) are
   untouched. The differential fuzzer's oracle (which forced positive divisors) now also generates
   negative divisors incl. `-1`, exercising the wrap at every width; direct integration tests in
   `crates/align_driver/tests/div_guard.rs` cover the abort + `INT_MIN/-1` cases.
