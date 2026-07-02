@@ -645,7 +645,17 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
 `array<slice<T>>` (for `chunks`), `array<Struct>.clone()`, and a bare whole-struct element value
 `users[i]` (no field) — see `08-memory-model-v2.md` §11 and `open-questions.md`.
 
-## M6 — SIMD / vec / mask — STARTED (explicit `vecN<T>` slice 1 landed)
+## M6 — SIMD / vec / mask — DONE (2026-07-03)
+
+Both completion conditions (below) are met and independently re-verified: `emit-llvm` on a `vecN<T>`
+program shows real `<N x T>` IR (`add <4 x i32>`, `extractelement`, …), and `where(p).<reducer>()` is
+branch-free for every reducer (`sum`/`count`/`min`/`max`/`any`/`all`/`reduce`), matching the plain
+(no-`where`) path. Shipped: `vecN<T>`/`maskN<T>` (construct, elementwise arithmetic, compare/`select`,
+`sum`/`sum_where`/`dot`/`min`/`max`/`fma`, broadcast, lane read/write, array `load`/`store`), the SoA
+surface (borrowed `soa<T>` view, field projection, gather/scatter, `group_by`, `json.decode → soa`),
+and `align(N)` (struct form + scalar-array-binding form + the aligned-load fast path). **Not a
+blocker, tracked as post-M6 backlog** (own section below): owned SoA columns, `soa_slice<T>`,
+packed-bool columns, and the arena/heap `align(N)` over-alignment gaps.
 
 - `vec2/4/8/16<T>`, `mask<T>`, `bitset`.
   - **`vecN<T>` slice 1 — DONE.** The explicit fixed-width vector type `vec2`/`vec4`/`vec8`/`vec16`
@@ -865,6 +875,26 @@ predication-ready, the forward-compatible shape for scalable-ISA tails (`05 §5`
   kernel with no `where`, already branch-free. (`tests/branchless_where.rs`, `tests/optimizer.rs`.)
   Materializing terminals (`to_array`/`scan`) keep a real skip-branch (they must not *append* a
   masked-out element — not an identity op). The completion condition is met.
+
+### Post-M6 backlog (not M6 blockers — M6 is closed; these are future perf/feature slices)
+
+None of the below gated M6's completion conditions (vector IR + branchless `where`, both met above).
+They are deferred SoA/alignment slices, tracked for whenever picked up next; full detail + rationale
+already lives in `docs/open-questions.md`.
+
+- **Owned SoA columns** (`string`/`array<T>` fields in a `soa<T>`): needs per-column drop on
+  overwrite, whole-soa recursive drop, and `region_of` treating an owned column as self-contained
+  rather than a borrow. See `docs/open-questions.md` → "Memory layout — `soa<T>`" (the "owned columns"
+  sub-item, near "the largest remaining soa gap").
+- **`soa_slice<T>`** (multi-column `s[a..b]` sub-view over every column): needs a
+  `{ptr, total_len, start, count}` view repr since column stride depends on the original row count.
+  See `docs/open-questions.md` → "Multi-column `soa_slice<T>`".
+- **Packed-bool columns** (`bitset`-backed `bool` fields in a `soa<T>`, instead of one byte/lane).
+- **Dynamic over-aligned arrays**: a heap-allocated `array<align(N)Struct>` (element stride is already
+  correct; only the heap buffer's own alignment is missing) and arena/heap-buffer over-alignment in
+  general; an `align(N)` struct as a struct field; the cross-function aligned-load path (a fat
+  `slice<T>` carrying its alignment through a call). See `docs/open-questions.md` →
+  "Struct/array alignment attribute `align(N)`" ("Still deferred").
 
 ## M7 — Parallelism — DONE (par_map/chunks/purity, first-class closures ①–③, task_group ④a–④c; only fully-escaping fn values deferred)
 

@@ -5,7 +5,16 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-03 (main @ PR #324)._
+_Last updated: 2026-07-03 (main @ PR #326; M6 formally closed same day, docs-only)._
+
+## M6 — SIMD / vec / mask — formally closed (2026-07-03)
+
+Both completion conditions in `docs/impl/07-roadmap.md` are met and re-verified: `emit-llvm` on a
+`vecN<T>` program shows real `<N x T>` IR, and `where(p).<reducer>()` is branch-free for every
+reducer (`sum`/`count`/`min`/`max`/`any`/`all`/`reduce`), same as PR #303 established. See the M6
+section of the roadmap for the full shipped-feature summary. **Not blockers, deferred as post-M6
+backlog** (own labeled section right after M6 in the roadmap, and `docs/open-questions.md`): owned
+SoA columns, `soa_slice<T>`, packed-bool columns, dynamic/arena over-aligned arrays.
 
 ## Internal review (2026-07-02)
 
@@ -60,8 +69,8 @@ literals, both post-inference classification); **#314** was a clippy sweep, 50 w
 recorded in `docs/open-questions.md`): hot/cold field-split lint (heuristics need design), buffered
 `print` (deliberate), escape→MIR dataflow + purity-as-effect-bit (structural, big), relative pointers
 (no recursive types yet), `f16`/`bf16` (arithmetic semantics decision needed). Tests grew ~1047 → ~1103;
-clippy is clean at `-D warnings`. **Next:** continue roadmap work (M6/M8 remainders) — the queue is
-derived from `docs/impl/07-roadmap.md`.
+clippy is clean at `-D warnings`. **Next:** continue roadmap work (M6 is now formally closed, see
+above; M8 remainders) — the queue is derived from `docs/impl/07-roadmap.md`.
 
 ## Roadmap-remainder wave (2026-07-03, PRs #316–#324)
 
