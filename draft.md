@@ -295,7 +295,9 @@ char
 Integers are written in decimal, or with a base prefix: `0x` (hex), `0o` (octal), `0b` (binary). A
 literal is the same value whatever the base, with its width inferred from context like any literal,
 so a too-wide pattern truncates to the binding's type by the defined wrap rule. A `_` may separate
-digits for readability (in any base).
+digits for readability (in any base). When no context constrains it, an integer literal defaults to
+`i64` and a float literal to `f64` — the default is deliberate and visible here because it affects
+observable behavior (overflow width, float precision); annotate to pick another width.
 
 ```align
 mask := 0xFF_FF            // hex, = 65535
@@ -618,6 +620,12 @@ allocation, region-tied to the source so it cannot outlive it. Either bound may 
 `..` is a slicing construct only — there is no first-class range value (the language has no
 counting loops; iteration is the array pipeline).
 
+For a `str` the bounds are **byte** offsets, and because a `str` is always valid UTF-8 (§12), each
+bound must also land on a UTF-8 scalar boundary — a `start`/`end` that would split a multi-byte
+scalar aborts at runtime, in the same style as an out-of-range index, so the resulting `str` is never
+invalid. Arbitrary byte-range work belongs on the byte view instead (`s.bytes()[a..b]`, → `bytes`),
+which carries no UTF-8 obligation.
+
 ```align
 head := s[0..5]        // a borrowed sub-str
 rest := xs[1..]        // a slice<T> view of the tail
@@ -730,6 +738,13 @@ The unit of parallelism is basically the chunk.
 ---
 
 ## 9. SIMD and Vector
+
+SIMD comes in two layers. The **fixed vector types** `vecN<T>` / `maskN<T>` below are an escape hatch
+for hand-written register kernels — they are **always a fixed size** (a `Copy` register value with a
+constant width). Bulk vectorization — including future scalable ISAs (SVE/RVV) — instead belongs to
+the **array pipeline** (`map` / `where` / `reduce`, §8), which **never names a width**: the same
+source lowers to whatever the target supports (a fixed-width loop, or scalable predicated code), so a
+vector length stays a hardware detail rather than something written in source.
 
 ### Fixed Vector Types
 
@@ -997,13 +1012,21 @@ buffer   // mutable byte buffer
 builder  // append-oriented writer
 ```
 
+A `str` (and an owned `string`) is **always valid UTF-8** — that is a type invariant, so every
+operation that produces a `str` preserves it (a range slice that would split a scalar aborts, §7).
+The byte types `bytes` / `buffer` carry **no** UTF-8 obligation and are where arbitrary-byte work
+lives (`s.bytes()` views a `str`'s bytes without the invariant).
+
 ### No Implicit Concatenation Allocation
 
-```align
-msg := a + b // string allocation is forbidden or linted
-```
+`str + str` is a **hard compile error** — `+` never concatenates strings. A concatenation is a heap
+allocation, and an allocation must always be visible in source ("nothing hidden"); allowing `a + b`
+to allocate silently would also be a second way to build a string when there is already one. So there
+is exactly one way, and it is explicit:
 
-Recommended.
+```align
+msg := a + b // compile error: `+` does not concatenate strings — use a builder
+```
 
 ```align
 b := builder()

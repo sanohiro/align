@@ -59,8 +59,8 @@ Result<T,E>
 array<T>
 slice<T>
 
-vec<N,T>
-mask<T>
+vecN<T>
+maskN<T>
 bitset
 ```
 
@@ -68,7 +68,8 @@ bitset
 
 Decimal, or base-prefixed `0x` (hex) / `0o` (octal) / `0b` (binary); `_` may separate digits in any
 base. A literal's width is inferred from context like any literal (an over-wide pattern truncates to
-the binding's type by the defined wrap rule). (`draft.md` §5.)
+the binding's type by the defined wrap rule); with no constraining context an integer defaults to
+`i64` and a float to `f64` (a visible default — it affects overflow width / precision). (`draft.md` §5.)
 
 ### Numeric conversion
 
@@ -215,6 +216,11 @@ inferred). A lambda may capture enclosing variables by value — with no hidden 
 environment (it compiles like a named function, captures passed as arguments). `where(.active)`
 is shorthand for a one-field lambda.
 
+SIMD is two layers: the pipeline (`map`/`where`/`reduce`) is the width-agnostic main road — it never
+names a width, so bulk vectorization (including future scalable ISAs, SVE/RVV) is chosen in the
+backend and stays a hardware detail. `vecN<T>` / `maskN<T>` (below) are the fixed-size escape hatch
+for hand-written register kernels. (`draft.md` §9.)
+
 `array<T>` is row-major (array-of-structs); `soa<T>` is the explicit column-major (struct-of-arrays)
 layout, so a field-wise pipeline streams only the columns it touches (the cache lever that beats an
 AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`) or decode JSON into one
@@ -252,7 +258,11 @@ auto-borrowed) and work on bytes — UTF-8 is the representation, but the scan i
 byte-level (the SIMD-friendly default the spec mandates over a `chars()` walk); the
 predicates are backed by `memchr`-class scans. The trim set is the WHATWG ASCII
 whitespace (space, `\t`, `\n`, `\x0c`, `\r`; not vertical tab); Unicode-whitespace
-trimming is deliberately package-level, out of core.
+trimming is deliberately package-level, out of core. A `str`/`string` is **always valid
+UTF-8** (a type invariant): a range slice `s[a..b]` uses byte offsets and aborts if a bound
+splits a scalar, so arbitrary-byte work goes through `s.bytes()` (→ `bytes`, no UTF-8 obligation).
+`str + str` is a **hard error** — `+` never concatenates (a hidden allocation, and a second way to
+build a string); the one way is a `builder`. (`draft.md` §7/§12.)
 
 ### JSON
 

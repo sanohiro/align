@@ -53,7 +53,7 @@ executable
 
 ### Sema (2) Type Inference / Type Checking (`align_sema`)
 - Local type inference (deciding the type of `x := 10`) and reconciliation with annotations.
-- Typing of `Option<T>` / `Result<T,E>` / `array<T>` / `slice<T>` / `vec<N,T>` / `mask<T>`.
+- Typing of `Option<T>` / `Result<T,E>` / `array<T>` / `slice<T>` / `vecN<T>` / `maskN<T>`.
 - Checking that the `?` operator applies only to `Result`.
 - Typing of array-operation chains (`map`/`where`/`sum` ...). Details in `03-types.md`.
 
@@ -79,7 +79,7 @@ executable
 - Many lints (`draft.md` §16) reuse the results of this analysis for diagnostics.
 
 ### Codegen (`align_codegen_llvm`)
-- MIR → LLVM IR. Maps `vec<N,T>`/`mask` to LLVM's vector type / select and emits vector instructions deterministically.
+- MIR → LLVM IR. Maps `vecN<T>`/`maskN<T>` to LLVM's vector type / select and emits vector instructions deterministically.
 - Arena allocation becomes runtime calls. Details in `05-backend-llvm.md`.
 
 ### Driver (`align_driver`)

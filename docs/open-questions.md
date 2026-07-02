@@ -305,6 +305,23 @@ branch — `impl/05` §5), which is what keeps hot loops vectorizable and branch
 comes from the library layer's runtime dispatch — see "Build targets & portability".**)
 Record: `draft.md` §9, `impl/04-mir.md` §4, `impl/05-backend-llvm.md` §5
 
+**Addendum (2026-07-02, internal review — MIR width-agnostic invariant):** amends the above. **MIR
+carries vectorization-*enabling properties*** — element independence, `Effect=Pure`, `out`-derived
+noalias, trip count, a reduction's monoid (identity + associative op), and the access plan
+(contiguous/strided) — **and never bakes in a vector width.** Width is permanently a *backend*
+decision: fixed-width + scalar remainder on NEON/AVX-class ISAs, scalable + predication on SVE/RVV.
+(Was: MIR shapes a fused loop as width `W` + remainder, per `impl/04-mir.md` §4 / `impl/05-backend-
+llvm.md` §5 as originally written — that baked a fixed-width assumption into the backend-agnostic IR
+and is now understood to be wrong once scalable ISAs are in view; corrected at the documentation
+level before M6 locks the lowering in.) **Two-tier SIMD positioning, stated explicitly:**
+`vecN<T>`/`maskN<T>` stay the **fixed-width kernel escape hatch** (hand-tuned dot/FMA/FIR-style code,
+always a compile-time-constant width, never scalable) while the **pipeline** (`map`/`where`/`reduce`)
+is the **width-agnostic main path** — it names no width in source, so scalable ISAs live there
+invisibly, the same way choosing AVX2 vs NEON is already a hardware detail, not a semantic one.
+Opus and Codex, asked the same question independently, converged on this exact conclusion. Record:
+`impl/04-mir.md` §4, `impl/05-backend-llvm.md` §5 (doc update pending/parallel), this file's Future →
+"Hardware & backend optimization backlog" (scalable-vector / matrix-engine entries).
+
 ### Memory layout — `soa<T>` (struct-of-arrays) — SETTLED (2026-06-26)
 **Decision: the layout is chosen by an explicit type — `soa<T>` — not by automatic whole-program
 inference.** Add a first-class columnar collection `soa<User>` (peer to the row-major `array<User>`);
@@ -1563,6 +1580,29 @@ Record: `draft.md` §18.3
 Rationale: SSO adds a branch to every `ptr`/`len` access and breaks FFI pointer stability (an inline string cannot hand a stable address to C without first materializing it). Align's arena-centric model already avoids the small-`malloc` churn SSO targets, so the win is marginal while the cost lands on "predictable performance" + "nothing hidden". Revisit only if profiling on real workloads justifies it (digested from `work/proposals/string-optimization.md` §1).
 Record: `impl/08-memory-model-v2.md` (slice 7a, owned `string`), `design-notes.md`.
 
+### String concatenation via `+` — SETTLED 2026-07-02: hard error, builder is the one way
+**Decision: `str`/`string` do not support `+`; it is a compile-time error naming `builder` as the
+alternative.** `draft.md` §12 previously left this a two-way "forbidden or linted" note. Resolved in
+favor of the hard error: a lint is opt-out-able and a silent per-call hidden allocation is exactly
+what "Nothing hidden" + "One way" rule out (concatenation already leaked when reached through a
+lifted lambda with no arena — see "External benchmark report — Gemini on M2/arm64" Gap A above, fixed
+2026-06-27 for that specific path; this decision generalizes the fix into the actual rule rather than
+a lambda-only guard). `builder` (`.write`/`.finish()`) is the one way to build a string incrementally.
+Record: `draft.md` §12 (doc update pending/parallel), `impl/06-runtime-std.md`.
+
+### Unconstrained literal defaults + `&&`/`||` evaluation order — now explicit in the spec (2026-07-02)
+Two implementation-notes-only facts are promoted to explicit spec text: **an unconstrained integer
+literal defaults to `i64`, an unconstrained float literal to `f64`** (previously only stated in
+`impl/02-frontend.md` / this file's "Numeric literal typing" entry above, now stated in `draft.md`
+§5 directly — user-visible, since it affects overflow/precision); and **`&&`/`||` evaluate
+left-to-right with short-circuit semantics** (`a && b` never evaluates `b` if `a` is false), now
+given its own evaluation-order note in `draft.md` rather than being implied by "logical operators."
+This is a **spec-documentation** settlement, not a claim that the short-circuit *implementation* is
+verified end-to-end — track that separately (External soundness audit item **3-1** above records
+`&&`/`||` lowering to a strict, non-short-circuiting `Rvalue::Bin` in MIR as of that audit; confirm
+it is actually fixed before relying on the spec text here as also describing current codegen).
+Record: `draft.md` §5 (doc update pending/parallel).
+
 ### Panic / unwinding (CFG shape)
 **Decision: no unwinding; immediate abort.** Fatal errors (div-by-zero, OOM) abort the process; there is no catch/recover boundary. The compiler emits plain LLVM `call` (never `invoke` + landing pads), so the MIR→LLVM CFG stays exception-free. (Promotes the prior "currently: immediate abort" detail to a locked decision — committing now keeps the CFG-generation stage from ever needing landing-pad support.) The *build-level* `panic=abort` + strip-`.eh_frame` step that drops the Rust-std unwinder is a separate, opt-in binary-size/startup lever (see Future "Hardware & backend optimization backlog").
 Record: `impl/04-mir.md` (CFG), `non-goals.md`.
@@ -1638,6 +1678,100 @@ A 7-agent audit on another machine (frontend / sema-types / sema-flow / MIR+code
 - ~~Stand up **fuzzing** (parser / JSON / fmt, with a depth cap) and a **negative-test corpus**~~ **(DONE, #286–#290)** — dependency-free fuzz + property suite in `crates/align_driver/tests/` (SplitMix64 + `catch_unwind`, seeds printed, runs as `cargo test`): `fuzz_frontend.rs` (lexer/parser/sema never panic, incl. non-ASCII), `fuzz_fmt.rs` (formatter never panics + idempotent + parse-preserving on all examples), and `fuzz_differential.rs` — a **generate-program-with-its-oracle** differential fuzzer that catches *miscompiles* (the array-garbage class) across scalars, all integer widths + cross-width casts, the call ABI, and struct/array aggregates. A single `wrap(v, ITy)` models both arithmetic wrapping and integer casts; a per-test mutation check (deliberately `+1` the oracle) proves the harness isn't a vacuous pass. No miscompile found. The negative-test corpus is `tests/analysis_coverage.rs` + the audit repros. Still open: the MIR-dataflow / purity-as-effect-bit structural refactors above.
 
 Record: `crates/align_sema` (the analyses), `tests/analysis_coverage.rs`, `align-self-review` Gate 1.
+
+### 2026-07-02 internal review (multi-agent: 4 deep-dive tracks + independent Opus/Codex design passes)
+
+Same-day, separate from the external soundness audit above (no overlap): 4 parallel deep-dive tracks
+(frontend soundness / MIR+LLVM codegen / runtime+library / language-design evaluation), plus the
+design-evaluation question put to Opus and Codex **independently and cross-checked** (both converged
+on the same conclusions, folded into the Settled addendum above and the Future entries below).
+**Status: open** — none of the bugs below are fixed yet; recorded here so they aren't lost. Confidence
+follows the same convention as the external audit: **CONFIRMED** = read against the code (or
+reproduced), **PLAUSIBLE** = strong code-reading suspicion, not yet reproduced.
+
+**Confirmed bugs:**
+- **Division has no zero / `INT_MIN ÷ -1` guard — immediate LLVM UB, not a clean abort.**
+  `align_codegen_llvm/src/lib.rs` (~:3797) emits raw `sdiv`/`udiv`/`srem`/`urem` straight from MIR
+  `lower_bin`, with no guard branch anywhere upstream. `sdiv`/`srem` by zero and `sdiv INT_MIN, -1`
+  are LLVM-level *undefined behavior*, not a trap — the O2 optimizer is entitled to assume the divisor
+  is nonzero and can delete a surrounding `if b != 0` check, or delete the division itself if the
+  quotient is dead (so it wouldn't even SIGFPE). This **directly violates** the Settled "division by
+  zero ... is never silent, always an error" decision (see "Panic / unwinding" above and `draft.md`
+  §5). Fix: a MIR guard in `Div`/`Rem` lowering, the same shape as `emit_bounds_check`, branching to a
+  new `align_rt_div_fail`. Also note: the differential fuzzer's oracle currently avoids zero divisors,
+  so it can't catch this — close that gap alongside the fix.
+- **`json.decode` silently truncates/sign-wraps out-of-range integers.** `align_runtime/src/lib.rs`
+  (~:919, `parse_object`; same pattern ~:872-877, :996). `JsonField.tag` packs `(kind<<8)|width` with
+  **no sign bit**, so it structurally cannot range-check: `{"n": 300}` into `u8` silently becomes
+  `44`, `{"n": -1}` into `u32` becomes `0xFFFFFFFF`, `{"n": 200}` into `i8` becomes `-56`. Hidden
+  corruption from untrusted input, in a language whose flagship consumer is JSON. Fix needs a sign bit
+  added to the tag (an **ABI change spanning codegen + runtime together**) so the decoder can check
+  `[min,max]` before writing and route out-of-range values through the existing bad-value path.
+- **Parser depth guard doesn't cover iteratively-parsed chains — sema stack-overflows (ICE).**
+  `align_parser/src/lib.rs` (~:816-826) caps `MAX_EXPR_DEPTH=256`, but that budget is spent only by
+  *recursive* parsing; the left-associative binary-operator loop and the postfix-chain loop build
+  arbitrarily deep ASTs **iteratively**, consuming no depth budget. A ~1000-term chain
+  (`x := 1+1+1+...`, ~2KB source — a plausible size for machine-generated code, this project's target
+  authorship mode) parses cleanly and then blows the native stack in a downstream `align_sema`
+  recursive walk (`check_binary`/`MoveCheck`/`EscapeCheck`/`EffectScan`) — a process abort, not a
+  diagnostic. The existing "expression nests too deeply" guard never fires. Fix: a post-parse AST
+  depth/size ceiling (counting binary-loop iterations and postfix-chain length toward the same cap),
+  or make the sema walks iterative.
+- **`MoveCheck`'s `Stmt::AssignField` doesn't check `whole_moved(root)`.** `align_sema/src/lib.rs`
+  (~:3141) — writing into a field of an already-moved-out struct (`take(u); u.name =
+  "x".clone()`) is silently accepted, while *reading* a moved struct's field is correctly rejected.
+  `Stmt::AssignIndex` already has the matching `whole_moved(base)` check (~:3145-3151) — this is a
+  one-line fix mirroring it. MIR (~:935-947) drops the old value and stores the new one, but the
+  struct stays flagged moved and is excluded from `drop_locals`, so the freshly-stored value **leaks**
+  (confirmed no double-free under `MALLOC_CHECK_=3` — a leak, not UB, today).
+- **PLAUSIBLE / latent: `chunks` over a frame-local scalar array infers `Region::Static`.**
+  `align_sema/src/lib.rs` (~:2529) — `region_of(Local)` falls back to `Static` for an unregistered
+  local; `tracks_region` returns `false` for scalar arrays (~:2376), so a local scalar array is never
+  registered in the first place. `local_backed_slice` (~:2609-2637), the guard that would normally
+  catch this, only covers `Ty::Slice`, not the `DynSliceArray` that `chunks` produces. Not reachable
+  today only because "array elements are scalar-only" prevents writing `array<slice<T>>` — i.e. it is
+  **shielded by an unrelated restriction, not a correct check**:
+  `cs := arena { xs := [1,2,3,4]; xs.chunks(2) }` already type-checks with no escape error, and would
+  be a real use-after-free the moment that scalar-only restriction lifts. Fix before lifting it: give
+  frame-local scalar arrays a `Frame` region, or extend `local_backed_slice` to cover `DynSliceArray`.
+- **`align_rt_arena_alloc` uses a raw `as usize` cast, unlike every other FFI entry point.**
+  `align_runtime/src/lib.rs` (~:3495-3498) — every other runtime FFI boundary normalizes an incoming
+  size via `usize::try_from(...)`; this one does `size as usize` directly, so a negative input becomes
+  a huge `usize` and `off + need` (~:3471) could wrap in a release build. Not reachable today (codegen
+  always passes a sound value) — but it is exactly the `i64 as usize` bug class this repo's own past
+  audits keep flagging (`align-self-review` Gate 1). Fix: `usize::try_from(...).ok()`, matching the
+  shape of `align_rt_alloc`.
+
+**Perf backlog (non-blocking; recorded so none of it is re-discovered from scratch):**
+- **Top lever: no-alias information never reaches LLVM**, even though the language guarantees it (see
+  "`out` parameters + `noalias`" above, which already tracks the underlying gap — this is the
+  actionable next step on it). The slice ABI passes `{ptr, i64}` **by value**, so there is no
+  standalone pointer parameter to attach a `noalias` *attribute* to; the workable form is **`!alias.
+  scope`/`!noalias` metadata** on the fused loop's element loads/stores (one scope per slice argument;
+  `out` disjoint from every input), plus `!nonnull`/`!align` on the element loads themselves.
+- **`task_group` spawns one OS thread per task** (`align_runtime/src/lib.rs` ~:3585,
+  `align_rt_tg_wait`, via `thread::scope` + a `spawn` per task) instead of reusing the **persistent**
+  `ParPool` that `par_map` already built for exactly this cost. Fix: route `task_group` through
+  `ParPool`, preserving the panic-collecting join barrier it needs (join must still happen before the
+  region is freed at `wait()`/scope end).
+- **Allocator-family runtime declarations lack `noalias`/`nofree`/`willreturn` return attributes** in
+  codegen's function declarations — cheap, additive hygiene next to where the alloc functions are
+  already declared.
+- **`emit-llvm` output sets a data layout but no target triple.** `align_codegen_llvm/src/lib.rs`
+  (~:135, `build_module`) — feeding that IR to an external `opt`/`llc` (as opposed to the driver's own
+  `write_object` path, which is unaffected) falls back to a generic cost model and vectorizes worse.
+  One-line fix: `module.set_triple(&tm.get_triple())`.
+- **Low priority, deliberate design: `print` does a flushing `write(2)` per call.** An option is
+  process-lifetime buffered stdout flushed via `align_rt_start` — the runtime's existing
+  `BufferedWriter` already does this shape elsewhere, so it would be reuse, not new machinery. Noted
+  in passing so it isn't "fixed" by accident: the arena chunk's 64KiB zero-fill looks like waste but
+  is **load-bearing** — `json.decode` depends on the zeroed-out contract — don't remove it
+  independently of touching that contract.
+
+Record: none yet (all open); this session's design-facing conclusions (MIR width-agnostic invariant,
+two-tier SIMD positioning, the string-concatenation/literal-default/short-circuit spec gaps) are
+folded into the Settled/Open/Future entries above, and were also landed the same day in
+`draft.md`/`docs/impl/*` (see those files' history, not duplicated here) and in `HANDOFF.md`.
 
 ---
 
@@ -1754,6 +1888,30 @@ So this entry **waits on sum types** (4a) and then defines `Error` as a concrete
 
 **4b-2 DONE: the canonical `Error` is a builtin sum type.** `Error { NotFound, Invalid, Denied, Code(i32) }` — a real enum registered as a reserved type name (resolved via `enum_ids` like any sum type). `Error.NotFound` / `Error.Code(c)` construct it (`error(c)` is sugar for `Error.Code(c)`); `match` discriminates the categories; `?` propagates. Every fallible builtin (`fs.read_file`, `json.decode`, `io`, `task_group`) now returns `Result<_, Error>`, wrapping its runtime i32 status as `Error.Code(code)`. The **`main` exit mapping**: `Code(c)` → exit `clamp(c)`, a category → `tag + 1` (a small distinct nonzero code). The **task_group** fallible path was reworked to carry the full `Error` across threads: each task gets an `err_slot`, the trampoline writes its `Err` value there and returns 0/1, `tg_wait` returns the first errored `err_slot` (null if none), `wait()?` builds the `Result` from it. (`Ty::ErrCode`/`Scalar::ErrCode` are now vestigial — only an i32-status alias in the builtin lowerings; removable in a follow-up.) **4b-3 DONE** the explicit **`?` `E → E'` conversion** via `result.map_err(f)` (no implicit coercion). **4b-4 DONE (structured errors) / `.with_context` not adopted** — position-bearing structured errors already work on the 4b-1 + S2 foundation (a variant carrying a `Pos` struct, `?`-propagated, `match`-read); free-form `.with_context` string-chaining was reviewed and dropped as off-philosophy (structured sum-type payloads are the context mechanism — see the bullet above). **So the Error type (4b) is complete** for the planned surface: `Error` is a builtin sum type, user error enums work, `map_err` converts, structured payloads carry context. (Richer `str`-carrying error payloads remain deferred with S2's `str`-field payloads — enum region tracking.)
 
+**Open residual (found 2026-07-02, internal review): `main() -> Result<(), E>` exit-code mapping is
+defined only for the builtin `Error`.** The `main` wrapper's exit-code lowering
+(`align_codegen_llvm/src/lib.rs`, the `align_main` wrapper) reads the payload as the builtin `Error`
+enum's specific `{ i32 tag, i32 code }` shape (`Code(c)` → `clamp(c)`, category → `tag + 1`); a
+user-defined error enum at `main`'s `E` position has no defined mapping — undefined/unspecified
+behavior at the `main` boundary, not merely unimplemented sugar. **Decide:** either restrict `main`'s
+`E` to (be, or convert into) the builtin `Error`, or define a general enum→exit-code mapping (e.g.
+tag index + 1, ignoring payload) for any sum type at that position. (Separately: this section's own
+heading still says "Open" while its body reads as complete for the *type* — reconcile the heading
+once the exit-code-mapping question above is closed, so a future reader doesn't have to resolve the
+same drift again.)
+
+### Out-of-range compile-time integer literals — silently wrap (Open, found 2026-07-02)
+`x: u8 := 300` compiles and produces `44` (wrapped); a negative literal given an unsigned type is
+already correctly rejected (see the External soundness audit's item **1-1**, "unary `-` on an
+unsigned type"). Wrap is the Settled behavior for *runtime* arithmetic overflow (see "Integer
+overflow" above), but a literal whose value and target type are **both known at compile time** is a
+different case — the compiler could reject it outright with zero runtime cost, and silently accepting
+it is arguably hidden data corruption, in tension with "Nothing hidden." **Decide:** (a) hard
+compile-time error for a provably-out-of-range literal (recommended — cheapest, most consistent with
+`as`'s zero-UB design and with rejecting negative-into-unsigned; wrap stays exactly as-is for runtime
+values), or (b) leave it and pick it up as an M8 lint instead. Either way, record the decision here
+once made; until then the current (silent-wrap) behavior stands.
+
 ### Arena with explicit allocator — partially settled (M3)
 **M3 decision: anonymous `arena {}` only.** Nested arenas use region = arena nesting
 depth; a box's region is the depth at which it was allocated, and escape = reaching a
@@ -1780,7 +1938,12 @@ binding/allocation form over a scalar array (which, with a multiple-of-N index, 
 an **aligned vector-load fast path** — vec load/store currently uses the always-safe element
 alignment); arena/heap-buffer over-alignment; and padding an over-aligned struct's **size** up to its
 alignment for a tight `[N x %S]` array stride (the slot alloca is correctly aligned; the array stride
-uses the natural size today). Original design note follows.
+uses the natural size today). **Proposal (2026-07-02, internal review):** close this by making the
+rule unconditional — **an array's element stride is always `round_up(element_size, element_align)`**
+(not just for `align(N)` structs; this is also just what C already does). Keeps `align(N)` visible in
+layout math without adding a second, conditional stride rule — every element access already goes
+through one seam (`type_align`/element-size computation), so the fix is confined there. Original
+design note follows.
 
 A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) data := …`) for GPU/DMA/page-aligned zero-copy interop. **Retrofit-sensitive**: it modifies struct field-offset math and the arena bump allocator's alignment, so reserve room in the layout model now; the surface + LLVM `align N` emission + arena honoring it can land at M6 alongside SoA. (Digested from `work/proposals/next-draft.md` §1.1.)
 **Groundwork landed (pre-M6):** `StructDef` carries `align: Option<u32>` (always `None` today — no surface syntax), and codegen routes all allocation alignment through one seam, `type_align(ty)` (natural ABI alignment today; a struct's custom `align` if set). M6 work is then "parse `align(N)` → set `StructDef.align`" + the seam returns it — the stack-slot alloca already calls the seam; the arena bump allocator already takes an explicit `align` argument. (Retrofit risk was low — a custom alignment is largely *additive* at the alloca/global/alloc sites — so this groundwork is a light reservation, unlike the SoA field-access seam.)
@@ -1978,6 +2141,15 @@ Backend / codegen lowering (MIR -> LLVM, source unchanged):
   predictor assumes Ok. NOT a few lines — it touches the MIR Term, hence backlog not a quick fix.
 - Scalable-vector (VLA) loops: emit <vscale x N x T> + predication for ARM SVE /
   RISC-V V, eliminating the scalar remainder loop. (Baseline = fixed-width vec<N> at M6.)
+  Reservation (2026-07-02, internal review, Opus+Codex independently agreed): when this ships,
+  give scalable vectors their OWN spelling — e.g. svec<T>/spred<T>, still unused/undecided — never
+  a runtime-variable-N vecN<T>. A scalable type is register-only with no stable byte layout, so it
+  must be PROHIBITED (not just "not yet supported") in: struct fields, array/tuple elements,
+  layout(C), raw.load/raw.store, extern "C" signatures, and any constant layout computation (soa
+  column stride, sizeof). vecN<T>/maskN<T> stay fixed-size forever — this is a second, sibling type,
+  not a generalization of the first. The pipeline (map/where/reduce) stays the width-agnostic path
+  scalable ISAs actually live in (see the SIMD-exposure Settled addendum above); vecN<T> is only the
+  fixed-width kernel escape hatch.
 - Matrix engines — ARM SME/SME2 AND x86 AMX (deferred; the migration foundation is the point, not the
   implementation; the foundation is cross-ISA — same shaped-op surface lowers to SME, AMX, or a
   scalar fallback, picked by the capability dispatch above, never named in source). Taking SME as the
@@ -1995,6 +2167,24 @@ Backend / codegen lowering (MIR -> LLVM, source unchanged):
   surface lands AND SME hardware is testable (Apple M4+ has SME but no SVE; cloud Graviton/A64FX for
   SVE2 — none testable on the M1 dev host, so verification is rent-cloud-briefly, not a blocker).
   Needs the LLVM/inkwell upgrade checkpoint first (LLVM 19 predates serious `sme2` codegen).
+  Reservation (2026-07-02, internal review, Opus+Codex independently agreed): reserve mat<R,C,T> as
+  the fixed-shape 2D sibling of vecN<T> for this (tiles are naturally fixed-shape, matching SME/AMX
+  fixed tile registers). A tile is an OPAQUE accumulator — never a byte-layout type, never a soa/
+  array element or struct field, same rule as the scalable-vector reservation above. matmul/contract
+  is a builtin over contiguous or soa columns (the 2D sibling of `dot`), NOT a pipeline stage —
+  2D reduction doesn't fit the 1D map/where/reduce shape without a magic special case. The natural
+  input shape is already available: group_by's columnar `(array<K>, array<V...>)` result is the
+  right shape to feed a GEMM; only an explicit conversion to a future 2D/tensor view is allowed, no
+  implicit tiling. No new type is needed yet — this is a reservation, not a build item.
+- APX (x86, 32 GPRs instead of 16): fully backend-transparent, essentially zero language work
+  (2026-07-02, internal review, Opus+Codex independently agreed). LLVM handles the new encoding once
+  it targets APX; Align exposes no register constraints, no inline-asm, no fixed calling convention
+  (FFI is layout(C) + by-pointer, not register-pinned) — nothing in the surface assumes a GPR count.
+  The only guardrail: keep it that way — never let a spec passage assume 16 GPRs or fix a register
+  ABI, and keep struct-size-related lints (e.g. "this struct is cache-unfriendly") anchored to cache
+  line size, not register count. If anything, Align's shape (multi-accumulator reductions, wide
+  group_by) benefits more from extra GPRs than typical code. Implementation (LLVM/inkwell upgrade,
+  --target-cpu apx) rides the same LLVM-upgrade checkpoint as AVX10/SME2 above; nothing to do now.
 - Non-temporal stores: tag large materializing writes with !nontemporal to bypass cache.
 - Fast-math flags on float ops (opt-in): unlock float reassociation / autovectorization.
 - -march=native / host CPU feature detection (opt-in; breaks portable "predictable").
@@ -2025,6 +2215,34 @@ Library architecture principle (record before std is built, applies to all of st
   string. This makes zero-allocation pipelines the default and is painful to retrofit, so
   it is a design rule for std, not an afterthought. (Digested from library-foundations.md,
   api-server-db.md; consistent with design-notes "string philosophy".)
+```
+
+### M8 lint candidates (consolidated, gathered across reviews)
+The formatter is M8's first deliverable (in progress, see "Additional perf levers" above); these are
+the lint candidates that have accumulated around it, gathered here so they aren't scattered across
+individual review entries. None block anything; pick up when the lint suite is actually built.
+```text
+- Wasteful i64/f64 default on a large array/soa/pipeline literal: an unconstrained-width literal
+  defaults to i64/f64 (Settled, "Numeric literal typing"), which is fine for a scalar but doubles
+  memory bandwidth for a big data-oriented buffer that didn't need 64 bits. Flag it where it's most
+  likely to matter — array/soa element types and pipeline literals — not every scalar `x := 1`.
+- Lossy/saturating `as` diagnostic: `as` is the one conversion operator and deliberately covers
+  lossless, truncating, and saturating conversions alike (Settled, "Numeric conversion — as"); a lint
+  distinguishing narrowing / float→int / char<->int casts (silently lossy or saturating) from
+  lossless ones gives back the visibility without adding a second conversion mechanism.
+- Prefer-pipeline-over-vecN for bulk data: nudge bulk/array-shaped code from a hand-tuned fixed-width
+  vecN<T> kernel toward the width-agnostic pipeline (map/where/reduce) when the data is a plain bulk
+  scan — vecN<T> is the escape hatch for genuinely hand-tuned kernels, not the default, and pipeline
+  code is exactly what stays portable to scalable ISAs (see the SIMD-exposure Settled addendum and
+  the scalable-vector reservation in the Hardware backlog above). Reserved 2026-07-02 (internal
+  review, Opus+Codex independently agreed) specifically to guard against AI-generated code defaulting
+  to a fixed 128/256-bit vecN<T> loop and losing SVE/RVV portability for no reason.
+- Out-of-range compile-time integer literal (`x: u8 := 300`): candidate lint if the stronger
+  hard-error option (see "Out-of-range compile-time integer literals" in Open, above) isn't taken.
+- par_map cost-threshold lint / cheap-par_map-loses-to-sequential (already recorded above under
+  "Codex perf / I/O / LLM research sweep" — listed here only so it isn't missed in a lint-suite pass).
+- connect-per-request-to-a-static-host lint for the future std `http`/`socket` layer (already
+  recorded above under the same sweep).
 ```
 
 ### Domain libraries belong to `std`/`pkg`, not core (placement note)

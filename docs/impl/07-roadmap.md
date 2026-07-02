@@ -794,7 +794,11 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   element-field write (needs a pointer-based `StoreElemFieldPtr`, the write dual of `IndexFieldPtr`),
   whole-element write of `str`/nested/owned structs (region/move handling), bitset/bool packed columns.
 
-Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR level.
+Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR
+level; and extend the branchless identity-select `where` form beyond `sum`/`count` to every reducer
+(`reduce` / `min` / `max` / `any` / `all` / `dot`, identities `+∞` / `−∞` / `false` / `true` / `0`),
+so all reductions are predication-ready — the forward-compatible shape for scalable-ISA tails
+(`05 §5`).
 
 ## M7 — Parallelism — DONE (par_map/chunks/purity, first-class closures ①–③, task_group ④a–④c; only fully-escaping fn values deferred)
 
