@@ -1761,7 +1761,7 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   the same `whole_moved(root)` check to `Stmt::AssignField` (rejecting the write at compile time, so
   the MIR leak path is unreachable for valid programs); see `field_assign_after_whole_move_rejected` /
   `field_assign_without_move_still_checks` in `align_sema/src/lib.rs` tests.
-- **PLAUSIBLE / latent: `chunks` over a frame-local scalar array infers `Region::Static`.**
+- **Status: fixed.** **`chunks` over a frame-local scalar array infers `Region::Static`.**
   `align_sema/src/lib.rs` (~:2529) — `region_of(Local)` falls back to `Static` for an unregistered
   local; `tracks_region` returns `false` for scalar arrays (~:2376), so a local scalar array is never
   registered in the first place. `local_backed_slice` (~:2609-2637), the guard that would normally
@@ -1769,8 +1769,37 @@ the same convention as the external audit: **CONFIRMED** = read against the code
   today only because "array elements are scalar-only" prevents writing `array<slice<T>>` — i.e. it is
   **shielded by an unrelated restriction, not a correct check**:
   `cs := arena { xs := [1,2,3,4]; xs.chunks(2) }` already type-checks with no escape error, and would
-  be a real use-after-free the moment that scalar-only restriction lifts. Fix before lifting it: give
-  frame-local scalar arrays a `Frame` region, or extend `local_backed_slice` to cover `DynSliceArray`.
+  be a real use-after-free the moment that scalar-only restriction lifts — and it was **also present
+  for `array<str>`** (which *is* reachable today: `str` is a valid `chunks` element via `PrimScalar`).
+  There it is worse: `array<str>` is region-tracked, so its `Let` stores the array's *element* region
+  (`Static` for `str` literals) in the region map, and `region_of(chunks)` inherited that `Static` —
+  `cs := arena { xs := ["a","b","c","d"]; xs.chunks(2) }` and the outer-assign form both type-checked
+  with no escape error (confirmed). **Fixed** by binding `region_of(ArrayChunks)` to the source's
+  **storage** region (new `chunks_source_storage_region`), *distinct from* the element/value region
+  `region_of` returns: a fixed stack `array<T>`/`array<Struct>` bound as a `Let`-local owns a frame
+  slot scoped to the arena it was declared in (`Frame.shorter(arena(decl_depth))`), a fixed-array
+  parameter borrows the caller (`Static`, returnable), an array literal is a frame temporary, a
+  frame-backed slice (`local_backed_slice`) re-borrows frame storage; any other source keeps its
+  `region_of` — the chunks region is the shorter of the storage region and `region_of(source)` (so an
+  `array<str>` of arena strings is bounded by both). This is the key distinction: the storage region
+  is *not* the element region — an element read (`xs[0]`, a `str` view of static data) stays
+  returnable while the whole-array borrow (`chunks`) is frame-bound. Chosen over touching the region
+  map at the `Let` (would clobber the element region and wrongly reject `return xs[0]`) or extending
+  `local_backed_slice` (a parallel `Ty::Slice`-only mechanism that guards only *returns*, not the
+  arena-block-value / outer-assign escapes `region_of` already covers). A companion drop-set fix
+  always drops a `DynSliceArray` local even at `Arena(k)` region (its header buffer is always
+  heap-`malloc`'d by `align_rt_chunks`, never arena memory — region tracks the borrowed source, not
+  the container's storage), so a chunks bound inside an arena is freed, not leaked. Tests:
+  `chunks_of_arena_local_cannot_escape_as_block_value` / `…_via_outer_assign` (scalar + `str`),
+  `chunks_used_in_same_scope_ok`, `chunks_bound_in_arena_used_locally_ok`,
+  `chunks_of_local_cannot_be_returned`, `chunks_of_str_array_cannot_be_returned`,
+  `str_array_element_read_still_returnable`, `chunks_of_struct_array_rejected` (`align_sema/src/lib.rs`).
+  Related (**noted, not an active hole**): `region_of` also returns the *element* region (not the
+  storage region) for `ArrayToSlice` / `SliceRange` over a fixed `str` array — but the only genuine
+  use-after-free there (returning such a slice) is caught by the orthogonal type-driven
+  `local_backed_slice`/`slice_is_local` return check, and the arena-escape it under-reports is
+  conservatively safe (the frame slot outlives the arena, matching the existing slice leniency). A
+  future *region-only* consumer of those producers must not assume the region reflects storage.
 - **Status: fixed.** **`align_rt_arena_alloc` uses a raw `as usize` cast, unlike every other FFI entry
   point.** `align_runtime/src/lib.rs` (~:3495-3498) — every other runtime FFI boundary normalizes an
   incoming size via `usize::try_from(...)`; this one does `size as usize` directly, so a negative input
