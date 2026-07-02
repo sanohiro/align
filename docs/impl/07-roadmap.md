@@ -653,8 +653,12 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
     `<N x T>`). **Construction** reuses the array literal under a `vecN<T>` annotation (the annotation
     picks the SIMD representation — no new syntax, "Nothing hidden"; a dedicated `hir::VecLit` that
     lowers to a value `Rvalue::MakeVec` insertelement chain, unlike the slot-based `ArrayLit`).
-    **Elementwise `+`/`-`/`*`/`/`** route through `gen_bin` to inkwell's vector `build_int_*`/
-    `build_float_*` (one lane-wise instruction; `%` deferred). **Lane read `v[i]`** (a constant lane,
+    **Elementwise `+`/`-`/`*`/`/`/`%`** route through `gen_bin` to inkwell's vector `build_int_*`/
+    `build_float_*` (one lane-wise instruction). Integer `/`/`%` carry the same lane-wise divisor
+    guard as scalars (MIR `lower_vec_div`, the SIMD mirror of `lower_int_div`): `any(divisor == 0)`
+    (a `mask` reduced by `Rvalue::MaskAny`) aborts via `div_fail`, and a signed `INT_MIN / -1` lane is
+    remapped-and-`select`ed to the wrapped result; float `%` is IEEE `frem`, unguarded. **Lane read
+    `v[i]`** (a constant lane,
     reusing `ExprKind::Index` → `Rvalue::VecExtract`/extractelement). The N-in-name form (`vec4<f32>`)
     needs zero lexer/parser/AST change — `resolve_type` derives N from the name. Completion condition
     met: the IR carries real `<N x T>` types + `add <N x i32>` (verified via `emit-llvm`); per-lane
