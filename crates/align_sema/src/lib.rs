@@ -419,6 +419,14 @@ fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) ->
 /// not frequency-dependent, so unlike the allocation/clone perf lints it needs no `--profile` data.
 const HUGE_STRUCT_BYTES: u64 = 128;
 
+/// Element-count threshold for the **wasteful default element type** lint (`draft.md` §16): a
+/// literal array whose element type is left to the unconstrained default (`i64` / `f64`) and has at
+/// least this many elements is flagged. Rationale for 64: a narrower element (`i8`) would occupy one
+/// 64-byte cache line for 64 elements, whereas the `i64` default spends 8 lines (512 bytes) — an 8×
+/// memory/bandwidth cost. Below ~64 the wasted width is at most a line or two (negligible), so the
+/// lint prefers silence to noise and fires only where the default plausibly costs real bandwidth.
+const DEFAULT_ELEM_LITERAL_ARRAY_LEN: u32 = 64;
+
 /// Round `n` up to the next multiple of alignment `a` (`a` a power of two, ≥ 1). The bitwise form
 /// (vs `div_ceil`) is the standard branch-free align-up; the `a <= 1` guard also avoids the `a - 1`
 /// underflow a stray `a == 0` would cause.
@@ -6787,6 +6795,26 @@ impl<'a, 't> Checker<'a, 't> {
         for e in &elems[1..] {
             checked.push(self.check_expr(e, Some(elem_ty)));
         }
+        // Wasteful-default lint (`draft.md` §16): a large literal array whose element type is left
+        // unconstrained falls to the `i64` / `f64` default, spending 8 bytes/element even when the
+        // data would fit a narrower type. If nothing constrained the element type (`elem_expected`
+        // is `None`) and it is still an inference variable (so `payload_scalar` below will default
+        // it), warn once for the whole literal and point at a narrower annotation. A **warning**:
+        // the default is correct, just potentially wasteful. (`elem_expected` present, or a concrete
+        // element type from a real value like `[a, b]` where `a: i32`, stays silent.)
+        if elem_expected.is_none() && n >= DEFAULT_ELEM_LITERAL_ARRAY_LEN {
+            let (dflt, narrower) = match self.resolve(elem_ty) {
+                Ty::IntVar(_) => (Some("i64"), "a narrower integer type (e.g. `i32`/`i16`/`i8`)"),
+                Ty::FloatVar(_) => (Some("f64"), "`f32`"),
+                _ => (None, ""),
+            };
+            if let Some(dflt) = dflt {
+                self.diags.push(align_diag::Diagnostic::warning(
+                    format!("this {n}-element literal array has an unconstrained element type, so it defaults to `{dflt}` (8 bytes/element); annotate {narrower} if the values fit"),
+                    span,
+                ));
+            }
+        }
         let scalar = self.payload_scalar(elem_ty, span);
         Expr { kind: ExprKind::ArrayLit { elems: checked, elem: scalar_to_ty(scalar) }, ty: Ty::Array(scalar, n), span }
     }
@@ -9212,6 +9240,10 @@ impl<'a, 't> Checker<'a, 't> {
                 );
             }
         }
+        // The lossy-conversion lint is emitted later, in `finalize_expr` — only there are both the
+        // operand and target widths concrete (an unconstrained-default or forward-inferred source is
+        // still an inference variable here). Classifying now would miss those and could misreport a
+        // width later unified to something else (Gate 5: resolve fully before classifying).
         self.constrain(target, expected, span);
         Expr { kind: ExprKind::Cast(Box::new(inner)), ty: target, span }
     }
@@ -9669,7 +9701,33 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
-            ExprKind::Cast(expr) => self.finalize_expr(expr),
+            ExprKind::Cast(expr) => {
+                self.finalize_expr(expr);
+                // Lossy-conversion lint (`draft.md` §16): now that inference is complete, both the
+                // operand type (`expr.ty`, finalized above) and the target (`cur_ty`) are concrete —
+                // classify the conversion *here*, not in `check_cast`, so a value whose width is only
+                // fixed later (an unconstrained default like `x := 100000; x as i8`, or a
+                // forward-inferred local) is seen at its final type (Gate 5: resolve fully first). A
+                // narrowing / precision-losing / saturating `as` is defined behavior, so this is a
+                // **warning**. Skipped for the `char`↔float pair (already a hard error in
+                // `check_cast` — no cascade) and for a compile-time numeric-literal operand (an
+                // explicit constant annotation, `1 as i8`).
+                let (src, tgt) = (expr.ty, cur_ty);
+                let numeric_or_char = |t: Ty| matches!(t, Ty::Int(_) | Ty::Float(_) | Ty::Char);
+                let char_float = (src == Ty::Char && matches!(tgt, Ty::Float(_)))
+                    || (matches!(src, Ty::Float(_)) && tgt == Ty::Char);
+                if numeric_or_char(src)
+                    && numeric_or_char(tgt)
+                    && !char_float
+                    && !is_numeric_literal(expr)
+                    && let Some(reason) = cast_loss(src, tgt)
+                {
+                    self.diags.push(align_diag::Diagnostic::warning(
+                        format!("lossy conversion: `{} as {}` {reason} — this is defined behavior, not an error", ty_name(src), ty_name(tgt)),
+                        span,
+                    ));
+                }
+            }
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.finalize_expr(lhs);
                 self.finalize_expr(rhs);
@@ -10240,6 +10298,70 @@ fn ty_name(ty: Ty) -> String {
         Ty::Param(i) => format!("<type param {i}>"),
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
+    }
+}
+
+/// Classify an `as` conversion for the **lossy-conversion** lint (`draft.md` §16, "Numeric
+/// conversion — as"). Returns a short reason when the conversion *may* lose information — a
+/// defined, non-error conversion the programmer should be aware of — or `None` when it is
+/// value-preserving (lossless) and needs no warning. `from`/`to` are the concrete operand /
+/// target types (both numeric or `char`); `char` behaves as a 32-bit unsigned code point, exactly
+/// as codegen treats it (`gen_cast`). Only *narrowing* / precision-losing / truncating conversions
+/// warn — same-width, widening, and same-width sign changes (`u8 as i8`) keep every bit and are
+/// treated as lossless (the settled "`as` covers lossless, truncating, and saturating conversions
+/// alike" — the lint flags the last two so they are visible, never blocks them). A source still an
+/// inference variable (an unconstrained literal like `1 as i8`, which the programmer is explicitly
+/// typing) is not a concrete int/float here, so it is silently accepted — the lint targets *typed*
+/// values, not literal annotations.
+fn cast_loss(from: Ty, to: Ty) -> Option<&'static str> {
+    // `char` is a 21-bit code point stored in 32 bits; for capacity analysis treat it as `u32`.
+    let int_bits = |t: Ty| -> Option<u8> {
+        match t {
+            Ty::Int(it) => Some(it.bits),
+            Ty::Char => Some(32),
+            _ => None,
+        }
+    };
+    let float_bits = |t: Ty| -> Option<u8> {
+        if let Ty::Float(ft) = t { Some(ft.bits) } else { None }
+    };
+    match (float_bits(from), float_bits(to)) {
+        // float → float: narrowing (f64 → f32) drops precision; widening / equal is lossless.
+        (Some(fb), Some(tb)) => {
+            (tb < fb).then_some("narrows a float to fewer bits, which may lose precision")
+        }
+        // float → int: the fractional part is always dropped and out-of-range values saturate.
+        (Some(_), None) => {
+            Some("truncates the fractional part (out-of-range values saturate to MIN/MAX)")
+        }
+        // int/char → float: a source wider than the float's mantissa loses precision on large
+        // values. Mantissa bits: f32 = 24, f64 = 53. (`char → float` is a sema error, unreachable.)
+        (None, Some(tb)) => {
+            let fb = int_bits(from)?;
+            let mantissa = if tb <= 32 { 24 } else { 53 };
+            (fb > mantissa)
+                .then_some("the integer is wider than the float's mantissa, so large values lose precision")
+        }
+        // int/char → int/char: strict narrowing truncates the high bits. Same-width (incl. a sign
+        // change like `u8 as i8`) and widening keep every bit, so they are lossless here.
+        (None, None) => {
+            let (fb, tb) = (int_bits(from)?, int_bits(to)?);
+            (tb < fb).then_some("truncates the high bits")
+        }
+    }
+}
+
+/// Whether `e` is a compile-time numeric literal — an int/float literal, possibly behind a chain of
+/// unary `-` (`-1`, `--128`). Such an operand in `x as T` is an explicit annotation on a constant
+/// (`1 as i8`, `-1.0 as f32`), not a typed value being narrowed, so the lossy-conversion lint skips
+/// it: a bare literal always keeps its own default width and never carries a runtime value that a
+/// narrowing would silently lose (a provably-out-of-range constant is the separate out-of-range
+/// literal lint's concern, `open-questions.md` M8 lint candidates — not this one).
+fn is_numeric_literal(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) => true,
+        ExprKind::Unary { op: UnOp::Neg, expr } => is_numeric_literal(expr),
+        _ => false,
     }
 }
 

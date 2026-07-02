@@ -1373,6 +1373,8 @@ unhandled Result
 branch in hot loop
 string re-scan
 implicit copy
+lossy conversion       (narrowing / float->int / wide-int->float / char narrowing `as`)
+wasteful default type  (large literal array left to the i64/f64 default)
 ```
 
 ### Convergence Over Expression
