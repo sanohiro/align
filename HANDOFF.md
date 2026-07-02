@@ -5,7 +5,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-03 (main @ PR #326; M6 formally closed same day, docs-only)._
+_Last updated: 2026-07-03 (main @ PR #330)._
 
 ## M6 — SIMD / vec / mask — formally closed (2026-07-03)
 
@@ -92,6 +92,23 @@ now reconciles every value's type with its expected context at a single reconcil
 `as` casts. Tests grew ~1103 → ~1147. M6/M8 roadmap remainders are now essentially consumed;
 deferred-with-record: owned `soa` columns, dynamic over-aligned arrays, cross-function aligned slice
 loads, the `prefer-pipeline` lint (needs a kernel surface).
+
+## Third wave (2026-07-03, PRs #326–#330)
+
+**#326** extended the differential fuzzer to pipeline reducers and `vecN` lane arithmetic
+(mutation-checked, no miscompiles found); **#327** formally closed M6 with both completion conditions
+re-verified; **#328** shipped the `map_into(out)` pipeline terminal with the thrice-deferred
+out-slice noalias emission — overlap guards went 3→0 at `-O2` — and the Claude-side fallback review
+caught a CONFIRMED false-noalias miscompile (call-laundered aliasing args) pre-merge, fixed by
+conservatizing the caller-side out-disjointness check; **#329** shipped FFI by-value structs
+(x86-64 SysV, ≤16B register class) with clang-verified flattening, and the fallback review caught a
+CONFIRMED SysV atomicity miscompile under register pressure, resolved by a compile-time GP/SSE budget
+walk after aggregate-coerce was empirically disproven; **#330** decided the `soa_slice<T>` repr
+(windowed 4-word soa view, unification not a new type) with implementation deferred pending a
+concrete consumer. **Review process note:** `gemini-code-assist` ran out of daily quota mid-wave; per
+owner instruction the review gate switched to Claude-side fallback reviews (deep-reasoner adversarial
+pass + re-verification of fixes by the original reviewer). This caught two real miscompiles pre-merge
+(#328/#329) — the gate is load-bearing. Tests grew ~1147 → ~1190.
 
 ## Latest (2026-07-02, PRs #262–#290)
 
