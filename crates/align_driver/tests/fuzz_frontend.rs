@@ -41,7 +41,10 @@ fn gen_soup(rng: &mut Rng, len: usize) -> String {
     let mut s = String::new();
     for _ in 0..len {
         if rng.below(25) == 0 {
-            s.push(rng.below(128) as u8 as char);
+            // A random Unicode scalar — often non-ASCII, so the lexer's multi-byte UTF-8 decode +
+            // non-ASCII "unexpected character" paths get exercised (not just 7-bit ASCII).
+            let cp = rng.below(0x2000) as u32;
+            s.push(char::from_u32(cp).unwrap_or('a'));
         } else {
             s.push_str(TOKENS[rng.below(TOKENS.len())]);
             s.push(if rng.below(4) == 0 { '\n' } else { ' ' });

@@ -9,13 +9,19 @@ fn fmt(src: &str) -> Option<String> {
     align_fmt::format_source(0, src)
 }
 
-fn parses_clean(src: &str) -> bool {
+/// Parse `src` and return the concatenated diagnostic messages if it fails to parse cleanly (so a
+/// property failure can show *why* the reformatted output no longer parses), or `None` if clean.
+fn parse_errors(src: &str) -> Option<String> {
     let mut diags = align_diag::Diagnostics::new();
     let mut sm = align_span::SourceMap::new();
     let fid = sm.add_file("f", src);
     let toks = align_lexer::tokenize(fid, src, &mut diags);
     let _ = align_parser::parse_file(toks, &mut diags);
-    !diags.has_errors()
+    if diags.has_errors() {
+        Some(diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>().join("; "))
+    } else {
+        None
+    }
 }
 
 /// Every checked-in example is a real, valid program — the formatter must be idempotent on each and
@@ -33,18 +39,22 @@ fn examples() -> Vec<std::path::PathBuf> {
 
 #[test]
 fn formatter_is_idempotent_and_parse_preserving_on_examples() {
-    for path in examples() {
+    let paths = examples();
+    // Guard against a vacuous pass (wrong path / no examples found).
+    assert!(paths.len() >= 50, "expected the examples corpus, found {} files", paths.len());
+    for path in paths {
         let src = std::fs::read_to_string(&path).unwrap();
         let name = path.display();
-        let once = match fmt(&src) {
-            Some(s) => s,
-            None => continue, // formatter declined (e.g. a parse error) — nothing to assert
-        };
+        // Every checked-in (single-file) example is a valid program, so the formatter must format
+        // it — a `None` here is a formatter bug, not something to skip.
+        let once = fmt(&src).unwrap_or_else(|| panic!("formatter declined to format the valid example {name}"));
         // Formatting the formatted output must be a no-op (a stable fixed point).
         let twice = fmt(&once).unwrap_or_else(|| panic!("fmt of formatted {name} returned None"));
         assert_eq!(once, twice, "formatter is not idempotent on {name}");
         // The formatted output must still parse without introducing errors.
-        assert!(parses_clean(&once), "formatted {name} no longer parses cleanly");
+        if let Some(errs) = parse_errors(&once) {
+            panic!("formatted {name} no longer parses cleanly: {errs}\n--- formatted ---\n{once}");
+        }
     }
 }
 
