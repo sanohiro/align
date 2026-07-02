@@ -4453,7 +4453,8 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_field_access(recv, field, expected, e.span)
             }
             ast::ExprKind::ArrayLit(elems) => {
-                let lit = match self.resolve(expected.unwrap_or(Ty::Error)) {
+                let want = self.resolve(expected.unwrap_or(Ty::Error));
+                let lit = match want {
                     // `[…]` under a `vecN<T>` annotation builds a SIMD vector, not an array.
                     Ty::Vec(s, n) => self.check_vec_lit(elems, s, n, e.span),
                     _ => self.check_array_lit(elems, None, e.span),
@@ -4463,7 +4464,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // allocation — "Nothing hidden", and codegen currently miscompiles it): reject it
                 // in an owned-array context and point to `.to_array()` (the visible materialization).
                 if matches!(lit.ty, Ty::Array(..) | Ty::StructArray(..))
-                    && matches!(expected.map(|t| self.resolve(t)), Some(Ty::DynArray(_) | Ty::DynStructArray(..)))
+                    && matches!(want, Ty::DynArray(_) | Ty::DynStructArray(..))
                 {
                     self.diags.error(
                         "a fixed array literal is not an owned `array<T>` — materialize it with `.to_array()` (its heap allocation is explicit)".to_string(),
