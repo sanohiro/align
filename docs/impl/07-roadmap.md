@@ -917,7 +917,9 @@ predication-ready, the forward-compatible shape for scalable-ISA tails (`05 §5`
     (`mono_args` empty — a monomorph would duplicate it; a generic template's params are the opaque
     `Ty::Param`, never a struct). Struct byte size is a faithful natural-alignment layout computed in
     sema (`struct_size_align`, matching LLVM's default non-packed layout). (`tests/lint_huge_struct_copy.rs`,
-    `examples/huge_struct_copy.align`.) The remaining lints from the enumerated set are not started.
+    `examples/huge_struct_copy.align`.) Lint batches 1–2 add the four below; the rest of the enumerated
+    set (allocation-in-loop, the broader unnecessary-clone/unnecessary-heap forms, branch-in-hot-loop,
+    string re-scan, implicit copy) is not started.
   - **lossy conversion — DONE (lint batch 1).** A narrowing int→int, saturating float→int,
     wide-int→float (past the target float's mantissa: f32 = 24, f64 = 53), narrowing float→float, or
     `char`-narrowing `as` is a **warning** ("… — this is defined behavior, not an error"): the
@@ -933,6 +935,23 @@ predication-ready, the forward-compatible shape for scalable-ISA tails (`05 §5`
     below the threshold, when a context/annotation constrains the element type (a typed pipeline stage),
     or when the element type comes from a concrete value rather than a defaulted literal. Emitted in
     `check_array_lit`. (`tests/lint_default_elem_array.rs`.)
+  - **unnecessary heap — DONE (lint batch 2, narrow slice).** `heap.new(x).get()` — a box allocated in
+    the arena only to immediately read its scalar straight back — is a **warning** ("use the value
+    directly; a stack value suffices"): the allocation serves no purpose (a `box<T>` payload is a
+    scalar in M3, so `.get()` is a plain copy-out). Detected purely locally in `finalize_expr` — a
+    `BoxGet` whose receiver is the allocating `HeapNew` itself — so it reuses no escape-analysis state,
+    is profile-independent (structural like huge-struct-copy, not in the deferred frequency-dependent
+    allocation-lint bucket), and never false-positives. The broader "box bound to a local, only ever
+    `.get()`-ed, never escaping" form is **deferred** — it needs a whole-function box-use scan (the
+    escape pass keeps no reusable per-box escape fact), recorded in `open-questions.md` under the M8
+    lint candidates. (`tests/lint_unnecessary_heap.rs`.)
+  - **prefer-pipeline-over-vecN — DEFERRED (lint batch 2).** The lint targets a *hand-written `vecN<T>`
+    loop* (a counted `for` doing vec-load → arith → vec-store) that should be a width-agnostic pipeline.
+    But Align has **no loop construct** — iteration is only ever `map`/`reduce`/… pipelines, and a bare
+    `vecN<T>` expression (`a + b` over `vec4<i32>`) is the *correct* hand-tuned-kernel use, not a
+    convert-to-pipeline candidate. So there is no mechanical "hand-written vecN loop" form to detect in
+    the current language; the firing condition is recorded (with a proposed shape for when a
+    kernel/loop surface exists) in `open-questions.md` under the M8 lint candidates.
 - `unsafe` blocks and `raw.*`. — **first slice DONE.** `unsafe {}` is a block expression (a plain
   marker block — no region, no runtime effect, strictly simpler than `arena`); the only new mechanism
   is an `unsafe_depth` counter that gates the `raw.*` ops. Shipped: `unsafe {}` + `raw.alloc(size)`

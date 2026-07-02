@@ -2560,6 +2560,30 @@ individual review entries. None block anything; pick up when the lint suite is a
   wide-int->float (past the mantissa), narrowing float->float, or char narrowing `as` (`cast_loss`
   in `check_cast`). Same-width / widening / same-width sign-change and unconstrained-literal sources
   stay silent. `tests/lint_lossy_cast.rs`.
+- Unnecessary heap: a `box<T>` that is allocated but never needs a heap identity — its scalar is only
+  read back and it never escapes — should be a stack value.
+  DONE (2026-07-03, lint batch 2, narrow slice): a warning on the inline form `heap.new(x).get()` — a
+  box allocated only to immediately read its scalar straight back (a `box<T>` payload is a scalar in
+  M3, so `.get()` is a plain copy-out). Detected purely locally in `finalize_expr` (a `BoxGet` whose
+  receiver is the allocating `HeapNew` itself); reuses no escape-analysis state, is profile-independent
+  (structural, like huge-struct-copy — NOT in the deferred frequency-dependent allocation-lint bucket),
+  and never false-positives. `tests/lint_unnecessary_heap.rs`.
+  DEFERRED (broader form): the common shape is `p := heap.new(x); … p.get()` (box bound to a local,
+  only ever `.get()`-ed, never moved/stored/returned/cloned). Firing-condition proposal for when it is
+  built: collect every box local (a `Let` whose init is `HeapNew`), then in one linear pass over the
+  body classify every *occurrence* of that local — fire iff every occurrence is the direct receiver of
+  a `BoxGet` (i.e. the local never appears in any other position). Sound and conservative (any other
+  occurrence — a move, a store, a `.clone()`, a return — suppresses it). Not built here because it is a
+  new whole-function box-use scan: the escape pass (`EscapeCheck`) emits inline diagnostics and keeps
+  **no reusable per-box "escaped?" fact** to piggyback on. Also note it would fire on the didactic
+  arena/box examples/tests (all true positives, but worth pairing the scan with that judgment).
+  (Latent bug found while building this, orthogonal to the lint — recorded for a separate fix: the
+  inline `v: i32 := heap.new(7).get()` **miscompiles**. `heap.new`'s payload scalar is resolved eagerly
+  from the literal — defaulting to `i64` — and the outer `v: i32` annotation cannot flow back into it,
+  so an `i64` box is read into an `i32` slot and the `let`'s `i64`→`i32` mismatch is not caught. A box
+  bound with an explicit `box<i32>` annotation, or fed a typed variable, is correct. The soundness hole
+  is missing backward width inference / a missed `let`-annotation type check on the `heap.new(literal)`
+  path — not the lint.)
 - Prefer-pipeline-over-vecN for bulk data: nudge bulk/array-shaped code from a hand-tuned fixed-width
   vecN<T> kernel toward the width-agnostic pipeline (map/where/reduce) when the data is a plain bulk
   scan — vecN<T> is the escape hatch for genuinely hand-tuned kernels, not the default, and pipeline
@@ -2567,6 +2591,17 @@ individual review entries. None block anything; pick up when the lint suite is a
   the scalable-vector reservation in the Hardware backlog above). Reserved 2026-07-02 (internal
   review, Opus+Codex independently agreed) specifically to guard against AI-generated code defaulting
   to a fixed 128/256-bit vecN<T> loop and losing SVE/RVV portability for no reason.
+  DEFERRED (lint batch 2, 2026-07-03): no firing surface exists yet. The lint's target — a *hand-written
+  `vecN<T>` loop* (a counted loop doing vec-load → arith → vec-store per iteration) — cannot be written
+  in Align today: there is **no loop construct** (iteration is only `map`/`reduce`/… pipelines), and a
+  bare `vecN<T>` expression (`a + b` over `vec4<i32>`, or a single `.load(i)`/lane op) is the *correct*
+  hand-tuned-kernel use, not a convert-to-pipeline candidate — flagging it would be a false positive
+  against `vecN<T>`'s reason to exist. Any purely-mechanical single-expression trigger would be wrong;
+  the heuristic "bulk scan expressed as vecN" is only meaningful once a loop/kernel form exists.
+  Firing-condition proposal for then: a counted loop over an array whose body is *exactly* {vec-load a
+  contiguous chunk → one elementwise arithmetic op → vec-store the chunk}, with no other statements and
+  no cross-lane/reduction op — that mechanical shape is a portable `map`; anything richer (shuffles,
+  masked lanes, hand-tuned reductions) is a genuine kernel and stays silent.
 - ~~Out-of-range compile-time integer literal (`x: u8 := 300`): candidate lint~~ — **done as a hard
   error instead** (SETTLED 2026-07-02; see "Out-of-range compile-time integer literals — hard error"
   in Settled). No lint needed.
