@@ -146,3 +146,25 @@ fn main() -> i32 {\n  arena {\n    mut xs := [1, 2].map(id64).to_array()\n    xs
     );
     assert_eq!(count_slot_drops(&text, "_0"), 1, "only the exit drop, no reassign-drop:\n{text}");
 }
+
+#[test]
+fn struct_owned_field_reassign_no_leak_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // A field-level owned reassign (`u.name = new`) frees the OLD field value before the store
+    // (Slice 4b — Slice 3 only handled whole-struct reassign). Runs clean; len("new") = 3.
+    let src = "User { name: string, age: i64 }\nfn main() -> i32 {\n  mut u := User{name: \"aaaa\".clone(), age: 1}\n  u.name = \"new\".clone()\n  return u.name.len() as i32\n}\n";
+    assert_eq!(build_and_run("field-reassign", src).status.code(), Some(3));
+}
+
+#[test]
+fn struct_owned_field_reassign_from_variable_stores_value_not_null() {
+    if !backend_available() {
+        return;
+    }
+    // Regression (gemini #283): the RHS is a *variable* — `store_value_at` lowers it internally, so
+    // its moved source must be nulled *after* the store, not before (else null is stored). len = 3.
+    let src = "User { name: string, age: i64 }\nfn main() -> i32 {\n  mut u := User{name: \"aaaa\".clone(), age: 1}\n  v := \"bee\".clone()\n  u.name = v\n  return u.name.len() as i32\n}\n";
+    assert_eq!(build_and_run("field-reassign-var", src).status.code(), Some(3));
+}

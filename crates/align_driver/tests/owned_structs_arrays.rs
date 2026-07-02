@@ -152,3 +152,22 @@ fn main() -> i32 {
     let out = build_and_run("copy-array", src);
     assert_eq!(out.status.code(), Some(7));
 }
+
+#[test]
+fn element_owned_field_reassign_drops_old() {
+    if !backend_available() {
+        return;
+    }
+    // Slice 4b: `us[i].name = new` frees the OLD field value before storing the new one (else it
+    // leaks) and nulls a moved-in variable's slot. Two elements untouched apart from us[0].name.
+    let src = "\
+User { name: string, age: i64 }
+fn main() -> i32 {
+  mut us := [User{name: \"aaaa\".clone(), age: 1}, User{name: \"bee\".clone(), age: 2}]
+  us[0].name = \"cc\".clone()
+  return (us[0].name.len() + us[1].name.len()) as i32
+}
+";
+    // "aaaa" freed (drop-of-old), "cc"(2) stored; us[1] "bee"(3) untouched → 2 + 3 = 5.
+    assert_eq!(build_and_run("ms-elem-field-reassign", src).status.code(), Some(5));
+}

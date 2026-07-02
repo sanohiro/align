@@ -131,6 +131,10 @@ pub enum Stmt {
     /// (recursively), before it is overwritten by a whole-element store (`us[i] = new`, Slice 4b).
     /// `u32` is the element struct id. Null-safe (a moved/unwritten element reads nulls).
     DropElem(Slot, Operand, u32),
+    /// Drop one owned `string` field (`u32` = field index) of element `index` of a fixed struct-array
+    /// slot: free that field's buffer before it is overwritten by an element-field store
+    /// (`us[i].name = new`, Slice 4b). Null-safe.
+    DropElemField(Slot, Operand, u32),
     /// Free the buffer of a free-standing owned `array<T>` *value* (a `{ptr,len}` operand that
     /// is not backed by a slot — an unbound `.to_array()` temporary consumed in place). Used to
     /// free the materialized buffer right after the loop that consumes it (null-safe).
@@ -923,7 +927,24 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
         hir::Stmt::AssignField { root, path, value } => {
             // `root.f0.… = value`. A struct-literal value is expanded in place at the path (its
             // leaves stored under the extended path); a scalar value is a single field store.
+            // If the leaf being overwritten is an owned `string` field, free the OLD value first
+            // (else it leaks — Slice 3 handled whole-struct reassign, not field-level) and null the
+            // RHS's moved source so it isn't double-freed. (Slice 4b: an owned nested-struct value
+            // `u.addr = Address{…}` still expands via `store_value_at` — its own owned fields are a
+            // later slice; only a direct `string` leaf is drop-of-old'd here.)
+            let drop_old_field = !matches!(value.kind, hir::ExprKind::StructLit { .. }) && field_ty_at(b, *root, path) == Ty::String;
+            if drop_old_field {
+                let old = b.fresh_value(Ty::String);
+                b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
+                b.push(Stmt::DropValue(Operand::Value(old)));
+            }
             store_value_at(b, *root, &mut path.clone(), value);
+            // Null the RHS's moved source *after* the store — `store_value_at` lowers `value`
+            // internally, so nulling a variable RHS beforehand would store null. (The old value was
+            // already freed above, before the overwrite.)
+            if drop_old_field {
+                null_moved_source(b, value);
+            }
         }
         hir::Stmt::AssignIndex { base, index, value } => {
             // `base[index] = value` — bounds-checked element store (abort on out-of-range, like a
@@ -986,6 +1007,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     other => unreachable!("soa=false element-field assignment into {other:?}"),
                 };
                 emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
+                // An owned `string` field being overwritten: free the OLD value first (else it
+                // leaks) and null the RHS's moved source. A scalar field needs neither. (Slice 4b.)
+                if b.structs[*struct_id as usize].fields[*field as usize].ty == Ty::String {
+                    b.push(Stmt::DropElemField(*base, idx.clone(), *field));
+                    null_moved_source(b, value);
+                }
                 b.push(Stmt::StoreElemField(*base, idx, *field, val));
             }
         }
@@ -2038,6 +2065,21 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
 /// Store `value` into `slot` at the field `path`, expanding a struct literal in place: a nested
 /// `StructLit` field recurses with the path extended by the field index, so only leaf scalars are
 /// stored (no intermediate struct value is materialized). A non-literal value is one field store.
+/// The type of the field reached from struct slot `slot` by the field-index `path` (each step
+/// indexes the current struct's fields). `Ty::Error` if the walk leaves a struct (shouldn't happen
+/// on a well-typed path).
+fn field_ty_at(b: &Builder, slot: Slot, path: &[u32]) -> Ty {
+    let mut ty = b.slots[slot as usize];
+    for &f in path {
+        let Ty::Struct(sid) = ty else { return Ty::Error };
+        match b.structs[sid as usize].fields.get(f as usize) {
+            Some(field) => ty = field.ty,
+            None => return Ty::Error,
+        }
+    }
+    ty
+}
+
 fn store_value_at(b: &mut Builder, slot: Slot, path: &mut Vec<u32>, value: &hir::Expr) {
     match &value.kind {
         hir::ExprKind::StructLit { fields, .. } => {
