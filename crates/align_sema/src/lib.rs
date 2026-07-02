@@ -2659,8 +2659,20 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             Stmt::AssignVecLane { value, .. } => self.walk(value, depth),
-            Stmt::Assign { local, value, .. } => {
+            Stmt::Assign { local, value, drop_old } => {
                 self.walk(value, depth);
+                // The value being *overwritten* is dropped here (the move pass set `drop_old`). But
+                // if it lived in an arena, its buffer is bump-allocated and bulk-freed by the arena
+                // — never individually. Freeing it here would corrupt the allocator (an interior
+                // arena pointer passed to `free`, then freed again by the arena's bulk reset — the
+                // observed double-free). The move pass has no region facts, so clear `drop_old` here
+                // (this pass owns them). The *new* value's own drop is still handled correctly by
+                // its region: a `Static` heap array keeps its exit drop; another arena value stays
+                // bulk-freed. Checked before the region map is updated below, so it reads the region
+                // of the value being replaced, not the replacement.
+                if matches!(self.region.get(local).copied(), Some(Region::Arena(_))) {
+                    drop_old.set(false);
+                }
                 // Conservative without a dataflow join: a binding that is *ever* assigned a
                 // local-backed slice stays local-backed (a later branch could reach `return`
                 // while the binding still holds the local array). We never clear the flag.
