@@ -4227,12 +4227,13 @@ impl<'a, 't> Checker<'a, 't> {
                 // `soa` (its columns would need per-column drop).
                 let is_move = struct_is_move(sid, self.structs);
                 if !(pod || (!soa && is_move)) {
+                    // We are in the error block, so `!(pod || (!soa && is_move))` held: either `soa`
+                    // is true, or (`soa` false and `is_move` false) — a str-view struct. There is no
+                    // third case (a fixed Move-struct array is allowed above).
                     let why = if soa {
                         "a soa element store needs only numeric/bool/char fields for now"
-                    } else if !is_move {
-                        "the struct has borrowed `str`/view fields that need region handling — deferred (owned `string` fields are supported)"
                     } else {
-                        "unsupported element shape"
+                        "the struct has borrowed `str`/view fields that need region handling — deferred (owned `string` fields are supported)"
                     };
                     self.diags.error(
                         format!("whole-element assignment of {} is not supported yet ({why})", ty_name(local_ty)),
