@@ -192,7 +192,10 @@ a scalable ISA is handled by predicated scalable codegen instead, which is why M
 > **Why the identity-select shape matters beyond perf.** Selecting each reducer's identity for a
 > masked-out lane (`min` → `+∞`, `max` → `−∞`, `any` → `false`, `all` → `true`, `dot` → `0`, matching
 > `sum`/`count` → `0`) makes *every* reduction **predication-ready**: a masked-out lane contributes the
-> identity and cannot change the result. That is exactly how a scalable ISA predicates a partial tail
+> identity and cannot change the result. Generic `reduce` is the one exception — its user-supplied
+> function has no known identity (`init` is the starting accumulator, not an identity), so it uses the
+> equally branchless accumulator-select form `acc = mask ? f(acc, v) : acc`: a masked-out lane leaves
+> the accumulator unchanged. That is exactly how a scalable ISA predicates a partial tail
 > vector (`04 §4`), so extending the identity-select form across all reducers keeps them
 > scalable-tail-ready for free — the branchless form is the forward-compatible one, not just the fast
 > one.

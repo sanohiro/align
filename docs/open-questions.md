@@ -319,7 +319,7 @@ always a compile-time-constant width, never scalable) while the **pipeline** (`m
 is the **width-agnostic main path** — it names no width in source, so scalable ISAs live there
 invisibly, the same way choosing AVX2 vs NEON is already a hardware detail, not a semantic one.
 Opus and Codex, asked the same question independently, converged on this exact conclusion. Record:
-`impl/04-mir.md` §4, `impl/05-backend-llvm.md` §5 (doc update pending/parallel), this file's Future →
+`impl/04-mir.md` §4, `impl/05-backend-llvm.md` §5 (doc update landed), this file's Future →
 "Hardware & backend optimization backlog" (scalable-vector / matrix-engine entries).
 
 ### Memory layout — `soa<T>` (struct-of-arrays) — SETTLED (2026-06-26)
@@ -1588,7 +1588,7 @@ what "Nothing hidden" + "One way" rule out (concatenation already leaked when re
 lifted lambda with no arena — see "External benchmark report — Gemini on M2/arm64" Gap A above, fixed
 2026-06-27 for that specific path; this decision generalizes the fix into the actual rule rather than
 a lambda-only guard). `builder` (`.write`/`.finish()`) is the one way to build a string incrementally.
-Record: `draft.md` §12 (doc update pending/parallel), `impl/06-runtime-std.md`.
+Record: `draft.md` §12 (doc update landed), `impl/06-runtime-std.md`.
 
 ### Unconstrained literal defaults + `&&`/`||` evaluation order — now explicit in the spec (2026-07-02)
 Two implementation-notes-only facts are promoted to explicit spec text: **an unconstrained integer
@@ -1601,7 +1601,7 @@ This is a **spec-documentation** settlement, not a claim that the short-circuit 
 verified end-to-end — track that separately (External soundness audit item **3-1** above records
 `&&`/`||` lowering to a strict, non-short-circuiting `Rvalue::Bin` in MIR as of that audit; confirm
 it is actually fixed before relying on the spec text here as also describing current codegen).
-Record: `draft.md` §5 (doc update pending/parallel).
+Record: `draft.md` §5 (doc update landed).
 
 ### Panic / unwinding (CFG shape)
 **Decision: no unwinding; immediate abort.** Fatal errors (div-by-zero, OOM) abort the process; there is no catch/recover boundary. The compiler emits plain LLVM `call` (never `invoke` + landing pads), so the MIR→LLVM CFG stays exception-free. (Promotes the prior "currently: immediate abort" detail to a locked decision — committing now keeps the CFG-generation stage from ever needing landing-pad support.) The *build-level* `panic=abort` + strip-`.eh_frame` step that drops the Rust-std unwinder is a separate, opt-in binary-size/startup lever (see Future "Hardware & backend optimization backlog").

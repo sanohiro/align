@@ -795,10 +795,12 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   whole-element write of `str`/nested/owned structs (region/move handling), bitset/bool packed columns.
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR
-level; and extend the branchless identity-select `where` form beyond `sum`/`count` to every reducer
-(`reduce` / `min` / `max` / `any` / `all` / `dot`, identities `+∞` / `−∞` / `false` / `true` / `0`),
-so all reductions are predication-ready — the forward-compatible shape for scalable-ISA tails
-(`05 §5`).
+level; and extend the branchless `where` form beyond `sum`/`count` to every reducer —
+identity-select where a fixed identity exists (`min` / `max` / `any` / `all` / `dot`, identities
+`+∞` / `−∞` / `false` / `true` / `0`), and the accumulator-select form
+`acc = mask ? f(acc, v) : acc` for generic `reduce`, whose user-supplied `f` has no known identity
+(`init` is the starting accumulator, not an identity of `f`) — so all reductions are
+predication-ready, the forward-compatible shape for scalable-ISA tails (`05 §5`).
 
 ## M7 — Parallelism — DONE (par_map/chunks/purity, first-class closures ①–③, task_group ④a–④c; only fully-escaping fn values deferred)
 
