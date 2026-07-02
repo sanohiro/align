@@ -3964,29 +3964,39 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         if f.name.name == "main" {
-            // `main`'s error type — the `E` in `-> Result<(), E>` — is restricted to the builtin
-            // `Error`. The C-`main` wrapper's exit-code lowering reads the `Err` payload as the
-            // builtin `Error` enum's specific `{ i32 tag, i32 code }` shape (`Code(c)` → `clamp(c)`,
-            // a category → `tag + 1`); a user-defined error enum at that position has a different
-            // layout and no defined exit-code mapping, so it would miscompile. Reject it here with a
-            // clear diagnostic. (Relaxation waits on the full `Error` design — see `open-questions.md`
-            // "Error type design".)
-            if let Ty::Result(_, e) = ret
-                && !matches!(e, Scalar::Enum(eid) if eid == self.error_enum_id)
-            {
-                self.diags.error(
-                    "main's error type must be the builtin `Error`; user-defined error types in main's return will be allowed once the full Error design lands".to_string(),
-                    f.ret.as_ref().map(|t| t.span()).unwrap_or(f.span),
-                );
+            let ret_span = f.ret.as_ref().map(|t| t.span()).unwrap_or(f.span);
+            // A fallible `main` returns exactly `Result<(), Error>` (draft.md §17): the `Ok`
+            // payload must be `()` and the error must be the builtin `Error`. The C-`main`
+            // wrapper's exit-code lowering reads the `Err` payload as the builtin `Error` enum's
+            // specific `{ i32 tag, i32 code }` shape (`Code(c)` → `clamp(c)`, a category →
+            // `tag + 1`) and returns exit 0 on `Ok` — a non-unit `Ok` payload has no exit-code
+            // meaning (it would be silently discarded) and a user-defined error enum has a
+            // different layout with no defined mapping (it would miscompile). Reject both here with
+            // a clear diagnostic; to return a value, use `-> i32`. (Relaxation of the `E`
+            // restriction waits on the full `Error` design — see `open-questions.md` "Error type
+            // design".) These checks apply to every `main` form (no-arg and argv alike).
+            if let Ty::Result(ok, e) = ret {
+                if ok != Scalar::Unit {
+                    self.diags.error(
+                        "main's Ok type must be `()` — a fallible main returns `Result<(), Error>`; use `-> i32` to return a value".to_string(),
+                        ret_span,
+                    );
+                }
+                if !matches!(e, Scalar::Enum(eid) if eid == self.error_enum_id) {
+                    self.diags.error(
+                        "main's error type must be the builtin `Error`; user-defined error types in main's return will be allowed once the full Error design lands".to_string(),
+                        ret_span,
+                    );
+                }
             }
             // `main` takes no arguments, or exactly `args: array<str>` (argv, draft.md §19) with a
-            // `Result<(), _>` return — the latter is the only form the C-`main` wrapper marshals
-            // argv into (an `-> i32` argv `main` is a later follow-up). The `E` is validated
-            // separately above, so this checks only the parameter and `Ok`-payload shape.
+            // `Result<(), Error>` return — the argv form is the only one the C-`main` wrapper
+            // marshals argv into, so it must return a `Result` (an `-> i32` argv `main` is a later
+            // follow-up). The `Ok`/`E` shape is validated above, so this checks only the parameter
+            // shape and that the return is *some* `Result` (one error per root cause).
             if !f.params.is_empty() {
-                let args_ok = param_tys.as_slice() == [Ty::DynArray(Scalar::Str)]
-                    && matches!(ret, Ty::Result(Scalar::Unit, _));
-                if !args_ok {
+                let params_ok = param_tys.as_slice() == [Ty::DynArray(Scalar::Str)];
+                if !params_ok || !matches!(ret, Ty::Result(..)) {
                     self.diags.error(
                         "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return".to_string(),
                         f.span,
@@ -11925,6 +11935,19 @@ mod tests {
         // Same restriction on the argv form.
         let (_r, argv) = check("MyErr { Bad }\nfn main(args: array<str>) -> Result<(), MyErr> {\n  return Err(MyErr.Bad)\n}\n");
         assert!(argv.has_errors(), "main(args) with a user-defined error type must error");
+        // A fallible main's `Ok` type must be `()` — a non-unit Ok has no exit-code meaning and
+        // was silently discarded by the wrapper (return a value via `-> i32` instead).
+        let (_t, okint) = check("fn main() -> Result<i32, Error> {\n  return Ok(0)\n}\n");
+        assert!(okint.has_errors(), "main() -> Result<i32, Error> (non-unit Ok) must error");
+        assert!(
+            okint
+                .iter()
+                .any(|d| d.message.contains("main's Ok type must be `()`")),
+            "the diagnostic must name the unit-Ok restriction",
+        );
+        // The argv form carries the same Ok restriction.
+        let (_u, argvok) = check("fn main(args: array<str>) -> Result<i32, Error> {\n  return Ok(0)\n}\n");
+        assert!(argvok.has_errors(), "main(args) -> Result<i32, Error> (non-unit Ok) must error");
         // `main() -> i32` stays valid (the C-entry form).
         let (_s, i32main) = check("fn main() -> i32 {\n  return 0\n}\n");
         assert!(!i32main.has_errors(), "main() -> i32 must check");
