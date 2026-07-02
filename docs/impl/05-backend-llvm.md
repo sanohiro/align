@@ -175,7 +175,12 @@ loop:
 
 - **mask** → LLVM `<W x i1>` and `select` (branchless, `04 §4`).
 - **dot / sum / min / max** → `llvm.vector.reduce.*`.
-- **no-alias** (`out`, `03 §6`) → `noalias` attribute on the pointer argument. Make explicit to LLVM the basis for dependence-free vectorization.
+- **no-alias** (`out`, `03 §6`) → scoped `!alias.scope`/`!noalias` metadata on the `map_into` fused
+  loop's source load and `dst` store (a slice is passed by value as `{ptr,len}`, so its buffer
+  pointer is not a standalone param to carry a `noalias` *attribute* — the scoped metadata is the
+  equivalent per-access form). One fresh domain + `in`/`out` scope pair per loop; gated on the
+  sema-proven `dst`-disjoint-from-source precondition. Makes explicit to LLVM the basis for
+  dependence-free vectorization — verified to drop the loop's runtime overlap guard at `-O2`.
 - aligned load/store when already aligned.
 
 ### Choosing the width (a backend, per-target choice)

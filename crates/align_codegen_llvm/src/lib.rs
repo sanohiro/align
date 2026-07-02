@@ -29,7 +29,7 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, StructType};
-use inkwell::values::{BasicValueEnum, FunctionValue, IntValue};
+use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, IntValue};
 
 pub fn is_available() -> bool {
     true
@@ -227,6 +227,15 @@ fn build_module<'c>(
         "bounds_fail".to_string(),
         module.add_function(
             "align_rt_bounds_fail",
+            ctx.void_type().fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false),
+            None,
+        ),
+    );
+    // `map_into` destination/source length mismatch: report `(dst_len, src_len)` and abort (`-> !`).
+    funcs.insert(
+        "len_mismatch_fail".to_string(),
+        module.add_function(
+            "align_rt_len_mismatch_fail",
             ctx.void_type().fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false),
             None,
         ),
@@ -961,6 +970,7 @@ fn build_module<'c>(
             slots: HashMap::new(),
             values: HashMap::new(),
             blocks: Vec::new(),
+            alias_scopes: HashMap::new(),
         }
         .emit_fn()?;
     }
@@ -1553,11 +1563,47 @@ struct FnGen<'c, 'a> {
     slots: HashMap<Slot, inkwell::values::PointerValue<'c>>,
     values: HashMap<ValueId, BasicValueEnum<'c>>,
     blocks: Vec<BasicBlock<'c>>,
+    /// Per-`map_into`-loop scoped-`noalias` metadata, keyed by the MIR loop's scope id: the
+    /// `(in_list, out_list)` scope lists (each a one-scope MDNode) built lazily on first use. The
+    /// `in`/`out` scopes share a fresh disjoint domain per id, so the loop's source load
+    /// (`!alias.scope in`, `!noalias out`) and `dst` store (`!alias.scope out`, `!noalias in`) are
+    /// proven not to overlap. Globally unique per (function, id) so distinct loops never collide.
+    alias_scopes: HashMap<u32, (inkwell::values::MetadataValue<'c>, inkwell::values::MetadataValue<'c>)>,
 }
 
 impl<'c, 'a> FnGen<'c, 'a> {
     fn err(&self, e: impl std::fmt::Display) -> CodegenError {
         CodegenError::Lowering(e.to_string())
+    }
+
+    /// The `(in_list, out_list)` scoped-`noalias` metadata lists for `map_into` loop `scope`, built
+    /// once per id. `in`/`out` are two scopes sharing a fresh domain; each list is a one-scope
+    /// MDNode. A scope node's operand[1] is its domain (`AliasScopeNode::getDomain` reads operand 1),
+    /// so both scopes report the same domain and the AA can prove the `dst` store (`alias.scope=out`,
+    /// `noalias=in`) never aliases the source load (`alias.scope=in`, `noalias=out`). Every node
+    /// carries a globally-unique string (`fn_name.mapinto.id`) so the metadata uniquer keeps this
+    /// loop's scopes distinct from every other loop's — required for the disjointness claim to stay
+    /// sound if the function is later inlined next to another `map_into`.
+    fn alias_scope_lists(&mut self, scope: u32) -> (inkwell::values::MetadataValue<'c>, inkwell::values::MetadataValue<'c>) {
+        if let Some(v) = self.alias_scopes.get(&scope) {
+            return *v;
+        }
+        let tag = format!("{}.mapinto.{scope}", self.f.name);
+        let domain = self
+            .ctx
+            .metadata_node(&[self.ctx.metadata_string(&format!("align.domain.{tag}")).into()]);
+        let in_scope = self.ctx.metadata_node(&[
+            self.ctx.metadata_string(&format!("align.in.{tag}")).into(),
+            domain.into(),
+        ]);
+        let out_scope = self.ctx.metadata_node(&[
+            self.ctx.metadata_string(&format!("align.out.{tag}")).into(),
+            domain.into(),
+        ]);
+        let in_list = self.ctx.metadata_node(&[in_scope.into()]);
+        let out_list = self.ctx.metadata_node(&[out_scope.into()]);
+        self.alias_scopes.insert(scope, (in_list, out_list));
+        (in_list, out_list)
     }
 
     /// Translate a MIR (logical) field index into the LLVM (physical) index for struct `struct_id`.
@@ -1850,6 +1896,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|e| self.err(e))?
                     };
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                }
+                Stmt::PtrStoreNoalias { ptr, index, value, scope } => {
+                    // `dst[i] <- val` for a `map_into` loop: like `PtrStore`, plus the loop's `out`
+                    // alias scope so the vectorizer knows it can't overlap the (`in`-scoped) source
+                    // load. `alias.scope = {out}`, `noalias = {in}`.
+                    let p = self.operand(ptr).into_pointer_value();
+                    let idx = self.operand(index).into_int_value();
+                    let val = self.operand(value);
+                    let ep = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(val.get_type(), p, &[idx], "ptrstore")
+                            .map_err(|e| self.err(e))?
+                    };
+                    let st = self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                    let (in_list, out_list) = self.alias_scope_lists(*scope);
+                    let scope_kind = self.ctx.get_kind_id("alias.scope");
+                    let noalias_kind = self.ctx.get_kind_id("noalias");
+                    st.set_metadata(out_list, scope_kind).map_err(|_| self.err("set alias.scope"))?;
+                    st.set_metadata(in_list, noalias_kind).map_err(|_| self.err("set noalias"))?;
                 }
                 // `s.store(i, v)` — `<n x T>` store into `&buf[i]` at the element alignment.
                 Stmt::VecStore { slice, index, value, elem, n: _ } => {
@@ -3557,6 +3622,30 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?
                 };
                 self.builder.build_load(ty, ep, "slcload").map_err(|e| self.err(e))?
+            }
+            Rvalue::SliceIndexNoalias { slice, index, scope } => {
+                // Like `SliceIndex`, plus the `map_into` loop's `in` alias scope so the vectorizer
+                // knows this source load can't overlap the (`out`-scoped) `dst` store.
+                // `alias.scope = {in}`, `noalias = {out}`.
+                let agg = self.operand(slice).into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?.into_pointer_value();
+                let ty = scalar_type(self.ctx, result_ty, self.struct_types, self.enum_types);
+                let idx = self.operand(index).into_int_value();
+                let ep = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(ty, ptr, &[idx], "slcidx")
+                        .map_err(|e| self.err(e))?
+                };
+                let load = self.builder.build_load(ty, ep, "slcload").map_err(|e| self.err(e))?;
+                let (in_list, out_list) = self.alias_scope_lists(*scope);
+                let scope_kind = self.ctx.get_kind_id("alias.scope");
+                let noalias_kind = self.ctx.get_kind_id("noalias");
+                let inst = load
+                    .as_instruction_value()
+                    .ok_or_else(|| self.err("slice load is not an instruction"))?;
+                inst.set_metadata(in_list, scope_kind).map_err(|_| self.err("set alias.scope"))?;
+                inst.set_metadata(out_list, noalias_kind).map_err(|_| self.err("set noalias"))?;
+                load
             }
             Rvalue::SubSlice { base, start, len, elem } => {
                 // Offset the base pointer by `start` elements (the `elem` type sets the GEP stride —

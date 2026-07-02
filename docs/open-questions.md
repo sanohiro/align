@@ -738,9 +738,10 @@ compare means an unknown key colliding into an occupied slot is still skipped). 
   view rather than an outright rejection.
 - **`soa_slice<T>`** (a per-column-pointer view, so a function can take a borrowed soa slice —
   `slice<T>` is `{ptr,len}` AoS and can't); `str`/Move columns.
-- **`map_into(out dst)`** pipeline terminal — the minimal construct that makes `out` `noalias`/`nonnull`
-  metadata worth emitting (Sema already has the no-alias check; only the LLVM attribute is missing —
-  `declare_fn`, `align_codegen_llvm/src/lib.rs:~965`). ≈1.0–1.5×, secondary to construction.
+- ~~**`map_into(out dst)`** pipeline terminal — the minimal construct that makes `out` `noalias`
+  metadata worth emitting.~~ **DONE** — the terminal, the alias-soundness gate, and scoped
+  `!alias.scope`/`!noalias` emission all landed (verified the `-O2` overlap guard drops 3 → 0). See
+  "`out` parameters + `noalias`" above.
 - **`arena.checkpoint()` / `rollback()`** surface API over the existing `align_rt_arena_reset`
   (`align_runtime/src/lib.rs:~1158`) — O(1) reuse of per-iteration transient allocations in a
   long-running loop. ≈1.2–3× on alloc-heavy request loops (but Rust+`bumpalo` competes — bench against
@@ -2183,66 +2184,58 @@ kept out of this increment. Original design note follows.
 A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) data := …`) for GPU/DMA/page-aligned zero-copy interop. **Retrofit-sensitive**: it modifies struct field-offset math and the arena bump allocator's alignment, so reserve room in the layout model now; the surface + LLVM `align N` emission + arena honoring it can land at M6 alongside SoA. (Digested from `work/proposals/next-draft.md` §1.1.)
 **Groundwork landed (pre-M6):** `StructDef` carries `align: Option<u32>` (always `None` today — no surface syntax), and codegen routes all allocation alignment through one seam, `type_align(ty)` (natural ABI alignment today; a struct's custom `align` if set). M6 work is then "parse `align(N)` → set `StructDef.align`" + the seam returns it — the stack-slot alloca already calls the seam; the arena bump allocator already takes an explicit `align` argument. (Retrofit risk was low — a custom alignment is largely *additive* at the alloca/global/alloc sites — so this groundwork is a light reservation, unlike the SoA field-access seam.)
 
-### `out` parameters + `noalias` — write mechanism + no-alias check DONE; LLVM metadata is the follow-up
-`out` params (`draft.md` §7) are a no-alias optimization. **Implemented:** (1) the write mechanism —
-`out dst: slice<T>` is a writable output buffer and `place[i] = v` (bounds-checked) writes a `mut`
-array local or `out` slice (primitive elements); (2) the **no-alias check** — at a call site an
-`out` argument must not alias another argument, compared by **root buffer**: a slice local's
-provenance is tracked back to the array it borrows (`s: slice := a`), so `fill(a, s)` and
-`fill(s1, s2)` (two slices of `a`) are both rejected, not just `fill(a, a)`. **Sub-slice hole —
-Status: fixed.** `expr_root_local`/`arg_root_local` now see through `SliceRange` (`recv[a..b]`),
-so an inline sub-slice argument `fill(xs, xs[0..2])`, two overlapping sub-slices via bindings
-(`s1 := xs[0..2]; s2 := xs[1..3]; fill(s1, s2)`), and nested sub-slices (`xs[0..4][1..2]`) all
-resolve to the shared root buffer and are rejected. This is deliberately conservative: two
-sub-slices of the same array are rejected whether or not their ranges actually overlap
-(`fill(xs[0..2], out xs[2..4])` is rejected too — range analysis is a separate follow-up).
-(Residual, still open for the noalias-emission follow-up: forms whose root cannot be resolved by
-name/sub-slice remain treated as their own root and so escape the check — a slice **returned from a
-function** (unknown provenance), a **soa column** `s.col` or a **struct field** of slice type
-(both `FieldAccess`, would need per-field/per-column provenance). These need borrow-through-return
-and per-field provenance tracking; for today's direct-borrow slices they are sound, but the
-emission gate may need to conservatively reject unknown-provenance `out`/input args.) **What remains is emitting the LLVM `noalias`** so loop vectorization can skip
-runtime overlap checks — blocked on the slice ABI: a slice is passed **by value** as a `{ptr,len}`
-aggregate, so its buffer pointer is not a standalone pointer parameter to attribute. Needs either a
-by-pointer `out`-slice ABI or scoped `!noalias` metadata on the buffer stores. The no-alias *check*
-is the soundness precondition for that emission.
+### `out` parameters + `noalias` — DONE (write mechanism + no-alias check + `map_into` + scoped `!noalias` emission)
+`out` params (`draft.md` §7) are a no-alias optimization. **All three layers landed:**
+1. **Write mechanism** — `out dst: slice<T>` is a writable output buffer and `place[i] = v`
+   (bounds-checked) writes a `mut` array local or `out` slice (primitive elements).
+2. **No-alias check** — at a call site an `out` argument must not alias another argument, compared
+   by **root buffer**: a slice local's provenance is tracked back to the array it borrows
+   (`s: slice := a`), so `fill(a, s)` and `fill(s1, s2)` (two slices of `a`) are both rejected, not
+   just `fill(a, a)`. `expr_root_local`/`arg_root_local` see through `SliceRange` (`recv[a..b]`), so
+   an inline sub-slice argument `fill(xs, xs[0..2])`, two overlapping sub-slices via bindings
+   (`s1 := xs[0..2]; s2 := xs[1..3]; fill(s1, s2)`), and nested sub-slices (`xs[0..4][1..2]`) all
+   resolve to the shared root buffer and are rejected (conservative: sub-slices of one array are
+   rejected whether or not their ranges actually overlap — range analysis is a separate follow-up).
+   **Conservatized for the `noalias` precondition (fix for a confirmed miscompile):** the check now
+   also requires each root to be a *known* backing buffer (`slice_root_is_known` — a slice/array
+   parameter or a real array local) and **rejects** an argument it cannot resolve (a fn-call / `if` /
+   block result) or one bound to a slice of unknown origin — instead of the earlier silent skip that
+   let `scale(ident(ys[0..4]), ys[1..5])` (an aliasing fn-returned view) through, whereupon the
+   callee's `map_into` `noalias` was a miscompile. A fresh array-literal argument is allowed (stack
+   storage); scalar arguments are not compared. Tests: `crates/align_driver/tests/out_params.rs`.
+3. **`map_into(out dst)` + scoped `!noalias` emission** — the first materializing terminal that
+   writes a pipeline into a caller buffer (`src.map(f).map_into(dst)`), and the reachable target that
+   makes the metadata worth emitting. The fused loop's source load and `dst` store carry the loop's
+   disjoint `in`/`out` alias scopes (`MIR SliceIndexNoalias`/`PtrStoreNoalias` → codegen
+   `!alias.scope`/`!noalias`; one fresh domain + `in`/`out` scope pair per `map_into` loop, named
+   `fn.mapinto.id` so distinct loops never collide). **Verified:** at `-O2 -force-vector-width=4`
+   the loop's runtime overlap guard drops **3 → 0** `diff.check`/`or.cond` instructions vs. the same
+   IR with the metadata stripped, both still vectorizing. (`map_into` v1 is length-preserving —
+   `map`/field-projection stages, `dst.len() == src.len()` or abort; a filtering `where` before it,
+   which writes a variable prefix, is deferred.) Tests: `crates/align_driver/tests/map_into.rs`.
 
-**Investigated 2026-07-02 (scoped `!alias.scope`/`!noalias`) — mechanism proven, but DEFERRED: no
-reachable target today + a soundness gate to close first.** Findings:
-- **The metadata mechanism works and is the right shape.** A hand-written two-slice-param loop
-  (`out dst[i] = src[i]*10`) at `-O2` (host triple + `x86-64-v3`) emits a runtime overlap guard
-  (`%diff.check`/`%or.cond`) + a scalar prologue before the vector loop. Tagging the input load
-  `!alias.scope !{in}, !noalias !{out}` and the `out` store `!alias.scope !{out}, !noalias !{in}`
-  (one per-function domain; the single `out` scope disjoint from **one shared** `in` scope — inputs
-  may self-alias, so they share a scope and never claim noalias against each other) **removes the
-  overlap guard and the scalar prologue entirely** (verified: `diff.check`/`or.cond` count 4 → 0).
-- **But there is no source construct today that generates such a loop.** `out`-slice writes are only
-  the manual constant-index stores of `draft.md` §7's `scale` example (no loop). The
-  writable-in-a-loop terminal `map_into(out dst)` is deferred (below), and whole-slice arithmetic
-  (`dst = a + b`, draft §7 `add`) is **not** implemented (only `vecN<T>` is elementwise). The fused
-  pipeline loops that *do* store in a loop — `to_array`/`scan`/`to_soa` — all write a **freshly
-  allocated** buffer, disjoint from the source slice, and LLVM **already** vectorizes them with **no**
-  overlap check (verified byte-identical output with vs. without a `noalias` return attr on
-  `align_rt_arena_alloc`; a corpus sweep of every `examples/*.align` at `-O2`+triple shows **zero**
-  `found.conflict`/memcheck blocks anywhere). So emitting scope metadata now would attach it to
-  loads/stores that have **no disjoint counterpart in any loop** — dead complexity + soundness risk
-  for zero measured benefit (against "ideal form, or defer").
-- **Soundness gate found (must close before ANY `out` noalias emission).** The no-alias *check*
-  does **not** see through range-subslicing: `f(xs, xs[0..2])` and `f(s1, s2)` with `s1 := xs[0..2]`
-  / `s2 := xs[1..3]` are **accepted** even though the `out` buffer overlaps an input. `expr_root_local`
-  (`align_sema/src/lib.rs` ~:4915) only tracks `ExprKind::Local` and `ExprKind::ArrayToSlice`
-  (whole-array borrow, `s: slice := a`), not `ExprKind::SliceRange`; an inline `xs[0..2]` arg has no `place_local`
-  root at all. (The "`fill(s1,s2)` rejected" claim above holds **only** for the whole-array-borrow
-  form; the subslice form was an untracked hole.) The emission gate must extend provenance through
-  `SliceRange` and conservatively reject unknown-provenance `out` args, else scope metadata is a
-  miscompile.
-- **Conclusion / who inherits this:** implement scope-metadata emission **as part of the
-  `map_into(out dst)` slice** (the first real two-slice-param loop), after closing the subslice
-  provenance hole. The proven encoding above (per-fn domain; one `in` scope disjoint from each `out`
-  scope; tag only loads/stores whose base is a slice **parameter**, never fresh-alloc/local/arena
-  buffers) is ready to drop in then. The `noalias`/`willreturn`/`nofree` return attrs on the
-  allocator-family runtime decls (perf backlog above) are the orthogonal, simpler lever for the
-  fresh-alloc pipeline loops — but even those showed no effect on the current corpus.
+**Soundness gate (the precondition for emission), now closed.** `noalias` on the `map_into` loop
+asserts `dst` is disjoint from the source, so the emission gate rejects anything it cannot prove
+disjoint: (a) the destination and the source root must be a *known* backing buffer — a slice/array
+**parameter** (distinct by the caller's `out` no-alias contract) or a real array local; (b) a slice
+**local of unknown origin** (bound to a fn-returned slice, a `soa` column `s.col`, or a struct-field
+slice — all `expr_root_local == None`, so their root is themselves and would falsely read as
+"distinct") is rejected, as is such a form used directly as the source; (c) a fixed array-literal
+source (fresh stack storage, provably disjoint from any caller slice) is allowed but its loads are
+**not** scope-tagged (no over-emission). A slice-typed local carries a new `hir::Local::is_param`
+flag so the gate can tell a parameter from an unknown-origin `let`. This closes the earlier hole
+where two sub-slices of one array (or a fn-returned view that aliases the `out`) slipped past.
+
+**Encoding that shipped** (proven by the 2026-07-02 investigation, then implemented): tag only the
+loads/stores whose base is a slice — the source `SliceIndex` load `!alias.scope !{in}, !noalias
+!{out}` and the `dst` store `!alias.scope !{out}, !noalias !{in}`, with `in` and `out` two scopes in
+a fresh per-loop domain (a scope node's operand[1] is its domain, so both report the same domain and
+the AA proves the store/load never overlap). Only **one** input scope and **one** output scope per
+loop — inputs never claim noalias against each other, so no over-emission. Fresh-alloc pipeline
+loops (`to_array`/`scan`/`to_soa`) write a freshly allocated buffer disjoint from the source and
+LLVM already vectorizes them with no overlap check, so they are left untagged; the
+`noalias`/`willreturn`/`nofree` return attrs on the allocator-family runtime decls are the
+orthogonal lever there.
 
 (Digested from
 `work/proposals/optimization-milestones.md` §1.2, `toolchain-optimizations.md` §5; see also

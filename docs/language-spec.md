@@ -224,6 +224,14 @@ inferred). A lambda may capture enclosing variables by value — with no hidden 
 environment (it compiles like a named function, captures passed as arguments). `where(.active)`
 is shorthand for a one-field lambda.
 
+A pipeline **materializes** either into a fresh owned `array<T>` (`.to_array()`) or into a
+caller-provided `out`/`mut` slice (`.map_into(dst)` — the caller-storage counterpart). `map_into` is
+length-preserving (`map` / field-projection stages; `dst.len() == src.len()`, a mismatch aborts) and
+yields `()`; because the compiler proves `dst` is a distinct buffer from the source (the `out`
+no-alias rule), it emits the disjoint-buffer `noalias` so the fused write vectorizes with no runtime
+overlap check. An `out` parameter (`fn scale(src: slice<T>, out dst: slice<T>)`) is a writable output
+buffer that must not alias any other argument — both a safety constraint and the no-alias hint.
+
 SIMD is two layers: the pipeline (`map`/`where`/`reduce`) is the width-agnostic main road — it never
 names a width, so bulk vectorization (including future scalable ISAs, SVE/RVV) is chosen in the
 backend and stays a hardware detail. `vecN<T>` / `maskN<T>` (below) are the fixed-size escape hatch
