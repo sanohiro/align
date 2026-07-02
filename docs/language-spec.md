@@ -336,6 +336,11 @@ order, natural alignment, no reordering). Only such a struct may be written to /
 memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
 FFI-mappable scalars; by-value struct passing is a later slice.
 
+An `align(N)` attribute (`align(N) S { … }`, a power of two, composes with `layout(C)`) over-aligns a
+struct's storage — the max of `N` and the natural alignment, so it never under-aligns — for SIMD /
+GPU / DMA / page-aligned interop. It also rounds the type's **size** up to `N` (as C does), so a fixed
+array `[align(64) S]` has a tight, over-aligned element stride (every element stays `align(N)`).
+
 A `str`/`slice`/`bytes` view is FFI-safe as a **parameter**: it lowers to its data pointer (C
 `char*`/`void*`), the length passed separately by the caller (`s.len()`) — the C `(ptr, len)` idiom.
 A view is not a valid return type (a bare pointer has no length), and it is not NUL-terminated (only

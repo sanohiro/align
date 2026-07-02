@@ -1,7 +1,8 @@
 // The `align(N)` over-alignment attribute (M6). `align(N) Name { … }` over-aligns the type's
 // storage to N bytes (a power of two), for GPU / DMA / page-aligned zero-copy interop. The value's
 // semantics are unchanged — only its storage alignment. The attribute only ever *over*-aligns (it
-// is the max of N and the type's natural alignment).
+// is the max of N and the type's natural alignment). The type's size is also rounded up to N, so a
+// fixed array of the struct has a tight, over-aligned element stride — every element stays `align(N)`.
 
 align(64) CacheLine {
   a: i64,
@@ -13,5 +14,13 @@ align(64) CacheLine {
 fn main() -> i32 {
   // A `CacheLine` value lives in 64-byte-aligned storage.
   v := CacheLine { a: 10, b: 20, c: 30, d: 40 }
-  return (v.a + v.b + v.c + v.d) as i32   // 100
+
+  // A fixed array of the over-aligned struct: each element is 64-aligned (64-byte stride).
+  lines := [
+    CacheLine { a: 1, b: 2, c: 3, d: 4 },
+    CacheLine { a: 5, b: 6, c: 7, d: 8 },
+  ]
+  first := lines.a.sum()   // 1 + 5 = 6
+
+  return (v.a + v.b + v.c + v.d + first) as i32   // 100 + 6 = 106
 }

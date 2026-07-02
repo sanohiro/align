@@ -154,13 +154,7 @@ fn build_module<'c>(
     let field_perm: Vec<Vec<u32>> =
         program.structs.iter().map(|s| logical_to_physical(s, &program.structs)).collect();
     for ((s, st), perm) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
-        // `abi_type` maps each field (floats to their float type, `str` to the `{ ptr, len }` view,
-        // a nested struct to its (now-created) struct type). Fields are emitted in physical order:
-        // physical slot `p` holds the logical field whose map entry is `p`.
-        let phys_order = physical_order(perm);
-        let fields: Vec<BasicTypeEnum> =
-            phys_order.iter().map(|&li| abi_type(ctx, s.fields[li as usize].ty, &struct_types, &[])).collect();
-        st.set_body(&fields, false);
+        set_struct_body(ctx, *st, s, perm, &struct_types, &target_data);
     }
 
     // Sum-type layouts → a non-union tagged struct `{ i32 tag, <every variant's payload flattened> }`,
@@ -1305,6 +1299,48 @@ fn physical_order(map: &[u32]) -> Vec<u32> {
     order
 }
 
+/// Round `n` up to the next multiple of the power-of-two alignment `a` (branch-free; the `a <= 1`
+/// guard avoids the `a - 1` underflow a stray `a == 0` would cause). The codegen dual of
+/// `align_sema::align_up`.
+fn align_up(n: u64, a: u64) -> u64 {
+    if a <= 1 { n } else { (n + a - 1) & !(a - 1) }
+}
+
+/// Build and set the LLVM body of struct `s` (whose opaque type is `st`), the **one** place a struct's
+/// LLVM layout is emitted. Fields are laid out in codegen's canonical physical order (`perm`): a
+/// non-`layout(C)` struct is reordered by descending alignment to eliminate padding; a `layout(C)`
+/// struct keeps declaration order. For an `align(N)` struct, an `[K x i8]` tail is appended so the
+/// type's ABI **size** is rounded up to `N` — this is what gives a tight `[N x %S]` array an
+/// over-aligned element *stride* (every element stays `align(N)`), exactly as C pads a struct's size
+/// up to its alignment. The over-alignment itself is applied at the storage seam (`type_align`, the
+/// alloca / global), never as a member alignment, so the aggregate type's ABI *alignment* stays
+/// natural — the padding field is `align 1`. Shared by `emit_llvm` and the layout-parity test so the
+/// two can never diverge.
+fn set_struct_body<'c>(
+    ctx: &'c Context,
+    st: StructType<'c>,
+    s: &StructDef,
+    perm: &[u32],
+    struct_types: &[StructType<'c>],
+    target_data: &inkwell::targets::TargetData,
+) {
+    // `abi_type` maps each field (floats to their float type, `str` to the `{ ptr, len }` view, a
+    // nested struct to its (now-created) struct type). Fields are emitted in physical order: physical
+    // slot `p` holds the logical field whose map entry is `p`.
+    let mut fields: Vec<BasicTypeEnum> =
+        physical_order(perm).iter().map(|&li| abi_type(ctx, s.fields[li as usize].ty, struct_types, &[])).collect();
+    if let Some(a) = s.align {
+        // Measure the natural size (from an anonymous struct of the same fields), then pad the type
+        // up to `round_up(natural_size, align)` so the array stride is over-aligned.
+        let natural = target_data.get_abi_size(&ctx.struct_type(&fields, false));
+        let padded = align_up(natural, a as u64);
+        if padded > natural {
+            fields.push(ctx.i8_type().array_type((padded - natural) as u32).into());
+        }
+    }
+    st.set_body(&fields, false);
+}
+
 fn scalar_bytes(s: Scalar) -> u64 {
     match s {
         Scalar::Int(it) => (it.bits / 8).max(1) as u64,
@@ -1719,9 +1755,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .build_alloca(llty, &format!("_{i}"))
                 .map_err(|e| self.err(e))?;
             // Set the slot's alignment explicitly through the one alignment seam (`type_align`).
-            // Today this is the natural ABI alignment (a no-op vs LLVM's default); at M6 a struct
-            // declared `align(N)` returns `N` here, so its stack slot is over-aligned — the single
-            // place that change lands (`open-questions.md` "`align(N)`").
+            // Usually the natural ABI alignment (a no-op vs LLVM's default); for a struct (or fixed
+            // struct array) declared `align(N)` it returns `N`, so the stack slot is over-aligned —
+            // together with the `set_struct_body` size padding, a `[N x %S]` array's elements all stay
+            // over-aligned (`open-questions.md` "`align(N)`").
             let inst = ptr
                 .as_instruction()
                 .ok_or_else(|| self.err("alloca did not yield an instruction"))?;
@@ -3707,16 +3744,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     /// The **single alignment seam**: the byte alignment to use for a value/allocation of `ty`.
-    /// A struct (or struct array) declared `align(N)` returns `N`; everything else returns the
-    /// natural ABI alignment LLVM derives from the type. Reserved for M6 `align(N)` — today every
-    /// struct's `align` is `None`, so this is always the natural alignment (`open-questions.md`).
-    /// Routing all alignment through here means honoring a custom `align(N)` is a one-line change.
+    /// A struct (or fixed struct array) declared `align(N)` returns `N`; everything else returns the
+    /// natural ABI alignment LLVM derives from the type. This over-aligns the *storage* (alloca /
+    /// global); the matching *size* padding for a tight array stride lives in `set_struct_body`
+    /// (`open-questions.md` "`align(N)`"). Routing all alignment through here keeps it one place.
     fn type_align(&self, ty: Ty) -> u32 {
         let custom = match ty {
             // A struct value, and a fixed AoS array of it (`[N x %Struct]`, whose alignment is the
-            // element's), take the struct's declared alignment. A `DynStructArray` slot holds a
-            // `{ptr,len}` view, not the struct — its element-buffer alignment is a heap/runtime
-            // concern (M6), so the slot itself stays naturally aligned.
+            // element's), take the struct's declared alignment — together with the element size
+            // padding (`set_struct_body`), every array element stays over-aligned. A `DynStructArray`
+            // slot holds a `{ptr,len}` view, not the struct — its element-buffer over-alignment is a
+            // separate heap/runtime concern (still deferred), so the slot itself stays naturally aligned.
             Ty::Struct(id) | Ty::StructArray(id, _) => self.structs[id as usize].align,
             _ => None,
         };
@@ -4626,9 +4664,11 @@ mod tests {
     /// (`field_abi_align` here vs `ty_size_align` in sema) against LLVM ground truth, so any future
     /// drift — or a new wider-aligned field type added to `is_field_ok` without updating both — fails
     /// loudly. Covers every valid struct-field type, mixed widths that force a reorder, `str`/`string`
-    /// views, nested structs, and `layout(C)` (declaration order preserved). `align(N)` over-alignment
-    /// is deliberately excluded: it is applied at the alloca seam (`type_align`), not baked into the
-    /// LLVM struct type, so it is an orthogonal concern.
+    /// views, nested structs, and `layout(C)` (declaration order preserved). `align(N)` over-aligned
+    /// structs are **included**: the over-alignment pads the type's *size* up (the tight-array-stride
+    /// fix) but leaves the aggregate's own ABI *alignment* natural — so sema (which reports the natural
+    /// alignment and the padded size) must still equal LLVM's `(abi_size, abi_alignment)` of the
+    /// size-padded type. This pins the padding math on both sides.
     #[test]
     fn sema_and_codegen_struct_layout_agree() {
         fn i(bits: u8, signed: bool) -> Ty {
@@ -4648,6 +4688,11 @@ mod tests {
                 align: None,
                 c_repr,
             }
+        }
+        // An `align(N)` over-aligned struct (never `layout(C)`; over-alignment composes with either
+        // order but the point here is the size padding).
+        fn adef(name: &str, align: u32, fields: &[Ty]) -> StructDef {
+            StructDef { align: Some(align), ..sdef(name, false, fields) }
         }
 
         // Structs 0..=2 are nested targets referenced by later structs (ids are positional).
@@ -4677,20 +4722,27 @@ mod tests {
             // nested structs (reordered + layout(C) inner)
             sdef("Nest1", false, &[i(8, true), Ty::Struct(0), i(16, true)]),
             sdef("Nest2", false, &[Ty::Struct(1), Ty::Bool, Ty::Struct(2)]),
+            // `align(N)` over-aligned structs: the type's size is padded up to N (tight array stride),
+            // its natural ABI alignment is unchanged.
+            adef("A64", 64, &[i(64, true), i(64, true)]),   // nat (16,8) → size 64, align 8
+            adef("A16", 16, &[i(32, true)]),                // nat (4,4)  → size 16, align 4
+            adef("APage", 4096, &[i(64, true)]),            // nat (8,8)  → size 4096, align 8
+            adef("A4", 4, &[i(64, true)]),                  // N <= natural: a no-op (size 8, align 8)
+            adef("A32mix", 32, &[i(8, true), i(64, true), i(8, true)]), // reorder + pad (nat 24 → 32)
+            // `layout(C)` composed with `align(N)` (the FFI case): decl order preserved, size padded.
+            StructDef { align: Some(32), ..sdef("A32C", true, &[i(8, true), i(64, true), i(8, true)]) },
         ];
 
         let ctx = Context::create();
         let tm = create_target_machine(&BuildTarget::Baseline).expect("target machine");
         let td = tm.get_target_data();
 
-        // Build the LLVM struct types exactly as `codegen` does (opaque, then body in physical order).
+        // Build the LLVM struct types exactly as `codegen` does (opaque, then body via the shared
+        // `set_struct_body` — the same size-padding path production uses).
         let struct_types: Vec<StructType> = structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
         for (s, st) in structs.iter().zip(&struct_types) {
             let perm = logical_to_physical(s, &structs);
-            let order = physical_order(&perm);
-            let fields: Vec<BasicTypeEnum> =
-                order.iter().map(|&li| abi_type(&ctx, s.fields[li as usize].ty, &struct_types, &[])).collect();
-            st.set_body(&fields, false);
+            set_struct_body(&ctx, *st, s, &perm, &struct_types, &td);
         }
 
         for (id, s) in structs.iter().enumerate() {
