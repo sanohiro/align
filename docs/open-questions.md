@@ -1612,7 +1612,7 @@ elements) — bind it first. A Copy element reads fine in any position. The firs
 
 A 7-agent audit on another machine (frontend / sema-types / sema-flow / MIR+codegen / runtime+driver / docs / perf), cut short by a token budget. Every finding below was **reproduced by compiling + running** on this machine (Linux/glibc) before any fix. The unifying diagnosis (audit §6.1, confirmed): the escape / effect / move analyses are **per-`ExprKind` hand-written traversals with fail-open defaults** (`_ => Region::Static`, `_ => false`) — every hole was a syntax node someone forgot to add an arm for. `If` was handled; `Match` (and the fn-value / element-assign forms) repeatedly were not.
 
-**Confirmed soundness holes — FIXED (this PR / the analysis-coverage batch):**
+**Confirmed soundness holes — FIXED (in the analysis-coverage sema PR #270, not this docs-only entry):**
 - **1-2** arena `str` escapes through a `match` arm (`region_of` lacked `Match`).
 - **NEW-1** (found here) arena `str` escapes through an indirect call `g(t)` (`region_of` lacked `CallFnValue` — the fn-value sibling of 1-4).
 - **1-5** `return xs[0..2]` over a local array returns a dangling slice (`slice_is_local` lacked `SliceRange`; fixed-array locals weren't marked frame-local).
