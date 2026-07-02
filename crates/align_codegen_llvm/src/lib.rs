@@ -3861,10 +3861,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .enumerate()
             .map(|(i, f)| {
                 let (name_ptr, name_len) = self.str_global(&f.name);
-                // tag = (kind << 8) | byte-width. kind: 0 = int, 1 = bool, 2 = float, 3 = str.
+                // tag = (signed << 16) | (kind << 8) | byte-width. kind: 0 = int, 1 = bool,
+                // 2 = float, 3 = str. Bit 16 is the int sign flag (1 = signed, 0 = unsigned); it
+                // lets the runtime range-check the parsed value before writing (only meaningful for
+                // kind 0). It sits above the kind/width bytes, so the existing `tag & 0xff` (width)
+                // and `(tag >> 8) & 0xff` (kind) decoders are unchanged.
                 // A `str` field is a `{ptr,len}` view (16 bytes) written zero-copy into the input.
                 let tag: u64 = match f.ty {
-                    Ty::Int(it) => (it.bits / 8) as u64,
+                    Ty::Int(it) => ((it.signed as u64) << 16) | (it.bits / 8) as u64,
                     Ty::Bool => (1 << 8) | 1,
                     Ty::Float(ft) => (2 << 8) | (ft.bits / 8) as u64,
                     Ty::Str => (3 << 8) | 16,
@@ -4009,10 +4013,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let agg = self.operand(input).into_struct_value();
         let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
-        // Same tag encoding as struct fields: (kind << 8) | byte-width. kind 0 = int, 1 = bool,
-        // 2 = float.
+        // Same tag encoding as struct fields: (signed << 16) | (kind << 8) | byte-width. kind 0 =
+        // int, 1 = bool, 2 = float. Bit 16 is the int sign flag (1 = signed) for the runtime
+        // range-check.
         let tag: u64 = match elem {
-            Ty::Int(it) => (it.bits / 8) as u64,
+            Ty::Int(it) => ((it.signed as u64) << 16) | (it.bits / 8) as u64,
             Ty::Bool => (1 << 8) | 1,
             Ty::Float(ft) => (2 << 8) | (ft.bits / 8) as u64,
             _ => unreachable!("json.decode array element is int/float/bool (sema-checked)"),

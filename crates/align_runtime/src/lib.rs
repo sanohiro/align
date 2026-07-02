@@ -664,13 +664,51 @@ fn write_json_escape(buf: &mut Vec<u8>, c: u8) {
 }
 
 /// One field descriptor for `json.decode` (matches the codegen layout):
-/// `{ name_ptr, name_len, tag, offset }`. `tag`: byte width for ints (1/2/4/8), 0 for bool.
+/// `{ name_ptr, name_len, tag, offset }`. `tag` packs `(signed << 16) | (kind << 8) | byte-width`:
+/// kind 0 = int, 1 = bool, 2 = float, 3 = str; the byte-width is 1/2/4/8 for scalars (16 for a
+/// `str` view); bit 16 is the int sign flag (1 = signed, 0 = unsigned), only meaningful for kind 0.
+/// The sign flag lets the decoder range-check a parsed integer before writing (see [`int_in_range`]).
 #[repr(C)]
 pub struct JsonField {
     pub name_ptr: *const u8,
     pub name_len: i64,
     pub tag: i32,
     pub offset: i64,
+}
+
+/// Whether the parsed `i64` value `v` fits the target integer field of `w` bytes with signedness
+/// `signed` — the range-check that keeps `json.decode` from silently truncating/sign-wrapping
+/// out-of-range input (`{"n": 300}` into `u8`, `{"n": -1}` into `u32`, `{"n": 200}` into `i8`).
+/// `w` is 1/2/4/8 (caller-validated). A `w == 8` field spans the whole `i64`, so it always fits.
+/// **`u64` note:** `JsonParser::integer` parses into `i64`, so a JSON value in `(i64::MAX, u64::MAX]`
+/// is already rejected upstream as unrepresentable; a `u64` field therefore accepts exactly
+/// `[0, i64::MAX]` here. Widening the parser to full `u64` is a separate follow-up (open-questions).
+#[inline]
+fn int_in_range(v: i64, w: usize, signed: bool) -> bool {
+    // Defense in depth: a zero width is caller-validated as unreachable, but guard it so the
+    // `bits - 1` below can never underflow (no width fits a zero-byte field anyway).
+    if w == 0 {
+        return false;
+    }
+    if signed {
+        if w >= 8 {
+            return true;
+        }
+        let bits = (w as u32) * 8;
+        let min = -(1i64 << (bits - 1));
+        let max = (1i64 << (bits - 1)) - 1;
+        v >= min && v <= max
+    } else {
+        if v < 0 {
+            return false;
+        }
+        if w >= 8 {
+            return true;
+        }
+        let bits = (w as u32) * 8;
+        let max = (1i64 << bits) - 1;
+        v <= max
+    }
 }
 
 /// Parse the JSON object in `input` into the zeroed struct at `out` (size `out_size`),
@@ -865,7 +903,8 @@ unsafe fn parse_object(
                         return None; // duplicate field
                     }
                     let d = &descs[i];
-                    // tag = (kind << 8) | byte-width. kind: 0 = int, 1 = bool, 2 = float.
+                    // tag = (signed << 16) | (kind << 8) | byte-width. kind: 0 = int, 1 = bool,
+                    // 2 = float, 3 = str; bit 16 = int sign flag.
                     let kind = (d.tag >> 8) & 0xff;
                     let width = (d.tag & 0xff) as i64;
                     // Defense in depth: never write outside the out struct, even if a
@@ -921,6 +960,11 @@ unsafe fn parse_object(
                                 return None;
                             }
                             let v = p.integer()?;
+                            // Reject out-of-range values (per the field's width + sign) instead of
+                            // silently writing the low `w` bytes and truncating/sign-wrapping.
+                            if !int_in_range(v, w, (d.tag & 0x1_0000) != 0) {
+                                return None;
+                            }
                             let bytes = v.to_le_bytes();
                             for k in 0..w {
                                 unsafe { *out.add(off + k) = bytes[k] };
@@ -1081,6 +1125,10 @@ unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi
                 return None;
             }
             let v = vp.integer()?;
+            // Reject out-of-range values (per the field's width + sign) — see `parse_object`.
+            if !int_in_range(v, w, (d.tag & 0x1_0000) != 0) {
+                return None;
+            }
             let b = v.to_le_bytes();
             for j in 0..w {
                 unsafe { *p.add(j) = b[j] };
@@ -1473,8 +1521,9 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
 
 /// Parse the JSON array in `input` into a freshly heap-allocated owned `array<T>`, writing the
 /// materialized `{ptr, len}` (len = element count) to `out` (MMv2 slice 8c). `elem_tag` is the
-/// element encoding `(kind << 8) | byte-width` (kind 0 = int, 1 = bool, 2 = float), matching the
-/// struct-field tags. Elements are *copied* into the new buffer (not borrowed), so the result is
+/// element encoding `(signed << 16) | (kind << 8) | byte-width` (kind 0 = int, 1 = bool, 2 = float;
+/// bit 16 = int sign flag), matching the struct-field tags. Elements are *copied* into the new
+/// buffer (not borrowed), so the result is
 /// owned and freed by the generated `Drop`. Returns 0 on success, 1 on a parse error (leaving
 /// `out` as the caller-zeroed `{null,0}`). An empty array allocates nothing (null buffer).
 ///
@@ -1496,6 +1545,7 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     };
     let kind = (elem_tag >> 8) & 0xff;
     let width = (elem_tag & 0xff) as usize;
+    let signed = (elem_tag & 0x1_0000) != 0;
     let mut bytes: Vec<u8> = Vec::new();
     let mut count: i64 = 0;
 
@@ -1532,8 +1582,13 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
                         if !matches!(width, 1 | 2 | 4 | 8) {
                             return None;
                         }
-                        let le = p.integer()?.to_le_bytes();
-                        bytes.extend_from_slice(&le[..width]);
+                        let v = p.integer()?;
+                        // Reject out-of-range values (per the element's width + sign) instead of
+                        // silently truncating/sign-wrapping — see `parse_object`.
+                        if !int_in_range(v, width, signed) {
+                            return None;
+                        }
+                        bytes.extend_from_slice(&v.to_le_bytes()[..width]);
                     }
                 }
                 count += 1;
@@ -4452,6 +4507,111 @@ mod tests {
         let mut p = JsonParser { src: b"9223372036854775808,", pos: 0 };
         assert_eq!(p.integer(), None);
         assert_eq!(p.peek(), Some(b','), "overflow should consume all 19 digits, leaving pos at ','");
+    }
+
+    #[test]
+    fn int_in_range_covers_widths_and_signs() {
+        // Unsigned: [0, 2^(8w)-1]; a w==8 field spans the whole i64 (only < 0 is rejected).
+        assert!(int_in_range(0, 1, false));
+        assert!(int_in_range(255, 1, false));
+        assert!(!int_in_range(256, 1, false));
+        assert!(!int_in_range(-1, 1, false));
+        assert!(int_in_range(65535, 2, false));
+        assert!(!int_in_range(65536, 2, false));
+        assert!(int_in_range(4294967295, 4, false));
+        assert!(!int_in_range(4294967296, 4, false));
+        assert!(int_in_range(i64::MAX, 8, false));
+        assert!(!int_in_range(-1, 8, false)); // u64 field rejects a negative
+        // Signed: [-2^(8w-1), 2^(8w-1)-1]; a w==8 field is the whole i64.
+        assert!(int_in_range(-128, 1, true));
+        assert!(int_in_range(127, 1, true));
+        assert!(!int_in_range(128, 1, true));
+        assert!(!int_in_range(-129, 1, true));
+        assert!(int_in_range(-32768, 2, true));
+        assert!(int_in_range(32767, 2, true));
+        assert!(!int_in_range(32768, 2, true));
+        assert!(int_in_range(-2147483648, 4, true));
+        assert!(int_in_range(2147483647, 4, true));
+        assert!(!int_in_range(2147483648, 4, true));
+        assert!(int_in_range(i64::MIN, 8, true));
+        assert!(int_in_range(i64::MAX, 8, true));
+    }
+
+    #[test]
+    fn json_decode_range_checks_integer_fields() {
+        // Decode `{"n": <v>}` into a single integer field described by `tag` (int kind 0, so
+        // `tag = (signed << 16) | byte-width`). Returns (status, first 8 out bytes).
+        fn decode(json: &[u8], tag: i32, out_size: i64) -> (i32, [u8; 8]) {
+            let name = b"n";
+            let f = JsonField { name_ptr: name.as_ptr(), name_len: 1, tag, offset: 0 };
+            let mut out = [0u8; 8];
+            let rc = unsafe {
+                align_rt_json_decode(
+                    json.as_ptr(),
+                    json.len() as i64,
+                    &f,
+                    1,
+                    out.as_mut_ptr(),
+                    out_size,
+                    std::ptr::null(),
+                    0,
+                    0,
+                )
+            };
+            (rc, out)
+        }
+        const U8: i32 = 1; // unsigned, width 1
+        const U16: i32 = 2;
+        const U32: i32 = 4;
+        const I8: i32 = (1 << 16) | 1; // signed, width 1
+        const I16: i32 = (1 << 16) | 2;
+        const I32: i32 = (1 << 16) | 4;
+        const I64: i32 = (1 << 16) | 8;
+
+        // Out-of-range values must be rejected (status 1), not silently truncated/sign-wrapped.
+        assert_eq!(decode(b"{\"n\": 300}", U8, 1).0, 1, "300 into u8 rejected");
+        assert_eq!(decode(b"{\"n\": -1}", U32, 4).0, 1, "-1 into u32 rejected");
+        assert_eq!(decode(b"{\"n\": 200}", I8, 1).0, 1, "200 into i8 rejected");
+        assert_eq!(decode(b"{\"n\": 256}", U8, 1).0, 1, "256 into u8 rejected");
+        assert_eq!(decode(b"{\"n\": 65536}", U16, 2).0, 1, "65536 into u16 rejected");
+        assert_eq!(decode(b"{\"n\": 32768}", I16, 2).0, 1, "32768 into i16 rejected");
+        assert_eq!(decode(b"{\"n\": 2147483648}", I32, 4).0, 1, "INT32_MAX+1 into i32 rejected");
+
+        // In-range boundary values must decode (status 0) with the correct little-endian bytes.
+        let (rc, out) = decode(b"{\"n\": 0}", U8, 1);
+        assert_eq!((rc, out[0]), (0, 0), "u8 0 ok");
+        let (rc, out) = decode(b"{\"n\": 255}", U8, 1);
+        assert_eq!((rc, out[0]), (0, 255), "u8 255 ok");
+        let (rc, out) = decode(b"{\"n\": -128}", I8, 1);
+        assert_eq!((rc, out[0]), (0, 0x80), "i8 -128 ok");
+        let (rc, out) = decode(b"{\"n\": 127}", I8, 1);
+        assert_eq!((rc, out[0]), (0, 0x7f), "i8 127 ok");
+        let (rc, out) = decode(b"{\"n\": 42}", U8, 1);
+        assert_eq!((rc, out[0]), (0, 42), "u8 42 ok (regression)");
+        let (rc, out) = decode(b"{\"n\": -9223372036854775808}", I64, 8);
+        assert_eq!((rc, i64::from_le_bytes(out)), (0, i64::MIN), "i64::MIN ok");
+        let (rc, out) = decode(b"{\"n\": 9223372036854775807}", I64, 8);
+        assert_eq!((rc, i64::from_le_bytes(out)), (0, i64::MAX), "i64::MAX ok");
+    }
+
+    #[test]
+    fn json_decode_array_range_checks_integers() {
+        // `align_rt_json_decode_array` shares the range check via the same tag encoding.
+        fn decode(json: &[u8], tag: i32) -> i32 {
+            let mut out = AlignStr { ptr: std::ptr::null_mut(), len: 0 };
+            let rc = unsafe { align_rt_json_decode_array(json.as_ptr(), json.len() as i64, tag, &mut out) };
+            if !out.ptr.is_null() {
+                unsafe { align_rt_free(out.ptr as *mut u8) };
+            }
+            rc
+        }
+        const U8: i32 = 1;
+        const I8: i32 = (1 << 16) | 1;
+        assert_eq!(decode(b"[1, 2, 300]", U8), 1, "300 in array<u8> rejected");
+        assert_eq!(decode(b"[1, -1]", U8), 1, "-1 in array<u8> rejected");
+        assert_eq!(decode(b"[200]", I8), 1, "200 in array<i8> rejected");
+        assert_eq!(decode(b"[0, 255]", U8), 0, "in-range array<u8> ok");
+        assert_eq!(decode(b"[-128, 127]", I8), 0, "in-range array<i8> ok");
     }
 
     #[test]
