@@ -5,7 +5,21 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-03 (main @ PR #330)._
+_Last updated: 2026-07-03 (main @ PR #331; M8 formally closed same day, docs-only)._
+
+## M8 — Tooling and Quality — formally closed (2026-07-03)
+
+All four completion conditions are met: the formatter (#233, `align_fmt`); `unsafe`/`raw.*`
+(#262–264); `extern "C"` FFI v1 (#265–269) plus by-value struct passing shipped beyond the v1
+boundary (x86-64 SysV only, #329); and the lint suite's full **profile-independent** slice —
+unhandled-`Result` (#138), huge-struct-copy (#234), lossy-cast + wasteful-default-element (#313),
+unnecessary-heap narrow form (#323) — five lints that never need runtime/profile evidence. See the
+M8 section of the roadmap for the full shipped-feature summary. **Not blockers, deferred as post-M8
+backlog** (own labeled section right after M8 in the roadmap, and `docs/open-questions.md` → "M8
+lint candidates"): the frequency-dependent lints (allocation-in-loop, the broader
+unnecessary-clone/unnecessary-heap forms, branch-in-hot-loop, string re-scan, implicit copy),
+`prefer-pipeline-over-vecN` (no firing surface — no loop construct exists yet), and the hot/cold
+field-split suggestion (heuristic design needed).
 
 ## M6 — SIMD / vec / mask — formally closed (2026-07-03)
 

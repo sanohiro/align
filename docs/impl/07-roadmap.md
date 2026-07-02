@@ -958,7 +958,21 @@ already lives in `docs/open-questions.md`.
   `open-questions.md` "First-class closures + task_group" (the escape-every-region note).
 - async/await is not included (`non-goals.md`).
 
-## M8 — Tooling and Quality — STARTED (first lint landed)
+## M8 — Tooling and Quality — DONE (2026-07-03)
+
+All four completion conditions are met: the **formatter** (#233) normalizes only meaningless
+variation and round-trips idempotently + meaning-preservingly; **`unsafe`/`raw.*`** (#262–264)
+gates every raw memory op behind an explicit block, inferred impure; **FFI v1** (`extern "C"`,
+#265–269) plus **by-value struct passing shipped beyond the v1 boundary** (x86-64 SysV, #329)
+covers extern decls, scalar/`raw`/`()`/`layout(C)`-pointer/view/by-value-register signatures, and
+`link("name")`; and the lint suite ships its full **profile-independent** slice — five lints that
+fire on structure alone, never on runtime frequency, so none needs `--profile` data and none can
+false-positive: unhandled-`Result` (#138), huge-struct-copy (#234), lossy-cast +
+wasteful-default-element (#313), unnecessary-heap narrow form (#323). **Not blockers, tracked as
+post-M8 backlog** (own section below): the frequency-dependent lints (allocation-in-loop, the
+broader unnecessary-clone/unnecessary-heap forms, branch-in-hot-loop, string re-scan, implicit
+copy), `prefer-pipeline-over-vecN` (no firing surface — Align has no loop construct to convert),
+and the hot/cold field-split suggestion (needs heuristic design).
 
 - the official formatter (mandatory, `draft.md` §16). — **DONE** (`alignc fmt`, the `align_fmt`
   crate; normalizes only meaningless variation, idempotent + meaning-preserving over every example).
@@ -1059,14 +1073,39 @@ already lives in `docs/open-questions.md`.
   auto-linked). `ast::ExternBlock.link`, parser `parse_link_clause`. (`tests/ffi_link.rs`,
   `examples/ffi_link.align`.)
   **FFI v1 is COMPLETE** (extern decls + unsafe-gating, scalar+`raw`+`()` signatures, `layout(C)`
-  struct-by-pointer, `str`/`slice`/`bytes` views, `link("name")`). **Deliberately out of v1** (draft
-  §15 "Not in FFI v1"): **by-value struct passing** — per-target register classification (SysV
-  eightbytes / AAPCS64 / `byval` / `sret`), the one corner where a wrong rule silently miscompiles;
-  deferred rather than shipped half-right (struct-by-pointer covers the dominant C-API shape).
-  `bool`/`char` as FFI types — use the integer types (a C `_Bool` = `u8`, `char` = `i8`/`u8`,
-  `char32_t` = `u32`; Align `char` is a Unicode scalar, not a C `char`), keeping one unambiguous way
-  and dodging the `i1`-`zeroext` subtlety. `raw.ptr_cast<T>` — a typed reinterpret is meaningless with
-  one opaque pointer type; it waits on typed/external pointers.
+  struct-by-pointer, `str`/`slice`/`bytes` views, `link("name")`). **By-value struct passing shipped
+  beyond v1** (#329, 2026-07-03): a `layout(C)` struct ≤ 16 bytes passes/returns in registers on
+  **x86-64 SysV only**, emitting clang's exact coercion and verified against a compiled-C-helper
+  round-trip harness; codegen refuses (rather than guesses) on any non-SysV target, a >16-byte
+  MEMORY-class struct, or a signature that would fall to the stack under register pressure (see
+  `docs/open-questions.md` → "FFI" for the full classification). Still deliberately out of v1 (draft
+  §15 "Not in FFI v1"): **AAPCS64 / other-arch by-value classification** and the MEMORY-class
+  `byval`/`sret` path (both wait on a concrete cross-arch/large-struct consumer — struct-by-pointer
+  already covers that shape). `bool`/`char` as FFI types — use the integer types (a C `_Bool` = `u8`,
+  `char` = `i8`/`u8`, `char32_t` = `u32`; Align `char` is a Unicode scalar, not a C `char`), keeping
+  one unambiguous way and dodging the `i1`-`zeroext` subtlety. `raw.ptr_cast<T>` — a typed reinterpret
+  is meaningless with one opaque pointer type; it waits on typed/external pointers.
+
+### Post-M8 backlog (not M8 blockers — M8 is closed; these are future lint/perf slices)
+
+None of the below gated M8's completion conditions (formatter, `unsafe`/`raw.*`, FFI v1 + by-value
+SysV, and the five profile-independent lints, all met above). Full rationale + firing-condition
+proposals already live in `docs/open-questions.md` → "M8 lint candidates".
+
+- **Frequency-dependent lints** — need runtime/size evidence to avoid false positives, so parked
+  pending a `--profile` mechanism or a documented heuristic: allocation-in-loop, the broader
+  unnecessary-clone form, the broader unnecessary-heap form (`p := heap.new(x); … p.get()`, needs a
+  whole-function box-use scan — the escape pass keeps no reusable per-box fact to piggyback on),
+  branch-in-hot-loop, string re-scan, implicit copy.
+- **`prefer-pipeline-over-vecN`** — no firing surface exists: Align has no loop construct, so the
+  lint's target (a hand-written `vecN<T>` loop) cannot be written today; a bare `vecN<T>` expression
+  is the correct hand-tuned-kernel use, not a lint candidate. Deferred until a loop/kernel surface
+  exists.
+- **Hot/cold field-split suggestion** — needs heuristic design (when the mix of scanned vs
+  rarely-read fields actually matters) before it can ship without noise; suggestion-only, never an
+  automatic layout change (explicit layout is Settled).
+- **`par_map` cost-threshold lint** (cheap-`par_map`-loses-to-sequential) — recorded with the perf-rail
+  lint work, not yet built.
 
 ## Design Issues to Settle in Parallel
 
