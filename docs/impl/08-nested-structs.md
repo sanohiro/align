@@ -172,9 +172,20 @@ slices, but it reuses the Slice-3 Drop machinery). `crates/align_driver/tests/re
   each element's owned fields via `drop_struct_fields` (unrolled), and `DropFlagInit` zeroes the whole
   `[N x %Struct]`. Verified in LLVM (one free per element's owned buffer — no leak / double-free).
   Construction + scalar-field read supported. `crates/align_driver/tests/owned_structs_arrays.rs`.
-  - **deferred to Slice 4b** (kept sound by clean rejections, not silent gaps): a **`mut`** Move-struct
-    array (reassign / element store need a per-element drop-of-old); reading an owned (`string`) field
-    **out** of an element (`n := us[i].name`); whole-array move (return / pass — array materialization).
+  - **Slice 4b DONE** (PRs #281–#283): **mutable** Move-struct arrays. **4b-1** (`us[i] = newStruct`,
+    element replace): new MIR `Stmt::DropElem` frees the old element's owned fields before the store,
+    the RHS's moved source is nulled; whole-array reassign (`us = …`) is cleanly rejected (array values
+    aren't materialized). **4b-2** (`us[i].name` read): an owned `string` field of an element reads as a
+    borrowed **`str` view** (region-tied to the array — a Move-struct array is `Frame`-region since its
+    heap buffers die at function exit, so a view can't escape; `drop_locals` drops any non-`Arena`
+    owned local). `.clone()` is the owned-copy escape hatch. **4b-3** (`us[i].name = new` / `u.name =
+    new`, owned-field reassign): new MIR `Stmt::DropElemField` + an `AssignField` drop-of-old free the
+    overwritten `string` before the store (Slice 3 only dropped on *whole*-struct reassign — this closed
+    a pre-existing field-level leak too). All verified in LLVM (drop-of-old + exit free, no leak /
+    double-free). `tests/owned_structs_arrays.rs`, `tests/reassign_drop.rs`.
+  - **still deferred** (hard, with `.clone()` workarounds): moving an owned field *out* of an element by
+    value (`n: string := us[i].name` — needs per-element runtime drop flags for a dynamic index); whole-
+    array move (return / pass — array materialization).
 - **deferred**: nested element *write* (`arr[i].a.x = v` — `StoreElemField` is still depth-1); a soa
   column over a *nested* field (the nested-soa-column layout is a design choice). Risk: medium–high.
 
