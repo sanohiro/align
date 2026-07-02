@@ -1378,12 +1378,22 @@ struct), because only it promises a fixed representation — this is the pointer
 (hand C a buffer, read/write structs in it). Its fields must be FFI-mappable scalars (integers,
 floats).
 
+### By-value structs (SysV AMD64 only)
+
+A `layout(C)` struct also crosses the boundary **by value**, using the System V AMD64 register
+convention — but *only* on x86-64 Linux. Each eightbyte of the struct is classified INTEGER (a
+general-purpose register) or SSE (an XMM register); a struct ≤ 16 bytes is passed/returned in
+registers, and the compiler emits exactly the coerced form a C compiler does (`i64`/`double`
+argument slots, an `{T0,T1}` aggregate return), so a call is binary-compatible with a real C callee.
+This is the one FFI corner where a *wrong* per-target rule silently miscompiles, so it is deliberately
+scoped: on any non-SysV target the compiler **refuses** with a clear diagnostic (pass the struct by
+pointer instead) rather than guessing, and a struct larger than 16 bytes (MEMORY class, needing a
+`byval`/`sret` pointer) is likewise rejected — that shape is already served by struct-by-pointer, so
+a redundant second mechanism is not added. (AAPCS64 and the MEMORY-class `byval`/`sret` path are
+future work, added only when a concrete wrapper needs them.)
+
 ### Not in FFI v1 (deliberate boundaries)
 
-- **A struct by value.** A `layout(C)` struct crosses the boundary by **pointer** (above). Passing or
-  returning one *by value* needs per-target register-classification (SysV eightbytes, AAPCS64, `byval`
-  / `sret`) — the one FFI corner where a wrong rule silently miscompiles. It is deferred rather than
-  shipped half-right; struct-by-pointer already covers the dominant C-API shape.
 - **`bool` / `char` as FFI types.** Use the integer types, which map to C unambiguously: a C `_Bool`
   is a `u8` (0/1), a C `char` is an `i8`/`u8`, a `char32_t` is a `u32` (a `wchar_t` is platform-sized
   — pick the matching integer width). Align's

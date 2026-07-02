@@ -1804,25 +1804,46 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                     // `Ty::Error` already produced a diagnostic in `resolve_type` — don't pile a
                     // second "not FFI-safe" error on the same root cause. A parameter also accepts a
                     // `str`/`slice`/`bytes` view — passed to C as its data pointer (see
-                    // `is_ffi_safe_param`).
+                    // `is_ffi_safe_param`) — and a `layout(C)` struct **by value** (SysV register
+                    // passing; the ABI/target/size limits are enforced in codegen).
                     if ty != Ty::Error && !is_ffi_safe_param(ty) {
-                        diags.error(
-                            format!("'{}' is not an FFI-safe type for an extern parameter (use an integer, float, `raw`, or a `str`/`slice` view)", ty_name(ty)),
-                            p.ty.span(),
-                        );
+                        if let Ty::Struct(id) = ty {
+                            // A struct crosses the C ABI by value only with a stable C layout.
+                            if !structs[id as usize].c_repr {
+                                diags.error(
+                                    format!("an extern struct parameter must be `layout(C)` ('{}' is not) — mark the struct `layout(C)` so it has a stable C byte layout", ty_name(ty)),
+                                    p.ty.span(),
+                                );
+                            }
+                        } else {
+                            diags.error(
+                                format!("'{}' is not an FFI-safe type for an extern parameter (use an integer, float, `raw`, a `str`/`slice` view, or a `layout(C)` struct)", ty_name(ty)),
+                                p.ty.span(),
+                            );
+                        }
                     }
                     params.push(ty);
                 }
                 let ret = match &sig.ret {
                     Some(t) => {
                         let r = resolve_type(t, tcx!(m.path.as_str(), imports), &[], diags);
-                        // A `()` (void) return is allowed; otherwise it must be an FFI-safe scalar.
-                        // (`Ty::Error` already reported — don't double up, see the param note above.)
+                        // A `()` (void) return is allowed; otherwise an FFI-safe scalar or a
+                        // `layout(C)` struct returned **by value** (SysV register return; codegen
+                        // enforces the ABI/target/size limits). (`Ty::Error` already reported.)
                         if r != Ty::Unit && r != Ty::Error && !is_ffi_safe(r) {
-                            diags.error(
-                                format!("'{}' is not an FFI-safe return type for an extern (use an integer, float, `raw`, or `()`)", ty_name(r)),
-                                t.span(),
-                            );
+                            if let Ty::Struct(id) = r {
+                                if !structs[id as usize].c_repr {
+                                    diags.error(
+                                        format!("an extern struct return type must be `layout(C)` ('{}' is not) — mark the struct `layout(C)` so it has a stable C byte layout", ty_name(r)),
+                                        t.span(),
+                                    );
+                                }
+                            } else {
+                                diags.error(
+                                    format!("'{}' is not an FFI-safe return type for an extern (use an integer, float, `raw`, a `layout(C)` struct, or `()`)", ty_name(r)),
+                                    t.span(),
+                                );
+                            }
                         }
                         r
                     }

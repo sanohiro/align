@@ -6,12 +6,68 @@
 #![allow(dead_code, unused_imports)]
 
 pub use align_driver::{
-    backend_available, check, emit_llvm_ir, emit_object_file, link_executable, lower_to_mir,
-    BuildTarget,
+    backend_available, check, emit_llvm_ir, emit_object_file, link_executable, link_objects,
+    lower_to_mir, BuildTarget,
 };
 pub use align_span::SourceMap;
 
 use std::path::PathBuf;
+
+/// Whether a C compiler (`cc`) is available — the FFI by-value-struct tests compile a small C helper
+/// (the by-value struct callee) and link it against the Align object. Skip those tests where `cc`
+/// is absent (the backend itself may still be available for pure-Align tests).
+pub fn cc_available() -> bool {
+    std::process::Command::new("cc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Compile `align_src` and `c_src` (a C helper defining the `extern "C"` callee), link them
+/// together, run the result, and return its `Output`. This is the compiled-C-helper harness for
+/// by-value struct FFI: the C side is built by the system `cc` (clang/gcc), so the round trip
+/// validates Align's SysV register coercion against a real C ABI. Asserts the Align source
+/// type-checks; caller should gate on [`backend_available`] and [`cc_available`].
+pub fn build_and_run_with_c(name: &str, align_src: &str, c_src: &str) -> std::process::Output {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, name, align_src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let a_obj = dir.join(format!("align-ffic-{pid}-{name}.o"));
+    let c_src_path = dir.join(format!("align-ffic-{pid}-{name}.c"));
+    let c_obj = dir.join(format!("align-ffic-{pid}-{name}-helper.o"));
+    let exe = dir.join(format!("align-ffic-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
+    struct Cleanup(Vec<PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let _guard = Cleanup(vec![a_obj.clone(), c_src_path.clone(), c_obj.clone(), exe.clone()]);
+    emit_object_file(&mir, &a_obj, BuildTarget::Baseline).expect("codegen");
+    std::fs::write(&c_src_path, c_src).expect("write c helper");
+    let cc_status = std::process::Command::new("cc")
+        .args(["-c", "-O0"])
+        .arg(&c_src_path)
+        .arg("-o")
+        .arg(&c_obj)
+        .status()
+        .expect("launch cc");
+    assert!(cc_status.success(), "compiling the C helper failed");
+    link_objects(&[&a_obj, &c_obj], &exe, &mir.link_libs).expect("link");
+    std::process::Command::new(&exe).output().expect("run")
+}
 
 /// Removes a test's temporary object + executable on scope exit — including on a panic (an
 /// `assert_eq!` failure), so a failing test does not leak files into the temp directory.
