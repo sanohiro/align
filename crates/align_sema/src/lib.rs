@@ -910,6 +910,17 @@ fn wrap_to_int(v: i128, it: IntTy) -> i128 {
     }
 }
 
+/// The inclusive `[min, max]` value range of an integer type, as `i128` (wide enough to hold `u64`'s
+/// max and `i64`'s min). Widths are 8/16/32/64, so the shifts stay well within `i128`.
+fn int_range(it: IntTy) -> (i128, i128) {
+    let bits = it.bits as u32;
+    if it.signed {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    } else {
+        (0, (1i128 << bits) - 1)
+    }
+}
+
 /// Evaluates top-level constant initializers to folded values, resolving same-module references
 /// on demand (memoized) with cycle detection.
 struct ConstEval<'a, 'd> {
@@ -9534,6 +9545,25 @@ impl<'a, 't> Checker<'a, 't> {
 
     // --- finalize ---
 
+    /// A compile-time integer literal whose value provably does not fit its resolved type is a hard
+    /// error, not a silent two's-complement wrap: when both the value and the target type are known
+    /// at compile time, wrapping it is hidden data corruption, at odds with "nothing hidden" (and it
+    /// matches how `as`'s zero-UB design and negative-into-unsigned are already handled). This checks
+    /// only *value* literals; runtime arithmetic overflow still wraps (unchanged), and `match`
+    /// integer-pattern literals — when they exist — keep the defined-wrap rule (`draft.md` §5,
+    /// "Integer Literals"). `v` is the literal's *effective* value (already negated for `-lit`).
+    fn check_int_lit_range(&mut self, v: i128, ty: Ty, span: Span) {
+        let Ty::Int(it) = ty else { return };
+        let (min, max) = int_range(it);
+        if v < min || v > max {
+            let name = it.name();
+            self.diags.error(
+                format!("integer literal `{v}` is out of range for type `{name}` (valid range {min}..={max}): a provably-out-of-range literal would silently wrap. Write a value in range, or convert the bit pattern explicitly with `as {name}`."),
+                span,
+            );
+        }
+    }
+
     fn finalize_block(&mut self, b: &mut Block) {
         for s in &mut b.stmts {
             match s {
@@ -9566,7 +9596,26 @@ impl<'a, 't> Checker<'a, 't> {
         let mut recomputed: Option<Ty> = None;
         match &mut e.kind {
             ExprKind::Unary { op, expr } => {
-                self.finalize_expr(expr);
+                // A negated integer *literal* (`-128`): its effective value is `-v`, so range-check
+                // *that* against the (signed) target here, and do NOT let the inner literal be
+                // range-checked on its own — its bare magnitude (`128`) can exceed the type's `+max`
+                // even though `-128` is in range (`-128: i8`, `i64::MIN`). For an unsigned target the
+                // unsigned-`-` error below already rejects it, so no range error is stacked on top.
+                let neg_lit = matches!(op, UnOp::Neg)
+                    .then(|| match &expr.kind {
+                        ExprKind::Int(v) => Some(*v),
+                        _ => None,
+                    })
+                    .flatten();
+                match neg_lit {
+                    Some(v) => {
+                        expr.ty = self.finalize(expr.ty); // finalize the inner literal's type; skip its range check
+                        if matches!(cur_ty, Ty::Int(IntTy { signed: true, .. })) {
+                            self.check_int_lit_range(v.checked_neg().unwrap_or(v), cur_ty, span);
+                        }
+                    }
+                    None => self.finalize_expr(expr),
+                }
                 // Unary negation is a *signed* operation. Applying it to an unsigned type — a
                 // negative literal given an unsigned type by context (`x: u32 := -5`, `g(-5)` into a
                 // `u32` parameter) or a negated unsigned value — would silently two's-complement wrap
@@ -9773,8 +9822,12 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(c);
                 }
             }
+            // A bare (non-negated) integer literal: reject it if its value provably overflows the
+            // type inference resolved for it. A negated literal (`-lit`) is handled by the `Unary`
+            // arm above (which skips this by finalizing the inner literal itself), so a value that
+            // reaches here is always the literal's own effective value.
+            ExprKind::Int(v) => self.check_int_lit_range(*v, cur_ty, span),
             ExprKind::Unit
-            | ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Char(_)
             | ExprKind::Str(_)

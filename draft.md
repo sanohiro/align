@@ -293,11 +293,22 @@ char
 ### Integer Literals
 
 Integers are written in decimal, or with a base prefix: `0x` (hex), `0o` (octal), `0b` (binary). A
-literal is the same value whatever the base, with its width inferred from context like any literal,
-so a too-wide pattern truncates to the binding's type by the defined wrap rule. A `_` may separate
-digits for readability (in any base). When no context constrains it, an integer literal defaults to
-`i64` and a float literal to `f64` — the default is deliberate and visible here because it affects
-observable behavior (overflow width, float precision); annotate to pick another width.
+literal is the same value whatever the base, with its width inferred from context like any literal.
+A `_` may separate digits for readability (in any base). When no context constrains it, an integer
+literal defaults to `i64` and a float literal to `f64` — the default is deliberate and visible here
+because it affects observable behavior (overflow width, float precision); annotate to pick another
+width.
+
+A *value* literal whose value provably does not fit the type it is given by context (`x: u8 := 300`,
+an argument, a field initializer, an array element, a return value) is a **compile error**, not a
+silent wrap: when both the value and the type are known at compile time, wrapping it would be hidden
+data corruption ("nothing hidden"). This is a static check on literals only — runtime arithmetic
+overflow still wraps by the rule below — and it is symmetric with rejecting a negative literal given
+an unsigned type. Write the value in range, or convert the bit pattern explicitly with `as`
+(`0xFFFFFFFF as i32`). A negated literal is checked at its effective value, so `-128` is a valid `i8`
+though the positive `128` is not. (A too-wide literal in a `match` *pattern* is a separate case: it
+truncates to the scrutinee's type by the defined wrap rule, since a pattern is a comparison, not a
+stored value.)
 
 ```align
 mask := 0xFF_FF            // hex, = 65535

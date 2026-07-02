@@ -67,9 +67,13 @@ bitset
 ### Integer literals
 
 Decimal, or base-prefixed `0x` (hex) / `0o` (octal) / `0b` (binary); `_` may separate digits in any
-base. A literal's width is inferred from context like any literal (an over-wide pattern truncates to
-the binding's type by the defined wrap rule); with no constraining context an integer defaults to
-`i64` and a float to `f64` (a visible default — it affects overflow width / precision). (`draft.md` §5.)
+base. A literal's width is inferred from context like any literal; with no constraining context an
+integer defaults to `i64` and a float to `f64` (a visible default — it affects overflow width /
+precision). A *value* literal that provably does not fit its context type (`x: u8 := 300`, an
+argument / field / array element / return value) is a **compile error**, not a silent wrap — cast
+explicitly (`0xFFFFFFFF as i32`) if the wrapped bit pattern is wanted; `-128` is checked at its
+effective value so it is a valid `i8`. Runtime arithmetic overflow still wraps, and an over-wide
+`match` *pattern* literal still truncates to the scrutinee's type by the defined wrap rule. (`draft.md` §5.)
 
 ### Numeric conversion
 
