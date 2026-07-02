@@ -503,6 +503,29 @@ literal value, struct-local value, `mut`-required, `str`-field rejected), `tests
 gather→scatter `s[0]=s[1]`, `mut`-required); `examples/soa.align`.
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
 
+### Default struct layout: field reordering — SETTLED + DONE (2026-07-02)
+**Decision: a non-`layout(C)` struct has an *unspecified* field order; the compiler reorders fields
+by descending alignment (ties keep declaration order) to eliminate padding** (Rust's default).
+`{ a: i8, b: i64, c: i8 }` occupies 16 bytes, not 24. Source access is by name, so the reorder is
+invisible and free; it packs hot structs tighter — a direct cache-density win, the language's center
+of gravity. `layout(C)` is the escape hatch: it keeps declaration order + natural alignment + no
+reordering (the FFI / `raw` / `json`-encode / by-value byte-layout boundary, unchanged).
+**Implementation:** the reorder + a **logical→physical field-index map** (`field_perm[struct_id]`)
+live in *one* place — the struct `set_body` in `align_codegen_llvm`. Every field-index consumer routes
+through it: struct-field GEPs (`field_path_ptr`, `elem_field_ptr`, AoS `IndexFieldPtr`,
+`NullStructField`, `DropElemField`, the `drop_struct_fields` walk), byte-offset sites
+(`offset_of_element` for the `json.decode` field table, `group_by`/dict key & value offsets,
+`GatherColumnI64`), and the `soa` gather's struct-aggregate insert. `sizeof`/alignment follow for free
+(read back from the built LLVM struct type). `layout(C)` structs use the identity map. `soa` column
+order stays in declaration order (a separate, self-consistent column layout independent of the AoS
+field order). Tests: `tests/struct_field_reorder.rs` (padding elimination via the emitted LLVM type,
+all-width round-trip, field writes, struct-array element fields, json decode, `to_soa`, `layout(C)`
+unchanged, nested structs); the differential struct fuzzer (`tests/fuzz_differential.rs`) sums *all*
+mixed-width fields back against an oracle. All ~1057 workspace tests green.
+Provenance: surfaced by an external idea review (2026-07-02); adopted + implemented same day.
+Record: `draft.md` §9 (memory layout) + §15 (`layout(C)`), `docs/language-spec.md`,
+`docs/design-notes.md`, `impl/05-backend-llvm.md` §2, `tests/struct_field_reorder.rs`.
+
 ### Branchless `where` (all reducing terminals) — DONE (sum/count 2026-06-27; extended to min/max/any/all/reduce 2026-07-02)
 **Decision: a `where`/`where(.field)` feeding *any* reducing terminal lowers branchless** — AND the
 predicates into a `mask`, then `select` each masked-out lane to the reducer's identity instead of a
@@ -2079,27 +2102,6 @@ design note follows.
 
 A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) data := …`) for GPU/DMA/page-aligned zero-copy interop. **Retrofit-sensitive**: it modifies struct field-offset math and the arena bump allocator's alignment, so reserve room in the layout model now; the surface + LLVM `align N` emission + arena honoring it can land at M6 alongside SoA. (Digested from `work/proposals/next-draft.md` §1.1.)
 **Groundwork landed (pre-M6):** `StructDef` carries `align: Option<u32>` (always `None` today — no surface syntax), and codegen routes all allocation alignment through one seam, `type_align(ty)` (natural ABI alignment today; a struct's custom `align` if set). M6 work is then "parse `align(N)` → set `StructDef.align`" + the seam returns it — the stack-slot alloca already calls the seam; the arena bump allocator already takes an explicit `align` argument. (Retrofit risk was low — a custom alignment is largely *additive* at the alloca/global/alloc sites — so this groundwork is a light reservation, unlike the SoA field-access seam.)
-
-### Default struct layout: field reordering — Open (external idea review, 2026-07-02)
-Current: the default (non-`layout(C)`) struct layout is **declaration order + natural alignment**
-(`impl/05-backend-llvm.md` §2); `layout(C)` pins that same order explicitly as the FFI/byte-layout-
-boundary marker (see "FFI" above — `layout(C)`'s decl-order/no-reordering guarantee is *today's*
-default, locked in place).
-Proposal: make the *default* (non-`layout(C)`) layout **unspecified field order**, letting the
-compiler reorder fields by descending alignment to eliminate padding (Rust's default). Source-level
-access is by name, so reordering is invisible; codegen keeps a logical→physical field-index map for
-GEP.
-Why it fits: a pure win for cache density (the language's stated center of gravity), zero
-source-visible change, and the escape hatch (`layout(C)` = decl order) already exists for every
-byte-layout boundary.
-Checks required before implementation: json decode offset tables, soa column offsets, `sizeof`/align
-computation, and the FFI boundary all read layout through one place today — audit that a reorder
-decision is threaded through (or explicitly excluded from) every one of them.
-Recommendation: adopt; needs a spec edit (`draft.md` §9's memory-layout note + `impl/05-backend-
-llvm.md` §2) plus a codegen field-index-mapping change. Decide any time; must land before the
-layout/ABI freeze.
-Provenance: surfaced by an external idea review (2026-07-02); verified against the current spec/code
-before recording here.
 
 ### `out` parameters + `noalias` — write mechanism + no-alias check DONE; LLVM metadata is the follow-up
 `out` params (`draft.md` §7) are a no-alias optimization. **Implemented:** (1) the write mechanism —

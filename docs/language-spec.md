@@ -324,11 +324,13 @@ declaration is bodyless and bound to the C symbol; FFI-safe signature types are 
 AOT-via-LLVM with no GC), which is the keystone of the library strategy: `std`/`pkg` own the memory
 wrappers and borrow C engines via FFI.
 
-A `layout(C)` attribute (`layout(C) Point { … }`, composes with `align(N)`) pins a struct to a
-stable, C-compatible flat layout (declaration order, natural alignment, no reordering). Only such a
-struct may be written to / read from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the
-pointer-based FFI pattern. Its fields must be FFI-mappable scalars; by-value struct passing is a
-later slice.
+A normal (non-`layout(C)`) struct has an **unspecified field order**: the compiler reorders fields by
+descending alignment to eliminate padding (`{ a: i8, b: i64, c: i8 }` → 16 bytes, not 24), a
+by-name-invisible cache-density win. A `layout(C)` attribute (`layout(C) Point { … }`, composes with
+`align(N)`) is the escape hatch — it pins a struct to a stable, C-compatible flat layout (declaration
+order, natural alignment, no reordering). Only such a struct may be written to / read from `raw`
+memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
+FFI-mappable scalars; by-value struct passing is a later slice.
 
 A `str`/`slice`/`bytes` view is FFI-safe as a **parameter**: it lowers to its data pointer (C
 `char*`/`void*`), the length passed separately by the caller (`s.len()`) — the C `(ptr, len)` idiom.

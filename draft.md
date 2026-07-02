@@ -827,6 +827,14 @@ predictable, while the field-wise lowering under the type is automatic. Crossing
 boundary (FFI, `json`, by-value) materializes to AoS explicitly. Use `array<T>` by default; reach
 for `soa<T>` on large, hot, field-wise-processed data.
 
+**Field order within a struct is unspecified.** For a normal (non-`layout(C)`) struct the compiler
+chooses the field order — it lays fields out in descending alignment to eliminate padding (so
+`{ a: i8, b: i64, c: i8 }` occupies 16 bytes, not 24). Access is by name, so the reordering is
+invisible in source and costs nothing; it packs hot structs tighter, which is a direct cache-density
+win — the language's center of gravity. When you need a fixed, C-compatible byte layout (declaration
+order, no reordering) — for FFI, `raw` memory, or any external byte-layout contract — mark the struct
+`layout(C)` (see §15). That marker is the one escape hatch; everything else is the compiler's business.
+
 Build one with `.to_soa()` (transpose a row-major struct array) or decode JSON into one:
 
 ```align
@@ -1293,9 +1301,10 @@ is the mechanism the library-wrapper strategy rides on — `std`/`pkg` own thin 
 
 ### `layout(C)` — a C-compatible struct layout
 
-A struct's memory layout is normally the compiler's own business (Align may reorder fields for
-packing). A `layout(C)` attribute pins it to a **stable, C-compatible flat layout** — declaration
-order, natural alignment, no reordering — so the struct can cross the FFI boundary:
+A struct's memory layout is normally the compiler's own business — a non-`layout(C)` struct has an
+**unspecified field order**, and the compiler reorders fields by descending alignment to eliminate
+padding (§9). A `layout(C)` attribute pins it to a **stable, C-compatible flat layout** —
+declaration order, natural alignment, no reordering — so the struct can cross the FFI boundary:
 
 ```align
 layout(C) Point { x: i32, y: i32 }   // composes with align(N), in any order

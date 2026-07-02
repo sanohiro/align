@@ -43,12 +43,27 @@ Fn(..)            function pointer (+ environment pointer if there is a capture)
 
 ## 2. struct layout
 
-The default is **AoS** (declaration order, natural alignment, the value-type-centric `draft.md`). **SoA**, which helps for data parallelism, is treated as a transform over arrays.
+The default is **AoS** (row-major, the value-type-centric `draft.md`). **SoA**, which helps for data parallelism, is treated as a transform over arrays.
 
 ```text
 AoS   array<User> = contiguous User → { User* , len, cap }      (row-major, default)
 SoA   soa<User>   = one contiguous column per field → {id[], name[], active[], score[]}
 ```
+
+**Field order within a struct is unspecified for a non-`layout(C)` struct** (SETTLED,
+`open-questions.md` "Default struct layout: field reordering"). Codegen — the *one* place struct
+layout is computed (the `set_body` in `align_codegen_llvm`) — lays fields out in **descending
+alignment** (ties keep declaration order, a stable sort) to eliminate padding, matching Rust's
+default (`{ a: i8, b: i64, c: i8 }` → 16 bytes, not 24). Source access is by name, so the reorder is
+invisible; codegen keeps a **logical→physical field-index map** (`field_perm[struct_id][logical]`)
+that *every* field-index consumer routes through — struct-field GEPs (`field_path_ptr`,
+`elem_field_ptr`, AoS `IndexFieldPtr`, `NullStructField`, `DropElemField`, the `drop_struct_fields`
+walk), byte-offset sites (`offset_of_element` for `json.decode` field tables, `group_by`/dict key &
+value offsets, `GatherColumnI64`), and the `soa` gather's struct-aggregate insert. `sizeof`/alignment
+follow automatically because they read back the built LLVM struct type. A `layout(C)` struct uses the
+**identity map** (declaration order, natural alignment, no reordering) — its byte layout is the
+FFI / `raw` / `json`-encode / by-value boundary and must not move. `soa` *column* order stays in
+declaration order (a separate, self-consistent column layout, independent of the AoS field order).
 
 **SETTLED (`open-questions.md` "Memory layout — `soa<T>`"): the layout is chosen by an explicit type,
 not by automatic whole-program inference.** `soa<T>` is a first-class columnar collection (peer to

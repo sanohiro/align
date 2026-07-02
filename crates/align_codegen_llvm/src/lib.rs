@@ -144,11 +144,22 @@ fn build_module<'c>(
     // opaque type, then set each body (sema forbids non-`box` recursion, so the bodies are acyclic).
     let struct_types: Vec<StructType<'c>> =
         program.structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
-    for (s, st) in program.structs.iter().zip(&struct_types) {
+    // Field reordering (see `docs/impl/05-backend-llvm.md` §2): a non-`layout(C)` struct's field
+    // order is language-unspecified, so codegen lays fields out in **descending alignment** (ties
+    // keep declaration order) to eliminate padding. Source access is by name, so this is invisible.
+    // `field_perm[sid][logical]` is the logical→physical index map — every field GEP / byte-offset
+    // site must route the MIR (logical) field index through it. A `layout(C)` struct keeps
+    // declaration order (identity map), so its byte layout — the FFI/`raw`/json boundary — is
+    // unchanged.
+    let field_perm: Vec<Vec<u32>> =
+        program.structs.iter().map(|s| logical_to_physical(s, &program.structs)).collect();
+    for ((s, st), perm) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
         // `abi_type` maps each field (floats to their float type, `str` to the `{ ptr, len }` view,
-        // a nested struct to its (now-created) struct type).
+        // a nested struct to its (now-created) struct type). Fields are emitted in physical order:
+        // physical slot `p` holds the logical field whose map entry is `p`.
+        let phys_order = physical_order(perm);
         let fields: Vec<BasicTypeEnum> =
-            s.fields.iter().map(|f| abi_type(ctx, f.ty, &struct_types, &[])).collect();
+            phys_order.iter().map(|&li| abi_type(ctx, s.fields[li as usize].ty, &struct_types, &[])).collect();
         st.set_body(&fields, false);
     }
 
@@ -945,6 +956,7 @@ fn build_module<'c>(
             extern_params: &extern_params,
             structs: &program.structs,
             struct_types: &struct_types,
+            field_perm: &field_perm,
             enum_types: &enum_types,
             enums: &program.enums,
             tuple_types: &tuple_types,
@@ -1229,6 +1241,70 @@ fn task_tramp_key(ty: Ty) -> String {
     }
 }
 
+/// The natural ABI alignment (in bytes) of a struct field, used only to *order* fields for padding
+/// elimination — the actual byte offsets are always read back from the built LLVM struct type via
+/// `offset_of_element`, so a slightly-off estimate can never miscompile, only leave padding. Scalars
+/// use their width; a nested aggregate takes the max of its members; pointer-like views (`str`,
+/// `slice`, `string`, `box`, `soa`, dynamic arrays, …) are pointer-aligned (8).
+///
+/// The *valid* struct-field domain (`is_field_ok` in `align_sema`) is
+/// `Int`/`Float`/`Bool`/`Char`/`Str`/`String`/nested `Struct`; on that domain this **must** return the
+/// same alignment as `align_sema::ty_size_align` (the ordering must agree, or the sema huge-struct-copy
+/// lint's size would diverge from the real layout). It does. The `Unit` (→ 4, vs sema's 1) and `Array`
+/// (→ `scalar_bytes.min(8)`, vs sema's 8) arms below are for types `is_field_ok` **rejects**, so they
+/// never reach field ordering — kept only so the function is total. Scalars top out at 64-bit, so no
+/// field is wider than 8-byte aligned; a future wider-aligned field type (a `vecN<T>` field is
+/// 16-byte aligned) would need updating **both** this and `ty_size_align` **and** would be caught by
+/// the `layout_parity` test (which checks both against the real LLVM ABI alignment).
+fn field_abi_align(ty: Ty, structs: &[StructDef]) -> u64 {
+    match ty {
+        Ty::Int(it) => (it.bits / 8).max(1) as u64,
+        Ty::Float(ft) => (ft.bits / 8) as u64,
+        Ty::Bool => 1,
+        Ty::Char => 4,
+        Ty::Unit => 4,
+        Ty::Struct(id) | Ty::StructArray(id, _) => structs[id as usize]
+            .fields
+            .iter()
+            .map(|f| field_abi_align(f.ty, structs))
+            .max()
+            .unwrap_or(1),
+        Ty::Array(s, _) => scalar_bytes(s).min(8).max(1),
+        _ => 8,
+    }
+}
+
+/// The logical→physical field-index map for a struct. A non-`layout(C)` struct is laid out in
+/// **descending alignment** (Rust's default) to eliminate padding; ties keep declaration order
+/// (a *stable* sort), so the layout is deterministic. A `layout(C)` struct keeps declaration order
+/// (identity map) — its byte layout is the FFI/`raw`/json boundary and must not move. The returned
+/// vector `m` satisfies `m[logical] = physical`; invert with [`physical_order`] to emit the body.
+fn logical_to_physical(s: &StructDef, structs: &[StructDef]) -> Vec<u32> {
+    let n = s.fields.len();
+    if s.c_repr {
+        return (0..n as u32).collect();
+    }
+    // Physical order = logical indices sorted by descending alignment (stable → decl order on ties).
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(field_abi_align(s.fields[i as usize].ty, structs)));
+    // Invert: `map[logical] = physical`.
+    let mut map = vec![0u32; n];
+    for (phys, &logical) in order.iter().enumerate() {
+        map[logical as usize] = phys as u32;
+    }
+    map
+}
+
+/// Invert a logical→physical field map into `physical_order[physical] = logical` — the order in
+/// which to emit the LLVM struct body (physical slot `p` holds logical field `physical_order[p]`).
+fn physical_order(map: &[u32]) -> Vec<u32> {
+    let mut order = vec![0u32; map.len()];
+    for (logical, &phys) in map.iter().enumerate() {
+        order[phys as usize] = logical as u32;
+    }
+    order
+}
+
 fn scalar_bytes(s: Scalar) -> u64 {
     match s {
         Scalar::Int(it) => (it.bits / 8).max(1) as u64,
@@ -1427,6 +1503,10 @@ struct FnGen<'c, 'a> {
     extern_params: &'a HashMap<String, Vec<Ty>>,
     structs: &'a [StructDef],
     struct_types: &'a [StructType<'c>],
+    /// Logical→physical field-index map per struct id (`field_perm[sid][logical] = physical`).
+    /// Non-`layout(C)` structs are reordered by descending alignment to eliminate padding; every
+    /// field GEP / byte-offset site routes its MIR (logical) index through [`FnGen::pfield`].
+    field_perm: &'a [Vec<u32>],
     /// Sum-type LLVM structs, indexed by the id in [`Ty::Enum`].
     enum_types: &'a [StructType<'c>],
     enums: &'a [EnumDef],
@@ -1446,6 +1526,25 @@ struct FnGen<'c, 'a> {
 impl<'c, 'a> FnGen<'c, 'a> {
     fn err(&self, e: impl std::fmt::Display) -> CodegenError {
         CodegenError::Lowering(e.to_string())
+    }
+
+    /// Translate a MIR (logical) field index into the LLVM (physical) index for struct `struct_id`.
+    /// Non-`layout(C)` structs are reordered by descending alignment (padding elimination); every
+    /// struct-field GEP goes through here so the reorder stays invisible. `layout(C)` structs use the
+    /// identity map, so their byte layout — the FFI/`raw`/json boundary — is unchanged.
+    fn pfield(&self, struct_id: u32, logical: u32) -> u32 {
+        self.field_perm[struct_id as usize][logical as usize]
+    }
+
+    /// The byte offset of logical field `logical` within struct `struct_id`, read from the built
+    /// LLVM struct type at the field's *physical* position — so it is correct under reordering.
+    fn field_byte_offset(&self, struct_id: u32, logical: u32) -> u64 {
+        let st = self.struct_types[struct_id as usize];
+        // Field indices are sema-validated, so a missing offset is a compiler bug — panic loudly
+        // rather than defaulting to 0 (which would silently read the wrong field).
+        self.target_data
+            .offset_of_element(&st, self.pfield(struct_id, logical))
+            .expect("valid struct field offset")
     }
 
     /// The address `ptr + offset` bytes, for `raw.load`/`raw.store` — an `i8` (byte-granular) GEP off
@@ -1675,7 +1774,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     };
                     let ep = self.elem_ptr(*slot, idx)?;
                     let st = self.struct_types[sid as usize];
-                    let fp = self.builder.build_struct_gep(st, ep, *field, "dropelemfld").map_err(|e| self.err(e))?;
+                    let fp = self.builder.build_struct_gep(st, ep, self.pfield(sid, *field), "dropelemfld").map_err(|e| self.err(e))?;
                     let agg = self.builder.build_load(slice_struct_type(self.ctx), fp, "dropelemfldv").map_err(|e| self.err(e))?.into_struct_value();
                     let ptr = self.builder.build_extract_value(agg, 0, "dropelemfldptr").map_err(|e| self.err(e))?;
                     self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
@@ -1819,7 +1918,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     };
                     let field_ptr = self
                         .builder
-                        .build_struct_gep(self.struct_types[sid as usize], self.slots[slot], *idx, "nullstructfld")
+                        .build_struct_gep(self.struct_types[sid as usize], self.slots[slot], self.pfield(sid, *idx), "nullstructfld")
                         .map_err(|e| self.err(e))?;
                     self.builder
                         .build_store(field_ptr, slice_struct_type(self.ctx).const_zero())
@@ -2615,7 +2714,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let st = self.struct_types[*struct_id as usize];
                 let index = self.operand(index).into_int_value();
-                let f = self.ctx.i32_type().const_int(*field as u64, false);
+                let f = self.ctx.i32_type().const_int(self.pfield(*struct_id, *field) as u64, false);
                 let ep = unsafe {
                     self.builder
                         .build_in_bounds_gep(st, buf, &[index, f], "aosfield")
@@ -2667,7 +2766,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder.build_in_bounds_gep(fty, col_base, &[index], "gcolelem").map_err(|e| self.err(e))?
                     };
                     let val = self.builder.build_load(fty, ep, "gload").map_err(|e| self.err(e))?;
-                    acc = self.builder.build_insert_value(acc, val, f as u32, "ginsert").map_err(|e| self.err(e))?.into_struct_value();
+                    // Column `f` is logical (soa layout is declaration-ordered); insert it at its
+                    // physical slot in the reordered AoS struct aggregate.
+                    acc = self.builder.build_insert_value(acc, val, self.pfield(*struct_id, f as u32), "ginsert").map_err(|e| self.err(e))?.into_struct_value();
                 }
                 acc.into()
             }
@@ -2872,13 +2973,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let store = self.target_data.get_store_size(&st);
                 let align = self.target_data.get_abi_alignment(&st) as u64;
                 let stride = store.div_ceil(align) * align; // alloc size = align_up(store, align)
-                // Field indices are sema-validated, so a missing offset is a compiler bug — panic
-                // loudly rather than defaulting to 0 (which would silently read the wrong field).
-                let key_off = self.target_data.offset_of_element(&st, *key_field).expect("valid key field offset");
+                // Field indices are logical (MIR); `field_byte_offset` maps to the physical slot.
+                let key_off = self.field_byte_offset(*struct_id, *key_field);
                 // `count` has no value field; the runtime entry ignores `val_off`, so pass 0.
-                let val_off = value_field
-                    .map(|v| self.target_data.offset_of_element(&st, v).expect("valid value field offset"))
-                    .unwrap_or(0);
+                let val_off = value_field.map(|v| self.field_byte_offset(*struct_id, v)).unwrap_or(0);
                 let f = match op {
                     GroupOp::Sum => "group_sum_str",
                     GroupOp::Min => "group_min_str",
@@ -2919,7 +3017,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let store = self.target_data.get_store_size(&st);
                 let align = self.target_data.get_abi_alignment(&st) as u64;
                 let stride = store.div_ceil(align) * align;
-                let key_off = self.target_data.offset_of_element(&st, *key_field).expect("valid key field offset");
+                let key_off = self.field_byte_offset(*struct_id, *key_field);
                 let i64t = self.ctx.i64_type();
                 let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
                 let spec_ty = self.ctx.struct_type(&[i64t.into(), i64t.into(), ptr_ty.into()], false);
@@ -2928,7 +3026,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let specs_arr = self.alloca_at_entry(spec_ty.array_type(k as u32).into(), "gmspecs")?;
                 for (j, ((op, value_field), out)) in aggs.iter().zip(out_vals.iter()).enumerate() {
                     let val_off = value_field
-                        .map(|v| self.target_data.offset_of_element(&st, v).expect("valid value field offset"))
+                        .map(|v| self.field_byte_offset(*struct_id, v))
                         .unwrap_or(0);
                     let op_tag = match op {
                         GroupOp::Sum => 0,
@@ -2979,7 +3077,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let store = self.target_data.get_store_size(&st);
                 let align = self.target_data.get_abi_alignment(&st) as u64;
                 let stride = store.div_ceil(align) * align;
-                let key_off = self.target_data.offset_of_element(&st, *key_field).expect("valid key field offset");
+                let key_off = self.field_byte_offset(*struct_id, *key_field);
                 let agg = self.builder.build_load(slice_struct_type(self.ctx), self.slots[base], "encbase").map_err(|e| self.err(e))?.into_struct_value();
                 let bptr = self.builder.build_extract_value(agg, 0, "encptr").map_err(|e| self.err(e))?;
                 let blen = self.builder.build_extract_value(agg, 1, "enclen").map_err(|e| self.err(e))?;
@@ -3018,7 +3116,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let store = self.target_data.get_store_size(&st);
                 let align = self.target_data.get_abi_alignment(&st) as u64;
                 let stride = store.div_ceil(align) * align;
-                let off = self.target_data.offset_of_element(&st, *field).expect("valid value field offset");
+                let off = self.field_byte_offset(*struct_id, *field);
                 let agg = self.operand(source).into_struct_value();
                 let sptr = self.builder.build_extract_value(agg, 0, "gthptr").map_err(|e| self.err(e))?;
                 let slen = self.builder.build_extract_value(agg, 1, "gthlen").map_err(|e| self.err(e))?;
@@ -3611,7 +3709,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let arr_ty = self.llvm_type(self.f.slots[slot as usize]);
         let zero = self.ctx.i64_type().const_zero();
         let index = self.operand(idx).into_int_value();
-        let f = self.ctx.i32_type().const_int(field as u64, false);
+        let sid = self.array_elem_struct_id(slot);
+        let f = self.ctx.i32_type().const_int(self.pfield(sid, field) as u64, false);
         unsafe {
             self.builder
                 .build_in_bounds_gep(arr_ty, self.slots[&slot], &[zero, index, f], "elemfield")
@@ -3627,6 +3726,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
+    /// The element struct id of a fixed struct-array slot (`[N x %Struct]`) — for mapping a logical
+    /// element-field index to its physical position.
+    fn array_elem_struct_id(&self, slot: Slot) -> u32 {
+        match self.f.slots[slot as usize] {
+            Ty::StructArray(id, _) => id,
+            other => unreachable!("element-field access on non-struct-array slot of type {other:?}"),
+        }
+    }
+
     /// `&slot.f0.f1.…` via a chain of struct GEPs (each level needs its pointee struct type — LLVM
     /// 19 opaque pointers). Returns the pointer to the innermost field. `path` has length ≥ 1.
     fn field_path_ptr(&self, slot: Slot, path: &[u32]) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
@@ -3634,7 +3742,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let mut ptr = self.slots[&slot];
         for (k, &idx) in path.iter().enumerate() {
             let st = self.struct_types[sid as usize];
-            ptr = self.builder.build_struct_gep(st, ptr, idx, "fldptr").map_err(|e| self.err(e))?;
+            let pidx = self.pfield(sid, idx);
+            ptr = self.builder.build_struct_gep(st, ptr, pidx, "fldptr").map_err(|e| self.err(e))?;
             if k + 1 < path.len() {
                 sid = match self.structs[sid as usize].fields[idx as usize].ty {
                     Ty::Struct(nid) => nid,
@@ -3656,10 +3765,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // builder/recursion calls (`Ty` is `Copy`).
         let fields: Vec<(u32, Ty)> = self.structs[struct_id as usize].fields.iter().enumerate().map(|(i, f)| (i as u32, f.ty)).collect();
         for (i, fty) in fields {
+            // `i` is the logical field index; the GEP needs its physical (reordered) slot.
+            let pi = self.pfield(struct_id, i);
             match fty {
                 // An owned `string` field — free its heap buffer (field 0 of the `{ptr,len}`).
                 Ty::String => {
-                    let fp = self.builder.build_struct_gep(st, base, i, "dropfld").map_err(|e| self.err(e))?;
+                    let fp = self.builder.build_struct_gep(st, base, pi, "dropfld").map_err(|e| self.err(e))?;
                     let agg = self
                         .builder
                         .build_load(slice_struct_type(self.ctx), fp, "dropfldv")
@@ -3670,14 +3781,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 // A nested Move struct — recurse into it (a plain-data nested struct is Copy → skip).
                 Ty::Struct(nid) if struct_is_move(nid, self.structs) => {
-                    let fp = self.builder.build_struct_gep(st, base, i, "dropnest").map_err(|e| self.err(e))?;
+                    let fp = self.builder.build_struct_gep(st, base, pi, "dropnest").map_err(|e| self.err(e))?;
                     self.drop_struct_fields(fp, nid)?;
                 }
                 // A nested Move-struct *array* field — drop each element (defensive: struct fields
                 // reject array types today — `is_field_ok` — so this is unreachable, but keeping the
                 // owned case here means a future array-valued field can't silently fail-open and leak).
                 Ty::StructArray(eid, n) if struct_is_move(eid, self.structs) => {
-                    let fp = self.builder.build_struct_gep(st, base, i, "dropnestarr").map_err(|e| self.err(e))?;
+                    let fp = self.builder.build_struct_gep(st, base, pi, "dropnestarr").map_err(|e| self.err(e))?;
                     let arr_ty = self.struct_types[eid as usize].array_type(n);
                     let zero = self.ctx.i64_type().const_zero();
                     for e in 0..n {
@@ -3924,7 +4035,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Ty::Str => (3 << 8) | 16,
                     _ => unreachable!("json.decode field is int/float/bool/str (sema-checked)"),
                 };
-                let offset = self.target_data.offset_of_element(&sty, i as u32).unwrap_or(0);
+                // The descriptor lists fields by *name* in logical order, but the byte offset must be
+                // the field's physical slot (fields are alignment-reordered for non-`layout(C)`
+                // structs); `field_byte_offset` maps logical→physical.
+                let offset = self.field_byte_offset(struct_id, i as u32);
                 desc_ty.const_named_struct(&[
                     name_ptr.into(),
                     name_len.into(),
@@ -4458,6 +4572,88 @@ mod tests {
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
         emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline).unwrap()
+    }
+
+    /// Layout parity: the sema `(size, align)` computation (`align_sema::ty_size_align` /
+    /// `struct_size_align`, which the huge-struct-copy lint trusts) must equal the **real** LLVM ABI
+    /// size/alignment of the struct as codegen lays it out (descending-alignment field order via
+    /// `logical_to_physical`). This pins the two independent hand-written layout computations
+    /// (`field_abi_align` here vs `ty_size_align` in sema) against LLVM ground truth, so any future
+    /// drift — or a new wider-aligned field type added to `is_field_ok` without updating both — fails
+    /// loudly. Covers every valid struct-field type, mixed widths that force a reorder, `str`/`string`
+    /// views, nested structs, and `layout(C)` (declaration order preserved). `align(N)` over-alignment
+    /// is deliberately excluded: it is applied at the alloca seam (`type_align`), not baked into the
+    /// LLVM struct type, so it is an orthogonal concern.
+    #[test]
+    fn sema_and_codegen_struct_layout_agree() {
+        fn i(bits: u8, signed: bool) -> Ty {
+            Ty::Int(IntTy { bits, signed })
+        }
+        fn f(bits: u8) -> Ty {
+            Ty::Float(FloatTy { bits })
+        }
+        fn sdef(name: &str, c_repr: bool, fields: &[Ty]) -> StructDef {
+            StructDef {
+                name: name.to_string(),
+                fields: fields
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &ty)| align_sema::hir::FieldDef { name: format!("f{k}"), ty })
+                    .collect(),
+                align: None,
+                c_repr,
+            }
+        }
+
+        // Structs 0..=2 are nested targets referenced by later structs (ids are positional).
+        let structs = vec![
+            sdef("Inner0", false, &[i(8, false), i(64, true)]),          // 0: reorders internally
+            sdef("InnerC", true, &[i(8, false), i(64, true)]),           // 1: layout(C), decl order
+            sdef("Pair", false, &[i(32, true), i(32, true)]),            // 2
+            // every scalar alone
+            sdef("Si8", false, &[i(8, true)]),
+            sdef("Si16", false, &[i(16, true)]),
+            sdef("Si32", false, &[i(32, true)]),
+            sdef("Si64", false, &[i(64, true)]),
+            sdef("Su8", false, &[i(8, false)]),
+            sdef("Sf32", false, &[f(32)]),
+            sdef("Sf64", false, &[f(64)]),
+            sdef("Sbool", false, &[Ty::Bool]),
+            sdef("Schar", false, &[Ty::Char]),
+            sdef("Sstr", false, &[Ty::Str]),
+            sdef("Sstring", false, &[Ty::String]),
+            // mixed widths that force a reorder (the padding-elimination cases)
+            sdef("Mix1", false, &[i(8, true), i(64, true), i(8, true)]),
+            sdef("Mix2", false, &[Ty::Bool, f(64), i(16, true), i(8, true)]),
+            sdef("Mix3", false, &[i(8, true), Ty::Str, Ty::Bool, i(32, true)]),
+            sdef("Mix4", false, &[Ty::Char, i(8, false), i(64, false), Ty::Bool, f(32)]),
+            // the same field set with layout(C) — must NOT reorder
+            sdef("MixC", true, &[i(8, true), i(64, true), i(8, true)]),
+            // nested structs (reordered + layout(C) inner)
+            sdef("Nest1", false, &[i(8, true), Ty::Struct(0), i(16, true)]),
+            sdef("Nest2", false, &[Ty::Struct(1), Ty::Bool, Ty::Struct(2)]),
+        ];
+
+        let ctx = Context::create();
+        let tm = create_target_machine(&BuildTarget::Baseline).expect("target machine");
+        let td = tm.get_target_data();
+
+        // Build the LLVM struct types exactly as `codegen` does (opaque, then body in physical order).
+        let struct_types: Vec<StructType> = structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
+        for (s, st) in structs.iter().zip(&struct_types) {
+            let perm = logical_to_physical(s, &structs);
+            let order = physical_order(&perm);
+            let fields: Vec<BasicTypeEnum> =
+                order.iter().map(|&li| abi_type(&ctx, s.fields[li as usize].ty, &struct_types, &[])).collect();
+            st.set_body(&fields, false);
+        }
+
+        for (id, s) in structs.iter().enumerate() {
+            let st = struct_types[id];
+            let llvm = (td.get_abi_size(&st), td.get_abi_alignment(&st) as u64);
+            let sema = align_sema::struct_abi_layout(id as u32, &structs);
+            assert_eq!(sema, llvm, "layout parity mismatch on `{}` (sema {sema:?} vs LLVM {llvm:?})", s.name);
+        }
     }
 
     #[test]

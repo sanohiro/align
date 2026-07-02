@@ -260,28 +260,33 @@ fn aggregates_compute_the_oracle_value() {
     for seed in 0..150u64 {
         let mut rng = Rng(seed.wrapping_mul(0xA0761D_6478BD_642F).wrapping_add(3));
         let (src, oracle) = if rng.below(2) == 0 {
-            // Struct: build with concrete field values, read one field back.
+            // Struct: build with concrete field values, then read *every* field back and sum them.
+            // Mixed field widths force the compiler's descending-alignment field reordering; summing
+            // all fields exercises every physical slot's mapped GEP in one program (a single stale
+            // logical→physical index would corrupt the sum). Values are 0..9 (representable in every
+            // width), so each field reads back exactly what was stored and the sum stays small.
             let nf = 2 + rng.below(3); // 2..4 fields
             let mut fields = String::new();
             let mut inits = String::new();
-            let mut fvals = Vec::new();
+            let mut reads = String::new();
+            let mut sum = 0i128;
             for f in 0..nf {
                 let ty = TYPES[rng.below(TYPES.len())];
                 let v = rng.below(10) as i128;
                 if f > 0 {
                     fields.push_str(", ");
                     inits.push_str(", ");
+                    reads.push_str(" + ");
                 }
                 fields.push_str(&format!("f{f}: {}", ty.name()));
                 inits.push_str(&format!("f{f}: {v}"));
-                fvals.push((ty, v));
+                reads.push_str(&format!("(s.f{f} as i32)"));
+                sum += v; // 0..9 each, so no width wrap; the i32 sum wraps below
             }
-            let k = rng.below(nf); // field to read back
-            let (kty, kv) = fvals[k];
             let src = format!(
-                "S {{ {fields} }}\nfn main() -> i32 {{\n  s := S {{ {inits} }}\n  return s.f{k} as i32\n}}\n"
+                "S {{ {fields} }}\nfn main() -> i32 {{\n  s := S {{ {inits} }}\n  return {reads}\n}}\n"
             );
-            (src, wrap(kv, kty))
+            (src, wrap(sum, ITy::I32))
         } else {
             // Fixed array of default-typed (i64) elements, indexed by a constant.
             let n = 2 + rng.below(4); // 2..5 elements
