@@ -318,7 +318,7 @@ development  overflow-checked build + lint for bug detection (semantics unchange
 
 The reason is to commit fully to "predictably fast." Behavior is the same across all builds and does not break vectorization of hot loops. Where safety is needed, use the explicit ops.
 
-Arithmetic errors other than overflow, such as division by zero, are handled separately; they are never silent and always produce an error.
+Arithmetic errors other than overflow, such as division by zero, are handled separately; they are never silent and always produce an error — a runtime division/remainder by zero aborts (and a constant one is a compile error). The one signed division that could overflow, `INT_MIN / -1`, is not an exception to this: it **wraps** to `INT_MIN` (and `INT_MIN % -1` yields `0`), consistent with the defined two's-complement overflow above; only division by zero aborts.
 
 Unary negation `-x` is a **signed** operation: applying it to an unsigned type (e.g. a `-5` literal given an unsigned type by context, `x: u32 := -5`) is a **compile error**, not a silent wrap — a negative value cannot have an unsigned type. Convert explicitly (`(-5) as u32`) if the wrapped bit pattern is actually wanted. (This is distinct from unsigned *subtraction* `a - b`, which is ordinary defined two's-complement wrap.)
 

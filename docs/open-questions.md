@@ -1692,15 +1692,21 @@ the same convention as the external audit: **CONFIRMED** = read against the code
 
 **Confirmed bugs:**
 - **Division has no zero / `INT_MIN ÷ -1` guard — immediate LLVM UB, not a clean abort.**
-  `align_codegen_llvm/src/lib.rs` (~:3797) emits raw `sdiv`/`udiv`/`srem`/`urem` straight from MIR
-  `lower_bin`, with no guard branch anywhere upstream. `sdiv`/`srem` by zero and `sdiv INT_MIN, -1`
-  are LLVM-level *undefined behavior*, not a trap — the O2 optimizer is entitled to assume the divisor
-  is nonzero and can delete a surrounding `if b != 0` check, or delete the division itself if the
-  quotient is dead (so it wouldn't even SIGFPE). This **directly violates** the Settled "division by
-  zero ... is never silent, always an error" decision (see "Panic / unwinding" above and `draft.md`
-  §5). Fix: a MIR guard in `Div`/`Rem` lowering, the same shape as `emit_bounds_check`, branching to a
-  new `align_rt_div_fail`. Also note: the differential fuzzer's oracle currently avoids zero divisors,
-  so it can't catch this — close that gap alongside the fix.
+  **(status: FIXED — `fix/div-guard`.)** `align_codegen_llvm/src/lib.rs` (~:3797) emitted raw
+  `sdiv`/`udiv`/`srem`/`urem` straight from MIR, with no guard branch anywhere upstream. `sdiv`/`srem`
+  by zero and `sdiv INT_MIN, -1` are LLVM-level *undefined behavior*, not a trap — the O2 optimizer is
+  entitled to assume the divisor is nonzero and can delete a surrounding `if b != 0` check, or delete
+  the division itself if the quotient is dead (so it wouldn't even SIGFPE). This **directly violated**
+  the Settled "division by zero ... is never silent, always an error" decision (see "Panic / unwinding"
+  above and `draft.md` §5). **Fix:** MIR `lower_int_div` (align_mir) now guards every integer `/`/`%`,
+  the same shape as `emit_bounds_check`: `divisor == 0` branches to a new `align_rt_div_fail` (`-> !`,
+  cold edge, aborts with "division by zero"); the signed `INT_MIN / -1` overflow is folded away with a
+  `select` (divide by `1` in place of `-1` so the raw sdiv/srem never sees the UB case, then select the
+  wrapped result `0 - x` for `/` or `0` for `%`) so it wraps to `INT_MIN` per the defined
+  two's-complement overflow rule. `float` division (IEEE) and `vecN<T>` (SIMD, out of scope) are
+  untouched. The differential fuzzer's oracle (which forced positive divisors) now also generates
+  negative divisors incl. `-1`, exercising the wrap at every width; direct integration tests in
+  `crates/align_driver/tests/div_guard.rs` cover the abort + `INT_MIN/-1` cases.
 - **`json.decode` silently truncates/sign-wraps out-of-range integers.** `align_runtime/src/lib.rs`
   (~:919, `parse_object`; same pattern ~:872-877, :996). `JsonField.tag` packs `(kind<<8)|width` with
   **no sign bit**, so it structurally cannot range-check: `{"n": 300}` into `u8` silently becomes

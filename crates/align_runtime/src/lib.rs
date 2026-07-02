@@ -3440,6 +3440,17 @@ pub extern "C" fn align_rt_range_fail(start: i64, end: i64, len: i64) -> ! {
     std::process::abort();
 }
 
+/// Integer division (or remainder) by zero: report and abort. Codegen emits the `divisor == 0`
+/// check inline and calls this only on the failing path (the settled "division by zero is never
+/// silent, always an error" decision — a raw `sdiv`/`udiv` by zero is LLVM UB, so it must be
+/// guarded). The signed `INT_MIN / -1` overflow is handled inline (it wraps, matching defined
+/// two's-complement overflow) and does not reach here.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_div_fail() -> ! {
+    eprintln!("align: panic: division by zero");
+    std::process::abort();
+}
+
 /// A bump allocator (`docs/impl/06-runtime-std.md` §3). Memory is carved from a list of
 /// fixed-size chunks; individual allocations are never freed — the whole arena is
 /// released at once by [`align_rt_arena_end`]. Chunk buffers are heap-stable (the outer

@@ -44,9 +44,13 @@ fn gen_expr(rng: &mut Rng, depth: u32) -> (String, i64) {
             (format!("({l} {op} {r})"), val)
         }
         1 => {
-            // Division / remainder with a forced non-zero divisor (Align aborts on div-by-zero).
+            // Division / remainder. The divisor is forced non-zero (Align aborts on div-by-zero,
+            // which the oracle doesn't model) but may be negative, incl. `-1` — that exercises the
+            // signed `INT_MIN / -1` wrap guard. `wrapping_div`/`wrapping_rem` model it exactly
+            // (`x / -1 == -x` wrapping at MIN, `x % -1 == 0`).
             let (l, lv) = gen_expr(rng, depth - 1);
-            let d = 1 + rng.below(9) as i64;
+            let mag = 1 + rng.below(9) as i64;
+            let d = if rng.below(4) == 0 { -mag } else { mag };
             if rng.below(2) == 0 {
                 (format!("({l} / {d})"), lv.wrapping_div(d))
             } else {
@@ -176,7 +180,10 @@ fn gen_typed(rng: &mut Rng, depth: u32, t: ITy, vars: &[(String, ITy, i128)]) ->
         }
         1 => {
             let (l, lv) = gen_typed(rng, depth - 1, t, vars);
-            let d = 1 + rng.below(9) as i128; // literal divisor infers `t`; forced non-zero
+            let mag = 1 + rng.below(9) as i128; // literal divisor infers `t`; forced non-zero
+            // A signed type may also divide by a negative literal (incl. `-1` → the per-width
+            // `INT_MIN / -1` wrap guard); an unsigned type rejects a negative literal.
+            let d = if t.signed() && rng.below(4) == 0 { -mag } else { mag };
             if rng.below(2) == 0 {
                 (format!("({l} / {d})"), wrap(lv.wrapping_div(d), t))
             } else {

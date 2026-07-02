@@ -83,9 +83,11 @@ code := 'A' as i32        // char ↔ int = the Unicode code point; char never p
 ```
 
 `bool` and composite types do not participate. Integer overflow is defined two's-complement wrap;
-explicit `checked_*` / `saturating_*` / `wrapping_*` ops cover the rest. Unary `-` is signed, so
-negating an unsigned type (`x: u32 := -5`) is a compile error, not a silent wrap — cast explicitly
-if the wrapped pattern is wanted. (`draft.md` §3.)
+explicit `checked_*` / `saturating_*` / `wrapping_*` ops cover the rest. Division by zero is never
+silent — a runtime `/`/`%` by zero aborts, a constant one is a compile error — but `INT_MIN / -1`
+wraps to `INT_MIN` (`INT_MIN % -1` yields `0`), consistent with the two's-complement overflow rule;
+only zero divisors abort. Unary `-` is signed, so negating an unsigned type (`x: u32 := -5`) is a
+compile error, not a silent wrap — cast explicitly if the wrapped pattern is wanted. (`draft.md` §3.)
 
 ### Bitwise & shift
 
