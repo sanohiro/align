@@ -68,6 +68,7 @@ pub fn parse_file(tokens: Vec<Token>, diags: &mut Diagnostics) -> File {
         tokens,
         pos: 0,
         diags,
+        no_struct_literal: false,
     };
     p.parse_file()
 }
@@ -76,6 +77,11 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
     diags: &'a mut Diagnostics,
+    /// While parsing an `if`/`match` condition, a bare `Name { … }` is the header's block, not a
+    /// struct literal — so struct-literal recognition is suppressed at the condition's top level
+    /// (a struct literal there must be parenthesized, `if (P { x: 1 }).ok { … }`). Cleared inside
+    /// any delimiter (`(...)`, `[...]`, call args) where the block ambiguity can't arise.
+    no_struct_literal: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -770,7 +776,7 @@ impl<'a> Parser<'a> {
                 span: d.span.map(remap),
             });
         }
-        let mut sub = Parser { tokens, pos: 0, diags: self.diags };
+        let mut sub = Parser { tokens, pos: 0, diags: self.diags, no_struct_literal: false };
         let expr = sub.parse_expr(0);
         // The lexer appends an implicit `End` before `Eof`; skip it, then reject any
         // remaining tokens (e.g. `{x y}`): a hole must be exactly one expression.
@@ -828,6 +834,16 @@ impl<'a> Parser<'a> {
         Some(lhs)
     }
 
+    /// Parse a sub-expression that sits inside a delimiter (`(...)`, `[...]`, call args, an array
+    /// or struct-literal body). A `{` there can't begin a header block, so the `no_struct_literal`
+    /// condition restriction is lifted for it (and restored afterwards).
+    fn parse_delimited_expr(&mut self, min_bp: u8) -> Option<Expr> {
+        let saved = std::mem::replace(&mut self.no_struct_literal, false);
+        let e = self.parse_expr(min_bp);
+        self.no_struct_literal = saved;
+        e
+    }
+
     /// `expr as T (as U)*` — explicit conversions, between unary prefix and the binary operators.
     /// `as` applies to the whole prefix expression (so `-x as i64` is `(-x) as i64`), and chains
     /// left-to-right (`x as i64 as f64`).
@@ -835,11 +851,26 @@ impl<'a> Parser<'a> {
         let mut e = self.parse_prefix()?;
         while self.at(&TokKind::As) {
             self.bump();
-            let ty = self.parse_type()?;
+            let ty = self.parse_cast_type()?;
             let span = e.span.merge(ty.span());
             e = Expr { kind: ExprKind::Cast { expr: Box::new(e), ty }, span };
         }
         Some(e)
+    }
+
+    /// Parse a cast target type (`expr as T`). A cast target is always a concrete primitive scalar
+    /// (int / float / char / `raw`), never generic — so this reads a bare (possibly dotted) type
+    /// name and does **not** consume a following `<` as generic arguments. That keeps ordinary code
+    /// like `x as u32 < 5` parseable (the `<` is the comparison, not the start of `u32<…>`).
+    fn parse_cast_type(&mut self) -> Option<Type> {
+        let path = self.parse_path();
+        if path.segments.is_empty() {
+            // `parse_path` → `parse_ident` already emitted "expected identifier" at this span;
+            // just bail (don't double-report), matching `parse_type`.
+            return None;
+        }
+        let span = path.span;
+        Some(Type::Named { path, args: Vec::new(), span })
     }
 
     fn parse_prefix(&mut self) -> Option<Expr> {
@@ -872,7 +903,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let mut args = Vec::new();
                 while !self.at(&TokKind::RParen) && !self.at(&TokKind::Eof) {
-                    args.push(self.parse_expr(0)?);
+                    args.push(self.parse_delimited_expr(0)?);
                     if !self.eat(&TokKind::Comma) {
                         break;
                     }
@@ -910,15 +941,15 @@ impl<'a> Parser<'a> {
                 // after it makes this a slice (`[a..b]` / `[a..]`), else a plain index (`[i]`).
                 if self.at(&TokKind::DotDot) {
                     self.bump(); // '..'
-                    let end = if self.at(&TokKind::RBracket) { None } else { Some(Box::new(self.parse_expr(0)?)) };
+                    let end = if self.at(&TokKind::RBracket) { None } else { Some(Box::new(self.parse_delimited_expr(0)?)) };
                     self.expect(&TokKind::RBracket, "']'");
                     let span = e.span.merge(self.prev_span());
                     e = Expr { kind: ExprKind::SliceRange { recv: Box::new(e), start: None, end }, span };
                 } else {
-                    let first = self.parse_expr(0)?;
+                    let first = self.parse_delimited_expr(0)?;
                     if self.at(&TokKind::DotDot) {
                         self.bump(); // '..'
-                        let end = if self.at(&TokKind::RBracket) { None } else { Some(Box::new(self.parse_expr(0)?)) };
+                        let end = if self.at(&TokKind::RBracket) { None } else { Some(Box::new(self.parse_delimited_expr(0)?)) };
                         self.expect(&TokKind::RBracket, "']'");
                         let span = e.span.merge(self.prev_span());
                         e = Expr { kind: ExprKind::SliceRange { recv: Box::new(e), start: Some(Box::new(first)), end }, span };
@@ -989,8 +1020,10 @@ impl<'a> Parser<'a> {
                 // Distinguish from a block following a bare name (e.g. an `if` condition) by the
                 // `{ ident :` shape — no valid statement-block starts that way. The type name may
                 // be a dotted path (`geom.Point`), so skip over `(. ident)*` before the brace.
-                if let Some(segs) = self.struct_lit_path_len() {
-                    return self.parse_struct_lit(segs);
+                if !self.no_struct_literal {
+                    if let Some(segs) = self.struct_lit_path_len() {
+                        return self.parse_struct_lit(segs);
+                    }
                 }
                 // A single name; dotted access (`a.b`, method chains) is handled as a
                 // postfix in `parse_postfix`.
@@ -1083,12 +1116,12 @@ impl<'a> Parser<'a> {
                     let span = span.merge(self.prev_span());
                     return Some(Expr { kind: ExprKind::Unit, span });
                 }
-                let mut elems = vec![self.parse_expr(0)?];
+                let mut elems = vec![self.parse_delimited_expr(0)?];
                 while self.eat(&TokKind::Comma) {
                     if self.at(&TokKind::RParen) {
                         break;
                     }
-                    elems.push(self.parse_expr(0)?);
+                    elems.push(self.parse_delimited_expr(0)?);
                 }
                 self.expect(&TokKind::RParen, "')'");
                 let span = span.merge(self.prev_span());
@@ -1115,7 +1148,7 @@ impl<'a> Parser<'a> {
                     if self.at(&TokKind::RBracket) || self.at(&TokKind::Eof) {
                         break;
                     }
-                    elems.push(self.parse_expr(0)?);
+                    elems.push(self.parse_delimited_expr(0)?);
                     self.skip_ends();
                     if !self.eat(&TokKind::Comma) {
                         break;
@@ -1176,7 +1209,7 @@ impl<'a> Parser<'a> {
             let fstart = self.span();
             let fname = self.parse_ident("field name")?;
             self.expect(&TokKind::Colon, "':'");
-            let value = self.parse_expr(0)?;
+            let value = self.parse_delimited_expr(0)?;
             fields.push(FieldInit {
                 name: fname,
                 value,
@@ -1198,7 +1231,14 @@ impl<'a> Parser<'a> {
     fn parse_match(&mut self) -> Option<Expr> {
         let start = self.span();
         self.bump(); // match
-        let scrutinee = Box::new(self.parse_expr(0)?);
+        // The scrutinee parses like an `if` condition — a trailing `{` starts the arms, not a
+        // struct literal (`match p { … }`, never `match (P { … })`-as-scrutinee without parens).
+        // Restore the flag *before* the `?` so a scrutinee parse error can't leave it stuck on
+        // (which would disable struct literals for the rest of the file → cascading errors).
+        let saved = std::mem::replace(&mut self.no_struct_literal, true);
+        let scrutinee = self.parse_expr(0);
+        self.no_struct_literal = saved;
+        let scrutinee = Box::new(scrutinee?);
         self.expect(&TokKind::LBrace, "'{'");
         let mut arms = Vec::new();
         loop {
@@ -1261,7 +1301,15 @@ impl<'a> Parser<'a> {
     fn parse_if(&mut self) -> Option<Expr> {
         let start = self.span();
         self.bump(); // if
-        let cond = self.parse_expr(0)?;
+        // The `{` after the condition opens the `if` body, so a bare `Name { … }` in the condition
+        // is not a struct literal (it must be parenthesized). Suppress struct-literal recognition
+        // at the condition's top level; delimiters inside it lift the restriction.
+        // Restore the flag *before* the `?` so a condition parse error can't leave it stuck on
+        // (which would disable struct literals for the rest of the file → cascading errors).
+        let saved = std::mem::replace(&mut self.no_struct_literal, true);
+        let cond = self.parse_expr(0);
+        self.no_struct_literal = saved;
+        let cond = cond?;
         let then = self.parse_block()?;
         let els = if self.eat(&TokKind::Else) {
             if self.at(&TokKind::If) {
@@ -1542,5 +1590,42 @@ mod tests {
         // `if p { ... }` must parse `p` as the condition, not `p { ... }` as a literal.
         let (_f, err) = parse("fn f(p: bool) -> i32 {\n  if p { return 1 }\n  return 0\n}\n");
         assert!(!err);
+    }
+
+    #[test]
+    fn type_annotated_let_at_if_head_is_not_a_struct_literal() {
+        // `if flag { x: i32 := 5 … }` — the body's leading `ident :` used to be misread as a
+        // struct-literal field, breaking the condition. It must parse without error.
+        let (_f, err) = parse("fn f(flag: bool) -> i32 {\n  if flag { x: i32 := 5\n    return x }\n  return 0\n}\n");
+        assert!(!err);
+    }
+
+    #[test]
+    fn struct_literal_in_condition_call_args_still_parses() {
+        // The `no_struct_literal` restriction is lifted inside delimiters: a struct literal passed
+        // as a call argument in a condition is still a struct literal.
+        let (_f, err) = parse("P { a: i32 }\nfn g(p: P) -> bool = true\nfn f() -> i32 {\n  if g(P { a: 1 }) { return 1 }\n  return 0\n}\n");
+        assert!(!err);
+    }
+
+    #[test]
+    fn condition_parse_error_does_not_leak_no_struct_literal_flag() {
+        // Regression (gemini #272): if the condition itself fails to parse, the `no_struct_literal`
+        // flag must still be restored — otherwise every later struct literal in the file is
+        // misparsed. After a broken `if` condition, a subsequent struct literal must still be a
+        // `StructLit` in the AST.
+        let src = "fn bad() -> i32 {\n  if ) { return 1 }\n  return 0\n}\nP { a: i32 }\nfn good() -> i32 {\n  p := P { a: 5 }\n  return p.a\n}\n";
+        let (f, _err) = parse(src); // `bad` reports an error; that's expected.
+        let good = f.items.iter().find_map(|it| match it {
+            Item::Fn(fd) if fd.name.name == "good" => Some(fd),
+            _ => None,
+        }).expect("`good` function should still parse");
+        let FnBody::Block(b) = &good.body else { panic!() };
+        let Stmt::Let { init, .. } = &b.stmts[0] else { panic!("first stmt of `good` should be a let") };
+        assert!(
+            matches!(init.kind, ExprKind::StructLit { .. }),
+            "after a broken condition, `P {{ a: 5 }}` must still parse as a struct literal, got {:?}",
+            init.kind
+        );
     }
 }
