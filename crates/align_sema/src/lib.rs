@@ -2502,8 +2502,18 @@ impl<'a> EscapeCheck<'a> {
             // `t.N` reads an element; a `str` element is a view into the tuple, so it inherits the
             // tuple's region (a scalar element is Copy → harmless to inherit, never checked).
             ExprKind::TupleIndex { recv, .. } => self.region_of(recv, depth),
-            // `chunks` makes an array of slices that borrow the source array — region-tied to it.
-            ExprKind::ArrayChunks { source, .. } => self.region_of(source, depth),
+            // `chunks` makes an `array<slice<T>>` (`DynSliceArray`) whose slice headers borrow the
+            // source's **backing storage**. That storage region is distinct from the *element*
+            // region `region_of(source)` returns for reads: `arr[i]` of an `array<str>` yields a
+            // `str` view whose region is the element's (a literal's is `Static`, safely returnable),
+            // yet the array *slot* it was read from is frame-local. A str/struct-array's element
+            // region would otherwise hide the frame storage and let the chunks result escape (a
+            // use-after-free of the frame slot). So bind the chunks result to its source's storage
+            // region (see `chunks_source_storage_region`), and also to the element region (`shorter`)
+            // so an `array<str>` of arena strings is bounded by both its slot and that arena.
+            ExprKind::ArrayChunks { source, .. } => self
+                .chunks_source_storage_region(source, depth)
+                .shorter(self.region_of(source, depth)),
             // Borrowing an array as a slice preserves the array's region — a `slice<str>` coerced
             // from an arena str-array must not outlive that arena.
             ExprKind::ArrayToSlice(inner) => self.region_of(inner, depth),
@@ -2610,6 +2620,29 @@ impl<'a> EscapeCheck<'a> {
         b.value.as_ref().map(|v| self.region_of(v, depth)).unwrap_or(Region::Static)
     }
 
+    /// The region of the **backing storage** a `chunks` source borrows — deliberately distinct from
+    /// the source's *element/value* region ([`Self::region_of`]). A fixed stack `array<T>` / AoS
+    /// `array<Struct>` bound as a `Let`-local owns a **frame slot**, scoped to the arena it was
+    /// declared in (`Frame.shorter(arena(decl_depth))`); a fixed-array *parameter* borrows the caller
+    /// (never in `decl_depth` → `Static`, so chunking a param array stays returnable). An array
+    /// literal materializes a frame temporary at the current depth. A `slice` that itself borrows a
+    /// frame-local array (`local_backed_slice`) re-borrows that frame storage. Any other source (an
+    /// owned `array<T>`/`slice` producer, a slice param, a nested value expression) borrows storage
+    /// that `region_of` already places correctly — use it as-is. `chunks` restricts a fixed-`array`
+    /// source to a literal or a bare local (`check_array_chunks`), so no nested-expression fixed
+    /// array reaches here.
+    fn chunks_source_storage_region(&self, source: &Expr, depth: u32) -> Region {
+        match &source.kind {
+            ExprKind::Local(p) if matches!(source.ty, Ty::Array(..) | Ty::StructArray(..)) => self
+                .decl_depth
+                .get(p)
+                .map_or(Region::Static, |d| Region::Frame.shorter(Region::arena(*d))),
+            ExprKind::Local(p) if self.local_backed_slice.contains(p) => Region::Frame,
+            ExprKind::ArrayLit { .. } => Region::Frame.shorter(Region::arena(depth)),
+            _ => self.region_of(source, depth),
+        }
+    }
+
     /// Whether a `slice<T>`-typed expression borrows *function-local* array storage (and so
     /// cannot be returned). An array literal / local array materializes in this frame; a
     /// slice parameter borrows the caller (safe). A call returns a local-backed slice iff any
@@ -2681,23 +2714,6 @@ impl<'a> EscapeCheck<'a> {
                 // of this set (returnable), matching the slice-parameter convention above.
                 if matches!(init.ty, Ty::Array(..) | Ty::StructArray(..)) {
                     self.local_backed_slice.insert(*local);
-                }
-                // A fixed **scalar** array (`array<i64>` etc.) is not element-region-tracked, so the
-                // `tracks_region` branch above leaves it out of the region map — yet it owns frame
-                // storage, and a region-tracked *view* derived from it borrows that storage. In
-                // particular `chunks` yields an `array<slice<T>>` (`DynSliceArray`, region-tracked)
-                // whose slice headers point into this array. Without a region here, `region_of`
-                // falls back to `Static` for the array `Local`, `chunks` inherits `Static`, and the
-                // single escape rule wrongly lets the chunks result be returned / escape its arena
-                // (a use-after-free of the frame slot). Give the array its storage region — `Frame`,
-                // capped at the arena it is declared in (`Frame.shorter(arena(depth))`) — so a
-                // borrowing producer that inherits `region_of(source)` (today `chunks`; any future
-                // one automatically) cannot outlive the array. A str/struct array is already
-                // region-tracked via the branch above (its element region is more precise), so it is
-                // excluded here to avoid clobbering it.
-                if matches!(init.ty, Ty::Array(..)) && !self.tracks_region(init.ty) {
-                    self.region
-                        .insert(*local, Region::Frame.shorter(Region::arena(depth)));
                 }
             }
             // `base[index] = value` / `base[index].field = value`. The store itself targets the
@@ -11948,5 +11964,64 @@ mod tests {
             d.iter().any(|e| e.message.contains("borrows local storage")),
             "returning a chunks of a local array must raise the escape (local-storage borrow) error"
         );
+    }
+
+    // The same hole exists for a `str` array, and is *more* insidious: `array<str>` is
+    // region-tracked (`str` tracks), so its `Let` stores its **element** region (`Static` for str
+    // literals) in the region map — hiding the frame **storage** region. `chunks` binds to the
+    // storage region (`chunks_source_storage_region`), not the element region, so the escape is
+    // caught while an element read (`xs[0]`, a `str` view of static data) stays returnable.
+
+    #[test]
+    fn chunks_of_str_array_cannot_escape_via_outer_assign() {
+        // gemini's exact reproduction: an `array<str>` chunk escaping an arena via an outer binding.
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  mut cs := [\"x\"].chunks(1)\n  arena {\n    xs := [\"a\", \"b\", \"c\", \"d\"]\n    cs = xs.chunks(2)\n  }\n  print(cs.len())\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "chunks of an arena-local str array must not escape via outer assignment");
+    }
+
+    #[test]
+    fn chunks_of_str_array_cannot_escape_as_block_value() {
+        let (_p, d) = check(
+            "fn main() -> i32 {\n  cs := arena { xs := [\"a\", \"b\", \"c\", \"d\"]\n    xs.chunks(2)\n  }\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "chunks of an arena-local str array must not escape as the arena block value");
+    }
+
+    #[test]
+    fn chunks_of_str_array_cannot_be_returned() {
+        // The `array<slice<str>>` return type is not yet expressible (composite array element), so a
+        // type error also fires; the point is that the escape (frame-storage borrow) error is present.
+        let (_p, d) = check(
+            "fn f() -> array<slice<str>> {\n  xs := [\"a\", \"b\", \"c\", \"d\"]\n  return xs.chunks(2)\n}\nfn main() -> i32 { return 0 }\n",
+        );
+        assert!(
+            d.iter().any(|e| e.message.contains("borrows local storage")),
+            "returning a chunks of a local str array must raise the escape (local-storage borrow) error"
+        );
+    }
+
+    #[test]
+    fn str_array_element_read_still_returnable() {
+        // Regression: reading an element out of a fixed `str` array yields a `str` view whose region
+        // is the element's (a literal → `Static`), so it must stay returnable — the storage-region
+        // fix for `chunks` must not clobber the element region.
+        let (_p, d) = check(
+            "fn f() -> str {\n  xs := [\"a\", \"b\"]\n  return xs[0]\n}\nfn main() -> i32 { return 0 }\n",
+        );
+        assert!(!d.has_errors(), "reading a str element out of a local str array must stay returnable");
+    }
+
+    #[test]
+    fn chunks_of_struct_array_rejected() {
+        // A struct (AoS) array cannot be chunked today (`chunks` requires a scalar/str element view),
+        // so there is no escape hole — it is rejected at the type-check with no `array<slice<…>>`
+        // ever formed. (If AoS chunking is added later, `chunks_source_storage_region` already covers
+        // a `Ty::StructArray` local, so the escape stays closed.)
+        let (_p, d) = check(
+            "P { x: i64 }\nfn main() -> i32 {\n  xs := [P{x: 1}, P{x: 2}]\n  cs := xs.chunks(1)\n  return 0\n}\n",
+        );
+        assert!(d.has_errors(), "chunking a struct array must be rejected");
     }
 }
