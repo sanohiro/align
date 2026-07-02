@@ -2025,15 +2025,20 @@ A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) d
 `out dst: slice<T>` is a writable output buffer and `place[i] = v` (bounds-checked) writes a `mut`
 array local or `out` slice (primitive elements); (2) the **no-alias check** — at a call site an
 `out` argument must not alias another argument, compared by **root buffer**: a slice local's
-provenance is tracked back to the array it borrows via the **whole-array borrow** form
-(`s: slice := a`), so `fill(a, s)` and `fill(s1, s2)` (two whole-array borrows of `a`) are both
-rejected, not just `fill(a, a)`. (Residuals for the noalias-emission follow-up — both benign today
-because no metadata is emitted, but the emission gate must close them: (a) a slice returned from a
-function has unknown provenance and is treated as its own root; (b) **range-subslicing is NOT
-tracked** — `fill(a, a[0..2])` and `fill(s1, s2)` with `s1 := a[0..2]` / `s2 := a[1..3]` are
-currently **accepted** even though the buffers overlap, because `expr_root_local` only sees
-`Local`/`ArrayToSlice`, not `SliceRange`. The gate must track `SliceRange` and conservatively reject
-unknown-provenance `out` args — see the 2026-07-02 investigation note below.) **What remains is emitting the LLVM `noalias`** so loop vectorization can skip
+provenance is tracked back to the array it borrows (`s: slice := a`), so `fill(a, s)` and
+`fill(s1, s2)` (two slices of `a`) are both rejected, not just `fill(a, a)`. **Sub-slice hole —
+Status: fixed.** `expr_root_local`/`arg_root_local` now see through `SliceRange` (`recv[a..b]`),
+so an inline sub-slice argument `fill(xs, xs[0..2])`, two overlapping sub-slices via bindings
+(`s1 := xs[0..2]; s2 := xs[1..3]; fill(s1, s2)`), and nested sub-slices (`xs[0..4][1..2]`) all
+resolve to the shared root buffer and are rejected. This is deliberately conservative: two
+sub-slices of the same array are rejected whether or not their ranges actually overlap
+(`fill(xs[0..2], out xs[2..4])` is rejected too — range analysis is a separate follow-up).
+(Residual, still open for the noalias-emission follow-up: forms whose root cannot be resolved by
+name/sub-slice remain treated as their own root and so escape the check — a slice **returned from a
+function** (unknown provenance), a **soa column** `s.col` or a **struct field** of slice type
+(both `FieldAccess`, would need per-field/per-column provenance). These need borrow-through-return
+and per-field provenance tracking; for today's direct-borrow slices they are sound, but the
+emission gate may need to conservatively reject unknown-provenance `out`/input args.) **What remains is emitting the LLVM `noalias`** so loop vectorization can skip
 runtime overlap checks — blocked on the slice ABI: a slice is passed **by value** as a `{ptr,len}`
 aggregate, so its buffer pointer is not a standalone pointer parameter to attribute. Needs either a
 by-pointer `out`-slice ABI or scoped `!noalias` metadata on the buffer stores. The no-alias *check*

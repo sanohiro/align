@@ -4916,6 +4916,24 @@ impl<'a, 't> Checker<'a, 't> {
         match &e.kind {
             ExprKind::Local(id) => Some(self.root_local(*id)),
             ExprKind::ArrayToSlice(inner) => self.expr_root_local(inner),
+            // A sub-slice `recv[a..b]` is a view into `recv`'s storage, so its root buffer is the
+            // receiver's root (recursively — handles nested `xs[0..4][1..2]`). Without this, a
+            // slice binding `s := xs[0..2]` records no provenance and the `out` no-alias check
+            // cannot see that `s` and `xs` share a buffer.
+            ExprKind::SliceRange { recv, .. } => self.expr_root_local(recv),
+            _ => None,
+        }
+    }
+
+    /// The root buffer local an **AST** call argument borrows, if it resolves to one. A bare name
+    /// resolves through slice provenance to its root buffer (`root_local`); a sub-slice expression
+    /// `recv[a..b]` (an *inline* argument, which has no binding to record provenance for) resolves
+    /// to the receiver's root recursively. Used by the `out` no-alias check, which runs on the raw
+    /// argument AST before it is checked.
+    fn arg_root_local(&self, a: &ast::Expr) -> Option<LocalId> {
+        match &a.kind {
+            ast::ExprKind::Path(_) => self.place_local(a).map(|(id, _)| self.root_local(id)),
+            ast::ExprKind::SliceRange { recv, .. } => self.arg_root_local(recv),
             _ => None,
         }
     }
@@ -5693,19 +5711,21 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             );
         }
-        // No-alias check: an `out` argument must not name the same local as any other argument
-        // (the no-alias guarantee `out` lowers to LLVM `noalias`). A conservative base-local
-        // comparison — every slice of an array `a` goes through `a` directly today, so distinct
-        // locals are genuinely distinct buffers.
-        let arg_root = |s: &Self, a: &ast::Expr| s.place_local(a).map(|(id, _)| s.root_local(id));
+        // No-alias check: an `out` argument must not share its root buffer with any other argument
+        // (the no-alias guarantee `out` lowers to LLVM `noalias`). A conservative root-buffer
+        // comparison via `arg_root_local`: it sees through slice provenance and sub-slices, so two
+        // sub-slices of the same array — even non-overlapping ranges like `xs[0..2]` / `xs[2..4]` —
+        // are rejected (whether their ranges *actually* overlap is a range analysis for another day;
+        // sharing a root buffer is treated as "may alias"). Distinct roots are genuinely distinct
+        // buffers, so different arrays / freshly allocated storage still pass.
         for (i, is_out) in out.iter().enumerate() {
             if !is_out {
                 continue;
             }
             let Some(arg_i) = args.get(i) else { continue };
-            let Some(base) = arg_root(self, arg_i) else { continue };
+            let Some(base) = self.arg_root_local(arg_i) else { continue };
             for (j, a) in args.iter().enumerate() {
-                if j != i && arg_root(self, a) == Some(base) {
+                if j != i && self.arg_root_local(a) == Some(base) {
                     let lname = self.locals[base as usize].name.clone();
                     self.diags.error(
                         format!("the `out` argument also aliases '{lname}', another argument to '{name}' — an `out` buffer must not alias the other arguments"),
