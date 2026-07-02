@@ -4452,11 +4452,27 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::FieldAccess { recv, field } => {
                 self.check_field_access(recv, field, expected, e.span)
             }
-            ast::ExprKind::ArrayLit(elems) => match self.resolve(expected.unwrap_or(Ty::Error)) {
-                // `[…]` under a `vecN<T>` annotation builds a SIMD vector, not an array.
-                Ty::Vec(s, n) => self.check_vec_lit(elems, s, n, e.span),
-                _ => self.check_array_lit(elems, None, e.span),
-            },
+            ast::ExprKind::ArrayLit(elems) => {
+                let lit = match self.resolve(expected.unwrap_or(Ty::Error)) {
+                    // `[…]` under a `vecN<T>` annotation builds a SIMD vector, not an array.
+                    Ty::Vec(s, n) => self.check_vec_lit(elems, s, n, e.span),
+                    _ => self.check_array_lit(elems, None, e.span),
+                };
+                // A fixed array literal is a *stack* value; an owned `array<T>` (`DynArray`) is
+                // heap-allocated. A bare literal cannot silently become one (that would hide the
+                // allocation — "Nothing hidden", and codegen currently miscompiles it): reject it
+                // in an owned-array context and point to `.to_array()` (the visible materialization).
+                if matches!(lit.ty, Ty::Array(..) | Ty::StructArray(..))
+                    && matches!(expected.map(|t| self.resolve(t)), Some(Ty::DynArray(_) | Ty::DynStructArray(..)))
+                {
+                    self.diags.error(
+                        "a fixed array literal is not an owned `array<T>` — materialize it with `.to_array()` (its heap allocation is explicit)".to_string(),
+                        e.span,
+                    );
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
+                }
+                lit
+            }
             ast::ExprKind::Index { recv, index } => self.check_index(recv, index, e.span),
             ast::ExprKind::SliceRange { recv, start, end } => self.check_slice_range(recv, start.as_deref(), end.as_deref(), e.span),
             ast::ExprKind::Template(parts) => self.check_template(parts, expected, e.span),
