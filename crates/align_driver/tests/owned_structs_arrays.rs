@@ -128,6 +128,12 @@ fn string_field_view_of_element_cannot_escape_the_array() {
         "ms-array-view-move",
         "User { name: string }\nfn main() -> i32 {\n  us := [User{name: \"x\".clone()}]\n  n: string := us[0].name\n  return 0\n}\n"
     ));
+    // The view of an array literal indexed *directly* (not bound to a variable) is likewise
+    // frame-local — returning it must be rejected too (the temporary's buffer dies within the frame).
+    assert!(check_errs(
+        "ms-array-lit-view-escape",
+        "User { name: string }\nfn bad() -> str {\n  return [User{name: \"x\".clone()}][0].name\n}\nfn main() -> i32 = 0\n"
+    ));
 }
 
 #[test]

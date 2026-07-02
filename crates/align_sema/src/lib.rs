@@ -2471,10 +2471,21 @@ impl<'a> EscapeCheck<'a> {
             // same rule as `Index` / `StrTrim`; the bounds are scalar `i64`, never region-tracked).
             ExprKind::SliceRange { recv, .. } => self.region_of(recv, depth),
             // An array literal lives as long as its shortest-lived element — a `[str]` of arena
-            // `str` views is arena-regioned (the same rule as a struct literal over its fields).
-            ExprKind::ArrayLit { elems, .. } => elems
-                .iter()
-                .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth))),
+            // `str` views is arena-regioned (the same rule as a struct literal over its fields). A
+            // Move-struct array literal, however, *owns* its elements' heap buffers (its `.clone()`
+            // strings): a view into it (`[User{…}][i].name`, indexed directly without binding) is
+            // frame-local — the temporary's buffers die within the frame — so cap it at `Frame`, the
+            // same bound a bound Move-struct array gets at its `let` (else the view could be returned).
+            ExprKind::ArrayLit { elems, .. } => {
+                let r = elems
+                    .iter()
+                    .fold(Region::Static, |acc, el| acc.shorter(self.region_of(el, depth)));
+                if matches!(e.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs)) {
+                    r.shorter(Region::Frame)
+                } else {
+                    r
+                }
+            }
             // A tuple lives as long as its shortest-lived element (same rule as an array literal):
             // a tuple holding an arena `str` view is arena-regioned and cannot escape.
             ExprKind::Tuple { elems, .. } => elems
