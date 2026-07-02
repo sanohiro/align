@@ -2003,7 +2003,7 @@ extension is explicitly **not** pursued, to keep generics minimal and Align data
   decomposition for `Opt.None` — small optional refinements, rejected cleanly today; only revisit
   if real code demands them. Not required for the language to be complete.
 
-### Error type design — Open (next after sum types; the i32 is an M2 placeholder)
+### Error type design — Settled 2026-07-02 (built on sum types; the exit-code residual is now closed)
 Today `Error` is the M2 `Ty::ErrCode` (an i32 code). **Leaning (2026-06-24, validated by external review):** build the real `Error` **on the sum-type mechanism** — `Error` is a **sum type of categories** (the variant carries a lightweight payload: a `str` view + position for a parse error, a code for an OS error, …). Constraints from the philosophy:
 - **An explicit value, nothing hidden:** no exceptions, no unwinding, no implicit stack-trace allocation. (The cold-`Err`-edge treatment stays.)
 - **No implicit `?` conversion — explicit `map_err` instead (4b-3 DONE).** `?` requires the same `E` (an implicit `E → E'` coercion would be *hidden* — Align has no `From`-trait to point at, unlike Rust). To change a result's error type, use `result.map_err(f)` (`f: fn(E) -> E'`), then `?`: `inner().map_err(to_error)?`. Explicit, visible, closure-based; lowers to a branch over the `Result` reusing the existing unwrap rvalues + an indirect call.
@@ -2016,17 +2016,21 @@ So this entry **waits on sum types** (4a) and then defines `Error` as a concrete
 
 **4b-2 DONE: the canonical `Error` is a builtin sum type.** `Error { NotFound, Invalid, Denied, Code(i32) }` — a real enum registered as a reserved type name (resolved via `enum_ids` like any sum type). `Error.NotFound` / `Error.Code(c)` construct it (`error(c)` is sugar for `Error.Code(c)`); `match` discriminates the categories; `?` propagates. Every fallible builtin (`fs.read_file`, `json.decode`, `io`, `task_group`) now returns `Result<_, Error>`, wrapping its runtime i32 status as `Error.Code(code)`. The **`main` exit mapping**: `Code(c)` → exit `clamp(c)`, a category → `tag + 1` (a small distinct nonzero code). The **task_group** fallible path was reworked to carry the full `Error` across threads: each task gets an `err_slot`, the trampoline writes its `Err` value there and returns 0/1, `tg_wait` returns the first errored `err_slot` (null if none), `wait()?` builds the `Result` from it. (`Ty::ErrCode`/`Scalar::ErrCode` are now vestigial — only an i32-status alias in the builtin lowerings; removable in a follow-up.) **4b-3 DONE** the explicit **`?` `E → E'` conversion** via `result.map_err(f)` (no implicit coercion). **4b-4 DONE (structured errors) / `.with_context` not adopted** — position-bearing structured errors already work on the 4b-1 + S2 foundation (a variant carrying a `Pos` struct, `?`-propagated, `match`-read); free-form `.with_context` string-chaining was reviewed and dropped as off-philosophy (structured sum-type payloads are the context mechanism — see the bullet above). **So the Error type (4b) is complete** for the planned surface: `Error` is a builtin sum type, user error enums work, `map_err` converts, structured payloads carry context. (Richer `str`-carrying error payloads remain deferred with S2's `str`-field payloads — enum region tracking.)
 
-**Open residual (found 2026-07-02, internal review): `main() -> Result<(), E>` exit-code mapping is
-defined only for the builtin `Error`.** The `main` wrapper's exit-code lowering
-(`align_codegen_llvm/src/lib.rs`, the `align_main` wrapper) reads the payload as the builtin `Error`
-enum's specific `{ i32 tag, i32 code }` shape (`Code(c)` → `clamp(c)`, category → `tag + 1`); a
-user-defined error enum at `main`'s `E` position has no defined mapping — undefined/unspecified
-behavior at the `main` boundary, not merely unimplemented sugar. **Decide:** either restrict `main`'s
-`E` to (be, or convert into) the builtin `Error`, or define a general enum→exit-code mapping (e.g.
-tag index + 1, ignoring payload) for any sum type at that position. (Separately: this section's own
-heading still says "Open" while its body reads as complete for the *type* — reconcile the heading
-once the exit-code-mapping question above is closed, so a future reader doesn't have to resolve the
-same drift again.)
+**Exit-code residual — SETTLED 2026-07-02: `main`'s `E` is restricted to the builtin `Error`.**
+The `main` wrapper's exit-code lowering (`align_codegen_llvm/src/lib.rs`, the `align_main` wrapper)
+reads the payload as the builtin `Error` enum's specific `{ i32 tag, i32 code }` shape
+(`Code(c)` → `clamp(c)`, category → `tag + 1`); a user-defined error enum at `main`'s `E` position
+has a different layout and no defined exit-code mapping — previously this fell through to codegen and
+surfaced as an internal "aggregate extract index out of range" lowering failure (undefined behavior
+at the `main` boundary, not merely unimplemented sugar). **Decision (owner-approved): restrict**
+`main`'s `E` to the builtin `Error`; a user-defined error type there is now a clean sema diagnostic
+("main's error type must be the builtin `Error`; user-defined error types in main's return will be
+allowed once the full Error design lands"). The check is in `align_sema` alongside the other `main`
+signature checks (the return-type validation now runs for both the no-arg and the `args: array<str>`
+forms). Convert a domain error to `Error` at the boundary with `map_err(to_error)?`. **This will be
+revisited when the general enum→exit-code mapping is designed** (the deferred alternative — e.g. tag
+index + 1 for any sum type at that position); that is the only remaining piece of the broader Error
+type design (see the section body above), so this section is otherwise complete.
 
 ### Out-of-range compile-time integer literals — silently wrap (Open, found 2026-07-02)
 `x: u8 := 300` compiles and produces `44` (wrapped); a negative literal given an unsigned type is

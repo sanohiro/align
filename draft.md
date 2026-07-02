@@ -420,6 +420,12 @@ discriminate it with `match`, and at `main` it becomes the process exit code (`C
 category → a small distinct code). The standard fallible operations (`fs.read_file`, `json.decode`,
 …) return `Result<T, Error>`.
 
+A fallible entry point — `fn main() -> Result<(), E>` — requires `E` to be the builtin `Error`; the
+exit-code mapping above is defined only for it. A user-defined error enum at that position is a
+compile error today (it will be allowed once the full `Error` design settles the general
+enum→exit-code mapping); propagate it with `map_err(to_error)?` to convert to `Error` at the
+boundary.
+
 **Context is structured, not free-form.** To attach context to an error — where it occurred, what
 failed — give the error variant a payload that *carries that data*: a position, a code, a name.
 There is no free-form string-chaining (`anyhow`-style `.with_context("…")`); the structured payload

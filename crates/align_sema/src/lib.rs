@@ -3963,17 +3963,35 @@ impl<'a, 't> Checker<'a, 't> {
                 *t = subst_param_ty(*t, &self.mono_args);
             }
         }
-        // `main` takes no arguments, or exactly `args: array<str>` (argv, draft.md §19) with a
-        // `Result<(), Error>` return — the latter is the only form the C-`main` wrapper marshals
-        // argv into (an `-> i32` argv `main` is a later follow-up).
-        if f.name.name == "main" && !f.params.is_empty() {
-            let args_ok = param_tys.as_slice() == [Ty::DynArray(Scalar::Str)]
-                && matches!(ret, Ty::Result(Scalar::Unit, Scalar::Enum(eid)) if eid == self.error_enum_id);
-            if !args_ok {
+        if f.name.name == "main" {
+            // `main`'s error type — the `E` in `-> Result<(), E>` — is restricted to the builtin
+            // `Error`. The C-`main` wrapper's exit-code lowering reads the `Err` payload as the
+            // builtin `Error` enum's specific `{ i32 tag, i32 code }` shape (`Code(c)` → `clamp(c)`,
+            // a category → `tag + 1`); a user-defined error enum at that position has a different
+            // layout and no defined exit-code mapping, so it would miscompile. Reject it here with a
+            // clear diagnostic. (Relaxation waits on the full `Error` design — see `open-questions.md`
+            // "Error type design".)
+            if let Ty::Result(_, e) = ret
+                && !matches!(e, Scalar::Enum(eid) if eid == self.error_enum_id)
+            {
                 self.diags.error(
-                    "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return".to_string(),
-                    f.span,
+                    "main's error type must be the builtin `Error`; user-defined error types in main's return will be allowed once the full Error design lands".to_string(),
+                    f.ret.as_ref().map(|t| t.span()).unwrap_or(f.span),
                 );
+            }
+            // `main` takes no arguments, or exactly `args: array<str>` (argv, draft.md §19) with a
+            // `Result<(), _>` return — the latter is the only form the C-`main` wrapper marshals
+            // argv into (an `-> i32` argv `main` is a later follow-up). The `E` is validated
+            // separately above, so this checks only the parameter and `Ok`-payload shape.
+            if !f.params.is_empty() {
+                let args_ok = param_tys.as_slice() == [Ty::DynArray(Scalar::Str)]
+                    && matches!(ret, Ty::Result(Scalar::Unit, _));
+                if !args_ok {
+                    self.diags.error(
+                        "main takes no arguments, or exactly `args: array<str>` with a `Result<(), Error>` return".to_string(),
+                        f.span,
+                    );
+                }
             }
         }
         self.ret_hint = ret;
@@ -11886,6 +11904,30 @@ mod tests {
         // `main(args)` must return Result (the only form the wrapper marshals argv into).
         let (_r, noresult) = check("fn main(args: array<str>) -> i32 = 0\n");
         assert!(noresult.has_errors(), "main(args) with a non-Result return must error");
+    }
+
+    #[test]
+    fn main_error_type_restricted_to_builtin() {
+        // `main() -> Result<(), Error>` (builtin Error) is the accepted fallible form.
+        let (_p, ok) = check("fn main() -> Result<(), Error> {\n  return Ok(())\n}\n");
+        assert!(!ok.has_errors(), "main() -> Result<(), Error> must check");
+        // A user-defined error enum at `main`'s `E` position is rejected — the C-`main` wrapper's
+        // exit-code lowering only knows the builtin `Error` layout, so any other enum would
+        // miscompile. Must be a clean diagnostic, not a codegen `extract index out of range`.
+        let (_q, userenum) = check("MyErr { Bad, Worse }\nfn main() -> Result<(), MyErr> {\n  return Err(MyErr.Bad)\n}\n");
+        assert!(userenum.has_errors(), "main with a user-defined error type must error");
+        assert!(
+            userenum
+                .iter()
+                .any(|d| d.message.contains("main's error type must be the builtin `Error`")),
+            "the diagnostic must name the builtin-Error restriction",
+        );
+        // Same restriction on the argv form.
+        let (_r, argv) = check("MyErr { Bad }\nfn main(args: array<str>) -> Result<(), MyErr> {\n  return Err(MyErr.Bad)\n}\n");
+        assert!(argv.has_errors(), "main(args) with a user-defined error type must error");
+        // `main() -> i32` stays valid (the C-entry form).
+        let (_s, i32main) = check("fn main() -> i32 {\n  return 0\n}\n");
+        assert!(!i32main.has_errors(), "main() -> i32 must check");
     }
 
     #[test]
