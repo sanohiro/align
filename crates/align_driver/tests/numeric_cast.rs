@@ -175,3 +175,12 @@ fn unsigned_wrapping_subtraction_still_allowed() {
     let out = build_and_run("u32-wrap-sub", "fn main() -> i32 {\n  a: u32 := 6\n  b: u32 := 1\n  return (a - b) as i32\n}\n");
     assert_eq!(out.status.code(), Some(5));
 }
+
+#[test]
+fn negate_unsigned_constant_is_rejected() {
+    // gemini #277: the const-fold path (`ConstEval`) is separate from `finalize_expr`, so a
+    // top-level constant `X: u32 := -5` must be rejected there too (else it silently wraps at
+    // compile time). A default-typed / signed constant negation stays fine.
+    assert!(check_errs("neg-u32-const", "X: u32 := -5\nfn main() -> i32 { return 0 }\n"));
+    assert!(!check_errs("neg-default-const", "X := -5\nY: i32 := -5\nfn main() -> i32 { return 0 }\n"));
+}

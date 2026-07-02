@@ -1001,6 +1001,16 @@ impl<'a, 'd> ConstEval<'a, 'd> {
             UnOp::Neg => {
                 let (ty, val) = self.expr(expr, expected, module)?;
                 match (ty, val) {
+                    // Unary negation is signed; negating an unsigned type (`X: u32 := -5`) would
+                    // silently two's-complement wrap and lose the sign. Reject it here too — the
+                    // const-fold path is separate from the runtime `finalize_expr` check.
+                    (Ty::Int(it), _) if !it.signed => {
+                        self.diags.error(
+                            format!("cannot apply unary `-` to the unsigned type `{}`: a negative value cannot have an unsigned type (it would silently wrap). Use a signed type, or convert explicitly with `as {}`.", ty_name(ty), ty_name(ty)),
+                            span,
+                        );
+                        None
+                    }
                     (Ty::Int(it), ConstVal::Int(v)) => Some((ty, ConstVal::Int(wrap_to_int(v.wrapping_neg(), it)))),
                     (Ty::Float(_), ConstVal::Float(v)) => Some((ty, ConstVal::Float(-v))),
                     (Ty::Error, _) => None, // operand failed to fold; do not cascade
