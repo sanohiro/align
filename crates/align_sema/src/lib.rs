@@ -1001,6 +1001,16 @@ impl<'a, 'd> ConstEval<'a, 'd> {
             UnOp::Neg => {
                 let (ty, val) = self.expr(expr, expected, module)?;
                 match (ty, val) {
+                    // Unary negation is signed; negating an unsigned type (`X: u32 := -5`) would
+                    // silently two's-complement wrap and lose the sign. Reject it here too — the
+                    // const-fold path is separate from the runtime `finalize_expr` check.
+                    (Ty::Int(it), _) if !it.signed => {
+                        self.diags.error(
+                            format!("cannot apply unary `-` to the unsigned type `{}`: a negative value cannot have an unsigned type (it would silently wrap). Use a signed type, or convert explicitly with `as {}`.", ty_name(ty), ty_name(ty)),
+                            span,
+                        );
+                        None
+                    }
                     (Ty::Int(it), ConstVal::Int(v)) => Some((ty, ConstVal::Int(wrap_to_int(v.wrapping_neg(), it)))),
                     (Ty::Float(_), ConstVal::Float(v)) => Some((ty, ConstVal::Float(-v))),
                     (Ty::Error, _) => None, // operand failed to fold; do not cascade
@@ -9353,7 +9363,22 @@ impl<'a, 't> Checker<'a, 't> {
         // the type arguments are finalized; set from the Call arm and applied after the match.
         let mut recomputed: Option<Ty> = None;
         match &mut e.kind {
-            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.finalize_expr(expr),
+            ExprKind::Unary { op, expr } => {
+                self.finalize_expr(expr);
+                // Unary negation is a *signed* operation. Applying it to an unsigned type — a
+                // negative literal given an unsigned type by context (`x: u32 := -5`, `g(-5)` into a
+                // `u32` parameter) or a negated unsigned value — would silently two's-complement wrap
+                // and lose the sign (`-5` prints as `4294967291`). Reject it (checked here, after
+                // inference has resolved the operand's type). An explicit `(-5) as u32` is unaffected:
+                // the inner `-5` is signed (default `i64`), and the cast does the intended conversion.
+                if *op == UnOp::Neg && matches!(cur_ty, Ty::Int(IntTy { signed: false, .. })) {
+                    self.diags.error(
+                        format!("cannot apply unary `-` to the unsigned type `{}`: a negative value cannot have an unsigned type (it would silently wrap). Use a signed type, or convert explicitly with `as {}`.", ty_name(cur_ty), ty_name(cur_ty)),
+                        span,
+                    );
+                }
+            }
+            ExprKind::Cast(expr) => self.finalize_expr(expr),
             ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
                 self.finalize_expr(lhs);
                 self.finalize_expr(rhs);

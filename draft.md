@@ -318,6 +318,8 @@ The reason is to commit fully to "predictably fast." Behavior is the same across
 
 Arithmetic errors other than overflow, such as division by zero, are handled separately; they are never silent and always produce an error.
 
+Unary negation `-x` is a **signed** operation: applying it to an unsigned type (e.g. a `-5` literal given an unsigned type by context, `x: u32 := -5`) is a **compile error**, not a silent wrap — a negative value cannot have an unsigned type. Convert explicitly (`(-5) as u32`) if the wrapped bit pattern is actually wanted. (This is distinct from unsigned *subtraction* `a - b`, which is ordinary defined two's-complement wrap.)
+
 ### Numeric Conversion
 
 There is **no implicit numeric coercion** — not even widening. A value changes type only through the explicit `as` operator, so every conversion is visible in source ("nothing hidden"):

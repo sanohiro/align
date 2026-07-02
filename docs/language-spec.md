@@ -82,7 +82,9 @@ code := 'A' as i32        // char ↔ int = the Unicode code point; char never p
 ```
 
 `bool` and composite types do not participate. Integer overflow is defined two's-complement wrap;
-explicit `checked_*` / `saturating_*` / `wrapping_*` ops cover the rest. (`draft.md` §3.)
+explicit `checked_*` / `saturating_*` / `wrapping_*` ops cover the rest. Unary `-` is signed, so
+negating an unsigned type (`x: u32 := -5`) is a compile error, not a silent wrap — cast explicitly
+if the wrapped pattern is wanted. (`draft.md` §3.)
 
 ### Bitwise & shift
 
