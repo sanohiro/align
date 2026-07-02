@@ -1,7 +1,8 @@
 //! Radix-prefixed integer literals — `0x..` (hex), `0o..` (octal), `0b..` (binary) (`draft.md` §3).
 //! They are ordinary integer literals (same `i128` value, width inferred from context, `_`
-//! separators allowed), so they truncate to a binding's width by the defined wrap rule like any
-//! literal. They pair naturally with the bitwise/shift operators.
+//! separators allowed), so — like any literal — a value that provably does not fit the inferred
+//! type is a hard error (not a silent wrap; `draft.md` §5). They pair naturally with the
+//! bitwise/shift operators.
 
 mod common;
 use common::*;
@@ -46,14 +47,24 @@ fn hex_pairs_with_bitwise() {
 }
 
 #[test]
-fn hex_uppercase_value_truncates_to_width() {
+fn hex_uppercase_digits_parse() {
     if !backend_available() {
         return;
     }
-    // 0xFFFFFFFF stored as i128 4294967295, narrowed to i32 = -1 (defined wrap). -1 + 43 = 42.
-    let src = "fn main() -> i32 {\n  m: i32 := 0xFFFFFFFF\n  return m + 43\n}\n";
-    let out = build_and_run("radix-trunc", src);
+    // Uppercase hex digits (`0xAB`) parse to the same value as lowercase; 0xAB = 171 fits i32.
+    let src = "fn main() -> i32 {\n  m: i32 := 0xAB\n  return m - 129\n}\n"; // 171 - 129 = 42
+    let out = build_and_run("radix-upper", src);
     assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn hex_literal_overflowing_its_type_is_rejected() {
+    // 0xFFFFFFFF = 4294967295 does not fit i32 — a provably-out-of-range literal is a hard error
+    // (it would otherwise silently wrap to -1). Write `0xFFFFFFFF as i32` for the bit pattern.
+    assert!(check_errs(
+        "radix-overflow",
+        "fn main() -> i32 {\n  m: i32 := 0xFFFFFFFF\n  return m\n}\n"
+    ));
 }
 
 #[test]

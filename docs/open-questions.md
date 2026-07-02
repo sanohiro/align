@@ -110,6 +110,24 @@ in the impl plan, never the authoritative `draft.md`, and never implemented) is 
 type when fully unconstrained stays i64 / f64; a "wasteful i64 default in large arrays" lint remains a
 Future item. Record: `docs/impl/02-frontend.md` §2, `docs/impl/03-types.md` §2.
 
+### Out-of-range compile-time integer literals — hard error (SETTLED 2026-07-02)
+**Decision: a *value* literal whose value provably does not fit the type it is given by context is a
+compile error, not a silent two's-complement wrap.** When both the value and the type are known at
+compile time (`x: u8 := 300`, an argument, a field initializer, an array element, a return value), a
+provably-out-of-range literal is hidden data corruption — at odds with "nothing hidden" — and the
+compiler can reject it at zero runtime cost. This is symmetric with `as`'s zero-UB design and with
+rejecting a negative literal given an unsigned type. **Runtime arithmetic overflow is unchanged**
+(still defined wrap; see "Integer overflow" above) — this is a *static* check on literals only.
+Implemented in `align_sema` at the `finalize_expr` seam (after inference resolves each literal's
+concrete type): `check_int_lit_range` rejects a bare literal outside `[min, max]`; a negated literal
+(`-lit`) is checked at its **effective** value in the `Unary` arm, so `-128` is a valid `i8` while the
+positive `128` is not (and a negative literal into an unsigned type still reports only the existing
+unsigned-`-` error, not a duplicate). A too-wide **`match` pattern** literal is deliberately *not*
+affected — it truncates to the scrutinee's type by the defined wrap rule (`draft.md` §5), since a
+pattern is a comparison, not a stored value (integer-literal patterns are not implemented yet, so
+this is a spec reservation). Record: `draft.md` §5 ("Integer Literals"), `docs/language-spec.md`
+digest; tests in `crates/align_driver/tests/literal_range.rs`.
+
 ### Type declaration syntax
 **Decision: keyword-less.** Contains `ident: Type` → struct; `ident`/`ident(...)` → sum type, disambiguated by content. Fields/variants are `,`-separated.
 Record: `draft.md` §4, `impl/02-frontend.md`
@@ -2055,18 +2073,6 @@ revisited when the general enum→exit-code mapping is designed** (the deferred 
 index + 1 for any sum type at that position); that is the only remaining piece of the broader Error
 type design (see the section body above), so this section is otherwise complete.
 
-### Out-of-range compile-time integer literals — silently wrap (Open, found 2026-07-02)
-`x: u8 := 300` compiles and produces `44` (wrapped); a negative literal given an unsigned type is
-already correctly rejected (see the External soundness audit's item **1-1**, "unary `-` on an
-unsigned type"). Wrap is the Settled behavior for *runtime* arithmetic overflow (see "Integer
-overflow" above), but a literal whose value and target type are **both known at compile time** is a
-different case — the compiler could reject it outright with zero runtime cost, and silently accepting
-it is arguably hidden data corruption, in tension with "Nothing hidden." **Decide:** (a) hard
-compile-time error for a provably-out-of-range literal (recommended — cheapest, most consistent with
-`as`'s zero-UB design and with rejecting negative-into-unsigned; wrap stays exactly as-is for runtime
-values), or (b) leave it and pick it up as an M8 lint instead. Either way, record the decision here
-once made; until then the current (silent-wrap) behavior stands.
-
 ### Arena with explicit allocator — partially settled (M3)
 **M3 decision: anonymous `arena {}` only.** Nested arenas use region = arena nesting
 depth; a box's region is the depth at which it was allocated, and escape = reaching a
@@ -2484,8 +2490,9 @@ individual review entries. None block anything; pick up when the lint suite is a
   the scalable-vector reservation in the Hardware backlog above). Reserved 2026-07-02 (internal
   review, Opus+Codex independently agreed) specifically to guard against AI-generated code defaulting
   to a fixed 128/256-bit vecN<T> loop and losing SVE/RVV portability for no reason.
-- Out-of-range compile-time integer literal (`x: u8 := 300`): candidate lint if the stronger
-  hard-error option (see "Out-of-range compile-time integer literals" in Open, above) isn't taken.
+- ~~Out-of-range compile-time integer literal (`x: u8 := 300`): candidate lint~~ — **done as a hard
+  error instead** (SETTLED 2026-07-02; see "Out-of-range compile-time integer literals — hard error"
+  in Settled). No lint needed.
 - par_map cost-threshold lint / cheap-par_map-loses-to-sequential (already recorded above under
   "Codex perf / I/O / LLM research sweep" — listed here only so it isn't missed in a lint-suite pass).
 - connect-per-request-to-a-static-host lint for the future std `http`/`socket` layer (already
