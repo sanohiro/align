@@ -1,6 +1,6 @@
 //! M6 SIMD slice 1 — the explicit fixed-width vector type `vecN<T>` (`vec2`/`vec4`/`vec8`/`vec16`
 //! of a numeric scalar). Constructed from an array literal under a `vecN<T>` annotation; supports
-//! elementwise `+`/`-`/`*`/`/` (lowered to LLVM vector arithmetic) and constant-lane read `v[i]`
+//! elementwise `+`/`-`/`*`/`/`/`%` (lowered to LLVM vector arithmetic) and constant-lane read `v[i]`
 //! (extractelement). `mask`/comparisons/`select`/`dot`/broadcast are later slices.
 
 mod common;
@@ -573,7 +573,9 @@ fn select_width_mismatch_is_rejected() {
 }
 
 #[test]
-fn remainder_on_vectors_is_rejected() {
+fn remainder_on_vectors_is_accepted() {
+    // Elementwise `%` is now a supported vector op (guarded lane-wise like the scalar path); this is
+    // a no-error smoke check — the runtime lane-wise behavior is covered by the `*_remainder_*` tests.
     let src = concat!(
         "fn main() -> i32 {\n",
         "  a: vec4<i32> := [1, 2, 3, 4]\n",
@@ -582,7 +584,32 @@ fn remainder_on_vectors_is_rejected() {
         "  return c[0]\n",
         "}\n",
     );
-    assert!(check_errs("vec-rem", src));
+    assert!(!check_errs("vec-rem", src));
+}
+
+#[test]
+fn bitwise_and_shift_on_vectors_is_rejected() {
+    // Vectors carry only elementwise `+ - * / %` and comparisons — the bitwise/shift family
+    // (`& | ^ << >>`) is an explicit sema error (a clear vec-specific diagnostic, not a codegen
+    // crash and not the generic "expect integers" message). Guards self-review Gate 3 / #235.
+    for op in ["&", "|", "^", "<<", ">>"] {
+        let src = format!(
+            concat!(
+                "fn main() -> i32 {{\n",
+                "  a: vec4<i32> := [1, 2, 3, 4]\n",
+                "  b: vec4<i32> := [5, 6, 7, 8]\n",
+                "  c := a {op} b\n",
+                "  return c[0]\n",
+                "}}\n",
+            ),
+            op = op,
+        );
+        let diags = check_diagnostics("vec-bitop", &src);
+        assert!(
+            diags.contains("vectors do not support bitwise or shift operators"),
+            "op `{op}` should give the vec-specific rejection, got:\n{diags}"
+        );
+    }
 }
 
 #[test]
@@ -758,4 +785,182 @@ fn fma_is_float_only_and_takes_three_args() {
     assert!(check_errs("fma-int", "fn main() -> i32 {\n  return fma(2, 3, 1)\n}\n"));
     // It needs exactly three operands.
     assert!(check_errs("fma-arity", "fn main() -> i32 {\n  return fma(2.0, 3.0) as i32\n}\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Lane-wise remainder `%` (M6). The elementwise integer `/`/`%` carry the same divisor guard as
+// the scalar path (`lower_int_div` ⇄ `lower_vec_div`): any zero divisor lane aborts, and a signed
+// `INT_MIN / -1` lane wraps to the defined two's-complement result. Float `%` is IEEE `frem`, no
+// guard. Divisors are passed through `vecN<T>` params so the guard runs at runtime (not const-folded).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn signed_vector_remainder_lane_wise() {
+    if !backend_available() {
+        return;
+    }
+    // `[17,20,33,44] % [5,6,7,8]` = `[2,2,5,4]`; lane 2 = 33 % 7 = 5.
+    let src = concat!(
+        "fn rem4(a: vec4<i32>, b: vec4<i32>) -> vec4<i32> = a % b\n",
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [17, 20, 33, 44]\n",
+        "  b: vec4<i32> := [5, 6, 7, 8]\n",
+        "  q := rem4(a, b)\n",
+        "  return q[2]\n",
+        "}\n",
+    );
+    let out = build_and_run("vrem-i32", src);
+    assert_eq!(out.status.code(), Some(5));
+}
+
+#[test]
+fn signed_vector_remainder_negative_dividend() {
+    if !backend_available() {
+        return;
+    }
+    // C-style truncated remainder keeps the dividend's sign: `-17 % 5 == -2`. `0 - [17,…]` builds a
+    // runtime negative vector; `0 - q[0]` returns `2`.
+    let src = concat!(
+        "fn rem4(a: vec4<i32>, b: vec4<i32>) -> vec4<i32> = a % b\n",
+        "fn main() -> i32 {\n",
+        "  z: vec4<i32> := [0, 0, 0, 0]\n",
+        "  n: vec4<i32> := [17, 17, 17, 17]\n",
+        "  a := z - n\n",
+        "  b: vec4<i32> := [5, 5, 5, 5]\n",
+        "  q := rem4(a, b)\n",
+        "  return 0 - q[0]\n",
+        "}\n",
+    );
+    let out = build_and_run("vrem-neg", src);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn unsigned_vector_remainder_lane_wise() {
+    if !backend_available() {
+        return;
+    }
+    // `[17,20,100,44] % [5,6,7,8]` unsigned; lane 2 = 100 % 7 = 2.
+    let src = concat!(
+        "fn rem4(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> = a % b\n",
+        "fn main() -> i32 {\n",
+        "  a: vec4<u32> := [17, 20, 100, 44]\n",
+        "  b: vec4<u32> := [5, 6, 7, 8]\n",
+        "  q := rem4(a, b)\n",
+        "  return q[2] as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("vrem-u32", src);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn float_vector_remainder_is_frem() {
+    if !backend_available() {
+        return;
+    }
+    // `7.5 % 2.0 == 1.5` (IEEE frem, no guard); `1.5 as i32 == 1`.
+    let src = concat!(
+        "fn rem2(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> = a % b\n",
+        "fn main() -> i32 {\n",
+        "  a: vec2<f32> := [7.5, 10.0]\n",
+        "  b: vec2<f32> := [2.0, 3.0]\n",
+        "  q := rem2(a, b)\n",
+        "  return q[0] as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("vrem-f32", src);
+    assert_eq!(out.status.code(), Some(1));
+    // The lowering is a vector `frem`, not a masked/guarded path.
+    let ir = emit_llvm(src);
+    assert!(ir.contains("frem <2 x float>"), "expected a vector frem, got:\n{ir}");
+}
+
+#[test]
+fn vector_remainder_zero_lane_aborts() {
+    if !backend_available() {
+        return;
+    }
+    // A single zero divisor lane must abort the whole operation (never a silent poison lane).
+    let src = concat!(
+        "fn rem4(a: vec4<i32>, b: vec4<i32>) -> vec4<i32> = a % b\n",
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [10, 20, 30, 40]\n",
+        "  b: vec4<i32> := [1, 2, 0, 4]\n",
+        "  q := rem4(a, b)\n",
+        "  return q[0]\n",
+        "}\n",
+    );
+    let out = build_and_run("vrem-zero", src);
+    assert_eq!(out.status.code(), None, "a zero divisor lane must abort, not exit normally");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("division by zero"),
+        "expected a division-by-zero message, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn vector_division_zero_lane_aborts() {
+    if !backend_available() {
+        return;
+    }
+    // The same guard now also covers `/` (previously an unguarded vector `sdiv`).
+    let src = concat!(
+        "fn div4(a: vec4<i32>, b: vec4<i32>) -> vec4<i32> = a / b\n",
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [10, 20, 30, 40]\n",
+        "  b: vec4<i32> := [1, 0, 3, 4]\n",
+        "  q := div4(a, b)\n",
+        "  return q[0]\n",
+        "}\n",
+    );
+    let out = build_and_run("vdiv-zero", src);
+    assert_eq!(out.status.code(), None);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("division by zero"));
+}
+
+#[test]
+fn vector_int_min_div_rem_neg_one_lane_wraps() {
+    if !backend_available() {
+        return;
+    }
+    // A signed `INT_MIN / -1` lane wraps (`/ == INT_MIN`, `% == 0`), lane-wise, like the scalar path;
+    // a neighboring `100 / -1 == -100` lane is unaffected. Operands go through params → runtime path.
+    let src = concat!(
+        "fn div4(a: vec4<i32>, b: vec4<i32>) -> vec4<i32> = a / b\n",
+        "fn rem4(a: vec4<i32>, b: vec4<i32>) -> vec4<i32> = a % b\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  a: vec4<i32> := [-2147483648, 100, -2147483648, 7]\n",
+        "  m: vec4<i32> := [-1, -1, -1, -1]\n",
+        "  d := div4(a, m)\n",
+        "  q := rem4(a, m)\n",
+        "  print(d[0])\n",
+        "  print(q[0])\n",
+        "  print(d[1])\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("vdiv-imin", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "-2147483648\n0\n-100\n");
+}
+
+#[test]
+fn vector_remainder_broadcast_scalar_divisor() {
+    if !backend_available() {
+        return;
+    }
+    // A broadcast scalar divisor (`v % k`) is splatted before the guard; `[17,20,33,44] % 5` lane 2
+    // = 33 % 5 = 3.
+    let src = concat!(
+        "fn rem_k(a: vec4<i32>, k: i32) -> vec4<i32> = a % k\n",
+        "fn main() -> i32 {\n",
+        "  a: vec4<i32> := [17, 20, 33, 44]\n",
+        "  q := rem_k(a, 5)\n",
+        "  return q[2]\n",
+        "}\n",
+    );
+    let out = build_and_run("vrem-broadcast", src);
+    assert_eq!(out.status.code(), Some(3));
 }

@@ -2705,6 +2705,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let v = self.operand(vec).into_vector_value();
                 self.horizontal_sum(v, matches!(elem, Ty::Float(_)), *n)?
             }
+            // Reduce a mask to `bool` = true iff any lane is set (OR-fold), the vector div/rem guard.
+            Rvalue::MaskAny { mask, n } => {
+                let m = self.operand(mask).into_vector_value();
+                self.horizontal_or(m, *n)?.into()
+            }
             // `s.load(i)` — `<n x T>` load from `&buf[i]` at the element alignment (the GEP yields an
             // element-aligned pointer, so the vector load must NOT assume the wider vector alignment).
             Rvalue::VecLoad { slice, index, elem, n } => {
@@ -4407,6 +4412,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(acc)
     }
 
+    /// Reduce a `<N x i1>` mask to a scalar `i1` = true iff **any** lane is set (an OR-fold of the
+    /// lanes). Powers the vector `/`/`%` divisor guard (`any(divisor == 0)` → abort). Matches the
+    /// hand-folded style of `horizontal_sum`/`horizontal_minmax`.
+    fn horizontal_or(&self, v: inkwell::values::VectorValue<'c>, n: u32) -> Result<IntValue<'c>, CodegenError> {
+        assert!(n > 0, "vector width must be at least 1");
+        let mut acc = self
+            .builder
+            .build_extract_element(v, self.ctx.i32_type().const_zero(), "ho0")
+            .map_err(|e| self.err(e))?
+            .into_int_value();
+        for i in 1..n {
+            let idx = self.ctx.i32_type().const_int(i as u64, false);
+            let lane = self.builder.build_extract_element(v, idx, "hol").map_err(|e| self.err(e))?.into_int_value();
+            acc = self.builder.build_or(acc, lane, "hoor").map_err(|e| self.err(e))?;
+        }
+        Ok(acc)
+    }
+
     /// Fold the `n` lanes of a vector into the element scalar with the scalar min/max intrinsic
     /// (M6 `v.min()`/`v.max()`) — the same `llvm.{s,u}{min,max}` / `llvm.{minimum,maximum}` as the
     /// `core.math` scalar `a.min(b)`/`a.max(b)`, so the reduction matches that semantics exactly.
@@ -4432,16 +4455,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let l = self.operand_as_vector(a, elem, n)?;
         let r = self.operand_as_vector(b, elem, n)?;
         let bld = self.builder;
-        // sema restricts vector ops to `+`/`-`/`*`/`/`; guard here too so any future sema hole is a
-        // clean codegen error, never a panic.
-        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
-            return Err(self.err("unsupported vector operator (only + - * / are lowered)"));
+        // sema restricts vector ops to elementwise arithmetic `+`/`-`/`*`/`/`/`%`; guard here too so
+        // any future sema hole is a clean codegen error, never a panic. The `/`/`%` divisor guard
+        // (any zero lane aborts, signed `INT_MIN/-1` lane wraps) is emitted in MIR (`lower_vec_div`),
+        // so the raw `sdiv`/`udiv`/`srem`/`urem` below is already fed a UB-free divisor.
+        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) {
+            return Err(self.err("unsupported vector operator (only + - * / % are lowered)"));
         }
         let v = if matches!(elem, Ty::Float(_)) {
             match op {
                 BinOp::Sub => bld.build_float_sub(l, r, "vfsub"),
                 BinOp::Mul => bld.build_float_mul(l, r, "vfmul"),
                 BinOp::Div => bld.build_float_div(l, r, "vfdiv"),
+                BinOp::Rem => bld.build_float_rem(l, r, "vfrem"),
                 _ => bld.build_float_add(l, r, "vfadd"),
             }
         } else {
@@ -4451,6 +4477,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 BinOp::Mul => bld.build_int_mul(l, r, "vmul"),
                 BinOp::Div if signed => bld.build_int_signed_div(l, r, "vsdiv"),
                 BinOp::Div => bld.build_int_unsigned_div(l, r, "vudiv"),
+                BinOp::Rem if signed => bld.build_int_signed_rem(l, r, "vsrem"),
+                BinOp::Rem => bld.build_int_unsigned_rem(l, r, "vurem"),
                 _ => bld.build_int_add(l, r, "vadd"),
             }
         };

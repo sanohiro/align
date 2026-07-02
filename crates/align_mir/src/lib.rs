@@ -266,6 +266,10 @@ pub enum Rvalue {
     /// `v.sum()` — the horizontal sum of a `vecN<T>` (M6): add all `n` lanes, yielding the element
     /// scalar `elem` (the unmasked sibling of [`VecSumWhere`]).
     VecSum { vec: Operand, elem: Ty, n: u32 },
+    /// Reduce a `mask` (`<N x i1>`) to a scalar `bool` that is true iff **any** lane is set
+    /// (an OR-fold of the `n` lanes). Used by the vector `/`/`%` divisor guard:
+    /// `any(divisor == 0)` → abort. Yields `Ty::Bool`.
+    MaskAny { mask: Operand, n: u32 },
     /// `s.load(i)` — load `n` consecutive elements of a `slice<T>` (`{ptr,len}`) starting at `index`
     /// into a `<n x T>` vector (M6). Codegen GEPs `&buf[index]` and emits a `<n x T>` load at the
     /// element alignment. Bounds are checked before this rvalue.
@@ -1254,10 +1258,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             // Integer `/` / `%` need a divisor guard: division by zero aborts, and signed
             // `INT_MIN / -1` (LLVM UB) wraps to the defined two's-complement result. `float`
-            // division is IEEE (no guard), and a `vecN<T>` divide (element type not scalar `Int`)
-            // is out of this path — both fall through to the plain `Rvalue::Bin` below.
+            // division is IEEE (no guard).
             if matches!(op, BinOp::Div | BinOp::Rem) && matches!(lhs.ty, Ty::Int(_)) {
                 return lower_int_div(b, *op, l, r, lhs.ty);
+            }
+            // A `vecN<T>` `/` / `%` carries the same divisor guard, lane-wise: any zero lane aborts,
+            // and a signed `INT_MIN / -1` lane wraps. Float vectors are IEEE (no guard).
+            if let (BinOp::Div | BinOp::Rem, Ty::Vec(s, n)) = (op, e.ty) {
+                return lower_vec_div(b, *op, l, r, s, n, rhs.ty);
             }
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Bin(*op, l, r)));
@@ -1894,6 +1902,115 @@ fn lower_int_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, ty: Ty) -> 
     // Wrapped result on the `-1` path: `x / -1 == 0 - x` (wraps at INT_MIN); `x % -1 == 0`.
     let wrapped = fold_div_neg_one(b, op, l, ty);
     let v = b.fresh_value(ty);
+    b.push(Stmt::Let(v, Rvalue::Select { cond: Operand::Value(is_neg1), a: wrapped, b: Operand::Value(raw) }));
+    Operand::Value(v)
+}
+
+/// Lower a `vecN<T>` `/` or `%` with the same lane-wise divisor guards as the scalar [`lower_int_div`]
+/// — the SIMD mirror of that pass, so vector and scalar division share one semantics:
+/// - **Any zero lane aborts.** `divisor == splat(0)` is an elementwise compare → a `<N x i1>` mask;
+///   [`Rvalue::MaskAny`] reduces it to a scalar `bool`, and any set lane branches to `div_fail`
+///   (`-> !`, a cold edge). A raw `sdiv`/`udiv` with a zero lane is LLVM UB.
+/// - **A signed `INT_MIN / -1` lane wraps** to the defined two's-complement result (`x / -1 == -x`,
+///   `x % -1 == 0`), lane-wise. As in the scalar path, each `-1` divisor lane is remapped to `1` so
+///   the raw vector div/rem never hits UB, and a `select` restores the wrapped value on those lanes.
+///   Unsigned/float vectors have neither overflow case (float is IEEE, no guard at all).
+///
+/// The divisor `r` may be a broadcast scalar (`v % k`); it is splatted to a `<N x T>` vector so the
+/// guard's compares/selects are uniformly vector-typed. A **broadcast constant** divisor (`v / 16`,
+/// `v % width` — the common SIMD-kernel case) takes the same guard-free fast path as the scalar
+/// `lower_int_div` (a known non-zero, non-`-1` divisor has no UB). A constant *vector* divisor
+/// (`v / [a,b,c,d]`) isn't inspectable as an `Operand` here, so it keeps the guard — which folds away
+/// under the optimizer, and still (correctly) aborts on a constant zero lane.
+fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_sema::Scalar, n: u32, rhs_ty: Ty) -> Operand {
+    let elem = align_sema::scalar_to_ty(s);
+    let vec_ty = Ty::Vec(s, n);
+    let signed = matches!(elem, Ty::Int(IntTy { signed: true, .. }));
+    // Splat a constant scalar into a `<N x T>` vector value.
+    let splat = |b: &mut Builder, val: i128| -> Operand {
+        let v = b.fresh_value(vec_ty);
+        b.push(Stmt::Let(v, Rvalue::MakeVec { elems: vec![Operand::Const(Const::Int(val, elem)); n as usize], elem, n }));
+        Operand::Value(v)
+    };
+    // The wrapped result where the divisor is `-1`: `x / -1 == 0 - x` (wraps at INT_MIN), `x % -1 == 0`.
+    let neg1_wrapped = |b: &mut Builder, l: Operand| -> Operand {
+        if op == BinOp::Div {
+            let z = splat(b, 0);
+            let w = b.fresh_value(vec_ty);
+            b.push(Stmt::Let(w, Rvalue::Bin(BinOp::Sub, z, l)));
+            Operand::Value(w)
+        } else {
+            splat(b, 0)
+        }
+    };
+    // Float vectors: IEEE lane-wise `frem`/`fdiv`, no guard (matches scalar float `%`/`/`).
+    if matches!(elem, Ty::Float(_)) {
+        let v = b.fresh_value(vec_ty);
+        b.push(Stmt::Let(v, Rvalue::Bin(op, l, r)));
+        return Operand::Value(v);
+    }
+    // Broadcast constant-divisor fast path (mirrors the scalar `lower_int_div` constant path). Only a
+    // broadcast (scalar) divisor is a single `Operand::Const`; a constant vector is a `MakeVec` value.
+    // A constant `0` divisor is left out (`None`) so it falls through to the runtime guard, which aborts.
+    let broadcast_nonzero = match &r {
+        Operand::Const(Const::Int(val, _)) if !matches!(rhs_ty, Ty::Vec(..)) && *val != 0 => Some(*val),
+        _ => None,
+    };
+    if let Some(val) = broadcast_nonzero {
+        if signed && val == -1 {
+            return neg1_wrapped(b, l);
+        }
+        // Any other non-zero broadcast constant: no UB, emit the raw vector op unguarded.
+        let v = b.fresh_value(vec_ty);
+        b.push(Stmt::Let(v, Rvalue::Bin(op, l, r)));
+        return Operand::Value(v);
+    }
+    // Ensure the divisor is a vector (splat a broadcast scalar) so the guard is uniformly vectorized.
+    let rvec = if matches!(rhs_ty, Ty::Vec(..)) {
+        r
+    } else {
+        let v = b.fresh_value(vec_ty);
+        b.push(Stmt::Let(v, Rvalue::MakeVec { elems: vec![r; n as usize], elem, n }));
+        Operand::Value(v)
+    };
+    let mask_ty = Ty::Mask(s, n);
+    // any(divisor == 0) → report and abort (cold edge), the vector mirror of the scalar zero guard.
+    // Compare vector-vs-vector (splat the `0`) so the MIR node is well-typed — a vector `Eq` takes two
+    // `<N x T>` operands, not a bare scalar constant (codegen would splat it, but keep the IR honest).
+    let zero_vec = splat(b, 0);
+    let is_zero = b.fresh_value(mask_ty);
+    b.push(Stmt::Let(is_zero, Rvalue::Bin(BinOp::Eq, rvec.clone(), zero_vec)));
+    let any_zero = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(any_zero, Rvalue::MaskAny { mask: Operand::Value(is_zero), n }));
+    let fail = b.new_block();
+    let ok = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(any_zero), fail, ok));
+    b.cur = fail;
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(t, Rvalue::Call("div_fail".to_string(), vec![])));
+    b.terminate(Term::Unreachable);
+    b.cur = ok;
+
+    if !signed {
+        // Unsigned: no `INT_MIN / -1` case; divisor lanes are now known non-zero.
+        let v = b.fresh_value(vec_ty);
+        b.push(Stmt::Let(v, Rvalue::Bin(op, l, rvec)));
+        return Operand::Value(v);
+    }
+    // Signed: fold away the per-lane `INT_MIN / -1` UB (same shape as the scalar path, lane-wise).
+    // Again compare vector-vs-vector (splat the `-1`) to keep the MIR node well-typed.
+    let neg1_vec = splat(b, -1);
+    let is_neg1 = b.fresh_value(mask_ty);
+    b.push(Stmt::Let(is_neg1, Rvalue::Bin(BinOp::Eq, rvec.clone(), neg1_vec)));
+    // Remap each `-1` lane to `1` so the raw vector div/rem never triggers UB; the select below
+    // replaces the result on those lanes regardless.
+    let one_vec = splat(b, 1);
+    let safe = b.fresh_value(vec_ty);
+    b.push(Stmt::Let(safe, Rvalue::Select { cond: Operand::Value(is_neg1), a: one_vec, b: rvec }));
+    let raw = b.fresh_value(vec_ty);
+    b.push(Stmt::Let(raw, Rvalue::Bin(op, l.clone(), Operand::Value(safe))));
+    let wrapped = neg1_wrapped(b, l);
+    let v = b.fresh_value(vec_ty);
     b.push(Stmt::Let(v, Rvalue::Select { cond: Operand::Value(is_neg1), a: wrapped, b: Operand::Value(raw) }));
     Operand::Value(v)
 }
