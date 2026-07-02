@@ -4650,6 +4650,11 @@ impl<'a, 't> Checker<'a, 't> {
     /// recompile after the pre-existing error is fixed. A *warning* (e.g. the unnecessary-heap lint)
     /// does not gate it: the error count, not the diagnostic count, is the checkpoint.
     fn check_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
+        // No expected type → nothing to reconcile; `constrain(_, None)` is a no-op, so skip the
+        // error-count checkpoints entirely (the common case for most sub-expressions).
+        let Some(_) = expected else {
+            return self.check_expr_inner(e, None);
+        };
         let errors_before = self.diags.error_count();
         let result = self.check_expr_inner(e, expected);
         if self.diags.error_count() == errors_before {
