@@ -182,7 +182,7 @@ slices, but it reuses the Slice-3 Drop machinery). `crates/align_driver/tests/re
     new`, owned-field reassign): new MIR `Stmt::DropElemField` + an `AssignField` drop-of-old free the
     overwritten `string` before the store (Slice 3 only dropped on *whole*-struct reassign — this closed
     a pre-existing field-level leak too). All verified in LLVM (drop-of-old + exit free, no leak /
-    double-free). `tests/owned_structs_arrays.rs`, `tests/reassign_drop.rs`.
+    double-free). `crates/align_driver/tests/owned_structs_arrays.rs`, `crates/align_driver/tests/reassign_drop.rs`.
   - **still deferred** (hard, with `.clone()` workarounds): moving an owned field *out* of an element by
     value (`n: string := us[i].name` — needs per-element runtime drop flags for a dynamic index); whole-
     array move (return / pass — array materialization).
