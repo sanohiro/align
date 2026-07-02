@@ -796,11 +796,28 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
 
 Completion condition: confirm that the vectorized code contains vector instructions at the LLVM IR
 level; and extend the branchless `where` form beyond `sum`/`count` to every reducer —
-identity-select where a fixed identity exists (`min` / `max` / `any` / `all` / `dot`, identities
-`+∞` / `−∞` / `false` / `true` / `0`), and the accumulator-select form
+identity-select where a fixed identity exists (`min` / `max` / `any` / `all`, identities
+`+∞` / `−∞` / `false` / `true`), and the accumulator-select form
 `acc = mask ? f(acc, v) : acc` for generic `reduce`, whose user-supplied `f` has no known identity
 (`init` is the starting accumulator, not an identity of `f`) — so all reductions are
 predication-ready, the forward-compatible shape for scalable-ISA tails (`05 §5`).
+
+- **Branchless `where` for all reducing terminals — DONE.** `where(p).{min,max,any,all,reduce}` now
+  lowers branch-free like `sum`/`count`: `lower_array_reduce` AND-folds the predicates into one mask
+  and each reducer `select`s each masked-out lane to its identity (`min` → `+∞` / `max` → `−∞` — the
+  same `extreme_of` fold seed; `any` → `false` / `all` → `true`), while generic `reduce` uses the
+  accumulator-select form `acc = mask ? f(acc,v) : acc`. `min`/`max` additionally moved from a
+  compare-and-branch update to the `select(cur `cmp` acc, cur, acc)` idiom, so **both** the `where`
+  and the plain (no-`where`) paths are now branch-free and vectorize (one lowering, no dual
+  mechanism). Semantics are byte-identical to the branch form they replaced: same ordered
+  comparison (so NaN elements are still skipped by `min`/`max`), same empty-selection result (`min`/
+  `max` → the extreme seed, `reduce` → `init`, `any` → `false`, `all` → `true`). Verified: `emit-mir`
+  shows no per-element predicate branch for any reducer; `objdump` shows `xs.where(p).min()` over a
+  `slice<i32>` emitting `pminsd`/`pcmpgtd`/`movdqu` on the `x86-64-v2` baseline where the branch form
+  emitted purely scalar code with 10 branches. `dot` is out of scope — `a.dot(b)` is a two-array
+  kernel with no `where`, already branch-free. (`tests/branchless_where.rs`, `tests/optimizer.rs`.)
+  Materializing terminals (`to_array`/`scan`) keep a real skip-branch (they must not *append* a
+  masked-out element — not an identity op). The completion condition is met.
 
 ## M7 — Parallelism — DONE (par_map/chunks/purity, first-class closures ①–③, task_group ④a–④c; only fully-escaping fn values deferred)
 

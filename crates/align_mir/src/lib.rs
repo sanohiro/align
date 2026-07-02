@@ -2079,7 +2079,10 @@ fn index_const(i: usize) -> Operand {
     Operand::Const(Const::Int(i as i128, i64_ty()))
 }
 
-/// Zero of a numeric scalar type (the identity for `sum`).
+/// Zero of a numeric scalar type (the additive identity for `sum`). `ty` is always `Int` or `Float`
+/// — sema's `check_array_sum` rejects a non-numeric `sum` element (`is_numeric()`, `align_sema`), so
+/// the `_` arm (which would produce a nonsensical `Int(0)` of a non-numeric type) is unreachable for
+/// a well-typed program; it stands in for every integer width.
 fn zero_of(ty: Ty) -> Operand {
     match ty {
         Ty::Float(_) => Operand::Const(Const::Float(0.0, ty)),
@@ -2087,29 +2090,31 @@ fn zero_of(ty: Ty) -> Operand {
     }
 }
 
-/// Fold a `where` predicate into a reduction loop. Branchless (`sum`/`count`): AND `pred` into the
-/// running `mask` (`mask && pred`); the reducer then `select`s the contribution to the identity.
-/// Otherwise: branch — `false` skips this element to the increment block `cont`.
-fn accumulate_mask(b: &mut Builder, branchless: bool, mask: Option<Operand>, pred: Operand, cont: BlockId) -> Option<Operand> {
-    if branchless {
-        Some(match mask {
-            None => pred,
-            Some(m) => {
-                let v = b.fresh_value(Ty::Bool);
-                b.push(Stmt::Let(v, Rvalue::Bin(BinOp::And, m, pred)));
-                Operand::Value(v)
-            }
-        })
-    } else {
-        let keep = b.new_block();
-        b.terminate(Term::Branch(pred, keep, cont));
-        b.cur = keep;
-        None
+/// Fold a `where` predicate into a reduction loop's running `mask` (`mask && pred`). Branchless for
+/// *every* reducer: the loop stays branch-free and the reducer `select`s each masked-out lane to its
+/// identity (`sum`/`count` → 0, `min` → +∞, `max` → −∞, `any` → false, `all` → true) or, for generic
+/// `reduce` (no identity for a user `f`), leaves the accumulator unchanged (`acc = mask ? f(acc,v) :
+/// acc`). Branch-free is what lets LLVM vectorize and maps 1:1 onto a scalable-ISA predicated tail
+/// (`05 §5`). The materializing collect path (`to_array`/`scan`) keeps a real skip-branch — it must
+/// not append a masked-out element — so it does not use this helper.
+fn accumulate_mask(b: &mut Builder, mask: Option<Operand>, pred: Operand) -> Operand {
+    match mask {
+        None => pred,
+        Some(m) => {
+            let v = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(v, Rvalue::Bin(BinOp::And, m, pred)));
+            Operand::Value(v)
+        }
     }
 }
 
-/// The seed for a `min` (`is_max = false`) / `max` (`is_max = true`) fold: the element type's
-/// largest / smallest value, so the first element always replaces it. Floats use ±infinity.
+/// The seed / masked-out identity for a `min` (`is_max = false`) / `max` (`is_max = true`) fold: the
+/// element type's largest / smallest value, so the first (surviving) element always replaces it and a
+/// masked-out lane can never win. Floats use ±infinity. `ty` is always `Int` or `Float` — sema's
+/// `check_array_min_max` rejects a non-numeric `min`/`max` element (`is_numeric()`, which excludes
+/// `Char`/`Bool` — `align_sema`), so both callers (the fold seed and the `where` mask-select) only
+/// ever pass a numeric type. The `_` arm is therefore unreachable for a well-typed program; it must
+/// not be relied on as a real identity for a non-numeric type (it would be a wrong `Int(0)`).
 fn extreme_of(ty: Ty, is_max: bool) -> Operand {
     match ty {
         Ty::Float(_) => {
@@ -2127,6 +2132,7 @@ fn extreme_of(ty: Ty, is_max: bool) -> Operand {
             };
             Operand::Const(Const::Int(v, ty))
         }
+        // Unreachable: sema guarantees a numeric element (see the doc comment).
         _ => Operand::Const(Const::Int(0, ty)),
     }
 }
@@ -2462,12 +2468,10 @@ fn lower_array_reduce(
         None
     };
 
-    // Branchless `where` for identity-based reductions (`sum`/`count`): rather than a per-element
-    // branch that skips the accumulate (it doesn't auto-vectorize when the mask and value are in
-    // different soa columns), AND the predicates into a `mask` and `select` the contribution to the
-    // identity at the reducer (`acc += mask ? value : 0`). `reduce`/`any`/`all`/`min`/`max` have no
-    // simple identity-masked form here, so they keep the branch.
-    let branchless = matches!(reducer, Reducer::Sum | Reducer::Count);
+    // Branchless `where` for *every* reducer: rather than a per-element branch that skips the
+    // accumulate (it doesn't auto-vectorize, and defeats a scalable-ISA predicated tail), AND the
+    // predicates into a `mask` and let the reducer `select` each masked-out lane to its identity.
+    // The mask is `None` when the pipeline has no `where`.
     let mut mask: Option<Operand> = None;
 
     for stage in stages {
@@ -2511,83 +2515,129 @@ fn lower_array_reduce(
                 let call_args = stage_call_args(b, arg, captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
-                mask = accumulate_mask(b, branchless, mask, Operand::Value(pred), cont);
+                mask = Some(accumulate_mask(b, mask, Operand::Value(pred)));
             }
             hir::StageKind::WhereField { field } => {
                 // Predicate on a struct element's (bool) field; the element is unchanged.
                 let pred = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
-                mask = accumulate_mask(b, branchless, mask, Operand::Value(pred), cont);
+                mask = Some(accumulate_mask(b, mask, Operand::Value(pred)));
             }
         }
     }
     let a = b.fresh_value(acc_ty);
     b.push(Stmt::Let(a, Rvalue::Load(acc)));
-    // `min`/`max` update the accumulator conditionally (keep the element only when it beats the
-    // current best), branching straight to `cont`; the other reducers compute a `next` value
-    // unconditionally and fall through to the shared store-and-loop below.
-    if let Reducer::MinMax { is_max } = &reducer {
-        let cur = cur.expect("min/max needs a scalar element");
-        let op = if *is_max { BinOp::Gt } else { BinOp::Lt };
-        let cmp = b.fresh_value(Ty::Bool);
-        b.push(Stmt::Let(cmp, Rvalue::Bin(op, cur.clone(), Operand::Value(a))));
-        let upd = b.new_block();
-        b.terminate(Term::Branch(Operand::Value(cmp), upd, cont));
-        b.cur = upd;
-        b.push(Stmt::Store(acc, cur));
-        b.terminate(Term::Goto(cont));
-    } else {
-        let next = b.fresh_value(acc_ty);
-        match &reducer {
-            // `count`: acc = acc + (mask ? 1 : 0). Without a branchless `where`, mask is None → +1.
-            Reducer::Count => {
-                let one = index_const(1);
-                let inc = match &mask {
-                    Some(m) => {
-                        let s = b.fresh_value(acc_ty);
-                        b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: one, b: index_const(0) }));
-                        Operand::Value(s)
-                    }
-                    None => one,
-                };
-                b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), inc)));
-            }
-            // `sum`: acc = acc + (mask ? cur : 0). A branchless `where` masks the contribution to
-            // the additive identity instead of branching, so the loop vectorizes.
-            Reducer::Sum => {
-                let cur = cur.expect("sum needs a scalar element");
-                let contribution = match &mask {
-                    Some(m) => {
-                        let s = b.fresh_value(acc_ty);
-                        b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: cur, b: zero_of(acc_ty) }));
-                        Operand::Value(s)
-                    }
-                    None => cur,
-                };
-                b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a), contribution)));
-            }
-            // `reduce`: acc = f(acc, cur).
-            Reducer::Fold { func, captures } => {
-                let cur = cur.expect("reduce needs a scalar element");
-                let mut args = vec![Operand::Value(a), cur];
-                for c in captures {
-                    args.push(lower_expr(b, c));
+    // Every reducer is branchless. When there is a `where` (`mask` is `Some`), each masked-out lane
+    // contributes the reducer's identity so it cannot change the result — additive `0` (`sum`/
+    // `count`), `+∞`/`−∞` (`min`/`max`, exactly the fold seed), `false`/`true` (`any`/`all`) — or, for
+    // generic `reduce`, the accumulator is left unchanged (`acc = mask ? f(acc,v) : acc`), since a
+    // user-supplied `f` has no identity (`init` is the starting accumulator, not an identity).
+    //
+    // NB: a `where` mask no longer *guards* the reducer's own function. With the branchless form the
+    // reducer's `f`/predicate `p` (and any stage after the `where`) runs on masked-out elements too,
+    // its contribution then discarded. That matches the shipped `sum`/`count` branchless form (a
+    // post-`where` `map` already ran on every element) and is the deliberate cost of a vectorizable,
+    // predication-ready loop (pipeline functions are pure — a masked-out element cannot differ
+    // observably). See `05 §5`.
+    let next: Operand = match &reducer {
+        // `count`: acc + (mask ? 1 : 0).
+        Reducer::Count => {
+            let one = index_const(1);
+            let inc = match &mask {
+                Some(m) => {
+                    let s = b.fresh_value(acc_ty);
+                    b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: one, b: index_const(0) }));
+                    Operand::Value(s)
                 }
-                b.push(Stmt::Let(next, Rvalue::Call(func.clone(), args)));
-            }
-            // `any`/`all`: t = p(cur); acc = acc || t  /  acc && t.
-            Reducer::AnyAll { func, captures, all } => {
-                let cur = cur.expect("any/all needs a scalar element");
-                let t = b.fresh_value(Ty::Bool);
-                let args = stage_call_args(b, cur, captures);
-                b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
-                let op = if *all { BinOp::And } else { BinOp::Or };
-                b.push(Stmt::Let(next, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
-            }
-            Reducer::MinMax { .. } => unreachable!("min/max handled above"),
+                None => one,
+            };
+            let n = b.fresh_value(acc_ty);
+            b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), inc)));
+            Operand::Value(n)
         }
-        b.push(Stmt::Store(acc, Operand::Value(next)));
-        b.terminate(Term::Goto(cont));
-    }
+        // `sum`: acc + (mask ? cur : 0).
+        Reducer::Sum => {
+            let cur = cur.expect("sum needs a scalar element");
+            let contribution = match &mask {
+                Some(m) => {
+                    let s = b.fresh_value(acc_ty);
+                    b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: cur, b: zero_of(acc_ty) }));
+                    Operand::Value(s)
+                }
+                None => cur,
+            };
+            let n = b.fresh_value(acc_ty);
+            b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), contribution)));
+            Operand::Value(n)
+        }
+        // `reduce`: acc = mask ? f(acc, cur) : acc — accumulator-select (a masked-out lane leaves
+        // the accumulator unchanged, so the result is the fold over the surviving elements, seeded
+        // with `init`). No `where` → the fold result is the accumulator directly.
+        Reducer::Fold { func, captures } => {
+            let cur = cur.expect("reduce needs a scalar element");
+            let mut args = vec![Operand::Value(a), cur];
+            for c in captures {
+                args.push(lower_expr(b, c));
+            }
+            let folded = b.fresh_value(acc_ty);
+            b.push(Stmt::Let(folded, Rvalue::Call(func.clone(), args)));
+            match &mask {
+                Some(m) => {
+                    let n = b.fresh_value(acc_ty);
+                    b.push(Stmt::Let(n, Rvalue::Select { cond: m.clone(), a: Operand::Value(folded), b: Operand::Value(a) }));
+                    Operand::Value(n)
+                }
+                None => Operand::Value(folded),
+            }
+        }
+        // `any`/`all`: t = p(cur); acc = acc || (mask ? t : false)  /  acc && (mask ? t : true).
+        // A full ||/&&-fold (no early exit) — the branchless, vectorizable shape.
+        Reducer::AnyAll { func, captures, all } => {
+            let cur = cur.expect("any/all needs a scalar element");
+            let t = b.fresh_value(Ty::Bool);
+            let args = stage_call_args(b, cur, captures);
+            b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
+            let contribution = match &mask {
+                // masked-out contributes the fold identity: `any` (||) → false, `all` (&&) → true.
+                Some(m) => {
+                    let s = b.fresh_value(Ty::Bool);
+                    b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: Operand::Value(t), b: Operand::Const(Const::Bool(*all)) }));
+                    Operand::Value(s)
+                }
+                None => Operand::Value(t),
+            };
+            let op = if *all { BinOp::And } else { BinOp::Or };
+            let n = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(n, Rvalue::Bin(op, Operand::Value(a), contribution)));
+            Operand::Value(n)
+        }
+        // `min`/`max`: acc = (cur `op` acc) ? cur : acc — the branchless min/max reduction idiom
+        // LLVM recognizes (`llvm.{s,u}{min,max}` / `llvm.{min,max}imum`). The comparison is the same
+        // one the former per-element branch used (`Lt` for min, `Gt` for max, floats → ordered
+        // `OLT`/`OGT`), so NaN handling is unchanged: an ordered compare with a NaN operand is false,
+        // so the running best is kept and NaN elements are skipped, exactly as before. A `where`
+        // first selects each masked-out lane to the type extreme that can never win (`min` → type
+        // max / `+∞`, `max` → type min / `−∞`), which is exactly the fold seed (`extreme_of`) — so an
+        // all-masked selection still returns that seed, unchanged from the branch form.
+        Reducer::MinMax { is_max } => {
+            let cur = cur.expect("min/max needs a scalar element");
+            let cur = match &mask {
+                Some(m) => {
+                    let s = b.fresh_value(acc_ty);
+                    b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: cur, b: extreme_of(acc_ty, *is_max) }));
+                    Operand::Value(s)
+                }
+                None => cur,
+            };
+            let op = if *is_max { BinOp::Gt } else { BinOp::Lt };
+            let cmp = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(cmp, Rvalue::Bin(op, cur.clone(), Operand::Value(a))));
+            let n = b.fresh_value(acc_ty);
+            b.push(Stmt::Let(n, Rvalue::Select { cond: Operand::Value(cmp), a: cur, b: Operand::Value(a) }));
+            Operand::Value(n)
+        }
+    };
+    b.push(Stmt::Store(acc, next));
+    b.terminate(Term::Goto(cont));
 
     // cont: i += 1; loop.
     b.cur = cont;

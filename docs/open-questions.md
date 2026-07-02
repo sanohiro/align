@@ -503,20 +503,32 @@ literal value, struct-local value, `mut`-required, `str`-field rejected), `tests
 gather→scatter `s[0]=s[1]`, `mut`-required); `examples/soa.align`.
 Record: `draft.md` §3.4 / §9, `impl/05-backend-llvm.md` §3, `impl/04-mir.md` §3, `tests/soa.rs`, `bench/`.
 
-### Branchless `where` (sum/count) — DONE (2026-06-27)
-**Decision: a `where`/`where(.field)` feeding `sum` or `count` lowers branchless** — AND the
-predicates into a `mask`, then `select` the contribution to the reduction identity
-(`acc += mask ? value : 0`, count `+= mask ? 1 : 0`) instead of a per-element branch (`Rvalue::Select`
-+ `accumulate_mask` in `align_mir`). `reduce`/`any`/`all`/`min`/`max` have no simple identity-masked
-form, so they keep the branch. **Why it matters now (it was rightly deferred before):** the
-single-column `s.where(p).sum()` over `slice<i64>` already vectorized via LLVM if-conversion — no
+### Branchless `where` (all reducing terminals) — DONE (sum/count 2026-06-27; extended to min/max/any/all/reduce 2026-07-02)
+**Decision: a `where`/`where(.field)` feeding *any* reducing terminal lowers branchless** — AND the
+predicates into a `mask`, then `select` each masked-out lane to the reducer's identity instead of a
+per-element branch (`Rvalue::Select` + `accumulate_mask` in `align_mir`). Fixed identities:
+`sum`/`count` → `0` (`acc += mask ? value : 0`, `count += mask ? 1 : 0`), `min` → `+∞` / `max` → `−∞`
+(the `extreme_of` fold seed), `any` → `false` / `all` → `true`. Generic `reduce` has no identity for
+its user `f`, so it uses the **accumulator-select** form `acc = mask ? f(acc,v) : acc` (a masked-out
+lane leaves the accumulator unchanged). `min`/`max` also moved from a compare-and-branch update to
+the `select(cur `cmp` acc, cur, acc)` idiom, so the plain (no-`where`) path is branch-free too — one
+lowering, no dual mechanism. Semantics are byte-identical to the branch form: same ordered comparison
+(NaN elements still skipped by `min`/`max`), same empty-selection result (`min`/`max` → the extreme
+seed, `reduce` → `init`, `any` → `false`, `all` → `true`). `dot` is out of scope — `a.dot(b)` is a
+two-array kernel with no `where`, already branch-free. NB: the branchless form runs a reducer's own
+`f`/predicate (and any post-`where` stage) on masked-out elements too, its contribution discarded —
+the deliberate cost of a vectorizable, predication-ready loop (pipeline functions are pure, so this
+cannot differ observably); this already held for `sum`/`count`. **Why it matters (deferred before):**
+the single-column `s.where(p).sum()` over `slice<i64>` already vectorized via LLVM if-conversion — no
 gain. But the **soa filtered aggregate** `rs.where(.active).pay.sum()` (bool mask column + i64 value
 column) did NOT auto-vectorize — scalar, 20 branches, branch-bound, **0.93× vs Rust AoS** (parity).
 After branchless lowering it vectorizes (16 vector ops, no per-element branch) and is **≈3.5× faster
 than idiomatic Rust `Vec<Row>`** (`bench/` `total_pay`, "Align faster"). So the soa filtered
-aggregate now beats Rust too (the plain column scan stays ~7-10×). `tests/branchless_where.rs`,
-`bench/`. (Materialize via stream-compaction — `to_array`/`partition` under a `where` — stays
-branchy; that is a separate slice.)
+aggregate now beats Rust too (the plain column scan stays ~7-10×). `xs.where(p).min()` over a
+`slice<i32>` now emits `pminsd`/`pcmpgtd` (verified via `objdump`) where the branch form was scalar
+with 10 branches. `tests/branchless_where.rs`, `tests/optimizer.rs`, `bench/`. (Materialize via
+stream-compaction — `to_array`/`partition`/`scan` under a `where` — stays branchy: it must not
+*append* a masked-out element, which is not an identity op; that is a separate slice.)
 
 ### soa construction — IMPLEMENTATION PLAN (the largest remaining soa gap; RESUME HERE for perf)
 
