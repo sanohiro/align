@@ -16,6 +16,20 @@ fn arena_box_alloc_and_get() {
 }
 
 #[test]
+fn inline_heap_new_get_infers_payload_width() {
+    if !backend_available() {
+        return;
+    }
+    // Regression: `v: i32 := heap.new(7).get()` used to miscompile — the boxed literal defaulted to
+    // i64, an i64 box was read into the i32 slot, and the exit code came out garbage (160), not 7.
+    // The binding annotation now flows into the `heap.new` payload, so the box is `box<i32>` and the
+    // value round-trips correctly.
+    let src = "fn main() -> i32 {\n  arena {\n    v: i32 := heap.new(7).get()\n    return v\n  }\n}\n";
+    let out = build_and_run("inline-heap-get", src);
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn arena_freed_on_early_return() {
     if !backend_available() {
         return;

@@ -12,7 +12,7 @@ fn match_over_all_variants() {
         return;
     }
     // An enum passed to a function, matched exhaustively; `Type.Variant` constructs the value.
-    let src = "Color { Red, Green, Blue }\nfn code(c: Color) -> i64 = match c {\n  Red => 1,\n  Green => 2,\n  Blue => 3,\n}\nfn main() -> i32 {\n  c := Color.Green\n  return code(c)\n}\n";
+    let src = "Color { Red, Green, Blue }\nfn code(c: Color) -> i32 = match c {\n  Red => 1,\n  Green => 2,\n  Blue => 3,\n}\nfn main() -> i32 {\n  c := Color.Green\n  return code(c)\n}\n";
     let out = build_and_run("enum-allvariants", src);
     assert_eq!(out.status.code(), Some(2));
 }

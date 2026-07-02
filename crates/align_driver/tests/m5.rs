@@ -577,7 +577,7 @@ fn array_index_out_of_bounds_aborts() {
     }
     // An out-of-range index is a hard error: the bounds check calls the runtime, which aborts
     // (no silent UB / OOB read). The process dies via SIGABRT (no clean exit code).
-    let src = "fn main() -> i32 {\n  xs := [1, 2, 3]\n  return xs[5]\n}\n";
+    let src = "fn main() -> i32 {\n  xs := [1, 2, 3]\n  return xs[5] as i32\n}\n";
     let out = build_and_run("array-index-oob", src);
     assert_ne!(out.status.code(), Some(0), "out-of-bounds must not exit cleanly");
     assert!(
@@ -593,7 +593,7 @@ fn array_index_negative_aborts() {
         return;
     }
     // A negative index also fails the `index < 0` half of the bounds check and aborts.
-    let src = "fn main() -> i32 {\n  xs := [1, 2, 3]\n  mut i := 0\n  i = i - 1\n  return xs[i]\n}\n";
+    let src = "fn main() -> i32 {\n  xs := [1, 2, 3]\n  mut i := 0\n  i = i - 1\n  return xs[i] as i32\n}\n";
     let out = build_and_run("array-index-neg", src);
     assert_ne!(out.status.code(), Some(0), "a negative index must not exit cleanly");
     assert!(String::from_utf8_lossy(&out.stderr).contains("index out of bounds"));
@@ -887,7 +887,7 @@ fn slice_str_param_index_and_len() {
     }
     // `slice<str>` — an array<str> literal coerces to a slice<str> at the call (ArrayToSlice). The
     // callee indexes it (`xs[1]`) and reads its length. `second` prints "bb"; `count` returns 2.
-    let src = "fn second(xs: slice<str>) -> str = xs[1]\nfn count(xs: slice<str>) -> i64 = xs.len()\nfn main() -> i32 {\n  print(second([\"a\", \"bb\", \"ccc\"]))\n  return count([\"x\", \"y\"])\n}\n";
+    let src = "fn second(xs: slice<str>) -> str = xs[1]\nfn count(xs: slice<str>) -> i64 = xs.len()\nfn main() -> i32 {\n  print(second([\"a\", \"bb\", \"ccc\"]))\n  return count([\"x\", \"y\"]) as i32\n}\n";
     let out = build_and_run("slice-str", src);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "bb\n");

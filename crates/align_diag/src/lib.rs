@@ -60,6 +60,16 @@ impl Diagnostics {
             .any(|d| d.severity == Severity::Error)
     }
 
+    /// The number of **error** diagnostics so far (warnings excluded) — a checkpoint for gating a
+    /// follow-up check on "did this subtree already report an error", without being tripped by a
+    /// warning emitted in the same subtree.
+    pub fn error_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }

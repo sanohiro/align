@@ -34,7 +34,7 @@ fn out_write_computed_index() {
         return;
     }
     // A computed (non-constant) subscript on the write side.
-    let src = "fn put(out dst: slice<i64>, k: i64) {\n  dst[k + 1] = 42\n}\nfn main() -> i32 {\n  mut a := [0, 0, 0]\n  put(a, 1)\n  return a[2]\n}\n";
+    let src = "fn put(out dst: slice<i64>, k: i64) {\n  dst[k + 1] = 42\n}\nfn main() -> i32 {\n  mut a := [0, 0, 0]\n  put(a, 1)\n  return a[2] as i32\n}\n";
     let out = build_and_run("w-out-idx", src);
     assert_eq!(out.status.code(), Some(42));
 }
@@ -107,7 +107,7 @@ fn out_arg_subslices_of_distinct_arrays_ok() {
         return;
     }
     // Sub-slices of *different* arrays are genuinely distinct buffers — must pass. dst[0]=src[0]=7.
-    let src = "fn fill(out dst: slice<i64>, src: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  xs := [7, 2, 3, 4]\n  mut ys := [0, 0, 0, 0]\n  fill(ys[0..2], xs[0..2])\n  return ys[0]\n}\n";
+    let src = "fn fill(out dst: slice<i64>, src: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  xs := [7, 2, 3, 4]\n  mut ys := [0, 0, 0, 0]\n  fill(ys[0..2], xs[0..2])\n  return ys[0] as i32\n}\n";
     let out = build_and_run("na-distinct-subslices", src);
     assert_eq!(out.status.code(), Some(7));
 }
@@ -118,7 +118,7 @@ fn out_arg_distinct_ok() {
         return;
     }
     // Distinct buffers satisfy the no-alias rule and run. dst[0] = src[0] = 7.
-    let src = "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  xs := [7, 2, 3]\n  mut ys := [0, 0, 0]\n  fill(xs, ys)\n  return ys[0]\n}\n";
+    let src = "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  dst[0] = src[0]\n}\nfn main() -> i32 {\n  xs := [7, 2, 3]\n  mut ys := [0, 0, 0]\n  fill(xs, ys)\n  return ys[0] as i32\n}\n";
     let out = build_and_run("na-distinct", src);
     assert_eq!(out.status.code(), Some(7));
 }
