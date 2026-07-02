@@ -94,6 +94,153 @@ fn gen_expr(rng: &mut Rng, depth: u32) -> (String, i64) {
     }
 }
 
+// --- typed, multi-width variant: exercises every integer width's wrapping + cross-width casts ---
+
+#[derive(Clone, Copy, PartialEq)]
+enum ITy {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+}
+const TYPES: [ITy; 8] = [ITy::I8, ITy::I16, ITy::I32, ITy::I64, ITy::U8, ITy::U16, ITy::U32, ITy::U64];
+impl ITy {
+    fn name(self) -> &'static str {
+        match self {
+            ITy::I8 => "i8",
+            ITy::I16 => "i16",
+            ITy::I32 => "i32",
+            ITy::I64 => "i64",
+            ITy::U8 => "u8",
+            ITy::U16 => "u16",
+            ITy::U32 => "u32",
+            ITy::U64 => "u64",
+        }
+    }
+    fn bits(self) -> u32 {
+        match self {
+            ITy::I8 | ITy::U8 => 8,
+            ITy::I16 | ITy::U16 => 16,
+            ITy::I32 | ITy::U32 => 32,
+            ITy::I64 | ITy::U64 => 64,
+        }
+    }
+    fn signed(self) -> bool {
+        matches!(self, ITy::I8 | ITy::I16 | ITy::I32 | ITy::I64)
+    }
+}
+
+/// Normalize a computed value into `t`'s representable range — the single operation that models
+/// Align's *both* arithmetic wrapping (take the low `bits` two's-complement) *and* integer casts
+/// (`S as T` = reinterpret the source value's bits in `T`, sign-/zero-extending per the source, which
+/// falls out of passing the source's true numeric value here). Verified against the compiler
+/// (`u8: 3 - 10 == 249`, `i8: 3 - 10 == -7`).
+fn wrap(v: i128, t: ITy) -> i128 {
+    let w = t.bits();
+    let mask = (1u128 << w) - 1;
+    let bits = (v as u128) & mask;
+    if t.signed() && (bits >> (w - 1)) & 1 == 1 {
+        (bits as i128) - (1i128 << w)
+    } else {
+        bits as i128
+    }
+}
+
+/// Generate an expression *of type `t`* (all operands typed `t` so Align never coerces), paired with
+/// its normalized oracle value. Leaves are 0..9 literals or an in-scope variable of type `t`; the
+/// cast arm reinterprets any in-scope variable (of any width) into `t`.
+fn gen_typed(rng: &mut Rng, depth: u32, t: ITy, vars: &[(String, ITy, i128)]) -> (String, i128) {
+    let same: Vec<&(String, ITy, i128)> = vars.iter().filter(|v| v.1 == t).collect();
+    if depth == 0 || rng.below(3) == 0 {
+        if !same.is_empty() && rng.below(2) == 0 {
+            let v = same[rng.below(same.len())];
+            return (v.0.clone(), v.2);
+        }
+        let n = rng.below(10) as i128;
+        return (n.to_string(), wrap(n, t)); // literal infers `t` from the binding annotation
+    }
+    match rng.below(5) {
+        0 => {
+            let (l, lv) = gen_typed(rng, depth - 1, t, vars);
+            let (r, rv) = gen_typed(rng, depth - 1, t, vars);
+            let (op, val) = match rng.below(3) {
+                0 => ("+", lv.wrapping_add(rv)),
+                1 => ("-", lv.wrapping_sub(rv)),
+                _ => ("*", lv.wrapping_mul(rv)),
+            };
+            (format!("({l} {op} {r})"), wrap(val, t))
+        }
+        1 => {
+            let (l, lv) = gen_typed(rng, depth - 1, t, vars);
+            let d = 1 + rng.below(9) as i128; // literal divisor infers `t`; forced non-zero
+            if rng.below(2) == 0 {
+                (format!("({l} / {d})"), wrap(lv.wrapping_div(d), t))
+            } else {
+                (format!("({l} % {d})"), wrap(lv.wrapping_rem(d), t))
+            }
+        }
+        2 => {
+            let (a, av) = gen_typed(rng, depth - 1, t, vars);
+            let (b, bv) = gen_typed(rng, depth - 1, t, vars);
+            let (tb, tv) = gen_typed(rng, depth - 1, t, vars);
+            let (eb, ev) = gen_typed(rng, depth - 1, t, vars);
+            let (op, cond) = match rng.below(6) {
+                0 => ("<", av < bv),
+                1 => ("<=", av <= bv),
+                2 => (">", av > bv),
+                3 => (">=", av >= bv),
+                4 => ("==", av == bv),
+                _ => ("!=", av != bv),
+            };
+            (format!("if {a} {op} {b} {{ {tb} }} else {{ {eb} }}"), if cond { tv } else { ev })
+        }
+        3 if !vars.is_empty() => {
+            // Reinterpret any in-scope variable (of any width) into `t` — exercises trunc / sext / zext.
+            let v = &vars[rng.below(vars.len())];
+            (format!("({} as {})", v.0, t.name()), wrap(v.2, t))
+        }
+        _ => {
+            let n = rng.below(10) as i128;
+            (n.to_string(), wrap(n, t))
+        }
+    }
+}
+
+#[test]
+fn typed_multiwidth_programs_compute_the_oracle_value() {
+    if !backend_available() {
+        return;
+    }
+    for seed in 0..200u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(101));
+        let stmts = 2 + rng.below(4); // 2..5 typed let-bindings
+        let mut vars: Vec<(String, ITy, i128)> = Vec::new();
+        let mut body = String::new();
+        for i in 0..stmts {
+            let t = TYPES[rng.below(TYPES.len())];
+            let (expr, val) = gen_typed(&mut rng, 3, t, &vars);
+            body.push_str(&format!("  v{i}: {} := {}\n", t.name(), expr));
+            vars.push((format!("v{i}"), t, val));
+        }
+        let last = stmts - 1;
+        let final_val = wrap(vars[last].2, ITy::I32); // `return vN as i32`
+        body.push_str(&format!("  return v{last} as i32\n"));
+        let src = format!("fn main() -> i32 {{\n{body}}}\n");
+        let expected = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
+        let out = build_and_run(&format!("difft-{seed}"), &src);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, expected,
+            "miscompile on seed {seed}: expected {expected} (oracle {}), got {code}\n--- program ---\n{src}",
+            vars[last].2
+        );
+    }
+}
+
 #[test]
 fn generated_programs_compute_the_oracle_value() {
     if !backend_available() {
