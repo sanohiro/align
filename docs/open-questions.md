@@ -1812,11 +1812,15 @@ the same convention as the external audit: **CONFIRMED** = read against the code
 
 **Perf backlog (non-blocking; recorded so none of it is re-discovered from scratch):**
 - **Top lever: no-alias information never reaches LLVM**, even though the language guarantees it (see
-  "`out` parameters + `noalias`" above, which already tracks the underlying gap — this is the
-  actionable next step on it). The slice ABI passes `{ptr, i64}` **by value**, so there is no
-  standalone pointer parameter to attach a `noalias` *attribute* to; the workable form is **`!alias.
-  scope`/`!noalias` metadata** on the fused loop's element loads/stores (one scope per slice argument;
-  `out` disjoint from every input), plus `!nonnull`/`!align` on the element loads themselves.
+  "`out` parameters + `noalias`" above). The slice ABI passes `{ptr, i64}` **by value**, so there is
+  no standalone pointer parameter to attach a `noalias` *attribute* to; the workable form is **`!alias.
+  scope`/`!noalias` metadata** on the fused loop's element loads/stores. **Investigated 2026-07-02 —
+  DEFERRED (see the "`out` parameters + `noalias`" section for the full finding):** the metadata was
+  proven to remove the runtime overlap guard on a two-slice-param loop, but **no source construct
+  generates such a loop today** (`map_into(out)` deferred; whole-slice `dst = a + b` unimplemented;
+  the pipeline store-loops write fresh allocations LLVM already disambiguates — zero memchecks across
+  the whole example corpus at `-O2`), and the no-alias *check* has an untracked `SubSlice` provenance
+  hole that must be closed before any emission. Belongs with the `map_into(out)` slice, not now.
 - **`task_group` spawns one OS thread per task** (`align_runtime/src/lib.rs` ~:3585,
   `align_rt_tg_wait`, via `thread::scope` + a `spawn` per task) instead of reusing the **persistent**
   `ParPool` that `par_map` already built for exactly this cost. Fix: route `task_group` through
@@ -2021,15 +2025,58 @@ A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) d
 `out dst: slice<T>` is a writable output buffer and `place[i] = v` (bounds-checked) writes a `mut`
 array local or `out` slice (primitive elements); (2) the **no-alias check** — at a call site an
 `out` argument must not alias another argument, compared by **root buffer**: a slice local's
-provenance is tracked back to the array it borrows (`s: slice := a`), so `fill(a, s)` and
-`fill(s1, s2)` (two slices of `a`) are both rejected, not just `fill(a, a)`. (Residual for the
-noalias-emission follow-up: a slice returned from a function has unknown provenance and is treated
-as its own root — sound for today's direct-borrow slices, but the emission gate may need to
-conservatively reject unknown-provenance `out` args.) **What remains is emitting the LLVM `noalias`** so loop vectorization can skip
+provenance is tracked back to the array it borrows via the **whole-array borrow** form
+(`s: slice := a`), so `fill(a, s)` and `fill(s1, s2)` (two whole-array borrows of `a`) are both
+rejected, not just `fill(a, a)`. (Residuals for the noalias-emission follow-up — both benign today
+because no metadata is emitted, but the emission gate must close them: (a) a slice returned from a
+function has unknown provenance and is treated as its own root; (b) **range-subslicing is NOT
+tracked** — `fill(a, a[0..2])` and `fill(s1, s2)` with `s1 := a[0..2]` / `s2 := a[1..3]` are
+currently **accepted** even though the buffers overlap, because `expr_root_local` only sees
+`Local`/`ArrayToSlice`, not `SubSlice`. The gate must track `SubSlice` and conservatively reject
+unknown-provenance `out` args — see the 2026-07-02 investigation note below.) **What remains is emitting the LLVM `noalias`** so loop vectorization can skip
 runtime overlap checks — blocked on the slice ABI: a slice is passed **by value** as a `{ptr,len}`
 aggregate, so its buffer pointer is not a standalone pointer parameter to attribute. Needs either a
 by-pointer `out`-slice ABI or scoped `!noalias` metadata on the buffer stores. The no-alias *check*
-is the soundness precondition for that emission. (Digested from
+is the soundness precondition for that emission.
+
+**Investigated 2026-07-02 (scoped `!alias.scope`/`!noalias`) — mechanism proven, but DEFERRED: no
+reachable target today + a soundness gate to close first.** Findings:
+- **The metadata mechanism works and is the right shape.** A hand-written two-slice-param loop
+  (`out dst[i] = src[i]*10`) at `-O2` (host triple + `x86-64-v3`) emits a runtime overlap guard
+  (`%diff.check`/`%or.cond`) + a scalar prologue before the vector loop. Tagging the input load
+  `!alias.scope !{in}, !noalias !{out}` and the `out` store `!alias.scope !{out}, !noalias !{in}`
+  (one per-function domain; the single `out` scope disjoint from **one shared** `in` scope — inputs
+  may self-alias, so they share a scope and never claim noalias against each other) **removes the
+  overlap guard and the scalar prologue entirely** (verified: `diff.check`/`or.cond` count 4 → 0).
+- **But there is no source construct today that generates such a loop.** `out`-slice writes are only
+  the manual constant-index stores of `draft.md` §7's `scale` example (no loop). The
+  writable-in-a-loop terminal `map_into(out dst)` is deferred (below), and whole-slice arithmetic
+  (`dst = a + b`, draft §7 `add`) is **not** implemented (only `vecN<T>` is elementwise). The fused
+  pipeline loops that *do* store in a loop — `to_array`/`scan`/`to_soa` — all write a **freshly
+  allocated** buffer, disjoint from the source slice, and LLVM **already** vectorizes them with **no**
+  overlap check (verified byte-identical output with vs. without a `noalias` return attr on
+  `align_rt_arena_alloc`; a corpus sweep of every `examples/*.align` at `-O2`+triple shows **zero**
+  `found.conflict`/memcheck blocks anywhere). So emitting scope metadata now would attach it to
+  loads/stores that have **no disjoint counterpart in any loop** — dead complexity + soundness risk
+  for zero measured benefit (against "ideal form, or defer").
+- **Soundness gate found (must close before ANY `out` noalias emission).** The no-alias *check*
+  does **not** see through range-subslicing: `f(xs, xs[0..2])` and `f(s1, s2)` with `s1 := xs[0..2]`
+  / `s2 := xs[1..3]` are **accepted** even though the `out` buffer overlaps an input. `expr_root_local`
+  (`align_sema/src/lib.rs` ~:4915) only tracks `ExprKind::Local` and `ExprKind::ArrayToSlice`
+  (whole-array borrow, `s: slice := a`), not `SubSlice`; an inline `xs[0..2]` arg has no `place_local`
+  root at all. (The "`fill(s1,s2)` rejected" claim above holds **only** for the whole-array-borrow
+  form; the subslice form was an untracked hole.) The emission gate must extend provenance through
+  `SubSlice` and conservatively reject unknown-provenance `out` args, else scope metadata is a
+  miscompile.
+- **Conclusion / who inherits this:** implement scope-metadata emission **as part of the
+  `map_into(out dst)` slice** (the first real two-slice-param loop), after closing the subslice
+  provenance hole. The proven encoding above (per-fn domain; one `in` scope disjoint from each `out`
+  scope; tag only loads/stores whose base is a slice **parameter**, never fresh-alloc/local/arena
+  buffers) is ready to drop in then. The `noalias`/`willreturn`/`nofree` return attrs on the
+  allocator-family runtime decls (perf backlog above) are the orthogonal, simpler lever for the
+  fresh-alloc pipeline loops — but even those showed no effect on the current corpus.
+
+(Digested from
 `work/proposals/optimization-milestones.md` §1.2, `toolchain-optimizations.md` §5; see also
 `08-memory-model-v2.md` §11 "out parameters".)
 
