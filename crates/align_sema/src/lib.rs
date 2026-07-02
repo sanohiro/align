@@ -4444,20 +4444,23 @@ impl<'a, 't> Checker<'a, 't> {
                 // rest of the AoS str element work. Owned columns (`string`/`array<T>`, which need a
                 // per-column drop of the overwritten value + soa drop) are not scalars, so they fall
                 // out of this set and stay rejected — the forward-safe default.
-                let str_view = soa
-                    && !fields.is_empty()
-                    && fields.iter().all(|f| {
-                        matches!(
-                            ty_to_scalar(f.ty).and_then(scalar_to_prim),
-                            Some(
-                                PrimScalar::Int(_)
-                                    | PrimScalar::Float(_)
-                                    | PrimScalar::Bool
-                                    | PrimScalar::Char
-                                    | PrimScalar::Str
+                // Lazy: only walked when `pod` is false (short-circuited in the gate below), so a
+                // POD struct never pays the field scan twice.
+                let str_view = || {
+                    soa && !fields.is_empty()
+                        && fields.iter().all(|f| {
+                            matches!(
+                                ty_to_scalar(f.ty).and_then(scalar_to_prim),
+                                Some(
+                                    PrimScalar::Int(_)
+                                        | PrimScalar::Float(_)
+                                        | PrimScalar::Bool
+                                        | PrimScalar::Char
+                                        | PrimScalar::Str
+                                )
                             )
-                        )
-                    });
+                        })
+                };
                 // Allowed element-store shapes: a POD or str-view struct into a `soa` (a Copy
                 // aggregate scatter; a stored `str` view is escape-checked below); a POD struct into a
                 // fixed `array<Struct>` (a Copy aggregate store); or — for a *fixed* `array<Struct>`
@@ -4465,7 +4468,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // fields, then moves the new value in). Still deferred: a soa of *owned* columns
                 // (per-column drop), and a str-view struct into a *fixed* array.
                 let is_move = struct_is_move(sid, self.structs);
-                if !(pod || str_view || (!soa && is_move)) {
+                if !(pod || str_view() || (!soa && is_move)) {
                     // In the error block: either `soa` is true (an owned-column soa — neither the POD
                     // nor the str field set matched), or `soa` is false with a non-POD, non-Move
                     // struct (a borrowed `str`/view field in a fixed array).
