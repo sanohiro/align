@@ -1389,8 +1389,12 @@ This is the one FFI corner where a *wrong* per-target rule silently miscompiles,
 scoped: on any non-SysV target the compiler **refuses** with a clear diagnostic (pass the struct by
 pointer instead) rather than guessing, and a struct larger than 16 bytes (MEMORY class, needing a
 `byval`/`sret` pointer) is likewise rejected — that shape is already served by struct-by-pointer, so
-a redundant second mechanism is not added. (AAPCS64 and the MEMORY-class `byval`/`sret` path are
-future work, added only when a concrete wrapper needs them.)
+a redundant second mechanism is not added. The same MEMORY boundary is enforced under register
+pressure: SysV passes a struct in registers only if *all* its eightbytes fit in the class registers
+left after the preceding arguments, else the whole struct goes to memory — so a signature where a
+by-value struct argument would fall to memory (e.g. a two-eightbyte struct after five integer
+arguments) is also rejected (reorder it earlier, or pass it by pointer). (AAPCS64 and the
+MEMORY-class `byval`/`sret` path are future work, added only when a concrete wrapper needs them.)
 
 ### Not in FFI v1 (deliberate boundaries)
 

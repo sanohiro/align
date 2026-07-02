@@ -253,11 +253,19 @@ fn build_module<'c>(
     // assert it never unwinds.
     for ext in &program.externs {
         let abi = &extern_abi[&ext.name];
+        // Reject any signature where a by-value struct argument would fall to the MEMORY-class
+        // `byval` ABI because preceding arguments exhaust the class registers (the SysV all-or-
+        // nothing rule) — we cannot reproduce `byval` by flattening. See `check_sysv_struct_args_fit`.
+        check_sysv_struct_args_fit(&ext.name, abi, &ext.params, &program.structs)?;
         let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(ext.params.len());
         for (pa, &ty) in abi.params.iter().zip(&ext.params) {
             match pa {
                 ParamAbi::Direct => param_types.push(abi_type(ctx, ty, &struct_types, &enum_types).into()),
                 ParamAbi::ViewPtr => param_types.push(ctx.ptr_type(AddressSpace::default()).into()),
+                // A by-value struct flattens to one `i64`/`double` per eightbyte — byte-identical to
+                // clang's own flattened parameter form. This is sound only because
+                // `check_sysv_struct_args_fit` has already rejected the register-exhaustion boundary
+                // where clang would switch to a `byval` pointer (which flattening cannot mimic).
                 ParamAbi::StructRegs(sabi) => {
                     for &eb in &sabi.ebs {
                         param_types.push(eb.llvm(ctx).into());
@@ -1357,8 +1365,13 @@ fn classify_struct_abi(
     td: &inkwell::targets::TargetData,
 ) -> Option<StructAbi> {
     let size = td.get_store_size(st);
-    if size == 0 || size > 16 {
-        return None; // empty (no C meaning) or MEMORY-class: not register-passed
+    if size > 16 {
+        return None; // MEMORY-class: not register-passed
+    }
+    // A zero-size (empty) struct has no C ABI representation; sema rejects it as an FFI type before
+    // codegen, so it never reaches here — but stay total (no eightbytes to classify).
+    if size == 0 {
+        return Some(StructAbi { ebs: Vec::new(), id });
     }
     let eb_count = size.div_ceil(8) as usize; // 1 or 2 eightbytes
     let mut ebs: Vec<Option<Eb>> = vec![None; eb_count];
@@ -1427,6 +1440,65 @@ fn struct_ret_type<'c>(ctx: &'c Context, abi: &StructAbi) -> BasicTypeEnum<'c> {
         let fields: Vec<BasicTypeEnum> = abi.ebs.iter().map(|e| e.llvm(ctx)).collect();
         ctx.struct_type(&fields, false).into()
     }
+}
+
+/// The SysV AMD64 argument-register budget: 6 general-purpose (RDI, RSI, RDX, RCX, R8, R9) and 8 SSE
+/// (XMM0–XMM7).
+const SYSV_INT_ARG_REGS: u32 = 6;
+const SYSV_SSE_ARG_REGS: u32 = 8;
+
+/// Enforce the SysV **all-or-nothing** rule for by-value struct *arguments*: a struct is passed in
+/// registers only if *every* one of its eightbytes fits in the class registers still free after the
+/// preceding arguments; otherwise the ABI puts the whole struct in memory via a `byval` pointer.
+///
+/// We do not implement that `byval` path — and, crucially, cannot fake it by flattening. A flattened
+/// `{i64,i64}` argument at the exhaustion boundary makes LLVM assign one eightbyte to the last free
+/// register and spill the other to the stack, whereas a clang-compiled callee reading a `byval`
+/// argument expects the whole struct on the stack; the two disagree (verified: a `{i64,i64}` passed
+/// after five `i64` args round-trips to garbage). So we **reject** any signature where a by-value
+/// struct argument would fall to memory, rather than silently miscompile. In every *accepted* case
+/// the struct fits in registers, and per-eightbyte flattening is byte-identical to clang's own
+/// flattened parameter form, so the call is correct.
+///
+/// Only struct arguments consume the budget check: a scalar/pointer/view that itself spills to the
+/// stack is lowered identically on both sides (a single stack slot), so it never diverges.
+fn check_sysv_struct_args_fit(
+    ext_name: &str,
+    abi: &ExternAbi,
+    param_tys: &[Ty],
+    structs: &[StructDef],
+) -> Result<(), CodegenError> {
+    let mut gp = 0u32;
+    let mut sse = 0u32;
+    for (i, (pa, ty)) in abi.params.iter().zip(param_tys).enumerate() {
+        match pa {
+            ParamAbi::Direct => {
+                if matches!(ty, Ty::Float(_)) {
+                    sse += 1;
+                } else {
+                    gp += 1; // integer / `raw` pointer → a general-purpose register
+                }
+            }
+            ParamAbi::ViewPtr => gp += 1, // a `str`/`slice` passes as one data pointer
+            ParamAbi::StructRegs(sabi) => {
+                let need_int = sabi.ebs.iter().filter(|e| matches!(e, Eb::Integer)).count() as u32;
+                let need_sse = sabi.ebs.iter().filter(|e| matches!(e, Eb::Sse)).count() as u32;
+                if gp + need_int > SYSV_INT_ARG_REGS || sse + need_sse > SYSV_SSE_ARG_REGS {
+                    let sname = &structs[sabi.id as usize].name;
+                    return Err(CodegenError::Lowering(format!(
+                        "extern '{ext_name}': by-value struct '{sname}' (argument {n}) would be passed in memory — the preceding arguments exhaust the SysV class registers ({SYSV_INT_ARG_REGS} integer / {SYSV_SSE_ARG_REGS} SSE), so the struct falls to the MEMORY-class `byval` ABI, which is not supported in FFI v1. Reorder the parameters so the struct fits in registers, or pass it by pointer (`raw`).",
+                        n = i + 1,
+                    )));
+                }
+                gp += need_int;
+                sse += need_sse;
+            }
+            // A > 16-byte MEMORY struct consumes no registers and is rejected separately (with a size
+            // message) in the declaration loop.
+            ParamAbi::StructMemory => {}
+        }
+    }
+    Ok(())
 }
 
 /// Size/alignment (bytes) of a scalar's in-memory representation.

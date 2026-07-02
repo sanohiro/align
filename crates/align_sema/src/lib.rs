@@ -1808,10 +1808,16 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                     // passing; the ABI/target/size limits are enforced in codegen).
                     if ty != Ty::Error && !is_ffi_safe_param(ty) {
                         if let Ty::Struct(id) = ty {
-                            // A struct crosses the C ABI by value only with a stable C layout.
+                            // A struct crosses the C ABI by value only with a stable C layout, and an
+                            // empty struct has no defined C representation at all.
                             if !structs[id as usize].c_repr {
                                 diags.error(
                                     format!("an extern struct parameter must be `layout(C)` ('{}' is not) — mark the struct `layout(C)` so it has a stable C byte layout", ty_name(ty)),
+                                    p.ty.span(),
+                                );
+                            } else if structs[id as usize].fields.is_empty() {
+                                diags.error(
+                                    format!("an empty struct ('{}') has no C ABI representation, so it cannot cross an extern boundary", ty_name(ty)),
                                     p.ty.span(),
                                 );
                             }
@@ -1835,6 +1841,11 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                                 if !structs[id as usize].c_repr {
                                     diags.error(
                                         format!("an extern struct return type must be `layout(C)` ('{}' is not) — mark the struct `layout(C)` so it has a stable C byte layout", ty_name(r)),
+                                        t.span(),
+                                    );
+                                } else if structs[id as usize].fields.is_empty() {
+                                    diags.error(
+                                        format!("an empty struct ('{}') has no C ABI representation, so it cannot cross an extern boundary", ty_name(r)),
                                         t.span(),
                                     );
                                 }

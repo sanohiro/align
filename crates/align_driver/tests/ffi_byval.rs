@@ -179,7 +179,11 @@ fn round_trip_param_and_return() {
 fn oversized_struct_param_is_rejected_in_codegen() {
     // A > 16-byte struct is MEMORY class (would need a `byval` pointer). FFI v1 rejects it — pass by
     // pointer instead. It type-checks (the language accepts a `layout(C)` struct as an FFI type) but
-    // codegen refuses to emit a wrong/unsupported ABI.
+    // codegen refuses to emit a wrong/unsupported ABI. Gated on the backend so an unrelated
+    // target-machine failure can't masquerade as this rejection.
+    if !backend_available() {
+        return;
+    }
     let mut sm = SourceMap::new();
     let src = "layout(C) Big { a: i64, b: i64, c: i64 }\nextern \"C\" fn f(b: Big) -> i32\nfn main() -> i32 {\n  unsafe { return f(Big { a: 1, b: 2, c: 3 }) }\n}\n";
     let checked = check(&mut sm, "byval-big", src);
@@ -195,6 +199,9 @@ fn oversized_struct_param_is_rejected_in_codegen() {
 
 #[test]
 fn oversized_struct_return_is_rejected_in_codegen() {
+    if !backend_available() {
+        return;
+    }
     let mut sm = SourceMap::new();
     let src = "layout(C) Big { a: i64, b: i64, c: i64 }\nextern \"C\" fn f() -> Big\nfn main() -> i32 {\n  unsafe { b := f(); return b.a as i32 }\n}\n";
     let checked = check(&mut sm, "byval-big-ret", src);
@@ -202,6 +209,124 @@ fn oversized_struct_return_is_rejected_in_codegen() {
     let mir = lower_to_mir(&checked.hir);
     let ir = emit_llvm_ir(&mir, BuildTarget::Baseline);
     assert!(ir.is_err(), "a > 16-byte by-value struct return must be rejected in codegen");
+    assert!(
+        ir.unwrap_err().contains("16-byte"),
+        "the diagnostic should explain the MEMORY-class size limit, not fail for an unrelated reason"
+    );
+}
+
+#[test]
+fn empty_struct_extern_is_rejected_in_sema() {
+    // A zero-field struct has no C ABI representation — rejected in sema with an accurate message (not
+    // the wrong "> 16-byte MEMORY" diagnostic, and not silently accepted).
+    let msg = check_diagnostics(
+        "byval-empty",
+        "layout(C) E {}\nextern \"C\" fn f(e: E) -> i32\nfn main() -> i32 { return 0 }\n",
+    );
+    assert!(msg.contains("empty struct") && msg.contains("no C ABI representation"), "got: {msg}");
+    // And as a return type.
+    assert!(!ok("layout(C) E {}\nextern \"C\" fn g() -> E\nfn main() -> i32 { return 0 }\n"));
+}
+
+// ── SysV register-pressure (the all-or-nothing rule) ────────────────────────────────────────────
+//
+// A two-eightbyte struct is passed in registers only if *both* eightbytes fit in the class registers
+// free after the preceding arguments; otherwise the whole struct goes to memory (`byval`). We accept
+// the fits-in-registers cases (round-trip against a clang callee) and reject the exhaustion boundary
+// (which we cannot lower correctly by flattening).
+
+#[test]
+fn pressure_fits_zero_preceding_int() {
+    if !gated() {
+        return;
+    }
+    // 0 preceding integer args + `{i64,i64}` (needs 2 GP; 6 free) → registers. 10 + 20 = 30.
+    let out = build_and_run_with_c(
+        "byval-press-0",
+        "layout(C) L2 { a: i64, b: i64 }\nextern \"C\" fn f0(s: L2) -> i64\n\nfn main() -> i32 {\n  unsafe {\n    return f0(L2 { a: 10, b: 20 }) as i32\n  }\n}\n",
+        "#include <stdint.h>\nstruct L2 { int64_t a; int64_t b; };\nint64_t f0(struct L2 s) { return s.a + s.b; }\n",
+    );
+    assert_eq!(out.status.code(), Some(30));
+}
+
+#[test]
+fn pressure_fits_four_preceding_int_boundary() {
+    if !gated() {
+        return;
+    }
+    // 4 preceding integer args (RDI..RCX) + `{i64,i64}` needs 2 GP → exactly fills R8,R9 (6 total).
+    // The tight boundary that must still pass in registers. 1+2+3+4+10+20 = 40.
+    let out = build_and_run_with_c(
+        "byval-press-4",
+        "layout(C) L2 { a: i64, b: i64 }\nextern \"C\" fn f4(a: i64, b: i64, c: i64, d: i64, s: L2) -> i64\n\nfn main() -> i32 {\n  unsafe {\n    return f4(1, 2, 3, 4, L2 { a: 10, b: 20 }) as i32\n  }\n}\n",
+        "#include <stdint.h>\nstruct L2 { int64_t a; int64_t b; };\nint64_t f4(int64_t a, int64_t b, int64_t c, int64_t d, struct L2 s) { return a + b + c + d + s.a + s.b; }\n",
+    );
+    assert_eq!(out.status.code(), Some(40));
+}
+
+#[test]
+fn pressure_fits_six_preceding_sse_boundary() {
+    if !gated() {
+        return;
+    }
+    // 6 preceding double args (XMM0..5) + `{f64,f64}` needs 2 SSE → exactly fills XMM6,XMM7 (8 total).
+    // 1+1+1+1+1+1 + 1.5+2.5 = 10.0.
+    let out = build_and_run_with_c(
+        "byval-press-sse6",
+        "layout(C) D2 { x: f64, y: f64 }\nextern \"C\" fn h6(a: f64, b: f64, c: f64, d: f64, e: f64, g: f64, s: D2) -> f64\n\nfn main() -> i32 {\n  unsafe {\n    return h6(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, D2 { x: 1.5, y: 2.5 }) as i32\n  }\n}\n",
+        "struct D2 { double x; double y; };\ndouble h6(double a, double b, double c, double d, double e, double g, struct D2 s) { return a + b + c + d + e + g + s.x + s.y; }\n",
+    );
+    assert_eq!(out.status.code(), Some(10));
+}
+
+#[test]
+fn pressure_five_preceding_int_is_rejected() {
+    if !backend_available() {
+        return;
+    }
+    // 5 preceding integer args (only R9 free) + `{i64,i64}` needs 2 GP → the struct would go to
+    // memory (`byval`). clang lowers this as a `byval` pointer; flattening cannot mimic it, so we
+    // reject rather than silently miscompile.
+    let mut sm = SourceMap::new();
+    let src = "layout(C) L2 { a: i64, b: i64 }\nextern \"C\" fn f5(a: i64, b: i64, c: i64, d: i64, e: i64, s: L2) -> i64\nfn main() -> i32 {\n  unsafe { return f5(1, 2, 3, 4, 5, L2 { a: 10, b: 20 }) as i32 }\n}\n";
+    let checked = check(&mut sm, "byval-press-5", src);
+    assert!(!checked.diags.has_errors(), "the signature type-checks; the ABI limit is a codegen concern");
+    let mir = lower_to_mir(&checked.hir);
+    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline);
+    assert!(ir.is_err(), "a struct arg that falls to MEMORY under register pressure must be rejected");
+    let err = ir.unwrap_err();
+    assert!(err.contains("passed in memory") && err.contains("register"), "got: {err}");
+}
+
+#[test]
+fn pressure_seven_preceding_sse_is_rejected() {
+    if !backend_available() {
+        return;
+    }
+    // 7 preceding double args (only XMM7 free) + `{f64,f64}` needs 2 SSE → MEMORY. Rejected.
+    let mut sm = SourceMap::new();
+    let src = "layout(C) D2 { x: f64, y: f64 }\nextern \"C\" fn h7(a: f64, b: f64, c: f64, d: f64, e: f64, g: f64, h: f64, s: D2) -> f64\nfn main() -> i32 {\n  unsafe { return h7(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, D2 { x: 1.5, y: 2.5 }) as i32 }\n}\n";
+    let checked = check(&mut sm, "byval-press-sse7", src);
+    assert!(!checked.diags.has_errors());
+    let mir = lower_to_mir(&checked.hir);
+    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline);
+    assert!(ir.is_err(), "an SSE struct arg that falls to MEMORY under register pressure must be rejected");
+    assert!(ir.unwrap_err().contains("passed in memory"));
+}
+
+#[test]
+fn pressure_single_eightbyte_after_five_ints_still_fits() {
+    if !gated() {
+        return;
+    }
+    // A *single*-eightbyte struct needs only 1 GP, so after 5 ints (R9 free) it still fits — the
+    // atomicity rule only bites two-eightbyte structs. 1+2+3+4+5 + (6+7) = 28.
+    let out = build_and_run_with_c(
+        "byval-press-single",
+        "layout(C) Pt { a: i32, b: i32 }\nextern \"C\" fn s5(a: i64, b: i64, c: i64, d: i64, e: i64, p: Pt) -> i64\n\nfn main() -> i32 {\n  unsafe {\n    return s5(1, 2, 3, 4, 5, Pt { a: 6, b: 7 }) as i32\n  }\n}\n",
+        "#include <stdint.h>\nstruct Pt { int a; int b; };\nint64_t s5(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e, struct Pt p) { return a + b + c + d + e + p.a + p.b; }\n",
+    );
+    assert_eq!(out.status.code(), Some(28));
 }
 
 #[test]
