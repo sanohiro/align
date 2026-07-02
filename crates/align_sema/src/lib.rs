@@ -2554,6 +2554,10 @@ impl<'a> EscapeCheck<'a> {
             // `t.get()` exposes the task's result; a region-tracked result borrows whatever the
             // task closure did, so it inherits the inner value's region (conservative, never longer).
             ExprKind::TaskGet(inner) => self.region_of(inner, depth),
+            // A `task_group {}` opens a region for its spawned tasks (like `arena {}`), so its value
+            // is evaluated one level deeper — else a binding capturing a task_group's value (a `Task`
+            // handle / box) is inferred `Static` and escapes the group undetected (use-after-free).
+            ExprKind::TaskGroup(b) => self.region_of_block(b, depth + 1),
             // A call's result may be a view borrowing one of its arguments (`fn id(s: str) -> str
             // = s`), so conservatively it lives no longer than the shortest-lived argument — the
             // region analogue of `slice_is_local`'s arg propagation. Without this, returning
@@ -2595,6 +2599,12 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Match { arms, .. } => arms.iter().any(|a| self.slice_is_local(&a.body)),
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.slice_is_local(opt) || self.slice_is_local(fallback)
+            }
+            // An `arena` / `unsafe` / `task_group` block yields its block value, which is frame-local
+            // if the inner value is (like the plain `Block` arm above). Without these a local-backed
+            // slice returned through such a block escapes the function undetected (dangling slice).
+            ExprKind::Arena(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
+                b.value.as_ref().is_some_and(|v| self.slice_is_local(v))
             }
             _ => false,
         }

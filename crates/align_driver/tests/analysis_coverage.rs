@@ -145,3 +145,20 @@ fn main() -> i32 {
     let out = build_and_run("match-move-join", src);
     assert_eq!(out.status.code(), Some(0));
 }
+
+// --- gemini #270 review: a `task_group {}` opens a region (like `arena {}`), so a task/box value
+//     must not escape it (region_of / slice_is_local gained the `TaskGroup` block-wrapping arms). ---
+#[test]
+fn task_group_value_cannot_escape() {
+    let src = "\
+fn main() -> i32 {
+  t := task_group {
+    a := spawn(fn { 5 })
+    wait()
+    a
+  }
+  return 0
+}
+";
+    assert!(check_errs("task-group-escape", src), "a task value must not escape its task_group");
+}
