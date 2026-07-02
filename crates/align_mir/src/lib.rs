@@ -97,6 +97,13 @@ pub enum Stmt {
     VecStore { slice: Operand, index: Operand, value: Operand, elem: Ty, n: u32 },
     /// `slot[index].field <- value` (struct-array element field store).
     StoreElemField(Slot, Operand, u32, Operand),
+    /// `base[index].field <- value` for a `{ptr,len}` view of an owned, dynamic `array<Struct>`
+    /// (`DynStructArray`). The write dual of [`Rvalue::IndexFieldPtr`]: extract the buffer pointer
+    /// from `base` and GEP `%Struct, ptr, index, field` (through the logical→physical `pfield`
+    /// map). `value` is a scalar (POD) field — sema gates `str`/owned fields off, since a
+    /// pointer-based per-element drop of the overwritten field is not modeled. Bounds are checked
+    /// (by [`Stmt`]s emitted before this one) via the loaded view length.
+    StoreElemFieldPtr { base: Operand, index: Operand, field: u32, struct_id: u32, value: Operand },
     /// Store `value` into column `field` at row `index` of a `soa<Struct>` column-major buffer
     /// `base` (the [`Rvalue::SoaAlloc`] base pointer; `len` rows). The write counterpart of
     /// [`Rvalue::IndexColumn`] — codegen reuses its per-column `align_up` offset chain. Used by
@@ -1001,19 +1008,41 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     value: val,
                 });
             } else {
-                // A fixed `array<Struct>` slot (sema restricts the receiver to a `mut` local).
-                let n = match b.slots[*base as usize] {
-                    Ty::StructArray(_, n) => n,
+                match b.slots[*base as usize] {
+                    // A fixed `array<Struct>` slot (sema restricts the receiver to a `mut` local).
+                    Ty::StructArray(_, n) => {
+                        emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
+                        // An owned `string` field being overwritten: free the OLD value first (else
+                        // it leaks) and null the RHS's moved source. A scalar field needs neither.
+                        // (Slice 4b.)
+                        if b.structs[*struct_id as usize].fields[*field as usize].ty == Ty::String {
+                            b.push(Stmt::DropElemField(*base, idx.clone(), *field));
+                            null_moved_source(b, value);
+                        }
+                        b.push(Stmt::StoreElemField(*base, idx, *field, val));
+                    }
+                    // An owned, dynamic `array<Struct>` (`DynStructArray`) — a `{ptr,len}` view
+                    // addressed through its buffer pointer. Load the view, bounds-check against its
+                    // runtime length, then store the scalar field via the pointer-based write dual
+                    // of `IndexFieldPtr`. Sema restricts the field to a scalar (POD), so there is no
+                    // old-value drop / moved-source concern (unlike the fixed `string`-field path).
+                    Ty::DynStructArray(..) => {
+                        let view_ty = b.slots[*base as usize];
+                        let sv = b.fresh_value(view_ty);
+                        b.push(Stmt::Let(sv, Rvalue::Load(*base)));
+                        let len = b.fresh_value(i64_ty());
+                        b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(sv))));
+                        emit_bounds_check(b, &idx, Operand::Value(len));
+                        b.push(Stmt::StoreElemFieldPtr {
+                            base: Operand::Value(sv),
+                            index: idx,
+                            field: *field,
+                            struct_id: *struct_id,
+                            value: val,
+                        });
+                    }
                     other => unreachable!("soa=false element-field assignment into {other:?}"),
-                };
-                emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
-                // An owned `string` field being overwritten: free the OLD value first (else it
-                // leaks) and null the RHS's moved source. A scalar field needs neither. (Slice 4b.)
-                if b.structs[*struct_id as usize].fields[*field as usize].ty == Ty::String {
-                    b.push(Stmt::DropElemField(*base, idx.clone(), *field));
-                    null_moved_source(b, value);
                 }
-                b.push(Stmt::StoreElemField(*base, idx, *field, val));
             }
         }
         hir::Stmt::AssignElem { base, index, struct_id, soa, value } => {

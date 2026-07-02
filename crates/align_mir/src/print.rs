@@ -63,6 +63,15 @@ fn block_to_string(out: &mut String, b: &Block) {
                     operand_str(value)
                 );
             }
+            Stmt::StoreElemFieldPtr { base, index, field, struct_id, value } => {
+                let _ = writeln!(
+                    out,
+                    "    aos#{struct_id}({})[{}].{field} <- {}",
+                    operand_str(base),
+                    operand_str(index),
+                    operand_str(value)
+                );
+            }
             Stmt::DropFlagInit(slot) => {
                 let _ = writeln!(out, "    drop_init _{slot}");
             }

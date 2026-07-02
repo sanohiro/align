@@ -4470,12 +4470,15 @@ impl<'a, 't> Checker<'a, 't> {
             && let ast::ExprKind::Index { recv: irecv, index } = &recv.kind
             && let Some((id, local_ty)) = self.place_local(irecv)
         {
-            let soa = match local_ty {
-                Ty::Soa(sid) => Some((sid, true)),
-                Ty::StructArray(sid, _) => Some((sid, false)),
+            // `soa` selects the lowering (`StoreColumn`); `is_dyn` marks an owned dynamic
+            // `array<Struct>` view (`StoreElemFieldPtr`), a fixed slot array is neither.
+            let kind = match local_ty {
+                Ty::Soa(sid) => Some((sid, true, false)),
+                Ty::StructArray(sid, _) => Some((sid, false, false)),
+                Ty::DynStructArray(sid, _) => Some((sid, false, true)),
                 _ => None,
             };
-            if let Some((struct_id, soa)) = soa {
+            if let Some((struct_id, soa, is_dyn)) = kind {
                 if !self.locals[id as usize].is_mut {
                     let name = self.locals[id as usize].name.clone();
                     self.diags.error(
@@ -4487,6 +4490,22 @@ impl<'a, 't> Checker<'a, 't> {
                     Some(f) => f,
                     None => return Place::Err,
                 };
+                // An owned dynamic `array<Struct>` element-field write goes through the buffer
+                // pointer (`StoreElemFieldPtr`), which has no per-element drop of the overwritten
+                // field. Restrict it to a primitive scalar field (int/float/bool/char) — a `str`/
+                // owned/nested field write would leak the old value, so it is deferred (matching the
+                // fixed-array whole-element restriction: owned columns need region/drop handling).
+                let field_is_prim = matches!(
+                    ty_to_scalar(ty).and_then(scalar_to_prim),
+                    Some(PrimScalar::Int(_) | PrimScalar::Float(_) | PrimScalar::Bool | PrimScalar::Char)
+                );
+                if is_dyn && !field_is_prim {
+                    self.diags.error(
+                        format!("element-field assignment of `{}` into a dynamic array<{}> is not supported yet (primitive fields only for now; a str/owned field needs region/drop handling — deferred)", ty_name(ty), self.ty_display(Ty::Struct(struct_id))),
+                        place.span,
+                    );
+                    return Place::Err;
+                }
                 let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
                 if i.ty == Ty::Error {
                     return Place::Err;
