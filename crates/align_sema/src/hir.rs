@@ -179,6 +179,12 @@ pub struct Local {
     pub name: String,
     pub ty: Ty,
     pub is_mut: bool,
+    /// Whether this local is a real function **parameter** (declared in the signature), as opposed
+    /// to a `let` binding or a lambda capture. Used by `map_into`'s alias gate: a slice parameter's
+    /// buffer is distinct from the other arguments by the caller's `out` no-alias contract, whereas
+    /// a slice `let`-bound to a value of unknown origin (a fn-returned slice, a soa column, a
+    /// struct-field slice) could alias anything and cannot back a `noalias` claim.
+    pub is_param: bool,
     /// A declared over-alignment (bytes, a validated power of two) from an `align(N) data := [...]`
     /// binding, or `None` for the value's natural alignment. Set only for a scalar fixed-array
     /// binding; propagated to the MIR slot's alloca alignment (the aligned-vector-load enabler).
@@ -510,6 +516,16 @@ pub enum ExprKind {
     /// columns. The construction primitive that makes `soa<T>` usable in pure Align (it was
     /// parameter-only before): build once, then a multi-column scan touches only the fields it reads.
     ArrayToSoa { source: Box<Expr>, struct_id: u32 },
+    /// `source.….map_into(dst)` — a **materializing terminal that writes into a caller-provided
+    /// `out`/`mut` slice `dst`** instead of allocating a fresh buffer (the `to_array` sibling that
+    /// reuses caller storage — `draft.md` §7's `out` parameter as a pipeline terminal). One fused
+    /// counted loop stores `dst[i] = f(source[i])` for length-preserving stages only (v1 rejects
+    /// `where`); the runtime requires `dst.len() == source.len()` (abort otherwise). `elem` is the
+    /// element scalar. The expression `ty` is `Unit`. Sema proves `dst` does not alias the source
+    /// (the soundness precondition for the LLVM scoped-`noalias` metadata codegen emits on this
+    /// loop's load/store — the disjoint-buffer claim that lets the vectorizer drop its runtime
+    /// overlap guard).
+    ArrayMapInto { source: Box<Expr>, stages: Vec<Stage>, dst: Box<Expr>, elem: crate::Ty },
     /// `source.….partition(p)` — split the surviving (scalar) elements into two owned arrays by
     /// the predicate `func`: those satisfying it, then the rest. The expression `ty` is a tuple
     /// `(array<T>, array<T>)` (`Ty::Tuple`); `elem` is the element scalar. One fused loop fills

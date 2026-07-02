@@ -385,12 +385,23 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   marks the local writable; the store lowers through the slice buffer pointer (`SlicePtr` +
   `PtrStore`) or a fixed array's slot (`StoreIndex`). First cut: primitive elements only (a `str`
   element store needs a region check; struct/Move need ownership handling). (`examples/out_param.align`.)
-- [done] **`out` no-alias check** — at a call site an `out` argument must not name the same local as
-  any other argument (`fill(a, a)` rejected; `fill(xs, ys)` fine), a conservative base-local
-  comparison via `FnSig.out`. The language-level no-alias guarantee. **Still follow-up:** emitting
-  LLVM `noalias` (the actual vectorization payoff) — blocked on the slice ABI (a slice is passed by
-  value as `{ptr,len}`, so its buffer pointer is not a standalone param to attribute; needs a
-  by-pointer `out`-slice ABI or scoped `!noalias` metadata on the buffer stores).
+- [done] **`out` no-alias check** — at a call site an `out` argument must not share its root buffer
+  with any other argument (`fill(a, a)`, `fill(a, s)` with `s := a`, and sub-slice forms
+  `fill(xs, xs[0..2])` all rejected; `fill(xs, ys)` fine), a conservative root-buffer comparison via
+  `FnSig.out` + `arg_root_local` (sees through slice provenance and `SliceRange`). The language-level
+  no-alias guarantee.
+- [done] **`map_into(out dst)` + scoped `!noalias` emission** — the materializing terminal that
+  writes a length-preserving pipeline into a caller `out`/`mut` slice (`src.map(f).map_into(dst)`,
+  the `to_array` sibling; `dst.len() == src.len()` or abort; yields `()`). This is the reachable
+  two-slice-param loop that makes `noalias` worth emitting, so the metadata landed with it: the fused
+  loop's source `SliceIndex` load and `dst` store carry the loop's disjoint `in`/`out` alias scopes
+  (`MIR SliceIndexNoalias`/`PtrStoreNoalias` → codegen `!alias.scope`/`!noalias`, a fresh domain +
+  scope pair per loop, `alias_scope_lists`). The alias-soundness gate (both roots a *known* backing
+  buffer — a parameter or a real array local, via `hir::Local::is_param` + `slice_root_is_known`;
+  unknown-origin views and same-root aliasing rejected) is the precondition. Verified: at `-O2
+  -force-vector-width=4` the loop's overlap guard drops 3 → 0 `diff.check`/`or.cond` vs. the
+  metadata-stripped IR. (`crates/align_driver/tests/map_into.rs`; `open-questions.md` "`out`
+  parameters + `noalias`" DONE.)
 - [done] **`partition(p)`** — split a pipeline's surviving (primitive-scalar) elements into two
   owned arrays `(array<T>, array<T>)` (predicate true, then false) in one fused loop with two
   buffers + a per-element branch (`lower_array_partition`, the `to_array` collect loop doubled),

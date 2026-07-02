@@ -3535,6 +3535,16 @@ pub extern "C" fn align_rt_bounds_fail(index: i64, len: i64) -> ! {
     std::process::abort();
 }
 
+/// `map_into` destination/source length mismatch: report both lengths and abort. `map_into`
+/// writes each source element into the caller's `out`/`mut` slice, so the two must have the same
+/// length; codegen emits the `dst.len() == src.len()` check inline and calls this on mismatch (the
+/// settled panic model — a length violation is a hard error, never a silent partial/overrun write).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_len_mismatch_fail(dst_len: i64, src_len: i64) -> ! {
+    eprintln!("align: panic: map_into length mismatch: the destination slice length is {dst_len} but the source length is {src_len}");
+    std::process::abort();
+}
+
 /// Out-of-bounds range slice (`xs[start..end]`): report the whole `start..end` against `len` and
 /// abort. Unlike an element index, a range has three ways to fail — a negative `start`, an inverted
 /// `start > end`, or an over-length `end` — so all three values are reported together, avoiding the

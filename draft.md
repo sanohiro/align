@@ -662,7 +662,28 @@ fn add(out dst: slice<f32>, a: slice<f32>, b: slice<f32>) {
 }
 ```
 
-`out` is a no-alias optimization hint and also a safety constraint.
+An `out` parameter is a writable output buffer the callee fills. `out` is both a **safety
+constraint** and a **no-alias optimization**: an `out` argument must not alias any other argument
+(the compiler rejects a call that passes the same backing buffer twice — compared by root buffer,
+so a slice and the array it borrows, or two sub-slices of one array, are all caught), which lets the
+compiler emit `noalias` on the output and vectorize the fill without a runtime overlap check.
+
+The pipeline terminal `map_into` writes a pipeline's results straight into an `out` (or `mut`)
+slice, the caller-storage counterpart of `to_array` (which allocates a fresh owned array):
+
+```align
+fn scale(src: slice<i64>, out dst: slice<i64>) {
+  src.map(fn x { x * 2 }).map_into(dst)
+}
+```
+
+`map_into` is a **length-preserving** materializing terminal: it stores `dst[i] = f(src[i])` in one
+fused loop for `map` / field-projection stages, requires `dst.len() == src.len()` (a mismatch aborts
+at runtime, like an out-of-bounds index), and yields `()`. A filtering `where` before `map_into`
+(which would write a variable-length prefix) is not part of this form — filtering materializes with
+`to_array`. The compiler proves `dst` is a distinct buffer from the source (the same root-buffer
+no-alias rule as an `out` argument) and emits the disjoint-buffer `noalias`, so the fused loop
+vectorizes with no runtime overlap guard.
 
 ---
 

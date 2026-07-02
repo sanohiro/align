@@ -576,6 +576,7 @@ fn pipeline_stages(kind: &ExprKind) -> Option<&[Stage]> {
         | ExprKind::ArraySort { stages, .. }
         | ExprKind::ArraySortBy { stages, .. }
         | ExprKind::ArrayToArray { stages, .. }
+        | ExprKind::ArrayMapInto { stages, .. }
         | ExprKind::ArrayPartition { stages, .. }
         | ExprKind::ArrayParMap { stages, .. } => Some(stages),
         _ => None,
@@ -2152,6 +2153,13 @@ impl EffectScan {
                 self.stage_funcs(stages);
                 self.expr(source);
             }
+            // `map_into` writes each post-stage element into `dst` — a stage-carrying pipeline plus
+            // the destination place (a read of the `out`/`mut` slice), both walked for effects.
+            ExprKind::ArrayMapInto { source, stages, dst, .. } => {
+                self.stage_funcs(stages);
+                self.expr(source);
+                self.expr(dst);
+            }
             ExprKind::ArrayAnyAll { source, stages, func, .. }
             | ExprKind::ArrayReduce { source, stages, func, .. }
             | ExprKind::ArrayScan { source, stages, func, .. }
@@ -3046,6 +3054,12 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(source, depth);
                 self.walk(init, depth);
             }
+            // `map_into` reads its source and writes `dst` — recurse into both (the destination
+            // is a place read of the `out`/`mut` slice; nothing is moved out of it).
+            ExprKind::ArrayMapInto { source, dst, .. } => {
+                self.walk(source, depth);
+                self.walk(dst, depth);
+            }
             ExprKind::ArrayDot { a, b, .. } => {
                 self.walk(a, depth);
                 self.walk(b, depth);
@@ -3493,6 +3507,13 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.expr(source, moved, false, false);
                 self.expr(init, moved, false, false);
+            }
+            // `map_into`: the source is borrowed (read per element, never consumed) and `dst` is a
+            // borrowed writable slice place (a Copy `{ptr,len}` view — the buffer is written, but the
+            // slice value itself is not moved).
+            ExprKind::ArrayMapInto { source, dst, .. } => {
+                self.expr(source, moved, false, false);
+                self.expr(dst, moved, false, false);
             }
             ExprKind::ArrayDot { a, b, .. } => {
                 self.expr(a, moved, false, false);
@@ -4000,6 +4021,7 @@ impl<'a, 't> Checker<'a, 't> {
             ty,
             is_mut,
             align: None,
+            is_param: false,
         });
         self.scope.push((name.to_string(), id));
         id
@@ -4029,7 +4051,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A captured value becomes a synthetic parameter local (tracked in `captured`, *not* pushed
         // into the visible scope so a nested-block exit can't truncate it).
         let param_id = self.locals.len() as LocalId;
-        self.locals.push(Local { id: param_id, name: name.to_string(), ty, is_mut: false, align: None });
+        self.locals.push(Local { id: param_id, name: name.to_string(), ty, is_mut: false, align: None, is_param: false });
         cap.captured.push((name.to_string(), param_id, enc_id));
         Some(param_id)
     }
@@ -4142,6 +4164,7 @@ impl<'a, 't> Checker<'a, 't> {
                 );
             }
             let id = self.declare(&p.name.name, ty, p.is_out);
+            self.locals[id as usize].is_param = true;
             params.push(id);
         }
 
@@ -5125,6 +5148,19 @@ impl<'a, 't> Checker<'a, 't> {
             guard += 1;
         }
         cur
+    }
+
+    /// Whether a resolved root buffer local (`root_local`) is a *known, distinct* backing buffer —
+    /// the soundness test for `map_into`'s alias gate. Known ⇔ the root is a slice/array parameter
+    /// (its buffer is distinct from the other arguments by the caller's `out` no-alias contract) or
+    /// a real array local (a genuine backing buffer). A slice-typed **body** local that resolved to
+    /// itself was `let`-bound to a value of unknown origin (a fn-returned slice, a soa column, a
+    /// struct-field slice) — its buffer could be anything, so it is *not* known and must not back a
+    /// `noalias` claim. (A slice local borrowed from an array is provenance-tracked, so its root is
+    /// the array local, a non-slice type, and is known.)
+    fn slice_root_is_known(&self, root: LocalId) -> bool {
+        let l = &self.locals[root as usize];
+        l.is_param || !matches!(self.resolve(l.ty), Ty::Slice(_))
     }
 
     /// The root buffer local an HIR expression borrows, if it resolves to one (a local or an
@@ -6492,6 +6528,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "to_array" {
             return self.check_array_to_array(recv, args, span);
         }
+        if method == "map_into" {
+            return self.check_array_map_into(recv, args, span);
+        }
         if method == "to_soa" {
             return self.check_array_to_soa(recv, args, span);
         }
@@ -7789,6 +7828,142 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::ArrayToArray { source: Box::new(source), stages, elem },
             ty: Ty::DynArray(scalar),
+            span,
+        }
+    }
+
+    /// `src.….map_into(dst)` — a materializing terminal that writes each post-stage element into a
+    /// caller-provided writable slice `dst` (`out`/`mut`), instead of allocating a fresh buffer (the
+    /// `to_array` sibling that reuses caller storage — draft.md §7's `out` parameter as a terminal).
+    ///
+    /// v1 cut (the ideal length-preserving form): only length-preserving stages (`map` / `.field`);
+    /// `where` is rejected. That keeps the loop a clean `dst[i] = f(src[i])` — the exact vectorizable
+    /// shape the scoped-`noalias` metadata targets — and avoids a second return convention (a
+    /// filtering write returning a survivor count is a different operation, deferred). The runtime
+    /// requires `dst.len() == src.len()` (abort otherwise). Primitive scalar elements only. Yields `()`.
+    ///
+    /// Alias soundness (the precondition for the `noalias` codegen): `dst` must not share a backing
+    /// buffer with the pipeline source. `dst` is always a resolvable named place (a writable slice),
+    /// so its root is compared to the source root — same root ⇒ rejected. A source whose provenance
+    /// cannot be resolved (a slice returned from a function, a soa column, a struct-field slice) is
+    /// rejected too, because it could alias `dst` and we are about to claim they are disjoint. A fixed
+    /// stack array literal source has no name root but is provably disjoint from any caller slice, so
+    /// it is allowed.
+    fn check_array_map_into(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [dst_arg] = args else {
+            self.diags.error(
+                format!("'map_into' takes 1 argument (a writable `out`/`mut` slice), got {}", args.len()),
+                span,
+            );
+            return err;
+        };
+        // The destination must be a writable slice place: a `mut` local slice or an `out` parameter.
+        let dst = self.check_expr(dst_arg, None);
+        if dst.ty == Ty::Error {
+            return err;
+        }
+        let Ty::Slice(dst_es) = self.resolve(dst.ty) else {
+            self.diags.error(format!("'map_into' writes into a slice<T>, got {}", ty_name(dst.ty)), dst_arg.span);
+            return err;
+        };
+        let Some((dst_id, _)) = self.place_local(dst_arg) else {
+            self.diags.error(
+                "'map_into' needs a writable slice place (a `mut` local or an `out` parameter)".to_string(),
+                dst_arg.span,
+            );
+            return err;
+        };
+        if !self.locals[dst_id as usize].is_mut {
+            let name = self.locals[dst_id as usize].name.clone();
+            self.diags.error(
+                format!("cannot write into immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
+                dst_arg.span,
+            );
+            return err;
+        }
+        // Type-check the pipeline; a stageless inline literal source infers its element from `dst`.
+        let Some((source, stages, elem)) = self.check_pipeline(recv, Some(scalar_to_ty(dst_es)), span) else {
+            return err;
+        };
+        // v1: length-preserving stages only — a filtering `where` (a dynamic survivor count) is deferred.
+        if stages.iter().any(|s| matches!(s.kind, StageKind::Where { .. } | StageKind::WhereField { .. })) {
+            self.diags.error(
+                "'map_into' v1 supports only length-preserving stages (`map` / `.field`); a filtering `where` before `map_into` (which would write a variable prefix and return a count) is deferred".to_string(),
+                span,
+            );
+            return err;
+        }
+        let Some(scalar) = ty_to_scalar(elem) else {
+            self.diags.error(
+                format!("'map_into' needs a scalar element, got {} (project a field first)", ty_name(elem)),
+                span,
+            );
+            return err;
+        };
+        if matches!(elem, Ty::Struct(_)) {
+            self.diags.error("'map_into' over struct elements is not supported yet (project a field first)".to_string(), span);
+            return err;
+        }
+        if scalar != dst_es {
+            self.diags.error(
+                format!("'map_into' element {} does not match the destination slice element {}", scalar_name(scalar), scalar_name(dst_es)),
+                span,
+            );
+            return err;
+        }
+        // Alias soundness: `dst` must not alias the pipeline source (the precondition for the
+        // scoped-`noalias` metadata this lowers to). `dst_root` is the destination's root buffer.
+        // Both roots must resolve to a *known* backing buffer — a slice/array parameter (distinct by
+        // the caller's `out` no-alias contract) or a real array local. A slice `let`-bound to a value
+        // of unknown origin (a fn-returned slice, a soa column, a struct-field slice) has itself as
+        // its own root and would falsely read as "distinct", so it is rejected: it could alias the
+        // other buffer, and we are about to claim they are disjoint.
+        let dst_root = self.root_local(dst_id);
+        if !self.slice_root_is_known(dst_root) {
+            self.diags.error(
+                "'map_into' destination is a view of unknown origin (a fn-returned slice, a soa column, a struct field); its buffer cannot be proven distinct from the source — use a named array/slice or an `out` parameter (deferred)".to_string(),
+                dst_arg.span,
+            );
+            return err;
+        }
+        match self.expr_root_local(&source) {
+            Some(sr) if sr == dst_root => {
+                let name = self.locals[dst_root as usize].name.clone();
+                self.diags.error(
+                    format!("'map_into' destination aliases the pipeline source '{name}' — the output slice must be a distinct buffer"),
+                    dst_arg.span,
+                );
+                return err;
+            }
+            Some(sr) if !self.slice_root_is_known(sr) => {
+                // The source root is a slice local of unknown origin (bound to a fn return / soa
+                // column / struct field) — it could alias `dst`, so it cannot back a `noalias` claim.
+                self.diags.error(
+                    "'map_into' source is a view of unknown origin (a fn-returned slice, a soa column, a struct field); its buffer cannot be proven distinct from the `out` buffer, so it is rejected (deferred)".to_string(),
+                    span,
+                );
+                return err;
+            }
+            // Two distinct *known* backing buffers → provably disjoint. Two slice parameters are
+            // guaranteed distinct by the caller's `out` no-alias check; a param vs. an array local,
+            // or two distinct array locals, never share storage.
+            Some(_) => {}
+            None => {
+                // No name root. Sound only if the source is provably fresh/stack storage (a fixed
+                // array literal) — never a view of unknown origin that could alias `dst`.
+                if !matches!(source.ty, Ty::Array(..) | Ty::StructArray(..)) {
+                    self.diags.error(
+                        "'map_into' needs a source whose buffer is known — a named array/slice (or a sub-slice of one) or an array literal. A slice of unknown origin (returned from a function, a soa column, a struct field) could alias the `out` buffer, so it is rejected (deferred)".to_string(),
+                        span,
+                    );
+                    return err;
+                }
+            }
+        }
+        Expr {
+            kind: ExprKind::ArrayMapInto { source: Box::new(source), stages, dst: Box::new(dst), elem },
+            ty: Ty::Unit,
             span,
         }
     }
@@ -9983,6 +10158,10 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
                 self.finalize_expr(source);
                 self.finalize_expr(init);
+            }
+            ExprKind::ArrayMapInto { source, dst, .. } => {
+                self.finalize_expr(source);
+                self.finalize_expr(dst);
             }
             ExprKind::ArrayDot { a, b, .. } => {
                 self.finalize_expr(a);

@@ -50,6 +50,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::PtrStore(ptr, idx, val) => {
                 let _ = writeln!(out, "    {}[{}] <- {}", operand_str(ptr), operand_str(idx), operand_str(val));
             }
+            Stmt::PtrStoreNoalias { ptr, index, value, scope } => {
+                let _ = writeln!(out, "    {}[{}] <- {}  !alias.scope(out#{scope})", operand_str(ptr), operand_str(index), operand_str(value));
+            }
             Stmt::VecStore { slice, index, value, n, .. } => {
                 let _ = writeln!(out, "    {}[{}..+{n}] <- {}", operand_str(slice), operand_str(index), operand_str(value));
             }
@@ -323,6 +326,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
         Rvalue::SlicePtr(op) => format!("slice_ptr({})", operand_str(op)),
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
+        Rvalue::SliceIndexNoalias { slice, index, scope } => format!("{}[{}] !alias.scope(in#{scope})", operand_str(slice), operand_str(index)),
         Rvalue::SubSlice { base, start, len, elem } => {
             format!("subslice({}, +{}, len={} : {})", operand_str(base), operand_str(start), operand_str(len), ty_name(*elem))
         }

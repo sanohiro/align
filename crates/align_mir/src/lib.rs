@@ -95,6 +95,12 @@ pub enum Stmt {
     /// `ptr[index] <- value` — store into a raw element pointer (the buffer of an owned
     /// `array<T>` being filled). The element type comes from `value`.
     PtrStore(Operand, Operand, Operand),
+    /// `ptr[index] <- value`, exactly like [`Stmt::PtrStore`], but tagged with the `map_into` loop's
+    /// **`out` alias scope** (`u32` = the loop's scope id) so codegen attaches `!alias.scope !{out}`
+    /// / `!noalias !{in}`. Emitted only for the `dst` store of a `map_into` loop whose source is a
+    /// slice with a proven-disjoint root (sema's alias gate), so the vectorizer may drop its runtime
+    /// overlap guard. See [`Rvalue::SliceIndexNoalias`] (the matching source load).
+    PtrStoreNoalias { ptr: Operand, index: Operand, value: Operand, scope: u32 },
     /// `s.store(i, v)` — store the `n` lanes of vector `value` into a `slice<T>` (`{ptr,len}`) at
     /// `index..index+n` (M6). Codegen GEPs the slice buffer to `&buf[index]` and emits a `<n x T>`
     /// store at the element alignment. Bounds are checked before this statement is emitted.
@@ -386,6 +392,12 @@ pub enum Rvalue {
     SlicePtr(Operand),
     /// `slice[index]` — load a slice element (scalar).
     SliceIndex(Operand, Operand),
+    /// `slice[index]`, exactly like [`Rvalue::SliceIndex`], but tagged with the `map_into` loop's
+    /// **`in` alias scope** (`u32` = the loop's scope id) so codegen attaches `!alias.scope !{in}`
+    /// / `!noalias !{out}`. The matching source load for [`Stmt::PtrStoreNoalias`]; the two share a
+    /// scope id, and the `in`/`out` scopes are declared disjoint, which is what lets the vectorizer
+    /// prove the loop's load and store never overlap.
+    SliceIndexNoalias { slice: Operand, index: Operand, scope: u32 },
     /// `recv[start..end]` — build a borrowed sub-view `{ base.ptr + start, len }` of the `{ptr,len}`
     /// `base` (a `str` / `slice` / owned-array value). `start` offsets the base pointer by whole
     /// `elem`-sized steps (`u8` bytes for a `str`); `len` is the sub-view length (`end - start`,
@@ -700,6 +712,11 @@ struct Builder {
     tuples: Vec<hir::TupleDef>,
     /// Struct defs — `to_soa` reads each field's type to scatter it into its column.
     structs: Vec<hir::StructDef>,
+    /// Monotonic id for each `map_into` loop's alias scope (a fresh disjoint `in`/`out`
+    /// scope pair per loop). Threaded into [`Rvalue::SliceIndexNoalias`] / [`Stmt::PtrStoreNoalias`]
+    /// so codegen tags the source load and the `dst` store of the *same* loop with the same
+    /// scoped-`noalias` metadata. Per-function (the Builder is per-function).
+    alias_scope: u32,
 }
 
 impl Builder {
@@ -739,6 +756,15 @@ impl Builder {
         v
     }
 
+    /// A fresh alias-scope id for a `map_into` loop — its `in`/`out` scopes are declared disjoint
+    /// per loop (codegen builds distinct metadata per id) so two `map_into` loops in one function
+    /// never cross-constrain.
+    fn fresh_alias_scope(&mut self) -> u32 {
+        let s = self.alias_scope;
+        self.alias_scope += 1;
+        s
+    }
+
     fn new_slot(&mut self, ty: Ty) -> Slot {
         let s = self.slots.len() as Slot;
         self.slots.push(ty);
@@ -775,6 +801,7 @@ fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -
         drop_locals: f.drop_locals.clone(),
         tuples: tuples.to_vec(),
         structs: structs.to_vec(),
+        alias_scope: 0,
     };
     let entry = b.new_block();
     b.cur = entry;
@@ -1607,6 +1634,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             lower_array_collect(b, source, stages, *elem, CollectKind::Collect)
         }
         hir::ExprKind::ArrayToSoa { source, struct_id } => lower_array_to_soa(b, source, *struct_id),
+        hir::ExprKind::ArrayMapInto { source, stages, dst, elem } => lower_array_map_into(b, source, stages, dst, *elem),
         hir::ExprKind::ArrayScan { source, stages, func, captures, init, elem } => {
             let init_op = lower_expr(b, init);
             lower_array_collect(b, source, stages, *elem, CollectKind::Scan { func: func.clone(), init: init_op, captures: captures.clone() })
@@ -3077,6 +3105,142 @@ fn lower_array_collect(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage
         b.push(Stmt::DropValue(tmp));
     }
     Operand::Value(arr)
+}
+
+/// Abort unless `have == want` — the cold-edge guard `map_into` emits so `dst.len() == source.len()`
+/// holds before the fused loop writes into the caller's buffer. Same shape as [`emit_bounds_check`]:
+/// a branch to a `-> !` reporting block (`Unreachable`), continuing in the `ok` block.
+fn emit_len_eq_check(b: &mut Builder, have: Operand, want: Operand) {
+    let ne = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(ne, Rvalue::Bin(BinOp::Ne, have.clone(), want.clone())));
+    let fail = b.new_block();
+    let ok = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(ne), fail, ok));
+    b.cur = fail;
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(t, Rvalue::Call("len_mismatch_fail".to_string(), vec![have, want])));
+    b.terminate(Term::Unreachable);
+    b.cur = ok;
+}
+
+/// `source.….map_into(dst)` — write each post-stage element into the caller's writable slice `dst`
+/// (a `to_array` sibling that reuses caller storage). One fused counted loop stores `dst[i] =
+/// f(source[i])`; sema restricts the pipeline to length-preserving stages (`map`/`.field`), so the
+/// loop is a clean `for i in 0..len` with no survivor counter. The runtime first asserts
+/// `dst.len() == source.len()` (abort otherwise). When the source reads a runtime slice buffer, the
+/// source load and `dst` store are tagged with the loop's disjoint `in`/`out` alias scopes
+/// ([`Rvalue::SliceIndexNoalias`]/[`Stmt::PtrStoreNoalias`]) — sema proved `dst` is disjoint from the
+/// source — so the vectorizer drops its runtime overlap guard. Yields `()`.
+fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], dst: &hir::Expr, elem: Ty) -> Operand {
+    let SrcSetup { slot, slice_val, bound, scalar_slot, struct_view, temp_free: _ } = setup_source(b, source);
+    // The source load is scope-tagged only when it reads a runtime slice buffer (`SliceIndex`); a
+    // fixed stack-array source (`Index`) can't alias a caller slice, so it needs no metadata.
+    let emit_noalias = slice_val.is_some();
+    let scope = b.fresh_alias_scope();
+
+    // Destination `{ptr,len}`: its buffer pointer (store target) and length (for the guard).
+    let dst_val = lower_expr(b, dst);
+    let dst_ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
+    b.push(Stmt::Let(dst_ptr, Rvalue::SlicePtr(dst_val.clone())));
+    let dst_len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(dst_len, Rvalue::SliceLen(dst_val)));
+
+    // Runtime length check: `dst.len() == source.len()`, else abort (cold edge).
+    emit_len_eq_check(b, Operand::Value(dst_len), bound.clone());
+
+    // for i in 0..len: dst[i] = <post-stage element i>.
+    let iv = b.new_slot(i64_ty());
+    b.push(Stmt::Store(iv, Operand::Const(Const::Int(0, i64_ty()))));
+    let header = b.new_block();
+    let body = b.new_block();
+    let exit = b.new_block();
+    b.terminate(Term::Goto(header));
+
+    b.cur = header;
+    let i_val = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
+    let cond = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound.clone())));
+    b.terminate(Term::Branch(Operand::Value(cond), body, exit));
+
+    b.cur = body;
+    let idx = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(idx, Rvalue::Load(iv)));
+    let index = Operand::Value(idx);
+
+    // Load the source element (scalar sources); struct sources defer to the first Project stage.
+    let mut cur: Option<Operand> = if struct_view.is_some() {
+        None
+    } else if let Some(sv) = &slice_val {
+        let src_elem = match source.ty {
+            Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
+            Ty::DynSliceArray(p) => Ty::Slice(align_sema::prim_to_scalar(p)),
+            _ => elem,
+        };
+        let x = b.fresh_value(src_elem);
+        let load = if emit_noalias {
+            Rvalue::SliceIndexNoalias { slice: sv.clone(), index: index.clone(), scope }
+        } else {
+            Rvalue::SliceIndex(sv.clone(), index.clone())
+        };
+        b.push(Stmt::Let(x, load));
+        Some(Operand::Value(x))
+    } else if scalar_slot {
+        let src_elem = match source.ty {
+            Ty::Array(s, _) => align_sema::scalar_to_ty(s),
+            _ => elem,
+        };
+        let x = b.fresh_value(src_elem);
+        b.push(Stmt::Let(x, Rvalue::Index(slot, index.clone())));
+        Some(Operand::Value(x))
+    } else {
+        None
+    };
+
+    // Apply the length-preserving stages (sema rejects `where`, so there is no skip branch).
+    for stage in stages {
+        match &stage.kind {
+            hir::StageKind::Project { field } => {
+                let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
+                cur = Some(Operand::Value(v));
+            }
+            hir::StageKind::Map { func, captures } => {
+                let arg = match cur.take() {
+                    Some(a) => a,
+                    None => {
+                        let sid = match source.ty {
+                            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
+                            _ => unreachable!("map with no loaded element must be over a struct array"),
+                        };
+                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                    }
+                };
+                let call_args = stage_call_args(b, arg, captures);
+                let v = b.fresh_value(stage.out_ty);
+                b.push(Stmt::Let(v, Rvalue::Call(func.clone(), call_args)));
+                cur = Some(Operand::Value(v));
+            }
+            hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. } => {
+                unreachable!("map_into rejects filtering `where` stages in sema")
+            }
+        }
+    }
+
+    let value = cur.expect("map_into needs a scalar element");
+    let store = if emit_noalias {
+        Stmt::PtrStoreNoalias { ptr: Operand::Value(dst_ptr), index: index.clone(), value, scope }
+    } else {
+        Stmt::PtrStore(Operand::Value(dst_ptr), index.clone(), value)
+    };
+    b.push(store);
+
+    let inc = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, index, index_const(1))));
+    b.push(Stmt::Store(iv, Operand::Value(inc)));
+    b.terminate(Term::Goto(header));
+
+    b.cur = exit;
+    Operand::Const(Const::Unit)
 }
 
 /// `arr.to_soa()` — transpose an AoS `array<Struct>` source into a column-major `soa<Struct>`
