@@ -29,8 +29,17 @@ SIMD story where `vecN<T>`/`maskN<T>` stay the fixed-width kernel escape hatch a
 width-agnostic main path where scalable ISAs live; `str + str` is now a hard error, not a lint
 candidate; unconstrained-literal defaults and `&&`/`||` short-circuit order are now explicit in the
 spec) were landed the same day in `draft.md` / `docs/design-notes.md` / `docs/impl/*` and recorded as
-Settled/Future entries in `docs/open-questions.md`. **Next action from this review: the perf
-backlog**, led by LLVM alias-scope metadata on fused loops, then `task_group` → `ParPool`.
+Settled/Future entries in `docs/open-questions.md`. **The perf backlog from this review is now done
+(PRs #300–#303, same day):** alias-scope metadata was investigated and **deferred with the sound
+encoding documented** — the mechanism proven but no source construct generates an aliasing-ambiguous
+loop today (belongs with the future `map_into(out)` slice); the investigation surfaced and #302
+fixed a real soundness hole (`out` no-alias check blind to sub-slices); `task_group` now reuses
+`ParPool` via a caller-participating claim loop (nesting-deadlock-free by construction, #301);
+allocator declarations carry verified `noalias`/`nounwind`/split-`nofree` attributes and `emit-llvm`
+output is self-describing (triple, #301); and the branchless identity-select `where` now covers
+every reducer — the M6 completion criterion — with `where`+`min` demonstrably vectorizing (#303).
+**Remaining from the review: the design-decision Open items** (out-of-range literals,
+`main() -> Result<(), E>` exit mapping) and the deferred noalias emission gated on `map_into(out)`.
 
 ## Latest (2026-07-02, PRs #262–#290)
 
