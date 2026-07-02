@@ -5,7 +5,23 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-02._
+_Last updated: 2026-07-02 (main @ PR #290)._
+
+## Latest (2026-07-02, PRs #262–#290)
+
+Since the #183 snapshot below: **M8 unsafe/`raw.*` + `extern "C"` FFI v1 shipped** (#262–#269:
+`extern "C"` decls + unsafe-gated foreign calls, `layout(C)` struct-by-pointer ABI, `str`/`slice`/
+`bytes` → C data pointer, `link("name")`; deferred: by-value struct return, `bool`/`char` args,
+`ptr_cast`). The **2026-07-02 external soundness audit is fully addressed** (#270–#277: escape/effect/
+move coverage holes, `&&`/`||` short-circuit, arena double-free, negate-unsigned sign loss, parser/
+diagnostic papercuts). Owned-array materialization `.to_array()` + a clean error for bare-literal-in-
+owned-array-context (#283–#285). A **dependency-free fuzz + property suite** now locks the invariants
+(#286–#290): `fuzz_frontend.rs` (front end never panics), `fuzz_fmt.rs` (formatter idempotent +
+parse-preserving), `fuzz_differential.rs` (generate-program-with-oracle differential fuzzer over
+scalars / all widths + casts / call ABI / struct+array aggregates — **no miscompile found**). `cargo
+test` ≈ 990+ green. Remaining audit items are the structural refactors (escape→MIR-dataflow,
+purity-as-effect-bit) tracked **open** in `docs/open-questions.md`. See memory
+`fuzzing-infrastructure.md`, `audit-2026-07-02-fixes.md`, `m8-unsafe-raw-started.md`.
 
 ## Setup on the new machine
 
@@ -14,7 +30,7 @@ git clone https://github.com/sanohiro/align            # ideally into /home/<use
 cd align
 # Toolchain: Rust 1.96 + LLVM 19 (inkwell llvm19-1). Debian: apt install llvm-19 llvm-19-dev
 # .cargo/config.toml already sets LLVM_SYS_191_PREFER_DYNAMIC=1 (Debian llvm-19 is shared-only).
-cargo build && cargo test       # expect all green (~940 tests)
+cargo build && cargo test       # expect all green (~994 tests)
 ```
 
 The compiler is `./target/debug/alignc` (or `./target/release/alignc` after `--release`) — not on
