@@ -1975,8 +1975,11 @@ fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_se
     };
     let mask_ty = Ty::Mask(s, n);
     // any(divisor == 0) → report and abort (cold edge), the vector mirror of the scalar zero guard.
+    // Compare vector-vs-vector (splat the `0`) so the MIR node is well-typed — a vector `Eq` takes two
+    // `<N x T>` operands, not a bare scalar constant (codegen would splat it, but keep the IR honest).
+    let zero_vec = splat(b, 0);
     let is_zero = b.fresh_value(mask_ty);
-    b.push(Stmt::Let(is_zero, Rvalue::Bin(BinOp::Eq, rvec.clone(), Operand::Const(Const::Int(0, elem)))));
+    b.push(Stmt::Let(is_zero, Rvalue::Bin(BinOp::Eq, rvec.clone(), zero_vec)));
     let any_zero = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(any_zero, Rvalue::MaskAny { mask: Operand::Value(is_zero), n }));
     let fail = b.new_block();
@@ -1995,8 +1998,10 @@ fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_se
         return Operand::Value(v);
     }
     // Signed: fold away the per-lane `INT_MIN / -1` UB (same shape as the scalar path, lane-wise).
+    // Again compare vector-vs-vector (splat the `-1`) to keep the MIR node well-typed.
+    let neg1_vec = splat(b, -1);
     let is_neg1 = b.fresh_value(mask_ty);
-    b.push(Stmt::Let(is_neg1, Rvalue::Bin(BinOp::Eq, rvec.clone(), Operand::Const(Const::Int(-1, elem)))));
+    b.push(Stmt::Let(is_neg1, Rvalue::Bin(BinOp::Eq, rvec.clone(), neg1_vec)));
     // Remap each `-1` lane to `1` so the raw vector div/rem never triggers UB; the select below
     // replaces the result on those lanes regardless.
     let one_vec = splat(b, 1);
