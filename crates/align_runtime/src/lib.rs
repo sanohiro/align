@@ -5030,6 +5030,142 @@ mod tests {
         }
     }
 
+    /// Differential oracle for the generic `str` search ops, in the same discipline as the JSON
+    /// structural-index SIMD tests (`json_decode_index_simd_matches_scalar_oracle`).
+    ///
+    /// `contains`/`find`/`rfind` are backed by `memchr::memmem`, whose substring search ships an
+    /// AVX2 path (x86_64), a NEON path (aarch64 baseline), and a scalar fallback, selected by
+    /// runtime feature detection — the same first-byte-scan-then-verify technique the JSON index
+    /// uses, in its reference form. This locks whichever path the host CPU selects against an
+    /// independent naive scalar oracle across the edges that break SIMD substring search: a needle
+    /// straddling the 64-byte SIMD block boundary, prefilter decoys that must be verified and
+    /// rejected before the real match, needle lengths 0/1/large, multibyte UTF-8, overlapping
+    /// repeats, tail matches, a multi-KB haystack, and a deterministic randomized cross-check.
+    /// `starts_with`/`ends_with` (deliberately scalar `==`/`memcmp`, bounded to the needle length —
+    /// no worthwhile SIMD lever) ride along against the same corpus.
+    #[test]
+    fn str_search_simd_matches_scalar_oracle() {
+        // FFI entry points, driven exactly as codegen does ({ptr,len} pairs).
+        let contains = |h: &[u8], n: &[u8]| unsafe {
+            align_rt_str_contains(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+        };
+        let find = |h: &[u8], n: &[u8]| unsafe {
+            align_rt_str_find(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+        };
+        let rfind = |h: &[u8], n: &[u8]| unsafe {
+            align_rt_str_rfind(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+        };
+        let starts = |h: &[u8], n: &[u8]| unsafe {
+            align_rt_str_starts_with(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+        };
+        let ends = |h: &[u8], n: &[u8]| unsafe {
+            align_rt_str_ends_with(h.as_ptr(), h.len() as i64, n.as_ptr(), n.len() as i64)
+        };
+
+        // Independent scalar oracles — a naive sliding-window scan, no memchr involved.
+        fn oracle_find(h: &[u8], n: &[u8]) -> i64 {
+            if n.is_empty() {
+                return 0;
+            }
+            if n.len() > h.len() {
+                return -1;
+            }
+            h.windows(n.len()).position(|w| w == n).map_or(-1, |i| i as i64)
+        }
+        fn oracle_rfind(h: &[u8], n: &[u8]) -> i64 {
+            if n.is_empty() {
+                return h.len() as i64;
+            }
+            if n.len() > h.len() {
+                return -1;
+            }
+            h.windows(n.len()).rposition(|w| w == n).map_or(-1, |i| i as i64)
+        }
+
+        let check = |h: &[u8], n: &[u8]| {
+            let ef = oracle_find(h, n);
+            let er = oracle_rfind(h, n);
+            assert_eq!(find(h, n), ef, "find(hlen {}, needle {:?})", h.len(), n);
+            assert_eq!(rfind(h, n), er, "rfind(hlen {}, needle {:?})", h.len(), n);
+            assert_eq!(
+                contains(h, n),
+                (n.is_empty() || ef >= 0) as i32,
+                "contains(hlen {}, needle {:?})",
+                h.len(),
+                n
+            );
+            assert_eq!(starts(h, n), h.starts_with(n) as i32, "starts_with(hlen {}, needle {:?})", h.len(), n);
+            assert_eq!(ends(h, n), h.ends_with(n) as i32, "ends_with(hlen {}, needle {:?})", h.len(), n);
+        };
+
+        // (1) Boundary-padding sweep: place a distinctive needle at every offset 40..96 of a
+        // 160-byte buffer so it straddles the 64-byte SIMD block boundary, and scatter the needle's
+        // first byte before it so the SIMD prefilter fires on non-matches and must verify+reject
+        // them before reaching the real match. Needle bytes stay in A..=W (65..=87), never the '.'
+        // (46) pad, so no window accidentally matches except the planted one.
+        for needle_len in [1usize, 2, 3, 4, 7, 8, 15, 16, 17] {
+            let needle: Vec<u8> = (0..needle_len).map(|k| b'A' + (k as u8 % 23)).collect();
+            for off in 40..96 {
+                let mut buf = vec![b'.'; 160];
+                for j in (0..off).step_by(5) {
+                    buf[j] = needle[0]; // prefilter decoy
+                }
+                buf[off..off + needle_len].copy_from_slice(&needle);
+                check(&buf, &needle);
+            }
+        }
+
+        // (2) Degenerate lengths: empty needle, needle longer than haystack, whole-string, single byte.
+        check(b"", b"");
+        check(b"abc", b"");
+        check(b"abc", b"abcd");
+        check(b"abc", b"abc");
+        check(b"a", b"a");
+        check(b"a", b"b");
+
+        // (3) Multibyte UTF-8 haystack/needles straddling boundaries (repeat to cross 64B blocks).
+        let s = "café みかん 🍎 résumé ｱｲｳｴｵ ".repeat(6);
+        for n in ["みかん", "🍎", "é", "café", "ｳｴ", "résumé", "🍏 nope", " "] {
+            check(s.as_bytes(), n.as_bytes());
+        }
+
+        // (4) Overlapping repeats and tail matches.
+        let run = vec![b'a'; 200];
+        check(&run, b"aa");
+        check(&run, b"aaa");
+        check(&run, &vec![b'a'; 200]); // needle == whole haystack
+        let mut tail = vec![b'x'; 300];
+        tail[297..300].copy_from_slice(b"END");
+        check(&tail, b"END");
+        check(&tail, b"ND");
+        check(&tail, b"D");
+
+        // (5) Multi-KB haystack: single match near the end, a miss, and a dense single byte.
+        let mut long = vec![b'z'; 8192];
+        long[8000..8005].copy_from_slice(b"MATCH");
+        check(&long, b"MATCH");
+        check(&long, b"ABSENT");
+        check(&long, b"z"); // dense: find -> 0, rfind -> 8191
+
+        // (6) Deterministic randomized cross-check over a 3-symbol alphabet (dependency-free
+        // xorshift). Short needles over a boundary-spanning haystack length maximize candidate
+        // density, exercising the SIMD verify path hard.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..3000 {
+            let hlen = (rng() % 130) as usize;
+            let nlen = (rng() % 6) as usize;
+            let h: Vec<u8> = (0..hlen).map(|_| b'a' + (rng() % 3) as u8).collect();
+            let n: Vec<u8> = (0..nlen).map(|_| b'a' + (rng() % 3) as u8).collect();
+            check(&h, &n);
+        }
+    }
+
     #[test]
     fn str_eq_ignore_case_matches_reference() {
         let eq = |a: &[u8], b: &[u8]| unsafe {
