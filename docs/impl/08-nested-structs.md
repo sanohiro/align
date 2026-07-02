@@ -86,8 +86,8 @@ double-free). Landed as built below. `crates/align_driver/tests/owned_structs.rs
   tracking, and the lambda-capture rejection). Reading an **owned field out** of a struct (`n := u.name`,
   a partial move) is deferred — a clean sema error.
 - **soundness (the Move-vs-Copy seams)**: a Move struct must never be silently copied. Rejected:
-  an **array** of a Move struct (`[User{…}]` / indexing → per-element drop is a later slice); a Move
-  struct as an **`Option`/`Result`/sum-type payload** (the aggregate's drop frees a flat `{ptr,len}`,
+  an **array** of a Move struct (`[User{…}]` / indexing → per-element drop; **lifted in Slice 4a**,
+  below); a Move struct as an **`Option`/`Result`/sum-type payload** (the aggregate's drop frees a flat `{ptr,len}`,
   not a struct). `box`/`soa`/tuple payloads were already scalar/primitive-only.
 - **MIR**: `null_moved_source` nulls a moved-out Move-struct slot; `DropFlagInit`/`Drop` already cover
   every `drop_local` (Move structs now qualify); struct-literal lowering stores each owned field
@@ -166,9 +166,17 @@ slices, but it reuses the Slice-3 Drop machinery). `crates/align_driver/tests/re
   sub-struct to a temp slot, and projects the remainder with the ordinary slot-field GEP
   (`Rvalue::Field`). Works for fixed and dynamic (`{ptr,len}`) struct arrays, any depth.
   `crates/align_driver/tests/struct_index.rs`.
+- **arrays of Move structs — Slice 4a DONE** (PR #279). A fixed array of a Move struct
+  (`[User{name: string}]`) is now allowed: `is_owned_droppable` includes a Move `StructArray`, so the
+  slot is null-initialised + drop-scheduled; codegen's `Stmt::Drop` on a `StructArray(sid, n)` frees
+  each element's owned fields via `drop_struct_fields` (unrolled), and `DropFlagInit` zeroes the whole
+  `[N x %Struct]`. Verified in LLVM (one free per element's owned buffer — no leak / double-free).
+  Construction + scalar-field read supported. `crates/align_driver/tests/owned_structs_arrays.rs`.
+  - **deferred to Slice 4b** (kept sound by clean rejections, not silent gaps): a **`mut`** Move-struct
+    array (reassign / element store need a per-element drop-of-old); reading an owned (`string`) field
+    **out** of an element (`n := us[i].name`); whole-array move (return / pass — array materialization).
 - **deferred**: nested element *write* (`arr[i].a.x = v` — `StoreElemField` is still depth-1); a soa
-  column over a *nested* field (the nested-soa-column layout is a design choice); and **arrays of Move
-  structs** (`[User{name}]` — needs per-element drop). Risk for those: medium–high.
+  column over a *nested* field (the nested-soa-column layout is a design choice). Risk: medium–high.
 
 ### Slice 5 — cross-module field types (`f: other.T`) — DONE
 The module B3 leftover. A struct field, enum payload, or generic-template member may name a `pub`
