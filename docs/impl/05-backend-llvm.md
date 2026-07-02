@@ -86,11 +86,13 @@ scatters each AoS element's fields into their columns (`StoreColumn`), yielding 
 until parsed), `transpose_to_soa`, then free the AoS temp. `str`/owned columns are a later slice.
 
 JSON field dispatch is O(1): codegen bakes a **compile-time perfect-hash table** from the (known)
-field names (`build_phf` finds a collision-free FNV-1a seed + power-of-two size; emits a `[i32]`
+field names (`build_phf` finds a collision-free seed + power-of-two size; emits a `[i32]`
 slot→index global beside the descriptor table), and the runtime hashes each key to a slot + one
 confirming name compare instead of a linear scan. `phf_len = 0` (empty/1-field, or no table found)
-falls back to the scan, so it is a pure speedup. The two hashes are pinned by paired tests so they
-can't drift. (Known-schema field-skip decode is deferred — the perf is already had by declaring a
+falls back to the scan, so it is a pure speedup. Both ends call the **one** canonical `wyhash` (the
+shared `align_hash` crate — same hash as the `hash64` builtin), so the codegen-built table and the
+runtime probe route a field name identically *by construction* (the paired pinned tests are now a
+canary against an accidental algorithm edit, not the mechanism that keeps them in sync). (Known-schema field-skip decode is deferred — the perf is already had by declaring a
 narrow struct, since unknown keys are skipped; see `open-questions.md`.)
 
 ---

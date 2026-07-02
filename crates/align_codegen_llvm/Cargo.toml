@@ -8,6 +8,7 @@ license.workspace = true
 align_mir = { path = "../align_mir" }
 align_sema = { path = "../align_sema" }
 align_ast = { path = "../align_ast" }
+align_hash = { path = "../align_hash" }
 inkwell = { version = "0.9", features = ["llvm19-1"] }
 # Add prefer-dynamic to the llvm-sys (191.x) that inkwell uses, forcing dynamic
 # linking against libLLVM-19.so (Debian llvm-19 lacks static components like libPolly.a).

@@ -91,6 +91,29 @@ fn json_decode_str_field_zero_copy() {
 }
 
 #[test]
+fn json_decode_phf_two_end_match_all_fields() {
+    if !backend_available() {
+        return;
+    }
+    // Cross-stage PHF byte-match guard (Gate 4). Eight fields force a compile-time perfect-hash
+    // table (codegen `build_phf`), and the JSON keys arrive in *reverse* order, so every name must
+    // be re-hashed at decode time (runtime `find_field`) and routed to its own slot. Both ends call
+    // the one `align_hash::wyhash`, so a byte- or seed-level divergence would misroute at least one
+    // field and change the printed sequence. Values 1..=8 are assigned per name (not per position),
+    // so a correct decode prints them in *declaration* order: 1,2,…,8.
+    let src = "import core.json\n\
+        Rec { alpha: i64, bravo: i64, charlie: i64, delta: i64, echo: i64, foxtrot: i64, golf: i64, hotel: i64 }\n\
+        fn parse(s: str) -> Result<Rec, Error> {\n  r: Rec := json.decode(s)?\n  return Ok(r)\n}\n\
+        fn main() -> Result<(), Error> {\n  \
+        r := parse(\"{\\\"hotel\\\":8,\\\"golf\\\":7,\\\"foxtrot\\\":6,\\\"echo\\\":5,\\\"delta\\\":4,\\\"charlie\\\":3,\\\"bravo\\\":2,\\\"alpha\\\":1}\")?\n  \
+        print(r.alpha)\n  print(r.bravo)\n  print(r.charlie)\n  print(r.delta)\n  \
+        print(r.echo)\n  print(r.foxtrot)\n  print(r.golf)\n  print(r.hotel)\n  return Ok(())\n}\n";
+    let out = build_and_run("json-phf-two-end", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n3\n4\n5\n6\n7\n8\n");
+}
+
+#[test]
 fn json_decode_skips_unknown_numeric_fields() {
     if !backend_available() {
         return;

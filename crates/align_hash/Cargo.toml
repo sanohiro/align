@@ -1,0 +1,11 @@
+[package]
+name = "align_hash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Align's one canonical non-cryptographic hash (wyhash final v3), shared verbatim by every
+# component that hashes bytes: the `hash64`/`hash128` builtins + `group_by`/`dict_encode` (in
+# align_runtime) and the compile-time JSON perfect-hash table (in align_codegen_llvm). A single
+# source of truth makes the codegen<->runtime PHF byte-match structural — the two ends call the
+# same `wyhash`, so they cannot drift.

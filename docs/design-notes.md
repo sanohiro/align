@@ -507,8 +507,9 @@ direction, not a v1 commitment, and it must not distort the language into a GPU-
 
 - **One way.** A public `hash64` forces a decision the `group_by` perf work kept deferring — *which*
   hash is Align's non-crypto hash (FxHash vs `ahash` vs hand-rolled AES). Picking one canonical mixer
-  and pointing every internal path (group_by, dict-encode, eventually the JSON PHF) at it is the
-  convergent answer; two "non-crypto hashes" would be the thing to avoid.
+  and pointing every internal path (group_by, dict-encode, the JSON PHF) at it is the convergent
+  answer; two "non-crypto hashes" would be the thing to avoid. Realized 2026-07-03: all three now
+  route through the one `align_hash::wyhash` (see `open-questions.md`), replacing FxHash / FNV-1a.
 - **Minimal-runtime identity over peak speed.** `ahash` (AES-NI) benched faster but adds a dependency
   and a cross-arch fallback to a runtime whose whole identity is small/zero-dep/predictable. `wyhash`
   is ~40 lines, dependency-free, strong-avalanche, and proven — the ideal fit. Speed that costs the

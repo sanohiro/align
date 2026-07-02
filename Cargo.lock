@@ -15,6 +15,7 @@ version = "0.1.0"
 dependencies = [
  "align_ast",
  "align_diag",
+ "align_hash",
  "align_lexer",
  "align_mir",
  "align_parser",
@@ -57,6 +58,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "align_hash"
+version = "0.1.0"
+
+[[package]]
 name = "align_lexer"
 version = "0.1.0"
 dependencies = [
@@ -90,6 +95,7 @@ dependencies = [
 name = "align_runtime"
 version = "0.1.0"
 dependencies = [
+ "align_hash",
  "memchr",
 ]
 
