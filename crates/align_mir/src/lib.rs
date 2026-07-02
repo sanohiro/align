@@ -2274,7 +2274,9 @@ fn proven_vec_load_align(b: &Builder, src: &hir::Expr, index: &hir::Expr, elem: 
     let idx = const_int_expr(index)?;
     let elem_bytes = ty_byte_size(elem)?;
     let byte_off = start.checked_add(idx)?.checked_mul(elem_bytes)?;
-    if byte_off >= 0 && byte_off % i128::from(n) == 0 {
+    // `n` is a validated power of two (so never 0), but guard the modulus anyway — a stray 0 here
+    // would panic, and the repo standard is defense-in-depth on divisor/width zero (cf. `w == 0`).
+    if n != 0 && byte_off >= 0 && byte_off % i128::from(n) == 0 {
         Some(n)
     } else {
         None

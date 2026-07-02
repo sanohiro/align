@@ -2132,11 +2132,12 @@ including over-aligned cases). Composes with `layout(C)` (matches C's `__attribu
 which also pads `sizeof`). A *fixed* `[S{…}, …]` array literal of an `align(N)` struct now compiles;
 `draft.md` §9 documents the stride rule.
 
-**DONE (binding form + aligned load, M6):** `align(N) data := […]` over a scalar fixed array
-over-aligns its stack storage — the prefix flows `ast::Stmt::Let.align` → `hir::Local.align` →
-`mir::Function.slot_align`, and codegen over-aligns the alloca via the same `max(declared, natural)`
-rule as the struct form (a non-array binding target is a clean error; `N` is the parser-validated
-power of two). The **aligned vector-load fast path** rides on it: a `data[..].load(i)` on a whole
+**DONE (binding form + aligned load, M6):** `align(N) data := […]` over a fixed array of a **numeric**
+scalar (int/float — the only element a vector load can target; `int` covers every `u8..u64` byte-buffer
+/ DMA case) over-aligns its stack storage — the prefix flows `ast::Stmt::Let.align` → `hir::Local.align`
+→ `mir::Function.slot_align`, and codegen over-aligns the alloca via the same `max(declared, natural)`
+rule as the struct form (a scalar, a `str`/`bool`/`char`-element array, or a struct array is a clean
+error; `N` is the parser-validated power of two). The **aligned vector-load fast path** rides on it: a `data[..].load(i)` on a whole
 borrow of the binding is emitted as an *aligned* `<n x T>` load when `(start+i)*sizeof(elem)` is a
 compile-time `N`-multiple (`proven_vec_load_align` in MIR, computed from the HIR receiver before it
 becomes an opaque slice temp). Everything else — a runtime/non-const index, a non-`N` offset, or a

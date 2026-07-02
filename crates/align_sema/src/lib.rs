@@ -4205,12 +4205,18 @@ impl<'a, 't> Checker<'a, 't> {
                     // type (`align(N) Name { … }`), not the binding, so reject it here.
                     if let Some(n) = *align {
                         let resolved = self.resolve(local_ty);
-                        if matches!(resolved, Ty::Array(_, _)) {
+                        // The binding form is the aligned-vector-load enabler, so it applies to a
+                        // fixed array of a **numeric** scalar (int/float) only — the sole element a
+                        // `vecN<T>` load can target. `int` covers every byte-buffer / DMA case
+                        // (`u8..u64`). A `str`/`bool`/`char`-element array (still a `Ty::Array`), a
+                        // struct array (`Ty::StructArray` — a struct's over-alignment is declared on
+                        // the type: `align(N) Name { … }`), or a scalar are all rejected.
+                        if matches!(resolved, Ty::Array(s, _) if matches!(s, Scalar::Int(_) | Scalar::Float(_))) {
                             self.locals[local as usize].align = Some(n);
                         } else if resolved != Ty::Error {
                             self.diags.error(
                                 format!(
-                                    "`align(N)` on a binding applies to a scalar fixed array, got {} (a struct's over-alignment is declared on the type: `align(N) Name {{ … }}`)",
+                                    "`align(N)` on a binding applies to a fixed array of a numeric scalar (int/float), got {} (a struct's over-alignment is declared on the type: `align(N) Name {{ … }}`)",
                                     ty_name(resolved)
                                 ),
                                 name.span,

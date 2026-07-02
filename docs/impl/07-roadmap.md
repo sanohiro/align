@@ -774,7 +774,8 @@ un-rushed tracks, not corner-cut): tuples / multi-value returns (for `partition`
   what C does); a fixed array literal of an `align(N)` struct now compiles, and the sema/codegen layout
   parity test covers over-aligned cases. **`align(N) data := […]` binding form DONE** — the prefix
   parses to `ast::Stmt::Let.align` → `hir::Local.align` → `mir::Function.slot_align`, and codegen
-  over-aligns the scalar-array alloca (`max(declared, natural)`, the same conservative rule). The
+  over-aligns the alloca of a *numeric* scalar array (int/float — a `str`/`bool`/`char`-element array
+  or a struct array is rejected) via `max(declared, natural)`, the same conservative rule. The
   **aligned-vector-load fast path** rides on it: `data[..].load(i)` on a whole borrow of an `align(N)`
   binding is emitted as an *aligned* `<n x T>` load whenever `(start+i)*sizeof(elem)` is a compile-time
   `N`-multiple (`proven_vec_load_align`, MIR); every other case (non-const index, a cross-function

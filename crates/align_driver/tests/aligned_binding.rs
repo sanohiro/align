@@ -119,9 +119,38 @@ fn no_align_binding_is_element_aligned_regression() {
 
 #[test]
 fn align_on_a_non_array_binding_is_rejected() {
-    // The binding form applies to a scalar fixed array only — a scalar target is a clean error.
+    // The binding form applies to a numeric scalar array only — a scalar target is a clean error.
     let src = "fn main() -> i32 {\n  align(64) x := 5\n  return x\n}\n";
     assert!(check_errs("aligned-bind-scalar", src));
+}
+
+#[test]
+fn align_on_a_struct_array_is_rejected() {
+    // A struct array is `Ty::StructArray`, not `Ty::Array` — and a struct's over-alignment is
+    // declared on the *type* (`align(N) Name { … }`), not the binding. Clean error either way.
+    let src = concat!(
+        "Pt { x: i32, y: i32 }\n",
+        "fn main() -> i32 {\n",
+        "  align(64) ps := [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }]\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(check_errs("aligned-bind-struct-arr", src));
+}
+
+#[test]
+fn align_on_a_str_array_is_rejected() {
+    // A `str`-element array is a `Ty::Array(Scalar::Str, _)` — a `Ty::Array`, but non-numeric, so
+    // it can't be a vector-load target. Rejected (the numeric-element restriction).
+    let src = "fn main() -> i32 {\n  align(64) ss := [\"a\", \"b\"]\n  return 0\n}\n";
+    assert!(check_errs("aligned-bind-str-arr", src));
+}
+
+#[test]
+fn align_on_a_bool_array_is_rejected() {
+    // A `bool`-element array is a `Ty::Array`, but non-numeric — no vector load targets it. Rejected.
+    let src = "fn main() -> i32 {\n  align(64) bs := [true, false, true, false]\n  return 0\n}\n";
+    assert!(check_errs("aligned-bind-bool-arr", src));
 }
 
 #[test]
