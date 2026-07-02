@@ -97,12 +97,36 @@ fn whole_array_reassignment_is_rejected() {
 }
 
 #[test]
-fn reading_owned_field_out_of_element_is_rejected() {
-    // Moving/reading an owned (`string`) field out of an array element is deferred (Slice 4b);
-    // scalar fields are fine.
+fn reading_string_field_of_element_as_a_view() {
+    if !backend_available() {
+        return;
+    }
+    // Slice 4b: reading a `string` field of an element (`us[i].name`) yields a borrowed `str` view —
+    // usable for `.len()`, comparison, `str` args, and `.clone()` for an owned copy. No ownership
+    // transfer (a runtime index can't track which element gave up its buffer).
+    let src = "\
+User { name: string, age: i64 }
+fn main() -> i32 {
+  us := [User{name: \"alice\".clone(), age: 1}, User{name: \"bobby\".clone(), age: 2}]
+  n := us[0].name.clone()
+  return (us[1].name.len() + n.len()) as i32
+}
+";
+    assert_eq!(build_and_run("ms-array-field-view", src).status.code(), Some(10)); // 5 + 5
+}
+
+#[test]
+fn string_field_view_of_element_cannot_escape_the_array() {
+    // The view borrows the array's storage (freed at the array's scope exit), so returning it — or
+    // storing it past the array's scope — is rejected; `.clone()` is the escape hatch.
     assert!(check_errs(
-        "ms-array-fieldout",
-        "User { name: string }\nfn main() -> i32 {\n  us := [User{name: \"a\".clone()}]\n  n := us[0].name\n  return 0\n}\n"
+        "ms-array-view-escape",
+        "User { name: string }\nfn bad() -> str {\n  us := [User{name: \"x\".clone()}]\n  return us[0].name\n}\nfn main() -> i32 = 0\n"
+    ));
+    // Binding it to an owned `string` (a move) is a type mismatch — use `.clone()`.
+    assert!(check_errs(
+        "ms-array-view-move",
+        "User { name: string }\nfn main() -> i32 {\n  us := [User{name: \"x\".clone()}]\n  n: string := us[0].name\n  return 0\n}\n"
     ));
 }
 

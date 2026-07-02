@@ -1869,7 +1869,10 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             .iter()
             .filter(|l| is_owned_droppable(l.ty, structs) || ty_tuple_is_move(l.ty, tuples))
             .map(|l| l.id)
-            .filter(|id| region.get(id).copied().unwrap_or(Region::Static) == Region::Static)
+            // Drop at function exit unless the value lives in an arena (region `Arena(k)`), which
+            // bulk-frees it. A `Static` (heap-owned) *or* `Frame`-region owned local (a Move-struct
+            // array, whose owned buffers die at this frame's exit — Slice 4b) is dropped here.
+            .filter(|id| !matches!(region.get(id).copied().unwrap_or(Region::Static), Region::Arena(_)))
             .collect();
         f.drop_locals = drops;
     }
@@ -2637,7 +2640,17 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(init, depth);
                 self.decl_depth.insert(*local, depth);
                 if self.tracks_region(init.ty) {
-                    let r = self.region_of(init, depth);
+                    let mut r = self.region_of(init, depth);
+                    // A Move-struct array is a *frame* slot whose elements' heap buffers are freed
+                    // when the array is dropped — at **function exit** (`drop_locals`), not by an
+                    // enclosing arena's bulk free (the buffers are `malloc`'d by `.clone()`, not arena
+                    // memory). So a `str` view read out of it (`us[i].name`, Slice 4b) is `Frame`-
+                    // region — it can't be *returned* (freed when the function returns), but it stays
+                    // valid for the rest of the frame. `region_of` would infer `Static` from the
+                    // individually heap-owned strings; cap it at `Frame` so the return check fires.
+                    if matches!(init.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs)) {
+                        r = r.shorter(Region::Frame);
+                    }
                     self.region.insert(*local, r);
                 }
                 if matches!(init.ty, Ty::Slice(_)) && self.slice_is_local(init) {
@@ -8858,10 +8871,18 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         }
-        // A leaf that is itself a Move type would copy without ownership transfer (the same
-        // double-free concern as scalar indexing). An indexable struct array has a non-Move element
-        // (arrays of Move structs are rejected), so every nested field is non-Move; guard anyway.
-        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder) || payload_is_move(leaf_ty) {
+        // An owned `string` leaf field is read as a **borrowed `str` view** into the element's
+        // buffer — zero-copy, region-tied to the array (it must not outlive it), never an ownership
+        // transfer (a runtime index can't track which element gave up its buffer). All read ops work
+        // (`us[i].name.len()`, `.clone()` for an owned copy, comparison, `str`-arg); `String` and
+        // `str` share the `{ptr,len}` layout, so the lowering is unchanged — only the type. (Slice 4b.)
+        if leaf_ty == Ty::String {
+            leaf_ty = Ty::Str;
+        }
+        // Any other Move leaf (a `box`/owned-collection/builder field) can't occur — struct fields are
+        // scalar / `str` / `string` / plain-struct only — but guard defensively against a copy-without-
+        // ownership-transfer double-free if that ever changes.
+        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder) || payload_is_move(leaf_ty) {
             self.diags.error(
                 format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
                 span,
