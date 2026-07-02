@@ -2079,7 +2079,10 @@ fn index_const(i: usize) -> Operand {
     Operand::Const(Const::Int(i as i128, i64_ty()))
 }
 
-/// Zero of a numeric scalar type (the identity for `sum`).
+/// Zero of a numeric scalar type (the additive identity for `sum`). `ty` is always `Int` or `Float`
+/// — sema's `check_array_sum` rejects a non-numeric `sum` element (`is_numeric()`, `align_sema`), so
+/// the `_` arm (which would produce a nonsensical `Int(0)` of a non-numeric type) is unreachable for
+/// a well-typed program; it stands in for every integer width.
 fn zero_of(ty: Ty) -> Operand {
     match ty {
         Ty::Float(_) => Operand::Const(Const::Float(0.0, ty)),
@@ -2105,8 +2108,13 @@ fn accumulate_mask(b: &mut Builder, mask: Option<Operand>, pred: Operand) -> Ope
     }
 }
 
-/// The seed for a `min` (`is_max = false`) / `max` (`is_max = true`) fold: the element type's
-/// largest / smallest value, so the first element always replaces it. Floats use ±infinity.
+/// The seed / masked-out identity for a `min` (`is_max = false`) / `max` (`is_max = true`) fold: the
+/// element type's largest / smallest value, so the first (surviving) element always replaces it and a
+/// masked-out lane can never win. Floats use ±infinity. `ty` is always `Int` or `Float` — sema's
+/// `check_array_min_max` rejects a non-numeric `min`/`max` element (`is_numeric()`, which excludes
+/// `Char`/`Bool` — `align_sema`), so both callers (the fold seed and the `where` mask-select) only
+/// ever pass a numeric type. The `_` arm is therefore unreachable for a well-typed program; it must
+/// not be relied on as a real identity for a non-numeric type (it would be a wrong `Int(0)`).
 fn extreme_of(ty: Ty, is_max: bool) -> Operand {
     match ty {
         Ty::Float(_) => {
@@ -2124,6 +2132,7 @@ fn extreme_of(ty: Ty, is_max: bool) -> Operand {
             };
             Operand::Const(Const::Int(v, ty))
         }
+        // Unreachable: sema guarantees a numeric element (see the doc comment).
         _ => Operand::Const(Const::Int(0, ty)),
     }
 }

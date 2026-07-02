@@ -53,14 +53,15 @@ fn fused_where_min_correct_under_o2() {
         return;
     }
     // The branchless min reduction (`select` + `llvm.smin` idiom) must survive -O2 vectorization
-    // (it lowers to `pminsd` over a `pcmpgtd` mask — verified via objdump) and still be correct.
-    // keep > 2 of [5,1,8,2,9,3] → {5,8,9,3}; min = 3.
+    // (over a `slice<i32>` it lowers to `pminsd` over a `pcmpgtd` mask — verified via objdump) and
+    // still be correct. keep > 2 of [5,1,8,2,9,3] → {5,8,9,3}; min = 3.
+    // The literal is passed straight to the `slice<i32>` param so its elements infer i32 (a
+    // `let`-bound array literal would default to i64).
     let src = concat!(
-        "fn k(x: i64) -> bool = x > 2\n",
-        "fn run(xs: slice<i64>) -> i64 = xs.where(k).min()\n",
+        "fn k(x: i32) -> bool = x > 2\n",
+        "fn run(xs: slice<i32>) -> i32 = xs.where(k).min()\n",
         "fn main() -> i32 {\n",
-        "  a := [5, 1, 8, 2, 9, 3]\n",
-        "  return run(a) as i32\n",
+        "  return run([5, 1, 8, 2, 9, 3])\n",
         "}\n",
     );
     assert_eq!(build_and_run("opt-where-min", src).status.code(), Some(3));

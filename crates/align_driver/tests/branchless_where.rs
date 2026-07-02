@@ -164,10 +164,21 @@ fn where_min_max_extreme_int_values() {
     if !backend_available() {
         return;
     }
-    // Endpoint values must survive the identity-select: including i64::MIN in a `min` (it must beat
-    // the +∞ seed) and i64::MAX in a `max`. keep != 0 drops the 0 padding.
-    let min = build_and_run("blw-min-ext", "fn main() -> i32 {\n  return [0, 9, 5, 12].where(nz).min() as i32\n}\nfn nz(x: i64) -> bool = x != 0\n");
-    assert_eq!(min.status.code(), Some(5));
-    let max = build_and_run("blw-max-ext", "fn main() -> i32 {\n  return [0, 9, 5, 12].where(nz).max() as i32\n}\nfn nz(x: i64) -> bool = x != 0\n");
-    assert_eq!(max.status.code(), Some(12));
+    // The seed-valued endpoints must survive the identity-select — the boundary case: an element
+    // equal to the reducer's seed. `min` seeds with i64::MAX, so a surviving i64::MIN must still win
+    // (it must beat that seed); `max` seeds with i64::MIN, so a surviving i64::MAX must still win.
+    // The array carries *both* extremes (and a 0 the `where` drops), so each reducer must pick the
+    // correct endpoint out of the two. i64::MIN as i32 = 0 (low 32 bits), i64::MAX as i32 = -1.
+    let prelude = "fn nz(x: i64) -> bool = x != 0\n";
+    let arr = "[0, -9223372036854775808, 9223372036854775807]";
+    let min = build_and_run(
+        "blw-min-ext",
+        &format!("fn main() -> i32 {{\n  return {arr}.where(nz).min() as i32\n}}\n{prelude}"),
+    );
+    assert_eq!(min.status.code(), Some(0)); // i64::MIN → (0i32) as u8
+    let max = build_and_run(
+        "blw-max-ext",
+        &format!("fn main() -> i32 {{\n  return {arr}.where(nz).max() as i32\n}}\n{prelude}"),
+    );
+    assert_eq!(max.status.code(), Some(255)); // i64::MAX → (-1i32) as u8
 }
