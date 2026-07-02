@@ -580,6 +580,8 @@ fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
+        // A fixed array of a Move struct — dropped element-by-element (Slice 4a).
+        || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs))
 }
 
 impl Ty {
@@ -4005,6 +4007,17 @@ impl<'a, 't> Checker<'a, 't> {
                         },
                     };
                     let local_ty = ann.unwrap_or(init.ty);
+                    // Slice 4a: a Move-struct array (owned fields, per-element drop) is **immutable**
+                    // for now — mutating it (reassign / element store) needs a per-element drop of the
+                    // overwritten value, deferred to Slice 4b. Reject a `mut` binding cleanly so those
+                    // paths (which would otherwise hit array-materialization gaps) stay unreachable.
+                    if *is_mut && matches!(local_ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs)) {
+                        let Ty::StructArray(sid, _) = local_ty else { unreachable!() };
+                        self.diags.error(
+                            format!("a `mut` array of the Move struct '{}' is not supported yet (mutating it needs per-element drop-of-old — a later slice); bind it immutably", self.structs[sid as usize].name),
+                            name.span,
+                        );
+                    }
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     // Record slice provenance (`s: slice<T> := a` → `s` borrows `a`'s buffer) so
                     // the `out` no-alias check can see through slice variables.
@@ -6531,13 +6544,6 @@ impl<'a, 't> Checker<'a, 't> {
                 // An array of a **Move struct** (one that owns a `string`/owned field) needs
                 // per-element drop and ownership-aware indexing — deferred to the arrays×nesting
                 // slice. Reject cleanly so the owned elements aren't silently leaked / double-freed.
-                Some(id) if struct_is_move(id, self.structs) => {
-                    self.diags.error(
-                        format!("an array of the Move struct '{}' is not supported yet (owned-struct elements need per-element drop — a later slice)", self.structs[id as usize].name),
-                        span,
-                    );
-                    Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span }
-                }
                 // An `align(N)` struct element is not honored in an array yet (stride padding deferred).
                 Some(id) if self.structs[id as usize].align.is_some() => {
                     self.diags.error(

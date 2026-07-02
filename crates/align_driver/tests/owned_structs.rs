@@ -119,12 +119,8 @@ fn recursive_struct_still_rejected() {
 fn move_struct_in_unsupported_containers_rejected() {
     // A Move struct can't yet live where the container's drop is scalar-shaped and wouldn't recurse
     // into the struct's owned fields (leak / double-free). Each must be a clean sema error.
+    // (A fixed *array* of Move structs is now supported — Slice 4a — see `owned_structs_arrays.rs`.)
     let u = "User { name: string, age: i64 }\n";
-    // An array of Move structs (per-element drop = a later slice).
-    assert!(check_errs(
-        "ms-array",
-        &format!("{u}fn main() -> i32 {{\n  us := [User{{name: \"a\".clone(), age: 1}}]\n  return 0\n}}\n")
-    ));
     // `Option` / `Result` / user-enum payloads (their drop frees a flat `{ptr,len}`, not a struct).
     assert!(check_errs("ms-option", &format!("{u}fn f() -> Option<User> = Some(User{{name: \"a\".clone(), age: 1}})\nfn main() -> i32 = 0\n")));
     assert!(check_errs("ms-result", &format!("{u}fn f() -> Result<User, Error> = Ok(User{{name: \"a\".clone(), age: 1}})\nfn main() -> i32 = 0\n")));

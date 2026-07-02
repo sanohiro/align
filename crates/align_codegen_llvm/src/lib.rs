@@ -1709,6 +1709,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let z: BasicValueEnum = if ty == Ty::Builder || ty == Ty::BufWriter {
                         // A builder / buffered-writer slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
+                    } else if matches!(ty, Ty::StructArray(..)) {
+                        // A fixed array of a Move struct: zero the whole `[N x %Struct]` so every
+                        // element's owned fields read {null,0} until constructed — its per-element
+                        // `Drop` then frees nulls on an unwritten element (no-op). (Slice 4a.)
+                        self.llvm_type(ty).into_array_type().const_zero().into()
                     } else if payload_is_move(ty) || matches!(ty, Ty::Tuple(_) | Ty::Struct(_) | Ty::DictEncoded(..)) {
                         // Zero the whole aggregate so each owned field/element reads {null,0}. A Move
                         // struct is zeroed wholesale here; its recursive `Drop` then frees nulls on an
@@ -1819,6 +1824,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // recursing into nested Move-struct fields (null-safe — a moved-out struct was
                         // zeroed, and Copy fields are skipped).
                         self.drop_struct_fields(self.slots[slot], sid)?;
+                    } else if let Ty::StructArray(sid, n) = ty {
+                        // A fixed array of a Move struct: drop each element's owned fields in turn
+                        // (null-safe — the slot was zeroed by `DropFlagInit`). Unrolled: `n` is a
+                        // small compile-time constant. (Slice 4a.)
+                        let arr_ty = self.llvm_type(ty);
+                        let zero = self.ctx.i64_type().const_zero();
+                        for i in 0..n {
+                            let idx = self.ctx.i64_type().const_int(i as u64, false);
+                            let elem_ptr = unsafe {
+                                self.builder
+                                    .build_in_bounds_gep(arr_ty, self.slots[slot], &[zero, idx], "dropelem")
+                                    .map_err(|e| self.err(e))?
+                            };
+                            self.drop_struct_fields(elem_ptr, sid)?;
+                        }
                     } else if let Ty::DictEncoded(..) = ty {
                         // A `dict_encoded` value owns its `ids` (field 1) + `dict` (field 2) buffers;
                         // free both (null-safe). Field 0 (`source`) borrows the AoS — never freed.
@@ -3579,6 +3599,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 Ty::Struct(nid) if struct_is_move(nid, self.structs) => {
                     let fp = self.builder.build_struct_gep(st, base, i, "dropnest").map_err(|e| self.err(e))?;
                     self.drop_struct_fields(fp, nid)?;
+                }
+                // A nested Move-struct *array* field — drop each element (defensive: struct fields
+                // reject array types today — `is_field_ok` — so this is unreachable, but keeping the
+                // owned case here means a future array-valued field can't silently fail-open and leak).
+                Ty::StructArray(eid, n) if struct_is_move(eid, self.structs) => {
+                    let fp = self.builder.build_struct_gep(st, base, i, "dropnestarr").map_err(|e| self.err(e))?;
+                    let arr_ty = self.struct_types[eid as usize].array_type(n);
+                    let zero = self.ctx.i64_type().const_zero();
+                    for e in 0..n {
+                        let idx = self.ctx.i64_type().const_int(e as u64, false);
+                        let ep = unsafe {
+                            self.builder.build_in_bounds_gep(arr_ty, fp, &[zero, idx], "dropnestel").map_err(|e| self.err(e))?
+                        };
+                        self.drop_struct_fields(ep, eid)?;
+                    }
                 }
                 _ => {}
             }
