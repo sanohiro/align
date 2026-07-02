@@ -3600,6 +3600,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let fp = self.builder.build_struct_gep(st, base, i, "dropnest").map_err(|e| self.err(e))?;
                     self.drop_struct_fields(fp, nid)?;
                 }
+                // A nested Move-struct *array* field — drop each element (defensive: struct fields
+                // reject array types today — `is_field_ok` — so this is unreachable, but keeping the
+                // owned case here means a future array-valued field can't silently fail-open and leak).
+                Ty::StructArray(eid, n) if struct_is_move(eid, self.structs) => {
+                    let fp = self.builder.build_struct_gep(st, base, i, "dropnestarr").map_err(|e| self.err(e))?;
+                    let arr_ty = self.struct_types[eid as usize].array_type(n);
+                    let zero = self.ctx.i64_type().const_zero();
+                    for e in 0..n {
+                        let idx = self.ctx.i64_type().const_int(e as u64, false);
+                        let ep = unsafe {
+                            self.builder.build_in_bounds_gep(arr_ty, fp, &[zero, idx], "dropnestel").map_err(|e| self.err(e))?
+                        };
+                        self.drop_struct_fields(ep, eid)?;
+                    }
+                }
                 _ => {}
             }
         }
