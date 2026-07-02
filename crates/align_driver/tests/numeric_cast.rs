@@ -130,3 +130,48 @@ fn cast_char_to_float_rejected() {
     let src = "fn main() -> i32 {\n  c: char := 'A'\n  f: f64 := c as f64\n  return 0\n}\n";
     assert!(check_errs("cast-charfloat", src));
 }
+
+// --- Audit 1-1: unary `-` on an unsigned type is rejected (the sign would be silently lost:
+//     `-5` typed `u32` prints `4294967291`). Only unary negation is caught — the defined u32
+//     wrapping subtraction and an explicit `as u32` conversion are unchanged. ---
+
+#[test]
+fn negate_unsigned_literal_is_rejected() {
+    assert!(check_errs("neg-u32-annot", "fn main() -> i32 {\n  x: u32 := -5\n  print(x)\n  return 0\n}\n"));
+}
+
+#[test]
+fn negate_into_unsigned_param_is_rejected() {
+    assert!(check_errs("neg-u32-param", "fn g(x: u32) -> u32 = x\nfn main() -> i32 {\n  print(g(-5))\n  return 0\n}\n"));
+}
+
+#[test]
+fn negate_signed_is_fine() {
+    if !backend_available() {
+        return;
+    }
+    // `-5` at a signed type prints `-5` — the whole point (exit code carries the low byte).
+    let out = build_and_run("neg-i32", "fn main() -> i32 {\n  x: i32 := -5\n  return 0 - x\n}\n");
+    assert_eq!(out.status.code(), Some(5));
+}
+
+#[test]
+fn explicit_cast_of_negative_to_unsigned_is_fine() {
+    if !backend_available() {
+        return;
+    }
+    // An *explicit* `(-5) as u32` is the sanctioned conversion (4294967291) — not caught, because the
+    // inner `-5` is signed and only the cast changes its type. Round-trip back to a small i32.
+    let out = build_and_run("neg-cast", "fn main() -> i32 {\n  x: i32 := -5\n  y := x as u32\n  return (y as i64 - 4294967290) as i32\n}\n");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn unsigned_wrapping_subtraction_still_allowed() {
+    if !backend_available() {
+        return;
+    }
+    // `a - b` on `u32` is defined two's-complement wrap (a Binary op, not unary negation) — allowed.
+    let out = build_and_run("u32-wrap-sub", "fn main() -> i32 {\n  a: u32 := 6\n  b: u32 := 1\n  return (a - b) as i32\n}\n");
+    assert_eq!(out.status.code(), Some(5));
+}
