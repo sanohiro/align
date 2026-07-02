@@ -5,7 +5,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-06-29._
+_Last updated: 2026-07-02._
 
 ## Setup on the new machine
 
@@ -14,7 +14,7 @@ git clone https://github.com/sanohiro/align            # ideally into /home/<use
 cd align
 # Toolchain: Rust 1.96 + LLVM 19 (inkwell llvm19-1). Debian: apt install llvm-19 llvm-19-dev
 # .cargo/config.toml already sets LLVM_SYS_191_PREFER_DYNAMIC=1 (Debian llvm-19 is shared-only).
-cargo build && cargo test       # expect all green (~676 tests)
+cargo build && cargo test       # expect all green (~940 tests)
 ```
 
 The compiler is `./target/debug/alignc` (or `./target/release/alignc` after `--release`) — not on

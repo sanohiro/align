@@ -1608,6 +1608,37 @@ elements) — bind it first. A Copy element reads fine in any position. The firs
 ### Type-argument syntax: no turbofish (expression position)
 **Decision (2026-06-22): there is no expression-position type-argument syntax.** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context, including back through `?` (`u: User := json.decode(d)?`). When neither supplies the type it is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. Rationale: keeps "one way" (the binding annotation is the single place a type is written), removes the `<` vs comparison parse ambiguity at expression position outright (the reason Go uses `f[T](x)` and Rust `::<>`), and is friendlier to generate. The headline case — `draft.md` §19's `json.decode<array<User>>(data)` — therefore becomes `users: array<User> := json.decode(data)?`; the checker already takes `decode`'s target from the expected `Result<T,_>` and emits an annotate-the-binding error otherwise (no code change needed — only the spec/comment caught up). **Residual (still open):** a *schema-selector* builtin whose type appears in neither arguments nor result (`json.validate<T>`, `json.field_table<T>`); narrow, unimplemented, and may fold into `decode`. This rule scales to general generics (below): a return-only type parameter is supplied by the binding annotation, never a turbofish. Record: `impl/02-frontend.md` §8 (generics `<` vs comparison), `draft.md` §18 (core.json), `language-spec.md` (JSON).
 
+### External soundness audit — multi-agent (2026-07-02, VERIFIED; fixes in progress)
+
+A 7-agent audit on another machine (frontend / sema-types / sema-flow / MIR+codegen / runtime+driver / docs / perf), cut short by a token budget. Every finding below was **reproduced by compiling + running** on this machine (Linux/glibc) before any fix. The unifying diagnosis (audit §6.1, confirmed): the escape / effect / move analyses are **per-`ExprKind` hand-written traversals with fail-open defaults** (`_ => Region::Static`, `_ => false`) — every hole was a syntax node someone forgot to add an arm for. `If` was handled; `Match` (and the fn-value / element-assign forms) repeatedly were not.
+
+**Confirmed soundness holes — FIXED (in the analysis-coverage sema PR #270, not this docs-only entry):**
+- **1-2** arena `str` escapes through a `match` arm (`region_of` lacked `Match`).
+- **NEW-1** (found here) arena `str` escapes through an indirect call `g(t)` (`region_of` lacked `CallFnValue` — the fn-value sibling of 1-4).
+- **1-5** `return xs[0..2]` over a local array returns a dangling slice (`slice_is_local` lacked `SliceRange`; fixed-array locals weren't marked frame-local).
+- **1-6** arena `str` stored into an outer array element via `arr[i] = t` (element/field stores skipped the region check that `Assign`/`AssignField` do).
+- **1-4** an impure fn laundered through a fn value (`g := loud; g(x)`) bypassed `par_map` purity (`EffectScan` had `FnValue(_) => {}`).
+- **NEW-3** (found here) a *false* "use of moved value" when mutually-exclusive `match` arms consume the same value (`MoveCheck` shared one moved-set across arms instead of clone+join like `if`/`else`).
+
+**Confirmed — still open (tracked in the Open section / their milestones):**
+- **1-3** `arena { mut xs := […].to_array(); xs = make() }` double-frees. Reproduced as `free(): double free detected in tcache` once the arrays are large enough to trip glibc's tcache (a small case survives silently; macOS aborts immediately). The `to_array` arena-bump result and the reassignment `drop_old` / arena bulk-free don't reconcile. **Highest-priority remaining bug.**
+- **3-1** `&&` / `||` are **not short-circuit** — MIR lowers them as a strict `Rvalue::Bin`, so `i < len && arr[i]` still evaluates `arr[i]` and can trap. (Confirms the audit's "requires-verification" item.)
+- **2-1** a type-annotated `let` at an `if`-body head (`if flag { x: i32 := 5 … }`) misparses as a struct literal (no `no_struct_literal` context flag on the condition).
+- **2-2** `x as u32 < 5` won't parse (`parse_type` greedily eats `<` as generic args; a cast target is always a concrete primitive).
+- **2-3** two statements with no separator (`{ x := 1 return x }`) are silently accepted (weak statement-boundary check).
+- **2-4** deep nesting (50k parens / 100k unary `-`) overflows the parser stack (exit 134); needs a recursion-depth limit that errors.
+- **2-5..2-8** diagnostic-quality: `1e999` silently becomes `inf` (no diagnostic); a non-ASCII identifier reports byte-wise garbage; the internal `enum#0` leaks into a type-mismatch message instead of the source name; a trailing `\` before EOF emits a doubled/misleading error.
+
+**Not reproduced:** **1-1** (a signed `i32` `-5` printed as `4294967291`) — the audit lost its minimal repro, and straightforward negatives (`-5`, subtraction, `i8`/`i16`, args, `as`) all print correctly here. Left open as "investigate; may be a specific inference path"; a golden-MIR snapshot test would catch a regression of this shape (exit-code integration tests can't localize a value corruption).
+
+**Structural follow-ups (design-level, from audit §6):**
+- Move escape/region checking off per-`ExprKind` enumeration onto a **MIR dataflow pass** (like `MoveCheck`'s shape), so a new syntax node can't silently open a hole. This is the `align-self-review` "new IR variant skips an analysis pass" gate recurring at the *language-design* level. Until then, prefer **failing closed** (a region-tracked value reaching an unhandled node → conservative shortest region / error, not `Static`).
+- Record purity as an **effect bit on the function type**, not a name-based propagation result, so fn-value / closure / FFI-pointer indirection can't dodge it (keeps "purity is inferred"; only stores the result in the type).
+- A spec table of **value-carrying control structures** (block / `if` / `match` / `else`-unwrap / `?`): for each, how the region is composed and how an owned value moves/drops — with 1:1 tests. Every hole above is a blank cell in that table.
+- Stand up **fuzzing** (parser / JSON / fmt, with a depth cap) and a **negative-test corpus** (minimal must-be-rejected programs per escape/move/purity rule — the audit repros are the seed; `tests/analysis_coverage.rs` is the first deposit).
+
+Record: `crates/align_sema` (the analyses), `tests/analysis_coverage.rs`, `align-self-review` Gate 1.
+
 ---
 
 ## Open (to be decided)

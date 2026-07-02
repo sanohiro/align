@@ -10,17 +10,22 @@ compiler (`alignc`) is being implemented in Rust under `crates/`.
 
 ## Status
 
-Milestones **M0–M3** are complete: programs flow end to end through
-`lexer → parser → sema → MIR → LLVM → executable`. M1 adds functions and calls,
-`if`/comparisons/`bool`, `mut` reassignment, structs (declaration, literal,
-field access), the full primitive set (`i8..u64`, `f32`/`f64`, `char`), and a
-builtin `print` wired to the runtime. M2 adds `Option<T>` with `else`-unwrap,
-`Result<T, E>` with `?`, and a `Result`-returning `main` (mapped to an exit code).
-M3 adds the memory model: `arena {}` regions with bulk free, the heap box
-`box<T>` (`heap.new`/`.get()`/`.clone()`), move / use-after-move checking, and
-arena escape checking. M4 (core slice) adds fixed-length arrays and the fused
-pipeline `[...].map(f).where(p).sum()` — lowered to a single loop with no
-intermediate arrays.
+Milestones **M0–M5** are complete and **M6–M8 are well underway**: programs
+flow end to end through `lexer → parser → sema → MIR → LLVM → executable`.
+M1 adds functions and calls, `if`/comparisons/`bool`, `mut` reassignment,
+structs (declaration, literal, field access), the full primitive set
+(`i8..u64`, `f32`/`f64`, `char`), and a builtin `print`. M2 adds `Option<T>`
+with `else`-unwrap, `Result<T, E>` with `?`, and a `Result`-returning `main`
+(mapped to an exit code). M3 adds the memory model: `arena {}` regions with
+bulk free, the heap box `box<T>`, and move / use-after-move / arena-escape
+checking. M4 (array-processing core) adds arrays/slices and fused pipelines
+(`map`/`where`/`reduce`/`scan`/`sort`/`partition`/`to_array`) lowered to a
+single loop with no intermediate arrays. M5 adds strings (`str`/`string`/
+builder), `template`, and `json.encode`/`decode`, on a borrow-region + owned-
+heap memory model (v2). Beyond the core: **M6** SIMD (`vecN<T>`/`mask`, `dot`,
+horizontal reductions) and cache-optimal `soa<T>` + columnar `group_by`;
+**M7** `par_map`/`chunks` + inferred purity (`task_group` closures remain);
+**M8** `unsafe {}` + `raw.*` and `extern "C"` FFI v1, plus the first lints.
 
 ```sh
 cargo build
