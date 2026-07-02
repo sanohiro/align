@@ -119,3 +119,30 @@ fn reassign_consuming_runtime_no_double_free() {
     let src = "fn id(s: string) -> string = s\nfn main() -> i32 {\n  mut s := \"aaaa\".clone()\n  s = id(s)\n  return s.len() as i32\n}\n";
     assert_eq!(build_and_run("reassign-consume", src).status.code(), Some(4));
 }
+
+#[test]
+fn arena_owned_array_reassign_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // 1-3: `mut xs := […].to_array()` allocated in an arena, reassigned to another owned array.
+    // The overwritten value is arena-bump memory (bulk-freed by the arena), so it must NOT get a
+    // reassign-drop — freeing an interior arena pointer individually corrupts the allocator
+    // (the observed `double free detected in tcache`). Running to completion proves it doesn't.
+    let src = "fn id64(x: i64) -> i64 = x\n\
+fn make() -> array<i64> {\n  ys := [7, 8, 9, 10, 11, 12, 13, 14].map(id64).to_array()\n  return ys\n}\n\
+fn main() -> i32 {\n  arena {\n    mut xs := [1, 2, 3, 4, 5, 6, 7, 8].map(id64).to_array()\n    xs = make()\n    xs = make()\n    print(xs[0])\n  }\n  return 0\n}\n";
+    assert_eq!(build_and_run("arena-reassign", src).status.code(), Some(0));
+}
+
+#[test]
+fn arena_owned_array_reassign_suppresses_reassign_drop_in_mir() {
+    // The two reassigns of the arena-allocated `xs` must emit no reassign-drop (arena memory is
+    // bulk-freed); only the single exit drop of the final, heap-owned value remains.
+    let text = mir_text(
+        "fn id64(x: i64) -> i64 = x\n\
+fn make() -> array<i64> {\n  ys := [7, 8, 9].map(id64).to_array()\n  return ys\n}\n\
+fn main() -> i32 {\n  arena {\n    mut xs := [1, 2].map(id64).to_array()\n    xs = make()\n    print(xs[0])\n  }\n  return 0\n}\n",
+    );
+    assert_eq!(count_slot_drops(&text, "_0"), 1, "only the exit drop, no reassign-drop:\n{text}");
+}
