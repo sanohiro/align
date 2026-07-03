@@ -277,6 +277,14 @@ pipeline walks memory sequentially (no random jumps), and `where` / conditional 
 branchless (mask + `select`, not a per-element `if`) — so the predictable shape, not hand-tuning, is
 what keeps hot loops vectorizable.
 
+**Branchless is for vectorization, not because branches are slow (recorded 2026-07-04, external
+design-note review adoption).** Modern branch predictors (TAGE-class) make well-predicted branches
+near-free, and scalar CMOV chains create data dependencies that can be *slower* than branching.
+Align's branchless `where` exists because the select-form enables SIMD (a lane-masked reduction), not
+as a scalar-branch-avoidance dogma — don't cargo-cult branchless into scalar std code. The one
+exception where branchless is mandatory is `std.crypto`'s constant-time requirement (see
+`open-questions.md`).
+
 SIMD lives in two layers, and the split is deliberate. **`vecN<T>` / `maskN<T>` are an escape hatch**
 for hand-tuned fixed-width register kernels (a dot product, an FMA loop, a FIR filter) — they are
 *always* a fixed size, so they can be a `Copy` register value with a constant `sizeof` and constant

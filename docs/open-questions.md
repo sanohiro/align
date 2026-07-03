@@ -63,6 +63,8 @@ The roadmap pairs these two as "#6", but they split cleanly by their prerequisit
   ruling above). The `bitset` type is "large, SIMD-friendly", so its layout *is* the M6 `vec`/`mask`/
   SoA/`align(N)` model. Designing it before that model exists is exactly the premature design that
   ruling parked. → not built in #6; it rides M6 (roadmap #7). Nothing to do now but record the split.
+  **Reference pointer (recorded 2026-07-04, external design-note review adoption):** Roaring Bitmaps
+  (compressed/sparse bitset representation) as prior art when `core.bitset`'s design resumes.
 
 - **`core.hash` is the buildable half of #6, and it is the forcing function that settles the
   long-deferred "canonical non-crypto hash" question** (raised in the `group_by` perf notes: FxHash
@@ -191,6 +193,9 @@ Decomposition: **④a** scope + the task region + `spawn` (fresh region env per 
 - **`Task<R>` becomes a pointer to a result slot** in the `task_group` region (no longer the bare `R`). The region (an arena-like bump allocator owned by the scope, freed at scope end) holds, per `spawn`: (a) a **fresh env** — the captures memcpy-snapshotted out of the frame, so concurrent/deferred tasks never share the one hoisted frame slot; (b) a **result slot** sized for `R`.
 - **`spawn`** lowers to: alloc env + slot in the region, copy captures into env, register a per-spawn **trampoline** `fn(env, slot) { *slot = closure(env) }` (generated — it knows `R` for the typed store), and hand `(trampoline, env, slot)` to the runtime. The `Task<R>` value is the slot pointer.
 - **Runtime IF** (`align_rt_tg_*`): `begin() -> *tg`; `alloc(*tg, size) -> *u8` (bump); `register(*tg, tramp, env, slot)` (④b-1) → in ④b-2 `register` instead spawns a `std::thread` running `tramp(env, slot)`; `wait(*tg)` runs/joins all; `end(*tg)` frees the region. ④b-1 keeps it **deferred-sequential** (run at `wait`); ④b-2 swaps the run-loop for thread-per-task + join (reusing `par_map`'s threading).
+  **Reference pointer (concurrent arena, Future, recorded 2026-07-04, external design-note review
+  adoption):** Mimalloc free-list sharding as prior art if/when this region's bump allocator needs to
+  serve concurrent `spawn`/`alloc` calls across the ④b-2 real threads without a single global lock.
 - **Owned `R` (`string`/`array<T>`)** is the subtle case: the slot holds the owned `{ptr,len}`. `get()` (consuming for a Move `R`, per ④a) moves it out — afterward the caller owns the buffer, while the slot itself stays in the region until the whole region is reclaimed at scope end. An **un-`get()`'d** owned-`R` task must still free its buffer before the region drops: codegen emits a conditional drop of each owned-`R` task at scope end, gated by a **drop flag cleared by `get()`** (the existing drop-flag-via-null pattern, applied to the slot). (Alternative under consideration: make `get()` mandatory for an owned-`R` task — a must-consume rule — so the buffer always moves out and no in-region drop is needed; decide in ④b-1.) Copy `R` needs none of this (the region free reclaims everything).
 
 **④c-2 plan — the `wait()?` error boundary (the last task_group slice).** A task may **fail**: its closure returns `Result<R, Error>`. `wait()?` joins all, and if any task failed, propagates **an** `Err` out of the enclosing function (with parallel tasks there is no deterministic "first" — any failing task's error surfaces; documented). After `wait()?`, `get()` yields the `Ok` `R`. Implementation, in order:
@@ -1098,6 +1103,11 @@ the return type first** — done here.
   (one `malloc` per call, amortized over all elements) to stay self-contained + unit-testable;
   allocating the table in the caller's arena (to drop that one `malloc` when `group_by` runs in a hot
   loop) is a **refinement** for once the wiring threads an arena — secondary to the aggregate itself.
+  **Reference pointers (dict/std.collections, recorded 2026-07-04, external design-note review
+  adoption; the string rail already rides `std::collections::HashMap`'s hashbrown Swiss table
+  indirectly — this integer rail's linear-probe table is the replacement candidate):** Swiss
+  Tables/F14 (SIMD metadata probing) + Eytzinger branchless search + FAST + AMAC prefetch chaining +
+  cache-oblivious algorithms + the 7-dimensional hashing-scheme analysis (L1-resident metadata).
 - **First slice scope:** `i64` key + `i64` value + `sum`, source = `soa<Struct>` or `array<Struct>`
   (read the key + value columns). Output `(array<i64>, array<i64>)`. Requires an arena (the hash
   table is arena-allocated, like `to_soa`); the result arrays are owned (heap, `Drop`-freed) so they
@@ -1232,7 +1242,8 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     io.stdout.write(builder)` / a buffered writer (the no-`to_string()` API is already right, make it
     standard). Std should be `read_file_view`/`mmap`, `json.decode(view)`, `json.write(out, value)`,
     `csv.scan(view)`, `io.copy`/`writev` — never materialize an owned string in the hot path. (Std
-    layer — after core; records the *direction*.)
+    layer — after core; records the *direction*.) Reference pointer (csv, recorded 2026-07-04,
+    external design-note review adoption): simdcsv-style structural scan.
   - **Two-pass JSON→SoA (count then direct column fill) — SHIPPED (#228, 2026-06-29).** The eventual
     form of json→soa landed: a structural count pass for N, allocate columns, then fill columns
     directly (`align_rt_json_decode_soa`) — dropping the AoS intermediate + transpose of the earlier
@@ -1678,6 +1689,8 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
     high-cardinality primitive keys → sort-group for very-high-cardinality or pre-sorted, with
     diagnostics ("key is a dense integer range — use dense group_by"; "string key in a hot group_by —
     dictionary id"). Extends the Dictionary-id rail + SwissTable bullets with the sort-group third leg.
+    **Reference pointer (sort, recorded 2026-07-04, external design-note review adoption):** VQSort
+    (VLA-portable vectorized sort) as prior art for a vectorized sort-group implementation.
   - **Codex's handed-over priority order** (for sequencing, not commitment): (1) builder inline/LTO,
     (2) JSON SIMD structural scan + projected/column decode, (3) dense-id/dictionary group_by, (4)
     `core.string` byte-first APIs + runtime CPU dispatch, (5) buffered/view-first I/O *(buffered stdout
@@ -2074,6 +2087,7 @@ Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`
 **The last big language-core gap.** Today `module`/`import` are *parsed* into `File.module`/`File.imports` but otherwise **ignored** (single-file compilation; `core.*`/`std.*` are compiler builtins). Decided:
 
 - **core stays builtin (language-intrinsic), and so does std for now.** core members are intrinsically compiler-magic — `core.json`/`core.template` need compiler-generated static field tables (`non-goals.md`: "compile-time story is builtin-driven static data only"), `map`/`where`/`reduce` fuse into one MIR loop, `core.vec`/`core.mask` lower to SIMD. They are language semantics wearing a library name, not hand-writable library code. **std** bottoms out in `align_rt_*` calls today; it becomes real Align-over-FFI library code only **after FFI** (post-M8), so it stays builtin until then.
+  - **Preconditions for std-in-Align (recorded 2026-07-04, external design-note review adoption):** writing std in Align requires (a) function multiversioning — first candidate: compiler-automatic multiversioning of hot/pipeline fns + capability predicate builtins (NOT user-facing target-feature attributes; Align minimizes annotations), (b) arena-aware allocation from library code, (c) native soa layout access. Until then the C-ABI boundary costs (no inlining, fragile arena calls from Rust, hardcoded soa layouts) are the accepted tradeoff of the builtin approach.
 - **`import` is REQUIRED + verified for the prefix-accessed builtin namespaces** — exactly `json` (`core.json`), `fs` (`std.fs`), `io` (`std.io`) today (the only builtins called through a module-name prefix; everything else in core is method/operator/keyword syntax). Using `json.decode` / `fs.read_file` / `io.stdout.write` without the matching `import` is a compile error; an `import` naming an unknown module is a compile error; an unused `import` is a lint. This makes a file's capability surface (touches JSON / filesystem / stdout) visible in its header — "Nothing hidden." The **language-syntactic core** (`Option`/`Result`/`?`/`else`, `arena`, the array pipeline `.map`/`.where`/`.reduce`/`.sum`/…, `x.abs()` math methods, `template "…"`) needs **no import** — requiring one would be requiring an import for syntax.
 - **User-authored modules are load-bearing** — `module foo` names a file's module; `import myproj.foo` resolves to another source file; `pub` controls cross-module visibility; names are mangled per module. This is the genuinely new machinery (multi-file discovery + resolution + visibility + cross-module name/type identity).
 
@@ -2419,6 +2433,13 @@ SQPOLL polling mode, and **Direct I/O into huge-page-backed arenas** are candida
 the dispatch table above. The API-shaping constraint is unchanged either way: `std.fs`/`std.io`
 buffers are caller-owned (arena), so a zero-copy path drops in without an API change.
 
+**Pinned-memory arena option (Future, recorded 2026-07-04, external design-note review adoption):**
+an arena flavor allocating page-locked (pinned) memory, enabling zero-copy DMA to GPUs (`cuMemcpy` et
+al.). Same shape as the huge-page option above. GPU integration itself needs NO language surface:
+every vendor (CUDA Driver API, ROCm/HIP, Vulkan, Metal, WebGPU-native) exposes a C ABI, and Align's
+soa/array layouts match GPU buffer layouts bit-for-bit — plain FFI suffices (consistent with
+non-goals: no GPU syntax).
+
 Placement: `std.io` (OS boundary, `draft.md` §18.2), implemented in the Rust runtime
 with a portable fallback; cross-platform mmap via a crate (e.g. `memmap2`). Revisit
 around the string/JSON milestone (M5) and std build-out.
@@ -2473,7 +2494,8 @@ SoA §05-backend §2):
 - Limited const-eval: precompute lookup tables at build time instead of at startup
   (also feeds "fast startup"). Distinct from reflection (which stays "none").
 - SIMD numeric parse/format (fast atoi/itoa): CLIs convert numbers <-> text constantly.
-  Lives in core.str / core.math.
+  Lives in core.str / core.math. Reference pointer (builder/fmt, recorded 2026-07-04, external
+  design-note review adoption): Dragonbox float formatting.
 - Perfect hashing for static keys: compile-time perfect hash for JSON fields / keyword
   lookup (an extension of the field table).
 - Embedding read-only data in the binary as const (no startup load).
@@ -2576,7 +2598,9 @@ Backend / codegen lowering (MIR -> LLVM, source unchanged):
 
 Runtime / std internals (API unchanged, fast path swapped in):
 - SIMD-accelerated runtime: JSON structural scan, str find/split/trim, UTF-8 validation,
-  zero-alloc itoa/atoi (an extension of the existing fast atoi/itoa lever).
+  zero-alloc itoa/atoi (an extension of the existing fast atoi/itoa lever). Reference pointer
+  (UTF-8, recorded 2026-07-04, external design-note review adoption): Lemire 2021 (<1 inst/byte);
+  already cited at its fix-PR call site, noted here only for the consolidated list.
 - Perfect hashing for static keys (already a lever above; JSON field tables / keywords).
 - core.bitset (POPCNT/TZCNT/LZCNT) and a default SIMD non-crypto hash (core.hash).
 - Buffered, optionally-unlocked stdout (ring buffer; flush on full/newline-to-TTY/exit).
@@ -2756,7 +2780,8 @@ framework concerns into the core (per `non-goals.md` and `draft.md` §18 layerin
 ```text
 - std (OS boundary): std.fs / std.net / std.io fast paths, std.regex (RE2-style linear-time
   NFA/DFA; a compile-time `rx"…"` literal is a *language* add tracked separately if pursued),
-  std.compress (FFI wrappers over libzstd/zlib-ng — gated on FFI).
+  std.compress (FFI wrappers over libzstd/zlib-ng — gated on FFI). Reference pointer (std.encoding,
+  recorded 2026-07-04, external design-note review adoption): Lemire Base64-at-memcpy-speed.
 - pkg (frameworks/ecosystem, kept out of core/std): HTTP/3 client+server, socket tuning
   (TFO/REUSEPORT/thread-per-core), RDB drivers (Postgres/MySQL/SQLite), the API-server
   blueprint. DB ecosystem delegation is already Settled above.
@@ -2764,6 +2789,35 @@ framework concerns into the core (per `non-goals.md` and `draft.md` §18 layerin
 These ride on the core capabilities (arena, views, FFI, task_group, zero-copy I/O); they
 are downstream consumers, scheduled after the core + std foundations, and are recorded here
 only so the vision is not lost when `work/proposals/` is discarded.
+
+### std.rand (Future)
+
+**Design direction (recorded 2026-07-04, external design-note review adoption):** seed from the OS
+(`getrandom`/`urandom` — never raw `RDRAND`/`RNDR`: not in the x86-64-v2/armv8-a baseline, `SIGILL`
+on older silicon), then a fast portable PRNG (PCG or Xoshiro256++ class, pure bit ops, SIMD-friendly
+at baseline). Non-cryptographic per `draft.md` §18.
+
+### std.crypto (Future)
+
+**Hard requirement (recorded 2026-07-04, external design-note review adoption):** all secret-dependent
+code paths MUST be constant-time (no secret-dependent branches or memory addressing; CMOV/bitwise
+only) regardless of speed — the one domain where Align's branchless-for-vectorization machinery
+becomes a correctness requirement, not a perf choice.
+
+### std.ndslice — strided multi-dimensional views (Future)
+
+**Recorded 2026-07-04 (external design-note review adoption).** A std-layer (not syntax) strided 2D+
+view over contiguous storage — `{ptr, rows, cols, stride}` with `img[y,x]` / `.roi(x,y,w,h)` as
+library methods — the OpenCV `cv::Mat` / numpy `ndarray` shape. Rationale: signal/image processing
+wants pitch/ROI views; `soa` already gives planar (RRR GGG BBB) layout — the superior form
+interleaved formats must convert to. Belongs M10+, after a concrete consumer.
+
+### Zero-copy serialization (Cap'n Proto / FlatBuffers class) (Future)
+
+**Recorded 2026-07-04 (external design-note review adoption).** Align's region system makes zero-copy
+deserialization *safe* — a wire-format view is region-tied to its mapping arena exactly like
+`fs.read_file_view` (the #339 machinery above is already the substrate). Recorded as a distinctive
+future capability; concretize on demand.
 
 ### Resource-oriented north star + local LLM inference (Future / direction, not a v1 commitment)
 
