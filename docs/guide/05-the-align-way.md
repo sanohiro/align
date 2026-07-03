@@ -22,7 +22,7 @@ A function that can fail returns `Result`; call it with `?`. The happy path read
 ```align
 import std.fs
 
-fn load() -> Result<Config, Error> {
+fn load(path: str) -> Result<Config, Error> {
     raw := fs.read_file(path)?
     cfg := parse(raw)?
     return Ok(cfg)
