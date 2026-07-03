@@ -3174,6 +3174,330 @@ impl<'a> EscapeCheck<'a> {
     }
 }
 
+/// The "unnecessary heap" lint, broad form (`draft.md` §16, `open-questions.md` M8 lint candidates).
+///
+/// The narrow slice (in `finalize_expr`) flags the inline `heap.new(x).get()`. This is the common
+/// shape it deliberately left out: a box bound to a local that is *only* ever read back with `.get()`
+/// and never escapes — `p := heap.new(x); … p.get()`. A `box<T>` payload is a scalar in M3, so `.get()`
+/// is a plain copy-out; a box that is only copied-out and never moved / stored / returned / cloned /
+/// captured serves no purpose (a stack value suffices), so it is a **warning** (the code still
+/// type-checks and runs).
+///
+/// It is a whole-function box-use scan — the escape pass keeps no reusable per-box "escaped?" fact to
+/// piggyback on. One linear pass over the body classifies every *occurrence* of every box local: a
+/// `BoxGet` whose receiver is the local is a "get" occurrence, any *other* appearance (a move, a store,
+/// a return, a `.clone()`, a function-call argument, a closure/pipeline capture, a reassignment target)
+/// is an "other" occurrence. The lint fires for a box local iff it has at least one get and **no** other
+/// occurrence — sound and conservative: any occurrence the walk does not recognize as a get suppresses
+/// the warning. The `match` on `ExprKind` is exhaustive (no wildcard) so a future IR variant that could
+/// carry a box use forces a compile error here rather than silently escaping the classification.
+struct UnnecessaryHeapScan {
+    /// Box locals (a `Let` whose init is `HeapNew`) → the span of the allocation (`heap.new`).
+    candidates: std::collections::HashMap<LocalId, Span>,
+    /// Per local: how many times it is the direct receiver of a `.get()`.
+    get_uses: std::collections::HashMap<LocalId, u32>,
+    /// Per local: how many times it appears in any *other* position (a use that needs the heap box).
+    other_uses: std::collections::HashMap<LocalId, u32>,
+}
+
+impl UnnecessaryHeapScan {
+    fn record_get(&mut self, l: LocalId) {
+        *self.get_uses.entry(l).or_insert(0) += 1;
+    }
+
+    fn record_other(&mut self, l: LocalId) {
+        *self.other_uses.entry(l).or_insert(0) += 1;
+    }
+
+    fn block(&mut self, b: &Block) {
+        for s in &b.stmts {
+            self.stmt(s);
+        }
+        if let Some(v) = &b.value {
+            self.visit(v);
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt) {
+        match s {
+            // The defining binding: `local` is a definition, not a use, so it is never recorded. A
+            // `heap.new` init makes `local` a candidate; visit the init either way (its boxed value
+            // may itself reference locals).
+            Stmt::Let { local, init } => {
+                if matches!(init.kind, ExprKind::HeapNew(_)) {
+                    self.candidates.insert(*local, init.span);
+                }
+                self.visit(init);
+            }
+            // `local = value` — a reassignment target is a use of the local (it needs a live binding);
+            // for a box that is an "other" occurrence that suppresses the lint.
+            Stmt::Assign { local, value, .. } => {
+                self.record_other(*local);
+                self.visit(value);
+            }
+            Stmt::AssignVecLane { local, value, .. } => {
+                self.record_other(*local);
+                self.visit(value);
+            }
+            // The remaining assignment targets (a struct field root / array or soa base) are never a
+            // box local — a box has no fields, no indexing — but recording them costs nothing and keeps
+            // the "every LocalId target counts as other" rule uniform.
+            Stmt::AssignField { root, value, .. } => {
+                self.record_other(*root);
+                self.visit(value);
+            }
+            Stmt::AssignIndex { base, index, value }
+            | Stmt::AssignElemField { base, index, value, .. }
+            | Stmt::AssignElem { base, index, value, .. } => {
+                self.record_other(*base);
+                self.visit(index);
+                self.visit(value);
+            }
+            // Destructure binds fresh locals (definitions, and never `box` — no producer yields a
+            // tuple of boxes); just visit the init.
+            Stmt::LetTuple { init, .. } => self.visit(init),
+            Stmt::Return(Some(e)) | Stmt::Expr(e) => self.visit(e),
+            Stmt::Return(None) => {}
+        }
+    }
+
+    fn visit(&mut self, e: &Expr) {
+        // Capture operands (a lifted lambda's captured enclosing locals) live outside the normal child
+        // recursion — a captured box is an "other" use, so classify them too.
+        if let Some(stages) = pipeline_stages(&e.kind) {
+            for c in stage_capture_exprs(stages) {
+                self.visit(c);
+            }
+        }
+        for c in node_captures(&e.kind) {
+            self.visit(c);
+        }
+        match &e.kind {
+            // `p.get()` — the one occurrence that does *not* need a heap box. When the receiver is a
+            // bare local, record it as a get and do NOT recurse into the receiver (so the inner
+            // `Local` is not double-counted as an "other" use). Any other receiver (e.g. the inline
+            // `heap.new(x).get()`, handled by the narrow lint) recurses normally.
+            ExprKind::BoxGet(inner) => {
+                if let ExprKind::Local(l) = inner.kind {
+                    self.record_get(l);
+                } else {
+                    self.visit(inner);
+                }
+            }
+            // Any bare appearance of a local is an "other" use of it.
+            ExprKind::Local(l) => self.record_other(*l),
+            ExprKind::Tuple { elems, .. } => {
+                for el in elems {
+                    self.visit(el);
+                }
+            }
+            ExprKind::MathOp { operands, .. } => {
+                for o in operands {
+                    self.visit(o);
+                }
+            }
+            ExprKind::TupleIndex { recv, .. } => self.visit(recv),
+            ExprKind::Arena(b) | ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
+                self.block(b);
+            }
+            ExprKind::Spawn { closure, .. } => self.visit(closure),
+            ExprKind::EnumValue { payload, .. } => {
+                for p in payload {
+                    self.visit(p);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.visit(scrutinee);
+                for a in arms {
+                    self.visit(&a.body);
+                }
+            }
+            ExprKind::ResultMapErr { result, f } => {
+                self.visit(result);
+                self.visit(f);
+            }
+            ExprKind::TaskGet(inner) => self.visit(inner),
+            ExprKind::Wait => {}
+            ExprKind::If { cond, then, els } => {
+                self.visit(cond);
+                self.block(then);
+                self.block(els);
+            }
+            ExprKind::Unary { expr, .. } | ExprKind::Cast(expr) => self.visit(expr),
+            ExprKind::Binary { lhs, rhs, .. } | ExprKind::IntArith { lhs, rhs, .. } => {
+                self.visit(lhs);
+                self.visit(rhs);
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.visit(a);
+                }
+            }
+            ExprKind::FnValue(_) => {}
+            ExprKind::Closure { captures, .. } => {
+                for c in captures {
+                    self.visit(c);
+                }
+            }
+            ExprKind::CallFnValue { callee, args } => {
+                self.visit(callee);
+                for a in args {
+                    self.visit(a);
+                }
+            }
+            ExprKind::StructLit { fields, .. } => {
+                for f in fields {
+                    self.visit(f);
+                }
+            }
+            ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
+            | ExprKind::Try(i) | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::BuilderToString(i) | ExprKind::ArraySum { source: i, .. } | ExprKind::ArrayCount { source: i, .. } | ExprKind::ArrayAnyAll { source: i, .. } | ExprKind::ArrayMinMax { source: i, .. } | ExprKind::ArrayToArray { source: i, .. } | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayPartition { source: i, .. } | ExprKind::ArrayParMap { source: i, .. } | ExprKind::ArraySort { source: i, .. } | ExprKind::ArraySortBy { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::Len(i) => self.visit(i),
+            ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
+                self.visit(recv);
+                self.visit(index);
+            }
+            ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
+                self.visit(ptr);
+                self.visit(offset);
+            }
+            ExprKind::RawStore { ptr, offset, value } => {
+                self.visit(ptr);
+                self.visit(offset);
+                self.visit(value);
+            }
+            ExprKind::SliceRange { recv, start, end } => {
+                self.visit(recv);
+                if let Some(s) = start { self.visit(s); }
+                if let Some(en) = end { self.visit(en); }
+            }
+            ExprKind::BuilderWrite { builder, arg, .. } => {
+                self.visit(builder);
+                self.visit(arg);
+            }
+            ExprKind::StrPredicate { haystack, needle, .. } => {
+                self.visit(haystack);
+                self.visit(needle);
+            }
+            ExprKind::StrTrim { recv, .. } => self.visit(recv),
+            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
+                self.visit(source);
+                self.visit(init);
+            }
+            ExprKind::ArrayMapInto { source, dst, .. } => {
+                self.visit(source);
+                self.visit(dst);
+            }
+            ExprKind::ArrayDot { a, b, .. } => {
+                self.visit(a);
+                self.visit(b);
+            }
+            ExprKind::ArrayChunks { source, n, .. } => {
+                self.visit(source);
+                self.visit(n);
+            }
+            ExprKind::ArrayLit { elems, .. } | ExprKind::VecLit { elems, .. } => {
+                for el in elems {
+                    self.visit(el);
+                }
+            }
+            ExprKind::Select { mask, a, b } => {
+                self.visit(mask);
+                self.visit(a);
+                self.visit(b);
+            }
+            ExprKind::VecSumWhere { vec, mask } => {
+                self.visit(vec);
+                self.visit(mask);
+            }
+            ExprKind::VecDot { a, b } => {
+                self.visit(a);
+                self.visit(b);
+            }
+            ExprKind::VecMinMax { vec, .. } => self.visit(vec),
+            ExprKind::VecSum { vec } => self.visit(vec),
+            ExprKind::VecLoad { src, index, .. } => {
+                self.visit(src);
+                self.visit(index);
+            }
+            ExprKind::VecStore { dst, index, value, .. } => {
+                self.visit(dst);
+                self.visit(index);
+                self.visit(value);
+            }
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                self.visit(opt);
+                self.visit(fallback);
+            }
+            ExprKind::Template(parts) => {
+                for p in parts {
+                    if let TemplatePart::Hole(h) | TemplatePart::JsonStr(h) = p {
+                        self.visit(h);
+                    }
+                }
+            }
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.visit(input),
+            ExprKind::FsReadFile { path } => self.visit(path),
+            ExprKind::IoStdoutWrite { arg } => self.visit(arg),
+            ExprKind::IoStdoutWriteBuilder { builder } => self.visit(builder),
+            ExprKind::BufWriterWrite { writer, arg } => {
+                self.visit(writer);
+                self.visit(arg);
+            }
+            ExprKind::BufWriterFlush { writer } => self.visit(writer),
+            ExprKind::BuilderNew { capacity } => {
+                if let Some(c) = capacity {
+                    self.visit(c);
+                }
+            }
+            // Leaves and nodes whose only local references (a `Field`/`SoaColumn`/`IndexField` /
+            // group-agg base) are never a box local — a box has no fields, columns, or indexing.
+            ExprKind::Unit
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Char(_)
+            | ExprKind::Str(_)
+            | ExprKind::Bool(_)
+            | ExprKind::OptionNone
+            | ExprKind::BufWriterNew { .. }
+            | ExprKind::Field { .. }
+            | ExprKind::SoaColumn { .. }
+            | ExprKind::ArrayGroupAgg { .. }
+            | ExprKind::ArrayGroupAggMulti { .. }
+            | ExprKind::ArrayDictEncode { .. }
+            | ExprKind::IndexField { .. } => {}
+        }
+    }
+
+    /// Run the scan over a function body and emit one warning per unnecessary box local.
+    fn run(body: &Block, diags: &mut Diagnostics) {
+        let mut scan = UnnecessaryHeapScan {
+            candidates: std::collections::HashMap::new(),
+            get_uses: std::collections::HashMap::new(),
+            other_uses: std::collections::HashMap::new(),
+        };
+        scan.block(body);
+        // Emit in a deterministic order (by span start) so diagnostics are stable.
+        let mut fire: Vec<Span> = scan
+            .candidates
+            .iter()
+            .filter(|(l, _)| {
+                scan.get_uses.get(*l).copied().unwrap_or(0) >= 1
+                    && scan.other_uses.get(*l).copied().unwrap_or(0) == 0
+            })
+            .map(|(_, span)| *span)
+            .collect();
+        fire.sort_by_key(|s| s.lo);
+        for span in fire {
+            diags.push(align_diag::Diagnostic::warning(
+                "unnecessary heap allocation: this box is only ever read back with `.get()` and never escapes — use the value directly (a stack value suffices)".to_string(),
+                span,
+            ));
+        }
+    }
+}
+
 /// Whether a single HIR statement always diverges (control never proceeds to the next statement).
 /// A `return` always diverges; a `let`/assignment/expression statement diverges iff the value it
 /// evaluates does.
@@ -4215,6 +4539,10 @@ impl<'a, 't> Checker<'a, 't> {
         // Finalize all inferred types to concrete (or default i64).
         let mut body = body;
         self.finalize_block(&mut body);
+        // The broad "unnecessary heap" lint: a whole-function scan for a box local that is only ever
+        // read back with `.get()` and never escapes (the narrow inline `heap.new(x).get()` slice lives
+        // in `finalize_expr`). A warning, not an error — it never blocks a build.
+        UnnecessaryHeapScan::run(&body, &mut self.diags);
         let mut locals = std::mem::take(&mut self.locals);
         for l in &mut locals {
             l.ty = self.finalize(l.ty);
@@ -7203,6 +7531,10 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let mut body_fin = checked;
         self.finalize_block(&mut body_fin);
+        // Run the broad unnecessary-heap scan on the lifted lambda body too (parity with the narrow
+        // lint in `finalize_expr`); a box local here is function-local (Move values cannot be
+        // captured), so the scan is self-contained and never double-reports the enclosing function.
+        UnnecessaryHeapScan::run(&body_fin, &mut self.diags);
 
         // Collect captures: each becomes a trailing parameter of the lifted function, and the
         // enclosing local is passed at the call site. Slice ③ supports copy-value captures only.
@@ -10217,9 +10549,9 @@ impl<'a, 't> Checker<'a, 't> {
                 // scalar in M3, so `.get()` is a plain copy-out). A **warning**: the code is correct,
                 // just wasteful. Detected purely locally — a `.get()` whose receiver is the allocating
                 // `heap.new` *itself* — so it reuses no escape-analysis state and cannot false-positive.
-                // The broader "box bound to a local, only ever `.get()`-ed, never escaping" case needs
-                // a whole-function box-use scan (the escape pass keeps no reusable per-box escape fact);
-                // it is deferred, recorded in `open-questions.md` under the M8 lint candidates.
+                // The broader "box bound to a local, only ever `.get()`-ed, never escaping" case is
+                // handled by the whole-function `UnnecessaryHeapScan` (run from `check_fn`); the two are
+                // disjoint — this arm's receiver is a `HeapNew`, the scan's is a `Local`.
                 if matches!(inner.kind, ExprKind::HeapNew(_)) {
                     self.diags.push(align_diag::Diagnostic::warning(
                         "unnecessary heap allocation: `heap.new(...).get()` boxes a value only to read it straight back — use the value directly (a stack value suffices)".to_string(),
