@@ -1132,11 +1132,20 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   Known minor gap (a general MIR limitation, not std.io-specific): an **unbound Move temporary**
   isn't dropped, so a one-shot `io.stdout.write(x)?` leaks its ~40-byte writer handle (bound writers
   / readers / buffers drop correctly); the fix is dropping Move temporaries, a separate improvement.
-- **Slice 2 — `io.copy`.** The portable fixed-buffer loop (the v1/reference implementation —
-  `docs/open-questions.md` "Transparent zero-copy I/O"), returning bytes transferred.
-  **Completion condition:** byte-exact transfer, plus a test that memory stays bounded
-  (`O(buffer)`, not `O(file size)`) on a large input. Fast paths (`sendfile`/`splice`/mmap/
-  `io_uring`) are explicitly **post-M9** — see that Future entry, unchanged in shape by this slice.
+- **Slice 2 — `io.copy` — DONE.** `io.copy(r: reader, w: writer) -> Result<i64, Error>`, the
+  portable fixed-buffer loop (`align_rt_io_copy`: a 64 KiB transfer buffer matching `BUF_WRITER_CAP`,
+  read→write with `EINTR` retry + partial-write handling shared with `writer.write`, errno
+  sign-encoded like `reader.read`) — the v1/reference implementation (`docs/open-questions.md`
+  "Transparent zero-copy I/O"), returning bytes transferred. `io.copy` is a **non-consuming**
+  builtin (`ExprKind::IoCopy` / `Rvalue::IoCopy`): it *borrows* both Move handles (fd ownership does
+  not move — like `print`'s argument), so MoveCheck does not consume `r`/`w` and both stay usable
+  after the call. v1 keeps the Slice-1 bound-receiver restriction (each owned handle must be a bound
+  local; the borrowed `io.std*` streams are exempt — `io.copy(io.stdin, io.stdout)` is the `cat`
+  form). **Completion condition met:** byte-exact transfer below/at/above the buffer boundary + empty
+  file + `cat` + a non-consumption test + an `O(buffer)`-not-`O(file size)` RSS test on a 64 MiB file
+  (peak `VmHWM` bounded via a stdout/stdin handshake), `tests/m9_io.rs` + `examples/io_copy.align` +
+  runtime unit tests. Fast paths (`sendfile`/`splice`/mmap/`io_uring`) are explicitly **post-M9** —
+  see that Future entry, unchanged in shape by this slice (the runtime marks the dispatch site).
 - **Slice 3 — std.fs complete.** `write_file`/`exists`/`remove`/`read_dir`, and
   `read_file_view` (mmap view; requires an enclosing arena, region bound to the arena, munmap at
   arena end — the guardrails in `docs/open-questions.md` "Transparent zero-copy I/O" lines

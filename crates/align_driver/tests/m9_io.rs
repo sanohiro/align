@@ -437,3 +437,331 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n");
 }
+
+// --- Slice 2: io.copy -------------------------------------------------------------------------
+// `io.copy(r: reader, w: writer) -> Result<i64, Error>` — stream all of `r` into `w` through a
+// fixed 64 KiB buffer (memory O(buffer), never O(file size)), returning the byte count. It
+// **borrows** both handles (fd ownership does not move — like `print`'s argument), so `r`/`w`
+// remain usable afterward. (`docs/impl/07-roadmap.md` M9 Slice 2; `draft.md` §18.2.)
+
+/// The runtime transfer buffer size (`BUF_WRITER_CAP` in `align_runtime`) — the boundary the
+/// byte-exact test straddles (below / at / above one buffer).
+const IO_COPY_BUF: usize = 64 * 1024;
+
+/// The headline: `io.copy` is byte-exact at, below, and above the transfer-buffer boundary (so the
+/// copy loop runs zero, one, and many times over the final partial chunk). `w` is bound in `main`
+/// and not consumed by `io.copy`, so it flushes/closes on scope-exit drop.
+#[test]
+fn io_copy_is_byte_exact_across_the_buffer_boundary() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.fs
+import std.io
+pub fn main(args: array<str>) -> Result<(), Error> {
+  r := fs.open(args[1])?
+  w := fs.create(args[2])?
+  n := io.copy(r, w)?
+  print(n)
+  return Ok(())
+}
+";
+    // A deterministic, non-repeating-ish payload at each size around the 64 KiB buffer.
+    for &len in &[10usize, IO_COPY_BUF - 1, IO_COPY_BUF, IO_COPY_BUF + 123, 3 * IO_COPY_BUF] {
+        let content: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+        let src = TempFile::new(&format!("iocopy-src-{len}"), &content);
+        let dst = TempFile::out(&format!("iocopy-dst-{len}"));
+        let out = build_and_run_args("m9-copy", prog, &[&src.str(), &dst.str()]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "io.copy of {len} bytes exits 0; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{len}\n"),
+            "io.copy returns the transferred byte count ({len})"
+        );
+        let copied = std::fs::read(&dst.path).expect("read the copied file");
+        assert_eq!(copied.len(), len, "copied length matches for {len} bytes");
+        assert_eq!(copied, content, "the {len}-byte copy is byte-exact");
+    }
+}
+
+/// `io.copy` of an empty file transfers `0` bytes and produces an empty (but created) destination.
+#[test]
+fn io_copy_empty_file_transfers_zero() {
+    if !backend_available() {
+        return;
+    }
+    let src = TempFile::new("copy-empty-src", b"");
+    let dst = TempFile::out("copy-empty-dst");
+    let prog = "\
+import std.fs
+import std.io
+pub fn main(args: array<str>) -> Result<(), Error> {
+  r := fs.open(args[1])?
+  w := fs.create(args[2])?
+  n := io.copy(r, w)?
+  print(n)
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m9-copy-empty", prog, &[&src.str(), &dst.str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n", "an empty source transfers 0 bytes");
+    assert_eq!(std::fs::read(&dst.path).expect("read dst"), b"", "the destination is empty");
+}
+
+/// Non-consumption: `io.copy` **borrows** both handles, so after the call `r` still reads (now at
+/// EOF → `0`) and `w` still writes (a trailing byte appends after the copied bytes). The MoveCheck
+/// must not treat `io.copy` as consuming its Move-typed arguments (like `print`).
+#[test]
+fn io_copy_does_not_consume_reader_or_writer() {
+    if !backend_available() {
+        return;
+    }
+    let content = b"copy me, then keep using both handles\n";
+    let src = TempFile::new("copy-reuse-src", content);
+    let dst = TempFile::out("copy-reuse-dst");
+    let prog = "\
+import std.fs
+import std.io
+pub fn main(args: array<str>) -> Result<(), Error> {
+  r := fs.open(args[1])?
+  w := fs.create(args[2])?
+  n := io.copy(r, w)?
+  print(n)
+  buf := buffer(8)
+  m := r.read(buf)?
+  print(m)
+  w.write(\"!\")?
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m9-copy-reuse", prog, &[&src.str(), &dst.str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n0\n", content.len()),
+        "copy returns the count; the reused reader then hits EOF (0)"
+    );
+    let mut expected = content.to_vec();
+    expected.push(b'!');
+    assert_eq!(
+        std::fs::read(&dst.path).expect("read dst"),
+        expected,
+        "the reused writer appended after the copied bytes — proof it was not consumed"
+    );
+}
+
+/// `io.copy(io.stdin, io.stdout)` — the classic `cat`. The borrowed std streams (no owned fd) are
+/// valid, un-bound `io.copy` arguments; feed a payload on stdin and expect it verbatim on stdout.
+#[test]
+fn io_copy_stdin_to_stdout_is_cat() {
+    if !backend_available() {
+        return;
+    }
+    use std::io::Write;
+    let prog = "\
+import std.io
+pub fn main() -> Result<(), Error> {
+  n := io.copy(io.stdin, io.stdout)?
+  return Ok(())
+}
+";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "m9-cat", prog);
+    assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sm, &checked.diags));
+    let mir = lower_to_mir(&checked.hir);
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let obj = dir.join(format!("align-m9-cat-{pid}.o"));
+    let exe = dir.join(format!("align-m9-cat-{pid}{}", std::env::consts::EXE_SUFFIX));
+    struct Cleanup(Vec<PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let _g = Cleanup(vec![obj.clone(), exe.clone()]);
+    emit_object_file(&mir, &obj, BuildTarget::Baseline).expect("codegen");
+    link_executable(&obj, &exe, &mir.link_libs).expect("link");
+    let payload = b"a cat program: bytes in == bytes out, unbuffered stdout\n0123456789";
+    let mut child = std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child.stdin.take().unwrap().write_all(payload).expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, payload, "cat echoes stdin to stdout verbatim");
+}
+
+/// O(buffer) guarantee: copying a large file (many times the transfer buffer) keeps the process's
+/// peak resident memory bounded — it must not scale with the file size. Linux-only (reads
+/// `/proc/<pid>/status` `VmHWM`). The child signals "copy done" on stdout, then blocks reading
+/// stdin so the parent can sample its stable peak RSS before letting it exit — deterministic, no
+/// sleeps. A copy that buffered the whole file would show `VmHWM` ≳ the file size.
+#[test]
+#[cfg(target_os = "linux")]
+fn io_copy_rss_stays_bounded_on_large_input() {
+    if !backend_available() {
+        return;
+    }
+    use std::io::{BufRead, BufReader, Write};
+
+    // 64 MiB — 1024× the transfer buffer, so an O(file) copy would be unmistakable in VmHWM.
+    const FILE_LEN: usize = 64 * 1024 * 1024;
+    let content: Vec<u8> = (0..FILE_LEN).map(|i| (i * 131 + 17) as u8).collect();
+    let src = TempFile::new("copy-big-src", &content);
+    let dst = TempFile::out("copy-big-dst");
+
+    // Copy, flush the destination, print the count (the "done" handshake), then block on stdin so
+    // the process stays alive at its peak RSS while the parent samples it.
+    let prog = "\
+import std.fs
+import std.io
+pub fn main(args: array<str>) -> Result<(), Error> {
+  r := fs.open(args[1])?
+  w := fs.create(args[2])?
+  n := io.copy(r, w)?
+  w.flush()?
+  print(n)
+  sin := io.stdin
+  b := buffer(4)
+  k := sin.read(b)?
+  return Ok(())
+}
+";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "m9-copy-rss", prog);
+    assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sm, &checked.diags));
+    let mir = lower_to_mir(&checked.hir);
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let obj = dir.join(format!("align-m9-copy-rss-{pid}.o"));
+    let exe = dir.join(format!("align-m9-copy-rss-{pid}{}", std::env::consts::EXE_SUFFIX));
+    struct Cleanup(Vec<PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let _g = Cleanup(vec![obj.clone(), exe.clone()]);
+    emit_object_file(&mir, &obj, BuildTarget::Baseline).expect("codegen");
+    link_executable(&obj, &exe, &mir.link_libs).expect("link");
+
+    let mut child = std::process::Command::new(&exe)
+        .args([src.str(), dst.str()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let child_pid = child.id();
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("child stdout"));
+
+    // Block until the child reports the copy is done (it then blocks on stdin, alive at peak RSS).
+    let mut done = String::new();
+    lines.read_line(&mut done).expect("read done handshake");
+    assert_eq!(done.trim(), FILE_LEN.to_string(), "child copied the whole file");
+
+    // Sample the peak resident set from /proc while the child is blocked.
+    let vm_hwm_kb = read_vm_hwm_kb(child_pid).expect("read VmHWM");
+    // Release the child (close its stdin → its `sin.read` returns EOF → it exits).
+    let _ = stdin.flush();
+    drop(stdin);
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0), "child exits cleanly after the handshake");
+
+    // O(buffer), not O(file): peak RSS must be a small fraction of the 64 MiB file. 32 MiB is a
+    // generous ceiling (the whole-file copy would be ≥ 64 MiB); the real figure is a few MiB.
+    let ceiling_kb = 32 * 1024;
+    assert!(
+        vm_hwm_kb < ceiling_kb,
+        "io.copy peak RSS {vm_hwm_kb} kB must stay bounded (< {ceiling_kb} kB) for a {} MiB file — \
+         O(buffer), not O(file size)",
+        FILE_LEN / (1024 * 1024)
+    );
+
+    // Byte-exact even at this size.
+    assert_eq!(std::fs::read(&dst.path).expect("read big dst").len(), FILE_LEN, "big copy length matches");
+}
+
+/// Read `VmHWM` (peak resident set size, in kB) from `/proc/<pid>/status`. `None` if the field is
+/// absent (e.g. the process already exited).
+#[cfg(target_os = "linux")]
+fn read_vm_hwm_kb(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            let kb = rest.split_whitespace().next()?;
+            return kb.parse().ok();
+        }
+    }
+    None
+}
+
+// --- Slice 2: io.copy ownership guardrails (compile-time) -------------------------------------
+
+/// v1 restriction (until Move temporaries drop): an owned handle passed to `io.copy` must be a
+/// bound local — an unbound temporary (`io.copy(fs.open(p)?, w)`) is never `Drop`ped, so its fd
+/// leaks / its buffered output is lost. The borrowed `io.std*` streams are exempt.
+#[test]
+fn io_copy_temporary_handle_argument_is_rejected() {
+    // A temporary reader argument.
+    assert!(check_errs(
+        "m9-copy-temp-reader",
+        "import std.fs\nimport std.io\npub fn main(args: array<str>) -> Result<(), Error> {\n  w := fs.create(args[2])?\n  n := io.copy(fs.open(args[1])?, w)?\n  return Ok(())\n}\n",
+    ), "a temporary reader argument to io.copy must be rejected");
+    // A temporary writer argument.
+    assert!(check_errs(
+        "m9-copy-temp-writer",
+        "import std.fs\nimport std.io\npub fn main(args: array<str>) -> Result<(), Error> {\n  r := fs.open(args[1])?\n  n := io.copy(r, fs.create(args[2])?)?\n  return Ok(())\n}\n",
+    ), "a temporary writer argument to io.copy must be rejected");
+    // Bound reader + writer: allowed (regression — the restriction doesn't over-reach).
+    assert!(!check_errs(
+        "m9-copy-bound-ok",
+        "import std.fs\nimport std.io\npub fn main(args: array<str>) -> Result<(), Error> {\n  r := fs.open(args[1])?\n  w := fs.create(args[2])?\n  n := io.copy(r, w)?\n  return Ok(())\n}\n",
+    ), "io.copy of two bound handles must be allowed");
+    // Borrowed std streams: allowed (no owned fd — the `cat` form).
+    assert!(!check_errs(
+        "m9-copy-std-ok",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  n := io.copy(io.stdin, io.stdout)?\n  return Ok(())\n}\n",
+    ), "io.copy(io.stdin, io.stdout) must be allowed");
+}
+
+/// `io.copy` returns `Result<i64, Error>`; discarding it (no `?` / `match` / bind) is the
+/// unhandled-`Result` error — a copy failure must not be silently dropped.
+#[test]
+fn io_copy_discarding_the_result_is_rejected() {
+    assert!(check_errs(
+        "m9-copy-unhandled",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  io.copy(io.stdin, io.stdout)\n  return Ok(())\n}\n",
+    ), "an unhandled io.copy Result must be rejected");
+}
+
+/// `io.copy` type-checks its arguments: a non-reader / non-writer is a clear error.
+#[test]
+fn io_copy_argument_types_are_checked() {
+    assert!(check_errs(
+        "m9-copy-bad-reader",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  n := io.copy(42, io.stdout)?\n  return Ok(())\n}\n",
+    ), "a non-reader first argument must be rejected");
+    assert!(check_errs(
+        "m9-copy-bad-writer",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  n := io.copy(io.stdin, 42)?\n  return Ok(())\n}\n",
+    ), "a non-writer second argument must be rejected");
+    assert!(check_errs(
+        "m9-copy-arity",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  n := io.copy(io.stdin)?\n  return Ok(())\n}\n",
+    ), "the wrong argument count must be rejected");
+}

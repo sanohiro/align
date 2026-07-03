@@ -683,6 +683,11 @@ fn build_module<'c>(
         module.add_function("align_rt_io_writer_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
+        // io.copy(r, w) (r: *Reader, w: *Writer) -> i64 (bytes transferred, or -(status)).
+        "io_copy".to_string(),
+        module.add_function("align_rt_io_copy", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
         // buffer(cap) (cap: i64) -> *Buffer (opaque handle).
         "buffer_new".to_string(),
         module.add_function("align_rt_buffer_new", ptr.fn_type(&[i64t2.into()], false), None),
@@ -3947,6 +3952,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["io_reader_read"], &[rp, bp], "read")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_reader_read returns i64")
+            }
+            Rvalue::IoCopy(r, w) => {
+                let rp = self.operand(r).into();
+                let wp = self.operand(w).into();
+                self.builder
+                    .build_call(self.funcs["io_copy"], &[rp, wp], "copy")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_copy returns i64")
             }
             Rvalue::WriterWrite(w, s) => {
                 let wp = self.operand(w).into();

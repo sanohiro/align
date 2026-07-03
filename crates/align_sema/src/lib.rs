@@ -2193,6 +2193,11 @@ impl EffectScan {
                 self.expr(reader);
                 self.expr(buffer);
             }
+            ExprKind::IoCopy { reader, writer } => {
+                self.impure_direct = true;
+                self.expr(reader);
+                self.expr(writer);
+            }
             // `.bytes()` / `.len()` on a buffer read owned memory — pure (no I/O), like a field read.
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => {
@@ -3180,6 +3185,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(reader, depth);
                 self.walk(buffer, depth);
             }
+            ExprKind::IoCopy { reader, writer } => {
+                self.walk(reader, depth);
+                self.walk(writer, depth);
+            }
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.walk(buffer, depth),
             ExprKind::BufferNew { capacity } => self.walk(capacity, depth),
             ExprKind::BuilderNew { capacity } => {
@@ -3480,6 +3489,10 @@ impl UnnecessaryHeapScan {
             ExprKind::ReaderRead { reader, buffer } => {
                 self.visit(reader);
                 self.visit(buffer);
+            }
+            ExprKind::IoCopy { reader, writer } => {
+                self.visit(reader);
+                self.visit(writer);
             }
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.visit(buffer),
             ExprKind::BufferNew { capacity } => self.visit(capacity),
@@ -3879,6 +3892,13 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ReaderRead { reader, buffer } => {
                 self.expr(reader, moved, false, false);
                 self.expr(buffer, moved, false, false);
+            }
+            // `io.copy(r, w)` borrows both handles (fd ownership does not move — neither is
+            // consumed, so both stay usable after the call), like `print`'s argument. NOT a
+            // consuming call, even though `reader`/`writer` are Move types.
+            ExprKind::IoCopy { reader, writer } => {
+                self.expr(reader, moved, false, false);
+                self.expr(writer, moved, false, false);
             }
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer, moved, false, false),
             ExprKind::BufferNew { capacity } => self.expr(capacity, moved, false, false),
@@ -6874,6 +6894,18 @@ impl<'a, 't> Checker<'a, 't> {
             if single_name(p) == Some("fs") && (method == "open" || method == "create") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_open_create(method == "create", args, span);
+            }
+            // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred). A local/captured `io`
+            // shadows this (then it's value-method dispatch, not the std.io builtin).
+            if single_name(p) == Some("io")
+                && method == "copy"
+                && self.lookup("io").is_none()
+                && !self.capture.as_ref().is_some_and(|c| {
+                    c.captured.iter().any(|(n, _, _)| n == "io") || c.enclosing.iter().any(|(n, _, _)| n == "io")
+                })
+            {
+                self.require_import("std.io", "io.copy", span);
+                return self.check_io_copy(args, span);
             }
         }
         // `io.stdout.buffered()` / `io.stderr.buffered()` — a buffered `writer` over a standard
@@ -9928,6 +9960,57 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `io.copy(r: reader, w: writer)` — stream all of `r` into `w` through a fixed-size buffer,
+    /// yielding `Result<i64, Error>` (bytes transferred; memory is O(buffer), never O(file size)).
+    /// **Non-consuming**: both handles are borrowed (fd ownership does not move — like `print`'s
+    /// argument), so `r`/`w` stay usable after the call. A builtin, dispatched like `fs.read_file`.
+    fn check_io_copy(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'io.copy' expects 2 arguments (a reader and a writer), got {}", args.len()), span);
+            return err;
+        }
+        let reader = self.check_expr(&args[0], Some(Ty::Reader));
+        let writer = self.check_expr(&args[1], Some(Ty::Writer));
+        if reader.ty == Ty::Error || writer.ty == Ty::Error {
+            return err;
+        }
+        if reader.ty != Ty::Reader {
+            self.diags
+                .error(format!("'io.copy' reads from a reader, got {}", ty_name(reader.ty)), args[0].span);
+            return err;
+        }
+        if writer.ty != Ty::Writer {
+            self.diags
+                .error(format!("'io.copy' writes to a writer, got {}", ty_name(writer.ty)), args[1].span);
+            return err;
+        }
+        // v1 restriction (mirrors `check_reader_method` / `check_writer_method`): each owned handle
+        // must be a bound local — an unbound temporary (`io.copy(fs.open(p)?, w)`) would leak its fd
+        // (its `Drop` never runs). The borrowed std streams (`io.stdin` / `io.stdout` / `io.stderr`,
+        // incl. `.buffered()`) own no fd and are exempt. Lifted when Move temporaries get a `Drop`.
+        if !matches!(reader.kind, ExprKind::Local(_) | ExprKind::ReaderStdin) {
+            self.diags.error(
+                "bind the reader to a local first, then pass it (`r := <expr>` then `io.copy(r, w)`) — a temporary owned reader handle is not dropped yet, so its fd would leak".to_string(),
+                args[0].span,
+            );
+            return err;
+        }
+        if !matches!(writer.kind, ExprKind::Local(_) | ExprKind::WriterStd { .. }) {
+            self.diags.error(
+                "bind the writer to a local first, then pass it (`w := <expr>` then `io.copy(r, w)`) — a temporary owned writer handle is not dropped yet, so its buffered output would be lost".to_string(),
+                args[1].span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::IoCopy { reader: Box::new(reader), writer: Box::new(writer) },
+            ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
     /// `b.bytes()` on a `buffer` ([`Ty::Buffer`]), the receiver already evaluated. A `slice<u8>`
     /// view of the buffer's current contents, borrowing it (region-tracked: must not outlive `b`).
     fn check_buffer_bytes(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
@@ -10839,6 +10922,10 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::ReaderRead { reader, buffer } => {
                 self.finalize_expr(reader);
                 self.finalize_expr(buffer);
+            }
+            ExprKind::IoCopy { reader, writer } => {
+                self.finalize_expr(reader);
+                self.finalize_expr(writer);
             }
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.finalize_expr(buffer),
             ExprKind::BufferNew { capacity } => self.finalize_expr(capacity),

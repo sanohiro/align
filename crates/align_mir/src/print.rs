@@ -401,6 +401,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::ReaderStdin => "io_reader_stdin()".to_string(),
         Rvalue::WriterStd { fd, buffered } => format!("io_writer_std(fd={fd}, buffered={buffered})"),
         Rvalue::ReaderRead(r, buf) => format!("io_read({}, {})", operand_str(r), operand_str(buf)),
+        Rvalue::IoCopy(r, w) => format!("io_copy({}, {})", operand_str(r), operand_str(w)),
         Rvalue::WriterWrite(w, s) => format!("io_write({}, {})", operand_str(w), operand_str(s)),
         Rvalue::WriterWriteBuilder(w, b) => format!("io_write_builder({}, {})", operand_str(w), operand_str(b)),
         Rvalue::WriterFlush(w) => format!("io_flush({})", operand_str(w)),

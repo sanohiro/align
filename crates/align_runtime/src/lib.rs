@@ -3424,6 +3424,64 @@ pub unsafe extern "C" fn align_rt_io_writer_free(w: *mut Writer) {
     }
 }
 
+/// `io.copy(r, w)` — stream all of `r` into `w` through a fixed 64 KiB buffer (memory is
+/// O(buffer), never O(file size)), returning the number of bytes transferred, or `-(status)` on
+/// error (the errno mapped through [`io_error_to_status`], sign-encoded like
+/// [`align_rt_io_reader_read`]). Both handles are **borrowed** — neither fd is closed here, so the
+/// caller's `reader`/`writer` remain usable afterward. Retries `EINTR` on read; the write side
+/// (partial writes, `EINTR`, buffering) is shared with [`align_rt_io_writer_write`]. Buffered bytes
+/// left in `w` flush on its `flush()` / `Drop`, like any other `w.write` (this does not force a
+/// flush — that stays the caller's one way, `w.flush()`).
+///
+/// v1 is this portable fixed-buffer loop (the reference implementation). A Linux `sendfile` /
+/// `splice` fast path (file → pipe/socket) would dispatch on the fd kinds at the marked point
+/// below — post-M9 (`docs/open-questions.md` "Transparent zero-copy I/O"), validated against this
+/// loop and without changing the signature.
+///
+/// # Safety
+/// `r` must be a valid `Reader` pointer and `w` a valid `Writer` pointer for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_copy(r: *mut Reader, w: *mut Writer) -> i64 {
+    if r.is_null() || w.is_null() {
+        return -(AL_INVALID as i64);
+    }
+    let rfd = unsafe { (*r).fd };
+    // A fixed 64 KiB transfer buffer (matches `BUF_WRITER_CAP`) — the point is O(buffer) memory,
+    // independent of the file size. `try_reserve` so a hostile/OOM environment fails softly
+    // (EINVAL) instead of aborting the process.
+    let mut buf: Vec<u8> = Vec::new();
+    if buf.try_reserve_exact(BUF_WRITER_CAP).is_err() {
+        return -(AL_INVALID as i64);
+    }
+    buf.resize(BUF_WRITER_CAP, 0);
+
+    // Fast-path dispatch site (post-M9): on Linux, if `rfd` is a regular file and `w`'s fd is a
+    // pipe/socket, a `sendfile`/`splice` loop would replace the read+write below — same result,
+    // same O(buffer) bound, no signature change. v1 always takes the portable loop.
+    let mut total: i64 = 0;
+    loop {
+        let n = unsafe { read(rfd, buf.as_mut_ptr() as *mut core::ffi::c_void, BUF_WRITER_CAP) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue; // interrupted before reading: retry
+            }
+            return -(io_error_to_status(&e) as i64);
+        }
+        if n == 0 {
+            break; // EOF
+        }
+        // Route the chunk through the writer so buffering + partial-write + EINTR handling is the
+        // one shared implementation.
+        let s = unsafe { align_rt_io_writer_write(w, buf.as_ptr(), n as i64) };
+        if s != 0 {
+            return -(s as i64);
+        }
+        total = total.saturating_add(n as i64);
+    }
+    total
+}
+
 // --- buffer -----------------------------------------------------------------------------------
 
 /// A `buffer` (`core.buffer`) — an owned, growable byte container (the byte analog of `Vec<u8>`),
@@ -4231,6 +4289,50 @@ mod tests {
         let s = unsafe { align_rt_io_reader_open(path.as_ptr(), path.len() as i64, &mut r) };
         assert_eq!(s, AL_NOT_FOUND);
         assert!(r.is_null(), "a failed open leaves the out handle null");
+    }
+
+    #[test]
+    fn io_copy_is_byte_exact_and_does_not_consume_the_handles() {
+        use std::io::Write;
+        // A payload larger than the transfer buffer so the copy loop runs many times over a final
+        // partial chunk.
+        let content: Vec<u8> = (0..(BUF_WRITER_CAP * 2 + 777)).map(|i| (i * 37 + 5) as u8).collect();
+        let mut src = std::env::temp_dir();
+        src.push(format!("align_rt_iocopy_src_{}", std::process::id()));
+        let mut dst = std::env::temp_dir();
+        dst.push(format!("align_rt_iocopy_dst_{}", std::process::id()));
+        std::fs::File::create(&src).unwrap().write_all(&content).unwrap();
+
+        let src_bytes = src.to_str().unwrap().as_bytes();
+        let dst_bytes = dst.to_str().unwrap().as_bytes();
+        let mut r: *mut Reader = std::ptr::null_mut();
+        let mut w: *mut Writer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_reader_open(src_bytes.as_ptr(), src_bytes.len() as i64, &mut r) }, 0);
+        assert_eq!(unsafe { align_rt_io_writer_create(dst_bytes.as_ptr(), dst_bytes.len() as i64, &mut w) }, 0);
+
+        let n = unsafe { align_rt_io_copy(r, w) };
+        assert_eq!(n, content.len() as i64, "io.copy returns the transferred byte count");
+
+        // Non-consumption: both handles are still valid after the copy. The reader is now at EOF;
+        // the writer can still append.
+        let b = align_rt_buffer_new(16);
+        assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 0, "the borrowed reader is at EOF, still usable");
+        assert_eq!(unsafe { align_rt_io_writer_write(w, b"!".as_ptr(), 1) }, 0, "the borrowed writer still writes");
+
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_reader_free(r) };
+        unsafe { align_rt_io_writer_free(w) }; // flush + close
+
+        let mut expected = content.clone();
+        expected.push(b'!');
+        assert_eq!(std::fs::read(&dst).unwrap(), expected, "the copy is byte-exact (plus the appended byte)");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn io_copy_null_handles_are_invalid_not_a_crash() {
+        assert_eq!(unsafe { align_rt_io_copy(std::ptr::null_mut(), std::ptr::null_mut()) }, -(AL_INVALID as i64));
     }
 
     #[test]
