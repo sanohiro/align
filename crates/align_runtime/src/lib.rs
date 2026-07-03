@@ -136,8 +136,10 @@ pub unsafe extern "C" fn align_rt_str_clone(ptr: *const u8, len: i64) -> AlignSt
 /// `fs.read_file(path)` — read the whole file at `path` (a `str`, `ptr`/`len`) into a freshly
 /// heap-allocated owned `string`, writing its `{ptr,len}` to `out`. The buffer comes from
 /// [`align_rt_alloc`] (so the generated `Drop` frees it). Returns 0 on success, 1 on any I/O error
-/// (or a non-UTF-8 path), leaving `out` as the caller-zeroed `{null,0}`. An empty file yields a
-/// null buffer with len 0 (no allocation). The first `std.fs` surface (`06-runtime-std.md`).
+/// (or a non-UTF-8 path), `AL_INVALID` if the file's **content** is not valid UTF-8 (a `str`/`string`
+/// is always UTF-8, draft §7/§12 — binary files are read via `reader.read(buffer)`), leaving `out` as
+/// the caller-zeroed `{null,0}`. An empty file yields a null buffer with len 0 (no allocation). The
+/// first `std.fs` surface (`06-runtime-std.md`).
 ///
 /// # Safety
 /// `path` must describe a valid byte range; `out` must point to a writable `{ptr,len}`.
@@ -185,6 +187,13 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
                 // more read must hit EOF — otherwise the file grew past the snapshot and the
                 // buffer would silently truncate, so fall back. Any failure frees and falls back.
                 if file.read_exact(buf).is_ok() && matches!(file.read(&mut [0u8; 1]), Ok(0)) {
+                    // A `str`/`string` is always valid UTF-8 (draft §7/§12); binary content is read via
+                    // `reader.read(buffer)`. Invalid → `Error.Invalid` (no fallback: re-reading yields
+                    // the same bytes). `buf`'s borrow of `dst` ends here, so the free below is sound.
+                    if !validate_utf8(buf) {
+                        unsafe { align_rt_free(dst) };
+                        return AL_INVALID;
+                    }
                     unsafe { *out = AlignStr { ptr: dst, len: len_i } };
                     return 0;
                 }
@@ -196,6 +205,11 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
         Ok(d) => d,
         Err(_) => return 1,
     };
+    // A `str`/`string` is always valid UTF-8 (draft §7/§12); reject binary content before it becomes
+    // a `str` (binary reads use `reader.read(buffer)`). `Error.Invalid` (== `AL_INVALID`).
+    if !validate_utf8(&data) {
+        return AL_INVALID;
+    }
     let len = data.len() as i64;
     // Copy into the runtime's own allocator so the generated `Drop` (which calls `free`) owns it.
     let dst = align_rt_alloc(len);
@@ -280,8 +294,10 @@ pub unsafe extern "C" fn align_rt_fs_remove(path: *const u8, path_len: i64) -> i
 /// `fs.read_dir(path)` — the entry names of directory `path` as an owned `array<string>` written to
 /// `out` (`{ptr,len}`: a heap buffer of `len` `AlignStr` headers, each owning its own name buffer).
 /// Entries are bare names (no path prefix), in OS order (`.`/`..` excluded — Rust's `read_dir`
-/// omits them; the caller sorts if a deterministic order is wanted, per `draft.md` §18.2). Returns
-/// `0` on success, else the mapped errno (leaving `out` = `{null,0}`). The whole array is `Drop`-freed
+/// omits them; the caller sorts if a deterministic order is wanted, per `draft.md` §18.2). An entry
+/// whose name is **not valid UTF-8 is excluded** (a `string` is always UTF-8, draft §7/§12; such a
+/// file is unreachable through a `str` path regardless), so the result may be shorter than the
+/// on-disk entry count. Returns `0` on success, else the mapped errno (leaving `out` = `{null,0}`). The whole array is `Drop`-freed
 /// by [`align_rt_free_string_array`] (each name buffer, then the header).
 ///
 /// # Safety
@@ -306,8 +322,16 @@ pub unsafe extern "C" fn align_rt_fs_read_dir(path: *const u8, path_len: i64, ou
             Ok(e) => e,
             Err(e) => return io_error_to_status(&e),
         };
-        // The bare file name as raw bytes (lossless for non-UTF-8 Unix names).
-        names.push(entry.file_name().as_encoded_bytes().to_vec());
+        // A `string` is always valid UTF-8 (draft §7/§12), so an entry whose name is not valid UTF-8
+        // cannot be represented — it is **excluded** from the listing (draft §18.2). Excluding just the
+        // broken name keeps enumeration usable for the rest of the directory; such a file is
+        // unreachable through a `str` path anyway. The bare file name, as raw bytes.
+        let name = entry.file_name();
+        let bytes = name.as_encoded_bytes();
+        if !validate_utf8(bytes) {
+            continue;
+        }
+        names.push(bytes.to_vec());
     }
     let n = names.len();
     if n == 0 {
@@ -368,6 +392,11 @@ unsafe fn read_file_view_into_arena(path: &str, arena: *mut Arena, out: *mut Ali
     };
     if data.is_empty() {
         return 0; // already {null,0}
+    }
+    // A `str` is always valid UTF-8 (draft §7/§12) — reject binary content (read via
+    // `reader.read(buffer)`) before it becomes an arena-owned `str` view. `Error.Invalid`.
+    if !validate_utf8(&data) {
+        return AL_INVALID;
     }
     let Ok(len_z) = isize::try_from(data.len()) else { return AL_INVALID };
     let dst = unsafe { align_rt_arena_alloc(arena, len_z as i64, 1) };
@@ -434,6 +463,14 @@ pub unsafe extern "C" fn align_rt_fs_read_file_view(path: *const u8, path_len: i
                 mmap(core::ptr::null_mut(), len_u, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
             };
             if addr != MAP_FAILED && !addr.is_null() {
+                // A `str` is always valid UTF-8 (draft §7/§12). Validate the mapped bytes before the
+                // view escapes; invalid → `munmap` immediately (it was never registered on the arena)
+                // and fail with `Error.Invalid`. Binary files take the `reader.read(buffer)` path.
+                let mapped = unsafe { core::slice::from_raw_parts(addr as *const u8, len_u) };
+                if !validate_utf8(mapped) {
+                    unsafe { munmap(addr, len_u) };
+                    return AL_INVALID;
+                }
                 // Register on the arena for bulk `munmap` at arena end (every exit path).
                 unsafe { (*arena).maps.push((addr, len_u)) };
                 unsafe { *out = AlignStr { ptr: addr as *const u8, len: len_z as i64 } };
@@ -946,6 +983,12 @@ pub unsafe extern "C" fn align_rt_json_decode(
     } else {
         unsafe { std::slice::from_raw_parts(input, input_len as usize) }
     };
+    // A `str` field decoded from JSON is a zero-copy `{ptr,len}` view into `src`, so validating the
+    // whole input once guarantees every `str` field is valid UTF-8 (draft §7/§12; the same one-shot
+    // check simdjson does). Invalid → a decode error, before any view is handed out.
+    if !validate_utf8(src) {
+        return 1;
+    }
     // `from_raw_parts` is UB on a null pointer even with len 0 — guard `fields` like `input`.
     let descs: &[JsonField] = if n_fields <= 0 || fields.is_null() {
         &[]
@@ -1462,6 +1505,11 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     } else {
         unsafe { std::slice::from_raw_parts(input, input_len as usize) }
     };
+    // Validate the whole input once — every decoded `str` field is a zero-copy view into `src`, so
+    // this covers all of them (draft §7/§12). Invalid UTF-8 → a decode error.
+    if !validate_utf8(src) {
+        return 1;
+    }
     // `from_raw_parts` is UB on a null pointer even with len 0 — guard `fields` like `input`.
     let descs: &[JsonField] = if n_fields <= 0 || fields.is_null() {
         &[]
@@ -1627,6 +1675,11 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
     } else {
         unsafe { std::slice::from_raw_parts(input, input_len as usize) }
     };
+    // Validate the whole input once — every decoded `str` column entry is a zero-copy view into
+    // `src`, so this covers all of them (draft §7/§12). Invalid UTF-8 → a decode error.
+    if !validate_utf8(src) {
+        return 1;
+    }
     let descs: &[JsonField] = if n_fields <= 0 || fields.is_null() {
         &[]
     } else {
@@ -1777,6 +1830,13 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     } else {
         unsafe { std::slice::from_raw_parts(input, input_len as usize) }
     };
+    // A JSON `array<str>` element is a zero-copy view into `src`; validate the whole input once so
+    // every element is valid UTF-8 (draft §7/§12). Invalid UTF-8 → a decode error. (A scalar-element
+    // array carries no `str`, but the invariant that a decoded `str` is UTF-8 is uniform, so the
+    // one-shot check stays at every `json.decode` entry.)
+    if !validate_utf8(src) {
+        return 1;
+    }
     let kind = (elem_tag >> 8) & 0xff;
     let width = (elem_tag & 0xff) as usize;
     let signed = (elem_tag & 0x1_0000) != 0;
@@ -2915,6 +2975,235 @@ fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
     }
     #[cfg(not(target_arch = "aarch64"))]
     json_decode_index_scalar(src, out);
+}
+
+// ── UTF-8 validation (draft §7/§12: a `str`/`string` is always valid UTF-8) ──────────────────────
+// Every I/O surface that hands out a `str` — `fs.read_file`, `fs.read_file_view` (mmap + fallback),
+// `json.decode` (a decoded `str` field is a zero-copy view into the input, so validating the whole
+// input once covers every field, exactly as simdjson does) — runs its bytes through here first;
+// invalid → the operation fails rather than producing a `str` that breaks the invariant. Binary reads
+// take the `reader.read(buffer)` path instead (`bytes`/`buffer` carry no UTF-8 invariant, draft §18.2).
+//
+// Algorithm: Lemire's range/lookup table method (simdjson `utf8_lookup4`), with AVX2 (x86_64) / NEON
+// (aarch64) / scalar paths. The scalar path is `std::str::from_utf8` — the correctness reference and
+// the oracle the SIMD paths are differentially tested against (same discipline as the decode index).
+
+/// Scalar reference validator (and the SIMD oracle): `bytes` is well-formed UTF-8. On aarch64 the
+/// NEON path is baseline (always taken), so this is only the dispatch fallback / test oracle there.
+#[inline]
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_utf8_scalar(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok()
+}
+
+// simdjson `utf8_lookup4` error-class bits (a lead+continuation pattern that sets any of these under
+// the three-table AND is malformed). `TOO_LARGE_1000` and `OVERLONG_4` deliberately share bit 6 —
+// they never co-occur in one lane, per the algorithm.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod utf8_tbl {
+    pub const TOO_SHORT: u8 = 1 << 0; // 11______ not followed by 10______
+    pub const TOO_LONG: u8 = 1 << 1; // 0_______ or 10______ following 10______
+    pub const OVERLONG_3: u8 = 1 << 2; // 11100000 100_____
+    pub const TOO_LARGE: u8 = 1 << 3; // > U+10FFFF
+    pub const SURROGATE: u8 = 1 << 4; // U+D800..U+DFFF
+    pub const OVERLONG_2: u8 = 1 << 5; // 1100000_ 10______
+    pub const TOO_LARGE_1000: u8 = 1 << 6;
+    pub const OVERLONG_4: u8 = 1 << 6; // 11110000 1000____
+    pub const TWO_CONTS: u8 = 1 << 7; // 10______ 10______
+    pub const CARRY: u8 = TOO_SHORT | TOO_LONG | TWO_CONTS;
+
+    /// Lookup by the high nibble of the lead byte (`prev1 >> 4`).
+    pub const B1H: [u8; 16] = [
+        TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG, // 0_ ASCII
+        TWO_CONTS, TWO_CONTS, TWO_CONTS, TWO_CONTS, // 10 continuation
+        TOO_SHORT | OVERLONG_2,                     // 1100 two-byte lead (C0/C1 overlong)
+        TOO_SHORT,                                  // 1101 two-byte lead
+        TOO_SHORT | OVERLONG_3 | SURROGATE,         // 1110 three-byte lead
+        TOO_SHORT | TOO_LARGE | TOO_LARGE_1000 | OVERLONG_4, // 1111 four-byte lead
+    ];
+    /// Lookup by the low nibble of the lead byte (`prev1 & 0x0F`).
+    pub const B1L: [u8; 16] = [
+        CARRY | OVERLONG_2 | OVERLONG_3 | OVERLONG_4, // 0 (C0/E0/F0)
+        CARRY | OVERLONG_2,                           // 1 (C1)
+        CARRY,                                        // 2
+        CARRY,                                        // 3
+        CARRY | TOO_LARGE,                            // 4 (F4)
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // 5
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // 6
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // 7
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // 8
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // 9
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // a
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // b
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // c
+        CARRY | TOO_LARGE | TOO_LARGE_1000 | SURROGATE, // d (ED lead → surrogate range)
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // e
+        CARRY | TOO_LARGE | TOO_LARGE_1000,           // f
+    ];
+    /// Lookup by the high nibble of the current (second) byte (`input >> 4`).
+    pub const B2H: [u8; 16] = [
+        TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, // 0_ ASCII
+        TOO_LONG | OVERLONG_2 | TWO_CONTS | OVERLONG_3 | TOO_LARGE_1000 | OVERLONG_4, // 1000
+        TOO_LONG | OVERLONG_2 | TWO_CONTS | OVERLONG_3 | TOO_LARGE,                   // 1001
+        TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE,                    // 1010
+        TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE,                    // 1011
+        TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, // 11 not a continuation
+    ];
+}
+
+/// AVX2 UTF-8 validator — 32-byte blocks, Lemire's `utf8_lookup4`. Carries the last block's tail
+/// (`prev_input`) so sequences straddling a block boundary are checked, and `prev_incomplete` so a
+/// lead byte in the final block with no room for its continuations is an error. A wholly-ASCII block
+/// takes the fast path (only the carried incompleteness matters). The `< 32`-byte tail is validated
+/// in a zero-padded block — the zero padding is ASCII, so an unfinished lead there is caught as
+/// `TOO_SHORT`. Bytewise-equal to [`validate_utf8_scalar`] (differentially fuzzed).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn validate_utf8_avx2(input: &[u8]) -> bool {
+    use core::arch::x86_64::*;
+    let b1h = _mm256_broadcastsi128_si256(unsafe { _mm_loadu_si128(utf8_tbl::B1H.as_ptr() as *const __m128i) });
+    let b1l = _mm256_broadcastsi128_si256(unsafe { _mm_loadu_si128(utf8_tbl::B1L.as_ptr() as *const __m128i) });
+    let b2h = _mm256_broadcastsi128_si256(unsafe { _mm_loadu_si128(utf8_tbl::B2H.as_ptr() as *const __m128i) });
+    let low_mask = _mm256_set1_epi8(0x0f);
+    // `is_incomplete` cap: a lead byte in the last three lanes with no room for its continuations is
+    // > the cap → nonzero after the saturating subtract. Lanes 0..28 cap at 0xFF (never flagged).
+    let inc_max = {
+        let mut m = [0xffu8; 32];
+        m[29] = 0xf0 - 1; // a 4-byte lead needs 3 more bytes
+        m[30] = 0xe0 - 1; // a 3-byte lead needs 2 more
+        m[31] = 0xc0 - 1; // any lead needs at least 1 more
+        unsafe { _mm256_loadu_si256(m.as_ptr() as *const __m256i) }
+    };
+    // High nibble of each byte (`v >> 4`): a 16-bit shift then mask keeps each byte's top nibble.
+    let high_nib = |v: __m256i| _mm256_and_si256(_mm256_srli_epi16(v, 4), low_mask);
+    // Per-block special-case + multibyte-length error bits (0 where valid).
+    let block_err = |cur: __m256i, prev: __m256i| -> __m256i {
+        let shifted = _mm256_permute2x128_si256(prev, cur, 0x21);
+        let prev1 = _mm256_alignr_epi8(cur, shifted, 15);
+        let prev2 = _mm256_alignr_epi8(cur, shifted, 14);
+        let prev3 = _mm256_alignr_epi8(cur, shifted, 13);
+        let sc = _mm256_and_si256(
+            _mm256_and_si256(
+                _mm256_shuffle_epi8(b1h, high_nib(prev1)),
+                _mm256_shuffle_epi8(b1l, _mm256_and_si256(prev1, low_mask)),
+            ),
+            _mm256_shuffle_epi8(b2h, high_nib(cur)),
+        );
+        // This byte must be a 2nd/3rd continuation iff prev2 is a 3+-byte lead (>= 0xE0) or prev3 is a
+        // 4-byte lead (>= 0xF0). Saturating-subtract so only those set bit 0x80; XOR against `sc`
+        // (whose 0x80 = TWO_CONTS marks an actual continuation-after-continuation) → 0 iff consistent.
+        let is_third = _mm256_subs_epu8(prev2, _mm256_set1_epi8(0x60)); // 0xE0 - 0x80
+        let is_fourth = _mm256_subs_epu8(prev3, _mm256_set1_epi8(0x70)); // 0xF0 - 0x80
+        let must23_80 = _mm256_and_si256(_mm256_or_si256(is_third, is_fourth), _mm256_set1_epi8(0x80u8 as i8));
+        _mm256_xor_si256(must23_80, sc)
+    };
+
+    let n = input.len();
+    let ptr = input.as_ptr();
+    let mut err = _mm256_setzero_si256();
+    let mut prev_input = _mm256_setzero_si256();
+    let mut prev_incomplete = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        let cur = unsafe { _mm256_loadu_si256(ptr.add(i) as *const __m256i) };
+        if _mm256_movemask_epi8(cur) == 0 {
+            // All ASCII: only a lead spilling from the previous block can be an error here.
+            err = _mm256_or_si256(err, prev_incomplete);
+            prev_incomplete = _mm256_setzero_si256();
+        } else {
+            err = _mm256_or_si256(err, block_err(cur, prev_input));
+            prev_incomplete = _mm256_subs_epu8(cur, inc_max);
+        }
+        prev_input = cur;
+        i += 32;
+    }
+    if i < n {
+        let mut buf = [0u8; 32];
+        unsafe { core::ptr::copy_nonoverlapping(ptr.add(i), buf.as_mut_ptr(), n - i) };
+        let cur = unsafe { _mm256_loadu_si256(buf.as_ptr() as *const __m256i) };
+        err = _mm256_or_si256(err, block_err(cur, prev_input));
+        prev_incomplete = _mm256_subs_epu8(cur, inc_max);
+    }
+    err = _mm256_or_si256(err, prev_incomplete);
+    _mm256_testz_si256(err, err) == 1
+}
+
+/// NEON UTF-8 validator — the aarch64 counterpart to [`validate_utf8_avx2`], 16-byte blocks. NEON is
+/// ARMv8-A baseline (no runtime detection). `vqtbl1q_u8` does the 16-entry table lookup directly (no
+/// lane duplication). Same carry / tail / incompleteness logic; bytewise-equal to the scalar oracle.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn validate_utf8_neon(input: &[u8]) -> bool {
+    use core::arch::aarch64::*;
+    let b1h = unsafe { vld1q_u8(utf8_tbl::B1H.as_ptr()) };
+    let b1l = unsafe { vld1q_u8(utf8_tbl::B1L.as_ptr()) };
+    let b2h = unsafe { vld1q_u8(utf8_tbl::B2H.as_ptr()) };
+    let low_mask = vdupq_n_u8(0x0f);
+    let inc_max = {
+        let mut m = [0xffu8; 16];
+        m[13] = 0xf0 - 1;
+        m[14] = 0xe0 - 1;
+        m[15] = 0xc0 - 1;
+        unsafe { vld1q_u8(m.as_ptr()) }
+    };
+    let block_err = |cur: uint8x16_t, prev: uint8x16_t| -> uint8x16_t {
+        let prev1 = vextq_u8(prev, cur, 15);
+        let prev2 = vextq_u8(prev, cur, 14);
+        let prev3 = vextq_u8(prev, cur, 13);
+        let sc = vandq_u8(
+            vandq_u8(vqtbl1q_u8(b1h, vshrq_n_u8(prev1, 4)), vqtbl1q_u8(b1l, vandq_u8(prev1, low_mask))),
+            vqtbl1q_u8(b2h, vshrq_n_u8(cur, 4)),
+        );
+        let is_third = vqsubq_u8(prev2, vdupq_n_u8(0x60));
+        let is_fourth = vqsubq_u8(prev3, vdupq_n_u8(0x70));
+        let must23_80 = vandq_u8(vorrq_u8(is_third, is_fourth), vdupq_n_u8(0x80));
+        veorq_u8(must23_80, sc)
+    };
+
+    let n = input.len();
+    let ptr = input.as_ptr();
+    let mut err = vdupq_n_u8(0);
+    let mut prev_input = vdupq_n_u8(0);
+    let mut prev_incomplete = vdupq_n_u8(0);
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let cur = unsafe { vld1q_u8(ptr.add(i)) };
+        if vmaxvq_u8(cur) < 0x80 {
+            err = vorrq_u8(err, prev_incomplete);
+            prev_incomplete = vdupq_n_u8(0);
+        } else {
+            err = vorrq_u8(err, block_err(cur, prev_input));
+            prev_incomplete = vqsubq_u8(cur, inc_max);
+        }
+        prev_input = cur;
+        i += 16;
+    }
+    if i < n {
+        let mut buf = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(ptr.add(i), buf.as_mut_ptr(), n - i) };
+        let cur = unsafe { vld1q_u8(buf.as_ptr()) };
+        err = vorrq_u8(err, block_err(cur, prev_input));
+        prev_incomplete = vqsubq_u8(cur, inc_max);
+    }
+    err = vorrq_u8(err, prev_incomplete);
+    vmaxvq_u8(err) == 0
+}
+
+/// Validate that `bytes` is well-formed UTF-8 (draft §7/§12). Runtime-dispatched: AVX2 on x86_64 when
+/// present, baseline NEON on aarch64, else the scalar reference — every path returns the same answer.
+fn validate_utf8(bytes: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { validate_utf8_avx2(bytes) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { validate_utf8_neon(bytes) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    validate_utf8_scalar(bytes)
 }
 
 /// The key `"..."` immediately before the colon at byte position `cpos`, scanned from the raw bytes
@@ -5555,9 +5844,15 @@ mod tests {
         };
 
         // Fast path: a regular file larger than one read buffer — the whole content comes back
-        // intact (exercises `read_exact` filling the owned buffer + the EOF guard).
+        // intact (exercises `read_exact` filling the owned buffer + the EOF guard). `read_file`
+        // returns a `string`, so the content is valid multibyte UTF-8 (draft §7/§12; whole units are
+        // appended so no multibyte char is truncated) — binary is read via `reader.read(buffer)`.
         let big_path = dir.join(format!("{uniq}-big.bin"));
-        let content: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let mut text = String::new();
+        while text.len() < 100_000 {
+            text.push_str("café 日本語 fast-path 😀 line\n");
+        }
+        let content = text.into_bytes();
         std::fs::write(&big_path, &content).expect("write big temp file");
         let (rc, got) = read(big_path.to_str().unwrap());
         assert_eq!(rc, 0);
@@ -6588,6 +6883,286 @@ mod tests {
         assert!(out.len > 0, "the proc file has real content via the fallback");
         assert_eq!(unsafe { (*arena).maps.len() }, 0, "a size-0 special file is not mmapped");
         unsafe { align_rt_arena_end(arena) };
+    }
+
+    // --- UTF-8 validation (draft §7/§12: a `str`/`string` is always valid UTF-8) ---------------
+
+    /// Differential-test every SIMD validator path against the scalar oracle (`std::str::from_utf8`),
+    /// across the cases that break naive SIMD: isolated continuations, truncated multibyte sequences,
+    /// overlong encodings, surrogates, out-of-range 4-byte leads, and sequences straddling the 16/32
+    /// byte block boundaries + the zero-padded tail. Same discipline as the decode-index SIMD test.
+    #[test]
+    fn utf8_validate_simd_matches_scalar_oracle() {
+        let check = |bytes: &[u8]| {
+            let want = validate_utf8_scalar(bytes);
+            assert_eq!(validate_utf8(bytes), want, "dispatch mismatch on {bytes:02x?}");
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") {
+                assert_eq!(unsafe { validate_utf8_avx2(bytes) }, want, "avx2 mismatch on {bytes:02x?}");
+            }
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(unsafe { validate_utf8_neon(bytes) }, want, "neon mismatch on {bytes:02x?}"); // baseline
+        };
+
+        let snippets: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"hello, world",
+            "café — 日本語テスト 😀🎉".as_bytes(), // 2/3/4-byte chars mixed
+            &[0x80],                   // isolated continuation
+            &[0xBF],
+            &[0xC2],                   // 2-byte lead, truncated
+            &[0xC2, 0x41],             // 2-byte lead + non-continuation
+            &[0xC0, 0x80],             // overlong 2 (C0)
+            &[0xC1, 0xBF],             // overlong 2 (C1)
+            &[0xC2, 0xA9],             // valid © U+00A9
+            &[0xE0, 0xA0],             // 3-byte lead, truncated
+            &[0xE0, 0x80, 0x80],       // overlong 3
+            &[0xE0, 0x9F, 0x80],       // 3-byte 2nd byte too low (overlong)
+            &[0xE0, 0xA0, 0x80],       // valid U+0800 (min 3-byte)
+            &[0xED, 0xA0, 0x80],       // surrogate U+D800
+            &[0xED, 0xBF, 0xBF],       // surrogate U+DFFF
+            &[0xED, 0x9F, 0xBF],       // valid U+D7FF (just below surrogates)
+            &[0xEE, 0x80, 0x80],       // valid U+E000 (just above surrogates)
+            &[0xE2, 0x82, 0xAC],       // valid € U+20AC
+            &[0xF0, 0x90, 0x80, 0x80], // valid U+10000 (min 4-byte)
+            &[0xF0, 0x80, 0x80, 0x80], // overlong 4
+            &[0xF0, 0x8F, 0x80, 0x80], // 4-byte 2nd byte too low (overlong)
+            &[0xF4, 0x8F, 0xBF, 0xBF], // valid U+10FFFF (max)
+            &[0xF4, 0x90, 0x80, 0x80], // too large U+110000
+            &[0xF5, 0x80, 0x80, 0x80], // 4-byte lead > F4
+            &[0xF0, 0x90, 0x80],       // 4-byte truncated
+            &[0xF8],                   // 5-byte lead (invalid in UTF-8)
+            &[0xFF],                   // never valid
+            &[0xC2, 0x80, 0xE0, 0xA0, 0x80, 0xF0, 0x90, 0x80, 0x80], // adjacent 2/3/4-byte chars
+        ];
+        for s in snippets {
+            check(s);
+        }
+        // Embed each snippet at offsets that place its sequence across the 16/32-byte boundaries and
+        // the tail — where SIMD carry / incompleteness bugs hide — both mid-buffer and at the end.
+        for s in snippets {
+            for pad in [0usize, 1, 13, 14, 15, 16, 17, 29, 30, 31, 32, 33, 62, 63, 64, 65] {
+                let mut mid = vec![b'a'; pad];
+                mid.extend_from_slice(s);
+                mid.extend_from_slice(b"trailing bytes z");
+                check(&mid);
+                let mut end = vec![b'z'; pad];
+                end.extend_from_slice(s); // snippet at the very end → incompleteness matters
+                check(&end);
+            }
+        }
+
+        // Randomized fuzz: a dependency-free LCG, reproducible. Raw random bytes biased toward the
+        // UTF-8-significant ranges so malformed multibyte structure actually occurs.
+        let mut state: u64 = 0x1234_5678_9abc_def1;
+        let mut rng = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..30_000 {
+            let len = (rng() % 140) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| match rng() % 4 {
+                    0 => (rng() % 0x80) as u8,        // ASCII
+                    1 => 0x80 | (rng() % 0x40) as u8, // continuation
+                    2 => 0xC0 | (rng() % 0x40) as u8, // lead
+                    _ => rng() as u8,                 // anything
+                })
+                .collect();
+            check(&bytes);
+        }
+        // Valid multibyte text, then a single corrupted byte.
+        let alphabet: Vec<char> = "aZ0 é本😀€ß①".chars().collect();
+        for _ in 0..5_000 {
+            let nchars = (rng() % 40) as usize;
+            let s: String = (0..nchars).map(|_| alphabet[(rng() as usize) % alphabet.len()]).collect();
+            let mut b = s.into_bytes();
+            check(&b);
+            if !b.is_empty() {
+                let i = (rng() as usize) % b.len();
+                b[i] ^= (1 + (rng() % 255)) as u8;
+                check(&b);
+            }
+        }
+    }
+
+    #[test]
+    fn fs_read_file_rejects_non_utf8_content() {
+        let dir = std::env::temp_dir();
+        let uniq = format!("align-rt-utf8-{}-{:p}", std::process::id(), &dir as *const _);
+
+        // Valid multibyte content larger than one read buffer (fast path) reads back intact.
+        let good = dir.join(format!("{uniq}-good.txt"));
+        let good_content = "日本語 test café 😀\n".repeat(5000).into_bytes();
+        std::fs::write(&good, &good_content).unwrap();
+        let gs = good.to_str().unwrap();
+        let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_file(gs.as_ptr(), gs.len() as i64, &mut out) }, 0);
+        let got = unsafe { core::slice::from_raw_parts(out.ptr, out.len as usize) }.to_vec();
+        assert_eq!(got, good_content);
+        unsafe { align_rt_free(out.ptr as *mut u8) };
+
+        // A short valid multibyte file also accepts.
+        let small = dir.join(format!("{uniq}-small.txt"));
+        std::fs::write(&small, "é本".as_bytes()).unwrap();
+        let ss = small.to_str().unwrap();
+        let mut o2 = AlignStr { ptr: core::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_file(ss.as_ptr(), ss.len() as i64, &mut o2) }, 0);
+        unsafe { align_rt_free(o2.ptr as *mut u8) };
+
+        // Binary content (a 0..256 byte cycle: has 0xFF and lone continuations) → Error.Invalid, and
+        // no buffer is handed out (the invariant: a `str`/`string` is always valid UTF-8).
+        let bad = dir.join(format!("{uniq}-bad.bin"));
+        let bad_content: Vec<u8> = (0..50_000u32).map(|i| (i % 256) as u8).collect();
+        assert!(std::str::from_utf8(&bad_content).is_err());
+        std::fs::write(&bad, &bad_content).unwrap();
+        let bs = bad.to_str().unwrap();
+        let mut o3 = AlignStr { ptr: core::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_file(bs.as_ptr(), bs.len() as i64, &mut o3) }, AL_INVALID);
+        assert!(o3.ptr.is_null(), "no `str` view on invalid content");
+
+        std::fs::remove_file(&good).ok();
+        std::fs::remove_file(&small).ok();
+        std::fs::remove_file(&bad).ok();
+    }
+
+    #[test]
+    fn fs_read_file_view_rejects_non_utf8_content() {
+        // Invalid content on the mmap path → Error.Invalid, mapping unmapped (none registered).
+        let path = tmp_path("view-bad");
+        let bad: Vec<u8> = (0..40_000u32).map(|i| (i % 256) as u8).collect();
+        assert!(std::str::from_utf8(&bad).is_err());
+        std::fs::write(&path, &bad).unwrap();
+        let ps = path.display().to_string();
+        let (pp, pl) = view_of(&ps);
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_file_view(pp, pl, arena, &mut out) }, AL_INVALID);
+        assert!(out.ptr.is_null());
+        assert_eq!(unsafe { (*arena).maps.len() }, 0, "the invalid mapping was munmapped, not registered");
+        unsafe { align_rt_arena_end(arena) };
+
+        // Valid multibyte content maps fine and reads back intact.
+        let good = tmp_path("view-good");
+        let gc = "日本語テスト café 😀\n".repeat(3000).into_bytes();
+        std::fs::write(&good, &gc).unwrap();
+        let gs = good.display().to_string();
+        let (gp, gl) = view_of(&gs);
+        let arena2 = align_rt_arena_begin();
+        let mut out2 = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_file_view(gp, gl, arena2, &mut out2) }, 0);
+        assert_eq!(out2.len, gc.len() as i64);
+        assert_eq!(unsafe { std::slice::from_raw_parts(out2.ptr, out2.len as usize) }, gc.as_slice());
+        unsafe { align_rt_arena_end(arena2) };
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&good).ok();
+    }
+
+    #[test]
+    fn json_decode_rejects_non_utf8_input() {
+        // A one-field struct `{ s: str }` — str field: kind 3, width 16, offset 0.
+        let name = b"s";
+        let descs = [JsonField { name_ptr: name.as_ptr(), name_len: 1, tag: (3 << 8) | 16, offset: 0 }];
+        let decode = |src: &[u8]| -> i32 {
+            let mut out = [0u8; 16];
+            unsafe {
+                align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 1, out.as_mut_ptr(), 16, core::ptr::null(), 0, 0)
+            }
+        };
+        // Valid: ASCII and multibyte string values decode.
+        assert_eq!(decode(br#"{"s":"ok"}"#), 0);
+        assert_eq!(decode("{\"s\":\"日本 café 😀\"}".as_bytes()), 0);
+        // A raw continuation byte inside the string value makes the whole input non-UTF-8 → the
+        // one-shot head check rejects before any `str` view into the input is handed out.
+        let mut bad = b"{\"s\":\"o".to_vec();
+        bad.push(0x80);
+        bad.extend_from_slice(b"k\"}");
+        assert!(std::str::from_utf8(&bad).is_err());
+        assert_ne!(decode(&bad), 0, "non-UTF-8 input must not decode into a `str`");
+
+        // The array decoder validates its input too.
+        assert_eq!(decode(br#"{"s":"ok"}"#), 0); // sanity: the good path still decodes
+        let mut arr = b"[1,2,".to_vec();
+        arr.push(0xFF);
+        arr.extend_from_slice(b"3]");
+        let mut aout = AlignStr { ptr: core::ptr::null(), len: 0 };
+        let tag = (1 << 16) | 8; // i64 elements (signed, width 8)
+        assert_ne!(unsafe { align_rt_json_decode_array(arr.as_ptr(), arr.len() as i64, tag, &mut aout) }, 0);
+        assert!(aout.ptr.is_null());
+    }
+
+    /// Rough throughput probe: the UTF-8 validation added at every `str`-returning I/O entry must cost on
+    /// the order of a `memcpy` (it is a single linear pass), so decode/read paths degrade a few %, not
+    /// materially. Prints SIMD-validate vs scalar-validate vs `memcpy` GB/s. `cargo test -p
+    /// align_runtime -- --ignored --nocapture utf8_validate_throughput`.
+    #[test]
+    #[ignore]
+    fn utf8_validate_throughput() {
+        // ~64 MiB of realistic mostly-ASCII JSON text with some multibyte content.
+        let unit = r#"{"name":"café 日本語 😀","id":123456,"active":true},"#;
+        let n = (64 * 1024 * 1024) / unit.len();
+        let mut buf = String::with_capacity(n * unit.len() + 2);
+        buf.push('[');
+        for _ in 0..n {
+            buf.push_str(unit);
+        }
+        buf.push(']');
+        let bytes = buf.as_bytes();
+        let mb = bytes.len() as f64 / (1024.0 * 1024.0);
+        let time = |mut f: Box<dyn FnMut() -> bool>| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..20 {
+                let t = std::time::Instant::now();
+                std::hint::black_box(f());
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            mb / 1024.0 / best // GB/s
+        };
+        let simd = time(Box::new(|| validate_utf8(bytes)));
+        let scalar = time(Box::new(|| validate_utf8_scalar(bytes)));
+        let memcpy = {
+            let mut dst = vec![0u8; bytes.len()];
+            let mut best = f64::MAX;
+            for _ in 0..20 {
+                let t = std::time::Instant::now();
+                dst.copy_from_slice(bytes);
+                std::hint::black_box(dst[0]);
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            mb / 1024.0 / best
+        };
+        assert!(validate_utf8(bytes), "the probe buffer is valid UTF-8");
+        println!(
+            "utf8 validate over {:.0} MiB: SIMD {simd:.1} GB/s | scalar {scalar:.1} GB/s | memcpy {memcpy:.1} GB/s | SIMD/memcpy {:.0}%",
+            mb,
+            simd / memcpy * 100.0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_dir_skips_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tmp_path("rd-utf8");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("good.txt"), b"x").unwrap();
+        // A file whose name is not valid UTF-8 (0xFF is never valid) — cannot be a `string`.
+        let bad_name = std::ffi::OsStr::from_bytes(b"bad-\xff-name");
+        std::fs::write(dir.join(bad_name), b"y").unwrap();
+
+        let ds = dir.display().to_string();
+        let (pp, pl) = view_of(&ds);
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_dir(pp, pl, &mut out) }, 0);
+        assert_eq!(out.len, 1, "only the valid-UTF-8 name is listed; the broken name is excluded");
+        let e = unsafe { *(out.ptr as *const AlignStr) };
+        let nm = unsafe { std::slice::from_raw_parts(e.ptr, e.len as usize) };
+        assert_eq!(nm, b"good.txt");
+        unsafe { align_rt_free_string_array(out.ptr as *mut u8, out.len) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- std.path (Slice 4) — pure lexical byte ops -------------------------------------------
