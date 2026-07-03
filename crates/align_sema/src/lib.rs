@@ -9582,8 +9582,19 @@ impl<'a, 't> Checker<'a, 't> {
             // `str`/`slice`/`soa` carry a runtime length in their `{ ptr, len }` view (a `soa`'s
             // length is its row count).
             Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::Soa(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
-            // A `buffer`'s length is its current byte count (the last read's size).
-            Ty::Buffer => Expr { kind: ExprKind::BufferLen { buffer: Box::new(r) }, ty: i64_ty, span },
+            // A `buffer`'s length is its current byte count (the last read's size). Same v1
+            // bound-receiver restriction as `.bytes()` (uniform across buffer methods, until Move
+            // temporaries drop): reject `buffer(n).len()` on an unbound temporary.
+            Ty::Buffer => {
+                if !matches!(r.kind, ExprKind::Local(_)) {
+                    self.diags.error(
+                        "bind the buffer to a local first, then call the method (`b := buffer(n)` then `b.len()`) — a temporary buffer handle is not dropped yet".to_string(),
+                        span,
+                    );
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+                }
+                Expr { kind: ExprKind::BufferLen { buffer: Box::new(r) }, ty: i64_ty, span }
+            }
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
@@ -9921,6 +9932,19 @@ impl<'a, 't> Checker<'a, 't> {
     /// view of the buffer's current contents, borrowing it (region-tracked: must not outlive `b`).
     fn check_buffer_bytes(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 restriction (mirrors reader/writer): the receiver must be a bound local. On an unbound
+        // `buffer` temporary (`buffer(4).bytes()`), `.bytes()` returns a `slice<u8>` viewing the
+        // temp's storage — leaked-but-valid today, but a dangling slice (UAF) the moment Move
+        // temporaries get a `Drop`. Bind the buffer first. Lifted with Move-temporary drop.
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the buffer to a local first, then call the method (`b := buffer(n)` then `b.bytes()`) — a temporary buffer handle is not dropped yet, and `.bytes()` returns a slice into it".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
         if !args.is_empty() {
             self.diags.error(format!("'.bytes()' takes no arguments, got {}", args.len()), span);
             return err;

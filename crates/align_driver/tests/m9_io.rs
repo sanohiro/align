@@ -351,6 +351,27 @@ fn io_handles_cannot_be_array_or_slice_elements() {
     ), "`array<buffer>` must be rejected");
 }
 
+/// v1 restriction (until Move temporaries drop): a `buffer` **method** call requires a bound
+/// receiver too — `buffer(n).bytes()` on an unbound temporary returns a `slice<u8>` into storage
+/// that is leaked-but-valid today, but a dangling slice (UAF) the moment Move temporaries drop.
+/// Bind the buffer first.
+#[test]
+fn buffer_temporary_as_method_receiver_is_rejected() {
+    assert!(check_errs(
+        "m9-buffer-bytes-temp",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  io.stdout.write(buffer(4).bytes())?\n  return Ok(())\n}\n",
+    ), "`.bytes()` on an unbound buffer temporary must be rejected");
+    assert!(check_errs(
+        "m9-buffer-len-temp",
+        "pub fn main() -> i32 {\n  return buffer(4).len() as i32\n}\n",
+    ), "`.len()` on an unbound buffer temporary must be rejected");
+    // A bound buffer's methods still work (regression: the restriction doesn't over-reach).
+    assert!(!check_errs(
+        "m9-buffer-bound-ok",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  b := buffer(4)\n  io.stdout.write(b.bytes())?\n  print(b.len())\n  return Ok(())\n}\n",
+    ), "a bound buffer's .bytes()/.len() must stay allowed");
+}
+
 /// v1 restriction (until Move temporaries drop): a reader/writer **method** call requires a bound
 /// receiver — an unbound owned-handle temporary (`fs.create(p)?.write(d)?`) is never `Drop`ped, so
 /// its buffered output would be lost / its fd leaked. The borrowed `io.std*` streams are exempt.
