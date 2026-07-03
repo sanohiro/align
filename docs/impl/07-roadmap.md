@@ -1117,7 +1117,7 @@ non-consuming portable fixed-buffer transfer (`Result<i64, Error>`). **`std.fs`*
 (arena-scoped, `munmap`ped at every arena exit, with an owned-copy fallback for special/
 untrustworthy-size files). **`std.path`/`std.env`/`std.time`** round-trip (`join`/`normalize`/
 `base`/`dir`/`ext`, `get`/`set`, `now`/`instant`/`sleep`). A single errno→`Error` table (`draft.md`
-§18.2) backs every fallible call across all three modules. **v1 restrictions, not blockers:** each
+§18.2) backs every fallible call across the fallible modules (std.io, std.fs, and std.env). **v1 restrictions, not blockers:** each
 owned handle passed to `io.copy` must be a bound local (the `io.std*` streams are exempt — the
 bound-receiver restriction, which also covers a bound `.buffered()` writer); and an unbound Move
 *temporary* isn't dropped yet, so a one-shot `io.stdout.write(x)?` leaks its small handle (any bound
