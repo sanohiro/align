@@ -2246,6 +2246,9 @@ to M11 rather than folded into M10. Two candidates, not yet settled:
 
 Settle when `std.process` is designed (M11); not resolved ahead of that design.
 
+**Settled in `docs/impl/std-design/process.md` (2026-07-03):** run-Drops-then-exit default,
+`process.abort()` escape hatch.
+
 ### Arena with explicit allocator — partially settled (M3)
 **M3 decision: anonymous `arena {}` only.** Nested arenas use region = arena nesting
 depth; a box's region is the depth at which it was allocated, and escape = reaching a
