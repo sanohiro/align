@@ -4096,6 +4096,23 @@ const BASE64_STD: [u8; 64] = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv
 /// The URL/filename-safe Base64 alphabet (RFC 4648 §5): `+`->`-`, `/`->`_`.
 const BASE64_URL: [u8; 64] = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// The reverse decode table for a Base64 `alphabet`: symbol byte -> 6-bit value, `0xFF` = not in
+/// this alphabet. Built once at compile time (a `const fn`), so a decode is a pure table lookup with
+/// no per-call setup.
+const fn base64_decode_table(alphabet: &[u8; 64]) -> [u8; 256] {
+    let mut table = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 64 {
+        table[alphabet[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+}
+
+/// Compile-time reverse tables for the two alphabets (built once, not per `base64_decode_impl` call).
+static BASE64_STD_TABLE: [u8; 256] = base64_decode_table(&BASE64_STD);
+static BASE64_URL_TABLE: [u8; 256] = base64_decode_table(&BASE64_URL);
+
 /// Copy an owned byte vector into a freshly `align_rt_alloc`'d `string` `{ptr,len}` (the generated
 /// `Drop` frees the buffer via `align_rt_free`). An empty result owns no buffer (null ptr, len 0),
 /// so its `free(null)` drop is a harmless no-op — same convention as `align_rt_str_clone`.
@@ -4158,14 +4175,9 @@ fn base64_encode_into(data: &[u8], alphabet: &[u8; 64], pad: bool, out: &mut Vec
 /// trailing bits (non-canonical). Padding is optional when absent; when present it must complete a
 /// 4-char group. Scalar reference implementation.
 fn base64_decode_impl(input: &[u8], url: bool) -> Option<Vec<u8>> {
-    let alphabet = if url { &BASE64_URL } else { &BASE64_STD };
-    // Reverse table: symbol byte -> 6-bit value, 0xFF = not in this alphabet.
-    let mut table = [0xFFu8; 256];
-    let mut i = 0;
-    while i < 64 {
-        table[alphabet[i] as usize] = i as u8;
-        i += 1;
-    }
+    // The reverse table is built once at compile time (see `base64_decode_table`), so a decode is a
+    // pure table lookup — no per-call setup.
+    let table = if url { &BASE64_URL_TABLE } else { &BASE64_STD_TABLE };
     // Split off trailing `=` padding (at most 2). A `=` anywhere before the padding is rejected
     // below (it maps to 0xFF in the table since it is not an alphabet symbol).
     let mut end = input.len();
