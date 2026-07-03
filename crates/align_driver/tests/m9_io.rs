@@ -387,12 +387,24 @@ fn owned_handle_temporary_as_method_receiver_is_rejected() {
         "m9-reader-temp",
         "import std.fs\npub fn main(args: array<str>) -> Result<(), Error> {\n  buf := buffer(4)\n  n := fs.open(args[1])?.read(buf)?\n  return Ok(())\n}\n",
     ), "a reader method on an unbound fs.open temporary must be rejected");
-    // The borrowed std streams are exempt — `io.stdout.write(x)?` inline still type-checks (a
-    // regression guard so the restriction doesn't over-reach).
+    // The borrowed *unbuffered* std streams are exempt — `io.stdout.write(x)?` inline still
+    // type-checks (a regression guard so the restriction doesn't over-reach).
     assert!(!check_errs(
         "m9-stdout-inline-ok",
         "import std.io\npub fn main() -> Result<(), Error> {\n  io.stdout.write(\"ok\\n\")?\n  return Ok(())\n}\n",
     ), "io.stdout.write inline must stay allowed (borrowed, no owned fd)");
+    // But a *buffered* std writer temporary is NOT exempt (Slice-1 hole regression): its bytes only
+    // reach the OS on flush/Drop, so `io.stdout.buffered().write(x)?` on an unbound temporary would
+    // silently lose the output. Must be bound.
+    assert!(check_errs(
+        "m9-stdout-buffered-inline",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  io.stdout.buffered().write(\"x\")?\n  return Ok(())\n}\n",
+    ), "a buffered std writer temporary as a method receiver must be rejected");
+    // A bound buffered writer's methods still work (regression: the tightened rule doesn't over-reach).
+    assert!(!check_errs(
+        "m9-stdout-buffered-bound-ok",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  w := io.stdout.buffered()\n  w.write(\"x\")?\n  w.flush()?\n  return Ok(())\n}\n",
+    ), "a bound buffered writer's write/flush must stay allowed");
 }
 
 /// `w.write(x)` returns `Result<(), Error>`; discarding it (no `?` / `match` / bind) is the
@@ -603,6 +615,56 @@ pub fn main() -> Result<(), Error> {
     assert_eq!(out.stdout, payload, "cat echoes stdin to stdout verbatim");
 }
 
+/// `io.copy` into a **bound** buffered `writer` (`io.stdout.buffered()`) delivers the whole input,
+/// including the final sub-buffer tail chunk — the case the narrowed exemption protects. The
+/// payload is far under the 64 KiB buffer, so *all* of it is a tail that only reaches the OS on
+/// `flush`/`Drop`; if binding weren't required (or flush lost), the output would vanish.
+#[test]
+fn io_copy_into_bound_buffered_stdout_flushes_the_tail() {
+    if !backend_available() {
+        return;
+    }
+    use std::io::Write;
+    let prog = "\
+import std.io
+pub fn main() -> Result<(), Error> {
+  w := io.stdout.buffered()
+  n := io.copy(io.stdin, w)?
+  w.flush()?
+  return Ok(())
+}
+";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "m9-copy-buffered", prog);
+    assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sm, &checked.diags));
+    let mir = lower_to_mir(&checked.hir);
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let obj = dir.join(format!("align-m9-copy-buffered-{pid}.o"));
+    let exe = dir.join(format!("align-m9-copy-buffered-{pid}{}", std::env::consts::EXE_SUFFIX));
+    struct Cleanup(Vec<PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let _g = Cleanup(vec![obj.clone(), exe.clone()]);
+    emit_object_file(&mir, &obj, BuildTarget::Baseline).expect("codegen");
+    link_executable(&obj, &exe, &mir.link_libs).expect("link");
+    let payload = b"a short tail chunk that must survive buffering\n";
+    let mut child = std::process::Command::new(&exe)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child.stdin.take().unwrap().write_all(payload).expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, payload, "the buffered tail chunk is flushed byte-exact");
+}
+
 /// O(buffer) guarantee: copying a large file (many times the transfer buffer) keeps the process's
 /// peak resident memory bounded — it must not scale with the file size. Linux-only (reads
 /// `/proc/<pid>/status` `VmHWM`). The child signals "copy done" on stdout, then blocks reading
@@ -732,11 +794,22 @@ fn io_copy_temporary_handle_argument_is_rejected() {
         "m9-copy-bound-ok",
         "import std.fs\nimport std.io\npub fn main(args: array<str>) -> Result<(), Error> {\n  r := fs.open(args[1])?\n  w := fs.create(args[2])?\n  n := io.copy(r, w)?\n  return Ok(())\n}\n",
     ), "io.copy of two bound handles must be allowed");
-    // Borrowed std streams: allowed (no owned fd — the `cat` form).
+    // Borrowed *unbuffered* std streams: allowed (no owned fd, no buffer — the `cat` form).
     assert!(!check_errs(
         "m9-copy-std-ok",
         "import std.io\npub fn main() -> Result<(), Error> {\n  n := io.copy(io.stdin, io.stdout)?\n  return Ok(())\n}\n",
     ), "io.copy(io.stdin, io.stdout) must be allowed");
+    // A *buffered* std writer temporary is NOT exempt: its bytes only reach the OS on flush/Drop, so
+    // an unbound `io.stdout.buffered()` would silently lose io.copy's tail chunk. Must be bound.
+    assert!(check_errs(
+        "m9-copy-buffered-temp",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  n := io.copy(io.stdin, io.stdout.buffered())?\n  return Ok(())\n}\n",
+    ), "a buffered std writer temporary argument to io.copy must be rejected");
+    // A bound buffered writer is fine (it flushes on scope-exit Drop).
+    assert!(!check_errs(
+        "m9-copy-buffered-bound-ok",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  w := io.stdout.buffered()\n  n := io.copy(io.stdin, w)?\n  return Ok(())\n}\n",
+    ), "io.copy into a bound buffered writer must be allowed");
 }
 
 /// `io.copy` returns `Result<i64, Error>`; discarding it (no `?` / `match` / bind) is the

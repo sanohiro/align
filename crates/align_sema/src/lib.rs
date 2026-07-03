@@ -9855,13 +9855,16 @@ impl<'a, 't> Checker<'a, 't> {
         // v1 restriction (until Move *temporaries* get a `Drop`): the receiver of a writer method
         // must be a bound local — never an unbound owned-handle temporary. `fs.create(p)?.write(d)?`
         // would leave the temp writer un-`Drop`ped, so its buffered bytes are never flushed and its
-        // fd never closed — silent data loss. The borrowed std streams (`io.stdout`/`io.stderr`,
-        // incl. `.buffered()`) own no fd and are exempt (chaining them is unchanged). Lifted when
-        // dropping Move temporaries lands (`draft.md` §18.2).
-        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::WriterStd { .. }) {
+        // fd never closed — silent data loss. Only an **unbuffered** borrowed std stream
+        // (`io.stdout`/`io.stderr`) is exempt: it owns no fd and holds no buffer, so an un-`Drop`ped
+        // temporary loses nothing. A **buffered** std writer (`io.stdout.buffered()`) accumulates
+        // bytes that only reach the OS on `flush`/`Drop`, so it must be bound like any owned handle —
+        // else its tail chunk (< the buffer size) is silently dropped. Lifted when dropping Move
+        // temporaries lands (`draft.md` §18.2).
+        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::WriterStd { buffered: false, .. }) {
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
-                    "bind the writer to a local first, then call the method (`w := <expr>` then `w.write(...)`) — a temporary owned writer handle is not dropped/flushed yet, so its output would be lost".to_string(),
+                    "bind the writer to a local first, then call the method (`w := <expr>` then `w.write(...)`) — a temporary owned/buffered writer handle is not dropped/flushed yet, so its output would be lost".to_string(),
                     span,
                 );
             }
@@ -9988,8 +9991,11 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // v1 restriction (mirrors `check_reader_method` / `check_writer_method`): each owned handle
         // must be a bound local — an unbound temporary (`io.copy(fs.open(p)?, w)`) would leak its fd
-        // (its `Drop` never runs). The borrowed std streams (`io.stdin` / `io.stdout` / `io.stderr`,
-        // incl. `.buffered()`) own no fd and are exempt. Lifted when Move temporaries get a `Drop`.
+        // (its `Drop` never runs). Only the **unbuffered** borrowed std streams (`io.stdin` /
+        // `io.stdout` / `io.stderr`) are exempt (no fd, no buffer). A **buffered** std writer
+        // (`io.stdout.buffered()`) holds bytes that only reach the OS on `flush`/`Drop`, so an
+        // un-`Drop`ped temporary would silently lose `io.copy`'s tail chunk — it must be bound.
+        // Lifted when Move temporaries get a `Drop`.
         if !matches!(reader.kind, ExprKind::Local(_) | ExprKind::ReaderStdin) {
             self.diags.error(
                 "bind the reader to a local first, then pass it (`r := <expr>` then `io.copy(r, w)`) — a temporary owned reader handle is not dropped yet, so its fd would leak".to_string(),
@@ -9997,9 +10003,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        if !matches!(writer.kind, ExprKind::Local(_) | ExprKind::WriterStd { .. }) {
+        if !matches!(writer.kind, ExprKind::Local(_) | ExprKind::WriterStd { buffered: false, .. }) {
             self.diags.error(
-                "bind the writer to a local first, then pass it (`w := <expr>` then `io.copy(r, w)`) — a temporary owned writer handle is not dropped yet, so its buffered output would be lost".to_string(),
+                "bind the writer to a local first, then pass it (`w := <expr>` then `io.copy(r, w)`) — a temporary owned/buffered writer handle is not dropped/flushed yet, so its buffered output would be lost".to_string(),
                 args[1].span,
             );
             return err;
