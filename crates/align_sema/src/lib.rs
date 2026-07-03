@@ -283,6 +283,13 @@ pub enum Ty {
     /// `slice<u8>` borrow), `.len()` is its byte count; `Drop`-freed. Constructing / reading it is
     /// pure (no I/O).
     Buffer,
+    /// `rng` (`std.rand`) — a non-cryptographic random generator. A **Copy** state-only value (the
+    /// 256-bit Xoshiro256++ state, four `i64`s) — deliberately unlike the Move `reader`/`writer`
+    /// handles: it owns no external resource (no fd), so Copy is the right default. `Static` region
+    /// (borrows nothing, never dropped, never Move). `rand.seed()`/`rand.seed_with(s)` produce one;
+    /// `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)` take a **mut** receiver and
+    /// advance the state in place. Laid out in LLVM as `[4 x i64]`, passed/returned by value.
+    Rng,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -2253,6 +2260,35 @@ impl EffectScan {
             // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data),
             ExprKind::EncodingDecode { input, .. } => self.expr(input),
+            // `std.rand` — **all impure**: `seed()` reads OS entropy; `seed_with`/`next`/`range`/
+            // `shuffle`/`sample` produce or advance mutable RNG state. So an rng-using closure is
+            // never `Pure` and is excluded from `par_map` (each thread would need its own generator).
+            ExprKind::RandSeed => self.impure_direct = true,
+            ExprKind::RandSeedWith { seed } => {
+                self.impure_direct = true;
+                self.expr(seed);
+            }
+            ExprKind::RandNext { rng } => {
+                self.impure_direct = true;
+                self.expr(rng);
+            }
+            ExprKind::RandRange { rng, lo, hi } => {
+                self.impure_direct = true;
+                self.expr(rng);
+                self.expr(lo);
+                self.expr(hi);
+            }
+            ExprKind::RandShuffle { rng, xs, .. } => {
+                self.impure_direct = true;
+                self.expr(rng);
+                self.expr(xs);
+            }
+            ExprKind::RandSample { rng, xs, k, .. } => {
+                self.impure_direct = true;
+                self.expr(rng);
+                self.expr(xs);
+                self.expr(k);
+            }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 self.stage_funcs(stages);
@@ -3256,6 +3292,26 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::TimeSleep { ns } => self.walk(ns, depth),
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
             ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
+            // `std.rand`: an `rng` is Copy/`Static` (borrows nothing); `sample` returns a fresh owned
+            // `array<T>` that borrows nothing from `xs`. Nothing escapes — just recurse into the
+            // subexpressions so any escape *inside* them (a captured local, etc.) is still checked.
+            ExprKind::RandSeed => {}
+            ExprKind::RandSeedWith { seed } => self.walk(seed, depth),
+            ExprKind::RandNext { rng } => self.walk(rng, depth),
+            ExprKind::RandRange { rng, lo, hi } => {
+                self.walk(rng, depth);
+                self.walk(lo, depth);
+                self.walk(hi, depth);
+            }
+            ExprKind::RandShuffle { rng, xs, .. } => {
+                self.walk(rng, depth);
+                self.walk(xs, depth);
+            }
+            ExprKind::RandSample { rng, xs, k, .. } => {
+                self.walk(rng, depth);
+                self.walk(xs, depth);
+                self.walk(k, depth);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -3581,6 +3637,24 @@ impl UnnecessaryHeapScan {
             ExprKind::TimeSleep { ns } => self.visit(ns),
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.visit(data),
             ExprKind::EncodingDecode { input, .. } => self.visit(input),
+            // `std.rand` — recurse into the subexpressions (no heap-narrowing pattern of its own).
+            ExprKind::RandSeed => {}
+            ExprKind::RandSeedWith { seed } => self.visit(seed),
+            ExprKind::RandNext { rng } => self.visit(rng),
+            ExprKind::RandRange { rng, lo, hi } => {
+                self.visit(rng);
+                self.visit(lo);
+                self.visit(hi);
+            }
+            ExprKind::RandShuffle { rng, xs, .. } => {
+                self.visit(rng);
+                self.visit(xs);
+            }
+            ExprKind::RandSample { rng, xs, k, .. } => {
+                self.visit(rng);
+                self.visit(xs);
+                self.visit(k);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
@@ -4192,6 +4266,26 @@ impl<'a> MoveCheck<'a> {
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data, moved, false, false),
             ExprKind::EncodingDecode { input, .. } => self.expr(input, moved, false, false),
+            // `std.rand`: the `rng` receiver is Copy (advanced in place, never consumed) and `xs` is a
+            // Copy slice view (borrowed), so nothing is moved — recurse non-consuming to catch a
+            // use-after-move *inside* the operands.
+            ExprKind::RandSeed => {}
+            ExprKind::RandSeedWith { seed } => self.expr(seed, moved, false, false),
+            ExprKind::RandNext { rng } => self.expr(rng, moved, false, false),
+            ExprKind::RandRange { rng, lo, hi } => {
+                self.expr(rng, moved, false, false);
+                self.expr(lo, moved, false, false);
+                self.expr(hi, moved, false, false);
+            }
+            ExprKind::RandShuffle { rng, xs, .. } => {
+                self.expr(rng, moved, false, false);
+                self.expr(xs, moved, false, false);
+            }
+            ExprKind::RandSample { rng, xs, k, .. } => {
+                self.expr(rng, moved, false, false);
+                self.expr(xs, moved, false, false);
+                self.expr(k, moved, false, false);
+            }
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -7080,6 +7174,13 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.encoding", &format!("encoding.{method}"), span);
                 return self.check_encoding_op(method, args, span);
             }
+            // `std.rand` — a Copy `rng`: `rand.seed()` (OS-seeded) / `rand.seed_with(s)`
+            // (deterministic). The `r.next()`/`range`/`shuffle`/`sample` methods dispatch on the
+            // receiver type below (value methods on an `rng`), not here.
+            if module == "rand" && matches!(method, "seed" | "seed_with") {
+                self.require_import("std.rand", &format!("rand.{method}"), span);
+                return self.check_rand_seed(method, args, span);
+            }
         }
         // `io.stdout.buffered()` / `io.stderr.buffered()` — a buffered `writer` over a standard
         // stream. The receiver is the 2-segment `io.stdout` / `io.stderr`, so it parses as a
@@ -7260,6 +7361,21 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty != Ty::Error {
                 self.diags
                     .error(format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        // `std.rand` value methods on an `rng`: `r.next()` / `r.range(lo, hi)` / `r.shuffle(out xs)`
+        // / `r.sample(xs, k)`. Each advances the receiver state in place, so the receiver must be a
+        // **mut** local (checked in `check_rng_method`). Dispatched on the receiver type so a same-
+        // named user method on another value still resolves normally.
+        if matches!(method, "next" | "range" | "shuffle" | "sample") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::Rng {
+                return self.check_rng_method(recv, recv_expr, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.{method}()' is not a method on {} (it is an `rng` method)", ty_name(recv_expr.ty)), span);
             }
             return err;
         }
@@ -10258,6 +10374,184 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::EncodingEncode { kind, data: Box::new(data) }, ty: Ty::String, span }
     }
 
+    /// Require `ty` to be **exactly** `i64` (the `align_rt_rng_*` runtime ABI), binding a bare-int-
+    /// literal inference var to it — not merely int-like. A narrower `i32`/`u8` operand would build a
+    /// node whose value width doesn't match the runtime signature (the `time.sleep` #343 discipline;
+    /// Align has no implicit int coercion). Returns `false` (after erroring) on a non-`i64` width.
+    fn require_i64_arg(&mut self, ty: Ty, span: Span, what: &str) -> bool {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match self.resolve(ty) {
+            Ty::Int(IntTy { bits: 64, signed: true }) => true,
+            Ty::IntVar(_) => {
+                self.constrain(ty, Some(i64_ty), span);
+                true
+            }
+            Ty::Error => false,
+            other => {
+                self.diags.error(format!("{what} must be i64, got {}", ty_name(other)), span);
+                false
+            }
+        }
+    }
+
+    /// `rand.seed()` / `rand.seed_with(s)` — build a Copy `rng` value ([`Ty::Rng`]). `seed()` reads
+    /// the OS CSPRNG (no argument); `seed_with(s)` takes an `i64` seed (deterministic). Both are
+    /// module functions (dispatched like `encoding.*`), not methods.
+    fn check_rand_seed(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if method == "seed" {
+            if !args.is_empty() {
+                self.diags.error(format!("'rand.seed' takes no arguments, got {}", args.len()), span);
+                return err;
+            }
+            return Expr { kind: ExprKind::RandSeed, ty: Ty::Rng, span };
+        }
+        // `seed_with(s)` — one `i64` seed.
+        if args.len() != 1 {
+            self.diags.error(format!("'rand.seed_with' expects 1 argument (an i64 seed), got {}", args.len()), span);
+            return err;
+        }
+        // No hint — `require_i64_arg` is the sole width check (binds a bare literal's var to i64),
+        // so a non-i64 operand reports exactly once (not also a hint-unification mismatch).
+        let seed = self.check_expr(&args[0], None);
+        if seed.ty == Ty::Error {
+            return err;
+        }
+        if !self.require_i64_arg(seed.ty, args[0].span, "'rand.seed_with' seed") {
+            return err;
+        }
+        Expr { kind: ExprKind::RandSeedWith { seed: Box::new(seed) }, ty: Ty::Rng, span }
+    }
+
+    /// `r.next()` / `r.range(lo, hi)` / `r.shuffle(out xs)` / `r.sample(xs, k)` on an `rng`
+    /// ([`Ty::Rng`]). Each advances the receiver state in place, so the receiver must be a **mut**
+    /// local. `recv_expr` is the already-checked receiver (a [`ExprKind::Local`]); `recv` is its AST
+    /// (for the mut/place check).
+    fn check_rng_method(&mut self, recv: &ast::Expr, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        // The receiver must be a bound **mut** local — the method mutates the rng state in place, so
+        // an immutable binding (or a non-place receiver like `arr[0].next()`) is a compile error.
+        let Some((rid, _)) = self.place_local(recv) else {
+            self.diags.error(
+                format!("'.{method}()' needs a `mut` rng local (bind it first: `mut r := rand.seed()`, then `r.{method}(...)`) — it advances the generator state in place"),
+                recv.span,
+            );
+            return err;
+        };
+        if !self.locals[rid as usize].is_mut {
+            let name = self.locals[rid as usize].name.clone();
+            self.diags.error(
+                format!("cannot advance immutable rng '{name}' (declare with `mut`) — '.{method}()' mutates the generator state"),
+                recv.span,
+            );
+            return err;
+        }
+        match method {
+            "next" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.next()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::RandNext { rng: Box::new(recv_expr) }, ty: i64_ty, span }
+            }
+            "range" => {
+                let [lo_arg, hi_arg] = args else {
+                    self.diags.error(format!("'.range()' takes 2 arguments (lo, hi), got {}", args.len()), span);
+                    return err;
+                };
+                // No hint — `require_i64_arg` is the sole width check (single diagnostic on a bad width).
+                let lo = self.check_expr(lo_arg, None);
+                let hi = self.check_expr(hi_arg, None);
+                if lo.ty == Ty::Error || hi.ty == Ty::Error {
+                    return err;
+                }
+                // Both bounds must be exactly i64 (the runtime `align_rt_rng_range` ABI); check both
+                // before bailing so a mistake in either is reported.
+                let lo_ok = self.require_i64_arg(lo.ty, lo_arg.span, "'.range()' bound");
+                let hi_ok = self.require_i64_arg(hi.ty, hi_arg.span, "'.range()' bound");
+                if !lo_ok || !hi_ok {
+                    return err;
+                }
+                Expr { kind: ExprKind::RandRange { rng: Box::new(recv_expr), lo: Box::new(lo), hi: Box::new(hi) }, ty: i64_ty, span }
+            }
+            "shuffle" => {
+                let [xs_arg] = args else {
+                    self.diags.error(format!("'.shuffle()' takes 1 argument (an `out` slice), got {}", args.len()), span);
+                    return err;
+                };
+                // `out xs: slice<T>` — a writable slice place (a `mut` local slice), like `map_into`'s
+                // destination. Fisher-Yates rearranges the elements in place through this slice.
+                let xs = self.check_expr(xs_arg, None);
+                if xs.ty == Ty::Error {
+                    return err;
+                }
+                let Ty::Slice(es) = self.resolve(xs.ty) else {
+                    self.diags.error(format!("'.shuffle()' rearranges a slice<T> in place, got {}", ty_name(xs.ty)), xs_arg.span);
+                    return err;
+                };
+                if scalar_to_prim(es).is_none() {
+                    self.diags.error(
+                        format!("'.shuffle()' element must be a primitive scalar (int/float/bool/char), got {}", scalar_name(es)),
+                        xs_arg.span,
+                    );
+                    return err;
+                }
+                let Some((xid, _)) = self.place_local(xs_arg) else {
+                    self.diags.error(
+                        "'.shuffle()' needs a writable slice place (a `mut` local, or an `out` parameter)".to_string(),
+                        xs_arg.span,
+                    );
+                    return err;
+                };
+                if !self.locals[xid as usize].is_mut {
+                    let name = self.locals[xid as usize].name.clone();
+                    self.diags.error(
+                        format!("cannot shuffle immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
+                        xs_arg.span,
+                    );
+                    return err;
+                }
+                Expr { kind: ExprKind::RandShuffle { rng: Box::new(recv_expr), xs: Box::new(xs), elem: scalar_to_ty(es) }, ty: Ty::Unit, span }
+            }
+            "sample" => {
+                let [xs_arg, k_arg] = args else {
+                    self.diags.error(format!("'.sample()' takes 2 arguments (a slice and a count), got {}", args.len()), span);
+                    return err;
+                };
+                let xs = self.check_expr(xs_arg, None);
+                if xs.ty == Ty::Error {
+                    return err;
+                }
+                let Ty::Slice(es) = self.resolve(xs.ty) else {
+                    self.diags.error(format!("'.sample()' draws from a slice<T>, got {}", ty_name(xs.ty)), xs_arg.span);
+                    return err;
+                };
+                if scalar_to_prim(es).is_none() {
+                    self.diags.error(
+                        format!("'.sample()' element must be a primitive scalar (int/float/bool/char), got {}", scalar_name(es)),
+                        xs_arg.span,
+                    );
+                    return err;
+                }
+                let k = self.check_expr(k_arg, None); // sole width check below (single diagnostic).
+                if k.ty == Ty::Error {
+                    return err;
+                }
+                if !self.require_i64_arg(k.ty, k_arg.span, "'.sample()' count") {
+                    return err;
+                }
+                // The result is a fresh owned `array<T>` (the drawn elements copied out — it borrows
+                // nothing from `xs`, so no region tie).
+                Expr { kind: ExprKind::RandSample { rng: Box::new(recv_expr), xs: Box::new(xs), k: Box::new(k), elem: scalar_to_ty(es) }, ty: Ty::DynArray(es), span }
+            }
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on an rng (try next / range / shuffle / sample)"), span);
+                err
+            }
+        }
+    }
+
     /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — a buffered `writer` over the
     /// given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
     fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
@@ -11364,6 +11658,23 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
             ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
+            ExprKind::RandSeed => {}
+            ExprKind::RandSeedWith { seed } => self.finalize_expr(seed),
+            ExprKind::RandNext { rng } => self.finalize_expr(rng),
+            ExprKind::RandRange { rng, lo, hi } => {
+                self.finalize_expr(rng);
+                self.finalize_expr(lo);
+                self.finalize_expr(hi);
+            }
+            ExprKind::RandShuffle { rng, xs, .. } => {
+                self.finalize_expr(rng);
+                self.finalize_expr(xs);
+            }
+            ExprKind::RandSample { rng, xs, k, .. } => {
+                self.finalize_expr(rng);
+                self.finalize_expr(xs);
+                self.finalize_expr(k);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);
@@ -11782,6 +12093,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
+        Ty::Rng => "rng".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -12175,6 +12487,15 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::Buffer
+        }
+        // `rng` (`std.rand`) — a Copy state-only random-generator value. A surface type name so it
+        // can be a `let` annotation / function parameter (an rng is Copy, passed/returned by value).
+        "rng" => {
+            if !args.is_empty() {
+                diags.error("rng takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::Rng
         }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {

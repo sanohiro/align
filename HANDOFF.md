@@ -5,9 +5,18 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-04 (docs-only: M10 std-2 design settled)._
+_Last updated: 2026-07-05 (M10 Slice 2 — std.rand — DONE)._
 
-## M10 — std (encoding / rand / cli) — design settled (2026-07-04); Slice 1 (std.encoding) DONE
+## M10 — std (encoding / rand / cli) — design settled (2026-07-04); Slices 1–2 (encoding, rand) DONE
+
+**Slice 2 — std.rand — DONE.** Copy `rng` ([`Ty::Rng`] = Xoshiro256++ `[4 x i64]`, value not Move —
+never on the move/drop/escape path); `rand.seed()` (OS `getrandom`, abort on the rare failure) /
+`rand.seed_with(s)` (SplitMix64 deterministic); `r.next()`/`r.range(lo,hi)` (Lemire, `lo>=hi` aborts)
+/`r.shuffle(out xs)` (in-place Fisher-Yates) /`r.sample(xs,k)` (partial Fisher-Yates → owned
+`array<T>`, `k<0`/`k>len` aborts) take a **mut** receiver. All rand nodes Impure (excluded from
+`par_map`). New `Ty::Rng` swept Copy/`Static` through every pass; HIR `Rand*` + MIR `Rvalue`s +
+`align_rt_rng_*`; `tests/m10_rand.rs` (12) + runtime units (5). Only Slice 3 (std.cli) remains.
+
 
 **Slice 1 — std.encoding — DONE.** `encoding.base64_encode`/`base64_decode`/`base64url_encode`/
 `base64url_decode`/`hex_encode`/`hex_decode`/`utf8_valid`: encode (byte view) -> owned `string`,
@@ -15,7 +24,6 @@ decode (`str`) -> `Result<buffer, Error>` (invalid -> `Error.Invalid`), `utf8_va
 reusing the #344 validator. New `Scalar::Buffer` owned-Move payload (reader/writer precedent) carries
 the decoded `buffer`; scalar reference impl (SIMD later, same signatures). sema dispatch + MIR
 `Encoding*`/`Utf8Valid` + `align_rt_*` runtime; `tests/m10_encoding.rs` (11) + runtime units (7).
-Slices 2 (std.rand) / 3 (std.cli) remain.
 
 
 

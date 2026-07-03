@@ -5303,6 +5303,18 @@ unsafe extern "C" {
     // UB (POSIX — `setenv` is not thread-safe against `getenv`/`setenv` in other threads).
     fn getenv(name: *const u8) -> *const u8;
     fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32;
+    // OS CSPRNG seed for `rand.seed()`; never raw `RDRAND`/`RNDR` (outside the baseline, `SIGILL`
+    // on older silicon — `docs/open-questions.md` #342). Per-OS symbol (the C entry differs):
+    //   Linux — `getrandom(2)` (glibc ≥ 2.25 / musl): fills `buf` with `buflen` bytes, returns the
+    //   byte count or -1 (with `errno`). `flags` = 0 (block until the pool is initialized, then
+    //   never fails short of `EINTR`).
+    #[cfg(target_os = "linux")]
+    fn getrandom(buf: *mut core::ffi::c_void, buflen: usize, flags: u32) -> isize;
+    //   macOS — `getentropy(2)`: fills `buf` with `buflen` (≤ 256) bytes, returns 0 on success or
+    //   -1 (with `errno`). No `getrandom` symbol exists on macOS, so a bare `getrandom` extern would
+    //   be a link error there.
+    #[cfg(target_os = "macos")]
+    fn getentropy(buf: *mut core::ffi::c_void, buflen: usize) -> i32;
 }
 
 // `mmap` protection / flags — the portable POSIX constants (identical on Linux and macOS).
@@ -5334,6 +5346,243 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
     unsafe { free(ptr as *mut core::ffi::c_void) }
+}
+
+// ── std.rand — Xoshiro256++ ────────────────────────────────────────────────────────────────────
+//
+// A non-cryptographic PRNG (`draft.md` §18.2). `rng` is a Copy 256-bit state (`[4 x i64]`); the
+// generated code passes a pointer to that slot and the runtime advances it in place. Seeding is
+// SplitMix64 (deterministic) or `getrandom` (OS). `range`/`shuffle`/`sample` draw bias-free indices
+// via Lemire's nearly-divisionless bounded generator.
+
+/// One Xoshiro256++ step: advance `s` and return the next 64-bit output.
+#[inline]
+fn xoshiro_next(s: &mut [u64; 4]) -> u64 {
+    let result = (s[0].wrapping_add(s[3])).rotate_left(23).wrapping_add(s[0]);
+    let t = s[1] << 17;
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = s[3].rotate_left(45);
+    result
+}
+
+/// Expand a 64-bit seed into a full 256-bit Xoshiro256++ state via SplitMix64 (the author-
+/// recommended seeding). Guard the all-zero state (a fixed point for xoshiro) — SplitMix64 makes it
+/// astronomically unlikely, but never rely on that.
+fn splitmix64_state(seed: u64) -> [u64; 4] {
+    let mut x = seed;
+    let mut nextword = || {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let s = [nextword(), nextword(), nextword(), nextword()];
+    if s == [0, 0, 0, 0] { [1, 0, 0, 0] } else { s }
+}
+
+/// A uniform `u64` in `[0, range)` (`range > 0`), bias-free via Lemire's nearly-divisionless method
+/// (at most one rejection in the rare biased tail). Advances `s`.
+fn bounded(s: &mut [u64; 4], range: u64) -> u64 {
+    let mut m = (xoshiro_next(s) as u128) * (range as u128);
+    let mut low = m as u64;
+    if low < range {
+        // Reject the `(2^64) mod range` biased low residues so every value in `[0, range)` is
+        // equally likely; `range.wrapping_neg() % range` == `(2^64 - range) % range` == `2^64 % range`.
+        let threshold = range.wrapping_neg() % range;
+        while low < threshold {
+            m = (xoshiro_next(s) as u128) * (range as u128);
+            low = m as u64;
+        }
+    }
+    (m >> 64) as u64
+}
+
+/// `rand.seed_with(s)` — deterministic seed. Writes the 256-bit state into `state` (a `[4 x i64]`).
+///
+/// # Safety
+/// `state` must point to a writable `[u64; 4]` (the caller's `rng` slot).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_rng_seed_with(state: *mut u64, seed: i64) {
+    let s = splitmix64_state(seed as u64);
+    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), state, 4) };
+}
+
+/// Fill `buf` with OS CSPRNG entropy — the per-OS seed source (Linux `getrandom`, macOS
+/// `getentropy`). A failure is rare (the pool is initialized at boot) and **aborts** — seeding is
+/// not a fallible user-facing operation. On a platform with neither symbol this is a hard abort at
+/// runtime (the rest of `align_runtime` is Linux-only today anyway; the cfg keeps `rand` buildable).
+fn fill_os_entropy(buf: &mut [u8; 32]) {
+    #[cfg(target_os = "linux")]
+    {
+        // `getrandom(2)`: loop over short reads / `EINTR` until the 32 bytes are filled.
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let n = unsafe {
+                getrandom(buf.as_mut_ptr().add(filled) as *mut core::ffi::c_void, buf.len() - filled, 0)
+            };
+            if n < 0 {
+                // A signal interrupted the fill → resume; any other error is unrecoverable.
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic_abort("rand.seed: getrandom failed");
+            }
+            if n == 0 {
+                panic_abort("rand.seed: getrandom returned no bytes");
+            }
+            filled += n as usize;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `getentropy(2)` fills the whole buffer in one call (32 ≤ its 256-byte limit).
+        let rc = unsafe { getentropy(buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
+        if rc != 0 {
+            panic_abort("rand.seed: getentropy failed");
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = buf;
+        panic_abort("rand.seed: OS seeding unsupported on this platform");
+    }
+}
+
+/// `rand.seed()` — OS-seeded. Fills the 256-bit state from the OS CSPRNG (see [`fill_os_entropy`]).
+/// A seed failure is rare and **aborts** rather than surface a `Result` — the settled design:
+/// seeding is not a fallible user-facing operation.
+///
+/// # Safety
+/// `state` must point to a writable `[u64; 4]` (the caller's `rng` slot).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_rng_seed_os(state: *mut u64) {
+    let mut buf = [0u8; 32];
+    fill_os_entropy(&mut buf);
+    let mut s = [0u64; 4];
+    for (i, word) in s.iter_mut().enumerate() {
+        *word = u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+    if s == [0, 0, 0, 0] {
+        s[0] = 1;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), state, 4) };
+}
+
+/// `r.next()` — advance the rng and return the next `i64`.
+///
+/// # Safety
+/// `state` must point to a valid, seeded `[u64; 4]` (the caller's `rng` slot).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_rng_next(state: *mut u64) -> i64 {
+    let s = unsafe { &mut *(state as *mut [u64; 4]) };
+    xoshiro_next(s) as i64
+}
+
+/// `r.range(lo, hi)` — a uniform `i64` in `[lo, hi)` (bias-free). `lo >= hi` is a programmer error
+/// (an empty range — nothing to draw) and aborts at runtime, like an out-of-bounds index.
+///
+/// # Safety
+/// `state` must point to a valid, seeded `[u64; 4]`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_rng_range(state: *mut u64, lo: i64, hi: i64) -> i64 {
+    if lo >= hi {
+        eprintln!("align: panic: rand.range: empty range [{lo}, {hi}) — lo must be < hi");
+        std::process::abort();
+    }
+    let s = unsafe { &mut *(state as *mut [u64; 4]) };
+    // The width fits a `u64` (an i64 span is at most `2^64 - 1`); compute in `i128` to avoid the
+    // `hi - lo` overflow when the span crosses zero (e.g. `i64::MIN`..`i64::MAX`).
+    let width = (hi as i128 - lo as i128) as u64;
+    let draw = bounded(s, width);
+    (lo as i128 + draw as i128) as i64
+}
+
+/// `r.shuffle(out xs)` — Fisher-Yates shuffle the slice in place. `ptr`/`len` describe the slice;
+/// `elem_size` is one element's byte width. Advances the rng. A `len <= 1` slice is left unchanged.
+///
+/// # Safety
+/// `state` must point to a valid `[u64; 4]`; `ptr`/`len`/`elem_size` must describe a writable slice
+/// of `len` elements of `elem_size` bytes each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_rng_shuffle(state: *mut u64, ptr: *mut u8, len: i64, elem_size: i64) {
+    if len <= 1 || elem_size <= 0 || ptr.is_null() {
+        return;
+    }
+    // `len`/`elem_size` describe an in-memory slice, so they fit `usize`; validate before any index
+    // math (a truncating `as usize` on a 32-bit target would corrupt the offsets).
+    let (Ok(n), Ok(es)) = (usize::try_from(len), usize::try_from(elem_size)) else {
+        return;
+    };
+    let s = unsafe { &mut *(state as *mut [u64; 4]) };
+    // i from n-1 down to 1: pick j uniformly in [0, i], swap elements i and j byte-wise.
+    let mut i = n - 1;
+    while i >= 1 {
+        let j = bounded(s, (i + 1) as u64) as usize; // [0, i]
+        if j != i {
+            let a = unsafe { ptr.add(i * es) };
+            let b = unsafe { ptr.add(j * es) };
+            // Distinct indices → non-overlapping element ranges.
+            unsafe { core::ptr::swap_nonoverlapping(a, b, es) };
+        }
+        i -= 1;
+    }
+}
+
+/// `r.sample(xs, k)` — draw `k` elements of the slice (`src`/`src_len`, element size `elem_size`)
+/// without replacement, into a fresh owned `array<T>` returned as `{ptr, len}` (buffer from
+/// [`align_rt_alloc`], freed by the bound local's `Drop`). `k < 0` or `k > src_len` aborts — it is
+/// impossible to draw that many distinct items. Advances the rng.
+///
+/// v1 uses a full `0..n` index permutation (O(n) scratch) partially shuffled to its first `k` —
+/// correctness before speed; an O(k) Floyd's-sample is a later optimization behind this signature.
+///
+/// # Safety
+/// `state` must point to a valid `[u64; 4]`; `src`/`src_len`/`elem_size` must describe a readable
+/// slice of `src_len` elements of `elem_size` bytes each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_rng_sample(
+    state: *mut u64,
+    src: *const u8,
+    src_len: i64,
+    k: i64,
+    elem_size: i64,
+) -> AlignStr {
+    if k < 0 || k > src_len {
+        eprintln!("align: panic: rand.sample: cannot draw {k} distinct items from a slice of length {src_len}");
+        std::process::abort();
+    }
+    if k == 0 || elem_size <= 0 || src.is_null() {
+        // An empty draw owns no buffer (its `free(null)` drop is a no-op).
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    // All three describe / index an in-memory slice, so they fit `usize` (guard the truncating
+    // `as usize` on a 32-bit target); `k` is already validated to `0..=src_len` above.
+    let (Ok(es), Ok(n), Ok(kk)) = (usize::try_from(elem_size), usize::try_from(src_len), usize::try_from(k)) else {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    };
+    let out_bytes = kk
+        .checked_mul(es)
+        .and_then(|b| i64::try_from(b).ok())
+        .unwrap_or_else(|| panic_abort("rand.sample: output size overflow"));
+    let out = align_rt_alloc(out_bytes); // kk > 0 → non-null (or aborts on OOM)
+    let s = unsafe { &mut *(state as *mut [u64; 4]) };
+    // Partial Fisher-Yates: select the first `kk` of a shuffled permutation of `0..n`, copying each
+    // chosen source element into the output in draw order.
+    let mut idx: Vec<usize> = (0..n).collect();
+    for i in 0..kk {
+        // Pick uniformly from the not-yet-selected suffix [i, n).
+        let j = i + bounded(s, (n - i) as u64) as usize;
+        idx.swap(i, j);
+        let srcp = unsafe { src.add(idx[i] * es) };
+        let dstp = unsafe { out.add(i * es) };
+        unsafe { core::ptr::copy_nonoverlapping(srcp, dstp, es) };
+    }
+    AlignStr { ptr: out as *const u8, len: kk as i64 }
 }
 
 #[cfg(test)]
@@ -7702,5 +7951,105 @@ mod tests {
         // A non-positive sleep is a no-op (returns immediately).
         align_rt_time_sleep(-1);
         align_rt_time_sleep(0);
+    }
+
+    // --- std.rand ------------------------------------------------------------------------------
+
+    /// Advance a fresh `[u64;4]` state through the FFI `next` entry, returning `count` outputs.
+    fn seq_with(seed: i64, count: usize) -> Vec<i64> {
+        let mut s = [0u64; 4];
+        unsafe { align_rt_rng_seed_with(s.as_mut_ptr(), seed) };
+        (0..count).map(|_| unsafe { align_rt_rng_next(s.as_mut_ptr()) }).collect()
+    }
+
+    #[test]
+    fn seed_with_is_deterministic_and_advances() {
+        // Same seed → identical sequence; different seeds → different sequences.
+        assert_eq!(seq_with(42, 8), seq_with(42, 8), "same seed must reproduce the sequence");
+        assert_ne!(seq_with(42, 8), seq_with(43, 8), "different seeds diverge");
+        // The generator advances (consecutive outputs are not all equal).
+        let s = seq_with(7, 4);
+        assert!(s.iter().any(|&x| x != s[0]), "next() must advance the state");
+        // Pin the first outputs (locks the Xoshiro256++ / SplitMix64 constants, portable).
+        assert_eq!(seq_with(42, 2), vec![-3425465463722317665, 5881210131331364753]);
+    }
+
+    #[test]
+    fn seed_os_fills_a_nonzero_state() {
+        // Two OS seeds are (almost surely) different, and never the all-zero fixed point.
+        let mut a = [0u64; 4];
+        let mut b = [0u64; 4];
+        unsafe { align_rt_rng_seed_os(a.as_mut_ptr()) };
+        unsafe { align_rt_rng_seed_os(b.as_mut_ptr()) };
+        assert_ne!(a, [0, 0, 0, 0], "OS seed must not be the all-zero fixed point");
+        assert_ne!(a, b, "two OS seeds must (almost surely) differ");
+    }
+
+    #[test]
+    fn range_is_half_open_and_bias_free() {
+        let mut s = [0u64; 4];
+        unsafe { align_rt_rng_seed_with(s.as_mut_ptr(), 1) };
+        // A single-value range is always its lower bound (lo inclusive, hi exclusive).
+        for _ in 0..1000 {
+            assert_eq!(unsafe { align_rt_rng_range(s.as_mut_ptr(), 5, 6) }, 5);
+        }
+        // Every draw lands in [lo, hi); across many draws every value in a small range appears
+        // (a coverage/uniformity smoke check — bias would drop or over-represent an endpoint).
+        let mut seen = [false; 4];
+        for _ in 0..2000 {
+            let v = unsafe { align_rt_rng_range(s.as_mut_ptr(), -1, 3) }; // {-1,0,1,2}
+            assert!((-1..3).contains(&v), "draw {v} outside [-1, 3)");
+            seen[(v + 1) as usize] = true;
+        }
+        assert!(seen.iter().all(|&b| b), "every value in the range must be reachable");
+    }
+
+    #[test]
+    fn shuffle_is_a_permutation() {
+        let mut s = [0u64; 4];
+        unsafe { align_rt_rng_seed_with(s.as_mut_ptr(), 123) };
+        let mut xs: Vec<i64> = (0..50).collect();
+        let orig = xs.clone();
+        unsafe { align_rt_rng_shuffle(s.as_mut_ptr(), xs.as_mut_ptr() as *mut u8, xs.len() as i64, 8) };
+        // Same multiset (a permutation), and the order actually changed.
+        let mut sorted = xs.clone();
+        sorted.sort();
+        assert_eq!(sorted, orig, "shuffle must preserve the multiset");
+        assert_ne!(xs, orig, "shuffle must reorder (50 elements: p(identity) ~ 1/50!)");
+        // A single-element / empty slice is left unchanged (no panic).
+        let mut one = [99i64];
+        unsafe { align_rt_rng_shuffle(s.as_mut_ptr(), one.as_mut_ptr() as *mut u8, 1, 8) };
+        assert_eq!(one, [99]);
+    }
+
+    #[test]
+    fn sample_draws_k_distinct_members() {
+        let mut s = [0u64; 4];
+        unsafe { align_rt_rng_seed_with(s.as_mut_ptr(), 5) };
+        let src: Vec<i64> = (0..20).collect();
+        let out = unsafe { align_rt_rng_sample(s.as_mut_ptr(), src.as_ptr() as *const u8, src.len() as i64, 8, 8) };
+        assert_eq!(out.len, 8);
+        let drawn: Vec<i64> = (0..8)
+            .map(|i| unsafe { *(out.ptr as *const i64).add(i) })
+            .collect();
+        // Each drawn item is a member of the source, and all are distinct (without replacement).
+        for &d in &drawn {
+            assert!(src.contains(&d), "sampled {d} is not from the source");
+        }
+        let mut uniq = drawn.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), drawn.len(), "sampled items must be distinct");
+        unsafe { align_rt_free(out.ptr as *mut u8) };
+        // k == 0 → empty draw, no buffer.
+        let empty = unsafe { align_rt_rng_sample(s.as_mut_ptr(), src.as_ptr() as *const u8, src.len() as i64, 0, 8) };
+        assert_eq!(empty.len, 0);
+        assert!(empty.ptr.is_null());
+        // Sampling the whole slice is a permutation of it.
+        let full = unsafe { align_rt_rng_sample(s.as_mut_ptr(), src.as_ptr() as *const u8, src.len() as i64, src.len() as i64, 8) };
+        let mut got: Vec<i64> = (0..src.len()).map(|i| unsafe { *(full.ptr as *const i64).add(i) }).collect();
+        got.sort();
+        assert_eq!(got, src, "sampling n of n is a full permutation");
+        unsafe { align_rt_free(full.ptr as *mut u8) };
     }
 }

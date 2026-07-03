@@ -1880,7 +1880,8 @@ Move `reader`/`writer` handles: it holds no external resource, so Copy is the ri
 special case. Methods take a `mut` receiver to advance the state. The OS seed comes from
 `getrandom`/`urandom` — never raw `RDRAND`/`RNDR` (outside the x86-64-v2/armv8-a baseline, `SIGILL`
 on older silicon; `docs/open-questions.md` #342). `rand.seed`'s OS call is assumed not to fail in
-practice; whether a real failure aborts or returns a `Result` is left to the implementation slice.
+practice; a real failure **aborts** (it is not surfaced as a `Result` — seeding is not a fallible
+user-facing operation), like the other runtime traps.
 `lo >= hi` on `r.range` is a programmer error and aborts at runtime (like out-of-bounds indexing /
 div-by-zero) — there is no non-empty range to draw from. Likewise `r.sample`'s `k < 0` or
 `k > xs.len()` aborts at runtime: sampling more distinct items than exist, without replacement, is
