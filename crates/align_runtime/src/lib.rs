@@ -5303,11 +5303,18 @@ unsafe extern "C" {
     // UB (POSIX — `setenv` is not thread-safe against `getenv`/`setenv` in other threads).
     fn getenv(name: *const u8) -> *const u8;
     fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32;
-    // `getrandom(2)` (glibc ≥ 2.25 / musl) — fill `buf` with `buflen` bytes of OS CSPRNG output.
-    // Used only to seed `rand.seed()`; never raw `RDRAND`/`RNDR` (outside the baseline, `SIGILL` on
-    // older silicon — `docs/open-questions.md` #342). Returns the byte count, or -1 (with `errno`)
-    // on error. `flags` = 0 (block until the pool is initialized, then never fails short of EINTR).
+    // OS CSPRNG seed for `rand.seed()`; never raw `RDRAND`/`RNDR` (outside the baseline, `SIGILL`
+    // on older silicon — `docs/open-questions.md` #342). Per-OS symbol (the C entry differs):
+    //   Linux — `getrandom(2)` (glibc ≥ 2.25 / musl): fills `buf` with `buflen` bytes, returns the
+    //   byte count or -1 (with `errno`). `flags` = 0 (block until the pool is initialized, then
+    //   never fails short of `EINTR`).
+    #[cfg(target_os = "linux")]
     fn getrandom(buf: *mut core::ffi::c_void, buflen: usize, flags: u32) -> isize;
+    //   macOS — `getentropy(2)`: fills `buf` with `buflen` (≤ 256) bytes, returns 0 on success or
+    //   -1 (with `errno`). No `getrandom` symbol exists on macOS, so a bare `getrandom` extern would
+    //   be a link error there.
+    #[cfg(target_os = "macos")]
+    fn getentropy(buf: *mut core::ffi::c_void, buflen: usize) -> i32;
 }
 
 // `mmap` protection / flags — the portable POSIX constants (identical on Linux and macOS).
@@ -5405,36 +5412,57 @@ pub unsafe extern "C" fn align_rt_rng_seed_with(state: *mut u64, seed: i64) {
     unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), state, 4) };
 }
 
-/// `rand.seed()` — OS-seeded. Fills the 256-bit state from `getrandom`. A `getrandom` failure is
-/// rare (the pool is initialized at boot; `flags = 0` blocks until then), so we **abort** rather
-/// than surface a `Result` — the settled design: seeding is not a fallible user-facing operation.
+/// Fill `buf` with OS CSPRNG entropy — the per-OS seed source (Linux `getrandom`, macOS
+/// `getentropy`). A failure is rare (the pool is initialized at boot) and **aborts** — seeding is
+/// not a fallible user-facing operation. On a platform with neither symbol this is a hard abort at
+/// runtime (the rest of `align_runtime` is Linux-only today anyway; the cfg keeps `rand` buildable).
+fn fill_os_entropy(buf: &mut [u8; 32]) {
+    #[cfg(target_os = "linux")]
+    {
+        // `getrandom(2)`: loop over short reads / `EINTR` until the 32 bytes are filled.
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let n = unsafe {
+                getrandom(buf.as_mut_ptr().add(filled) as *mut core::ffi::c_void, buf.len() - filled, 0)
+            };
+            if n < 0 {
+                // A signal interrupted the fill → resume; any other error is unrecoverable.
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic_abort("rand.seed: getrandom failed");
+            }
+            if n == 0 {
+                panic_abort("rand.seed: getrandom returned no bytes");
+            }
+            filled += n as usize;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `getentropy(2)` fills the whole buffer in one call (32 ≤ its 256-byte limit).
+        let rc = unsafe { getentropy(buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
+        if rc != 0 {
+            panic_abort("rand.seed: getentropy failed");
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = buf;
+        panic_abort("rand.seed: OS seeding unsupported on this platform");
+    }
+}
+
+/// `rand.seed()` — OS-seeded. Fills the 256-bit state from the OS CSPRNG (see [`fill_os_entropy`]).
+/// A seed failure is rare and **aborts** rather than surface a `Result` — the settled design:
+/// seeding is not a fallible user-facing operation.
 ///
 /// # Safety
 /// `state` must point to a writable `[u64; 4]` (the caller's `rng` slot).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_rng_seed_os(state: *mut u64) {
     let mut buf = [0u8; 32];
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        let n = unsafe {
-            getrandom(
-                buf.as_mut_ptr().add(filled) as *mut core::ffi::c_void,
-                buf.len() - filled,
-                0,
-            )
-        };
-        if n < 0 {
-            // A signal interrupted the fill → resume; any other error is unrecoverable.
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            panic_abort("rand.seed: getrandom failed");
-        }
-        if n == 0 {
-            panic_abort("rand.seed: getrandom returned no bytes");
-        }
-        filled += n as usize;
-    }
+    fill_os_entropy(&mut buf);
     let mut s = [0u64; 4];
     for (i, word) in s.iter_mut().enumerate() {
         *word = u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
