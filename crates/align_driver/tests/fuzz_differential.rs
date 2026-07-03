@@ -678,3 +678,328 @@ fn generated_programs_compute_the_oracle_value() {
         );
     }
 }
+
+// === wave 2: Option/Result value round-trip, enum + match, nested struct read/write ===
+//
+// Each generator, like the wave-1 ones, emits a **valid** Align program together with the value it
+// must compute (a Rust oracle mirroring Align's semantics exactly) and asserts the process exit code
+// equals it. The "small value representable at every width" trick (element/field/arg values 0..9) is
+// kept so a stored value always reads back unchanged and only the final i32 sum wraps. The two
+// control-flow generators additionally assert their seed range *exercises both branches* (Some/None,
+// Ok/Err) so a generator that silently only ever took one path would fail loudly.
+
+// --- Option `else`-unwrap: a chain of `pick(b) else fallback` unwraps, observed by their i32 sum.
+// Each helper returns `Some(payload)` for a `true` selector and `None` for `false`; the oracle picks
+// the payload or the fallback per the (statically known) selector. Both the Some and None arms are
+// forced across the seed range. ---
+
+#[test]
+fn option_else_unwrap_computes_the_oracle_value() {
+    if !backend_available() {
+        return;
+    }
+    let (mut some_hit, mut none_hit) = (false, false);
+    for seed in 0..150u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x94D0_49BB_1331_11EB).wrapping_add(23));
+        let nfns = 1 + rng.below(3); // 1..3 Option helpers
+        let mut helpers = String::new();
+        let mut body = String::new();
+        let mut names = Vec::new();
+        let mut acc = 0i128;
+        for i in 0..nfns {
+            // Payload of `Some` and the `else` fallback are both i32-typed expressions (they wrap at
+            // i32 exactly like the binding they feed). The selector is a compile-time-known literal.
+            let (payload, pv) = gen_typed(&mut rng, 2, ITy::I32, &[]);
+            let (fallback, fv) = gen_typed(&mut rng, 2, ITy::I32, &[]);
+            let take_some = rng.below(2) == 0;
+            if take_some {
+                some_hit = true;
+            } else {
+                none_hit = true;
+            }
+            helpers.push_str(&format!(
+                "fn pick{i}(b: bool) -> Option<i32> {{\n  if b {{ return Some({payload}) }}\n  return None\n}}\n"
+            ));
+            body.push_str(&format!("  v{i} := pick{i}({take_some}) else ({fallback})\n"));
+            names.push(format!("v{i}"));
+            acc = wrap(acc.wrapping_add(if take_some { pv } else { fv }), ITy::I32);
+        }
+        let src = format!(
+            "{helpers}fn main() -> i32 {{\n{body}  return ({}) as i32\n}}\n",
+            names.join(" + ")
+        );
+        let final_val = wrap(acc, ITy::I32);
+        let expected = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
+        let out = build_and_run(&format!("diffopt-{seed}"), &src);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, expected,
+            "miscompile on seed {seed}: expected {expected} (oracle {acc}), got {code}\n--- program ---\n{src}"
+        );
+    }
+    assert!(some_hit && none_hit, "seed range must exercise both the Some and None `else`-unwrap arms");
+}
+
+// --- Result `?`-propagation chain: a `run()` helper threads 2..3 `step(b)?` calls; a `true` selector
+// makes `step` return `Err(error(code))`, short-circuiting the chain at the first such step; all-false
+// reaches `Ok(sum)`. `main` matches the result — `Ok(v) => v`, `Err(Code(c)) => c` — so a wrong
+// short-circuit point, a dropped payload, or a mis-propagated code all surface as a wrong exit code.
+// Codes are 1..120 (a distinct, byte-fitting nonzero); Ok payloads are i32 expressions. ---
+
+#[test]
+fn result_question_chain_computes_the_oracle_value() {
+    if !backend_available() {
+        return;
+    }
+    let (mut ok_hit, mut err_hit) = (false, false);
+    for seed in 0..150u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(29));
+        let nsteps = 2 + rng.below(2); // 2..3 steps
+        let mut helpers = String::new();
+        let mut chain = String::new();
+        let mut names = Vec::new();
+        let mut first_err: Option<i128> = None;
+        let mut sum = 0i128;
+        for i in 0..nsteps {
+            let (payload, pv) = gen_typed(&mut rng, 2, ITy::I32, &[]);
+            let code = 1 + rng.below(120) as i128; // 1..120: nonzero, fits a byte, no exit clamp
+            let take_err = rng.below(2) == 0;
+            helpers.push_str(&format!(
+                "fn step{i}(b: bool) -> Result<i32, Error> {{\n  if b {{ return Err(error({code})) }}\n  return Ok({payload})\n}}\n"
+            ));
+            chain.push_str(&format!("  x{i} := step{i}({take_err})?\n"));
+            names.push(format!("x{i}"));
+            // Oracle: the first `true` step's Err short-circuits `run`; only preceding Oks ran.
+            if take_err && first_err.is_none() {
+                first_err = Some(code);
+            }
+            if first_err.is_none() {
+                sum = wrap(sum.wrapping_add(pv), ITy::I32);
+            }
+        }
+        let (oracle, tag) = match first_err {
+            Some(code) => {
+                err_hit = true;
+                (code, "err")
+            }
+            None => {
+                ok_hit = true;
+                (sum, "ok")
+            }
+        };
+        let src = format!(
+            "{helpers}fn run() -> Result<i32, Error> {{\n{chain}  return Ok({})\n}}\n\
+             fn main() -> i32 = match run() {{\n  Ok(v) => v as i32,\n  Err(e) => match e {{ Code(c) => c as i32, _ => 0 }},\n}}\n",
+            names.join(" + ")
+        );
+        let final_val = wrap(oracle, ITy::I32);
+        let expected = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
+        let out = build_and_run(&format!("diffres-{seed}"), &src);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, expected,
+            "miscompile on seed {seed} ({tag} path): expected {expected} (oracle {oracle}), got {code}\n--- program ---\n{src}"
+        );
+    }
+    assert!(ok_hit && err_hit, "seed range must exercise both the all-Ok and short-circuiting Err paths");
+}
+
+// --- enum + exhaustive match: a generated sum type (2..5 variants, mixed tag-only / 1..2 scalar
+// payloads of mixed widths) with a per-variant arm that combines a distinct base constant and its
+// payloads. `main` constructs 2..4 variants and sums their `eval`. Reading the payload back (0..9,
+// representable at every width) and choosing a per-variant base means a mis-tagged match or a
+// mis-read payload both change the sum. `eval` returns i64 so widening payload casts never truncate. ---
+
+#[test]
+fn enum_match_computes_the_oracle_value() {
+    if !backend_available() {
+        return;
+    }
+    for seed in 0..150u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xA076_1D64_78BD_642F).wrapping_add(31));
+        let nv = 2 + rng.below(4); // 2..5 variants
+        // Per-variant schema: arity 0..2 and a payload type per slot; a distinct base constant.
+        let mut arity = Vec::new();
+        let mut ptypes: Vec<Vec<ITy>> = Vec::new();
+        let mut bases = Vec::new();
+        for v in 0..nv {
+            let a = rng.below(3); // 0..2 payload slots
+            arity.push(a);
+            ptypes.push((0..a).map(|_| TYPES[rng.below(TYPES.len())]).collect());
+            bases.push(3 + 13 * v as i128 + rng.below(7) as i128); // distinct-ish per variant
+        }
+        // Declaration: `E { V0, V1(t), V2(t, t), ... }`.
+        let decl_variants: Vec<String> = (0..nv)
+            .map(|v| {
+                if arity[v] == 0 {
+                    format!("V{v}")
+                } else {
+                    let ts: Vec<&str> = ptypes[v].iter().map(|t| t.name()).collect();
+                    format!("V{v}({})", ts.join(", "))
+                }
+            })
+            .collect();
+        // `match` arms: `Vk(a, b) => base_k + (a as i64) + (b as i64)`.
+        let arms: Vec<String> = (0..nv)
+            .map(|v| {
+                if arity[v] == 0 {
+                    format!("  V{v} => {},", bases[v])
+                } else {
+                    let binds: Vec<String> = (0..arity[v]).map(|p| format!("a{p}")).collect();
+                    let adds: String = binds.iter().map(|b| format!(" + ({b} as i64)")).collect();
+                    format!("  V{v}({}) => {}{adds},", binds.join(", "), bases[v])
+                }
+            })
+            .collect();
+        // Constructions in `main`: 2..4 randomly chosen variants with 0..9 literal args.
+        let nc = 2 + rng.below(3);
+        let mut calls = Vec::new();
+        let mut oracle = 0i128;
+        for _ in 0..nc {
+            let v = rng.below(nv);
+            let args: Vec<i128> = (0..arity[v]).map(|_| rng.below(10) as i128).collect();
+            let ctor = if args.is_empty() {
+                format!("E.V{v}")
+            } else {
+                let a: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+                format!("E.V{v}({})", a.join(", "))
+            };
+            calls.push(format!("eval({ctor})"));
+            oracle = oracle.wrapping_add(bases[v] + args.iter().sum::<i128>());
+        }
+        let src = format!(
+            "E {{ {} }}\nfn eval(x: E) -> i64 = match x {{\n{}\n}}\nfn main() -> i32 {{\n  return ({}) as i32\n}}\n",
+            decl_variants.join(", "),
+            arms.join("\n"),
+            calls.join(" + ")
+        );
+        let final_val = wrap(oracle, ITy::I32);
+        let expected = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
+        let out = build_and_run(&format!("diffenum-{seed}"), &src);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, expected,
+            "miscompile on seed {seed}: expected {expected} (oracle {oracle}), got {code}\n--- program ---\n{src}"
+        );
+    }
+}
+
+// --- nested struct read/write chains: a depth-2..3 tower of structs, each level mixing scalar fields
+// (mixed widths) with one nested-struct field placed at a random position — so the compiler's
+// descending-alignment field reordering (#307) must map every logical field path to the right
+// physical slot at *every* nesting level. We build with nested literals, do an optional whole-subtree
+// literal write plus some leaf-path writes, then sum every leaf read back by its full path. A single
+// stale logical→physical index anywhere corrupts the sum. Values are 0..9 (exact at every width). ---
+
+#[derive(Clone)]
+enum Field {
+    Scalar(String, ITy),
+    Nested,
+}
+
+/// Generate a literal for struct `S{k}` at value-path `prefix` (deepest recursion first), pushing
+/// each scalar leaf's `(path, type, value)` so the oracle knows what every leaf holds.
+fn gen_nested_instance(
+    rng: &mut Rng,
+    schema: &[Vec<Field>],
+    k: usize,
+    prefix: &str,
+    leaves: &mut Vec<(String, ITy, i128)>,
+) -> String {
+    let mut parts = Vec::new();
+    for field in &schema[k] {
+        match field {
+            Field::Scalar(name, ty) => {
+                let v = rng.below(10) as i128; // 0..9: representable at every width
+                leaves.push((format!("{prefix}.{name}"), *ty, v));
+                parts.push(format!("{name}: {v}"));
+            }
+            Field::Nested => {
+                let inner = gen_nested_instance(rng, schema, k + 1, &format!("{prefix}.n"), leaves);
+                parts.push(format!("n: {inner}"));
+            }
+        }
+    }
+    format!("S{k}{{{}}}", parts.join(", "))
+}
+
+#[test]
+fn nested_struct_chains_compute_the_oracle_value() {
+    if !backend_available() {
+        return;
+    }
+    for seed in 0..150u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(37));
+        let levels = 2 + rng.below(2); // 2 or 3 struct levels
+        // Schema: each level has 1..2 scalars (innermost 1..3) plus, unless innermost, a nested field
+        // "n" inserted at a random position among the scalars (exercises reordering around it).
+        let mut schema: Vec<Vec<Field>> = Vec::new();
+        for k in 0..levels {
+            let innermost = k == levels - 1;
+            let nscalars = if innermost { 1 + rng.below(3) } else { 1 + rng.below(2) };
+            let mut fields: Vec<Field> = (0..nscalars)
+                .map(|s| Field::Scalar(format!("s{s}"), TYPES[rng.below(TYPES.len())]))
+                .collect();
+            if !innermost {
+                let pos = rng.below(fields.len() + 1);
+                fields.insert(pos, Field::Nested);
+            }
+            schema.push(fields);
+        }
+        // Declarations, deepest first so each struct's nested-field type is already declared.
+        let mut decls = String::new();
+        for k in (0..levels).rev() {
+            let fs: Vec<String> = schema[k]
+                .iter()
+                .map(|f| match f {
+                    Field::Scalar(n, t) => format!("{n}: {}", t.name()),
+                    Field::Nested => format!("n: S{}", k + 1),
+                })
+                .collect();
+            decls.push_str(&format!("S{k} {{ {} }}\n", fs.join(", ")));
+        }
+        // Construct the root, recording every leaf (path, type, initial value).
+        let mut leaves: Vec<(String, ITy, i128)> = Vec::new();
+        let root_lit = gen_nested_instance(&mut rng, &schema, 0, "u", &mut leaves);
+        // The oracle is a path -> current-value map, updated in the exact order writes are emitted.
+        use std::collections::HashMap;
+        let mut vals: HashMap<String, i128> = leaves.iter().map(|(p, _, v)| (p.clone(), *v)).collect();
+        let read_paths: Vec<(String, ITy)> = leaves.iter().map(|(p, t, _)| (p.clone(), *t)).collect();
+
+        let mut body = format!("  mut u := {root_lit}\n");
+        // Optional whole-subtree write: rewrite `u.n(.n)` from a fresh literal (resets its leaves).
+        if levels >= 2 && rng.below(3) == 0 {
+            // Choose a nesting level k in 1..levels-1 (there is a `Nested` chain to reach it).
+            let k = 1 + rng.below(levels - 1);
+            let prefix = format!("u{}", ".n".repeat(k));
+            let mut sub: Vec<(String, ITy, i128)> = Vec::new();
+            let sub_lit = gen_nested_instance(&mut rng, &schema, k, &prefix, &mut sub);
+            body.push_str(&format!("  {prefix} = {sub_lit}\n"));
+            for (p, _, v) in sub {
+                vals.insert(p, v); // same paths as existing leaves; just new values
+            }
+        }
+        // Some leaf-path writes (0..=nleaves), overriding individual leaves.
+        let nwrites = rng.below(read_paths.len() + 1);
+        for _ in 0..nwrites {
+            let (p, _) = &read_paths[rng.below(read_paths.len())];
+            let nv = rng.below(10) as i128;
+            body.push_str(&format!("  {p} = {nv}\n"));
+            vals.insert(p.clone(), nv);
+        }
+        // Read every leaf back by its full path and sum (each widened to i64 — exact for 0..9).
+        let reads: Vec<String> = read_paths.iter().map(|(p, _)| format!("({p} as i64)")).collect();
+        body.push_str(&format!("  return ({}) as i32\n", reads.join(" + ")));
+        let src = format!("{decls}fn main() -> i32 {{\n{body}}}\n");
+
+        let oracle: i128 = read_paths.iter().fold(0i128, |a, (p, _)| a.wrapping_add(vals[p]));
+        let final_val = wrap(oracle, ITy::I32);
+        let expected = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
+        let out = build_and_run(&format!("diffnest-{seed}"), &src);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(
+            code, expected,
+            "miscompile on seed {seed}: expected {expected} (oracle {oracle}), got {code}\n--- program ---\n{src}"
+        );
+    }
+}
