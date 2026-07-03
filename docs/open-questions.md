@@ -2640,15 +2640,20 @@ individual review entries. None block anything; pick up when the lint suite is a
   receiver is the allocating `HeapNew` itself); reuses no escape-analysis state, is profile-independent
   (structural, like huge-struct-copy — NOT in the deferred frequency-dependent allocation-lint bucket),
   and never false-positives. `tests/lint_unnecessary_heap.rs`.
-  DEFERRED (broader form): the common shape is `p := heap.new(x); … p.get()` (box bound to a local,
-  only ever `.get()`-ed, never moved/stored/returned/cloned). Firing-condition proposal for when it is
-  built: collect every box local (a `Let` whose init is `HeapNew`), then in one linear pass over the
-  body classify every *occurrence* of that local — fire iff every occurrence is the direct receiver of
-  a `BoxGet` (i.e. the local never appears in any other position). Sound and conservative (any other
-  occurrence — a move, a store, a `.clone()`, a return — suppresses it). Not built here because it is a
-  new whole-function box-use scan: the escape pass (`EscapeCheck`) emits inline diagnostics and keeps
-  **no reusable per-box "escaped?" fact** to piggyback on. Also note it would fire on the didactic
-  arena/box examples/tests (all true positives, but worth pairing the scan with that judgment).
+  DONE (2026-07-03, lint batch 2, broad slice): the common shape `p := heap.new(x); … p.get()` (box
+  bound to a local, only ever `.get()`-ed, never moved/stored/returned/cloned) is now flagged by a new
+  whole-function box-use scan (`UnnecessaryHeapScan` in `align_sema`, run from `check_fn` after
+  finalize). It collects every box local (a `Let` whose init is `HeapNew`), then in one linear pass
+  over the body classifies every *occurrence* of every local: a `BoxGet` whose receiver is the local is
+  a "get", anything else is an "other". It fires for a box local iff it has ≥1 get and **no** other
+  occurrence (any move / store / return / `.clone()` / call-arg / capture / reassignment target
+  suppresses it) — sound and conservative, exactly as proposed. The scan's `ExprKind` match is
+  exhaustive (no wildcard), so a future IR variant carrying a box use forces a compile error rather than
+  silently escaping the classification. Disjoint from the narrow slice (its `.get()` receiver is a
+  `HeapNew`, the scan's is a `Local`), so the two never double-report. The didactic `examples/arena.align`
+  did fire (a true positive: both boxes were only `.get()`-ed) — rather than distort the firing
+  condition, the example was rewritten to demonstrate `box<T>`'s defining trait, the *move* (`q := p`),
+  which is a genuine non-`.get()` box use and keeps the example warning-clean. `tests/lint_unnecessary_heap.rs`.
   (Latent bug found while building this, orthogonal to the lint — **FIXED** (2026-07-03): the inline
   `v: i32 := heap.new(7).get()` used to **miscompile**. `heap.new`'s payload scalar resolved eagerly
   from the literal — defaulting to `i64` — the outer `v: i32` annotation did not flow back into it, so

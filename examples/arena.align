@@ -1,11 +1,12 @@
 // Arena + heap box (M3). `heap.new` allocates inside the `arena {}` region; the
-// whole arena is freed in bulk when the block ends. Scalars read out with `.get()`
-// are copied, so they outlive the arena.
+// whole arena is freed in bulk when the block ends. `box<T>` is the anchor Move type:
+// binding it to a new name moves the box (the old name is consumed). `.get()` copies
+// the scalar back out, so the result outlives the arena.
 fn main() -> i32 {
   r: i32 := arena {
-    p: box<i32> := heap.new(7)
-    q: box<i32> := heap.new(35)
-    p.get() + q.get()
+    p: box<i32> := heap.new(42)
+    q: box<i32> := p
+    q.get()
   }
   return r
 }
