@@ -1,5 +1,7 @@
 # Align
 
+> 🌐 **English** · [日本語](./README.ja.md)
+
 Align is an AOT-compiled, data-oriented programming language. It aligns four readers at once — the **human** who writes the code, the **AI** that generates it, the **compiler** that optimizes it, and the **hardware** that runs it.
 
 > Less code. Predictable performance. Nothing hidden.
