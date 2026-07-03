@@ -519,6 +519,29 @@ pub enum Rvalue {
     /// `str` view `{ptr,len}` into `out`. Yields an `i32` errno-status (0 = ok). The mapping is
     /// `munmap`ped at arena end (the region rule) — no `Drop`.
     FsReadFileView { path: Operand, arena: Operand, out: Slot },
+    /// `path.join(a, b)` — join two path fragments into a freshly heap-allocated owned `string`,
+    /// returned by value as a `{ptr,len}` (like `str_clone`). Pure.
+    PathJoin { a: Operand, b: Operand },
+    /// `path.base`/`dir`/`ext(p)` — a zero-copy substring `str` view `{ptr,len}` of `p` (aliases its
+    /// bytes, no allocation — like `StrTrim`), returned by value. `kind` selects the component. Pure.
+    PathComponent { kind: hir::PathComponentKind, path: Operand },
+    /// `path.normalize(p)` — lexically normalize `p` into a freshly heap-allocated owned `string`,
+    /// returned by value as a `{ptr,len}`. Pure.
+    PathNormalize { path: Operand },
+    /// `env.get(name)` — write the owned `string` value `{ptr,len}` of environment variable `name`
+    /// into `out` (or `{null,0}` if unset), returning an `i32` present flag (`1` = set, `0` = unset).
+    /// The caller branches into `Some`/`None`. Impure.
+    EnvGet { name: Operand, out: Slot },
+    /// `env.set(name, value)` — set environment variable `name` to `value`. Yields an `i32`
+    /// errno-status (0 = ok). Impure.
+    EnvSet { name: Operand, value: Operand },
+    /// `time.now()` — wall-clock UNIX-epoch nanoseconds (`CLOCK_REALTIME`), an `i64`. Impure.
+    TimeNow,
+    /// `time.instant()` — monotonic-clock nanoseconds (`CLOCK_MONOTONIC`), an `i64`. Impure.
+    TimeInstant,
+    /// `time.sleep(ns)` — suspend the thread for `ns` nanoseconds (negative = no-op). Yields no
+    /// meaningful value (the expression's type is `()`); codegen emits the void call. Impure.
+    TimeSleep { ns: Operand },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -1396,6 +1419,57 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
         // runtime registers the mmap for `munmap` at arena end.
         hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
+        // `path.join(a, b)` → an owned `string` `{ptr,len}` returned by value (like `str_clone`).
+        hir::ExprKind::PathJoin { a, b: pb } => {
+            let ao = lower_expr(b, a);
+            let bo = lower_expr(b, pb);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::PathJoin { a: ao, b: bo }));
+            Operand::Value(v)
+        }
+        // `path.base`/`dir`/`ext(p)` → a borrowed sub-`str` `{ptr,len}` of `p` returned by value.
+        hir::ExprKind::PathComponent { kind, path } => {
+            let po = lower_expr(b, path);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::PathComponent { kind: *kind, path: po }));
+            Operand::Value(v)
+        }
+        // `path.normalize(p)` → an owned `string` `{ptr,len}` returned by value.
+        hir::ExprKind::PathNormalize { path } => {
+            let po = lower_expr(b, path);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::PathNormalize { path: po }));
+            Operand::Value(v)
+        }
+        // `env.get(name)` → `Option<string>`: the runtime writes the owned value into `out` and
+        // returns a present flag; branch `Some(<value>)` / `None`.
+        hir::ExprKind::EnvGet { name } => lower_env_get(b, name, e.ty),
+        // `env.set(name, value)` → `Result<(), Error>` from an i32 errno-status.
+        hir::ExprKind::EnvSet { name, value } => {
+            let no = lower_expr(b, name);
+            let vo = lower_expr(b, value);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::EnvSet { name: no, value: vo }));
+            lower_status_result(b, code, e.ty)
+        }
+        // `time.now()` / `time.instant()` → an `i64` returned by value.
+        hir::ExprKind::TimeNow => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::TimeNow));
+            Operand::Value(v)
+        }
+        hir::ExprKind::TimeInstant => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::TimeInstant));
+            Operand::Value(v)
+        }
+        // `time.sleep(ns)` → `()`; emit the void call and yield unit.
+        hir::ExprKind::TimeSleep { ns } => {
+            let no = lower_expr(b, ns);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::TimeSleep { ns: no }));
+            Operand::Const(Const::Unit)
+        }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -4339,6 +4413,45 @@ fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Opera
     let ec = make_error_from_status(b, code, result_ty);
     b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `env.get(name)` → `Option<string>`: the runtime writes the owned value `{ptr,len}` into an out
+/// slot and returns an `i32` present flag; branch `Some(<value>)` (flag != 0) / `None` (flag == 0).
+/// Mirrors [`lower_fs_read_file`]'s out-slot shape, building an `Option` (not a `Result`).
+fn lower_env_get(b: &mut Builder, name: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::String);
+    let n = lower_expr(b, name);
+    let flag = b.fresh_value(status_ty());
+    b.push(Stmt::Let(flag, Rvalue::EnvGet { name: n, out }));
+
+    let present = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    let some_bb = b.new_block();
+    let none_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+
+    // Some: load the materialized owned string `{ptr,len}` (it owns its buffer now) and wrap it.
+    b.cur = some_bb;
+    let s = b.fresh_value(Ty::String);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let somev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(somev, Rvalue::OptionSome(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(somev)));
+    b.terminate(Term::Goto(join));
+
+    // None: the out slot was zeroed (`{null,0}`) → nothing to free.
+    b.cur = none_bb;
+    let nonev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(nonev, Rvalue::OptionNone));
+    b.push(Stmt::Store(rslot, Operand::Value(nonev)));
     b.terminate(Term::Goto(join));
 
     b.cur = join;

@@ -2221,6 +2221,27 @@ impl EffectScan {
                 self.expr(path);
                 self.expr(data);
             }
+            // `std.path` ops are pure lexical string manipulation (no OS access) — like a field read.
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.expr(path),
+            ExprKind::PathJoin { a, b } => {
+                self.expr(a);
+                self.expr(b);
+            }
+            // `std.env` / `std.time` observe/mutate external state — Impure.
+            ExprKind::EnvGet { name } => {
+                self.impure_direct = true;
+                self.expr(name);
+            }
+            ExprKind::EnvSet { name, value } => {
+                self.impure_direct = true;
+                self.expr(name);
+                self.expr(value);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => self.impure_direct = true,
+            ExprKind::TimeSleep { ns } => {
+                self.impure_direct = true;
+                self.expr(ns);
+            }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 self.stage_funcs(stages);
@@ -2719,6 +2740,12 @@ impl<'a> EscapeCheck<'a> {
             // long as the receiver — inherit its region directly. (The receiver is already a `str`:
             // an owned `string` was auto-borrowed to a `Frame` view first, so this stays sound.)
             ExprKind::StrTrim { recv, .. } => self.region_of(recv, depth),
+            // `path.base`/`dir`/`ext(p)` return a zero-copy substring `str` view of `p`, so the view
+            // lives exactly as long as `p` — inherit its region directly (like `StrTrim`). Without this
+            // explicit arm the wildcard below would mis-infer `Static`, letting a view of an arena/frame
+            // `str` escape (the #297-class bug). `path.join`/`normalize` allocate owned strings and stay
+            // `Static` (the wildcard).
+            ExprKind::PathComponent { path, .. } => self.region_of(path, depth),
             // `buf.bytes()` is a `slice<u8>` view of the `buffer` local's heap storage (freed at
             // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
             ExprKind::BufferBytes { buffer } => Region::Frame.shorter(self.region_of(buffer, depth)),
@@ -3204,6 +3231,18 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(path, depth);
                 self.walk(data, depth);
             }
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.walk(path, depth),
+            ExprKind::PathJoin { a, b } => {
+                self.walk(a, depth);
+                self.walk(b, depth);
+            }
+            ExprKind::EnvGet { name } => self.walk(name, depth),
+            ExprKind::EnvSet { name, value } => {
+                self.walk(name, depth);
+                self.walk(value, depth);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeSleep { ns } => self.walk(ns, depth),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -3515,6 +3554,18 @@ impl UnnecessaryHeapScan {
                 self.visit(path);
                 self.visit(data);
             }
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.visit(path),
+            ExprKind::PathJoin { a, b } => {
+                self.visit(a);
+                self.visit(b);
+            }
+            ExprKind::EnvGet { name } => self.visit(name),
+            ExprKind::EnvSet { name, value } => {
+                self.visit(name);
+                self.visit(value);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeSleep { ns } => self.visit(ns),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
@@ -4110,6 +4161,19 @@ impl<'a> MoveCheck<'a> {
                 self.expr(path, moved, false, false);
                 self.expr(data, moved, false, false);
             }
+            // `std.path`/`std.env`/`std.time` builtins borrow their `str`/`i64` args (never consumed).
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.expr(path, moved, false, false),
+            ExprKind::PathJoin { a, b } => {
+                self.expr(a, moved, false, false);
+                self.expr(b, moved, false, false);
+            }
+            ExprKind::EnvGet { name } => self.expr(name, moved, false, false),
+            ExprKind::EnvSet { name, value } => {
+                self.expr(name, moved, false, false);
+                self.expr(value, moved, false, false);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeSleep { ns } => self.expr(ns, moved, false, false),
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -5524,10 +5588,7 @@ impl<'a, 't> Checker<'a, 't> {
         if let ast::ExprKind::Path(p) = &recv.kind
             && single_name(p) == Some("io")
             && matches!(field.name.as_str(), "stdin" | "stdout" | "stderr")
-            && self.lookup("io").is_none()
-            && !self.capture.as_ref().is_some_and(|c| {
-                c.captured.iter().any(|(n, _, _)| n == "io") || c.enclosing.iter().any(|(n, _, _)| n == "io")
-            }) {
+            && !self.name_in_scope("io") {
                 self.require_import("std.io", &format!("io.{}", field.name), span);
                 return match field.name.as_str() {
                     "stdin" => Expr { kind: ExprKind::ReaderStdin, ty: Ty::Reader, span },
@@ -6905,58 +6966,88 @@ impl<'a, 't> Checker<'a, 't> {
         Some(idx as u32)
     }
 
+    /// Whether `name` is an in-scope value — a local/parameter, or a captured/enclosing binding of a
+    /// closure. A builtin **module** dispatch (`heap.*`, `raw.*`, `json.*`, `fs.*`, `path.*`, `env.*`,
+    /// `time.*`, `io.*`) must fire only when its module name is *not* shadowed by such a value:
+    /// `path`/`env`/`time`/`fs` are ordinary parameter names, so `fn f(path: str) { path.base("x") }`
+    /// must route to normal value-method resolution (→ "no method `base` on `str`"), never to the
+    /// builtin (which would silently ignore the `path` receiver). Mirrors the `leftmost_is_local`
+    /// guard used below for cross-module calls — one rule, applied at every builtin dispatch.
+    fn name_in_scope(&self, name: &str) -> bool {
+        self.lookup(name).is_some()
+            || self.capture.as_ref().is_some_and(|c| {
+                c.captured.iter().any(|(n, _, _)| n == name) || c.enclosing.iter().any(|(n, _, _)| n == name)
+            })
+    }
+
     /// A method call `recv.method(args)`: the `heap.new` builtin, or a method on a value
     /// (`box.get()`, `box.clone()`).
     fn check_method_call(&mut self, recv: &ast::Expr, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        // `heap.new(...)` — `heap` is a module name, not a value.
-        if let ast::ExprKind::Path(p) = &recv.kind {
-            if single_name(p) == Some("heap") && method == "new" {
+        // Builtin **module** dispatches (`heap.*`, `raw.*`, `json.*`, `fs.*`, `path.*`, `env.*`,
+        // `time.*`, `io.*`). Each fires only when the module name is a bare path *and* is not
+        // shadowed by an in-scope value (`name_in_scope`) — otherwise `fn f(path: str) { path.base(x) }`
+        // would silently swallow the `path` receiver into the builtin. A shadowing binding falls
+        // through to normal value-method resolution (and never triggers a spurious `require_import`).
+        if let ast::ExprKind::Path(p) = &recv.kind
+            && let Some(module) = single_name(p)
+            && !self.name_in_scope(module)
+        {
+            // `heap.new(...)` — `heap` is a module name, not a value.
+            if module == "heap" && method == "new" {
                 return self.check_heap_new(args, expected, span);
             }
             // `raw.alloc(size)` / `raw.free(p)` / `raw.load(p, off)` / `raw.store(p, off, v)` /
             // `raw.offset(p, n)` — the unsafe raw-pointer ops (`raw` is a module name, not a value).
             // `unsafe {}`-only.
-            if single_name(p) == Some("raw") && matches!(method, "alloc" | "free" | "load" | "store" | "offset") {
+            if module == "raw" && matches!(method, "alloc" | "free" | "load" | "store" | "offset") {
                 return self.check_raw_op(method, args, expected, span);
             }
-            if single_name(p) == Some("json") && method == "encode" {
+            if module == "json" && method == "encode" {
                 self.require_import("core.json", "json.encode", span);
                 return self.check_json_encode(args, span);
             }
-            if single_name(p) == Some("json") && method == "decode" {
+            if module == "json" && method == "decode" {
                 self.require_import("core.json", "json.decode", span);
                 return self.check_json_decode(args, expected, span);
             }
-            if single_name(p) == Some("fs") && method == "read_file" {
+            if module == "fs" && method == "read_file" {
                 self.require_import("std.fs", "fs.read_file", span);
                 return self.check_fs_read_file(args, span);
             }
             // `fs.open(path)` -> Result<reader, Error>; `fs.create(path)` -> Result<writer, Error>.
-            if single_name(p) == Some("fs") && (method == "open" || method == "create") {
+            if module == "fs" && (method == "open" || method == "create") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_open_create(method == "create", args, span);
             }
             // `fs.write_file(path, data)` -> Result<(), Error> (data: str | bytes | builder).
-            if single_name(p) == Some("fs") && method == "write_file" {
+            if module == "fs" && method == "write_file" {
                 self.require_import("std.fs", "fs.write_file", span);
                 return self.check_fs_write_file(args, span);
             }
             // `fs.exists(path)` -> bool; `fs.remove(path)` / `fs.read_dir(path)` / `fs.read_file_view(path)`
             // — the single-path std.fs ops.
-            if single_name(p) == Some("fs") && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view") {
+            if module == "fs" && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_path_op(method, args, span);
             }
-            // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred). A local/captured `io`
-            // shadows this (then it's value-method dispatch, not the std.io builtin).
-            if single_name(p) == Some("io")
-                && method == "copy"
-                && self.lookup("io").is_none()
-                && !self.capture.as_ref().is_some_and(|c| {
-                    c.captured.iter().any(|(n, _, _)| n == "io") || c.enclosing.iter().any(|(n, _, _)| n == "io")
-                })
-            {
+            // `std.path` — `path.join`/`base`/`dir`/`ext`/`normalize` (pure lexical string ops).
+            if module == "path" && matches!(method, "join" | "base" | "dir" | "ext" | "normalize") {
+                self.require_import("std.path", &format!("path.{method}"), span);
+                return self.check_path_op(method, args, span);
+            }
+            // `std.env` — `env.get(name)` -> Option<string>; `env.set(name, value)` -> Result<(), Error>.
+            if module == "env" && matches!(method, "get" | "set") {
+                self.require_import("std.env", &format!("env.{method}"), span);
+                return self.check_env_op(method, args, span);
+            }
+            // `std.time` — `time.now()`/`time.instant()` -> i64 ns; `time.sleep(ns)`.
+            if module == "time" && matches!(method, "now" | "instant" | "sleep") {
+                self.require_import("std.time", &format!("time.{method}"), span);
+                return self.check_time_op(method, args, span);
+            }
+            // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred).
+            if module == "io" && method == "copy" {
                 self.require_import("std.io", "io.copy", span);
                 return self.check_io_copy(args, span);
             }
@@ -6969,7 +7060,8 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "buffered"
             && let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind
                 && let ast::ExprKind::Path(p) = &inner.kind
-                && single_name(p) == Some("io") {
+                && single_name(p) == Some("io")
+                && !self.name_in_scope("io") {
                     let fd = match field.name.as_str() {
                         "stdout" => 1,
                         "stderr" => 2,
@@ -9968,6 +10060,97 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `std.path` — `path.join(a, b)` -> owned `string`; `path.base`/`dir`/`ext(p)` -> a zero-copy
+    /// `str` **view** of `p` (region inherited from `p`, see `region_of`); `path.normalize(p)` ->
+    /// owned `string`. All pure lexical POSIX string ops (no filesystem access). Builtins.
+    fn check_path_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if method == "join" {
+            if args.len() != 2 {
+                self.diags
+                    .error(format!("'path.join' expects 2 arguments (two path fragments), got {}", args.len()), span);
+                return err;
+            }
+            let a = self.check_str_init(&args[0]);
+            let b = self.check_str_init(&args[1]);
+            return Expr { kind: ExprKind::PathJoin { a: Box::new(a), b: Box::new(b) }, ty: Ty::String, span };
+        }
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'path.{method}' expects 1 argument (the path), got {}", args.len()), span);
+            return err;
+        }
+        let path = Box::new(self.check_str_init(&args[0]));
+        match method {
+            "base" => Expr { kind: ExprKind::PathComponent { kind: hir::PathComponentKind::Base, path }, ty: Ty::Str, span },
+            "dir" => Expr { kind: ExprKind::PathComponent { kind: hir::PathComponentKind::Dir, path }, ty: Ty::Str, span },
+            "ext" => Expr { kind: ExprKind::PathComponent { kind: hir::PathComponentKind::Ext, path }, ty: Ty::Str, span },
+            "normalize" => Expr { kind: ExprKind::PathNormalize { path }, ty: Ty::String, span },
+            _ => unreachable!("check_path_op is only dispatched for join/base/dir/ext/normalize"),
+        }
+    }
+
+    /// `std.env` — `env.get(name)` -> `Option<string>` (owned; the environment is volatile, so the
+    /// value is copied out, never a view); `env.set(name, value)` -> `Result<(), Error>`. Builtins.
+    fn check_env_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if method == "get" {
+            if args.len() != 1 {
+                self.diags
+                    .error(format!("'env.get' expects 1 argument (the variable name), got {}", args.len()), span);
+                return err;
+            }
+            let name = self.check_str_init(&args[0]);
+            return Expr { kind: ExprKind::EnvGet { name: Box::new(name) }, ty: Ty::Option(Scalar::String), span };
+        }
+        // `env.set(name, value)`.
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'env.set' expects 2 arguments (the name and value), got {}", args.len()), span);
+            return err;
+        }
+        let name = self.check_str_init(&args[0]);
+        let value = self.check_str_init(&args[1]);
+        Expr {
+            kind: ExprKind::EnvSet { name: Box::new(name), value: Box::new(value) },
+            ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `std.time` — `time.now()` (wall clock) / `time.instant()` (monotonic) -> `i64` nanoseconds;
+    /// `time.sleep(ns)` -> `()` (a negative `ns` is a no-op). One `i64`-nanosecond timeline, no
+    /// `Duration` type ("one way"). Builtins.
+    fn check_time_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        if method == "sleep" {
+            if args.len() != 1 {
+                self.diags
+                    .error(format!("'time.sleep' expects 1 argument (nanoseconds, i64), got {}", args.len()), span);
+                return err;
+            }
+            let ns = self.check_expr(&args[0], Some(i64_ty));
+            if ns.ty == Ty::Error {
+                return err;
+            }
+            if !matches!(ns.ty, Ty::Int(_) | Ty::IntVar(_)) {
+                self.diags
+                    .error(format!("'time.sleep' expects a nanosecond count (i64), got {}", ty_name(ns.ty)), args[0].span);
+                return err;
+            }
+            return Expr { kind: ExprKind::TimeSleep { ns: Box::new(ns) }, ty: Ty::Unit, span };
+        }
+        // `time.now()` / `time.instant()` — no arguments.
+        if !args.is_empty() {
+            self.diags
+                .error(format!("'time.{method}' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        let kind = if method == "now" { ExprKind::TimeNow } else { ExprKind::TimeInstant };
+        Expr { kind, ty: i64_ty, span }
+    }
+
     /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — a buffered `writer` over the
     /// given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
     fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
@@ -11060,6 +11243,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(path);
                 self.finalize_expr(data);
             }
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.finalize_expr(path),
+            ExprKind::PathJoin { a, b } => {
+                self.finalize_expr(a);
+                self.finalize_expr(b);
+            }
+            ExprKind::EnvGet { name } => self.finalize_expr(name),
+            ExprKind::EnvSet { name, value } => {
+                self.finalize_expr(name);
+                self.finalize_expr(value);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);

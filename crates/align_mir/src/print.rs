@@ -419,6 +419,14 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::MakeError { enum_id, tag, code } => {
             format!("make_error(enum#{enum_id}, tag={}, code={})", operand_str(tag), operand_str(code))
         }
+        Rvalue::PathJoin { a, b } => format!("path_join({}, {})", operand_str(a), operand_str(b)),
+        Rvalue::PathComponent { kind, path } => format!("path_{kind:?}({})", operand_str(path)),
+        Rvalue::PathNormalize { path } => format!("path_normalize({})", operand_str(path)),
+        Rvalue::EnvGet { name, out } => format!("env_get({}, -> _{out})", operand_str(name)),
+        Rvalue::EnvSet { name, value } => format!("env_set({}, {})", operand_str(name), operand_str(value)),
+        Rvalue::TimeNow => "time_now()".to_string(),
+        Rvalue::TimeInstant => "time_instant()".to_string(),
+        Rvalue::TimeSleep { ns } => format!("time_sleep({})", operand_str(ns)),
     }
 }
 

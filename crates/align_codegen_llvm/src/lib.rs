@@ -910,6 +910,53 @@ fn build_module<'c>(
             ),
         );
     }
+    // `std.path` — `base`/`dir`/`ext(p)` return a borrowed sub-`str` `{ptr,len}` of `p`; `normalize(p)`
+    // returns a freshly-allocated owned `string` `{ptr,len}`. Each is (ptr, len) -> {ptr,len}.
+    for (key, sym) in [
+        ("path_base", "align_rt_path_base"),
+        ("path_dir", "align_rt_path_dir"),
+        ("path_ext", "align_rt_path_ext"),
+        ("path_normalize", "align_rt_path_normalize"),
+    ] {
+        funcs.insert(
+            key.to_string(),
+            module.add_function(sym, slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into()], false), None),
+        );
+    }
+    funcs.insert(
+        // path.join (a_ptr, a_len, b_ptr, b_len) -> {ptr,len} owned string.
+        "path_join".to_string(),
+        module.add_function(
+            "align_rt_path_join",
+            slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // env.get (name_ptr, name_len, out: *{ptr,len}) -> i32 present flag (1/0).
+        "env_get".to_string(),
+        module.add_function("align_rt_env_get", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // env.set (name_ptr, name_len, val_ptr, val_len) -> i32 errno-status.
+        "env_set".to_string(),
+        module.add_function("align_rt_env_set", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // time.now () -> i64 (UNIX-epoch ns, CLOCK_REALTIME).
+        "time_now".to_string(),
+        module.add_function("align_rt_time_now", i64t2.fn_type(&[], false), None),
+    );
+    funcs.insert(
+        // time.instant () -> i64 (monotonic ns, CLOCK_MONOTONIC).
+        "time_instant".to_string(),
+        module.add_function("align_rt_time_instant", i64t2.fn_type(&[], false), None),
+    );
+    funcs.insert(
+        // time.sleep (ns: i64) -> void.
+        "time_sleep".to_string(),
+        module.add_function("align_rt_time_sleep", ctx.void_type().fn_type(&[i64t2.into()], false), None),
+    );
     // Surface `builder` (MMv2 slice 7c): `to_string()` finishes into an owned `string`; `free`
     // drops an unfinished builder at scope exit.
     funcs.insert(
@@ -4133,6 +4180,69 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["fs_read_file_view"], &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frfv")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_read_file_view returns i32")
+            }
+            // std.path — join/normalize return an owned `{ptr,len}`; base/dir/ext a borrowed view.
+            Rvalue::PathJoin { a, b } => {
+                let (ap, al) = self.split_str(a)?;
+                let (bp, bl) = self.split_str(b)?;
+                self.builder
+                    .build_call(self.funcs["path_join"], &[ap.into(), al.into(), bp.into(), bl.into()], "pjoin")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("path_join returns a {ptr,len}")
+            }
+            Rvalue::PathComponent { kind, path } => {
+                let fk = match kind {
+                    align_sema::hir::PathComponentKind::Base => "path_base",
+                    align_sema::hir::PathComponentKind::Dir => "path_dir",
+                    align_sema::hir::PathComponentKind::Ext => "path_ext",
+                };
+                let (pp, pl) = self.split_str(path)?;
+                self.builder
+                    .build_call(self.funcs[fk], &[pp.into(), pl.into()], "pcomp")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("path component returns a {ptr,len}")
+            }
+            Rvalue::PathNormalize { path } => {
+                let (pp, pl) = self.split_str(path)?;
+                self.builder
+                    .build_call(self.funcs["path_normalize"], &[pp.into(), pl.into()], "pnorm")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("path_normalize returns a {ptr,len}")
+            }
+            // env.get — write the owned value {ptr,len} into `out`, return an i32 present flag.
+            Rvalue::EnvGet { name, out } => {
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.funcs["env_get"], &[np.into(), nl.into(), out_ptr.into()], "envget")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("env_get returns i32")
+            }
+            Rvalue::EnvSet { name, value } => {
+                let (np, nl) = self.split_str(name)?;
+                let (vp, vl) = self.split_str(value)?;
+                self.builder
+                    .build_call(self.funcs["env_set"], &[np.into(), nl.into(), vp.into(), vl.into()], "envset")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("env_set returns i32")
+            }
+            Rvalue::TimeNow => self
+                .builder
+                .build_call(self.funcs["time_now"], &[], "now")
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value().basic().expect("time_now returns i64"),
+            Rvalue::TimeInstant => self
+                .builder
+                .build_call(self.funcs["time_instant"], &[], "instant")
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value().basic().expect("time_instant returns i64"),
+            Rvalue::TimeSleep { ns } => {
+                let n = self.operand(ns).into();
+                self.builder
+                    .build_call(self.funcs["time_sleep"], &[n], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
             }
             Rvalue::MakeError { enum_id, tag, code } => {
                 // Build the builtin `Error` aggregate `{ i32 tag, i32 code }` from runtime operands.

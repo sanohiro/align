@@ -679,6 +679,52 @@ pub enum ExprKind {
     /// region is bound to the arena, and `munmap` runs at arena end. The `ty` is `Result<str, Error>`.
     /// Escapes the region via `.clone()`. Impure.
     FsReadFileView { path: Box<Expr> },
+    /// `path.join(a, b)` — join two path fragments with a single `/` separator into a freshly
+    /// heap-allocated owned `string` (the `ty` is [`crate::Ty::String`]). Pure string manipulation
+    /// (no OS access); the separator is collapsed at the boundary (`a`'s trailing `/` and `b`'s
+    /// leading `/` fold to one). An empty fragment yields a clone of the other.
+    PathJoin { a: Box<Expr>, b: Box<Expr> },
+    /// `path.base(p)` / `path.dir(p)` / `path.ext(p)` — a **zero-copy substring `str` view** of `p`
+    /// (the `ty` is [`crate::Ty::Str`]); `kind` selects which component. The result aliases `p`'s
+    /// bytes, so its region is **inherited from `p`** (`region_of`) — it must not outlive `p`. Pure.
+    PathComponent { kind: PathComponentKind, path: Box<Expr> },
+    /// `path.normalize(p)` — lexically resolve `.` / `..` / redundant `/` into a freshly
+    /// heap-allocated owned `string` (the `ty` is [`crate::Ty::String`]). POSIX vocabulary only, a
+    /// pure string operation — no symlink resolution, no filesystem access. Pure.
+    PathNormalize { path: Box<Expr> },
+    /// `env.get(name)` — the value of environment variable `name` as a freshly heap-allocated owned
+    /// `string`, or `None` if unset (the `ty` is `Option<string>`; the string is owned because the
+    /// environment is volatile — a view would dangle after a later `env.set`). Impure (reads process
+    /// environment).
+    EnvGet { name: Box<Expr> },
+    /// `env.set(name, value)` — set environment variable `name` to `value` (the `ty` is
+    /// `Result<(), Error>`). Impure. v1 is a plain `setenv`; concurrent `env.set` from multiple tasks
+    /// is **undefined** (POSIX — `setenv` is not thread-safe), documented, not enforced.
+    EnvSet { name: Box<Expr>, value: Box<Expr> },
+    /// `time.now()` — wall-clock time as UNIX-epoch nanoseconds (`CLOCK_REALTIME`), an `i64` (the
+    /// `ty` is [`crate::Ty::Int`] i64). Impure (observes the clock).
+    TimeNow,
+    /// `time.instant()` — a monotonic-clock reading in nanoseconds (`CLOCK_MONOTONIC`), an `i64`.
+    /// Impure.
+    TimeInstant,
+    /// `time.sleep(ns)` — suspend the calling thread for `ns` nanoseconds (the `ty` is
+    /// [`crate::Ty::Unit`]). A negative `ns` is a no-op; `EINTR` resumes for the remaining time.
+    /// Impure.
+    TimeSleep { ns: Box<Expr> },
+}
+
+/// Which component `path.base` / `path.dir` / `path.ext` extracts — each a zero-copy `str` view
+/// (a substring) of the input path (`std.path`, view-safe POSIX lexical semantics).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathComponentKind {
+    /// `path.base(p)` — the final path component (trailing `/` stripped; all-`/` → `/`).
+    Base,
+    /// `path.dir(p)` — everything before the final component (an **empty** view when `p` has no
+    /// separator, since the result must be a substring of `p` — not `.`).
+    Dir,
+    /// `path.ext(p)` — the extension of the final component including the leading `.` (empty when
+    /// there is none, or when the only `.` starts the component — a dotfile).
+    Ext,
 }
 
 /// The source/key path of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).
