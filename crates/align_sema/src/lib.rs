@@ -122,6 +122,13 @@ pub enum PrimScalar {
     /// `array<str>` (`Scalar::DynArray(Str)`) be a payload / tuple element: a buffer of `str` views,
     /// freed as a unit while its elements borrow their source. Produced by `group_by(.str_key)`.
     Str,
+    /// An owned `string` (`{ptr,len}`) element — the only **Move** `PrimScalar` (non-recursive: a
+    /// tag, no inner, so `PrimScalar` stays `Copy`). Lets an owned `array<string>`
+    /// (`Scalar::DynArray(String)`) be a `Result` payload — the result of `fs.read_dir`. Each element
+    /// owns its own buffer, so the array's `Drop` is a **deep** free (each element, then the header),
+    /// distinct from every other `array<T>` (one buffer). Move-element *indexing* is still deferred
+    /// project-wide (`check_index`), so today the array is used whole (`.len()`, move/return).
+    String,
 }
 
 /// A [`PrimScalar`] as a full [`Scalar`] (the array element type).
@@ -132,6 +139,7 @@ pub fn prim_to_scalar(p: PrimScalar) -> Scalar {
         PrimScalar::Bool => Scalar::Bool,
         PrimScalar::Char => Scalar::Char,
         PrimScalar::Str => Scalar::Str,
+        PrimScalar::String => Scalar::String,
     }
 }
 
@@ -144,6 +152,8 @@ pub fn scalar_to_prim(s: Scalar) -> Option<PrimScalar> {
         Scalar::Bool => Some(PrimScalar::Bool),
         Scalar::Char => Some(PrimScalar::Char),
         Scalar::Str => Some(PrimScalar::Str),
+        // Owned `string` is a Move `PrimScalar` (the only one) — `array<string>` (`fs.read_dir`).
+        Scalar::String => Some(PrimScalar::String),
         _ => None,
     }
 }
@@ -2200,9 +2210,16 @@ impl EffectScan {
             }
             // `.bytes()` / `.len()` on a buffer read owned memory — pure (no I/O), like a field read.
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer),
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => {
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsReadFileView { path } => {
                 self.impure_direct = true;
                 self.expr(path);
+            }
+            ExprKind::FsWriteFile { path, data, .. } => {
+                self.impure_direct = true;
+                self.expr(path);
+                self.expr(data);
             }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
@@ -2563,6 +2580,11 @@ impl<'a> EscapeCheck<'a> {
             // Allocating producers are bound to the enclosing arena (Static outside any arena,
             // where the result is leaked / process-lifetime and safe to return).
             ExprKind::HeapNew(_) | ExprKind::BoxClone(_) | ExprKind::Template(_) => Region::arena(depth),
+            // `fs.read_file_view(p)` returns a `str` viewing an mmap `munmap`ped at arena end, so it is
+            // bound to the enclosing arena exactly like `heap.new` (sema requires an arena). The view
+            // must not escape it — `.clone()` copies out. `fs.read_dir` / `fs.write_file` / `fs.exists`
+            // / `fs.remove` return owned / non-region values and stay `Static` (the wildcard below).
+            ExprKind::FsReadFileView { .. } => Region::arena(depth),
             // A spawned task's handle is a box in the enclosing `task_group` region.
             ExprKind::Spawn { .. } => Region::arena(depth),
             // `.to_array()` bump-allocates the owned array in the enclosing arena. `reduce` folds
@@ -3175,7 +3197,13 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.walk(input, depth),
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => self.walk(path, depth),
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsReadFileView { path } => self.walk(path, depth),
+            ExprKind::FsWriteFile { path, data, .. } => {
+                self.walk(path, depth);
+                self.walk(data, depth);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -3480,7 +3508,13 @@ impl UnnecessaryHeapScan {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.visit(input),
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => self.visit(path),
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsReadFileView { path } => self.visit(path),
+            ExprKind::FsWriteFile { path, data, .. } => {
+                self.visit(path);
+                self.visit(data);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
@@ -4067,7 +4101,15 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.expr(input, moved, false, false),
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => self.expr(path, moved, false, false),
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsReadFileView { path } => self.expr(path, moved, false, false),
+            // `fs.write_file(path, data)` borrows `data` (str/bytes/builder — not consumed), like
+            // `writer.write`; neither `path` nor `data` is moved.
+            ExprKind::FsWriteFile { path, data, .. } => {
+                self.expr(path, moved, false, false);
+                self.expr(data, moved, false, false);
+            }
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -6894,6 +6936,17 @@ impl<'a, 't> Checker<'a, 't> {
             if single_name(p) == Some("fs") && (method == "open" || method == "create") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_open_create(method == "create", args, span);
+            }
+            // `fs.write_file(path, data)` -> Result<(), Error> (data: str | bytes | builder).
+            if single_name(p) == Some("fs") && method == "write_file" {
+                self.require_import("std.fs", "fs.write_file", span);
+                return self.check_fs_write_file(args, span);
+            }
+            // `fs.exists(path)` -> bool; `fs.remove(path)` / `fs.read_dir(path)` / `fs.read_file_view(path)`
+            // — the single-path std.fs ops.
+            if single_name(p) == Some("fs") && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view") {
+                self.require_import("std.fs", &format!("fs.{method}"), span);
+                return self.check_fs_path_op(method, args, span);
             }
             // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred). A local/captured `io`
             // shadows this (then it's value-method dispatch, not the std.io builtin).
@@ -9834,6 +9887,87 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `fs.write_file(path, data)` -> `Result<(), Error>`. `data` is a `str` / owned `string`
+    /// (auto-borrowed) / `bytes` (`slice<u8>`) / a `builder` — the same three accepted forms as
+    /// `writer.write`. A builtin, dispatched like `fs.read_file`.
+    fn check_fs_write_file(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'fs.write_file' expects 2 arguments (the path and the data), got {}", args.len()), span);
+            return err;
+        }
+        let path = self.check_str_init(&args[0]);
+        let mut data = self.check_expr(&args[1], None);
+        if data.ty == Ty::Error {
+            return err;
+        }
+        let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
+        // A `builder`'s bytes are written directly (no `to_string()` materialization), borrowing it.
+        if data.ty == Ty::Builder {
+            return Expr {
+                kind: ExprKind::FsWriteFile { path: Box::new(path), data: Box::new(data), builder: true },
+                ty: result_ty,
+                span,
+            };
+        }
+        // An owned `string` borrows to a `str` (zero-cost, non-consuming); a `str` / `bytes`
+        // (`slice<u8>`) is written as-is; anything else is a type error (mirrors `writer.write`).
+        if data.ty == Ty::String {
+            let s = data.span;
+            data = Expr { kind: ExprKind::StrBorrow(Box::new(data)), ty: Ty::Str, span: s };
+        }
+        if data.ty != Ty::Str && data.ty != Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) {
+            self.diags
+                .error(format!("'fs.write_file' expects a str, bytes (slice<u8>), or builder, got {}", ty_name(data.ty)), args[1].span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::FsWriteFile { path: Box::new(path), data: Box::new(data), builder: false },
+            ty: result_ty,
+            span,
+        }
+    }
+
+    /// The single-path `std.fs` ops: `fs.exists(path)` -> `bool` (errors fold to `false`);
+    /// `fs.remove(path)` -> `Result<(), Error>`; `fs.read_dir(path)` -> `Result<array<string>, Error>`
+    /// (owned strings); `fs.read_file_view(path)` -> `Result<str, Error>` (an mmap view — **requires an
+    /// enclosing `arena {}`**, like `heap.new`, its region bound to that arena). Builtins.
+    fn check_fs_path_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        // `read_file_view`'s returned `str` views an mmap that is `munmap`ped at arena end, so it must
+        // live inside an arena — checked here, exactly like `heap.new` (same diagnostic shape).
+        if method == "read_file_view" && self.arena_depth == 0 {
+            self.diags
+                .error("fs.read_file_view must be used inside an `arena {}` block (the view is unmapped at arena end)".to_string(), span);
+        }
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'fs.{method}' expects 1 argument (the path), got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let path = Box::new(self.check_str_init(&args[0]));
+        let err_enum = Scalar::Enum(self.error_enum_id);
+        match method {
+            "exists" => Expr { kind: ExprKind::FsExists { path }, ty: Ty::Bool, span },
+            "remove" => Expr {
+                kind: ExprKind::FsRemove { path },
+                ty: Ty::Result(Scalar::Unit, err_enum),
+                span,
+            },
+            "read_dir" => Expr {
+                kind: ExprKind::FsReadDir { path },
+                ty: Ty::Result(Scalar::DynArray(PrimScalar::String), err_enum),
+                span,
+            },
+            "read_file_view" => Expr {
+                kind: ExprKind::FsReadFileView { path },
+                ty: Ty::Result(Scalar::Str, err_enum),
+                span,
+            },
+            _ => unreachable!("check_fs_path_op is only dispatched for exists/remove/read_dir/read_file_view"),
+        }
+    }
+
     /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — a buffered `writer` over the
     /// given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
     fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
@@ -10919,7 +11053,13 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.finalize_expr(input),
-            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => self.finalize_expr(path),
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsReadFileView { path } => self.finalize_expr(path),
+            ExprKind::FsWriteFile { path, data, .. } => {
+                self.finalize_expr(path);
+                self.finalize_expr(data);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);

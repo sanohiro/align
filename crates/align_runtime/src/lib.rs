@@ -206,6 +206,249 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
     0
 }
 
+/// `fs.write_file(path, data)` — create/truncate `path` (a `str` view) and write all of `data` (a
+/// `str`/`bytes` view: `{ptr,len}`), then close. Returns `0` on success, else the errno mapped
+/// through [`io_error_to_status`]. An empty `data` still create+truncates the file (an empty file).
+///
+/// # Safety
+/// `path`/`data` must describe valid byte ranges for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_write_file(path: *const u8, path_len: i64, data: *const u8, data_len: i64) -> i32 {
+    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+        return AL_INVALID;
+    };
+    // `from_raw_parts` is UB on a null pointer even for len 0 — guard an empty/owned data view.
+    let bytes: &[u8] = if data_len <= 0 || data.is_null() {
+        &[]
+    } else {
+        let Ok(n) = usize::try_from(data_len) else { return AL_INVALID };
+        unsafe { std::slice::from_raw_parts(data, n) }
+    };
+    use std::io::Write;
+    match std::fs::File::create(&path_str).and_then(|mut f| f.write_all(bytes)) {
+        Ok(()) => 0,
+        Err(e) => io_error_to_status(&e),
+    }
+}
+
+/// `fs.write_file(path, builder)` — the `builder`-source form (writes the builder's accumulated
+/// bytes; the builder is borrowed, not consumed), mirroring [`align_rt_io_writer_write_builder`].
+///
+/// # Safety
+/// `path` must describe a valid byte range; `b` must be a valid `Builder` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_write_file_builder(path: *const u8, path_len: i64, b: *mut Builder) -> i32 {
+    if b.is_null() {
+        return AL_INVALID;
+    }
+    let b = unsafe { &*b };
+    let (ptr, len) = (b.buf.as_ptr(), b.buf.len() as i64);
+    unsafe { align_rt_fs_write_file(path, path_len, ptr, len) }
+}
+
+/// `fs.exists(path)` — `1` if `path` exists, else `0`. Per `draft.md` §18.2 this folds *every* error
+/// (a `stat` failure — not found, a permission error on a path component, a bad path) to `0` ("does
+/// not exist"), so it returns a plain `bool`, never a `Result`. Uses `stat` (follows symlinks), so
+/// "stat failure = does not exist" as specified.
+///
+/// # Safety
+/// `path` must describe a valid byte range for its length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_exists(path: *const u8, path_len: i64) -> i32 {
+    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+        return 0;
+    };
+    i32::from(std::fs::metadata(&path_str).is_ok())
+}
+
+/// `fs.remove(path)` — delete the file at `path`. Returns `0` on success, else the mapped errno.
+/// Files only (v1) — `remove_file`, not a recursive/directory remove.
+///
+/// # Safety
+/// `path` must describe a valid byte range for its length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_remove(path: *const u8, path_len: i64) -> i32 {
+    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+        return AL_INVALID;
+    };
+    match std::fs::remove_file(&path_str) {
+        Ok(()) => 0,
+        Err(e) => io_error_to_status(&e),
+    }
+}
+
+/// `fs.read_dir(path)` — the entry names of directory `path` as an owned `array<string>` written to
+/// `out` (`{ptr,len}`: a heap buffer of `len` `AlignStr` headers, each owning its own name buffer).
+/// Entries are bare names (no path prefix), in OS order (`.`/`..` excluded — Rust's `read_dir`
+/// omits them; the caller sorts if a deterministic order is wanted, per `draft.md` §18.2). Returns
+/// `0` on success, else the mapped errno (leaving `out` = `{null,0}`). The whole array is `Drop`-freed
+/// by [`align_rt_free_string_array`] (each name buffer, then the header).
+///
+/// # Safety
+/// `path` must describe a valid byte range; `out` must point to a writable `{ptr,len}` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_read_dir(path: *const u8, path_len: i64, out: *mut AlignStr) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+        return AL_INVALID;
+    };
+    let rd = match std::fs::read_dir(&path_str) {
+        Ok(rd) => rd,
+        Err(e) => return io_error_to_status(&e),
+    };
+    // Collect every entry name first (a mid-iteration error maps like any other, leaving `out` empty).
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    for entry in rd {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => return io_error_to_status(&e),
+        };
+        // The bare file name as raw bytes (lossless for non-UTF-8 Unix names).
+        names.push(entry.file_name().as_encoded_bytes().to_vec());
+    }
+    let n = names.len();
+    if n == 0 {
+        return 0; // empty directory → {null,0}
+    }
+    // The header buffer: `n` `AlignStr` entries. `checked_mul` guards a 32-bit size overflow (which
+    // would otherwise under-allocate and heap-overflow the store loop below).
+    let Some(hdr_bytes) = n.checked_mul(core::mem::size_of::<AlignStr>()).and_then(|b| i64::try_from(b).ok()) else {
+        return AL_INVALID;
+    };
+    let hdr = align_rt_alloc(hdr_bytes) as *mut AlignStr;
+    for (i, name) in names.into_iter().enumerate() {
+        let len = name.len() as i64;
+        let dst = align_rt_alloc(len); // null for an empty name (len 0) — a harmless free at Drop
+        if len > 0 {
+            unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len()) };
+        }
+        unsafe { *hdr.add(i) = AlignStr { ptr: dst, len } };
+    }
+    unsafe { *out = AlignStr { ptr: hdr as *const u8, len: n as i64 } };
+    0
+}
+
+/// Free an owned `array<string>` (`fs.read_dir`): free each element's name buffer, then the header
+/// buffer. Null-safe (a moved-out / never-initialised `{null,0}` frees nothing). This is the deep
+/// `Drop` for `array<string>` — unlike a scalar `array<T>` (one buffer), each element owns a buffer.
+///
+/// # Safety
+/// `ptr` must be null or a header buffer from [`align_rt_fs_read_dir`] of `len` `AlignStr` entries
+/// (each entry's `ptr` an [`align_rt_alloc`] buffer or null), not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_free_string_array(ptr: *mut u8, len: i64) {
+    if ptr.is_null() {
+        return;
+    }
+    if let Ok(n) = usize::try_from(len) {
+        let hdr = ptr as *mut AlignStr;
+        for i in 0..n {
+            let entry = unsafe { *hdr.add(i) };
+            unsafe { align_rt_free(entry.ptr as *mut u8) };
+        }
+    }
+    unsafe { align_rt_free(ptr) };
+}
+
+/// Read the whole file at `path` into a fresh **arena** allocation, writing a `{ptr,len}` view to
+/// `out` — the [`align_rt_fs_read_file_view`] fallback for special / zero-length files. Returns `0`
+/// or a mapped errno; an empty file yields `{null,0}`. Unlike `fs.read_file` (heap-owned,
+/// `Drop`-freed), this buffer is arena-owned (bulk-freed at arena end), so the returned view follows
+/// the same region rule as the mmap path — no separate `Drop`.
+///
+/// # Safety
+/// `arena` must be a valid arena handle; `out` must point to a writable `{ptr,len}` slot.
+unsafe fn read_file_view_into_arena(path: &str, arena: *mut Arena, out: *mut AlignStr) -> i32 {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => return io_error_to_status(&e),
+    };
+    if data.is_empty() {
+        return 0; // already {null,0}
+    }
+    let Ok(len_z) = isize::try_from(data.len()) else { return AL_INVALID };
+    let dst = unsafe { align_rt_arena_alloc(arena, len_z as i64, 1) };
+    if dst.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
+    unsafe { *out = AlignStr { ptr: dst as *const u8, len: len_z as i64 } };
+    0
+}
+
+/// `fs.read_file_view(path)` — memory-map the regular file at `path` read-only into `arena`, writing
+/// the `{ptr,len}` view to `out`. Returns `0` on success, else the errno mapped through
+/// [`io_error_to_status`] (leaving `out` = `{null,0}`). The mapping is registered on `arena` and
+/// `munmap`ped when the arena ends (`draft.md` §18.2 region rule), so the returned `str` lives
+/// exactly as long as the arena — no separate `Drop`, and a small returned view cannot pin the
+/// mapping past the arena.
+///
+/// Guardrails (`open-questions.md` "Transparent zero-copy I/O", the mmap bullet):
+/// - **Regular files only.** `fstat` (via the fd's `metadata`) gates to a regular file; a character
+///   device / FIFO / `/proc` file (whose `st_size` is 0 or a lie) is *not* mmap'd — it takes the
+///   owned-copy fallback ([`read_file_view_into_arena`]), which reads the real bytes into arena
+///   memory. That changes the cost class (a copy, not a zero-copy view) but is correct — the
+///   deliberate v1 behavior (recorded), preferring correctness over a broken zero-copy on files
+///   whose size can't be trusted.
+/// - **Zero-length files** are never `mmap`ped (`mmap` of length 0 is `EINVAL`); the fallback reads
+///   them, yielding an empty `{null,0}` view.
+/// - **Truncation after mapping (SIGBUS):** the mapping length is fixed at `mmap` time from the
+///   `fstat` size. If another process truncates the file afterward, touching the lost pages raises
+///   `SIGBUS` — a known v1 limitation, not UB. We deliberately install **no** `SIGBUS` handler: a
+///   process-global signal handler is exactly the hidden global side effect Align forbids ("nothing
+///   hidden"), and per-mapping recovery needs `sigsetjmp`/`siglongjmp` machinery out of v1 scope.
+///   Concurrent truncation of a mapped file is the caller's contract to avoid.
+///
+/// # Safety
+/// `path` must describe a valid byte range; `arena` must be a valid arena handle; `out` must point
+/// to a writable `{ptr,len}` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_read_file_view(path: *const u8, path_len: i64, arena: *mut Arena, out: *mut AlignStr) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+    // A view must be arena-owned (sema requires an enclosing arena; codegen always passes a real
+    // handle). Guard the FFI boundary rather than deref a null arena.
+    if arena.is_null() {
+        return AL_INVALID;
+    }
+    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+        return AL_INVALID;
+    };
+    use std::os::fd::AsRawFd;
+    let (file, meta) = match std::fs::File::open(&path_str).and_then(|f| f.metadata().map(|m| (f, m))) {
+        Ok(fm) => fm,
+        Err(e) => return io_error_to_status(&e),
+    };
+    // A regular file with a nonzero size that fits `isize` (so it fits both the `usize` map length
+    // and the `i64` view len) takes the mmap fast path; a special / zero-length / oversized file
+    // falls back to an owned arena copy (correctness over zero-copy).
+    if meta.is_file() && meta.len() > 0
+        && let Ok(len_z) = isize::try_from(meta.len()) {
+            let len_u = len_z as usize;
+            let addr = unsafe {
+                mmap(core::ptr::null_mut(), len_u, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
+            };
+            if addr != MAP_FAILED && !addr.is_null() {
+                // Register on the arena for bulk `munmap` at arena end (every exit path).
+                unsafe { (*arena).maps.push((addr, len_u)) };
+                unsafe { *out = AlignStr { ptr: addr as *const u8, len: len_z as i64 } };
+                // The fd can close now — the mapping keeps the file alive on its own (POSIX).
+                return 0;
+            }
+            // mmap failed (rare — e.g. a filesystem that can't map): fall through to the copy path.
+        }
+    // Fallback: read the true contents into arena memory (special files, /proc, zero-length, or a
+    // failed mmap). A directory errors here (`std::fs::read` on a dir → mapped errno). Re-reads by
+    // path, so dropping `file` first is fine.
+    drop(file);
+    unsafe { read_file_view_into_arena(&path_str, arena, out) }
+}
+
 /// Build the `args: array<str>` value for `main` from the C `argc`/`argv`. Returns the owned
 /// `array<str>` as an `{ptr, len}`: a freshly [`align_rt_alloc`]'d buffer of `argc` `AlignStr`
 /// (`{ptr,len}`) entries, each a zero-copy view of one argv string (length via `strlen`). The
@@ -3839,6 +4082,25 @@ pub struct Arena {
     chunks: Vec<Vec<u8>>,
     /// Byte offset into the last chunk.
     off: usize,
+    /// `mmap` views registered by `fs.read_file_view` — `(addr, len)` pairs `munmap`ped in bulk when
+    /// the arena ends/resets. Distinct from `chunks` (owned bump memory `free`d by dropping the
+    /// `Vec`s): a mapping is kernel-owned and must be released with `munmap`, not `free`. Binding the
+    /// mapping's lifetime to the arena (per the `draft.md` §18.2 region rule) is what guarantees a
+    /// small returned `str` view cannot pin a huge mapping past the arena — release runs on *every*
+    /// arena exit (block end, `return`, `?`), since they all lower to `ArenaEnd` → `align_rt_arena_end`.
+    maps: Vec<(*mut core::ffi::c_void, usize)>,
+}
+
+impl Arena {
+    /// Release every registered `mmap` view (`fs.read_file_view`). Called from both
+    /// [`align_rt_arena_reset`] and [`align_rt_arena_end`] so a view is never leaked on any arena exit.
+    fn unmap_all(&mut self) {
+        for (addr, len) in self.maps.drain(..) {
+            // `len` is the mapping length passed to `mmap`; `munmap` on a valid `(addr,len)` cannot
+            // fail here (the pair came straight from a successful `mmap`), so the return is ignored.
+            unsafe { munmap(addr, len) };
+        }
+    }
 }
 
 const CHUNK: usize = 64 * 1024;
@@ -3878,7 +4140,7 @@ impl Arena {
 /// Open a new arena. The returned handle is freed by [`align_rt_arena_end`].
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_arena_begin() -> *mut Arena {
-    Box::into_raw(Box::new(Arena { chunks: Vec::new(), off: 0 }))
+    Box::into_raw(Box::new(Arena { chunks: Vec::new(), off: 0, maps: Vec::new() }))
 }
 
 /// Bump-allocate `size` bytes (with `align`) from the arena.
@@ -3914,6 +4176,7 @@ pub unsafe extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, alig
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_arena_reset(arena: *mut Arena) {
     let arena = unsafe { &mut *arena };
+    arena.unmap_all();
     arena.chunks.clear();
     arena.off = 0;
 }
@@ -3925,7 +4188,12 @@ pub unsafe extern "C" fn align_rt_arena_reset(arena: *mut Arena) {
 /// call consumes it (frees the `Arena` object), so `arena` must not be used again afterward.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_arena_end(arena: *mut Arena) {
-    drop(unsafe { Box::from_raw(arena) });
+    let mut arena = unsafe { Box::from_raw(arena) };
+    // Release every `fs.read_file_view` mapping before the arena's own memory is dropped. This is the
+    // munmap path for *all* arena exits — the block end, an early `return`, and `?` all lower to
+    // `ArenaEnd(handle)` (`align_mir::emit_exit_cleanup`), which codegen lowers to this call.
+    arena.unmap_all();
+    drop(arena);
 }
 
 // `task_group` runtime (slice ④b). A `TaskGroup` owns a region (arena) holding each spawned
@@ -3956,7 +4224,7 @@ pub struct TaskGroup {
 /// Open a `task_group`. Freed by [`align_rt_tg_end`].
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_tg_begin() -> *mut TaskGroup {
-    Box::into_raw(Box::new(TaskGroup { arena: Arena { chunks: Vec::new(), off: 0 }, tasks: Vec::new() }))
+    Box::into_raw(Box::new(TaskGroup { arena: Arena { chunks: Vec::new(), off: 0, maps: Vec::new() }, tasks: Vec::new() }))
 }
 
 /// Bump-allocate `size` bytes (with `align`) from the task group's region (envs + result slots).
@@ -4160,7 +4428,17 @@ unsafe extern "C" {
     fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
     // POSIX `close(2)` — a file-backed `reader`/`writer` closes the fd it owns at `Drop`.
     fn close(fd: i32) -> i32;
+    // POSIX `mmap(2)` / `munmap(2)` — `fs.read_file_view` maps a regular file read-only into the
+    // enclosing arena's address space; the mapping is `munmap`ped when the arena ends.
+    fn mmap(addr: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut core::ffi::c_void;
+    fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
 }
+
+// `mmap` protection / flags — the portable POSIX constants (identical on Linux and macOS).
+const PROT_READ: i32 = 0x1;
+const MAP_PRIVATE: i32 = 0x2;
+/// `mmap` failure sentinel — `(void*)-1`, not null.
+const MAP_FAILED: *mut core::ffi::c_void = usize::MAX as *mut core::ffi::c_void;
 
 /// Allocate `size` bytes on the heap (C `malloc`). Returns null for `size <= 0` (an empty
 /// buffer). On OOM (`malloc` returns null for a positive request) we fail fast and abort,
@@ -5859,5 +6137,141 @@ mod tests {
             assert_eq!(unsafe { *(*s as *const i64) }, 32 * base as i64 + 240, "outer base={base}");
         }
         unsafe { align_rt_tg_end(tg) };
+    }
+
+    // --- std.fs Slice 3 -----------------------------------------------------------------------
+
+    /// A unique temp path under the OS temp dir, cleaned up by the caller.
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("align-rt-fs-{}-{name}", std::process::id()))
+    }
+
+    fn view_of(s: &str) -> (*const u8, i64) {
+        (s.as_ptr(), s.len() as i64)
+    }
+
+    #[test]
+    fn fs_write_exists_remove_round_trip() {
+        let path = tmp_path("wer");
+        let ps = path.display().to_string();
+        let (pp, pl) = view_of(&ps);
+        let data = b"payload-123";
+        // Not present yet.
+        assert_eq!(unsafe { align_rt_fs_exists(pp, pl) }, 0);
+        // Write, then it exists and reads back exactly.
+        assert_eq!(unsafe { align_rt_fs_write_file(pp, pl, data.as_ptr(), data.len() as i64) }, 0);
+        assert_eq!(unsafe { align_rt_fs_exists(pp, pl) }, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        // Remove, then it is gone.
+        assert_eq!(unsafe { align_rt_fs_remove(pp, pl) }, 0);
+        assert_eq!(unsafe { align_rt_fs_exists(pp, pl) }, 0);
+        // Removing a missing file maps ENOENT -> NotFound.
+        assert_eq!(unsafe { align_rt_fs_remove(pp, pl) }, AL_NOT_FOUND);
+    }
+
+    #[test]
+    fn fs_write_file_empty_creates_empty() {
+        let path = tmp_path("empty");
+        let ps = path.display().to_string();
+        let (pp, pl) = view_of(&ps);
+        assert_eq!(unsafe { align_rt_fs_write_file(pp, pl, std::ptr::null(), 0) }, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fs_read_dir_lists_and_deep_frees() {
+        let dir = tmp_path("rd");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("e{i}")), b"x").unwrap();
+        }
+        let ds = dir.display().to_string();
+        let (pp, pl) = view_of(&ds);
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_dir(pp, pl, &mut out) }, 0);
+        assert_eq!(out.len, 4, "four entries");
+        // Each header entry owns a non-null name buffer with a plausible name.
+        let hdr = out.ptr as *const AlignStr;
+        for i in 0..out.len as usize {
+            let e = unsafe { *hdr.add(i) };
+            assert!(!e.ptr.is_null() && e.len > 0);
+            let name = unsafe { std::slice::from_raw_parts(e.ptr, e.len as usize) };
+            assert!(name.starts_with(b"e"), "entry name looks like eN");
+        }
+        // Deep free (each name + header) — under a leak sanitizer this proves no leak.
+        unsafe { align_rt_free_string_array(out.ptr as *mut u8, out.len) };
+        // Missing dir -> NotFound.
+        let miss = tmp_path("rd-missing");
+        let ms = miss.display().to_string();
+        let (mp, ml) = view_of(&ms);
+        let mut o2 = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_dir(mp, ml, &mut o2) }, AL_NOT_FOUND);
+        assert!(o2.ptr.is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_read_file_view_mmaps_and_arena_end_unmaps() {
+        let path = tmp_path("view");
+        let content = b"mmapped-file-view-content";
+        std::fs::write(&path, content).unwrap();
+        let ps = path.display().to_string();
+        let (pp, pl) = view_of(&ps);
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_file_view(pp, pl, arena, &mut out) }, 0);
+        assert_eq!(out.len, content.len() as i64);
+        let got = unsafe { std::slice::from_raw_parts(out.ptr, out.len as usize) };
+        assert_eq!(got, content, "the view bytes match the file");
+        // The mapping was registered on the arena for munmap at end.
+        assert_eq!(unsafe { (*arena).maps.len() }, 1, "one mapping registered");
+        // arena_end munmaps it (and frees the arena) — must not crash / double free.
+        unsafe { align_rt_arena_end(arena) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fs_read_file_view_empty_file_is_empty_view() {
+        let path = tmp_path("view-empty");
+        std::fs::write(&path, b"").unwrap();
+        let ps = path.display().to_string();
+        let (pp, pl) = view_of(&ps);
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_file_view(pp, pl, arena, &mut out) }, 0);
+        assert_eq!(out.len, 0, "empty file -> empty view");
+        assert_eq!(unsafe { (*arena).maps.len() }, 0, "no mapping for a zero-length file");
+        unsafe { align_rt_arena_end(arena) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fs_read_file_view_missing_is_not_found() {
+        let path = tmp_path("view-missing");
+        let _ = std::fs::remove_file(&path);
+        let ps = path.display().to_string();
+        let (pp, pl) = view_of(&ps);
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_file_view(pp, pl, arena, &mut out) }, AL_NOT_FOUND);
+        assert!(out.ptr.is_null());
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fs_read_file_view_proc_falls_back_to_copy() {
+        // /proc/self/stat is a regular file with st_size 0 but real content — the fallback reads it
+        // into arena memory (no mmap registered).
+        let ps = "/proc/self/stat".to_string();
+        let (pp, pl) = view_of(&ps);
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_fs_read_file_view(pp, pl, arena, &mut out) }, 0);
+        assert!(out.len > 0, "the proc file has real content via the fallback");
+        assert_eq!(unsafe { (*arena).maps.len() }, 0, "a size-0 special file is not mmapped");
+        unsafe { align_rt_arena_end(arena) };
     }
 }
