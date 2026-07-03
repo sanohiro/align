@@ -159,6 +159,94 @@ fn elem_field_assign_immutable_rejected() {
     ));
 }
 
+// --- Nested element-field write (`arr[i].a.x = v`, Slice 4): the write counterpart of the
+// `arr[i].a.x` read. The `StoreElemField` field became a `Vec<u32>` path, symmetric with the read
+// side's `ElemField.path` and the local-field-path `StoreField`. ---
+
+#[test]
+fn elem_nested_field_assign_writes_leaf() {
+    if !backend_available() {
+        return;
+    }
+    // Depth-2 write→read: `ls[k].a.x` and `ls[0].b.y` are overwritten; the other leaves stay put.
+    // ls[0]={a:{1,2}, b:{3,4}}, ls[1]={a:{10,0}, b:{0,0}}. Write ls[0].b.y=40, ls[1].a.x=100.
+    // Read ls[0].a.x(1) + ls[0].b.y(40) + ls[1].a.x(100) = 141.
+    let src = concat!(
+        "Point { x: i64, y: i64 }\n",
+        "Line { a: Point, b: Point }\n",
+        "fn main() -> i32 {\n",
+        "  mut ls := [Line{a: Point{x: 1, y: 2}, b: Point{x: 3, y: 4}}, Line{a: Point{x: 10, y: 0}, b: Point{x: 0, y: 0}}]\n",
+        "  mut k := 1\n",
+        "  ls[0].b.y = 40\n",
+        "  ls[k].a.x = 100\n",
+        "  return (ls[0].a.x + ls[0].b.y + ls[k].a.x) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("elem-nested-write", src).status.code(), Some(141));
+}
+
+#[test]
+fn elem_nested_field_assign_depth_three() {
+    if !backend_available() {
+        return;
+    }
+    // Depth-3 element write then read back: `cs[0].b.a.v = 42`.
+    let src = "A { v: i64 }\nB { a: A }\nC { b: B }\nfn main() -> i32 {\n  mut cs := [C{b: B{a: A{v: 1}}}]\n  cs[0].b.a.v = 42\n  return cs[0].b.a.v as i32\n}\n";
+    assert_eq!(build_and_run("elem-nested-write3", src).status.code(), Some(42));
+}
+
+#[test]
+fn elem_nested_field_assign_reorder_mix() {
+    if !backend_available() {
+        return;
+    }
+    // #307 field reordering at *every* level: both the outer and the nested struct mix widths, so
+    // the descending-alignment physical layout is permuted. A correct nested write must route each
+    // path segment through the logical→physical `pfield` map. Writes: q.a=7, q.b=100, q.c=20, p=3.
+    // Sum q.a(7) + q.b(100) + q.c(20) + p(3) + r(5, untouched) = 135.
+    let src = concat!(
+        "Inner { a: i8, b: i64, c: i16 }\n",
+        "Outer { p: i32, q: Inner, r: i8 }\n",
+        "fn main() -> i32 {\n",
+        "  mut arr := [Outer{p: 0, q: Inner{a: 0, b: 0, c: 0}, r: 5}]\n",
+        "  arr[0].q.a = 7\n",
+        "  arr[0].q.b = 100\n",
+        "  arr[0].q.c = 20\n",
+        "  arr[0].p = 3\n",
+        "  return ((arr[0].q.a as i64) + arr[0].q.b + (arr[0].q.c as i64) + (arr[0].p as i64) + (arr[0].r as i64)) as i32\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("elem-nested-write-reorder", src).status.code(), Some(135));
+}
+
+#[test]
+fn elem_nested_field_assign_immutable_rejected() {
+    // Writing a nested field of an element still requires the array local to be `mut`.
+    assert!(check_errs(
+        "elem-nested-write-immut",
+        "Point { x: i64, y: i64 }\nLine { a: Point, b: Point }\nfn main() -> i32 {\n  ls := [Line{a: Point{x: 1, y: 2}, b: Point{x: 3, y: 4}}]\n  ls[0].a.x = 9\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn elem_nested_field_assign_through_scalar_rejected() {
+    // A non-final field in the write path must be a struct: `arr[i].a.z = v` where `a` is a scalar.
+    assert!(check_errs(
+        "elem-nested-write-scalar",
+        "Line { a: i64 }\nfn main() -> i32 {\n  mut ls := [Line{a: 5}]\n  ls[0].a.z = 9\n  return 0\n}\n",
+    ));
+}
+
+#[test]
+fn elem_nested_field_assign_moved_value_rejected() {
+    // MoveCheck still sees the RHS through the (now path-carrying) element-field store: writing a
+    // moved-out `string` into a nested leaf is a use-after-move.
+    assert!(check_errs(
+        "elem-nested-write-moved",
+        "Addr { name: string }\nUser { addr: Addr }\nfn main() -> i32 {\n  mut us := [User{addr: Addr{name: \"a\".clone()}}]\n  s := \"b\".clone()\n  t := s\n  us[0].addr.name = s\n  return (t.len()) as i32\n}\n",
+    ));
+}
+
 #[test]
 fn whole_elem_assign_struct_value() {
     if !backend_available() {

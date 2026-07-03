@@ -2144,35 +2144,39 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ep = self.elem_ptr(*slot, idx)?;
                     self.drop_struct_fields(ep, *sid)?;
                 }
-                Stmt::DropElemField(slot, idx, field) => {
-                    // Free one owned `string` field of element `idx` before it is overwritten (4b).
-                    let Ty::StructArray(sid, _) = self.f.slots[*slot as usize] else {
-                        unreachable!("DropElemField on a non-struct-array slot");
-                    };
-                    let ep = self.elem_ptr(*slot, idx)?;
-                    let st = self.struct_types[sid as usize];
-                    let fp = self.builder.build_struct_gep(st, ep, self.pfield(sid, *field), "dropelemfld").map_err(|e| self.err(e))?;
+                Stmt::DropElemField(slot, idx, path) => {
+                    // Free one owned `string` leaf field of element `idx` before it is overwritten
+                    // (4b) — `us[i].name` or a nested `us[i].addr.name`. The leaf field pointer is
+                    // built the same way as the store (`elem_field_ptr`, a `[0,idx,*path]` GEP).
+                    debug_assert!(matches!(self.f.slots[*slot as usize], Ty::StructArray(..)), "DropElemField on a non-struct-array slot");
+                    let fp = self.elem_field_ptr(*slot, idx, path)?;
                     let agg = self.builder.build_load(slice_struct_type(self.ctx), fp, "dropelemfldv").map_err(|e| self.err(e))?.into_struct_value();
                     let ptr = self.builder.build_extract_value(agg, 0, "dropelemfldptr").map_err(|e| self.err(e))?;
                     self.builder.build_call(self.funcs["free"], &[ptr.into()], "").map_err(|e| self.err(e))?;
                 }
-                Stmt::StoreElemField(slot, idx, field, op) => {
-                    let ep = self.elem_field_ptr(*slot, idx, *field)?;
+                Stmt::StoreElemField(slot, idx, path, op) => {
+                    let ep = self.elem_field_ptr(*slot, idx, path)?;
                     let val = self.operand(op);
                     self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
                 }
-                Stmt::StoreElemFieldPtr { base, index, field, struct_id, value } => {
-                    // `base[index].field <- value` for an owned dynamic `array<Struct>` view — the
+                Stmt::StoreElemFieldPtr { base, index, path, struct_id, value } => {
+                    // `base[index].f0.f1.… <- value` for an owned dynamic `array<Struct>` view — the
                     // write dual of `Rvalue::IndexFieldPtr`: extract the buffer pointer from the
-                    // `{ptr,len}` aggregate and GEP `%Struct, ptr, index, pfield(field)`.
+                    // `{ptr,len}` aggregate and GEP `%Struct, ptr, index, *pfield(path)` (one struct
+                    // GEP level per path segment, each through the logical→physical map).
                     let agg = self.operand(base).into_struct_value();
                     let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
                     let st = self.struct_types[*struct_id as usize];
                     let idx = self.operand(index).into_int_value();
-                    let f = self.ctx.i32_type().const_int(self.pfield(*struct_id, *field) as u64, false);
+                    // `[index]` reaches element `index` (stride `st`); each physical field index then
+                    // descends one struct level to the leaf being written.
+                    let mut indices = vec![idx];
+                    for pidx in self.phys_field_indices(*struct_id, path) {
+                        indices.push(self.ctx.i32_type().const_int(pidx as u64, false));
+                    }
                     let ep = unsafe {
                         self.builder
-                            .build_in_bounds_gep(st, buf, &[idx, f], "aosfieldst")
+                            .build_in_bounds_gep(st, buf, &indices, "aosfieldst")
                             .map_err(|e| self.err(e))?
                     };
                     let val = self.operand(value);
@@ -3043,7 +3047,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_load(ty, ep, "idx").map_err(|e| self.err(e))?
             }
             Rvalue::IndexField(slot, idx, field) => {
-                let ep = self.elem_field_ptr(*slot, idx, *field)?;
+                let ep = self.elem_field_ptr(*slot, idx, &[*field])?;
                 let ty = abi_type(self.ctx, result_ty, self.struct_types, self.enum_types);
                 self.builder.build_load(ty, ep, "idxfld").map_err(|e| self.err(e))?
             }
@@ -4184,18 +4188,44 @@ impl<'c, 'a> FnGen<'c, 'a> {
         custom.map_or(natural, |c| c.max(natural))
     }
 
-    /// `&slot[index].field` — GEP `[0, index, field]` into a `[N x %Struct]` alloca.
-    fn elem_field_ptr(&self, slot: Slot, idx: &Operand, field: u32) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+    /// `&slot[index].f0.f1.…` — GEP `[0, index, *pfield(path)]` into a `[N x %Struct]` alloca. The
+    /// field `path` (length ≥ 1) walks the (nested) element struct; each level's logical index is
+    /// mapped to its physical slot via [`Self::phys_field_indices`] (correct under field reordering).
+    fn elem_field_ptr(&self, slot: Slot, idx: &Operand, path: &[u32]) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let arr_ty = self.llvm_type(self.f.slots[slot as usize]);
         let zero = self.ctx.i64_type().const_zero();
         let index = self.operand(idx).into_int_value();
         let sid = self.array_elem_struct_id(slot);
-        let f = self.ctx.i32_type().const_int(self.pfield(sid, field) as u64, false);
+        // `[0, index]` reaches element `index`; each physical field index descends one struct level.
+        let mut indices = vec![zero, index];
+        for pidx in self.phys_field_indices(sid, path) {
+            indices.push(self.ctx.i32_type().const_int(pidx as u64, false));
+        }
         unsafe {
             self.builder
-                .build_in_bounds_gep(arr_ty, self.slots[&slot], &[zero, index, f], "elemfield")
+                .build_in_bounds_gep(arr_ty, self.slots[&slot], &indices, "elemfield")
                 .map_err(|e| self.err(e))
         }
+    }
+
+    /// Map a logical field `path` (length ≥ 1) through a chain of nested structs rooted at
+    /// `struct_id` to the sequence of **physical** (reordered, `pfield`) field indices — one per
+    /// path segment. Each non-final field must be a `Struct` (sema's nested-access walk guarantees
+    /// it); used to build a multi-index element-field GEP for both fixed (`[N x %Struct]`) and
+    /// dynamic (`{ptr,len}` buffer) struct arrays.
+    fn phys_field_indices(&self, struct_id: u32, path: &[u32]) -> Vec<u32> {
+        let mut sid = struct_id;
+        let mut out = Vec::with_capacity(path.len());
+        for (k, &logical) in path.iter().enumerate() {
+            out.push(self.pfield(sid, logical));
+            if k + 1 < path.len() {
+                sid = match self.structs[sid as usize].fields[logical as usize].ty {
+                    Ty::Struct(nid) => nid,
+                    other => unreachable!("nested element-field path through non-struct {other:?}"),
+                };
+            }
+        }
+        out
     }
 
     /// The struct id held by a slot (assumes a struct-typed slot).

@@ -166,6 +166,22 @@ slices, but it reuses the Slice-3 Drop machinery). `crates/align_driver/tests/re
   sub-struct to a temp slot, and projects the remainder with the ordinary slot-field GEP
   (`Rvalue::Field`). Works for fixed and dynamic (`{ptr,len}`) struct arrays, any depth.
   `crates/align_driver/tests/struct_index.rs`.
+- **`arr[i].a.x = v` write — DONE.** The symmetric write counterpart of the read: `StoreElemField`'s
+  `field: u32`, `StoreElemFieldPtr.field`, `DropElemField`'s field, and `Place::ElemField.field` all
+  became a `path: Vec<u32>` — the same generalization Slice 1 did to the local-field-path `StoreField`.
+  Sema's write-place builder reuses `peel_index_field_chain` (the read side's) to resolve the whole
+  path through the nested element struct (each non-final field must be a struct); the leaf value
+  restriction is unchanged from the depth-1 write (a fixed `array<Struct>` leaf may be a scalar or an
+  owned `string` with drop-of-old; a dynamic `array<Struct>` leaf stays primitive-scalar). Codegen
+  emits a single multi-index GEP per store (`[0, index, *pfield(path)]` fixed, `[index, *pfield(path)]`
+  dynamic; `phys_field_indices` maps each logical segment to its physical slot under #307 reordering),
+  and `DropElemField` frees the old buffer for a nested owned `string` leaf. The flow walks
+  (effect / `MoveCheck` / `EscapeCheck` / drop) read only `base`/`index`/`value` of `AssignElemField`,
+  so the path change is transparent to them. Fixed + dynamic both path-generalized (symmetric); the
+  dynamic-nested case has no source constructor today (json decode is scalar/str only), so it is
+  exercised at depth-1 by the existing tests and is dead-but-symmetric at depth-2+.
+  `crates/align_driver/tests/struct_index.rs`, `owned_structs_arrays.rs`, plus the wave-2 differential
+  fuzzer (`fuzz_differential.rs`, now array-rooting the nested tower half the time).
 - **arrays of Move structs — Slice 4a DONE** (PR #279). A fixed array of a Move struct
   (`[User{name: string}]`) is now allowed: `is_owned_droppable` includes a Move `StructArray`, so the
   slot is null-initialised + drop-scheduled; codegen's `Stmt::Drop` on a `StructArray(sid, n)` frees
@@ -186,8 +202,11 @@ slices, but it reuses the Slice-3 Drop machinery). `crates/align_driver/tests/re
   - **still deferred** (hard, with `.clone()` workarounds): moving an owned field *out* of an element by
     value (`n: string := us[i].name` — needs per-element runtime drop flags for a dynamic index); whole-
     array move (return / pass — array materialization).
-- **deferred**: nested element *write* (`arr[i].a.x = v` — `StoreElemField` is still depth-1); a soa
-  column over a *nested* field (the nested-soa-column layout is a design choice). Risk: medium–high.
+- **deferred**: a soa column over a *nested* field (the nested-soa-column layout is a design choice —
+  a soa column stays scalar, so a nested soa element-field write is rejected in sema as "field is not
+  a struct"). A whole *Move-struct* leaf element-field write (`arr[i].inner = MoveStruct{…}`) still
+  leaks the overwritten value — a pre-existing depth-1 gap (a fixed-array element-field write has no
+  Move-struct-leaf drop-of-old), carried unchanged into the nested path, not introduced here.
 
 ### Slice 5 — cross-module field types (`f: other.T`) — DONE
 The module B3 leftover. A struct field, enum payload, or generic-template member may name a `pub`

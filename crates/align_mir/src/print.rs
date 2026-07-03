@@ -44,8 +44,8 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::StoreIndex(slot, idx, val) => {
                 let _ = writeln!(out, "    _{slot}[{}] <- {}", operand_str(idx), operand_str(val));
             }
-            Stmt::StoreElemField(slot, idx, field, val) => {
-                let _ = writeln!(out, "    _{slot}[{}].{field} <- {}", operand_str(idx), operand_str(val));
+            Stmt::StoreElemField(slot, idx, path, val) => {
+                let _ = writeln!(out, "    _{slot}[{}]{} <- {}", operand_str(idx), path_str(path), operand_str(val));
             }
             Stmt::PtrStore(ptr, idx, val) => {
                 let _ = writeln!(out, "    {}[{}] <- {}", operand_str(ptr), operand_str(idx), operand_str(val));
@@ -66,12 +66,13 @@ fn block_to_string(out: &mut String, b: &Block) {
                     operand_str(value)
                 );
             }
-            Stmt::StoreElemFieldPtr { base, index, field, struct_id, value } => {
+            Stmt::StoreElemFieldPtr { base, index, path, struct_id, value } => {
                 let _ = writeln!(
                     out,
-                    "    aos#{struct_id}({})[{}].{field} <- {}",
+                    "    aos#{struct_id}({})[{}]{} <- {}",
                     operand_str(base),
                     operand_str(index),
+                    path_str(path),
                     operand_str(value)
                 );
             }
@@ -90,8 +91,8 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::DropElem(slot, idx, sid) => {
                 let _ = writeln!(out, "    drop_elem _{slot}[{}] (struct#{sid})", operand_str(idx));
             }
-            Stmt::DropElemField(slot, idx, field) => {
-                let _ = writeln!(out, "    drop_elem_field _{slot}[{}].{field}", operand_str(idx));
+            Stmt::DropElemField(slot, idx, path) => {
+                let _ = writeln!(out, "    drop_elem_field _{slot}[{}]{}", operand_str(idx), path_str(path));
             }
             Stmt::DropValue(op) => {
                 let _ = writeln!(out, "    drop_value {}", operand_str(op));
@@ -405,6 +406,11 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BufWriterWrite(w, s) => format!("io_buf_write({}, {})", operand_str(w), operand_str(s)),
         Rvalue::BufWriterFlush(w) => format!("io_buf_flush({})", operand_str(w)),
     }
+}
+
+/// A field path (`[0, 2]`) rendered as a dotted suffix (`.0.2`) for a place display.
+fn path_str(path: &[u32]) -> String {
+    path.iter().map(|i| format!(".{i}")).collect::<String>()
 }
 
 fn operand_str(op: &Operand) -> String {
