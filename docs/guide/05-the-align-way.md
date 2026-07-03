@@ -20,8 +20,10 @@ total := xs.map(f).where(p).sum()
 A function that can fail returns `Result`; call it with `?`. The happy path reads top-to-bottom; the error path is the cold edge the compiler lays out away from the hot code.
 
 ```align
+import std.fs
+
 fn load() -> Result<Config, Error> {
-    raw := read_file(path)?
+    raw := fs.read_file(path)?
     cfg := parse(raw)?
     return Ok(cfg)
 }
