@@ -7,7 +7,7 @@ Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-03 (main @ PR #331; M8 formally closed same day, docs-only)._
 
-## M9 — std phase (design settled 2026-07-03; Slices 1–3 DONE)
+## M9 — std phase (design settled 2026-07-03; Slices 1–4 DONE — all slices complete)
 
 M0–M8 are done (language core + tooling/FFI). M9 (`std.io`/`std.fs`/`std.path`/`std.env`/
 `std.time`) design is settled — see `docs/impl/07-roadmap.md` M9 and `docs/open-questions.md`
@@ -34,7 +34,19 @@ registered on the runtime `Arena`, `munmap`ped at arena end on every exit via `A
 the arena, so escape is rejected, `.clone()` copies out). Guardrails: `fstat`-gated to regular
 nonzero files; special/`/proc`/zero-length files take an owned arena-copy fallback; no `SIGBUS`
 handler (documented v1 limit — no hidden global signal state). §19 runs end to end.
-`tests/m9_fs.rs` (17) + runtime unit tests (8). **Next: Slice 4 (`std.path`/`std.env`/`std.time`).**
+`tests/m9_fs.rs` (17) + runtime unit tests (8).
+
+**Slice 4 (std.path / std.env / std.time) — DONE.** `path.join`/`normalize` (owned `string`;
+`normalize` = pure POSIX lexical `.`/`..`/`//`, no symlink/FS access), `path.base`/`dir`/`ext`
+(zero-copy `str` **views** — region **inherited from the input** via a new `region_of` arm, so a view
+of an arena `str` can't escape; view-safe edges: no-separator `dir` = empty view, dotfile `ext` =
+empty, all-`/` → `/`); `env.get` -> `Option<string>` (owned; empty value = `Some("")` ≠ `None`),
+`env.set` -> `Result<(), Error>` (plain `setenv`; concurrent set documented UB per POSIX);
+`time.now` (`SystemTime`) / `time.instant` (monotonic `Instant`, non-decreasing) / `time.sleep`
+(`thread::sleep`, `EINTR`-resuming, non-positive = no-op) — one `i64`-ns timeline. sema dispatch +
+MIR `Rvalue` + `align_rt_path_*`/`env_*`/`time_*`. `tests/m9_path_env_time.rs` (10) + runtime unit
+tests (7). **M9 all four slices done** (std.io/fs/path/env/time complete); the formal M9-close
+declaration (heading + `CLAUDE.md` status) is a separate docs PR.
 
 ## M8 — Tooling and Quality — formally closed (2026-07-03)
 

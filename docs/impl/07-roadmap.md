@@ -1168,11 +1168,32 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   pipeline); a byte-exact view read (incl. multi-page); the view escape rejected at compile time;
   write/exists/remove/read_dir round-trips + errno mapping — `tests/m9_fs.rs` (17) + `align_runtime`
   unit tests (8).
-- **Slice 4 — std.path / std.env / std.time.** `path.join`/`base`/`dir`/`ext`/`normalize`;
-  `env.get`/`env.set` (no `env.args`); `time.now`/`time.instant`/`time.sleep` (one `i64`-nanosecond
-  timeline, no `Duration` type). **Completion condition:** a round-trip test per module (e.g.
-  `path.join` then `path.dir`/`base`/`ext` recover the pieces; `env.set` then `env.get` round-trips;
-  `time.instant()` before/after `time.sleep(ns)` shows elapsed `ns` monotonically increasing).
+- **Slice 4 — std.path / std.env / std.time — DONE.** `path.join`/`normalize` (freshly-allocated
+  owned `string`; `normalize` is pure POSIX lexical `.`/`..`/`//` resolution — **no** symlink /
+  filesystem access) and `path.base`/`dir`/`ext` (**zero-copy `str` views** of the input — their
+  region is **inherited from the input** via a `region_of` arm, so a view of an arena `str`
+  (`fs.read_file_view`) is rejected from escaping the arena; the #297-class trap avoided). The
+  view-safe POSIX edge choices: `dir` of a path with no separator is the **empty** view (not `.`,
+  which isn't a substring); an all-`/` path's `base`/`dir` is `/`; `ext` of a dotfile (leading `.`)
+  is empty. `env.get` -> `Option<string>` (owned — the environment is volatile, so a view would
+  dangle after a later `env.set`; a present-but-empty value is `Some("")`, distinct from `None`);
+  `env.set` -> `Result<(), Error>` (plain `setenv`; concurrent `env.set` from another `task_group`
+  task is documented **undefined** per POSIX — no hidden serializing lock). `time.now` (`CLOCK_REALTIME`
+  via `SystemTime`) / `time.instant` (`CLOCK_MONOTONIC` via a process-lazy `Instant` base, guaranteed
+  non-decreasing) / `time.sleep` (`std::thread::sleep`, which retries `EINTR` with the remaining
+  time; a non-positive `ns` is a no-op) — one `i64`-nanosecond timeline, no `Duration` type. All
+  three are Impure; `path.*` are Pure (lexical byte ops). Implementation: sema builtin dispatch +
+  MIR `Rvalue` + `align_rt_path_*`/`env_*`/`time_*` runtime, the `core.json`/std.fs precedent.
+  **Completion condition met:** a round-trip per module — `path.join` then `dir`/`base`/`ext` recover
+  the pieces; `env.set` then `env.get` round-trips (and an unset name is `None`); `time.instant()`
+  around `time.sleep(ns)` shows elapsed `ns` monotonically increasing — plus `normalize`
+  representative + edge cases, the base/dir/ext view region escape rejection, and the invalid-name /
+  import-required negatives (`tests/m9_path_env_time.rs`, 10 + `align_runtime` unit tests, 7).
+
+**M9 — all slices done.** Slices 1–4 (std.io / io.copy / std.fs / path·env·time) are all complete and
+their completion conditions met; the five M9 modules (`std.io`/`std.fs`/`std.path`/`std.env`/`std.time`)
+are implemented end to end. (The formal M9-close declaration — heading + `CLAUDE.md` status — lands in a
+separate docs PR, per the close-milestone convention.)
 
 **Explicitly deferred to M10+ (not part of M9):** `std.net`, `std.http`, `std.cli`, `std.process`,
 `std.encoding`, `std.compress`, `std.rand`, `std.crypto` (unstarted modules, out of this milestone's

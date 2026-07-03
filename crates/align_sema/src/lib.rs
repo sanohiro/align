@@ -2221,6 +2221,27 @@ impl EffectScan {
                 self.expr(path);
                 self.expr(data);
             }
+            // `std.path` ops are pure lexical string manipulation (no OS access) — like a field read.
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.expr(path),
+            ExprKind::PathJoin { a, b } => {
+                self.expr(a);
+                self.expr(b);
+            }
+            // `std.env` / `std.time` observe/mutate external state — Impure.
+            ExprKind::EnvGet { name } => {
+                self.impure_direct = true;
+                self.expr(name);
+            }
+            ExprKind::EnvSet { name, value } => {
+                self.impure_direct = true;
+                self.expr(name);
+                self.expr(value);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => self.impure_direct = true,
+            ExprKind::TimeSleep { ns } => {
+                self.impure_direct = true;
+                self.expr(ns);
+            }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 self.stage_funcs(stages);
@@ -2719,6 +2740,12 @@ impl<'a> EscapeCheck<'a> {
             // long as the receiver — inherit its region directly. (The receiver is already a `str`:
             // an owned `string` was auto-borrowed to a `Frame` view first, so this stays sound.)
             ExprKind::StrTrim { recv, .. } => self.region_of(recv, depth),
+            // `path.base`/`dir`/`ext(p)` return a zero-copy substring `str` view of `p`, so the view
+            // lives exactly as long as `p` — inherit its region directly (like `StrTrim`). Without this
+            // explicit arm the wildcard below would mis-infer `Static`, letting a view of an arena/frame
+            // `str` escape (the #297-class bug). `path.join`/`normalize` allocate owned strings and stay
+            // `Static` (the wildcard).
+            ExprKind::PathComponent { path, .. } => self.region_of(path, depth),
             // `buf.bytes()` is a `slice<u8>` view of the `buffer` local's heap storage (freed at
             // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
             ExprKind::BufferBytes { buffer } => Region::Frame.shorter(self.region_of(buffer, depth)),
@@ -3204,6 +3231,18 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(path, depth);
                 self.walk(data, depth);
             }
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.walk(path, depth),
+            ExprKind::PathJoin { a, b } => {
+                self.walk(a, depth);
+                self.walk(b, depth);
+            }
+            ExprKind::EnvGet { name } => self.walk(name, depth),
+            ExprKind::EnvSet { name, value } => {
+                self.walk(name, depth);
+                self.walk(value, depth);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeSleep { ns } => self.walk(ns, depth),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -3515,6 +3554,18 @@ impl UnnecessaryHeapScan {
                 self.visit(path);
                 self.visit(data);
             }
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.visit(path),
+            ExprKind::PathJoin { a, b } => {
+                self.visit(a);
+                self.visit(b);
+            }
+            ExprKind::EnvGet { name } => self.visit(name),
+            ExprKind::EnvSet { name, value } => {
+                self.visit(name);
+                self.visit(value);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeSleep { ns } => self.visit(ns),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
@@ -4110,6 +4161,19 @@ impl<'a> MoveCheck<'a> {
                 self.expr(path, moved, false, false);
                 self.expr(data, moved, false, false);
             }
+            // `std.path`/`std.env`/`std.time` builtins borrow their `str`/`i64` args (never consumed).
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.expr(path, moved, false, false),
+            ExprKind::PathJoin { a, b } => {
+                self.expr(a, moved, false, false);
+                self.expr(b, moved, false, false);
+            }
+            ExprKind::EnvGet { name } => self.expr(name, moved, false, false),
+            ExprKind::EnvSet { name, value } => {
+                self.expr(name, moved, false, false);
+                self.expr(value, moved, false, false);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeSleep { ns } => self.expr(ns, moved, false, false),
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -6947,6 +7011,21 @@ impl<'a, 't> Checker<'a, 't> {
             if single_name(p) == Some("fs") && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_path_op(method, args, span);
+            }
+            // `std.path` — `path.join`/`base`/`dir`/`ext`/`normalize` (pure lexical string ops).
+            if single_name(p) == Some("path") && matches!(method, "join" | "base" | "dir" | "ext" | "normalize") {
+                self.require_import("std.path", &format!("path.{method}"), span);
+                return self.check_path_op(method, args, span);
+            }
+            // `std.env` — `env.get(name)` -> Option<string>; `env.set(name, value)` -> Result<(), Error>.
+            if single_name(p) == Some("env") && matches!(method, "get" | "set") {
+                self.require_import("std.env", &format!("env.{method}"), span);
+                return self.check_env_op(method, args, span);
+            }
+            // `std.time` — `time.now()`/`time.instant()` -> i64 ns; `time.sleep(ns)`.
+            if single_name(p) == Some("time") && matches!(method, "now" | "instant" | "sleep") {
+                self.require_import("std.time", &format!("time.{method}"), span);
+                return self.check_time_op(method, args, span);
             }
             // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred). A local/captured `io`
             // shadows this (then it's value-method dispatch, not the std.io builtin).
@@ -9968,6 +10047,97 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `std.path` — `path.join(a, b)` -> owned `string`; `path.base`/`dir`/`ext(p)` -> a zero-copy
+    /// `str` **view** of `p` (region inherited from `p`, see `region_of`); `path.normalize(p)` ->
+    /// owned `string`. All pure lexical POSIX string ops (no filesystem access). Builtins.
+    fn check_path_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if method == "join" {
+            if args.len() != 2 {
+                self.diags
+                    .error(format!("'path.join' expects 2 arguments (two path fragments), got {}", args.len()), span);
+                return err;
+            }
+            let a = self.check_str_init(&args[0]);
+            let b = self.check_str_init(&args[1]);
+            return Expr { kind: ExprKind::PathJoin { a: Box::new(a), b: Box::new(b) }, ty: Ty::String, span };
+        }
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'path.{method}' expects 1 argument (the path), got {}", args.len()), span);
+            return err;
+        }
+        let path = Box::new(self.check_str_init(&args[0]));
+        match method {
+            "base" => Expr { kind: ExprKind::PathComponent { kind: hir::PathComponentKind::Base, path }, ty: Ty::Str, span },
+            "dir" => Expr { kind: ExprKind::PathComponent { kind: hir::PathComponentKind::Dir, path }, ty: Ty::Str, span },
+            "ext" => Expr { kind: ExprKind::PathComponent { kind: hir::PathComponentKind::Ext, path }, ty: Ty::Str, span },
+            "normalize" => Expr { kind: ExprKind::PathNormalize { path }, ty: Ty::String, span },
+            _ => unreachable!("check_path_op is only dispatched for join/base/dir/ext/normalize"),
+        }
+    }
+
+    /// `std.env` — `env.get(name)` -> `Option<string>` (owned; the environment is volatile, so the
+    /// value is copied out, never a view); `env.set(name, value)` -> `Result<(), Error>`. Builtins.
+    fn check_env_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if method == "get" {
+            if args.len() != 1 {
+                self.diags
+                    .error(format!("'env.get' expects 1 argument (the variable name), got {}", args.len()), span);
+                return err;
+            }
+            let name = self.check_str_init(&args[0]);
+            return Expr { kind: ExprKind::EnvGet { name: Box::new(name) }, ty: Ty::Option(Scalar::String), span };
+        }
+        // `env.set(name, value)`.
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'env.set' expects 2 arguments (the name and value), got {}", args.len()), span);
+            return err;
+        }
+        let name = self.check_str_init(&args[0]);
+        let value = self.check_str_init(&args[1]);
+        Expr {
+            kind: ExprKind::EnvSet { name: Box::new(name), value: Box::new(value) },
+            ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `std.time` — `time.now()` (wall clock) / `time.instant()` (monotonic) -> `i64` nanoseconds;
+    /// `time.sleep(ns)` -> `()` (a negative `ns` is a no-op). One `i64`-nanosecond timeline, no
+    /// `Duration` type ("one way"). Builtins.
+    fn check_time_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        if method == "sleep" {
+            if args.len() != 1 {
+                self.diags
+                    .error(format!("'time.sleep' expects 1 argument (nanoseconds, i64), got {}", args.len()), span);
+                return err;
+            }
+            let ns = self.check_expr(&args[0], Some(i64_ty));
+            if ns.ty == Ty::Error {
+                return err;
+            }
+            if !matches!(ns.ty, Ty::Int(_) | Ty::IntVar(_)) {
+                self.diags
+                    .error(format!("'time.sleep' expects a nanosecond count (i64), got {}", ty_name(ns.ty)), args[0].span);
+                return err;
+            }
+            return Expr { kind: ExprKind::TimeSleep { ns: Box::new(ns) }, ty: Ty::Unit, span };
+        }
+        // `time.now()` / `time.instant()` — no arguments.
+        if !args.is_empty() {
+            self.diags
+                .error(format!("'time.{method}' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        let kind = if method == "now" { ExprKind::TimeNow } else { ExprKind::TimeInstant };
+        Expr { kind, ty: i64_ty, span }
+    }
+
     /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — a buffered `writer` over the
     /// given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
     fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
@@ -11060,6 +11230,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(path);
                 self.finalize_expr(data);
             }
+            ExprKind::PathComponent { path, .. } | ExprKind::PathNormalize { path } => self.finalize_expr(path),
+            ExprKind::PathJoin { a, b } => {
+                self.finalize_expr(a);
+                self.finalize_expr(b);
+            }
+            ExprKind::EnvGet { name } => self.finalize_expr(name),
+            ExprKind::EnvSet { name, value } => {
+                self.finalize_expr(name);
+                self.finalize_expr(value);
+            }
+            ExprKind::TimeNow | ExprKind::TimeInstant => {}
+            ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);

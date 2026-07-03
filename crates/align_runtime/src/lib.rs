@@ -4016,6 +4016,315 @@ pub unsafe extern "C" fn align_rt_str_trim_end(ptr: *const u8, len: i64) -> Alig
     str_subview(bytes.trim_ascii_end())
 }
 
+// ---------------------------------------------------------------------------------------------
+// std.path / std.env / std.time (M9 Slice 4). `path.*` are pure lexical byte operations (UTF-8 is
+// the representation, as for every other `str`, but the vocabulary — `/`, `.`, `..` — is ASCII, so
+// the ops are byte-level and never split a multi-byte scalar). `env.*`/`time.*` touch process /
+// OS state (Impure). Every returned owned `string` comes from `align_rt_alloc` and is freed by the
+// generated `Drop`; the `path.base`/`dir`/`ext` results are borrowed sub-views of the input.
+// ---------------------------------------------------------------------------------------------
+
+/// View a `{ptr,len}` argument as a byte slice, tolerating the empty/null view (`{null,0}`).
+///
+/// # Safety
+/// For a non-empty view, `ptr`/`len` must describe a valid byte range for the call.
+#[inline]
+unsafe fn bytes_view<'a>(ptr: *const u8, len: i64) -> &'a [u8] {
+    // Null / non-positive → empty (never `from_raw_parts(null, 0)`, which is UB). `usize::try_from`
+    // rather than `len as usize` so a length that doesn't fit a `usize` (only reachable on a 32-bit
+    // target) yields empty instead of a truncated, out-of-bounds view.
+    match usize::try_from(len) {
+        Ok(n) if n > 0 && !ptr.is_null() => unsafe { std::slice::from_raw_parts(ptr, n) },
+        _ => &[],
+    }
+}
+
+/// `path.base(p)` — the final path component as a **borrowed** sub-`str` `{ptr,len}` of `p` (no
+/// allocation; aliases `p`'s bytes). Trailing `/` are stripped; an all-`/` path yields `/`; an empty
+/// path yields an empty view. View-safe (always a substring of `p`).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_path_base(ptr: *const u8, len: i64) -> AlignStr {
+    let b = unsafe { bytes_view(ptr, len) };
+    if b.is_empty() {
+        return AlignStr { ptr, len: 0 };
+    }
+    let mut end = b.len();
+    while end > 0 && b[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        // All slashes → "/" (a 1-byte view of a separator).
+        return str_subview(&b[0..1]);
+    }
+    let mut start = end;
+    while start > 0 && b[start - 1] != b'/' {
+        start -= 1;
+    }
+    str_subview(&b[start..end])
+}
+
+/// `path.dir(p)` — everything before the final component as a **borrowed** sub-`str` `{ptr,len}` of
+/// `p`. Trailing separators are cleaned; a path with no separator yields an **empty** view (not `.`,
+/// since the result must be a substring of `p`); separators that reach the root yield `/`. View-safe.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_path_dir(ptr: *const u8, len: i64) -> AlignStr {
+    let b = unsafe { bytes_view(ptr, len) };
+    if b.is_empty() {
+        return AlignStr { ptr, len: 0 };
+    }
+    let mut end = b.len();
+    while end > 0 && b[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        // All slashes → dir is "/".
+        return str_subview(&b[0..1]);
+    }
+    let mut start = end;
+    while start > 0 && b[start - 1] != b'/' {
+        start -= 1;
+    }
+    if start == 0 {
+        // No directory separator → empty view.
+        return AlignStr { ptr, len: 0 };
+    }
+    // Strip the separator(s) before the base component.
+    let mut dend = start;
+    while dend > 0 && b[dend - 1] == b'/' {
+        dend -= 1;
+    }
+    if dend == 0 {
+        // The separators reach the root → "/".
+        return str_subview(&b[0..1]);
+    }
+    str_subview(&b[0..dend])
+}
+
+/// `path.ext(p)` — the extension of the final component (from the last `.` to the end, including
+/// the dot) as a **borrowed** sub-`str` `{ptr,len}` of `p`; empty when there is no `.`, or when the
+/// only `.` starts the component (a dotfile like `.bashrc`). View-safe (always a suffix of the base).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_path_ext(ptr: *const u8, len: i64) -> AlignStr {
+    let b = unsafe { bytes_view(ptr, len) };
+    if b.is_empty() {
+        return AlignStr { ptr, len: 0 };
+    }
+    let mut end = b.len();
+    while end > 0 && b[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        return AlignStr { ptr, len: 0 };
+    }
+    let mut start = end;
+    while start > 0 && b[start - 1] != b'/' {
+        start -= 1;
+    }
+    let mut i = end;
+    while i > start {
+        i -= 1;
+        if b[i] == b'.' {
+            if i == start {
+                // Leading dot → dotfile, no extension.
+                return AlignStr { ptr, len: 0 };
+            }
+            return str_subview(&b[i..end]);
+        }
+    }
+    AlignStr { ptr, len: 0 }
+}
+
+/// `path.join(a, b)` — join two fragments with a single `/` separator into a freshly heap-allocated
+/// owned `string` `{ptr,len}`. An empty fragment yields a clone of the other; otherwise `a`'s
+/// trailing `/` and `b`'s leading `/` are collapsed to exactly one separator.
+///
+/// # Safety
+/// Each `{ptr,len}` pair must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_path_join(aptr: *const u8, alen: i64, bptr: *const u8, blen: i64) -> AlignStr {
+    let a = unsafe { bytes_view(aptr, alen) };
+    let b = unsafe { bytes_view(bptr, blen) };
+    if a.is_empty() {
+        return unsafe { align_rt_str_clone(bptr, blen) };
+    }
+    if b.is_empty() {
+        return unsafe { align_rt_str_clone(aptr, alen) };
+    }
+    let mut ae = a.len();
+    while ae > 0 && a[ae - 1] == b'/' {
+        ae -= 1;
+    }
+    let mut bs = 0;
+    while bs < b.len() && b[bs] == b'/' {
+        bs += 1;
+    }
+    let asl = &a[0..ae];
+    let bsl = &b[bs..];
+    let total = asl.len() + 1 + bsl.len();
+    let dst = align_rt_alloc(total as i64);
+    unsafe {
+        core::ptr::copy_nonoverlapping(asl.as_ptr(), dst, asl.len());
+        *dst.add(asl.len()) = b'/';
+        core::ptr::copy_nonoverlapping(bsl.as_ptr(), dst.add(asl.len() + 1), bsl.len());
+    }
+    AlignStr { ptr: dst, len: total as i64 }
+}
+
+/// `path.normalize(p)` — lexically resolve `.` / `..` / redundant `/` into a freshly heap-allocated
+/// owned `string` `{ptr,len}`. Pure string manipulation (POSIX vocabulary only) — **no** symlink
+/// resolution or filesystem access. A relative result that collapses to nothing is `.`; an absolute
+/// one that collapses to nothing is `/`; a leading `..` is preserved on a relative path, and dropped
+/// past the root on an absolute one.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_path_normalize(ptr: *const u8, len: i64) -> AlignStr {
+    let b = unsafe { bytes_view(ptr, len) };
+    let absolute = !b.is_empty() && b[0] == b'/';
+    let mut comps: Vec<&[u8]> = Vec::new();
+    for comp in b.split(|&c| c == b'/') {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if comp == b".." {
+            if absolute {
+                comps.pop(); // Can't go above the root; empty → no-op.
+            } else if matches!(comps.last(), Some(&last) if last == b"..") || comps.is_empty() {
+                comps.push(comp); // Preserve a leading `..` on a relative path.
+            } else {
+                comps.pop();
+            }
+        } else {
+            comps.push(comp);
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    if absolute {
+        out.push(b'/');
+    }
+    for (i, c) in comps.iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(c);
+    }
+    if out.is_empty() {
+        out.push(b'.'); // A relative path that collapsed to nothing → ".".
+    }
+    let n = out.len();
+    let dst = align_rt_alloc(n as i64);
+    unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), dst, n) };
+    AlignStr { ptr: dst, len: n as i64 }
+}
+
+/// `env.get(name)` — write the owned `string` `{ptr,len}` value of environment variable `name` into
+/// `*out` (or `{null,0}` if unset / the name is invalid), returning `1` if set, `0` if not. The
+/// value is copied out (owned) — the environment is volatile, so a view would dangle after a later
+/// `env.set`. A present-but-empty value is `1` with a `{null,0}` (empty owned) string — distinct
+/// from absent (`0`).
+///
+/// # Safety
+/// `nptr`/`nlen` must describe a valid byte range, and `out` a valid `*mut AlignStr`, for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_env_get(nptr: *const u8, nlen: i64, out: *mut AlignStr) -> i32 {
+    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+    let name = unsafe { bytes_view(nptr, nlen) };
+    // `getenv` needs a NUL-terminated name; an empty name or an interior NUL can never name a
+    // variable, so treat it as absent.
+    if name.is_empty() || name.contains(&0) {
+        return 0;
+    }
+    let mut c = Vec::with_capacity(name.len() + 1);
+    c.extend_from_slice(name);
+    c.push(0);
+    let v = unsafe { getenv(c.as_ptr()) };
+    if v.is_null() {
+        return 0;
+    }
+    // `strlen(v)`, then copy the bytes into an owned buffer immediately (before any later `setenv`
+    // could invalidate the returned pointer).
+    let mut n = 0usize;
+    while unsafe { *v.add(n) } != 0 {
+        n += 1;
+    }
+    unsafe { *out = align_rt_str_clone(v, n as i64) };
+    1
+}
+
+/// `env.set(name, value)` — `setenv(name, value, overwrite=1)`. Returns `0` on success, else the
+/// errno mapped through [`io_error_to_status`]. `name` must be non-empty and contain no `=` or NUL,
+/// and `value` no NUL (POSIX `EINVAL` otherwise → `AL_INVALID`). **v1 concurrency:** `setenv` is not
+/// thread-safe (POSIX), so a concurrent `env.set` from another `task_group` task is undefined; v1
+/// documents this rather than serializing (no hidden global lock — "nothing hidden").
+///
+/// # Safety
+/// Each `{ptr,len}` pair must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_env_set(nptr: *const u8, nlen: i64, vptr: *const u8, vlen: i64) -> i32 {
+    let name = unsafe { bytes_view(nptr, nlen) };
+    let value = unsafe { bytes_view(vptr, vlen) };
+    if name.is_empty() || name.contains(&0) || name.contains(&b'=') || value.contains(&0) {
+        return AL_INVALID;
+    }
+    let mut cn = Vec::with_capacity(name.len() + 1);
+    cn.extend_from_slice(name);
+    cn.push(0);
+    let mut cv = Vec::with_capacity(value.len() + 1);
+    cv.extend_from_slice(value);
+    cv.push(0);
+    let r = unsafe { setenv(cn.as_ptr(), cv.as_ptr(), 1) };
+    if r == 0 {
+        0
+    } else {
+        io_error_to_status(&std::io::Error::last_os_error())
+    }
+}
+
+/// `time.now()` — wall-clock time as UNIX-epoch nanoseconds (`CLOCK_REALTIME` via `SystemTime`). A
+/// clock set before the epoch yields a negative count. (`i128` ns is truncated to `i64` — good until
+/// ~year 2262.)
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_time_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i64,
+        Err(e) => -(e.duration().as_nanos() as i64),
+    }
+}
+
+/// `time.instant()` — a monotonic-clock reading in nanoseconds (`CLOCK_MONOTONIC` via `Instant`),
+/// measured from the first call in this process. Guaranteed non-decreasing (unlike `time.now`), so
+/// it is the correct clock for measuring elapsed intervals.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_time_instant() -> i64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    let base = BASE.get_or_init(Instant::now);
+    base.elapsed().as_nanos() as i64
+}
+
+/// `time.sleep(ns)` — suspend the calling thread for `ns` nanoseconds. A non-positive `ns` is a
+/// no-op. `std::thread::sleep` retries `EINTR` internally with the remaining time (POSIX
+/// `nanosleep` resume semantics), so a signal never shortens the sleep.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_time_sleep(ns: i64) {
+    if ns <= 0 {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_nanos(ns as u64));
+}
+
 /// Report an `Err` returned from `main` (`docs/impl/06-runtime-std.md` §9). M2's `Error`
 /// is an i32 code; the original code is reported, and the returned value is the process
 /// exit code — clamped to a nonzero `u8` so a failure never looks like success (exit 0)
@@ -4432,6 +4741,12 @@ unsafe extern "C" {
     // enclosing arena's address space; the mapping is `munmap`ped when the arena ends.
     fn mmap(addr: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut core::ffi::c_void;
     fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
+    // POSIX `getenv(3)` / `setenv(3)` — `std.env`. `getenv` returns a pointer to the value's
+    // NUL-terminated bytes (or null if unset); `setenv` returns 0 on success, -1 (with `errno` set)
+    // on failure. Both are used only from the calling thread; concurrent `env.set` is documented
+    // UB (POSIX — `setenv` is not thread-safe against `getenv`/`setenv` in other threads).
+    fn getenv(name: *const u8) -> *const u8;
+    fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32;
 }
 
 // `mmap` protection / flags — the portable POSIX constants (identical on Linux and macOS).
@@ -6273,5 +6588,138 @@ mod tests {
         assert!(out.len > 0, "the proc file has real content via the fallback");
         assert_eq!(unsafe { (*arena).maps.len() }, 0, "a size-0 special file is not mmapped");
         unsafe { align_rt_arena_end(arena) };
+    }
+
+    // --- std.path (Slice 4) — pure lexical byte ops -------------------------------------------
+
+    /// A `path.base`/`dir`/`ext` result is a byte view; render it as a `&str` for comparison.
+    fn view_str(s: AlignStr) -> String {
+        if s.len <= 0 || s.ptr.is_null() {
+            return String::new();
+        }
+        let b = unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) };
+        String::from_utf8_lossy(b).into_owned()
+    }
+    /// Render an owned `string` result and free its buffer (it came from `align_rt_alloc`).
+    fn owned_str(s: AlignStr) -> String {
+        let out = view_str(s);
+        if !s.ptr.is_null() {
+            unsafe { align_rt_free(s.ptr as *mut u8) };
+        }
+        out
+    }
+    fn base(p: &str) -> String {
+        let (pp, pl) = view_of(p);
+        view_str(unsafe { align_rt_path_base(pp, pl) })
+    }
+    fn dir(p: &str) -> String {
+        let (pp, pl) = view_of(p);
+        view_str(unsafe { align_rt_path_dir(pp, pl) })
+    }
+    fn ext(p: &str) -> String {
+        let (pp, pl) = view_of(p);
+        view_str(unsafe { align_rt_path_ext(pp, pl) })
+    }
+    fn normalize(p: &str) -> String {
+        let (pp, pl) = view_of(p);
+        owned_str(unsafe { align_rt_path_normalize(pp, pl) })
+    }
+    fn join(a: &str, b: &str) -> String {
+        let (ap, al) = view_of(a);
+        let (bp, bl) = view_of(b);
+        owned_str(unsafe { align_rt_path_join(ap, al, bp, bl) })
+    }
+
+    #[test]
+    fn path_base_cases() {
+        assert_eq!(base("/usr/bin/ls"), "ls");
+        assert_eq!(base("/usr/bin/"), "bin");
+        assert_eq!(base("file.txt"), "file.txt");
+        assert_eq!(base("/"), "/");
+        assert_eq!(base(""), "");
+        assert_eq!(base("a/b/c"), "c");
+    }
+
+    #[test]
+    fn path_dir_cases() {
+        assert_eq!(dir("/usr/bin/ls"), "/usr/bin");
+        assert_eq!(dir("a/b"), "a");
+        assert_eq!(dir("a//b"), "a");
+        assert_eq!(dir("file"), ""); // no separator → empty view (not ".")
+        assert_eq!(dir("/file"), "/"); // separator at the root
+        assert_eq!(dir("/"), "/");
+        assert_eq!(dir(""), "");
+    }
+
+    #[test]
+    fn path_ext_cases() {
+        assert_eq!(ext("a.txt"), ".txt");
+        assert_eq!(ext("archive.tar.gz"), ".gz");
+        assert_eq!(ext(".bashrc"), ""); // leading dot → dotfile, no ext
+        assert_eq!(ext("dir/.hidden"), "");
+        assert_eq!(ext("a/b.c"), ".c");
+        assert_eq!(ext("noext"), "");
+        assert_eq!(ext("a.txt/"), ".txt");
+    }
+
+    #[test]
+    fn path_normalize_cases() {
+        assert_eq!(normalize("a/./b/../c"), "a/c");
+        assert_eq!(normalize("../a"), "../a"); // leading `..` preserved (relative)
+        assert_eq!(normalize("/../a"), "/a"); // `..` past the root dropped (absolute)
+        assert_eq!(normalize("a//b"), "a/b");
+        assert_eq!(normalize(""), ".");
+        assert_eq!(normalize("/"), "/");
+        assert_eq!(normalize("a/b/../.."), ".");
+        assert_eq!(normalize("a/../../b"), "../b");
+        assert_eq!(normalize("/usr/./local/../bin"), "/usr/bin");
+    }
+
+    #[test]
+    fn path_join_cases() {
+        assert_eq!(join("dir/sub", "file.txt"), "dir/sub/file.txt");
+        assert_eq!(join("a/", "/b"), "a/b"); // boundary separators collapse to one
+        assert_eq!(join("a", "b"), "a/b");
+        assert_eq!(join("", "b"), "b");
+        assert_eq!(join("a", ""), "a");
+        assert_eq!(join("/", "b"), "/b");
+    }
+
+    // --- std.env / std.time (Slice 4) ---------------------------------------------------------
+
+    #[test]
+    fn env_set_get_round_trip() {
+        let (np, nl) = view_of("ALIGN_RT_TEST_VAR");
+        let (vp, vl) = view_of("rt-value");
+        assert_eq!(unsafe { align_rt_env_set(np, nl, vp, vl) }, 0);
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_env_get(np, nl, &mut out) }, 1, "the var is set");
+        assert_eq!(owned_str(out), "rt-value");
+        // An unset name → flag 0, {null,0}.
+        let (up, ul) = view_of("ALIGN_RT_UNSET_ZZZ");
+        let mut out2 = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_env_get(up, ul, &mut out2) }, 0, "the var is unset");
+        assert!(out2.ptr.is_null());
+    }
+
+    #[test]
+    fn env_set_invalid_name_is_invalid() {
+        let (np, nl) = view_of("BAD=NAME");
+        let (vp, vl) = view_of("x");
+        assert_eq!(unsafe { align_rt_env_set(np, nl, vp, vl) }, AL_INVALID);
+        let (ep, el) = view_of("");
+        assert_eq!(unsafe { align_rt_env_set(ep, el, vp, vl) }, AL_INVALID, "empty name is invalid");
+    }
+
+    #[test]
+    fn time_now_positive_and_instant_monotonic() {
+        assert!(align_rt_time_now() > 0, "wall clock is after the epoch");
+        let a = align_rt_time_instant();
+        align_rt_time_sleep(2_000_000); // 2 ms
+        let b = align_rt_time_instant();
+        assert!(b - a >= 2_000_000, "instant is monotonic and reflects the sleep");
+        // A non-positive sleep is a no-op (returns immediately).
+        align_rt_time_sleep(-1);
+        align_rt_time_sleep(0);
     }
 }
