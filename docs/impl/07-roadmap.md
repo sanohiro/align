@@ -1107,6 +1107,46 @@ proposals already live in `docs/open-questions.md` → "M8 lint candidates".
 - **`par_map` cost-threshold lint** (cheap-`par_map`-loses-to-sequential) — recorded with the perf-rail
   lint work, not yet built.
 
+## M9 — std (I/O, filesystem, path, env, time) — design settled 2026-07-03, implementation not started
+
+Scope: `std.io`, `std.fs`, `std.path`, `std.env`, `std.time` — the five modules an ordinary CLI
+program needs. Full API shape (types + signatures) is in `draft.md` §18.2; the five underlying
+decisions are recorded in `docs/open-questions.md` Settled → "M9 std design". As with every prior
+`std`/`core` module, the implementation is Rust runtime (`align_rt_*`) + sema builtin dispatch +
+required `import` — the `core.json` pattern, not yet Align-over-FFI library code.
+
+- **Slice 1 — std.io core.** `reader`/`writer` as concrete Move types (own an fd, `Drop` closes
+  it); `fs.open`/`fs.create` constructing them; `r.read(b: mut buffer)` / `w.write(x)` /
+  `w.flush()`; `io.stdout.buffered()` unifies buffering into `writer` (no separate buffered type —
+  "one way"). Before building this, check `core.buffer`'s implementation status (design is
+  Settled — `docs/open-questions.md` "`bytes`/`buffer`" — but build was deliberately deferred until
+  a consumer); if still unbuilt, this slice includes the minimal owned growable byte-buffer needed
+  by `reader.read`. **Completion condition:** an Align program byte-exact-copies a file through a
+  `read`/`write` loop (`fs.open` → `reader.read(buf)` loop → `fs.create` → `writer.write(buf)`).
+- **Slice 2 — `io.copy`.** The portable fixed-buffer loop (the v1/reference implementation —
+  `docs/open-questions.md` "Transparent zero-copy I/O"), returning bytes transferred.
+  **Completion condition:** byte-exact transfer, plus a test that memory stays bounded
+  (`O(buffer)`, not `O(file size)`) on a large input. Fast paths (`sendfile`/`splice`/mmap/
+  `io_uring`) are explicitly **post-M9** — see that Future entry, unchanged in shape by this slice.
+- **Slice 3 — std.fs complete.** `write_file`/`exists`/`remove`/`read_dir`, and
+  `read_file_view` (mmap view; requires an enclosing arena, region bound to the arena, munmap at
+  arena end — the guardrails in `docs/open-questions.md` "Transparent zero-copy I/O" lines
+  ~2383–2396 apply: gate to regular files via `fstat`, handle `SIGBUS` on truncation, avoid
+  zero-length/`/proc`/character-device files). **Completion condition:** the `draft.md` §19
+  type-checks and runs end to end; a view read works; an attempt to escape the view past its arena
+  is rejected at compile time.
+- **Slice 4 — std.path / std.env / std.time.** `path.join`/`base`/`dir`/`ext`/`normalize`;
+  `env.get`/`env.set` (no `env.args`); `time.now`/`time.instant`/`time.sleep` (one `i64`-nanosecond
+  timeline, no `Duration` type). **Completion condition:** a round-trip test per module (e.g.
+  `path.join` then `path.dir`/`base`/`ext` recover the pieces; `env.set` then `env.get` round-trips;
+  `time.instant()` before/after `time.sleep(ns)` shows elapsed `ns` monotonically increasing).
+
+**Explicitly deferred to M10+ (not part of M9):** `std.net`, `std.http`, `std.cli`, `std.process`,
+`std.encoding`, `std.compress`, `std.rand`, `std.crypto` (unstarted modules, out of this milestone's
+scope); streaming × pipeline integration (a `reader`/`writer` as a pipeline source/sink); and
+`io_uring` / Direct I/O fast paths for `io.copy` (recorded in `docs/open-questions.md` Future —
+"Transparent zero-copy I/O", "Hardware & backend optimization backlog").
+
 ## Design Issues to Settle in Parallel
 
 Settle each item in `open-questions.md`, tied to its related M (do not defer).

@@ -7,6 +7,12 @@ Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-03 (main @ PR #331; M8 formally closed same day, docs-only)._
 
+## M9 — std phase begun (design settled, 2026-07-03)
+
+M0–M8 are done (language core + tooling/FFI). M9 (`std.io`/`std.fs`/`std.path`/`std.env`/
+`std.time`) design is now settled — see `docs/impl/07-roadmap.md` M9 and `docs/open-questions.md`
+Settled → "M9 std design". Implementation has not started.
+
 ## M8 — Tooling and Quality — formally closed (2026-07-03)
 
 All four completion conditions are met: the formatter (#233, `align_fmt`); `unsafe`/`raw.*`
