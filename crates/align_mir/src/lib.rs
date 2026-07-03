@@ -502,6 +502,23 @@ pub enum Rvalue {
     BufferBytes(Operand),
     /// `b.len()` — the buffer's current byte count (`i64`).
     BufferLen(Operand),
+    /// `fs.write_file(path, data)` — write all of the `str`/`bytes` operand `data` to `path`, then
+    /// close. Yields an `i32` errno-status (0 = ok).
+    FsWriteFile { path: Operand, data: Operand },
+    /// `fs.write_file(path, builder)` — the `builder`-source form (writes the builder's bytes).
+    FsWriteFileBuilder { path: Operand, builder: Operand },
+    /// `fs.exists(path)` — `1` if `path` exists, else `0` (an `i32` used directly as a `bool`; every
+    /// error folds to `0`, so there is no status branch).
+    FsExists { path: Operand },
+    /// `fs.remove(path)` — delete the file at `path`. Yields an `i32` errno-status (0 = ok).
+    FsRemove { path: Operand },
+    /// `fs.read_dir(path)` — the entry names of directory `path` as an owned `array<string>`
+    /// (`{ptr,len}`) written into `out`. Yields an `i32` errno-status (0 = ok).
+    FsReadDir { path: Operand, out: Slot },
+    /// `fs.read_file_view(path)` — mmap the regular file `path` read-only into `arena`, writing the
+    /// `str` view `{ptr,len}` into `out`. Yields an `i32` errno-status (0 = ok). The mapping is
+    /// `munmap`ped at arena end (the region rule) — no `Drop`.
+    FsReadFileView { path: Operand, arena: Operand, out: Slot },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -1342,6 +1359,43 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::BufferLen(bop)));
             Operand::Value(v)
         }
+        // `fs.write_file(path, data)` yields `Result<(), Error>` from an i32 errno-status (str/bytes
+        // vs builder pick the runtime fn, like `writer.write`).
+        hir::ExprKind::FsWriteFile { path, data, builder } => {
+            let pop = lower_expr(b, path);
+            let dop = lower_expr(b, data);
+            let code = b.fresh_value(status_ty());
+            let rv = if *builder {
+                Rvalue::FsWriteFileBuilder { path: pop, builder: dop }
+            } else {
+                Rvalue::FsWriteFile { path: pop, data: dop }
+            };
+            b.push(Stmt::Let(code, rv));
+            lower_status_result(b, code, e.ty)
+        }
+        // `fs.exists(path)` yields a plain `bool` — the runtime's `1`/`0` compared `!= 0` (every
+        // error already folded to `0`, so there is no status branch).
+        hir::ExprKind::FsExists { path } => {
+            let pop = lower_expr(b, path);
+            let c = b.fresh_value(status_ty());
+            b.push(Stmt::Let(c, Rvalue::FsExists { path: pop }));
+            let v = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
+            Operand::Value(v)
+        }
+        // `fs.remove(path)` yields `Result<(), Error>` from an i32 errno-status.
+        hir::ExprKind::FsRemove { path } => {
+            let pop = lower_expr(b, path);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::FsRemove { path: pop }));
+            lower_status_result(b, code, e.ty)
+        }
+        // `fs.read_dir(path)` yields `Result<array<string>, Error>` — the same out-slot shape as
+        // `fs.read_file`, with an owned `DynArray(String)` payload.
+        hir::ExprKind::FsReadDir { path } => lower_fs_read_dir(b, path, e.ty),
+        // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
+        // runtime registers the mmap for `munmap` at arena end.
+        hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -4280,6 +4334,90 @@ fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Opera
 
     // Err: map the runtime errno-status to the builtin `Error` (the out slot was zeroed → no buffer
     // allocated on failure).
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `fs.read_dir(path)` → the runtime writes the owned `array<string>` `{ptr,len}` into an out slot
+/// and returns an errno-status; branch `Ok(<array>)` / `Err(<mapped status>)`. Mirrors
+/// [`lower_fs_read_file`] with a `DynArray(String)` payload instead of a `string`.
+fn lower_fs_read_dir(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
+    let arr_ty = Ty::DynArray(align_sema::Scalar::String);
+    let out = b.new_slot(arr_ty);
+    let p = lower_expr(b, path);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::FsReadDir { path: p, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the materialized `{ptr,len}` owned array and wrap it (it owns its buffers now).
+    b.cur = ok_bb;
+    let a = b.fresh_value(arr_ty);
+    b.push(Stmt::Let(a, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(a))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (`{null,0}`) → nothing to free; map the status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `fs.read_file_view(path)` → the runtime mmaps the file into the enclosing arena, writing the
+/// `str` view `{ptr,len}` into an out slot and returning an errno-status; branch `Ok(<view>)` /
+/// `Err(<mapped status>)`. The arena handle (guaranteed present — sema requires an enclosing arena)
+/// is threaded so the runtime registers the mapping for `munmap` at arena end. Mirrors
+/// [`lower_fs_read_file`] with a `str` view payload (no `Drop` — it borrows the arena).
+fn lower_fs_read_file_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
+    let arena = *b.arenas.last().expect("read_file_view outside an arena (sema-checked)");
+    let out = b.new_slot(Ty::Str);
+    let p = lower_expr(b, path);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::FsReadFileView { path: p, arena: Operand::Value(arena), out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the mapped `str` view and wrap it (arena-owned — no `Drop`).
+    b.cur = ok_bb;
+    let s = b.fresh_value(Ty::Str);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (`{null,0}`); map the status.
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
     let ec = make_error_from_status(b, code, result_ty);

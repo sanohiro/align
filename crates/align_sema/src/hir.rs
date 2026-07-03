@@ -661,6 +661,24 @@ pub enum ExprKind {
     BufferBytes { buffer: Box<Expr> },
     /// `b.len()` — the buffer's current byte count (an `i64`). Pure.
     BufferLen { buffer: Box<Expr> },
+    /// `fs.write_file(path, data)` — create/truncate `path` (a `str`) and write all of `data`, then
+    /// close. `data` is a `str`/`bytes` (`slice<u8>`) view, or — when `builder` is set — a `builder`'s
+    /// accumulated bytes (borrowed, not consumed). The `ty` is `Result<(), Error>`. Impure.
+    FsWriteFile { path: Box<Expr>, data: Box<Expr>, builder: bool },
+    /// `fs.exists(path)` — whether `path` exists. Every error (stat failure) folds to `false`, so the
+    /// `ty` is [`crate::Ty::Bool`], never a `Result` (`draft.md` §18.2). Impure (touches the filesystem).
+    FsExists { path: Box<Expr> },
+    /// `fs.remove(path)` — delete the file at `path`. The `ty` is `Result<(), Error>`. Impure.
+    FsRemove { path: Box<Expr> },
+    /// `fs.read_dir(path)` — the entry names of directory `path` as a freshly heap-allocated owned
+    /// `array<string>` (each element owns its buffer; a **deep** `Drop`). The `ty` is
+    /// `Result<array<string>, Error>`. Owned/returnable (borrows nothing). Impure.
+    FsReadDir { path: Box<Expr> },
+    /// `fs.read_file_view(path)` — mmap the regular file at `path` read-only into the enclosing arena,
+    /// yielding a `str` view of its bytes. Requires an enclosing `arena {}` (like `heap.new`); the
+    /// region is bound to the arena, and `munmap` runs at arena end. The `ty` is `Result<str, Error>`.
+    /// Escapes the region via `.clone()`. Impure.
+    FsReadFileView { path: Box<Expr> },
 }
 
 /// The source/key path of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).

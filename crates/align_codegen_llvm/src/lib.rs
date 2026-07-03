@@ -631,6 +631,49 @@ fn build_module<'c>(
             None,
         ),
     );
+    funcs.insert(
+        // fs.write_file (path_ptr, path_len, data_ptr, data_len) -> i32 errno-status.
+        "fs_write_file".to_string(),
+        module.add_function(
+            "align_rt_fs_write_file",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // fs.write_file (path_ptr, path_len, b: *Builder) -> i32 errno-status.
+        "fs_write_file_builder".to_string(),
+        module.add_function(
+            "align_rt_fs_write_file_builder",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // fs.exists (path_ptr, path_len) -> i32 (1/0; every error folds to 0).
+        "fs_exists".to_string(),
+        module.add_function("align_rt_fs_exists", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // fs.remove (path_ptr, path_len) -> i32 errno-status.
+        "fs_remove".to_string(),
+        module.add_function("align_rt_fs_remove", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // fs.read_dir (path_ptr, path_len, out: *{ptr,len}) -> i32 errno-status (owned array<string>).
+        "fs_read_dir".to_string(),
+        module.add_function("align_rt_fs_read_dir", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // fs.read_file_view (path_ptr, path_len, arena: *Arena, out: *{ptr,len}) -> i32 errno-status.
+        "fs_read_file_view".to_string(),
+        module.add_function("align_rt_fs_read_file_view", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // drop(array<string>) (ptr, len) -> void; deep free (each element's buffer, then the header).
+        "free_string_array".to_string(),
+        module.add_function("align_rt_free_string_array", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
     // std.io / std.fs — reader / writer (own an fd) + buffer (owned bytes).
     funcs.insert(
         // fs.open (path_ptr, path_len, out: **Reader) -> i32 errno-status.
@@ -2441,6 +2484,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         .build_call(self.funcs[free_fn], &[field.into_pointer_value().into()], "")
                                         .map_err(|e| self.err(e))?;
                                 }
+                                Some(Scalar::DynArray(align_sema::PrimScalar::String)) => {
+                                    // `Result<array<string>, Error>` (`fs.read_dir`): the field is a
+                                    // `{ptr,len}` owned string-array — deep free (each element buffer,
+                                    // then the header), null-safe.
+                                    let sv = field.into_struct_value();
+                                    let ptr = self.builder.build_extract_value(sv, 0, "dropplptr").map_err(|e| self.err(e))?;
+                                    let len = self.builder.build_extract_value(sv, 1, "droppllen").map_err(|e| self.err(e))?;
+                                    self.builder
+                                        .build_call(self.funcs["free_string_array"], &[ptr.into(), len.into()], "")
+                                        .map_err(|e| self.err(e))?;
+                                }
                                 _ => {
                                     let ptr = self.builder.build_extract_value(field.into_struct_value(), 0, "dropplptr").map_err(|e| self.err(e))?;
                                     self.builder
@@ -2507,6 +2561,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_call(self.funcs["free"], &[ptr.into()], "")
                                 .map_err(|e| self.err(e))?;
                         }
+                    } else if matches!(ty, Ty::DynArray(Scalar::String)) {
+                        // An owned `array<string>` (`fs.read_dir`): each element owns its own buffer, so
+                        // the `Drop` is a **deep** free — `align_rt_free_string_array(base, len)` frees
+                        // every element buffer, then the header. Distinct from a scalar `array<T>` (one
+                        // buffer, the else below). Null-safe (a moved-out `{null,0}` frees nothing).
+                        let agg = self
+                            .builder
+                            .build_load(slice_struct_type(self.ctx), self.slots[slot], "dropstrarr")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                        let ptr = self.builder.build_extract_value(agg, 0, "dropstrarrptr").map_err(|e| self.err(e))?;
+                        let len = self.builder.build_extract_value(agg, 1, "dropstrarrlen").map_err(|e| self.err(e))?;
+                        self.builder
+                            .build_call(self.funcs["free_string_array"], &[ptr.into(), len.into()], "")
+                            .map_err(|e| self.err(e))?;
                     } else {
                         // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
                         let agg = self
@@ -2521,7 +2590,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                 }
                 Stmt::DropValue(op) => {
-                    // Free the buffer of an owned `{ptr, len}` value (an unbound temporary).
+                    // Free the buffer of an owned `{ptr, len}` value (an unbound temporary). An
+                    // `array<string>` temporary would need the deep free, but none is produced today
+                    // (`fs.read_dir` is always bound via `?`), so the shallow free stays correct here.
                     let agg = self.operand(op).into_struct_value();
                     let ptr = self.builder.build_extract_value(agg, 0, "dropvalptr").map_err(|e| self.err(e))?;
                     self.builder
@@ -4009,6 +4080,60 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("buffer_len returns i64")
             }
+            // fs.write_file — marshal the path `{ptr,len}` and the str/bytes data `{ptr,len}`, return
+            // an i32 errno-status.
+            Rvalue::FsWriteFile { path, data } => {
+                let (p_ptr, p_len) = self.split_str(path)?;
+                let (d_ptr, d_len) = self.split_str(data)?;
+                self.builder
+                    .build_call(self.funcs["fs_write_file"], &[p_ptr.into(), p_len.into(), d_ptr.into(), d_len.into()], "fwf")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("fs_write_file returns i32")
+            }
+            Rvalue::FsWriteFileBuilder { path, builder } => {
+                let (p_ptr, p_len) = self.split_str(path)?;
+                let bp = self.operand(builder).into();
+                self.builder
+                    .build_call(self.funcs["fs_write_file_builder"], &[p_ptr.into(), p_len.into(), bp], "fwfb")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("fs_write_file_builder returns i32")
+            }
+            Rvalue::FsExists { path } => {
+                let (p_ptr, p_len) = self.split_str(path)?;
+                self.builder
+                    .build_call(self.funcs["fs_exists"], &[p_ptr.into(), p_len.into()], "fex")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("fs_exists returns i32")
+            }
+            Rvalue::FsRemove { path } => {
+                let (p_ptr, p_len) = self.split_str(path)?;
+                self.builder
+                    .build_call(self.funcs["fs_remove"], &[p_ptr.into(), p_len.into()], "frm")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("fs_remove returns i32")
+            }
+            // fs.read_dir — write the owned array<string> `{ptr,len}` into `out`, return i32 status.
+            Rvalue::FsReadDir { path, out } => {
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let (p_ptr, p_len) = self.split_str(path)?;
+                self.builder
+                    .build_call(self.funcs["fs_read_dir"], &[p_ptr.into(), p_len.into(), out_ptr.into()], "frd")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("fs_read_dir returns i32")
+            }
+            // fs.read_file_view — mmap into the arena, write the str view `{ptr,len}` into `out`,
+            // return i32 status.
+            Rvalue::FsReadFileView { path, arena, out } => {
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let (p_ptr, p_len) = self.split_str(path)?;
+                let ah = self.operand(arena).into();
+                self.builder
+                    .build_call(self.funcs["fs_read_file_view"], &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frfv")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("fs_read_file_view returns i32")
+            }
             Rvalue::MakeError { enum_id, tag, code } => {
                 // Build the builtin `Error` aggregate `{ i32 tag, i32 code }` from runtime operands.
                 let sty = self.enum_types[*enum_id as usize];
@@ -4834,6 +4959,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// `fs.read_file(path)`: zero the out `{ptr,len}` slot, then call the runtime reader with the
     /// path `{ptr,len}`. The runtime writes the owned `string` (heap buffer freed by `Drop`) to
     /// `out`. Returns the i32 status (0 = ok).
+    /// Split a `str`/`bytes` `{ptr,len}` operand into its `(data_ptr, len)` components — the marshal
+    /// for every runtime call that takes a view as a `ptr`+`len` pair (`fs.write_file`, `fs.exists`,
+    /// `fs.remove`, `fs.read_dir`, `fs.read_file_view` paths).
+    fn split_str(&mut self, op: &Operand) -> Result<(BasicValueEnum<'c>, BasicValueEnum<'c>), CodegenError> {
+        let agg = self.operand(op).into_struct_value();
+        let ptr = self.builder.build_extract_value(agg, 0, "sv_ptr").map_err(|e| self.err(e))?;
+        let len = self.builder.build_extract_value(agg, 1, "sv_len").map_err(|e| self.err(e))?;
+        Ok((ptr, len))
+    }
+
     fn gen_fs_read_file(&mut self, path: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
         let out_ptr = self.slots[&out];
         // Zero the {ptr,len} so a failed read reads {null,0} (its Drop frees null).

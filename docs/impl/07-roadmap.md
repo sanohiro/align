@@ -1146,13 +1146,28 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   (peak `VmHWM` bounded via a stdout/stdin handshake), `tests/m9_io.rs` + `examples/io_copy.align` +
   runtime unit tests. Fast paths (`sendfile`/`splice`/mmap/`io_uring`) are explicitly **post-M9** —
   see that Future entry, unchanged in shape by this slice (the runtime marks the dispatch site).
-- **Slice 3 — std.fs complete.** `write_file`/`exists`/`remove`/`read_dir`, and
-  `read_file_view` (mmap view; requires an enclosing arena, region bound to the arena, munmap at
-  arena end — the guardrails in `docs/open-questions.md` "Transparent zero-copy I/O" lines
-  ~2383–2396 apply: gate to regular files via `fstat`, handle `SIGBUS` on truncation, avoid
-  zero-length/`/proc`/character-device files). **Completion condition:** the `draft.md` §19
-  type-checks and runs end to end; a view read works; an attempt to escape the view past its arena
-  is rejected at compile time.
+- **Slice 3 — std.fs complete — DONE.** `write_file` (`str`/`bytes`/`builder`, the same three
+  forms as `writer.write`), `exists` (a plain `bool` — every `stat` failure folds to `false`, never
+  a `Result`), `remove`, `read_dir` (an **owned `array<string>`** — a new `PrimScalar::String` lets
+  it be a `Result` payload, and its `Drop` is a **deep** free `align_rt_free_string_array`: each
+  element buffer, then the header, distinct from a scalar `array<T>`; Move-element *indexing* stays
+  deferred project-wide, so v1 uses the array whole — `.len()`, move/return), and `read_file_view`
+  (an `mmap` view; requires an enclosing `arena {}` — sema-checked like `heap.new`; the mapping is
+  registered on the runtime `Arena` and `munmap`ped at arena end, so **every** exit — block end /
+  `return` / `?` — releases it via `ArenaEnd`, no separate `Drop`; the view's region is the arena,
+  so escaping it is rejected and `.clone()` copies out). The errno→`Error` table (`draft.md` §18.2)
+  is shared via `io_error_to_status` + `make_error_from_status`. Guardrails (`docs/open-questions.md`
+  "Transparent zero-copy I/O" ~2383–2396): `fstat` gates `mmap` to a **regular, nonzero** file; a
+  special / `/proc` / character-device / zero-length file takes an **owned arena copy** fallback
+  (`read_file_view_into_arena` — correctness over a broken zero-copy on a file whose size can't be
+  trusted; the cost class changes to a copy — recorded); no `SIGBUS` handler is installed (a
+  process-global handler is a hidden global side effect Align forbids — the mapping size is fixed at
+  `mmap` time and concurrent truncation is a documented v1 limitation). **Completion condition met:**
+  the `draft.md` §19 program type-checks and runs end to end (`fs.read_file` → `json.decode` →
+  fused pipeline → `builder` → `io.stdout`, and a `read_file_view` variant feeding the same
+  pipeline); a byte-exact view read (incl. multi-page); the view escape rejected at compile time;
+  write/exists/remove/read_dir round-trips + errno mapping — `tests/m9_fs.rs` (17) + `align_runtime`
+  unit tests (8).
 - **Slice 4 — std.path / std.env / std.time.** `path.join`/`base`/`dir`/`ext`/`normalize`;
   `env.get`/`env.set` (no `env.args`); `time.now`/`time.instant`/`time.sleep` (one `i64`-nanosecond
   timeline, no `Duration` type). **Completion condition:** a round-trip test per module (e.g.

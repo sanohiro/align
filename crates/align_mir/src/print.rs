@@ -408,6 +408,14 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BufferNew(cap) => format!("buffer_new({})", operand_str(cap)),
         Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
         Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),
+        Rvalue::FsWriteFile { path, data } => format!("fs_write_file({}, {})", operand_str(path), operand_str(data)),
+        Rvalue::FsWriteFileBuilder { path, builder } => format!("fs_write_file_builder({}, {})", operand_str(path), operand_str(builder)),
+        Rvalue::FsExists { path } => format!("fs_exists({})", operand_str(path)),
+        Rvalue::FsRemove { path } => format!("fs_remove({})", operand_str(path)),
+        Rvalue::FsReadDir { path, out } => format!("fs_read_dir({}, -> _{out})", operand_str(path)),
+        Rvalue::FsReadFileView { path, arena, out } => {
+            format!("fs_read_file_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))
+        }
         Rvalue::MakeError { enum_id, tag, code } => {
             format!("make_error(enum#{enum_id}, tag={}, code={})", operand_str(tag), operand_str(code))
         }
