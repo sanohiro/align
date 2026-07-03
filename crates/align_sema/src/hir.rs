@@ -711,6 +711,32 @@ pub enum ExprKind {
     /// [`crate::Ty::Unit`]). A negative `ns` is a no-op; `EINTR` resumes for the remaining time.
     /// Impure.
     TimeSleep { ns: Box<Expr> },
+    /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode a byte view (`str` /
+    /// owned `string` (auto-borrowed) / `slice<u8>`) into a freshly heap-allocated owned `string`
+    /// (the `ty` is [`crate::Ty::String`]). `kind` selects the alphabet. Pure (a byte transform, no
+    /// I/O); `data` is borrowed, never consumed (like `hash64` / `print`).
+    EncodingEncode { kind: EncodingKind, data: Box<Expr> },
+    /// `encoding.base64_decode`/`base64url_decode`/`hex_decode(s)` — decode a `str` into an owned
+    /// `buffer` (`bytes` carries no UTF-8 invariant, so a decoded blob is not a `str`); invalid
+    /// input yields `Error.Invalid`. The `ty` is `Result<buffer, Error>`. Pure; `input` is borrowed.
+    EncodingDecode { kind: EncodingKind, input: Box<Expr> },
+    /// `encoding.utf8_valid(b)` — whether the bytes `b` (`slice<u8>`) are valid UTF-8 (the `ty` is
+    /// [`crate::Ty::Bool`]). A thin wrapper over the shared UTF-8 validator, for checking `bytes`
+    /// before turning them into a `str`. Pure; `data` is borrowed.
+    Utf8Valid { data: Box<Expr> },
+}
+
+/// Which `std.encoding` transform an [`ExprKind::EncodingEncode`] / [`ExprKind::EncodingDecode`]
+/// performs — the alphabet is the only axis of variation, so one node kind serves encode and
+/// decode alike (the direction is the node, the alphabet is this `kind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodingKind {
+    /// Standard Base64 (RFC 4648 §4): `A-Za-z0-9+/`, `=` padding on encode.
+    Base64,
+    /// URL/filename-safe Base64 (RFC 4648 §5): `-`/`_`, no padding on encode.
+    Base64Url,
+    /// Lower-case hex (`hex_encode`); `hex_decode` accepts both cases.
+    Hex,
 }
 
 /// Which component `path.base` / `path.dir` / `path.ext` extracts — each a zero-copy `str` view

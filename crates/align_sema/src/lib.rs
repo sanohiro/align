@@ -98,13 +98,18 @@ pub enum Scalar {
     /// A `writer` payload (`Result<writer, Error>` from `fs.create`). An owned **Move** handle (an fd
     /// + buffer); the enclosing `Result`'s `Drop` flushes + closes it. Opaque pointer.
     Writer,
+    /// A `buffer` payload (`Result<buffer, Error>` from `encoding.*_decode`). An owned **Move**
+    /// handle (a growable byte container); the enclosing `Result`'s `Drop` frees it. Opaque pointer,
+    /// like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never region-tracked (it borrows nothing).
+    Buffer,
 }
 
 impl Scalar {
     /// Whether this payload scalar is an owned **Move** type (a heap buffer that the enclosing
-    /// `Option`/`Result` owns and must drop / move out). Today: `string` (8a), `array<T>` (8b).
+    /// `Option`/`Result` owns and must drop / move out). Today: `string` (8a), `array<T>` (8b),
+    /// the I/O handles `reader`/`writer`, and a decoded `buffer`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer)
     }
 }
 
@@ -332,6 +337,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // A `reader`/`writer` owned handle as a `Result` Ok payload (`fs.open`/`fs.create`).
         Ty::Reader => Some(Scalar::Reader),
         Ty::Writer => Some(Scalar::Writer),
+        // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
+        Ty::Buffer => Some(Scalar::Buffer),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -361,6 +368,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Param(i) => Ty::Param(i),
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
+        Scalar::Buffer => Ty::Buffer,
     }
 }
 
@@ -2242,6 +2250,9 @@ impl EffectScan {
                 self.impure_direct = true;
                 self.expr(ns);
             }
+            // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
+            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data),
+            ExprKind::EncodingDecode { input, .. } => self.expr(input),
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 self.stage_funcs(stages);
@@ -3243,6 +3254,8 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::TimeNow | ExprKind::TimeInstant => {}
             ExprKind::TimeSleep { ns } => self.walk(ns, depth),
+            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
+            ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -3566,6 +3579,8 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::TimeNow | ExprKind::TimeInstant => {}
             ExprKind::TimeSleep { ns } => self.visit(ns),
+            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.visit(data),
+            ExprKind::EncodingDecode { input, .. } => self.visit(input),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
@@ -4174,6 +4189,9 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::TimeNow | ExprKind::TimeInstant => {}
             ExprKind::TimeSleep { ns } => self.expr(ns, moved, false, false),
+            // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
+            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data, moved, false, false),
+            ExprKind::EncodingDecode { input, .. } => self.expr(input, moved, false, false),
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -7050,6 +7068,17 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "io" && method == "copy" {
                 self.require_import("std.io", "io.copy", span);
                 return self.check_io_copy(args, span);
+            }
+            // `std.encoding` — Base64 (standard + URL-safe), hex, and UTF-8 validation. Pure byte
+            // transforms: encode -> owned `string`, decode -> `Result<buffer, Error>`.
+            if module == "encoding"
+                && matches!(
+                    method,
+                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "utf8_valid"
+                )
+            {
+                self.require_import("std.encoding", &format!("encoding.{method}"), span);
+                return self.check_encoding_op(method, args, span);
             }
         }
         // `io.stdout.buffered()` / `io.stderr.buffered()` — a buffered `writer` over a standard
@@ -10162,6 +10191,73 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind, ty: i64_ty, span }
     }
 
+    /// `std.encoding` — Base64 (standard + URL-safe), hex, and UTF-8 validation. Pure byte
+    /// transforms, no state / Move types of their own:
+    /// - `base64_encode`/`base64url_encode`/`hex_encode(data)` take a byte view (`str` / owned
+    ///   `string` (auto-borrowed) / `slice<u8>`, exactly `hash64`'s accepted forms) and yield an
+    ///   owned `string`.
+    /// - `base64_decode`/`base64url_decode`/`hex_decode(s)` take a `str` (owned `string`
+    ///   auto-borrowed) and yield `Result<buffer, Error>` (invalid input -> `Error.Invalid`).
+    /// - `utf8_valid(b)` takes `bytes` (`slice<u8>`) and yields `bool`.
+    /// Builtins, dispatched like the other `std` namespaces.
+    fn check_encoding_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'encoding.{method}' expects 1 argument, got {}", args.len()), span);
+            return err;
+        }
+        let kind = match method {
+            "base64_encode" | "base64_decode" => hir::EncodingKind::Base64,
+            "base64url_encode" | "base64url_decode" => hir::EncodingKind::Base64Url,
+            _ => hir::EncodingKind::Hex, // hex_encode / hex_decode / utf8_valid (unused for utf8_valid)
+        };
+        // `utf8_valid(b)` — a byte-only check (`slice<u8>`); trivially true for a `str`, so it takes
+        // raw `bytes` (`draft.md` §18.2: "check before turning bytes into str").
+        if method == "utf8_valid" {
+            let arg = self.check_expr(&args[0], None);
+            if arg.ty == Ty::Error {
+                return err;
+            }
+            let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
+            let resolved = self.resolve(arg.ty);
+            if resolved != Ty::Slice(u8s) {
+                self.diags
+                    .error(format!("'encoding.utf8_valid' expects bytes (slice<u8>), got {}", ty_name(resolved)), args[0].span);
+                return err;
+            }
+            return Expr { kind: ExprKind::Utf8Valid { data: Box::new(arg) }, ty: Ty::Bool, span };
+        }
+        // A decode consumes a `str`; the result is `Result<buffer, Error>`.
+        if method.ends_with("_decode") {
+            let input = self.check_str_init(&args[0]);
+            let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
+            return Expr { kind: ExprKind::EncodingDecode { kind, input: Box::new(input) }, ty: result_ty, span };
+        }
+        // An encode takes a byte view (str / string / slice<u8>) and returns an owned `string`.
+        let mut data = self.check_expr(&args[0], None);
+        let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
+        let resolved = self.resolve(data.ty);
+        let ok = match resolved {
+            Ty::Str => true,
+            Ty::String => {
+                let s = data.span;
+                data = Expr { kind: ExprKind::StrBorrow(Box::new(data)), ty: Ty::Str, span: s };
+                true
+            }
+            Ty::Slice(el) => el == u8s,
+            _ => false,
+        };
+        if !ok {
+            if resolved != Ty::Error {
+                self.diags
+                    .error(format!("'encoding.{method}' expects a str, string, or bytes (slice<u8>), got {}", ty_name(resolved)), args[0].span);
+            }
+            return err;
+        }
+        Expr { kind: ExprKind::EncodingEncode { kind, data: Box::new(data) }, ty: Ty::String, span }
+    }
+
     /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — a buffered `writer` over the
     /// given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
     fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
@@ -11266,6 +11362,8 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::TimeNow | ExprKind::TimeInstant => {}
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
+            ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
+            ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);

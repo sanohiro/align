@@ -4082,6 +4082,273 @@ pub unsafe extern "C" fn align_rt_buffer_free(b: *mut Buffer) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// std.encoding (M10 Slice 1) — Base64 (standard + URL-safe), hex, and UTF-8 validation. Pure
+// functions over `bytes`/`str`: encode returns an owned `string` (a fresh `align_rt_alloc` buffer,
+// freed by the generated `Drop`); decode returns an owned `buffer` handle (Box, freed by
+// `align_rt_buffer_free`) or fails with `AL_INVALID` -> `Error.Invalid`. v1 is a scalar reference
+// implementation (correctness before speed); a Lemire-class SIMD Base64 is a later optimization
+// behind these same symbols (`draft.md` §18.2, `open-questions.md` #342), never a signature change.
+// ---------------------------------------------------------------------------------------------
+
+/// The standard Base64 alphabet (RFC 4648 §4): `A-Za-z0-9+/`.
+const BASE64_STD: [u8; 64] = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// The URL/filename-safe Base64 alphabet (RFC 4648 §5): `+`->`-`, `/`->`_`.
+const BASE64_URL: [u8; 64] = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// The reverse decode table for a Base64 `alphabet`: symbol byte -> 6-bit value, `0xFF` = not in
+/// this alphabet. Built once at compile time (a `const fn`), so a decode is a pure table lookup with
+/// no per-call setup.
+const fn base64_decode_table(alphabet: &[u8; 64]) -> [u8; 256] {
+    let mut table = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 64 {
+        table[alphabet[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+}
+
+/// Compile-time reverse tables for the two alphabets (built once, not per `base64_decode_impl` call).
+static BASE64_STD_TABLE: [u8; 256] = base64_decode_table(&BASE64_STD);
+static BASE64_URL_TABLE: [u8; 256] = base64_decode_table(&BASE64_URL);
+
+/// Copy an owned byte vector into a freshly `align_rt_alloc`'d `string` `{ptr,len}` (the generated
+/// `Drop` frees the buffer via `align_rt_free`). An empty result owns no buffer (null ptr, len 0),
+/// so its `free(null)` drop is a harmless no-op — same convention as `align_rt_str_clone`.
+fn owned_str_from_vec(v: &[u8]) -> AlignStr {
+    let n = v.len();
+    if n == 0 {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let dst = align_rt_alloc(n as i64);
+    unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), dst, n) };
+    AlignStr { ptr: dst, len: n as i64 }
+}
+
+/// Wrap a decoded byte vector into an owned `buffer` handle (`cap == len == v.len()`, so `.bytes()`
+/// views all of it and `.len()` is its length). Freed by `align_rt_buffer_free` like every `buffer`.
+fn buffer_from_vec(v: Vec<u8>) -> *mut Buffer {
+    let n = v.len();
+    Box::into_raw(Box::new(Buffer { data: v, cap: n, len: n }))
+}
+
+/// Encode `data` into `out` using `alphabet`; append `=` padding to a whole 4-char group iff `pad`
+/// (standard Base64 pads; URL-safe does not — `draft.md` §18.2). Pure, allocation-only.
+fn base64_encode_into(data: &[u8], alphabet: &[u8; 64], pad: bool, out: &mut Vec<u8>) {
+    out.reserve(data.len().div_ceil(3) * 4);
+    let mut chunks = data.chunks_exact(3);
+    for c in &mut chunks {
+        let n = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
+        out.push(alphabet[(n >> 18 & 63) as usize]);
+        out.push(alphabet[(n >> 12 & 63) as usize]);
+        out.push(alphabet[(n >> 6 & 63) as usize]);
+        out.push(alphabet[(n & 63) as usize]);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = (rem[0] as u32) << 16;
+            out.push(alphabet[(n >> 18 & 63) as usize]);
+            out.push(alphabet[(n >> 12 & 63) as usize]);
+            if pad {
+                out.push(b'=');
+                out.push(b'=');
+            }
+        }
+        2 => {
+            let n = (rem[0] as u32) << 16 | (rem[1] as u32) << 8;
+            out.push(alphabet[(n >> 18 & 63) as usize]);
+            out.push(alphabet[(n >> 12 & 63) as usize]);
+            out.push(alphabet[(n >> 6 & 63) as usize]);
+            if pad {
+                out.push(b'=');
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Decode a Base64 `input` (accepting `url`-safe or standard alphabet by the flag). `None` on any
+/// invalid input: a symbol outside the chosen alphabet, a stray `=` before the trailing padding,
+/// a length whose non-pad remainder is 1 (impossible group), inconsistent padding, or non-zero
+/// trailing bits (non-canonical). Padding is optional when absent; when present it must complete a
+/// 4-char group. Scalar reference implementation.
+fn base64_decode_impl(input: &[u8], url: bool) -> Option<Vec<u8>> {
+    // The reverse table is built once at compile time (see `base64_decode_table`), so a decode is a
+    // pure table lookup — no per-call setup.
+    let table = if url { &BASE64_URL_TABLE } else { &BASE64_STD_TABLE };
+    // Split off trailing `=` padding (at most 2). A `=` anywhere before the padding is rejected
+    // below (it maps to 0xFF in the table since it is not an alphabet symbol).
+    let mut end = input.len();
+    let mut pads = 0usize;
+    while end > 0 && input[end - 1] == b'=' {
+        end -= 1;
+        pads += 1;
+    }
+    if pads > 2 {
+        return None;
+    }
+    let content = &input[..end];
+    let rem = content.len() % 4;
+    if rem == 1 {
+        return None; // a lone trailing symbol carries < 8 bits — no valid encoding produces it.
+    }
+    // When padding is present it must bring the group to a multiple of 4 (RFC 4648); when absent,
+    // an unpadded (URL-safe or stripped) input is accepted as-is.
+    if pads > 0 && (content.len() + pads) % 4 != 0 {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(content.len() / 4 * 3 + 2);
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    for &c in content {
+        let v = table[c as usize];
+        if v == 0xFF {
+            return None; // outside the alphabet (includes a mid-string `=`).
+        }
+        acc = (acc << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    // Any leftover bits must be zero — a canonical encoding never sets the discarded padding bits.
+    if nbits > 0 && (acc & ((1 << nbits) - 1)) != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// A single hex digit's value, accepting both cases; `None` for a non-hex byte.
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// `encoding.base64_encode(data)` — standard alphabet + padding. Returns an owned `string`.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_base64_encode(ptr: *const u8, len: i64) -> AlignStr {
+    let data = unsafe { bytes_view(ptr, len) };
+    let mut out = Vec::new();
+    base64_encode_into(data, &BASE64_STD, true, &mut out);
+    owned_str_from_vec(&out)
+}
+
+/// `encoding.base64url_encode(data)` — URL-safe alphabet, no padding. Returns an owned `string`.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_base64url_encode(ptr: *const u8, len: i64) -> AlignStr {
+    let data = unsafe { bytes_view(ptr, len) };
+    let mut out = Vec::new();
+    base64_encode_into(data, &BASE64_URL, false, &mut out);
+    owned_str_from_vec(&out)
+}
+
+/// `encoding.hex_encode(data)` — lower-case hex. Returns an owned `string`.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_hex_encode(ptr: *const u8, len: i64) -> AlignStr {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let data = unsafe { bytes_view(ptr, len) };
+    let mut out = Vec::with_capacity(data.len() * 2);
+    for &b in data {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 15) as usize]);
+    }
+    owned_str_from_vec(&out)
+}
+
+/// `encoding.base64_decode(s)` — standard alphabet. Writes an owned `buffer` handle to `*out` and
+/// returns `0`, or `AL_INVALID` (`Error.Invalid`) on invalid input (leaving `*out` null).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_base64_decode(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+    unsafe { decode_into(base64_decode_impl(bytes_view(ptr, len), false), out) }
+}
+
+/// `encoding.base64url_decode(s)` — URL-safe alphabet. Same contract as [`align_rt_base64_decode`].
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_base64url_decode(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+    unsafe { decode_into(base64_decode_impl(bytes_view(ptr, len), true), out) }
+}
+
+/// `encoding.hex_decode(s)` — accepts both cases; odd length / non-hex byte -> `AL_INVALID`.
+/// Same out-slot contract as [`align_rt_base64_decode`].
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_hex_decode(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+    let input = unsafe { bytes_view(ptr, len) };
+    let decoded = if input.len() % 2 != 0 {
+        None
+    } else {
+        let mut v = Vec::with_capacity(input.len() / 2);
+        let mut ok = true;
+        let mut i = 0;
+        while i < input.len() {
+            match (hex_val(input[i]), hex_val(input[i + 1])) {
+                (Some(hi), Some(lo)) => v.push(hi << 4 | lo),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+            i += 2;
+        }
+        if ok { Some(v) } else { None }
+    };
+    unsafe { decode_into(decoded, out) }
+}
+
+/// Shared tail of the three decoders: on `Some(v)` publish an owned `buffer` handle and return `0`;
+/// on `None` leave `*out` null and return `AL_INVALID` (`Error.Invalid`).
+///
+/// # Safety
+/// `out` must point to a writable handle slot (or be null, handled here).
+unsafe fn decode_into(decoded: Option<Vec<u8>>, out: *mut *mut Buffer) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    match decoded {
+        Some(v) => {
+            unsafe { *out = buffer_from_vec(v) };
+            0
+        }
+        None => AL_INVALID,
+    }
+}
+
+/// `encoding.utf8_valid(b)` — whether `b`'s bytes are valid UTF-8 (a thin wrapper over the shared
+/// SIMD/scalar [`validate_utf8`], the same validator used at every str-returning I/O boundary).
+/// Returns `1` if valid, `0` otherwise. Lets a caller check `bytes` before turning them into a `str`.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_utf8_valid(ptr: *const u8, len: i64) -> i32 {
+    if validate_utf8(unsafe { bytes_view(ptr, len) }) { 1 } else { 0 }
+}
+
 /// Byte-equality of two `str` views (M5). Returns 1 if equal, else 0.
 ///
 /// # Safety
@@ -5162,6 +5429,145 @@ mod tests {
         let b2 = align_rt_buffer_new(-5);
         assert_eq!(unsafe { &*b2 }.cap, 0);
         unsafe { align_rt_buffer_free(b2) };
+    }
+
+    // --- std.encoding (M10 Slice 1) ----------------------------------------------------------
+
+    /// Encode via the internal encoder (the FFI shape is a thin `owned_str_from_vec` wrapper).
+    fn b64_enc(data: &[u8], url: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        base64_encode_into(data, if url { &BASE64_URL } else { &BASE64_STD }, !url, &mut out);
+        out
+    }
+
+    fn hex_enc(data: &[u8]) -> Vec<u8> {
+        const HEX: [u8; 16] = *b"0123456789abcdef";
+        let mut out = Vec::new();
+        for &b in data {
+            out.push(HEX[(b >> 4) as usize]);
+            out.push(HEX[(b & 15) as usize]);
+        }
+        out
+    }
+
+    /// A hex decode mirroring the FFI path (odd length / non-hex byte -> `None`).
+    fn hex_dec(input: &[u8]) -> Option<Vec<u8>> {
+        if input.len() % 2 != 0 {
+            return None;
+        }
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < input.len() {
+            v.push(hex_val(input[i])? << 4 | hex_val(input[i + 1])?);
+            i += 2;
+        }
+        Some(v)
+    }
+
+    #[test]
+    fn base64_known_vectors() {
+        // RFC 4648 §10 test vectors (standard alphabet + padding).
+        for (input, want) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(b64_enc(input, false), want.as_bytes(), "encode {input:?}");
+            assert_eq!(base64_decode_impl(want.as_bytes(), false).as_deref(), Some(input), "decode {want}");
+        }
+    }
+
+    #[test]
+    fn base64url_known_vectors_no_padding() {
+        // URL-safe alphabet, no padding; `0xfbf0`/`0xffffff` exercise the `-`/`_` (62/63) symbols.
+        for (input, want) in [(&[0xfb, 0xf0][..], "-_A"), (&[0xff, 0xff, 0xff][..], "____")] {
+            assert_eq!(b64_enc(input, true), want.as_bytes(), "url encode {input:?}");
+            assert_eq!(base64_decode_impl(want.as_bytes(), true).as_deref(), Some(input), "url decode {want}");
+        }
+        // The two alphabets are strict: a URL decode rejects `+`/`/`, a standard decode rejects `-`/`_`.
+        assert_eq!(base64_decode_impl(b"+/A=", true), None);
+        assert_eq!(base64_decode_impl(b"-_A", false), None);
+    }
+
+    #[test]
+    fn encodings_round_trip_all_boundaries_and_binary() {
+        // Empty, every 1/2/3-byte prefix boundary, and every single byte value 0..=255.
+        let mut cases: Vec<Vec<u8>> = vec![vec![], vec![0], vec![0, 255], vec![1, 2, 3]];
+        for b in 0u16..=255 {
+            cases.push(vec![b as u8]);
+        }
+        // A full 0..=255 binary blob (all byte values, non-block-aligned length 256 -> 0 mod 3? 256
+        // % 3 = 1, so it exercises the 1-byte residue too).
+        cases.push((0u16..=255).map(|b| b as u8).collect());
+        for data in &cases {
+            for url in [false, true] {
+                let enc = b64_enc(data, url);
+                assert_eq!(base64_decode_impl(&enc, url).as_ref(), Some(data), "base64 round trip {data:?} url={url}");
+            }
+            let hx = hex_enc(data);
+            assert_eq!(hex_dec(&hx).as_ref(), Some(data), "hex round trip {data:?}");
+        }
+    }
+
+    #[test]
+    fn base64_decode_rejects_invalid() {
+        assert_eq!(base64_decode_impl(b"Zm9v!mFy", false), None, "bad symbol");
+        assert_eq!(base64_decode_impl(b"Zm9vY", false), None, "residue-1 length");
+        assert_eq!(base64_decode_impl(b"Zg=", false), None, "inconsistent padding (single = on residue 2)");
+        assert_eq!(base64_decode_impl(b"Z===", false), None, "too much padding");
+        assert_eq!(base64_decode_impl(b"Zm=9", false), None, "mid-string padding");
+        // Non-canonical trailing bits: "Zh" carries a nonzero remainder ('h' = 33, low bits set).
+        assert_eq!(base64_decode_impl(b"Zh", false), None, "non-canonical trailing bits");
+        // The canonical residue-2/residue-3 forms decode fine (unpadded accepted).
+        assert_eq!(base64_decode_impl(b"Zg", false).as_deref(), Some(&b"f"[..]));
+        assert_eq!(base64_decode_impl(b"Zm8", false).as_deref(), Some(&b"fo"[..]));
+    }
+
+    #[test]
+    fn hex_decode_rejects_invalid() {
+        assert_eq!(hex_dec(b"abc"), None, "odd length");
+        assert_eq!(hex_dec(b"zz"), None, "non-hex");
+        assert_eq!(hex_dec(b"666F6F626172").as_deref(), Some(&b"foobar"[..]), "upper-case accepted");
+        assert_eq!(hex_dec(b"666f6f626172").as_deref(), Some(&b"foobar"[..]), "lower-case accepted");
+    }
+
+    #[test]
+    fn ffi_encode_returns_owned_string_and_decode_returns_buffer() {
+        // FFI encode: a heap-owned `{ptr,len}` string, freed like any owned string.
+        let s = unsafe { align_rt_base64_encode(b"foobar".as_ptr(), 6) };
+        assert_eq!(unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) }, b"Zm9vYmFy");
+        unsafe { align_rt_free(s.ptr as *mut u8) };
+        // FFI decode: an owned `buffer` handle whose `.bytes()` is the decoded blob.
+        let input = b"Zm9vYmFy";
+        let mut buf: *mut Buffer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_base64_decode(input.as_ptr(), input.len() as i64, &mut buf) }, 0);
+        assert!(!buf.is_null());
+        assert_eq!(unsafe { align_rt_buffer_len(buf) }, 6);
+        let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
+        unsafe { align_rt_buffer_bytes(buf, &mut view) };
+        assert_eq!(unsafe { std::slice::from_raw_parts(view.ptr, view.len as usize) }, b"foobar");
+        unsafe { align_rt_buffer_free(buf) };
+        // FFI decode failure: null handle + AL_INVALID.
+        let bad = b"Zm9v!mFy";
+        let mut buf2: *mut Buffer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_base64_decode(bad.as_ptr(), bad.len() as i64, &mut buf2) }, AL_INVALID);
+        assert!(buf2.is_null(), "a failed decode leaves the out slot null");
+    }
+
+    #[test]
+    fn ffi_utf8_valid_matches_validator() {
+        let valid = b"Hello, world";
+        assert_eq!(unsafe { align_rt_utf8_valid(valid.as_ptr(), valid.len() as i64) }, 1);
+        // A lone 0xff is never a valid UTF-8 lead byte; a truncated 0xc3 sequence is incomplete.
+        for bad in [&[0xffu8][..], &[0xc3][..], &[0x80]] {
+            assert_eq!(unsafe { align_rt_utf8_valid(bad.as_ptr(), bad.len() as i64) }, 0, "invalid {bad:02x?}");
+        }
+        // Empty is valid; matches `std::str::from_utf8`.
+        assert_eq!(unsafe { align_rt_utf8_valid(std::ptr::null(), 0) }, 1);
     }
 
     #[test]

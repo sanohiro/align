@@ -542,6 +542,18 @@ pub enum Rvalue {
     /// `time.sleep(ns)` — suspend the thread for `ns` nanoseconds (negative = no-op). Yields no
     /// meaningful value (the expression's type is `()`); codegen emits the void call. Impure.
     TimeSleep { ns: Operand },
+    /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode the byte view `data`
+    /// (`{ptr,len}`) into a freshly heap-allocated owned `string`, returned by value as a `{ptr,len}`
+    /// (like `PathNormalize`). `kind` selects the alphabet. Pure.
+    EncodingEncode { kind: hir::EncodingKind, data: Operand },
+    /// `encoding.base64_decode`/`base64url_decode`/`hex_decode(s)` — decode the `str` view `input`
+    /// (`{ptr,len}`) into an owned `buffer` handle written to `out`; yields an `i32` status
+    /// (0 = ok, `AL_INVALID` -> `Error.Invalid`; see [`make_error_from_status`]). The caller branches
+    /// `Ok(buffer)` / `Err`. Pure.
+    EncodingDecode { kind: hir::EncodingKind, input: Operand, out: Slot },
+    /// `encoding.utf8_valid(b)` — whether the byte view `b` (`{ptr,len}`) is valid UTF-8, an `i32`
+    /// used directly as a `bool` (`1`/`0`). Pure.
+    Utf8Valid { data: Operand },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -1469,6 +1481,27 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::TimeSleep { ns: no }));
             Operand::Const(Const::Unit)
+        }
+        // `encoding.*_encode(data)` → an owned `string` `{ptr,len}` returned by value (like
+        // `PathNormalize`); the runtime allocates the buffer, the bound local `Drop`-frees it.
+        hir::ExprKind::EncodingEncode { kind, data } => {
+            let d = lower_expr(b, data);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::EncodingEncode { kind: *kind, data: d }));
+            Operand::Value(v)
+        }
+        // `encoding.*_decode(s)` → `Result<buffer, Error>`: the runtime writes an owned `buffer`
+        // handle into `out` and returns an i32 status; branch `Ok(<buffer>)` / `Err(<mapped>)`.
+        hir::ExprKind::EncodingDecode { kind, input } => lower_encoding_decode(b, *kind, input, e.ty),
+        // `encoding.utf8_valid(b)` → the runtime returns an `i32` (1/0); compare `!= 0` to a `bool`
+        // (the same i32→bool bridge as `fs.exists`).
+        hir::ExprKind::Utf8Valid { data } => {
+            let d = lower_expr(b, data);
+            let c = b.fresh_value(status_ty());
+            b.push(Stmt::Let(c, Rvalue::Utf8Valid { data: d }));
+            let v = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
+            Operand::Value(v)
         }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
@@ -4577,6 +4610,47 @@ fn lower_open_handle(
     b.terminate(Term::Goto(join));
 
     // Err: the out slot was zeroed (null handle) → nothing to close; map the status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `encoding.*_decode(s)` → the runtime writes an owned `buffer` handle into an out slot and
+/// returns an `i32` status (0 = ok; `AL_INVALID` -> `Error.Invalid`). Branch `Ok(<buffer>)` /
+/// `Err(<mapped status>)`. Mirrors [`lower_open_handle`], but the source is a `str` **view**
+/// (not a path) and there is no arena. The wrapped buffer is owned — the unwrapped local `Drop`s it.
+fn lower_encoding_decode(b: &mut Builder, kind: hir::EncodingKind, input: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::Buffer);
+    let inp = lower_expr(b, input);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::EncodingDecode { kind, input: inp, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the buffer handle and wrap it (the unwrapped local owns it — `Drop` frees it).
+    b.cur = ok_bb;
+    let h = b.fresh_value(Ty::Buffer);
+    b.push(Stmt::Let(h, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(h))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (null handle) → nothing to free; map the status (`Error.Invalid`).
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
     let ec = make_error_from_status(b, code, result_ty);

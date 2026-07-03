@@ -1245,13 +1245,24 @@ exist). Full API shape is in `draft.md` §18.2; the scope decision + rationale i
 `docs/open-questions.md` Settled → "M10 scope decision". Implementation stays the `core.json`/M9
 pattern: Rust runtime (`align_rt_*`) + sema builtin dispatch + required `import`.
 
-- **Slice 1 — std.encoding.** `base64_encode`/`base64_decode`, `base64url_encode`/
+- **Slice 1 — std.encoding — DONE.** `base64_encode`/`base64_decode`, `base64url_encode`/
   `base64url_decode`, `hex_encode`/`hex_decode`, `utf8_valid` — pure functions over `bytes`/`str`,
-  no state, no Move types. The lightest slice: a scalar reference implementation first, correctness
-  before speed; SIMD (Lemire's Base64-at-memcpy-speed) is a later optimization behind the same
-  signatures. **Completion condition:** encode/decode round-trip for all three encodings (including
-  empty input and non-block-aligned lengths), invalid input rejected as `Error.Invalid`, and
-  `utf8_valid` positive/negative cases.
+  no state, no Move types. Encode takes a byte view (`str`/owned `string` (auto-borrowed)/`slice<u8>`,
+  the `hash64` accepted forms) and returns an owned `string`; decode takes a `str` and returns
+  `Result<buffer, Error>` (invalid input -> `Error.Invalid`, mapped through the same fixed table as
+  the syscall paths — the runtime just returns `AL_INVALID`); `utf8_valid` takes `bytes` and reuses
+  the shared SIMD/scalar UTF-8 validator (`#344`). A new **`Scalar::Buffer`** owned-Move payload
+  (the `reader`/`writer` precedent) lets `Result<buffer, Error>` carry the decoded handle, dropped
+  via `align_rt_buffer_free` on the Result's `Drop`. v1 is a **scalar** reference implementation
+  (correctness before speed); SIMD (Lemire's Base64-at-memcpy-speed) is a later optimization behind
+  the same signatures. Implementation: sema builtin dispatch (`import std.encoding`) + MIR `Rvalue`
+  (`EncodingEncode`/`EncodingDecode`/`Utf8Valid`) + `align_rt_base64*_encode`/`hex_encode`/
+  `*_decode`/`utf8_valid` runtime, the `core.json`/std.fs precedent. **Completion condition met:**
+  encode/decode round-trip for all three encodings including empty input, the 1/2/3-byte padding
+  boundaries, and every byte value 0..=255 (runtime unit tests); the RFC 4648 `"foobar"` vectors;
+  invalid input (bad symbol / bad length / wrong alphabet / odd-length or non-hex) rejected as
+  `Error.Invalid`; and `utf8_valid` positive/negative cases — `tests/m10_encoding.rs` (11) +
+  `align_runtime` unit tests (7).
 - **Slice 2 — std.rand.** `rand.seed()`/`rand.seed_with(s)` producing a **Copy** `rng` value;
   `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)`. The one new runtime primitive this
   milestone needs: an OS-seed fn (`getrandom`/`urandom`). **Completion condition:** `seed_with` is

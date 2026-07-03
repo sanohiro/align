@@ -895,6 +895,33 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `std.encoding` — encode (byte view `{ptr,len}`) -> owned `string` `{ptr,len}`.
+    for (key, sym) in [
+        ("base64_encode", "align_rt_base64_encode"),
+        ("base64url_encode", "align_rt_base64url_encode"),
+        ("hex_encode", "align_rt_hex_encode"),
+    ] {
+        funcs.insert(
+            key.to_string(),
+            module.add_function(sym, slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into()], false), None),
+        );
+    }
+    // `std.encoding` — decode (`str` view `{ptr,len}`, out: *handle) -> i32 status (0 ok / AL_INVALID).
+    for (key, sym) in [
+        ("base64_decode", "align_rt_base64_decode"),
+        ("base64url_decode", "align_rt_base64url_decode"),
+        ("hex_decode", "align_rt_hex_decode"),
+    ] {
+        funcs.insert(
+            key.to_string(),
+            module.add_function(sym, ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+        );
+    }
+    funcs.insert(
+        // encoding.utf8_valid (ptr, len) -> i32 (1 valid / 0 invalid).
+        "utf8_valid".to_string(),
+        module.add_function("align_rt_utf8_valid", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
     // `core.string` trims → a borrowed sub-`str` `{ptr,len}` of the receiver (no allocation).
     for (key, sym) in [
         ("str_trim", "align_rt_str_trim"),
@@ -1785,6 +1812,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
         Scalar::Reader | Scalar::Writer => unreachable!("a reader/writer handle is not a box/array payload"),
+        Scalar::Buffer => unreachable!("a buffer handle is not a box/array payload"),
     }
 }
 
@@ -2524,9 +2552,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) => {
-                                    // The field is the handle pointer itself.
-                                    let free_fn = if matches!(payload_field_scalar(ty, idx), Some(Scalar::Writer)) { "io_writer_free" } else { "io_reader_free" };
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) => {
+                                    // The field is the handle pointer itself; each `*_free` is null-safe
+                                    // (the inactive arm / a moved-out aggregate reads a null handle).
+                                    let free_fn = match payload_field_scalar(ty, idx) {
+                                        Some(Scalar::Writer) => "io_writer_free",
+                                        Some(Scalar::Reader) => "io_reader_free",
+                                        _ => "buffer_free",
+                                    };
                                     self.builder
                                         .build_call(self.funcs[free_fn], &[field.into_pointer_value().into()], "")
                                         .map_err(|e| self.err(e))?;
@@ -4208,6 +4241,43 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["path_normalize"], &[pp.into(), pl.into()], "pnorm")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("path_normalize returns a {ptr,len}")
+            }
+            // std.encoding — encode returns an owned `{ptr,len}` string; decode writes a `buffer`
+            // handle into `out` and returns an i32 status; utf8_valid returns an i32 (1/0).
+            Rvalue::EncodingEncode { kind, data } => {
+                let fk = match kind {
+                    align_sema::hir::EncodingKind::Base64 => "base64_encode",
+                    align_sema::hir::EncodingKind::Base64Url => "base64url_encode",
+                    align_sema::hir::EncodingKind::Hex => "hex_encode",
+                };
+                let (dp, dl) = self.split_str(data)?;
+                self.builder
+                    .build_call(self.funcs[fk], &[dp.into(), dl.into()], "enc")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("encode returns a {ptr,len}")
+            }
+            Rvalue::EncodingDecode { kind, input, out } => {
+                let fk = match kind {
+                    align_sema::hir::EncodingKind::Base64 => "base64_decode",
+                    align_sema::hir::EncodingKind::Base64Url => "base64url_decode",
+                    align_sema::hir::EncodingKind::Hex => "hex_decode",
+                };
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (ip, il) = self.split_str(input)?;
+                self.builder
+                    .build_call(self.funcs[fk], &[ip.into(), il.into(), out_ptr.into()], "dec")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("decode returns i32 status")
+            }
+            Rvalue::Utf8Valid { data } => {
+                let (dp, dl) = self.split_str(data)?;
+                self.builder
+                    .build_call(self.funcs["utf8_valid"], &[dp.into(), dl.into()], "u8v")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("utf8_valid returns i32")
             }
             // env.get — write the owned value {ptr,len} into `out`, return an i32 present flag.
             Rvalue::EnvGet { name, out } => {
