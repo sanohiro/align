@@ -32,7 +32,9 @@ resp.header(name: str) -> Option<str>       // view into resp
 resp.body() -> bytes                         // view into resp (region-bound)
 // Server primitive (not a framework)
 srv := http.serve(host: str, port: i64) -> Result<http_server, Error>
-s.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response
+srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response
+// Batched client (the rail — moved here from net; see Concurrency in net.md)
+cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, Error>
 ```
 
 ## Type & ownership classification

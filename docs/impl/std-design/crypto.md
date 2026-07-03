@@ -73,6 +73,12 @@ over the OS CSPRNG. Argon2 params struct.
   secret-dependent branch — a byte-diff OR-reduction over the full length, then a single 0-check.
   A `for` with early break leaks length/content via timing. The self-review must verify no
   secret-dependent control flow. This is the module's defining constraint.
+  - **Length handling**: the input *length* is treated as **public**, not secret (in the intended
+    use — comparing MAC tags / digests — both sides are fixed, publicly-known lengths). Differing
+    lengths therefore return `false` immediately; the constant-time guarantee is over the
+    *content* of **equal-length** inputs. This matches the libsodium `sodium_memcmp` contract
+    (equal length is effectively a precondition). Document this explicitly so callers never pass a
+    secret-length input expecting the length itself to be hidden.
 - **P2 (AEAD all-or-nothing)**: `open()` on auth failure returns `Error.Invalid` and ZERO
   plaintext bytes — never partial, never a distinguishable error. Releasing unverified plaintext
   is the classic AEAD misuse.

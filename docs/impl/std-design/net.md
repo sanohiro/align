@@ -24,8 +24,6 @@ c.writer() -> writer          // borrow an M9 writer over the socket fd
 // TCP server
 tcp.listen(host: str, port: i64) -> Result<tcp_listener, Error> // bind+listen; SO_REUSEADDR
 l.accept() -> Result<tcp_conn, Error>
-// Batched client (the rail — see Concurrency)
-tcp.get_many(reqs: slice<request>, max_concurrency: i64) -> Result<array<response>, Error>
 // UDP
 udp.bind(host: str, port: i64) -> Result<udp_socket, Error>
 u.send_to(data: bytes, host: str, port: i64) -> Result<i64, Error>
@@ -51,8 +49,7 @@ dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
 
 ## Effect classification
 
-All net ops are **impure** (syscalls) — never in a `par_map` closure. `get_many` internally uses
-`task_group` + the blocking pool but presents as one impure call.
+All net ops are **impure** (syscalls) — never in a `par_map` closure.
 
 ## Error policy
 
@@ -65,19 +62,23 @@ Connection reset mid-stream surfaces as a read/write Error.
 ## Concurrency model
 
 The recorded rail (open-questions "Network std rails"): connection reuse by default (keepalive
-ON); the batched **get_many** does pipelined write-then-read across a bounded pool (`task_group` +
-the `par_map` blocking pool — NOT a new async runtime; `io_uring` is a later Linux backend, not
-the semantic model). A connect-per-request loop to one static host is a lint target (post-v1
-lint, record but don't implement in the module). HTTP/3, TLS, socket tuning (TFO/REUSEPORT/
-thread-per-core) are pkg, not std.
+ON). net provides the **substrate** for bounded-concurrency batching — `task_group` + the
+`par_map` blocking pool (NOT a new async runtime; `io_uring` is a later Linux backend, not the
+semantic model). The concrete batched API (`get_many`, pipelined write-then-read) lives **one
+layer up in `std.http`** (`cl.get_many`) — it operates on HTTP request/response types, which are
+`std.http`'s, so it must NOT sit in `std.net` (a net→http dependency would be a layering
+violation / circular dependency; see http.md). net stays byte-stream generic. A connect-per-request
+loop to one static host is a lint target (post-v1 lint, record but don't implement in the module).
+HTTP/3, TLS, socket tuning (TFO/REUSEPORT/thread-per-core) are pkg, not std.
 
 ## New machinery required
 
 3 new Move `Ty` (TcpConn/TcpListener/UdpSocket) + runtime structs + Drop(close); socket-lifecycle
 runtime fns (socket/connect/bind/listen/accept, getaddrinfo for `dns.resolve`, sendto/recvfrom);
 reuse M9 reader/writer verbatim for the byte path (the win); `region_of` arms binding borrowed
-reader/writer to their conn; `get_many` built on the existing `task_group` + blocking pool. No new
-effect, no new I/O path, no async runtime.
+reader/writer to their conn; the `task_group` + blocking-pool substrate that `std.http`'s
+`get_many` builds on (batching itself is http's, not net's). No new effect, no new I/O path, no
+async runtime.
 
 ## Slice breakdown
 
@@ -87,7 +88,9 @@ effect, no new I/O path, no async runtime.
    core proof) + Drop-closes-fd + full Gate-1 sweep.
 3. `tcp_listener` + `listen` + `accept` (server side).
 4. `udp_socket` + `bind` + `send_to` + `recv_from`.
-5. `get_many` (the rail) on `task_group` + blocking pool.
+
+(The batched `get_many` rail is implemented in `std.http`, not here — it needs HTTP types. net
+just supplies the `task_group` + blocking-pool substrate, already available.)
 
 ## Pitfalls (implement carefully)
 
@@ -102,10 +105,12 @@ effect, no new I/O path, no async runtime.
   binding is new).
 - **P3 (fd double-close)**: conn owns the fd; `reader()`/`writer()` borrows must set
   `owns_fd:false` so only the conn's Drop closes. Verify no path closes twice.
-- **P4 (get_many pool reuse)**: must reuse the existing `par_map` blocking pool (no new
-  thread-per-request); bounded by `max_concurrency`; a failed connection in the batch → that
-  response is an Err, not a whole-batch abort (partial results). Nested `task_group` deadlock
-  avoidance (the #301 work-claiming lesson).
+- **P4 (batching lives in http, not net)**: the batched `get_many` takes HTTP request/response
+  types, so it belongs in `std.http` (`cl.get_many`), NOT `std.net` — putting it here would make
+  net depend on http (a layering violation / circular dependency). net only exposes the substrate
+  (task_group + the `par_map` blocking pool). When http implements it: reuse that pool (no
+  thread-per-request), bound by `max_concurrency`, a failed request → that slot is an Err not a
+  whole-batch abort, and avoid nested `task_group` deadlock (the #301 work-claiming lesson).
 - **P5 (DNS owned strings deep-drop)**: `array<string>` from `resolve` must deep-free each IP
   string (`read_dir` #339 template).
 - **P6 (bound-receiver, #337/#338)**: conn/listener/socket are owned Move — unbound temporaries
@@ -119,7 +124,6 @@ effect, no new I/O path, no async runtime.
 - reader used past conn Drop → compile error (P2)
 - accept loop serves N clients
 - udp `send_to`/`recv_from` round-trip
-- `get_many` with a bounded pool over M requests, one failing → partial Err in that slot
 - fd not double-closed (the RSS/fd-count test pattern)
 - conn/listener as array element → rejected
 - unbound-temporary receiver → rejected

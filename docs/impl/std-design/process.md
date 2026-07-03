@@ -23,10 +23,16 @@ process.abort()                        // immediate _exit, NO cleanup
 ## Type & ownership classification
 
 `child` is a **Move type** owning a pid. Drop = if already waited → no-op; if not waited →
-**detach** (do not block; leave the OS to reap via a SIGCHLD-ignore disposition set at startup, or
-double-fork-style reaping — v1: set SIGCHLD to SA_NOCLDWAIT at runtime init so un-waited children
-don't become zombies). Explicit `wait()` is encouraged; Drop-without-wait is safe (no zombie) but
-loses the exit code.
+**reap it** with a blocking `waitpid` (discarding the exit code) so it cannot become a zombie.
+Explicit `wait()` is encouraged and returns the exit code; Drop-without-wait is safe (no zombie)
+but loses the code and may block until the child exits.
+
+**Why not `SA_NOCLDWAIT`** (a rejected alternative): setting `SA_NOCLDWAIT` globally on `SIGCHLD`
+at init would auto-reap zombies, but under POSIX it makes a subsequent `waitpid` for a specific
+child fail with `ECHILD` — which directly breaks `ch.wait() -> Result<i64, Error>` (explicit wait
+could no longer retrieve the exit status). So v1 keeps the default `SIGCHLD` disposition and reaps
+per-child in Drop instead. If a caller wants to drop a long-lived child *without* blocking, it
+should `kill()` first (or use a future explicit `detach()` API — recorded, not in v1).
 
 ## `process.exit` Drop-semantics decision (SETTLED here)
 
@@ -50,8 +56,9 @@ fork/exec/wait failures → errno→Error table (M9). `exec` returning at all = 
 
 ## New machinery required
 
-`child` Move type + runtime fork/execvp/waitpid/kill wrappers; SIGCHLD SA_NOCLDWAIT init (so
-Drop-detach doesn't zombie); **the exit-runs-cleanup path** — `process.exit` must hook the same
+`child` Move type + runtime fork/execvp/waitpid/kill wrappers; **child Drop reaps via blocking
+`waitpid`** (no `SA_NOCLDWAIT` — it would break explicit `wait()` with `ECHILD`); **the
+exit-runs-cleanup path** — `process.exit` must hook the same
 unwind/cleanup emission that a top-level return uses (emit_exit_cleanup for all open arenas +
 drop_locals + writer flush), then call `exit()`. This is the one non-trivial codegen piece: exit
 is not a plain runtime call, it must run the function's (and ideally the stack's) pending cleanup
@@ -63,7 +70,7 @@ current-frame + global flush. (Record the gap honestly.)
 
 1. `process.exit`/`abort` + the cleanup-then-exit path (the settled semantics) + global std-handle
    flush registration.
-2. `child` Move type + `spawn` + `wait` + Drop-detach + SIGCHLD init.
+2. `child` Move type + `spawn` + `wait` + Drop-reaps-via-waitpid (no `SA_NOCLDWAIT`).
 3. `kill` + `exec`.
 
 ## Pitfalls
@@ -71,8 +78,12 @@ current-frame + global flush. (Record the gap honestly.)
 - **P1 (exit skips cleanup = the hazard)**: the WHOLE point is exit runs cleanup. A naive
   `process.exit` = libc `exit()` would silently drop buffered writer output and skip arena frees —
   exactly the bug. Must emit cleanup first. Highest-value correctness point.
-- **P2 (zombie children)**: Drop-without-wait must not zombie. SA_NOCLDWAIT at init, or reap.
-  Test: spawn 100, drop all without wait, assert no zombies (ps/proc).
+- **P2 (zombie children)**: Drop-without-wait must not zombie — reap per-child with a blocking
+  `waitpid` in Drop. Do NOT use a global `SA_NOCLDWAIT`: it auto-reaps but makes explicit
+  `ch.wait()` fail with `ECHILD`, breaking the exit-code contract. The tradeoff is that dropping a
+  still-running child blocks until it exits (documented; `kill()` first to avoid). Test: spawn 100
+  short-lived, drop all without wait, assert no zombies (ps/proc) and that a separate explicit
+  `wait()` still returns a code.
 - **P3 (fork+exec fd leak)**: child inherits fds; set CLOEXEC on Align-owned fds
   (readers/writers/sockets) so they don't leak into the child. Or document the inheritance. v1:
   CLOEXEC on all Align fd-owning handles.
