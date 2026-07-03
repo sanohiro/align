@@ -4,6 +4,8 @@ module.
 
 # std.compress — implementation design (M11)
 
+> 🌐 **English** · [日本語](./ja/compress.md)
+
 ## Overview
 
 gzip, zstd (draft §18.2). The keystone library strategy: **own the memory wrappers, borrow the
