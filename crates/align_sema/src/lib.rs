@@ -10130,14 +10130,25 @@ impl<'a, 't> Checker<'a, 't> {
                     .error(format!("'time.sleep' expects 1 argument (nanoseconds, i64), got {}", args.len()), span);
                 return err;
             }
-            let ns = self.check_expr(&args[0], Some(i64_ty));
+            let ns = self.check_expr(&args[0], None);
             if ns.ty == Ty::Error {
                 return err;
             }
-            if !matches!(ns.ty, Ty::Int(_) | Ty::IntVar(_)) {
-                self.diags
-                    .error(format!("'time.sleep' expects a nanosecond count (i64), got {}", ty_name(ns.ty)), args[0].span);
-                return err;
+            // `sleep` takes an `i64` nanosecond count (draft §18.2), and the lowered
+            // `align_rt_time_sleep` has an `i64` parameter. Require *exactly* `i64` — binding a
+            // bare int literal's inference var to it — rather than accept any int-like width: a
+            // narrower `i32`/`u8` operand would build a `TimeSleep` node whose value doesn't match
+            // the runtime signature (only the compile-aborting mismatch would otherwise catch it).
+            match self.resolve(ns.ty) {
+                Ty::Int(IntTy { bits: 64, signed: true }) => {}
+                Ty::IntVar(_) => self.constrain(ns.ty, Some(i64_ty), args[0].span),
+                other => {
+                    self.diags.error(
+                        format!("'time.sleep' expects a nanosecond count (i64), got {}", ty_name(other)),
+                        args[0].span,
+                    );
+                    return err;
+                }
             }
             return Expr { kind: ExprKind::TimeSleep { ns: Box::new(ns) }, ty: Ty::Unit, span };
         }

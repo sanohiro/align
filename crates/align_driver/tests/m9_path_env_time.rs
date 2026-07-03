@@ -236,6 +236,70 @@ pub fn main() -> Result<(), Error> {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
 }
 
+/// `time.sleep` takes exactly `i64` (draft §18.2; the runtime `align_rt_time_sleep` has an `i64`
+/// parameter). A narrower-width variable (`i32`/`u8`) is rejected with a single, specific
+/// diagnostic — not a generic `type mismatch`, and never lowered to a `TimeSleep` node whose
+/// operand doesn't match the runtime signature.
+#[test]
+fn time_sleep_rejects_narrower_int() {
+    let prog = "\
+import std.time
+pub fn main() -> Result<(), Error> {
+  x: i32 := 5
+  time.sleep(x)
+  return Ok(())
+}
+";
+    let d = check_diagnostics("m9-time-sleep-i32", prog);
+    assert!(
+        d.contains("'time.sleep' expects a nanosecond count (i64), got i32"),
+        "an i32 argument is rejected with the specific i64 diagnostic; got: {d}"
+    );
+    assert!(!d.contains("type mismatch"), "no redundant reconciliation error alongside it; got: {d}");
+}
+
+/// An unsigned `i64` (`u64`) is likewise rejected — the sleep argument is the *signed* `i64`
+/// timeline type, one way (a caller casts explicitly).
+#[test]
+fn time_sleep_rejects_unsigned() {
+    let prog = "\
+import std.time
+pub fn main() -> Result<(), Error> {
+  x: u64 := 5
+  time.sleep(x)
+  return Ok(())
+}
+";
+    let d = check_diagnostics("m9-time-sleep-u64", prog);
+    assert!(
+        d.contains("'time.sleep' expects a nanosecond count (i64), got u64"),
+        "a u64 argument is rejected (i64 is the one timeline type); got: {d}"
+    );
+}
+
+/// The accepting path: a bare int literal (its inference var binds to `i64`) and an explicit
+/// `i64` local both compile and run. Guards the `IntVar → i64` constrain and the exact-`i64`
+/// acceptance in one build-and-run.
+#[test]
+fn time_sleep_accepts_literal_and_i64() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.time
+pub fn main() -> Result<(), Error> {
+  x: i64 := 0
+  time.sleep(x)
+  time.sleep(0)
+  print(7)
+  return Ok(())
+}
+";
+    let out = build_and_run("m9-time-sleep-accept", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
 // --- import required --------------------------------------------------------------------------
 
 /// Each module builtin requires its `import` — using `path.join` without `import std.path` is an
