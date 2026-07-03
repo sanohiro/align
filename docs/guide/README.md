@@ -1,3 +1,5 @@
+> 🌐 **English** · [日本語](./ja/README.md)
+
 A hands-on introduction to writing Align — not the spec (that's draft.md), but how to think and write in Align. Chapters are ordered; start at 00.
 
 - [00 — Why Align](00-why-align.md)

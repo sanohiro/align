@@ -1,5 +1,7 @@
 # Memory: value, arena, heap
 
+> 🌐 **English** · [日本語](./ja/03-memory.md)
+
 Align has no garbage collector and no manual `free`. Instead, where data lives is a property you choose, and the compiler inserts the cleanup. There are three places.
 
 ## Values (the default)

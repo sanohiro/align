@@ -1,5 +1,7 @@
 # Data-oriented: structure-of-arrays
 
+> 🌐 **English** · [日本語](./ja/04-data-oriented.md)
+
 This chapter is why Align exists. How you lay out data in memory decides how fast you can process it — often by an order of magnitude — and Align gives you the fast layout as a first-class citizen.
 
 ## Array-of-structs vs structure-of-arrays

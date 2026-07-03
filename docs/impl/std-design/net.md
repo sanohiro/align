@@ -4,6 +4,8 @@ module.
 
 # std.net — implementation design (M11)
 
+> 🌐 **English** · [日本語](./ja/net.md)
+
 ## Overview
 
 Low-level sockets: tcp, udp, dns, socket. Syscall-backed. The keystone reuse: a connected

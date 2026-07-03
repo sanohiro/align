@@ -4,6 +4,8 @@ module.
 
 # std.process — implementation design (M11)
 
+> 🌐 **English** · [日本語](./ja/process.md)
+
 ## Overview
 
 spawn, exec, exit (draft §18.2). Fork/exec/waitpid + a child Move handle. **This module settles

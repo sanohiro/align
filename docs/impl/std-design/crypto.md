@@ -4,6 +4,8 @@ module.
 
 # std.crypto — implementation design (M11)
 
+> 🌐 **English** · [日本語](./ja/crypto.md)
+
 ## Overview
 
 crypto.random, sha256/sha512, blake3, hmac, hkdf, argon2id, aes_gcm, chacha20_poly1305,

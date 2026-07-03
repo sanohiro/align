@@ -4,6 +4,8 @@ module.
 
 # std.cli — implementation design (M10 Slice 3)
 
+> 🌐 **English** · [日本語](./ja/cli.md)
+
 ## Overview
 
 A parser over `main(args: array<str>)`'s `array<str>` (§17) — the one argv source (no

@@ -4,6 +4,8 @@ module.
 
 # std.http — implementation design (M11)
 
+> 🌐 **English** · [日本語](./ja/http.md)
+
 ## Overview
 
 An HTTP/1.1 primitive, NOT a framework (draft §18.2). Built on std.net sockets. Members: request,

@@ -1,5 +1,7 @@
 # Thinking in pipelines
 
+> 🌐 **English** · [日本語](./ja/02-pipelines.md)
+
 This is the heart of Align. You rarely write a `for` loop; you describe a transformation over a collection and let the compiler generate the loop — fused, branch-minimal, vectorizable.
 
 ## The shape
