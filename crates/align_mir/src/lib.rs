@@ -105,15 +105,18 @@ pub enum Stmt {
     /// `index..index+n` (M6). Codegen GEPs the slice buffer to `&buf[index]` and emits a `<n x T>`
     /// store at the element alignment. Bounds are checked before this statement is emitted.
     VecStore { slice: Operand, index: Operand, value: Operand, elem: Ty, n: u32 },
-    /// `slot[index].field <- value` (struct-array element field store).
-    StoreElemField(Slot, Operand, u32, Operand),
-    /// `base[index].field <- value` for a `{ptr,len}` view of an owned, dynamic `array<Struct>`
+    /// `slot[index].f0.f1.… <- value` (struct-array element nested-field store). The field `path`
+    /// (length ≥ 1) walks the element struct to the leaf being written; codegen GEPs
+    /// `[0, index, *pfield(path)]` into the `[N x %Struct]` slot (each level through the
+    /// logical→physical `pfield` map). A depth-1 path is the plain element-field store.
+    StoreElemField(Slot, Operand, Vec<u32>, Operand),
+    /// `base[index].f0.f1.… <- value` for a `{ptr,len}` view of an owned, dynamic `array<Struct>`
     /// (`DynStructArray`). The write dual of [`Rvalue::IndexFieldPtr`]: extract the buffer pointer
-    /// from `base` and GEP `%Struct, ptr, index, field` (through the logical→physical `pfield`
-    /// map). `value` is a scalar (POD) field — sema gates `str`/owned fields off, since a
+    /// from `base` and GEP `%Struct, ptr, index, *field-path` (through the logical→physical `pfield`
+    /// map). `value` is a scalar (POD) leaf — sema gates `str`/owned fields off, since a
     /// pointer-based per-element drop of the overwritten field is not modeled. Bounds are checked
     /// (by [`Stmt`]s emitted before this one) via the loaded view length.
-    StoreElemFieldPtr { base: Operand, index: Operand, field: u32, struct_id: u32, value: Operand },
+    StoreElemFieldPtr { base: Operand, index: Operand, path: Vec<u32>, struct_id: u32, value: Operand },
     /// Store `value` into column `field` at row `index` of a `soa<Struct>` column-major buffer
     /// `base` (the [`Rvalue::SoaAlloc`] base pointer; `len` rows). The write counterpart of
     /// [`Rvalue::IndexColumn`] — codegen reuses its per-column `align_up` offset chain. Used by
@@ -148,10 +151,10 @@ pub enum Stmt {
     /// (recursively), before it is overwritten by a whole-element store (`us[i] = new`, Slice 4b).
     /// `u32` is the element struct id. Null-safe (a moved/unwritten element reads nulls).
     DropElem(Slot, Operand, u32),
-    /// Drop one owned `string` field (`u32` = field index) of element `index` of a fixed struct-array
-    /// slot: free that field's buffer before it is overwritten by an element-field store
-    /// (`us[i].name = new`, Slice 4b). Null-safe.
-    DropElemField(Slot, Operand, u32),
+    /// Drop one owned `string` leaf field (the `Vec<u32>` = field path, length ≥ 1) of element
+    /// `index` of a fixed struct-array slot: free that field's buffer before it is overwritten by an
+    /// element-field store (`us[i].name = new` / `us[i].addr.name = new`, Slice 4b). Null-safe.
+    DropElemField(Slot, Operand, Vec<u32>),
     /// Free the buffer of a free-standing owned `array<T>` *value* (a `{ptr,len}` operand that
     /// is not backed by a slot — an unbound `.to_array()` temporary consumed in place). Used to
     /// free the materialized buffer right after the loop that consumes it (null-safe).
@@ -861,6 +864,25 @@ fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -
     }
 }
 
+/// The type of the leaf field reached by a logical field `path` (length ≥ 1) through a chain of
+/// nested structs rooted at `struct_id`. Each non-final field is a struct (sema's nested-access
+/// walk guarantees it); the final field's type is returned. Used to decide the drop-of-old-value on
+/// an element-field store (`us[i].addr.name = new` frees the old `string`).
+fn field_path_leaf_ty(structs: &[hir::StructDef], struct_id: u32, path: &[u32]) -> Ty {
+    let mut sid = struct_id;
+    for (k, &f) in path.iter().enumerate() {
+        let fty = structs[sid as usize].fields[f as usize].ty;
+        if k + 1 == path.len() {
+            return fty;
+        }
+        match fty {
+            Ty::Struct(nid) => sid = nid,
+            other => unreachable!("nested element-field path through non-struct {other:?}"),
+        }
+    }
+    unreachable!("field_path_leaf_ty called with an empty path")
+}
+
 /// Null the slot of an owned `array<T>` local moved out at a (just-lowered) consuming site,
 /// so its exit [`Stmt::Drop`] becomes a no-op `free(null)` and the buffer is freed once — by
 /// the new owner. The moved expression is a bare `Local` (null its slot) or a block/arena whose
@@ -1021,11 +1043,13 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 other => unreachable!("element assignment into non-array/slice {other:?}"),
             }
         }
-        hir::Stmt::AssignElemField { base, index, field, struct_id, soa, value } => {
-            // `base[index].field = value` — bounds-checked element-field store (the write
-            // counterpart of the `base[index].field` read). A `soa<Struct>` writes one column
-            // (`StoreColumn`, the column-major `align_up` offset chain); a fixed `array<Struct>`
-            // writes its slot element-field directly (`StoreElemField`, a `[0,index,field]` GEP).
+        hir::Stmt::AssignElemField { base, index, path, struct_id, soa, value } => {
+            // `base[index].f0.f1.… = value` — bounds-checked element-(nested-)field store (the write
+            // counterpart of the `base[index].f0.f1.…` read). A `soa<Struct>` writes one column
+            // (`StoreColumn`, the column-major `align_up` offset chain; soa columns are scalar, so
+            // its path is always length 1); a fixed `array<Struct>` writes its slot element-field via
+            // `StoreElemField` (a `[0,index,*path]` GEP); an owned dynamic `array<Struct>` writes
+            // through the buffer pointer (`StoreElemFieldPtr`, a `[index,*path]` GEP).
             let idx = lower_expr(b, index);
             let val = lower_expr(b, value);
             if *soa {
@@ -1042,11 +1066,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 let first_scalar = align_sema::ty_to_scalar(first_field.ty).expect("soa field is a scalar");
                 let ptr = b.fresh_value(Ty::Box(first_scalar));
                 b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(sv))));
+                // A soa column is scalar, so sema restricts the path to a single field.
                 b.push(Stmt::StoreColumn {
                     base: Operand::Value(ptr),
                     len: Operand::Value(len),
                     index: idx,
-                    field: *field,
+                    field: path[0],
                     struct_id: *struct_id,
                     value: val,
                 });
@@ -1055,20 +1080,20 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     // A fixed `array<Struct>` slot (sema restricts the receiver to a `mut` local).
                     Ty::StructArray(_, n) => {
                         emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
-                        // An owned `string` field being overwritten: free the OLD value first (else
-                        // it leaks) and null the RHS's moved source. A scalar field needs neither.
-                        // (Slice 4b.)
-                        if b.structs[*struct_id as usize].fields[*field as usize].ty == Ty::String {
-                            b.push(Stmt::DropElemField(*base, idx.clone(), *field));
+                        // An owned `string` leaf field being overwritten: free the OLD value first
+                        // (else it leaks) and null the RHS's moved source. A scalar leaf needs
+                        // neither. (Slice 4b.)
+                        if field_path_leaf_ty(&b.structs, *struct_id, path) == Ty::String {
+                            b.push(Stmt::DropElemField(*base, idx.clone(), path.clone()));
                             null_moved_source(b, value);
                         }
-                        b.push(Stmt::StoreElemField(*base, idx, *field, val));
+                        b.push(Stmt::StoreElemField(*base, idx, path.clone(), val));
                     }
                     // An owned, dynamic `array<Struct>` (`DynStructArray`) — a `{ptr,len}` view
                     // addressed through its buffer pointer. Load the view, bounds-check against its
-                    // runtime length, then store the scalar field via the pointer-based write dual
-                    // of `IndexFieldPtr`. Sema restricts the field to a scalar (POD), so there is no
-                    // old-value drop / moved-source concern (unlike the fixed `string`-field path).
+                    // runtime length, then store the scalar leaf field via the pointer-based write
+                    // dual of `IndexFieldPtr`. Sema restricts the leaf to a scalar (POD), so there is
+                    // no old-value drop / moved-source concern (unlike the fixed `string`-field path).
                     Ty::DynStructArray(..) => {
                         let view_ty = b.slots[*base as usize];
                         let sv = b.fresh_value(view_ty);
@@ -1079,7 +1104,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                         b.push(Stmt::StoreElemFieldPtr {
                             base: Operand::Value(sv),
                             index: idx,
-                            field: *field,
+                            path: path.clone(),
                             struct_id: *struct_id,
                             value: val,
                         });
@@ -2450,7 +2475,7 @@ fn store_array_elems(b: &mut Builder, slot: Slot, elems: &[hir::Expr], elem: Ty)
             if let hir::ExprKind::StructLit { fields, .. } = &e.kind {
                 for (j, fe) in fields.iter().enumerate() {
                     let v = lower_expr(b, fe);
-                    b.push(Stmt::StoreElemField(slot, index_const(i), j as u32, v));
+                    b.push(Stmt::StoreElemField(slot, index_const(i), vec![j as u32], v));
                 }
             }
         }

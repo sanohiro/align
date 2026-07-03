@@ -958,20 +958,29 @@ fn nested_struct_chains_compute_the_oracle_value() {
                 .collect();
             decls.push_str(&format!("S{k} {{ {} }}\n", fs.join(", ")));
         }
+        // Root the tower either in a plain local (`u`, nested `StoreField`/`Field` paths) or in a
+        // single-element fixed struct array (`arr[0]`, nested `StoreElemField`/`IndexField` paths) —
+        // so the same reordering-heavy oracle exercises *both* the local and the element GEP seams.
+        let array_rooted = rng.below(2) == 0;
+        let root_path = if array_rooted { "arr[0]" } else { "u" };
         // Construct the root, recording every leaf (path, type, initial value).
         let mut leaves: Vec<(String, ITy, i128)> = Vec::new();
-        let root_lit = gen_nested_instance(&mut rng, &schema, 0, "u", &mut leaves);
+        let root_lit = gen_nested_instance(&mut rng, &schema, 0, root_path, &mut leaves);
         // The oracle is a path -> current-value map, updated in the exact order writes are emitted.
         use std::collections::HashMap;
         let mut vals: HashMap<String, i128> = leaves.iter().map(|(p, _, v)| (p.clone(), *v)).collect();
         let read_paths: Vec<(String, ITy)> = leaves.iter().map(|(p, t, _)| (p.clone(), *t)).collect();
 
-        let mut body = format!("  mut u := {root_lit}\n");
-        // Optional whole-subtree write: rewrite `u.n(.n)` from a fresh literal (resets its leaves).
+        let mut body = if array_rooted {
+            format!("  mut arr := [{root_lit}]\n")
+        } else {
+            format!("  mut u := {root_lit}\n")
+        };
+        // Optional whole-subtree write: rewrite `<root>.n(.n)` from a fresh literal (resets its leaves).
         if levels >= 2 && rng.below(3) == 0 {
             // Choose a nesting level k in 1..levels-1 (there is a `Nested` chain to reach it).
             let k = 1 + rng.below(levels - 1);
-            let prefix = format!("u{}", ".n".repeat(k));
+            let prefix = format!("{root_path}{}", ".n".repeat(k));
             let mut sub: Vec<(String, ITy, i128)> = Vec::new();
             let sub_lit = gen_nested_instance(&mut rng, &schema, k, &prefix, &mut sub);
             body.push_str(&format!("  {prefix} = {sub_lit}\n"));

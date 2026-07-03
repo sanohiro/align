@@ -171,3 +171,26 @@ fn main() -> i32 {
     // "aaaa" freed (drop-of-old), "cc"(2) stored; us[1] "bee"(3) untouched → 2 + 3 = 5.
     assert_eq!(build_and_run("ms-elem-field-reassign", src).status.code(), Some(5));
 }
+
+#[test]
+fn element_nested_owned_field_reassign_drops_old() {
+    if !backend_available() {
+        return;
+    }
+    // Slice 4 (nested element write): `us[i].addr.name = new` overwrites a `string` reached through
+    // a *nested* struct field. The path-carrying `DropElemField` frees the OLD buffer at
+    // `[0, i, addr, name]` before storing the new one (else it leaks); the RHS `.clone()` temporary
+    // is stored in. At exit the per-element drop frees the surviving nested buffers. No leak, no
+    // double-free — verified by a clean exit code (and the read-back of the nested `string` view).
+    let src = "\
+Addr { name: string }
+User { addr: Addr, age: i64 }
+fn main() -> i32 {
+  mut us := [User{addr: Addr{name: \"aaaa\".clone()}, age: 1}, User{addr: Addr{name: \"bee\".clone()}, age: 2}]
+  us[0].addr.name = \"cc\".clone()
+  return (us[0].addr.name.len() + us[1].addr.name.len()) as i32
+}
+";
+    // "aaaa" freed (nested drop-of-old), "cc"(2) stored; us[1] "bee"(3) untouched → 2 + 3 = 5.
+    assert_eq!(build_and_run("ms-elem-nested-field-reassign", src).status.code(), Some(5));
+}

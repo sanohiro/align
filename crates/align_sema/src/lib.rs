@@ -745,10 +745,11 @@ enum Place {
     /// `v[lane] = value` — write one lane of a `mut vecN<T>` local (M6). `lane` is a constant in
     /// `0..N`; `elem` is the element scalar. Lowers to `v = insertelement(v, value, lane)`.
     VecLane { local: LocalId, lane: u32, elem: Ty },
-    /// `base[index].field = value` — store one scalar field of element `index` of a `mut`
-    /// struct-array or soa local. `soa` selects the lowering (`StoreColumn` vs `StoreElemField`);
-    /// `ty` is the (scalar) field type the value is checked against.
-    ElemField { base: LocalId, index: Expr, field: u32, struct_id: u32, soa: bool, ty: Ty },
+    /// `base[index].f0.f1.… = value` — store the leaf field reached by `path` (length ≥ 1) of
+    /// element `index` of a `mut` struct-array or soa local. `soa` selects the lowering
+    /// (`StoreColumn` vs `StoreElemField`/`StoreElemFieldPtr`); `ty` is the leaf field type the value
+    /// is checked against.
+    ElemField { base: LocalId, index: Expr, path: Vec<u32>, struct_id: u32, soa: bool, ty: Ty },
     /// `base[index] = value` — store a whole struct value into element `index` of a `mut`
     /// struct-array or soa local. `soa` selects the lowering (per-column scatter vs aggregate slot
     /// store); the value is checked against `Ty::Struct(struct_id)`.
@@ -4387,9 +4388,9 @@ impl<'a, 't> Checker<'a, 't> {
                         let v = self.check_expr(value, Some(elem));
                         stmts.push(Stmt::AssignVecLane { local, lane, value: v });
                     }
-                    Place::ElemField { base, index, field, struct_id, soa, ty } => {
+                    Place::ElemField { base, index, path, struct_id, soa, ty } => {
                         let v = self.check_expr(value, Some(ty));
-                        stmts.push(Stmt::AssignElemField { base, index, field, struct_id, soa, value: v });
+                        stmts.push(Stmt::AssignElemField { base, index, path, struct_id, soa, value: v });
                     }
                     Place::Elem { base, index, struct_id, soa } => {
                         let v = self.check_expr(value, Some(Ty::Struct(struct_id)));
@@ -4579,11 +4580,13 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return Place::Index { base: id, index: i, elem };
         }
-        // `local[index].field = v` — store one scalar field of a struct-array / soa element (the
-        // write counterpart of the `c[i].field` read). One field is written, no whole-element copy.
-        if let ast::ExprKind::FieldAccess { recv, field } = &place.kind
-            && let ast::ExprKind::Index { recv: irecv, index } = &recv.kind
-            && let Some((id, local_ty)) = self.place_local(irecv)
+        // `local[index].f0.f1.… = v` — store the leaf field of a (possibly nested) struct-array /
+        // soa element (the write counterpart of the `c[i].f0.f1.…` read). One leaf is written, no
+        // whole-element copy. The receiver spine bottoms at an `Index` of a `mut` local
+        // (`peel_index_field_chain`); a pure field path (`local.f0.f1`) returns `None` and falls
+        // through to the ordinary field-path handling below.
+        if let Some((arr, index, fields)) = peel_index_field_chain(place)
+            && let Some((id, local_ty)) = self.place_local(arr)
         {
             // `soa` selects the lowering (`StoreColumn`); `is_dyn` marks an owned dynamic
             // `array<Struct>` view (`StoreElemFieldPtr`), a fixed slot array is neither.
@@ -4601,22 +4604,36 @@ impl<'a, 't> Checker<'a, 't> {
                         place.span,
                     );
                 }
-                let (field_idx, ty) = match self.field_of(Ty::Struct(struct_id), &field.name, place.span) {
-                    Some(f) => f,
-                    None => return Place::Err,
-                };
+                // Resolve the field path through the (possibly nested) element struct — each
+                // non-final field must itself be a struct so the path can continue (`arr[i].a.x`),
+                // mirroring the read side (`check_index_field`). The final field is the leaf written.
+                let mut path = Vec::with_capacity(fields.len());
+                let mut cur = Ty::Struct(struct_id);
+                let mut leaf_ty = Ty::Error;
+                for (k, f) in fields.iter().enumerate() {
+                    let Some((idx, fty)) = self.field_of(cur, &f.name, f.span) else { return Place::Err };
+                    path.push(idx);
+                    if k + 1 == fields.len() {
+                        leaf_ty = fty;
+                    } else if let Ty::Struct(nid) = fty {
+                        cur = Ty::Struct(nid);
+                    } else {
+                        self.diags.error(format!("field '{}' is {}, not a struct — cannot access '.{}' through it", f.name, ty_name(fty), fields[k + 1].name), f.span);
+                        return Place::Err;
+                    }
+                }
                 // An owned dynamic `array<Struct>` element-field write goes through the buffer
                 // pointer (`StoreElemFieldPtr`), which has no per-element drop of the overwritten
-                // field. Restrict it to a primitive scalar field (int/float/bool/char) — a `str`/
-                // owned/nested field write would leak the old value, so it is deferred (matching the
-                // fixed-array whole-element restriction: owned columns need region/drop handling).
-                let field_is_prim = matches!(
-                    ty_to_scalar(ty).and_then(scalar_to_prim),
+                // field. Restrict its leaf to a primitive scalar (int/float/bool/char) — a `str`/
+                // owned/nested-Move leaf write would leak the old value, so it is deferred (matching
+                // the fixed-array whole-element restriction: owned columns need region/drop handling).
+                let leaf_is_prim = matches!(
+                    ty_to_scalar(leaf_ty).and_then(scalar_to_prim),
                     Some(PrimScalar::Int(_) | PrimScalar::Float(_) | PrimScalar::Bool | PrimScalar::Char)
                 );
-                if is_dyn && !field_is_prim {
+                if is_dyn && !leaf_is_prim {
                     self.diags.error(
-                        format!("element-field assignment of `{}` into a dynamic array<{}> is not supported yet (primitive fields only for now; a str/owned field needs region/drop handling — deferred)", ty_name(ty), self.ty_display(Ty::Struct(struct_id))),
+                        format!("element-field assignment of `{}` into a dynamic array<{}> is not supported yet (primitive fields only for now; a str/owned field needs region/drop handling — deferred)", ty_name(leaf_ty), self.ty_display(Ty::Struct(struct_id))),
                         place.span,
                     );
                     return Place::Err;
@@ -4629,7 +4646,7 @@ impl<'a, 't> Checker<'a, 't> {
                     self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
                     return Place::Err;
                 }
-                return Place::ElemField { base: id, index: i, field: field_idx, struct_id, soa, ty };
+                return Place::ElemField { base: id, index: i, path, struct_id, soa, ty: leaf_ty };
             }
         }
         // `local.f0.f1.… = v` — a (possibly nested) field path rooted at a mutable local.
