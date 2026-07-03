@@ -7,7 +7,17 @@ Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-04 (docs-only: M10 std-2 design settled)._
 
-## M10 — std (encoding / rand / cli) — design settled (2026-07-04), not yet implemented
+## M10 — std (encoding / rand / cli) — design settled (2026-07-04); Slice 1 (std.encoding) DONE
+
+**Slice 1 — std.encoding — DONE.** `encoding.base64_encode`/`base64_decode`/`base64url_encode`/
+`base64url_decode`/`hex_encode`/`hex_decode`/`utf8_valid`: encode (byte view) -> owned `string`,
+decode (`str`) -> `Result<buffer, Error>` (invalid -> `Error.Invalid`), `utf8_valid(bytes)` -> `bool`
+reusing the #344 validator. New `Scalar::Buffer` owned-Move payload (reader/writer precedent) carries
+the decoded `buffer`; scalar reference impl (SIMD later, same signatures). sema dispatch + MIR
+`Encoding*`/`Utf8Valid` + `align_rt_*` runtime; `tests/m10_encoding.rs` (11) + runtime units (7).
+Slices 2 (std.rand) / 3 (std.cli) remain.
+
+
 
 **M10 std-2 design settled: `std.encoding` / `std.rand` / `std.cli`** — all three close over
 existing mechanisms (`str`/`bytes`/`buffer`, `mut` slice, `main(args: array<str>)`'s `array<str>`)
