@@ -7,7 +7,7 @@ Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-03 (main @ PR #331; M8 formally closed same day, docs-only)._
 
-## M9 — std phase (design settled 2026-07-03; Slice 1 DONE)
+## M9 — std phase (design settled 2026-07-03; Slices 1–3 DONE)
 
 M0–M8 are done (language core + tooling/FFI). M9 (`std.io`/`std.fs`/`std.path`/`std.env`/
 `std.time`) design is settled — see `docs/impl/07-roadmap.md` M9 and `docs/open-questions.md`
@@ -24,7 +24,17 @@ shared by every std fn. Byte-exact file copy + per-method tests in `crates/align
 `Result<reader/writer, Error>` works (new `Scalar::Reader`/`Scalar::Writer` payloads with a
 per-payload drop dtor). Known minor gap: an unbound Move *temporary* isn't dropped, so a one-shot
 `io.stdout.write(x)?` leaks its ~40-byte writer handle (bound handles drop correctly) — a general
-MIR limitation, fixed by dropping Move temporaries (separate work). **Next: Slice 2 (`io.copy`).**
+MIR limitation, fixed by dropping Move temporaries (separate work).
+
+**Slice 3 (std.fs complete) — DONE.** `fs.write_file` (`str`/`bytes`/`builder`), `fs.exists`
+(`bool`, errors fold to `false`), `fs.remove`, `fs.read_dir` (owned `array<string>` — new
+`PrimScalar::String` + deep-`Drop` `align_rt_free_string_array`; Move-element indexing still
+deferred, so used whole), and `fs.read_file_view` (an `mmap` view requiring an enclosing arena;
+registered on the runtime `Arena`, `munmap`ped at arena end on every exit via `ArenaEnd`; region =
+the arena, so escape is rejected, `.clone()` copies out). Guardrails: `fstat`-gated to regular
+nonzero files; special/`/proc`/zero-length files take an owned arena-copy fallback; no `SIGBUS`
+handler (documented v1 limit — no hidden global signal state). §19 runs end to end.
+`tests/m9_fs.rs` (17) + runtime unit tests (8). **Next: Slice 4 (`std.path`/`std.env`/`std.time`).**
 
 ## M8 — Tooling and Quality — formally closed (2026-07-03)
 

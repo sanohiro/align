@@ -2425,8 +2425,24 @@ around the string/JSON milestone (M5) and std build-out.
 
 **Status update (2026-07-03, M9 std design):** the v1/reference portable fixed-buffer loop for
 `io.copy` is scheduled as `impl/07-roadmap.md` M9 Slice 2 (memory-bounded, `O(buffer)`, tested).
-The fast paths above (`sendfile`/`splice`/mmap/`io_uring`/Direct I/O) stay **post-M9**, added later
+The fast paths above (`sendfile`/`splice`/`io_uring`/Direct I/O) stay **post-M9**, added later
 without an `io.copy` signature change.
+
+**Status update (2026-07-03, M9 Slice 3 DONE):** the **`mmap` scan path** landed as `fs.read_file_view`
+(`draft.md` §18.2), the one place a view's backing is bound to a region (the enclosing arena;
+`munmap` at arena end). Two guardrail decisions were resolved concretely in v1:
+- **Special / untrustworthy-size files → owned copy, not an error.** `fstat` gates `mmap` to a
+  regular file with a nonzero size; a character device / FIFO / `/proc` file (`st_size` 0 or a lie)
+  and any zero-length file take an **owned arena-copy fallback** (read the real bytes into arena
+  memory, return a view of that). The record said "avoid" such files — v1 reads them correctly at a
+  changed cost class (a copy, not zero-copy) rather than erroring; the view stays arena-bound either
+  way, so no API/region change.
+- **`SIGBUS` on post-`mmap` truncation → documented limitation, no handler.** The mapping length is
+  fixed at `mmap` time from the `fstat` size; if the file is truncated afterward, touching the lost
+  pages raises `SIGBUS`. v1 installs **no** `SIGBUS` handler — a process-global signal handler is
+  exactly the hidden global side effect Align forbids ("nothing hidden"), and per-mapping recovery
+  needs `sigsetjmp`/`siglongjmp` out of v1 scope. Concurrent truncation of a mapped file is the
+  caller's contract to avoid (a known limit, not UB in the language sense).
 
 ### Fast startup (non-functional goal)
 
