@@ -19,7 +19,7 @@ fn main() -> i32 {
 }
 ```
 
-`print` is a builtin. (In the current implementation it prints integers; richer output arrives with the string/IO work.)
+`print` is a builtin. It handles the primitive types — integers, floats, `bool`, `char`, and strings.
 
 ## Values and inference
 
@@ -57,11 +57,19 @@ fn main() -> Result<(), Error> {
 
 The `?` operator unwraps an `Ok`, or returns the `Err` early — the cold path. There are no exceptions; an error is an ordinary value that travels back through `?`. When `main` returns `Result`, a non-zero exit code is produced from an `Err` automatically.
 
-`Option<T>` is the same idea for "maybe absent," with no null:
+`Option<T>` is the same idea for "maybe absent," with no null. A function that might not have an answer returns `Option`:
 
 ```align
-first := items.first()      // Option<T>
-n := first else 0           // unwrap with a default
+fn safe_div(a: i64, b: i64) -> Option<i64> {
+    if b == 0 {
+        return None
+    }
+    return Some(a / b)
+}
+
+// at the call site, unwrap with a default using `else`:
+n := safe_div(10, 2) else 0     // n == 5
+z := safe_div(10, 0) else 0     // z == 0  (None → the default)
 ```
 
 ## Functions

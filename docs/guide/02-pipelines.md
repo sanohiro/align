@@ -16,7 +16,7 @@ Read left to right: take `prices`, apply `with_tax` to each, keep the ones where
 - `where(p)` — keep elements matching a predicate. (`where(.active)` keeps rows whose `active` field is true.)
 - `.field` — project a field out of each struct.
 - `reduce(init, f)` / `sum()` — collapse to a single value. A pipeline ends in a reduction.
-- `scan`, `filter`, `chunks` — the wider family (see the spec for the full set).
+- `chunks`, `partition` — the wider family (with more, like `sort` and `scan`, arriving as the language grows; see the spec for the current set).
 
 ## Why this is fast
 
@@ -39,7 +39,7 @@ fn main() -> i32 {
     ]
     total := items.where(.active).price.map(with_tax).sum()
     // (100.0 + 200.0) * 1.08 = 324.0
-    print_f64(total)
+    print(total)
     return 0
 }
 ```

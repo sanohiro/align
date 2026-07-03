@@ -16,7 +16,7 @@ Align prefers convergence over expressiveness. One error model (`Result<T, E>` +
 
 ## Data-oriented at the core
 
-The center of Align is not the object — it is the array. Real programs spend their time walking over collections of data: transforming, filtering, summing. Align makes that the natural thing to write, and lowers it to tight, cache-friendly, SIMD-friendly machine code. You write `prices.map(withTax).where(inStock).sum()`; the compiler fuses it into one loop with no intermediate arrays. The speed comes from ordinary code lowering well, not from hand-written intrinsics.
+The center of Align is not the object — it is the array. Real programs spend their time walking over collections of data: transforming, filtering, summing. Align makes that the natural thing to write, and lowers it to tight, cache-friendly, SIMD-friendly machine code. You write `prices.map(with_tax).where(in_stock).sum()`; the compiler fuses it into one loop with no intermediate arrays. The speed comes from ordinary code lowering well, not from hand-written intrinsics.
 
 ## What this means when you write Align
 
