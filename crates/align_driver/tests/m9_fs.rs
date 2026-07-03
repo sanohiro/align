@@ -259,8 +259,15 @@ fn read_file_view_multi_page() {
     if !backend_available() {
         return;
     }
-    // 100 KiB of a repeating pattern — well over a 4 KiB page.
-    let content: Vec<u8> = (0..100 * 1024).map(|i| (i % 251) as u8).collect();
+    // > 100 KiB of valid multibyte UTF-8 (well over a 4 KiB page) — `read_file_view` returns a `str`,
+    // so the content must be valid UTF-8 (draft §7/§12); binary reads use `reader.read(buffer)`. Whole
+    // units are appended (never a truncated multibyte char), so the buffer stays well-formed.
+    let unit = "café 日本語 test 😀 multi-page line\n";
+    let mut text = String::new();
+    while text.len() < 100 * 1024 {
+        text.push_str(unit);
+    }
+    let content = text.into_bytes();
     let src = TempFile::new("view-big", &content);
     let dst = TempFile::out("view-big-out");
     let prog = "\

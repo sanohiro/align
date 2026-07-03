@@ -1748,6 +1748,8 @@ fs.remove(path: str) -> Result<(), Error>
 fs.read_dir(path: str) -> Result<array<string>, Error>   // v1: owned strings
 ```
 
+Any read that yields a `str`/`string` (`read_file`, `read_file_view`, and a decoded `str` from `json.decode`) validates the bytes as UTF-8 — `str` is always valid UTF-8 (§7, §12), so non-UTF-8 content fails with `Error.Invalid`; read binary with `reader.read(buffer)` instead, since `bytes`/`buffer` carry no UTF-8 invariant. For the same reason `read_dir` **excludes** any directory entry whose name is not valid UTF-8 (it cannot be a `string`, and is unreachable through a `str` path regardless).
+
 ### std.path
 
 ```text
