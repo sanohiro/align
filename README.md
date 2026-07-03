@@ -1,32 +1,44 @@
 # Align
 
-Align is an AOT-compiled, data-oriented programming language designed to align
-human intent, AI generation, compiler optimization, and modern hardware.
+Align is an AOT-compiled, data-oriented programming language. It aligns four readers at once — the **human** who writes the code, the **AI** that generates it, the **compiler** that optimizes it, and the **hardware** that runs it.
 
-> Less code. Predictable performance.
+> Less code. Predictable performance. Nothing hidden.
 
-This is an early-stage project. The design lives in `draft.md` + `docs/`; the
-compiler (`alignc`) is being implemented in Rust under `crates/`.
+This is an early-stage project. The authoritative design lives in `draft.md` + `docs/`; the compiler (`alignc`) is being implemented in Rust under `crates/`.
 
-## Status
+## Why Align
 
-Milestones **M0–M5** are complete and **M6–M8 are well underway**: programs
-flow end to end through `lexer → parser → sema → MIR → LLVM → executable`.
-M1 adds functions and calls, `if`/comparisons/`bool`, `mut` reassignment,
-structs (declaration, literal, field access), the full primitive set
-(`i8..u64`, `f32`/`f64`, `char`), and a builtin `print`. M2 adds `Option<T>`
-with `else`-unwrap, `Result<T, E>` with `?`, and a `Result`-returning `main`
-(mapped to an exit code). M3 adds the memory model: `arena {}` regions with
-bulk free, the heap box `box<T>`, and move / use-after-move / arena-escape
-checking. M4 (array-processing core) adds arrays/slices and fused pipelines
-(`map`/`where`/`reduce`/`scan`/`sort`/`partition`/`to_array`) lowered to a
-single loop with no intermediate arrays. M5 adds strings (`str`/`string`/
-builder), `template`, and `json.encode`/`decode`, on a borrow-region + owned-
-heap memory model (v2). Beyond the core: **M6** SIMD (`vecN<T>`/`mask`, `dot`,
-horizontal reductions) and cache-optimal `soa<T>` + columnar `group_by`;
-**M7** `par_map`/`chunks` + inferred purity + first-class closures +
-`task_group`/`spawn`/`wait()?` on real threads (only fully-escaping fn values
-stay deferred); **M8** `unsafe {}` + `raw.*` and `extern "C"` FFI v1, plus the first lints.
+- **Data-oriented core.** Arrays and slices are the center of the language. You write `prices.map(with_tax).where(in_stock).sum()` and the compiler fuses it into one loop with no intermediate arrays — cache- and SIMD-friendly, because ordinary code lowers well.
+- **Nothing hidden.** Allocation, errors, effects, and parallelism are always visible in the source. No hidden copies, no exceptions, no threads spawned behind your back.
+- **One way to do things.** One error model (`Result` + `?`), one optional model (`Option`, no null), one ownership model (value / `arena` / heap), one parallel model (`map` / `reduce` / `task_group`).
+- **No manual memory, no GC.** Ownership is a property of the type; lifetimes are inferred as regions, never written. You choose *where* data lives — a value, an `arena`, or the heap — and the compiler inserts the cleanup.
+
+## A taste
+
+```align
+Item { price: f64, active: bool }
+
+fn with_tax(p: f64) -> f64 = p * 1.08
+
+fn main() -> i32 {
+    items := [
+        Item { price: 100.0, active: true },
+        Item { price: 50.0,  active: false },
+        Item { price: 200.0, active: true },
+    ]
+    total := items.where(.active).price.map(with_tax).sum()  // one fused loop, no temporaries
+    print(total)                                             // 324.0
+    return 0
+}
+```
+
+## Learn Align
+
+New to the language? Start with the guide — a hands-on introduction to thinking and writing in Align:
+
+**[Tutorial (English)](docs/guide/README.md)** · **[チュートリアル(日本語)](docs/guide/ja/README.md)**
+
+## Build & run
 
 ```sh
 cargo build
@@ -37,31 +49,22 @@ cargo run --bin alignc -- run examples/pipeline.align  # fused map/where/sum; ex
 
 `alignc` subcommands: `check`, `emit-mir`, `emit-llvm`, `build`, `run`.
 
+**Requirements:** Rust (stable), LLVM 19 (`llvm-config` on `PATH`), and a C compiler (`cc`) for linking.
+
+## Status
+
+Early-stage, but the pipeline runs end to end (`lexer → parser → sema → MIR → LLVM → native`): functions and control flow, structs, the full primitive set, `Option`/`Result` with `?`, `arena`/`box` with move & escape checking, fused array pipelines, strings + `json`, SIMD (`vecN`/`soa`/`group_by`), `par_map`/`task_group` on real threads, `unsafe`/FFI, and a growing std library (`io`/`fs`/`path`/`env`/`time`/`encoding`/`rand`). See `docs/impl/07-roadmap.md` for the milestone detail.
+
 ## Performance & portability
 
-Align targets the cloud/container reality of *build once, run on a varied fleet*. The default build
-uses a **safe, portable per-architecture baseline** (`x86-64-v2` on amd64, `armv8-a`/NEON on arm64),
-so one binary runs across mixed Intel/AMD/Graviton and feature-masked hosts. More aggressive targets
-are **opt-in, never the default** (`--target-cpu native` for a source build on the host you run on,
-or `--target-cpu x86-64-v3` — a portable AVX2/FMA tier, the recommended "fast" build for a server
-fleet you control). Wide SIMD on a varied fleet comes from **runtime
-CPU-feature dispatch in the library** (one binary picks AVX2/NEON at run time, falling back safely) —
-not from a fixed high baseline. See `draft.md` §3.4 and `docs/open-questions.md` ("Build targets &
-portability"). The default build now targets that portable baseline (`x86-64-v2` on amd64, the
-`armv8-a` floor on arm64); `alignc build|run … --target-cpu native` opts into the build host's exact
-CPU. *(The codegen baseline + opt-in is in place; library runtime-dispatched SIMD still lands with the
-std/runtime layer — the current backend builds scalar IR and leans on LLVM `-O2` autovectorization.)*
-
-## Requirements
-
-- Rust (stable)
-- LLVM 19 (`llvm-config` on `PATH`), a C compiler (`cc`) for linking
+The default build uses a **safe, portable per-architecture baseline** (`x86-64-v2` on amd64, `armv8-a`/NEON on arm64), so one binary runs across a mixed cloud fleet. Aggressive targets are **opt-in, never the default** — `--target-cpu native` for a host-specific build, or the portable AVX2/FMA tier `x86-64-v3`. Wide SIMD across a varied fleet is meant to come from runtime CPU-feature dispatch in the library, not a raised baseline. See `draft.md` §3.4 and `docs/open-questions.md` ("Build targets & portability").
 
 ## Layout
 
 - `draft.md` — authoritative language specification
+- `docs/guide/` — hands-on tutorial (English + 日本語)
 - `docs/` — design rationale, history, non-goals, open questions
-- `docs/impl/` — compiler implementation plan (stages, MIR, backend, roadmap)
+- `docs/impl/` — compiler implementation plan + std module design specs
 - `crates/` — the `alignc` compiler workspace
 
 ## License
