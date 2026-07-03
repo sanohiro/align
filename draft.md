@@ -1660,37 +1660,89 @@ std.crypto
 std.http
 ```
 
+### I/O design principles
+
+`std.io` / `std.fs` / `std.path` / `std.env` / `std.time` (M9) are built on four rules:
+
+- **One concrete type, not a trait.** Align has no traits/comptime polymorphism, so `reader` and
+  `writer` are concrete, builtin **Move** types — each owns exactly one fd, and `Drop` closes it.
+  The polymorphism lives in how one is *constructed* (`fs.open`, `io.stdin`, `io.stdout.buffered()`,
+  …), not in the type: one type, many constructors — "one way."
+- **Read = view or explicit owned; write = sink.** A read fills a caller-owned `mut buffer` (no
+  hidden allocation) or, for a whole file, returns an explicit owned value. A write always appends
+  into a sink (`writer` / `builder`) — never a hidden allocate-and-return.
+- **Mechanism may be hidden; cost class may not.** Which syscall serves a read/write/copy is an
+  implementation choice, not a language contract — hiding the *mechanism* doesn't violate "nothing
+  hidden" (that principle governs allocation / errors / effects / parallelism / `unsafe`, not
+  syscall selection). What must stay visible **in the spec** is the **cost class**: `io.copy` is
+  documented `O(buffer)` memory, never `O(file size)`.
+- **Implementation follows the `core.json` precedent.** Each of these modules is Rust runtime
+  (`align_rt_*`) + sema builtin dispatch + a required `import`, exactly like `core.json` — not yet
+  Align-over-FFI library code. "`std` as a real library" stays a Future item (`docs/open-questions.md`
+  "Transparent zero-copy I/O"), not this milestone's job.
+
+### Error mapping (all of std)
+
+Every `std` fn returns `Result<T, Error>` (the builtin `Error` sum type, §5/`open-questions.md`
+"Error type design"). A failing syscall maps its `errno` through **one fixed table**, the same
+everywhere — not a per-module ad hoc mapping ("one way"):
+
+```text
+ENOENT           -> Error.NotFound
+EACCES, EPERM    -> Error.Denied
+EINVAL           -> Error.Invalid
+(anything else)  -> Error.Code(errno)
+```
+
 ### std.io
 
 ```text
 reader
 writer
-stream
-stdin
-stdout
-stderr
+stream    // surface not yet specified
 ```
+
+```text
+io.stdin                    -> reader
+io.stdout                   -> writer
+io.stderr                   -> writer
+io.stdout.buffered()        -> writer   // buffering is a writer, not a separate type — "one way"
+r.read(b: mut buffer)       -> Result<i64, Error>   // fills b up to its capacity, overwrites b's len;
+                                                     // returns bytes read, 0 = EOF
+w.write(x: str | bytes | builder) -> Result<(), Error>
+w.flush()                   -> Result<(), Error>
+io.copy(r: reader, w: writer) -> Result<i64, Error>   // returns bytes transferred; memory is always
+                                                       // O(buffer), never O(file size)
+```
+
+`reader`/`writer` are the concrete Move types from "I/O design principles" above. `io.copy`
+dispatches on fd kind internally (a portable fixed-buffer loop is the v1 / reference
+implementation; a `sendfile`/`splice`/mmap fast path may follow, validated against that loop,
+without changing this signature — `docs/open-questions.md` "Transparent zero-copy I/O").
 
 ### std.fs
 
 ```text
-read_file
-write_file
-open
-create
-remove
-exists
-read_dir
+fs.read_file(path: str)      -> Result<string, Error>
+fs.read_file_view(path: str) -> Result<str, Error>
+  // an mmap view: requires an enclosing arena — the region is bound to the arena, munmap runs at
+  // arena end (the same shape as M3's heap.new requiring an arena). Escapes the region via .clone().
+fs.write_file(path: str, data: str | bytes | builder) -> Result<(), Error>
+fs.open(path: str)   -> Result<reader, Error>
+fs.create(path: str) -> Result<writer, Error>
+fs.exists(path: str) -> bool
+fs.remove(path: str) -> Result<(), Error>
+fs.read_dir(path: str) -> Result<array<string>, Error>   // v1: owned strings
 ```
 
 ### std.path
 
 ```text
-join
-base
-dir
-ext
-normalize
+path.join(a: str, b: str) -> string
+path.base(p: str) -> str   // zero-copy substring view of p — the existing str-view region rule
+path.dir(p: str)  -> str   // ditto
+path.ext(p: str)  -> str   // ditto
+path.normalize(p: str) -> string
 ```
 
 ### std.process
@@ -1704,19 +1756,22 @@ exit
 ### std.env
 
 ```text
-args
-get
-set
+env.get(name: str) -> Option<string>
+env.set(name: str, value: str) -> Result<(), Error>
 ```
+
+`args` is deliberately **not** here: `main(args: array<str>)` (§17/§19) is the one way to reach
+argv — there is no `env.args`.
 
 ### std.time
 
 ```text
-now
-instant
-duration
-sleep
+time.now()      -> i64   // wall clock, UNIX epoch nanoseconds
+time.instant()  -> i64   // monotonic nanoseconds
+time.sleep(ns: i64)
 ```
+
+One duration representation, an `i64` nanosecond count — there is no `Duration` type ("one way").
 
 ### std.net
 

@@ -2044,6 +2044,26 @@ two-tier SIMD positioning, the string-concatenation/literal-default/short-circui
 folded into the Settled/Open/Future entries above, and were also landed the same day in
 `draft.md`/`docs/impl/*` (see those files' history, not duplicated here) and in `HANDOFF.md`.
 
+### M9 std design (2026-07-03)
+
+Settled ahead of any `std.io`/`std.fs`/`std.path`/`std.env`/`std.time` implementation
+(`impl/07-roadmap.md` M9; full API shape in `draft.md` §18.2):
+
+1. **`reader`/`writer` are concrete, builtin Move types (own an fd, `Drop` closes it) — not a
+   trait.** Align has no traits/comptime, so "one type, many constructors" (`fs.open`, `io.stdin`,
+   `io.stdout.buffered()`) is the only way to get polymorphism without a second mechanism.
+2. **Time is one `i64` nanosecond timeline — no `Duration` type.** `time.now()`/`time.instant()`/
+   `time.sleep(ns)` all take/return a plain `i64`; one representation, one way.
+3. **One fixed errno→`Error` mapping table, shared by every `std` fn.** `ENOENT`→`NotFound`,
+   `EACCES`/`EPERM`→`Denied`, `EINVAL`→`Invalid`, else `Code(errno)` — a per-module ad hoc mapping
+   would be a second error-translation mechanism.
+4. **A view-returning std fn (`fs.read_file_view`, `path.base`/`dir`/`ext`) requires an enclosing
+   arena; escaping the view is `.clone()`.** Same region rule as M3's `heap.new` requiring an arena
+   — one escape/region mechanism for the whole language, not a new one for I/O views.
+5. **Implementation stays the `core.json` pattern: Rust runtime `align_rt_*` + sema builtin
+   dispatch + required `import`.** "`std` as a real Align-over-FFI library" remains a Future item —
+   not reopened for M9.
+
 ---
 
 ## Open (to be decided)
@@ -2402,6 +2422,11 @@ buffers are caller-owned (arena), so a zero-copy path drops in without an API ch
 Placement: `std.io` (OS boundary, `draft.md` §18.2), implemented in the Rust runtime
 with a portable fallback; cross-platform mmap via a crate (e.g. `memmap2`). Revisit
 around the string/JSON milestone (M5) and std build-out.
+
+**Status update (2026-07-03, M9 std design):** the v1/reference portable fixed-buffer loop for
+`io.copy` is scheduled as `impl/07-roadmap.md` M9 Slice 2 (memory-bounded, `O(buffer)`, tested).
+The fast paths above (`sendfile`/`splice`/mmap/`io_uring`/Direct I/O) stay **post-M9**, added later
+without an `io.copy` signature change.
 
 ### Fast startup (non-functional goal)
 

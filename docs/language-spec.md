@@ -436,6 +436,21 @@ std.crypto
 std.http
 ```
 
+`std.io`: concrete builtin **Move** `reader`/`writer` types (own an fd, `Drop` closes it) — one
+type, many constructors (`fs.open`, `io.stdin`, `io.stdout.buffered()`), not a trait. `io.stdout`/
+`io.stderr` are `writer`; `io.stdout.buffered()` unifies buffering into `writer` rather than a
+separate type. `r.read(b: mut buffer) -> Result<i64, Error>` fills `b` up to its capacity (0 =
+EOF); `w.write(str|bytes|builder)` / `w.flush()`; `io.copy(r, w) -> Result<i64, Error>` is always
+`O(buffer)` memory (a portable fixed-buffer loop is the v1/reference; a `sendfile`/`splice`/mmap
+fast path may follow without an API change). `std.fs`: `read_file`/`write_file`/`open`/`create`/
+`exists`/`remove`/`read_dir`, plus `read_file_view` (an mmap view — requires an enclosing arena,
+escapes via `.clone()`). `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
+substring views). `std.env`: `get`/`set` only — `args` comes solely from `main(args: array<str>)`,
+there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no `Duration` type — `now()`
+(wall), `instant()` (monotonic), `sleep(ns)`. Every `std` fn returns `Result<T, Error>`; a failing
+syscall maps through one fixed errno table (`ENOENT`→`NotFound`, `EACCES`/`EPERM`→`Denied`,
+`EINVAL`→`Invalid`, else `Code(errno)`). (`draft.md` §18.2, M9.)
+
 ## Packages
 
 ```text
