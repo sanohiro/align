@@ -922,6 +922,38 @@ fn build_module<'c>(
         "utf8_valid".to_string(),
         module.add_function("align_rt_utf8_valid", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
     );
+    // `std.rand` — the `rng` state is always passed by pointer to its `[4 x i64]` slot (mutated in
+    // place). `seed_with(out, s)` / `seed_os(out)` initialize it; `next`/`range` advance + return an
+    // i64; `shuffle`/`sample` take the slice `{ptr,len}` split into a raw pointer + length + element
+    // size. `sample` returns a fresh owned `array<T>` `{ptr,len}`.
+    funcs.insert(
+        "rng_seed_with".to_string(),
+        module.add_function("align_rt_rng_seed_with", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "rng_seed_os".to_string(),
+        module.add_function("align_rt_rng_seed_os", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "rng_next".to_string(),
+        module.add_function("align_rt_rng_next", i64t2.fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "rng_range".to_string(),
+        module.add_function("align_rt_rng_range", i64t2.fn_type(&[ptr.into(), i64t2.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "rng_shuffle".to_string(),
+        module.add_function("align_rt_rng_shuffle", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "rng_sample".to_string(),
+        module.add_function(
+            "align_rt_rng_sample",
+            slice_struct_type(ctx).fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into(), i64t2.into()], false),
+            None,
+        ),
+    );
     // `core.string` trims → a borrowed sub-`str` `{ptr,len}` of the receiver (no allocation).
     for (key, sym) in [
         ("str_trim", "align_rt_str_trim"),
@@ -1373,8 +1405,17 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
         Ty::Mask(_, n) => ctx.bool_type().vec_type(n).into(),
+        // `rng` — the 256-bit Xoshiro256++ state as `[4 x i64]` (a Copy by-value aggregate).
+        Ty::Rng => rng_llvm_type(ctx),
         _ => int_type(ctx, ty).into(),
     }
+}
+
+/// The LLVM type of an `rng` value — the Xoshiro256++ state, `[4 x i64]`. A Copy by-value
+/// aggregate (passed/returned in memory per SysV, which LLVM handles); the runtime mutates it
+/// through a pointer to its slot.
+fn rng_llvm_type<'c>(ctx: &'c Context) -> BasicTypeEnum<'c> {
+    ctx.i64_type().array_type(4).into()
 }
 
 /// The LLVM vector type `<N x T>` for a `vecN<T>` value (M6). `elem` is a numeric scalar `Ty`
@@ -4279,6 +4320,63 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("utf8_valid returns i32")
             }
+            // std.rand — the rng state is passed by pointer to its slot (mutated in place).
+            // `seed*` writes into `out`; `next`/`range` advance and return an i64; `shuffle`
+            // rearranges a slice in place; `sample` returns a fresh owned `array<T>` `{ptr,len}`.
+            Rvalue::RandSeed { seed, out } => {
+                let out_ptr = self.slots[out];
+                match seed {
+                    Some(s) => {
+                        let sv = self.operand(s);
+                        self.builder
+                            .build_call(self.funcs["rng_seed_with"], &[out_ptr.into(), sv.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    }
+                    None => {
+                        self.builder
+                            .build_call(self.funcs["rng_seed_os"], &[out_ptr.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    }
+                }
+                return Ok(None);
+            }
+            Rvalue::RandNext { rng } => {
+                let rng_ptr = self.slots[rng];
+                self.builder
+                    .build_call(self.funcs["rng_next"], &[rng_ptr.into()], "rnext")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("rng_next returns i64")
+            }
+            Rvalue::RandRange { rng, lo, hi } => {
+                let rng_ptr = self.slots[rng];
+                let lo = self.operand(lo);
+                let hi = self.operand(hi);
+                self.builder
+                    .build_call(self.funcs["rng_range"], &[rng_ptr.into(), lo.into(), hi.into()], "rrange")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("rng_range returns i64")
+            }
+            Rvalue::RandShuffle { rng, xs, elem } => {
+                let rng_ptr = self.slots[rng];
+                let (xp, xl) = self.split_str(xs)?;
+                let esz = scalar_bytes(align_sema::ty_to_scalar(*elem).expect("shuffle element is a scalar"));
+                let esz = self.ctx.i64_type().const_int(esz, false);
+                self.builder
+                    .build_call(self.funcs["rng_shuffle"], &[rng_ptr.into(), xp.into(), xl.into(), esz.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::RandSample { rng, xs, k, elem } => {
+                let rng_ptr = self.slots[rng];
+                let (xp, xl) = self.split_str(xs)?;
+                let kv = self.operand(k);
+                let esz = scalar_bytes(align_sema::ty_to_scalar(*elem).expect("sample element is a scalar"));
+                let esz = self.ctx.i64_type().const_int(esz, false);
+                self.builder
+                    .build_call(self.funcs["rng_sample"], &[rng_ptr.into(), xp.into(), xl.into(), kv.into(), esz.into()], "rsample")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("rng_sample returns a {ptr,len}")
+            }
             // env.get — write the owned value {ptr,len} into `out`, return an i32 present flag.
             Rvalue::EnvGet { name, out } => {
                 let out_ptr = self.slots[out];
@@ -4579,6 +4677,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
             Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(self.ctx).into(),
             Ty::DictEncoded(..) => dictenc_struct_type(self.ctx).into(),
+            // `rng` — the Xoshiro256++ state, `[4 x i64]` (a Copy by-value aggregate).
+            Ty::Rng => rng_llvm_type(self.ctx),
             _ => scalar_type(self.ctx, ty, self.struct_types, self.enum_types),
         }
     }

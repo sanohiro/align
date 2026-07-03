@@ -724,6 +724,29 @@ pub enum ExprKind {
     /// [`crate::Ty::Bool`]). A thin wrapper over the shared UTF-8 validator, for checking `bytes`
     /// before turning them into a `str`. Pure; `data` is borrowed.
     Utf8Valid { data: Box<Expr> },
+    /// `rand.seed()` — a fresh [`crate::Ty::Rng`] seeded from the OS CSPRNG (`getrandom`). The `ty`
+    /// is [`crate::Ty::Rng`], a **Copy** state-only value (no fd/ownership). Impure (reads OS
+    /// entropy — a different sequence each run).
+    RandSeed,
+    /// `rand.seed_with(s)` — a deterministic [`crate::Ty::Rng`] seeded from the `i64` `s` (same seed
+    /// → same sequence). The `ty` is [`crate::Ty::Rng`]. Impure (it produces mutable RNG state; a
+    /// closure that seeds/advances an rng is never `Pure`, so it stays out of `par_map`).
+    RandSeedWith { seed: Box<Expr> },
+    /// `r.next()` — advance the rng state (Xoshiro256++) and return the next `i64`. `rng` is a bound
+    /// **mut** local (the receiver, an [`ExprKind::Local`]); the state is updated in place. The `ty`
+    /// is `i64`. Impure (mutates the receiver state).
+    RandNext { rng: Box<Expr> },
+    /// `r.range(lo, hi)` — a uniform `i64` in `[lo, hi)` (bias-free, Lemire nearly-divisionless);
+    /// `lo >= hi` aborts at runtime. `rng` is a bound mut local. The `ty` is `i64`. Impure.
+    RandRange { rng: Box<Expr>, lo: Box<Expr>, hi: Box<Expr> },
+    /// `r.shuffle(out xs)` — Fisher-Yates shuffle of the writable slice `xs` (`slice<T>`) in place.
+    /// `rng` is a bound mut local; `xs` is a mut/`out` slice place. The `ty` is [`crate::Ty::Unit`].
+    /// Impure (mutates both the rng state and the slice contents).
+    RandShuffle { rng: Box<Expr>, xs: Box<Expr>, elem: crate::Ty },
+    /// `r.sample(xs, k)` — `k` elements drawn from `xs` (`slice<T>`) without replacement, as a fresh
+    /// owned `array<T>` (`ty` = [`crate::Ty::DynArray`]); `k < 0` or `k > xs.len()` aborts at
+    /// runtime. `rng` is a bound mut local. Impure.
+    RandSample { rng: Box<Expr>, xs: Box<Expr>, k: Box<Expr>, elem: crate::Ty },
 }
 
 /// Which `std.encoding` transform an [`ExprKind::EncodingEncode`] / [`ExprKind::EncodingDecode`]

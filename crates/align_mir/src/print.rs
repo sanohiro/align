@@ -430,6 +430,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::EncodingEncode { kind, data } => format!("encode_{kind:?}({})", operand_str(data)),
         Rvalue::EncodingDecode { kind, input, out } => format!("decode_{kind:?}({}, -> _{out})", operand_str(input)),
         Rvalue::Utf8Valid { data } => format!("utf8_valid({})", operand_str(data)),
+        Rvalue::RandSeed { seed: Some(s), out } => format!("rng_seed_with({}, -> _{out})", operand_str(s)),
+        Rvalue::RandSeed { seed: None, out } => format!("rng_seed_os(-> _{out})"),
+        Rvalue::RandNext { rng } => format!("rng_next(_{rng})"),
+        Rvalue::RandRange { rng, lo, hi } => format!("rng_range(_{rng}, {}, {})", operand_str(lo), operand_str(hi)),
+        Rvalue::RandShuffle { rng, xs, .. } => format!("rng_shuffle(_{rng}, {})", operand_str(xs)),
+        Rvalue::RandSample { rng, xs, k, .. } => format!("rng_sample(_{rng}, {}, {})", operand_str(xs), operand_str(k)),
     }
 }
 

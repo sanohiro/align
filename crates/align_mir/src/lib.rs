@@ -554,6 +554,23 @@ pub enum Rvalue {
     /// `encoding.utf8_valid(b)` — whether the byte view `b` (`{ptr,len}`) is valid UTF-8, an `i32`
     /// used directly as a `bool` (`1`/`0`). Pure.
     Utf8Valid { data: Operand },
+    /// `rand.seed()` / `rand.seed_with(s)` — initialize an `rng` (four `i64`s, Xoshiro256++) into the
+    /// slot `out`. `seed` is `None` for the OS-seeded form (`getrandom`), `Some(s)` for the
+    /// deterministic form. Yields no value (the caller `Load`s `out` for the `rng` aggregate).
+    RandSeed { seed: Option<Operand>, out: Slot },
+    /// `r.next()` — advance the rng in slot `rng` (in place, by pointer) and return the next `i64`.
+    RandNext { rng: Slot },
+    /// `r.range(lo, hi)` — a uniform `i64` in `[lo, hi)` from the rng in slot `rng` (advanced in
+    /// place); `lo >= hi` aborts at runtime.
+    RandRange { rng: Slot, lo: Operand, hi: Operand },
+    /// `r.shuffle(out xs)` — Fisher-Yates the slice `xs` (`{ptr,len}`) in place, using (and
+    /// advancing) the rng in slot `rng`. `elem` sizes each element (byte swaps). Yields no value.
+    RandShuffle { rng: Slot, xs: Operand, elem: Ty },
+    /// `r.sample(xs, k)` — draw `k` elements of `xs` (`{ptr,len}`) without replacement into a fresh
+    /// owned `array<T>`, returned by value as a `{ptr,len}` (freed by the bound local's `Drop`).
+    /// Uses/advances the rng in slot `rng`; `k < 0` or `k > len` aborts at runtime. `elem` sizes each
+    /// element.
+    RandSample { rng: Slot, xs: Operand, k: Operand, elem: Ty },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -1024,6 +1041,16 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
             b.push(Stmt::NullStructField(*root, path[0]));
         }
         _ => {}
+    }
+}
+
+/// The slot backing an `rng` method receiver. Sema requires the receiver to be a bound **mut**
+/// local, so its HIR is an [`hir::ExprKind::Local`] whose id is exactly the state slot the runtime
+/// mutates in place (locals map 1:1 to slots). Any other shape is a sema bug.
+fn rng_slot(rng: &hir::Expr) -> Slot {
+    match &rng.kind {
+        hir::ExprKind::Local(id) => *id,
+        _ => unreachable!("an rng method receiver is a bound mut local (sema-checked)"),
     }
 }
 
@@ -1501,6 +1528,55 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(c, Rvalue::Utf8Valid { data: d }));
             let v = b.fresh_value(Ty::Bool);
             b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
+            Operand::Value(v)
+        }
+        // `rand.seed()` / `rand.seed_with(s)` → initialize the `rng` state into a temp slot (the
+        // runtime writes through the pointer), then load the `[4 x i64]` aggregate as the value.
+        hir::ExprKind::RandSeed | hir::ExprKind::RandSeedWith { .. } => {
+            let seed = match &e.kind {
+                hir::ExprKind::RandSeedWith { seed } => Some(lower_expr(b, seed)),
+                _ => None,
+            };
+            let out = b.new_slot(Ty::Rng);
+            let dummy = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(dummy, Rvalue::RandSeed { seed, out }));
+            let v = b.fresh_value(Ty::Rng);
+            b.push(Stmt::Let(v, Rvalue::Load(out)));
+            Operand::Value(v)
+        }
+        // `r.next()` — the receiver is a bound mut local (sema-checked); its slot id *is* the rng
+        // state, mutated in place by the runtime through a pointer.
+        hir::ExprKind::RandNext { rng } => {
+            let slot = rng_slot(rng);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::RandNext { rng: slot }));
+            Operand::Value(v)
+        }
+        // `r.range(lo, hi)` — advance the rng, return a uniform i64 in `[lo, hi)`.
+        hir::ExprKind::RandRange { rng, lo, hi } => {
+            let slot = rng_slot(rng);
+            let lo = lower_expr(b, lo);
+            let hi = lower_expr(b, hi);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::RandRange { rng: slot, lo, hi }));
+            Operand::Value(v)
+        }
+        // `r.shuffle(out xs)` — Fisher-Yates the slice in place; no value.
+        hir::ExprKind::RandShuffle { rng, xs, elem } => {
+            let slot = rng_slot(rng);
+            let xv = lower_expr(b, xs);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::RandShuffle { rng: slot, xs: xv, elem: *elem }));
+            Operand::Const(Const::Unit)
+        }
+        // `r.sample(xs, k)` → a fresh owned `array<T>` `{ptr,len}` returned by value; the bound local
+        // `Drop`-frees it. The runtime allocates + validates `k` (aborts on `k < 0` / `k > len`).
+        hir::ExprKind::RandSample { rng, xs, k, elem } => {
+            let slot = rng_slot(rng);
+            let xv = lower_expr(b, xs);
+            let kv = lower_expr(b, k);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::RandSample { rng: slot, xs: xv, k: kv, elem: *elem }));
             Operand::Value(v)
         }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
@@ -5174,6 +5250,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
+        Ty::Rng => "rng".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

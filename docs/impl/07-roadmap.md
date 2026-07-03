@@ -1263,12 +1263,26 @@ pattern: Rust runtime (`align_rt_*`) + sema builtin dispatch + required `import`
   invalid input (bad symbol / bad length / wrong alphabet / odd-length or non-hex) rejected as
   `Error.Invalid`; and `utf8_valid` positive/negative cases — `tests/m10_encoding.rs` (11) +
   `align_runtime` unit tests (7).
-- **Slice 2 — std.rand.** `rand.seed()`/`rand.seed_with(s)` producing a **Copy** `rng` value;
-  `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)`. The one new runtime primitive this
-  milestone needs: an OS-seed fn (`getrandom`/`urandom`). **Completion condition:** `seed_with` is
-  deterministic (same seed → same sequence, portable across runs); `range` is bias-free under a
-  statistical check; `shuffle` yields a permutation of the input (same multiset, Fisher-Yates); and
-  `sample` returns `k` distinct-index items.
+- **Slice 2 — std.rand — DONE.** `rand.seed()`/`rand.seed_with(s)` produce a **Copy** `rng`
+  ([`Ty::Rng`], the 256-bit Xoshiro256++ state as `[4 x i64]` — a value, not a Move handle: it owns
+  no fd, so it is passed/returned/reassigned by value and is *never* on the Move/drop/escape path);
+  `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)` take a **mut** receiver and
+  advance the state in place (the runtime mutates the slot through a pointer). All rand nodes are
+  **Impure** (seed reads OS entropy; the rest produce/advance mutable state), so an rng-using closure
+  is excluded from `par_map`. Implementation: a new `Ty::Rng` swept through every pass (Copy/`Static`
+  everywhere — `ty_is_move`/`tracks_region`/`region_of`/`null_moved_source` all leave it out) + new
+  HIR `RandSeed`/`RandSeedWith`/`RandNext`/`RandRange`/`RandShuffle`/`RandSample` + MIR `Rvalue`s +
+  `align_rt_rng_*` runtime (SplitMix64 deterministic seed / `getrandom` OS seed → **abort** on the
+  rare failure; Xoshiro256++ `next`; Lemire nearly-divisionless `range`, `lo >= hi` aborts; in-place
+  Fisher-Yates `shuffle`; partial-Fisher-Yates `sample` → a fresh owned `array<T>` (heap, `Drop`-
+  freed), `k < 0`/`k > len` aborts). `shuffle`/`sample` are element-size-generic (byte swaps /
+  copies), primitive-scalar elements. **Completion condition met:** `seed_with` deterministic +
+  portable (pinned outputs); `range` half-open `[lo, hi)` (single-value ranges exact) + reachability
+  smoke check; `shuffle` preserves the multiset (Fisher-Yates permutation); `sample` returns `k`
+  distinct items; `lo >= hi` / `k` out of range abort; `rng` is Copy (value pass / reassign);
+  `import std.rand` required — `tests/m10_rand.rs` (12) + `align_runtime` unit tests (5).
+  v1 `sample` uses an O(n) index-permutation scratch (correctness before speed); an O(k) Floyd's-
+  sample is a later optimization behind the same signature.
 - **Slice 3 — std.cli.** `cli.command`/`c.flag_bool`/`c.flag_str`/`c.flag_i64`/`c.parse`/
   `p.get_bool`/`p.get_str`/`p.get_i64`/`c.usage` — a parser over `main(args: array<str>)`'s
   `array<str>`, not a second argv source.
