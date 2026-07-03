@@ -5,7 +5,19 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-04 (main @ PR #340; M9 formally closed same day, docs-only)._
+_Last updated: 2026-07-04 (docs-only: M10 std-2 design settled)._
+
+## M10 — std (encoding / rand / cli) — design settled (2026-07-04), not yet implemented
+
+**M10 std-2 design settled: `std.encoding` / `std.rand` / `std.cli`** — all three close over
+existing mechanisms (`str`/`bytes`/`buffer`, `mut` slice, `main(args: array<str>)`'s `array<str>`)
+with zero new Move types, zero new effects, and no FFI engine; `rand.seed`'s OS-getrandom call is
+the only new runtime primitive. Full signatures in `draft.md` §18.2; slice breakdown + completion
+conditions in `docs/impl/07-roadmap.md` M10; scope rationale in `docs/open-questions.md` Settled →
+"M10 scope decision". **`std.net`/`std.http`/`std.process`/`std.compress`/`std.crypto` → explicitly
+M11+** (each needs a new Move type, an FFI engine, or an unsettled design question — recorded per-
+module in the roadmap's M10 deferral list); `process.exit`'s Drop/arena-cleanup semantics is a new
+Open item to settle when `std.process` is designed. Implementation (M10 Slices 1–3) has not started.
 
 ## M9 — std (I/O, filesystem, path, env, time) — formally closed (2026-07-04)
 

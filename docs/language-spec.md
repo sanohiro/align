@@ -451,6 +451,16 @@ there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no `Duration`
 syscall maps through one fixed errno table (`ENOENT`→`NotFound`, `EACCES`/`EPERM`→`Denied`,
 `EINVAL`→`Invalid`, else `Code(errno)`). (`draft.md` §18.2, M9.)
 
+`std.encoding`: `base64`/`base64url`/`hex` encode+decode (decode returns an owned `buffer` — no
+UTF-8 invariant on `bytes`; invalid input is `Error.Invalid`) plus `utf8_valid`. `std.rand`
+(non-cryptographic): `rand.seed()`/`seed_with(s)` produce a **Copy** `rng` value (state-only, no
+fd — unlike `reader`/`writer`); `r.next()`/`r.range(lo, hi)`/`r.shuffle(xs)`/`r.sample(xs, k)` take
+a `mut` receiver, OS-seeded via `getrandom`/`urandom`. `std.cli`: an explicit flag-registration
+builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/`c.parse`/`p.get_*`/`c.usage`) parsing
+`main(args: array<str>)`'s `array<str>` — not a second argv source. Lookups are **total** after a
+successful `parse` (every flag has a value or its default, like `json.decode`); input errors surface
+from `parse` as `Error.Invalid`. A v1 provisional pending derive. (`draft.md` §18.2, M10.)
+
 ## Packages
 
 ```text
