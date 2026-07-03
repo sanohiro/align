@@ -645,6 +645,13 @@ pub enum ExprKind {
     /// `w.flush()` — flush a `writer`'s buffered bytes to the OS, borrowing it. The `ty` is
     /// `Result<(), Error>`. Impure.
     WriterFlush { writer: Box<Expr> },
+    /// `io.copy(r: reader, w: writer)` — stream all of `r` into `w` through a fixed-size buffer
+    /// (memory is O(buffer), never O(file size)), borrowing **both** (neither consumed — the fd
+    /// ownership does not move, so `r`/`w` remain usable after the call, like `print`'s argument).
+    /// The `ty` is `Result<i64, Error>` (bytes transferred). Impure. v1 is the portable fixed-buffer
+    /// loop; `sendfile`/`splice` fast paths stay post-M9 (`open-questions.md` "Transparent
+    /// zero-copy I/O"), added without changing this node.
+    IoCopy { reader: Box<Expr>, writer: Box<Expr> },
     /// `buffer(cap)` — open an owned growable byte buffer with read window `cap` (a `str`-less byte
     /// sink for `reader.read`). The `ty` is [`crate::Ty::Buffer`] (an owned Move handle, `Drop`-freed).
     /// Pure (allocation only), like `BuilderNew`.

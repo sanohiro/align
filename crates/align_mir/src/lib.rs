@@ -492,6 +492,10 @@ pub enum Rvalue {
     WriterWriteBuilder(Operand, Operand),
     /// `w.flush()` — drain a `writer` to the OS, borrowing it. `i32` errno-status (0 = ok).
     WriterFlush(Operand),
+    /// `io.copy(r, w)` — stream all of the `reader` operand into the `writer` operand through a
+    /// fixed-size buffer (O(buffer) memory), borrowing both. Yields an `i64`: bytes transferred on
+    /// success, or `-(status)` on error (same sign convention as [`Self::ReaderRead`]).
+    IoCopy(Operand, Operand),
     /// `buffer(cap)` — open an owned byte buffer with read window `cap`, yielding an opaque handle.
     BufferNew(Operand),
     /// `b.bytes()` — a `slice<u8>` view `{ptr,len}` of the buffer's current contents (borrow).
@@ -1292,6 +1296,15 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let rop = lower_expr(b, reader);
             let bop = lower_expr(b, buffer);
             lower_reader_read(b, rop, bop, e.ty)
+        }
+        // `io.copy(r, w)` yields `Result<i64, Error>` from the runtime's i64 (bytes transferred, or
+        // `-(status)` on error) — the same sign convention (and lowering) as `reader.read`.
+        hir::ExprKind::IoCopy { reader, writer } => {
+            let rop = lower_expr(b, reader);
+            let wop = lower_expr(b, writer);
+            let n = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(n, Rvalue::IoCopy(rop, wop)));
+            lower_count_or_status_result(b, n, e.ty)
         }
         // `w.write(x)` / `w.flush()` yield `Result<(), Error>` from an i32 errno-status.
         hir::ExprKind::WriterWrite { writer, arg, builder } => {
@@ -4331,7 +4344,13 @@ fn lower_open_handle(
 fn lower_reader_read(b: &mut Builder, reader: Operand, buffer: Operand, result_ty: Ty) -> Operand {
     let n = b.fresh_value(i64_ty());
     b.push(Stmt::Let(n, Rvalue::ReaderRead(reader, buffer)));
+    lower_count_or_status_result(b, n, result_ty)
+}
 
+/// Wrap a runtime `i64` that encodes either a non-negative **count** (`Ok`) or `-(status)` on
+/// error (`Err`, the errno mapped through the fixed table) into `Result<i64, Error>`. Shared by
+/// `reader.read` and `io.copy` (identical sign convention).
+fn lower_count_or_status_result(b: &mut Builder, n: ValueId, result_ty: Ty) -> Operand {
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Ge, Operand::Value(n), Operand::Const(Const::Int(0, i64_ty())))));
     let ok_bb = b.new_block();

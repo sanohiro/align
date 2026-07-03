@@ -1,0 +1,18 @@
+module main
+
+import std.fs
+import std.io
+
+// `io.copy` (std.io Slice 2): stream a whole file from a `reader` into a `writer` in one call.
+// Memory stays O(buffer) (a fixed 64 KiB transfer buffer), never O(file size) — no matter how big
+// the file is. `io.copy` *borrows* both handles (it does not consume them, like `print`'s
+// argument), so `w` is still usable afterward — here it appends a trailing newline, then drops
+// (flush + close) at scope end. Returns the number of bytes transferred.
+pub fn main(args: array<str>) -> Result<(), Error> {
+  r := fs.open(args[1])?
+  w := fs.create(args[2])?
+  n := io.copy(r, w)?
+  w.write("\n")?
+  print(n)
+  return Ok(())
+}

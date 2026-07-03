@@ -1725,9 +1725,13 @@ without changing this signature — `docs/open-questions.md` "Transparent zero-c
 method is called on it: `w := fs.create(p)?` then `w.write(d)?`, not `fs.create(p)?.write(d)?`; `b
 := buffer(n)` then `b.bytes()`, not `buffer(n).bytes()`. An unbound owned handle never runs its
 `Drop`, which silently loses a buffered `writer`'s output, leaks a `reader`'s fd, and leaves a
-`buffer`'s `.bytes()` slice dangling. The borrowed standard streams (`io.stdin` / `io.stdout` /
-`io.stderr`, incl. `io.stdout.buffered()`) own no fd and may be chained directly. This restriction
-lifts once Move *temporaries* get a `Drop`.
+`buffer`'s `.bytes()` slice dangling. The **unbuffered** borrowed standard streams (`io.stdin` /
+`io.stdout` / `io.stderr`) own no fd and hold no buffer, so they may be used inline (chained method
+call, or passed to `io.copy`) directly. A **buffered** std writer (`io.stdout.buffered()`) is
+subject to the same rule as an owned handle: it accumulates bytes that reach the OS only on
+`flush`/`Drop`, so it must be bound to a local (`w := io.stdout.buffered()` then `w.write(d)?` /
+`io.copy(r, w)?`) — an unbound temporary would silently drop its tail chunk. This restriction lifts
+once Move *temporaries* get a `Drop`.
 
 ### std.fs
 
