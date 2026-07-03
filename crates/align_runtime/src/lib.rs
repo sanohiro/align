@@ -43,59 +43,6 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     let _ = out.write_all(b"\n").and_then(|()| out.flush());
 }
 
-/// `io.stdout.write(s)` — write the bytes of a `str` to stdout with **no** trailing newline
-/// (unlike `print`). Returns 0 on success, 1 on an I/O error. The first `std.io` surface
-/// (`06-runtime-std.md`). An empty / null `{ptr,len}` writes nothing and succeeds.
-///
-/// # Safety
-/// `ptr`/`len` must describe a valid byte range for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_io_stdout_write(ptr: *const u8, len: i64) -> i32 {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let ok = if len > 0 && !ptr.is_null() {
-        // `try_from` avoids a truncating `len as usize` (a heap OOB) on a 32-bit target; an
-        // overflow is a write failure.
-        match usize::try_from(len) {
-            Ok(n) => {
-                let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
-                out.write_all(bytes).and_then(|()| out.flush()).is_ok()
-            }
-            Err(_) => false,
-        }
-    } else {
-        // Nothing to write; still flush so ordering with other output is stable.
-        out.flush().is_ok()
-    };
-    if ok {
-        0
-    } else {
-        1
-    }
-}
-
-/// `io.stdout.write(b)` for a `builder` — write the builder's accumulated bytes to stdout (no
-/// newline), without consuming it (a borrow). Returns 0 on success, 1 on an I/O error.
-///
-/// # Safety
-/// `b` must be a valid `Builder` pointer for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_io_stdout_write_builder(b: *mut Builder) -> i32 {
-    use std::io::Write;
-    // Codegen always passes a live builder handle, but guard the raw pointer at the FFI boundary
-    // (this fn returns a status, so a null is a clean error rather than a deref UB).
-    if b.is_null() {
-        return 1;
-    }
-    let b = unsafe { &*b };
-    let mut out = std::io::stdout().lock();
-    if out.write_all(&b.buf).and_then(|()| out.flush()).is_ok() {
-        0
-    } else {
-        1
-    }
-}
-
 /// Builtin `print` for booleans: write `true`/`false` + a newline.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_print_bool(v: i32) {
@@ -3161,127 +3108,387 @@ pub unsafe extern "C" fn align_rt_builder_free(b: *mut Builder) {
     }
 }
 
-/// A buffered writer over a raw file descriptor (`io.stdout.buffered()` → fd 1,
-/// `io.stderr.buffered()` → fd 2): the sink-first fast path. Bytes accumulate in a fixed-capacity
-/// buffer and reach the fd in one `write(2)` only when the buffer fills or on an explicit `flush` /
-/// drop — so per-`write` calls do no syscall and memory stays O(buffer), not O(total output). Writes
-/// go straight to the fd, skipping the `std::io::Stdout`/`Stderr` lock + line buffer.
-pub struct BufferedWriter {
-    /// The destination file descriptor (1 = stdout, 2 = stderr). Chosen by the constructor; every
-    /// flush / large-chunk passthrough targets it.
-    fd: i32,
-    buf: Vec<u8>,
-    /// Sticky: an internal flush (on a full buffer) failed. `write` returns `()`, so the error is
-    /// latched here and surfaced by the next `flush` — matching `out.write(..); out.flush()?`.
-    err: bool,
+// ---------------------------------------------------------------------------------------------
+// std.io / std.fs — `reader` / `writer` (own an fd, `Drop` closes it) + `buffer` (owned bytes).
+// The one fixed errno→`Error` mapping table (`draft.md` §18.2): every std fn maps a failing
+// syscall's errno through `io_error_to_status`, and MIR rebuilds the builtin `Error` from the
+// returned status — see `make_error_from_status` (`align_mir`). The status encoding is shared:
+//   0            success
+//   AL_NOT_FOUND success->Error.NotFound   (ENOENT)
+//   AL_INVALID   ->Error.Invalid           (EINVAL)
+//   AL_DENIED    ->Error.Denied            (EACCES / EPERM)
+//   >= AL_CODE   ->Error.Code(status - AL_CODE)   (anything else — the raw errno)
+// The three category sentinels sit below `AL_CODE` so they never collide with an encoded errno.
+// ---------------------------------------------------------------------------------------------
+
+const AL_NOT_FOUND: i32 = 1;
+const AL_INVALID: i32 = 2;
+const AL_DENIED: i32 = 3;
+/// Base offset for `Error.Code(errno)`: an encoded status is `AL_CODE + errno`, kept above the
+/// three category sentinels so a small errno (e.g. `ESRCH` = 3) can never look like a category.
+const AL_CODE: i32 = 4;
+
+/// The one fixed errno→`Error` table (`draft.md` §18.2). Uses `std::io::ErrorKind` so the mapping
+/// is portable (the kernel errno numbers differ per platform): `NotFound`←ENOENT, `PermissionDenied`
+/// ←EACCES/EPERM, `InvalidInput`←EINVAL; anything else carries its raw errno as `Error.Code`.
+fn io_error_to_status(e: &std::io::Error) -> i32 {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => AL_NOT_FOUND,
+        ErrorKind::PermissionDenied => AL_DENIED,
+        ErrorKind::InvalidInput => AL_INVALID,
+        // `AL_CODE + errno`. `saturating_add` keeps a pathological errno from wrapping into a
+        // category sentinel; a missing errno (`None`) degrades to `Code(0)`.
+        _ => AL_CODE.saturating_add(e.raw_os_error().unwrap_or(0)),
+    }
 }
 
 /// 64 KiB — large enough to amortize the syscall over many small writes, small enough to stay in
-/// cache and bound memory.
+/// cache and bound a buffered writer's memory to O(buffer).
 const BUF_WRITER_CAP: usize = 64 * 1024;
 
-/// Write all of `bytes` to `fd`, looping over partial writes and retrying `EINTR`. Returns false on
-/// any other error. An empty slice succeeds without a syscall.
-fn write_all_fd(fd: i32, mut bytes: &[u8]) -> bool {
+/// Write all of `bytes` to `fd`, looping over partial writes and retrying `EINTR`. Returns `0` on
+/// success, else the errno mapped through [`io_error_to_status`]. An empty slice succeeds without a
+/// syscall.
+fn write_all_fd(fd: i32, mut bytes: &[u8]) -> i32 {
     while !bytes.is_empty() {
         let n = unsafe { write(fd, bytes.as_ptr() as *const core::ffi::c_void, bytes.len()) };
         if n > 0 {
             bytes = &bytes[n as usize..];
-        } else if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue; // interrupted before writing: retry
         } else {
-            return false; // error, or a 0-byte write (treat as failure rather than spin)
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue; // interrupted before writing: retry
+            }
+            // A genuine error, or a 0-byte write (treat as failure rather than spin). A 0-byte
+            // write leaves errno unset, so `io_error_to_status` yields `Code(0)` — a distinct
+            // non-success status.
+            return io_error_to_status(&e);
         }
     }
-    true
+    0
 }
 
-impl BufferedWriter {
-    /// Flush the buffer to the writer's fd, clearing it on success and latching `err` on failure.
-    fn flush_buf(&mut self) {
-        if self.buf.is_empty() {
-            return;
-        }
-        if write_all_fd(self.fd, &self.buf) {
-            self.buf.clear();
-        } else {
-            self.err = true;
-            self.buf.clear(); // drop the unwritten bytes; the latched error reports the loss
-        }
-    }
-}
-
-/// `io.stdout.buffered()` / `io.stderr.buffered()` — open a buffered writer over `fd` (1 = stdout,
-/// 2 = stderr). Freed (after a final flush) by the generated `Drop` via [`align_rt_io_buf_free`].
-#[unsafe(no_mangle)]
-pub extern "C" fn align_rt_io_buf_new(fd: i32) -> *mut BufferedWriter {
-    Box::into_raw(Box::new(BufferedWriter { fd, buf: Vec::with_capacity(BUF_WRITER_CAP), err: false }))
-}
-
-/// `w.write(s)` — append a `str`'s bytes, flushing to the writer's fd only when the buffer would
-/// overflow. A chunk larger than the whole buffer is written straight through (no buffering, no
-/// double copy). Infallible at the surface; an internal flush failure is latched and surfaces at
-/// the next `flush`.
+/// Copy a `str` view's bytes (`ptr`/`len`) into an owned UTF-8 path `String`. `None` for a
+/// length that doesn't fit `usize` (a 32-bit target) or non-UTF-8 bytes.
 ///
 /// # Safety
-/// `w` must be a valid `BufferedWriter` pointer; `ptr`/`len` must describe a valid byte range.
+/// `ptr`/`len` must describe a valid byte range when `len > 0`.
+unsafe fn path_from_view(ptr: *const u8, len: i64) -> Option<String> {
+    let bytes: &[u8] = if len <= 0 || ptr.is_null() {
+        &[]
+    } else {
+        let n = usize::try_from(len).ok()?;
+        unsafe { std::slice::from_raw_parts(ptr, n) }
+    };
+    std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+}
+
+// --- reader -----------------------------------------------------------------------------------
+
+/// A `reader` (`std.io`) — a Move handle owning a file descriptor; `Drop` (`align_rt_io_reader_free`)
+/// closes it iff `owns_fd` (a `fs.open` file, not a borrowed `io.stdin`).
+pub struct Reader {
+    fd: i32,
+    owns_fd: bool,
+}
+
+/// `io.stdin` — a `reader` over fd 0. Borrows the fd (does not close it on `Drop`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_io_buf_write(w: *mut BufferedWriter, ptr: *const u8, len: i64) {
-    if w.is_null() || len <= 0 || ptr.is_null() {
+pub extern "C" fn align_rt_io_reader_stdin() -> *mut Reader {
+    Box::into_raw(Box::new(Reader { fd: 0, owns_fd: false }))
+}
+
+/// `fs.open(path)` — open `path` (a `str` view) for reading, writing the owned `reader` handle to
+/// `out`. Returns `0` on success, else the errno mapped through [`io_error_to_status`] (leaving
+/// `*out` null). The fd is owned — `Drop` closes it.
+///
+/// # Safety
+/// `path`/`path_len` must describe a valid byte range; `out` must point to a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_reader_open(path: *const u8, path_len: i64, out: *mut *mut Reader) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+        return AL_INVALID;
+    };
+    use std::os::fd::IntoRawFd;
+    match std::fs::File::open(&path_str) {
+        Ok(f) => {
+            unsafe { *out = Box::into_raw(Box::new(Reader { fd: f.into_raw_fd(), owns_fd: true })) };
+            0
+        }
+        Err(e) => io_error_to_status(&e),
+    }
+}
+
+/// `r.read(b: mut buffer)` — read up to `b`'s capacity from the reader's fd into `b`, overwriting
+/// `b`'s length. Returns the number of bytes read (`0` = EOF) on success, or `-(status)` where
+/// `status` is the errno mapped through [`io_error_to_status`] (always `>= 1`, so an error is a
+/// distinct negative value). Retries `EINTR`.
+///
+/// # Safety
+/// `r` and `b` must be valid handles for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_reader_read(r: *mut Reader, b: *mut Buffer) -> i64 {
+    if r.is_null() || b.is_null() {
+        return -(AL_INVALID as i64);
+    }
+    let r = unsafe { &*r };
+    let b = unsafe { &mut *b };
+    if b.cap == 0 {
+        b.len = 0;
+        return 0;
+    }
+    // Ensure the backing storage spans the full capacity (read fills up to `cap`).
+    if b.data.len() != b.cap {
+        b.data.resize(b.cap, 0);
+    }
+    loop {
+        let n = unsafe { read(r.fd, b.data.as_mut_ptr() as *mut core::ffi::c_void, b.cap) };
+        if n >= 0 {
+            b.len = n as usize;
+            return n as i64;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        b.len = 0;
+        return -(io_error_to_status(&e) as i64);
+    }
+}
+
+/// Free a `reader`, closing its fd first iff owned. Null-safe (a never-initialised owned slot
+/// drops harmlessly).
+///
+/// # Safety
+/// `r` must be null or a pointer from [`align_rt_io_reader_open`] / [`align_rt_io_reader_stdin`],
+/// not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_reader_free(r: *mut Reader) {
+    if r.is_null() {
         return;
     }
-    let w = unsafe { &mut *w };
-    let Ok(n) = usize::try_from(len) else { return };
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
-    // If it won't fit in the remaining space, flush what's buffered first.
-    if w.buf.len() + n > BUF_WRITER_CAP {
-        w.flush_buf();
-        if w.err {
-            return;
+    let r = unsafe { Box::from_raw(r) };
+    if r.owns_fd {
+        unsafe { close(r.fd) };
+    }
+}
+
+// --- writer -----------------------------------------------------------------------------------
+
+/// A `writer` (`std.io`) — one Move type for every write sink (`io.stdout`, `io.stderr`,
+/// `io.stdout.buffered()`, `fs.create`): it owns an fd and, when `buffered`, an O(buffer)
+/// accumulator that reaches the fd only on a full buffer / explicit `flush` / `Drop`. `Drop`
+/// (`align_rt_io_writer_free`) flushes best-effort, then closes the fd iff `owns_fd`.
+pub struct Writer {
+    fd: i32,
+    owns_fd: bool,
+    buffered: bool,
+    buf: Vec<u8>,
+}
+
+impl Writer {
+    /// Flush the accumulator to the fd, clearing it on success. Returns the write status.
+    fn flush_buf(&mut self) -> i32 {
+        if self.buf.is_empty() {
+            return 0;
         }
-        // A chunk at least as big as the buffer would just be copied in and flushed right back
-        // out — write it straight to the fd instead.
+        let s = write_all_fd(self.fd, &self.buf);
+        self.buf.clear(); // drop bytes regardless; the status reports any loss
+        s
+    }
+}
+
+/// `io.stdout` / `io.stderr` / `io.stdout.buffered()` — a `writer` over a standard-stream fd
+/// (1 = stdout, 2 = stderr), `buffered != 0` selecting the O(buffer) accumulator. The fd is
+/// borrowed (never closed on `Drop`).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_io_writer_std(fd: i32, buffered: i32) -> *mut Writer {
+    let buffered = buffered != 0;
+    let buf = if buffered { Vec::with_capacity(BUF_WRITER_CAP) } else { Vec::new() };
+    Box::into_raw(Box::new(Writer { fd, owns_fd: false, buffered, buf }))
+}
+
+/// `fs.create(path)` — create/truncate `path` (a `str` view) for writing, writing the owned
+/// `writer` handle to `out`. Buffered (the file sink amortizes syscalls). Returns `0` on success,
+/// else the errno mapped through [`io_error_to_status`] (leaving `*out` null). The fd is owned —
+/// `Drop` flushes then closes it.
+///
+/// # Safety
+/// `path`/`path_len` must describe a valid byte range; `out` must point to a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_writer_create(path: *const u8, path_len: i64, out: *mut *mut Writer) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+        return AL_INVALID;
+    };
+    use std::os::fd::IntoRawFd;
+    match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path_str) {
+        Ok(f) => {
+            unsafe {
+                *out = Box::into_raw(Box::new(Writer {
+                    fd: f.into_raw_fd(),
+                    owns_fd: true,
+                    buffered: true,
+                    buf: Vec::with_capacity(BUF_WRITER_CAP),
+                }))
+            };
+            0
+        }
+        Err(e) => io_error_to_status(&e),
+    }
+}
+
+/// `w.write(bytes)` — append `ptr`/`len` bytes to the writer. An unbuffered writer streams straight
+/// to the fd; a buffered one accumulates, flushing when the buffer would overflow (a chunk at least
+/// the buffer's size is written straight through, no double copy). Returns `0` on success, else the
+/// errno mapped through [`io_error_to_status`].
+///
+/// # Safety
+/// `w` must be a valid `Writer` pointer; `ptr`/`len` must describe a valid byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_writer_write(w: *mut Writer, ptr: *const u8, len: i64) -> i32 {
+    if w.is_null() {
+        return AL_INVALID;
+    }
+    if len <= 0 || ptr.is_null() {
+        return 0; // nothing to write — success
+    }
+    let w = unsafe { &mut *w };
+    let Ok(n) = usize::try_from(len) else { return AL_INVALID };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
+    if !w.buffered {
+        return write_all_fd(w.fd, bytes);
+    }
+    if w.buf.len() + n > BUF_WRITER_CAP {
+        let s = w.flush_buf();
+        if s != 0 {
+            return s;
+        }
         if n >= BUF_WRITER_CAP {
-            if !write_all_fd(w.fd, bytes) {
-                w.err = true;
-            }
-            return;
+            return write_all_fd(w.fd, bytes);
         }
     }
     w.buf.extend_from_slice(bytes);
+    0
 }
 
-/// `w.flush()` — write any buffered bytes to the writer's fd. Returns 0 on success, 1 if this flush
-/// or any earlier internal flush failed (the latched error is then cleared).
+/// `w.write(b)` for a `builder` — append the builder's accumulated bytes (a borrow; the builder is
+/// not consumed). Returns the same status as [`align_rt_io_writer_write`].
 ///
 /// # Safety
-/// `w` must be a valid `BufferedWriter` pointer.
+/// `w` must be a valid `Writer`; `b` must be a valid `Builder` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_io_buf_flush(w: *mut BufferedWriter) -> i32 {
+pub unsafe extern "C" fn align_rt_io_writer_write_builder(w: *mut Writer, b: *mut Builder) -> i32 {
+    if b.is_null() {
+        return AL_INVALID;
+    }
+    let b = unsafe { &*b };
+    let (ptr, len) = (b.buf.as_ptr(), b.buf.len() as i64);
+    unsafe { align_rt_io_writer_write(w, ptr, len) }
+}
+
+/// `w.flush()` — write any buffered bytes to the fd. Returns `0` on success, else the mapped errno.
+///
+/// # Safety
+/// `w` must be a valid `Writer` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_writer_flush(w: *mut Writer) -> i32 {
     if w.is_null() {
-        return 1;
+        return AL_INVALID;
     }
-    let w = unsafe { &mut *w };
-    w.flush_buf();
-    if w.err {
-        w.err = false; // report once, then clear so the writer stays usable
-        1
-    } else {
-        0
+    unsafe { (*w).flush_buf() }
+}
+
+/// Free a `writer`, flushing any buffered bytes best-effort first (errors are not observable here —
+/// use an explicit `flush()?` to handle them), then closing the fd iff owned. Null-safe.
+///
+/// # Safety
+/// `w` must be null or a pointer from a `writer` constructor, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_writer_free(w: *mut Writer) {
+    if w.is_null() {
+        return;
+    }
+    let mut w = unsafe { Box::from_raw(w) };
+    let _ = w.flush_buf();
+    if w.owns_fd {
+        unsafe { close(w.fd) };
     }
 }
 
-/// Free a buffered stdout writer, flushing any remaining bytes best-effort first (a drop-time
-/// safety net; errors are not observable here — use an explicit `flush()?` to handle them).
-/// Null-safe, so a never-initialised owned slot drops harmlessly.
+// --- buffer -----------------------------------------------------------------------------------
+
+/// A `buffer` (`core.buffer`) — an owned, growable byte container (the byte analog of `Vec<u8>`),
+/// the caller-owned sink a `reader.read` fills. `cap` is the read window; `len` is how many bytes
+/// the last read produced (`.bytes()` views `data[..len]`). A Move type, `Drop`-freed.
+pub struct Buffer {
+    data: Vec<u8>,
+    cap: usize,
+    len: usize,
+}
+
+/// `buffer(cap)` — open an owned byte buffer whose read window is `cap` bytes (`<= 0` → empty).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
+    let requested = usize::try_from(cap).unwrap_or(0);
+    let mut data = Vec::new();
+    // `try_reserve` so a bogus/huge capacity fails softly instead of aborting on OOM. The read
+    // window is capped to what was actually reserved, so `reader.read`'s later `resize(cap)` can
+    // never trigger a new (infallible, abort-on-OOM) allocation — a huge `buffer(cap)` degrades to
+    // an empty window rather than crashing the process.
+    let cap = match data.try_reserve_exact(requested) {
+        Ok(()) => requested,
+        Err(_) => 0,
+    };
+    Box::into_raw(Box::new(Buffer { data, cap, len: 0 }))
+}
+
+/// `b.bytes()` — a `slice<u8>` view of the buffer's current contents (`data[..len]`), written to
+/// `out` as a `{ptr,len}`. The view borrows the buffer (region-tracked; must not outlive it).
 ///
 /// # Safety
-/// `w` must be null or a pointer returned by [`align_rt_io_buf_new`] and not yet freed.
+/// `b` must be a valid `Buffer`; `out` must point to a writable `{ptr,len}` slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_io_buf_free(w: *mut BufferedWriter) {
-    if !w.is_null() {
-        let mut w = unsafe { Box::from_raw(w) };
-        w.flush_buf();
+pub unsafe extern "C" fn align_rt_buffer_bytes(b: *mut Buffer, out: *mut AlignStr) {
+    if out.is_null() {
+        return;
+    }
+    if b.is_null() {
+        unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+        return;
+    }
+    let b = unsafe { &*b };
+    unsafe { *out = AlignStr { ptr: b.data.as_ptr(), len: b.len as i64 } };
+}
+
+/// `b.len()` — the number of bytes the buffer currently holds (the last read's count).
+///
+/// # Safety
+/// `b` must be a valid `Buffer` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_buffer_len(b: *mut Buffer) -> i64 {
+    if b.is_null() {
+        return 0;
+    }
+    unsafe { (*b).len as i64 }
+}
+
+/// Free a `buffer` (its heap storage). Null-safe.
+///
+/// # Safety
+/// `b` must be null or a pointer from [`align_rt_buffer_new`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_buffer_free(b: *mut Buffer) {
+    if !b.is_null() {
+        drop(unsafe { Box::from_raw(b) });
     }
 }
 
@@ -3888,9 +4095,13 @@ pub unsafe extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
     fn free(ptr: *mut core::ffi::c_void);
-    // POSIX `write(2)` — the buffered stdout writer streams straight to fd 1, bypassing the
-    // `std::io::Stdout` lock + line-buffering that `print` / `io.stdout.write` pay per call.
+    // POSIX `write(2)` — a `writer` streams straight to its fd, bypassing the `std::io::Stdout`
+    // lock + line-buffering that `print` pays per call.
     fn write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
+    // POSIX `read(2)` — a `reader` fills a caller-owned `buffer` straight from its fd.
+    fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
+    // POSIX `close(2)` — a file-backed `reader`/`writer` closes the fd it owns at `Drop`.
+    fn close(fd: i32) -> i32;
 }
 
 /// Allocate `size` bytes on the heap (C `malloc`). Returns null for `size <= 0` (an empty
@@ -3942,22 +4153,84 @@ mod tests {
     #[test]
     fn buffered_writer_accumulates_small_writes_without_flushing() {
         // Small writes stay buffered (no syscall, nothing reaches the fd): the buffer holds exactly
-        // the concatenated bytes and no error is latched, and the writer records its target fd. The
-        // flush and large-chunk pass-through paths are covered end-to-end (they necessarily touch a
-        // real fd). fd 2 (stderr) is used so the buffered bytes, if ever flushed, don't pollute the
-        // test harness's stdout.
-        let w = align_rt_io_buf_new(2);
+        // the concatenated bytes, and the writer records its target fd. The flush and large-chunk
+        // pass-through paths are covered end-to-end (they necessarily touch a real fd). fd 2
+        // (stderr) is used so the buffered bytes, if ever flushed, don't pollute the harness stdout.
+        let w = align_rt_io_writer_std(2, 1);
         for part in [&b"hello "[..], b"world", b"!"] {
-            unsafe { align_rt_io_buf_write(w, part.as_ptr(), part.len() as i64) };
+            assert_eq!(unsafe { align_rt_io_writer_write(w, part.as_ptr(), part.len() as i64) }, 0);
         }
         {
             let wr = unsafe { &mut *w };
             assert_eq!(wr.fd, 2, "writer targets the fd it was constructed with");
             assert_eq!(wr.buf, b"hello world!", "small writes accumulate, unflushed");
-            assert!(!wr.err);
             wr.buf.clear(); // so the drop-flush below emits nothing
         }
-        unsafe { align_rt_io_buf_free(w) };
+        unsafe { align_rt_io_writer_free(w) };
+    }
+
+    #[test]
+    fn errno_table_maps_categories_and_passes_through_codes() {
+        // The one fixed errno→status table (`draft.md` §18.2). `ErrorKind` drives the three
+        // categories portably; anything else carries its raw errno as `Code`.
+        use std::io::{Error, ErrorKind};
+        assert_eq!(io_error_to_status(&Error::from(ErrorKind::NotFound)), AL_NOT_FOUND);
+        assert_eq!(io_error_to_status(&Error::from(ErrorKind::PermissionDenied)), AL_DENIED);
+        assert_eq!(io_error_to_status(&Error::from(ErrorKind::InvalidInput)), AL_INVALID);
+        // A raw errno with no dedicated `ErrorKind` (EIO = 5) passes through as `Code`, encoded
+        // above the category sentinels so it can never look like one.
+        assert_eq!(io_error_to_status(&Error::from_raw_os_error(5)), AL_CODE + 5);
+    }
+
+    #[test]
+    fn reader_read_fills_buffer_and_reports_eof() {
+        // A `buffer` over a temp file: the first read fills up to capacity, the second hits EOF (0).
+        use std::io::Write;
+        let mut path = std::env::temp_dir();
+        path.push(format!("align_rt_reader_test_{}", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(b"hello").unwrap();
+        let path_bytes = path.to_str().unwrap().as_bytes();
+
+        let mut r: *mut Reader = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_reader_open(path_bytes.as_ptr(), path_bytes.len() as i64, &mut r) }, 0);
+        let b = align_rt_buffer_new(3);
+        // First read: up to 3 bytes ("hel").
+        assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 3);
+        assert_eq!(unsafe { align_rt_buffer_len(b) }, 3);
+        let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
+        unsafe { align_rt_buffer_bytes(b, &mut view) };
+        assert_eq!(unsafe { std::slice::from_raw_parts(view.ptr, view.len as usize) }, b"hel");
+        // Second read: "lo". Third: EOF.
+        assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 2);
+        assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 0);
+
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_reader_free(r) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn buffer_huge_capacity_degrades_to_empty_window_not_abort() {
+        // A pathological capacity must fail softly (an empty read window), never abort the process
+        // on an infallible allocation. `read` into it then yields 0 (nothing to fill).
+        let b = align_rt_buffer_new(i64::MAX);
+        let bref = unsafe { &*b };
+        assert_eq!(bref.cap, 0, "an unreservable capacity degrades to a 0-byte window");
+        assert_eq!(unsafe { align_rt_buffer_len(b) }, 0);
+        unsafe { align_rt_buffer_free(b) };
+        // A negative capacity is also an empty window (never a wrapping `as usize`).
+        let b2 = align_rt_buffer_new(-5);
+        assert_eq!(unsafe { &*b2 }.cap, 0);
+        unsafe { align_rt_buffer_free(b2) };
+    }
+
+    #[test]
+    fn reader_open_missing_file_maps_to_not_found() {
+        let path = b"/nonexistent/align/rt/path/xyzzy";
+        let mut r: *mut Reader = std::ptr::null_mut();
+        let s = unsafe { align_rt_io_reader_open(path.as_ptr(), path.len() as i64, &mut r) };
+        assert_eq!(s, AL_NOT_FOUND);
+        assert!(r.is_null(), "a failed open leaves the out handle null");
     }
 
     #[test]

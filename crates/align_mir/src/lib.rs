@@ -223,6 +223,11 @@ pub enum Rvalue {
     /// `Type.Variant(payload…)` — build a sum-type aggregate `{ i32 tag, … }`: store the variant
     /// tag in field 0 and each payload operand in this variant's fields.
     MakeEnum { enum_id: u32, variant: u32, payload: Vec<Operand> },
+    /// Build the builtin `Error` aggregate `{ i32 tag, i32 code }` from **runtime** `tag`/`code`
+    /// operands — the one way a std runtime errno-status becomes an `Error` ([`make_error_from_status`]).
+    /// Unlike [`Self::MakeEnum`] (a compile-time variant), the tag is computed at runtime, so the
+    /// category (`NotFound`/`Invalid`/`Denied`) vs `Code(errno)` is selected branchlessly.
+    MakeError { enum_id: u32, tag: Operand, code: Operand },
     /// Whether a sum-type operand's tag equals `variant` (the `match`-arm test).
     EnumTagEq { enum_id: u32, scrutinee: Operand, variant: u32 },
     /// The `slot`-th payload field of a sum-type operand for `variant` (valid only on that variant).
@@ -466,21 +471,33 @@ pub enum Rvalue {
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
     FsReadFile { path: Operand, out: Slot },
-    /// `io.stdout.write(arg)`: write the bytes of the `str` `arg` to stdout (no newline). Yields
-    /// an `i32` status (0 = ok). The first `std.io` surface.
-    IoStdoutWrite { arg: Operand },
-    /// `io.stdout.write(b)` for a `builder` `b`: write the builder's bytes to stdout (no newline),
-    /// borrowing it. Yields an `i32` status (0 = ok).
-    IoStdoutWriteBuilder { builder: Operand },
-    /// `io.stdout.buffered()` / `io.stderr.buffered()` — open a buffered writer over `fd` (1 =
-    /// stdout, 2 = stderr), yielding an opaque handle (std.io).
-    BufWriterNew { fd: i32 },
-    /// `w.write(s)` — append a `str` operand's bytes to a buffered stdout writer (flushing to the
-    /// OS only when the buffer fills). Side-effecting; yields unit.
-    BufWriterWrite(Operand, Operand),
-    /// `w.flush()` — drain a buffered stdout writer to the OS, borrowing it. Yields an `i32` status
-    /// (0 = ok), lowered to a `Result<(), Error>` like the other std.io ops.
-    BufWriterFlush(Operand),
+    /// `fs.open(path)`: open `path` for reading, writing the owned `reader` handle into `out`.
+    /// Yields an `i32` errno-status (0 = ok; see [`make_error_from_status`]).
+    ReaderOpen { path: Operand, out: Slot },
+    /// `fs.create(path)`: create/truncate `path` for writing, writing the owned `writer` handle into
+    /// `out`. Yields an `i32` errno-status (0 = ok).
+    WriterCreate { path: Operand, out: Slot },
+    /// `io.stdin` — a `reader` over fd 0 (an owned handle; std.io).
+    ReaderStdin,
+    /// `io.stdout` / `io.stderr` / `io.stdout.buffered()` — a `writer` over `fd` (1 = stdout,
+    /// 2 = stderr), `buffered` selecting the accumulator. An owned handle (std.io).
+    WriterStd { fd: i32, buffered: bool },
+    /// `r.read(b)` — read up to `b`'s capacity into the `buffer` `b`, borrowing both reader and
+    /// buffer. Yields an `i64`: bytes read (`0` = EOF) on success, or `-(status)` on error.
+    ReaderRead(Operand, Operand),
+    /// `w.write(x)` — append a `str`/`bytes` operand's bytes to a `writer`. Yields an `i32`
+    /// errno-status (0 = ok).
+    WriterWrite(Operand, Operand),
+    /// `w.write(b)` — append a `builder`'s bytes to a `writer`, borrowing it. `i32` errno-status.
+    WriterWriteBuilder(Operand, Operand),
+    /// `w.flush()` — drain a `writer` to the OS, borrowing it. `i32` errno-status (0 = ok).
+    WriterFlush(Operand),
+    /// `buffer(cap)` — open an owned byte buffer with read window `cap`, yielding an opaque handle.
+    BufferNew(Operand),
+    /// `b.bytes()` — a `slice<u8>` view `{ptr,len}` of the buffer's current contents (borrow).
+    BufferBytes(Operand),
+    /// `b.len()` — the buffer's current byte count (`i64`).
+    BufferLen(Operand),
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -895,7 +912,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::BufWriter | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -1255,28 +1272,62 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::JsonDecodeStructArray { struct_id, input } => lower_json_decode_struct_array(b, *struct_id, input, e.ty),
         hir::ExprKind::JsonDecodeSoa { struct_id, input } => lower_json_decode_soa(b, *struct_id, input, e.ty),
         hir::ExprKind::FsReadFile { path } => lower_fs_read_file(b, path, e.ty),
-        hir::ExprKind::IoStdoutWrite { arg } => {
-            lower_io_stdout_write(b, arg, e.ty, |a| Rvalue::IoStdoutWrite { arg: a })
-        }
-        hir::ExprKind::IoStdoutWriteBuilder { builder } => {
-            lower_io_stdout_write(b, builder, e.ty, |a| Rvalue::IoStdoutWriteBuilder { builder: a })
-        }
-        hir::ExprKind::BufWriterNew { fd } => {
+        // `fs.open` / `fs.create` — the runtime writes the reader/writer handle into `out` and
+        // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).
+        hir::ExprKind::ReaderOpen { path } => lower_open_handle(b, path, Ty::Reader, e.ty, |p, out| Rvalue::ReaderOpen { path: p, out }),
+        hir::ExprKind::WriterCreate { path } => lower_open_handle(b, path, Ty::Writer, e.ty, |p, out| Rvalue::WriterCreate { path: p, out }),
+        hir::ExprKind::ReaderStdin => {
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::BufWriterNew { fd: *fd }));
+            b.push(Stmt::Let(v, Rvalue::ReaderStdin));
             Operand::Value(v)
         }
-        hir::ExprKind::BufWriterWrite { writer, arg } => {
+        hir::ExprKind::WriterStd { fd, buffered } => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::WriterStd { fd: *fd, buffered: *buffered }));
+            Operand::Value(v)
+        }
+        // `r.read(b)` yields `Result<i64, Error>` from the runtime's i64: a count `>= 0` is `Ok`,
+        // a `< 0` value encodes `-(status)` for the `Err`.
+        hir::ExprKind::ReaderRead { reader, buffer } => {
+            let rop = lower_expr(b, reader);
+            let bop = lower_expr(b, buffer);
+            lower_reader_read(b, rop, bop, e.ty)
+        }
+        // `w.write(x)` / `w.flush()` yield `Result<(), Error>` from an i32 errno-status.
+        hir::ExprKind::WriterWrite { writer, arg, builder } => {
             let wop = lower_expr(b, writer);
             let aop = lower_expr(b, arg);
-            let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::BufWriterWrite(wop, aop)));
-            Operand::Const(Const::Unit)
+            let mk: Box<dyn FnOnce(&mut Builder) -> ValueId> = if *builder {
+                Box::new(move |b| { let v = b.fresh_value(status_ty()); b.push(Stmt::Let(v, Rvalue::WriterWriteBuilder(wop, aop))); v })
+            } else {
+                Box::new(move |b| { let v = b.fresh_value(status_ty()); b.push(Stmt::Let(v, Rvalue::WriterWrite(wop, aop))); v })
+            };
+            let code = mk(b);
+            lower_status_result(b, code, e.ty)
         }
-        // `w.flush()` yields `Result<(), Error>` exactly like `io.stdout.write`: an i32 status
-        // wrapped into Ok(())/Err(code). The "arg" threaded through is the writer.
-        hir::ExprKind::BufWriterFlush { writer } => {
-            lower_io_stdout_write(b, writer, e.ty, Rvalue::BufWriterFlush)
+        hir::ExprKind::WriterFlush { writer } => {
+            let wop = lower_expr(b, writer);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::WriterFlush(wop)));
+            lower_status_result(b, code, e.ty)
+        }
+        hir::ExprKind::BufferNew { capacity } => {
+            let cap = lower_expr(b, capacity);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::BufferNew(cap)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::BufferBytes { buffer } => {
+            let bop = lower_expr(b, buffer);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::BufferBytes(bop)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::BufferLen { buffer } => {
+            let bop = lower_expr(b, buffer);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::BufferLen(bop)));
+            Operand::Value(v)
         }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
@@ -4159,6 +4210,38 @@ fn make_error_code(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand {
     Operand::Value(ev)
 }
 
+/// Decode a std runtime **errno-status** into the builtin `Error` value — the one fixed table
+/// (`draft.md` §18.2), decoded from the encoding `align_rt_io_*` produces (`io_error_to_status` in
+/// `align_runtime`): `1 -> NotFound` (tag 0), `2 -> Invalid` (tag 1), `3 -> Denied` (tag 2),
+/// `>= 4 -> Code(status - 4)` (tag 3, the raw errno). Branchless — `tag = min(status-1, 3)`,
+/// `code = max(status-4, 0)` (a `select` each) — built into the `{i32 tag, i32 code}` `Error`
+/// aggregate by [`Rvalue::MakeError`].
+fn make_error_from_status(b: &mut Builder, status: ValueId, result_ty: Ty) -> Operand {
+    let error_id = match result_ty {
+        Ty::Result(_, align_sema::Scalar::Enum(eid)) => eid,
+        _ => 0, // sema guarantees `Result<_, Error>` for these builtins
+    };
+    let i32t = status_ty();
+    let s = Operand::Value(status);
+    // tag = min(status - 1, 3)
+    let sm1 = b.fresh_value(i32t);
+    b.push(Stmt::Let(sm1, Rvalue::Bin(BinOp::Sub, s.clone(), Operand::Const(Const::Int(1, i32t)))));
+    let ge3 = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(ge3, Rvalue::Bin(BinOp::Ge, Operand::Value(sm1), Operand::Const(Const::Int(3, i32t)))));
+    let tag = b.fresh_value(i32t);
+    b.push(Stmt::Let(tag, Rvalue::Select { cond: Operand::Value(ge3), a: Operand::Const(Const::Int(3, i32t)), b: Operand::Value(sm1) }));
+    // code = max(status - 4, 0)
+    let sm4 = b.fresh_value(i32t);
+    b.push(Stmt::Let(sm4, Rvalue::Bin(BinOp::Sub, s, Operand::Const(Const::Int(4, i32t)))));
+    let ge0 = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(ge0, Rvalue::Bin(BinOp::Ge, Operand::Value(sm4), Operand::Const(Const::Int(0, i32t)))));
+    let code = b.fresh_value(i32t);
+    b.push(Stmt::Let(code, Rvalue::Select { cond: Operand::Value(ge0), a: Operand::Value(sm4), b: Operand::Const(Const::Int(0, i32t)) }));
+    let ev = b.fresh_value(Ty::Enum(error_id));
+    b.push(Stmt::Let(ev, Rvalue::MakeError { enum_id: error_id, tag: Operand::Value(tag), code: Operand::Value(code) }));
+    Operand::Value(ev)
+}
+
 fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::String);
     let p = lower_expr(b, path);
@@ -4182,10 +4265,11 @@ fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Opera
     b.push(Stmt::Store(rslot, Operand::Value(okv)));
     b.terminate(Term::Goto(join));
 
-    // Err: wrap the status code (the out slot was zeroed → no buffer allocated on failure).
+    // Err: map the runtime errno-status to the builtin `Error` (the out slot was zeroed → no buffer
+    // allocated on failure).
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
-    let ec = make_error_code(b, code, result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
     b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));
@@ -4196,18 +4280,20 @@ fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Opera
     Operand::Value(r)
 }
 
-/// `io.stdout.write(arg)` → call the runtime writer (status `i32`), then branch `Ok(())` /
-/// `Err(<code>)`. No out slot — the result payload is unit. `write_rv` builds the status-producing
-/// rvalue from the lowered argument (a `str` value or a `builder` handle).
-fn lower_io_stdout_write(
+/// `fs.open` / `fs.create` → the runtime writes the owned `reader`/`writer` handle into an out slot
+/// (of `handle_ty`) and returns an errno-status; branch `Ok(<handle>)` / `Err(<mapped status>)`.
+/// Mirrors [`lower_fs_read_file`] with a handle payload instead of a `string`.
+fn lower_open_handle(
     b: &mut Builder,
-    arg: &hir::Expr,
+    path: &hir::Expr,
+    handle_ty: Ty,
     result_ty: Ty,
-    write_rv: impl FnOnce(Operand) -> Rvalue,
+    open_rv: impl FnOnce(Operand, Slot) -> Rvalue,
 ) -> Operand {
-    let a = lower_expr(b, arg);
+    let out = b.new_slot(handle_ty);
+    let p = lower_expr(b, path);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, write_rv(a)));
+    b.push(Stmt::Let(code, open_rv(p, out)));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -4217,17 +4303,88 @@ fn lower_io_stdout_write(
     let rslot = b.new_slot(result_ty);
     b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
 
-    // Ok: wrap unit.
+    // Ok: load the handle pointer and wrap it (the unwrapped local owns it — `Drop` closes it).
+    b.cur = ok_bb;
+    let h = b.fresh_value(handle_ty);
+    b.push(Stmt::Let(h, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(h))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (null handle) → nothing to close; map the status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `r.read(b)` → the runtime returns an `i64`: bytes read (`>= 0`, `0` = EOF) or `-(status)` on
+/// error. Branch `Ok(<count>)` / `Err(<mapped status>)` on the sign.
+fn lower_reader_read(b: &mut Builder, reader: Operand, buffer: Operand, result_ty: Ty) -> Operand {
+    let n = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(n, Rvalue::ReaderRead(reader, buffer)));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Ge, Operand::Value(n), Operand::Const(Const::Int(0, i64_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: the count `n`.
+    b.cur = ok_bb;
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(n))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the status is `-n`, narrowed to i32 for the fixed-table decode.
+    b.cur = err_bb;
+    let neg = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(neg, Rvalue::Bin(BinOp::Sub, Operand::Const(Const::Int(0, i64_ty())), Operand::Value(n))));
+    let status = b.fresh_value(status_ty());
+    b.push(Stmt::Let(status, Rvalue::Cast { operand: Operand::Value(neg), from: i64_ty(), to: status_ty() }));
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, status, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// Wrap a precomputed i32 errno-status `code` into `Result<(), Error>`: `Ok(())` on `0`, else
+/// `Err(<mapped status>)`. The `writer.write` / `writer.flush` tail.
+fn lower_status_result(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand {
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
     b.cur = ok_bb;
     let okv = b.fresh_value(result_ty);
     b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Const(Const::Unit))));
     b.push(Stmt::Store(rslot, Operand::Value(okv)));
     b.terminate(Term::Goto(join));
 
-    // Err: wrap the status code.
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
-    let ec = make_error_code(b, code, result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
     b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));
@@ -4670,7 +4827,9 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Builder => "builder".to_string(),
-        Ty::BufWriter => "bufwriter".to_string(),
+        Ty::Writer => "writer".to_string(),
+        Ty::Reader => "reader".to_string(),
+        Ty::Buffer => "buffer".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

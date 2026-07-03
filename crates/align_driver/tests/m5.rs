@@ -713,9 +713,9 @@ fn io_stdout_buffered_writes_then_explicit_flush() {
     if !backend_available() {
         return;
     }
-    // std.io: `io.stdout.buffered()` opens a buffered writer; `.write(s)` appends without a
+    // std.io: `io.stdout.buffered()` opens a buffered writer; `.write(s)?` appends without a
     // syscall, `.flush()?` drains the buffer to the OS in one write. The three appends concatenate.
-    let src = "import std.io\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  out.write(\"hello \")\n  out.write(\"buffered \")\n  out.write(\"world\\n\")\n  out.flush()?\n  return Ok(())\n}\n";
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  out.write(\"hello \")?\n  out.write(\"buffered \")?\n  out.write(\"world\\n\")?\n  out.flush()?\n  return Ok(())\n}\n";
     let out = build_and_run("io-buffered-flush", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello buffered world\n");
@@ -727,8 +727,8 @@ fn io_stdout_buffered_flushes_on_drop() {
         return;
     }
     // Without an explicit `flush()`, the writer's `Drop` flushes any buffered bytes best-effort at
-    // scope exit — so the output still appears.
-    let src = "import std.io\nfn main() -> i32 {\n  out := io.stdout.buffered()\n  out.write(\"flushed on drop\\n\")\n  return 0\n}\n";
+    // scope exit — so the output still appears. (`write` returns `Result`, propagated with `?`.)
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  out.write(\"flushed on drop\\n\")?\n  return Ok(())\n}\n";
     let out = build_and_run("io-buffered-drop", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "flushed on drop\n");
@@ -742,7 +742,7 @@ fn io_stdout_buffered_writes_owned_string_without_consuming_it() {
     // `out.write(owned_string)` auto-borrows the `string` as a `str` (zero-cost, non-consuming), so
     // the owned string stays usable afterwards (`s.len()` = 10). The buffered "owned-text\n" is
     // flushed at `out.flush()`; `print` flushes immediately, so the length (10) prints first.
-    let src = "import std.io\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  s := mk(\"owned-\", \"text\")\n  out.write(s)\n  out.write(\"\\n\")\n  print(s.len())\n  out.flush()?\n  return Ok(())\n}\n";
+    let src = "import std.io\nfn mk(a: str, b: str) -> string {\n  arena {\n    c := a + b\n    return c.clone()\n  }\n}\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  s := mk(\"owned-\", \"text\")\n  out.write(s)?\n  out.write(\"\\n\")?\n  print(s.len())\n  out.flush()?\n  return Ok(())\n}\n";
     let out = build_and_run("io-buffered-owned", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "10\nowned-text\n");
@@ -754,14 +754,15 @@ fn io_stdout_buffered_threaded_through_functions() {
         return;
     }
     // A `writer` is a Move handle with a surface type name, so it can be passed to helpers and
-    // threaded through a loop by pass-and-return. `emit` writes a line and hands the writer back;
-    // `loop_n` recurses (the `if i >= n { return w }` guard relies on the diverging-branch move
-    // fix). Three lines are buffered, then flushed once.
+    // threaded through a loop by pass-and-return — and returned inside a `Result<writer, Error>`
+    // (the `?` unwraps the writer back out, moving it on). `emit` writes a line and hands the writer
+    // back; `loop_n` recurses (the `if i >= n { return Ok(w) }` guard relies on the diverging-branch
+    // move fix). Three lines are buffered, then flushed once.
     let src = concat!(
         "import std.io\n",
-        "fn emit(w: writer, msg: str) -> writer {\n  w.write(msg)\n  w.write(\"\\n\")\n  return w\n}\n",
-        "fn loop_n(w: writer, i: i64, n: i64) -> writer {\n  if i >= n { return w }\n  return loop_n(emit(w, \"line\"), i + 1, n)\n}\n",
-        "fn main() -> Result<(), Error> {\n  w := io.stdout.buffered()\n  w2 := loop_n(w, 0, 3)\n  w2.flush()?\n  return Ok(())\n}\n",
+        "fn emit(w: writer, msg: str) -> Result<writer, Error> {\n  w.write(msg)?\n  w.write(\"\\n\")?\n  return Ok(w)\n}\n",
+        "fn loop_n(w: writer, i: i64, n: i64) -> Result<writer, Error> {\n  if i >= n { return Ok(w) }\n  return loop_n(emit(w, \"line\")?, i + 1, n)\n}\n",
+        "fn main() -> Result<(), Error> {\n  w := io.stdout.buffered()\n  w2 := loop_n(w, 0, 3)?\n  w2.flush()?\n  return Ok(())\n}\n",
     );
     let out = build_and_run("io-buffered-thread", src);
     assert_eq!(out.status.code(), Some(0));
@@ -1226,7 +1227,7 @@ fn io_stderr_buffered_writes_to_stderr_not_stdout() {
     }
     // `io.stderr.buffered()` opens the same buffered writer over fd 2. The bytes land on stderr
     // (drained at `flush()?`), and stdout stays empty — the writer is fd-parameterized.
-    let src = "import std.io\nfn main() -> Result<(), Error> {\n  log := io.stderr.buffered()\n  log.write(\"warn: \")\n  log.write(\"disk low\\n\")\n  log.flush()?\n  return Ok(())\n}\n";
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  log := io.stderr.buffered()\n  log.write(\"warn: \")?\n  log.write(\"disk low\\n\")?\n  log.flush()?\n  return Ok(())\n}\n";
     let out = build_and_run("io-stderr-buffered", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stderr), "warn: disk low\n");
@@ -1239,7 +1240,7 @@ fn io_stderr_buffered_flushes_on_drop() {
         return;
     }
     // No explicit flush: the writer's Drop drains the buffer to fd 2 at scope exit.
-    let src = "import std.io\nfn main() -> i32 {\n  log := io.stderr.buffered()\n  log.write(\"dropped to stderr\\n\")\n  return 0\n}\n";
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  log := io.stderr.buffered()\n  log.write(\"dropped to stderr\\n\")?\n  return Ok(())\n}\n";
     let out = build_and_run("io-stderr-drop", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stderr), "dropped to stderr\n");
@@ -1252,7 +1253,7 @@ fn io_stdout_and_stderr_buffered_are_independent_sinks() {
         return;
     }
     // Two buffered writers over different fds in the same program route to the right streams.
-    let src = "import std.io\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  err := io.stderr.buffered()\n  out.write(\"to-out\\n\")\n  err.write(\"to-err\\n\")\n  out.flush()?\n  err.flush()?\n  return Ok(())\n}\n";
+    let src = "import std.io\nfn main() -> Result<(), Error> {\n  out := io.stdout.buffered()\n  err := io.stderr.buffered()\n  out.write(\"to-out\\n\")?\n  err.write(\"to-err\\n\")?\n  out.flush()?\n  err.flush()?\n  return Ok(())\n}\n";
     let out = build_and_run("io-both-sinks", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "to-out\n");

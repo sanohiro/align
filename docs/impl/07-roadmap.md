@@ -1115,14 +1115,23 @@ decisions are recorded in `docs/open-questions.md` Settled → "M9 std design". 
 `std`/`core` module, the implementation is Rust runtime (`align_rt_*`) + sema builtin dispatch +
 required `import` — the `core.json` pattern, not yet Align-over-FFI library code.
 
-- **Slice 1 — std.io core.** `reader`/`writer` as concrete Move types (own an fd, `Drop` closes
-  it); `fs.open`/`fs.create` constructing them; `r.read(b: mut buffer)` / `w.write(x)` /
-  `w.flush()`; `io.stdout.buffered()` unifies buffering into `writer` (no separate buffered type —
-  "one way"). Before building this, check `core.buffer`'s implementation status (design is
-  Settled — `docs/open-questions.md` "`bytes`/`buffer`" — but build was deliberately deferred until
-  a consumer); if still unbuilt, this slice includes the minimal owned growable byte-buffer needed
-  by `reader.read`. **Completion condition:** an Align program byte-exact-copies a file through a
-  `read`/`write` loop (`fs.open` → `reader.read(buf)` loop → `fs.create` → `writer.write(buf)`).
+- **Slice 1 — std.io core — DONE.** `reader`/`writer` as concrete Move types (`Ty::Reader`/
+  `Ty::Writer`, own an fd, `Drop` closes it — a file fd; `io.stdin`/`io.stdout`/`io.stderr` borrow
+  the std fd); `io.stdin` / `io.stdout` / `io.stderr` / `io.stdout.buffered()` / `fs.open` /
+  `fs.create` are the constructors (one type, many constructors — the old `Ty::BufWriter` and the
+  `io.stdout.write` special-case collapsed into `writer`); `r.read(b: mut buffer)` / `w.write(x:
+  str|bytes|builder)` / `w.flush()`, all `Result<_, Error>`. `core.buffer`'s build (deferred in
+  `open-questions.md` "`bytes`/`buffer`" until a consumer) landed here as the minimal owned growable
+  `Ty::Buffer` (`buffer(cap)` / `.bytes()` → `slice<u8>` / `.len()`), the sink `reader.read` fills.
+  The **errno→`Error` fixed table** (`draft.md` §18.2) is one runtime helper (`io_error_to_status`)
+  + one MIR decode (`make_error_from_status`, branchless), shared by `fs.read_file`/`fs.open`/
+  `fs.create`/read/write/flush. **Completion condition met:** an Align program byte-exact-copies a
+  file through a tail-recursive `read`/`write` loop (`fs.open` → `reader.read(buf)` loop →
+  `fs.create` → `writer.write(buf.bytes())`), plus per-method tests (EOF, `NotFound`/`Denied`
+  mapping, `io.stdin`, moved-reader rejection, buffer-view escape rejection) — `tests/m9_io.rs`.
+  Known minor gap (a general MIR limitation, not std.io-specific): an **unbound Move temporary**
+  isn't dropped, so a one-shot `io.stdout.write(x)?` leaks its ~40-byte writer handle (bound writers
+  / readers / buffers drop correctly); the fix is dropping Move temporaries, a separate improvement.
 - **Slice 2 — `io.copy`.** The portable fixed-buffer loop (the v1/reference implementation —
   `docs/open-questions.md` "Transparent zero-copy I/O"), returning bytes transferred.
   **Completion condition:** byte-exact transfer, plus a test that memory stays bounded
