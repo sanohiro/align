@@ -631,48 +631,76 @@ fn build_module<'c>(
             None,
         ),
     );
+    // std.io / std.fs — reader / writer (own an fd) + buffer (owned bytes).
     funcs.insert(
-        // io.stdout.write (ptr, len) -> i32 status (std.io); writes bytes, no newline.
-        "io_stdout_write".to_string(),
-        module.add_function(
-            "align_rt_io_stdout_write",
-            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false),
-            None,
-        ),
+        // fs.open (path_ptr, path_len, out: **Reader) -> i32 errno-status.
+        "io_reader_open".to_string(),
+        module.add_function("align_rt_io_reader_open", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
     );
     funcs.insert(
-        // io.stdout.write(builder) (b: *Builder) -> i32 status; writes the builder's bytes.
-        "io_stdout_write_builder".to_string(),
-        module.add_function(
-            "align_rt_io_stdout_write_builder",
-            ctx.i32_type().fn_type(&[ptr.into()], false),
-            None,
-        ),
-    );
-    // io.stdout.buffered() — the buffered stdout writer (std.io).
-    funcs.insert(
-        // io.stdout.buffered() / io.stderr.buffered(): (fd: i32) -> *BufferedWriter (opaque handle).
-        "io_buf_new".to_string(),
-        module.add_function("align_rt_io_buf_new", ptr.fn_type(&[ctx.i32_type().into()], false), None),
+        // io.stdin () -> *Reader (opaque handle).
+        "io_reader_stdin".to_string(),
+        module.add_function("align_rt_io_reader_stdin", ptr.fn_type(&[], false), None),
     );
     funcs.insert(
-        // w.write(s) (w: *StdoutWriter, ptr, len) -> void; appends, flushing only when full.
-        "io_buf_write".to_string(),
-        module.add_function(
-            "align_rt_io_buf_write",
-            ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false),
-            None,
-        ),
+        // r.read(b) (r: *Reader, b: *Buffer) -> i64 (count, or -(status)).
+        "io_reader_read".to_string(),
+        module.add_function("align_rt_io_reader_read", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
     );
     funcs.insert(
-        // w.flush() (w: *StdoutWriter) -> i32 status; drains the buffer to the OS.
-        "io_buf_flush".to_string(),
-        module.add_function("align_rt_io_buf_flush", ctx.i32_type().fn_type(&[ptr.into()], false), None),
+        // drop(r) (r: *Reader) -> void; close if owned.
+        "io_reader_free".to_string(),
+        module.add_function("align_rt_io_reader_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
-        // drop(w) (w: *StdoutWriter) -> void; final flush + free.
-        "io_buf_free".to_string(),
-        module.add_function("align_rt_io_buf_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+        // fs.create (path_ptr, path_len, out: **Writer) -> i32 errno-status.
+        "io_writer_create".to_string(),
+        module.add_function("align_rt_io_writer_create", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // io.stdout / io.stderr / .buffered() (fd: i32, buffered: i32) -> *Writer (opaque handle).
+        "io_writer_std".to_string(),
+        module.add_function("align_rt_io_writer_std", ptr.fn_type(&[ctx.i32_type().into(), ctx.i32_type().into()], false), None),
+    );
+    funcs.insert(
+        // w.write(s) (w: *Writer, ptr, len) -> i32 errno-status.
+        "io_writer_write".to_string(),
+        module.add_function("align_rt_io_writer_write", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // w.write(builder) (w: *Writer, b: *Builder) -> i32 errno-status.
+        "io_writer_write_builder".to_string(),
+        module.add_function("align_rt_io_writer_write_builder", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // w.flush() (w: *Writer) -> i32 errno-status.
+        "io_writer_flush".to_string(),
+        module.add_function("align_rt_io_writer_flush", ctx.i32_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // drop(w) (w: *Writer) -> void; final flush + close if owned.
+        "io_writer_free".to_string(),
+        module.add_function("align_rt_io_writer_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // buffer(cap) (cap: i64) -> *Buffer (opaque handle).
+        "buffer_new".to_string(),
+        module.add_function("align_rt_buffer_new", ptr.fn_type(&[i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // b.bytes() (b: *Buffer, out: *{ptr,len}) -> void; a slice<u8> view.
+        "buffer_bytes".to_string(),
+        module.add_function("align_rt_buffer_bytes", ctx.void_type().fn_type(&[ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // b.len() (b: *Buffer) -> i64.
+        "buffer_len".to_string(),
+        module.add_function("align_rt_buffer_len", i64t2.fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // drop(b) (b: *Buffer) -> void; free.
+        "buffer_free".to_string(),
+        module.add_function("align_rt_buffer_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
         // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len},
@@ -1217,6 +1245,8 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
+        // A `reader`/`writer` handle payload (`Result<reader/writer, Error>`) is an opaque pointer.
+        Ty::Reader | Ty::Writer | Ty::Buffer => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
@@ -1238,6 +1268,18 @@ fn vec_llvm_ty<'c>(ctx: &'c Context, elem: Ty, n: u32) -> BasicTypeEnum<'c> {
 /// Field indices of an `Option`/`Result` aggregate whose payload is an owned (Move) type and
 /// must be freed when the aggregate is dropped (MMv2 slice 8a). Some/Ok = field 1, Err = field 2.
 /// Allocation-free (≤ 2 indices).
+/// The payload [`Scalar`] at aggregate field `idx` of an `Option`/`Result` (Some/Ok = field 1,
+/// Err = field 2) — so a drop can pick the right destructor (`reader`/`writer` handles close their
+/// fd; every other Move payload frees a `{ptr,len}` buffer).
+fn payload_field_scalar(ty: Ty, idx: u32) -> Option<Scalar> {
+    match (ty, idx) {
+        (Ty::Option(s), 1) => Some(s),
+        (Ty::Result(o, _), 1) => Some(o),
+        (Ty::Result(_, e), 2) => Some(e),
+        _ => None,
+    }
+}
+
 fn move_payload_fields(ty: Ty) -> impl Iterator<Item = u32> {
     let (ok, err) = match ty {
         Ty::Option(s) => (s.is_move().then_some(1), None),
@@ -1295,7 +1337,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::BufWriter | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -1647,6 +1689,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Soa(_) => unreachable!("a soa view is not a box payload"),
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
+        Scalar::Reader | Scalar::Writer => unreachable!("a reader/writer handle is not a box/array payload"),
     }
 }
 
@@ -2295,8 +2338,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if ty == Ty::Builder || ty == Ty::BufWriter {
-                        // A builder / buffered-writer slot holds a bare (nullable) handle pointer.
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer) {
+                        // A builder / writer / reader / buffer slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
                         // A fixed array of a Move struct: zero the whole `[N x %Struct]` so every
@@ -2353,21 +2396,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if ty == Ty::BufWriter {
-                        // A buffered stdout writer: flush any remaining bytes best-effort, then free
-                        // (null-safe). The drop-time flush is the safety net for output not explicitly
-                        // `flush()`ed.
+                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer) {
+                        // A writer flushes + closes; a reader closes; a buffer frees. Each runtime
+                        // `*_free` is null-safe (a moved-out / never-initialised slot drops harmlessly).
+                        let free_fn = match ty {
+                            Ty::Writer => "io_writer_free",
+                            Ty::Reader => "io_reader_free",
+                            _ => "buffer_free",
+                        };
                         let p = self
                             .builder
-                            .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropw")
+                            .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "droph")
                             .map_err(|e| self.err(e))?;
                         self.builder
-                            .build_call(self.funcs["io_buf_free"], &[p.into()], "")
+                            .build_call(self.funcs[free_fn], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if payload_is_move(ty) {
-                        // An Option/Result owning a Move payload: free each owned payload field's
-                        // buffer pointer (null-safe — the inactive arm reads {null,0}, and a
-                        // moved-out aggregate was nulled at the move site).
+                        // An Option/Result owning a Move payload: free each owned payload field
+                        // (null-safe — the inactive arm reads {null,0}/null, and a moved-out aggregate
+                        // was nulled at the move site). A `reader`/`writer` payload is a bare handle
+                        // pointer closed by its own `*_free`; every other Move payload is a `{ptr,len}`
+                        // whose buffer pointer is `free`d.
                         let aty = self.llvm_type(ty).into_struct_type();
                         let agg = self
                             .builder
@@ -2375,15 +2424,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|e| self.err(e))?
                             .into_struct_value();
                         for idx in move_payload_fields(ty) {
-                            let payload = self
+                            let field = self
                                 .builder
                                 .build_extract_value(agg, idx, "droppl")
-                                .map_err(|e| self.err(e))?
-                                .into_struct_value();
-                            let ptr = self.builder.build_extract_value(payload, 0, "dropplptr").map_err(|e| self.err(e))?;
-                            self.builder
-                                .build_call(self.funcs["free"], &[ptr.into()], "")
                                 .map_err(|e| self.err(e))?;
+                            match payload_field_scalar(ty, idx) {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) => {
+                                    // The field is the handle pointer itself.
+                                    let free_fn = if matches!(payload_field_scalar(ty, idx), Some(Scalar::Writer)) { "io_writer_free" } else { "io_reader_free" };
+                                    self.builder
+                                        .build_call(self.funcs[free_fn], &[field.into_pointer_value().into()], "")
+                                        .map_err(|e| self.err(e))?;
+                                }
+                                _ => {
+                                    let ptr = self.builder.build_extract_value(field.into_struct_value(), 0, "dropplptr").map_err(|e| self.err(e))?;
+                                    self.builder
+                                        .build_call(self.funcs["free"], &[ptr.into()], "")
+                                        .map_err(|e| self.err(e))?;
+                                }
+                            }
                         }
                     } else if let Ty::Tuple(tid) = ty {
                         // A Move tuple: free each owned element's buffer pointer (null-safe — a
@@ -3865,41 +3924,92 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonDecodeStructArray { struct_id, input, out } => self.gen_json_decode_struct_array(*struct_id, input, *out)?,
             Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => self.gen_json_decode_soa(*struct_id, input, *out, arena)?,
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
-            Rvalue::IoStdoutWrite { arg } => self.gen_io_stdout_write(arg)?,
-            Rvalue::IoStdoutWriteBuilder { builder } => {
-                let b = self.operand(builder).into();
-                let cs = self
-                    .builder
-                    .build_call(self.funcs["io_stdout_write_builder"], &[b], "sowb")
-                    .map_err(|e| self.err(e))?;
-                cs.try_as_basic_value().basic().expect("io_stdout_write_builder returns i32")
-            }
-            Rvalue::BufWriterNew { fd } => {
+            // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
+            Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
+            Rvalue::WriterCreate { path, out } => self.gen_open_handle("io_writer_create", path, *out)?,
+            Rvalue::ReaderStdin => self
+                .builder
+                .build_call(self.funcs["io_reader_stdin"], &[], "stdin")
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value().basic().expect("io_reader_stdin returns a pointer"),
+            Rvalue::WriterStd { fd, buffered } => {
                 let fd = self.ctx.i32_type().const_int(*fd as u64, true);
+                let buffered = self.ctx.i32_type().const_int(*buffered as u64, false);
                 self.builder
-                    .build_call(self.funcs["io_buf_new"], &[fd.into()], "bufw")
+                    .build_call(self.funcs["io_writer_std"], &[fd.into(), buffered.into()], "wstd")
                     .map_err(|e| self.err(e))?
-                    .try_as_basic_value()
-                    .basic()
-                    .expect("io_buf_new returns a pointer")
+                    .try_as_basic_value().basic().expect("io_writer_std returns a pointer")
             }
-            Rvalue::BufWriterWrite(w, s) => {
+            Rvalue::ReaderRead(r, buf) => {
+                let rp = self.operand(r).into();
+                let bp = self.operand(buf).into();
+                self.builder
+                    .build_call(self.funcs["io_reader_read"], &[rp, bp], "read")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_reader_read returns i64")
+            }
+            Rvalue::WriterWrite(w, s) => {
                 let wp = self.operand(w).into();
                 let agg = self.operand(s).into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "wptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "wlen").map_err(|e| self.err(e))?;
                 self.builder
-                    .build_call(self.funcs["io_buf_write"], &[wp, ptr.into(), len.into()], "")
-                    .map_err(|e| self.err(e))?;
-                return Ok(None);
+                    .build_call(self.funcs["io_writer_write"], &[wp, ptr.into(), len.into()], "wr")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_writer_write returns i32")
             }
-            Rvalue::BufWriterFlush(w) => {
+            Rvalue::WriterWriteBuilder(w, bld) => {
                 let wp = self.operand(w).into();
-                let cs = self
-                    .builder
-                    .build_call(self.funcs["io_buf_flush"], &[wp], "bufflush")
+                let bp = self.operand(bld).into();
+                self.builder
+                    .build_call(self.funcs["io_writer_write_builder"], &[wp, bp], "wrb")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_writer_write_builder returns i32")
+            }
+            Rvalue::WriterFlush(w) => {
+                let wp = self.operand(w).into();
+                self.builder
+                    .build_call(self.funcs["io_writer_flush"], &[wp], "wflush")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_writer_flush returns i32")
+            }
+            Rvalue::BufferNew(cap) => {
+                let cap = self.operand(cap).into();
+                self.builder
+                    .build_call(self.funcs["buffer_new"], &[cap], "buf")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("buffer_new returns a pointer")
+            }
+            Rvalue::BufferBytes(buf) => {
+                // The runtime writes the `{ptr,len}` view into a stack slot; load it back.
+                let bp = self.operand(buf).into();
+                let slot = self.builder.build_alloca(slice_struct_type(self.ctx), "bytesslot").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["buffer_bytes"], &[bp, slot.into()], "")
                     .map_err(|e| self.err(e))?;
-                cs.try_as_basic_value().basic().expect("io_buf_flush returns i32")
+                self.builder.build_load(slice_struct_type(self.ctx), slot, "bytes").map_err(|e| self.err(e))?
+            }
+            Rvalue::BufferLen(buf) => {
+                let bp = self.operand(buf).into();
+                self.builder
+                    .build_call(self.funcs["buffer_len"], &[bp], "buflen")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("buffer_len returns i64")
+            }
+            Rvalue::MakeError { enum_id, tag, code } => {
+                // Build the builtin `Error` aggregate `{ i32 tag, i32 code }` from runtime operands.
+                let sty = self.enum_types[*enum_id as usize];
+                let t = self.operand(tag);
+                let c = self.operand(code);
+                let agg = self
+                    .builder
+                    .build_insert_value(sty.const_zero(), t, 0, "etag")
+                    .map_err(|e| self.err(e))?;
+                self.builder
+                    .build_insert_value(agg, c, 1, "ecode")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
             }
             Rvalue::SliceLen(op) => {
                 let agg = self.operand(op).into_struct_value();
@@ -4143,7 +4253,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::BufWriter | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
@@ -4726,17 +4836,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(cs.try_as_basic_value().basic().expect("fs_read_file returns i32"))
     }
 
-    /// `io.stdout.write(arg)`: pass the `str` arg's `{ptr,len}` to the runtime writer (no newline).
-    /// Returns the i32 status (0 = ok).
-    fn gen_io_stdout_write(&mut self, arg: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
-        let agg = self.operand(arg).into_struct_value();
-        let s_ptr = self.builder.build_extract_value(agg, 0, "out_p").map_err(|e| self.err(e))?;
-        let s_len = self.builder.build_extract_value(agg, 1, "out_l").map_err(|e| self.err(e))?;
+    /// `fs.open` / `fs.create`: zero the out handle slot (so a failed open leaves null — its `Drop`
+    /// is a null-safe no-op), then call the runtime opener (`func`) with the path `{ptr,len}` and the
+    /// out slot. Returns the i32 errno-status (0 = ok).
+    fn gen_open_handle(&mut self, func: &str, path: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        self.builder
+            .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+            .map_err(|e| self.err(e))?;
+        let agg = self.operand(path).into_struct_value();
+        let p_ptr = self.builder.build_extract_value(agg, 0, "path_p").map_err(|e| self.err(e))?;
+        let p_len = self.builder.build_extract_value(agg, 1, "path_l").map_err(|e| self.err(e))?;
         let cs = self
             .builder
-            .build_call(self.funcs["io_stdout_write"], &[s_ptr.into(), s_len.into()], "sow")
+            .build_call(self.funcs[func], &[p_ptr.into(), p_len.into(), out_ptr.into()], "open")
             .map_err(|e| self.err(e))?;
-        Ok(cs.try_as_basic_value().basic().expect("io_stdout_write returns i32"))
+        Ok(cs.try_as_basic_value().basic().expect("open returns i32 status"))
     }
 
     fn gen_template(&mut self, pieces: &[align_mir::TemplatePiece], arena: Option<&Operand>) -> Result<BasicValueEnum<'c>, CodegenError> {

@@ -618,26 +618,42 @@ pub enum ExprKind {
     /// `fs.read_file(path)` — read the file at `path` (a `str`) into a freshly heap-allocated owned
     /// `string`; the expression `ty` is `Result<string, Error>`. The first `std.fs` surface.
     FsReadFile { path: Box<Expr> },
-    /// `io.stdout.write(arg)` — write the bytes of the `str` `arg` to stdout with no trailing
-    /// newline; the expression `ty` is `Result<(), Error>`. The first `std.io` surface.
-    IoStdoutWrite { arg: Box<Expr> },
-    /// `io.stdout.write(b)` where `b` is a `builder` — write the builder's accumulated bytes to
-    /// stdout directly (no `to_string()` materialization), borrowing it (not consumed). `ty` is
-    /// `Result<(), Error>`.
-    IoStdoutWriteBuilder { builder: Box<Expr> },
-    /// `io.stdout.buffered()` / `io.stderr.buffered()` — open a buffered writer over `fd` (1 =
-    /// stdout, 2 = stderr), the sink-first fast path. The `ty` is [`crate::Ty::BufWriter`] (an owned,
-    /// Move handle). Bytes accumulate in a buffer and reach the OS only when it fills or on `flush` /
-    /// drop — so writes do no syscall and memory stays O(buffer). I/O-effecting (Impure), unlike the
-    /// pure string `BuilderNew`.
-    BufWriterNew { fd: i32 },
-    /// `w.write(s)` — append a `str` to a buffered stdout writer, borrowing it (not consumed). The
-    /// `ty` is `Unit`; an internal flush failure is latched and surfaced by the next `flush`.
-    /// Impure (it may flush to stdout).
-    BufWriterWrite { writer: Box<Expr>, arg: Box<Expr> },
-    /// `w.flush()` — flush a buffered stdout writer's bytes to the OS, borrowing it. The `ty` is
+    /// `io.stdin` — a `reader` over fd 0. The `ty` is [`crate::Ty::Reader`] (an owned Move handle;
+    /// its fd is borrowed, not closed on `Drop`). Constructing it is allocation only (pure), like
+    /// `BuilderNew`; the *reads* are what is Impure.
+    ReaderStdin,
+    /// `fs.open(path)` — open `path` (a `str`) for reading; the `ty` is `Result<reader, Error>`. The
+    /// returned `reader` owns its fd (closed on `Drop`). Impure (touches the filesystem).
+    ReaderOpen { path: Box<Expr> },
+    /// `io.stdout` / `io.stderr` / `io.stdout.buffered()` — a `writer` over a standard-stream fd
+    /// (`fd`: 1 = stdout, 2 = stderr), `buffered` selecting the O(buffer) accumulator ("one type,
+    /// many constructors"). The `ty` is [`crate::Ty::Writer`] (an owned Move handle; its fd is
+    /// borrowed, not closed). Constructing it is allocation only (pure); the *writes* are Impure.
+    WriterStd { fd: i32, buffered: bool },
+    /// `fs.create(path)` — create/truncate `path` (a `str`) for writing; the `ty` is
+    /// `Result<writer, Error>`. The returned `writer` owns its fd (flushed + closed on `Drop`).
+    /// Impure.
+    WriterCreate { path: Box<Expr> },
+    /// `r.read(b: mut buffer)` — read up to `b`'s capacity into `b` (overwriting its length),
+    /// borrowing both `reader` and `buffer` (neither consumed). The `ty` is `Result<i64, Error>`
+    /// (bytes read; `0` = EOF). Impure.
+    ReaderRead { reader: Box<Expr>, buffer: Box<Expr> },
+    /// `w.write(x)` — append a `str`/`bytes` (`slice<u8>`) value or a `builder`'s bytes to a
+    /// `writer`, borrowing it (not consumed). `builder` marks the builder-source form (its bytes are
+    /// written directly). The `ty` is `Result<(), Error>`. Impure.
+    WriterWrite { writer: Box<Expr>, arg: Box<Expr>, builder: bool },
+    /// `w.flush()` — flush a `writer`'s buffered bytes to the OS, borrowing it. The `ty` is
     /// `Result<(), Error>`. Impure.
-    BufWriterFlush { writer: Box<Expr> },
+    WriterFlush { writer: Box<Expr> },
+    /// `buffer(cap)` — open an owned growable byte buffer with read window `cap` (a `str`-less byte
+    /// sink for `reader.read`). The `ty` is [`crate::Ty::Buffer`] (an owned Move handle, `Drop`-freed).
+    /// Pure (allocation only), like `BuilderNew`.
+    BufferNew { capacity: Box<Expr> },
+    /// `b.bytes()` — a `slice<u8>` view of the buffer's current contents. Borrows the buffer
+    /// (region-tracked: the view must not outlive `b`). Pure.
+    BufferBytes { buffer: Box<Expr> },
+    /// `b.len()` — the buffer's current byte count (an `i64`). Pure.
+    BufferLen { buffer: Box<Expr> },
 }
 
 /// The source/key path of a column-oriented `group_by` ([`ExprKind::ArrayGroupAgg`]).

@@ -1,0 +1,24 @@
+module main
+
+import std.fs
+
+// Byte-exact file copy (std.io Slice 1): `fs.open` a reader, `fs.create` a writer, then stream
+// through a fixed-window `buffer` — memory stays O(buffer), never O(file size). Align has no loop
+// keyword, so the read/write loop is expressed by tail recursion, threading the moved handles; at
+// EOF (`read` returns 0) the handles drop, closing both files.
+fn copy_all(r: reader, w: writer, buf: buffer) -> Result<(), Error> {
+  n := r.read(buf)?
+  if n == 0 {
+    return Ok(())
+  }
+  w.write(buf.bytes())?
+  return copy_all(r, w, buf)
+}
+
+pub fn main(args: array<str>) -> Result<(), Error> {
+  r := fs.open(args[1])?
+  w := fs.create(args[2])?
+  buf := buffer(65536)
+  copy_all(r, w, buf)?
+  return Ok(())
+}

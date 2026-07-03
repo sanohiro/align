@@ -396,15 +396,20 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsReadFile { path, out } => {
             format!("fs_read_file({}, -> _{out})", operand_str(path))
         }
-        Rvalue::IoStdoutWrite { arg } => {
-            format!("io_stdout_write({})", operand_str(arg))
+        Rvalue::ReaderOpen { path, out } => format!("fs_open({}, -> _{out})", operand_str(path)),
+        Rvalue::WriterCreate { path, out } => format!("fs_create({}, -> _{out})", operand_str(path)),
+        Rvalue::ReaderStdin => "io_reader_stdin()".to_string(),
+        Rvalue::WriterStd { fd, buffered } => format!("io_writer_std(fd={fd}, buffered={buffered})"),
+        Rvalue::ReaderRead(r, buf) => format!("io_read({}, {})", operand_str(r), operand_str(buf)),
+        Rvalue::WriterWrite(w, s) => format!("io_write({}, {})", operand_str(w), operand_str(s)),
+        Rvalue::WriterWriteBuilder(w, b) => format!("io_write_builder({}, {})", operand_str(w), operand_str(b)),
+        Rvalue::WriterFlush(w) => format!("io_flush({})", operand_str(w)),
+        Rvalue::BufferNew(cap) => format!("buffer_new({})", operand_str(cap)),
+        Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
+        Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),
+        Rvalue::MakeError { enum_id, tag, code } => {
+            format!("make_error(enum#{enum_id}, tag={}, code={})", operand_str(tag), operand_str(code))
         }
-        Rvalue::IoStdoutWriteBuilder { builder } => {
-            format!("io_stdout_write_builder({})", operand_str(builder))
-        }
-        Rvalue::BufWriterNew { fd } => format!("io_buf_new(fd={fd})"),
-        Rvalue::BufWriterWrite(w, s) => format!("io_buf_write({}, {})", operand_str(w), operand_str(s)),
-        Rvalue::BufWriterFlush(w) => format!("io_buf_flush({})", operand_str(w)),
     }
 }
 

@@ -91,13 +91,20 @@ pub enum Scalar {
     /// while a generic template is type-checked abstractly; monomorphization re-resolves every type
     /// with the concrete arguments, so a `Scalar::Param` never reaches MoveCheck / MIR / codegen.
     Param(u32),
+    /// A `reader` payload (`Result<reader, Error>` from `fs.open`). An owned **Move** handle (an fd);
+    /// the enclosing `Result` owns it and its `Drop` closes it. Opaque pointer, like [`Scalar::Str`]'s
+    /// counterpart but owned.
+    Reader,
+    /// A `writer` payload (`Result<writer, Error>` from `fs.create`). An owned **Move** handle (an fd
+    /// + buffer); the enclosing `Result`'s `Drop` flushes + closes it. Opaque pointer.
+    Writer,
 }
 
 impl Scalar {
     /// Whether this payload scalar is an owned **Move** type (a heap buffer that the enclosing
     /// `Option`/`Result` owns and must drop / move out). Today: `string` (8a), `array<T>` (8b).
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer)
     }
 }
 
@@ -244,11 +251,23 @@ pub enum Ty {
     /// object (a Move type): `builder()` opens it, `.write(...)` appends, `.to_string()` consumes
     /// it into an owned `string`. An unfinished builder is `Drop`-freed at scope exit (MMv2 7c).
     Builder,
-    /// A buffered stdout writer (`io.stdout.buffered()`, std.io) — an opaque owned handle to a heap
-    /// writer object (a Move type, like [`Ty::Builder`]): `.write(s)` appends, `.flush()` drains to
-    /// the OS. `Drop`-freed (after a best-effort flush) at scope exit. Unlike a builder, its writes
-    /// are I/O-effecting (Impure).
-    BufWriter,
+    /// A `writer` (`std.io`) — the one concrete write-sink Move type: `io.stdout`/`io.stderr`
+    /// (unbuffered), `io.stdout.buffered()` (buffered), `fs.create` (a file). An opaque owned handle
+    /// to a heap writer object owning an fd (like [`Ty::Builder`]): `.write(x)` appends, `.flush()`
+    /// drains to the OS. `Drop`-freed (after a best-effort flush; a file fd is also closed). Its
+    /// writes are I/O-effecting (Impure). Polymorphism lives in the constructors, not the type
+    /// ("one way").
+    Writer,
+    /// A `reader` (`std.io`) — the one concrete read-source Move type: `io.stdin`, `fs.open` (a
+    /// file). An opaque owned handle to a heap reader object owning an fd. `r.read(b: mut buffer)`
+    /// fills a caller-owned buffer. `Drop`-freed (a file fd is also closed). Its reads are Impure.
+    Reader,
+    /// A `buffer` (`core.buffer`) — an owned, growable byte container (the byte analog of a
+    /// `Vec<u8>`), the caller-owned sink `reader.read` fills. An opaque owned handle to a heap
+    /// buffer object (a Move type). `buffer(cap)` opens it, `.bytes()` views its contents (a
+    /// `slice<u8>` borrow), `.len()` is its byte count; `Drop`-freed. Constructing / reading it is
+    /// pure (no I/O).
+    Buffer,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -300,6 +319,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // later concern (so `Scalar::DynStructArray` stays layout-free — always AoS).
         Ty::DynStructArray(id, Layout::Aos) => Some(Scalar::DynStructArray(id)),
         Ty::Str => Some(Scalar::Str),
+        // A `reader`/`writer` owned handle as a `Result` Ok payload (`fs.open`/`fs.create`).
+        Ty::Reader => Some(Scalar::Reader),
+        Ty::Writer => Some(Scalar::Writer),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -327,6 +349,8 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Enum(id) => Ty::Enum(id),
         Scalar::Soa(id) => Ty::Soa(id),
         Scalar::Param(i) => Ty::Param(i),
+        Scalar::Reader => Ty::Reader,
+        Scalar::Writer => Ty::Writer,
     }
 }
 
@@ -375,7 +399,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::BufWriter | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -407,7 +431,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -556,7 +580,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -628,7 +652,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::BufWriter | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2152,27 +2176,26 @@ impl EffectScan {
                     self.expr(a);
                 }
             }
-            ExprKind::IoStdoutWrite { arg } => {
-                self.impure_direct = true;
-                self.expr(arg);
-            }
-            ExprKind::IoStdoutWriteBuilder { builder } => {
-                self.impure_direct = true;
-                self.expr(builder);
-            }
-            // Opening a buffered writer is allocation only (no I/O → pure, like `BuilderNew`); its
-            // `write`/`flush` may reach the OS, so those are impure.
-            ExprKind::BufWriterNew { .. } => {}
-            ExprKind::BufWriterWrite { writer, arg } => {
+            // Constructing a `writer`/`reader`/`buffer` is allocation only (no I/O → pure, like
+            // `BuilderNew`); the reads/writes below reach the OS, so those are impure.
+            ExprKind::WriterStd { .. } | ExprKind::ReaderStdin | ExprKind::BufferNew { .. } => {}
+            ExprKind::WriterWrite { writer, arg, .. } => {
                 self.impure_direct = true;
                 self.expr(writer);
                 self.expr(arg);
             }
-            ExprKind::BufWriterFlush { writer } => {
+            ExprKind::WriterFlush { writer } => {
                 self.impure_direct = true;
                 self.expr(writer);
             }
-            ExprKind::FsReadFile { path } => {
+            ExprKind::ReaderRead { reader, buffer } => {
+                self.impure_direct = true;
+                self.expr(reader);
+                self.expr(buffer);
+            }
+            // `.bytes()` / `.len()` on a buffer read owned memory — pure (no I/O), like a field read.
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer),
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => {
                 self.impure_direct = true;
                 self.expr(path);
             }
@@ -2669,6 +2692,9 @@ impl<'a> EscapeCheck<'a> {
             // long as the receiver — inherit its region directly. (The receiver is already a `str`:
             // an owned `string` was auto-borrowed to a `Frame` view first, so this stays sound.)
             ExprKind::StrTrim { recv, .. } => self.region_of(recv, depth),
+            // `buf.bytes()` is a `slice<u8>` view of the `buffer` local's heap storage (freed at
+            // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
+            ExprKind::BufferBytes { buffer } => Region::Frame.shorter(self.region_of(buffer, depth)),
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
@@ -2774,7 +2800,9 @@ impl<'a> EscapeCheck<'a> {
     /// argument it borrows is itself local-backed (the callee can only re-borrow its args).
     fn slice_is_local(&self, e: &Expr) -> bool {
         match &e.kind {
-            ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } => true,
+            // `buf.bytes()` views storage owned by the `buffer` local (`Drop`-freed at frame exit),
+            // so the `slice<u8>` is frame-local and must not be returned — like a slice of a local array.
+            ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } => true,
             ExprKind::Local(p) => self.local_backed_slice.contains(p),
             ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
             ExprKind::Block(b) => b.value.as_ref().is_some_and(|v| self.slice_is_local(v)),
@@ -3142,14 +3170,18 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.walk(input, depth),
-            ExprKind::FsReadFile { path } => self.walk(path, depth),
-            ExprKind::IoStdoutWrite { arg } => self.walk(arg, depth),
-            ExprKind::IoStdoutWriteBuilder { builder } => self.walk(builder, depth),
-            ExprKind::BufWriterWrite { writer, arg } => {
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => self.walk(path, depth),
+            ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
             }
-            ExprKind::BufWriterFlush { writer } => self.walk(writer, depth),
+            ExprKind::WriterFlush { writer } => self.walk(writer, depth),
+            ExprKind::ReaderRead { reader, buffer } => {
+                self.walk(reader, depth);
+                self.walk(buffer, depth);
+            }
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.walk(buffer, depth),
+            ExprKind::BufferNew { capacity } => self.walk(capacity, depth),
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
                     self.walk(c, depth);
@@ -3163,7 +3195,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
-            | ExprKind::BufWriterNew { .. }
+            | ExprKind::WriterStd { .. }
+            | ExprKind::ReaderStdin
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
@@ -3438,14 +3471,18 @@ impl UnnecessaryHeapScan {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.visit(input),
-            ExprKind::FsReadFile { path } => self.visit(path),
-            ExprKind::IoStdoutWrite { arg } => self.visit(arg),
-            ExprKind::IoStdoutWriteBuilder { builder } => self.visit(builder),
-            ExprKind::BufWriterWrite { writer, arg } => {
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => self.visit(path),
+            ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
             }
-            ExprKind::BufWriterFlush { writer } => self.visit(writer),
+            ExprKind::WriterFlush { writer } => self.visit(writer),
+            ExprKind::ReaderRead { reader, buffer } => {
+                self.visit(reader);
+                self.visit(buffer);
+            }
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.visit(buffer),
+            ExprKind::BufferNew { capacity } => self.visit(capacity),
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
                     self.visit(c);
@@ -3460,7 +3497,8 @@ impl UnnecessaryHeapScan {
             | ExprKind::Str(_)
             | ExprKind::Bool(_)
             | ExprKind::OptionNone
-            | ExprKind::BufWriterNew { .. }
+            | ExprKind::WriterStd { .. }
+            | ExprKind::ReaderStdin
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
@@ -3829,14 +3867,22 @@ impl<'a> MoveCheck<'a> {
                     self.expr(c, moved, false, false);
                 }
             }
-            // `w.write(s)` / `w.flush()` borrow the writer (and the str arg); `io.stdout.buffered()`
-            // is a leaf. The writer is never consumed — it is `Drop`-flushed at scope exit.
-            ExprKind::BufWriterWrite { writer, arg } => {
+            // `w.write(x)` / `w.flush()` borrow the writer (and its arg); `r.read(b)` borrows both
+            // reader and buffer (the buffer is filled in place, not consumed); `b.bytes()` / `b.len()`
+            // borrow the buffer. The constructors (`io.stdout`, `buffer(cap)`) are leaves. None of
+            // these Move handles is consumed — each is `Drop`-freed at scope exit.
+            ExprKind::WriterWrite { writer, arg, .. } => {
                 self.expr(writer, moved, false, false);
                 self.expr(arg, moved, false, false);
             }
-            ExprKind::BufWriterFlush { writer } => self.expr(writer, moved, false, false),
-            ExprKind::BufWriterNew { .. } => {}
+            ExprKind::WriterFlush { writer } => self.expr(writer, moved, false, false),
+            ExprKind::ReaderRead { reader, buffer } => {
+                self.expr(reader, moved, false, false);
+                self.expr(buffer, moved, false, false);
+            }
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer, moved, false, false),
+            ExprKind::BufferNew { capacity } => self.expr(capacity, moved, false, false),
+            ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
             // Both operands are borrowed (read for bytes), never consumed.
             ExprKind::StrPredicate { haystack, needle, .. } => {
                 self.expr(haystack, moved, false, false);
@@ -4001,9 +4047,7 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.expr(input, moved, false, false),
-            ExprKind::FsReadFile { path } => self.expr(path, moved, false, false),
-            ExprKind::IoStdoutWrite { arg } => self.expr(arg, moved, false, false),
-            ExprKind::IoStdoutWriteBuilder { builder } => self.expr(builder, moved, false, false),
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => self.expr(path, moved, false, false),
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -5412,6 +5456,23 @@ impl<'a, 't> Checker<'a, 't> {
     /// a local (chained field access on a value comes later).
     fn check_field_access(&mut self, recv: &ast::Expr, field: &ast::Ident, expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
+        // `io.stdin` / `io.stdout` / `io.stderr` — a std.io `reader` / `writer` VALUE (a constructor).
+        // "One type, many constructors": the bare stream is unbuffered; `.buffered()` (intercepted in
+        // `check_method_call`) is the buffered writer. A local/captured `io` shadows this.
+        if let ast::ExprKind::Path(p) = &recv.kind
+            && single_name(p) == Some("io")
+            && matches!(field.name.as_str(), "stdin" | "stdout" | "stderr")
+            && self.lookup("io").is_none()
+            && !self.capture.as_ref().is_some_and(|c| {
+                c.captured.iter().any(|(n, _, _)| n == "io") || c.enclosing.iter().any(|(n, _, _)| n == "io")
+            }) {
+                self.require_import("std.io", &format!("io.{}", field.name), span);
+                return match field.name.as_str() {
+                    "stdin" => Expr { kind: ExprKind::ReaderStdin, ty: Ty::Reader, span },
+                    "stdout" => Expr { kind: ExprKind::WriterStd { fd: 1, buffered: false }, ty: Ty::Writer, span },
+                    _ => Expr { kind: ExprKind::WriterStd { fd: 2, buffered: false }, ty: Ty::Writer, span },
+                };
+            }
         // `Type.Variant` / `mod.Type.Variant` — a (tag-only) sum-type value, not field access on a
         // value. The receiver names a sum type (bare in this module, or a qualified import); a
         // payload variant is a *call* (handled in `check_call`). `check_variant_ctor` reports a
@@ -6299,6 +6360,9 @@ impl<'a, 't> Checker<'a, 't> {
         if name == "builder" {
             return self.check_builder_new(args, span);
         }
+        if name == "buffer" {
+            return self.check_buffer_new(args, span);
+        }
         if name == "select" {
             return self.check_select(args, span);
         }
@@ -6806,26 +6870,29 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.fs", "fs.read_file", span);
                 return self.check_fs_read_file(args, span);
             }
+            // `fs.open(path)` -> Result<reader, Error>; `fs.create(path)` -> Result<writer, Error>.
+            if single_name(p) == Some("fs") && (method == "open" || method == "create") {
+                self.require_import("std.fs", &format!("fs.{method}"), span);
+                return self.check_fs_open_create(method == "create", args, span);
+            }
         }
-        // `io.stdout.write(s)` / `io.stdout.buffered()` / `io.stderr.buffered()` — the receiver is the
-        // 2-segment `io.stdout` / `io.stderr`, so it parses as a `FieldAccess` (`io` . `stdout`), not
-        // a single-name path.
-        if (method == "write" || method == "buffered")
+        // `io.stdout.buffered()` / `io.stderr.buffered()` — a buffered `writer` over a standard
+        // stream. The receiver is the 2-segment `io.stdout` / `io.stderr`, so it parses as a
+        // `FieldAccess` (`io` . `stdout`). `buffered` is intercepted here (before the receiver is
+        // evaluated as an unbuffered writer value) so `io.stdout.buffered()` builds one buffered
+        // writer, not an unbuffered one wrapped in a buffered one.
+        if method == "buffered"
             && let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind
-                && let ast::ExprKind::Path(p) = &inner.kind {
-                    if single_name(p) == Some("io") && field.name == "stdout" {
-                        if method == "buffered" {
-                            self.require_import("std.io", "io.stdout.buffered", span);
-                            return self.check_io_buffered("stdout", 1, args, span);
-                        }
-                        self.require_import("std.io", "io.stdout.write", span);
-                        return self.check_io_stdout_write(args, span);
-                    }
-                    // `io.stderr.buffered()` — the buffered writer over fd 2 (logging/diagnostics).
-                    // Unbuffered `io.stderr.write` is a later, parallel addition.
-                    if single_name(p) == Some("io") && field.name == "stderr" && method == "buffered" {
-                        self.require_import("std.io", "io.stderr.buffered", span);
-                        return self.check_io_buffered("stderr", 2, args, span);
+                && let ast::ExprKind::Path(p) = &inner.kind
+                && single_name(p) == Some("io") {
+                    let fd = match field.name.as_str() {
+                        "stdout" => 1,
+                        "stderr" => 2,
+                        _ => 0,
+                    };
+                    if fd != 0 {
+                        self.require_import("std.io", &format!("io.{}.buffered", field.name), span);
+                        return self.check_io_buffered(&field.name, fd, args, span);
                     }
                 }
         // `mod.fn(...)` / `a.b.fn(...)` — a cross-module call into an imported user module. The
@@ -6962,28 +7029,35 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "chunks" {
             return self.check_array_chunks(recv, args, span);
         }
-        // Writer methods: a `builder`'s typed `write*` / `to_string`, and a buffered stdout writer's
-        // `write` / `flush`. `.write` is shared, so evaluate the receiver once and dispatch on its
-        // type. (`write_int`/`to_string` are builder-only; `flush` is buffered-writer-only.)
-        if matches!(method, "write" | "write_int" | "write_bool" | "write_char" | "write_float" | "to_string" | "flush") {
+        // Sink/source methods: a `builder`'s typed `write*` / `to_string`, a `writer`'s `write` /
+        // `flush`, a `reader`'s `read`, a `buffer`'s `bytes`. `.write` is shared, so evaluate the
+        // receiver once and dispatch on its type. (`write_int`/`to_string` are builder-only.)
+        if matches!(method, "write" | "write_int" | "write_bool" | "write_char" | "write_float" | "to_string" | "flush" | "read" | "bytes") {
             let recv_expr = self.check_expr(recv, None);
-            if recv_expr.ty == Ty::BufWriter {
-                return self.check_bufwriter_method(recv_expr, method, args, span);
+            if recv_expr.ty == Ty::Writer {
+                return self.check_writer_method(recv_expr, method, args, span);
             }
-            if let Some(kind) = builder_write_kind(method) {
+            if recv_expr.ty == Ty::Reader {
+                return self.check_reader_method(recv_expr, method, args, span);
+            }
+            if recv_expr.ty == Ty::Buffer && method == "bytes" {
+                return self.check_buffer_bytes(recv_expr, args, span);
+            }
+            if method != "read" && method != "bytes"
+                && let Some(kind) = builder_write_kind(method) {
                 return self.check_builder_write(recv_expr, args, kind, span);
             }
             if method == "to_string" {
                 return self.check_builder_to_string(recv_expr, args, span);
             }
-            // `.flush()` on something that is neither a builder nor a buffered writer.
+            // A sink/source method on a value that is none of the above.
             if recv_expr.ty != Ty::Error {
                 self.diags
-                    .error(format!("'.{method}()' is a buffered-writer method, got {}", ty_name(recv_expr.ty)), span);
+                    .error(format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)), span);
             }
             return err;
         }
-        // `.len()` of a `str`/`slice`/array — the element count (an `i64`).
+        // `.len()` of a `str`/`slice`/array/`buffer` — the element/byte count (an `i64`).
         if method == "len" {
             return self.check_len(recv, args, span);
         }
@@ -7377,6 +7451,16 @@ impl<'a, 't> Checker<'a, 't> {
         // Otherwise a scalar array.
         let first = self.check_expr(&elems[0], elem_expected);
         let elem_ty = first.ty;
+        // A `reader`/`writer`/`buffer` element is rejected at construction (like a struct field /
+        // tuple element): the array read copies the handle by value, so collecting handles would
+        // alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer) {
+            self.diags.error(
+                format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
         let mut checked = vec![first];
         for e in &elems[1..] {
             checked.push(self.check_expr(e, Some(elem_ty)));
@@ -9030,6 +9114,25 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::BuilderNew { capacity }, ty: Ty::Builder, span }
     }
 
+    /// `buffer(cap)` — open an owned growable byte buffer with read window `cap` bytes (the sink a
+    /// `reader.read` fills). `cap` is a required `i64` (a 0-window buffer reads nothing).
+    fn check_buffer_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [cap] = args else {
+            self.diags.error(format!("'buffer' takes a capacity (1 argument, the read window in bytes), got {}", args.len()), span);
+            return err;
+        };
+        let c = self.check_expr(cap, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if c.ty == Ty::Error {
+            return err;
+        }
+        if !c.ty.is_int_like() {
+            self.diags.error(format!("'buffer' capacity must be an integer, got {}", ty_name(c.ty)), cap.span);
+            return err;
+        }
+        Expr { kind: ExprKind::BufferNew { capacity: Box::new(c) }, ty: Ty::Buffer, span }
+    }
+
     /// `b.write(s)` / `b.write_int(n)` / `b.write_bool(v)` / `b.write_char(c)` /
     /// `b.write_float(x)` — append to a builder (MMv2 slice 7c/7d). The builder is borrowed
     /// (mutated through its handle, not consumed). Each writer takes the matching scalar; `write`
@@ -9479,6 +9582,19 @@ impl<'a, 't> Checker<'a, 't> {
             // `str`/`slice`/`soa` carry a runtime length in their `{ ptr, len }` view (a `soa`'s
             // length is its row count).
             Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::Soa(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            // A `buffer`'s length is its current byte count (the last read's size). Same v1
+            // bound-receiver restriction as `.bytes()` (uniform across buffer methods, until Move
+            // temporaries drop): reject `buffer(n).len()` on an unbound temporary.
+            Ty::Buffer => {
+                if !matches!(r.kind, ExprKind::Local(_)) {
+                    self.diags.error(
+                        "bind the buffer to a local first, then call the method (`b := buffer(n)` then `b.len()`) — a temporary buffer handle is not dropped yet".to_string(),
+                        span,
+                    );
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+                }
+                Expr { kind: ExprKind::BufferLen { buffer: Box::new(r) }, ty: i64_ty, span }
+            }
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
@@ -9545,7 +9661,7 @@ impl<'a, 't> Checker<'a, 't> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder)
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer)
             || payload_is_move(elem)
             || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs))
         {
@@ -9590,7 +9706,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // frees — same double-free reasoning as `check_index`. Slices are read-only views,
                 // so a `slice<scalar>` is fine; reject Move-element collections until a borrow design.
                 let elem = scalar_to_ty(s);
-                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder) || payload_is_move(elem) {
+                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer) || payload_is_move(elem) {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
                         span,
@@ -9663,56 +9779,62 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `io.stdout.write(s)` — write the bytes of a `str` (or owned `string`, auto-borrowed) to
-    /// stdout with **no** trailing newline (unlike `print`), yielding `Result<(), Error>` (an I/O
-    /// failure is `Err`). The first `std.io` surface; a builtin like `fs.read_file`.
-    fn check_io_stdout_write(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+    /// `fs.open(path)` -> `Result<reader, Error>` / `fs.create(path)` -> `Result<writer, Error>`.
+    /// Open (`create` = create/truncate) `path` (a `str`, owned `string` auto-borrowed); the handle
+    /// owns its fd (closed on `Drop`). A builtin, dispatched like `fs.read_file`.
+    fn check_fs_open_create(&mut self, create: bool, args: &[ast::Expr], span: Span) -> Expr {
+        let name = if create { "fs.create" } else { "fs.open" };
         if args.len() != 1 {
             self.diags
-                .error(format!("'io.stdout.write' expects 1 argument, got {}", args.len()), span);
+                .error(format!("'{name}' expects 1 argument (the path), got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
-        // The argument is written as bytes: a `builder` (its accumulated bytes, written directly —
-        // no `to_string()` materialization), or a `str` / owned `string` (auto-borrowed). The
-        // builder is *borrowed* (not consumed), so it is still usable / dropped normally after.
-        let arg0 = self.check_expr(&args[0], None);
-        let kind = match arg0.ty {
-            Ty::Builder => ExprKind::IoStdoutWriteBuilder { builder: Box::new(arg0) },
-            // Replicates `check_str_init`: borrow an owned `string` as a `str`; constrain anything
-            // else to `str`.
-            Ty::String => {
-                let span = arg0.span;
-                ExprKind::IoStdoutWrite { arg: Box::new(Expr { kind: ExprKind::StrBorrow(Box::new(arg0)), ty: Ty::Str, span }) }
-            }
-            Ty::Str | Ty::Error => ExprKind::IoStdoutWrite { arg: Box::new(arg0) },
-            other => {
-                self.constrain(other, Some(Ty::Str), args[0].span);
-                ExprKind::IoStdoutWrite { arg: Box::new(arg0) }
-            }
+        let path = self.check_str_init(&args[0]);
+        let (kind, ok) = if create {
+            (ExprKind::WriterCreate { path: Box::new(path) }, Scalar::Writer)
+        } else {
+            (ExprKind::ReaderOpen { path: Box::new(path) }, Scalar::Reader)
         };
-        Expr { kind, ty: result_ty, span }
+        Expr {
+            kind,
+            ty: Ty::Result(ok, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
     }
 
-    /// `io.stdout.buffered()` — open a buffered stdout writer (the sink-first fast path), yielding a
-    /// [`Ty::BufWriter`] owned handle. Takes no arguments; the writer is `Drop`-flushed at scope exit.
-    /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — open a buffered writer over
-    /// the given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
+    /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — a buffered `writer` over the
+    /// given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
     fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
         if !args.is_empty() {
             self.diags
                 .error(format!("'io.{sink}.buffered' takes no arguments, got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        Expr { kind: ExprKind::BufWriterNew { fd }, ty: Ty::BufWriter, span }
+        Expr { kind: ExprKind::WriterStd { fd, buffered: true }, ty: Ty::Writer, span }
     }
 
-    /// `w.write(s)` / `w.flush()` on a buffered stdout writer ([`Ty::BufWriter`]), the receiver
-    /// already evaluated. `write` appends a `str` (an owned `string` auto-borrows, staying usable)
-    /// and yields `Unit`; `flush` drains to the OS and yields `Result<(), Error>`. Both borrow the
-    /// writer (it is never consumed — `Drop`-flushed at scope exit).
-    fn check_bufwriter_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+    /// `w.write(x)` / `w.flush()` on a `writer` ([`Ty::Writer`]), the receiver already evaluated.
+    /// `write` appends a `str` / owned `string` (auto-borrowed) / `bytes` (`slice<u8>`) / a
+    /// `builder`'s bytes; `flush` drains to the OS. Both yield `Result<(), Error>` and borrow the
+    /// writer (never consumed — `Drop`-flushed/closed at scope exit).
+    fn check_writer_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
+        // v1 restriction (until Move *temporaries* get a `Drop`): the receiver of a writer method
+        // must be a bound local — never an unbound owned-handle temporary. `fs.create(p)?.write(d)?`
+        // would leave the temp writer un-`Drop`ped, so its buffered bytes are never flushed and its
+        // fd never closed — silent data loss. The borrowed std streams (`io.stdout`/`io.stderr`,
+        // incl. `.buffered()`) own no fd and are exempt (chaining them is unchanged). Lifted when
+        // dropping Move temporaries lands (`draft.md` §18.2).
+        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::WriterStd { .. }) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the writer to a local first, then call the method (`w := <expr>` then `w.write(...)`) — a temporary owned writer handle is not dropped/flushed yet, so its output would be lost".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
         match method {
             "flush" => {
                 if !args.is_empty() {
@@ -9720,11 +9842,7 @@ impl<'a, 't> Checker<'a, 't> {
                         .error(format!("'.flush()' takes no arguments, got {}", args.len()), span);
                     return err;
                 }
-                Expr {
-                    kind: ExprKind::BufWriterFlush { writer: Box::new(recv_expr) },
-                    ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
-                    span,
-                }
+                Expr { kind: ExprKind::WriterFlush { writer: Box::new(recv_expr) }, ty: result_ty, span }
             }
             "write" => {
                 if args.len() != 1 {
@@ -9736,28 +9854,105 @@ impl<'a, 't> Checker<'a, 't> {
                 if arg.ty == Ty::Error {
                     return err;
                 }
-                // A `string` borrows as a `str` (zero-cost, non-consuming), so `w.write(owned)`
-                // keeps `owned` usable — mirrors `builder.write` / `io.stdout.write`.
+                // A `builder`'s bytes are written directly (no `to_string()` materialization),
+                // borrowing it (not consumed).
+                if arg.ty == Ty::Builder {
+                    return Expr {
+                        kind: ExprKind::WriterWrite { writer: Box::new(recv_expr), arg: Box::new(arg), builder: true },
+                        ty: result_ty,
+                        span,
+                    };
+                }
+                // A `string` borrows as a `str` (zero-cost, non-consuming); `bytes` (a `slice<u8>`)
+                // is written as-is; a `str` is written as-is; anything else is a type error.
                 if arg.ty == Ty::String {
                     let s = arg.span;
                     arg = Expr { kind: ExprKind::StrBorrow(Box::new(arg)), ty: Ty::Str, span: s };
                 }
-                if arg.ty != Ty::Str {
+                if arg.ty != Ty::Str && arg.ty != Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) {
                     self.diags
-                        .error(format!("'.write()' expects a str, got {}", ty_name(arg.ty)), arg.span);
+                        .error(format!("'.write()' expects a str, bytes (slice<u8>), or builder, got {}", ty_name(arg.ty)), arg.span);
                     return err;
                 }
                 Expr {
-                    kind: ExprKind::BufWriterWrite { writer: Box::new(recv_expr), arg: Box::new(arg) },
-                    ty: Ty::Unit,
+                    kind: ExprKind::WriterWrite { writer: Box::new(recv_expr), arg: Box::new(arg), builder: false },
+                    ty: result_ty,
                     span,
                 }
             }
             _ => {
                 self.diags
-                    .error(format!("'.{method}()' is not a method on a buffered writer (try write / flush)"), span);
+                    .error(format!("'.{method}()' is not a method on a writer (try write / flush)"), span);
                 err
             }
+        }
+    }
+
+    /// `r.read(b: mut buffer)` on a `reader` ([`Ty::Reader`]), the receiver already evaluated. Fills
+    /// `b` up to its capacity (overwriting its length), yielding `Result<i64, Error>` (bytes read;
+    /// `0` = EOF). Borrows both reader and buffer (neither consumed).
+    fn check_reader_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 restriction (mirrors `check_writer_method`): the receiver must be a bound local — an
+        // unbound owned-handle temporary (`fs.open(p)?.read(buf)?`) would leak its fd (no `Drop`).
+        // `io.stdin` (borrowed, no owned fd) is exempt. Lifted when Move temporaries drop.
+        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::ReaderStdin) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the reader to a local first, then call the method (`r := <expr>` then `r.read(...)`) — a temporary owned reader handle is not dropped yet, so its fd would leak".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        if method != "read" {
+            self.diags.error(format!("'.{method}()' is not a method on a reader (try read)"), span);
+            return err;
+        }
+        if args.len() != 1 {
+            self.diags.error(format!("'.read()' takes 1 argument (a mut buffer), got {}", args.len()), span);
+            return err;
+        }
+        let buffer = self.check_expr(&args[0], Some(Ty::Buffer));
+        if buffer.ty == Ty::Error {
+            return err;
+        }
+        if buffer.ty != Ty::Buffer {
+            self.diags.error(format!("'.read()' fills a buffer, got {}", ty_name(buffer.ty)), args[0].span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ReaderRead { reader: Box::new(recv_expr), buffer: Box::new(buffer) },
+            ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `b.bytes()` on a `buffer` ([`Ty::Buffer`]), the receiver already evaluated. A `slice<u8>`
+    /// view of the buffer's current contents, borrowing it (region-tracked: must not outlive `b`).
+    fn check_buffer_bytes(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 restriction (mirrors reader/writer): the receiver must be a bound local. On an unbound
+        // `buffer` temporary (`buffer(4).bytes()`), `.bytes()` returns a `slice<u8>` viewing the
+        // temp's storage — leaked-but-valid today, but a dangling slice (UAF) the moment Move
+        // temporaries get a `Drop`. Bind the buffer first. Lifted with Move-temporary drop.
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the buffer to a local first, then call the method (`b := buffer(n)` then `b.bytes()`) — a temporary buffer handle is not dropped yet, and `.bytes()` returns a slice into it".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        if !args.is_empty() {
+            self.diags.error(format!("'.bytes()' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::BufferBytes { buffer: Box::new(recv_expr) },
+            ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+            span,
         }
     }
 
@@ -9827,7 +10022,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Any other Move leaf (a `box`/owned-collection/builder field) can't occur — struct fields are
         // scalar / `str` / `string` / plain-struct only — but guard defensively against a copy-without-
         // ownership-transfer double-free if that ever changes.
-        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder) || payload_is_move(leaf_ty) {
+        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer) || payload_is_move(leaf_ty) {
             self.diags.error(
                 format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
                 span,
@@ -10635,14 +10830,18 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.finalize_expr(input),
-            ExprKind::FsReadFile { path } => self.finalize_expr(path),
-            ExprKind::IoStdoutWrite { arg } => self.finalize_expr(arg),
-            ExprKind::IoStdoutWriteBuilder { builder } => self.finalize_expr(builder),
-            ExprKind::BufWriterWrite { writer, arg } => {
+            ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path } => self.finalize_expr(path),
+            ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);
             }
-            ExprKind::BufWriterFlush { writer } => self.finalize_expr(writer),
+            ExprKind::WriterFlush { writer } => self.finalize_expr(writer),
+            ExprKind::ReaderRead { reader, buffer } => {
+                self.finalize_expr(reader);
+                self.finalize_expr(buffer);
+            }
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.finalize_expr(buffer),
+            ExprKind::BufferNew { capacity } => self.finalize_expr(capacity),
             ExprKind::StrPredicate { haystack, needle, .. } => {
                 self.finalize_expr(haystack);
                 self.finalize_expr(needle);
@@ -10676,7 +10875,8 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::Bool(_)
             | ExprKind::Local(_)
             | ExprKind::OptionNone
-            | ExprKind::BufWriterNew { .. }
+            | ExprKind::WriterStd { .. }
+            | ExprKind::ReaderStdin
             | ExprKind::Field { .. }
             | ExprKind::SoaColumn { .. }
             | ExprKind::ArrayGroupAgg { .. }
@@ -11041,8 +11241,10 @@ fn ty_name(ty: Ty) -> String {
         Ty::ArenaHandle => "arena".to_string(),
         Ty::Raw => "raw".to_string(),
         Ty::Builder => "builder".to_string(),
-        // The surface type name (`fn f(w: writer)`), so diagnostics match what the user writes.
-        Ty::BufWriter => "writer".to_string(),
+        // The surface type names (`fn f(w: writer)`), so diagnostics match what the user writes.
+        Ty::Writer => "writer".to_string(),
+        Ty::Reader => "reader".to_string(),
+        Ty::Buffer => "buffer".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -11201,6 +11403,20 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // `box`/`slice`/`array` over a `T` are not supported yet, so reject `Param` there.
     if matches!(ty, Ty::Param(_)) && !allow_param {
         diags.error(format!("{what} cannot be a generic type parameter yet, got {}", ty_name(ty)), span);
+        return None;
+    }
+    // An owned I/O handle (`reader`/`writer`) is bound to exactly one local and closes its fd once
+    // at that binding's `Drop`. It may ride in an `Option`/`Result` payload (`fs.open`/`fs.create`
+    // return `Result<reader/writer, Error>`) — the `allow_param` positions — but **never** as an
+    // array / slice / vec / box **element**: an element read copies the handle by value (no
+    // move-out), so two copies would close/free the same fd (double close + double `Box::from_raw`
+    // = UB). A `buffer` is never a payload at all. Reject at the type, matching `is_field_ok` /
+    // tuple elements (which also refuse these handles).
+    if matches!(ty, Ty::Buffer) || (matches!(ty, Ty::Reader | Ty::Writer) && !allow_param) {
+        diags.error(
+            format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
+            span,
+        );
         return None;
     }
     match ty_to_scalar(ty) {
@@ -11400,14 +11616,28 @@ fn resolve_type(
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
-        // `writer` — the std.io buffered byte sink (`io.stdout.buffered()`). A surface type name so
-        // a writer can be threaded through functions (it is a Move handle; pass-and-return to loop).
+        // `writer` / `reader` / `buffer` — the std.io / core.buffer Move handles. Surface type names
+        // so they can be threaded through functions (each is a Move handle; passed by value).
         "writer" => {
             if !args.is_empty() {
                 diags.error("writer takes no type arguments".to_string(), span);
                 return Ty::Error;
             }
-            Ty::BufWriter
+            Ty::Writer
+        }
+        "reader" => {
+            if !args.is_empty() {
+                diags.error("reader takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::Reader
+        }
+        "buffer" => {
+            if !args.is_empty() {
+                diags.error("buffer takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::Buffer
         }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {

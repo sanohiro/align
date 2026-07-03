@@ -7,11 +7,24 @@ Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-03 (main @ PR #331; M8 formally closed same day, docs-only)._
 
-## M9 — std phase begun (design settled, 2026-07-03)
+## M9 — std phase (design settled 2026-07-03; Slice 1 DONE)
 
 M0–M8 are done (language core + tooling/FFI). M9 (`std.io`/`std.fs`/`std.path`/`std.env`/
-`std.time`) design is now settled — see `docs/impl/07-roadmap.md` M9 and `docs/open-questions.md`
-Settled → "M9 std design". Implementation has not started.
+`std.time`) design is settled — see `docs/impl/07-roadmap.md` M9 and `docs/open-questions.md`
+Settled → "M9 std design".
+
+**Slice 1 (std.io core) — DONE.** `reader`/`writer` (`Ty::Reader`/`Ty::Writer`, own an fd, `Drop`
+closes a file fd; std streams borrow theirs) + the minimal owned `buffer` (`Ty::Buffer`,
+`buffer(cap)`/`.bytes()`/`.len()`) `core.buffer` type; constructors `io.stdin`/`io.stdout`/
+`io.stderr`/`io.stdout.buffered()`/`fs.open`/`fs.create` (the old `Ty::BufWriter` + `io.stdout.write`
+special-case collapsed into the one `writer` type — "one type, many constructors"); methods
+`r.read(b: mut buffer)` / `w.write(str|bytes|builder)` / `w.flush()`, all `Result<_, Error>`; the
+errno→`Error` fixed table (`draft.md` §18.2) as one runtime helper + one branchless MIR decode,
+shared by every std fn. Byte-exact file copy + per-method tests in `crates/align_driver/tests/m9_io.rs`.
+`Result<reader/writer, Error>` works (new `Scalar::Reader`/`Scalar::Writer` payloads with a
+per-payload drop dtor). Known minor gap: an unbound Move *temporary* isn't dropped, so a one-shot
+`io.stdout.write(x)?` leaks its ~40-byte writer handle (bound handles drop correctly) — a general
+MIR limitation, fixed by dropping Move temporaries (separate work). **Next: Slice 2 (`io.copy`).**
 
 ## M8 — Tooling and Quality — formally closed (2026-07-03)
 
