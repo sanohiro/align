@@ -1720,6 +1720,13 @@ dispatches on fd kind internally (a portable fixed-buffer loop is the v1 / refer
 implementation; a `sendfile`/`splice`/mmap fast path may follow, validated against that loop,
 without changing this signature — `docs/open-questions.md` "Transparent zero-copy I/O").
 
+**v1 restriction (temporary implementation limit, not a design choice):** an **owned** `reader` /
+`writer` (from `fs.open` / `fs.create`) must be bound to a local before a method is called on it —
+`w := fs.create(p)?` then `w.write(d)?`, not `fs.create(p)?.write(d)?`. An unbound owned handle
+would never run its `Drop`, silently losing a buffered `writer`'s output and leaking the fd. The
+borrowed standard streams (`io.stdin` / `io.stdout` / `io.stderr`, incl. `io.stdout.buffered()`) own
+no fd and may be chained directly. This restriction lifts once Move *temporaries* get a `Drop`.
+
 ### std.fs
 
 ```text

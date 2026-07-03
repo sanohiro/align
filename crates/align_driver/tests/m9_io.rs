@@ -322,6 +322,58 @@ pub fn main() -> i32 {
     assert!(check_errs("m9-bytes-escape", prog), "returning a slice into a local buffer must be rejected");
 }
 
+/// An owned I/O handle (`reader`/`writer`/`buffer`) cannot be an array/slice element — an element
+/// read copies the handle by value, so a collection of handles would alias one fd/buffer across
+/// copies → double close/free (UB). Rejected at construction (array literal) and at the type
+/// (`array<T>` / `slice<T>`), matching struct fields / tuple elements.
+#[test]
+fn io_handles_cannot_be_array_or_slice_elements() {
+    // Array literal of readers.
+    assert!(check_errs(
+        "m9-arr-lit-reader",
+        "import std.fs\npub fn main(args: array<str>) -> Result<(), Error> {\n  arr := [fs.open(args[1])?, fs.open(args[1])?]\n  return Ok(())\n}\n",
+    ), "an array literal of readers must be rejected");
+    // `array<reader>` type annotation.
+    assert!(check_errs(
+        "m9-arr-ty-reader",
+        "import std.io\nfn f(xs: array<reader>) -> i32 = 0\npub fn main() -> i32 { return 0 }\n",
+    ), "`array<reader>` must be rejected");
+    // `slice<writer>` type annotation.
+    assert!(check_errs(
+        "m9-slice-ty-writer",
+        "import std.io\nfn f(xs: slice<writer>) -> i32 = 0\npub fn main() -> i32 { return 0 }\n",
+    ), "`slice<writer>` must be rejected");
+    // `array<buffer>` type annotation (buffer was accidentally safe via `ty_to_scalar`; now
+    // rejected explicitly for consistency).
+    assert!(check_errs(
+        "m9-arr-ty-buffer",
+        "import std.io\nfn f(xs: array<buffer>) -> i32 = 0\npub fn main() -> i32 { return 0 }\n",
+    ), "`array<buffer>` must be rejected");
+}
+
+/// v1 restriction (until Move temporaries drop): a reader/writer **method** call requires a bound
+/// receiver — an unbound owned-handle temporary (`fs.create(p)?.write(d)?`) is never `Drop`ped, so
+/// its buffered output would be lost / its fd leaked. The borrowed `io.std*` streams are exempt.
+#[test]
+fn owned_handle_temporary_as_method_receiver_is_rejected() {
+    // `fs.create(p)?.write(...)?` — the writer temp would never flush.
+    assert!(check_errs(
+        "m9-writer-temp",
+        "import std.fs\npub fn main(args: array<str>) -> Result<(), Error> {\n  fs.create(args[1])?.write(\"x\")?\n  return Ok(())\n}\n",
+    ), "a writer method on an unbound fs.create temporary must be rejected");
+    // `fs.open(p)?.read(buf)?` — the reader temp would leak its fd.
+    assert!(check_errs(
+        "m9-reader-temp",
+        "import std.fs\npub fn main(args: array<str>) -> Result<(), Error> {\n  buf := buffer(4)\n  n := fs.open(args[1])?.read(buf)?\n  return Ok(())\n}\n",
+    ), "a reader method on an unbound fs.open temporary must be rejected");
+    // The borrowed std streams are exempt — `io.stdout.write(x)?` inline still type-checks (a
+    // regression guard so the restriction doesn't over-reach).
+    assert!(!check_errs(
+        "m9-stdout-inline-ok",
+        "import std.io\npub fn main() -> Result<(), Error> {\n  io.stdout.write(\"ok\\n\")?\n  return Ok(())\n}\n",
+    ), "io.stdout.write inline must stay allowed (borrowed, no owned fd)");
+}
+
 /// `w.write(x)` returns `Result<(), Error>`; discarding it (no `?` / `match` / bind) is the
 /// unhandled-`Result` error — a write failure must not be silently dropped.
 #[test]

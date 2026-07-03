@@ -7451,6 +7451,16 @@ impl<'a, 't> Checker<'a, 't> {
         // Otherwise a scalar array.
         let first = self.check_expr(&elems[0], elem_expected);
         let elem_ty = first.ty;
+        // A `reader`/`writer`/`buffer` element is rejected at construction (like a struct field /
+        // tuple element): the array read copies the handle by value, so collecting handles would
+        // alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer) {
+            self.diags.error(
+                format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
         let mut checked = vec![first];
         for e in &elems[1..] {
             checked.push(self.check_expr(e, Some(elem_ty)));
@@ -9640,7 +9650,7 @@ impl<'a, 't> Checker<'a, 't> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder)
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer)
             || payload_is_move(elem)
             || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs))
         {
@@ -9685,7 +9695,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // frees — same double-free reasoning as `check_index`. Slices are read-only views,
                 // so a `slice<scalar>` is fine; reject Move-element collections until a borrow design.
                 let elem = scalar_to_ty(s);
-                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder) || payload_is_move(elem) {
+                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer) || payload_is_move(elem) {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
                         span,
@@ -9799,6 +9809,21 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_writer_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
+        // v1 restriction (until Move *temporaries* get a `Drop`): the receiver of a writer method
+        // must be a bound local — never an unbound owned-handle temporary. `fs.create(p)?.write(d)?`
+        // would leave the temp writer un-`Drop`ped, so its buffered bytes are never flushed and its
+        // fd never closed — silent data loss. The borrowed std streams (`io.stdout`/`io.stderr`,
+        // incl. `.buffered()`) own no fd and are exempt (chaining them is unchanged). Lifted when
+        // dropping Move temporaries lands (`draft.md` §18.2).
+        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::WriterStd { .. }) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the writer to a local first, then call the method (`w := <expr>` then `w.write(...)`) — a temporary owned writer handle is not dropped/flushed yet, so its output would be lost".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
         match method {
             "flush" => {
                 if !args.is_empty() {
@@ -9857,6 +9882,18 @@ impl<'a, 't> Checker<'a, 't> {
     /// `0` = EOF). Borrows both reader and buffer (neither consumed).
     fn check_reader_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 restriction (mirrors `check_writer_method`): the receiver must be a bound local — an
+        // unbound owned-handle temporary (`fs.open(p)?.read(buf)?`) would leak its fd (no `Drop`).
+        // `io.stdin` (borrowed, no owned fd) is exempt. Lifted when Move temporaries drop.
+        if !matches!(recv_expr.kind, ExprKind::Local(_) | ExprKind::ReaderStdin) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the reader to a local first, then call the method (`r := <expr>` then `r.read(...)`) — a temporary owned reader handle is not dropped yet, so its fd would leak".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
         if method != "read" {
             self.diags.error(format!("'.{method}()' is not a method on a reader (try read)"), span);
             return err;
@@ -9961,7 +9998,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Any other Move leaf (a `box`/owned-collection/builder field) can't occur — struct fields are
         // scalar / `str` / `string` / plain-struct only — but guard defensively against a copy-without-
         // ownership-transfer double-free if that ever changes.
-        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder) || payload_is_move(leaf_ty) {
+        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer) || payload_is_move(leaf_ty) {
             self.diags.error(
                 format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
                 span,
@@ -11342,6 +11379,20 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // `box`/`slice`/`array` over a `T` are not supported yet, so reject `Param` there.
     if matches!(ty, Ty::Param(_)) && !allow_param {
         diags.error(format!("{what} cannot be a generic type parameter yet, got {}", ty_name(ty)), span);
+        return None;
+    }
+    // An owned I/O handle (`reader`/`writer`) is bound to exactly one local and closes its fd once
+    // at that binding's `Drop`. It may ride in an `Option`/`Result` payload (`fs.open`/`fs.create`
+    // return `Result<reader/writer, Error>`) — the `allow_param` positions — but **never** as an
+    // array / slice / vec / box **element**: an element read copies the handle by value (no
+    // move-out), so two copies would close/free the same fd (double close + double `Box::from_raw`
+    // = UB). A `buffer` is never a payload at all. Reject at the type, matching `is_field_ok` /
+    // tuple elements (which also refuse these handles).
+    if matches!(ty, Ty::Buffer) || (matches!(ty, Ty::Reader | Ty::Writer) && !allow_param) {
+        diags.error(
+            format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
+            span,
+        );
         return None;
     }
     match ty_to_scalar(ty) {
