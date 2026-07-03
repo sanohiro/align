@@ -454,12 +454,17 @@ syscall maps through one fixed errno table (`ENOENT`→`NotFound`, `EACCES`/`EPE
 `std.encoding`: `base64`/`base64url`/`hex` encode+decode (decode returns an owned `buffer` — no
 UTF-8 invariant on `bytes`; invalid input is `Error.Invalid`) plus `utf8_valid`. `std.rand`
 (non-cryptographic): `rand.seed()`/`seed_with(s)` produce a **Copy** `rng` value (state-only, no
-fd — unlike `reader`/`writer`); `r.next()`/`r.range(lo, hi)`/`r.shuffle(xs)`/`r.sample(xs, k)` take
-a `mut` receiver, OS-seeded via `getrandom`/`urandom`. `std.cli`: an explicit flag-registration
-builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/`c.parse`/`p.get_*`/`c.usage`) parsing
-`main(args: array<str>)`'s `array<str>` — not a second argv source. Lookups are **total** after a
-successful `parse` (every flag has a value or its default, like `json.decode`); input errors surface
-from `parse` as `Error.Invalid`. A v1 provisional pending derive. (`draft.md` §18.2, M10.)
+fd — unlike `reader`/`writer`); `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)`
+take a `mut` receiver, OS-seeded via `getrandom`/`urandom`; `lo >= hi` (`range`) and `k < 0` or
+`k > xs.len()` (`sample`) are programmer errors and abort at runtime, like out-of-bounds indexing.
+`std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/
+`c.parse -> Result<parsed, Error>`/`p.get_*`/`c.usage`) parsing `main(args: array<str>)`'s
+`array<str>` — not a second argv source. Lookups are **total** after a successful `parse` (every
+flag has a value or its default, like `json.decode`), but the lookup itself is checked at
+**runtime**, not compile time: a `get_*` call for an unregistered name or the wrong type aborts at
+runtime (Align has no comptime evaluator to statically validate against the builder's registered
+flags); input errors surface from `parse` as `Error.Invalid`. A v1 provisional pending derive — a
+future declarative flag-spec can move `get_*` validation to compile time. (`draft.md` §18.2, M10.)
 
 ## Packages
 

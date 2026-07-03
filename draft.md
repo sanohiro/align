@@ -1809,7 +1809,7 @@ c := cli.command(name: str)                    // builder
 c.flag_bool(name: str)                          // register a bool flag (default false)
 c.flag_str(name: str, default: str)             // register a str flag with a default
 c.flag_i64(name: str, default: i64)             // register an i64 flag with a default
-c.parse(args: array<str>) -> Result<Parsed, Error>
+c.parse(args: array<str>) -> Result<parsed, Error>
 p.get_bool(name: str) -> bool                   // total after a successful parse (see below)
 p.get_str(name: str) -> str
 p.get_i64(name: str) -> i64
@@ -1820,11 +1820,19 @@ c.usage() -> string
 has a value after `c.parse(args)?` succeeds: the one given on the command line, or the default from
 its `flag_*` registration (`bool` defaults to `false`). So `p.get_bool`/`get_str`/`get_i64` never
 fail and return the value directly — the same shape as `json.decode`, where decoding validates the
-whole input and field access is then a plain read. A `get_*` for a name that was never registered,
-or with the wrong type, is a **compile-time** error against the command's flag set, not a runtime
-`Result`. All *input* errors (unknown flag, missing value, wrong kind, bad `i64` literal) are
-surfaced by `parse` as `Error.Invalid` — the same fixed mapping as every other `std` fn — with
-`c.usage()` available to render help.
+whole input and field access is then a plain read. But the lookup itself is only **checked at
+runtime**: `p.get_bool(name)`/`get_str`/`get_i64` return the parsed value or default for a
+registered flag, and a `get_*` call for a name that was never registered, or against the wrong
+flag's type, **aborts at runtime** — the same "programmer error aborts, never silently misbehaves"
+rule as out-of-bounds indexing or div-by-zero. Align has no comptime evaluator, so there is no
+compile-time way to check a `get_*` call against the flag set the builder happened to register at
+runtime — a static check here would need flow-dependent typing (the value registered by a prior
+`flag_*` call determining what a later `get_*` call may accept), which is a second, ad hoc type
+mechanism and so contradicts One way. All *input* errors (unknown flag, missing value, wrong kind,
+bad `i64` literal) are surfaced by `parse` as `Error.Invalid` — the same fixed mapping as every
+other `std` fn — with `c.usage()` available to render help. Once a derive/declarative flag-spec
+mechanism exists (see below), `get_*` calls against it can move to compile-time validation; this
+runtime-checked lookup is the v1 shape for the explicit builder.
 
 **v1 is an explicit flag-registration builder API.** Align has no derive/attributes yet, so
 decoding straight into a struct (the `json.decode`-shaped ideal) waits for that mechanism. This API
@@ -1863,7 +1871,7 @@ rand.seed() -> rng             // OS getrandom-seeded
 rand.seed_with(s: i64) -> rng  // deterministic (tests / reproducibility)
 r.next() -> i64                    // rng is a mut receiver; state advances each call — Xoshiro256++ class
 r.range(lo: i64, hi: i64) -> i64   // uniform [lo, hi), bias-free (Lemire nearly-divisionless)
-r.shuffle(xs: mut slice<T>)        // Fisher-Yates
+r.shuffle(out xs: slice<T>)        // Fisher-Yates
 r.sample(xs: slice<T>, k: i64) -> array<T>   // k items, without replacement
 ```
 
@@ -1873,6 +1881,10 @@ special case. Methods take a `mut` receiver to advance the state. The OS seed co
 `getrandom`/`urandom` — never raw `RDRAND`/`RNDR` (outside the x86-64-v2/armv8-a baseline, `SIGILL`
 on older silicon; `docs/open-questions.md` #342). `rand.seed`'s OS call is assumed not to fail in
 practice; whether a real failure aborts or returns a `Result` is left to the implementation slice.
+`lo >= hi` on `r.range` is a programmer error and aborts at runtime (like out-of-bounds indexing /
+div-by-zero) — there is no non-empty range to draw from. Likewise `r.sample`'s `k < 0` or
+`k > xs.len()` aborts at runtime: sampling more distinct items than exist, without replacement, is
+impossible.
 
 ### std.crypto
 

@@ -1253,13 +1253,14 @@ pattern: Rust runtime (`align_rt_*`) + sema builtin dispatch + required `import`
   empty input and non-block-aligned lengths), invalid input rejected as `Error.Invalid`, and
   `utf8_valid` positive/negative cases.
 - **Slice 2 — std.rand.** `rand.seed()`/`rand.seed_with(s)` producing a **Copy** `rng` value;
-  `r.next()`/`r.range(lo, hi)`/`r.shuffle(xs)`/`r.sample(xs, k)`. The one new runtime primitive this
+  `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)`. The one new runtime primitive this
   milestone needs: an OS-seed fn (`getrandom`/`urandom`). **Completion condition:** `seed_with` is
   deterministic (same seed → same sequence, portable across runs); `range` is bias-free under a
   statistical check; `shuffle` yields a permutation of the input (same multiset, Fisher-Yates); and
   `sample` returns `k` distinct-index items.
-- **Slice 3 — std.cli.** `cli.command`/`c.flag`/`c.parse`/`p.get_bool`/`p.get_str`/`p.get_i64`/
-  `c.usage` — a parser over `main(args: array<str>)`'s `array<str>`, not a second argv source.
+- **Slice 3 — std.cli.** `cli.command`/`c.flag_bool`/`c.flag_str`/`c.flag_i64`/`c.parse`/
+  `p.get_bool`/`p.get_str`/`p.get_i64`/`c.usage` — a parser over `main(args: array<str>)`'s
+  `array<str>`, not a second argv source.
   **Completion condition:** a representative CLI program (a few flags of each kind) parses
   correctly, an unknown flag / missing value / wrong kind is `Error.Invalid`, and `usage()` renders
   the registered flags.
