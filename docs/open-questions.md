@@ -2085,6 +2085,21 @@ Settled ahead of any `std.io`/`std.fs`/`std.path`/`std.env`/`std.time` implement
    dispatch + required `import`.** "`std` as a real Align-over-FFI library" remains a Future item —
    not reopened for M9.
 
+### M10 scope decision (2026-07-04)
+
+Settled ahead of any `std.encoding`/`std.rand`/`std.cli` implementation (`impl/07-roadmap.md` M10;
+full API shape in `draft.md` §18.2):
+
+1. **Scope = `std.encoding` / `std.rand` / `std.cli`.** All three are pure Align surface over
+   already-existing mechanisms — `str`/`bytes`/`buffer`, `mut` slice, `main(args: array<str>)`'s
+   `array<str>` — with **zero new Move types, zero new effects, no concurrency, and no FFI engine**.
+   `rand.seed`'s OS `getrandom` call is the only new runtime primitive this milestone adds.
+2. **`std.net` / `std.http` / `std.process` / `std.compress` / `std.crypto` are explicitly deferred
+   to M11+.** Each needs a new Move type (socket / child-process handle), an FFI engine (TLS,
+   `libzstd`/`zlib-ng`), or an unsettled design question (`process.exit`'s Drop semantics,
+   constant-time verification for crypto) — heavier ground than a scope-closing milestone should
+   carry. encoding/rand/cli establish the std-module footing first, individually, before those.
+
 ---
 
 ## Open (to be decided)
@@ -2216,6 +2231,20 @@ forms). Convert a domain error to `Error` at the boundary with `map_err(to_error
 revisited when the general enum→exit-code mapping is designed** (the deferred alternative — e.g. tag
 index + 1 for any sum type at that position); that is the only remaining piece of the broader Error
 type design (see the section body above), so this section is otherwise complete.
+
+### `process.exit` Drop semantics (target: M11 — std.process)
+
+Recorded 2026-07-04 alongside the M10 scope decision — the exact reason `std.process` is deferred
+to M11 rather than folded into M10. Two candidates, not yet settled:
+
+- **First candidate: `exit` runs pending `Drop`s / arena cleanup, then `_exit`** — the same
+  shutdown path an ordinary `return` out of `main` already takes, just triggered early. Keeps
+  "one way": `exit` would not be a second, Drop-skipping shutdown mechanism alongside normal return.
+- **Alternative: an immediate hard-exit as a separate API**, e.g. `process.abort`, distinct from
+  `process.exit` — for the rare case that deliberately wants to skip cleanup (a fatal-error path
+  where running arbitrary `Drop` code is itself unsafe).
+
+Settle when `std.process` is designed (M11); not resolved ahead of that design.
 
 ### Arena with explicit allocator — partially settled (M3)
 **M3 decision: anonymous `arena {}` only.** Nested arenas use region = arena nesting
@@ -2805,12 +2834,21 @@ only so the vision is not lost when `work/proposals/` is discarded.
 on older silicon), then a fast portable PRNG (PCG or Xoshiro256++ class, pure bit ops, SIMD-friendly
 at baseline). Non-cryptographic per `draft.md` §18.
 
+**Status update (2026-07-04, M10 scope decision):** this direction is now the M10 Slice 2 design —
+full signatures settled in `draft.md` §18.2 (`rand.seed`/`seed_with`/`r.next`/`r.range`/`r.shuffle`/
+`r.sample`, a Copy `rng` value), scheduled in `impl/07-roadmap.md` M10. No longer purely a Future
+direction; implementation is next.
+
 ### std.crypto (Future)
 
 **Hard requirement (recorded 2026-07-04, external design-note review adoption):** all secret-dependent
 code paths MUST be constant-time (no secret-dependent branches or memory addressing; CMOV/bitwise
 only) regardless of speed — the one domain where Align's branchless-for-vectorization machinery
 becomes a correctness requirement, not a perf choice.
+
+**Status update (2026-07-04, M10 scope decision):** stays deferred to M11+ — out of M10 scope
+specifically because the constant-time requirement above needs verification, not just
+specification, before implementation (`impl/07-roadmap.md` M10).
 
 ### std.ndslice — strided multi-dimensional views (Future)
 

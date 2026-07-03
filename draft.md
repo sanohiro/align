@@ -1801,21 +1801,59 @@ socket
 
 ### std.cli
 
+A parser over `main(args: array<str>)`'s `array<str>` (§17) — the one way to reach argv (`std.env`
+above: "there is no `env.args`"); `std.cli` is not a second argv source.
+
 ```text
-args
-flags
-command
-usage
+c := cli.command(name: str)                    // builder
+c.flag_bool(name: str)                          // register a bool flag (default false)
+c.flag_str(name: str, default: str)             // register a str flag with a default
+c.flag_i64(name: str, default: i64)             // register an i64 flag with a default
+c.parse(args: array<str>) -> Result<parsed, Error>
+p.get_bool(name: str) -> bool                   // total after a successful parse (see below)
+p.get_str(name: str) -> str
+p.get_i64(name: str) -> i64
+c.usage() -> string
 ```
+
+**Lookups are total, not fallible — validation happens once, at `parse`.** Every registered flag
+has a value after `c.parse(args)?` succeeds: the one given on the command line, or the default from
+its `flag_*` registration (`bool` defaults to `false`). So `p.get_bool`/`get_str`/`get_i64` never
+fail and return the value directly — the same shape as `json.decode`, where decoding validates the
+whole input and field access is then a plain read. But the lookup itself is only **checked at
+runtime**: `p.get_bool(name)`/`get_str`/`get_i64` return the parsed value or default for a
+registered flag, and a `get_*` call for a name that was never registered, or against the wrong
+flag's type, **aborts at runtime** — the same "programmer error aborts, never silently misbehaves"
+rule as out-of-bounds indexing or div-by-zero. Align has no comptime evaluator, so there is no
+compile-time way to check a `get_*` call against the flag set the builder happened to register at
+runtime — a static check here would need flow-dependent typing (the value registered by a prior
+`flag_*` call determining what a later `get_*` call may accept), which is a second, ad hoc type
+mechanism and so contradicts One way. All *input* errors (unknown flag, missing value, wrong kind,
+bad `i64` literal) are surfaced by `parse` as `Error.Invalid` — the same fixed mapping as every
+other `std` fn — with `c.usage()` available to render help. Once a derive/declarative flag-spec
+mechanism exists (see below), `get_*` calls against it can move to compile-time validation; this
+runtime-checked lookup is the v1 shape for the explicit builder.
+
+**v1 is an explicit flag-registration builder API.** Align has no derive/attributes yet, so
+decoding straight into a struct (the `json.decode`-shaped ideal) waits for that mechanism. This API
+shape is a v1 provisional: builder vs. a declarative spec is revisited once derive lands.
 
 ### std.encoding
 
 ```text
-base64
-base64url
-hex
-utf8
+encoding.base64_encode(data: bytes) -> string          // owned; standard alphabet + padding
+encoding.base64_decode(s: str) -> Result<buffer, Error> // invalid input -> Error.Invalid
+encoding.base64url_encode(data: bytes) -> string        // URL-safe alphabet, no padding
+encoding.base64url_decode(s: str) -> Result<buffer, Error>
+encoding.hex_encode(data: bytes) -> string
+encoding.hex_decode(s: str) -> Result<buffer, Error>
+encoding.utf8_valid(b: bytes) -> bool                   // check before turning bytes into str
 ```
+
+Decode returns an owned `buffer` — `bytes` carries no UTF-8 invariant, so a decoded blob is not a
+`str` — consistent with the sink/owned-return convention above. SIMD (Lemire's
+Base64-at-memcpy-speed) is an internal optimization; it does not change these signatures. Encode
+returns `string`; a builder-sink variant is a later addition once bulk-output demand appears.
 
 ### std.compress
 
@@ -1826,14 +1864,27 @@ zstd
 
 ### std.rand
 
-Non-cryptographic use.
+Non-cryptographic use (`std.crypto` is the cryptographic counterpart).
 
 ```text
-seed
-range
-shuffle
-sample
+rand.seed() -> rng             // OS getrandom-seeded
+rand.seed_with(s: i64) -> rng  // deterministic (tests / reproducibility)
+r.next() -> i64                    // rng is a mut receiver; state advances each call — Xoshiro256++ class
+r.range(lo: i64, hi: i64) -> i64   // uniform [lo, hi), bias-free (Lemire nearly-divisionless)
+r.shuffle(out xs: slice<T>)        // Fisher-Yates
+r.sample(xs: slice<T>, k: i64) -> array<T>   // k items, without replacement
 ```
+
+`rng` is a **Copy** value — a small state-only struct, no fd/ownership — deliberately unlike the
+Move `reader`/`writer` handles: it holds no external resource, so Copy is the right default, not a
+special case. Methods take a `mut` receiver to advance the state. The OS seed comes from
+`getrandom`/`urandom` — never raw `RDRAND`/`RNDR` (outside the x86-64-v2/armv8-a baseline, `SIGILL`
+on older silicon; `docs/open-questions.md` #342). `rand.seed`'s OS call is assumed not to fail in
+practice; whether a real failure aborts or returns a `Result` is left to the implementation slice.
+`lo >= hi` on `r.range` is a programmer error and aborts at runtime (like out-of-bounds indexing /
+div-by-zero) — there is no non-empty range to draw from. Likewise `r.sample`'s `k < 0` or
+`k > xs.len()` aborts at runtime: sampling more distinct items than exist, without replacement, is
+impossible.
 
 ### std.crypto
 

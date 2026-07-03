@@ -1236,6 +1236,44 @@ rationale for the I/O fast-path and mmap items already lives in `docs/open-quest
 - **M10+ modules** (unstarted, out of this milestone's scope): `std.net`, `std.http`, `std.cli`,
   `std.process`, `std.encoding`, `std.compress`, `std.rand`, `std.crypto`.
 
+## M10 — std (encoding / rand / cli) — design settled 2026-07-04, implementation not started
+
+Scope: `std.encoding`, `std.rand`, `std.cli` — three modules that close over mechanisms the
+language already has, with **zero new Move types, zero new effects, no concurrency, and no FFI
+engine** (`str`/`bytes`/`buffer`, `mut` slice, and `main(args: array<str>)`'s `array<str>` already
+exist). Full API shape is in `draft.md` §18.2; the scope decision + rationale is recorded in
+`docs/open-questions.md` Settled → "M10 scope decision". Implementation stays the `core.json`/M9
+pattern: Rust runtime (`align_rt_*`) + sema builtin dispatch + required `import`.
+
+- **Slice 1 — std.encoding.** `base64_encode`/`base64_decode`, `base64url_encode`/
+  `base64url_decode`, `hex_encode`/`hex_decode`, `utf8_valid` — pure functions over `bytes`/`str`,
+  no state, no Move types. The lightest slice: a scalar reference implementation first, correctness
+  before speed; SIMD (Lemire's Base64-at-memcpy-speed) is a later optimization behind the same
+  signatures. **Completion condition:** encode/decode round-trip for all three encodings (including
+  empty input and non-block-aligned lengths), invalid input rejected as `Error.Invalid`, and
+  `utf8_valid` positive/negative cases.
+- **Slice 2 — std.rand.** `rand.seed()`/`rand.seed_with(s)` producing a **Copy** `rng` value;
+  `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)`. The one new runtime primitive this
+  milestone needs: an OS-seed fn (`getrandom`/`urandom`). **Completion condition:** `seed_with` is
+  deterministic (same seed → same sequence, portable across runs); `range` is bias-free under a
+  statistical check; `shuffle` yields a permutation of the input (same multiset, Fisher-Yates); and
+  `sample` returns `k` distinct-index items.
+- **Slice 3 — std.cli.** `cli.command`/`c.flag_bool`/`c.flag_str`/`c.flag_i64`/`c.parse`/
+  `p.get_bool`/`p.get_str`/`p.get_i64`/`c.usage` — a parser over `main(args: array<str>)`'s
+  `array<str>`, not a second argv source.
+  **Completion condition:** a representative CLI program (a few flags of each kind) parses
+  correctly, an unknown flag / missing value / wrong kind is `Error.Invalid`, and `usage()` renders
+  the registered flags.
+
+**Explicitly deferred to M11+ (not part of M10):** `std.net`, `std.http`, `std.process`,
+`std.compress`, `std.crypto` — each carries a new Move type (socket / child-process handle), an FFI
+engine dependency, or an unsettled design question that would block a scope-closing milestone:
+`std.process` needs `process.exit`'s Drop/arena-cleanup semantics settled first
+(`docs/open-questions.md` Open → "`process.exit` Drop semantics"); `std.crypto` needs its
+constant-time requirement verified, not just specified; `std.http` depends on TLS (an FFI engine);
+`std.compress` depends on `libzstd`/`zlib-ng` (FFI). encoding/rand/cli ship first specifically
+because they close over already-existing mechanisms.
+
 ## Design Issues to Settle in Parallel
 
 Settle each item in `open-questions.md`, tied to its related M (do not defer).
