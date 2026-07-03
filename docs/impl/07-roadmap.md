@@ -1107,7 +1107,26 @@ proposals already live in `docs/open-questions.md` → "M8 lint candidates".
 - **`par_map` cost-threshold lint** (cheap-`par_map`-loses-to-sequential) — recorded with the perf-rail
   lint work, not yet built.
 
-## M9 — std (I/O, filesystem, path, env, time) — design settled 2026-07-03, implementation not started
+## M9 — std (I/O, filesystem, path, env, time) — DONE (2026-07-04)
+
+All four slices are done and their completion conditions independently met (design settled #336;
+shipped #337–#340). **`std.io`** ships `reader`/`writer` as concrete Move types (own an fd,
+`Drop`-closed; `io.std*` streams borrow theirs) plus the minimal owned `buffer`, with `io.copy` as a
+non-consuming portable fixed-buffer transfer (`Result<i64, Error>`). **`std.fs`** is complete —
+`open`/`create`/`write_file`/`exists`/`remove`/`read_dir` plus the `mmap`-backed `read_file_view`
+(arena-scoped, `munmap`ped at every arena exit, with an owned-copy fallback for special/
+untrustworthy-size files). **`std.path`/`std.env`/`std.time`** round-trip (`join`/`normalize`/
+`base`/`dir`/`ext`, `get`/`set`, `now`/`instant`/`sleep`). A single errno→`Error` table (`draft.md`
+§18.2) backs every fallible call across all three modules. **v1 restrictions, not blockers:** each
+owned handle passed to `io.copy` must be a bound local (the `io.std*` streams are exempt — the
+bound-receiver restriction, which also covers a bound `.buffered()` writer); and an unbound Move
+*temporary* isn't dropped yet, so a one-shot `io.stdout.write(x)?` leaks its small handle (any bound
+handle drops correctly) — a general MIR gap, not std.io-specific. **Not blockers, tracked as post-M9
+backlog** (own subsection below): `io.copy` syscall fast paths (`sendfile`/`splice`/`io_uring`), no
+`SIGBUS` handler on post-`mmap` truncation, non-UTF-8 filenames from `read_dir` (a caveat for
+downstream `string` ops that assume UTF-8), Move-temporary dropping, streaming×pipeline integration,
+and the M10+ module set (`std.net`/`std.http`/`std.cli`/`std.process`/`std.encoding`/`std.compress`/
+`std.rand`/`std.crypto`).
 
 Scope: `std.io`, `std.fs`, `std.path`, `std.env`, `std.time` — the five modules an ordinary CLI
 program needs. Full API shape (types + signatures) is in `draft.md` §18.2; the five underlying
@@ -1192,14 +1211,30 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
 
 **M9 — all slices done.** Slices 1–4 (std.io / io.copy / std.fs / path·env·time) are all complete and
 their completion conditions met; the five M9 modules (`std.io`/`std.fs`/`std.path`/`std.env`/`std.time`)
-are implemented end to end. (The formal M9-close declaration — heading + `CLAUDE.md` status — lands in a
-separate docs PR, per the close-milestone convention.)
+are implemented end to end.
 
-**Explicitly deferred to M10+ (not part of M9):** `std.net`, `std.http`, `std.cli`, `std.process`,
-`std.encoding`, `std.compress`, `std.rand`, `std.crypto` (unstarted modules, out of this milestone's
-scope); streaming × pipeline integration (a `reader`/`writer` as a pipeline source/sink); and
-`io_uring` / Direct I/O fast paths for `io.copy` (recorded in `docs/open-questions.md` Future —
-"Transparent zero-copy I/O", "Hardware & backend optimization backlog").
+### Post-M9 backlog (not M9 blockers — M9 is closed; these are future std/perf slices)
+
+None of the below gated M9's completion conditions (all four slices done and verified above). Full
+rationale for the I/O fast-path and mmap items already lives in `docs/open-questions.md` →
+"Transparent zero-copy I/O".
+
+- **`io.copy` syscall fast paths** (`sendfile`/`splice` on Linux, `io_uring`, Direct I/O into
+  huge-page-backed arenas) — the portable fixed-buffer loop shipped in Slice 2 is the v1/reference
+  implementation; fast paths are validated against it and drop in later behind the same `io.copy`
+  signature, no API change.
+- **`SIGBUS` on post-`mmap` truncation** — v1 installs no handler (a process-global signal handler is
+  exactly the hidden global side effect Align forbids); concurrent truncation of a
+  `read_file_view`-mapped file is a documented v1 caller contract, not a language-level guarantee.
+- **Non-UTF-8 path/file names** — `fs.read_dir` stores each entry's raw OS bytes losslessly into an
+  Align `string` (Unix filenames are not guaranteed valid UTF-8); this is a caveat for any later
+  `string` operation that assumes valid UTF-8, not yet resolved.
+- **Move-temporary drop** — an unbound Move temporary (e.g. a one-shot `io.stdout.write(x)?`) isn't
+  dropped and leaks its handle; a general MIR improvement, not std.io-specific (Slice 1 known gap).
+- **Streaming × pipeline integration** — a `reader`/`writer` as a `map`/`where`/`reduce` pipeline
+  source/sink is not wired up.
+- **M10+ modules** (unstarted, out of this milestone's scope): `std.net`, `std.http`, `std.cli`,
+  `std.process`, `std.encoding`, `std.compress`, `std.rand`, `std.crypto`.
 
 ## Design Issues to Settle in Parallel
 

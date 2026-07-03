@@ -5,48 +5,24 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-03 (main @ PR #331; M8 formally closed same day, docs-only)._
+_Last updated: 2026-07-04 (main @ PR #340; M9 formally closed same day, docs-only)._
 
-## M9 — std phase (design settled 2026-07-03; Slices 1–4 DONE — all slices complete)
+## M9 — std (I/O, filesystem, path, env, time) — formally closed (2026-07-04)
 
-M0–M8 are done (language core + tooling/FFI). M9 (`std.io`/`std.fs`/`std.path`/`std.env`/
-`std.time`) design is settled — see `docs/impl/07-roadmap.md` M9 and `docs/open-questions.md`
-Settled → "M9 std design".
-
-**Slice 1 (std.io core) — DONE.** `reader`/`writer` (`Ty::Reader`/`Ty::Writer`, own an fd, `Drop`
-closes a file fd; std streams borrow theirs) + the minimal owned `buffer` (`Ty::Buffer`,
-`buffer(cap)`/`.bytes()`/`.len()`) `core.buffer` type; constructors `io.stdin`/`io.stdout`/
-`io.stderr`/`io.stdout.buffered()`/`fs.open`/`fs.create` (the old `Ty::BufWriter` + `io.stdout.write`
-special-case collapsed into the one `writer` type — "one type, many constructors"); methods
-`r.read(b: mut buffer)` / `w.write(str|bytes|builder)` / `w.flush()`, all `Result<_, Error>`; the
-errno→`Error` fixed table (`draft.md` §18.2) as one runtime helper + one branchless MIR decode,
-shared by every std fn. Byte-exact file copy + per-method tests in `crates/align_driver/tests/m9_io.rs`.
-`Result<reader/writer, Error>` works (new `Scalar::Reader`/`Scalar::Writer` payloads with a
-per-payload drop dtor). Known minor gap: an unbound Move *temporary* isn't dropped, so a one-shot
-`io.stdout.write(x)?` leaks its ~40-byte writer handle (bound handles drop correctly) — a general
-MIR limitation, fixed by dropping Move temporaries (separate work).
-
-**Slice 3 (std.fs complete) — DONE.** `fs.write_file` (`str`/`bytes`/`builder`), `fs.exists`
-(`bool`, errors fold to `false`), `fs.remove`, `fs.read_dir` (owned `array<string>` — new
-`PrimScalar::String` + deep-`Drop` `align_rt_free_string_array`; Move-element indexing still
-deferred, so used whole), and `fs.read_file_view` (an `mmap` view requiring an enclosing arena;
-registered on the runtime `Arena`, `munmap`ped at arena end on every exit via `ArenaEnd`; region =
-the arena, so escape is rejected, `.clone()` copies out). Guardrails: `fstat`-gated to regular
-nonzero files; special/`/proc`/zero-length files take an owned arena-copy fallback; no `SIGBUS`
-handler (documented v1 limit — no hidden global signal state). §19 runs end to end.
-`tests/m9_fs.rs` (17) + runtime unit tests (8).
-
-**Slice 4 (std.path / std.env / std.time) — DONE.** `path.join`/`normalize` (owned `string`;
-`normalize` = pure POSIX lexical `.`/`..`/`//`, no symlink/FS access), `path.base`/`dir`/`ext`
-(zero-copy `str` **views** — region **inherited from the input** via a new `region_of` arm, so a view
-of an arena `str` can't escape; view-safe edges: no-separator `dir` = empty view, dotfile `ext` =
-empty, all-`/` → `/`); `env.get` -> `Option<string>` (owned; empty value = `Some("")` ≠ `None`),
-`env.set` -> `Result<(), Error>` (plain `setenv`; concurrent set documented UB per POSIX);
-`time.now` (`SystemTime`) / `time.instant` (monotonic `Instant`, non-decreasing) / `time.sleep`
-(`thread::sleep`, `EINTR`-resuming, non-positive = no-op) — one `i64`-ns timeline. sema dispatch +
-MIR `Rvalue` + `align_rt_path_*`/`env_*`/`time_*`. `tests/m9_path_env_time.rs` (10) + runtime unit
-tests (7). **M9 all four slices done** (std.io/fs/path/env/time complete); the formal M9-close
-declaration (heading + `CLAUDE.md` status) is a separate docs PR.
+**M0–M9 COMPLETE** (language core + tooling/FFI + std phase 1). All four M9 slices are done and
+their completion conditions independently met (design settled #336; shipped #337–#340): **`std.io`**
+core (`reader`/`writer`/`buffer` Move types + a shared errno→`Error` table), **`io.copy`** (a
+non-consuming portable fixed-buffer transfer, `Result<i64, Error>`), **`std.fs`** complete
+(`write_file`/`exists`/`remove`/`read_dir` plus the arena-scoped `mmap` view `read_file_view`), and
+**`std.path`/`std.env`/`std.time`** (`path.join`/`normalize`/`base`/`dir`/`ext` views, `env.get`/
+`env.set`, `time.now`/`instant`/`sleep`). See the M9 section of `docs/impl/07-roadmap.md` for the
+full shipped-feature summary. **Not blockers, deferred as post-M9 backlog** (own labeled subsection
+right after M9 in the roadmap): `io.copy` syscall fast paths (`sendfile`/`splice`/`io_uring`), no
+`SIGBUS` handler on post-`mmap` truncation, non-UTF-8 filenames from `read_dir` (a raw-byte caveat
+for `string` ops that assume UTF-8), dropping unbound Move temporaries (a one-shot
+`io.stdout.write(x)?` leaks its writer handle today), streaming×pipeline integration, and the M10+
+module set (`std.net`/`std.http`/`std.cli`/`std.process`/`std.encoding`/`std.compress`/`std.rand`/
+`std.crypto`).
 
 ## M8 — Tooling and Quality — formally closed (2026-07-03)
 
