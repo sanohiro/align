@@ -1,5 +1,7 @@
 # Why Align
 
+> 🌐 **English** · [日本語](./ja/00-why-align.md)
+
 Align is an AOT-compiled, data-oriented language. Before the syntax, the mindset — because Align asks you to write differently than a scalar, object-oriented language does.
 
 ## Four-way alignment

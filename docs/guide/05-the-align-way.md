@@ -1,5 +1,7 @@
 # The Align way
 
+> 🌐 **English** · [日本語](./ja/05-the-align-way.md)
+
 A short collection of the idioms that make Align code fast and idiomatic — the "culture," the way an experienced Align programmer reaches for things. Each is a habit the earlier chapters introduced; here they are as a checklist.
 
 ## Describe transformations, don't iterate

@@ -1,5 +1,7 @@
 # Your first program
 
+> 🌐 **English** · [日本語](./ja/01-first-program.md)
+
 The smallest Align program:
 
 ```align
