@@ -5588,10 +5588,7 @@ impl<'a, 't> Checker<'a, 't> {
         if let ast::ExprKind::Path(p) = &recv.kind
             && single_name(p) == Some("io")
             && matches!(field.name.as_str(), "stdin" | "stdout" | "stderr")
-            && self.lookup("io").is_none()
-            && !self.capture.as_ref().is_some_and(|c| {
-                c.captured.iter().any(|(n, _, _)| n == "io") || c.enclosing.iter().any(|(n, _, _)| n == "io")
-            }) {
+            && !self.name_in_scope("io") {
                 self.require_import("std.io", &format!("io.{}", field.name), span);
                 return match field.name.as_str() {
                     "stdin" => Expr { kind: ExprKind::ReaderStdin, ty: Ty::Reader, span },
@@ -6969,73 +6966,88 @@ impl<'a, 't> Checker<'a, 't> {
         Some(idx as u32)
     }
 
+    /// Whether `name` is an in-scope value — a local/parameter, or a captured/enclosing binding of a
+    /// closure. A builtin **module** dispatch (`heap.*`, `raw.*`, `json.*`, `fs.*`, `path.*`, `env.*`,
+    /// `time.*`, `io.*`) must fire only when its module name is *not* shadowed by such a value:
+    /// `path`/`env`/`time`/`fs` are ordinary parameter names, so `fn f(path: str) { path.base("x") }`
+    /// must route to normal value-method resolution (→ "no method `base` on `str`"), never to the
+    /// builtin (which would silently ignore the `path` receiver). Mirrors the `leftmost_is_local`
+    /// guard used below for cross-module calls — one rule, applied at every builtin dispatch.
+    fn name_in_scope(&self, name: &str) -> bool {
+        self.lookup(name).is_some()
+            || self.capture.as_ref().is_some_and(|c| {
+                c.captured.iter().any(|(n, _, _)| n == name) || c.enclosing.iter().any(|(n, _, _)| n == name)
+            })
+    }
+
     /// A method call `recv.method(args)`: the `heap.new` builtin, or a method on a value
     /// (`box.get()`, `box.clone()`).
     fn check_method_call(&mut self, recv: &ast::Expr, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        // `heap.new(...)` — `heap` is a module name, not a value.
-        if let ast::ExprKind::Path(p) = &recv.kind {
-            if single_name(p) == Some("heap") && method == "new" {
+        // Builtin **module** dispatches (`heap.*`, `raw.*`, `json.*`, `fs.*`, `path.*`, `env.*`,
+        // `time.*`, `io.*`). Each fires only when the module name is a bare path *and* is not
+        // shadowed by an in-scope value (`name_in_scope`) — otherwise `fn f(path: str) { path.base(x) }`
+        // would silently swallow the `path` receiver into the builtin. A shadowing binding falls
+        // through to normal value-method resolution (and never triggers a spurious `require_import`).
+        if let ast::ExprKind::Path(p) = &recv.kind
+            && let Some(module) = single_name(p)
+            && !self.name_in_scope(module)
+        {
+            // `heap.new(...)` — `heap` is a module name, not a value.
+            if module == "heap" && method == "new" {
                 return self.check_heap_new(args, expected, span);
             }
             // `raw.alloc(size)` / `raw.free(p)` / `raw.load(p, off)` / `raw.store(p, off, v)` /
             // `raw.offset(p, n)` — the unsafe raw-pointer ops (`raw` is a module name, not a value).
             // `unsafe {}`-only.
-            if single_name(p) == Some("raw") && matches!(method, "alloc" | "free" | "load" | "store" | "offset") {
+            if module == "raw" && matches!(method, "alloc" | "free" | "load" | "store" | "offset") {
                 return self.check_raw_op(method, args, expected, span);
             }
-            if single_name(p) == Some("json") && method == "encode" {
+            if module == "json" && method == "encode" {
                 self.require_import("core.json", "json.encode", span);
                 return self.check_json_encode(args, span);
             }
-            if single_name(p) == Some("json") && method == "decode" {
+            if module == "json" && method == "decode" {
                 self.require_import("core.json", "json.decode", span);
                 return self.check_json_decode(args, expected, span);
             }
-            if single_name(p) == Some("fs") && method == "read_file" {
+            if module == "fs" && method == "read_file" {
                 self.require_import("std.fs", "fs.read_file", span);
                 return self.check_fs_read_file(args, span);
             }
             // `fs.open(path)` -> Result<reader, Error>; `fs.create(path)` -> Result<writer, Error>.
-            if single_name(p) == Some("fs") && (method == "open" || method == "create") {
+            if module == "fs" && (method == "open" || method == "create") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_open_create(method == "create", args, span);
             }
             // `fs.write_file(path, data)` -> Result<(), Error> (data: str | bytes | builder).
-            if single_name(p) == Some("fs") && method == "write_file" {
+            if module == "fs" && method == "write_file" {
                 self.require_import("std.fs", "fs.write_file", span);
                 return self.check_fs_write_file(args, span);
             }
             // `fs.exists(path)` -> bool; `fs.remove(path)` / `fs.read_dir(path)` / `fs.read_file_view(path)`
             // — the single-path std.fs ops.
-            if single_name(p) == Some("fs") && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view") {
+            if module == "fs" && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_path_op(method, args, span);
             }
             // `std.path` — `path.join`/`base`/`dir`/`ext`/`normalize` (pure lexical string ops).
-            if single_name(p) == Some("path") && matches!(method, "join" | "base" | "dir" | "ext" | "normalize") {
+            if module == "path" && matches!(method, "join" | "base" | "dir" | "ext" | "normalize") {
                 self.require_import("std.path", &format!("path.{method}"), span);
                 return self.check_path_op(method, args, span);
             }
             // `std.env` — `env.get(name)` -> Option<string>; `env.set(name, value)` -> Result<(), Error>.
-            if single_name(p) == Some("env") && matches!(method, "get" | "set") {
+            if module == "env" && matches!(method, "get" | "set") {
                 self.require_import("std.env", &format!("env.{method}"), span);
                 return self.check_env_op(method, args, span);
             }
             // `std.time` — `time.now()`/`time.instant()` -> i64 ns; `time.sleep(ns)`.
-            if single_name(p) == Some("time") && matches!(method, "now" | "instant" | "sleep") {
+            if module == "time" && matches!(method, "now" | "instant" | "sleep") {
                 self.require_import("std.time", &format!("time.{method}"), span);
                 return self.check_time_op(method, args, span);
             }
-            // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred). A local/captured `io`
-            // shadows this (then it's value-method dispatch, not the std.io builtin).
-            if single_name(p) == Some("io")
-                && method == "copy"
-                && self.lookup("io").is_none()
-                && !self.capture.as_ref().is_some_and(|c| {
-                    c.captured.iter().any(|(n, _, _)| n == "io") || c.enclosing.iter().any(|(n, _, _)| n == "io")
-                })
-            {
+            // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred).
+            if module == "io" && method == "copy" {
                 self.require_import("std.io", "io.copy", span);
                 return self.check_io_copy(args, span);
             }
@@ -7048,7 +7060,8 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "buffered"
             && let ast::ExprKind::FieldAccess { recv: inner, field } = &recv.kind
                 && let ast::ExprKind::Path(p) = &inner.kind
-                && single_name(p) == Some("io") {
+                && single_name(p) == Some("io")
+                && !self.name_in_scope("io") {
                     let fd = match field.name.as_str() {
                         "stdout" => 1,
                         "stderr" => 2,

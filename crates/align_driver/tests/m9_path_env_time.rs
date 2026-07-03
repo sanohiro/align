@@ -250,3 +250,76 @@ pub fn main() -> Result<(), Error> {
 ";
     assert!(check_errs("m9-path-no-import", prog), "path.join without `import std.path` is an error");
 }
+
+// --- shadowing: a value named like the module takes precedence over the builtin ----------------
+
+/// A parameter (or local) named `path`/`env`/`time`/`fs` **shadows** the std module, so
+/// `path.base(...)` on such a value routes to normal value-method resolution — never silently
+/// swallowing the receiver into the builtin. `path` is a classic parameter name, so this matters:
+/// the diagnostic must be "unknown method on <type>" (proving value dispatch), not a spurious
+/// `import`/argument error from the builtin. (PR #340 fallback-review CONFIRMED finding.)
+#[test]
+fn path_receiver_shadows_module() {
+    // `path` is a `str` parameter; `path.base(...)` must resolve as a method on that `str`.
+    let prog = "\
+import std.path
+fn f(path: str) -> str {
+  return path.base(\"ignored\")
+}
+pub fn main() -> Result<(), Error> {
+  return Ok(())
+}
+";
+    let d = check_diagnostics("m9-path-shadow", prog);
+    assert!(d.contains("unknown method '.base()' on str"), "shadowed `path` routes to value dispatch, not the builtin; got: {d}");
+}
+
+#[test]
+fn env_receiver_shadows_module() {
+    let prog = "\
+import std.env
+fn f(env: str) -> bool {
+  return env.get(\"x\")
+}
+pub fn main() -> Result<(), Error> {
+  return Ok(())
+}
+";
+    let d = check_diagnostics("m9-env-shadow", prog);
+    // `.get()` is also the `box<T>`/`Task<R>` method, so value dispatch resolves it there and
+    // reports the receiver type (`str`) — the point is it routed to value dispatch (the `env`
+    // receiver was not swallowed into the `env.get` builtin), never a spurious `import std.env`.
+    assert!(d.contains("got str"), "shadowed `env` routes to value dispatch (receiver kept); got: {d}");
+    assert!(!d.contains("import std.env"), "no spurious import diagnostic when `env` is shadowed; got: {d}");
+}
+
+#[test]
+fn time_receiver_shadows_module() {
+    // A shadowing `time` local (an i64) — `time.sleep(...)` must report "no method on int",
+    // not a spurious `import std.time` error (finding (b)).
+    let prog = "\
+pub fn main() -> Result<(), Error> {
+  time := 5
+  time.sleep(10)
+  return Ok(())
+}
+";
+    let d = check_diagnostics("m9-time-shadow", prog);
+    assert!(d.contains("unknown method '.sleep()'"), "shadowed `time` routes to value dispatch; got: {d}");
+    assert!(!d.contains("import std.time"), "no spurious import diagnostic when `time` is shadowed; got: {d}");
+}
+
+#[test]
+fn fs_receiver_shadows_module() {
+    let prog = "\
+import std.fs
+fn f(fs: str) -> bool {
+  return fs.exists(\"ignored\")
+}
+pub fn main() -> Result<(), Error> {
+  return Ok(())
+}
+";
+    let d = check_diagnostics("m9-fs-shadow", prog);
+    assert!(d.contains("unknown method '.exists()' on str"), "shadowed `fs` routes to value dispatch, not the builtin; got: {d}");
+}
