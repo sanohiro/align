@@ -747,6 +747,48 @@ pub enum ExprKind {
     /// owned `array<T>` (`ty` = [`crate::Ty::DynArray`]); `k < 0` or `k > xs.len()` aborts at
     /// runtime. `rng` is a bound mut local. Impure.
     RandSample { rng: Box<Expr>, xs: Box<Expr>, k: Box<Expr>, elem: crate::Ty },
+    /// `cli.command(name)` — a fresh [`crate::Ty::CliCommand`] builder named `name` (a `str`). A
+    /// **Move** handle owning its registered-flag table; `Drop`-freed. Pure (no I/O — argv is
+    /// already captured by `main(args)`). `name` is borrowed.
+    CliCommand { name: Box<Expr> },
+    /// `c.flag_bool(name)` / `c.flag_str(name, default)` / `c.flag_i64(name, default)` — register a
+    /// flag into the command `cmd`'s table (`kind` selects which). The `ty` is [`crate::Ty::Unit`].
+    /// `cmd` is a bound [`crate::Ty::CliCommand`] local, mutated in place through its handle pointer
+    /// (not consumed — like a `buffer` method). `default` is `None` for `flag_bool` (default `false`),
+    /// `Some(str)` for `flag_str`, `Some(i64)` for `flag_i64`. Pure.
+    CliFlag { cmd: Box<Expr>, kind: CliFlagKind, name: Box<Expr>, default: Option<Box<Expr>> },
+    /// `c.parse(args)` — parse the `array<str>` argv `args` against `cmd`'s flag table, yielding
+    /// `Result<parsed, Error>` (the `ty`). An unknown flag / missing value / malformed i64 / wrong
+    /// kind is `Error.Invalid`. **`cmd` is borrowed, NOT consumed** (`c.usage()` stays callable after
+    /// parse, including on the `Err` path). `args` is borrowed. Pure.
+    CliParse { cmd: Box<Expr>, args: Box<Expr> },
+    /// `p.get_bool(name)` — the parsed `bool` value of flag `name` (the `ty` is [`crate::Ty::Bool`]).
+    /// Total after a successful parse: an unregistered `name` or a kind mismatch is a **runtime
+    /// abort** (programmer error, like an OOB index — never a silent default / `Result`). `parsed` is
+    /// a bound [`crate::Ty::CliParsed`] local. Pure.
+    CliGetBool { parsed: Box<Expr>, name: Box<Expr> },
+    /// `p.get_i64(name)` — the parsed `i64` value of flag `name` (the `ty` is `i64`). Abort on
+    /// unregistered / wrong-kind (see [`Self::CliGetBool`]). `parsed` is a bound local. Pure.
+    CliGetI64 { parsed: Box<Expr>, name: Box<Expr> },
+    /// `p.get_str(name)` — the parsed `str` value of flag `name`, a **view into `parsed`'s storage**
+    /// (the `ty` is [`crate::Ty::Str`]), so it is region-bound to `parsed` (must not outlive it —
+    /// `.clone()` copies out). Abort on unregistered / wrong-kind. `parsed` is a bound local. Pure.
+    CliGetStr { parsed: Box<Expr>, name: Box<Expr> },
+    /// `c.usage()` — render `cmd`'s flag table into a fresh owned `string` (the `ty` is
+    /// [`crate::Ty::String`]). `cmd` is borrowed, not consumed. Pure.
+    CliUsage { cmd: Box<Expr> },
+}
+
+/// Which `std.cli` flag an [`ExprKind::CliFlag`] registers — the kind decides the value type and
+/// whether a default is carried (`Bool` defaults to `false` with no operand; `Str`/`I64` carry one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliFlagKind {
+    /// `c.flag_bool(name)` — a boolean flag, default `false`, set by a bare `--name`.
+    Bool,
+    /// `c.flag_str(name, default)` — a `str` flag with a default, set by `--name value` / `--name=value`.
+    Str,
+    /// `c.flag_i64(name, default)` — an `i64` flag with a default, set by `--name value` / `--name=value`.
+    I64,
 }
 
 /// Which `std.encoding` transform an [`ExprKind::EncodingEncode`] / [`ExprKind::EncodingDecode`]

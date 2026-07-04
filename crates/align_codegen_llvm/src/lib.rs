@@ -954,6 +954,54 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `std.cli` — the command / parsed handles are opaque pointers. `command(name)` allocates one;
+    // `flag_*` register into it (void); `parse(cmd, argv{ptr,len}, out)` -> i32 status; `get_*` read
+    // a flag (i32/i64/`{ptr,len}` view); `usage` renders an owned `string` `{ptr,len}`; the two
+    // `*_free` symbols drop the handles.
+    funcs.insert(
+        "cli_command".to_string(),
+        module.add_function("align_rt_cli_command_new", ptr.fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "cli_flag_bool".to_string(),
+        module.add_function("align_rt_cli_flag_bool", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "cli_flag_str".to_string(),
+        module.add_function("align_rt_cli_flag_str", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "cli_flag_i64".to_string(),
+        module.add_function("align_rt_cli_flag_i64", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "cli_parse".to_string(),
+        module.add_function("align_rt_cli_parse", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        "cli_get_bool".to_string(),
+        module.add_function("align_rt_cli_get_bool", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "cli_get_i64".to_string(),
+        module.add_function("align_rt_cli_get_i64", i64t2.fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "cli_get_str".to_string(),
+        module.add_function("align_rt_cli_get_str", slice_struct_type(ctx).fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "cli_usage".to_string(),
+        module.add_function("align_rt_cli_usage", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "cli_command_free".to_string(),
+        module.add_function("align_rt_cli_command_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "cli_parsed_free".to_string(),
+        module.add_function("align_rt_cli_parsed_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     // `core.string` trims → a borrowed sub-`str` `{ptr,len}` of the receiver (no allocation).
     for (key, sym) in [
         ("str_trim", "align_rt_str_trim"),
@@ -1399,8 +1447,8 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
-        // A `reader`/`writer` handle payload (`Result<reader/writer, Error>`) is an opaque pointer.
-        Ty::Reader | Ty::Writer | Ty::Buffer => ctx.ptr_type(AddressSpace::default()).into(),
+        // A `reader`/`writer`/`buffer` / cli handle payload is an opaque pointer.
+        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
@@ -1854,6 +1902,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
         Scalar::Reader | Scalar::Writer => unreachable!("a reader/writer handle is not a box/array payload"),
         Scalar::Buffer => unreachable!("a buffer handle is not a box/array payload"),
+        Scalar::CliParsed => unreachable!("a cli parsed handle is not a box/array payload"),
     }
 }
 
@@ -2502,8 +2551,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer) {
-                        // A builder / writer / reader / buffer slot holds a bare (nullable) handle pointer.
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed) {
+                        // A builder / writer / reader / buffer / cli handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
                         // A fixed array of a Move struct: zero the whole `[N x %Struct]` so every
@@ -2560,13 +2609,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer) {
-                        // A writer flushes + closes; a reader closes; a buffer frees. Each runtime
-                        // `*_free` is null-safe (a moved-out / never-initialised slot drops harmlessly).
+                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed) {
+                        // A writer flushes + closes; a reader closes; a buffer / cli handle frees. Each
+                        // runtime `*_free` is null-safe (a moved-out / never-initialised slot drops
+                        // harmlessly).
                         let free_fn = match ty {
                             Ty::Writer => "io_writer_free",
                             Ty::Reader => "io_reader_free",
-                            _ => "buffer_free",
+                            Ty::Buffer => "buffer_free",
+                            Ty::CliCommand => "cli_command_free",
+                            _ => "cli_parsed_free",
                         };
                         let p = self
                             .builder
@@ -2593,13 +2645,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) => {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::CliParsed) => {
                                     // The field is the handle pointer itself; each `*_free` is null-safe
                                     // (the inactive arm / a moved-out aggregate reads a null handle).
                                     let free_fn = match payload_field_scalar(ty, idx) {
                                         Some(Scalar::Writer) => "io_writer_free",
                                         Some(Scalar::Reader) => "io_reader_free",
-                                        _ => "buffer_free",
+                                        Some(Scalar::Buffer) => "buffer_free",
+                                        _ => "cli_parsed_free",
                                     };
                                     self.builder
                                         .build_call(self.funcs[free_fn], &[field.into_pointer_value().into()], "")
@@ -4376,6 +4429,85 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["rng_sample"], &[rng_ptr.into(), xp.into(), xl.into(), kv.into(), esz.into()], "rsample")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("rng_sample returns a {ptr,len}")
+            }
+            // std.cli — the command / parsed handles are opaque pointers passed by value; `command`
+            // allocates one; `flag_*` register (void); `parse` writes a handle into `out` + returns an
+            // i32 status; `get_*` read a flag; `usage` returns an owned `{ptr,len}` string.
+            Rvalue::CliCommand { name } => {
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.funcs["cli_command"], &[np.into(), nl.into()], "clicmd")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("cli_command returns a handle pointer")
+            }
+            Rvalue::CliFlag { cmd, kind, name, default } => {
+                let c = self.operand(cmd).into_pointer_value();
+                let (np, nl) = self.split_str(name)?;
+                match kind {
+                    align_sema::hir::CliFlagKind::Bool => {
+                        self.builder
+                            .build_call(self.funcs["cli_flag_bool"], &[c.into(), np.into(), nl.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    }
+                    align_sema::hir::CliFlagKind::Str => {
+                        let d = default.as_ref().expect("flag_str carries a str default");
+                        let (dp, dl) = self.split_str(d)?;
+                        self.builder
+                            .build_call(self.funcs["cli_flag_str"], &[c.into(), np.into(), nl.into(), dp.into(), dl.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    }
+                    align_sema::hir::CliFlagKind::I64 => {
+                        let d = default.as_ref().expect("flag_i64 carries an i64 default");
+                        let dv = self.operand(d);
+                        self.builder
+                            .build_call(self.funcs["cli_flag_i64"], &[c.into(), np.into(), nl.into(), dv.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    }
+                }
+                return Ok(None);
+            }
+            Rvalue::CliParse { cmd, args, out } => {
+                let c = self.operand(cmd).into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (ap, al) = self.split_str(args)?;
+                self.builder
+                    .build_call(self.funcs["cli_parse"], &[c.into(), ap.into(), al.into(), out_ptr.into()], "cliparse")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("cli_parse returns i32 status")
+            }
+            Rvalue::CliGetBool { parsed, name } => {
+                let p = self.operand(parsed).into_pointer_value();
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.funcs["cli_get_bool"], &[p.into(), np.into(), nl.into()], "cligetb")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("cli_get_bool returns i32")
+            }
+            Rvalue::CliGetI64 { parsed, name } => {
+                let p = self.operand(parsed).into_pointer_value();
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.funcs["cli_get_i64"], &[p.into(), np.into(), nl.into()], "cligeti")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("cli_get_i64 returns i64")
+            }
+            Rvalue::CliGetStr { parsed, name } => {
+                let p = self.operand(parsed).into_pointer_value();
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.funcs["cli_get_str"], &[p.into(), np.into(), nl.into()], "cligets")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("cli_get_str returns a {ptr,len}")
+            }
+            Rvalue::CliUsage { cmd } => {
+                let c = self.operand(cmd).into_pointer_value();
+                self.builder
+                    .build_call(self.funcs["cli_usage"], &[c.into()], "cliusage")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("cli_usage returns a {ptr,len}")
             }
             // env.get — write the owned value {ptr,len} into `out`, return an i32 present flag.
             Rvalue::EnvGet { name, out } => {

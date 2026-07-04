@@ -1283,12 +1283,33 @@ pattern: Rust runtime (`align_rt_*`) + sema builtin dispatch + required `import`
   `import std.rand` required — `tests/m10_rand.rs` (12) + `align_runtime` unit tests (5).
   v1 `sample` uses an O(n) index-permutation scratch (correctness before speed); an O(k) Floyd's-
   sample is a later optimization behind the same signature.
-- **Slice 3 — std.cli.** `cli.command`/`c.flag_bool`/`c.flag_str`/`c.flag_i64`/`c.parse`/
-  `p.get_bool`/`p.get_str`/`p.get_i64`/`c.usage` — a parser over `main(args: array<str>)`'s
-  `array<str>`, not a second argv source.
-  **Completion condition:** a representative CLI program (a few flags of each kind) parses
-  correctly, an unknown flag / missing value / wrong kind is `Error.Invalid`, and `usage()` renders
-  the registered flags.
+- **Slice 3 — std.cli — DONE.** `cli.command`/`c.flag_bool`/`c.flag_str`/`c.flag_i64`/`c.parse`/
+  `p.get_bool`/`p.get_str`/`p.get_i64`/`c.usage` — a flag-registration parser over
+  `main(args: array<str>)`'s `array<str>`, not a second argv source. Two new **Move** handle types
+  (`Ty::CliCommand`/`Ty::CliParsed`, the `reader`/`writer`/`buffer` precedent) swept through every
+  pass (`ty_is_move`/`is_owned_droppable`/`scalar_arg`/`null_moved_source`/drop-insertion/MIR/codegen)
+  + a new **`Scalar::CliParsed`** owned-Move payload so `c.parse(args)` returns `Result<parsed, Error>`
+  (dropped via `align_rt_cli_parsed_free` on the Result's `Drop`). **`parse` borrows `c` (never
+  consumes it)**, so `c.usage()` stays callable *after* parse — including on the `Err` path, which is
+  exactly when help is printed. Getters are **total** after a successful parse; an unregistered name /
+  wrong kind is a **runtime abort** (the settled #345 policy — Align has no comptime, so a `get_*` can
+  neither be statically checked against a runtime flag set nor silently default; it aborts like an OOB
+  index). `get_str` returns a `str` **view** into `parsed` (region-bound — a `Frame` view, so an
+  escape is a compile error; `.clone()` copies out — the #297 arm). v1 bound-receiver gate: an owned
+  handle temporary cannot be a method receiver (the `check_reader_method` precedent), so
+  `cli.command("x").flag_bool("v")` and `c.parse(args)?.get_bool("v")` are rejected until Move-
+  temporary drops land; `flag_*` do **not** require `mut` (mutate in place through the handle, like a
+  `buffer`). v1 argv grammar: `--name` (bool), `--name value`, `--name=value` (str/i64); `args[0]` is
+  the program name, skipped. All cli ops are **Pure** (no syscalls — argv is already captured).
+  Implementation: sema builtin dispatch (`import std.cli`) + HIR `CliCommand`/`CliFlag`/`CliParse`/
+  `CliGet{Bool,I64,Str}`/`CliUsage` + MIR `Rvalue`s + `align_rt_cli_*` runtime (owned Rust `String`
+  flag table / value map, deep-freed on `Drop`; the tokenizer walks the `AlignStr` argv buffer).
+  **Completion condition met:** bool present/absent, str/i64 default+override, both `--name value` and
+  `--name=value`, unknown/missing/malformed → `Error.Invalid`, `get_*` unregistered/wrong-kind abort,
+  `get_str` escape rejected (`.clone()` OK), `usage()` renders all flags and stays callable after a
+  parse `Err`, and the import + bound-receiver + array-element gates — `tests/m10_cli.rs` (15) +
+  `align_runtime` unit tests (5). v1 is a scalar reference parser; struct-decode (the `json.decode`-
+  shaped ideal) waits for derive.
 
 **Explicitly deferred to M11+ (not part of M10):** `std.net`, `std.http`, `std.process`,
 `std.compress`, `std.crypto` — each carries a new Move type (socket / child-process handle), an FFI
