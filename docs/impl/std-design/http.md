@@ -4,7 +4,7 @@ module.
 
 # std.http — implementation design (M11)
 
-> 🌐 **English** · [日本語](./ja/http.md)
+> 🌐 **English** · [Japanese](./ja/http.md)
 
 ## Overview
 

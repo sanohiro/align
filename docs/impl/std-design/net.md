@@ -4,7 +4,7 @@ module.
 
 # std.net — implementation design (M11)
 
-> 🌐 **English** · [日本語](./ja/net.md)
+> 🌐 **English** · [Japanese](./ja/net.md)
 
 ## Overview
 
