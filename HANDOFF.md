@@ -18,7 +18,8 @@ truth: signatures, the two new Move types `Ty::CliCommand`/`Ty::CliParsed`, effe
 policy = `Error.Invalid` on parse / **runtime abort** on a `get_*` for an unregistered-or-wrong-type
 flag, the 5 pitfalls incl. the Move-sweep, the bound-receiver gate, and the `get_str` view region).
 Implement it the way Slices 1–2 were done (new Move `Ty` swept through every pass, sema dispatch +
-MIR + `align_rt_*` runtime, driver tests), open a PR, wait for the gemini review, reflect it, merge.
+MIR + `align_rt_*` runtime, driver tests), open a PR, wait for the `gemini-code-assist` review,
+reflect it, merge.
 After Slice 3, M10 can be formally closed (like M9 #341), then M11 begins — its five modules
 (net/http/process/compress/crypto) are each already spec'd in `docs/impl/std-design/*.md`.
 
@@ -52,7 +53,8 @@ rule updated; guide ch07 string-method list corrected (EN+JA).
   hard-exit escape hatch); `child` Drop reaps via blocking `waitpid` (NOT `SA_NOCLDWAIT` — it breaks
   `wait()` with `ECHILD`); net's `get_many` lives in `std.http` (net→http would be a layering
   violation); http v1 is plaintext-only (HTTPS deferred, `https://` rejected not silently downgraded);
-  crypto borrows a constant-time-audited engine, `constant_time_equal` the one self-host.
+  crypto borrows a constant-time-audited engine, with `constant_time_equal` as the only
+  self-hosted primitive.
 - **Hands-on tutorial** `docs/guide/` 00–05 (#349) + **bilingual mirrors** `docs/guide/ja/` and
   `docs/impl/std-design/ja/` + `README.ja.md`, cross-linked (#350).
 - **README streamlined + CLAUDE.md refreshed** (#350): the language rule now allows **bilingual
