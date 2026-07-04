@@ -1585,7 +1585,13 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         double-scan fallback). **This is the first *real consumer* of the dispatch table** (P0: ship
         byte-first APIs **backed by `memchr`/`memmem` now** — no scaffold needed; P1: move them
         behind the dispatch table + AVX2 `find_any`/structural classifier + NEON + UTF-8 validator,
-        reused across JSON/HTTP/CSV/HTML/tokenizers since they share one byte-classifier). Keep
+        reused across JSON/HTTP/CSV/HTML/tokenizers since they share one byte-classifier).
+        **Reference pointers (recorded 2026-07-04, external design-note review adoption):**
+        Parabix-class parallel bit streams (transpose bytes into per-bit SIMD streams, then boolean
+        ops) as prior art if a regex/XML-class engine ever outgrows the shared byte-classifier;
+        for UAX #29 grapheme segmentation, pure SIMD cannot handle ZWJ sequences — the
+        state-of-the-art shape is SIMD as an ASCII/fast-path prefilter over a scalar general path.
+        Keep
         Unicode (`chars`/grapheme/normalization/case-fold) explicit and mostly package-level, out of
         core v1. Builder is ~0.55× of optimized Rust — batching adjacent static/template appends into
         fewer runtime calls (a `write_many` internal ABI) is the lever. Probe:
@@ -1665,7 +1671,11 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
   story (task_group + blocking batch pool first); hidden auto-SoA / hidden per-request arenas (explicit
   type/scope + lint); a general `HashMap` as the headline (columnar/dictionary/group_by rails); a
   hand-written SIMD library before the O2 baseline is measured; chasing load *alignment* before data
-  shape + copy elimination (unaligned AVX2 loads were within ~0.95–1.0× on this host).
+  shape + copy elimination (unaligned AVX2 loads were within ~0.95–1.0× on this host); **blanket
+  branchless-ification of scalar control flow** (recorded 2026-07-04, external design-note review
+  adoption: TAGE-class predictors make predictable branches nearly free, while CMOV/select chains add
+  data dependencies that stall — matches the measured dense-bitset `where` value-sum loss above;
+  branchless is for vectorized kernels and `std.crypto` constant-time code, not a general style).
 
 - **Recheck + sharpened conclusions (codex re-run 2026-06-28, three new probes verified on this host).**
   A second pass re-ran the Align-vs-Rust suite (parity zone, SoA, JSON, group_by, builder, and par_map,
@@ -1689,7 +1699,11 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
     penalty for trivial bodies (seq inline vs seq indirect). So the rail is: lint a cheap `par_map`
     toward sequential/vectorized, and (P1) specialize the chunk body in MIR/codegen so the per-element
     thunk disappears. Reinforces the "make the fast shape the normal rail, warn when it falls off"
-    direction (and the Profile-guided perf-lints bullet above).
+    direction (and the Profile-guided perf-lints bullet above). **Reference pointer (recorded
+    2026-07-04, external design-note review adoption):** Futhark's defunctionalisation (Henriksen
+    et al., 2018) — compile higher-order functions to static data + inlined dispatch so pipelines
+    stay vectorizable; prior art for the thunk-erasing specialization (Align's non-escaping lambdas
+    already take the same shape: inlined, captures-as-parameters).
   - **group_by wants *three* strategies, not one hash table.** `work/group_sort_probe.rs` (verified,
     1M rows): **dense-id array aggregation 5.8 ms vs std HashMap 63 ms (~11×)** when keys are a dense
     integer range; **sort-group (24 ms) beats hash (63 ms) at 1M distinct** (high cardinality / already
@@ -2536,6 +2550,10 @@ SoA §05-backend §2):
 - SIMD numeric parse/format (fast atoi/itoa): CLIs convert numbers <-> text constantly.
   Lives in core.str / core.math. Reference pointer (builder/fmt, recorded 2026-07-04, external
   design-note review adoption): Dragonbox float formatting.
+- Compile-time template compilation (Askama/Sailfish class): parse the template at build time,
+  emit direct buffer-write code. core.template's compiler-generated static field tables already
+  take this shape; recorded as confirming prior art (reference pointer, 2026-07-04, external
+  design-note review adoption).
 - Perfect hashing for static keys: compile-time perfect hash for JSON fields / keyword
   lookup (an extension of the field table).
 - Embedding read-only data in the binary as const (no startup load).
@@ -2707,7 +2725,10 @@ an independent scalar oracle across a 64-byte-boundary padding sweep, prefilter 
 0/1/large, multibyte UTF-8, overlapping repeats, tail matches, a multi-KB haystack, and a
 deterministic randomized cross-check (the JSON-index `json_decode_index_simd_matches_scalar_oracle`
 discipline). Converges with the `core.string` byte-first-APIs plan above (P0 memchr/memmem-backed).
-Provenance: surfaced by an external idea review (2026-07-02); verified.
+Provenance: surfaced by an external idea review (2026-07-02); verified. **Reference pointer
+(recorded 2026-07-04, external design-note review adoption):** Faro & Lecroq's SIMD-filter
+substring-search family — confirms the shipped approach (simple wide compare-and-filter beats
+Boyer-Moore-style skipping on modern hardware); no code change implied.
 
 ### Relative (offset) pointers inside arenas (external idea review, 2026-07-02)
 When recursive/pointer-linked types are eventually designed (recursive enums are currently deferred —
