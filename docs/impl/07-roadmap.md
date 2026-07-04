@@ -1236,14 +1236,18 @@ rationale for the I/O fast-path and mmap items already lives in `docs/open-quest
 - **M10+ modules** (unstarted, out of this milestone's scope): `std.net`, `std.http`, `std.cli`,
   `std.process`, `std.encoding`, `std.compress`, `std.rand`, `std.crypto`.
 
-## M10 — std (encoding / rand / cli) — design settled 2026-07-04, implementation not started
+## M10 — std (encoding / rand / cli) — DONE (2026-07-04)
 
-Scope: `std.encoding`, `std.rand`, `std.cli` — three modules that close over mechanisms the
-language already has, with **zero new Move types, zero new effects, no concurrency, and no FFI
-engine** (`str`/`bytes`/`buffer`, `mut` slice, and `main(args: array<str>)`'s `array<str>` already
-exist). Full API shape is in `draft.md` §18.2; the scope decision + rationale is recorded in
-`docs/open-questions.md` Settled → "M10 scope decision". Implementation stays the `core.json`/M9
-pattern: Rust runtime (`align_rt_*`) + sema builtin dispatch + required `import`.
+**All three slices shipped (#346 encoding, #347 rand, #356 cli) and the milestone is formally
+closed.** Scope: `std.encoding`, `std.rand`, `std.cli` — three modules that close over mechanisms
+the language already has, with **no new effects, no concurrency, and no FFI engine**
+(`str`/`bytes`/`buffer`, `mut` slice, and `main(args: array<str>)`'s `array<str>` already exist).
+The original scoping note said "zero new Move types"; the settled per-module designs superseded
+that — Slice 1 added the `Scalar::Buffer` owned payload, Slice 3 the `CliCommand`/`CliParsed` Move
+handles (each swept through every pass, the reader/writer discipline). Full API shape is in
+`draft.md` §18.2; the scope decision + rationale is recorded in `docs/open-questions.md` Settled →
+"M10 scope decision". Implementation stays the `core.json`/M9 pattern: Rust runtime (`align_rt_*`)
++ sema builtin dispatch + required `import`.
 
 - **Slice 1 — std.encoding — DONE.** `base64_encode`/`base64_decode`, `base64url_encode`/
   `base64url_decode`, `hex_encode`/`hex_decode`, `utf8_valid` — pure functions over `bytes`/`str`,
@@ -1307,9 +1311,12 @@ pattern: Rust runtime (`align_rt_*`) + sema builtin dispatch + required `import`
   **Completion condition met:** bool present/absent, str/i64 default+override, both `--name value` and
   `--name=value`, unknown/missing/malformed → `Error.Invalid`, `get_*` unregistered/wrong-kind abort,
   `get_str` escape rejected (`.clone()` OK), `usage()` renders all flags and stays callable after a
-  parse `Err`, and the import + bound-receiver + array-element gates — `tests/m10_cli.rs` (15) +
-  `align_runtime` unit tests (5). v1 is a scalar reference parser; struct-decode (the `json.decode`-
-  shaped ideal) waits for derive.
+  parse `Err`, and the import + bound-receiver + array-element gates — `tests/m10_cli.rs` (17) +
+  `align_runtime` unit tests (5). Review-driven refinement (#356): the cli method names dispatch as
+  **type-guarded arms in the tail method match** (the `trim`/`map_err` shape), so a same-named
+  method on any other receiver type falls through to standard resolution instead of an eager
+  cli-specific error. v1 is a scalar reference parser; struct-decode (the `json.decode`-shaped
+  ideal) waits for derive.
 
 **Explicitly deferred to M11+ (not part of M10):** `std.net`, `std.http`, `std.process`,
 `std.compress`, `std.crypto` — each carries a new Move type (socket / child-process handle), an FFI
