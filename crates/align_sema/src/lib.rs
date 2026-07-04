@@ -7489,33 +7489,6 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
-        // `std.cli` command methods on a `cli command`: `c.flag_bool/str/i64(...)` register a flag,
-        // `c.parse(args)` yields `Result<parsed, Error>`, `c.usage()` renders help. Dispatched on the
-        // receiver type so a same-named user method on another value still resolves normally.
-        if matches!(method, "flag_bool" | "flag_str" | "flag_i64" | "parse" | "usage") {
-            let recv_expr = self.check_expr(recv, None);
-            if recv_expr.ty == Ty::CliCommand {
-                return self.check_cli_command_method(recv_expr, method, args, span);
-            }
-            if recv_expr.ty != Ty::Error {
-                self.diags
-                    .error(format!("'.{method}()' is not a method on {} (it is a `cli command` method)", ty_name(recv_expr.ty)), span);
-            }
-            return err;
-        }
-        // `std.cli` parsed getters on a `cli parsed`: `p.get_bool/i64/str(name)`. Total after a
-        // successful parse; unregistered / wrong-kind aborts at runtime.
-        if matches!(method, "get_bool" | "get_i64" | "get_str") {
-            let recv_expr = self.check_expr(recv, None);
-            if recv_expr.ty == Ty::CliParsed {
-                return self.check_cli_parsed_method(recv_expr, method, args, span);
-            }
-            if recv_expr.ty != Ty::Error {
-                self.diags
-                    .error(format!("'.{method}()' is not a method on {} (it is a `cli parsed` method)", ty_name(recv_expr.ty)), span);
-            }
-            return err;
-        }
         // `.len()` of a `str`/`slice`/array/`buffer` — the element/byte count (an `i64`).
         if method == "len" {
             return self.check_len(recv, args, span);
@@ -7560,6 +7533,18 @@ impl<'a, 't> Checker<'a, 't> {
             }
             "map_err" if matches!(self.resolve(recv_ty), Ty::Result(..)) => {
                 self.check_map_err(recv_expr, args, expected, span)
+            }
+            // `std.cli` command methods on a `cli command`: `c.flag_bool/str/i64(...)` register a
+            // flag, `c.parse(args)` yields `Result<parsed, Error>`, `c.usage()` renders help.
+            // Type-guarded (like `trim`/`contains`/`map_err`): a same-named method on any other type
+            // falls through to the `_` arm's normal "unknown method" resolution, never intercepted.
+            "flag_bool" | "flag_str" | "flag_i64" | "parse" | "usage" if recv_ty == Ty::CliCommand => {
+                self.check_cli_command_method(recv_expr, method, args, span)
+            }
+            // `std.cli` parsed getters on a `cli parsed`: `p.get_bool/i64/str(name)`. Total after a
+            // successful parse; unregistered / wrong-kind aborts at runtime. Type-guarded, same as above.
+            "get_bool" | "get_i64" | "get_str" if recv_ty == Ty::CliParsed => {
+                self.check_cli_parsed_method(recv_expr, method, args, span)
             }
             _ => {
                 if recv_ty != Ty::Error {

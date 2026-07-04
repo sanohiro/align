@@ -358,6 +358,34 @@ pub fn main() -> i32 = 0
     assert!(check_errs("m10-cli-escape", src), "returning a get_str view must be a compile error");
 }
 
+/// A cli method **name** on a non-cli receiver is not intercepted by the cli dispatch — it falls
+/// through to normal method resolution (`unknown method` on that type), so a future same-named method
+/// on another type resolves normally (the cli dispatch is type-guarded, like `trim`/`map_err`). A
+/// generic word like `parse` on a `str` must report against `str`, not claim a cli command method.
+#[test]
+fn cli_method_name_on_other_type_falls_through() {
+    let src = "\
+pub fn main() -> i32 {
+  s := \"hello\"
+  x := s.parse(\"y\")
+  return 0
+}
+";
+    let diags = check_diagnostics("m10-cli-fallthrough", src);
+    assert!(diags.contains("unknown method '.parse()' on str"), "expected a normal 'unknown method' error, got: {diags}");
+    assert!(!diags.contains("cli command"), "must not claim a cli command method on a str: {diags}");
+    // A cli method name on an erroring receiver reports the receiver error once — no cascade from
+    // the (removed) eager cli error re-checking the receiver.
+    let casc = "\
+pub fn main() -> i32 {
+  x := nope.parse(\"y\")
+  return 0
+}
+";
+    let cd = check_diagnostics("m10-cli-nocascade", casc);
+    assert_eq!(cd.matches("error:").count(), 1, "an undefined receiver must report exactly one error: {cd}");
+}
+
 /// A `flag_i64` default (and the runtime ABI) is exactly `i64`; a narrower width is a type error.
 #[test]
 fn flag_i64_default_must_be_i64() {
