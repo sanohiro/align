@@ -4,7 +4,7 @@ module.
 
 # std.process — implementation design (M11)
 
-> 🌐 **English** · [日本語](./ja/process.md)
+> 🌐 **English** · [Japanese](./ja/process.md)
 
 ## Overview
 

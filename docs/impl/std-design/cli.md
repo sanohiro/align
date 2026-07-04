@@ -4,7 +4,7 @@ module.
 
 # std.cli — implementation design (M10 Slice 3)
 
-> 🌐 **English** · [日本語](./ja/cli.md)
+> 🌐 **English** · [Japanese](./ja/cli.md)
 
 ## Overview
 
