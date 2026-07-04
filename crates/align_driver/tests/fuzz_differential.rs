@@ -147,7 +147,7 @@ fn wrap(v: i128, t: ITy) -> i128 {
     let w = t.bits();
     let mask = (1u128 << w) - 1;
     let bits = (v as u128) & mask;
-    if t.signed() && (bits >> (w - 1)) & 1 == 1 {
+    if t.signed() && (bits & (1u128 << (w - 1))) != 0 {
         (bits as i128) - (1i128 << w)
     } else {
         bits as i128

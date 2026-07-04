@@ -725,9 +725,12 @@ pub extern "C" fn align_rt_builder_new(arena: *mut Arena, capacity: i64) -> *mut
 /// `ptr`/`len` must describe a valid byte range.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write(b: *mut Builder, ptr: *const u8, len: i64) {
+    if b.is_null() { return; }
     let b = unsafe { &mut *b };
-    if len > 0 {
-        b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
+    if let Ok(len_z) = isize::try_from(len) {
+        if len_z > 0 && !ptr.is_null() {
+            b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len_z as usize) });
+        }
     }
 }
 
@@ -800,13 +803,18 @@ pub unsafe extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
 /// `p1`/`l1` and `p2`/`l2` must describe valid byte ranges when their lengths are positive.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_str_int_str(b: *mut Builder, p1: *const u8, l1: i64, v: i64, p2: *const u8, l2: i64) {
+    if b.is_null() { return; }
     let b = unsafe { &mut *b };
-    if l1 > 0 {
-        b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p1, l1 as usize) });
+    if let Ok(l1_z) = isize::try_from(l1) {
+        if l1_z > 0 && !p1.is_null() {
+            b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p1, l1_z as usize) });
+        }
     }
     builder_push_i64(&mut b.buf, v);
-    if l2 > 0 {
-        b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p2, l2 as usize) });
+    if let Ok(l2_z) = isize::try_from(l2) {
+        if l2_z > 0 && !p2.is_null() {
+            b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p2, l2_z as usize) });
+        }
     }
 }
 
@@ -2154,7 +2162,12 @@ pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i
 /// `keys` must be valid for `len` `i64`s; `out_keys`/`out_vals` for `cap` `i64`s.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_count_i64(keys: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
-    let keys: &[i64] = if len <= 0 || keys.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(keys, len as usize) } };
+    let len_u = usize::try_from(len).unwrap_or(0);
+    let keys: &[i64] = if len_u == 0 || keys.is_null() || len_u > isize::MAX as usize / 8 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(keys, len_u) }
+    };
     unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
@@ -2705,15 +2718,16 @@ pub unsafe extern "C" fn align_rt_dict_lookup(ids: *const i64, n: i64, dict: *co
 pub unsafe extern "C" fn align_rt_gather_i64(base: *const u8, n: i64, stride: i64, off: i64, out: *mut i64) {
     // A negative `stride`/`off` is meaningless and would wrap to a huge value through `as usize`
     // (an out-of-bounds read); reject it defensively, like `align_rt_dict_lookup`'s `try_from` guards.
-    if n <= 0 || base.is_null() || out.is_null() || stride < 0 || off < 0 {
+    let Ok(n_u) = usize::try_from(n) else { return };
+    let Ok(stride_u) = usize::try_from(stride) else { return };
+    let Ok(off_u) = usize::try_from(off) else { return };
+    if n_u == 0 || base.is_null() || out.is_null() || n_u > isize::MAX as usize / 8 {
         return;
     }
-    let n = n as usize;
-    let (stride, off) = (stride as usize, off as usize);
-    let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
+    let out = unsafe { std::slice::from_raw_parts_mut(out, n_u) };
     for (i, slot) in out.iter_mut().enumerate() {
-        let row = unsafe { base.add(i * stride) };
-        *slot = unsafe { (row.add(off) as *const i64).read_unaligned() };
+        let row = unsafe { base.add(i.wrapping_mul(stride_u)) };
+        *slot = unsafe { (row.add(off_u) as *const i64).read_unaligned() };
     }
 }
 
@@ -5098,7 +5112,12 @@ pub extern "C" fn align_rt_tg_begin() -> *mut TaskGroup {
 /// `tg` must be a non-null, valid pointer returned by [`align_rt_tg_begin`] and not yet ended.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align: i64) -> *mut u8 {
-    unsafe { &mut *tg }.arena.alloc(size as usize, align as usize)
+    if tg.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Ok(size_u) = usize::try_from(size) else { return core::ptr::null_mut() };
+    let Ok(align_u) = usize::try_from(align) else { return core::ptr::null_mut() };
+    unsafe { &mut *tg }.arena.alloc(size_u, align_u)
 }
 
 /// Register a deferred task (its trampoline + closure pointer + env + result slot).
