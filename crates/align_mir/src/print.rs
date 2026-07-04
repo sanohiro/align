@@ -436,6 +436,16 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::RandRange { rng, lo, hi } => format!("rng_range(_{rng}, {}, {})", operand_str(lo), operand_str(hi)),
         Rvalue::RandShuffle { rng, xs, .. } => format!("rng_shuffle(_{rng}, {})", operand_str(xs)),
         Rvalue::RandSample { rng, xs, k, .. } => format!("rng_sample(_{rng}, {}, {})", operand_str(xs), operand_str(k)),
+        Rvalue::CliCommand { name } => format!("cli_command({})", operand_str(name)),
+        Rvalue::CliFlag { cmd, kind, name, default } => match default {
+            Some(d) => format!("cli_flag_{kind:?}({}, {}, {})", operand_str(cmd), operand_str(name), operand_str(d)),
+            None => format!("cli_flag_{kind:?}({}, {})", operand_str(cmd), operand_str(name)),
+        },
+        Rvalue::CliParse { cmd, args, out } => format!("cli_parse({}, {}, -> _{out})", operand_str(cmd), operand_str(args)),
+        Rvalue::CliGetBool { parsed, name } => format!("cli_get_bool({}, {})", operand_str(parsed), operand_str(name)),
+        Rvalue::CliGetI64 { parsed, name } => format!("cli_get_i64({}, {})", operand_str(parsed), operand_str(name)),
+        Rvalue::CliGetStr { parsed, name } => format!("cli_get_str({}, {})", operand_str(parsed), operand_str(name)),
+        Rvalue::CliUsage { cmd } => format!("cli_usage({})", operand_str(cmd)),
     }
 }
 

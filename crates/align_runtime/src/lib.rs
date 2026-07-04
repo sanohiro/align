@@ -5585,6 +5585,352 @@ pub unsafe extern "C" fn align_rt_rng_sample(
     AlignStr { ptr: out as *const u8, len: kk as i64 }
 }
 
+// ---------------------------------------------------------------------------------------------
+// std.cli (M10 Slice 3) — a flag-registration parser over `main(args: array<str>)`'s `array<str>`
+// (the one argv source). Pure in-language (no syscalls — argv is already captured). A `cli command`
+// (`CliCommand`) is a Move handle owning its registered-flag table; `c.parse(args)` **borrows** it
+// (so `c.usage()` stays callable after, including on the `Err` path) and yields an owned `cli parsed`
+// (`CliParsed`) — the resolved name→value map. Both are `Box`ed and freed by the generated `Drop`.
+// The three `get_*` are total after a successful parse: an unregistered name / wrong kind is a
+// **programmer error** and aborts (like an OOB index), never a silent default. v1 argv grammar:
+// `--name` (bool), `--name value`, `--name=value` (str/i64); `args[0]` is the program name, skipped.
+// ---------------------------------------------------------------------------------------------
+
+/// Which value a registered `std.cli` flag carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CliFlagKind {
+    Bool,
+    Str,
+    I64,
+}
+
+/// A registered flag's default (a `bool` flag always defaults to `false`, so it carries no payload).
+enum CliDefault {
+    Bool,
+    Str(String),
+    I64(i64),
+}
+
+/// One registered flag: its `--name`, its kind, and its default.
+struct CliFlag {
+    name: String,
+    kind: CliFlagKind,
+    default: CliDefault,
+}
+
+/// A `cli command` — the flag-registration builder. Owns its flag table (each entry holds owned
+/// `String`s), freed by [`align_rt_cli_command_free`].
+pub struct CliCommand {
+    name: String,
+    flags: Vec<CliFlag>,
+}
+
+/// A resolved flag value after a successful parse.
+enum CliValue {
+    Bool(bool),
+    Str(String),
+    I64(i64),
+}
+
+/// A `cli parsed` — the resolved name→value map (one entry per registered flag, defaults filled in).
+/// Owns its `String`s (`get_str` returns a zero-copy view into them), freed by
+/// [`align_rt_cli_parsed_free`].
+pub struct CliParsed {
+    values: Vec<(String, CliValue)>,
+}
+
+/// Read a `str` `{ptr,len}` into an owned `String`. A `str` is UTF-8 by the language invariant;
+/// `from_utf8_lossy` is used defensively (never aborts) so a non-UTF-8 view degrades rather than
+/// crashing at registration time.
+fn cli_str_owned(ptr: *const u8, len: i64) -> String {
+    String::from_utf8_lossy(unsafe { bytes_view(ptr, len) }).into_owned()
+}
+
+/// Abort the process on a `get_*` programmer error (unregistered name, or a kind mismatch) — the
+/// settled #345 policy: Align has no comptime, so a `get_*` cannot be checked against the runtime
+/// flag set; it aborts like an OOB index, never a silent default. Mirrors [`align_rt_rng_range`]'s
+/// `lo >= hi` abort.
+fn cli_get_abort(what: &str, name: &[u8], detail: &str) -> ! {
+    eprintln!("align: panic: cli.{what}: {detail} for flag '{}'", String::from_utf8_lossy(name));
+    std::process::abort();
+}
+
+/// `cli.command(name)` — allocate a `cli command` handle named `name`.
+///
+/// # Safety
+/// `name_ptr`/`name_len` must describe a valid byte range (or be `{null, <=0}`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_command_new(name_ptr: *const u8, name_len: i64) -> *mut CliCommand {
+    Box::into_raw(Box::new(CliCommand { name: cli_str_owned(name_ptr, name_len), flags: Vec::new() }))
+}
+
+/// `c.flag_bool(name)` — register a bool flag (default `false`). Null-safe on `cmd`.
+///
+/// # Safety
+/// `cmd` must be a valid `CliCommand` (or null); `name_ptr`/`name_len` a valid byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_flag_bool(cmd: *mut CliCommand, name_ptr: *const u8, name_len: i64) {
+    if cmd.is_null() {
+        return;
+    }
+    let c = unsafe { &mut *cmd };
+    c.flags.push(CliFlag { name: cli_str_owned(name_ptr, name_len), kind: CliFlagKind::Bool, default: CliDefault::Bool });
+}
+
+/// `c.flag_str(name, default)` — register a `str` flag with a default. Null-safe on `cmd`.
+///
+/// # Safety
+/// `cmd` must be a valid `CliCommand` (or null); the two byte ranges must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_flag_str(cmd: *mut CliCommand, name_ptr: *const u8, name_len: i64, def_ptr: *const u8, def_len: i64) {
+    if cmd.is_null() {
+        return;
+    }
+    let c = unsafe { &mut *cmd };
+    c.flags.push(CliFlag {
+        name: cli_str_owned(name_ptr, name_len),
+        kind: CliFlagKind::Str,
+        default: CliDefault::Str(cli_str_owned(def_ptr, def_len)),
+    });
+}
+
+/// `c.flag_i64(name, default)` — register an `i64` flag with a default. Null-safe on `cmd`.
+///
+/// # Safety
+/// `cmd` must be a valid `CliCommand` (or null); `name_ptr`/`name_len` a valid byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_flag_i64(cmd: *mut CliCommand, name_ptr: *const u8, name_len: i64, def: i64) {
+    if cmd.is_null() {
+        return;
+    }
+    let c = unsafe { &mut *cmd };
+    c.flags.push(CliFlag { name: cli_str_owned(name_ptr, name_len), kind: CliFlagKind::I64, default: CliDefault::I64(def) });
+}
+
+/// Set (or replace) a resolved value in the parse accumulator, so a repeated `--flag` keeps the last
+/// occurrence (the conventional last-wins rule).
+fn cli_set_value(values: &mut Vec<(String, CliValue)>, name: &str, v: CliValue) {
+    if let Some(slot) = values.iter_mut().find(|(nm, _)| nm == name) {
+        slot.1 = v;
+    } else {
+        values.push((name.to_string(), v));
+    }
+}
+
+/// Parse the value bytes `val` for the flag `f` into a [`CliValue`], or `None` on a malformed i64 /
+/// non-UTF-8 str (→ `AL_INVALID`). A bool flag never reaches here (it takes no value).
+fn cli_parse_value(f: &CliFlag, val: &[u8]) -> Option<CliValue> {
+    let s = std::str::from_utf8(val).ok()?;
+    match f.kind {
+        CliFlagKind::Str => Some(CliValue::Str(s.to_string())),
+        CliFlagKind::I64 => Some(CliValue::I64(s.parse::<i64>().ok()?)),
+        CliFlagKind::Bool => None,
+    }
+}
+
+/// `c.parse(args)` — tokenize the argv `array<str>` `{argv, argv_len}` (an `AlignStr` buffer) against
+/// `cmd`'s flag table. `args[0]` is the program name (skipped). Writes an owned `cli parsed` handle to
+/// `*out` and returns `0`, or `AL_INVALID` (`Error.Invalid`) — leaving `*out` null — on any input
+/// error (unknown flag, missing value, malformed i64, wrong kind).
+///
+/// # Safety
+/// `cmd` must be a valid `CliCommand` (or null); `argv`/`argv_len` must describe a valid `AlignStr`
+/// buffer (each entry a valid `str` view); `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_parse(cmd: *mut CliCommand, argv: *const AlignStr, argv_len: i64, out: *mut *mut CliParsed) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    if cmd.is_null() {
+        return AL_INVALID;
+    }
+    let c = unsafe { &*cmd };
+    let n = usize::try_from(argv_len).unwrap_or(0);
+    let argv_slice: &[AlignStr] = if n > 0 && !argv.is_null() { unsafe { std::slice::from_raw_parts(argv, n) } } else { &[] };
+    let mut values: Vec<(String, CliValue)> = Vec::new();
+
+    // Skip `argv[0]` (the program name — the `main(args)` convention).
+    let mut i = 1usize;
+    while i < argv_slice.len() {
+        let tok = unsafe { bytes_view(argv_slice[i].ptr, argv_slice[i].len) };
+        // v1 grammar: every token is a `--flag` form. A bare / short token is rejected.
+        if tok.len() < 2 || &tok[..2] != b"--" {
+            return AL_INVALID;
+        }
+        let body = &tok[2..];
+        if let Some(eq) = body.iter().position(|&b| b == b'=') {
+            // `--name=value` (str/i64 only — a bool takes no value).
+            let name = &body[..eq];
+            let val = &body[eq + 1..];
+            let Some(f) = c.flags.iter().find(|f| f.name.as_bytes() == name) else {
+                return AL_INVALID; // unknown flag
+            };
+            if f.kind == CliFlagKind::Bool {
+                return AL_INVALID; // a bool flag takes no `=value`
+            }
+            let Some(v) = cli_parse_value(f, val) else {
+                return AL_INVALID; // malformed i64 / non-UTF-8
+            };
+            cli_set_value(&mut values, &f.name, v);
+            i += 1;
+        } else {
+            // `--name` (bool) or `--name value` (str/i64).
+            let Some(f) = c.flags.iter().find(|f| f.name.as_bytes() == body) else {
+                return AL_INVALID; // unknown flag
+            };
+            match f.kind {
+                CliFlagKind::Bool => {
+                    cli_set_value(&mut values, &f.name, CliValue::Bool(true));
+                    i += 1;
+                }
+                CliFlagKind::Str | CliFlagKind::I64 => {
+                    // The value is the next token.
+                    if i + 1 >= argv_slice.len() {
+                        return AL_INVALID; // missing value
+                    }
+                    let val = unsafe { bytes_view(argv_slice[i + 1].ptr, argv_slice[i + 1].len) };
+                    let Some(v) = cli_parse_value(f, val) else {
+                        return AL_INVALID;
+                    };
+                    cli_set_value(&mut values, &f.name, v);
+                    i += 2;
+                }
+            }
+        }
+    }
+
+    // Fill in the default for every registered flag not seen on the command line.
+    for f in &c.flags {
+        if values.iter().any(|(nm, _)| nm.as_bytes() == f.name.as_bytes()) {
+            continue;
+        }
+        let v = match &f.default {
+            CliDefault::Bool => CliValue::Bool(false),
+            CliDefault::Str(s) => CliValue::Str(s.clone()),
+            CliDefault::I64(x) => CliValue::I64(*x),
+        };
+        values.push((f.name.clone(), v));
+    }
+
+    unsafe { *out = Box::into_raw(Box::new(CliParsed { values })) };
+    0
+}
+
+/// Look up flag `name` in a parsed handle, aborting (programmer error) if `parsed` is null or the
+/// name was never registered. Returns the resolved value.
+///
+/// # Safety
+/// `parsed` must be a valid `CliParsed` (or null); `name_ptr`/`name_len` a valid byte range.
+unsafe fn cli_lookup<'a>(parsed: *const CliParsed, what: &str, name_ptr: *const u8, name_len: i64) -> (&'a CliValue, &'a [u8]) {
+    let name = unsafe { bytes_view(name_ptr, name_len) };
+    if parsed.is_null() {
+        cli_get_abort(what, name, "the parsed result is null");
+    }
+    let p = unsafe { &*parsed };
+    match p.values.iter().find(|(nm, _)| nm.as_bytes() == name) {
+        Some((_, v)) => (v, name),
+        None => cli_get_abort(what, name, "no such flag was registered"),
+    }
+}
+
+/// `p.get_bool(name)` — `1`/`0`. Aborts on unregistered / wrong-kind.
+///
+/// # Safety
+/// See [`cli_lookup`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_get_bool(parsed: *const CliParsed, name_ptr: *const u8, name_len: i64) -> i32 {
+    let (v, name) = unsafe { cli_lookup(parsed, "get_bool", name_ptr, name_len) };
+    match v {
+        CliValue::Bool(b) => *b as i32,
+        _ => cli_get_abort("get_bool", name, "flag is not a bool"),
+    }
+}
+
+/// `p.get_i64(name)`. Aborts on unregistered / wrong-kind.
+///
+/// # Safety
+/// See [`cli_lookup`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_get_i64(parsed: *const CliParsed, name_ptr: *const u8, name_len: i64) -> i64 {
+    let (v, name) = unsafe { cli_lookup(parsed, "get_i64", name_ptr, name_len) };
+    match v {
+        CliValue::I64(x) => *x,
+        _ => cli_get_abort("get_i64", name, "flag is not an i64"),
+    }
+}
+
+/// `p.get_str(name)` — a `str` **view** into the parsed handle's owned storage (no copy;
+/// region-bound to `parsed` in sema). Aborts on unregistered / wrong-kind.
+///
+/// # Safety
+/// See [`cli_lookup`]. The returned view borrows `parsed`, which must outlive it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_get_str(parsed: *const CliParsed, name_ptr: *const u8, name_len: i64) -> AlignStr {
+    let (v, name) = unsafe { cli_lookup(parsed, "get_str", name_ptr, name_len) };
+    match v {
+        CliValue::Str(s) => AlignStr { ptr: s.as_ptr(), len: s.len() as i64 },
+        _ => cli_get_abort("get_str", name, "flag is not a str"),
+    }
+}
+
+/// `c.usage()` — render `cmd`'s flag table into a fresh owned `string` `{ptr,len}` (freed by the
+/// bound local's `Drop` via `align_rt_free`). Null-`cmd` yields an empty string.
+///
+/// # Safety
+/// `cmd` must be a valid `CliCommand` (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_usage(cmd: *const CliCommand) -> AlignStr {
+    if cmd.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let c = unsafe { &*cmd };
+    let mut s = String::new();
+    s.push_str("usage: ");
+    s.push_str(&c.name);
+    s.push_str(" [flags]\n");
+    for f in &c.flags {
+        s.push_str("  --");
+        s.push_str(&f.name);
+        match &f.default {
+            CliDefault::Bool => s.push_str("  (bool)\n"),
+            CliDefault::Str(d) => {
+                s.push_str("  (str, default: ");
+                s.push_str(d);
+                s.push_str(")\n");
+            }
+            CliDefault::I64(d) => {
+                s.push_str("  (i64, default: ");
+                s.push_str(&d.to_string());
+                s.push_str(")\n");
+            }
+        }
+    }
+    owned_str_from_vec(s.as_bytes())
+}
+
+/// Free a `cli command` (its flag table). Null-safe.
+///
+/// # Safety
+/// `cmd` must be null or a pointer from [`align_rt_cli_command_new`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_command_free(cmd: *mut CliCommand) {
+    if !cmd.is_null() {
+        drop(unsafe { Box::from_raw(cmd) });
+    }
+}
+
+/// Free a `cli parsed` (its value map). Null-safe.
+///
+/// # Safety
+/// `parsed` must be null or a pointer from [`align_rt_cli_parse`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_cli_parsed_free(parsed: *mut CliParsed) {
+    if !parsed.is_null() {
+        drop(unsafe { Box::from_raw(parsed) });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8051,5 +8397,130 @@ mod tests {
         got.sort();
         assert_eq!(got, src, "sampling n of n is a full permutation");
         unsafe { align_rt_free(full.ptr as *mut u8) };
+    }
+
+    // --- std.cli --------------------------------------------------------------------------------
+
+    /// Build an `argv` `AlignStr` buffer from a slice of `&str` (each entry views its `&str`'s bytes).
+    /// The returned `Vec` must outlive any `align_rt_cli_parse` call (its entries borrow `toks`).
+    fn cli_argv(toks: &[&str]) -> Vec<AlignStr> {
+        toks.iter().map(|s| AlignStr { ptr: s.as_ptr(), len: s.len() as i64 }).collect()
+    }
+
+    /// A `str` view over a `&str` (for the name / default arguments).
+    fn cli_s(s: &str) -> (*const u8, i64) {
+        (s.as_ptr(), s.len() as i64)
+    }
+
+    /// The tokenizer accepts all three v1 forms — bare `--bool`, `--str value` / `--str=value`,
+    /// `--i64 value` / `--i64=value` — skips `argv[0]`, and fills defaults for unseen flags.
+    #[test]
+    fn cli_parse_three_forms_and_defaults() {
+        let cmd = unsafe { align_rt_cli_command_new(cli_s("t").0, cli_s("t").1) };
+        unsafe { align_rt_cli_flag_bool(cmd, cli_s("verbose").0, cli_s("verbose").1) };
+        unsafe { align_rt_cli_flag_str(cmd, cli_s("name").0, cli_s("name").1, cli_s("world").0, cli_s("world").1) };
+        unsafe { align_rt_cli_flag_i64(cmd, cli_s("count").0, cli_s("count").1, 3) };
+
+        // argv[0] is the program name (skipped); mix the space form and the equals form.
+        let argv = cli_argv(&["prog", "--verbose", "--name", "Align", "--count=42"]);
+        let mut out: *mut CliParsed = core::ptr::null_mut();
+        let rc = unsafe { align_rt_cli_parse(cmd, argv.as_ptr(), argv.len() as i64, &mut out) };
+        assert_eq!(rc, 0);
+        assert!(!out.is_null());
+        assert_eq!(unsafe { align_rt_cli_get_bool(out, cli_s("verbose").0, cli_s("verbose").1) }, 1);
+        let nv = unsafe { align_rt_cli_get_str(out, cli_s("name").0, cli_s("name").1) };
+        assert_eq!(String::from_utf8_lossy(unsafe { bytes_view(nv.ptr, nv.len) }), "Align");
+        assert_eq!(unsafe { align_rt_cli_get_i64(out, cli_s("count").0, cli_s("count").1) }, 42);
+        unsafe { align_rt_cli_parsed_free(out) };
+
+        // No args → every flag reports its default.
+        let argv0 = cli_argv(&["prog"]);
+        let mut out2: *mut CliParsed = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_cli_parse(cmd, argv0.as_ptr(), argv0.len() as i64, &mut out2) }, 0);
+        assert_eq!(unsafe { align_rt_cli_get_bool(out2, cli_s("verbose").0, cli_s("verbose").1) }, 0);
+        let nv2 = unsafe { align_rt_cli_get_str(out2, cli_s("name").0, cli_s("name").1) };
+        assert_eq!(String::from_utf8_lossy(unsafe { bytes_view(nv2.ptr, nv2.len) }), "world");
+        assert_eq!(unsafe { align_rt_cli_get_i64(out2, cli_s("count").0, cli_s("count").1) }, 3);
+        unsafe { align_rt_cli_parsed_free(out2) };
+        unsafe { align_rt_cli_command_free(cmd) };
+    }
+
+    /// Every input error maps to `AL_INVALID` and leaves `*out` null: unknown flag, missing value,
+    /// malformed i64, a `=value` on a bool flag, and a bare (non-`--`) token.
+    #[test]
+    fn cli_parse_errors_map_to_invalid() {
+        let cmd = unsafe { align_rt_cli_command_new(cli_s("t").0, cli_s("t").1) };
+        unsafe { align_rt_cli_flag_bool(cmd, cli_s("verbose").0, cli_s("verbose").1) };
+        unsafe { align_rt_cli_flag_i64(cmd, cli_s("count").0, cli_s("count").1, 0) };
+
+        for bad in [
+            vec!["prog", "--bogus"],          // unknown flag
+            vec!["prog", "--count"],          // missing value
+            vec!["prog", "--count", "abc"],   // malformed i64
+            vec!["prog", "--verbose=1"],      // a bool takes no value
+            vec!["prog", "positional"],       // not a --flag
+        ] {
+            let argv = cli_argv(&bad);
+            let mut out: *mut CliParsed = core::ptr::null_mut();
+            let rc = unsafe { align_rt_cli_parse(cmd, argv.as_ptr(), argv.len() as i64, &mut out) };
+            assert_eq!(rc, AL_INVALID, "argv {bad:?} should be AL_INVALID");
+            assert!(out.is_null(), "argv {bad:?} must leave *out null");
+        }
+        // A null out slot / null command is AL_INVALID, not UB.
+        let argv = cli_argv(&["prog"]);
+        assert_eq!(unsafe { align_rt_cli_parse(cmd, argv.as_ptr(), argv.len() as i64, core::ptr::null_mut()) }, AL_INVALID);
+        let mut out: *mut CliParsed = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_cli_parse(core::ptr::null_mut(), argv.as_ptr(), argv.len() as i64, &mut out) }, AL_INVALID);
+        unsafe { align_rt_cli_command_free(cmd) };
+    }
+
+    /// A repeated `--flag` keeps the last occurrence (last-wins).
+    #[test]
+    fn cli_parse_last_occurrence_wins() {
+        let cmd = unsafe { align_rt_cli_command_new(cli_s("t").0, cli_s("t").1) };
+        unsafe { align_rt_cli_flag_i64(cmd, cli_s("count").0, cli_s("count").1, 0) };
+        let argv = cli_argv(&["prog", "--count", "1", "--count=9"]);
+        let mut out: *mut CliParsed = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_cli_parse(cmd, argv.as_ptr(), argv.len() as i64, &mut out) }, 0);
+        assert_eq!(unsafe { align_rt_cli_get_i64(out, cli_s("count").0, cli_s("count").1) }, 9);
+        unsafe { align_rt_cli_parsed_free(out) };
+        unsafe { align_rt_cli_command_free(cmd) };
+    }
+
+    /// `usage()` renders the command name and one line per registered flag; a null command is empty.
+    #[test]
+    fn cli_usage_renders_all_flags() {
+        let cmd = unsafe { align_rt_cli_command_new(cli_s("tool").0, cli_s("tool").1) };
+        unsafe { align_rt_cli_flag_bool(cmd, cli_s("verbose").0, cli_s("verbose").1) };
+        unsafe { align_rt_cli_flag_str(cmd, cli_s("name").0, cli_s("name").1, cli_s("world").0, cli_s("world").1) };
+        unsafe { align_rt_cli_flag_i64(cmd, cli_s("count").0, cli_s("count").1, 3) };
+        let u = unsafe { align_rt_cli_usage(cmd) };
+        let text = String::from_utf8_lossy(unsafe { bytes_view(u.ptr, u.len) }).into_owned();
+        assert!(text.contains("usage: tool"), "{text}");
+        assert!(text.contains("--verbose"), "{text}");
+        assert!(text.contains("--name"), "{text}");
+        assert!(text.contains("--count"), "{text}");
+        assert!(text.contains("default: 3"), "{text}");
+        unsafe { align_rt_free(u.ptr as *mut u8) };
+
+        let empty = unsafe { align_rt_cli_usage(core::ptr::null()) };
+        assert_eq!(empty.len, 0);
+        assert!(empty.ptr.is_null());
+        unsafe { align_rt_cli_command_free(cmd) };
+    }
+
+    /// The `*_free` symbols are null-safe (a moved-out / never-initialised slot drops harmlessly).
+    #[test]
+    fn cli_free_is_null_safe() {
+        unsafe { align_rt_cli_command_free(core::ptr::null_mut()) };
+        unsafe { align_rt_cli_parsed_free(core::ptr::null_mut()) };
+        // A real round trip frees without leaking (Miri/ASan would catch a double-free here).
+        let cmd = unsafe { align_rt_cli_command_new(cli_s("t").0, cli_s("t").1) };
+        unsafe { align_rt_cli_flag_str(cmd, cli_s("name").0, cli_s("name").1, cli_s("world").0, cli_s("world").1) };
+        let argv = cli_argv(&["prog", "--name", "Align"]);
+        let mut out: *mut CliParsed = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_cli_parse(cmd, argv.as_ptr(), argv.len() as i64, &mut out) }, 0);
+        unsafe { align_rt_cli_parsed_free(out) };
+        unsafe { align_rt_cli_command_free(cmd) };
     }
 }

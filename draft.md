@@ -1839,6 +1839,18 @@ other `std` fn — with `c.usage()` available to render help. Once a derive/decl
 mechanism exists (see below), `get_*` calls against it can move to compile-time validation; this
 runtime-checked lookup is the v1 shape for the explicit builder.
 
+**`parse` borrows the command, it does not consume it.** `c.parse(args)` reads the registered-flag
+table by borrow, so `c.usage()` stays callable *after* `parse` — including on the `Err` path, which
+is exactly when help is wanted. (If `parse` moved `c`, a parse failure would leave you unable to
+render usage.)
+
+**v1 argv grammar.** `parse` treats `args[0]` as the program name (the `main(args)` convention) and
+reads flags from `args[1..]` in three forms: `--name` (a bool flag, set to `true`), `--name value`
+(the value is the next token), and `--name=value` (str/i64 flags). A bool flag takes no value; a
+str/i64 flag with no following value, an unknown flag, a bare positional token, or a malformed `i64`
+is an *input* error (`Error.Invalid`). Richer conventions (`-x` short flags, `--` end-of-flags,
+clustered bools, positionals) are deferred behind this same signature.
+
 **v1 is an explicit flag-registration builder API.** Align has no derive/attributes yet, so
 decoding straight into a struct (the `json.decode`-shaped ideal) waits for that mechanism. This API
 shape is a v1 provisional: builder vs. a declarative spec is revisited once derive lands.

@@ -102,14 +102,19 @@ pub enum Scalar {
     /// handle (a growable byte container); the enclosing `Result`'s `Drop` frees it. Opaque pointer,
     /// like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never region-tracked (it borrows nothing).
     Buffer,
+    /// A `cli parsed` payload (`Result<parsed, Error>` from `cli.command(...).parse(args)`). An owned
+    /// **Move** handle (the resolved flag map); the enclosing `Result`'s `Drop` frees it. Opaque
+    /// pointer, like [`Scalar::Reader`]/[`Scalar::Writer`]/[`Scalar::Buffer`] — owned, never
+    /// region-tracked. (There is no `Scalar::CliCommand`: a `command` never rides an aggregate.)
+    CliParsed,
 }
 
 impl Scalar {
     /// Whether this payload scalar is an owned **Move** type (a heap buffer that the enclosing
     /// `Option`/`Result` owns and must drop / move out). Today: `string` (8a), `array<T>` (8b),
-    /// the I/O handles `reader`/`writer`, and a decoded `buffer`.
+    /// the I/O handles `reader`/`writer`, a decoded `buffer`, and a `cli parsed`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed)
     }
 }
 
@@ -290,6 +295,18 @@ pub enum Ty {
     /// `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)` take a **mut** receiver and
     /// advance the state in place. Laid out in LLVM as `[4 x i64]`, passed/returned by value.
     Rng,
+    /// A `cli command` (`std.cli`) — the flag-registration builder from `cli.command(name)`. An
+    /// owned **Move** handle (like `reader`/`writer`/`buffer`) owning its heap flag table (each entry
+    /// holds an owned `string` name / default), `Drop`-freed. `c.flag_bool/str/i64(...)` register a
+    /// flag (mutate in place through the handle, not consumed); `c.parse(args)` **borrows** it and
+    /// yields `Result<parsed, Error>`; `c.usage()` renders it. Opaque pointer.
+    CliCommand,
+    /// A `cli parsed` (`std.cli`) — the outcome of `c.parse(args)`, the `Ok` payload of its
+    /// `Result<parsed, Error>`. An owned **Move** handle owning the resolved name→value map (with
+    /// owned `string` values), `Drop`-freed. `p.get_bool/i64/str(name)` read a flag total-ly (abort
+    /// on unregistered / wrong-kind); `get_str` returns a `str` **view** into this handle's storage
+    /// (region-bound to `p`). Opaque pointer.
+    CliParsed,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -346,6 +363,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Writer => Some(Scalar::Writer),
         // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
         Ty::Buffer => Some(Scalar::Buffer),
+        // A `cli parsed` owned handle as the `Result` Ok payload of `c.parse(args)`. (A `cli command`
+        // is never a payload — it has no `Scalar` and maps to `None` here.)
+        Ty::CliParsed => Some(Scalar::CliParsed),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -376,6 +396,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
         Scalar::Buffer => Ty::Buffer,
+        Scalar::CliParsed => Ty::CliParsed,
     }
 }
 
@@ -424,7 +445,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -456,7 +477,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -605,7 +626,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -677,7 +698,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2289,6 +2310,25 @@ impl EffectScan {
                 self.expr(xs);
                 self.expr(k);
             }
+            // `std.cli` — **all pure** (no I/O; argv is already captured by `main(args)`): just
+            // recurse into the operands so any effect *inside* them is still counted.
+            ExprKind::CliCommand { name } => self.expr(name),
+            ExprKind::CliFlag { cmd, name, default, .. } => {
+                self.expr(cmd);
+                self.expr(name);
+                if let Some(d) = default {
+                    self.expr(d);
+                }
+            }
+            ExprKind::CliParse { cmd, args } => {
+                self.expr(cmd);
+                self.expr(args);
+            }
+            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
+                self.expr(parsed);
+                self.expr(name);
+            }
+            ExprKind::CliUsage { cmd } => self.expr(cmd),
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 self.stage_funcs(stages);
@@ -2796,6 +2836,11 @@ impl<'a> EscapeCheck<'a> {
             // `buf.bytes()` is a `slice<u8>` view of the `buffer` local's heap storage (freed at
             // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
             ExprKind::BufferBytes { buffer } => Region::Frame.shorter(self.region_of(buffer, depth)),
+            // `p.get_str(name)` is a `str` view into the `cli parsed` handle's owned storage (freed at
+            // frame exit), so — like `BufferBytes` — it is `Frame`-regioned and cannot escape the
+            // frame. Without this explicit arm the wildcard below mis-infers `Static`, letting the view
+            // of a dropped `parsed` escape (the #297-class bug); `.clone()` copies out.
+            ExprKind::CliGetStr { parsed, .. } => Region::Frame.shorter(self.region_of(parsed, depth)),
             ExprKind::Local(p) => self.region.get(p).copied().unwrap_or(Region::Static),
             // A struct's region is the shortest-lived of its fields (a view over it lives only
             // as long as the shortest source); a scalar/literal-only struct stays `Static`.
@@ -3312,6 +3357,26 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(xs, depth);
                 self.walk(k, depth);
             }
+            // `std.cli`: the command / parsed handles are owned Move (never region-borrows); a
+            // `get_str` view borrows `parsed` but its escape is caught by `region_of` (a `Frame` view),
+            // not here — just recurse so an escape *inside* the operands is still checked.
+            ExprKind::CliCommand { name } => self.walk(name, depth),
+            ExprKind::CliFlag { cmd, name, default, .. } => {
+                self.walk(cmd, depth);
+                self.walk(name, depth);
+                if let Some(d) = default {
+                    self.walk(d, depth);
+                }
+            }
+            ExprKind::CliParse { cmd, args } => {
+                self.walk(cmd, depth);
+                self.walk(args, depth);
+            }
+            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
+                self.walk(parsed, depth);
+                self.walk(name, depth);
+            }
+            ExprKind::CliUsage { cmd } => self.walk(cmd, depth),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -3655,6 +3720,24 @@ impl UnnecessaryHeapScan {
                 self.visit(xs);
                 self.visit(k);
             }
+            // `std.cli` — no heap-narrowing pattern of its own; recurse into the operands.
+            ExprKind::CliCommand { name } => self.visit(name),
+            ExprKind::CliFlag { cmd, name, default, .. } => {
+                self.visit(cmd);
+                self.visit(name);
+                if let Some(d) = default {
+                    self.visit(d);
+                }
+            }
+            ExprKind::CliParse { cmd, args } => {
+                self.visit(cmd);
+                self.visit(args);
+            }
+            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
+                self.visit(parsed);
+                self.visit(name);
+            }
+            ExprKind::CliUsage { cmd } => self.visit(cmd),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
@@ -4286,6 +4369,27 @@ impl<'a> MoveCheck<'a> {
                 self.expr(xs, moved, false, false);
                 self.expr(k, moved, false, false);
             }
+            // `std.cli`: every receiver (`cmd` / `parsed`) is **borrowed, never consumed** — `parse`
+            // reads the flag table without moving the command (so `usage()` stays callable after),
+            // and `get_*` reads the parsed map. The `str` name / argv / default args are borrowed too.
+            // Recurse non-consuming to catch a use-after-move *inside* the operands.
+            ExprKind::CliCommand { name } => self.expr(name, moved, false, false),
+            ExprKind::CliFlag { cmd, name, default, .. } => {
+                self.expr(cmd, moved, false, false);
+                self.expr(name, moved, false, false);
+                if let Some(d) = default {
+                    self.expr(d, moved, false, false);
+                }
+            }
+            ExprKind::CliParse { cmd, args } => {
+                self.expr(cmd, moved, false, false);
+                self.expr(args, moved, false, false);
+            }
+            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
+                self.expr(parsed, moved, false, false);
+                self.expr(name, moved, false, false);
+            }
+            ExprKind::CliUsage { cmd } => self.expr(cmd, moved, false, false),
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -7181,6 +7285,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.rand", &format!("rand.{method}"), span);
                 return self.check_rand_seed(method, args, span);
             }
+            // `std.cli` — `cli.command(name)` builds a Move `cli command`. The `flag_*`/`parse`/
+            // `usage`/`get_*` methods dispatch on the receiver type below (methods on a bound handle).
+            if module == "cli" && method == "command" {
+                self.require_import("std.cli", "cli.command", span);
+                return self.check_cli_command(args, span);
+            }
         }
         // `io.stdout.buffered()` / `io.stderr.buffered()` — a buffered `writer` over a standard
         // stream. The receiver is the 2-segment `io.stdout` / `io.stderr`, so it parses as a
@@ -7376,6 +7486,33 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty != Ty::Error {
                 self.diags
                     .error(format!("'.{method}()' is not a method on {} (it is an `rng` method)", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        // `std.cli` command methods on a `cli command`: `c.flag_bool/str/i64(...)` register a flag,
+        // `c.parse(args)` yields `Result<parsed, Error>`, `c.usage()` renders help. Dispatched on the
+        // receiver type so a same-named user method on another value still resolves normally.
+        if matches!(method, "flag_bool" | "flag_str" | "flag_i64" | "parse" | "usage") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::CliCommand {
+                return self.check_cli_command_method(recv_expr, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.{method}()' is not a method on {} (it is a `cli command` method)", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        // `std.cli` parsed getters on a `cli parsed`: `p.get_bool/i64/str(name)`. Total after a
+        // successful parse; unregistered / wrong-kind aborts at runtime.
+        if matches!(method, "get_bool" | "get_i64" | "get_str") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::CliParsed {
+                return self.check_cli_parsed_method(recv_expr, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.{method}()' is not a method on {} (it is a `cli parsed` method)", ty_name(recv_expr.ty)), span);
             }
             return err;
         }
@@ -7773,10 +7910,10 @@ impl<'a, 't> Checker<'a, 't> {
         // Otherwise a scalar array.
         let first = self.check_expr(&elems[0], elem_expected);
         let elem_ty = first.ty;
-        // A `reader`/`writer`/`buffer` element is rejected at construction (like a struct field /
-        // tuple element): the array read copies the handle by value, so collecting handles would
-        // alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer) {
+        // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
+        // field / tuple element): the array read copies the handle by value, so collecting handles
+        // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -10552,6 +10689,159 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `cli.command(name)` — build a Move `cli command` builder ([`Ty::CliCommand`]) named `name`
+    /// (a `str`). A module function (dispatched like `encoding.*`), not a method.
+    fn check_cli_command(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'cli.command' expects 1 argument (the command name), got {}", args.len()), span);
+            return err;
+        }
+        let name = self.check_str_init(&args[0]);
+        if name.ty == Ty::Error {
+            return err;
+        }
+        Expr { kind: ExprKind::CliCommand { name: Box::new(name) }, ty: Ty::CliCommand, span }
+    }
+
+    /// `c.flag_bool(name)` / `c.flag_str(name, default)` / `c.flag_i64(name, default)` / `c.parse(args)`
+    /// / `c.usage()` on a `cli command` ([`Ty::CliCommand`]), the receiver already evaluated. The
+    /// receiver must be a **bound local** — an owned Move handle temporary is not dropped yet (v1
+    /// restriction, the `check_reader_method`/`check_writer_method` precedent), so a chained
+    /// `cli.command("x").flag_bool("v")` is rejected until Move-temporary drops land. `flag_*` do
+    /// **not** require `mut`: they mutate the flag table in place through the handle pointer, exactly
+    /// like a `buffer`/`writer` method.
+    fn check_cli_command_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 bound-receiver gate: the receiver must be a bound `cli command` local (there is no
+        // borrowed/exempt form, unlike `io.stdin`/`io.stdout`). Bind it first, then call the method.
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the cli command to a local first, then call the method (`c := cli.command(\"...\")` then `c.flag_bool(...)`) — a temporary owned command handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        match method {
+            "flag_bool" | "flag_str" | "flag_i64" => {
+                let kind = match method {
+                    "flag_bool" => hir::CliFlagKind::Bool,
+                    "flag_str" => hir::CliFlagKind::Str,
+                    _ => hir::CliFlagKind::I64,
+                };
+                // `flag_bool(name)` takes one arg; `flag_str`/`flag_i64` take `(name, default)`.
+                let want = if matches!(kind, hir::CliFlagKind::Bool) { 1 } else { 2 };
+                if args.len() != want {
+                    self.diags.error(
+                        format!("'.{method}()' takes {want} argument{}, got {}", if want == 1 { "" } else { "s" }, args.len()),
+                        span,
+                    );
+                    return err;
+                }
+                let name = self.check_str_init(&args[0]);
+                if name.ty == Ty::Error {
+                    return err;
+                }
+                let default = match kind {
+                    hir::CliFlagKind::Bool => None,
+                    hir::CliFlagKind::Str => {
+                        let d = self.check_str_init(&args[1]);
+                        if d.ty == Ty::Error {
+                            return err;
+                        }
+                        Some(Box::new(d))
+                    }
+                    hir::CliFlagKind::I64 => {
+                        // The default must be exactly `i64` (the `align_rt_cli_flag_i64` ABI; the
+                        // `time.sleep` #343 discipline — `require_i64_arg` binds a bare literal's var).
+                        let d = self.check_expr(&args[1], None);
+                        if d.ty == Ty::Error {
+                            return err;
+                        }
+                        if !self.require_i64_arg(d.ty, args[1].span, "'.flag_i64()' default") {
+                            return err;
+                        }
+                        Some(Box::new(d))
+                    }
+                };
+                Expr { kind: ExprKind::CliFlag { cmd: Box::new(recv_expr), kind, name: Box::new(name), default }, ty: Ty::Unit, span }
+            }
+            "parse" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.parse()' takes 1 argument (the argv `array<str>`), got {}", args.len()), span);
+                    return err;
+                }
+                let argv = self.check_expr(&args[0], None);
+                if argv.ty == Ty::Error {
+                    return err;
+                }
+                // The argument is `main(args)`'s `array<str>` (`DynArray(Str)`) — the one argv source.
+                if self.resolve(argv.ty) != Ty::DynArray(Scalar::Str) {
+                    self.diags.error(
+                        format!("'.parse()' takes the `array<str>` from `main(args)`, got {}", ty_name(argv.ty)),
+                        args[0].span,
+                    );
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::CliParse { cmd: Box::new(recv_expr), args: Box::new(argv) },
+                    ty: Ty::Result(Scalar::CliParsed, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
+            "usage" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.usage()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::CliUsage { cmd: Box::new(recv_expr) }, ty: Ty::String, span }
+            }
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on a cli command (try flag_bool / flag_str / flag_i64 / parse / usage)"), span);
+                err
+            }
+        }
+    }
+
+    /// `p.get_bool(name)` / `p.get_i64(name)` / `p.get_str(name)` on a `cli parsed`
+    /// ([`Ty::CliParsed`]), the receiver already evaluated. Total after a successful parse — an
+    /// unregistered name / wrong kind aborts at runtime (no `Result`, no silent default). The
+    /// receiver must be a bound local (the v1 gate); `get_str` returns a `str` **view** into `parsed`
+    /// (region-bound to it — the `region_of` arm rejects an escape).
+    fn check_cli_parsed_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the parsed result to a local first, then read a flag (`p := c.parse(args)?` then `p.get_bool(...)`) — a temporary owned parsed handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        if args.len() != 1 {
+            self.diags.error(format!("'.{method}()' takes 1 argument (the flag name), got {}", args.len()), span);
+            return err;
+        }
+        let name = self.check_str_init(&args[0]);
+        if name.ty == Ty::Error {
+            return err;
+        }
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match method {
+            "get_bool" => Expr { kind: ExprKind::CliGetBool { parsed: Box::new(recv_expr), name: Box::new(name) }, ty: Ty::Bool, span },
+            "get_i64" => Expr { kind: ExprKind::CliGetI64 { parsed: Box::new(recv_expr), name: Box::new(name) }, ty: i64_ty, span },
+            "get_str" => Expr { kind: ExprKind::CliGetStr { parsed: Box::new(recv_expr), name: Box::new(name) }, ty: Ty::Str, span },
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on a cli parsed (try get_bool / get_i64 / get_str)"), span);
+                err
+            }
+        }
+    }
+
     /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — a buffered `writer` over the
     /// given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
     fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
@@ -11675,6 +11965,23 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(xs);
                 self.finalize_expr(k);
             }
+            ExprKind::CliCommand { name } => self.finalize_expr(name),
+            ExprKind::CliFlag { cmd, name, default, .. } => {
+                self.finalize_expr(cmd);
+                self.finalize_expr(name);
+                if let Some(d) = default {
+                    self.finalize_expr(d);
+                }
+            }
+            ExprKind::CliParse { cmd, args } => {
+                self.finalize_expr(cmd);
+                self.finalize_expr(args);
+            }
+            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
+                self.finalize_expr(parsed);
+                self.finalize_expr(name);
+            }
+            ExprKind::CliUsage { cmd } => self.finalize_expr(cmd),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);
@@ -12094,6 +12401,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::Rng => "rng".to_string(),
+        Ty::CliCommand => "cli command".to_string(),
+        Ty::CliParsed => "cli parsed".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -12261,7 +12570,10 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // move-out), so two copies would close/free the same fd (double close + double `Box::from_raw`
     // = UB). A `buffer` is never a payload at all. Reject at the type, matching `is_field_ok` /
     // tuple elements (which also refuse these handles).
-    if matches!(ty, Ty::Buffer) || (matches!(ty, Ty::Reader | Ty::Writer) && !allow_param) {
+    // A `cli command` is never a payload (like `buffer`); a `cli parsed` may ride a `Result` Ok
+    // payload (`c.parse(args)`) — the `allow_param` positions — but never as an array/slice/box
+    // element (an element read would copy + double-free the handle), same as `reader`/`writer`.
+    if matches!(ty, Ty::Buffer | Ty::CliCommand) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,

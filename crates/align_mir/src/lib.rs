@@ -571,6 +571,31 @@ pub enum Rvalue {
     /// Uses/advances the rng in slot `rng`; `k < 0` or `k > len` aborts at runtime. `elem` sizes each
     /// element.
     RandSample { rng: Slot, xs: Operand, k: Operand, elem: Ty },
+    /// `cli.command(name)` — allocate a `cli command` handle named `name` (a `str` `{ptr,len}`),
+    /// returned by value as an opaque pointer (the bound local `Drop`-frees it). Pure.
+    CliCommand { name: Operand },
+    /// `c.flag_bool/str/i64(...)` — register a flag into the command handle `cmd` (an opaque
+    /// pointer), mutating it in place. `kind` selects the runtime symbol; `name` is a `str`
+    /// `{ptr,len}`; `default` is the `str` default `{ptr,len}` (`flag_str`) or the `i64` default
+    /// (`flag_i64`), `None` for `flag_bool`. Yields no value. Pure.
+    CliFlag { cmd: Operand, kind: hir::CliFlagKind, name: Operand, default: Option<Operand> },
+    /// `c.parse(args)` — parse the argv `array<str>` `args` (`{ptr,len}` = an `AlignStr` buffer +
+    /// count) against the command handle `cmd`, writing an owned `cli parsed` handle into `out` and
+    /// returning an `i32` status (0 = ok, `AL_INVALID` -> `Error.Invalid`). The caller branches
+    /// `Ok(parsed)` / `Err`. Pure.
+    CliParse { cmd: Operand, args: Operand, out: Slot },
+    /// `p.get_bool(name)` — the parsed `bool` for flag `name` (a `str` `{ptr,len}`) from the parsed
+    /// handle `parsed`, an `i32` (1/0) used as a `bool`. Aborts at runtime on unregistered /
+    /// wrong-kind. Pure.
+    CliGetBool { parsed: Operand, name: Operand },
+    /// `p.get_i64(name)` — the parsed `i64` for flag `name`. Aborts on unregistered / wrong-kind. Pure.
+    CliGetI64 { parsed: Operand, name: Operand },
+    /// `p.get_str(name)` — the parsed `str` **view** (`{ptr,len}`) for flag `name`, borrowing the
+    /// parsed handle's storage (region-bound to `parsed`). Aborts on unregistered / wrong-kind. Pure.
+    CliGetStr { parsed: Operand, name: Operand },
+    /// `c.usage()` — render the command handle `cmd`'s flag table into a fresh owned `string`,
+    /// returned by value as a `{ptr,len}` (the bound local `Drop`-frees it). Pure.
+    CliUsage { cmd: Operand },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -985,7 +1010,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -1577,6 +1602,61 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let kv = lower_expr(b, k);
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::RandSample { rng: slot, xs: xv, k: kv, elem: *elem }));
+            Operand::Value(v)
+        }
+        // `cli.command(name)` → an owned `cli command` handle returned by value (the bound local
+        // `Drop`-frees it via `cli_command_free`).
+        hir::ExprKind::CliCommand { name } => {
+            let nm = lower_expr(b, name);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::CliCommand { name: nm }));
+            Operand::Value(v)
+        }
+        // `c.flag_*(...)` → register a flag into the command handle in place; no value. The receiver
+        // is a bound local (sema-checked); its loaded pointer value is the handle the runtime mutates.
+        hir::ExprKind::CliFlag { cmd, kind, name, default } => {
+            let cop = lower_expr(b, cmd);
+            let nm = lower_expr(b, name);
+            let def = default.as_ref().map(|d| lower_expr(b, d));
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::CliFlag { cmd: cop, kind: *kind, name: nm, default: def }));
+            Operand::Const(Const::Unit)
+        }
+        // `c.parse(args)` → `Result<parsed, Error>`: the runtime writes an owned `parsed` handle into
+        // `out` and returns an i32 status; branch `Ok(<parsed>)` / `Err(<mapped>)`.
+        hir::ExprKind::CliParse { cmd, args } => lower_cli_parse(b, cmd, args, e.ty),
+        // `p.get_bool(name)` → the runtime returns an i32 (1/0); compare `!= 0` to a `bool`.
+        hir::ExprKind::CliGetBool { parsed, name } => {
+            let pop = lower_expr(b, parsed);
+            let nm = lower_expr(b, name);
+            let c = b.fresh_value(status_ty());
+            b.push(Stmt::Let(c, Rvalue::CliGetBool { parsed: pop, name: nm }));
+            let v = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
+            Operand::Value(v)
+        }
+        // `p.get_i64(name)` → the runtime returns the i64 value directly.
+        hir::ExprKind::CliGetI64 { parsed, name } => {
+            let pop = lower_expr(b, parsed);
+            let nm = lower_expr(b, name);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::CliGetI64 { parsed: pop, name: nm }));
+            Operand::Value(v)
+        }
+        // `p.get_str(name)` → a `str` view `{ptr,len}` into the parsed handle's storage (region-bound
+        // to `parsed`; not owned — no `Drop`).
+        hir::ExprKind::CliGetStr { parsed, name } => {
+            let pop = lower_expr(b, parsed);
+            let nm = lower_expr(b, name);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::CliGetStr { parsed: pop, name: nm }));
+            Operand::Value(v)
+        }
+        // `c.usage()` → an owned `string` `{ptr,len}` returned by value (the bound local `Drop`-frees it).
+        hir::ExprKind::CliUsage { cmd } => {
+            let cop = lower_expr(b, cmd);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::CliUsage { cmd: cop }));
             Operand::Value(v)
         }
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
@@ -4740,6 +4820,48 @@ fn lower_encoding_decode(b: &mut Builder, kind: hir::EncodingKind, input: &hir::
     Operand::Value(r)
 }
 
+/// `c.parse(args)` → the runtime writes an owned `cli parsed` handle into an out slot and returns an
+/// `i32` status (0 = ok; `AL_INVALID` -> `Error.Invalid`). Branch `Ok(<parsed>)` / `Err(<mapped
+/// status>)`. Mirrors [`lower_encoding_decode`], but the source is the command handle + the argv
+/// `array<str>`. The wrapped `parsed` is owned — the unwrapped local `Drop`s it (`cli_parsed_free`).
+fn lower_cli_parse(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::CliParsed);
+    let cop = lower_expr(b, cmd);
+    let av = lower_expr(b, args);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::CliParse { cmd: cop, args: av, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the parsed handle and wrap it (the unwrapped local owns it — `Drop` frees it).
+    b.cur = ok_bb;
+    let h = b.fresh_value(Ty::CliParsed);
+    b.push(Stmt::Let(h, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(h))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (null handle) → nothing to free; map the status (`Error.Invalid`).
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
 /// `r.read(b)` → the runtime returns an `i64`: bytes read (`>= 0`, `0` = EOF) or `-(status)` on
 /// error. Branch `Ok(<count>)` / `Err(<mapped status>)` on the sign.
 fn lower_reader_read(b: &mut Builder, reader: Operand, buffer: Operand, result_ty: Ty) -> Operand {
@@ -5251,6 +5373,8 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::Rng => "rng".to_string(),
+        Ty::CliCommand => "cli command".to_string(),
+        Ty::CliParsed => "cli parsed".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
