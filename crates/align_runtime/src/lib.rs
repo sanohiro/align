@@ -119,11 +119,11 @@ pub struct AlignStr {
 // Helper to safely construct a slice from an FFI pointer and i64 length.
 // Returns an empty slice if len <= 0, ptr is null, or len exceeds isize::MAX.
 #[inline(always)]
-
-#[inline(always)]
 fn safe_len(len: i64) -> Result<usize, ()> {
     usize::try_from(len).map_err(|_| ()).and_then(|x| if x <= isize::MAX as usize { Ok(x) } else { Err(()) })
 }
+
+#[inline(always)]
 
 unsafe fn safe_slice<'a, T>(ptr: *const T, len: i64) -> &'a [T] {
     let Ok(n) = isize::try_from(len) else { return &[] };
@@ -131,12 +131,6 @@ unsafe fn safe_slice<'a, T>(ptr: *const T, len: i64) -> &'a [T] {
     unsafe { std::slice::from_raw_parts(ptr, n as usize) }
 }
 
-#[inline(always)]
-unsafe fn safe_slice_mut<'a, T>(ptr: *mut T, len: i64) -> &'a mut [T] {
-    let Ok(n) = isize::try_from(len) else { return &mut [] };
-    if n <= 0 || ptr.is_null() { return &mut [] }
-    unsafe { std::slice::from_raw_parts_mut(ptr, n as usize) }
-}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_str_clone(ptr: *const u8, len: i64) -> AlignStr {
@@ -654,8 +648,8 @@ pub unsafe extern "C" fn align_rt_par_map(
         return core::ptr::null_mut();
     }
     let count = safe_len(count).unwrap_or_else(|_| panic_abort("par_map count overflow"));
-    let in_stride = safe_len(in_stride).unwrap_or(0);
-    let out_stride = safe_len(out_stride).unwrap_or(0);
+    let Ok(in_stride) = safe_len(in_stride) else { return core::ptr::null_mut() };
+    let Ok(out_stride) = safe_len(out_stride) else { return core::ptr::null_mut() };
     let bytes = count
         .checked_mul(out_stride)
         .and_then(|b| i64::try_from(b).ok())
@@ -1018,8 +1012,6 @@ pub unsafe extern "C" fn align_rt_json_decode(
     phf_len: i64,
     phf_seed: i64,
 ) -> i32 {
-    // `from_raw_parts` is UB on a null pointer even with len 0, and an empty owned `string`
-    // (e.g. an empty `builder().to_string()` or `str.clone()`) is `{null, 0}` — guard it.
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
     // A `str` field decoded from JSON is a zero-copy `{ptr,len}` view into `src`, so validating the
     // whole input once guarantees every `str` field is valid UTF-8 (draft §7/§12; the same one-shot
@@ -1027,7 +1019,6 @@ pub unsafe extern "C" fn align_rt_json_decode(
     if !validate_utf8(src) {
         return 1;
     }
-    // `from_raw_parts` is UB on a null pointer even with len 0 — guard `fields` like `input`.
     let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
     let phf = unsafe { phf_slice(phf, phf_len) };
 
@@ -1533,14 +1524,12 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     phf_len: i64,
     phf_seed: i64,
 ) -> i32 {
-    // `from_raw_parts` is UB on a null pointer even with len 0 — guard an empty owned `string`.
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
     // Validate the whole input once — every decoded `str` field is a zero-copy view into `src`, so
     // this covers all of them (draft §7/§12). Invalid UTF-8 → a decode error.
     if !validate_utf8(src) {
         return 1;
     }
-    // `from_raw_parts` is UB on a null pointer even with len 0 — guard `fields` like `input`.
     let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
     let phf = unsafe { phf_slice(phf, phf_len) };
     let phf_seed = phf_seed as u64;
@@ -1841,8 +1830,6 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     elem_tag: i32,
     out: *mut AlignStr,
 ) -> i32 {
-    // `from_raw_parts` is UB on a null pointer even with len 0, and an empty owned `string`
-    // (e.g. an empty `builder().to_string()` or `str.clone()`) is `{null, 0}` — guard it.
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
     // A JSON `array<str>` element is a zero-copy view into `src`; validate the whole input once so
     // every element is valid UTF-8 (draft §7/§12). Invalid UTF-8 → a decode error. (A scalar-element
@@ -2168,7 +2155,7 @@ pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i
 /// `keys` must be valid for `len` `i64`s; `out_keys`/`out_vals` for `cap` `i64`s.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_count_i64(keys: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
-    let len_u = safe_len(len).unwrap_or(0);
+    let Ok(len_u) = safe_len(len) else { return 0 };
     let keys: &[i64] = if len_u == 0 || keys.is_null() || len_u > isize::MAX as usize / 8 {
         &[]
     } else {
@@ -2379,7 +2366,7 @@ pub unsafe extern "C" fn align_rt_group_sum_str(base: *const u8, n: i64, stride:
     if n <= 0 || base.is_null() {
         return 0;
     }
-    let (n, stride, key_off, val_off) = (safe_len(n).unwrap_or(0), safe_len(stride).unwrap_or(0), safe_len(key_off).unwrap_or(0), safe_len(val_off).unwrap_or(0));
+    let (Ok(n), Ok(stride), Ok(key_off), Ok(val_off)) = (safe_len(n), safe_len(stride), safe_len(key_off), safe_len(val_off)) else { return 0 };
     unsafe {
         group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.wrapping_add(b))
     }
@@ -2394,7 +2381,7 @@ pub unsafe extern "C" fn align_rt_group_min_str(base: *const u8, n: i64, stride:
     if n <= 0 || base.is_null() {
         return 0;
     }
-    let (n, stride, key_off, val_off) = (safe_len(n).unwrap_or(0), safe_len(stride).unwrap_or(0), safe_len(key_off).unwrap_or(0), safe_len(val_off).unwrap_or(0));
+    let (Ok(n), Ok(stride), Ok(key_off), Ok(val_off)) = (safe_len(n), safe_len(stride), safe_len(key_off), safe_len(val_off)) else { return 0 };
     unsafe {
         group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.min(b))
     }
@@ -2409,7 +2396,7 @@ pub unsafe extern "C" fn align_rt_group_max_str(base: *const u8, n: i64, stride:
     if n <= 0 || base.is_null() {
         return 0;
     }
-    let (n, stride, key_off, val_off) = (safe_len(n).unwrap_or(0), safe_len(stride).unwrap_or(0), safe_len(key_off).unwrap_or(0), safe_len(val_off).unwrap_or(0));
+    let (Ok(n), Ok(stride), Ok(key_off), Ok(val_off)) = (safe_len(n), safe_len(stride), safe_len(key_off), safe_len(val_off)) else { return 0 };
     unsafe {
         group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.max(b))
     }
@@ -2424,7 +2411,7 @@ pub unsafe extern "C" fn align_rt_group_count_str(base: *const u8, n: i64, strid
     if n <= 0 || base.is_null() {
         return 0;
     }
-    let (n, stride, key_off) = (safe_len(n).unwrap_or(0), safe_len(stride).unwrap_or(0), safe_len(key_off).unwrap_or(0));
+    let (Ok(n), Ok(stride), Ok(key_off)) = (safe_len(n), safe_len(stride), safe_len(key_off)) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
@@ -2455,7 +2442,7 @@ pub unsafe extern "C" fn align_rt_group_sum_str_cols(key_col: *const AlignStr, v
     if n <= 0 || key_col.is_null() || val_col.is_null() {
         return 0;
     }
-    let n = safe_len(n).unwrap_or(0);
+    let Ok(n) = safe_len(n) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), soa_value_at(val_col), |a, b| a.wrapping_add(b)) }
 }
 
@@ -2468,7 +2455,7 @@ pub unsafe extern "C" fn align_rt_group_min_str_cols(key_col: *const AlignStr, v
     if n <= 0 || key_col.is_null() || val_col.is_null() {
         return 0;
     }
-    let n = safe_len(n).unwrap_or(0);
+    let Ok(n) = safe_len(n) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), soa_value_at(val_col), |a, b| a.min(b)) }
 }
 
@@ -2481,7 +2468,7 @@ pub unsafe extern "C" fn align_rt_group_max_str_cols(key_col: *const AlignStr, v
     if n <= 0 || key_col.is_null() || val_col.is_null() {
         return 0;
     }
-    let n = safe_len(n).unwrap_or(0);
+    let Ok(n) = safe_len(n) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), soa_value_at(val_col), |a, b| a.max(b)) }
 }
 
@@ -2494,7 +2481,7 @@ pub unsafe extern "C" fn align_rt_group_count_str_cols(key_col: *const AlignStr,
     if n <= 0 || key_col.is_null() {
         return 0;
     }
-    let n = safe_len(n).unwrap_or(0);
+    let Ok(n) = safe_len(n) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
@@ -2539,9 +2526,9 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     if cap < 0 || k < 0 || out_keys.is_null() || (k > 0 && specs.is_null()) {
         return -1;
     }
-    let n = safe_len(n).unwrap_or(0);
-    let k = safe_len(k).unwrap_or(0);
-    let (stride, key_off) = (safe_len(stride).unwrap_or(0), safe_len(key_off).unwrap_or(0));
+    let Ok(n) = safe_len(n) else { return 0 };
+    let Ok(k) = safe_len(k) else { return -1 };
+    let (Ok(stride), Ok(key_off)) = (safe_len(stride), safe_len(key_off)) else { return -1 };
     let specs: &[GroupMultiSpec] = if k == 0 { &[] } else { unsafe { std::slice::from_raw_parts(specs, k) } };
     // Per aggregate: the value reader (a row pointer → i64; `count` reads `1`) and the combine op. The
     // combine is selected once per aggregate (not per row) so the inner fold is a small fixed match.
@@ -2645,8 +2632,8 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
     if out_ids.is_null() || out_dict.is_null() || cap < 0 {
         return -1;
     }
-    let n = safe_len(n).unwrap_or(0);
-    let (stride, key_off) = (safe_len(stride).unwrap_or(0), safe_len(key_off).unwrap_or(0));
+    let Ok(n) = safe_len(n) else { return 0 };
+    let (Ok(stride), Ok(key_off)) = (safe_len(stride), safe_len(key_off)) else { return -1 };
     let out_ids = unsafe { std::slice::from_raw_parts_mut(out_ids, n) };
     let initial = n.min(cap as usize).min(1024);
     let mut ids: HashMap<WyKey, i64, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
@@ -2695,8 +2682,8 @@ pub unsafe extern "C" fn align_rt_dict_lookup(ids: *const i64, n: i64, dict: *co
     let Ok(n) = safe_len(n) else { return };
     let ids = unsafe { std::slice::from_raw_parts(ids, n) };
     let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
-    let dict_len = safe_len(dict_len).unwrap_or(0);
-    let dict: &[AlignStr] = if dict_len == 0 || dict.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(dict, dict_len) } };
+    let Ok(dict_len) = safe_len(dict_len) else { return };
+    let dict: &[AlignStr] = unsafe { safe_slice(dict, dict_len as i64) };
     let empty = AlignStr { ptr: core::ptr::NonNull::dangling().as_ptr(), len: 0 };
     for i in 0..n {
         out[i] = usize::try_from(ids[i]).ok().and_then(|id| dict.get(id).copied()).unwrap_or(empty);
@@ -4040,7 +4027,7 @@ pub struct Buffer {
 /// `buffer(cap)` — open an owned byte buffer whose read window is `cap` bytes (`<= 0` → empty).
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
-    let requested = safe_len(cap).unwrap_or(0);
+    let Ok(requested) = safe_len(cap) else { return core::ptr::null_mut() };
     let mut data = Vec::new();
     // `try_reserve` so a bogus/huge capacity fails softly instead of aborting on OOM. The read
     // window is capped to what was actually reserved, so `reader.read`'s later `resize(cap)` can
@@ -4602,7 +4589,7 @@ unsafe fn bytes_view<'a>(ptr: *const u8, len: i64) -> &'a [u8] {
     // rather than `len as usize` so a length that doesn't fit a `usize` (only reachable on a 32-bit
     // target) yields empty instead of a truncated, out-of-bounds view.
     match safe_len(len) {
-        Ok(n) if n > 0 && !ptr.is_null() => unsafe { std::slice::from_raw_parts(ptr, n) },
+        Ok(n) => unsafe { safe_slice(ptr, n as i64) },
         _ => &[],
     }
 }
@@ -5763,8 +5750,8 @@ pub unsafe extern "C" fn align_rt_cli_parse(cmd: *mut CliCommand, argv: *const A
         return AL_INVALID;
     }
     let c = unsafe { &*cmd };
-    let n = safe_len(argv_len).unwrap_or(0);
-    let argv_slice: &[AlignStr] = if n > 0 && !argv.is_null() { unsafe { std::slice::from_raw_parts(argv, n) } } else { &[] };
+    let Ok(n) = safe_len(argv_len) else { return 1 };
+    let argv_slice: &[AlignStr] = unsafe { safe_slice(argv, n as i64) };
     let mut values: Vec<(String, CliValue)> = Vec::new();
 
     // Skip `argv[0]` (the program name — the `main(args)` convention).
