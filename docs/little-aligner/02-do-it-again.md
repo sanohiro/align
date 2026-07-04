@@ -42,7 +42,7 @@ Same answer, `12`. A stage takes any function of the right shape.
 
 **Q6.** What is `[].map(fn x { x * x }).sum()` — mapping over nothing?
 
-**A6.** Trick question — an empty array literal has no element type to infer. But map over an empty *slice* of `i64` and the sum is `0`. Nothing, doubled, is still nothing.
+**A6.** Trick question — an empty array literal has no element type to infer. But map over an empty *slice* of `i64` and the sum is `0`. Nothing, squared, is still nothing.
 
 ---
 
