@@ -36,7 +36,7 @@ pub unsafe extern "C" fn align_rt_print_str(ptr: *const u8, len: i64) {
     // An empty owned `string` (from `str.clone()` / `builder().to_string()`) carries a *null*
     // pointer with `len == 0`; `from_raw_parts(null, 0)` is UB, so emit just the newline. `try_from`
     // avoids a truncating `len as usize` (a heap OOB) on a 32-bit target.
-    if len > 0 && let Ok(n) = usize::try_from(len) {
+    if len > 0 && let Ok(n) = safe_len(len) {
         let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
         let _ = out.write_all(bytes);
     }
@@ -115,6 +115,23 @@ pub struct AlignStr {
 ///
 /// # Safety
 /// `ptr`/`len` must describe a valid byte range for the call.
+
+// Helper to safely construct a slice from an FFI pointer and i64 length.
+// Returns an empty slice if len <= 0, ptr is null, or len exceeds isize::MAX.
+#[inline(always)]
+fn safe_len(len: i64) -> Result<usize, ()> {
+    usize::try_from(len).map_err(|_| ()).and_then(|x| if x <= isize::MAX as usize { Ok(x) } else { Err(()) })
+}
+
+#[inline(always)]
+
+unsafe fn safe_slice<'a, T>(ptr: *const T, len: i64) -> &'a [T] {
+    let Ok(n) = isize::try_from(len) else { return &[] };
+    if n <= 0 || ptr.is_null() { return &[] }
+    unsafe { std::slice::from_raw_parts(ptr, n as usize) }
+}
+
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_str_clone(ptr: *const u8, len: i64) -> AlignStr {
     if len <= 0 {
@@ -124,7 +141,7 @@ pub unsafe extern "C" fn align_rt_str_clone(ptr: *const u8, len: i64) -> AlignSt
     // `len as usize` would truncate, so `align_rt_alloc` would size a tiny buffer while we return
     // the full `len` — a heap out-of-bounds. After this check, both the alloc and the copy are
     // exact (on 64-bit the check never fires).
-    let n = match usize::try_from(len) {
+    let n = match safe_len(len) {
         Ok(n) => n,
         Err(_) => panic_abort("string length exceeds addressable memory"),
     };
@@ -156,7 +173,7 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
     let path_bytes: &[u8] = if path_len <= 0 || path.is_null() {
         &[]
     } else {
-        let Ok(n) = usize::try_from(path_len) else {
+        let Ok(n) = safe_len(path_len) else {
             return 1;
         };
         unsafe { std::slice::from_raw_parts(path, n) }
@@ -235,7 +252,7 @@ pub unsafe extern "C" fn align_rt_fs_write_file(path: *const u8, path_len: i64, 
     let bytes: &[u8] = if data_len <= 0 || data.is_null() {
         &[]
     } else {
-        let Ok(n) = usize::try_from(data_len) else { return AL_INVALID };
+        let Ok(n) = safe_len(data_len) else { return AL_INVALID };
         unsafe { std::slice::from_raw_parts(data, n) }
     };
     use std::io::Write;
@@ -367,7 +384,7 @@ pub unsafe extern "C" fn align_rt_free_string_array(ptr: *mut u8, len: i64) {
     if ptr.is_null() {
         return;
     }
-    if let Ok(n) = usize::try_from(len) {
+    if let Ok(n) = safe_len(len) {
         let hdr = ptr as *mut AlignStr;
         for i in 0..n {
             let entry = unsafe { *hdr.add(i) };
@@ -543,7 +560,7 @@ pub unsafe extern "C" fn align_rt_chunks(src: *const u8, src_len: i64, n: i64, e
     let count = (src_len - 1) / n + 1; // ceil(src_len / n), overflow-free (src_len > 0, n > 0)
     // Header buffer of `count` `AlignStr` entries. `try_from` + `checked_mul` guard a 32-bit
     // `usize` truncation/overflow (a huge `count` would otherwise under-allocate and heap-overflow).
-    let count_usize = usize::try_from(count).unwrap_or_else(|_| panic_abort("chunks count overflow"));
+    let count_usize = safe_len(count).unwrap_or_else(|_| panic_abort("chunks count overflow"));
     let bytes = count_usize
         .checked_mul(core::mem::size_of::<AlignStr>())
         .and_then(|b| i64::try_from(b).ok())
@@ -552,8 +569,12 @@ pub unsafe extern "C" fn align_rt_chunks(src: *const u8, src_len: i64, n: i64, e
     for i in 0..count {
         let start = i * n; // element offset of this chunk
         let len = core::cmp::min(n, src_len - start);
-        let ptr = unsafe { src.add((start * elem_size) as usize) };
-        unsafe { *buf.add(i as usize) = AlignStr { ptr, len } };
+        let offset = start.checked_mul(elem_size)
+            .and_then(|o| isize::try_from(o).ok())
+            .map(|o| o as usize)
+            .unwrap_or_else(|| panic_abort("chunks offset overflow"));
+        let ptr = unsafe { src.add(offset) };
+        unsafe { *buf.add(isize::try_from(i).unwrap_or(0) as usize) = AlignStr { ptr, len } };
     }
     AlignStr { ptr: buf as *const u8, len: count }
 }
@@ -626,13 +647,20 @@ pub unsafe extern "C" fn align_rt_par_map(
     if count <= 0 {
         return core::ptr::null_mut();
     }
-    let count = usize::try_from(count).unwrap_or_else(|_| panic_abort("par_map count overflow"));
-    let in_stride = in_stride as usize;
-    let out_stride = out_stride as usize;
+    let count = safe_len(count).unwrap_or_else(|_| panic_abort("par_map count overflow"));
+    let Ok(in_stride) = safe_len(in_stride) else { return core::ptr::null_mut() };
+    let Ok(out_stride) = safe_len(out_stride) else { return core::ptr::null_mut() };
     let bytes = count
         .checked_mul(out_stride)
         .and_then(|b| i64::try_from(b).ok())
         .unwrap_or_else(|| panic_abort("par_map output size overflow"));
+    
+    // Check input size overflow
+    let _in_bytes = count
+        .checked_mul(in_stride)
+        .and_then(|b| isize::try_from(b).ok())
+        .unwrap_or_else(|| panic_abort("par_map input size overflow"));
+
     let out_buf = align_rt_alloc(bytes);
     let in_addr = in_buf as usize;
     let out_addr = out_buf as usize;
@@ -640,8 +668,8 @@ pub unsafe extern "C" fn align_rt_par_map(
     // `Send` — raw pointers are not; the ranges are disjoint, so this is race-free).
     let run = move |start: usize, end: usize| {
         for i in start..end {
-            let ip = (in_addr + i * in_stride) as *const u8;
-            let op = (out_addr + i * out_stride) as *mut u8;
+            let ip = in_addr.checked_add(i.checked_mul(in_stride).unwrap()).unwrap() as *const u8;
+            let op = out_addr.checked_add(i.checked_mul(out_stride).unwrap()).unwrap() as *mut u8;
             thunk(ip, op);
         }
     };
@@ -713,7 +741,7 @@ pub extern "C" fn align_rt_builder_new(arena: *mut Arena, capacity: i64) -> *mut
     // `try_reserve` (not `with_capacity`) so a bogus/huge user capacity can't abort the process on
     // OOM — an over-large reservation just fails silently and the buffer grows on demand instead.
     let mut buf = Vec::new();
-    if let Ok(cap) = usize::try_from(capacity) {
+    if let Ok(cap) = safe_len(capacity) {
         let _ = buf.try_reserve(cap);
     }
     Box::into_raw(Box::new(Builder { buf, arena }))
@@ -729,7 +757,7 @@ pub unsafe extern "C" fn align_rt_builder_write(b: *mut Builder, ptr: *const u8,
     let b = unsafe { &mut *b };
     if let Ok(len_z) = isize::try_from(len) {
         if len_z > 0 && !ptr.is_null() {
-            b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len_z as usize) });
+            b.buf.extend_from_slice(unsafe { safe_slice(ptr, len_z as i64) });
         }
     }
 }
@@ -807,13 +835,13 @@ pub unsafe extern "C" fn align_rt_builder_write_str_int_str(b: *mut Builder, p1:
     let b = unsafe { &mut *b };
     if let Ok(l1_z) = isize::try_from(l1) {
         if l1_z > 0 && !p1.is_null() {
-            b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p1, l1_z as usize) });
+            b.buf.extend_from_slice(unsafe { safe_slice(p1, l1_z as i64) });
         }
     }
     builder_push_i64(&mut b.buf, v);
     if let Ok(l2_z) = isize::try_from(l2) {
         if l2_z > 0 && !p2.is_null() {
-            b.buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p2, l2_z as usize) });
+            b.buf.extend_from_slice(unsafe { safe_slice(p2, l2_z as i64) });
         }
     }
 }
@@ -871,7 +899,7 @@ pub unsafe extern "C" fn align_rt_builder_write_json_str(b: *mut Builder, ptr: *
     let b = unsafe { &mut *b };
     b.buf.push(b'"');
     if len > 0 {
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let bytes = unsafe { safe_slice(ptr, len) };
         // Only `"`, `\`, and the C0 control set need escaping; every other byte (including all
         // multi-byte UTF-8 continuations) passes through verbatim. Copy each clean run in bulk
         // (`extend_from_slice`) instead of pushing byte by byte — ~1.9–3× on typical text
@@ -984,25 +1012,14 @@ pub unsafe extern "C" fn align_rt_json_decode(
     phf_len: i64,
     phf_seed: i64,
 ) -> i32 {
-    // `from_raw_parts` is UB on a null pointer even with len 0, and an empty owned `string`
-    // (e.g. an empty `builder().to_string()` or `str.clone()`) is `{null, 0}` — guard it.
-    let src: &[u8] = if input_len <= 0 || input.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(input, input_len as usize) }
-    };
+    let src: &[u8] = unsafe { safe_slice(input, input_len) };
     // A `str` field decoded from JSON is a zero-copy `{ptr,len}` view into `src`, so validating the
     // whole input once guarantees every `str` field is valid UTF-8 (draft §7/§12; the same one-shot
     // check simdjson does). Invalid → a decode error, before any view is handed out.
     if !validate_utf8(src) {
         return 1;
     }
-    // `from_raw_parts` is UB on a null pointer even with len 0 — guard `fields` like `input`.
-    let descs: &[JsonField] = if n_fields <= 0 || fields.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(fields, n_fields as usize) }
-    };
+    let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
     let phf = unsafe { phf_slice(phf, phf_len) };
 
     let mut p = JsonParser { src, pos: 0 };
@@ -1089,7 +1106,7 @@ unsafe fn phf_slice<'a>(ptr: *const i32, len: i64) -> Option<&'a [i32]> {
     if len <= 0 || ptr.is_null() {
         None
     } else {
-        Some(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
+        Some(unsafe { safe_slice(ptr, len) })
     }
 }
 
@@ -1256,7 +1273,7 @@ unsafe fn field_name<'a>(d: &JsonField) -> &'a [u8] {
     if d.name_ptr.is_null() || d.name_len <= 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(d.name_ptr, d.name_len as usize) }
+        unsafe { safe_slice(d.name_ptr, d.name_len) }
     }
 }
 
@@ -1507,23 +1524,13 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     phf_len: i64,
     phf_seed: i64,
 ) -> i32 {
-    // `from_raw_parts` is UB on a null pointer even with len 0 — guard an empty owned `string`.
-    let src: &[u8] = if input_len <= 0 || input.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(input, input_len as usize) }
-    };
+    let src: &[u8] = unsafe { safe_slice(input, input_len) };
     // Validate the whole input once — every decoded `str` field is a zero-copy view into `src`, so
     // this covers all of them (draft §7/§12). Invalid UTF-8 → a decode error.
     if !validate_utf8(src) {
         return 1;
     }
-    // `from_raw_parts` is UB on a null pointer even with len 0 — guard `fields` like `input`.
-    let descs: &[JsonField] = if n_fields <= 0 || fields.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(fields, n_fields as usize) }
-    };
+    let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
     let phf = unsafe { phf_slice(phf, phf_len) };
     let phf_seed = phf_seed as u64;
     let esz = elem_size.max(0) as usize;
@@ -1678,21 +1685,13 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
     if arena.is_null() || out.is_null() {
         return 1;
     }
-    let src: &[u8] = if input_len <= 0 || input.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(input, input_len as usize) }
-    };
+    let src: &[u8] = unsafe { safe_slice(input, input_len) };
     // Validate the whole input once — every decoded `str` column entry is a zero-copy view into
     // `src`, so this covers all of them (draft §7/§12). Invalid UTF-8 → a decode error.
     if !validate_utf8(src) {
         return 1;
     }
-    let descs: &[JsonField] = if n_fields <= 0 || fields.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(fields, n_fields as usize) }
-    };
+    let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
     let phf = unsafe { phf_slice(phf, phf_len) };
     let phf_seed = phf_seed as u64;
 
@@ -1831,13 +1830,7 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     elem_tag: i32,
     out: *mut AlignStr,
 ) -> i32 {
-    // `from_raw_parts` is UB on a null pointer even with len 0, and an empty owned `string`
-    // (e.g. an empty `builder().to_string()` or `str.clone()`) is `{null, 0}` — guard it.
-    let src: &[u8] = if input_len <= 0 || input.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(input, input_len as usize) }
-    };
+    let src: &[u8] = unsafe { safe_slice(input, input_len) };
     // A JSON `array<str>` element is a zero-copy view into `src`; validate the whole input once so
     // every element is valid UTF-8 (draft §7/§12). Invalid UTF-8 → a decode error. (A scalar-element
     // array carries no `str`, but the invariant that a decoded `str` is UTF-8 is uniform, so the
@@ -2162,7 +2155,7 @@ pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i
 /// `keys` must be valid for `len` `i64`s; `out_keys`/`out_vals` for `cap` `i64`s.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_count_i64(keys: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
-    let len_u = usize::try_from(len).unwrap_or(0);
+    let Ok(len_u) = safe_len(len) else { return 0 };
     let keys: &[i64] = if len_u == 0 || keys.is_null() || len_u > isize::MAX as usize / 8 {
         &[]
     } else {
@@ -2256,11 +2249,7 @@ use align_hash::{WY_SECRET, WY_SEED, wyhash};
 /// `ptr`/`len` must describe a valid byte range for the call (`len == 0` ⇒ `ptr` unused).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_hash64(ptr: *const u8, len: i64) -> u64 {
-    let bytes: &[u8] = if len <= 0 || ptr.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
-    };
+    let bytes: &[u8] = unsafe { safe_slice(ptr, len) };
     wyhash(bytes, WY_SEED)
 }
 
@@ -2281,11 +2270,7 @@ pub struct AlignHash128 {
 /// `ptr`/`len` must describe a valid byte range for the call (`len == 0` ⇒ `ptr` unused).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_hash128(ptr: *const u8, len: i64) -> AlignHash128 {
-    let bytes: &[u8] = if len <= 0 || ptr.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
-    };
+    let bytes: &[u8] = unsafe { safe_slice(ptr, len) };
     let lo = wyhash(bytes, WY_SEED);
     let hi = wyhash(bytes, lo ^ WY_SECRET[2]);
     AlignHash128 { lo, hi }
@@ -2303,7 +2288,7 @@ unsafe fn read_key_slice<'a>(row: *const u8, key_off: usize) -> (&'a [u8], Align
     let bytes = if ks.ptr.is_null() || ks.len <= 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(ks.ptr, ks.len as usize) }
+        unsafe { safe_slice(ks.ptr, ks.len) }
     };
     (bytes, ks)
 }
@@ -2381,7 +2366,7 @@ pub unsafe extern "C" fn align_rt_group_sum_str(base: *const u8, n: i64, stride:
     if n <= 0 || base.is_null() {
         return 0;
     }
-    let (n, stride, key_off, val_off) = (n as usize, stride as usize, key_off as usize, val_off as usize);
+    let (Ok(n), Ok(stride), Ok(key_off), Ok(val_off)) = (safe_len(n), safe_len(stride), safe_len(key_off), safe_len(val_off)) else { return 0 };
     unsafe {
         group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.wrapping_add(b))
     }
@@ -2396,7 +2381,7 @@ pub unsafe extern "C" fn align_rt_group_min_str(base: *const u8, n: i64, stride:
     if n <= 0 || base.is_null() {
         return 0;
     }
-    let (n, stride, key_off, val_off) = (n as usize, stride as usize, key_off as usize, val_off as usize);
+    let (Ok(n), Ok(stride), Ok(key_off), Ok(val_off)) = (safe_len(n), safe_len(stride), safe_len(key_off), safe_len(val_off)) else { return 0 };
     unsafe {
         group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.min(b))
     }
@@ -2411,7 +2396,7 @@ pub unsafe extern "C" fn align_rt_group_max_str(base: *const u8, n: i64, stride:
     if n <= 0 || base.is_null() {
         return 0;
     }
-    let (n, stride, key_off, val_off) = (n as usize, stride as usize, key_off as usize, val_off as usize);
+    let (Ok(n), Ok(stride), Ok(key_off), Ok(val_off)) = (safe_len(n), safe_len(stride), safe_len(key_off), safe_len(val_off)) else { return 0 };
     unsafe {
         group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), aos_value_at(base, stride, val_off), |a, b| a.max(b))
     }
@@ -2426,7 +2411,7 @@ pub unsafe extern "C" fn align_rt_group_count_str(base: *const u8, n: i64, strid
     if n <= 0 || base.is_null() {
         return 0;
     }
-    let (n, stride, key_off) = (n as usize, stride as usize, key_off as usize);
+    let (Ok(n), Ok(stride), Ok(key_off)) = (safe_len(n), safe_len(stride), safe_len(key_off)) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, aos_key_at(base, stride, key_off), |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
@@ -2457,7 +2442,7 @@ pub unsafe extern "C" fn align_rt_group_sum_str_cols(key_col: *const AlignStr, v
     if n <= 0 || key_col.is_null() || val_col.is_null() {
         return 0;
     }
-    let n = n as usize;
+    let Ok(n) = safe_len(n) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), soa_value_at(val_col), |a, b| a.wrapping_add(b)) }
 }
 
@@ -2470,7 +2455,7 @@ pub unsafe extern "C" fn align_rt_group_min_str_cols(key_col: *const AlignStr, v
     if n <= 0 || key_col.is_null() || val_col.is_null() {
         return 0;
     }
-    let n = n as usize;
+    let Ok(n) = safe_len(n) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), soa_value_at(val_col), |a, b| a.min(b)) }
 }
 
@@ -2483,7 +2468,7 @@ pub unsafe extern "C" fn align_rt_group_max_str_cols(key_col: *const AlignStr, v
     if n <= 0 || key_col.is_null() || val_col.is_null() {
         return 0;
     }
-    let n = n as usize;
+    let Ok(n) = safe_len(n) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), soa_value_at(val_col), |a, b| a.max(b)) }
 }
 
@@ -2496,7 +2481,7 @@ pub unsafe extern "C" fn align_rt_group_count_str_cols(key_col: *const AlignStr,
     if n <= 0 || key_col.is_null() {
         return 0;
     }
-    let n = n as usize;
+    let Ok(n) = safe_len(n) else { return 0 };
     unsafe { group_agg_str(n, out_keys, out_vals, cap, soa_key_at(key_col), |_| 1, |a, b| a.wrapping_add(b)) }
 }
 
@@ -2541,9 +2526,9 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     if cap < 0 || k < 0 || out_keys.is_null() || (k > 0 && specs.is_null()) {
         return -1;
     }
-    let n = n as usize;
-    let k = k as usize;
-    let (stride, key_off) = (stride as usize, key_off as usize);
+    let Ok(n) = safe_len(n) else { return 0 };
+    let Ok(k) = safe_len(k) else { return -1 };
+    let (Ok(stride), Ok(key_off)) = (safe_len(stride), safe_len(key_off)) else { return -1 };
     let specs: &[GroupMultiSpec] = if k == 0 { &[] } else { unsafe { std::slice::from_raw_parts(specs, k) } };
     // Per aggregate: the value reader (a row pointer → i64; `count` reads `1`) and the combine op. The
     // combine is selected once per aggregate (not per row) so the inner fold is a small fixed match.
@@ -2647,8 +2632,8 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
     if out_ids.is_null() || out_dict.is_null() || cap < 0 {
         return -1;
     }
-    let n = n as usize;
-    let (stride, key_off) = (stride as usize, key_off as usize);
+    let Ok(n) = safe_len(n) else { return 0 };
+    let (Ok(stride), Ok(key_off)) = (safe_len(stride), safe_len(key_off)) else { return -1 };
     let out_ids = unsafe { std::slice::from_raw_parts_mut(out_ids, n) };
     let initial = n.min(cap as usize).min(1024);
     let mut ids: HashMap<WyKey, i64, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
@@ -2694,11 +2679,11 @@ pub unsafe extern "C" fn align_rt_dict_lookup(ids: *const i64, n: i64, dict: *co
     }
     // `usize::try_from` (not `as usize`) so an out-of-range id can't truncate into a false in-bounds
     // hit (Align is 64-bit, but a public C-ABI entry shouldn't depend on that).
-    let Ok(n) = usize::try_from(n) else { return };
+    let Ok(n) = safe_len(n) else { return };
     let ids = unsafe { std::slice::from_raw_parts(ids, n) };
     let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
-    let dict_len = usize::try_from(dict_len).unwrap_or(0);
-    let dict: &[AlignStr] = if dict_len == 0 || dict.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(dict, dict_len) } };
+    let Ok(dict_len) = safe_len(dict_len) else { return };
+    let dict: &[AlignStr] = unsafe { safe_slice(dict, dict_len as i64) };
     let empty = AlignStr { ptr: core::ptr::NonNull::dangling().as_ptr(), len: 0 };
     for i in 0..n {
         out[i] = usize::try_from(ids[i]).ok().and_then(|id| dict.get(id).copied()).unwrap_or(empty);
@@ -2718,9 +2703,9 @@ pub unsafe extern "C" fn align_rt_dict_lookup(ids: *const i64, n: i64, dict: *co
 pub unsafe extern "C" fn align_rt_gather_i64(base: *const u8, n: i64, stride: i64, off: i64, out: *mut i64) {
     // A negative `stride`/`off` is meaningless and would wrap to a huge value through `as usize`
     // (an out-of-bounds read); reject it defensively, like `align_rt_dict_lookup`'s `try_from` guards.
-    let Ok(n_u) = usize::try_from(n) else { return };
-    let Ok(stride_u) = usize::try_from(stride) else { return };
-    let Ok(off_u) = usize::try_from(off) else { return };
+    let Ok(n_u) = safe_len(n) else { return };
+    let Ok(stride_u) = safe_len(stride) else { return };
+    let Ok(off_u) = safe_len(off) else { return };
     if n_u == 0 || base.is_null() || out.is_null() || n_u > isize::MAX as usize / 8 {
         return;
     }
@@ -3724,7 +3709,7 @@ unsafe fn path_from_view(ptr: *const u8, len: i64) -> Option<String> {
     let bytes: &[u8] = if len <= 0 || ptr.is_null() {
         &[]
     } else {
-        let n = usize::try_from(len).ok()?;
+        let n = safe_len(len).ok()?;
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
@@ -3908,7 +3893,7 @@ pub unsafe extern "C" fn align_rt_io_writer_write(w: *mut Writer, ptr: *const u8
         return 0; // nothing to write — success
     }
     let w = unsafe { &mut *w };
-    let Ok(n) = usize::try_from(len) else { return AL_INVALID };
+    let Ok(n) = safe_len(len) else { return AL_INVALID };
     let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
     if !w.buffered {
         return write_all_fd(w.fd, bytes);
@@ -4042,7 +4027,7 @@ pub struct Buffer {
 /// `buffer(cap)` — open an owned byte buffer whose read window is `cap` bytes (`<= 0` → empty).
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
-    let requested = usize::try_from(cap).unwrap_or(0);
+    let Ok(requested) = safe_len(cap) else { return core::ptr::null_mut() };
     let mut data = Vec::new();
     // `try_reserve` so a bogus/huge capacity fails softly instead of aborting on OOM. The read
     // window is capped to what was actually reserved, so `reader.read`'s later `resize(cap)` can
@@ -4381,8 +4366,8 @@ pub unsafe extern "C" fn align_rt_str_eq(a: *const u8, alen: i64, b: *const u8, 
     }
     let (x, y) = unsafe {
         (
-            std::slice::from_raw_parts(a, alen as usize),
-            std::slice::from_raw_parts(b, blen as usize),
+            safe_slice(a, alen),
+            safe_slice(b, blen),
         )
     };
     (x == y) as i32
@@ -4404,8 +4389,8 @@ pub unsafe extern "C" fn align_rt_str_contains(hptr: *const u8, hlen: i64, nptr:
     }
     let (hay, needle) = unsafe {
         (
-            std::slice::from_raw_parts(hptr, hlen as usize),
-            std::slice::from_raw_parts(nptr, nlen as usize),
+            safe_slice(hptr, hlen),
+            safe_slice(nptr, nlen),
         )
     };
     memchr::memmem::find(hay, needle).is_some() as i32
@@ -4427,8 +4412,8 @@ pub unsafe extern "C" fn align_rt_str_find(hptr: *const u8, hlen: i64, nptr: *co
     }
     let (hay, needle) = unsafe {
         (
-            std::slice::from_raw_parts(hptr, hlen as usize),
-            std::slice::from_raw_parts(nptr, nlen as usize),
+            safe_slice(hptr, hlen),
+            safe_slice(nptr, nlen),
         )
     };
     match memchr::memmem::find(hay, needle) {
@@ -4453,8 +4438,8 @@ pub unsafe extern "C" fn align_rt_str_rfind(hptr: *const u8, hlen: i64, nptr: *c
     }
     let (hay, needle) = unsafe {
         (
-            std::slice::from_raw_parts(hptr, hlen as usize),
-            std::slice::from_raw_parts(nptr, nlen as usize),
+            safe_slice(hptr, hlen),
+            safe_slice(nptr, nlen),
         )
     };
     match memchr::memmem::rfind(hay, needle) {
@@ -4482,8 +4467,8 @@ pub unsafe extern "C" fn align_rt_str_eq_ignore_case(aptr: *const u8, alen: i64,
     }
     let (a, b) = unsafe {
         (
-            std::slice::from_raw_parts(aptr, alen as usize),
-            std::slice::from_raw_parts(bptr, blen as usize),
+            safe_slice(aptr, alen),
+            safe_slice(bptr, blen),
         )
     };
     a.eq_ignore_ascii_case(b) as i32
@@ -4503,8 +4488,8 @@ pub unsafe extern "C" fn align_rt_str_starts_with(hptr: *const u8, hlen: i64, pp
     }
     let (hay, pre) = unsafe {
         (
-            std::slice::from_raw_parts(hptr, plen as usize),
-            std::slice::from_raw_parts(pptr, plen as usize),
+            safe_slice(hptr, plen),
+            safe_slice(pptr, plen),
         )
     };
     (hay == pre) as i32
@@ -4526,8 +4511,8 @@ pub unsafe extern "C" fn align_rt_str_ends_with(hptr: *const u8, hlen: i64, sptr
     let tail = unsafe { hptr.add((hlen - slen) as usize) };
     let (hay, suf) = unsafe {
         (
-            std::slice::from_raw_parts(tail, slen as usize),
-            std::slice::from_raw_parts(sptr, slen as usize),
+            safe_slice(tail, slen),
+            safe_slice(sptr, slen),
         )
     };
     (hay == suf) as i32
@@ -4554,7 +4539,7 @@ pub unsafe extern "C" fn align_rt_str_trim(ptr: *const u8, len: i64) -> AlignStr
     if len <= 0 {
         return AlignStr { ptr, len: 0 };
     }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let bytes = unsafe { safe_slice(ptr, len) };
     str_subview(bytes.trim_ascii())
 }
 
@@ -4568,7 +4553,7 @@ pub unsafe extern "C" fn align_rt_str_trim_start(ptr: *const u8, len: i64) -> Al
     if len <= 0 {
         return AlignStr { ptr, len: 0 };
     }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let bytes = unsafe { safe_slice(ptr, len) };
     str_subview(bytes.trim_ascii_start())
 }
 
@@ -4582,7 +4567,7 @@ pub unsafe extern "C" fn align_rt_str_trim_end(ptr: *const u8, len: i64) -> Alig
     if len <= 0 {
         return AlignStr { ptr, len: 0 };
     }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let bytes = unsafe { safe_slice(ptr, len) };
     str_subview(bytes.trim_ascii_end())
 }
 
@@ -4603,8 +4588,8 @@ unsafe fn bytes_view<'a>(ptr: *const u8, len: i64) -> &'a [u8] {
     // Null / non-positive → empty (never `from_raw_parts(null, 0)`, which is UB). `usize::try_from`
     // rather than `len as usize` so a length that doesn't fit a `usize` (only reachable on a 32-bit
     // target) yields empty instead of a truncated, out-of-bounds view.
-    match usize::try_from(len) {
-        Ok(n) if n > 0 && !ptr.is_null() => unsafe { std::slice::from_raw_parts(ptr, n) },
+    match safe_len(len) {
+        Ok(n) => unsafe { safe_slice(ptr, n as i64) },
         _ => &[],
     }
 }
@@ -5039,7 +5024,7 @@ pub unsafe extern "C" fn align_rt_arena_alloc(arena: *mut Arena, size: i64, alig
     // `Arena::alloc`'s aligned-address bit-trick assumes it. Not reachable today (codegen always
     // passes a sound value), but guard it rather than trust the caller.
     let (Ok(size), Some(align)) =
-        (usize::try_from(size), usize::try_from(align).ok().filter(|&a| a.is_power_of_two()))
+        (safe_len(size), safe_len(align).ok().filter(|&a| a.is_power_of_two()))
     else {
         return core::ptr::null_mut();
     };
@@ -5115,8 +5100,8 @@ pub unsafe extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align:
     if tg.is_null() {
         return core::ptr::null_mut();
     }
-    let Ok(size_u) = usize::try_from(size) else { return core::ptr::null_mut() };
-    let Ok(align_u) = usize::try_from(align) else { return core::ptr::null_mut() };
+    let Ok(size_u) = safe_len(size) else { return core::ptr::null_mut() };
+    let Ok(align_u) = safe_len(align) else { return core::ptr::null_mut() };
     unsafe { &mut *tg }.arena.alloc(size_u, align_u)
 }
 
@@ -5534,7 +5519,7 @@ pub unsafe extern "C" fn align_rt_rng_shuffle(state: *mut u64, ptr: *mut u8, len
     }
     // `len`/`elem_size` describe an in-memory slice, so they fit `usize`; validate before any index
     // math (a truncating `as usize` on a 32-bit target would corrupt the offsets).
-    let (Ok(n), Ok(es)) = (usize::try_from(len), usize::try_from(elem_size)) else {
+    let (Ok(n), Ok(es)) = (safe_len(len), safe_len(elem_size)) else {
         return;
     };
     let s = unsafe { &mut *(state as *mut [u64; 4]) };
@@ -5581,7 +5566,7 @@ pub unsafe extern "C" fn align_rt_rng_sample(
     }
     // All three describe / index an in-memory slice, so they fit `usize` (guard the truncating
     // `as usize` on a 32-bit target); `k` is already validated to `0..=src_len` above.
-    let (Ok(es), Ok(n), Ok(kk)) = (usize::try_from(elem_size), usize::try_from(src_len), usize::try_from(k)) else {
+    let (Ok(es), Ok(n), Ok(kk)) = (safe_len(elem_size), safe_len(src_len), safe_len(k)) else {
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     };
     let out_bytes = kk
@@ -5765,8 +5750,8 @@ pub unsafe extern "C" fn align_rt_cli_parse(cmd: *mut CliCommand, argv: *const A
         return AL_INVALID;
     }
     let c = unsafe { &*cmd };
-    let n = usize::try_from(argv_len).unwrap_or(0);
-    let argv_slice: &[AlignStr] = if n > 0 && !argv.is_null() { unsafe { std::slice::from_raw_parts(argv, n) } } else { &[] };
+    let Ok(n) = safe_len(argv_len) else { return 1 };
+    let argv_slice: &[AlignStr] = unsafe { safe_slice(argv, n as i64) };
     let mut values: Vec<(String, CliValue)> = Vec::new();
 
     // Skip `argv[0]` (the program name — the `main(args)` convention).
@@ -6020,7 +6005,7 @@ mod tests {
         assert_eq!(unsafe { align_rt_buffer_len(b) }, 3);
         let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
         unsafe { align_rt_buffer_bytes(b, &mut view) };
-        assert_eq!(unsafe { std::slice::from_raw_parts(view.ptr, view.len as usize) }, b"hel");
+        assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"hel");
         // Second read: "lo". Third: EOF.
         assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 2);
         assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 0);
@@ -6153,7 +6138,7 @@ mod tests {
     fn ffi_encode_returns_owned_string_and_decode_returns_buffer() {
         // FFI encode: a heap-owned `{ptr,len}` string, freed like any owned string.
         let s = unsafe { align_rt_base64_encode(b"foobar".as_ptr(), 6) };
-        assert_eq!(unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) }, b"Zm9vYmFy");
+        assert_eq!(unsafe { safe_slice(s.ptr, s.len) }, b"Zm9vYmFy");
         unsafe { align_rt_free(s.ptr as *mut u8) };
         // FFI decode: an owned `buffer` handle whose `.bytes()` is the decoded blob.
         let input = b"Zm9vYmFy";
@@ -6163,7 +6148,7 @@ mod tests {
         assert_eq!(unsafe { align_rt_buffer_len(buf) }, 6);
         let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
         unsafe { align_rt_buffer_bytes(buf, &mut view) };
-        assert_eq!(unsafe { std::slice::from_raw_parts(view.ptr, view.len as usize) }, b"foobar");
+        assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"foobar");
         unsafe { align_rt_buffer_free(buf) };
         // FFI decode failure: null handle + AL_INVALID.
         let bad = b"Zm9v!mFy";
@@ -6514,7 +6499,7 @@ mod tests {
 
         // The id column re-labels through the dict back to the original keys (the reuse contract).
         for (i, r) in rows.iter().enumerate() {
-            let orig = unsafe { std::slice::from_raw_parts(r.key.ptr, r.key.len as usize) };
+            let orig = unsafe { safe_slice(r.key.ptr, r.key.len) };
             assert_eq!(dict[out_ids[i] as usize], orig, "row {i} round-trips via the dictionary");
         }
 
@@ -6627,7 +6612,7 @@ mod tests {
         let key_off = std::mem::offset_of!(Row, key) as i64;
         let val_off = std::mem::offset_of!(Row, val) as i64;
         let to_map = |keys: &[AlignStr], vals: &[i64]| -> std::collections::HashMap<Vec<u8>, i64> {
-            keys.iter().zip(vals).map(|(k, &v)| (unsafe { std::slice::from_raw_parts(k.ptr, k.len as usize) }.to_vec(), v)).collect()
+            keys.iter().zip(vals).map(|(k, &v)| (unsafe { safe_slice(k.ptr, k.len) }.to_vec(), v)).collect()
         };
 
         // A1 reference: one-shot string-key group sum.
@@ -6853,7 +6838,7 @@ mod tests {
             let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
             let rc = unsafe { align_rt_fs_read_file(path.as_ptr(), path.len() as i64, &mut out) };
             let bytes = if rc == 0 && out.len > 0 {
-                let v = unsafe { core::slice::from_raw_parts(out.ptr, out.len as usize) }.to_vec();
+                let v = unsafe { safe_slice(out.ptr, out.len) }.to_vec();
                 unsafe { align_rt_free(out.ptr as *mut u8) };
                 Some(v)
             } else {
@@ -7625,7 +7610,7 @@ mod tests {
         // Each trim must equal the equivalent `[u8]::trim_ascii*` and return a sub-view that still
         // points *into* the original buffer (no allocation).
         let view = |s: &AlignStr| -> &[u8] {
-            if s.len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) } }
+            if s.len == 0 { &[] } else { unsafe { safe_slice(s.ptr, s.len) } }
         };
         let cases: &[&[u8]] = &[
             b"  hi  ",
@@ -7827,7 +7812,7 @@ mod tests {
         for i in 0..out.len as usize {
             let e = unsafe { *hdr.add(i) };
             assert!(!e.ptr.is_null() && e.len > 0);
-            let name = unsafe { std::slice::from_raw_parts(e.ptr, e.len as usize) };
+            let name = unsafe { safe_slice(e.ptr, e.len) };
             assert!(name.starts_with(b"e"), "entry name looks like eN");
         }
         // Deep free (each name + header) — under a leak sanitizer this proves no leak.
@@ -7853,7 +7838,7 @@ mod tests {
         let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
         assert_eq!(unsafe { align_rt_fs_read_file_view(pp, pl, arena, &mut out) }, 0);
         assert_eq!(out.len, content.len() as i64);
-        let got = unsafe { std::slice::from_raw_parts(out.ptr, out.len as usize) };
+        let got = unsafe { safe_slice(out.ptr, out.len) };
         assert_eq!(got, content, "the view bytes match the file");
         // The mapping was registered on the arena for munmap at end.
         assert_eq!(unsafe { (*arena).maps.len() }, 1, "one mapping registered");
@@ -8019,7 +8004,7 @@ mod tests {
         let gs = good.to_str().unwrap();
         let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
         assert_eq!(unsafe { align_rt_fs_read_file(gs.as_ptr(), gs.len() as i64, &mut out) }, 0);
-        let got = unsafe { core::slice::from_raw_parts(out.ptr, out.len as usize) }.to_vec();
+        let got = unsafe { safe_slice(out.ptr, out.len) }.to_vec();
         assert_eq!(got, good_content);
         unsafe { align_rt_free(out.ptr as *mut u8) };
 
@@ -8073,7 +8058,7 @@ mod tests {
         let mut out2 = AlignStr { ptr: std::ptr::null(), len: 0 };
         assert_eq!(unsafe { align_rt_fs_read_file_view(gp, gl, arena2, &mut out2) }, 0);
         assert_eq!(out2.len, gc.len() as i64);
-        assert_eq!(unsafe { std::slice::from_raw_parts(out2.ptr, out2.len as usize) }, gc.as_slice());
+        assert_eq!(unsafe { safe_slice(out2.ptr, out2.len) }, gc.as_slice());
         unsafe { align_rt_arena_end(arena2) };
 
         std::fs::remove_file(&path).ok();
@@ -8179,7 +8164,7 @@ mod tests {
         assert_eq!(unsafe { align_rt_fs_read_dir(pp, pl, &mut out) }, 0);
         assert_eq!(out.len, 1, "only the valid-UTF-8 name is listed; the broken name is excluded");
         let e = unsafe { *(out.ptr as *const AlignStr) };
-        let nm = unsafe { std::slice::from_raw_parts(e.ptr, e.len as usize) };
+        let nm = unsafe { safe_slice(e.ptr, e.len) };
         assert_eq!(nm, b"good.txt");
         unsafe { align_rt_free_string_array(out.ptr as *mut u8, out.len) };
         let _ = std::fs::remove_dir_all(&dir);
@@ -8192,7 +8177,7 @@ mod tests {
         if s.len <= 0 || s.ptr.is_null() {
             return String::new();
         }
-        let b = unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) };
+        let b = unsafe { safe_slice(s.ptr, s.len) };
         String::from_utf8_lossy(b).into_owned()
     }
     /// Render an owned `string` result and free its buffer (it came from `align_rt_alloc`).
