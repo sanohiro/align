@@ -46,7 +46,18 @@ fn main() -> i32 {
 }
 ```
 
-`len` / `contains` / `starts_with` / `ends_with` / `trim` / `trim_start` / `trim_end` / `clone` ― 現時点のメソッドはこれで全部です。いずれもバイト単位で動作し、検索系は内部で SIMD を使っています(`contains` はナイーブなループではなくベクトル化されたスキャンです)。`split` はまだ存在しません(実装中)。今は `contains` / `starts_with` にスライスを組み合わせるか、本物のパーサーを書いてください。
+`len` / `contains` / `starts_with` / `ends_with` / `find` / `rfind` / `eq_ignore_ascii_case` / `trim` / `trim_start` / `trim_end` / `clone` ― 現時点のメソッドはこれで全部です。いずれもバイト単位で動作し、検索系は内部で SIMD を使っています(`contains` はナイーブなループではなくベクトル化されたスキャンです)。`find` / `rfind` は `Option<i64>` ― 最初/最後に一致した位置のバイトインデックス、なければ `None` ― を返し、文字列にも使える範囲スライスと組み合わせられます。
+
+```align
+fn main() -> i32 {
+    path := "align/docs/guide.md"
+    j := path.rfind("/") else -1
+    print(path[j + 1..path.len()])      // guide.md ― ゼロコピーのビュー
+    return 0
+}
+```
+
+(`path[i]` のような単一バイトへのアクセスはありません ― バイトインデックスはスライスのためのものであって、1 バイトずつ辿るためのものではありません。)`split` はまだ存在しません(実装中)。今は `find` / `rfind` に `[a..b]` を組み合わせて手動の分割を組み立てるか、本物のパーサーを書いてください。
 
 ## 連結 ― 確保先が定まっているところでのみ許される
 
