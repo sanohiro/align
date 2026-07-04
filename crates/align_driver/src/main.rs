@@ -109,12 +109,11 @@ fn front_to_mir(path: &str) -> Option<align_mir::Program> {
     let src = read(path)?;
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, path, &src);
-    if checked.diags.has_errors() {
-        eprint!("{}", format_diagnostics(&sm, &checked.diags));
-        return None;
-    }
     if !checked.diags.is_empty() {
         eprint!("{}", format_diagnostics(&sm, &checked.diags));
+    }
+    if checked.diags.has_errors() {
+        return None;
     }
     Some(lower_to_mir(&checked.hir))
 }

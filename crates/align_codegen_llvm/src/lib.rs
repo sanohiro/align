@@ -3016,7 +3016,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let oty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
                 let payload = self.operand(op);
                 let tag = self.ctx.i8_type().const_int(1, false);
-                // Start zeroed (not undef): an owned (Move) payload's drop frees the payload field
+                // Start zeroed (not poison): an owned (Move) payload's drop frees the payload field
                 // null-safely, so the inactive arm must read as {null,0}, not garbage (slice 8a).
                 let agg = self
                     .builder
@@ -3523,7 +3523,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_load(st, ep, "idxp").map_err(|e| self.err(e))?
             }
             Rvalue::MakeTuple { tuple_id, elems } => {
-                // Build the tuple aggregate by inserting each element into an undef struct.
+                // Build the tuple aggregate by inserting each element into a poison struct.
                 let st = self.tuple_types[*tuple_id as usize];
                 let mut agg = st.get_poison();
                 for (i, el) in elems.iter().enumerate() {
@@ -5551,10 +5551,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // mask broadcasts lane 0 to every lane — two instructions regardless of width `N`.
         let scalar = self.operand(op);
         let vty = vec_llvm_ty(self.ctx, elem, n).into_vector_type();
-        let undef = vty.get_poison();
-        let init = self.builder.build_insert_element(undef, scalar, self.ctx.i32_type().const_zero(), "splat_init").map_err(|e| self.err(e))?;
+        let poison = vty.get_poison();
+        let init = self.builder.build_insert_element(poison, scalar, self.ctx.i32_type().const_zero(), "splat_init").map_err(|e| self.err(e))?;
         let mask = self.ctx.i32_type().vec_type(n).const_zero();
-        self.builder.build_shuffle_vector(init, undef, mask, "splat").map_err(|e| self.err(e))
+        self.builder.build_shuffle_vector(init, poison, mask, "splat").map_err(|e| self.err(e))
     }
 
     /// Sum the `n` lanes of a vector into the element scalar (M6 reductions — `sum_where`, `dot`).
