@@ -1516,6 +1516,11 @@ returning, and `match`ing it, an exported sum type is fully usable across module
 
 `core` is the foundation, close to the language philosophy itself.
 
+> This section is the design-intent catalog. The **exact shipped surface** per core area —
+> verified signatures, ownership/effect classification, error/abort policy, pitfalls, test
+> anchors, and which of the names below are not implemented yet — is maintained at
+> std-design depth in `docs/impl/core-design/`.
+
 ```text
 core.option
 core.result

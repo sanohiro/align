@@ -46,7 +46,18 @@ fn main() -> i32 {
 }
 ```
 
-`len` / `contains` / `starts_with` / `ends_with` / `trim` / `trim_start` / `trim_end` / `clone` — that is the current set. They are byte-oriented, and the searching ones are SIMD under the hood (`contains` is a vectorized scan, not a naive loop). A `split` does not exist yet (implementation in progress); today you reach for `contains`/`starts_with` + slicing, or a real parser.
+`len` / `contains` / `starts_with` / `ends_with` / `find` / `rfind` / `eq_ignore_ascii_case` / `trim` / `trim_start` / `trim_end` / `clone` — that is the current set. All byte-oriented, and the searching ones are SIMD under the hood (`contains` is a vectorized scan, not a naive loop). `find`/`rfind` return `Option<i64>` — a byte index, or `None` — and pair with range slicing, which works on strings too:
+
+```align
+fn main() -> i32 {
+    path := "align/docs/guide.md"
+    j := path.rfind("/") else -1
+    print(path[j + 1..path.len()])      // guide.md — a zero-copy view
+    return 0
+}
+```
+
+(There is no `path[i]` single-byte access — a byte index is for slicing, not for walking.) A `split` does not exist yet (implementation in progress); today `find`/`rfind` + `[a..b]` compose the manual split, or you write a real parser.
 
 ## Concatenation: allowed where the allocation has a home
 
