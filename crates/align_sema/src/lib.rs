@@ -4928,7 +4928,7 @@ impl<'a, 't> Checker<'a, 't> {
         // The broad "unnecessary heap" lint: a whole-function scan for a box local that is only ever
         // read back with `.get()` and never escapes (the narrow inline `heap.new(x).get()` slice lives
         // in `finalize_expr`). A warning, not an error — it never blocks a build.
-        UnnecessaryHeapScan::run(&body, &mut self.diags);
+        UnnecessaryHeapScan::run(&body, self.diags);
         let mut locals = std::mem::take(&mut self.locals);
         for l in &mut locals {
             l.ty = self.finalize(l.ty);
@@ -8062,7 +8062,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Run the broad unnecessary-heap scan on the lifted lambda body too (parity with the narrow
         // lint in `finalize_expr`); a box local here is function-local (Move values cannot be
         // captured), so the scan is self-contained and never double-reports the enclosing function.
-        UnnecessaryHeapScan::run(&body_fin, &mut self.diags);
+        UnnecessaryHeapScan::run(&body_fin, self.diags);
 
         // Collect captures: each becomes a trailing parameter of the lifted function, and the
         // enclosing local is passed at the call site. Slice ③ supports copy-value captures only.
