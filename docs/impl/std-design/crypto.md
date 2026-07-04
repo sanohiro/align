@@ -4,7 +4,7 @@ module.
 
 # std.crypto — implementation design (M11)
 
-> 🌐 **English** · [日本語](./ja/crypto.md)
+> 🌐 **English** · [Japanese](./ja/crypto.md)
 
 ## Overview
 

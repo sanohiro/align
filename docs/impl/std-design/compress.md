@@ -4,7 +4,7 @@ module.
 
 # std.compress — implementation design (M11)
 
-> 🌐 **English** · [日本語](./ja/compress.md)
+> 🌐 **English** · [Japanese](./ja/compress.md)
 
 ## Overview
 

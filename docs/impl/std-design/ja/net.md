@@ -1,5 +1,6 @@
-このディレクトリには、ロードマップの本文を超えた std モジュールの Opus 実装可能な設計仕様が置かれている。
-メインループ (Fable) が執筆したもので、各モジュールを実装する際の source of truth である。
+このディレクトリには、ロードマップの本文だけでは足りない std モジュールについて、Opus がそのまま実装に
+移せる粒度の設計仕様を収めている。執筆はメインループ (Fable) が担当しており、各モジュールを実装する際は
+これが source of truth となる。
 
 # std.net — implementation design (M11)
 
@@ -7,16 +8,15 @@
 
 ## Overview
 
-低レベルソケット: tcp、udp、dns、socket。syscall に裏打ちされている。要となる再利用ポイント: 接続済み
-ソケットの fd は、**既存の M9 reader/writer** にそのまま差し込める — 多態性は construction 側(fd を
-所有するハンドルを返す net 側のコンストラクタ)にあり、read/write/Drop で fd を close する仕組みは
-まったく同一である(draft §18.2 の io の原則。reader/writer が fd に対して汎用的であることによって実現
-されている)。したがって net が追加するのはソケットのライフサイクルと DNS であり、新しい I/O パスでは
-ない。
+低レベルのソケット群である: tcp、udp、dns、socket。いずれも syscall に裏打ちされる。設計の要は再利用に
+ある。接続済みソケットの fd は、**既存の M9 reader/writer** にそのまま差し込める。多態性は construction
+の側 — fd を所有するハンドルを返す net 側のコンストラクタ — にあり、read/write と Drop での fd close の
+仕組みは全く同一である(draft §18.2 の io 原則。reader/writer が fd に対して汎用であることで実現してい
+る)。つまり net が足すのはソケットのライフサイクルと DNS だけで、新しい I/O パスは足さない。
 
 ## Signatures
 
-v1 案 — draft §18.2 はメンバー名のみ列挙している。以下は Fable が確定させた形である:
+v1 案である。draft §18.2 はメンバー名を列挙するだけなので、以下は Fable が確定させた形を示す:
 
 ```text
 // TCP client
@@ -37,105 +37,102 @@ dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
 ## Type & ownership classification
 
 - `tcp_conn`、`tcp_listener`、`udp_socket` は **Move 型** である(新設の `Ty::TcpConn`/`Ty::TcpListener`/
-  `Ty::UdpSocket`)。それぞれ 1 つの fd を所有し、Drop = close(fd) であり、まさに reader/writer/buffer の
-  Move の前例通りである。array/slice/vec/box の要素として、また Option/Result のペイロードとして
-  `scalar_arg` のチョークポイントで拒否される。ただし各自のコンストラクタが返す Result の Ok ペイロード
-  位置は例外である(connect/listen/accept/bind は `Result<T, Error>` を返す) — reader/writer が許可され
-  たのと同様にこれらの Ok 位置は許可する(`Scalar::Buffer` #346 のテンプレート)。
-- `c.reader()`/`c.writer()` は、conn の fd 上に構築された M9 の reader/writer を **借用** として返す
-  (`owns_fd: false` — fd の所有・close は引き続き conn 側が行う)。したがって reader/writer のリージョ
-  ンは conn `c` に束縛され、`c` の Drop を越えて使用することは拒否される
-  (`region_of(TcpReader) = region_of(c)`)。これは #297 のトラップを意識した分岐である。
-- `dns.resolve` は所有権付きの `array<string>` を返す(`read_dir` #339 と同様の deep-drop)。
-  `datagram`/`response` は小さな構造体(Copy)であり、カウントと、必要に応じて所有権付きの
-  peer/body を運ぶ。
+  `Ty::UdpSocket`)。いずれも fd を 1 つ所有し、Drop = close(fd) となる — reader/writer/buffer の Move の
+  前例そのままである。array/slice/vec/box の要素や Option/Result のペイロードとしては `scalar_arg` の
+  チョークポイントで拒否する。ただし自分のコンストラクタが返す Result の Ok ペイロード位置だけは例外で
+  ある(connect/listen/accept/bind はいずれも `Result<T, Error>` を返す)。reader/writer が許可されたのと
+  同じく、これらの Ok 位置は許可する(`Scalar::Buffer` #346 のテンプレート)。
+- `c.reader()`/`c.writer()` は、conn の fd 上に構築した M9 の reader/writer を **借用** として返す
+  (`owns_fd: false` — fd の所有と close は引き続き conn 側が担う)。したがって reader/writer のリージョン
+  は conn `c` に束縛され、`c` の Drop を越えて使うことは拒否される(`region_of(TcpReader) = region_of(c)`)。
+  これは #297 のトラップを意識した分岐である。
+- `dns.resolve` は所有権付きの `array<string>` を返す(`read_dir` #339 と同じ deep-drop)。
+  `datagram`/`response` は小さな構造体(Copy)で、カウントと、必要に応じて所有権付きの peer/body を運ぶ。
 
 ## Effect classification
 
-net の演算はすべて **impure**(syscall)である — 決して `par_map` のクロージャの中には入らない。
+net の操作はすべて **impure**(syscall)である — `par_map` のクロージャには決して入らない。
 
 ## Error policy
 
-syscall の失敗は **共有の errno→Error テーブル**(M9)を経由する: ECONNREFUSED/ETIMEDOUT/
-EHOSTUNREACH → `Error.Code(errno)`(v1 では専用のバリアントを設けない — 分岐が必要になる消費者が現れた
-場合にのみテーブルを拡張する)、ENOENT 系の DNS 失敗 → resolve 専用の `Error.Invalid` または
-`Error.Code`。部分的な read/write は(すでに正しく実装済みの)再利用された reader/writer が処理する。
-ストリーム途中でのコネクションリセットは read/write の Error として現れる。
+syscall の失敗は **共有の errno→Error テーブル**(M9)を通す。ECONNREFUSED/ETIMEDOUT/EHOSTUNREACH は
+`Error.Code(errno)` になる(v1 では専用バリアントを設けず、これらで分岐したい消費者が現れたときに初めて
+テーブルを拡張する)。ENOENT 系の DNS 失敗は、resolve 専用の `Error.Invalid` か `Error.Code` にする。
+部分的な read/write は、再利用する reader/writer 側がすでに正しく処理している。ストリーム途中のコネクション
+リセットは read/write の Error として表面化する。
 
 ## Concurrency model
 
-記録済みのレール(open-questions「Network std rails」): デフォルトでコネクション再利用(keepalive ON)。
-net はバウンド付き並行処理バッチングのための **基盤** を提供する — `task_group` + `par_map` のブロッキ
-ングプール(新しい async ランタイムではない。`io_uring` は後日の Linux バックエンドであって、意味論上の
-モデルではない)。具体的なバッチ API(`get_many`、パイプライン化された write-then-read)は **1 層上の
-`std.http`**(`cl.get_many`)に存在する — それは HTTP リクエスト/レスポンス型を操作するものであり、これ
-は `std.http` が持つべきものなので、`std.net` には**置いてはならない**(net→http への依存はレイヤリング
-違反/循環依存になる。http.md を参照)。net はバイトストリームに対して汎用であり続ける。1 つの静的な
-ホストに対して接続ごとにループする実装は lint の対象である(post-v1 の lint、このモジュールでは記録の
-みで実装はしない)。HTTP/3、TLS、ソケットのチューニング(TFO/REUSEPORT/thread-per-core)は pkg であり
-std ではない。
+記録済みのレール(open-questions「Network std rails」)は、デフォルトでコネクションを再利用する(keepalive
+ON)ことである。net は、上限付き並行バッチングのための **基盤** を提供する — `task_group` と `par_map` の
+ブロッキングプールである(新しい async ランタイムではない。`io_uring` はあくまで後日の Linux バックエンド
+であって、意味論上のモデルではない)。具体的なバッチ API(`get_many`、パイプライン化した write-then-read)
+は **1 層上の `std.http`**(`cl.get_many`)に置く。これらは HTTP のリクエスト/レスポンス型を扱うもので、
+それらは `std.http` の型だから、`std.net` に**置いてはならない**(net→http の依存はレイヤリング違反、
+すなわち循環依存になる。http.md 参照)。net はバイトストリームに対して汎用のままにしておく。単一の静的
+ホストに対して接続ごとにループを回す実装は lint の対象だが、これは post-v1 の lint として記録するだけで、
+このモジュールでは実装しない。HTTP/3、TLS、ソケットのチューニング(TFO/REUSEPORT/thread-per-core)は
+std ではなく pkg の領分である。
 
 ## New machinery required
 
-新設の Move `Ty` 3 種(TcpConn/TcpListener/UdpSocket)+ ランタイム構造体 + Drop(close);ソケットのライ
-フサイクル用ランタイム関数(socket/connect/bind/listen/accept、`dns.resolve` 用の getaddrinfo、
-sendto/recvfrom);バイトパスには M9 の reader/writer をそのまま再利用する(これが利点);借用された
-reader/writer をその conn に束縛する `region_of` の分岐;`std.http` の `get_many` が土台とする
-`task_group` + ブロッキングプールの基盤(バッチング自体は net ではなく http のもの)。新しい effect、
-新しい I/O パス、async ランタイムは不要。
+必要になるものは次のとおり。Move 型の `Ty` 3 種(TcpConn/TcpListener/UdpSocket)+ ランタイム構造体 +
+Drop(close)。ソケットのライフサイクル用ランタイム関数(socket/connect/bind/listen/accept、`dns.resolve`
+用の getaddrinfo、sendto/recvfrom)。バイトパスは M9 の reader/writer をそのまま再利用する(ここが最大の
+利点)。借用した reader/writer をその conn に束縛する `region_of` 分岐。そして `std.http` の `get_many` が
+土台にする `task_group` + ブロッキングプールの基盤(バッチング自体は net ではなく http の担当)。新しい
+effect も、新しい I/O パスも、async ランタイムも要らない。
 
 ## Slice breakdown
 
-1. `dns.resolve` 単体(getaddrinfo → 所有権付き `array<string>`) — 最小、Move 型なし、errno パスと
-   deep-drop を検証する。
-2. `tcp_conn` の Move 型 + `connect` + `reader()`/`writer()` 借用(reader/writer の再利用 — 中核となる
-   証明) + Drop で fd を close + 全パスの Gate-1 スイープ。
+1. `dns.resolve` 単体(getaddrinfo → 所有権付き `array<string>`) — 最小で、Move 型を伴わず、errno パスと
+   deep-drop を検証できる。
+2. `tcp_conn` の Move 型 + `connect` + `reader()`/`writer()` の借用(reader/writer 再利用の核心的な証明)
+   + Drop での fd close + 全パスの Gate-1 スイープ。
 3. `tcp_listener` + `listen` + `accept`(サーバ側)。
 4. `udp_socket` + `bind` + `send_to` + `recv_from`。
 
-(バッチ処理された `get_many` のレールは `std.http` で実装するのであってここではない — HTTP 型が必要
-だからである。net が供給するのは `task_group` + ブロッキングプールの基盤のみで、これはすでに利用可能
-である。)
+(バッチ化した `get_many` のレールは、ここではなく `std.http` で実装する — HTTP 型が要るからである。net が
+供給するのは `task_group` + ブロッキングプールの基盤だけで、これはすでに利用できる。)
 
 ## Pitfalls (implement carefully)
 
-- **P1 (Move sweep ×3)**: 新設の 3 つの Move Ty は reader/writer と同様にすべてのパスを漏れなく通過し
-  なければならない(`ty_is_move`/`tracks_region`/`null_moved_source`/drop/`MoveCheck`/`EscapeCheck`/
-  `region_of`/finalize/MIR/codegen/print)。最もリスクが高い。見落とすと fd の二重 close またはリークに
-  つながる。
-- **P2 (borrowed reader/writer region, #297)**: `c.reader()`/`writer()` は conn の fd を借用する
-  (`owns_fd:false`)。そのリージョンは Static ではなく必ず `region_of(c)` でなければならない — さもない
-  と reader が conn の `close(fd)` より長生きし、use-after-close になる。明示的な `region_of` の分岐 +
-  escape テストが必要。これは微妙な点である: reader 自体は Move 型だが、ここでは非所有の借用として振る
-  舞うため、自身の Drop で fd を close してはならない(`owns_fd:false` はランタイム側ですでに処理済みだ
-  が、リージョンの束縛は新規である)。
-- **P3 (fd double-close)**: conn が fd を所有する。`reader()`/`writer()` の借用は `owns_fd:false` を
-  設定し、conn の Drop のみが close するようにする。二重 close する経路がないことを検証する。
-- **P4 (batching lives in http, not net)**: バッチ処理された `get_many` は HTTP のリクエスト/レスポン
-  ス型を扱うため `std.http`(`cl.get_many`)に属し、`std.net` には**属さない** — ここに置くと net が
-  http に依存することになる(レイヤリング違反/循環依存)。net が公開するのは基盤(task_group +
-  `par_map` ブロッキングプール)のみである。http がこれを実装する際は: このプールを再利用する(リクエ
-  ストごとにスレッドを起こさない)、`max_concurrency` で上限を設ける、1 件のリクエスト失敗はそのスロッ
-  トが Err になるのであってバッチ全体の中断にはしない、ネストした `task_group` によるデッドロックを避
-  ける(#301 の work-claiming の教訓)。
-- **P5 (DNS owned strings deep-drop)**: `resolve` から得られる `array<string>` は各 IP 文字列を
+- **P1 (Move sweep ×3)**: 新設の 3 つの Move Ty は、reader/writer と同じく全パスを漏れなく通す必要がある
+  (`ty_is_move`/`tracks_region`/`null_moved_source`/drop/`MoveCheck`/`EscapeCheck`/`region_of`/finalize/
+  MIR/codegen/print)。最もリスクが高い。漏らせば fd の二重 close かリークになる。
+- **P2 (借用した reader/writer のリージョン, #297)**: `c.reader()`/`writer()` は conn の fd を借用する
+  (`owns_fd:false`)。そのリージョンは Static ではなく必ず `region_of(c)` でなければならない。さもないと
+  reader が conn の `close(fd)` より長生きし、use-after-close になる。`region_of` の分岐を明示的に加え、
+  escape テストを用意する。ここは微妙な点である: reader 自体は Move 型だが、ここでは非所有の借用として
+  振る舞うため、自身の Drop で fd を close してはならない(`owns_fd:false` により close 抑止はランタイム側
+  ですでに処理済みだが、リージョン束縛の方は新規である)。
+- **P3 (fd の二重 close)**: fd を所有するのは conn である。`reader()`/`writer()` の借用は `owns_fd:false`
+  を立て、close するのは conn の Drop だけになるようにする。二重に close する経路がないことを検証する。
+- **P4 (バッチングは net ではなく http にある)**: バッチ化した `get_many` は HTTP のリクエスト/レスポンス
+  型を扱うので、`std.net` ではなく `std.http`(`cl.get_many`)に属する — ここに置くと net が http に依存
+  してしまう(レイヤリング違反、すなわち循環依存)。net が公開するのは基盤(task_group + `par_map` の
+  ブロッキングプール)だけである。http 側で実装するときは、このプールを再利用し(リクエストごとにスレッド
+  を起こさない)、`max_concurrency` で上限を設け、1 件のリクエスト失敗はそのスロットを Err にするだけで
+  バッチ全体を中断させず、ネストした `task_group` によるデッドロックを避ける(#301 の work-claiming の
+  教訓)。
+- **P5 (DNS の所有権付き文字列の deep-drop)**: `resolve` が返す `array<string>` は、各 IP 文字列を
   deep-free しなければならない(`read_dir` #339 のテンプレート)。
-- **P6 (bound-receiver, #337/#338)**: conn/listener/socket は所有権付きの Move である — v1 では束縛さ
-  れていない一時値をレシーバにできない(先に束縛が必要)。`tcp.connect(...).reader()` は
-  Move-temp の drop 対応が実装されるまで拒否される。
+- **P6 (bound-receiver, #337/#338)**: conn/listener/socket は所有権付きの Move なので、v1 では束縛して
+  いない一時値をレシーバにできない(先に束縛する)。`tcp.connect(...).reader()` は Move 一時値の drop
+  対応が入るまで拒否する。
 
 ## Test checklist
 
-- `dns.resolve` の localhost が 127.0.0.1 を含む
-- ローカルの listener へ connect し、reader/writer を通じてバイトを往復させる
+- `dns.resolve` の localhost に 127.0.0.1 が含まれる
+- ローカルの listener へ connect し、reader/writer 経由でバイトを往復させる
 - conn の Drop 後に reader を使う → コンパイルエラー(P2)
-- accept ループが N 個のクライアントを処理する
+- accept ループが N 個のクライアントをさばく
 - udp の `send_to`/`recv_from` の往復
 - fd が二重に close されない(RSS/fd カウントのテストパターン)
-- conn/listener を array の要素にする → 拒否される
-- 束縛されていない一時値をレシーバにする → 拒否される
+- conn/listener を array の要素にする → 拒否
+- 束縛していない一時値をレシーバにする → 拒否
 - import が必須であること
-- (統合テストには、プロセス内で動作するループバック listener が必要 — m9 の io テストハーネスのパターン。)
+- (統合テストにはプロセス内で動くループバック listener が要る — m9 の io テストハーネスのパターン。)
 
-**Note**: v1 はブロッキングプール上のブロッキングソケットである。Non-blocking/epoll/io_uring は同一
-シグネチャの背後にある後日の Linux バックエンドであり、意味論上の変更ではない。
+**Note**: v1 はブロッキングプール上のブロッキングソケットである。Non-blocking/epoll/io_uring は、同じ
+シグネチャの背後に置く後日の Linux バックエンドであって、意味論上の変更ではない。

@@ -5,7 +5,57 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-05 (M10 Slice 2 — std.rand — DONE)._
+_Last updated: 2026-07-04 (M10 Slices 1–2 done; full std design specs + bilingual docs landed;
+docs session: 18-chapter guide rewrite + The Little Aligner, PR #352)._
+
+## ▶ NEXT SESSION — start here
+
+**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merge: #350.
+
+**The single remaining code task in M10 is Slice 3 — `std.cli`.** It is fully designed at
+implementable depth in **`docs/impl/std-design/cli.md`** (read that first — it is the source of
+truth: signatures, the two new Move types `Ty::CliCommand`/`Ty::CliParsed`, effect = Pure, error
+policy = `Error.Invalid` on parse / **runtime abort** on a `get_*` for an unregistered-or-wrong-type
+flag, the 5 pitfalls incl. the Move-sweep, the bound-receiver gate, and the `get_str` view region).
+Implement it the way Slices 1–2 were done (new Move `Ty` swept through every pass, sema dispatch +
+MIR + `align_rt_*` runtime, driver tests), open a PR, wait for the gemini review, reflect it, merge.
+After Slice 3, M10 can be formally closed (like M9 #341), then M11 begins — its five modules
+(net/http/process/compress/crypto) are each already spec'd in `docs/impl/std-design/*.md`.
+
+**Docs session 2026-07-04 (PR #352):** the tutorial `docs/guide/` was rewritten from 6 thin
+chapters into a **full 18-chapter book** (The Book style; every example compiled+run against
+`alignc`; unimplemented surfaces marked "implementation in progress"), and a second learning
+track **`docs/little-aligner/`** was added — a *Little Schemer*-style Q&A drill book (11 chapters
++ Commandments) drilling pipelines/match/Option-Result/Move-arena/SoA/group_by/recursion. Both
+bilingual (EN original + `ja/` mirror, deep-reasoner natural-JA translation); `docs/impl/
+std-design/ja/` and `README.ja.md` retranslated to natural Japanese; English-side cross-links now
+say "Japanese" (not 日本語). Implementation-behavior facts discovered while verifying examples
+(worth knowing when writing docs/tests): `else`-unwrap is **Option-only** (not Result);
+`to_soa()` requires an enclosing `arena {}`; string literals are single-line; `group_by(...).agg`
+/`dict_encode` need a *dynamic* `array<Struct>` source (fixed-size literal arrays are rejected);
+generic fn over generic struct (`fn f<T>(p: Pair<T>)`) not supported yet; `Result<buffer,_>`
+can't be bound to a local (match it directly).
+
+**What landed the previous session (all merged):**
+- M10 Slice 1 `std.encoding` (#346) + Slice 2 `std.rand` (#347) — the last implementation work.
+- **Full std design specs** `docs/impl/std-design/{cli,net,http,process,compress,crypto}.md` (#348) —
+  Opus-implementable depth; **these are the source of truth for implementing each std module.**
+  Notable settled decisions inside: `process.exit` runs cleanup-then-exit (`process.abort()` is the
+  hard-exit escape hatch); `child` Drop reaps via blocking `waitpid` (NOT `SA_NOCLDWAIT` — it breaks
+  `wait()` with `ECHILD`); net's `get_many` lives in `std.http` (net→http would be a layering
+  violation); http v1 is plaintext-only (HTTPS deferred, `https://` rejected not silently downgraded);
+  crypto borrows a constant-time-audited engine, `constant_time_equal` the one self-host.
+- **Hands-on tutorial** `docs/guide/` 00–05 (#349) + **bilingual mirrors** `docs/guide/ja/` and
+  `docs/impl/std-design/ja/` + `README.ja.md`, cross-linked (#350).
+- **README streamlined + CLAUDE.md refreshed** (#350): the language rule now allows **bilingual
+  user-facing docs** (guide + std-design keep an English original + a `ja/` mirror; core spec, code,
+  identifiers, diagnostics, commits stay English — English is authoritative, `ja/` must not drift).
+  CLAUDE.md's redundant M0–M4 blow-by-blow narrative was removed (roadmap is the milestone truth).
+
+**Out-of-repo (NOT in git, on this machine only):** two Japanese learning docs the user asked for,
+at `/home/hiro/prj/learning/` — `alignc-compiler-guide.md` (how this compiler is built, with general
+compiler theory) and `rust-primer.md` (Rust basics oriented toward reading alignc). These are the
+user's personal study material; they do not travel with `git clone`.
 
 ## M10 — std (encoding / rand / cli) — design settled (2026-07-04); Slices 1–2 (encoding, rand) DONE
 

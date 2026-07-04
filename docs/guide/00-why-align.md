@@ -1,8 +1,10 @@
 # Why Align
 
-> 🌐 **English** · [日本語](./ja/00-why-align.md)
+> 🌐 **English** · [Japanese](./ja/00-why-align.md)
 
-Align is an AOT-compiled, data-oriented language. Before the syntax, the mindset — because Align asks you to write differently than a scalar, object-oriented language does.
+Align is an AOT-compiled, data-oriented programming language. Before the syntax, the mindset — because Align asks you to write differently than a scalar, object-oriented language does.
+
+> **Status.** Align is pre-release. The compiler (`alignc`) builds real native executables, and everything in this book compiles and runs today unless a section is explicitly marked **implementation in progress** — those parts are designed (the design lives in the spec) but not built yet, and the book says so wherever it applies. There is no stability promise: pre-release, the language changes outright, with no deprecation cycles.
 
 ## Four-way alignment
 
@@ -22,9 +24,15 @@ The center of Align is not the object — it is the array. Real programs spend t
 
 ## What this means when you write Align
 
-- You will write very few explicit loops. You describe the transformation, not the iteration.
+- You will write very few explicit loops. In fact Align has **no loop keyword at all**: you describe transformations as pipelines, and for the rare genuinely sequential process you use recursion.
 - You will not manage memory by hand, but you will decide *where* data lives (a value, an arena, the heap).
 - You will handle errors as values, with `?`, not with try/catch.
 - You will lay data out as structure-of-arrays when it's processed in bulk, and the compiler rewards you for it.
 
-The rest of this guide teaches those four habits in order.
+## How to read this book
+
+Chapters 01–05 get you writing programs: the toolchain, the expression-oriented core, data modeling, errors, and memory. Chapters 06–12 are the heart of the language: pipelines, strings, JSON, generics and modules, closures and parallelism, data-oriented layout, and explicit SIMD. Chapters 13–16 cover the standard library and the edges (unsafe, FFI, tooling). Chapter 17 closes with the idioms that make Align code fast and idiomatic.
+
+Prefer learning by drilling? [The Little Aligner](../little-aligner/README.md) teaches the same material as a question-and-answer workbook, in the style of *The Little Schemer*.
+
+Every code block in this book is real: it compiles with today's `alignc` unless marked otherwise.

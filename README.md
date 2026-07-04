@@ -1,6 +1,6 @@
 # Align
 
-> 🌐 **English** · [日本語](./README.ja.md)
+> 🌐 **English** · [Japanese](./README.ja.md)
 
 Align is an AOT-compiled, data-oriented programming language. It aligns four readers at once — the **human** who writes the code, the **AI** that generates it, the **compiler** that optimizes it, and the **hardware** that runs it.
 
@@ -38,7 +38,9 @@ fn main() -> i32 {
 
 New to the language? Start with the guide — a hands-on introduction to thinking and writing in Align:
 
-**[Tutorial (English)](docs/guide/README.md)** · **[チュートリアル(日本語)](docs/guide/ja/README.md)**
+**[Tutorial (English)](docs/guide/README.md)** · **[Tutorial (Japanese)](docs/guide/ja/README.md)**
+
+Prefer drills? **[The Little Aligner](docs/little-aligner/README.md)** ([Japanese](docs/little-aligner/ja/README.md)) teaches the same idioms as a Q&A workbook, in the style of *The Little Schemer*.
 
 ## Build & run
 
@@ -64,7 +66,8 @@ The default build uses a **safe, portable per-architecture baseline** (`x86-64-v
 ## Layout
 
 - `draft.md` — authoritative language specification
-- `docs/guide/` — hands-on tutorial (English + 日本語)
+- `docs/guide/` — hands-on tutorial, 18 chapters (English + Japanese)
+- `docs/little-aligner/` — Q&A drill workbook in the style of *The Little Schemer* (English + Japanese)
 - `docs/` — design rationale, history, non-goals, open questions
 - `docs/impl/` — compiler implementation plan + std module design specs
 - `crates/` — the `alignc` compiler workspace
