@@ -6,7 +6,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-04 (M10 Slices 1–2 done; full std design specs + bilingual docs landed;
-docs session: 18-chapter guide rewrite + The Little Aligner, PR #352)._
+docs session: 18-chapter guide rewrite + The Little Aligner #352; core-design library docs #353)._
 
 ## ▶ NEXT SESSION — start here
 
@@ -22,7 +22,7 @@ MIR + `align_rt_*` runtime, driver tests), open a PR, wait for the gemini review
 After Slice 3, M10 can be formally closed (like M9 #341), then M11 begins — its five modules
 (net/http/process/compress/crypto) are each already spec'd in `docs/impl/std-design/*.md`.
 
-**Docs session 2026-07-04 (PR #352):** the tutorial `docs/guide/` was rewritten from 6 thin
+**Docs session 2026-07-04 (PRs #352, #353):** the tutorial `docs/guide/` was rewritten from 6 thin
 chapters into a **full 18-chapter book** (The Book style; every example compiled+run against
 `alignc`; unimplemented surfaces marked "implementation in progress"), and a second learning
 track **`docs/little-aligner/`** was added — a *Little Schemer*-style Q&A drill book (11 chapters
@@ -35,6 +35,14 @@ say "Japanese" (not 日本語). Implementation-behavior facts discovered while v
 /`dict_encode` need a *dynamic* `array<Struct>` source (fixed-size literal arrays are rejected);
 generic fn over generic struct (`fn f<T>(p: Pair<T>)`) not supported yet; `Result<buffer,_>`
 can't be bound to a local (match it directly).
+
+**PR #353 (same session):** `docs/impl/core-design/` — core library surface docs at std-design
+depth (README + option-result / array-slice-pipeline / string / json / soa-groupby / vec-mask /
+arena-heap / hash, EN + `ja/`). Records verified-implemented surface incl. `hash64`/`hash128`,
+str `find`/`rfind`/`eq_ignore_ascii_case`, string range slicing, scalar math methods — and the
+not-implemented set (`split`/`find_any`, `bitset`, `json.scan`/`validate`/`token`/`field_table`,
+non-scalar box payloads). draft.md §18.1 points there for status; CLAUDE.md docs map + bilingual
+rule updated; guide ch07 string-method list corrected (EN+JA).
 
 **What landed the previous session (all merged):**
 - M10 Slice 1 `std.encoding` (#346) + Slice 2 `std.rand` (#347) — the last implementation work.
