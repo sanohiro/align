@@ -1700,7 +1700,7 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
     toward sequential/vectorized, and (P1) specialize the chunk body in MIR/codegen so the per-element
     thunk disappears. Reinforces the "make the fast shape the normal rail, warn when it falls off"
     direction (and the Profile-guided perf-lints bullet above). **Reference pointer (recorded
-    2026-07-04, external design-note review adoption):** Futhark's defunctionalisation (Henriksen
+    2026-07-04, external design-note review adoption):** Futhark's defunctionalisation (Hovgaard
     et al., 2018) — compile higher-order functions to static data + inlined dispatch so pipelines
     stay vectorizable; prior art for the thunk-erasing specialization (Align's non-escaping lambdas
     already take the same shape: inlined, captures-as-parameters).
@@ -2726,8 +2726,8 @@ an independent scalar oracle across a 64-byte-boundary padding sweep, prefilter 
 deterministic randomized cross-check (the JSON-index `json_decode_index_simd_matches_scalar_oracle`
 discipline). Converges with the `core.string` byte-first-APIs plan above (P0 memchr/memmem-backed).
 Provenance: surfaced by an external idea review (2026-07-02); verified. **Reference pointer
-(recorded 2026-07-04, external design-note review adoption):** Faro & Lecroq's SIMD-filter
-substring-search family — confirms the shipped approach (simple wide compare-and-filter beats
+(recorded 2026-07-04, external design-note review adoption):** Faro & Külekci's SIMD-filter
+substring-search family (EPSM class) — confirms the shipped approach (simple wide compare-and-filter beats
 Boyer-Moore-style skipping on modern hardware); no code change implied.
 
 ### Relative (offset) pointers inside arenas (external idea review, 2026-07-02)
