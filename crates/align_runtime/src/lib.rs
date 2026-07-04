@@ -4196,7 +4196,7 @@ fn base64_decode_impl(input: &[u8], url: bool) -> Option<Vec<u8>> {
     }
     // When padding is present it must bring the group to a multiple of 4 (RFC 4648); when absent,
     // an unpadded (URL-safe or stripped) input is accepted as-is.
-    if pads > 0 && (content.len() + pads) % 4 != 0 {
+    if pads > 0 && !(content.len() + pads).is_multiple_of(4) {
         return None;
     }
     let mut out: Vec<u8> = Vec::with_capacity(content.len() / 4 * 3 + 2);

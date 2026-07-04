@@ -109,12 +109,11 @@ fn front_to_mir(path: &str) -> Option<align_mir::Program> {
     let src = read(path)?;
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, path, &src);
-    if checked.diags.has_errors() {
-        print!("{}", format_diagnostics(&sm, &checked.diags));
-        return None;
-    }
     if !checked.diags.is_empty() {
-        print!("{}", format_diagnostics(&sm, &checked.diags));
+        eprint!("{}", format_diagnostics(&sm, &checked.diags));
+    }
+    if checked.diags.has_errors() {
+        return None;
     }
     Some(lower_to_mir(&checked.hir))
 }
@@ -148,7 +147,7 @@ fn run_check(path: &str) -> ExitCode {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, path, &src);
     if !checked.diags.is_empty() {
-        print!("{}", format_diagnostics(&sm, &checked.diags));
+        eprint!("{}", format_diagnostics(&sm, &checked.diags));
     }
     if checked.diags.has_errors() {
         ExitCode::FAILURE

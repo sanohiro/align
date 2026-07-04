@@ -3006,7 +3006,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_in_bounds_gep(self.ctx.i8_type(), ptr, &[byte_off], "colptr")
                         .map_err(|e| self.err(e))?
                 };
-                let agg = self.builder.build_insert_value(sty.get_undef(), new_ptr, 0, "colptr").map_err(|e| self.err(e))?.into_struct_value();
+                let agg = self.builder.build_insert_value(sty.get_poison(), new_ptr, 0, "colptr").map_err(|e| self.err(e))?.into_struct_value();
                 self.builder.build_insert_value(agg, len, 1, "collen").map_err(|e| self.err(e))?.into_struct_value().into()
             }
             Rvalue::OptionSome(op) => {
@@ -3016,7 +3016,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let oty = option_struct_type(self.ctx, s, self.struct_types, self.enum_types);
                 let payload = self.operand(op);
                 let tag = self.ctx.i8_type().const_int(1, false);
-                // Start zeroed (not undef): an owned (Move) payload's drop frees the payload field
+                // Start zeroed (not poison): an owned (Move) payload's drop frees the payload field
                 // null-safely, so the inactive arm must read as {null,0}, not garbage (slice 8a).
                 let agg = self
                     .builder
@@ -3363,7 +3363,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // Build `<n x elem>` via an insertelement chain over a poison vector (M6).
             Rvalue::MakeVec { elems, elem, n } => {
                 let vty = vec_llvm_ty(self.ctx, *elem, *n).into_vector_type();
-                let mut acc = vty.get_undef();
+                let mut acc = vty.get_poison();
                 for (i, op) in elems.iter().enumerate() {
                     let val = self.operand(op);
                     let idx = self.ctx.i32_type().const_int(i as u64, false);
@@ -3491,7 +3491,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let sizes = self.soa_field_sizes(*struct_id);
                 let st = self.struct_types[*struct_id as usize];
                 let fields = &self.structs[*struct_id as usize].fields;
-                let mut acc = st.get_undef();
+                let mut acc = st.get_poison();
                 for (f, field) in fields.iter().enumerate() {
                     let off = self.soa_column_offset(len, &sizes, f)?;
                     let col_base = unsafe {
@@ -3523,9 +3523,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_load(st, ep, "idxp").map_err(|e| self.err(e))?
             }
             Rvalue::MakeTuple { tuple_id, elems } => {
-                // Build the tuple aggregate by inserting each element into an undef struct.
+                // Build the tuple aggregate by inserting each element into a poison struct.
                 let st = self.tuple_types[*tuple_id as usize];
-                let mut agg = st.get_undef();
+                let mut agg = st.get_poison();
                 for (i, el) in elems.iter().enumerate() {
                     let v = self.operand(el);
                     agg = self
@@ -3554,7 +3554,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let sty = slice_struct_type(self.ctx);
                 let agg = self
                     .builder
-                    .build_insert_value(sty.get_undef(), ptr0, 0, "slcptr")
+                    .build_insert_value(sty.get_poison(), ptr0, 0, "slcptr")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 let len = self.ctx.i64_type().const_int(*n as u64, false);
@@ -3620,7 +3620,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let sty = slice_struct_type(self.ctx);
                 let agg = self
                     .builder
-                    .build_insert_value(sty.get_undef(), p, 0, "arrptr")
+                    .build_insert_value(sty.get_poison(), p, 0, "arrptr")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 self.builder
@@ -3775,7 +3775,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_in_bounds_gep(spec_ty.array_type(k as u32), specs_arr, &[i64t.const_zero(), i64t.const_int(j as u64, false)], "gmspec")
                             .map_err(|e| self.err(e))?
                     };
-                    let mut spec_val = spec_ty.get_undef();
+                    let mut spec_val = spec_ty.get_poison();
                     spec_val = self.builder.build_insert_value(spec_val, i64t.const_int(val_off, false), 0, "gmvoff").map_err(|e| self.err(e))?.into_struct_value();
                     spec_val = self.builder.build_insert_value(spec_val, i64t.const_int(op_tag, false), 1, "gmop").map_err(|e| self.err(e))?.into_struct_value();
                     spec_val = self.builder.build_insert_value(spec_val, self.operand(out), 2, "gmout").map_err(|e| self.err(e))?.into_struct_value();
@@ -3837,7 +3837,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let s = self.operand(source);
                 let i = self.operand(ids);
                 let d = self.operand(dict);
-                let agg = self.builder.build_insert_value(ty.get_undef(), s, 0, "encsrc").map_err(|e| self.err(e))?.into_struct_value();
+                let agg = self.builder.build_insert_value(ty.get_poison(), s, 0, "encsrc").map_err(|e| self.err(e))?.into_struct_value();
                 let agg = self.builder.build_insert_value(agg, i, 1, "encids").map_err(|e| self.err(e))?.into_struct_value();
                 self.builder.build_insert_value(agg, d, 2, "encdict").map_err(|e| self.err(e))?.into_struct_value().into()
             }
@@ -3926,7 +3926,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let sty = slice_struct_type(self.ctx);
                 let r = self
                     .builder
-                    .build_insert_value(sty.get_undef(), out_buf, 0, "pmptr")
+                    .build_insert_value(sty.get_poison(), out_buf, 0, "pmptr")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 self.builder
@@ -3940,7 +3940,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let sty = slice_struct_type(self.ctx);
                 let agg = self
                     .builder
-                    .build_insert_value(sty.get_undef(), ptr, 0, "strptr")
+                    .build_insert_value(sty.get_poison(), ptr, 0, "strptr")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 self.builder
@@ -4620,7 +4620,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let sty = slice_struct_type(self.ctx);
                 let s0 = self
                     .builder
-                    .build_insert_value(sty.get_undef(), newptr, 0, "subvptr")
+                    .build_insert_value(sty.get_poison(), newptr, 0, "subvptr")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
                 self.builder
@@ -5551,10 +5551,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // mask broadcasts lane 0 to every lane — two instructions regardless of width `N`.
         let scalar = self.operand(op);
         let vty = vec_llvm_ty(self.ctx, elem, n).into_vector_type();
-        let undef = vty.get_undef();
-        let init = self.builder.build_insert_element(undef, scalar, self.ctx.i32_type().const_zero(), "splat_init").map_err(|e| self.err(e))?;
+        let poison = vty.get_poison();
+        let init = self.builder.build_insert_element(poison, scalar, self.ctx.i32_type().const_zero(), "splat_init").map_err(|e| self.err(e))?;
         let mask = self.ctx.i32_type().vec_type(n).const_zero();
-        self.builder.build_shuffle_vector(init, undef, mask, "splat").map_err(|e| self.err(e))
+        self.builder.build_shuffle_vector(init, poison, mask, "splat").map_err(|e| self.err(e))
     }
 
     /// Sum the `n` lanes of a vector into the element scalar (M6 reductions — `sum_where`, `dot`).
