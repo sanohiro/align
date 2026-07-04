@@ -5,23 +5,40 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-04 (M10 Slices 1–2 done; full std design specs + bilingual docs landed;
-docs session: 18-chapter guide rewrite + The Little Aligner #352; core-design library docs #353)._
+_Last updated: 2026-07-04 (M10 CLOSED: Slice 3 std.cli shipped #356; external design-note import
+completed #355; previous same-day: guide/Little Aligner #352, core-design docs #353)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merge: #350.
+**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #355 (docs), #356
+(std.cli), plus the M10-close docs PR.
 
-**The single remaining code task in M10 is Slice 3 — `std.cli`.** It is fully designed at
-implementable depth in **`docs/impl/std-design/cli.md`** (read that first — it is the source of
-truth: signatures, the two new Move types `Ty::CliCommand`/`Ty::CliParsed`, effect = Pure, error
-policy = `Error.Invalid` on parse / **runtime abort** on a `get_*` for an unregistered-or-wrong-type
-flag, the 5 pitfalls incl. the Move-sweep, the bound-receiver gate, and the `get_str` view region).
-Implement it the way Slices 1–2 were done (new Move `Ty` swept through every pass, sema dispatch +
-MIR + `align_rt_*` runtime, driver tests), open a PR, wait for the `gemini-code-assist` review,
-reflect it, merge.
-After Slice 3, M10 can be formally closed (like M9 #341), then M11 begins — its five modules
-(net/http/process/compress/crypto) are each already spec'd in `docs/impl/std-design/*.md`.
+**M10 is COMPLETE and formally closed** (Slice 1 `std.encoding` #346, Slice 2 `std.rand` #347,
+Slice 3 `std.cli` #356 — see the roadmap's M10 section for the shipped-feature summary).
+`cargo test --workspace` ≈ **1349 green**.
+
+**Next: M11 — `std.net` / `std.http` / `std.process` / `std.compress` / `std.crypto`.** Each is
+already spec'd at implementable depth in **`docs/impl/std-design/*.md`** (the source of truth per
+module). Before implementing, settle the recorded blockers per the roadmap's M11+ deferral list:
+`std.process` needs the `process.exit` Drop/arena-cleanup Open item settled
+(`docs/open-questions.md` Open); `std.crypto` needs its constant-time requirement *verified* (not
+just specified); `std.http` depends on TLS (FFI engine) and is plaintext-only v1; `std.compress`
+depends on `libzstd`/`zlib-ng` (FFI). `std.net` is the natural first slice (new Move socket type,
+no external engine). Follow the M10 pattern: one module per PR, Move-sweep discipline,
+`/align-self-review`, gemini review reflected before merge (until its 2026-07-17 sunset).
+
+**std.cli slice 3 notes (2026-07-04, #356):** two new Move types `Ty::CliCommand`/`Ty::CliParsed` +
+`Scalar::CliParsed` payload; `parse` borrows the command (usage callable after `Err`); `get_*`
+total-or-abort (the #345 policy); `get_str` = Frame-capped view (#297 arm). Review-driven
+refinement: cli method names live as **type-guarded arms in the tail method match** (`trim`/
+`map_err` shape) — same-named methods on other types fall through to normal resolution (the rng
+eager-error pre-block from #347 predates this and was left as-is; consider aligning it if it ever
+matters). Deferred behind the same signatures: richer argv (`-x` clustering, `--`, positionals),
+struct-decode (waits for derive).
+
+**External design-note import COMPLETE (#355 + earlier same-day adoptions):** the out-of-repo memo
+`~/prj/std_simd_design_notes.md` is now fully digested into `docs/open-questions.md` ("external
+design-note review adoption" entries); the memo file is no longer load-bearing and may be discarded.
 
 **Docs session 2026-07-04 (PRs #352, #353):** the tutorial `docs/guide/` was rewritten from 6 thin
 chapters into a **full 18-chapter book** (The Book style; every example compiled+run against
@@ -67,7 +84,10 @@ at `/home/hiro/prj/learning/` — `alignc-compiler-guide.md` (how this compiler 
 compiler theory) and `rust-primer.md` (Rust basics oriented toward reading alignc). These are the
 user's personal study material; they do not travel with `git clone`.
 
-## M10 — std (encoding / rand / cli) — design settled (2026-07-04); Slices 1–2 (encoding, rand) DONE
+## M10 — std (encoding / rand / cli) — DONE (2026-07-04, formally closed)
+
+**Slice 3 — std.cli — DONE (#356).** See "▶ NEXT SESSION" above for the slice notes; full record in
+the roadmap's M10 section.
 
 **Slice 2 — std.rand — DONE.** Copy `rng` ([`Ty::Rng`] = Xoshiro256++ `[4 x i64]`, value not Move —
 never on the move/drop/escape path); `rand.seed()` (OS `getrandom`, abort on the rare failure) /
