@@ -515,6 +515,10 @@ pub enum Rvalue {
     /// `fs.read_dir(path)` — the entry names of directory `path` as an owned `array<string>`
     /// (`{ptr,len}`) written into `out`. Yields an `i32` errno-status (0 = ok).
     FsReadDir { path: Operand, out: Slot },
+    /// `dns.resolve(host)` — the IP-address strings of `host` as an owned `array<string>`
+    /// (`{ptr,len}`) written into `out`. Yields an `i32` status (0 = ok). Same shape as
+    /// [`Rvalue::FsReadDir`].
+    DnsResolve { host: Operand, out: Slot },
     /// `fs.read_file_view(path)` — mmap the regular file `path` read-only into `arena`, writing the
     /// `str` view `{ptr,len}` into `out`. Yields an `i32` errno-status (0 = ok). The mapping is
     /// `munmap`ped at arena end (the region rule) — no `Drop`.
@@ -1480,6 +1484,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `fs.read_dir(path)` yields `Result<array<string>, Error>` — the same out-slot shape as
         // `fs.read_file`, with an owned `DynArray(String)` payload.
         hir::ExprKind::FsReadDir { path } => lower_fs_read_dir(b, path, e.ty),
+        // `dns.resolve(host)` yields `Result<array<string>, Error>` — identical lowering to
+        // `fs.read_dir` (owned `DynArray(String)` payload, deep-`Drop`), only the runtime call differs.
+        hir::ExprKind::DnsResolve { host } => lower_dns_resolve(b, host, e.ty),
         // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
         // runtime registers the mmap for `munmap` at arena end.
         hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
@@ -4658,6 +4665,47 @@ fn lower_fs_read_dir(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operan
     let p = lower_expr(b, path);
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::FsReadDir { path: p, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the materialized `{ptr,len}` owned array and wrap it (it owns its buffers now).
+    b.cur = ok_bb;
+    let a = b.fresh_value(arr_ty);
+    b.push(Stmt::Let(a, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(a))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (`{null,0}`) → nothing to free; map the status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `dns.resolve(host)` → the runtime writes the owned `array<string>` `{ptr,len}` into an out slot
+/// and returns a status; branch `Ok(<array>)` / `Err(<mapped status>)`. Identical to
+/// [`lower_fs_read_dir`] except for the runtime call — same `DynArray(String)` payload + deep `Drop`.
+fn lower_dns_resolve(b: &mut Builder, host: &hir::Expr, result_ty: Ty) -> Operand {
+    let arr_ty = Ty::DynArray(align_sema::Scalar::String);
+    let out = b.new_slot(arr_ty);
+    let h = lower_expr(b, host);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::DnsResolve { host: h, out }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));

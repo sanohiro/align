@@ -674,6 +674,11 @@ pub enum ExprKind {
     /// `array<string>` (each element owns its buffer; a **deep** `Drop`). The `ty` is
     /// `Result<array<string>, Error>`. Owned/returnable (borrows nothing). Impure.
     FsReadDir { path: Box<Expr> },
+    /// `dns.resolve(host)` (`std.net`) — resolve `host` to its IP-address strings via `getaddrinfo`,
+    /// as a freshly heap-allocated owned `array<string>` (each element owns its buffer; a **deep**
+    /// `Drop`, identical to [`FsReadDir`]). The `ty` is `Result<array<string>, Error>`.
+    /// Owned/returnable (borrows nothing). Impure (a name-resolution syscall).
+    DnsResolve { host: Box<Expr> },
     /// `fs.read_file_view(path)` — mmap the regular file at `path` read-only into the enclosing arena,
     /// yielding a `str` view of its bytes. Requires an enclosing `arena {}` (like `heap.new`); the
     /// region is bound to the arena, and `munmap` runs at arena end. The `ty` is `Result<str, Error>`.

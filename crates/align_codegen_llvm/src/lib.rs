@@ -665,6 +665,11 @@ fn build_module<'c>(
         module.add_function("align_rt_fs_read_dir", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
     );
     funcs.insert(
+        // dns.resolve (host_ptr, host_len, out: *{ptr,len}) -> i32 status (owned array<string>).
+        "dns_resolve".to_string(),
+        module.add_function("align_rt_dns_resolve", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
         // fs.read_file_view (path_ptr, path_len, arena: *Arena, out: *{ptr,len}) -> i32 errno-status.
         "fs_read_file_view".to_string(),
         module.add_function("align_rt_fs_read_file_view", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false), None),
@@ -4295,6 +4300,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["fs_read_dir"], &[p_ptr.into(), p_len.into(), out_ptr.into()], "frd")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_read_dir returns i32")
+            }
+            // dns.resolve — write the owned array<string> `{ptr,len}` into `out`, return i32 status.
+            Rvalue::DnsResolve { host, out } => {
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let (h_ptr, h_len) = self.split_str(host)?;
+                self.builder
+                    .build_call(self.funcs["dns_resolve"], &[h_ptr.into(), h_len.into(), out_ptr.into()], "dnsr")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("dns_resolve returns i32")
             }
             // fs.read_file_view — mmap into the arena, write the str view `{ptr,len}` into `out`,
             // return i32 status.

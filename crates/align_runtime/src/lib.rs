@@ -395,6 +395,161 @@ pub unsafe extern "C" fn align_rt_free_string_array(ptr: *mut u8, len: i64) {
     unsafe { align_rt_free(ptr) };
 }
 
+// --- dns.resolve (std.net Slice 1) ------------------------------------------------------------
+
+// `getaddrinfo`'s `struct addrinfo`. Only `ai_family`, `ai_addr` and `ai_next` are read (and
+// `ai_family`/`ai_socktype` written into the hints); the rest are present for the C layout.
+// Glibc/Linux orders `ai_addr` before `ai_canonname`; macOS/BSD swap them — cfg the two pointer
+// fields so the offsets are correct on both.
+#[repr(C)]
+#[allow(dead_code)]
+struct AddrInfo {
+    ai_flags: i32,
+    ai_family: i32,
+    ai_socktype: i32,
+    ai_protocol: i32,
+    ai_addrlen: u32, // socklen_t
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    ai_addr: *mut u8,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    ai_canonname: *mut u8,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    ai_canonname: *mut u8,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    ai_addr: *mut u8,
+    ai_next: *mut AddrInfo,
+}
+
+const AF_UNSPEC: i32 = 0;
+const AF_INET: i32 = 2; // identical on Linux and macOS/BSD
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const AF_INET6: i32 = 10; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const AF_INET6: i32 = 30; // macOS/BSD
+const SOCK_STREAM: i32 = 1; // identical on Linux and macOS/BSD
+/// Buffer size for an IPv6 numeric string incl. the NUL (`INET6_ADDRSTRLEN`).
+const INET6_ADDRSTRLEN: usize = 46;
+
+// `getaddrinfo` failure codes (EAI_*) — NOT `errno`; their numeric values differ per platform.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const EAI_NONAME: i32 = -2; // glibc: the name does not resolve
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const EAI_NODATA: i32 = -5; // glibc: the name is valid but has no address
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const EAI_NONAME: i32 = 8;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const EAI_NODATA: i32 = 7;
+
+/// Map a `getaddrinfo` EAI_* return code (not an `errno`) to the shared status encoding
+/// ([`io_error_to_status`] table): a definitive "no such host" (`EAI_NONAME`/`EAI_NODATA`) is a bad
+/// name → `Error.Invalid` (`AL_INVALID`); every other failure (`EAI_AGAIN` transient, `EAI_FAIL`,
+/// `EAI_MEMORY`, `EAI_SYSTEM`, …) carries the code's magnitude as `Error.Code` (`AL_CODE + |eai|`,
+/// kept above the category sentinels). Never aborts.
+fn eai_to_status(eai: i32) -> i32 {
+    if eai == EAI_NONAME || eai == EAI_NODATA {
+        AL_INVALID
+    } else {
+        AL_CODE.saturating_add(eai.saturating_abs())
+    }
+}
+
+/// `dns.resolve(host)` — resolve `host` to its IP-address strings via `getaddrinfo`, writing an
+/// owned `array<string>` `{ptr,len}` (each element an owned numeric IP string) into `out`. Both
+/// IPv4 (A) and IPv6 (AAAA) results are returned, formatted with `inet_ntop`; exact-duplicate
+/// strings are removed (the hints pin `SOCK_STREAM` so `getaddrinfo` returns one entry per address
+/// rather than one per socktype — the dedup is a defensive second guard). Returns `0` on success,
+/// else a status the shared table maps: `AL_INVALID` for a definitive bad name (a non-UTF-8 view,
+/// an interior NUL, `EAI_NONAME`/`EAI_NODATA`, or a resolve that yields no A/AAAA address),
+/// otherwise `AL_CODE + |eai|` (`Error.Code` — transient/other failures). Leaves `out = {null,0}`
+/// on failure. `freeaddrinfo` runs on the success path (no leak). The array is deep-`Drop`-freed
+/// by [`align_rt_free_string_array`] (each IP string, then the header).
+///
+/// # Safety
+/// `host` must describe a valid byte range for `host_len`; `out` must point to a writable
+/// `{ptr,len}` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_dns_resolve(host: *const u8, host_len: i64, out: *mut AlignStr) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+    // Copy the host view into an owned `String` (rejects a non-UTF-8 / oversized `host_len` — no
+    // `i64 as usize`), then into a NUL-terminated `CString` for `getaddrinfo`. An interior NUL is a
+    // bad name (`Error.Invalid`), not a panic.
+    let Some(host_str) = (unsafe { path_from_view(host, host_len) }) else {
+        return AL_INVALID;
+    };
+    let Ok(c_host) = std::ffi::CString::new(host_str) else {
+        return AL_INVALID; // interior NUL
+    };
+
+    // hints: AF_UNSPEC (both A and AAAA), SOCK_STREAM (one entry per address, not per socktype).
+    let mut hints: AddrInfo = unsafe { core::mem::zeroed() };
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    let mut res: *mut AddrInfo = core::ptr::null_mut();
+    let rc = unsafe { getaddrinfo(c_host.as_ptr() as *const u8, core::ptr::null(), &hints, &mut res) };
+    if rc != 0 {
+        return eai_to_status(rc);
+    }
+
+    // Walk the result list, formatting each address. `freeaddrinfo(res)` is called before any
+    // return below (success or an alloc-guard bail-out) — the list is always freed.
+    let mut ips: Vec<Vec<u8>> = Vec::new();
+    let mut cur = res;
+    while !cur.is_null() {
+        let ai = unsafe { &*cur };
+        // The numeric address sits at a fixed byte offset inside `sockaddr`: `sin_addr` at +4
+        // (AF_INET), `sin6_addr` at +8 (AF_INET6) — identical on Linux and macOS/BSD. Any other
+        // family is skipped.
+        let (af, off) = if ai.ai_family == AF_INET {
+            (AF_INET, 4usize)
+        } else if ai.ai_family == AF_INET6 {
+            (AF_INET6, 8usize)
+        } else {
+            cur = ai.ai_next;
+            continue;
+        };
+        if !ai.ai_addr.is_null() {
+            let src = unsafe { ai.ai_addr.add(off) } as *const core::ffi::c_void;
+            let mut buf = [0u8; INET6_ADDRSTRLEN];
+            let p = unsafe { inet_ntop(af, src, buf.as_mut_ptr(), buf.len() as u32) };
+            if !p.is_null() {
+                // `inet_ntop` writes a NUL-terminated string — take the bytes up to the NUL.
+                let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                let s = &buf[..n];
+                if !ips.iter().any(|e| e.as_slice() == s) {
+                    ips.push(s.to_vec());
+                }
+            }
+        }
+        cur = ai.ai_next;
+    }
+    unsafe { freeaddrinfo(res) };
+
+    let n = ips.len();
+    if n == 0 {
+        // The name resolved but yielded no usable A/AAAA address — a definitive no-address.
+        return AL_INVALID;
+    }
+    // Header buffer: `n` `AlignStr` entries. `checked_mul` guards a 32-bit size overflow.
+    let Some(hdr_bytes) = n.checked_mul(core::mem::size_of::<AlignStr>()).and_then(|b| i64::try_from(b).ok()) else {
+        return AL_INVALID;
+    };
+    let hdr = align_rt_alloc(hdr_bytes) as *mut AlignStr;
+    for (i, ip) in ips.into_iter().enumerate() {
+        let len = ip.len() as i64;
+        let dst = align_rt_alloc(len); // null for a 0-length string — harmless free at Drop
+        if len > 0 {
+            unsafe { core::ptr::copy_nonoverlapping(ip.as_ptr(), dst, ip.len()) };
+        }
+        unsafe { *hdr.add(i) = AlignStr { ptr: dst, len } };
+    }
+    unsafe { *out = AlignStr { ptr: hdr as *const u8, len: n as i64 } };
+    0
+}
+
 /// Read the whole file at `path` into a fresh **arena** allocation, writing a `{ptr,len}` view to
 /// `out` — the [`align_rt_fs_read_file_view`] fallback for special / zero-length files. Returns `0`
 /// or a mapped errno; an empty file yields `{null,0}`. Unlike `fs.read_file` (heap-owned,
@@ -5337,6 +5492,13 @@ unsafe extern "C" {
     //   be a link error there.
     #[cfg(target_os = "macos")]
     fn getentropy(buf: *mut core::ffi::c_void, buflen: usize) -> i32;
+    // POSIX name resolution for `dns.resolve` (in libc — always linked). `getaddrinfo` fills `res`
+    // with a heap-allocated `addrinfo` list, returning 0 on success or a nonzero EAI_* code (NOT an
+    // `errno`); `freeaddrinfo` releases that list. `inet_ntop` formats an in_addr/in6_addr (`src`)
+    // into the caller's `dst` buffer, returning `dst` or null on error.
+    fn getaddrinfo(node: *const u8, service: *const u8, hints: *const AddrInfo, res: *mut *mut AddrInfo) -> i32;
+    fn freeaddrinfo(res: *mut AddrInfo);
+    fn inet_ntop(af: i32, src: *const core::ffi::c_void, dst: *mut u8, size: u32) -> *const u8;
 }
 
 // `mmap` protection / flags — the portable POSIX constants (identical on Linux and macOS).
@@ -7843,6 +8005,50 @@ mod tests {
         assert_eq!(unsafe { align_rt_fs_read_dir(mp, ml, &mut o2) }, AL_NOT_FOUND);
         assert!(o2.ptr.is_null());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dns_resolve_localhost_yields_loopback() {
+        let host = "localhost";
+        let (hp, hl) = view_of(host);
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        let rc = unsafe { align_rt_dns_resolve(hp, hl, &mut out) };
+        // A sandbox without any resolver may still map `localhost` via `/etc/hosts`; if even that
+        // fails (no name resolution at all), don't hard-fail the suite — just skip the assertion.
+        if rc != 0 {
+            assert!(out.ptr.is_null(), "a failed resolve leaves out empty");
+            return;
+        }
+        assert!(out.len > 0, "localhost resolves to at least one address");
+        let hdr = out.ptr as *const AlignStr;
+        let mut found_loopback = false;
+        for i in 0..out.len as usize {
+            let e = unsafe { *hdr.add(i) };
+            assert!(!e.ptr.is_null() && e.len > 0, "each IP string is non-empty");
+            let s = std::str::from_utf8(unsafe { safe_slice(e.ptr, e.len) }).expect("inet_ntop output is UTF-8");
+            if s == "127.0.0.1" || s == "::1" {
+                found_loopback = true;
+            }
+        }
+        assert!(found_loopback, "localhost includes a loopback address (127.0.0.1 or ::1)");
+        // Deep free (each IP string + header) — under a leak sanitizer this proves no leak.
+        unsafe { align_rt_free_string_array(out.ptr as *mut u8, out.len) };
+    }
+
+    #[test]
+    fn dns_resolve_null_and_empty_host() {
+        // A null `out` slot is rejected as Error.Invalid, never a crash.
+        assert_eq!(unsafe { align_rt_dns_resolve(b"x".as_ptr(), 1, std::ptr::null_mut()) }, AL_INVALID);
+        // An empty host (len 0 / null ptr) resolves to nothing on any platform — a non-zero status,
+        // no crash, and `out` left empty (no leak). Accept whatever non-success status the resolver
+        // returns; on the off chance it succeeds, free the result.
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        let rc = unsafe { align_rt_dns_resolve(std::ptr::null(), 0, &mut out) };
+        if rc == 0 {
+            unsafe { align_rt_free_string_array(out.ptr as *mut u8, out.len) };
+        } else {
+            assert!(out.ptr.is_null(), "a failed resolve leaves out empty");
+        }
     }
 
     #[test]
