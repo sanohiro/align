@@ -2404,6 +2404,18 @@ impl EffectScan {
                 self.impure_direct = true;
                 self.expr(child);
             }
+            // `ch.kill(sig)` (signal delivery) / `process.exec` (execvp) are impure — excluded from
+            // `par_map`.
+            ExprKind::ChildKill { child, sig } => {
+                self.impure_direct = true;
+                self.expr(child);
+                self.expr(sig);
+            }
+            ExprKind::ProcessExec { cmd, args } => {
+                self.impure_direct = true;
+                self.expr(cmd);
+                self.expr(args);
+            }
             // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data),
             ExprKind::EncodingDecode { input, .. } => self.expr(input),
@@ -3524,6 +3536,16 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(args, depth);
             }
             ExprKind::ChildWait { child } => self.walk(child, depth),
+            // `kill`'s `child` is a borrowed handle + `sig` a scalar; `exec`'s `cmd`/`args` are borrowed
+            // views (nothing escapes) — recurse only.
+            ExprKind::ChildKill { child, sig } => {
+                self.walk(child, depth);
+                self.walk(sig, depth);
+            }
+            ExprKind::ProcessExec { cmd, args } => {
+                self.walk(cmd, depth);
+                self.walk(args, depth);
+            }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
             ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             // `std.rand`: an `rng` is Copy/`Static` (borrows nothing); `sample` returns a fresh owned
@@ -3921,6 +3943,14 @@ impl UnnecessaryHeapScan {
                 self.visit(args);
             }
             ExprKind::ChildWait { child } => self.visit(child),
+            ExprKind::ChildKill { child, sig } => {
+                self.visit(child);
+                self.visit(sig);
+            }
+            ExprKind::ProcessExec { cmd, args } => {
+                self.visit(cmd);
+                self.visit(args);
+            }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.visit(data),
             ExprKind::EncodingDecode { input, .. } => self.visit(input),
             // `std.rand` — recurse into the subexpressions (no heap-narrowing pattern of its own).
@@ -4612,6 +4642,16 @@ impl<'a> MoveCheck<'a> {
                 self.expr(args, moved, false, false);
             }
             ExprKind::ChildWait { child } => self.expr(child, moved, false, false),
+            // `kill` borrows its `child` (only flips the reaped flag through the borrow, like `wait`) and
+            // reads a scalar `sig`; `exec` borrows `cmd`/`args` (never consumed).
+            ExprKind::ChildKill { child, sig } => {
+                self.expr(child, moved, false, false);
+                self.expr(sig, moved, false, false);
+            }
+            ExprKind::ProcessExec { cmd, args } => {
+                self.expr(cmd, moved, false, false);
+                self.expr(args, moved, false, false);
+            }
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data, moved, false, false),
             ExprKind::EncodingDecode { input, .. } => self.expr(input, moved, false, false),
@@ -7559,6 +7599,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.process", "process.spawn", span);
                 return self.check_process_spawn(args, span);
             }
+            // `std.process` — `process.exec(cmd, args)` -> Result<(), Error> (execvp in-place; returns
+            // only on failure — success replaces the image).
+            if module == "process" && method == "exec" {
+                self.require_import("std.process", "process.exec", span);
+                return self.check_process_exec(args, span);
+            }
             // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred).
             if module == "io" && method == "copy" {
                 self.require_import("std.io", "io.copy", span);
@@ -7810,6 +7856,19 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty != Ty::Error {
                 self.diags
                     .error(format!("'.wait()' is not a method on {} (it is a `child` method)", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        // `std.process` — `ch.kill(sig)` on a `child` sends signal `sig` via libc `kill`
+        // (`Result<(), Error>`). Dispatched on the receiver type so the name stays free on other values.
+        if method == "kill" {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::Child {
+                return self.check_child_kill(recv_expr, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.kill()' is not a method on {} (it is a `child` method)", ty_name(recv_expr.ty)), span);
             }
             return err;
         }
@@ -11064,45 +11123,85 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         let cmd = Box::new(self.check_str_init(&args[0]));
-        let argv = self.check_expr(&args[1], None);
-        if cmd.ty == Ty::Error || argv.ty == Ty::Error {
+        let Some(argv) = self.check_argv("process.spawn", &args[1]) else {
+            return err;
+        };
+        if cmd.ty == Ty::Error {
             return err;
         }
-        // `argv` is the child's full argv — a borrowed str-view collection, all forms lowering to a
-        // `{ptr,len}` of `str` views the runtime marshals into C strings. An interior NUL / empty argv
-        // is rejected at runtime (`Error.Invalid`). Accept:
-        //   * `array<str>` (`DynArray(Str)`, e.g. `main(args)`) and `slice<str>` (a sub-range of one,
-        //     so a caller can pass part of its own argv) — already `{ptr,len}` values;
-        //   * a fixed-size `array<str, N>` literal/local (the natural `["/bin/echo", "hi"]` call) —
-        //     borrowed to a `slice<str>` via the same `ArrayToSlice` coercion used for any
-        //     slice-typed argument/binding (`check_slice_init`), which materializes the data-ptr +
-        //     constant len. No new mechanism, no argv copy: the borrow is a `MakeSlice(slot, N)`.
-        let argv = match self.resolve(argv.ty) {
-            Ty::DynArray(Scalar::Str) | Ty::Slice(Scalar::Str) => argv,
+        Expr {
+            kind: ExprKind::ProcessSpawn { cmd, args: Box::new(argv) },
+            ty: Ty::Result(Scalar::Child, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// Check + coerce a `process.spawn` / `process.exec` argv operand into a borrowed str-view
+    /// `{ptr,len}` (`array<str>` / `slice<str>`), the child/new image's **full** argv (incl. argv[0],
+    /// P5). Shared by both call sites so the accepted forms + array→slice borrow stay identical. All
+    /// forms lower to a `{ptr,len}` of `str` views the runtime marshals into C strings; an interior NUL /
+    /// empty argv is rejected at runtime (`Error.Invalid`). Accepts:
+    ///   * `array<str>` (`DynArray(Str)`, e.g. `main(args)`) and `slice<str>` (a sub-range of one, so a
+    ///     caller can pass part of its own argv) — already `{ptr,len}` values;
+    ///   * a fixed-size `array<str, N>` literal/local (the natural `["/bin/echo", "hi"]` call) — borrowed
+    ///     to a `slice<str>` via the same `ArrayToSlice` coercion used for any slice-typed argument
+    ///     (`check_slice_init`), which materializes the data-ptr + constant len. No new mechanism, no
+    ///     argv copy: the borrow is a `MakeSlice(slot, N)`.
+    ///
+    /// Returns `None` (after emitting a diagnostic) on a type/shape error.
+    fn check_argv(&mut self, callee: &str, arg: &ast::Expr) -> Option<Expr> {
+        let argv = self.check_expr(arg, None);
+        if argv.ty == Ty::Error {
+            return None;
+        }
+        match self.resolve(argv.ty) {
+            Ty::DynArray(Scalar::Str) | Ty::Slice(Scalar::Str) => Some(argv),
             Ty::Array(Scalar::Str, _) => {
                 // Same restriction as every array→slice borrow: the source must be an array literal
                 // or a named local (an arbitrary array expression has no materializable slot yet).
                 if !matches!(argv.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
                     self.diags.error(
                         "an array coerced to a slice must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
-                        args[1].span,
+                        arg.span,
                     );
-                    return err;
+                    return None;
                 }
                 let span = argv.span;
-                Expr { kind: ExprKind::ArrayToSlice(Box::new(argv)), ty: Ty::Slice(Scalar::Str), span }
+                Some(Expr { kind: ExprKind::ArrayToSlice(Box::new(argv)), ty: Ty::Slice(Scalar::Str), span })
             }
             _ => {
                 self.diags.error(
-                    format!("'process.spawn' takes the argv as an `array<str>` / `slice<str>` (the full argv incl. argv[0]), got {}", ty_name(argv.ty)),
-                    args[1].span,
+                    format!("'{callee}' takes the argv as an `array<str>` / `slice<str>` (the full argv incl. argv[0]), got {}", ty_name(argv.ty)),
+                    arg.span,
                 );
-                return err;
+                None
             }
+        }
+    }
+
+    /// `process.exec(cmd, args)` (`std.process`) -> `Result<(), Error>` — `execvp(cmd, argv)` **in the
+    /// current process**. On success it replaces the image and never returns; the `Result` is only ever
+    /// observed as `Err` (a mapped `execvp` errno). `cmd` is the borrowed `str` lookup path; `args` is
+    /// the borrowed full argv (incl. argv[0], P5 — same convention as `spawn`). **No cleanup runs on the
+    /// success path** — `execvp` discards the address space, so pending `Drop`s / arena ends / buffered
+    /// writers are lost (flush first if needed); it is abort-class in cleanup terms. Impure. Builtin.
+    fn check_process_exec(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'process.exec' expects 2 arguments (the command path and the argv `array<str>`), got {}", args.len()), span);
+            return err;
+        }
+        let cmd = Box::new(self.check_str_init(&args[0]));
+        let Some(argv) = self.check_argv("process.exec", &args[1]) else {
+            return err;
         };
+        if cmd.ty == Ty::Error {
+            return err;
+        }
         Expr {
-            kind: ExprKind::ProcessSpawn { cmd, args: Box::new(argv) },
-            ty: Ty::Result(Scalar::Child, Scalar::Enum(self.error_enum_id)),
+            kind: ExprKind::ProcessExec { cmd, args: Box::new(argv) },
+            ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
             span,
         }
     }
@@ -11136,6 +11235,57 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::ChildWait { child: Box::new(recv_expr) },
             ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `ch.kill(sig)` on a `child` ([`Ty::Child`]), the receiver already evaluated. Sends signal `sig`
+    /// (an `i64`) to the child via libc `kill`, returning `Result<(), Error>`. Like `wait`, `kill`
+    /// **borrows** the child (never consumed) and is gated to a bound local (an unbound owned-child
+    /// temporary is not `Drop`ped yet, so its pid would never be reaped). `sig` is required to be exactly
+    /// `i64` (like `process.exit`'s code), so the operand matches the runtime `align_rt_child_kill(ch,
+    /// sig: i64)` signature. `sig == 0` is the standard liveness probe; a negative / out-of-range `sig`
+    /// (and killing an already-reaped child, guarded through the borrow) surfaces as a clean `Err` from
+    /// the runtime rather than a stray signal.
+    fn check_child_kill(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 bound-receiver gate (mirrors `check_child_wait`): kill borrows the child, so the receiver
+        // must be a bound local — an unbound owned-child temporary would never be reaped (a zombie).
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the child to a local first, then kill (`ch := process.spawn(...)?` then `ch.kill(sig)`) — a temporary owned child handle is not dropped yet, so its pid would never be reaped".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'.kill()' expects 1 argument (the signal number, i64), got {}", args.len()), span);
+            return err;
+        }
+        let sig = self.check_expr(&args[0], None);
+        if sig.ty == Ty::Error {
+            return err;
+        }
+        // Require *exactly* `i64` (binding a bare int literal's inference var), mirroring `process.exit`
+        // / `time.sleep`: a narrower operand would mismatch the runtime `align_rt_child_kill(ch, i64)`.
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match self.resolve(sig.ty) {
+            Ty::Int(IntTy { bits: 64, signed: true }) => {}
+            Ty::IntVar(_) => self.constrain(sig.ty, Some(i64_ty), args[0].span),
+            other => {
+                self.diags.error(
+                    format!("'.kill()' expects a signal number (i64), got {}", ty_name(other)),
+                    args[0].span,
+                );
+                return err;
+            }
+        }
+        Expr {
+            kind: ExprKind::ChildKill { child: Box::new(recv_expr), sig: Box::new(sig) },
+            ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
             span,
         }
     }
@@ -12736,6 +12886,14 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(args);
             }
             ExprKind::ChildWait { child } => self.finalize_expr(child),
+            ExprKind::ChildKill { child, sig } => {
+                self.finalize_expr(child);
+                self.finalize_expr(sig);
+            }
+            ExprKind::ProcessExec { cmd, args } => {
+                self.finalize_expr(cmd);
+                self.finalize_expr(args);
+            }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
             ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
             ExprKind::RandSeed => {}

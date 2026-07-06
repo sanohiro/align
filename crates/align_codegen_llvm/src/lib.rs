@@ -753,6 +753,19 @@ fn build_module<'c>(
         module.add_function("align_rt_child_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
+        // ch.kill (ch: *Child, sig: i64) -> i32 status (0 = ok; AL_INVALID for a bad sig / reaped child,
+        // else the mapped errno — EPERM/ESRCH). libc kill(pid, sig); sig 0 = liveness probe.
+        "child_kill".to_string(),
+        module.add_function("align_rt_child_kill", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // process.exec (cmd_ptr, cmd_len: i64, args_ptr: *AlignStr, args_len: i64) -> i32 status.
+        // execvp in the CURRENT process: on success it replaces the image and never returns, so this
+        // returns only on failure (the mapped errno; AL_INVALID for a bad cmd/argv).
+        "process_exec".to_string(),
+        module.add_function("align_rt_process_exec", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
         // fs.read_file_view (path_ptr, path_len, arena: *Arena, out: *{ptr,len}) -> i32 errno-status.
         "fs_read_file_view".to_string(),
         module.add_function("align_rt_fs_read_file_view", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false), None),
@@ -4510,6 +4523,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["child_wait"], &[cp], "cwait")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("child_wait returns i64")
+            }
+            // ch.kill — libc kill(pid, sig); return i32 status (0 = ok, AL_INVALID for a bad sig /
+            // reaped child, else the mapped errno). `child` is a *Child pointer, `sig` an i64.
+            Rvalue::ChildKill { child, sig } => {
+                let cp = self.operand(child).into();
+                let sv = self.operand(sig).into();
+                self.builder
+                    .build_call(self.funcs["child_kill"], &[cp, sv], "ckill")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("child_kill returns i32")
+            }
+            // process.exec — execvp in the current process; on success it never returns, so this only
+            // returns an i32 status on failure. `cmd` is a {ptr,len} str view (the lookup path); `args`
+            // is a {ptr,len} of str views (the new image's full argv, marshalled to C strings).
+            Rvalue::ProcessExec { cmd, args } => {
+                let (c_ptr, c_len) = self.split_str(cmd)?;
+                let (a_ptr, a_len) = self.split_str(args)?;
+                self.builder
+                    .build_call(self.funcs["process_exec"], &[c_ptr.into(), c_len.into(), a_ptr.into(), a_len.into()], "pexec")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("process_exec returns i32")
             }
             // fs.read_file_view — mmap into the arena, write the str view `{ptr,len}` into `out`,
             // return i32 status.

@@ -381,3 +381,267 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 ";
     assert!(check_errs("m11proc-noimport-spawn", src), "process.spawn without `import std.process` must error");
 }
+
+// --- Slice 3 — `ch.kill(sig)` / `process.exec(cmd, args)` --------------------------------------
+//
+// `ch.kill(sig: i64) -> Result<(), Error>` sends signal `sig` to the child via libc `kill` (borrows
+// the child like `wait`; `sig == 0` is the liveness probe; a reaped child / bad signal is a clean Err).
+// `process.exec(cmd, args) -> Result<(), Error>` `execvp`s in the CURRENT process: on success it
+// REPLACES the image and never returns (so the `Result` is only ever observed as its `Err` arm — a
+// mapped `execvp` errno), and **no cleanup runs** (pending Drops / arena ends / buffered writers are
+// lost — inherent to execvp). Align-owned fds are CLOEXEC, so the new image doesn't inherit them.
+
+/// `ch.kill(15)` (SIGTERM) terminates a live child; `wait()` then reports `128 + 15 = 143` (the shell
+/// convention — the child dies by signal, not a normal exit). The harness supplies a long-lived sleeper.
+#[test]
+fn kill_terminates_live_child_wait_is_143() {
+    if !backend_available() || !std::path::Path::new("/bin/sleep").exists() {
+        return;
+    }
+    let prog = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  ch.kill(15)?
+  code := ch.wait()?
+  print(code)
+  return Ok(())
+}";
+    let out = build_and_run_args("m11proc-kill-term", prog, &["/bin/sleep", "30"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "143", "kill(SIGTERM) → wait 128+15; stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `ch.kill(0)` is the liveness probe: no signal is sent, but it succeeds (`Ok`) on a still-running
+/// child. The child is then `SIGKILL`ed (9) and reaped → `wait()` returns `128 + 9 = 137`.
+#[test]
+fn kill_zero_is_liveness_probe() {
+    if !backend_available() || !std::path::Path::new("/bin/sleep").exists() {
+        return;
+    }
+    let prog = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  ch.kill(0)?
+  print(\"alive\")
+  ch.kill(9)?
+  code := ch.wait()?
+  print(code)
+  return Ok(())
+}";
+    let out = build_and_run_args("m11proc-kill-probe", prog, &["/bin/sleep", "30"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "alive\n137", "kill(0) Ok on live child, then SIGKILL → 137; stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Killing an already-`wait()`ed (reaped) child is a clean `Err` — the reaped flag guards the possibly
+/// recycled pid, so no stray signal is sent. The first wait succeeds; the `kill`'s `Err` arm runs.
+#[test]
+fn kill_after_wait_is_err() {
+    if !backend_available() || !std::path::Path::new("/bin/true").exists() {
+        return;
+    }
+    let prog = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  code := ch.wait()?
+  print(code)
+  match ch.kill(15) {
+    Ok(_) => {
+      print(\"unexpected-ok\")
+    }
+    Err(_) => {
+      print(\"kill-err\")
+    }
+  }
+  return Ok(())
+}";
+    let out = build_and_run_args("m11proc-kill-reaped", prog, &["/bin/true"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0\nkill-err", "kill after wait (reaped) → clean Err");
+}
+
+/// `process.exec` on success REPLACES the process image: `/bin/echo hi` prints `hi` and the exec'd
+/// program's `exit 0` becomes this process's status — the code AFTER a successful `exec` (the sentinel
+/// print) NEVER runs, because there is no image left to run it.
+#[test]
+fn exec_replaces_image_success_path_never_returns() {
+    if !backend_available() || !std::path::Path::new("/bin/echo").exists() {
+        return;
+    }
+    let src = "\
+import std.process
+pub fn main() -> Result<(), Error> {
+  process.exec(\"/bin/echo\", [\"/bin/echo\", \"hi\"])?
+  print(\"SENTINEL-after-exec\")
+  return Ok(())
+}";
+    let out = build_and_run("m11proc-exec-echo", src);
+    assert_eq!(out.status.code(), Some(0), "the exec'd /bin/echo exits 0; stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n", "exec replaces the image: /bin/echo's output only, no post-exec sentinel");
+}
+
+/// The caller supplies `argv[0]` (P5): `exec("/bin/sh", ["align-argv0", "-c", "echo $0"])` runs
+/// `/bin/sh` but with `$0` = the caller's `argv[0]` ("align-argv0"), proving the argv (incl. `argv[0]`)
+/// is delivered verbatim — the lookup path (`cmd`) and `argv[0]` are independent.
+#[test]
+fn exec_argv0_is_caller_supplied() {
+    if !backend_available() || !std::path::Path::new("/bin/sh").exists() {
+        return;
+    }
+    let src = "\
+import std.process
+pub fn main() -> Result<(), Error> {
+  process.exec(\"/bin/sh\", [\"align-argv0\", \"-c\", \"echo $0\"])?
+  return Ok(())
+}";
+    let out = build_and_run("m11proc-exec-argv0", src);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "align-argv0", "sh saw the caller's argv[0] as $0; stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `process.exec` returns ONLY on failure: an exec of a nonexistent command yields `Err`, so control
+/// DOES continue past the `exec` (the sentinel after it runs) — the mirror image of the success case.
+#[test]
+fn exec_failure_returns_err_and_continues() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+import std.process
+pub fn main() -> i32 {
+  match process.exec(\"/nonexistent/definitely-not-a-real-binary\", [\"/nonexistent/definitely-not-a-real-binary\"]) {
+    Ok(_) => {
+      print(\"unexpected-ok\")
+    }
+    Err(_) => {
+      print(\"exec-failed\")
+    }
+  }
+  return 0
+}";
+    let out = build_and_run("m11proc-exec-fail", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "exec-failed", "a failed exec returns Err and control continues");
+}
+
+/// `process.exec` requires `import std.process` (the capability gate), like every other `std` surface.
+#[test]
+fn exec_requires_import() {
+    let src = "\
+pub fn main() -> Result<(), Error> {
+  process.exec(\"/bin/true\", [\"/bin/true\"])?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11proc-exec-noimport", src), "process.exec without `import std.process` must error");
+}
+
+/// `process.exec` is a syscall (execvp) — impure. A closure that calls it is never `Pure`, so `par_map`
+/// rejects it (the `process.spawn` / `fs` / `io` impurity precedent).
+#[test]
+fn exec_rejected_by_par_map() {
+    let src = "\
+import std.process
+fn f(x: i64) -> i64 {
+  match process.exec(\"/bin/true\", [\"/bin/true\"][0..1]) {
+    Ok(_) => {
+      return x
+    }
+    Err(_) => {
+      return x
+    }
+  }
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11proc-exec-parmap", src), "a process.exec-using (impure) closure must be rejected by par_map");
+}
+
+/// `process.exec` takes exactly 2 arguments (the command path + the argv); a wrong arity is a compile
+/// error.
+#[test]
+fn exec_wrong_arity_rejected() {
+    assert!(
+        check_errs("m11proc-exec-arity1", "import std.process\npub fn main() -> Result<(), Error> {\n  process.exec(\"/bin/true\")?\n  return Ok(())\n}\n"),
+        "process.exec with 1 argument must error"
+    );
+    assert!(
+        check_errs("m11proc-exec-arity3", "import std.process\npub fn main() -> Result<(), Error> {\n  process.exec(\"/bin/true\", [\"/bin/true\"], 0)?\n  return Ok(())\n}\n"),
+        "process.exec with 3 arguments must error"
+    );
+}
+
+/// `ch.kill(sig)` takes exactly one `i64` signal argument; a wrong arity is a compile error.
+#[test]
+fn kill_wrong_arity_rejected() {
+    let no_arg = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  ch.kill()?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11proc-kill-arity0", no_arg), "ch.kill() with no signal must error");
+    let two_args = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  ch.kill(1, 2)?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11proc-kill-arity2", two_args), "ch.kill(1, 2) with two args must error");
+}
+
+/// P4: `ch.kill` borrows the child, so (like `wait`) it cannot be called on an unbound owned-child
+/// temporary (`process.spawn(...)?.kill(1)`) — the pid would never be reaped. Bind it first.
+#[test]
+fn kill_unbound_temporary_receiver_rejected() {
+    let src = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  process.spawn(args[1], args[1..])?.kill(1)?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11proc-kill-unbound", src), "a kill on an unbound child temporary must be rejected (bind first)");
+}
+
+/// A closure that spawns + kills a child is impure (both are syscalls), so `par_map` rejects it.
+#[test]
+fn kill_rejected_by_par_map() {
+    let src = "\
+import std.process
+fn f(x: i64) -> i64 {
+  match process.spawn(\"/bin/sleep\", [\"/bin/sleep\", \"30\"][0..2]) {
+    Ok(ch) => {
+      match ch.kill(9) {
+        Ok(_) => {
+          return x
+        }
+        Err(_) => {
+          return x
+        }
+      }
+    }
+    Err(_) => {
+      return x
+    }
+  }
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11proc-kill-parmap", src), "a kill-using (impure) closure must be rejected by par_map");
+}

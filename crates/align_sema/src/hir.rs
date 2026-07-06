@@ -790,6 +790,25 @@ pub enum ExprKind {
     /// a second `wait()` on an already-reaped child is `Err` (a clean status, not an `ECHILD` race).
     /// `child` is borrowed (never consumed — mirrors `l.accept()`). Impure.
     ChildWait { child: Box<Expr> },
+    /// `ch.kill(sig)` (`std.process`) — send signal `sig` (an `i64`) to the `child` via libc `kill`,
+    /// returning `Result<(), Error>`. Like [`ChildWait`], `child` is **borrowed** (never consumed); the
+    /// already-`reaped` flag guards against signalling a recycled pid (killing a reaped child is a clean
+    /// `Err`, not a stray signal to an unrelated process). `sig == 0` is the standard liveness probe (no
+    /// signal sent, just an existence/permission check); a negative or out-of-range `sig` is
+    /// `Error.Invalid`; `EPERM`/`ESRCH` surface via the shared errno table. Impure.
+    ChildKill { child: Box<Expr>, sig: Box<Expr> },
+    /// `process.exec(cmd, args)` (`std.process`) — `execvp(cmd, argv)` **in the current process**: on
+    /// success it REPLACES the process image and never returns, so the `ty` `Result<(), Error>` is only
+    /// ever observed as its `Err` arm (an `execvp` failure — the mapped errno). `cmd` is the borrowed
+    /// `str` lookup path (resolved via `PATH`); `args` is the borrowed `array<str>` / `slice<str>` that
+    /// becomes the new image's **full** `argv` (the caller supplies `argv[0]`, P5 — same convention as
+    /// [`ProcessSpawn`]). **No cleanup runs** on the success path: `execvp` discards the entire address
+    /// space, so pending `Drop`s / arena ends / buffered-writer flushes DO NOT run (buffered bytes still
+    /// in user space are lost — flush before `exec` if they matter). This is inherent to `execvp` and is
+    /// abort-class in cleanup terms (unlike `process.exit`, which runs cleanup first). Align-owned fds
+    /// are `CLOEXEC` (Slice 2), so the new image does NOT inherit them; only the inherited standard
+    /// streams (fds 0/1/2, not `CLOEXEC`) survive. Impure; both `cmd` and `args` are borrowed.
+    ProcessExec { cmd: Box<Expr>, args: Box<Expr> },
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode a byte view (`str` /
     /// owned `string` (auto-borrowed) / `slice<u8>`) into a freshly heap-allocated owned `string`
     /// (the `ty` is [`crate::Ty::String`]). `kind` selects the alphabet. Pure (a byte transform, no
