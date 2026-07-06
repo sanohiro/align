@@ -6243,6 +6243,10 @@ impl<'a, 't> Checker<'a, 't> {
         let mark = self.diags.len();
         let r = self.check_expr(rhs, Some(lhs_ty));
         if matches!(self.resolve(r.ty), Ty::Vec(..)) {
+            // Sound to roll back here: the only side effect of the speculative check was the
+            // diagnostic. The hint applied `unify(rhs = Vec, lhs_ty)`, and `unify` binds a variable
+            // only to a concrete `Int`/`Float` (its `(IntVar, Int)` / `(FloatVar, Float)` arms) — never
+            // to a `Vec` (that hits the mismatch arm), so `lhs_ty` is left exactly as it was.
             self.diags.truncate(mark);
             return self.check_expr(rhs, None);
         }
@@ -10433,6 +10437,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// - `base64_decode`/`base64url_decode`/`hex_decode(s)` take a `str` (owned `string`
     ///   auto-borrowed) and yield `Result<buffer, Error>` (invalid input -> `Error.Invalid`).
     /// - `utf8_valid(b)` takes `bytes` (`slice<u8>`) and yields `bool`.
+    ///
     /// Builtins, dispatched like the other `std` namespaces.
     fn check_encoding_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };

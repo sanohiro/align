@@ -108,14 +108,6 @@ pub struct AlignStr {
     pub len: i64,
 }
 
-/// `str.clone()` — deep-copy the bytes of a `str` view into a fresh heap buffer, returning an
-/// owned `string` `{ptr,len}` (MMv2 slice 7). The buffer comes from [`align_rt_alloc`] and is
-/// freed by the generated code's `Drop` of the owning slot. An empty clone owns no buffer (null
-/// ptr), so its `free(null)` drop is a harmless no-op.
-///
-/// # Safety
-/// `ptr`/`len` must describe a valid byte range for the call.
-
 // Helper to safely construct a slice from an FFI pointer and i64 length.
 // Returns an empty slice if len <= 0, ptr is null, or len exceeds isize::MAX.
 #[inline(always)]
@@ -124,7 +116,6 @@ fn safe_len(len: i64) -> Result<usize, ()> {
 }
 
 #[inline(always)]
-
 unsafe fn safe_slice<'a, T>(ptr: *const T, len: i64) -> &'a [T] {
     let Ok(n) = isize::try_from(len) else { return &[] };
     if n <= 0 || ptr.is_null() { return &[] }
@@ -134,7 +125,13 @@ unsafe fn safe_slice<'a, T>(ptr: *const T, len: i64) -> &'a [T] {
     unsafe { std::slice::from_raw_parts(ptr, n) }
 }
 
-
+/// `str.clone()` — deep-copy the bytes of a `str` view into a fresh heap buffer, returning an
+/// owned `string` `{ptr,len}` (MMv2 slice 7). The buffer comes from [`align_rt_alloc`] and is
+/// freed by the generated code's `Drop` of the owning slot. An empty clone owns no buffer (null
+/// ptr), so its `free(null)` drop is a harmless no-op.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_str_clone(ptr: *const u8, len: i64) -> AlignStr {
     if len <= 0 {
@@ -2128,7 +2125,7 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(keys: *const i64, vals: *const i
         group_agg_i64(keys, out_keys, out_vals, cap, |i| {
             // SAFETY: `group_agg_i64` only calls `per_row` with indices in `0..keys.len()`.
             // Since `keys` and `vals` have the same length (guaranteed by `group_io`), `i` is always in-bounds for `vals`.
-            unsafe { *vals.get_unchecked(i) }
+            *vals.get_unchecked(i)
         }, |a, b| a.wrapping_add(b))
     }
 }
@@ -2144,7 +2141,7 @@ pub unsafe extern "C" fn align_rt_group_min_i64(keys: *const i64, vals: *const i
         group_agg_i64(keys, out_keys, out_vals, cap, |i| {
             // SAFETY: `group_agg_i64` only calls `per_row` with indices in `0..keys.len()`.
             // Since `keys` and `vals` have the same length (guaranteed by `group_io`), `i` is always in-bounds for `vals`.
-            unsafe { *vals.get_unchecked(i) }
+            *vals.get_unchecked(i)
         }, |a, b| a.min(b))
     }
 }
@@ -2160,7 +2157,7 @@ pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i
         group_agg_i64(keys, out_keys, out_vals, cap, |i| {
             // SAFETY: `group_agg_i64` only calls `per_row` with indices in `0..keys.len()`.
             // Since `keys` and `vals` have the same length (guaranteed by `group_io`), `i` is always in-bounds for `vals`.
-            unsafe { *vals.get_unchecked(i) }
+            *vals.get_unchecked(i)
         }, |a, b| a.max(b))
     }
 }
@@ -6071,7 +6068,7 @@ mod tests {
 
     /// A hex decode mirroring the FFI path (odd length / non-hex byte -> `None`).
     fn hex_dec(input: &[u8]) -> Option<Vec<u8>> {
-        if input.len() % 2 != 0 {
+        if !input.len().is_multiple_of(2) {
             return None;
         }
         let mut v = Vec::new();
