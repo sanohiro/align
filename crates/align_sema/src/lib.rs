@@ -10476,6 +10476,9 @@ impl<'a, 't> Checker<'a, 't> {
         if host.ty == Ty::Error || port.ty == Ty::Error {
             return err;
         }
+        // Defensive backstop only: `check_expr` already reconciled the port against the i64
+        // hint (a non-i64 integer is a hard "type mismatch" error there), so a non-i64 type
+        // cannot actually reach codegen through this path.
         if !port.ty.is_int_like() {
             self.diags
                 .error(format!("'tcp.connect' port must be an integer, got {}", ty_name(port.ty)), args[1].span);
