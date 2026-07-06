@@ -414,6 +414,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsRemove { path } => format!("fs_remove({})", operand_str(path)),
         Rvalue::FsReadDir { path, out } => format!("fs_read_dir({}, -> _{out})", operand_str(path)),
         Rvalue::DnsResolve { host, out } => format!("dns_resolve({}, -> _{out})", operand_str(host)),
+        Rvalue::TcpConnect { host, port, out } => format!("tcp_connect({}, {}, -> _{out})", operand_str(host), operand_str(port)),
+        Rvalue::ConnReader(c) => format!("conn_reader({})", operand_str(c)),
+        Rvalue::ConnWriter(c) => format!("conn_writer({})", operand_str(c)),
         Rvalue::FsReadFileView { path, arena, out } => {
             format!("fs_read_file_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))
         }

@@ -519,6 +519,17 @@ pub enum Rvalue {
     /// (`{ptr,len}`) written into `out`. Yields an `i32` status (0 = ok). Same shape as
     /// [`Rvalue::FsReadDir`].
     DnsResolve { host: Operand, out: Slot },
+    /// `tcp.connect(host, port)` — resolve `host` and open a TCP connection to `port`, writing the
+    /// owned `tcp_conn` handle (a bare pointer) into `out`. Yields an `i32` status (0 = ok, else the
+    /// shared errno/status table; a bad port or bad host is `AL_INVALID`). Mirrors [`Rvalue::ReaderOpen`]
+    /// (a handle payload written into an out slot), with a second `port` operand.
+    TcpConnect { host: Operand, port: Operand, out: Slot },
+    /// `c.reader()` — borrow an M9 `reader` over the `tcp_conn` operand's socket fd (`owns_fd:false`).
+    /// Yields the reader handle pointer (like [`Rvalue::ReaderStdin`], but over the conn's fd).
+    ConnReader(Operand),
+    /// `c.writer()` — borrow an M9 (unbuffered) `writer` over the `tcp_conn` operand's socket fd
+    /// (`owns_fd:false`). Yields the writer handle pointer.
+    ConnWriter(Operand),
     /// `fs.read_file_view(path)` — mmap the regular file `path` read-only into `arena`, writing the
     /// `str` view `{ptr,len}` into `out`. Yields an `i32` errno-status (0 = ok). The mapping is
     /// `munmap`ped at arena end (the region rule) — no `Drop`.
@@ -1014,7 +1025,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -1487,6 +1498,20 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `dns.resolve(host)` yields `Result<array<string>, Error>` — identical lowering to
         // `fs.read_dir` (owned `DynArray(String)` payload, deep-`Drop`), only the runtime call differs.
         hir::ExprKind::DnsResolve { host } => lower_dns_resolve(b, host, e.ty),
+        hir::ExprKind::TcpConnect { host, port } => lower_tcp_connect(b, host, port, e.ty),
+        // `c.reader()` / `c.writer()` wrap the conn's fd in a borrowed reader/writer (`owns_fd:false`).
+        hir::ExprKind::ConnReader { conn } => {
+            let c = lower_expr(b, conn);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::ConnReader(c)));
+            Operand::Value(v)
+        }
+        hir::ExprKind::ConnWriter { conn } => {
+            let c = lower_expr(b, conn);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::ConnWriter(c)));
+            Operand::Value(v)
+        }
         // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
         // runtime registers the mmap for `munmap` at arena end.
         hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
@@ -4738,6 +4763,48 @@ fn lower_dns_resolve(b: &mut Builder, host: &hir::Expr, result_ty: Ty) -> Operan
     Operand::Value(r)
 }
 
+/// `tcp.connect(host, port)` → the runtime resolves `host`, connects to `port`, and writes the
+/// owned `tcp_conn` handle into an out slot, returning a status; branch `Ok(<conn>)` /
+/// `Err(<mapped status>)`. Mirrors [`lower_open_handle`] with a second `port` operand and a
+/// `tcp_conn` handle payload.
+fn lower_tcp_connect(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::TcpConn);
+    let h = lower_expr(b, host);
+    let p = lower_expr(b, port);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::TcpConnect { host: h, port: p, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the conn handle and wrap it (the unwrapped local owns it — `Drop` closes its fd).
+    b.cur = ok_bb;
+    let c = b.fresh_value(Ty::TcpConn);
+    b.push(Stmt::Let(c, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(c))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (null handle) → nothing to close; map the status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
 /// `fs.read_file_view(path)` → the runtime mmaps the file into the enclosing arena, writing the
 /// `str` view `{ptr,len}` into an out slot and returning an errno-status; branch `Ok(<view>)` /
 /// `Err(<mapped status>)`. The arena handle (guaranteed present — sema requires an enclosing arena)
@@ -5423,6 +5490,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Rng => "rng".to_string(),
         Ty::CliCommand => "cli command".to_string(),
         Ty::CliParsed => "cli parsed".to_string(),
+        Ty::TcpConn => "tcp_conn".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

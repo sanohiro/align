@@ -2,9 +2,41 @@
 //! returned as an owned `array<string>` (deep-`Drop`, the `fs.read_dir` template). Validates the
 //! errno/EAI-status path, the owned-string-array deep drop, the `import std.net` capability gate,
 //! and impurity (rejected by `par_map`). (`docs/impl/std-design/net.md` Slice 1; `draft.md` §18.2.)
+//!
+//! M11 Slice 2 — std.net `tcp_conn`: `tcp.connect(host, port)` opens a TCP connection (an owned Move
+//! handle owning the socket fd; `Drop` closes it), and `c.reader()`/`c.writer()` borrow M9
+//! reader/writer over the same fd (`owns_fd:false`), region-bound to `c`. Round-trips bytes against
+//! an in-process Rust echo listener, and checks the Gate-1 rejections: reader-past-conn escape (P2),
+//! conn-as-array-element, conn-in-`par_map`, unbound-temporary receiver (P6), bad/refused ports, and
+//! the import gate. (`docs/impl/std-design/net.md` Slice 2; `draft.md` §18.2.)
 
 mod common;
 use common::*;
+
+/// Bind an in-process echo server on an ephemeral loopback port; return `(port, join_handle)`. The
+/// thread accepts one connection and echoes every chunk until the client closes (EOF) — the m9 io
+/// harness pattern. The port is a real OS-assigned `1..=65535` value.
+fn spawn_echo_server() -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut buf = [0u8; 256];
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (port, handle)
+}
 
 /// `dns.resolve("localhost")` returns an owned `array<string>` of IP strings containing at least one
 /// loopback form (`127.0.0.1` or `::1`), resolved via `/etc/hosts` even with no external resolver.
@@ -121,4 +153,179 @@ pub fn main() -> i32 {
 }
 ";
     assert!(check_errs("m11net-parmap", src), "a dns.resolve-using (impure) closure must be rejected by par_map");
+}
+
+// --- Slice 2: tcp_conn round-trip + Gate-1 rejections ------------------------------------------
+
+/// `tcp.connect` to an in-process echo listener, then write through `c.writer()` and read the echo
+/// back through `c.reader()` — the reader/writer-reuse proof. The port is passed as a `--port` flag
+/// (an OS-assigned ephemeral port). Both streams borrow the conn's fd (`owns_fd:false`); only the
+/// conn's `Drop` closes it, so the whole program exits 0 with no double-close.
+#[test]
+fn tcp_connect_round_trip_bytes() {
+    if !backend_available() {
+        return;
+    }
+    let (port, server) = spawn_echo_server();
+    let prog = "\
+import std.net
+import std.io
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"rt\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  conn := tcp.connect(\"127.0.0.1\", p.get_i64(\"port\"))?
+  w := conn.writer()
+  w.write(\"ping\\n\")?
+  r := conn.reader()
+  b := buffer(64)
+  n := r.read(b)?
+  print(n)
+  io.stdout.write(b.bytes())?
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m11net-roundtrip", prog, &["--port", &port.to_string()]);
+    let _ = server.join();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\nping\n", "the 5 bytes round-trip through the borrowed reader/writer");
+}
+
+/// P2 (#297): `c.reader()` borrows the conn's fd, so its region is bound to `c`. Returning it out of
+/// the function (past `c`'s `Drop`, which closes the fd) is a use-after-close — a compile error.
+#[test]
+fn tcp_conn_reader_cannot_escape_conn() {
+    let src = "\
+import std.net
+fn steal() -> Result<reader, Error> {
+  conn := tcp.connect(\"127.0.0.1\", 80)?
+  return Ok(conn.reader())
+}
+pub fn main() -> Result<(), Error> {
+  r := steal()?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11net-reader-escape", src), "a reader borrowing a local conn must not escape the conn's scope");
+}
+
+/// A `tcp_conn` is an owned handle bound to one local — it cannot be collected into an array (a
+/// copied conn would double-`close` its fd), rejected at construction like `reader`/`writer`.
+#[test]
+fn tcp_conn_rejected_as_array_element() {
+    let src = "\
+import std.net
+fn f(a: tcp_conn, b: tcp_conn) -> i64 {
+  xs := [a, b]
+  return xs.len()
+}
+pub fn main() -> i32 {
+  return 0
+}
+";
+    assert!(check_errs("m11net-conn-array", src), "a tcp_conn cannot be an array element");
+}
+
+/// `tcp.connect` is a syscall — impure. A closure that connects is never `Pure`, so `par_map`
+/// rejects it (the `dns.resolve` / `fs` / `io` impurity precedent).
+#[test]
+fn tcp_connect_rejected_by_par_map() {
+    let src = "\
+import std.net
+fn f(x: i64) -> i64 {
+  conn := tcp.connect(\"127.0.0.1\", 80) else { return x }
+  r := conn.reader()
+  b := buffer(8)
+  n := r.read(b) else { return x }
+  return n
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11net-conn-parmap", src), "a tcp.connect-using (impure) closure must be rejected by par_map");
+}
+
+/// P6: a `tcp_conn` is an owned Move handle — an unbound temporary (`tcp.connect(...)?.reader()`) is
+/// not dropped yet, so it cannot be a method receiver in v1. Bind it first. (Mirrors the M9
+/// bound-receiver restriction on reader/writer.)
+#[test]
+fn tcp_conn_unbound_temporary_receiver_rejected() {
+    let src = "\
+import std.net
+pub fn main() -> Result<(), Error> {
+  r := tcp.connect(\"127.0.0.1\", 80)?.reader()
+  return Ok(())
+}
+";
+    assert!(check_errs("m11net-conn-temp-recv", src), "a stream borrow on an unbound conn temporary must be rejected (bind first)");
+}
+
+/// Connecting to a closed port is an `Err` (a refused connection), never an abort — `main` exits
+/// non-zero. Bind then drop a listener so its port is closed.
+#[test]
+fn tcp_connect_refused_is_err() {
+    if !backend_available() {
+        return;
+    }
+    // Bind then immediately drop a listener: its port is (almost certainly) now closed, so a
+    // connect is refused.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let prog = "\
+import std.net
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"rf\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  conn := tcp.connect(\"127.0.0.1\", p.get_i64(\"port\"))?
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m11net-refused", prog, &["--port", &closed_port.to_string()]);
+    assert_ne!(out.status.code(), Some(0), "connecting to a closed port is an Err (main exits non-zero), never an abort");
+}
+
+/// An out-of-range port (0 or 70000) is an `Err` (Error.Invalid) at runtime — never an abort, never
+/// a wrap into a valid port. `main` exits non-zero.
+#[test]
+fn tcp_connect_invalid_port_is_err() {
+    if !backend_available() {
+        return;
+    }
+    // The port arrives through `--port` (parsed to an i64), so one program serves both cases.
+    let prog = "\
+import std.net
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"bp\")
+  c.flag_i64(\"port\", -1)
+  p := c.parse(args)?
+  conn := tcp.connect(\"127.0.0.1\", p.get_i64(\"port\"))?
+  return Ok(())
+}
+";
+    for bad in ["0", "70000"] {
+        let out = build_and_run_args("m11net-badport", prog, &["--port", bad]);
+        assert_ne!(out.status.code(), Some(0), "port {bad} is Error.Invalid (main exits non-zero), never an abort");
+    }
+}
+
+/// `tcp.connect` requires `import std.net` (the capability-header rule).
+#[test]
+fn tcp_connect_requires_import() {
+    let src = "\
+pub fn main() -> Result<(), Error> {
+  conn := tcp.connect(\"127.0.0.1\", 80)?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11net-conn-noimport", src), "tcp.connect without `import std.net` must error");
 }

@@ -679,6 +679,20 @@ pub enum ExprKind {
     /// `Drop`, identical to [`FsReadDir`]). The `ty` is `Result<array<string>, Error>`.
     /// Owned/returnable (borrows nothing). Impure (a name-resolution syscall).
     DnsResolve { host: Box<Expr> },
+    /// `tcp.connect(host, port)` (`std.net`) — resolve `host` (via `getaddrinfo`) and open a TCP
+    /// connection to `port`, trying each resolved address in order. The `ty` is
+    /// `Result<tcp_conn, Error>` (an owned Move handle owning the connected socket fd; `Drop` closes
+    /// it). `host` is a borrowed `str` (never consumed), `port` an `i64` (Copy). SO_KEEPALIVE is set
+    /// on success. Impure (a network syscall).
+    TcpConnect { host: Box<Expr>, port: Box<Expr> },
+    /// `c.reader()` (`std.net`) — borrow an M9 `reader` over the `tcp_conn` `conn`'s socket fd
+    /// (`owns_fd: false`; only the conn's `Drop` closes it). The `ty` is [`crate::Ty::Reader`], its
+    /// region bound to `conn` (see `region_of`). `conn` is borrowed (never consumed).
+    ConnReader { conn: Box<Expr> },
+    /// `c.writer()` (`std.net`) — borrow an M9 (unbuffered) `writer` over the `tcp_conn` `conn`'s
+    /// socket fd (`owns_fd: false`; only the conn's `Drop` closes it). The `ty` is
+    /// [`crate::Ty::Writer`], its region bound to `conn`. `conn` is borrowed (never consumed).
+    ConnWriter { conn: Box<Expr> },
     /// `fs.read_file_view(path)` — mmap the regular file at `path` read-only into the enclosing arena,
     /// yielding a `str` view of its bytes. Requires an enclosing `arena {}` (like `heap.new`); the
     /// region is bound to the arena, and `munmap` runs at arena end. The `ty` is `Result<str, Error>`.

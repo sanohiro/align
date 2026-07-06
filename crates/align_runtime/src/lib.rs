@@ -556,6 +556,164 @@ pub unsafe extern "C" fn align_rt_dns_resolve(host: *const u8, host_len: i64, ou
     0
 }
 
+// --- tcp.connect (std.net Slice 2) ------------------------------------------------------------
+
+// `setsockopt` level / option for SO_KEEPALIVE. `SOL_SOCKET` and `SO_KEEPALIVE` are among the few
+// socket constants that differ between Linux and macOS/BSD, so cfg them (a port to another BSD must
+// revisit these, like the `AF_INET6`/`EAI_*` note on `AddrInfo`).
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const SOL_SOCKET: i32 = 1; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SOL_SOCKET: i32 = 0xffff; // macOS/BSD
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const SO_KEEPALIVE: i32 = 9; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SO_KEEPALIVE: i32 = 0x0008; // macOS/BSD
+
+/// A `tcp_conn` (`std.net`) — a Move handle owning one connected TCP socket fd; `Drop`
+/// ([`align_rt_tcp_conn_free`]) closes it. `c.reader()`/`c.writer()` hand back **borrowed** M9
+/// `Reader`/`Writer` over the same fd (`owns_fd: false`), so only this handle closes the fd.
+pub struct TcpConn {
+    fd: i32,
+}
+
+/// `tcp.connect(host, port)` — resolve `host` via `getaddrinfo` (AF_UNSPEC — both IPv4 and IPv6,
+/// SOCK_STREAM) with the numeric `port` as the service, then `socket`+`connect` to each resolved
+/// address in order until one succeeds. On success, sets `SO_KEEPALIVE` (best-effort — a failure to
+/// set it does not fail the connection) and writes the owned `tcp_conn` handle to `out`. Returns `0`
+/// on success, else a status the shared table maps: `AL_INVALID` for a bad `port` (outside
+/// `1..=65535`), a non-UTF-8 / interior-NUL host, or `EAI_NONAME`/`EAI_NODATA`; `AL_CODE + |eai|`
+/// for another resolver failure; or the last `connect`/`socket` errno (via [`io_error_to_status`])
+/// when every candidate address failed. Leaves `*out = null` on failure. `freeaddrinfo` runs on
+/// every path (no leak).
+///
+/// # Safety
+/// `host` must describe a valid byte range for `host_len`; `out` must point to a writable
+/// `*mut TcpConn` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_connect(host: *const u8, host_len: i64, port: i64, out: *mut *mut TcpConn) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    // A TCP port is 1..=65535 — reject out-of-range (0, negative, > 65535) as a bad argument rather
+    // than aborting or letting it wrap into a valid port.
+    if !(1..=65535).contains(&port) {
+        return AL_INVALID;
+    }
+    // Copy the host view into an owned `String` (rejects a non-UTF-8 / oversized `host_len` — no
+    // `i64 as usize`), then a NUL-terminated `CString`. An interior NUL is a bad name.
+    let Some(host_str) = (unsafe { path_from_view(host, host_len) }) else {
+        return AL_INVALID;
+    };
+    let Ok(c_host) = std::ffi::CString::new(host_str) else {
+        return AL_INVALID; // interior NUL
+    };
+    // The port passed to `getaddrinfo` as a numeric service string — it fills the correct
+    // `sin_port`/`sin6_port` per family, so no manual `sockaddr` surgery is needed. `port` is in
+    // `1..=65535`, so the decimal string never contains an interior NUL.
+    let Ok(c_service) = std::ffi::CString::new(port.to_string()) else {
+        return AL_INVALID;
+    };
+
+    // hints: AF_UNSPEC (both A and AAAA), SOCK_STREAM (TCP).
+    let mut hints: AddrInfo = unsafe { core::mem::zeroed() };
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    let mut res: *mut AddrInfo = core::ptr::null_mut();
+    let rc = unsafe { getaddrinfo(c_host.as_ptr() as *const u8, c_service.as_ptr() as *const u8, &hints, &mut res) };
+    if rc != 0 {
+        return eai_to_status(rc);
+    }
+
+    // Try each resolved address in order. `freeaddrinfo(res)` runs before every return below.
+    let mut last_status = AL_INVALID; // if the list is empty / every family unsupported
+    let mut cur = res;
+    while !cur.is_null() {
+        let ai = unsafe { &*cur };
+        // Only AF_INET / AF_INET6 with a non-null `sockaddr` are connectable; skip anything else.
+        if (ai.ai_family != AF_INET && ai.ai_family != AF_INET6) || ai.ai_addr.is_null() || ai.ai_addrlen == 0 {
+            cur = ai.ai_next;
+            continue;
+        }
+        let fd = unsafe { socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
+        if fd < 0 {
+            last_status = io_error_to_status(&std::io::Error::last_os_error());
+            cur = ai.ai_next;
+            continue;
+        }
+        let rc = unsafe { connect(fd, ai.ai_addr, ai.ai_addrlen) };
+        if rc == 0 {
+            // Connected. Enable TCP keepalive (best-effort — ignore the result: an unset keepalive
+            // does not make the connection unusable).
+            let on: i32 = 1;
+            unsafe {
+                setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_KEEPALIVE,
+                    &on as *const i32 as *const core::ffi::c_void,
+                    core::mem::size_of::<i32>() as u32,
+                );
+            }
+            unsafe { freeaddrinfo(res) };
+            unsafe { *out = Box::into_raw(Box::new(TcpConn { fd })) };
+            return 0;
+        }
+        // Failed — record the errno and close this fd before trying the next address.
+        last_status = io_error_to_status(&std::io::Error::last_os_error());
+        unsafe { close(fd) };
+        cur = ai.ai_next;
+    }
+    unsafe { freeaddrinfo(res) };
+    last_status
+}
+
+/// Free a `tcp_conn`, closing its socket fd. Null-safe (a moved-out / never-initialised owned slot
+/// drops harmlessly).
+///
+/// # Safety
+/// `c` must be null or a pointer from [`align_rt_tcp_connect`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_conn_free(c: *mut TcpConn) {
+    if c.is_null() {
+        return;
+    }
+    let c = unsafe { Box::from_raw(c) };
+    unsafe { close(c.fd) };
+}
+
+/// `c.reader()` — a **borrowed** M9 `Reader` over the conn's socket fd (`owns_fd: false`, so its own
+/// `Drop` does not close the fd — only the `tcp_conn` does). Null-safe: a null conn yields a null
+/// reader (its `Drop` is a harmless no-op).
+///
+/// # Safety
+/// `c` must be null or a valid `TcpConn` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_conn_reader(c: *mut TcpConn) -> *mut Reader {
+    if c.is_null() {
+        return core::ptr::null_mut();
+    }
+    let fd = unsafe { (*c).fd };
+    Box::into_raw(Box::new(Reader { fd, owns_fd: false }))
+}
+
+/// `c.writer()` — a **borrowed**, unbuffered M9 `Writer` over the conn's socket fd
+/// (`owns_fd: false`; writes stream straight to the socket). Only the `tcp_conn` closes the fd.
+/// Null-safe (a null conn yields a null writer).
+///
+/// # Safety
+/// `c` must be null or a valid `TcpConn` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_conn_writer(c: *mut TcpConn) -> *mut Writer {
+    if c.is_null() {
+        return core::ptr::null_mut();
+    }
+    let fd = unsafe { (*c).fd };
+    Box::into_raw(Box::new(Writer { fd, owns_fd: false, buffered: false, buf: Vec::new() }))
+}
+
 /// Read the whole file at `path` into a fresh **arena** allocation, writing a `{ptr,len}` view to
 /// `out` — the [`align_rt_fs_read_file_view`] fallback for special / zero-length files. Returns `0`
 /// or a mapped errno; an empty file yields `{null,0}`. Unlike `fs.read_file` (heap-owned,
@@ -5505,6 +5663,11 @@ unsafe extern "C" {
     fn getaddrinfo(node: *const u8, service: *const u8, hints: *const AddrInfo, res: *mut *mut AddrInfo) -> i32;
     fn freeaddrinfo(res: *mut AddrInfo);
     fn inet_ntop(af: i32, src: *const core::ffi::c_void, dst: *mut u8, size: u32) -> *const u8;
+    // `socket`/`connect`/`setsockopt` — the BSD socket calls (identical prototypes on Linux and
+    // macOS/BSD; `socklen_t` is `u32` on both). `connect` takes the `sockaddr` `getaddrinfo` filled.
+    fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
+    fn connect(sockfd: i32, addr: *const u8, addrlen: u32) -> i32;
+    fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *const core::ffi::c_void, optlen: u32) -> i32;
 }
 
 // `mmap` protection / flags — the portable POSIX constants (identical on Linux and macOS).
@@ -8055,6 +8218,84 @@ mod tests {
         } else {
             assert!(out.ptr.is_null(), "a failed resolve leaves out empty");
         }
+    }
+
+    #[test]
+    fn tcp_connect_roundtrip_reader_writer() {
+        use std::io::{Read, Write};
+        // In-process echo server on an ephemeral loopback port (the m9 io harness pattern).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port() as i64;
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 64];
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut conn: *mut TcpConn = std::ptr::null_mut();
+        let rc = unsafe { align_rt_tcp_connect(hp, hl, port, &mut conn) };
+        assert_eq!(rc, 0, "connect to the local listener succeeds");
+        assert!(!conn.is_null(), "a successful connect writes a non-null handle");
+
+        // Borrow a writer + reader over the conn's fd (both `owns_fd:false`).
+        let w = unsafe { align_rt_tcp_conn_writer(conn) };
+        let r = unsafe { align_rt_tcp_conn_reader(conn) };
+        assert!(!w.is_null() && !r.is_null());
+        assert_eq!(unsafe { align_rt_io_writer_write(w, b"ping".as_ptr(), 4) }, 0, "write reaches the socket");
+
+        let b = align_rt_buffer_new(16);
+        let n = unsafe { align_rt_io_reader_read(r, b) };
+        assert_eq!(n, 4, "the echo server returns the 4 bytes");
+        let got = unsafe { &*b };
+        assert_eq!(&got.data[..got.len], b"ping", "the bytes round-trip byte-exact");
+
+        // Free the borrowed handles (`owns_fd:false` → they must NOT close the fd), then the conn
+        // (closes the fd exactly once). No double-close: if the reader/writer closed the fd, this
+        // conn free would close an already-closed / reused fd.
+        unsafe { align_rt_io_writer_free(w) };
+        unsafe { align_rt_io_reader_free(r) };
+        unsafe { align_rt_tcp_conn_free(conn) };
+        unsafe { align_rt_buffer_free(b) };
+        let _ = server.join();
+    }
+
+    #[test]
+    fn tcp_connect_bad_port_and_null_out() {
+        let (hp, hl) = view_of("127.0.0.1");
+        // A null `out` slot is rejected as Error.Invalid, never a crash.
+        assert_eq!(unsafe { align_rt_tcp_connect(hp, hl, 80, std::ptr::null_mut()) }, AL_INVALID);
+        // Out-of-range ports (0, negative, > 65535) are Error.Invalid, never an abort and never a
+        // wrap into a valid port; `out` is left null.
+        for bad in [0i64, -1, 65536, 70000] {
+            let mut conn: *mut TcpConn = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_tcp_connect(hp, hl, bad, &mut conn) }, AL_INVALID, "port {bad} is invalid");
+            assert!(conn.is_null(), "a rejected port leaves out null");
+        }
+    }
+
+    #[test]
+    fn tcp_connect_refused_is_err() {
+        // Bind then immediately drop a listener: its port is (almost certainly) now closed, so a
+        // connect is refused — a non-zero status, never an abort, `out` left null.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port() as i64;
+        drop(listener);
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut conn: *mut TcpConn = std::ptr::null_mut();
+        let rc = unsafe { align_rt_tcp_connect(hp, hl, port, &mut conn) };
+        assert_ne!(rc, 0, "connecting to a closed port is an Err");
+        assert!(conn.is_null(), "a failed connect leaves out null");
     }
 
     #[test]
