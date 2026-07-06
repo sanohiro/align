@@ -108,8 +108,9 @@ pub struct AlignStr {
     pub len: i64,
 }
 
-// Helper to safely construct a slice from an FFI pointer and i64 length.
-// Returns an empty slice if len <= 0, ptr is null, or len exceeds isize::MAX.
+// FFI-boundary helpers. `safe_len` validates an i64 length (Err if negative or > isize::MAX).
+// `safe_slice` constructs a `&[T]` from an FFI pointer and i64 length, returning an empty slice
+// if len <= 0, ptr is null, or the total byte size would exceed isize::MAX.
 #[inline(always)]
 fn safe_len(len: i64) -> Result<usize, ()> {
     usize::try_from(len).map_err(|_| ()).and_then(|x| if x <= isize::MAX as usize { Ok(x) } else { Err(()) })

@@ -5,13 +5,34 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-04 (M10 CLOSED: Slice 3 std.cli shipped #356; external design-note import
-completed #355; previous same-day: guide/Little Aligner #352, core-design docs #353)._
+_Last updated: 2026-07-06 (Gemini fix wave #358–#368 audited SOUND; cleanup #369 + #370;
+previous: M10 CLOSED #356/#357)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #355 (docs), #356
-(std.cli), plus the M10-close docs PR.
+**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #358–#368 (Gemini CLI
+fix/optimization wave), #369 (stray-artifact removal), #370 (clippy/doc cleanup, this note).
+
+**Gemini fix wave #358–#368 audited (2026-07-06):** PRs #358–#368 were authored by **Gemini CLI**
+(not Claude): runtime memory-safety hardening (`safe_len`/`safe_slice` FFI-boundary guards,
+`checked_mul` size math, null checks, group_agg/group_io overflow fixes, buffer huge-capacity
+panic), group_agg hot-loop optimization (`get_unchecked` + `HashMap::entry`), LLVM vector
+reductions via `llvm.vector.reduce.*` (NaN-correct `fminimum`/`fmaximum`; strict-ordered `fadd`),
+undef→poison, diagnostics stdout→stderr. A two-lens adversarial re-review (runtime soundness /
+semantics+regression) found the work **SOUND**: every `get_unchecked` invariant holds, no
+abort→silent-return policy downgrade (the "safe returns" only replaced previously-*unsafe* silent
+`as usize` wraps), reductions semantics-preserving, tests 1349 green. Of Gemini's 30 inline review
+findings, 26 were addressed within the wave; the 4 unaddressed (#364, same-pattern
+`get_unchecked`/`get_unchecked_mut` double-index micro-perf nits) are **consciously rejected** —
+LLVM folds the duplicate index; not worth the churn. Cleanup after the audit: **#369** removed an
+8 MB compiled binary (`unsafe_raw`) + throwaway script accidentally committed by #365 and added
+root-scratch `.gitignore` rules (`/scratch*`, `/test_*.sh`, `/*.o`; the blob stays in git history —
+reclaiming it needs a history rewrite, owner's call); **#370** fixed the wave's clippy regressions
+(re-attached the orphaned `# Safety` doc on `align_rt_str_clone`, removed redundant nested `unsafe`,
+two pre-existing lints) and restored the deleted sema rollback-soundness comment — **clippy clean
+again at `-D warnings`**. Process note: #364/#366 were merged before/seconds after the gemini
+review landed (the reflect-before-merge rule lapsed for the Gemini-driven PRs); the findings were
+recovered post-hoc this time, but hold the gate for future Gemini-authored PRs too.
 
 **M10 is COMPLETE and formally closed** (Slice 1 `std.encoding` #346, Slice 2 `std.rand` #347,
 Slice 3 `std.cli` #356 — see the roadmap's M10 section for the shipped-feature summary).
