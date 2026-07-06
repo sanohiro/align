@@ -6243,10 +6243,6 @@ impl<'a, 't> Checker<'a, 't> {
         let mark = self.diags.len();
         let r = self.check_expr(rhs, Some(lhs_ty));
         if matches!(self.resolve(r.ty), Ty::Vec(..)) {
-            // Sound to roll back here: the only side effect of the speculative check was the
-            // diagnostic. The hint applied `unify(rhs = Vec, lhs_ty)`, and `unify` binds a variable
-            // only to a concrete `Int`/`Float` (its `(IntVar, Int)` / `(FloatVar, Float)` arms) — never
-            // to a `Vec` (that hits the mismatch arm), so `lhs_ty` is left exactly as it was.
             self.diags.truncate(mark);
             return self.check_expr(rhs, None);
         }

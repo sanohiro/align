@@ -128,7 +128,10 @@ fn safe_len(len: i64) -> Result<usize, ()> {
 unsafe fn safe_slice<'a, T>(ptr: *const T, len: i64) -> &'a [T] {
     let Ok(n) = isize::try_from(len) else { return &[] };
     if n <= 0 || ptr.is_null() { return &[] }
-    unsafe { std::slice::from_raw_parts(ptr, n as usize) }
+    let n = n as usize;
+    let size = std::mem::size_of::<T>();
+    if size > 0 && n > isize::MAX as usize / size { return &[] }
+    unsafe { std::slice::from_raw_parts(ptr, n) }
 }
 
 
@@ -2531,9 +2534,9 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
     // Per aggregate: the value reader (a row pointer → i64; `count` reads `1`) and the combine op. The
     // combine is selected once per aggregate (not per row) so the inner fold is a small fixed match.
     let ops: Vec<i64> = specs.iter().map(|s| s.op).collect();
-    let val_offs: Vec<usize> = specs.iter().map(|s| s.val_off as usize).collect();
+    let val_offs: Vec<usize> = specs.iter().map(|s| usize::try_from(s.val_off).unwrap_or(0)).collect();
 
-    let initial = n.min(cap as usize).min(1024);
+    let initial = n.min(usize::try_from(cap).unwrap_or(0)).min(1024);
     let mut ids: HashMap<WyKey, usize, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
     // Accumulators, row-major per group: `acc[id*k + j]`. One contiguous buffer keeps a group's K
     // accumulators adjacent (cache-friendly on the update).
@@ -2634,7 +2637,7 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
     let Ok(n) = safe_len(n) else { return 0 };
     let (Ok(stride), Ok(key_off)) = (safe_len(stride), safe_len(key_off)) else { return -1 };
     let out_ids = unsafe { std::slice::from_raw_parts_mut(out_ids, n) };
-    let initial = n.min(cap as usize).min(1024);
+    let initial = n.min(usize::try_from(cap).unwrap_or(0)).min(1024);
     let mut ids: HashMap<WyKey, i64, WyBuildHasher> = HashMap::with_capacity_and_hasher(initial, WyBuildHasher::default());
     let mut reprs: Vec<AlignStr> = Vec::with_capacity(initial);
     for (i, out_id) in out_ids.iter_mut().enumerate() {

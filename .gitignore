@@ -31,3 +31,5 @@ target
 # bench build artifacts
 bench/kernels.o
 bench/harness
+ll_out/
+*.ll
