@@ -1367,11 +1367,45 @@ and http last (needs net + TLS).
     backends (later Linux backend behind the same signatures), BSD-family port surface.
   - Process note: every slice shipped through an independent adversarial gate review before its
     PR (slices 3/4 came back zero-finding), plus the gemini review reflected before merge.
-- **`std.process` — NEXT.** Its one design blocker is already settled
-  (`process.exit` = run-Drops-then-exit, `process.abort()` = hard exit; recorded in
-  `std-design/process.md` — move the open-questions entry to Settled when it ships).
-- **`std.compress` / `std.crypto` / `std.http`** — after process (FFI engines; http needs TLS
-  and stays plaintext-only v1 per http.md).
+- **`std.process` — DONE (2026-07-06, PRs #376–#378, one slice per PR).**
+  - Slice 1 `process.exit`/`process.abort` (#376): the settled Drop-semantics decision BUILT —
+    `exit(code)` emits the current frame's pending cleanup via the **same** `emit_exit_cleanup`
+    a `return` uses (drops → task_groups reversed → arenas reversed, innermost-first; no second
+    mechanism), then `exit(code)` (low-byte truncation documented); `abort()` = immediate
+    `_exit(1)`, no cleanup — the named-dangerous escape hatch, distinct from `panic_abort`'s
+    SIGABRT. No `Ty::Never` exists, so both are typed `Ty::Unit` v1 (statement position; a
+    proper `Ty::Never` is a recorded deferral); the block gets `Unreachable`, and the normal-path
+    cleanup is `is_terminated`-guarded (no double drop/arena-end). Global flush machinery
+    proven unneeded (print is write-through; every writer is a local flushed by its Drop in
+    the exit cleanup). v1 gap recorded: current-frame cleanup only; full stack unwind is the
+    documented ideal. The open-questions "process.exit Drop semantics" entry moved
+    Open → Settled.
+  - Slice 2 `child` + `spawn` + `wait` (#377): Move type `Ty::Child` (pid + reaped flag);
+    **Drop reaps via blocking waitpid** (P2 — no zombies; NO `SA_NOCLDWAIT`, it breaks explicit
+    `wait()` with ECHILD); `spawn` = fork+execvp with argv marshalled fully pre-fork (the child
+    branch is execvp + `_exit(127)` only — exec-not-found surfaces as wait()==127, the honest
+    fork/exec contract); args = full argv incl. [0], accepted as a fixed literal (the existing
+    `ArrayToSlice` coercion — no new mechanism), dynamic array, or slice; `wait()` borrows
+    (non-consuming, mirrors accept), EINTR-retried, WEXITSTATUS / signal → 128+sig, double-wait
+    → clean Err before any syscall (recycled-pid safe). **P3 CLOEXEC sweep** landed on all
+    existing fd constructors (std.net sockets via SOCK_CLOEXEC/accept4 + fcntl fallback; fs.open
+    already O_CLOEXEC, test-proven). The self-review caught a real Gate-1 miss pre-PR
+    (`null_moved_source` lacked `Ty::Child` — a moved child would have double-reaped), fixed +
+    test-pinned.
+  - Slice 3 `ch.kill` + `process.exec` (#378): `kill(sig)` borrows the child, reaped/pid<=0
+    guard before the syscall (no stray/broadcast signal — the kill(0/-1) POSIX semantics), sig
+    0 allowed (liveness probe), 0..=64 bounds the i64→i32 narrow; `exec` = execvp in-process,
+    returns only on error — deliberately NOT noreturn (the failure path must run), lowered as
+    a plain fallible call; **no cleanup runs on a successful exec** (image replaced —
+    abort-class, documented loudly), and CLOEXEC'd Align fds don't survive into the new image
+    (0/1/2 do). Marshalling shared with spawn (one runtime helper, one sema `check_argv`).
+  - **Deferred with record (not blockers):** a proper `Ty::Never` for diverging exprs;
+    multi-frame exit unwind; `detach()` for dropping a running child without blocking;
+    posix_spawn / pre-resolved-PATH exec (the fork-from-multithreaded-parent allocator caveat,
+    documented).
+- **`std.compress` / `std.crypto` / `std.http`** — NEXT (FFI engines: `libzstd`/zlib-ng, a
+  constant-time-audited crypto engine; http needs net + TLS and stays plaintext-only v1 per
+  http.md).
 
 ## Design Issues to Settle in Parallel
 
