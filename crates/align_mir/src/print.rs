@@ -419,6 +419,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::ConnWriter(c) => format!("conn_writer({})", operand_str(c)),
         Rvalue::TcpListen { host, port, out } => format!("tcp_listen({}, {}, -> _{out})", operand_str(host), operand_str(port)),
         Rvalue::TcpAccept { listener, out } => format!("tcp_accept({}, -> _{out})", operand_str(listener)),
+        Rvalue::UdpBind { host, port, out } => format!("udp_bind({}, {}, -> _{out})", operand_str(host), operand_str(port)),
+        Rvalue::UdpSendTo { sock, data, host, port } => format!("udp_send_to({}, {}, {}, {})", operand_str(sock), operand_str(data), operand_str(host), operand_str(port)),
+        Rvalue::UdpRecvFrom { sock, buffer } => format!("udp_recv_from({}, {})", operand_str(sock), operand_str(buffer)),
         Rvalue::FsReadFileView { path, arena, out } => {
             format!("fs_read_file_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))
         }

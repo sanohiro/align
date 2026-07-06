@@ -115,15 +115,19 @@ pub enum Scalar {
     /// handle (a listening socket fd); the enclosing `Result`'s `Drop` closes it. Opaque pointer,
     /// like [`Scalar::TcpConn`] — owned, never region-tracked.
     TcpListener,
+    /// A `udp_socket` payload (`Result<udp_socket, Error>` from `udp.bind`). An owned **Move** handle
+    /// (a bound `SOCK_DGRAM` socket fd); the enclosing `Result`'s `Drop` closes it. Opaque pointer,
+    /// like [`Scalar::TcpConn`]/[`Scalar::TcpListener`] — owned, never region-tracked.
+    UdpSocket,
 }
 
 impl Scalar {
     /// Whether this payload scalar is an owned **Move** type (a heap buffer that the enclosing
     /// `Option`/`Result` owns and must drop / move out). Today: `string` (8a), `array<T>` (8b),
-    /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, and a
-    /// `tcp_listener`.
+    /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
+    /// `tcp_listener`, and a `udp_socket`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket)
     }
 }
 
@@ -329,6 +333,12 @@ pub enum Ty {
     /// `tcp_conn` (never a borrow of the listener), so — unlike `c.reader()`/`c.writer()` — accept's
     /// result is not region-bound to the listener. Impure (its I/O hits the network). Opaque pointer.
     TcpListener,
+    /// A `udp_socket` (`std.net`) — a bound `SOCK_DGRAM` (UDP) socket, the `Ok` payload of
+    /// `udp.bind`'s `Result<udp_socket, Error>`. An owned **Move** handle owning one socket fd (like
+    /// `tcp_conn`/`tcp_listener`), `Drop`-freed (the fd is `close`d). Its `u.send_to(...)` /
+    /// `u.recv_from(...)` datagram ops each return a `Result<i64, Error>` (a byte count) — connectionless,
+    /// so there is no borrowed reader/writer and no region binding. Impure. Opaque pointer.
+    UdpSocket,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -392,6 +402,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::TcpConn => Some(Scalar::TcpConn),
         // A `tcp_listener` owned handle as the `Result` Ok payload of `tcp.listen`.
         Ty::TcpListener => Some(Scalar::TcpListener),
+        // A `udp_socket` owned handle as the `Result` Ok payload of `udp.bind`.
+        Ty::UdpSocket => Some(Scalar::UdpSocket),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -425,6 +437,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::CliParsed => Ty::CliParsed,
         Scalar::TcpConn => Ty::TcpConn,
         Scalar::TcpListener => Ty::TcpListener,
+        Scalar::UdpSocket => Ty::UdpSocket,
     }
 }
 
@@ -473,7 +486,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -505,7 +518,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -654,7 +667,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -726,7 +739,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -1728,7 +1741,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             // that have actually shipped are listed — a user local named `tcp` must not suppress
             // the unused-import warning. Extend this list as net slices 2-4 land.
             let is_used = if p == "std.net" {
-                ["dns", "tcp"].iter().any(|ns| used(ns))
+                ["dns", "tcp", "udp"].iter().any(|ns| used(ns))
             } else {
                 let namespace: &str = if BUILTIN_MODULES.contains(&p.as_str()) {
                     // The accessed namespace is the prefix after the last `.` (`core.json` → `json`).
@@ -2313,6 +2326,25 @@ impl EffectScan {
             ExprKind::TcpAccept { listener } => {
                 self.impure_direct = true;
                 self.expr(listener);
+            }
+            // `udp.bind` / `u.send_to` / `u.recv_from` are impure (bind/sendto/recvfrom syscalls) —
+            // excluded from `par_map`.
+            ExprKind::UdpBind { host, port } => {
+                self.impure_direct = true;
+                self.expr(host);
+                self.expr(port);
+            }
+            ExprKind::UdpSendTo { sock, data, host, port } => {
+                self.impure_direct = true;
+                self.expr(sock);
+                self.expr(data);
+                self.expr(host);
+                self.expr(port);
+            }
+            ExprKind::UdpRecvFrom { sock, buffer } => {
+                self.impure_direct = true;
+                self.expr(sock);
+                self.expr(buffer);
             }
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.impure_direct = true;
@@ -3419,6 +3451,20 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(port, depth);
             }
             ExprKind::TcpAccept { listener } => self.walk(listener, depth),
+            ExprKind::UdpBind { host, port } => {
+                self.walk(host, depth);
+                self.walk(port, depth);
+            }
+            ExprKind::UdpSendTo { sock, data, host, port } => {
+                self.walk(sock, depth);
+                self.walk(data, depth);
+                self.walk(host, depth);
+                self.walk(port, depth);
+            }
+            ExprKind::UdpRecvFrom { sock, buffer } => {
+                self.walk(sock, depth);
+                self.walk(buffer, depth);
+            }
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.walk(path, depth);
                 self.walk(data, depth);
@@ -3795,6 +3841,20 @@ impl UnnecessaryHeapScan {
                 self.visit(port);
             }
             ExprKind::TcpAccept { listener } => self.visit(listener),
+            ExprKind::UdpBind { host, port } => {
+                self.visit(host);
+                self.visit(port);
+            }
+            ExprKind::UdpSendTo { sock, data, host, port } => {
+                self.visit(sock);
+                self.visit(data);
+                self.visit(host);
+                self.visit(port);
+            }
+            ExprKind::UdpRecvFrom { sock, buffer } => {
+                self.visit(sock);
+                self.visit(buffer);
+            }
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.visit(path);
                 self.visit(data);
@@ -4456,6 +4516,23 @@ impl<'a> MoveCheck<'a> {
             // `l.accept()` borrows the `tcp_listener` (the listening fd stays owned by `l`); the
             // returned `tcp_conn` is freshly owned, never consumes the listener.
             ExprKind::TcpAccept { listener } => self.expr(listener, moved, false, false),
+            // `udp.bind` borrows `host` (str, never consumed); `port` is a Copy i64. `u.send_to` /
+            // `u.recv_from` borrow the `udp_socket` (the fd stays owned by `u`) plus their byte
+            // view / buffer — none consumed.
+            ExprKind::UdpBind { host, port } => {
+                self.expr(host, moved, false, false);
+                self.expr(port, moved, false, false);
+            }
+            ExprKind::UdpSendTo { sock, data, host, port } => {
+                self.expr(sock, moved, false, false);
+                self.expr(data, moved, false, false);
+                self.expr(host, moved, false, false);
+                self.expr(port, moved, false, false);
+            }
+            ExprKind::UdpRecvFrom { sock, buffer } => {
+                self.expr(sock, moved, false, false);
+                self.expr(buffer, moved, false, false);
+            }
             // `fs.write_file(path, data)` borrows `data` (str/bytes/builder — not consumed), like
             // `writer.write`; neither `path` nor `data` is moved.
             ExprKind::FsWriteFile { path, data, .. } => {
@@ -7391,6 +7468,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.net", "tcp.listen", span);
                 return self.check_tcp_listen(args, span);
             }
+            // `std.net` — `udp.bind(host, port)` -> Result<udp_socket, Error> (a bound UDP socket).
+            if module == "udp" && method == "bind" {
+                self.require_import("std.net", "udp.bind", span);
+                return self.check_udp_bind(args, span);
+            }
             // `std.path` — `path.join`/`base`/`dir`/`ext`/`normalize` (pure lexical string ops).
             if module == "path" && matches!(method, "join" | "base" | "dir" | "ext" | "normalize") {
                 self.require_import("std.path", &format!("path.{method}"), span);
@@ -7643,6 +7725,20 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty != Ty::Error {
                 self.diags
                     .error(format!("'.accept()' is not a method on {} (it is a `tcp_listener` method)", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        // `std.net` — `u.send_to(data, host, port)` / `u.recv_from(buf)` on a `udp_socket`. Datagram
+        // ops, each returning `Result<i64, Error>` (a byte count). Dispatched on the receiver type so
+        // the names stay free on other values.
+        if matches!(method, "send_to" | "recv_from") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::UdpSocket {
+                return self.check_udp_socket_method(recv_expr, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.{method}()' is not a method on {} (it is a `udp_socket` method)", ty_name(recv_expr.ty)), span);
             }
             return err;
         }
@@ -8070,7 +8166,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener) {
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -10277,7 +10373,7 @@ impl<'a, 't> Checker<'a, 't> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener)
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket)
             || payload_is_move(elem)
             || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs))
         {
@@ -10322,12 +10418,12 @@ impl<'a, 't> Checker<'a, 't> {
                 // frees — same double-free reasoning as `check_index`. Slices are read-only views,
                 // so a `slice<scalar>` is fine; reject Move-element collections until a borrow design.
                 let elem = scalar_to_ty(s);
-                // `Ty::TcpConn` / `Ty::TcpListener` are defensive parity with `check_index`'s guard
-                // above: a `slice<tcp_conn>` / `array<tcp_listener>` (etc.) is unconstructible today (a
-                // `tcp_conn`/`tcp_listener` is rejected as an array element at construction), so this
-                // arm can't currently be reached — kept in sync so a future array-of-handle path can't
-                // slip past this guard silently.
-                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener) || payload_is_move(elem) {
+                // `Ty::TcpConn` / `Ty::TcpListener` / `Ty::UdpSocket` are defensive parity with
+                // `check_index`'s guard above: a `slice<tcp_conn>` / `array<udp_socket>` (etc.) is
+                // unconstructible today (each handle is rejected as an array element at construction),
+                // so this arm can't currently be reached — kept in sync so a future array-of-handle
+                // path can't slip past this guard silently.
+                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) || payload_is_move(elem) {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
                         span,
@@ -10582,6 +10678,134 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::TcpListen { host, port: Box::new(port) },
             ty: Ty::Result(Scalar::TcpListener, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `udp.bind(host, port)` (`std.net`) -> `Result<udp_socket, Error>` — open a `SOCK_DGRAM` (UDP)
+    /// socket bound to `port`. `host` is a borrowed `str` (never consumed); an empty host binds the
+    /// wildcard address (`AI_PASSIVE`). `port` is an `i64` validated to `1..=65535` at runtime →
+    /// `Error.Invalid` on a bad port, never an abort. Port `0` (kernel-assigned) is rejected in v1 —
+    /// there is no way to read the bound port back yet (the `tcp.listen` deferral). The Ok payload is
+    /// an owned `udp_socket` Move handle (`Drop` closes its fd). Impure. Builtin.
+    fn check_udp_bind(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'udp.bind' expects 2 arguments (the host and port), got {}", args.len()), span);
+            return err;
+        }
+        let host = Box::new(self.check_str_init(&args[0]));
+        let port = self.check_expr(&args[1], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if host.ty == Ty::Error || port.ty == Ty::Error {
+            return err;
+        }
+        // Defensive backstop only: `check_expr` already reconciled the port against the i64 hint (a
+        // non-i64 integer is a hard "type mismatch" error there), so a non-i64 type cannot actually
+        // reach codegen through this path.
+        if !port.ty.is_int_like() {
+            self.diags
+                .error(format!("'udp.bind' port must be an integer, got {}", ty_name(port.ty)), args[1].span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::UdpBind { host, port: Box::new(port) },
+            ty: Ty::Result(Scalar::UdpSocket, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `u.send_to(data, host, port)` / `u.recv_from(buf)` on a `udp_socket` ([`Ty::UdpSocket`]), the
+    /// receiver already evaluated. Both are datagram ops returning `Result<i64, Error>` (a byte
+    /// count). The receiver must be a **bound local** (the `check_conn_stream` / `accept` v1 rule — an
+    /// unbound owned-socket temporary is not `Drop`ped yet, so its fd would leak).
+    ///
+    /// `send_to` resolves `host`/`port` per call (`SOCK_DGRAM`) and sends the byte view `data`
+    /// (`str` / owned `string` auto-borrowed / `slice<u8>` — `encoding.base64_encode`'s accepted
+    /// forms) as one datagram; the count is the bytes sent. `recv_from` blocks for one datagram and
+    /// fills `buf` (a `mut buffer`) up to its capacity (overwriting its length, like `reader.read`);
+    /// the count is the bytes received. A datagram larger than the buffer is truncated.
+    ///
+    /// v1 shape note: `recv_from` returns the received **count** only. `net.md` sketches a
+    /// `datagram {n, peer}` return, but the peer address is an owned `string` and a `Result` `Ok`
+    /// payload must be a single [`Scalar`] (there is no `Scalar::Tuple`, and synthesizing a builtin
+    /// Move struct-with-owned-field aggregate would be a magic special-case) — so the ideal `{n, peer}`
+    /// shape is **deferred** until first-class builtin-struct returns land, and v1 mirrors
+    /// `reader.read`'s clean `Result<i64, Error>` (fill-buffer-return-count) exactly.
+    fn check_udp_socket_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 bound-receiver gate (mirrors `check_conn_stream` / `check_listener_accept`): the socket
+        // must be a bound local — an unbound owned-socket temporary (`udp.bind(...)?.recv_from(b)`) is
+        // not `Drop`ped yet, so its fd would leak. Bind it first. Lifted when Move temporaries drop.
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the socket to a local first, then call the method (`u := udp.bind(...)?` then `u.send_to(...)`) — a temporary owned socket handle is not dropped yet, so its fd would leak".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        let i64_result = Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id));
+        if method == "recv_from" {
+            if args.len() != 1 {
+                self.diags.error(format!("'.recv_from()' takes 1 argument (a mut buffer), got {}", args.len()), span);
+                return err;
+            }
+            let buffer = self.check_expr(&args[0], Some(Ty::Buffer));
+            if buffer.ty == Ty::Error {
+                return err;
+            }
+            if buffer.ty != Ty::Buffer {
+                self.diags.error(format!("'.recv_from()' fills a buffer, got {}", ty_name(buffer.ty)), args[0].span);
+                return err;
+            }
+            return Expr {
+                kind: ExprKind::UdpRecvFrom { sock: Box::new(recv_expr), buffer: Box::new(buffer) },
+                ty: i64_result,
+                span,
+            };
+        }
+        // `send_to(data, host, port)`.
+        if args.len() != 3 {
+            self.diags.error(format!("'.send_to()' takes 3 arguments (data, host, port), got {}", args.len()), span);
+            return err;
+        }
+        // `data` is a byte view: `str` / owned `string` (auto-borrowed) / `slice<u8>` — the
+        // `encoding.base64_encode` accepted forms.
+        let mut data = self.check_expr(&args[0], None);
+        let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
+        let resolved = self.resolve(data.ty);
+        let data_ok = match resolved {
+            Ty::Str => true,
+            Ty::String => {
+                let s = data.span;
+                data = Expr { kind: ExprKind::StrBorrow(Box::new(data)), ty: Ty::Str, span: s };
+                true
+            }
+            Ty::Slice(el) => el == u8s,
+            _ => false,
+        };
+        if !data_ok {
+            if resolved != Ty::Error {
+                self.diags
+                    .error(format!("'.send_to()' expects data as a str, string, or bytes (slice<u8>), got {}", ty_name(resolved)), args[0].span);
+            }
+            return err;
+        }
+        let host = self.check_str_init(&args[1]);
+        let port = self.check_expr(&args[2], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if host.ty == Ty::Error || port.ty == Ty::Error {
+            return err;
+        }
+        if !port.ty.is_int_like() {
+            self.diags
+                .error(format!("'.send_to()' port must be an integer, got {}", ty_name(port.ty)), args[2].span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::UdpSendTo { sock: Box::new(recv_expr), data: Box::new(data), host: Box::new(host), port: Box::new(port) },
+            ty: i64_result,
             span,
         }
     }
@@ -11425,7 +11649,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Any other Move leaf (a `box`/owned-collection/builder field) can't occur — struct fields are
         // scalar / `str` / `string` / plain-struct only — but guard defensively against a copy-without-
         // ownership-transfer double-free if that ever changes.
-        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener) || payload_is_move(leaf_ty) {
+        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) || payload_is_move(leaf_ty) {
             self.diags.error(
                 format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
                 span,
@@ -12247,6 +12471,20 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(port);
             }
             ExprKind::TcpAccept { listener } => self.finalize_expr(listener),
+            ExprKind::UdpBind { host, port } => {
+                self.finalize_expr(host);
+                self.finalize_expr(port);
+            }
+            ExprKind::UdpSendTo { sock, data, host, port } => {
+                self.finalize_expr(sock);
+                self.finalize_expr(data);
+                self.finalize_expr(host);
+                self.finalize_expr(port);
+            }
+            ExprKind::UdpRecvFrom { sock, buffer } => {
+                self.finalize_expr(sock);
+                self.finalize_expr(buffer);
+            }
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.finalize_expr(path);
                 self.finalize_expr(data);
@@ -12722,6 +12960,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::CliParsed => "cli parsed".to_string(),
         Ty::TcpConn => "tcp_conn".to_string(),
         Ty::TcpListener => "tcp_listener".to_string(),
+        Ty::UdpSocket => "udp_socket".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -12892,10 +13131,11 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // A `cli command` is never a payload (like `buffer`); a `cli parsed` may ride a `Result` Ok
     // payload (`c.parse(args)`) — the `allow_param` positions — but never as an array/slice/box
     // element (an element read would copy + double-free the handle), same as `reader`/`writer`.
-    // A `tcp_conn` / `tcp_listener` follows `reader`/`writer` exactly: a `Result` Ok payload
-    // (`tcp.connect`/`l.accept` for the conn, `tcp.listen` for the listener) is fine, but never an
-    // array/slice/box element (a copied handle would double-`close` its fd).
-    if matches!(ty, Ty::Buffer | Ty::CliCommand) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener) && !allow_param) {
+    // A `tcp_conn` / `tcp_listener` / `udp_socket` follows `reader`/`writer` exactly: a `Result` Ok
+    // payload (`tcp.connect`/`l.accept` for the conn, `tcp.listen` for the listener, `udp.bind` for
+    // the socket) is fine, but never an array/slice/box element (a copied handle would
+    // double-`close` its fd).
+    if matches!(ty, Ty::Buffer | Ty::CliCommand) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -13148,6 +13388,15 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::TcpListener
+        }
+        // `udp_socket` (`std.net`) — a bound UDP (`SOCK_DGRAM`) socket Move handle (`udp.bind`). A
+        // surface type name so it can be threaded through functions (a Move handle; passed by value).
+        "udp_socket" => {
+            if !args.is_empty() {
+                diags.error("udp_socket takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::UdpSocket
         }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {

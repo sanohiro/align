@@ -48,6 +48,13 @@ dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
   This is the #297-trap-aware arm.
 - `dns.resolve` → owned `array<string>` (deep-drop like `read_dir` #339). `datagram`/`response`
   are small structs (Copy) carrying counts + owned peer/body as appropriate.
+  - **Slice 4 v1 shape (shipped):** `recv_from` returns the received **count** only —
+    `Result<i64, Error>`, mirroring `reader.read` exactly (fill the caller's buffer, return the byte
+    count). The ideal `datagram {n, peer}` return is **deferred**: a `Result` `Ok` payload is a single
+    `Scalar` (there is no `Scalar::Tuple`), and the peer address is an owned `string`, so `{n, peer}`
+    would require synthesizing a builtin Move struct-with-owned-field aggregate — a magic special-case
+    that "ideal form or defer" forbids. It waits for first-class builtin-struct returns. The socket
+    already receives the peer at the syscall (`recvfrom`); v1 simply discards it (null `src_addr`).
 
 ## Effect classification
 
