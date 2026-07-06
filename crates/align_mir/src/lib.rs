@@ -564,6 +564,19 @@ pub enum Rvalue {
     /// `WEXITSTATUS`, or `128 + signal` for a signal-killed child) on success, or `-(status)` on error
     /// (a double-wait / `waitpid` failure — the [`Rvalue::ReaderRead`] sign convention).
     ChildWait { child: Operand },
+    /// `ch.kill(sig)` — send signal `sig` (an `i64`) to the `child` operand via libc `kill`. Yields an
+    /// `i32` errno-status (0 = ok; a negative / out-of-range `sig`, or killing an already-`reaped` child,
+    /// is `AL_INVALID`; `EPERM`/`ESRCH` map through the shared table). `child` is borrowed (read, not
+    /// consumed — like [`Rvalue::ChildWait`]). Wrapped into `Result<(), Error>` by `lower_status_result`.
+    ChildKill { child: Operand, sig: Operand },
+    /// `process.exec(cmd, args)` — `execvp(cmd, argv)` **in the current process**. `cmd` is a `str` view
+    /// (the lookup path); `args` is a str-view collection `{ptr,len}` (the new image's full argv, incl.
+    /// argv[0]). On **success it replaces the image and never returns** — so this yields an `i32`
+    /// errno-status only on failure (a bad `cmd`/`argv` is `AL_INVALID`, else the mapped `execvp` errno),
+    /// wrapped into `Result<(), Error>` by `lower_status_result` (whose `Err` arm is the only observable
+    /// one). **No cleanup is emitted** (unlike `process.exit`): `execvp` discards the address space, so
+    /// pending `Drop`s / arena ends / buffered writers are inherently lost on success.
+    ProcessExec { cmd: Operand, args: Operand },
     /// `fs.read_file_view(path)` — mmap the regular file `path` read-only into `arena`, writing the
     /// `str` view `{ptr,len}` into `out`. Yields an `i32` errno-status (0 = ok). The mapping is
     /// `munmap`ped at arena end (the region rule) — no `Drop`.
@@ -1553,6 +1566,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::UdpRecvFrom { sock, buffer } => lower_udp_recv_from(b, sock, buffer, e.ty),
         hir::ExprKind::ProcessSpawn { cmd, args } => lower_process_spawn(b, cmd, args, e.ty),
         hir::ExprKind::ChildWait { child } => lower_child_wait(b, child, e.ty),
+        hir::ExprKind::ChildKill { child, sig } => lower_child_kill(b, child, sig, e.ty),
+        hir::ExprKind::ProcessExec { cmd, args } => lower_process_exec(b, cmd, args, e.ty),
         // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
         // runtime registers the mmap for `munmap` at arena end.
         hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
@@ -5065,6 +5080,31 @@ fn lower_child_wait(b: &mut Builder, child: &hir::Expr, result_ty: Ty) -> Operan
     let n = b.fresh_value(i64_ty());
     b.push(Stmt::Let(n, Rvalue::ChildWait { child: ch }));
     lower_count_or_status_result(b, n, result_ty)
+}
+
+/// `ch.kill(sig)` → the runtime `kill(pid, sig)`s (guarding a reaped/recycled pid through the borrow),
+/// returning an `i32` errno-status; wrap into `Result<(), Error>` via the shared status helper. `child`
+/// is borrowed (no move-out); `sig` is a scalar `i64`.
+fn lower_child_kill(b: &mut Builder, child: &hir::Expr, sig: &hir::Expr, result_ty: Ty) -> Operand {
+    let ch = lower_expr(b, child);
+    let s = lower_expr(b, sig);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::ChildKill { child: ch, sig: s }));
+    lower_status_result(b, code, result_ty)
+}
+
+/// `process.exec(cmd, args)` → the runtime `execvp`s in place. On **success it replaces the image and
+/// never returns**, so control falls through to the status check only on failure — the runtime returns
+/// the mapped errno, which the shared status helper wraps into the `Err` arm of `Result<(), Error>`
+/// (the only observable arm). No cleanup is emitted (unlike `process.exit`): `execvp` discards the
+/// address space, so pending `Drop`s / arena ends / buffered writers are inherently lost on success —
+/// this is the settled abort-class treatment (`docs/impl/std-design/process.md`).
+fn lower_process_exec(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty: Ty) -> Operand {
+    let c = lower_expr(b, cmd);
+    let a = lower_expr(b, args);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::ProcessExec { cmd: c, args: a }));
+    lower_status_result(b, code, result_ty)
 }
 
 /// `fs.read_file_view(path)` → the runtime mmaps the file into the enclosing arena, writing the

@@ -70,7 +70,38 @@ should `kill()` first (or use a future explicit `detach()` API — recorded, not
   arena / buffered writer bound there), current-frame cleanup already covers everything expressible;
   the gap bites only when a caller up the stack owns a resource whose `Drop` has an observable effect.
 
-Slices 2 (`child` / `spawn` / `wait`) and 3 (`kill` / `exec`) remain per the breakdown below.
+Slice 2 (`child` / `spawn` / `wait`) SHIPPED (2026-07-06, `feat/m11-process-slice2-*`, PR #377).
+
+## Slice 3 — SHIPPED (2026-07-06, branch `feat/m11-process-slice3-kill-exec`)
+
+`ch.kill(sig)` / `process.exec(cmd, args)` are built end-to-end (sema → HIR `ChildKill`/`ProcessExec`
+→ MIR → runtime `align_rt_child_kill`/`align_rt_process_exec`):
+
+- **`ch.kill(sig: i64) -> Result<(), Error>`** — libc `kill(pid, sig)`. Borrows the child (like
+  `wait`, non-consuming; bound-receiver gated) and guards the `reaped` flag *before* signalling: killing
+  an already-reaped child is a clean `Err` (`AL_INVALID`), never a stray signal to a possibly-recycled
+  pid. **`sig == 0` is ALLOWED** — the standard POSIX liveness/permission probe (no signal sent, just an
+  existence check); a negative or out-of-range `sig` (`> 64`, the Linux `SIGRTMAX`) is `Error.Invalid`
+  *before* the syscall (so the `i64 → i32` narrow is always sound). `EPERM`/`ESRCH` surface via the
+  shared errno table. A signal-killed child then `wait()`s as `128 + sig`.
+- **`process.exec(cmd, args) -> Result<(), Error>`** — `execvp(cmd, argv)` **in the current process**
+  (no `fork`). `args` is the new image's FULL argv incl. `argv[0]` (P5 — same convention as `spawn`;
+  `cmd` is the independent lookup path). **On success it REPLACES the process image and NEVER RETURNS**,
+  so the `Result` is only ever observed as its `Err` arm (a mapped `execvp` errno; `AL_INVALID` for a
+  bad `cmd`/`argv`). **⚠️ NO CLEANUP RUNS on the success path — this is loud and deliberate:** `execvp`
+  discards the entire address space, so pending `Drop`s / arena ends / **buffered-writer flushes DO NOT
+  RUN** (buffered bytes still sitting in user space are LOST — flush before `exec` if they matter). This
+  is inherent to `execvp` and makes `exec` **abort-class** in cleanup terms — the mirror image of
+  `process.exit` (which runs cleanup first) and closer to `process.abort` (no cleanup). Unlike
+  `process.exit`/`abort`, `exec` does NOT diverge in the type system (it returns `Result` on failure);
+  the MIR is a plain fallible builtin call whose success path simply never returns from the runtime, so
+  no cleanup is emitted (nor could it run). **CLOEXEC interaction:** Align-owned fds (readers / writers /
+  sockets / children) are `CLOEXEC` (Slice 2's P3 sweep), so the exec'd image does NOT inherit them;
+  only the inherited standard streams (fds 0/1/2, not `CLOEXEC`) survive — the normal contract.
+- **Marshalling shared with `spawn`.** `cmd` + argv → C strings (interior-NUL / empty-argv / non-UTF-8
+  rejection) is a single runtime helper `marshal_cmd_argv`, used by both `spawn` (in the parent, pre-
+  `fork`) and `exec` (in the process about to be replaced). No duplication. The three argv source forms
+  (`array<str>` / `slice<str>` / fixed-array-literal via `ArrayToSlice`) share one sema helper too.
 
 ## `process.exit` Drop-semantics decision (SETTLED here)
 

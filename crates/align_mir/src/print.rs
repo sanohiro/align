@@ -424,6 +424,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::UdpRecvFrom { sock, buffer } => format!("udp_recv_from({}, {})", operand_str(sock), operand_str(buffer)),
         Rvalue::ProcessSpawn { cmd, args, out } => format!("process_spawn({}, {}, -> _{out})", operand_str(cmd), operand_str(args)),
         Rvalue::ChildWait { child } => format!("child_wait({})", operand_str(child)),
+        Rvalue::ChildKill { child, sig } => format!("child_kill({}, {})", operand_str(child), operand_str(sig)),
+        Rvalue::ProcessExec { cmd, args } => format!("process_exec({}, {})", operand_str(cmd), operand_str(args)),
         Rvalue::FsReadFileView { path, arena, out } => {
             format!("fs_read_file_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))
         }

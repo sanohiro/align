@@ -5777,6 +5777,59 @@ fn decode_wait_status(status: i32) -> i64 {
     }
 }
 
+/// Marshal a `cmd` lookup-path view + a full-argv `AlignStr` slice into NUL-terminated C strings for
+/// `execvp` — shared by `process.spawn` (built in the parent before `fork`) and `process.exec` (built
+/// in the process about to be replaced). Returns the `cmd` `CString`, the owned argv `CString`s (kept
+/// alive by the caller to back the pointer vector), and the argv pointer vector (NULL-terminated).
+/// `Err(AL_INVALID)` for a null/empty/non-UTF-8/interior-NUL `cmd`, an empty argv (no `argv[0]`), a
+/// null/oversized `args` pointer, or an interior NUL in any arg. Never panics.
+///
+/// # Safety
+/// `cmd`/`cmd_len` and `args`/`args_len` must describe valid byte / `AlignStr` ranges.
+unsafe fn marshal_cmd_argv(
+    cmd: *const u8,
+    cmd_len: i64,
+    args: *const AlignStr,
+    args_len: i64,
+) -> Result<(std::ffi::CString, Vec<std::ffi::CString>, Vec<*const u8>), i32> {
+    // `cmd` → a NUL-terminated C string (the `execvp` lookup path). Empty / non-UTF-8 / interior-NUL is
+    // rejected — never a panic.
+    let Some(cmd_str) = (unsafe { path_from_view(cmd, cmd_len) }) else {
+        return Err(AL_INVALID);
+    };
+    if cmd_str.is_empty() {
+        return Err(AL_INVALID);
+    }
+    let Ok(cmd_c) = std::ffi::CString::new(cmd_str) else {
+        return Err(AL_INVALID); // interior NUL
+    };
+    // `args` → the full argv. An empty argv (no `argv[0]`) is invalid; a null/oversized slice is
+    // likewise rejected (`safe_slice` yields empty). Every entry becomes an owned `CString`; an
+    // interior NUL in any arg is `AL_INVALID`.
+    let Ok(n) = safe_len(args_len) else {
+        return Err(AL_INVALID);
+    };
+    if n == 0 {
+        return Err(AL_INVALID);
+    }
+    let argv_views: &[AlignStr] = unsafe { safe_slice(args, args_len) };
+    if argv_views.len() != n {
+        return Err(AL_INVALID); // null / oversized args pointer
+    }
+    let mut argv_owned: Vec<std::ffi::CString> = Vec::with_capacity(n);
+    for a in argv_views {
+        let bytes = unsafe { bytes_view(a.ptr, a.len) };
+        let Ok(c) = std::ffi::CString::new(bytes) else {
+            return Err(AL_INVALID); // interior NUL in an arg
+        };
+        argv_owned.push(c);
+    }
+    // The argv pointer vector (borrowing `argv_owned`'s bytes) + a null terminator.
+    let mut argv_ptrs: Vec<*const u8> = argv_owned.iter().map(|c| c.as_ptr() as *const u8).collect();
+    argv_ptrs.push(core::ptr::null());
+    Ok((cmd_c, argv_owned, argv_ptrs))
+}
+
 /// `process.spawn(cmd, args)` — `fork` + `execvp` a child process. `cmd` is the lookup-path `str` view
 /// (resolved via `PATH` by `execvp` when it has no `/`); `args` is the child's **full** `argv`
 /// (`args_len` `AlignStr` views, **including `argv[0]`** — the caller supplies the program name, P5).
@@ -5802,42 +5855,14 @@ pub unsafe extern "C" fn align_rt_process_spawn(
         return AL_INVALID;
     }
     unsafe { *out = core::ptr::null_mut() };
-    // `cmd` → a NUL-terminated C string (the `execvp` lookup path). Empty / non-UTF-8 / interior-NUL
-    // is rejected — never a panic.
-    let Some(cmd_str) = (unsafe { path_from_view(cmd, cmd_len) }) else {
-        return AL_INVALID;
+    // Marshal `cmd` + the full argv into C strings **before** `fork` (so the child branch below does no
+    // allocation of its own). `_argv_owned` backs the raw pointers in `argv_ptrs` — it must stay live
+    // through the `execvp` call, so it is bound (leading `_` only silences the unused-read warning; the
+    // value is still dropped at scope end, not early).
+    let (cmd_c, _argv_owned, argv_ptrs) = match unsafe { marshal_cmd_argv(cmd, cmd_len, args, args_len) } {
+        Ok(v) => v,
+        Err(status) => return status,
     };
-    if cmd_str.is_empty() {
-        return AL_INVALID;
-    }
-    let Ok(cmd_c) = std::ffi::CString::new(cmd_str) else {
-        return AL_INVALID; // interior NUL
-    };
-    // `args` → the child's full argv. An empty argv (no `argv[0]`) is invalid; a null/oversized slice
-    // is likewise rejected (`safe_slice` yields empty). Every entry becomes an owned `CString`; an
-    // interior NUL in any arg is `AL_INVALID`.
-    let Ok(n) = safe_len(args_len) else {
-        return AL_INVALID;
-    };
-    if n == 0 {
-        return AL_INVALID;
-    }
-    let argv_views: &[AlignStr] = unsafe { safe_slice(args, args_len) };
-    if argv_views.len() != n {
-        return AL_INVALID; // null / oversized args pointer
-    }
-    let mut argv_owned: Vec<std::ffi::CString> = Vec::with_capacity(n);
-    for a in argv_views {
-        let bytes = unsafe { bytes_view(a.ptr, a.len) };
-        let Ok(c) = std::ffi::CString::new(bytes) else {
-            return AL_INVALID; // interior NUL in an arg
-        };
-        argv_owned.push(c);
-    }
-    // The argv pointer vector (borrowing `argv_owned`'s bytes) + a null terminator. Built here in the
-    // parent so the post-`fork` child branch performs no allocation.
-    let mut argv_ptrs: Vec<*const u8> = argv_owned.iter().map(|c| c.as_ptr() as *const u8).collect();
-    argv_ptrs.push(core::ptr::null());
 
     // SAFETY: `fork` takes no arguments and is always available. We do our own marshalling (the `cmd`
     // / `argv` CStrings and the pointer vector) in the *parent* above so the child branch below does no
@@ -5925,6 +5950,75 @@ pub unsafe extern "C" fn align_rt_child_free(ch: *mut Child) {
             break;
         }
     }
+}
+
+/// Signals are numbered `1..=SIGRTMAX` (`64` on Linux, `31` "highest" on macOS + realtime up to ~127).
+/// `64` covers the fixed + realtime range on Linux and safely bounds the `i64 → i32` narrowing below;
+/// anything outside `0..=64` is rejected as `AL_INVALID` before the `kill` call so a huge/negative
+/// `i64` can never be truncated into a *valid* signal number. `0` is allowed (the POSIX liveness probe).
+const MAX_SIGNAL: i64 = 64;
+
+/// `ch.kill(sig)` — send signal `sig` to the child via libc `kill(pid, sig)`. Returns `0` on success,
+/// else a mapped errno-status (`EPERM` → `AL_DENIED`, `ESRCH`/other → `Error.Code`, a bad signal →
+/// `AL_INVALID`). `sig == 0` is the standard existence/permission probe (no signal sent). A negative /
+/// out-of-range `sig` is `AL_INVALID` **before** the syscall (so the `i64 → i32` narrow is always
+/// sound). Killing an already-`reaped` child returns `AL_INVALID` **without** calling `kill` — the pid
+/// may have been recycled, so signalling it could hit an unrelated process (the same reaped-flag guard
+/// as double-`wait`). Null child → `AL_INVALID`.
+///
+/// # Safety
+/// `ch` must be null or a valid `Child` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_child_kill(ch: *mut Child, sig: i64) -> i32 {
+    if ch.is_null() {
+        return AL_INVALID;
+    }
+    let c = unsafe { &*ch };
+    if c.reaped {
+        // Reaped/recycled pid — never signal a possibly-unrelated process. Clean `Err`, no ESRCH race.
+        return AL_INVALID;
+    }
+    if !(0..=MAX_SIGNAL).contains(&sig) {
+        return AL_INVALID; // out-of-range signal → Error.Invalid (guards the i64→i32 narrow)
+    }
+    // SAFETY: `c.pid` is this process's child (from a successful `fork`), `sig` is bounded to `0..=64`
+    // (fits `i32`). `kill` performs no allocation and is async-signal-safe.
+    let r = unsafe { kill(c.pid, sig as i32) };
+    if r < 0 {
+        return io_error_to_status(&std::io::Error::last_os_error());
+    }
+    0
+}
+
+/// `process.exec(cmd, args)` — `execvp(cmd, argv)` in the **current** process (no `fork`). On success it
+/// replaces the image and never returns; it returns only on failure, yielding a mapped errno-status
+/// (`AL_INVALID` for a null/empty/interior-NUL `cmd`, an empty argv, or an interior NUL in any arg; else
+/// the `execvp` errno). **No cleanup runs on the success path** — `execvp` discards the whole address
+/// space, so buffered writer bytes still in user space are lost and no `Drop` / arena cleanup executes
+/// (inherent to `execvp`; abort-class in cleanup terms). Align-owned fds are `CLOEXEC` (Slice 2), so the
+/// new image does not inherit them; only the inherited standard streams (fds 0/1/2) survive.
+///
+/// # Safety
+/// `cmd`/`cmd_len` and `args`/`args_len` must describe valid byte / `AlignStr` ranges.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_process_exec(
+    cmd: *const u8,
+    cmd_len: i64,
+    args: *const AlignStr,
+    args_len: i64,
+) -> i32 {
+    // `_argv_owned` backs the raw pointers in `argv_ptrs`; keep it live through the `execvp` call.
+    let (cmd_c, _argv_owned, argv_ptrs) = match unsafe { marshal_cmd_argv(cmd, cmd_len, args, args_len) } {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+    // SAFETY: `cmd_c` / `argv_ptrs` are valid NUL-terminated C strings marshalled above; `argv_ptrs` is
+    // NULL-terminated. `execvp` returns ONLY on failure (on success the image is replaced and control
+    // never returns here), so reading `errno` afterwards is always valid.
+    unsafe {
+        execvp(cmd_c.as_ptr() as *const u8, argv_ptrs.as_ptr());
+    }
+    io_error_to_status(&std::io::Error::last_os_error())
 }
 
 /// A bump allocator (`docs/impl/06-runtime-std.md` §3). Memory is carved from a list of
@@ -6345,6 +6439,11 @@ unsafe extern "C" {
     fn fork() -> i32;
     fn execvp(file: *const u8, argv: *const *const u8) -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    // `kill(2)` — `ch.kill(sig)` (Slice 3): send signal `sig` to `pid`, returning `0` on success or
+    // `-1` (errno set: EINVAL for a bad signal, EPERM/ESRCH otherwise). `sig == 0` sends no signal but
+    // still performs the existence/permission check (the POSIX liveness probe). Identical prototype on
+    // Linux and macOS/BSD.
+    fn kill(pid: i32, sig: i32) -> i32;
     // `accept4` (Linux) — `accept` plus a `flags` arg, so `SOCK_CLOEXEC` sets close-on-exec on the
     // connected fd atomically (no `accept`+`fcntl` race). No such call on macOS/BSD (see `set_cloexec`).
     #[cfg(target_os = "linux")]
@@ -9422,6 +9521,93 @@ mod tests {
         assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
         assert_eq!(unsafe { align_rt_child_wait(ch) }, 2, "sh saw two positional args → exit 2");
         unsafe { align_rt_child_free(ch) };
+    }
+
+    // --- std.process Slice 3 — kill / exec ------------------------------------------------------
+
+    /// Spawn a long-lived child (`sleep 30`) for the `kill` tests; `None` (→ skip) if no suitable
+    /// binary exists. Prefers `/bin/sleep`, falling back to `/bin/sh -c 'sleep 30'`.
+    fn spawn_sleeper() -> Option<*mut Child> {
+        let mut ch: *mut Child = std::ptr::null_mut();
+        if std::path::Path::new("/bin/sleep").exists() {
+            let (cp, cl) = view_of("/bin/sleep");
+            let argv = argv_of(&["/bin/sleep", "30"]);
+            if unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) } == 0 {
+                return Some(ch);
+            }
+        }
+        if std::path::Path::new("/bin/sh").exists() {
+            let (cp, cl) = view_of("/bin/sh");
+            let argv = argv_of(&["/bin/sh", "-c", "sleep 30"]);
+            if unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) } == 0 {
+                return Some(ch);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn child_kill_signals_a_live_child() {
+        let Some(ch) = spawn_sleeper() else { return };
+        // SIGTERM (15) terminates the sleeper; `wait` then reports 128 + 15 = 143 (shell convention).
+        assert_eq!(unsafe { align_rt_child_kill(ch, 15) }, 0, "kill(SIGTERM) on a live child succeeds");
+        assert_eq!(unsafe { align_rt_child_wait(ch) }, 143, "signal-killed child → 128 + 15");
+        unsafe { align_rt_child_free(ch) };
+    }
+
+    #[test]
+    fn child_kill_zero_is_liveness_probe() {
+        let Some(ch) = spawn_sleeper() else { return };
+        // sig 0 sends no signal but confirms the child exists (the POSIX liveness/permission probe).
+        assert_eq!(unsafe { align_rt_child_kill(ch, 0) }, 0, "kill(0) on a live child is Ok");
+        // Clean up: SIGKILL + reap.
+        assert_eq!(unsafe { align_rt_child_kill(ch, 9) }, 0);
+        let _ = unsafe { align_rt_child_wait(ch) };
+        unsafe { align_rt_child_free(ch) };
+    }
+
+    #[test]
+    fn child_kill_after_wait_is_err() {
+        if !std::path::Path::new("/bin/true").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/true");
+        let argv = argv_of(&["/bin/true"]);
+        let mut ch: *mut Child = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
+        assert_eq!(unsafe { align_rt_child_wait(ch) }, 0);
+        // The child is reaped; killing it must NOT signal the (possibly recycled) pid — a clean Err.
+        assert_eq!(unsafe { align_rt_child_kill(ch, 15) }, AL_INVALID, "kill after wait (reaped) → clean Err");
+        unsafe { align_rt_child_free(ch) };
+    }
+
+    #[test]
+    fn child_kill_bad_sig_and_null() {
+        assert_eq!(unsafe { align_rt_child_kill(std::ptr::null_mut(), 15) }, AL_INVALID, "null child → Err");
+        let Some(ch) = spawn_sleeper() else { return };
+        assert_eq!(unsafe { align_rt_child_kill(ch, -1) }, AL_INVALID, "negative signal → Invalid");
+        assert_eq!(unsafe { align_rt_child_kill(ch, MAX_SIGNAL + 1) }, AL_INVALID, "out-of-range signal → Invalid");
+        // The child is untouched by the rejected signals — still killable normally.
+        assert_eq!(unsafe { align_rt_child_kill(ch, 9) }, 0);
+        let _ = unsafe { align_rt_child_wait(ch) };
+        unsafe { align_rt_child_free(ch) };
+    }
+
+    #[test]
+    fn process_exec_failure_returns_errno() {
+        // exec of a nonexistent command CANNOT succeed (so it never replaces this test process); it
+        // returns a mapped errno-status. A *successful* exec is exercised only by the driver subprocess
+        // tests (it would replace the test runner).
+        let (cp, cl) = view_of("/nonexistent/definitely-not-a-real-binary");
+        let argv = argv_of(&["/nonexistent/definitely-not-a-real-binary"]);
+        let rc = unsafe { align_rt_process_exec(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        assert_ne!(rc, 0, "a failed execvp returns a mapped errno-status (never 0)");
+        // Bad-args rejections (shared with spawn's marshalling): empty cmd / empty argv / interior NUL.
+        let (ep, el) = view_of("");
+        assert_eq!(unsafe { align_rt_process_exec(ep, el, argv.as_ptr(), argv.len() as i64) }, AL_INVALID, "empty cmd");
+        assert_eq!(unsafe { align_rt_process_exec(cp, cl, argv.as_ptr(), 0) }, AL_INVALID, "empty argv");
+        let bad = argv_of(&["/x", "a\0b"]);
+        assert_eq!(unsafe { align_rt_process_exec(cp, cl, bad.as_ptr(), bad.len() as i64) }, AL_INVALID, "interior NUL in an arg");
     }
 
     #[test]
