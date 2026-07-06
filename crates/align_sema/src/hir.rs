@@ -783,7 +783,7 @@ pub enum ExprKind {
     /// exec-not-found surfaces later as `wait() == 127`. Impure. Both `cmd` and `args` are borrowed
     /// (never consumed).
     ProcessSpawn { cmd: Box<Expr>, args: Box<Expr> },
-    /// `ch.wait()` (`std.process`) — block in `waitpid` for the `child` `child` to exit, returning its
+    /// `ch.wait()` (`std.process`) — block in `waitpid` for the `child` to exit, returning its
     /// exit code as `Result<i64, Error>`: a normal exit yields `WEXITSTATUS` (`0..=255`); a
     /// signal-killed child yields `128 + signal` (the shell convention). Marks the child **reaped**
     /// (through the borrow — the receiver is read, not consumed, so the later `Drop` becomes a no-op);
