@@ -147,3 +147,237 @@ fn abort_in_par_map_is_rejected() {
     let src = "import std.process\nfn boom(x: i64) -> i64 {\n  process.abort()\n  x\n}\nfn main() -> Result<(), Error> {\n  ys := [1, 2].par_map(boom)\n  print(ys.sum())\n  return Ok(())\n}\n";
     assert!(check_errs("proc-abort-parmap", src));
 }
+
+// --- Slice 2 — `child` / `process.spawn` / `ch.wait()` + Drop-reaps-via-waitpid ----------------
+//
+// `process.spawn(cmd, args) -> Result<child, Error>` forks + `execvp`s (an owned Move handle owning
+// the pid; `Drop` reaps it via a blocking `waitpid`, so a dropped-without-`wait()` child can't zombie
+// — P2, no `SA_NOCLDWAIT`). `args` is the child's FULL argv incl. `argv[0]` (P5). `ch.wait()` blocks
+// in `waitpid` and returns the exit code (`WEXITSTATUS`, or `128 + signal` for a signal-killed child —
+// the shell convention); it borrows the child (never consumed — mirrors `l.accept()`) and flips its
+// reaped state so the later `Drop` is a no-op. A double-`wait()` is a clean `Err`. The CLOEXEC (P3)
+// and rigorous no-zombie (`ECHILD` after the reap) proofs are runtime unit tests in `align_runtime`.
+
+/// A program that spawns `args[1]` with the child argv `args[1..]` (the full argv incl. `argv[0]`),
+/// waits, and prints the exit code — the harness supplies the command + its argv as `prog_args`.
+const SPAWN_WAIT_PRINT: &str = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  code := ch.wait()?
+  print(code)
+  return Ok(())
+}";
+
+/// `/bin/true` exits 0 → `wait()` returns 0. The child argv is a single element (`argv[0]` only).
+#[test]
+fn spawn_true_waits_zero() {
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run_args("m11proc-true", SPAWN_WAIT_PRINT, &["/bin/true"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0", "spawn /bin/true → wait 0");
+}
+
+/// `/bin/false` exits 1 → `wait()` returns 1.
+#[test]
+fn spawn_false_waits_one() {
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run_args("m11proc-false", SPAWN_WAIT_PRINT, &["/bin/false"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1", "spawn /bin/false → wait 1");
+}
+
+/// An exec-not-found cannot be reported synchronously (the fork already happened): the forked child
+/// `_exit(127)`s (the shell convention), so `wait()` returns 127 (P5).
+#[test]
+fn spawn_nonexistent_waits_127() {
+    if !backend_available() {
+        return;
+    }
+    let out = build_and_run_args("m11proc-missing", SPAWN_WAIT_PRINT, &["/nonexistent/definitely-not-a-real-binary"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "127", "exec-not-found → wait 127");
+}
+
+/// The natural call form: the argv is a **fixed-size array literal** (`["/bin/true"]`, typed
+/// `array<str, 1>`), not a dynamic array or a slice-range of one. It is borrowed to a `slice<str>`
+/// via the existing `ArrayToSlice` coercion, so no `[..]` / `[0..n]` dance is needed. `/bin/true`
+/// exits 0 → `wait()` returns 0.
+#[test]
+fn spawn_with_fixed_array_literal_argv() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+import std.process
+pub fn main() -> Result<(), Error> {
+  ch := process.spawn(\"/bin/true\", [\"/bin/true\"])?
+  code := ch.wait()?
+  print(code)
+  return Ok(())
+}";
+    let out = build_and_run("m11proc-fixed-argv", src);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "0",
+        "fixed-array-literal argv spawns + waits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A signal-killed child yields `128 + signal`: `sh -c 'kill -9 $$'` sends itself `SIGKILL` (9), so
+/// `wait()` returns `128 + 9 = 137` (the shell convention; `ch.kill` is a Slice-3 API, so the child
+/// kills itself here).
+#[test]
+fn spawn_signal_killed_child_is_128_plus_sig() {
+    if !backend_available() || !std::path::Path::new("/bin/sh").exists() {
+        return;
+    }
+    let out = build_and_run_args("m11proc-signal", SPAWN_WAIT_PRINT, &["/bin/sh", "-c", "kill -9 $$"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "137", "SIGKILL-ed child → 128+9");
+}
+
+/// A `child` dropped without `wait()` is reaped by its `Drop` (a blocking `waitpid`) — no zombie, no
+/// hang. Here `ch` drops at function end after `print`; `/bin/true` has already exited, so the reap is
+/// immediate. (The rigorous no-zombie proof — the reap makes a later `waitpid` return `ECHILD` — is a
+/// runtime unit test.)
+#[test]
+fn spawn_then_drop_without_wait_reaps_cleanly() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  print(\"spawned\")
+  return Ok(())
+}";
+    let out = build_and_run_args("m11proc-drop", prog, &["/bin/true"]);
+    assert!(out.status.success(), "drop-without-wait exits cleanly (the reap does not hang)");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "spawned");
+}
+
+/// A second `wait()` on an already-reaped child is a clean `Err` (detected via the reaped flag, not an
+/// `ECHILD` race). The first wait succeeds (prints the code); the second's `else`-unwrap runs.
+#[test]
+fn double_wait_second_is_err() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  first := ch.wait()?
+  print(first)
+  match ch.wait() {
+    Ok(code) => {
+      print(code)
+    }
+    Err(_) => {
+      print(\"second-err\")
+    }
+  }
+  return Ok(())
+}";
+    let out = build_and_run_args("m11proc-double-wait", prog, &["/bin/true"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0\nsecond-err", "double-wait → clean Err");
+}
+
+/// A `child` threads through a function parameter (a Move handle passed by value) — but cannot be
+/// collected into an array (a copied handle would double-reap its pid), rejected at construction like
+/// `reader`/`writer`/`tcp_conn`.
+#[test]
+fn child_rejected_as_array_element() {
+    let src = "\
+import std.process
+fn f(a: child, b: child) -> i64 {
+  xs := [a, b]
+  return xs.len()
+}
+pub fn main() -> i32 {
+  return 0
+}
+";
+    assert!(check_errs("m11proc-child-array", src), "a child cannot be an array element");
+}
+
+/// `process.spawn` is a fork+exec syscall — impure. A closure that spawns is never `Pure`, so `par_map`
+/// (which requires a Pure closure) rejects it (the `tcp.connect` / `fs` / `io` impurity precedent).
+#[test]
+fn spawn_rejected_by_par_map() {
+    let src = "\
+import std.process
+fn f(x: i64) -> i64 {
+  ch := process.spawn(\"/bin/true\", [\"/bin/true\"][0..1]) else { return x }
+  code := ch.wait() else { return x }
+  return code
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11proc-parmap", src), "a process.spawn-using (impure) closure must be rejected by par_map");
+}
+
+/// P4: a `child` is an owned Move handle — an unbound temporary (`process.spawn(...)?.wait()`) is not
+/// dropped yet, so it cannot be a `wait()` receiver in v1 (its pid would never be reaped). Bind it
+/// first. (Mirrors the `l.accept()` / reader/writer bound-receiver restriction.)
+#[test]
+fn child_wait_unbound_temporary_receiver_rejected() {
+    let src = "\
+import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  code := process.spawn(args[1], args[1..])?.wait()?
+  print(code)
+  return Ok(())
+}
+";
+    assert!(check_errs("m11proc-unbound-recv", src), "a wait on an unbound child temporary must be rejected (bind first)");
+}
+
+/// A `child` moved by value into a function is reaped **exactly once**: the move nulls the caller's
+/// slot (`null_moved_source`), so `main`'s exit `Drop` is a no-op and only the callee's param `Drop`
+/// (after its `wait()`) reaps. Without the move-nulling this would double-reap (a recycled pid hazard).
+#[test]
+fn child_moved_into_function_is_reaped_once() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.process
+fn run(c: child) -> Result<i64, Error> {
+  code := c.wait()?
+  return Ok(code)
+}
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  code := run(ch)?
+  print(code)
+  return Ok(())
+}";
+    let out = build_and_run_args("m11proc-move-fn", prog, &["/bin/true"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0", "child moved into run(), waited once");
+}
+
+/// `process.spawn` requires `import std.process` (the capability-header rule), like every other `std`
+/// surface.
+#[test]
+fn process_spawn_requires_import() {
+    let src = "\
+pub fn main(args: array<str>) -> Result<(), Error> {
+  ch := process.spawn(args[1], args[1..])?
+  code := ch.wait()?
+  print(code)
+  return Ok(())
+}
+";
+    assert!(check_errs("m11proc-noimport-spawn", src), "process.spawn without `import std.process` must error");
+}

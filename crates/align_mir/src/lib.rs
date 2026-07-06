@@ -552,6 +552,18 @@ pub enum Rvalue {
     /// `buffer` operand up to its capacity (overwriting its length). Yields an `i64`: the bytes
     /// received (`>= 0`, `Ok`) or `-(status)` on error (the [`Rvalue::ReaderRead`] sign convention).
     UdpRecvFrom { sock: Operand, buffer: Operand },
+    /// `process.spawn(cmd, args)` — `fork` + `execvp(cmd, argv)`. `cmd` is a `str` view (the lookup
+    /// path); `args` is a str-view collection `{ptr,len}` (the child's full argv, incl. argv[0]). On
+    /// success writes the owned `child` handle (a bare pointer) into `out`. Yields an `i32` status (0 =
+    /// ok, else the shared errno/status table; a `fork` failure is the mapped errno, an interior-NUL /
+    /// empty argv is `AL_INVALID`). An `execvp` failure is NOT reported here — the forked child
+    /// `_exit(127)`s. Mirrors [`Rvalue::UdpBind`] with a `child` handle payload.
+    ProcessSpawn { cmd: Operand, args: Operand, out: Slot },
+    /// `ch.wait()` — block in `waitpid` for the `child` operand to exit, marking it reaped (through the
+    /// borrow — the receiver is read, not consumed). Yields an `i64`: the exit code (`>= 0`:
+    /// `WEXITSTATUS`, or `128 + signal` for a signal-killed child) on success, or `-(status)` on error
+    /// (a double-wait / `waitpid` failure — the [`Rvalue::ReaderRead`] sign convention).
+    ChildWait { child: Operand },
     /// `fs.read_file_view(path)` — mmap the regular file `path` read-only into `arena`, writing the
     /// `str` view `{ptr,len}` into `out`. Yields an `i32` errno-status (0 = ok). The mapping is
     /// `munmap`ped at arena end (the region rule) — no `Drop`.
@@ -1047,7 +1059,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -1539,6 +1551,8 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::UdpBind { host, port } => lower_udp_bind(b, host, port, e.ty),
         hir::ExprKind::UdpSendTo { sock, data, host, port } => lower_udp_send_to(b, sock, data, host, port, e.ty),
         hir::ExprKind::UdpRecvFrom { sock, buffer } => lower_udp_recv_from(b, sock, buffer, e.ty),
+        hir::ExprKind::ProcessSpawn { cmd, args } => lower_process_spawn(b, cmd, args, e.ty),
+        hir::ExprKind::ChildWait { child } => lower_child_wait(b, child, e.ty),
         // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
         // runtime registers the mmap for `munmap` at arena end.
         hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
@@ -5002,6 +5016,57 @@ fn lower_udp_recv_from(b: &mut Builder, sock: &hir::Expr, buffer: &hir::Expr, re
     lower_count_or_status_result(b, n, result_ty)
 }
 
+/// `process.spawn(cmd, args)` → the runtime `fork`s + `execvp`s, writing the owned `child` handle into
+/// an out slot and returning an errno-status; branch `Ok(<child>)` / `Err(<mapped status>)`. Mirrors
+/// [`lower_udp_bind`] with a `child` handle payload (the unwrapped local owns it — `Drop` reaps it).
+fn lower_process_spawn(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::Child);
+    let c = lower_expr(b, cmd);
+    let a = lower_expr(b, args);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::ProcessSpawn { cmd: c, args: a, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the child handle and wrap it (the unwrapped local owns it — `Drop` reaps its pid).
+    b.cur = ok_bb;
+    let ch = b.fresh_value(Ty::Child);
+    b.push(Stmt::Let(ch, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(ch))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (null handle) → nothing to reap; map the status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `ch.wait()` → the runtime `waitpid`s (marking the child reaped through the borrow), returning the
+/// exit code (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
+/// helper (the `reader.read` sign convention). `child` is borrowed (never consumed — no move-out).
+fn lower_child_wait(b: &mut Builder, child: &hir::Expr, result_ty: Ty) -> Operand {
+    let ch = lower_expr(b, child);
+    let n = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(n, Rvalue::ChildWait { child: ch }));
+    lower_count_or_status_result(b, n, result_ty)
+}
+
 /// `fs.read_file_view(path)` → the runtime mmaps the file into the enclosing arena, writing the
 /// `str` view `{ptr,len}` into an out slot and returning an errno-status; branch `Ok(<view>)` /
 /// `Err(<mapped status>)`. The arena handle (guaranteed present — sema requires an enclosing arena)
@@ -5690,6 +5755,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::TcpConn => "tcp_conn".to_string(),
         Ty::TcpListener => "tcp_listener".to_string(),
         Ty::UdpSocket => "udp_socket".to_string(),
+        Ty::Child => "child".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

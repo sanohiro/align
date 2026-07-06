@@ -119,6 +119,11 @@ pub enum Scalar {
     /// (a bound `SOCK_DGRAM` socket fd); the enclosing `Result`'s `Drop` closes it. Opaque pointer,
     /// like [`Scalar::TcpConn`]/[`Scalar::TcpListener`] — owned, never region-tracked.
     UdpSocket,
+    /// A `child` payload (`Result<child, Error>` from `process.spawn`). An owned **Move** handle
+    /// (a child process pid + a reaped flag); the enclosing `Result`'s `Drop` reaps it (a blocking
+    /// `waitpid`, discarding the code, so it can't zombie). Opaque pointer, like [`Scalar::TcpConn`]
+    /// — owned, never region-tracked. The one Move scalar backed by a pid, not an fd.
+    Child,
 }
 
 impl Scalar {
@@ -127,7 +132,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, and a `udp_socket`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child)
     }
 }
 
@@ -339,6 +344,13 @@ pub enum Ty {
     /// `u.recv_from(...)` datagram ops each return a `Result<i64, Error>` (a byte count) — connectionless,
     /// so there is no borrowed reader/writer and no region binding. Impure. Opaque pointer.
     UdpSocket,
+    /// A `child` (`std.process`) — a spawned child process, the `Ok` payload of `process.spawn`'s
+    /// `Result<child, Error>`. An owned **Move** handle owning the child's pid (plus a reaped flag),
+    /// `Drop`-reaped (a blocking `waitpid` discarding the code — no zombie; the documented tradeoff is
+    /// that dropping a still-running child blocks). Its `ch.wait()` returns `Result<i64, Error>` (the
+    /// exit code) and flips the reaped flag through the borrow so the later `Drop` is a no-op — the
+    /// receiver is read, not consumed (mirrors `l.accept()`). Impure. Opaque pointer.
+    Child,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -404,6 +416,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::TcpListener => Some(Scalar::TcpListener),
         // A `udp_socket` owned handle as the `Result` Ok payload of `udp.bind`.
         Ty::UdpSocket => Some(Scalar::UdpSocket),
+        // A `child` owned handle as the `Result` Ok payload of `process.spawn`.
+        Ty::Child => Some(Scalar::Child),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -438,6 +452,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::TcpConn => Ty::TcpConn,
         Scalar::TcpListener => Ty::TcpListener,
         Scalar::UdpSocket => Ty::UdpSocket,
+        Scalar::Child => Ty::Child,
     }
 }
 
@@ -486,7 +501,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -518,7 +533,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -667,7 +682,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -739,7 +754,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2379,6 +2394,16 @@ impl EffectScan {
                 self.expr(code);
             }
             ExprKind::ProcessAbort => self.impure_direct = true,
+            // `process.spawn` (fork+exec) / `ch.wait()` (waitpid) are impure — excluded from `par_map`.
+            ExprKind::ProcessSpawn { cmd, args } => {
+                self.impure_direct = true;
+                self.expr(cmd);
+                self.expr(args);
+            }
+            ExprKind::ChildWait { child } => {
+                self.impure_direct = true;
+                self.expr(child);
+            }
             // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data),
             ExprKind::EncodingDecode { input, .. } => self.expr(input),
@@ -3492,6 +3517,13 @@ impl<'a> EscapeCheck<'a> {
             // has no operand.
             ExprKind::ProcessExit { code } => self.walk(code, depth),
             ExprKind::ProcessAbort => {}
+            // `spawn`'s `cmd`/`args` are borrowed views (nothing escapes); `wait`'s `child` is a
+            // borrowed handle — recurse only.
+            ExprKind::ProcessSpawn { cmd, args } => {
+                self.walk(cmd, depth);
+                self.walk(args, depth);
+            }
+            ExprKind::ChildWait { child } => self.walk(child, depth),
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
             ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             // `std.rand`: an `rng` is Copy/`Static` (borrows nothing); `sample` returns a fresh owned
@@ -3884,6 +3916,11 @@ impl UnnecessaryHeapScan {
             ExprKind::TimeSleep { ns } => self.visit(ns),
             ExprKind::ProcessExit { code } => self.visit(code),
             ExprKind::ProcessAbort => {}
+            ExprKind::ProcessSpawn { cmd, args } => {
+                self.visit(cmd);
+                self.visit(args);
+            }
+            ExprKind::ChildWait { child } => self.visit(child),
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.visit(data),
             ExprKind::EncodingDecode { input, .. } => self.visit(input),
             // `std.rand` — recurse into the subexpressions (no heap-narrowing pattern of its own).
@@ -4568,6 +4605,13 @@ impl<'a> MoveCheck<'a> {
             // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
             ExprKind::ProcessExit { code } => self.expr(code, moved, false, false),
             ExprKind::ProcessAbort => {}
+            // `spawn` borrows `cmd`/`args` (never consumed); `wait` borrows its `child` (NOT consumed —
+            // it only flips the reaped flag through the borrow, mirroring `l.accept()`).
+            ExprKind::ProcessSpawn { cmd, args } => {
+                self.expr(cmd, moved, false, false);
+                self.expr(args, moved, false, false);
+            }
+            ExprKind::ChildWait { child } => self.expr(child, moved, false, false),
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data, moved, false, false),
             ExprKind::EncodingDecode { input, .. } => self.expr(input, moved, false, false),
@@ -7510,6 +7554,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.process", &format!("process.{method}"), span);
                 return self.check_process_op(method, args, span);
             }
+            // `std.process` — `process.spawn(cmd, args)` -> Result<child, Error> (fork+execvp).
+            if module == "process" && method == "spawn" {
+                self.require_import("std.process", "process.spawn", span);
+                return self.check_process_spawn(args, span);
+            }
             // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred).
             if module == "io" && method == "copy" {
                 self.require_import("std.io", "io.copy", span);
@@ -7747,6 +7796,20 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty != Ty::Error {
                 self.diags
                     .error(format!("'.accept()' is not a method on {} (it is a `tcp_listener` method)", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        // `std.process` — `ch.wait()` on a `child` blocks in `waitpid` and returns the exit code
+        // (`Result<i64, Error>`). Dispatched on the receiver type so the name stays free on other
+        // values (in particular the bare `wait(handle)` task_group builtin is unaffected).
+        if method == "wait" {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::Child {
+                return self.check_child_wait(recv_expr, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.wait()' is not a method on {} (it is a `child` method)", ty_name(recv_expr.ty)), span);
             }
             return err;
         }
@@ -8188,7 +8251,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) {
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -10395,7 +10458,7 @@ impl<'a, 't> Checker<'a, 't> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket)
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child)
             || payload_is_move(elem)
             || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs))
         {
@@ -10445,7 +10508,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // unconstructible today (each handle is rejected as an array element at construction),
                 // so this arm can't currently be reached — kept in sync so a future array-of-handle
                 // path can't slip past this guard silently.
-                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) || payload_is_move(elem) {
+                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) || payload_is_move(elem) {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
                         span,
@@ -10981,6 +11044,100 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         Expr { kind: ExprKind::ProcessExit { code: Box::new(code) }, ty: Ty::Unit, span }
+    }
+
+    /// `process.spawn(cmd, args)` (`std.process`) -> `Result<child, Error>` — `fork` + `execvp` a
+    /// child process. `cmd` is a borrowed `str` (owned `string` auto-borrowed) — the **lookup path**
+    /// passed to `execvp` (resolved via `PATH` when it has no `/`). `args` is a borrowed str-view
+    /// collection (`array<str>` — e.g. `main(args)` — or a `slice<str>` of it) that becomes the
+    /// child's **full** `argv`, **including `argv[0]`** (P5: the caller supplies the program name, not
+    /// the runtime; `cmd` and `args[0]` are independent). Both are borrowed (never consumed). The Ok
+    /// payload is an owned `child` Move handle (`Drop` reaps it via a blocking `waitpid`). A `fork`
+    /// failure is `Err(errno)`; an `execvp` failure cannot be reported synchronously — the forked child
+    /// `_exit(127)`s (the shell convention), so an exec-not-found surfaces later as `wait() == 127`
+    /// (`docs/impl/std-design/process.md` P5). Impure. Builtin.
+    fn check_process_spawn(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'process.spawn' expects 2 arguments (the command path and the argv `array<str>`), got {}", args.len()), span);
+            return err;
+        }
+        let cmd = Box::new(self.check_str_init(&args[0]));
+        let argv = self.check_expr(&args[1], None);
+        if cmd.ty == Ty::Error || argv.ty == Ty::Error {
+            return err;
+        }
+        // `argv` is the child's full argv — a borrowed str-view collection, all forms lowering to a
+        // `{ptr,len}` of `str` views the runtime marshals into C strings. An interior NUL / empty argv
+        // is rejected at runtime (`Error.Invalid`). Accept:
+        //   * `array<str>` (`DynArray(Str)`, e.g. `main(args)`) and `slice<str>` (a sub-range of one,
+        //     so a caller can pass part of its own argv) — already `{ptr,len}` values;
+        //   * a fixed-size `array<str, N>` literal/local (the natural `["/bin/echo", "hi"]` call) —
+        //     borrowed to a `slice<str>` via the same `ArrayToSlice` coercion used for any
+        //     slice-typed argument/binding (`check_slice_init`), which materializes the data-ptr +
+        //     constant len. No new mechanism, no argv copy: the borrow is a `MakeSlice(slot, N)`.
+        let argv = match self.resolve(argv.ty) {
+            Ty::DynArray(Scalar::Str) | Ty::Slice(Scalar::Str) => argv,
+            Ty::Array(Scalar::Str, _) => {
+                // Same restriction as every array→slice borrow: the source must be an array literal
+                // or a named local (an arbitrary array expression has no materializable slot yet).
+                if !matches!(argv.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+                    self.diags.error(
+                        "an array coerced to a slice must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                        args[1].span,
+                    );
+                    return err;
+                }
+                let span = argv.span;
+                Expr { kind: ExprKind::ArrayToSlice(Box::new(argv)), ty: Ty::Slice(Scalar::Str), span }
+            }
+            _ => {
+                self.diags.error(
+                    format!("'process.spawn' takes the argv as an `array<str>` / `slice<str>` (the full argv incl. argv[0]), got {}", ty_name(argv.ty)),
+                    args[1].span,
+                );
+                return err;
+            }
+        };
+        Expr {
+            kind: ExprKind::ProcessSpawn { cmd, args: Box::new(argv) },
+            ty: Ty::Result(Scalar::Child, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `ch.wait()` on a `child` ([`Ty::Child`]), the receiver already evaluated. Blocks in `waitpid`
+    /// for the child to exit and returns its exit code as `Result<i64, Error>`: a normal exit yields
+    /// `WEXITSTATUS` (`0..=255`), a signal-killed child yields `128 + signal` (the shell convention).
+    /// `wait` **borrows** the child (never consumed — mirrors `l.accept()`), but flips its reaped state
+    /// through the borrow so the later `Drop` is a no-op; a second `wait()` on an already-reaped child
+    /// is a clean `Err` (the reaped flag makes double-wait detectable without an `ECHILD` race). No
+    /// arguments.
+    fn check_child_wait(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 bound-receiver gate (mirrors `check_listener_accept`): the child must be a bound local —
+        // an unbound owned-child temporary (`process.spawn(...)?.wait()`) is not `Drop`ped yet, so its
+        // pid would never be reaped (a zombie). Bind it first. Lifted when Move temporaries drop.
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the child to a local first, then wait (`ch := process.spawn(...)?` then `ch.wait()`) — a temporary owned child handle is not dropped yet, so its pid would never be reaped".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        if !args.is_empty() {
+            self.diags
+                .error(format!("'.wait()' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ChildWait { child: Box::new(recv_expr) },
+            ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
+            span,
+        }
     }
 
     /// `std.encoding` — Base64 (standard + URL-safe), hex, and UTF-8 validation. Pure byte
@@ -11720,7 +11877,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Any other Move leaf (a `box`/owned-collection/builder field) can't occur — struct fields are
         // scalar / `str` / `string` / plain-struct only — but guard defensively against a copy-without-
         // ownership-transfer double-free if that ever changes.
-        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) || payload_is_move(leaf_ty) {
+        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) || payload_is_move(leaf_ty) {
             self.diags.error(
                 format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
                 span,
@@ -12574,6 +12731,11 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::ProcessExit { code } => self.finalize_expr(code),
             ExprKind::ProcessAbort => {}
+            ExprKind::ProcessSpawn { cmd, args } => {
+                self.finalize_expr(cmd);
+                self.finalize_expr(args);
+            }
+            ExprKind::ChildWait { child } => self.finalize_expr(child),
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
             ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
             ExprKind::RandSeed => {}
@@ -13034,6 +13196,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::TcpConn => "tcp_conn".to_string(),
         Ty::TcpListener => "tcp_listener".to_string(),
         Ty::UdpSocket => "udp_socket".to_string(),
+        Ty::Child => "child".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -13208,7 +13371,7 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // payload (`tcp.connect`/`l.accept` for the conn, `tcp.listen` for the listener, `udp.bind` for
     // the socket) is fine, but never an array/slice/box element (a copied handle would
     // double-`close` its fd).
-    if matches!(ty, Ty::Buffer | Ty::CliCommand) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -13470,6 +13633,15 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::UdpSocket
+        }
+        // `child` (`std.process`) — a spawned child process Move handle (`process.spawn`). A surface
+        // type name so it can be threaded through functions (a Move handle; passed by value).
+        "child" => {
+            if !args.is_empty() {
+                diags.error("child takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::Child
         }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {
