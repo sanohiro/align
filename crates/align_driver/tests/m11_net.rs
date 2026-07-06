@@ -329,3 +329,64 @@ pub fn main() -> Result<(), Error> {
 ";
     assert!(check_errs("m11net-conn-noimport", src), "tcp.connect without `import std.net` must error");
 }
+
+/// Adversarial-review F1: an owned reader constructed by a **direct** builtin (`fs.open`) inside a
+/// user function, called with only `Static`-region arguments (`args[1]` — an index into a
+/// parameter, never `Let`-bound to a shorter region), stays `Static` end to end. `region_of(Call)`
+/// folds over zero/`Static` args and produces `Static`, so the caller can bind the returned reader
+/// and use it normally (read from it) — contrast with the conservative-rejection case below, which
+/// differs only in that the argument itself is `Frame`-region.
+#[test]
+fn owned_reader_direct_constructor_returnable() {
+    let src = "\
+import std.fs
+import std.io
+fn make(p: str) -> Result<reader, Error> {
+  return fs.open(p)
+}
+pub fn main(args: array<str>) -> Result<(), Error> {
+  r := make(args[1])?
+  buf := buffer(4)
+  n := r.read(buf)?
+  print(n)
+  return Ok(())
+}
+";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "m11net-reader-direct-ctor", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "a reader from a direct builtin constructor, called with only Static args, must be usable by the caller:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+}
+
+/// Adversarial-review F1: the conservative counterpart to the test above. `open_it`'s own reader is
+/// an unrelated fixed-path `fs.open` — it borrows nothing from `tag` — but `region_of(Call)` has no
+/// per-fn "does this borrow arg i" fact, so it folds in *every* argument's region regardless. Passing
+/// a `Frame`-region argument (a `string` local auto-borrowed to `str`, MMv2 slice 7b) taints the call
+/// result, so returning it out of `steal` (past the frame) is conservatively rejected — sound (never
+/// miscompiles), just imprecise. (Documented on `tracks_region`'s `Reader | Writer` arm.)
+#[test]
+fn reader_through_call_with_frame_arg_conservatively_rejected() {
+    let src = "\
+import std.fs
+fn open_it(tag: str) -> Result<reader, Error> {
+  return fs.open(\"/tmp/align-m11-conservative-test-nonexistent\")
+}
+fn steal() -> Result<reader, Error> {
+  b := builder()
+  b.write(\"x\")
+  tag := b.to_string()
+  return open_it(tag)
+}
+pub fn main() -> Result<(), Error> {
+  r := steal()?
+  return Ok(())
+}
+";
+    assert!(
+        check_errs("m11net-reader-call-frame-arg", src),
+        "a reader returned through a user call with a Frame-region argument must be conservatively rejected"
+    );
+}

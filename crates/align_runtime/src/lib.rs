@@ -587,6 +587,10 @@ pub struct TcpConn {
 /// when every candidate address failed. Leaves `*out = null` on failure. `freeaddrinfo` runs on
 /// every path (no leak).
 ///
+/// v1 makes no `EINTR` retry on `connect` (an interrupted attempt fails that address and moves on
+/// to the next candidate) and sets no connect timeout (a hung/black-holed peer blocks indefinitely)
+/// — both acceptable for v1, documented here rather than silently assumed.
+///
 /// # Safety
 /// `host` must describe a valid byte range for `host_len`; `out` must point to a writable
 /// `*mut TcpConn` slot.

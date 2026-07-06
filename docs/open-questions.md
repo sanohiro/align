@@ -1874,6 +1874,8 @@ A 7-agent audit on another machine (frontend / sema-types / sema-flow / MIR+code
 
 Record: `crates/align_sema` (the analyses), `tests/analysis_coverage.rs`, `align-self-review` Gate 1.
 
+**Borrow-liveness gap (recorded 2026-07-06, net Slice 2 review):** the region analysis tracks *where* a borrow may point, not *how long its source stays live* — intra-frame borrow invalidation is not modeled. A `Frame`-region borrow (`c.reader()`/`c.writer()` on a `tcp_conn`, `buffer.bytes()`, `cli.get_str`, a `str`-borrow of a `string` field) stays type-checked as usable for the rest of the frame even after its source is reassigned (`drop_old` closes/frees the underlying resource) or moved out — a use-after-close/use-after-free window the checker doesn't see. For sockets (std.net Slice 2) the consequence is sharper than for files/buffers: a reassigned `tcp_conn` frees its fd back to the kernel, so a stale reader/writer can silently read/write a **reused fd** (a different, unrelated connection) instead of merely crashing. The fix is the same borrow-liveness dataflow the escape-check → MIR-dataflow structural item above already calls for — recorded here so the socket-fd-reuse sharpening isn't lost.
+
 ### 2026-07-02 internal review (multi-agent: 4 deep-dive tracks + independent Opus/Codex design passes)
 
 Same-day, separate from the external soundness audit above (no overlap): 4 parallel deep-dive tracks

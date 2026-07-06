@@ -2709,10 +2709,19 @@ impl<'a> EscapeCheck<'a> {
             // `c.writer()` on a `tcp_conn` hand back a reader/writer over the conn's fd
             // (`owns_fd: false`), region-bound to `c` (see `region_of` — `ConnReader`/`ConnWriter`),
             // so a stream used past the conn's `close(fd)` is a use-after-close (net.md P2, #297).
-            // An *owned* reader/writer (`io.stdin`/`fs.open`/`io.stdout`/`fs.create`) has region
-            // `Static` (its `region_of` producer falls through to the `Static` wildcard), so it stays
-            // freely returnable — this arm only makes the escape check *consult* the region. (A
-            // `tcp_conn` itself is always owned, never a borrow, so it is deliberately NOT here.)
+            // An *owned* reader/writer constructed **directly** by a builtin (`io.stdin`/`fs.open`/
+            // `io.stdout`/`fs.create`) has region `Static` (its `region_of` producer — `ReaderOpen` /
+            // `WriterCreate` — falls through to the `Static` wildcard), so it stays freely returnable.
+            // But a reader/writer threaded through a **user** function call is not so lucky:
+            // `region_of(Call)` conservatively folds in *every* argument's region (it has no per-fn
+            // "does this actually borrow arg i" fact), so calling that user fn with a Frame/Arena-
+            // region argument taints the whole result — even when the callee's own reader is an
+            // unrelated direct `fs.open`. Returning that call's result past the tainted region is
+            // then rejected, even though nothing is actually borrowed. This is sound (never
+            // miscompiles) but imprecise; the precise fix belongs to the escape-check → MIR-dataflow
+            // structural follow-up (`docs/open-questions.md` "External soundness audit"). This arm
+            // only makes the escape check *consult* the region either way. (A `tcp_conn` itself is
+            // always owned, never a borrow, so it is deliberately NOT here.)
             Ty::Reader | Ty::Writer => true,
             _ => false,
         }
@@ -10251,7 +10260,12 @@ impl<'a, 't> Checker<'a, 't> {
                 // frees — same double-free reasoning as `check_index`. Slices are read-only views,
                 // so a `slice<scalar>` is fine; reject Move-element collections until a borrow design.
                 let elem = scalar_to_ty(s);
-                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer) || payload_is_move(elem) {
+                // `Ty::TcpConn` is defensive parity with `check_index`'s guard above: a
+                // `slice<tcp_conn>` / `array<tcp_conn>` is unconstructible today (a `tcp_conn` is
+                // rejected as an array element at construction, `tcp_conn_rejected_as_array_element`),
+                // so this arm can't currently be reached — kept in sync so a future array-of-conn
+                // path can't slip past this guard silently.
+                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn) || payload_is_move(elem) {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
                         span,
