@@ -761,6 +761,19 @@ pub enum ExprKind {
     /// [`crate::Ty::Unit`]). A negative `ns` is a no-op; `EINTR` resumes for the remaining time.
     /// Impure.
     TimeSleep { ns: Box<Expr> },
+    /// `process.exit(code)` — run the current function's pending cleanup (Drops for live owned
+    /// locals + arena ends + buffered-writer flushes, the exact emission a top-level `return` uses),
+    /// THEN call libc `exit(code)`. The settled cleanup-then-exit semantics
+    /// (`docs/impl/std-design/process.md`): the default hard-exit is the *safe* one — no silently
+    /// lost buffered output. Impure; diverges. **v1 gap:** only the current frame's cleanup runs —
+    /// full multi-frame stack unwind is the documented ideal, deferred. There is no `Never` type
+    /// yet, so the `ty` is [`crate::Ty::Unit`]; `process.exit` therefore cannot sit in the tail
+    /// position of a non-unit-returning function (use it as a statement).
+    ProcessExit { code: Box<Expr> },
+    /// `process.abort()` — the named-dangerous escape hatch: immediate `_exit`, running NO cleanup
+    /// (no Drops / flushes / atexit). The asymmetric counterpart to `process.exit`. Impure; diverges.
+    /// The `ty` is [`crate::Ty::Unit`] (no `Never` type yet).
+    ProcessAbort,
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode a byte view (`str` /
     /// owned `string` (auto-borrowed) / `slice<u8>`) into a freshly heap-allocated owned `string`
     /// (the `ty` is [`crate::Ty::String`]). `kind` selects the alphabet. Pure (a byte transform, no

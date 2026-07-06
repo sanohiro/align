@@ -36,6 +36,42 @@ could no longer retrieve the exit status). So v1 keeps the default `SIGCHLD` dis
 per-child in Drop instead. If a caller wants to drop a long-lived child *without* blocking, it
 should `kill()` first (or use a future explicit `detach()` API — recorded, not in v1).
 
+## Slice 1 — SHIPPED (2026-07-06, branch `feat/m11-process-slice1-exit`)
+
+`process.exit(code)` / `process.abort()` are built end-to-end (sema → HIR `ProcessExit`/`ProcessAbort`
+→ MIR → runtime `align_rt_process_exit`/`align_rt_process_abort`):
+
+- **exit = cleanup-then-exit.** MIR lowering runs the current function's `emit_exit_cleanup` (the same
+  helper a `return` uses — drops for live owned locals, `task_group`/arena ends) *before* the runtime
+  call, then terminates the block `Unreachable`. So a buffered writer flushes + closes in its `Drop`
+  and an arena is freed before the process dies. The runtime side is just `std::process::exit(code)`.
+- **abort = named escape hatch.** A bare `align_rt_process_abort()` with **no** preceding cleanup, i.e.
+  libc `_exit(1)` — no Drops, no flushes, no `atexit`. Distinct from the compiler's `panic_abort`
+  (`SIGABRT`, reserved for arithmetic-trap / invariant violations); `abort()` is a user-requested
+  signal-free immediate exit, as specified below (`_exit`, not `abort`). Exit status `1` (abort takes
+  no code; a deliberate abnormal exit is a failure).
+- **"Global flush" turned out to require nothing.** The runtime owns no process-wide output buffer:
+  `print` flushes `stdout` on every call (generated `main` returns straight to crt0, so it can't rely
+  on an `atexit` hook), and every `writer` / buffered sink is an Align **Move** value flushed by its
+  `Drop` in the caller's cleanup. So there is no atexit-style registration to build — recorded here as
+  unneeded-today. If a runtime-owned global buffer is ever introduced, `align_rt_process_exit` is where
+  its flush would hook.
+- **Exit-code truncation.** `i64 -> i32`, observed as the low 8 bits on a Unix `wait`
+  (`WEXITSTATUS`): `exit(256)` → `0`, `exit(-1)` → `255`. Documented, matches `exit(3)`.
+- **Divergence typing (v1 limitation).** There is no `Never` type, so `exit`/`abort` are typed `()`.
+  They diverge in MIR (cleanup + call + `Unreachable`), and code after them is dead — not emitted
+  (`lower_block` stops at `is_terminated`), parity with code-after-`return`, no ICE. But because the
+  type system does not model the divergence, `process.exit` cannot be the **tail value** of a
+  non-unit-returning function — use it as a statement (e.g. `process.exit(3)` then a trailing `0`).
+  A proper diverging/`Never` type is the ideal, deferred.
+- **v1 multi-frame gap (recorded honestly).** Only the CURRENT function's cleanup runs. A full
+  multi-frame stack unwind — running *every* caller's Drops on the way out — is the documented ideal,
+  deferred. For a program whose owned resources all live in the frame that calls `exit` (or in an
+  arena / buffered writer bound there), current-frame cleanup already covers everything expressible;
+  the gap bites only when a caller up the stack owns a resource whose `Drop` has an observable effect.
+
+Slices 2 (`child` / `spawn` / `wait`) and 3 (`kill` / `exec`) remain per the breakdown below.
+
 ## `process.exit` Drop-semantics decision (SETTLED here)
 
 `process.exit(code)` runs like a normal return to the top — it **unwinds and runs all pending

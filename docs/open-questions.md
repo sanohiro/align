@@ -2116,6 +2116,23 @@ full API shape in `draft.md` §18.2):
    constant-time verification for crypto) — heavier ground than a scope-closing milestone should
    carry. encoding/rand/cli establish the std-module footing first, individually, before those.
 
+### `process.exit` Drop semantics — SETTLED + BUILT (M11 std.process Slice 1, 2026-07-06)
+
+Design settled in `docs/impl/std-design/process.md` and now **shipped** (M11 std.process Slice 1,
+branch `feat/m11-process-slice1-exit`): **`process.exit(code)` runs the current function's pending
+cleanup first — Drops for live owned locals (buffered writers flush + close), arena / `task_group`
+ends — the exact emission a top-level `return` uses, THEN calls libc `exit(code)`.** "One way": exit
+is not a second, Drop-skipping shutdown mechanism; it reuses `emit_exit_cleanup`. The immediate
+hard-exit that skips all cleanup is the separately-named `process.abort()` (`_exit(1)`, no Drops/
+flushes) — the default is the *safe* one (no silently lost buffered output), the dangerous one is
+named. There is no `Never` type yet, so both are typed `()` (they diverge in MIR — cleanup + runtime
+call + `Unreachable` — but the type system does not model the divergence, so `exit`/`abort` cannot be
+the tail value of a non-unit-returning function; use them as statements). **v1 gap (recorded in
+`process.md`):** only the *current* frame's cleanup runs — a full multi-frame stack unwind running
+every caller's Drops is the documented ideal, deferred. (Was Open, target M11; the two candidates —
+run-Drops-then-exit vs. an immediate hard-exit API — both landed: the first as `exit`, the second as
+`abort`.)
+
 ---
 
 ## Open (to be decided)
@@ -2247,23 +2264,6 @@ forms). Convert a domain error to `Error` at the boundary with `map_err(to_error
 revisited when the general enum→exit-code mapping is designed** (the deferred alternative — e.g. tag
 index + 1 for any sum type at that position); that is the only remaining piece of the broader Error
 type design (see the section body above), so this section is otherwise complete.
-
-### `process.exit` Drop semantics (target: M11 — std.process)
-
-Recorded 2026-07-04 alongside the M10 scope decision — the exact reason `std.process` is deferred
-to M11 rather than folded into M10. Two candidates, not yet settled:
-
-- **First candidate: `exit` runs pending `Drop`s / arena cleanup, then `_exit`** — the same
-  shutdown path an ordinary `return` out of `main` already takes, just triggered early. Keeps
-  "one way": `exit` would not be a second, Drop-skipping shutdown mechanism alongside normal return.
-- **Alternative: an immediate hard-exit as a separate API**, e.g. `process.abort`, distinct from
-  `process.exit` — for the rare case that deliberately wants to skip cleanup (a fatal-error path
-  where running arbitrary `Drop` code is itself unsafe).
-
-Settle when `std.process` is designed (M11); not resolved ahead of that design.
-
-**Settled in `docs/impl/std-design/process.md` (2026-07-03):** run-Drops-then-exit default,
-`process.abort()` escape hatch.
 
 ### Arena with explicit allocator — partially settled (M3)
 **M3 decision: anonymous `arena {}` only.** Nested arenas use region = arena nesting

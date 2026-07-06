@@ -1593,6 +1593,29 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::TimeSleep { ns: no }));
             Operand::Const(Const::Unit)
         }
+        // `process.exit(code)` — the settled cleanup-then-exit path: evaluate `code`, run the current
+        // function's pending cleanup (drops for live owned locals + `task_group`/arena ends — the
+        // exact emission a `return` uses, so buffered writers flush in their `Drop`), then a diverging
+        // runtime `align_rt_process_exit(code)` (void `-> !`, like `bounds_fail`). The block is then
+        // `Unreachable`; `lower_block`/`lower_fn` observe `is_terminated` and emit no code after it
+        // (#274 lesson). v1 gap: only the CURRENT frame's cleanup runs — full multi-frame unwind is
+        // deferred (`docs/impl/std-design/process.md`).
+        hir::ExprKind::ProcessExit { code } => {
+            let c = lower_expr(b, code);
+            b.emit_exit_cleanup();
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::Call("process_exit".to_string(), vec![c])));
+            b.terminate(Term::Unreachable);
+            Operand::Const(Const::Unit)
+        }
+        // `process.abort()` — the named escape hatch: NO cleanup emission, a bare diverging
+        // `align_rt_process_abort()` (`_exit`), then `Unreachable`.
+        hir::ExprKind::ProcessAbort => {
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::Call("process_abort".to_string(), vec![])));
+            b.terminate(Term::Unreachable);
+            Operand::Const(Const::Unit)
+        }
         // `encoding.*_encode(data)` → an owned `string` `{ptr,len}` returned by value (like
         // `PathNormalize`); the runtime allocates the buffer, the bound local `Drop`-frees it.
         hir::ExprKind::EncodingEncode { kind, data } => {
