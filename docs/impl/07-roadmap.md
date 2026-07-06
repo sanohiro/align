@@ -1327,6 +1327,52 @@ constant-time requirement verified, not just specified; `std.http` depends on TL
 `std.compress` depends on `libzstd`/`zlib-ng` (FFI). encoding/rand/cli ship first specifically
 because they close over already-existing mechanisms.
 
+## M11: std third wave — net / process / compress / crypto / http (IN PROGRESS)
+
+Design source of truth per module: `docs/impl/std-design/*.md` (#348). Order: net first (new
+Move types, no external engine), then process, then the FFI-engine modules (compress/crypto)
+and http last (needs net + TLS).
+
+- **`std.net` — DONE (2026-07-06, PRs #371–#374, one slice per PR).**
+  - Slice 1 `dns.resolve(host) -> Result<array<string>, Error>` (#371): getaddrinfo →
+    owned deep-dropping `array<string>` (the `fs.read_dir` #339 template followed arm-by-arm);
+    EAI mapping = `EAI_NONAME`/`EAI_NODATA`/no-address → `Error.Invalid`, everything else →
+    `Error.Code(|eai|)`; `AddrInfo` FFI layout cfg-gated Linux/macOS with the BSD-port surface
+    (layout + `AF_INET6` + `EAI_*` change together) documented; `ai_addrlen` guarded before the
+    fixed-offset sockaddr read.
+  - Slice 2 `tcp_conn` (#372): first Move fd type (`Ty::TcpConn`, Drop = close); `tcp.connect`
+    (per-address getaddrinfo walk, SO_KEEPALIVE on, port 1..=65535); `c.reader()`/`c.writer()`
+    borrow the **M9 reader/writer unchanged** (`owns_fd:false` — only the conn's Drop closes;
+    net adds socket lifecycle, not a new I/O path — the slice's core proof). The #297-aware arm:
+    `tracks_region(Reader/Writer)` flipped to true with `region_of(ConnReader/ConnWriter) =
+    Frame ∩ region_of(conn)` so a borrowed stream can't escape its conn; direct owned
+    constructors stay `Static`; the one conservatism (an owned reader threaded through a user
+    call with a non-Static arg is rejected on return) is test-pinned and honest in the
+    `tracks_region` comment — the precise fix rides the escape→MIR-dataflow follow-up.
+  - Slice 3 `tcp_listener` (#373): twin Move type; `tcp.listen` (AI_PASSIVE, empty host = null
+    node = wildcard bind, SO_REUSEADDR, backlog 128), `l.accept() -> Result<tcp_conn, Error>` —
+    accept **borrows** the listener (accept loops move-check-pinned); EINTR asymmetry documented
+    (accept retries; connect fails that address and moves on).
+  - Slice 4 `udp_socket` (#374): third twin; `udp.bind` (SOCK_DGRAM, wildcard on empty host),
+    `u.send_to(data: bytes, host, port)` (non-consuming byte-view arg, EINTR-retried atomic
+    sendto, per-call resolve = documented v1 cost), `u.recv_from(buf) -> Result<i64, Error>` —
+    the `reader.read(buf)` cap/len shape reused verbatim. **Datagram peer deferred**: Result Ok
+    payloads are single Scalars (no `Scalar::Tuple`), and an owned peer would make net.md's
+    "small Copy struct" a Move aggregate — count-only is the ideal v1; peer waits for
+    first-class builtin-struct returns (recorded in net.md EN+ja).
+  - **Deferred with record (not blockers):** port 0 / kernel-assigned bind (needs a
+    `local_addr()`-style accessor), datagram peer (above), intra-frame borrow invalidation
+    (reader outliving a reassigned/moved conn — the `buffer.bytes()`/`cli.get_str` class,
+    sharpened note in open-questions), send_to destination cache, non-blocking/epoll/io_uring
+    backends (later Linux backend behind the same signatures), BSD-family port surface.
+  - Process note: every slice shipped through an independent adversarial gate review before its
+    PR (slices 3/4 came back zero-finding), plus the gemini review reflected before merge.
+- **`std.process` — NEXT.** Its one design blocker is already settled
+  (`process.exit` = run-Drops-then-exit, `process.abort()` = hard exit; recorded in
+  `std-design/process.md` — move the open-questions entry to Settled when it ships).
+- **`std.compress` / `std.crypto` / `std.http`** — after process (FFI engines; http needs TLS
+  and stays plaintext-only v1 per http.md).
+
 ## Design Issues to Settle in Parallel
 
 Settle each item in `open-questions.md`, tied to its related M (do not defer).
