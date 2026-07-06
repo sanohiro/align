@@ -33,3 +33,10 @@ bench/kernels.o
 bench/harness
 ll_out/
 *.ll
+
+# One-off scratch outputs at the repo root — put scratch work in /work instead.
+# (PR #365 accidentally committed a compiled test binary and a throwaway script.)
+/scratch*
+/test_*.sh
+/unsafe_raw
+/*.o
