@@ -2124,7 +2124,7 @@ unsafe fn group_io<'a>(keys: *const i64, vals: *const i64, len: i64) -> (&'a [i6
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_sum_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let (keys, vals) = unsafe { group_io(keys, vals, len) };
-    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.wrapping_add(b)) }
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| *vals.get_unchecked(i), |a, b| a.wrapping_add(b)) }
 }
 
 /// `group_by(.key).min(.value)` — per-group minimum.
@@ -2134,7 +2134,7 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(keys: *const i64, vals: *const i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_min_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let (keys, vals) = unsafe { group_io(keys, vals, len) };
-    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.min(b)) }
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| *vals.get_unchecked(i), |a, b| a.min(b)) }
 }
 
 /// `group_by(.key).max(.value)` — per-group maximum.
@@ -2144,7 +2144,7 @@ pub unsafe extern "C" fn align_rt_group_min_i64(keys: *const i64, vals: *const i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let (keys, vals) = unsafe { group_io(keys, vals, len) };
-    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| vals[i], |a, b| a.max(b)) }
+    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| *vals.get_unchecked(i), |a, b| a.max(b)) }
 }
 
 /// `group_by(.key).count()` — per-group row count (no value column).
@@ -2687,8 +2687,8 @@ pub unsafe extern "C" fn align_rt_dict_lookup(ids: *const i64, n: i64, dict: *co
     let Ok(dict_len) = safe_len(dict_len) else { return };
     let dict: &[AlignStr] = unsafe { safe_slice(dict, dict_len as i64) };
     let empty = AlignStr { ptr: core::ptr::NonNull::dangling().as_ptr(), len: 0 };
-    for i in 0..n {
-        out[i] = usize::try_from(ids[i]).ok().and_then(|id| dict.get(id).copied()).unwrap_or(empty);
+    for (slot, &id) in out.iter_mut().zip(ids.iter()) {
+        *slot = usize::try_from(id).ok().and_then(|idx| dict.get(idx).copied()).unwrap_or(empty);
     }
 }
 
