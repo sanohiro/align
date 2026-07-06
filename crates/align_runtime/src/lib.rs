@@ -4027,7 +4027,7 @@ pub struct Buffer {
 /// `buffer(cap)` — open an owned byte buffer whose read window is `cap` bytes (`<= 0` → empty).
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
-    let Ok(requested) = safe_len(cap) else { return core::ptr::null_mut() };
+    let requested = safe_len(cap).unwrap_or(0);
     let mut data = Vec::new();
     // `try_reserve` so a bogus/huge capacity fails softly instead of aborting on OOM. The read
     // window is capped to what was actually reserved, so `reader.read`'s later `resize(cap)` can
