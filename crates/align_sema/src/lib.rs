@@ -1696,9 +1696,11 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 continue; // a duplicate import already errored above
             }
             // `std.net` is reached through its sub-namespaces (`dns`/`tcp`/`udp`/`socket`), not a
-            // bare `net.*`, so it is "used" if any of those is referenced (Slice 1 ships `dns`).
+            // bare `net.*`, so it is "used" if any of those is referenced. Only the namespaces
+            // that have actually shipped are listed — a user local named `tcp` must not suppress
+            // the unused-import warning. Extend this list as net slices 2-4 land.
             let is_used = if p == "std.net" {
-                ["dns", "tcp", "udp", "socket"].iter().any(|ns| used(ns))
+                ["dns"].iter().any(|ns| used(ns))
             } else {
                 let namespace: &str = if BUILTIN_MODULES.contains(&p.as_str()) {
                     // The accessed namespace is the prefix after the last `.` (`core.json` → `json`).
