@@ -200,6 +200,32 @@ fn spawn_nonexistent_waits_127() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "127", "exec-not-found → wait 127");
 }
 
+/// The natural call form: the argv is a **fixed-size array literal** (`["/bin/true"]`, typed
+/// `array<str, 1>`), not a dynamic array or a slice-range of one. It is borrowed to a `slice<str>`
+/// via the existing `ArrayToSlice` coercion, so no `[..]` / `[0..n]` dance is needed. `/bin/true`
+/// exits 0 → `wait()` returns 0.
+#[test]
+fn spawn_with_fixed_array_literal_argv() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+import std.process
+pub fn main() -> Result<(), Error> {
+  ch := process.spawn(\"/bin/true\", [\"/bin/true\"])?
+  code := ch.wait()?
+  print(code)
+  return Ok(())
+}";
+    let out = build_and_run("m11proc-fixed-argv", src);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "0",
+        "fixed-array-literal argv spawns + waits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A signal-killed child yields `128 + signal`: `sh -c 'kill -9 $$'` sends itself `SIGKILL` (9), so
 /// `wait()` returns `128 + 9 = 137` (the shell convention; `ch.kill` is a Slice-3 API, so the child
 /// kills itself here).

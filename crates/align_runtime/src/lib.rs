@@ -5780,8 +5780,8 @@ fn decode_wait_status(status: i32) -> i64 {
 /// `process.spawn(cmd, args)` — `fork` + `execvp` a child process. `cmd` is the lookup-path `str` view
 /// (resolved via `PATH` by `execvp` when it has no `/`); `args` is the child's **full** `argv`
 /// (`args_len` `AlignStr` views, **including `argv[0]`** — the caller supplies the program name, P5).
-/// Marshals `cmd` + every `argv` entry into NUL-terminated C strings **before** `fork` (so the child
-/// branch does no allocation — async-signal-safe), then forks: the child `execvp`s and, if that fails,
+/// Marshals `cmd` + every `argv` entry into NUL-terminated C strings **before** `fork` (so *our* child
+/// branch allocates nothing), then forks: the child `execvp`s and, if that fails,
 /// `_exit(127)`s (the shell convention — an exec-not-found is not reported synchronously; it surfaces
 /// as `wait() == 127`). On success writes the owned `child` handle to `out`, returns `0`. Failures:
 /// `AL_INVALID` for a null/empty `cmd`, an empty `argv` (no `argv[0]`), or an interior NUL in `cmd` /
@@ -5839,9 +5839,17 @@ pub unsafe extern "C" fn align_rt_process_spawn(
     let mut argv_ptrs: Vec<*const u8> = argv_owned.iter().map(|c| c.as_ptr() as *const u8).collect();
     argv_ptrs.push(core::ptr::null());
 
-    // SAFETY: `fork` takes no arguments and is always available; the child branch below calls only
-    // `execvp` (reading the argv built above — no allocation) and `_exit`, both async-signal-safe
-    // enough for the single-fork/exec shell contract.
+    // SAFETY: `fork` takes no arguments and is always available. We do our own marshalling (the `cmd`
+    // / `argv` CStrings and the pointer vector) in the *parent* above so the child branch below does no
+    // allocation of its own. The remaining honest caveat: `execvp` is NOT async-signal-safe — its
+    // `PATH` search may `getenv`/`malloc`. If the parent is multithreaded (`task_group` / `par_map`)
+    // and another thread holds the allocator lock at the instant we `fork`, the child can deadlock in
+    // `execvp` before it ever `exec`s (the child inherits a *copy* of the locked mutex, which no thread
+    // will ever unlock). This is the classic POSIX fork/exec-in-a-threaded-process hazard; Rust's own
+    // `std::process` takes the same risk on the fork path. The recorded ideal fix is `posix_spawn`
+    // (which the C library implements without running arbitrary user code between fork and exec) or
+    // pre-resolving `PATH` in the parent so the child calls only the async-signal-safe `execv`; both
+    // are deferred. The child otherwise touches only `execvp` and `_exit`.
     let pid = unsafe { fork() };
     if pid < 0 {
         return io_error_to_status(&std::io::Error::last_os_error());

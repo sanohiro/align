@@ -11068,17 +11068,38 @@ impl<'a, 't> Checker<'a, 't> {
         if cmd.ty == Ty::Error || argv.ty == Ty::Error {
             return err;
         }
-        // `argv` is the child's full argv — a borrowed str-view collection. Accept an `array<str>`
-        // (`DynArray(Str)`, e.g. `main(args)`) or a `slice<str>` of one (so a caller can pass a
-        // sub-range of its own argv); both lower to a `{ptr,len}` of `str` views the runtime marshals
-        // into C strings. An interior NUL / empty argv is rejected at runtime (`Error.Invalid`).
-        if !matches!(self.resolve(argv.ty), Ty::DynArray(Scalar::Str) | Ty::Slice(Scalar::Str)) {
-            self.diags.error(
-                format!("'process.spawn' takes the argv as an `array<str>` / `slice<str>` (the full argv incl. argv[0]), got {}", ty_name(argv.ty)),
-                args[1].span,
-            );
-            return err;
-        }
+        // `argv` is the child's full argv — a borrowed str-view collection, all forms lowering to a
+        // `{ptr,len}` of `str` views the runtime marshals into C strings. An interior NUL / empty argv
+        // is rejected at runtime (`Error.Invalid`). Accept:
+        //   * `array<str>` (`DynArray(Str)`, e.g. `main(args)`) and `slice<str>` (a sub-range of one,
+        //     so a caller can pass part of its own argv) — already `{ptr,len}` values;
+        //   * a fixed-size `array<str, N>` literal/local (the natural `["/bin/echo", "hi"]` call) —
+        //     borrowed to a `slice<str>` via the same `ArrayToSlice` coercion used for any
+        //     slice-typed argument/binding (`check_slice_init`), which materializes the data-ptr +
+        //     constant len. No new mechanism, no argv copy: the borrow is a `MakeSlice(slot, N)`.
+        let argv = match self.resolve(argv.ty) {
+            Ty::DynArray(Scalar::Str) | Ty::Slice(Scalar::Str) => argv,
+            Ty::Array(Scalar::Str, _) => {
+                // Same restriction as every array→slice borrow: the source must be an array literal
+                // or a named local (an arbitrary array expression has no materializable slot yet).
+                if !matches!(argv.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+                    self.diags.error(
+                        "an array coerced to a slice must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                        args[1].span,
+                    );
+                    return err;
+                }
+                let span = argv.span;
+                Expr { kind: ExprKind::ArrayToSlice(Box::new(argv)), ty: Ty::Slice(Scalar::Str), span }
+            }
+            _ => {
+                self.diags.error(
+                    format!("'process.spawn' takes the argv as an `array<str>` / `slice<str>` (the full argv incl. argv[0]), got {}", ty_name(argv.ty)),
+                    args[1].span,
+                );
+                return err;
+            }
+        };
         Expr {
             kind: ExprKind::ProcessSpawn { cmd, args: Box::new(argv) },
             ty: Ty::Result(Scalar::Child, Scalar::Enum(self.error_enum_id)),
