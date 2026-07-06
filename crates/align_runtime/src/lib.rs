@@ -718,6 +718,197 @@ pub unsafe extern "C" fn align_rt_tcp_conn_writer(c: *mut TcpConn) -> *mut Write
     Box::into_raw(Box::new(Writer { fd, owns_fd: false, buffered: false, buf: Vec::new() }))
 }
 
+// --- tcp.listen / accept (std.net Slice 3) ----------------------------------------------------
+
+// `getaddrinfo` hint: return an address suitable for `bind` (the wildcard address when the node is
+// null). `AI_PASSIVE` is `0x0001` on both Linux and macOS/BSD — no cfg needed.
+const AI_PASSIVE: i32 = 0x0001;
+
+// `setsockopt` option for SO_REUSEADDR — like SO_KEEPALIVE, one of the few socket constants that
+// differ between Linux and macOS/BSD, so cfg it (a port to another BSD must revisit this).
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const SO_REUSEADDR: i32 = 2; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SO_REUSEADDR: i32 = 0x0004; // macOS/BSD
+
+/// The `listen` backlog — the max number of pending (not-yet-`accept`ed) connections the kernel
+/// queues. `128` is the historical `SOMAXCONN` (the kernel silently clamps to its own current
+/// `SOMAXCONN` if larger), a sensible fixed default for a v1 blocking server. Not user-tunable yet
+/// (socket tuning is a pkg concern per net.md).
+const LISTEN_BACKLOG: i32 = 128;
+
+/// A `tcp_listener` (`std.net`) — a Move handle owning one listening TCP socket fd; `Drop`
+/// ([`align_rt_tcp_listener_free`]) closes it. `l.accept()` returns a new **owned** [`TcpConn`] (the
+/// Slice-2 type) — never a borrow of the listener.
+pub struct TcpListener {
+    fd: i32,
+}
+
+/// `tcp.listen(host, port)` — resolve `host` via `getaddrinfo` (`AF_UNSPEC`, `SOCK_STREAM`,
+/// `AI_PASSIVE`) with the numeric `port` as the service, then for each resolved address in order:
+/// `socket`, set `SO_REUSEADDR`, `bind`, `listen(LISTEN_BACKLOG)` — until one succeeds. An empty
+/// `host` passes a null node so `getaddrinfo` yields the wildcard address (`INADDR_ANY` / `in6addr_any`
+/// — bind on all interfaces). On success writes the owned `tcp_listener` handle to `out`. Returns `0`
+/// on success, else a status the shared table maps: `AL_INVALID` for a bad `port` (outside
+/// `1..=65535`), a non-UTF-8 / interior-NUL host, or `EAI_NONAME`/`EAI_NODATA`; `AL_CODE + |eai|` for
+/// another resolver failure; or the last `bind`/`listen`/`socket` errno (via [`io_error_to_status`])
+/// when every candidate address failed (e.g. `EADDRINUSE`). Leaves `*out = null` on failure.
+/// `freeaddrinfo` runs on every path (no leak).
+///
+/// v1 rejects `port = 0` (a kernel-assigned ephemeral port) — there is no way to read the bound port
+/// back out of the handle yet, so a caller could never discover the assigned port. Deferred until a
+/// `local_addr()`-style accessor lands.
+///
+/// # Safety
+/// `host` must describe a valid byte range for `host_len`; `out` must point to a writable
+/// `*mut TcpListener` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_listen(host: *const u8, host_len: i64, port: i64, out: *mut *mut TcpListener) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    // A TCP port is 1..=65535 — reject out-of-range (0, negative, > 65535). Port 0 (kernel-assigned)
+    // is deliberately rejected in v1 (see the doc comment) rather than silently binding a port the
+    // caller cannot read back.
+    if !(1..=65535).contains(&port) {
+        return AL_INVALID;
+    }
+    // Copy the host view into an owned `String` (rejects a non-UTF-8 / oversized `host_len` — no
+    // `i64 as usize`). An empty host means "wildcard" — pass a null node to `getaddrinfo` (with
+    // `AI_PASSIVE`). A non-empty host becomes a NUL-terminated `CString`; an interior NUL is a bad
+    // name.
+    let Some(host_str) = (unsafe { path_from_view(host, host_len) }) else {
+        return AL_INVALID;
+    };
+    let c_host = if host_str.is_empty() {
+        None
+    } else {
+        match std::ffi::CString::new(host_str) {
+            Ok(h) => Some(h),
+            Err(_) => return AL_INVALID, // interior NUL
+        }
+    };
+    // The port as a numeric service string — `getaddrinfo` fills the correct `sin_port`/`sin6_port`
+    // per family. `port` is in `1..=65535`, so the decimal string never contains an interior NUL.
+    let Ok(c_service) = std::ffi::CString::new(port.to_string()) else {
+        return AL_INVALID;
+    };
+
+    // hints: AF_UNSPEC (both A and AAAA), SOCK_STREAM (TCP), AI_PASSIVE (wildcard when node is null).
+    let mut hints: AddrInfo = unsafe { core::mem::zeroed() };
+    hints.ai_flags = AI_PASSIVE;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    let node = c_host.as_ref().map_or(core::ptr::null(), |h| h.as_ptr() as *const u8);
+    let mut res: *mut AddrInfo = core::ptr::null_mut();
+    let rc = unsafe { getaddrinfo(node, c_service.as_ptr() as *const u8, &hints, &mut res) };
+    if rc != 0 {
+        return eai_to_status(rc);
+    }
+
+    // Try each resolved address in order. `freeaddrinfo(res)` runs before every return below.
+    let mut last_status = AL_INVALID; // if the list is empty / every family unsupported
+    let mut cur = res;
+    while !cur.is_null() {
+        let ai = unsafe { &*cur };
+        // Only AF_INET / AF_INET6 with a non-null `sockaddr` are bindable; skip anything else.
+        if (ai.ai_family != AF_INET && ai.ai_family != AF_INET6) || ai.ai_addr.is_null() || ai.ai_addrlen == 0 {
+            cur = ai.ai_next;
+            continue;
+        }
+        let fd = unsafe { socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
+        if fd < 0 {
+            last_status = io_error_to_status(&std::io::Error::last_os_error());
+            cur = ai.ai_next;
+            continue;
+        }
+        // SO_REUSEADDR before `bind` — a restart of a server should not fail because the previous
+        // socket lingers in TIME_WAIT (best-effort: ignore the result, a failed set only loses the
+        // convenience). Note SO_REUSEADDR does NOT allow two live listeners on the same port — a
+        // second active bind still fails `EADDRINUSE` (that would need SO_REUSEPORT).
+        let on: i32 = 1;
+        unsafe {
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+        }
+        if unsafe { bind(fd, ai.ai_addr, ai.ai_addrlen) } != 0 {
+            last_status = io_error_to_status(&std::io::Error::last_os_error());
+            unsafe { close(fd) };
+            cur = ai.ai_next;
+            continue;
+        }
+        if unsafe { listen(fd, LISTEN_BACKLOG) } != 0 {
+            last_status = io_error_to_status(&std::io::Error::last_os_error());
+            unsafe { close(fd) };
+            cur = ai.ai_next;
+            continue;
+        }
+        unsafe { freeaddrinfo(res) };
+        unsafe { *out = Box::into_raw(Box::new(TcpListener { fd })) };
+        return 0;
+    }
+    unsafe { freeaddrinfo(res) };
+    last_status
+}
+
+/// Free a `tcp_listener`, closing its listening socket fd. Null-safe (a moved-out / never-initialised
+/// owned slot drops harmlessly).
+///
+/// # Safety
+/// `l` must be null or a pointer from [`align_rt_tcp_listen`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_listener_free(l: *mut TcpListener) {
+    if l.is_null() {
+        return;
+    }
+    let l = unsafe { Box::from_raw(l) };
+    unsafe { close(l.fd) };
+}
+
+/// `l.accept()` — block until an inbound connection arrives, returning a new **owned** [`TcpConn`]
+/// (the Slice-2 type — its `reader`/`writer`/`Drop` all just work) written to `out`. Returns `0` on
+/// success, else the `accept` errno mapped through [`io_error_to_status`]; leaves `*out = null` on
+/// failure.
+///
+/// Unlike `connect`, an `EINTR`-interrupted `accept` is **retried** rather than surfaced as an `Err`:
+/// an accept loop is the common server shape, and a signal that merely interrupts the blocking wait
+/// (no connection consumed) should not tear down the loop. (This is the deliberate asymmetry with
+/// [`align_rt_tcp_connect`], which lets `EINTR` fail that address and move on.)
+///
+/// # Safety
+/// `l` must be null or a valid `TcpListener` pointer; `out` must point to a writable `*mut TcpConn`
+/// slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_tcp_accept(l: *mut TcpListener, out: *mut *mut TcpConn) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    if l.is_null() {
+        return AL_INVALID;
+    }
+    let lfd = unsafe { (*l).fd };
+    loop {
+        // No peer address wanted — pass null addr/addrlen. `accept` returns the connected fd.
+        let fd = unsafe { accept(lfd, core::ptr::null_mut(), core::ptr::null_mut()) };
+        if fd >= 0 {
+            // Enable TCP keepalive on the accepted conn (best-effort — parity with `connect`).
+            let on: i32 = 1;
+            unsafe {
+                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+            }
+            unsafe { *out = Box::into_raw(Box::new(TcpConn { fd })) };
+            return 0;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            continue; // EINTR: a signal interrupted the wait before a connection — retry.
+        }
+        return io_error_to_status(&e);
+    }
+}
+
 /// Read the whole file at `path` into a fresh **arena** allocation, writing a `{ptr,len}` view to
 /// `out` — the [`align_rt_fs_read_file_view`] fallback for special / zero-length files. Returns `0`
 /// or a mapped errno; an empty file yields `{null,0}`. Unlike `fs.read_file` (heap-owned,
@@ -5672,6 +5863,12 @@ unsafe extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     fn connect(sockfd: i32, addr: *const u8, addrlen: u32) -> i32;
     fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *const core::ffi::c_void, optlen: u32) -> i32;
+    // `bind`/`listen`/`accept` — the BSD server-side socket calls (identical prototypes on Linux and
+    // macOS/BSD). `accept` with null `addr`/`addrlen` returns the connected fd without the peer
+    // address. `bind` takes the `sockaddr` `getaddrinfo` filled.
+    fn bind(sockfd: i32, addr: *const u8, addrlen: u32) -> i32;
+    fn listen(sockfd: i32, backlog: i32) -> i32;
+    fn accept(sockfd: i32, addr: *mut u8, addrlen: *mut u32) -> i32;
 }
 
 // `mmap` protection / flags — the portable POSIX constants (identical on Linux and macOS).
@@ -8300,6 +8497,107 @@ mod tests {
         let rc = unsafe { align_rt_tcp_connect(hp, hl, port, &mut conn) };
         assert_ne!(rc, 0, "connecting to a closed port is an Err");
         assert!(conn.is_null(), "a failed connect leaves out null");
+    }
+
+    #[test]
+    fn tcp_listen_accept_connect_loopback_roundtrip() {
+        use std::io::{Read, Write};
+        // A free loopback port: bind a probe listener on :0, read its port, drop it, then have the
+        // runtime bind that port. (Port 0 is rejected by `align_rt_tcp_listen`, so a real port is
+        // needed — the standard probe pattern.) The window between drop and re-bind is small; a
+        // failure here would surface as EADDRINUSE (a clean Err), never a hang.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().unwrap().port() as i64;
+        drop(probe);
+
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut listener: *mut TcpListener = std::ptr::null_mut();
+        let rc = unsafe { align_rt_tcp_listen(hp, hl, port, &mut listener) };
+        assert_eq!(rc, 0, "listen on the probed loopback port succeeds");
+        assert!(!listener.is_null(), "a successful listen writes a non-null handle");
+
+        // A client connects (via the runtime `connect`) once the listener is up, sends a byte string,
+        // then reads the echo we write back from the accepted conn.
+        let client = std::thread::spawn(move || {
+            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port as u16)).expect("client connect");
+            sock.write_all(b"hello").expect("client write");
+            let mut buf = [0u8; 16];
+            let n = sock.read(&mut buf).expect("client read");
+            buf[..n].to_vec()
+        });
+
+        // Accept the connection and round-trip bytes through the accepted conn's reader/writer.
+        let mut conn: *mut TcpConn = std::ptr::null_mut();
+        let arc = unsafe { align_rt_tcp_accept(listener, &mut conn) };
+        assert_eq!(arc, 0, "accept returns the inbound connection");
+        assert!(!conn.is_null(), "a successful accept writes a non-null conn handle");
+
+        let r = unsafe { align_rt_tcp_conn_reader(conn) };
+        let w = unsafe { align_rt_tcp_conn_writer(conn) };
+        let b = align_rt_buffer_new(16);
+        let n = unsafe { align_rt_io_reader_read(r, b) };
+        assert_eq!(n, 5, "the accepted conn reads the client's 5 bytes");
+        let got = unsafe { &*b };
+        assert_eq!(&got.data[..got.len], b"hello", "bytes round-trip byte-exact");
+        // Echo them back so the client's read completes.
+        assert_eq!(unsafe { align_rt_io_writer_write(w, b"hello".as_ptr(), 5) }, 0, "echo write reaches the client");
+
+        let echoed = client.join().expect("client thread");
+        assert_eq!(echoed, b"hello", "the client receives the echoed bytes");
+
+        // Free the borrowed handles (`owns_fd:false` — must NOT close the conn's fd), then the conn
+        // (closes it once), then the listener (closes the listening fd once). No double-close.
+        unsafe { align_rt_io_reader_free(r) };
+        unsafe { align_rt_io_writer_free(w) };
+        unsafe { align_rt_tcp_conn_free(conn) };
+        unsafe { align_rt_tcp_listener_free(listener) };
+        unsafe { align_rt_buffer_free(b) };
+    }
+
+    #[test]
+    fn tcp_listen_port_in_use_is_err() {
+        // Keep a live listener on a loopback port, then have the runtime try to bind the same port.
+        // SO_REUSEADDR does NOT permit two live listeners on one port, so the runtime `bind` fails
+        // `EADDRINUSE` — a non-zero status (never an abort), `out` left null.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held");
+        let port = held.local_addr().unwrap().port() as i64;
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut listener: *mut TcpListener = std::ptr::null_mut();
+        let rc = unsafe { align_rt_tcp_listen(hp, hl, port, &mut listener) };
+        assert_ne!(rc, 0, "binding a port already in use is an Err");
+        assert!(listener.is_null(), "a failed listen leaves out null");
+        drop(held);
+    }
+
+    #[test]
+    fn tcp_listen_bad_port_and_null_out() {
+        let (hp, hl) = view_of("127.0.0.1");
+        // A null `out` slot is rejected as Error.Invalid, never a crash.
+        assert_eq!(unsafe { align_rt_tcp_listen(hp, hl, 8080, std::ptr::null_mut()) }, AL_INVALID);
+        // Out-of-range ports (0 = kernel-assigned but unreadable in v1, negative, > 65535) are all
+        // Error.Invalid, never an abort; `out` is left null.
+        for bad in [0i64, -1, 65536, 70000] {
+            let mut listener: *mut TcpListener = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_tcp_listen(hp, hl, bad, &mut listener) }, AL_INVALID, "port {bad} is invalid");
+            assert!(listener.is_null(), "a rejected port leaves out null");
+        }
+    }
+
+    #[test]
+    fn tcp_accept_null_listener_and_out() {
+        // A null listener or null `out` is Error.Invalid, never a crash.
+        let mut conn: *mut TcpConn = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_tcp_accept(std::ptr::null_mut(), &mut conn) }, AL_INVALID);
+        assert!(conn.is_null());
+        // (a non-null listener with a null out slot)
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().unwrap().port() as i64;
+        drop(probe);
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut listener: *mut TcpListener = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_tcp_listen(hp, hl, port, &mut listener) }, 0);
+        assert_eq!(unsafe { align_rt_tcp_accept(listener, std::ptr::null_mut()) }, AL_INVALID);
+        unsafe { align_rt_tcp_listener_free(listener) };
     }
 
     #[test]

@@ -111,14 +111,19 @@ pub enum Scalar {
     /// (a connected socket fd); the enclosing `Result`'s `Drop` closes it. Opaque pointer, like
     /// [`Scalar::Reader`]/[`Scalar::Writer`]/[`Scalar::Buffer`] — owned, never region-tracked.
     TcpConn,
+    /// A `tcp_listener` payload (`Result<tcp_listener, Error>` from `tcp.listen`). An owned **Move**
+    /// handle (a listening socket fd); the enclosing `Result`'s `Drop` closes it. Opaque pointer,
+    /// like [`Scalar::TcpConn`] — owned, never region-tracked.
+    TcpListener,
 }
 
 impl Scalar {
     /// Whether this payload scalar is an owned **Move** type (a heap buffer that the enclosing
     /// `Option`/`Result` owns and must drop / move out). Today: `string` (8a), `array<T>` (8b),
-    /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, and a `tcp_conn`.
+    /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, and a
+    /// `tcp_listener`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener)
     }
 }
 
@@ -318,6 +323,12 @@ pub enum Ty {
     /// bound to `c` so a stream cannot outlive the connection. Impure (its I/O hits the network).
     /// Opaque pointer. Polymorphism lives in the constructor, not the byte path (reuses reader/writer).
     TcpConn,
+    /// A `tcp_listener` (`std.net`) — a listening TCP socket, the `Ok` payload of `tcp.listen`'s
+    /// `Result<tcp_listener, Error>`. An owned **Move** handle owning one listening socket fd (like
+    /// `tcp_conn`), `Drop`-freed (the fd is `close`d). Its `l.accept()` returns a new **owned**
+    /// `tcp_conn` (never a borrow of the listener), so — unlike `c.reader()`/`c.writer()` — accept's
+    /// result is not region-bound to the listener. Impure (its I/O hits the network). Opaque pointer.
+    TcpListener,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -377,8 +388,10 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // A `cli parsed` owned handle as the `Result` Ok payload of `c.parse(args)`. (A `cli command`
         // is never a payload — it has no `Scalar` and maps to `None` here.)
         Ty::CliParsed => Some(Scalar::CliParsed),
-        // A `tcp_conn` owned handle as the `Result` Ok payload of `tcp.connect`.
+        // A `tcp_conn` owned handle as the `Result` Ok payload of `tcp.connect` / `l.accept`.
         Ty::TcpConn => Some(Scalar::TcpConn),
+        // A `tcp_listener` owned handle as the `Result` Ok payload of `tcp.listen`.
+        Ty::TcpListener => Some(Scalar::TcpListener),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -411,6 +424,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Buffer => Ty::Buffer,
         Scalar::CliParsed => Ty::CliParsed,
         Scalar::TcpConn => Ty::TcpConn,
+        Scalar::TcpListener => Ty::TcpListener,
     }
 }
 
@@ -459,7 +473,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -491,7 +505,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -640,7 +654,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -712,7 +726,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2289,6 +2303,17 @@ impl EffectScan {
             // `c.reader()` / `c.writer()` just wrap the conn's fd (no syscall — the I/O happens on the
             // returned reader/writer's `read`/`write`, already impure), like `io.stdout`: walk `conn`.
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => self.expr(conn),
+            // `tcp.listen(host, port)` is impure (DNS + bind/listen syscalls) — excluded from `par_map`.
+            ExprKind::TcpListen { host, port } => {
+                self.impure_direct = true;
+                self.expr(host);
+                self.expr(port);
+            }
+            // `l.accept()` is impure (a blocking accept syscall) — excluded from `par_map`.
+            ExprKind::TcpAccept { listener } => {
+                self.impure_direct = true;
+                self.expr(listener);
+            }
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.impure_direct = true;
                 self.expr(path);
@@ -3389,6 +3414,11 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(port, depth);
             }
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => self.walk(conn, depth),
+            ExprKind::TcpListen { host, port } => {
+                self.walk(host, depth);
+                self.walk(port, depth);
+            }
+            ExprKind::TcpAccept { listener } => self.walk(listener, depth),
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.walk(path, depth);
                 self.walk(data, depth);
@@ -3760,6 +3790,11 @@ impl UnnecessaryHeapScan {
                 self.visit(port);
             }
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => self.visit(conn),
+            ExprKind::TcpListen { host, port } => {
+                self.visit(host);
+                self.visit(port);
+            }
+            ExprKind::TcpAccept { listener } => self.visit(listener),
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.visit(path);
                 self.visit(data);
@@ -4413,6 +4448,14 @@ impl<'a> MoveCheck<'a> {
             // `c.reader()` / `c.writer()` borrow the `tcp_conn` (the fd stays owned by `c` — the
             // returned stream is `owns_fd:false`), never consumed — like `io.copy`'s handles.
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => self.expr(conn, moved, false, false),
+            // `tcp.listen(host, port)` borrows `host` (str, never consumed); `port` is a Copy i64.
+            ExprKind::TcpListen { host, port } => {
+                self.expr(host, moved, false, false);
+                self.expr(port, moved, false, false);
+            }
+            // `l.accept()` borrows the `tcp_listener` (the listening fd stays owned by `l`); the
+            // returned `tcp_conn` is freshly owned, never consumes the listener.
+            ExprKind::TcpAccept { listener } => self.expr(listener, moved, false, false),
             // `fs.write_file(path, data)` borrows `data` (str/bytes/builder — not consumed), like
             // `writer.write`; neither `path` nor `data` is moved.
             ExprKind::FsWriteFile { path, data, .. } => {
@@ -7343,6 +7386,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.net", "tcp.connect", span);
                 return self.check_tcp_connect(args, span);
             }
+            // `std.net` — `tcp.listen(host, port)` -> Result<tcp_listener, Error> (a listening socket).
+            if module == "tcp" && method == "listen" {
+                self.require_import("std.net", "tcp.listen", span);
+                return self.check_tcp_listen(args, span);
+            }
             // `std.path` — `path.join`/`base`/`dir`/`ext`/`normalize` (pure lexical string ops).
             if module == "path" && matches!(method, "join" | "base" | "dir" | "ext" | "normalize") {
                 self.require_import("std.path", &format!("path.{method}"), span);
@@ -7581,6 +7629,20 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty != Ty::Error {
                 self.diags
                     .error(format!("'.{method}()' is not a method on {} (it is a `tcp_conn` method)", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        // `std.net` — `l.accept()` on a `tcp_listener` blocks for an inbound connection and returns a
+        // new owned `tcp_conn` (`Result<tcp_conn, Error>`). Dispatched on the receiver type so the
+        // name stays free on other values.
+        if method == "accept" {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::TcpListener {
+                return self.check_listener_accept(recv_expr, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.accept()' is not a method on {} (it is a `tcp_listener` method)", ty_name(recv_expr.ty)), span);
             }
             return err;
         }
@@ -8008,7 +8070,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn) {
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -10215,7 +10277,7 @@ impl<'a, 't> Checker<'a, 't> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn)
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener)
             || payload_is_move(elem)
             || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs))
         {
@@ -10260,12 +10322,12 @@ impl<'a, 't> Checker<'a, 't> {
                 // frees — same double-free reasoning as `check_index`. Slices are read-only views,
                 // so a `slice<scalar>` is fine; reject Move-element collections until a borrow design.
                 let elem = scalar_to_ty(s);
-                // `Ty::TcpConn` is defensive parity with `check_index`'s guard above: a
-                // `slice<tcp_conn>` / `array<tcp_conn>` is unconstructible today (a `tcp_conn` is
-                // rejected as an array element at construction, `tcp_conn_rejected_as_array_element`),
-                // so this arm can't currently be reached — kept in sync so a future array-of-conn
-                // path can't slip past this guard silently.
-                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn) || payload_is_move(elem) {
+                // `Ty::TcpConn` / `Ty::TcpListener` are defensive parity with `check_index`'s guard
+                // above: a `slice<tcp_conn>` / `array<tcp_listener>` (etc.) is unconstructible today (a
+                // `tcp_conn`/`tcp_listener` is rejected as an array element at construction), so this
+                // arm can't currently be reached — kept in sync so a future array-of-handle path can't
+                // slip past this guard silently.
+                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener) || payload_is_move(elem) {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
                         span,
@@ -10487,6 +10549,39 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::TcpConnect { host, port: Box::new(port) },
             ty: Ty::Result(Scalar::TcpConn, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `tcp.listen(host, port)` (`std.net`) -> `Result<tcp_listener, Error>` — bind a listening TCP
+    /// socket to `port` (`SO_REUSEADDR` before `bind`, then `listen`). `host` is a borrowed `str`
+    /// (never consumed); an empty host binds the wildcard address (`AI_PASSIVE`). `port` is an `i64`
+    /// validated to `1..=65535` at runtime → `Error.Invalid` on a bad port, never an abort. Port `0`
+    /// (kernel-assigned) is rejected in v1 — there is no way to read the bound port back yet. The Ok
+    /// payload is an owned `tcp_listener` Move handle (`Drop` closes its fd). Impure. Builtin.
+    fn check_tcp_listen(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'tcp.listen' expects 2 arguments (the host and port), got {}", args.len()), span);
+            return err;
+        }
+        let host = Box::new(self.check_str_init(&args[0]));
+        let port = self.check_expr(&args[1], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if host.ty == Ty::Error || port.ty == Ty::Error {
+            return err;
+        }
+        // Defensive backstop only: `check_expr` already reconciled the port against the i64 hint (a
+        // non-i64 integer is a hard "type mismatch" error there), so a non-i64 type cannot actually
+        // reach codegen through this path.
+        if !port.ty.is_int_like() {
+            self.diags
+                .error(format!("'tcp.listen' port must be an integer, got {}", ty_name(port.ty)), args[1].span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::TcpListen { host, port: Box::new(port) },
+            ty: Ty::Result(Scalar::TcpListener, Scalar::Enum(self.error_enum_id)),
             span,
         }
     }
@@ -11111,6 +11206,37 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `l.accept()` on a `tcp_listener` ([`Ty::TcpListener`]), the receiver already evaluated. Blocks
+    /// for an inbound connection and returns a new **owned** `tcp_conn` (`Result<tcp_conn, Error>`) —
+    /// the accepted conn is freshly owned (never a borrow of the listener), so its result is not
+    /// region-bound to `l` (unlike `c.reader()`/`c.writer()`). No arguments.
+    fn check_listener_accept(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // v1 bound-receiver gate (mirrors `check_conn_stream`): the listener must be a bound local —
+        // an unbound owned-listener temporary (`tcp.listen(...)?.accept()`) is not `Drop`ped yet, so
+        // its fd would leak. Bind the listener first. Lifted when dropping Move temporaries lands
+        // (net.md P6).
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the listener to a local first, then accept (`l := tcp.listen(...)?` then `l.accept()`) — a temporary owned listener handle is not dropped yet, so its fd would leak".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        if !args.is_empty() {
+            self.diags
+                .error(format!("'.accept()' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::TcpAccept { listener: Box::new(recv_expr) },
+            ty: Ty::Result(Scalar::TcpConn, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
     /// `r.read(b: mut buffer)` on a `reader` ([`Ty::Reader`]), the receiver already evaluated. Fills
     /// `b` up to its capacity (overwriting its length), yielding `Result<i64, Error>` (bytes read;
     /// `0` = EOF). Borrows both reader and buffer (neither consumed).
@@ -11299,7 +11425,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Any other Move leaf (a `box`/owned-collection/builder field) can't occur — struct fields are
         // scalar / `str` / `string` / plain-struct only — but guard defensively against a copy-without-
         // ownership-transfer double-free if that ever changes.
-        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn) || payload_is_move(leaf_ty) {
+        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener) || payload_is_move(leaf_ty) {
             self.diags.error(
                 format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
                 span,
@@ -12116,6 +12242,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(port);
             }
             ExprKind::ConnReader { conn } | ExprKind::ConnWriter { conn } => self.finalize_expr(conn),
+            ExprKind::TcpListen { host, port } => {
+                self.finalize_expr(host);
+                self.finalize_expr(port);
+            }
+            ExprKind::TcpAccept { listener } => self.finalize_expr(listener),
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.finalize_expr(path);
                 self.finalize_expr(data);
@@ -12590,6 +12721,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::CliCommand => "cli command".to_string(),
         Ty::CliParsed => "cli parsed".to_string(),
         Ty::TcpConn => "tcp_conn".to_string(),
+        Ty::TcpListener => "tcp_listener".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -12760,9 +12892,10 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // A `cli command` is never a payload (like `buffer`); a `cli parsed` may ride a `Result` Ok
     // payload (`c.parse(args)`) — the `allow_param` positions — but never as an array/slice/box
     // element (an element read would copy + double-free the handle), same as `reader`/`writer`.
-    // A `tcp_conn` follows `reader`/`writer` exactly: a `Result` Ok payload (`tcp.connect`) is fine,
-    // but never an array/slice/box element (a copied conn would double-`close` its fd).
-    if matches!(ty, Ty::Buffer | Ty::CliCommand) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn) && !allow_param) {
+    // A `tcp_conn` / `tcp_listener` follows `reader`/`writer` exactly: a `Result` Ok payload
+    // (`tcp.connect`/`l.accept` for the conn, `tcp.listen` for the listener) is fine, but never an
+    // array/slice/box element (a copied handle would double-`close` its fd).
+    if matches!(ty, Ty::Buffer | Ty::CliCommand) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -13006,6 +13139,15 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::TcpConn
+        }
+        // `tcp_listener` (`std.net`) — a listening TCP socket Move handle (`tcp.listen`). A surface
+        // type name so it can be threaded through functions (a Move handle; passed by value).
+        "tcp_listener" => {
+            if !args.is_empty() {
+                diags.error("tcp_listener takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::TcpListener
         }
         // `Error` is the builtin error sum type — resolved via `enum_ids` like any enum name.
         "box" => {
