@@ -5,13 +5,36 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-06 (Gemini fix wave #358–#368 audited SOUND; cleanup #369 + #370;
-previous: M10 CLOSED #356/#357)._
+_Last updated: 2026-07-06 evening (M11 std.net COMPLETE #371–#374; earlier same day: Gemini fix
+wave #358–#368 audited SOUND, cleanup #369/#370)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #358–#368 (Gemini CLI
-fix/optimization wave), #369 (stray-artifact removal), #370 (clippy/doc cleanup, this note).
+**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #371–#374 (std.net
+slices 1–4), plus this docs PR. `cargo test --workspace` ≈ **1392 green**; clippy clean at
+`-D warnings`.
+
+**M11 is IN PROGRESS — `std.net` is DONE (2026-07-06, PRs #371–#374).** Full shipped-feature
+summary + per-slice decisions + the deferral list now live in the roadmap's **M11 section**
+(`docs/impl/07-roadmap.md`) — that is the record; don't duplicate it here. Headlines: 3 new Move
+fd types (`tcp_conn`/`tcp_listener`/`udp_socket`, Drop = close), `dns.resolve`, borrowed
+reader/writer over the socket fd reusing M9 unchanged (`tracks_region(Reader/Writer)` now true —
+the #297-aware region arm), `recv_from` count-only v1 (datagram peer deferred — no
+`Scalar::Tuple` exists; ideal-form call), port-0 bind rejected (needs a `local_addr()` accessor).
+
+**Next: `std.process`** (design: `docs/impl/std-design/process.md`, source of truth). Its
+blocker is pre-settled: `process.exit` = run-Drops-then-exit, `process.abort()` = hard `_exit`
+(recorded in process.md §"Drop-semantics decision"; **move the open-questions Open entry to
+Settled when it ships**). New Move type = `child` (Drop = blocking `waitpid` reap — NOT
+`SA_NOCLDWAIT`). Then compress/crypto (FFI engines: `libzstd`/zlib-ng, constant-time-audited
+crypto engine), http last (needs net + TLS; plaintext-only v1).
+
+**Slice-flow that worked (keep it):** deep-reasoner implements in an isolated worktree (one
+slice per PR) → orchestrator re-verifies test total + clippy on the branch → an INDEPENDENT
+deep-reasoner adversarial gate review (skills/align-self-review Gates 1–4/6; twin-mirror diffing
+for sibling types) → fix/record findings → PR → gemini review reflected (verify each finding
+against the code — #372's "high" was a false positive disproven by an actual `alignc check`
+run) → squash-merge. Slices 3/4 came back zero-finding from the adversarial pass.
 
 **Gemini fix wave #358–#368 audited (2026-07-06):** PRs #358–#368 were authored by **Gemini CLI**
 (not Claude): runtime memory-safety hardening (`safe_len`/`safe_slice` FFI-boundary guards,
