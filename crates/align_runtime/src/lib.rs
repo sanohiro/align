@@ -2128,7 +2128,7 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(keys: *const i64, vals: *const i
         group_agg_i64(keys, out_keys, out_vals, cap, |i| {
             // SAFETY: `group_agg_i64` only calls `per_row` with indices in `0..keys.len()`.
             // Since `keys` and `vals` have the same length (guaranteed by `group_io`), `i` is always in-bounds for `vals`.
-            *vals.get_unchecked(i)
+            unsafe { *vals.get_unchecked(i) }
         }, |a, b| a.wrapping_add(b))
     }
 }
@@ -2144,7 +2144,7 @@ pub unsafe extern "C" fn align_rt_group_min_i64(keys: *const i64, vals: *const i
         group_agg_i64(keys, out_keys, out_vals, cap, |i| {
             // SAFETY: `group_agg_i64` only calls `per_row` with indices in `0..keys.len()`.
             // Since `keys` and `vals` have the same length (guaranteed by `group_io`), `i` is always in-bounds for `vals`.
-            *vals.get_unchecked(i)
+            unsafe { *vals.get_unchecked(i) }
         }, |a, b| a.min(b))
     }
 }
@@ -2160,7 +2160,7 @@ pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i
         group_agg_i64(keys, out_keys, out_vals, cap, |i| {
             // SAFETY: `group_agg_i64` only calls `per_row` with indices in `0..keys.len()`.
             // Since `keys` and `vals` have the same length (guaranteed by `group_io`), `i` is always in-bounds for `vals`.
-            *vals.get_unchecked(i)
+            unsafe { *vals.get_unchecked(i) }
         }, |a, b| a.max(b))
     }
 }
