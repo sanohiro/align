@@ -5562,17 +5562,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn horizontal_sum(&self, v: inkwell::values::VectorValue<'c>, is_float: bool, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {
         // A vector type always has width ≥ 1 (`vecN` is 2/4/8/16) — guard the lane-0 extract below.
         assert!(n > 0, "vector width must be at least 1");
-        let mut acc = self.builder.build_extract_element(v, self.ctx.i32_type().const_zero(), "hs0").map_err(|e| self.err(e))?;
-        for i in 1..n {
-            let idx = self.ctx.i32_type().const_int(i as u64, false);
-            let lane = self.builder.build_extract_element(v, idx, "hsl").map_err(|e| self.err(e))?;
-            acc = if is_float {
-                self.builder.build_float_add(acc.into_float_value(), lane.into_float_value(), "hsfadd").map_err(|e| self.err(e))?.into()
-            } else {
-                self.builder.build_int_add(acc.into_int_value(), lane.into_int_value(), "hsadd").map_err(|e| self.err(e))?.into()
-            };
+        if is_float {
+            let start = v.get_type().get_element_type().into_float_type().const_zero();
+            self.call_intrinsic("llvm.vector.reduce.fadd", &[v.get_type().into()], &[start.into(), v.into()])
+        } else {
+            self.call_intrinsic("llvm.vector.reduce.add", &[v.get_type().into()], &[v.into()])
         }
-        Ok(acc)
     }
 
     /// Reduce a `<N x i1>` mask to a scalar `i1` = true iff **any** lane is set (an OR-fold of the
@@ -5580,17 +5575,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// hand-folded style of `horizontal_sum`/`horizontal_minmax`.
     fn horizontal_or(&self, v: inkwell::values::VectorValue<'c>, n: u32) -> Result<IntValue<'c>, CodegenError> {
         assert!(n > 0, "vector width must be at least 1");
-        let mut acc = self
-            .builder
-            .build_extract_element(v, self.ctx.i32_type().const_zero(), "ho0")
-            .map_err(|e| self.err(e))?
-            .into_int_value();
-        for i in 1..n {
-            let idx = self.ctx.i32_type().const_int(i as u64, false);
-            let lane = self.builder.build_extract_element(v, idx, "hol").map_err(|e| self.err(e))?.into_int_value();
-            acc = self.builder.build_or(acc, lane, "hoor").map_err(|e| self.err(e))?;
-        }
-        Ok(acc)
+        Ok(self.call_intrinsic("llvm.vector.reduce.or", &[v.get_type().into()], &[v.into()])?.into_int_value())
     }
 
     /// Fold the `n` lanes of a vector into the element scalar with the scalar min/max intrinsic
@@ -5598,20 +5583,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// `core.math` scalar `a.min(b)`/`a.max(b)`, so the reduction matches that semantics exactly.
     fn horizontal_minmax(&self, v: inkwell::values::VectorValue<'c>, elem: Ty, n: u32, max: bool) -> Result<BasicValueEnum<'c>, CodegenError> {
         assert!(n > 0, "vector width must be at least 1");
-        let (name, overload): (&str, BasicTypeEnum<'c>) = if matches!(elem, Ty::Float(_)) {
-            (if max { "llvm.maximum" } else { "llvm.minimum" }, float_type(self.ctx, elem).into())
+        let name = if matches!(elem, Ty::Float(_)) {
+            if max { "llvm.vector.reduce.fmax" } else { "llvm.vector.reduce.fmin" }
         } else if is_signed(elem) {
-            (if max { "llvm.smax" } else { "llvm.smin" }, int_type(self.ctx, elem).into())
+            if max { "llvm.vector.reduce.smax" } else { "llvm.vector.reduce.smin" }
         } else {
-            (if max { "llvm.umax" } else { "llvm.umin" }, int_type(self.ctx, elem).into())
+            if max { "llvm.vector.reduce.umax" } else { "llvm.vector.reduce.umin" }
         };
-        let mut acc = self.builder.build_extract_element(v, self.ctx.i32_type().const_zero(), "hm0").map_err(|e| self.err(e))?;
-        for i in 1..n {
-            let idx = self.ctx.i32_type().const_int(i as u64, false);
-            let lane = self.builder.build_extract_element(v, idx, "hml").map_err(|e| self.err(e))?;
-            acc = self.call_intrinsic(name, &[overload], &[acc.into(), lane.into()])?;
-        }
-        Ok(acc)
+        self.call_intrinsic(name, &[v.get_type().into()], &[v.into()])
     }
 
     fn gen_vec_bin(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {

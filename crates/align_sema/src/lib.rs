@@ -6240,17 +6240,13 @@ impl<'a, 't> Checker<'a, 't> {
         if matches!(self.resolve(lhs_ty), Ty::Vec(..)) {
             return self.check_expr(rhs, None); // vec lhs: rhs self-types
         }
-        let mark = self.diags.len();
-        let r = self.check_expr(rhs, Some(lhs_ty));
+        let r = self.check_expr(rhs, None);
         if matches!(self.resolve(r.ty), Ty::Vec(..)) {
-            // Sound to roll back here: the only side effect of the speculative check was the
-            // diagnostic. The hint applied `unify(rhs = Vec, lhs_ty)`, and `unify` binds a variable
-            // only to a concrete `Int`/`Float` (its `(IntVar, Int)` / `(FloatVar, Float)` arms) — never
-            // to a `Vec` (that hits the mismatch arm), so `lhs_ty` is left exactly as it was.
-            self.diags.truncate(mark);
-            return self.check_expr(rhs, None);
+            // RHS is a vector, so it self-types correctly without the scalar LHS hint.
+            return r;
         }
-        r
+        // RHS is a scalar/literal. Re-check it with the LHS hint to apply the expected type.
+        self.check_expr(rhs, Some(lhs_ty))
     }
 
     fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {

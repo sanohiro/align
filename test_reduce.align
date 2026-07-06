@@ -1,0 +1,10 @@
+fn main() {
+    let vi = vec4(1, 2, 3, 4);
+    let vf = vec4(1.0, 2.0, 3.0, 4.0);
+    
+    let sum_i = vi.sum();
+    let sum_f = vf.sum();
+    
+    let max_i = vi.max();
+    let min_f = vf.min();
+}

@@ -128,7 +128,10 @@ fn safe_len(len: i64) -> Result<usize, ()> {
 unsafe fn safe_slice<'a, T>(ptr: *const T, len: i64) -> &'a [T] {
     let Ok(n) = isize::try_from(len) else { return &[] };
     if n <= 0 || ptr.is_null() { return &[] }
-    unsafe { std::slice::from_raw_parts(ptr, n as usize) }
+    let n = n as usize;
+    let size = std::mem::size_of::<T>();
+    if size > 0 && n > isize::MAX as usize / size { return &[] }
+    unsafe { std::slice::from_raw_parts(ptr, n) }
 }
 
 
