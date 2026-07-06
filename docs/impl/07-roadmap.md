@@ -1374,7 +1374,7 @@ and http last (needs net + TLS).
     mechanism), then `exit(code)` (low-byte truncation documented); `abort()` = immediate
     `_exit(1)`, no cleanup — the named-dangerous escape hatch, distinct from `panic_abort`'s
     SIGABRT. No `Ty::Never` exists, so both are typed `Ty::Unit` v1 (statement position; a
-    proper Never is a recorded deferral); the block gets `Unreachable`, and the normal-path
+    proper `Ty::Never` is a recorded deferral); the block gets `Unreachable`, and the normal-path
     cleanup is `is_terminated`-guarded (no double drop/arena-end). Global flush machinery
     proven unneeded (print is write-through; every writer is a local flushed by its Drop in
     the exit cleanup). v1 gap recorded: current-frame cleanup only; full stack unwind is the
@@ -1388,7 +1388,7 @@ and http last (needs net + TLS).
     `ArrayToSlice` coercion — no new mechanism), dynamic array, or slice; `wait()` borrows
     (non-consuming, mirrors accept), EINTR-retried, WEXITSTATUS / signal → 128+sig, double-wait
     → clean Err before any syscall (recycled-pid safe). **P3 CLOEXEC sweep** landed on all
-    existing fd constructors (net sockets via SOCK_CLOEXEC/accept4 + fcntl fallback; fs.open
+    existing fd constructors (std.net sockets via SOCK_CLOEXEC/accept4 + fcntl fallback; fs.open
     already O_CLOEXEC, test-proven). The self-review caught a real Gate-1 miss pre-PR
     (`null_moved_source` lacked `Ty::Child` — a moved child would have double-reaped), fixed +
     test-pinned.

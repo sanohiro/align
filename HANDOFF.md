@@ -43,7 +43,7 @@ totals) → an INDEPENDENT deep-reasoner adversarial gate review (skills/align-s
 1–4/6; twin-mirror diffing for sibling types) → fix/record findings → PR → gemini review
 reflected (verify each finding against the code — #372's "high" was a false positive disproven
 by an actual `alignc check` run; #376/#378's findings were real and applied) → squash-merge.
-net slices 3/4 and process slice 3 came back zero-or-low-finding from the adversarial pass; the
+std.net slices 3/4 and std.process slice 3 came back zero-or-low-finding from the adversarial pass; the
 process-slice-2 implementer self-caught a real double-reap hole via the Gate-1 sweep.
 
 **Gemini fix wave #358–#368 audited (2026-07-06):** PRs #358–#368 were authored by **Gemini CLI**
