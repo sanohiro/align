@@ -401,6 +401,11 @@ pub unsafe extern "C" fn align_rt_free_string_array(ptr: *mut u8, len: i64) {
 // `ai_family`/`ai_socktype` written into the hints); the rest are present for the C layout.
 // Glibc/Linux orders `ai_addr` before `ai_canonname`; macOS/BSD swap them — cfg the two pointer
 // fields so the offsets are correct on both.
+//
+// Supported platforms: Linux (glibc) and macOS/iOS — the same pair the rest of this runtime
+// targets. Other BSD-family systems (FreeBSD/OpenBSD/NetBSD/Android bionic) share the swapped
+// field order but ALSO differ in `AF_INET6` (28/24/24/10) and use positive `EAI_*` values, so a
+// port must change all three together — do not widen the layout cfg alone.
 #[repr(C)]
 #[allow(dead_code)]
 struct AddrInfo {
@@ -502,16 +507,17 @@ pub unsafe extern "C" fn align_rt_dns_resolve(host: *const u8, host_len: i64, ou
         let ai = unsafe { &*cur };
         // The numeric address sits at a fixed byte offset inside `sockaddr`: `sin_addr` at +4
         // (AF_INET), `sin6_addr` at +8 (AF_INET6) — identical on Linux and macOS/BSD. Any other
-        // family is skipped.
-        let (af, off) = if ai.ai_family == AF_INET {
-            (AF_INET, 4usize)
+        // family is skipped. `min_len` = offset + address size (4/16 bytes) — an entry whose
+        // `ai_addrlen` can't contain the address is skipped rather than read out of bounds.
+        let (af, off, min_len) = if ai.ai_family == AF_INET {
+            (AF_INET, 4usize, 8usize)
         } else if ai.ai_family == AF_INET6 {
-            (AF_INET6, 8usize)
+            (AF_INET6, 8usize, 24usize)
         } else {
             cur = ai.ai_next;
             continue;
         };
-        if !ai.ai_addr.is_null() {
+        if !ai.ai_addr.is_null() && ai.ai_addrlen as usize >= min_len {
             let src = unsafe { ai.ai_addr.add(off) } as *const core::ffi::c_void;
             let mut buf = [0u8; INET6_ADDRSTRLEN];
             let p = unsafe { inet_ntop(af, src, buf.as_mut_ptr(), buf.len() as u32) };
