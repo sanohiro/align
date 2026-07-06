@@ -48,6 +48,14 @@ dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
   これは #297 のトラップを意識した分岐である。
 - `dns.resolve` は所有権付きの `array<string>` を返す(`read_dir` #339 と同じ deep-drop)。
   `datagram`/`response` は小さな構造体(Copy)で、カウントと、必要に応じて所有権付きの peer/body を運ぶ。
+  - **Slice 4 v1 の形(実装済み):** `recv_from` は受信**バイト数**のみを返す(`Result<i64, Error>`)。
+    `reader.read` とまったく同じ形(呼び出し側のバッファを埋め、バイト数を返す)。理想形である
+    `datagram {n, peer}` は**先送り**する:`Result` の `Ok` ペイロードは単一の `Scalar` であり
+    (`Scalar::Tuple` は存在しない)、peer アドレスは所有権付きの `string` なので、`{n, peer}` は
+    所有フィールドを持つ組み込み Move 構造体という集約型を新たに合成する必要がある — これは
+    「あるべき姿、さもなくば先送り」が禁じる特殊ケースの魔法である。第一級の組み込み構造体戻り値が
+    入るまで待つ。ソケット自体は syscall(`recvfrom`)で peer を受け取っているが、v1 では単に破棄する
+    (`src_addr` は null)。
 
 ## Effect classification
 

@@ -539,6 +539,19 @@ pub enum Rvalue {
     /// owned `tcp_conn` handle into `out`. Yields an `i32` status (0 = ok, else the shared errno
     /// table). Mirrors [`Rvalue::TcpConnect`] but takes a listener operand instead of host/port.
     TcpAccept { listener: Operand, out: Slot },
+    /// `udp.bind(host, port)` — resolve `host` (`AI_PASSIVE`) and open a `SOCK_DGRAM` socket bound to
+    /// `port`, writing the owned `udp_socket` handle (a bare pointer) into `out`. Yields an `i32`
+    /// status (0 = ok, else the shared errno/status table; a bad port/host is `AL_INVALID`). Mirrors
+    /// [`Rvalue::TcpListen`] with a `udp_socket` handle payload.
+    UdpBind { host: Operand, port: Operand, out: Slot },
+    /// `u.send_to(data, host, port)` — resolve `host`/`port` (`SOCK_DGRAM`, per call) and `sendto` the
+    /// byte view `data` as one datagram from the `udp_socket` operand's fd. Yields an `i64`: the bytes
+    /// sent (`>= 0`, `Ok`) or `-(status)` on error (the [`Rvalue::ReaderRead`] sign convention).
+    UdpSendTo { sock: Operand, data: Operand, host: Operand, port: Operand },
+    /// `u.recv_from(buf)` — block for one inbound datagram on the `udp_socket` operand, filling the
+    /// `buffer` operand up to its capacity (overwriting its length). Yields an `i64`: the bytes
+    /// received (`>= 0`, `Ok`) or `-(status)` on error (the [`Rvalue::ReaderRead`] sign convention).
+    UdpRecvFrom { sock: Operand, buffer: Operand },
     /// `fs.read_file_view(path)` — mmap the regular file `path` read-only into `arena`, writing the
     /// `str` view `{ptr,len}` into `out`. Yields an `i32` errno-status (0 = ok). The mapping is
     /// `munmap`ped at arena end (the region rule) — no `Drop`.
@@ -1034,7 +1047,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -1523,6 +1536,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::TcpListen { host, port } => lower_tcp_listen(b, host, port, e.ty),
         hir::ExprKind::TcpAccept { listener } => lower_tcp_accept(b, listener, e.ty),
+        hir::ExprKind::UdpBind { host, port } => lower_udp_bind(b, host, port, e.ty),
+        hir::ExprKind::UdpSendTo { sock, data, host, port } => lower_udp_send_to(b, sock, data, host, port, e.ty),
+        hir::ExprKind::UdpRecvFrom { sock, buffer } => lower_udp_recv_from(b, sock, buffer, e.ty),
         // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
         // runtime registers the mmap for `munmap` at arena end.
         hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
@@ -4898,6 +4914,71 @@ fn lower_tcp_accept(b: &mut Builder, listener: &hir::Expr, result_ty: Ty) -> Ope
     Operand::Value(r)
 }
 
+/// `udp.bind(host, port)` → the runtime opens a bound `SOCK_DGRAM` socket, writing the owned
+/// `udp_socket` handle into an out slot and returning a status; branch `Ok(<socket>)` / `Err(<mapped
+/// status>)`. Mirrors [`lower_tcp_listen`] with a `udp_socket` handle payload.
+fn lower_udp_bind(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::UdpSocket);
+    let h = lower_expr(b, host);
+    let p = lower_expr(b, port);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::UdpBind { host: h, port: p, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the socket handle and wrap it (the unwrapped local owns it — `Drop` closes its fd).
+    b.cur = ok_bb;
+    let s = b.fresh_value(Ty::UdpSocket);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (null handle) → nothing to close; map the status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `u.send_to(data, host, port)` → the runtime `sendto`s one datagram from the socket's fd, returning
+/// the bytes sent (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
+/// helper (the `reader.read` sign convention).
+fn lower_udp_send_to(b: &mut Builder, sock: &hir::Expr, data: &hir::Expr, host: &hir::Expr, port: &hir::Expr, result_ty: Ty) -> Operand {
+    let s = lower_expr(b, sock);
+    let d = lower_expr(b, data);
+    let h = lower_expr(b, host);
+    let p = lower_expr(b, port);
+    let n = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(n, Rvalue::UdpSendTo { sock: s, data: d, host: h, port: p }));
+    lower_count_or_status_result(b, n, result_ty)
+}
+
+/// `u.recv_from(buf)` → the runtime blocks for one datagram, filling `buf` and returning the bytes
+/// received (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
+/// helper (the `reader.read` sign convention).
+fn lower_udp_recv_from(b: &mut Builder, sock: &hir::Expr, buffer: &hir::Expr, result_ty: Ty) -> Operand {
+    let s = lower_expr(b, sock);
+    let buf = lower_expr(b, buffer);
+    let n = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(n, Rvalue::UdpRecvFrom { sock: s, buffer: buf }));
+    lower_count_or_status_result(b, n, result_ty)
+}
+
 /// `fs.read_file_view(path)` → the runtime mmaps the file into the enclosing arena, writing the
 /// `str` view `{ptr,len}` into an out slot and returning an errno-status; branch `Ok(<view>)` /
 /// `Err(<mapped status>)`. The arena handle (guaranteed present — sema requires an enclosing arena)
@@ -5585,6 +5666,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::CliParsed => "cli parsed".to_string(),
         Ty::TcpConn => "tcp_conn".to_string(),
         Ty::TcpListener => "tcp_listener".to_string(),
+        Ty::UdpSocket => "udp_socket".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

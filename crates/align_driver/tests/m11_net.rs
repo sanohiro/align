@@ -571,3 +571,197 @@ pub fn main() -> Result<(), Error> {
         "a reader returned through a user call with a Frame-region argument must be conservatively rejected"
     );
 }
+
+// --- Slice 4: udp_socket (bind + send_to + recv_from) + Gate-1 rejections ----------------------
+
+/// UDP datagram round trip: an Align program `udp.bind`s on `127.0.0.1`, `recv_from`s one datagram,
+/// then `send_to`s the same bytes back to the Rust peer. The Rust peer sends `ping` (retrying, since
+/// UDP is lossy and the server may not be bound yet) until it receives the echoed datagram back. The
+/// Align bind port is probed (bind `:0`, read, drop — port 0 is rejected in v1); the peer's port is
+/// passed in so the server can reply (v1 `recv_from` does not return the peer address — see the
+/// deferral note in `check_udp_socket_method`). Exercises bind + recv_from + send_to and the
+/// `slice<u8>` (`b.bytes()`) send path.
+#[test]
+fn udp_bind_send_to_recv_from_roundtrip() {
+    if !backend_available() {
+        return;
+    }
+    use std::net::UdpSocket;
+    use std::process::{Command, Stdio};
+
+    // The Rust peer binds first so its port is known and can be handed to the Align server.
+    let peer = UdpSocket::bind("127.0.0.1:0").expect("peer bind");
+    peer.set_read_timeout(Some(std::time::Duration::from_millis(200))).expect("peer read timeout");
+    let peer_port = peer.local_addr().unwrap().port();
+
+    // Probe a free loopback port for the Align server (it can't use port 0 — rejected in v1).
+    let probe = UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+    let srv_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    // The server: bind, receive one datagram, echo its bytes back to the peer's port.
+    let prog = "\
+import std.net
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"udp\")
+  c.flag_i64(\"port\", 0)
+  c.flag_i64(\"peer\", 0)
+  p := c.parse(args)?
+  u := udp.bind(\"127.0.0.1\", p.get_i64(\"port\"))?
+  b := buffer(64)
+  n := u.recv_from(b)?
+  u.send_to(b.bytes(), \"127.0.0.1\", p.get_i64(\"peer\"))?
+  return Ok(())
+}
+";
+    let built = build_exe("m11net-udp-roundtrip", prog);
+    let mut child = Command::new(&built.exe)
+        .args(["--port", &srv_port.to_string(), "--peer", &peer_port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the Align UDP server");
+
+    // Send `ping` (retrying — UDP is lossy and the server may not be bound yet) until the echo lands.
+    let mut got_echo = false;
+    for _ in 0..100 {
+        peer.send_to(b"ping", ("127.0.0.1", srv_port)).expect("peer sends ping");
+        let mut buf = [0u8; 64];
+        match peer.recv_from(&mut buf) {
+            Ok((n, _from)) => {
+                assert_eq!(&buf[..n], b"ping", "the server echoes the datagram bytes exactly");
+                got_echo = true;
+                break;
+            }
+            Err(_) => continue, // timeout — the server wasn't up yet / the datagram was lost; retry.
+        }
+    }
+    if !got_echo {
+        let _ = child.kill();
+        let out = child.wait_with_output().expect("wait server");
+        panic!("never received the echoed datagram; server stderr: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let out = child.wait_with_output().expect("wait server");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the UDP server binds, receives, echoes and exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `udp_socket` is an owned handle bound to one local — it cannot be collected into an array (a
+/// copied socket would double-`close` its fd), rejected at construction like `tcp_conn`.
+#[test]
+fn udp_socket_rejected_as_array_element() {
+    let src = "\
+import std.net
+fn f(a: udp_socket, b: udp_socket) -> i64 {
+  xs := [a, b]
+  return xs.len()
+}
+pub fn main() -> i32 {
+  return 0
+}
+";
+    assert!(check_errs("m11net-udp-array", src), "a udp_socket cannot be an array element");
+}
+
+/// `udp.bind` is a syscall — impure. A closure that binds is never `Pure`, so `par_map` rejects it
+/// (the `tcp.connect` / `tcp.listen` impurity precedent).
+#[test]
+fn udp_bind_rejected_by_par_map() {
+    let src = "\
+import std.net
+fn f(x: i64) -> i64 {
+  u := udp.bind(\"127.0.0.1\", 8080) else { return x }
+  b := buffer(8)
+  n := u.recv_from(b) else { return x }
+  return x
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11net-udp-parmap", src), "a udp.bind-using (impure) closure must be rejected by par_map");
+}
+
+/// P6: a `udp_socket` is an owned Move handle — an unbound temporary (`udp.bind(...)?.recv_from(b)`)
+/// is not dropped yet, so it cannot be a method receiver in v1. Bind it first. (Mirrors the
+/// `tcp_conn` / `tcp_listener` bound-receiver restriction.)
+#[test]
+fn udp_socket_unbound_temporary_receiver_rejected() {
+    let src = "\
+import std.net
+pub fn main() -> Result<(), Error> {
+  b := buffer(8)
+  n := udp.bind(\"127.0.0.1\", 8080)?.recv_from(b)?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11net-udp-temp-recv", src), "a method on an unbound udp_socket temporary must be rejected (bind first)");
+}
+
+/// `udp.bind` requires `import std.net` (the capability-header rule).
+#[test]
+fn udp_bind_requires_import() {
+    let src = "\
+pub fn main() -> Result<(), Error> {
+  u := udp.bind(\"127.0.0.1\", 8080)?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11net-udp-noimport", src), "udp.bind without `import std.net` must error");
+}
+
+/// Port `0` (kernel-assigned) is rejected in v1 — `udp.bind("127.0.0.1", 0)` is an `Err`
+/// (Error.Invalid) at runtime, never an abort. `main` exits non-zero.
+#[test]
+fn udp_bind_port_zero_is_err() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.net
+pub fn main() -> Result<(), Error> {
+  u := udp.bind(\"127.0.0.1\", 0)?
+  return Ok(())
+}
+";
+    let out = build_and_run("m11net-udp-port0", prog);
+    assert_ne!(out.status.code(), Some(0), "port 0 is rejected in v1 (main exits non-zero), never an abort");
+}
+
+/// `send_to` to port `0` is an `Err` (Error.Invalid) at runtime — a datagram destination port must
+/// be `1..=65535`. `main` exits non-zero, never an abort.
+#[test]
+fn udp_send_to_port_zero_is_err() {
+    if !backend_available() {
+        return;
+    }
+    // Probe a free loopback port for the (valid) bind, then send to the invalid port 0.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let prog = "\
+import std.net
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"udp\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  u := udp.bind(\"127.0.0.1\", p.get_i64(\"port\"))?
+  u.send_to(\"x\", \"127.0.0.1\", 0)?
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m11net-udp-sendport0", prog, &["--port", &port.to_string()]);
+    assert_ne!(out.status.code(), Some(0), "send_to to port 0 is Error.Invalid (main exits non-zero), never an abort");
+}
