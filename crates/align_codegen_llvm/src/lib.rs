@@ -349,6 +349,17 @@ fn build_module<'c>(
         "div_fail".to_string(),
         module.add_function("align_rt_div_fail", ctx.void_type().fn_type(&[], false), None),
     );
+    // `std.process` (M11) — `process.exit(code)` (cleanup runs first, in MIR) and `process.abort()`.
+    // Both are diverging (`-> !`); MIR emits `Unreachable` after the call (like `bounds_fail`), so no
+    // `noreturn` attribute is required for correctness.
+    funcs.insert(
+        "process_exit".to_string(),
+        module.add_function("align_rt_process_exit", ctx.void_type().fn_type(&[ctx.i64_type().into()], false), None),
+    );
+    funcs.insert(
+        "process_abort".to_string(),
+        module.add_function("align_rt_process_abort", ctx.void_type().fn_type(&[], false), None),
+    );
     // Arena allocator (M3).
     let ptr = ctx.ptr_type(AddressSpace::default());
     let i64t = ctx.i64_type();

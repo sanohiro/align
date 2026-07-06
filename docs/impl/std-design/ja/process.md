@@ -36,6 +36,40 @@ process.abort()                        // immediate _exit, NO cleanup
 drop したい場合は、先に `kill()` するとよい(あるいは将来の明示的な `detach()` API を使う — これは記録の
 みで v1 には入れない)。
 
+## Slice 1 — 実装済み (2026-07-06, ブランチ `feat/m11-process-slice1-exit`)
+
+`process.exit(code)` / `process.abort()` はエンドツーエンドで実装済み(sema → HIR
+`ProcessExit`/`ProcessAbort` → MIR → ランタイム `align_rt_process_exit`/`align_rt_process_abort`):
+
+- **exit = クリーンアップしてから終了。** MIR ロワリングは、ランタイム呼び出しの *前に* 現在の関数の
+  `emit_exit_cleanup`(`return` が使うのと同じヘルパ — 生存する所有ローカルの Drop、`task_group`/arena の
+  終了)を実行し、その後ブロックを `Unreachable` で終端する。よってバッファ付き writer は `Drop` で
+  flush + close され、arena はプロセス終了前に解放される。ランタイム側は `std::process::exit(code)` だけ。
+- **abort = 名前付きの危険な脱出口。** クリーンアップを一切先行させない裸の `align_rt_process_abort()`、
+  すなわち libc `_exit(1)` — Drop なし、flush なし、`atexit` なし。コンパイラの `panic_abort`
+  (`SIGABRT`、算術トラップ / 不変条件違反用)とは別物。`abort()` は仕様どおりユーザ要求によるシグナル無しの
+  即時終了(`abort` ではなく `_exit`)。終了ステータスは `1`(abort は code を取らない。意図的な異常終了は
+  失敗)。
+- **「グローバル flush」は結局何も要らなかった。** ランタイムはプロセス全体の出力バッファを持たない:
+  `print` は毎回 `stdout` を flush し(生成された `main` は crt0 に直接戻るため `atexit` フックに頼れない)、
+  すべての `writer` / バッファ付きシンクは Align の **Move** 値で、呼び出し側のクリーンアップ内の `Drop` で
+  flush される。よって atexit 相当の登録機構を作る必要はない — 現時点では不要と記録する。将来ランタイム所有の
+  グローバルバッファを導入するなら、その flush は `align_rt_process_exit` にフックする。
+- **終了コードの切り詰め。** `i64 -> i32`、Unix の `wait` では下位 8 ビットのみが観測される
+  (`WEXITSTATUS`):`exit(256)` → `0`、`exit(-1)` → `255`。`exit(3)` に一致、ドキュメント化済み。
+- **divergence の型付け(v1 の制限)。** `Never` 型がまだ無いため `exit`/`abort` は `()` 型。MIR では発散する
+  (クリーンアップ + 呼び出し + `Unreachable`)し、後続コードは死んでいて出力されない(`lower_block` が
+  `is_terminated` で停止 — `return` 後のコードと同等、ICE なし)。ただし型システムは発散を表現しないため、
+  `process.exit` を非 unit を返す関数の**末尾値**にはできない — 文として使う(例:`process.exit(3)` の後に
+  末尾 `0`)。適切な発散/`Never` 型が理想形で、これは deferred。
+- **v1 のマルチフレーム gap(正直に記録)。** 現在の関数のクリーンアップのみが走る。スタックを遡って
+  *すべての* 呼び出し側の Drop を実行する完全なマルチフレーム巻き戻しは理想形で、deferred。所有リソースが
+  すべて `exit` を呼ぶフレーム内(あるいはそこに束縛された arena / バッファ付き writer)に存在するプログラムでは、
+  現在フレームのクリーンアップで表現可能なものは全てカバーされる。gap が問題になるのは、スタック上位の呼び出し側が
+  観測可能な `Drop` 効果を持つリソースを所有する場合のみ。
+
+Slice 2(`child` / `spawn` / `wait`)と Slice 3(`kill` / `exec`)は以下の breakdown どおり残っている。
+
 ## `process.exit` Drop-semantics decision(ここで SETTLED)
 
 `process.exit(code)` はトップレベルへの通常の return とまったく同じように振る舞う。**保留中の Drop・arena

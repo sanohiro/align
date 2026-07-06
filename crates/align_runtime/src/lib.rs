@@ -5707,6 +5707,46 @@ pub extern "C" fn align_rt_div_fail() -> ! {
     std::process::abort();
 }
 
+/// `process.exit(code)` (`std.process`, `docs/impl/std-design/process.md`) — terminate the process
+/// with `code`. The settled cleanup-then-exit semantics: the CALLER (codegen, via MIR
+/// `emit_exit_cleanup`) has already run the current function's pending cleanup — dropping every live
+/// owned local (buffered writers flush + close in their `Drop`) and ending open arenas /
+/// `task_group`s — *before* this call, so no buffered output is lost. This function only performs the
+/// final exit.
+///
+/// **Global flush:** the runtime owns no process-wide output buffer to flush here — `print` flushes
+/// `stdout` on every call (it cannot rely on an atexit hook, since generated `main` returns straight
+/// to crt0), and every `writer`/buffered sink is an Align Move value flushed by its `Drop` in the
+/// caller's cleanup above. So there is nothing global to flush; `std::process::exit` (libc `exit`)
+/// runs any C `atexit` handlers and terminates.
+///
+/// **Exit code:** narrowed `i64 -> i32` and, on a Unix `wait`, observed as the low 8 bits only
+/// (`WEXITSTATUS`) — e.g. `exit(256)` is observed as `0`, `exit(-1)` as `255`. Documented, not an
+/// error (matches the platform `exit(3)` contract).
+///
+/// **v1 gap:** only the current frame's cleanup ran (the caller emitted it); a full multi-frame stack
+/// unwind running every caller's Drops is the documented ideal, deferred (`process.md`).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_process_exit(code: i64) -> ! {
+    std::process::exit(code as i32);
+}
+
+/// `process.abort()` (`std.process`) — the named-dangerous escape hatch: terminate the process
+/// *immediately* via `_exit`, running NO cleanup (no Drops, no buffered-writer flushes, no C `atexit`
+/// handlers). The asymmetric counterpart to `align_rt_process_exit`: codegen emits this as a bare
+/// call with no preceding cleanup, so any pending buffered output is intentionally lost.
+///
+/// `_exit(1)` — a deterministic nonzero status (abort takes no code; a deliberate abnormal exit is a
+/// failure). This is distinct from [`panic_abort`]'s `SIGABRT`, which is reserved for
+/// compiler-invariant / arithmetic-trap violations; `process.abort()` is a user-requested clean
+/// (signal-free) immediate exit, as `process.md` specifies (`_exit`, not `abort`).
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_process_abort() -> ! {
+    // SAFETY: `_exit(2)` is an always-available libc entry that never returns and takes no pointers;
+    // calling it is unconditionally sound.
+    unsafe { _exit(1) }
+}
+
 /// A bump allocator (`docs/impl/06-runtime-std.md` §3). Memory is carved from a list of
 /// fixed-size chunks; individual allocations are never freed — the whole arena is
 /// released at once by [`align_rt_arena_end`]. Chunk buffers are heap-stable (the outer
@@ -6066,6 +6106,9 @@ unsafe extern "C" {
     fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
     // POSIX `close(2)` — a file-backed `reader`/`writer` closes the fd it owns at `Drop`.
     fn close(fd: i32) -> i32;
+    // POSIX `_exit(2)` — `process.abort()`: terminate immediately with `status`, skipping all
+    // `atexit`/stdio-flush handling (unlike libc `exit`). Never returns.
+    fn _exit(status: i32) -> !;
     // POSIX `mmap(2)` / `munmap(2)` — `fs.read_file_view` maps a regular file read-only into the
     // enclosing arena's address space; the mapping is `munmap`ped when the arena ends.
     fn mmap(addr: *mut core::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut core::ffi::c_void;

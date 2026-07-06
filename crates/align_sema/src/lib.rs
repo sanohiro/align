@@ -2372,6 +2372,13 @@ impl EffectScan {
                 self.impure_direct = true;
                 self.expr(ns);
             }
+            // `std.process` — `exit`/`abort` terminate the process (observable external effect), so
+            // both are Impure: an `exit`/`abort` inside a `par_map` closure is rejected (not Pure).
+            ExprKind::ProcessExit { code } => {
+                self.impure_direct = true;
+                self.expr(code);
+            }
+            ExprKind::ProcessAbort => self.impure_direct = true,
             // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data),
             ExprKind::EncodingDecode { input, .. } => self.expr(input),
@@ -3481,6 +3488,10 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::TimeNow | ExprKind::TimeInstant => {}
             ExprKind::TimeSleep { ns } => self.walk(ns, depth),
+            // `process.exit` diverges and its `code` is a scalar `i64` (nothing escapes); `abort`
+            // has no operand.
+            ExprKind::ProcessExit { code } => self.walk(code, depth),
+            ExprKind::ProcessAbort => {}
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
             ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             // `std.rand`: an `rng` is Copy/`Static` (borrows nothing); `sample` returns a fresh owned
@@ -3871,6 +3882,8 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::TimeNow | ExprKind::TimeInstant => {}
             ExprKind::TimeSleep { ns } => self.visit(ns),
+            ExprKind::ProcessExit { code } => self.visit(code),
+            ExprKind::ProcessAbort => {}
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.visit(data),
             ExprKind::EncodingDecode { input, .. } => self.visit(input),
             // `std.rand` — recurse into the subexpressions (no heap-narrowing pattern of its own).
@@ -4552,6 +4565,9 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::TimeNow | ExprKind::TimeInstant => {}
             ExprKind::TimeSleep { ns } => self.expr(ns, moved, false, false),
+            // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
+            ExprKind::ProcessExit { code } => self.expr(code, moved, false, false),
+            ExprKind::ProcessAbort => {}
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data, moved, false, false),
             ExprKind::EncodingDecode { input, .. } => self.expr(input, moved, false, false),
@@ -7487,6 +7503,12 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "time" && matches!(method, "now" | "instant" | "sleep") {
                 self.require_import("std.time", &format!("time.{method}"), span);
                 return self.check_time_op(method, args, span);
+            }
+            // `std.process` — `process.exit(code)` (cleanup-then-exit) / `process.abort()` (immediate
+            // `_exit`, no cleanup). Both diverge; typed `()` (no `Never` type yet).
+            if module == "process" && matches!(method, "exit" | "abort") {
+                self.require_import("std.process", &format!("process.{method}"), span);
+                return self.check_process_op(method, args, span);
             }
             // `io.copy(r, w)` -> Result<i64, Error> (bytes transferred).
             if module == "io" && method == "copy" {
@@ -10912,6 +10934,55 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind, ty: i64_ty, span }
     }
 
+    /// `std.process` — `process.exit(code)` / `process.abort()` (draft §18.2). Both terminate the
+    /// process and never return:
+    /// - `exit(code)` runs the current function's pending cleanup (Drops / arena ends / buffered
+    ///   flushes — the same emission a `return` uses) THEN calls libc `exit(code)`. The settled
+    ///   cleanup-then-exit semantics (Nothing-hidden: no silently lost buffered output).
+    /// - `abort()` is the named escape hatch: immediate `_exit`, NO cleanup.
+    ///
+    /// There is no `Never` type yet, so both are typed `()` (v1): they lower to a diverging runtime
+    /// call, but the type system does not model the divergence — so `process.exit` cannot be the tail
+    /// value of a non-unit-returning function (use it as a statement). Recorded in
+    /// `docs/impl/std-design/process.md`.
+    fn check_process_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if method == "abort" {
+            if !args.is_empty() {
+                self.diags
+                    .error(format!("'process.abort' takes no arguments, got {}", args.len()), span);
+                return err;
+            }
+            return Expr { kind: ExprKind::ProcessAbort, ty: Ty::Unit, span };
+        }
+        // `process.exit(code)` — one `i64` exit code (the OS truncates it to the low 8 bits).
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'process.exit' expects 1 argument (exit code, i64), got {}", args.len()), span);
+            return err;
+        }
+        let code = self.check_expr(&args[0], None);
+        if code.ty == Ty::Error {
+            return err;
+        }
+        // Require *exactly* `i64` (binding a bare int literal's inference var to it), mirroring
+        // `time.sleep`: a narrower operand would build a `ProcessExit` node whose value doesn't match
+        // the runtime `align_rt_process_exit(i64)` signature.
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match self.resolve(code.ty) {
+            Ty::Int(IntTy { bits: 64, signed: true }) => {}
+            Ty::IntVar(_) => self.constrain(code.ty, Some(i64_ty), args[0].span),
+            other => {
+                self.diags.error(
+                    format!("'process.exit' expects an exit code (i64), got {}", ty_name(other)),
+                    args[0].span,
+                );
+                return err;
+            }
+        }
+        Expr { kind: ExprKind::ProcessExit { code: Box::new(code) }, ty: Ty::Unit, span }
+    }
+
     /// `std.encoding` — Base64 (standard + URL-safe), hex, and UTF-8 validation. Pure byte
     /// transforms, no state / Move types of their own:
     /// - `base64_encode`/`base64url_encode`/`hex_encode(data)` take a byte view (`str` / owned
@@ -12501,6 +12572,8 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::TimeNow | ExprKind::TimeInstant => {}
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
+            ExprKind::ProcessExit { code } => self.finalize_expr(code),
+            ExprKind::ProcessAbort => {}
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
             ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
             ExprKind::RandSeed => {}
