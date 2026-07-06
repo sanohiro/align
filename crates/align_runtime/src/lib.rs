@@ -2124,8 +2124,13 @@ unsafe fn group_io<'a>(keys: *const i64, vals: *const i64, len: i64) -> (&'a [i6
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_sum_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let (keys, vals) = unsafe { group_io(keys, vals, len) };
-    // SAFETY: `group_io` ensures `vals.len() == keys.len()`. `group_agg_i64` calls this closure with `i < keys.len()`, making it strictly in-bounds for `vals`.
-    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| *vals.get_unchecked(i), |a, b| a.wrapping_add(b)) }
+    unsafe {
+        group_agg_i64(keys, out_keys, out_vals, cap, |i| {
+            // SAFETY: `group_agg_i64` only calls `per_row` with indices in `0..keys.len()`.
+            // Since `keys` and `vals` have the same length (guaranteed by `group_io`), `i` is always in-bounds for `vals`.
+            *vals.get_unchecked(i)
+        }, |a, b| a.wrapping_add(b))
+    }
 }
 
 /// `group_by(.key).min(.value)` — per-group minimum.
@@ -2135,8 +2140,13 @@ pub unsafe extern "C" fn align_rt_group_sum_i64(keys: *const i64, vals: *const i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_min_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let (keys, vals) = unsafe { group_io(keys, vals, len) };
-    // SAFETY: `group_io` ensures `vals.len() == keys.len()`. `group_agg_i64` calls this closure with `i < keys.len()`, making it strictly in-bounds for `vals`.
-    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| *vals.get_unchecked(i), |a, b| a.min(b)) }
+    unsafe {
+        group_agg_i64(keys, out_keys, out_vals, cap, |i| {
+            // SAFETY: `group_agg_i64` only calls `per_row` with indices in `0..keys.len()`.
+            // Since `keys` and `vals` have the same length (guaranteed by `group_io`), `i` is always in-bounds for `vals`.
+            *vals.get_unchecked(i)
+        }, |a, b| a.min(b))
+    }
 }
 
 /// `group_by(.key).max(.value)` — per-group maximum.
@@ -2146,8 +2156,13 @@ pub unsafe extern "C" fn align_rt_group_min_i64(keys: *const i64, vals: *const i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_group_max_i64(keys: *const i64, vals: *const i64, len: i64, out_keys: *mut i64, out_vals: *mut i64, cap: i64) -> i64 {
     let (keys, vals) = unsafe { group_io(keys, vals, len) };
-    // SAFETY: `group_io` ensures `vals.len() == keys.len()`. `group_agg_i64` calls this closure with `i < keys.len()`, making it strictly in-bounds for `vals`.
-    unsafe { group_agg_i64(keys, out_keys, out_vals, cap, |i| *vals.get_unchecked(i), |a, b| a.max(b)) }
+    unsafe {
+        group_agg_i64(keys, out_keys, out_vals, cap, |i| {
+            // SAFETY: `group_agg_i64` only calls `per_row` with indices in `0..keys.len()`.
+            // Since `keys` and `vals` have the same length (guaranteed by `group_io`), `i` is always in-bounds for `vals`.
+            *vals.get_unchecked(i)
+        }, |a, b| a.max(b))
+    }
 }
 
 /// `group_by(.key).count()` — per-group row count (no value column).
