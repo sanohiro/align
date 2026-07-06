@@ -422,6 +422,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::UdpBind { host, port, out } => format!("udp_bind({}, {}, -> _{out})", operand_str(host), operand_str(port)),
         Rvalue::UdpSendTo { sock, data, host, port } => format!("udp_send_to({}, {}, {}, {})", operand_str(sock), operand_str(data), operand_str(host), operand_str(port)),
         Rvalue::UdpRecvFrom { sock, buffer } => format!("udp_recv_from({}, {})", operand_str(sock), operand_str(buffer)),
+        Rvalue::ProcessSpawn { cmd, args, out } => format!("process_spawn({}, {}, -> _{out})", operand_str(cmd), operand_str(args)),
+        Rvalue::ChildWait { child } => format!("child_wait({})", operand_str(child)),
         Rvalue::FsReadFileView { path, arena, out } => {
             format!("fs_read_file_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))
         }

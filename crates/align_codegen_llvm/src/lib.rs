@@ -737,6 +737,22 @@ fn build_module<'c>(
         module.add_function("align_rt_udp_recv_from", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
     );
     funcs.insert(
+        // process.spawn (cmd_ptr, cmd_len: i64, args_ptr: *AlignStr, args_len: i64, out: **Child)
+        // -> i32 status (owned child; 0 = ok). fork+execvp; a failed exec `_exit(127)`s in the child.
+        "process_spawn".to_string(),
+        module.add_function("align_rt_process_spawn", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // ch.wait (ch: *Child) -> i64 (exit code >= 0: WEXITSTATUS / 128+sig, or -(status) on error).
+        "child_wait".to_string(),
+        module.add_function("align_rt_child_wait", i64t2.fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // drop(ch) (ch: *Child) -> void; reap via blocking waitpid if not yet waited (no zombie).
+        "child_free".to_string(),
+        module.add_function("align_rt_child_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
         // fs.read_file_view (path_ptr, path_len, arena: *Arena, out: *{ptr,len}) -> i32 errno-status.
         "fs_read_file_view".to_string(),
         module.add_function("align_rt_fs_read_file_view", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false), None),
@@ -1520,7 +1536,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // A `reader`/`writer`/`buffer` / cli handle / `tcp_conn` payload is an opaque pointer.
-        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
@@ -1620,7 +1636,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -1978,6 +1994,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::TcpConn => unreachable!("a tcp_conn handle is not a box/array payload"),
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
+        Scalar::Child => unreachable!("a child handle is not a box/array payload"),
     }
 }
 
@@ -2626,7 +2643,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -2684,7 +2701,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket) {
+                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) {
                         // A writer flushes + closes; a reader closes; a buffer / cli handle frees; a
                         // tcp_conn / tcp_listener / udp_socket closes its socket fd. Each runtime
                         // `*_free` is null-safe (a moved-out / never-initialised slot drops harmlessly).
@@ -2696,6 +2713,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             Ty::TcpConn => "tcp_conn_free",
                             Ty::TcpListener => "tcp_listener_free",
                             Ty::UdpSocket => "udp_socket_free",
+                            // A `child` reaps its pid (a blocking `waitpid`) if not yet waited.
+                            Ty::Child => "child_free",
                             _ => "cli_parsed_free",
                         };
                         let p = self
@@ -2723,7 +2742,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) => {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) => {
                                     // The field is the handle pointer itself; each `*_free` is null-safe
                                     // (the inactive arm / a moved-out aggregate reads a null handle).
                                     let free_fn = match payload_field_scalar(ty, idx) {
@@ -2733,6 +2752,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         Some(Scalar::TcpConn) => "tcp_conn_free",
                                         Some(Scalar::TcpListener) => "tcp_listener_free",
                                         Some(Scalar::UdpSocket) => "udp_socket_free",
+                                        Some(Scalar::Child) => "child_free",
                                         _ => "cli_parsed_free",
                                     };
                                     self.builder
@@ -4467,6 +4487,30 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("udp_recv_from returns i64")
             }
+            // process.spawn — fork+execvp; write the owned child handle into `out`, return i32 status.
+            // `cmd` is a {ptr,len} str view (the lookup path); `args` is a {ptr,len} of str views (the
+            // child's full argv, marshalled to C strings by the runtime).
+            Rvalue::ProcessSpawn { cmd, args, out } => {
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (c_ptr, c_len) = self.split_str(cmd)?;
+                let (a_ptr, a_len) = self.split_str(args)?;
+                self.builder
+                    .build_call(self.funcs["process_spawn"], &[c_ptr.into(), c_len.into(), a_ptr.into(), a_len.into(), out_ptr.into()], "spawn")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("process_spawn returns i32")
+            }
+            // ch.wait — waitpid the child (marking it reaped through the pointer); return i64 (exit
+            // code >= 0, or -(status) on a double-wait / waitpid error).
+            Rvalue::ChildWait { child } => {
+                let cp = self.operand(child).into();
+                self.builder
+                    .build_call(self.funcs["child_wait"], &[cp], "cwait")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("child_wait returns i64")
+            }
             // fs.read_file_view — mmap into the arena, write the str view `{ptr,len}` into `out`,
             // return i32 status.
             Rvalue::FsReadFileView { path, arena, out } => {
@@ -4972,7 +5016,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),

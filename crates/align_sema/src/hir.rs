@@ -774,6 +774,22 @@ pub enum ExprKind {
     /// (no Drops / flushes / atexit). The asymmetric counterpart to `process.exit`. Impure; diverges.
     /// The `ty` is [`crate::Ty::Unit`] (no `Never` type yet).
     ProcessAbort,
+    /// `process.spawn(cmd, args)` (`std.process`) — `fork` + `execvp(cmd, argv)` in the child. `cmd`
+    /// is the borrowed `str` lookup path (resolved via `PATH`); `args` is the borrowed `array<str>`
+    /// that becomes the child's **full** `argv` — the caller supplies `argv[0]` (P5). The `ty` is
+    /// `Result<child, Error>` (an owned Move handle owning the child's pid; `Drop` reaps it via a
+    /// blocking `waitpid`). A `fork` failure surfaces as `Err(errno)`; an `execvp` failure cannot be
+    /// reported synchronously — the forked child `_exit(127)`s (the shell convention), so an
+    /// exec-not-found surfaces later as `wait() == 127`. Impure. Both `cmd` and `args` are borrowed
+    /// (never consumed).
+    ProcessSpawn { cmd: Box<Expr>, args: Box<Expr> },
+    /// `ch.wait()` (`std.process`) — block in `waitpid` for the `child` `child` to exit, returning its
+    /// exit code as `Result<i64, Error>`: a normal exit yields `WEXITSTATUS` (`0..=255`); a
+    /// signal-killed child yields `128 + signal` (the shell convention). Marks the child **reaped**
+    /// (through the borrow — the receiver is read, not consumed, so the later `Drop` becomes a no-op);
+    /// a second `wait()` on an already-reaped child is `Err` (a clean status, not an `ECHILD` race).
+    /// `child` is borrowed (never consumed — mirrors `l.accept()`). Impure.
+    ChildWait { child: Box<Expr> },
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode a byte view (`str` /
     /// owned `string` (auto-borrowed) / `slice<u8>`) into a freshly heap-allocated owned `string`
     /// (the `ty` is [`crate::Ty::String`]). `kind` selects the alphabet. Pure (a byte transform, no

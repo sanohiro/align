@@ -642,7 +642,7 @@ pub unsafe extern "C" fn align_rt_tcp_connect(host: *const u8, host_len: i64, po
             cur = ai.ai_next;
             continue;
         }
-        let fd = unsafe { socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
+        let fd = unsafe { cloexec_socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
         if fd < 0 {
             last_status = io_error_to_status(&std::io::Error::last_os_error());
             cur = ai.ai_next;
@@ -819,7 +819,7 @@ pub unsafe extern "C" fn align_rt_tcp_listen(host: *const u8, host_len: i64, por
             cur = ai.ai_next;
             continue;
         }
-        let fd = unsafe { socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
+        let fd = unsafe { cloexec_socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
         if fd < 0 {
             last_status = io_error_to_status(&std::io::Error::last_os_error());
             cur = ai.ai_next;
@@ -892,7 +892,7 @@ pub unsafe extern "C" fn align_rt_tcp_accept(l: *mut TcpListener, out: *mut *mut
     let lfd = unsafe { (*l).fd };
     loop {
         // No peer address wanted — pass null addr/addrlen. `accept` returns the connected fd.
-        let fd = unsafe { accept(lfd, core::ptr::null_mut(), core::ptr::null_mut()) };
+        let fd = unsafe { cloexec_accept(lfd) };
         if fd >= 0 {
             // Enable TCP keepalive on the accepted conn (best-effort — parity with `connect`).
             let on: i32 = 1;
@@ -991,7 +991,7 @@ pub unsafe extern "C" fn align_rt_udp_bind(host: *const u8, host_len: i64, port:
             cur = ai.ai_next;
             continue;
         }
-        let fd = unsafe { socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
+        let fd = unsafe { cloexec_socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
         if fd < 0 {
             last_status = io_error_to_status(&std::io::Error::last_os_error());
             cur = ai.ai_next;
@@ -5747,6 +5747,178 @@ pub extern "C" fn align_rt_process_abort() -> ! {
     unsafe { _exit(1) }
 }
 
+// --- process.spawn / child.wait / child Drop-reap (std.process Slice 2) ------------------------
+
+/// A `child` (`std.process`) — a Move handle owning a spawned child process's pid, plus a `reaped`
+/// flag. `Drop` ([`align_rt_child_free`]) reaps the pid via a blocking `waitpid` iff not yet reaped,
+/// so a dropped-without-`wait()` child can never become a zombie (P2 — the documented tradeoff is that
+/// dropping a *still-running* child blocks until it exits; `kill()` first to avoid, a Slice-3 API). A
+/// successful `ch.wait()` flips `reaped` through the borrow so the later `Drop` is a no-op.
+pub struct Child {
+    pid: i32,
+    reaped: bool,
+}
+
+/// Decode a `waitpid` status into the exit code Align returns. A normal exit (`WIFEXITED`) yields
+/// `WEXITSTATUS` (`0..=255`); a signal-killed child (`WIFSIGNALED`) yields `128 + signal` (the shell
+/// convention — documented, may collide with a program that literally `exit`s in `129..=192`). The
+/// wait-status bit layout (`status & 0x7f` = the terminating signal, `0` = exited, `0x7f` = stopped;
+/// `(status >> 8) & 0xff` = the exit code) is identical on Linux and macOS/BSD. A `WIFSTOPPED` status
+/// (`0x7f`) should never occur — we never pass `WUNTRACED` — so it maps to a clean `AL_INVALID` `Err`
+/// rather than a bogus code.
+fn decode_wait_status(status: i32) -> i64 {
+    let term = status & 0x7f;
+    if term == 0 {
+        i64::from((status >> 8) & 0xff)
+    } else if term != 0x7f {
+        i64::from(128 + term)
+    } else {
+        -i64::from(AL_INVALID)
+    }
+}
+
+/// `process.spawn(cmd, args)` — `fork` + `execvp` a child process. `cmd` is the lookup-path `str` view
+/// (resolved via `PATH` by `execvp` when it has no `/`); `args` is the child's **full** `argv`
+/// (`args_len` `AlignStr` views, **including `argv[0]`** — the caller supplies the program name, P5).
+/// Marshals `cmd` + every `argv` entry into NUL-terminated C strings **before** `fork` (so the child
+/// branch does no allocation — async-signal-safe), then forks: the child `execvp`s and, if that fails,
+/// `_exit(127)`s (the shell convention — an exec-not-found is not reported synchronously; it surfaces
+/// as `wait() == 127`). On success writes the owned `child` handle to `out`, returns `0`. Failures:
+/// `AL_INVALID` for a null/empty `cmd`, an empty `argv` (no `argv[0]`), or an interior NUL in `cmd` /
+/// any arg; the mapped `fork` errno otherwise. Leaves `*out = null` on failure.
+///
+/// # Safety
+/// `cmd`/`cmd_len` and `args`/`args_len` must describe valid byte / `AlignStr` ranges; `out` must point
+/// to a writable `*mut Child` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_process_spawn(
+    cmd: *const u8,
+    cmd_len: i64,
+    args: *const AlignStr,
+    args_len: i64,
+    out: *mut *mut Child,
+) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    // `cmd` → a NUL-terminated C string (the `execvp` lookup path). Empty / non-UTF-8 / interior-NUL
+    // is rejected — never a panic.
+    let Some(cmd_str) = (unsafe { path_from_view(cmd, cmd_len) }) else {
+        return AL_INVALID;
+    };
+    if cmd_str.is_empty() {
+        return AL_INVALID;
+    }
+    let Ok(cmd_c) = std::ffi::CString::new(cmd_str) else {
+        return AL_INVALID; // interior NUL
+    };
+    // `args` → the child's full argv. An empty argv (no `argv[0]`) is invalid; a null/oversized slice
+    // is likewise rejected (`safe_slice` yields empty). Every entry becomes an owned `CString`; an
+    // interior NUL in any arg is `AL_INVALID`.
+    let Ok(n) = safe_len(args_len) else {
+        return AL_INVALID;
+    };
+    if n == 0 {
+        return AL_INVALID;
+    }
+    let argv_views: &[AlignStr] = unsafe { safe_slice(args, args_len) };
+    if argv_views.len() != n {
+        return AL_INVALID; // null / oversized args pointer
+    }
+    let mut argv_owned: Vec<std::ffi::CString> = Vec::with_capacity(n);
+    for a in argv_views {
+        let bytes = unsafe { bytes_view(a.ptr, a.len) };
+        let Ok(c) = std::ffi::CString::new(bytes) else {
+            return AL_INVALID; // interior NUL in an arg
+        };
+        argv_owned.push(c);
+    }
+    // The argv pointer vector (borrowing `argv_owned`'s bytes) + a null terminator. Built here in the
+    // parent so the post-`fork` child branch performs no allocation.
+    let mut argv_ptrs: Vec<*const u8> = argv_owned.iter().map(|c| c.as_ptr() as *const u8).collect();
+    argv_ptrs.push(core::ptr::null());
+
+    // SAFETY: `fork` takes no arguments and is always available; the child branch below calls only
+    // `execvp` (reading the argv built above — no allocation) and `_exit`, both async-signal-safe
+    // enough for the single-fork/exec shell contract.
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        return io_error_to_status(&std::io::Error::last_os_error());
+    }
+    if pid == 0 {
+        // Child: replace the image. `execvp` returns only on failure — then `_exit(127)` (the shell
+        // "command not found / not executable" convention). No `malloc`/`print` here.
+        unsafe {
+            execvp(cmd_c.as_ptr() as *const u8, argv_ptrs.as_ptr());
+            _exit(127)
+        }
+    }
+    // Parent: own the pid.
+    unsafe { *out = Box::into_raw(Box::new(Child { pid, reaped: false })) };
+    0
+}
+
+/// `ch.wait()` — block in `waitpid` for the child to exit, returning its exit code (`>= 0`:
+/// [`decode_wait_status`] — `WEXITSTATUS` or `128 + signal`) or `-(status)` on error (the
+/// `reader.read` sign convention). Marks the child **reaped** (through the pointer) so the later `Drop`
+/// is a no-op. A second `wait()` on an already-reaped child returns `-(AL_INVALID)` — a clean `Err`,
+/// detected via the `reaped` flag rather than racing `waitpid` into an `ECHILD` (the pid may have been
+/// recycled). `EINTR` is retried. Null child → `-(AL_INVALID)`.
+///
+/// # Safety
+/// `ch` must be null or a valid `Child` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_child_wait(ch: *mut Child) -> i64 {
+    if ch.is_null() {
+        return -i64::from(AL_INVALID);
+    }
+    let c = unsafe { &mut *ch };
+    if c.reaped {
+        return -i64::from(AL_INVALID); // double wait — clean Err, no ECHILD race
+    }
+    let mut status: i32 = 0;
+    loop {
+        let r = unsafe { waitpid(c.pid, &mut status, 0) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR: retry the blocking wait
+            }
+            // A genuine failure (e.g. ECHILD): mark reaped so `Drop` doesn't block on the same pid.
+            c.reaped = true;
+            return -i64::from(io_error_to_status(&e));
+        }
+        c.reaped = true;
+        return decode_wait_status(status);
+    }
+}
+
+/// Reap a `child` at `Drop`: if it was never `wait()`ed, `waitpid` it (blocking, discarding the code)
+/// so it cannot linger as a zombie (P2). Null-safe (a moved-out / never-initialised owned slot drops
+/// harmlessly). `EINTR` is retried; any other `waitpid` error is swallowed (the pid is already gone /
+/// not ours — nothing to reap).
+///
+/// # Safety
+/// `ch` must be null or a pointer from [`align_rt_process_spawn`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_child_free(ch: *mut Child) {
+    if ch.is_null() {
+        return;
+    }
+    let c = unsafe { Box::from_raw(ch) };
+    if !c.reaped {
+        loop {
+            let mut status: i32 = 0;
+            let r = unsafe { waitpid(c.pid, &mut status, 0) };
+            if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR: retry the reap
+            }
+            break;
+        }
+    }
+}
+
 /// A bump allocator (`docs/impl/06-runtime-std.md` §3). Memory is carved from a list of
 /// fixed-size chunks; individual allocations are never freed — the whole arena is
 /// released at once by [`align_rt_arena_end`]. Chunk buffers are heap-stable (the outer
@@ -6145,9 +6317,12 @@ unsafe extern "C" {
     fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *const core::ffi::c_void, optlen: u32) -> i32;
     // `bind`/`listen`/`accept` — the BSD server-side socket calls (identical prototypes on Linux and
     // macOS/BSD). `accept` with null `addr`/`addrlen` returns the connected fd without the peer
-    // address. `bind` takes the `sockaddr` `getaddrinfo` filled.
+    // address. `bind` takes the `sockaddr` `getaddrinfo` filled. On Linux the CLOEXEC-atomic `accept4`
+    // is used instead of `accept` (see `cloexec_accept`), so the plain `accept` is only linked on the
+    // non-Linux fallback path.
     fn bind(sockfd: i32, addr: *const u8, addrlen: u32) -> i32;
     fn listen(sockfd: i32, backlog: i32) -> i32;
+    #[cfg(not(target_os = "linux"))]
     fn accept(sockfd: i32, addr: *mut u8, addrlen: *mut u32) -> i32;
     // `sendto`/`recvfrom` — the connectionless (UDP) datagram calls (identical prototypes on Linux
     // and macOS/BSD). A null `dest_addr`/`src_addr` means "unspecified"; `recvfrom` with a null
@@ -6155,6 +6330,91 @@ unsafe extern "C" {
     // error.
     fn sendto(sockfd: i32, buf: *const core::ffi::c_void, len: usize, flags: i32, dest_addr: *const u8, addrlen: u32) -> isize;
     fn recvfrom(sockfd: i32, buf: *mut core::ffi::c_void, len: usize, flags: i32, src_addr: *mut u8, addrlen: *mut u32) -> isize;
+    // `fork`/`execvp`/`waitpid` — `std.process` (Slice 2). `fork` returns the child pid to the parent,
+    // `0` to the child, `-1` (errno set) on failure. `execvp` replaces the image (searching `PATH` for
+    // `file`), returning only on error. `waitpid` reaps `pid`, filling `status` with the wait-encoded
+    // exit info; `options = 0` blocks. Identical prototypes on Linux and macOS/BSD.
+    fn fork() -> i32;
+    fn execvp(file: *const u8, argv: *const *const u8) -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    // `accept4` (Linux) — `accept` plus a `flags` arg, so `SOCK_CLOEXEC` sets close-on-exec on the
+    // connected fd atomically (no `accept`+`fcntl` race). No such call on macOS/BSD (see `set_cloexec`).
+    #[cfg(target_os = "linux")]
+    fn accept4(sockfd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i32;
+    // `fcntl` (non-Linux) — the `FD_CLOEXEC` fallback for platforms without an atomic CLOEXEC-at-creation
+    // variant. Variadic in C (`int fcntl(int, int, ...)`); the `F_GETFD`/`F_SETFD` cmds take one `i32`
+    // arg, which passes correctly through this fixed-arity declaration on the SysV/AAPCS ABIs.
+    #[cfg(not(target_os = "linux"))]
+    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+}
+
+/// `SOCK_CLOEXEC` (Linux) — OR'd into a `socket`/`accept4` type so the new fd is close-on-exec, kept
+/// out of a spawned child (`std.process` P3). macOS has no such flag (uses `set_cloexec` instead).
+#[cfg(target_os = "linux")]
+const SOCK_CLOEXEC: i32 = 0o2000000;
+/// `fcntl` file-descriptor-flag commands + the `FD_CLOEXEC` bit (non-Linux CLOEXEC fallback).
+#[cfg(not(target_os = "linux"))]
+const F_GETFD: i32 = 1;
+#[cfg(not(target_os = "linux"))]
+const F_SETFD: i32 = 2;
+#[cfg(not(target_os = "linux"))]
+const FD_CLOEXEC: i32 = 1;
+
+/// Set `FD_CLOEXEC` on `fd` (best-effort). The non-Linux fallback where no atomic CLOEXEC-at-creation
+/// variant (`SOCK_CLOEXEC` / `accept4`) exists, so an Align-owned fd still doesn't leak into a spawned
+/// child. A failed `fcntl` only loses the leak protection — never fatal.
+///
+/// # Safety
+/// `fd` must be a valid open file descriptor.
+#[cfg(not(target_os = "linux"))]
+unsafe fn set_cloexec(fd: i32) {
+    let flags = unsafe { fcntl(fd, F_GETFD, 0) };
+    if flags >= 0 {
+        unsafe { fcntl(fd, F_SETFD, flags | FD_CLOEXEC) };
+    }
+}
+
+/// `socket(2)` with close-on-exec set. On Linux the atomic `SOCK_CLOEXEC` socktype flag does it in one
+/// call; elsewhere fall back to `FD_CLOEXEC` via `fcntl` right after creation. Keeps a spawned child
+/// (`std.process` P3) from inheriting an Align-owned socket fd. Returns the fd (`>= 0`) or a negative
+/// value (errno set), exactly like `socket`.
+///
+/// # Safety
+/// The arguments must be a valid `socket(2)` domain/type/protocol triple.
+unsafe fn cloexec_socket(domain: i32, ty: i32, protocol: i32) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { socket(domain, ty | SOCK_CLOEXEC, protocol) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let fd = unsafe { socket(domain, ty, protocol) };
+        if fd >= 0 {
+            unsafe { set_cloexec(fd) };
+        }
+        fd
+    }
+}
+
+/// `accept(2)` with close-on-exec set on the connected fd. On Linux `accept4(..., SOCK_CLOEXEC)` does it
+/// atomically; elsewhere fall back to `accept` + `fcntl`. Null `addr`/`addrlen` (the peer address is not
+/// wanted). Returns the connected fd (`>= 0`) or a negative value (errno set), like `accept`.
+///
+/// # Safety
+/// `sockfd` must be a valid listening socket.
+unsafe fn cloexec_accept(sockfd: i32) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { accept4(sockfd, core::ptr::null_mut(), core::ptr::null_mut(), SOCK_CLOEXEC) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let fd = unsafe { accept(sockfd, core::ptr::null_mut(), core::ptr::null_mut()) };
+        if fd >= 0 {
+            unsafe { set_cloexec(fd) };
+        }
+        fd
+    }
 }
 
 // `mmap` protection / flags — the portable POSIX constants (identical on Linux and macOS).
@@ -9030,6 +9290,199 @@ mod tests {
         // recv_from into a null buffer on a real socket is Err (not a crash).
         assert_eq!(unsafe { align_rt_udp_recv_from(sock, std::ptr::null_mut()) }, -(AL_INVALID as i64));
         unsafe { align_rt_udp_socket_free(sock) };
+    }
+
+    // --- std.process Slice 2 — spawn / wait / Drop-reap + CLOEXEC (P3) --------------------------
+
+    /// Build a `Vec<AlignStr>` argv over borrowed `&str`s (the caller keeps them alive).
+    fn argv_of<'a>(items: &'a [&'a str]) -> Vec<AlignStr> {
+        items.iter().map(|s| AlignStr { ptr: s.as_ptr(), len: s.len() as i64 }).collect()
+    }
+
+    // `fcntl(F_GETFD)` — read the file-descriptor flags to prove `FD_CLOEXEC` is set (the runtime
+    // declares `fcntl` only on the non-Linux path, so the test declares its own).
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32) -> i32;
+    }
+    const T_F_GETFD: i32 = 1;
+    const T_FD_CLOEXEC: i32 = 1;
+    fn fd_is_cloexec(fd: i32) -> bool {
+        let flags = unsafe { fcntl(fd, T_F_GETFD) };
+        flags >= 0 && (flags & T_FD_CLOEXEC) != 0
+    }
+
+    #[test]
+    fn process_spawn_and_wait_true_is_zero() {
+        if !std::path::Path::new("/bin/true").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/true");
+        let argv = argv_of(&["/bin/true"]);
+        let mut ch: *mut Child = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
+        assert!(!ch.is_null());
+        assert_eq!(unsafe { align_rt_child_wait(ch) }, 0, "/bin/true exits 0");
+        // A second wait on the reaped child is a clean Err, not an ECHILD race.
+        assert_eq!(unsafe { align_rt_child_wait(ch) }, -(AL_INVALID as i64), "double wait → clean Err");
+        unsafe { align_rt_child_free(ch) }; // already reaped — a no-op, must not block/crash
+    }
+
+    #[test]
+    fn process_spawn_and_wait_false_is_one() {
+        if !std::path::Path::new("/bin/false").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/false");
+        let argv = argv_of(&["/bin/false"]);
+        let mut ch: *mut Child = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
+        assert_eq!(unsafe { align_rt_child_wait(ch) }, 1, "/bin/false exits 1");
+        unsafe { align_rt_child_free(ch) };
+    }
+
+    #[test]
+    fn process_spawn_nonexistent_child_exits_127() {
+        // The fork succeeds (spawn returns 0); the failed `execvp` in the child `_exit(127)`s.
+        let (cp, cl) = view_of("/nonexistent/definitely-not-a-real-binary");
+        let argv = argv_of(&["/nonexistent/definitely-not-a-real-binary"]);
+        let mut ch: *mut Child = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
+        assert_eq!(unsafe { align_rt_child_wait(ch) }, 127, "exec-not-found → child _exit(127)");
+        unsafe { align_rt_child_free(ch) };
+    }
+
+    #[test]
+    fn process_spawn_bad_args() {
+        let (cp, cl) = view_of("/bin/true");
+        let argv = argv_of(&["/bin/true"]);
+        // A null out slot is rejected up front.
+        assert_eq!(
+            unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, std::ptr::null_mut()) },
+            AL_INVALID
+        );
+        let mut ch: *mut Child = std::ptr::null_mut();
+        // An empty command path.
+        let (ep, el) = view_of("");
+        assert_eq!(unsafe { align_rt_process_spawn(ep, el, argv.as_ptr(), argv.len() as i64, &mut ch) }, AL_INVALID);
+        assert!(ch.is_null());
+        // An empty argv (no argv[0]).
+        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), 0, &mut ch) }, AL_INVALID);
+        // An interior NUL in the command path.
+        let (np, nl) = view_of("/bin/tr\0ue");
+        assert_eq!(unsafe { align_rt_process_spawn(np, nl, argv.as_ptr(), argv.len() as i64, &mut ch) }, AL_INVALID);
+        // An interior NUL in an arg.
+        let bad = argv_of(&["/bin/true", "a\0b"]);
+        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, bad.as_ptr(), bad.len() as i64, &mut ch) }, AL_INVALID);
+        assert!(ch.is_null(), "no child handle is written on any failure");
+    }
+
+    #[test]
+    fn child_wait_null_is_err() {
+        assert_eq!(unsafe { align_rt_child_wait(std::ptr::null_mut()) }, -(AL_INVALID as i64));
+    }
+
+    #[test]
+    fn child_free_without_wait_reaps_no_zombie() {
+        if !std::path::Path::new("/bin/true").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/true");
+        let argv = argv_of(&["/bin/true"]);
+        let mut ch: *mut Child = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
+        let pid = unsafe { (*ch).pid };
+        // Drop the child WITHOUT waiting: `child_free` reaps it via a blocking `waitpid`.
+        unsafe { align_rt_child_free(ch) };
+        // The pid has been reaped — a fresh `waitpid` for it now fails with ECHILD (no zombie left).
+        let mut status: i32 = 0;
+        let r = unsafe { waitpid(pid, &mut status, 0) };
+        assert_eq!(r, -1, "the child was already reaped by its Drop");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(10), "ECHILD — no zombie remains");
+    }
+
+    #[test]
+    fn spawned_child_gets_the_argv_including_argv0() {
+        // Prove argv[0] is the caller's, not the runtime's: `sh -c 'exit $#'` exits with the number
+        // of positional args AFTER argv[0]/-c/script, so passing two extra args exits 2 — confirming
+        // the full argv (incl. argv[0]) is delivered verbatim (P5). Skip if no /bin/sh.
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "exit $#", "argv0-ignored-by-sh", "one", "two"]);
+        let mut ch: *mut Child = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
+        assert_eq!(unsafe { align_rt_child_wait(ch) }, 2, "sh saw two positional args → exit 2");
+        unsafe { align_rt_child_free(ch) };
+    }
+
+    #[test]
+    fn decode_wait_status_maps_exit_and_signal() {
+        // A normal exit: WEXITSTATUS in the high byte, low 7 bits zero.
+        assert_eq!(decode_wait_status(0 << 8), 0);
+        assert_eq!(decode_wait_status(3 << 8), 3);
+        assert_eq!(decode_wait_status(255 << 8), 255);
+        // A signal death: the terminating signal in the low 7 bits → 128 + signal (e.g. SIGKILL 9).
+        assert_eq!(decode_wait_status(9), 128 + 9);
+        assert_eq!(decode_wait_status(15), 128 + 15);
+    }
+
+    #[test]
+    fn tcp_listen_socket_is_cloexec() {
+        // A `tcp_listener`'s fd is close-on-exec, so a spawned child never inherits it (P3).
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        let port = probe.local_addr().unwrap().port() as i64;
+        drop(probe);
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut listener: *mut TcpListener = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_tcp_listen(hp, hl, port, &mut listener) }, 0);
+        assert!(fd_is_cloexec(unsafe { (*listener).fd }), "the listening socket fd must be CLOEXEC");
+        unsafe { align_rt_tcp_listener_free(listener) };
+    }
+
+    #[test]
+    fn udp_bind_socket_is_cloexec() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+        let port = probe.local_addr().unwrap().port() as i64;
+        drop(probe);
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut sock: *mut UdpSocket = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_udp_bind(hp, hl, port, &mut sock) }, 0);
+        assert!(fd_is_cloexec(unsafe { (*sock).fd }), "the UDP socket fd must be CLOEXEC");
+        unsafe { align_rt_udp_socket_free(sock) };
+    }
+
+    #[test]
+    fn tcp_accepted_conn_and_opened_reader_are_cloexec() {
+        // The `accept`-produced conn fd (via `accept4`/`SOCK_CLOEXEC`) and an `fs.open` reader fd (Rust
+        // std opens with `O_CLOEXEC`) are both close-on-exec — neither leaks into a spawned child (P3).
+        let (hp, hl) = view_of("127.0.0.1");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        let port = probe.local_addr().unwrap().port() as i64;
+        drop(probe);
+        let mut listener: *mut TcpListener = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_tcp_listen(hp, hl, port, &mut listener) }, 0);
+        // A peer connects so `accept` returns a conn.
+        let peer = std::thread::spawn(move || {
+            let _ = std::net::TcpStream::connect(("127.0.0.1", port as u16));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        let mut conn: *mut TcpConn = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_tcp_accept(listener, &mut conn) }, 0);
+        assert!(fd_is_cloexec(unsafe { (*conn).fd }), "the accepted conn fd must be CLOEXEC");
+        unsafe { align_rt_tcp_conn_free(conn) };
+        unsafe { align_rt_tcp_listener_free(listener) };
+        let _ = peer.join();
+        // An `fs.open` reader fd is CLOEXEC too (Rust std `O_CLOEXEC`, preserved by `into_raw_fd`).
+        let path = tmp_path("cloexec-reader");
+        std::fs::write(&path, b"x").unwrap();
+        let ps = path.display().to_string();
+        let (pp, pl) = view_of(&ps);
+        let mut r: *mut Reader = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_reader_open(pp, pl, &mut r) }, 0);
+        assert!(fd_is_cloexec(unsafe { (*r).fd }), "an fs.open reader fd must be CLOEXEC");
+        unsafe { align_rt_io_reader_free(r) };
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
