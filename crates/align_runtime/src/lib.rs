@@ -8555,6 +8555,33 @@ mod tests {
     }
 
     #[test]
+    fn tcp_listen_empty_host_binds_wildcard() {
+        // An empty host passes a null node to `getaddrinfo` (AI_PASSIVE) — the wildcard bind.
+        // Prove the path end-to-end: a loopback client can reach the wildcard listener.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().unwrap().port() as i64;
+        drop(probe);
+
+        let (hp, hl) = view_of("");
+        let mut listener: *mut TcpListener = std::ptr::null_mut();
+        let rc = unsafe { align_rt_tcp_listen(hp, hl, port, &mut listener) };
+        assert_eq!(rc, 0, "wildcard listen on the probed port succeeds");
+        assert!(!listener.is_null(), "a successful wildcard listen writes a non-null handle");
+
+        let client = std::thread::spawn(move || {
+            std::net::TcpStream::connect(("127.0.0.1", port as u16)).expect("client reaches the wildcard listener");
+        });
+        let mut conn: *mut TcpConn = std::ptr::null_mut();
+        let arc = unsafe { align_rt_tcp_accept(listener, &mut conn) };
+        assert_eq!(arc, 0, "accept returns the loopback connection");
+        assert!(!conn.is_null(), "a successful accept writes a non-null conn handle");
+        client.join().expect("client thread");
+
+        unsafe { align_rt_tcp_conn_free(conn) };
+        unsafe { align_rt_tcp_listener_free(listener) };
+    }
+
+    #[test]
     fn tcp_listen_port_in_use_is_err() {
         // Keep a live listener on a loopback port, then have the runtime try to bind the same port.
         // SO_REUSEADDR does NOT permit two live listeners on one port, so the runtime `bind` fails
