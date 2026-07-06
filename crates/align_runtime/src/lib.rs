@@ -2007,14 +2007,16 @@ unsafe fn group_agg_i64(
         for (i, &k) in keys.iter().enumerate() {
             let idx = (k - kmin) as usize;
             let v = per_row(i);
-            if occ[idx] {
-                acc[idx] = combine(acc[idx], v);
-            } else {
-                occ[idx] = true;
-                acc[idx] = v;
-                count += 1;
-                if count > cap as usize {
-                    return -1;
+            unsafe {
+                if *occ.get_unchecked(idx) {
+                    *acc.get_unchecked_mut(idx) = combine(*acc.get_unchecked(idx), v);
+                } else {
+                    *occ.get_unchecked_mut(idx) = true;
+                    *acc.get_unchecked_mut(idx) = v;
+                    count += 1;
+                    if count > cap as usize {
+                        return -1;
+                    }
                 }
             }
         }
@@ -2022,10 +2024,12 @@ unsafe fn group_agg_i64(
         let out_vals = unsafe { std::slice::from_raw_parts_mut(out_vals, count) };
         let mut g = 0;
         for s in 0..slots {
-            if occ[s] {
-                out_keys[g] = kmin + s as i64; // kmin + span = kmax, so this never overflows i64.
-                out_vals[g] = acc[s];
-                g += 1;
+            unsafe {
+                if *occ.get_unchecked(s) {
+                    out_keys[g] = kmin + s as i64; // kmin + span = kmax, so this never overflows i64.
+                    out_vals[g] = *acc.get_unchecked(s);
+                    g += 1;
+                }
             }
         }
         return count as i64;
@@ -2042,42 +2046,44 @@ unsafe fn group_agg_i64(
         let v = per_row(i);
         let mut slot = group_slot(k, mask);
         loop {
-            if !occ[slot] {
-                occ[slot] = true;
-                tkey[slot] = k;
-                tacc[slot] = v;
-                count += 1;
-                if count > cap as usize {
-                    return -1;
-                }
-                if count > tsize / 4 * 3 {
-                    let ns = tsize.checked_mul(2).unwrap_or_else(|| panic_abort("group_agg table overflow"));
-                    let nm = ns - 1;
-                    let mut nk = vec![0i64; ns];
-                    let mut na = vec![0i64; ns];
-                    let mut no = vec![false; ns];
-                    for s in 0..tsize {
-                        if occ[s] {
-                            let mut t = group_slot(tkey[s], nm);
-                            while no[t] {
-                                t = (t + 1) & nm;
-                            }
-                            no[t] = true;
-                            nk[t] = tkey[s];
-                            na[t] = tacc[s];
-                        }
+            unsafe {
+                if !*occ.get_unchecked(slot) {
+                    *occ.get_unchecked_mut(slot) = true;
+                    *tkey.get_unchecked_mut(slot) = k;
+                    *tacc.get_unchecked_mut(slot) = v;
+                    count += 1;
+                    if count > cap as usize {
+                        return -1;
                     }
-                    tkey = nk;
-                    tacc = na;
-                    occ = no;
-                    tsize = ns;
-                    mask = nm;
+                    if count > tsize / 4 * 3 {
+                        let ns = tsize.checked_mul(2).unwrap_or_else(|| panic_abort("group_agg table overflow"));
+                        let nm = ns - 1;
+                        let mut nk = vec![0i64; ns];
+                        let mut na = vec![0i64; ns];
+                        let mut no = vec![false; ns];
+                        for s in 0..tsize {
+                            if *occ.get_unchecked(s) {
+                                let mut t = group_slot(*tkey.get_unchecked(s), nm);
+                                while *no.get_unchecked(t) {
+                                    t = (t + 1) & nm;
+                                }
+                                *no.get_unchecked_mut(t) = true;
+                                *nk.get_unchecked_mut(t) = *tkey.get_unchecked(s);
+                                *na.get_unchecked_mut(t) = *tacc.get_unchecked(s);
+                            }
+                        }
+                        tkey = nk;
+                        tacc = na;
+                        occ = no;
+                        tsize = ns;
+                        mask = nm;
+                    }
+                    break;
                 }
-                break;
-            }
-            if tkey[slot] == k {
-                tacc[slot] = combine(tacc[slot], v);
-                break;
+                if *tkey.get_unchecked(slot) == k {
+                    *tacc.get_unchecked_mut(slot) = combine(*tacc.get_unchecked(slot), v);
+                    break;
+                }
             }
             slot = (slot + 1) & mask;
         }
@@ -2312,14 +2318,17 @@ unsafe fn group_agg_str<'a>(
         let (bytes, ks) = key_at(i);
         let v = value_at(i);
         let key = WyKey::new(bytes);
-        match ids.get(&key) {
-            Some(&id) => acc[id] = combine(acc[id], v),
-            None => {
+        match ids.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let id = *e.get();
+                unsafe { *acc.get_unchecked_mut(id) = combine(*acc.get_unchecked(id), v) };
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
                 let id = acc.len();
                 if id >= cap as usize {
                     return -1;
                 }
-                ids.insert(key, id);
+                e.insert(id);
                 acc.push(v);
                 reprs.push(ks);
             }
@@ -2553,8 +2562,9 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
         let row = unsafe { base.add(i * stride) };
         let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
         let key = WyKey::new(bytes);
-        match ids.get(&key) {
-            Some(&id) => {
+        match ids.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let id = *e.get();
                 // `id < reprs.len()` and `acc.len() == reprs.len() * k`, so `g + j < acc.len()`.
                 let g = id * k;
                 for j in 0..k {
@@ -2564,7 +2574,7 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
                     }
                 }
             }
-            None => {
+            std::collections::hash_map::Entry::Vacant(e) => {
                 let id = reprs.len();
                 // Bail early if the group count would exceed the caller's output capacity, before
                 // growing the tables further (cap = the row count in generated code, so unreachable
@@ -2572,7 +2582,7 @@ pub unsafe extern "C" fn align_rt_group_multi_str(
                 if id >= cap as usize {
                     return -1;
                 }
-                ids.insert(key, id);
+                e.insert(id);
                 reprs.push(ks);
                 // Seed each accumulator with the group's first row value.
                 for j in 0..k {
@@ -2631,16 +2641,16 @@ pub unsafe extern "C" fn align_rt_dict_encode_str(base: *const u8, n: i64, strid
         let row = unsafe { base.add(i * stride) };
         let (bytes, ks) = unsafe { read_key_slice(row, key_off) };
         let key = WyKey::new(bytes);
-        let id = match ids.get(&key) {
-            Some(&id) => id,
-            None => {
+        let id = match ids.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(e) => {
                 let id = reprs.len() as i64;
                 // The dictionary would exceed `out_dict`'s capacity — abort early (don't grow the
                 // table for a result we can't return).
                 if id >= cap {
                     return -1;
                 }
-                ids.insert(key, id);
+                e.insert(id);
                 reprs.push(ks);
                 id
             }
