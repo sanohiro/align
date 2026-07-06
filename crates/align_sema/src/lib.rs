@@ -1695,15 +1695,24 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             if !seen.insert(p.clone()) {
                 continue; // a duplicate import already errored above
             }
-            let namespace: &str = if BUILTIN_MODULES.contains(&p.as_str()) {
-                // The accessed namespace is the prefix after the last `.` (`core.json` → `json`).
-                p.rsplit('.').next().unwrap_or(p.as_str())
-            } else if known_modules.contains(p.as_str()) {
-                p.as_str() // a user module is referenced by its full dotted path
+            // `std.net` is reached through its sub-namespaces (`dns`/`tcp`/`udp`/`socket`), not a
+            // bare `net.*`, so it is "used" if any of those is referenced. Only the namespaces
+            // that have actually shipped are listed — a user local named `tcp` must not suppress
+            // the unused-import warning. Extend this list as net slices 2-4 land.
+            let is_used = if p == "std.net" {
+                ["dns"].iter().any(|ns| used(ns))
             } else {
-                continue; // an unknown import already errored above
+                let namespace: &str = if BUILTIN_MODULES.contains(&p.as_str()) {
+                    // The accessed namespace is the prefix after the last `.` (`core.json` → `json`).
+                    p.rsplit('.').next().unwrap_or(p.as_str())
+                } else if known_modules.contains(p.as_str()) {
+                    p.as_str() // a user module is referenced by its full dotted path
+                } else {
+                    continue; // an unknown import already errored above
+                };
+                used(namespace)
             };
-            if !used(namespace) {
+            if !is_used {
                 diags.push(align_diag::Diagnostic::warning(format!("unused import `{p}`"), imp.span));
             }
         }
@@ -2251,6 +2260,11 @@ impl EffectScan {
             | ExprKind::FsReadFileView { path } => {
                 self.impure_direct = true;
                 self.expr(path);
+            }
+            // `dns.resolve(host)` is impure (a name-resolution syscall) — excluded from `par_map`.
+            ExprKind::DnsResolve { host } => {
+                self.impure_direct = true;
+                self.expr(host);
             }
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.impure_direct = true;
@@ -3319,6 +3333,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } => self.walk(path, depth),
+            ExprKind::DnsResolve { host } => self.walk(host, depth),
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.walk(path, depth);
                 self.walk(data, depth);
@@ -3684,6 +3699,7 @@ impl UnnecessaryHeapScan {
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } => self.visit(path),
+            ExprKind::DnsResolve { host } => self.visit(host),
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.visit(path);
                 self.visit(data);
@@ -4327,6 +4343,8 @@ impl<'a> MoveCheck<'a> {
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } => self.expr(path, moved, false, false),
+            // `dns.resolve(host)` borrows its `str` host (never consumed).
+            ExprKind::DnsResolve { host } => self.expr(host, moved, false, false),
             // `fs.write_file(path, data)` borrows `data` (str/bytes/builder — not consumed), like
             // `writer.write`; neither `path` nor `data` is moved.
             ExprKind::FsWriteFile { path, data, .. } => {
@@ -7246,6 +7264,11 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "fs" && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_path_op(method, args, span);
+            }
+            // `std.net` — `dns.resolve(host)` -> Result<array<string>, Error> (owned IP strings).
+            if module == "dns" && method == "resolve" {
+                self.require_import("std.net", "dns.resolve", span);
+                return self.check_dns_resolve(args, span);
             }
             // `std.path` — `path.join`/`base`/`dir`/`ext`/`normalize` (pure lexical string ops).
             if module == "path" && matches!(method, "join" | "base" | "dir" | "ext" | "normalize") {
@@ -10327,6 +10350,24 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `dns.resolve(host)` (`std.net`) -> `Result<array<string>, Error>` — resolve `host` to its IP
+    /// strings (owned; a **deep**-`Drop` `array<string>`, exactly like `fs.read_dir`). `host` is a
+    /// borrowed `str` (never consumed). Impure (a name-resolution syscall). Builtin.
+    fn check_dns_resolve(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'dns.resolve' expects 1 argument (the host), got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let host = Box::new(self.check_str_init(&args[0]));
+        let err_enum = Scalar::Enum(self.error_enum_id);
+        Expr {
+            kind: ExprKind::DnsResolve { host },
+            ty: Ty::Result(Scalar::DynArray(PrimScalar::String), err_enum),
+            span,
+        }
+    }
+
     /// `std.path` — `path.join(a, b)` -> owned `string`; `path.base`/`dir`/`ext(p)` -> a zero-copy
     /// `str` **view** of `p` (region inherited from `p`, see `region_of`); `path.normalize(p)` ->
     /// owned `string`. All pure lexical POSIX string ops (no filesystem access). Builtins.
@@ -11916,6 +11957,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } => self.finalize_expr(path),
+            ExprKind::DnsResolve { host } => self.finalize_expr(host),
             ExprKind::FsWriteFile { path, data, .. } => {
                 self.finalize_expr(path);
                 self.finalize_expr(data);
