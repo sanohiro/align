@@ -690,6 +690,21 @@ fn build_module<'c>(
         module.add_function("align_rt_tcp_conn_writer", ptr.fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
+        // tcp.listen (host_ptr, host_len, port: i64, out: **TcpListener) -> i32 status (owned listener).
+        "tcp_listen".to_string(),
+        module.add_function("align_rt_tcp_listen", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // drop(l) (l: *TcpListener) -> void; close its fd.
+        "tcp_listener_free".to_string(),
+        module.add_function("align_rt_tcp_listener_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // l.accept() (l: *TcpListener, out: **TcpConn) -> i32 status (owned accepted conn).
+        "tcp_accept".to_string(),
+        module.add_function("align_rt_tcp_accept", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
         // fs.read_file_view (path_ptr, path_len, arena: *Arena, out: *{ptr,len}) -> i32 errno-status.
         "fs_read_file_view".to_string(),
         module.add_function("align_rt_fs_read_file_view", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false), None),
@@ -1473,7 +1488,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // A `reader`/`writer`/`buffer` / cli handle / `tcp_conn` payload is an opaque pointer.
-        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
@@ -1573,7 +1588,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -1929,6 +1944,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Buffer => unreachable!("a buffer handle is not a box/array payload"),
         Scalar::CliParsed => unreachable!("a cli parsed handle is not a box/array payload"),
         Scalar::TcpConn => unreachable!("a tcp_conn handle is not a box/array payload"),
+        Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
     }
 }
 
@@ -2577,8 +2593,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn) {
-                        // A builder / writer / reader / buffer / cli / tcp_conn handle slot holds a bare (nullable) handle pointer.
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener) {
+                        // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
                         // A fixed array of a Move struct: zero the whole `[N x %Struct]` so every
@@ -2635,16 +2651,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn) {
+                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener) {
                         // A writer flushes + closes; a reader closes; a buffer / cli handle frees; a
-                        // tcp_conn closes its socket fd. Each runtime `*_free` is null-safe (a moved-out
-                        // / never-initialised slot drops harmlessly).
+                        // tcp_conn / tcp_listener closes its socket fd. Each runtime `*_free` is
+                        // null-safe (a moved-out / never-initialised slot drops harmlessly).
                         let free_fn = match ty {
                             Ty::Writer => "io_writer_free",
                             Ty::Reader => "io_reader_free",
                             Ty::Buffer => "buffer_free",
                             Ty::CliCommand => "cli_command_free",
                             Ty::TcpConn => "tcp_conn_free",
+                            Ty::TcpListener => "tcp_listener_free",
                             _ => "cli_parsed_free",
                         };
                         let p = self
@@ -2672,7 +2689,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) => {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) => {
                                     // The field is the handle pointer itself; each `*_free` is null-safe
                                     // (the inactive arm / a moved-out aggregate reads a null handle).
                                     let free_fn = match payload_field_scalar(ty, idx) {
@@ -2680,6 +2697,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         Some(Scalar::Reader) => "io_reader_free",
                                         Some(Scalar::Buffer) => "buffer_free",
                                         Some(Scalar::TcpConn) => "tcp_conn_free",
+                                        Some(Scalar::TcpListener) => "tcp_listener_free",
                                         _ => "cli_parsed_free",
                                     };
                                     self.builder
@@ -4360,6 +4378,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("tcp_conn_writer returns a pointer")
             }
+            // tcp.listen — write the owned tcp_listener handle pointer into `out`, return i32 status.
+            Rvalue::TcpListen { host, port, out } => {
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
+                let (h_ptr, h_len) = self.split_str(host)?;
+                let port_v = self.operand(port).into();
+                self.builder
+                    .build_call(self.funcs["tcp_listen"], &[h_ptr.into(), h_len.into(), port_v, out_ptr.into()], "tlisten")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("tcp_listen returns i32")
+            }
+            // l.accept — write the owned accepted tcp_conn handle pointer into `out`, return i32 status.
+            Rvalue::TcpAccept { listener, out } => {
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
+                let lp = self.operand(listener).into();
+                self.builder
+                    .build_call(self.funcs["tcp_accept"], &[lp, out_ptr.into()], "taccept")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("tcp_accept returns i32")
+            }
             // fs.read_file_view — mmap into the arena, write the str view `{ptr,len}` into `out`,
             // return i32 status.
             Rvalue::FsReadFileView { path, arena, out } => {
@@ -4865,7 +4904,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),

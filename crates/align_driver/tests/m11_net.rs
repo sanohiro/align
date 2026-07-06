@@ -330,6 +330,187 @@ pub fn main() -> Result<(), Error> {
     assert!(check_errs("m11net-conn-noimport", src), "tcp.connect without `import std.net` must error");
 }
 
+// --- Slice 3: tcp_listener (Align listens, Rust connects) + Gate-1 rejections ------------------
+
+/// Full Align-to-Align-shaped round trip in the server direction: an Align program `tcp.listen`s on
+/// `127.0.0.1`, then `accept`s **two sequential clients**, echoing each one's message back through
+/// the accepted conn's `reader()`/`writer()`. The Rust test drives both clients. The port is probed
+/// (bind `:0`, read the port, drop) then passed via `--port`; there is a small TOCTOU window between
+/// the probe drop and the Align `bind` (documented tradeoff — a collision would surface as a clean
+/// `EADDRINUSE` Err, never a hang). The client retries connecting until the server is listening.
+#[test]
+fn tcp_listen_accept_serves_two_clients() {
+    if !backend_available() {
+        return;
+    }
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+
+    // Probe a free loopback port (the Align listener can't use port 0 — it's rejected in v1).
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    // The server: listen, then serve two sequential clients (accept → read one message → echo it).
+    // Each accepted conn borrows a reader + writer over its fd (`owns_fd:false`); only the conn's
+    // Drop closes the fd. Exits 0 after both clients.
+    let prog = "\
+import std.net
+import std.io
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"srv\")
+  c.flag_i64(\"port\", 0)
+  p := c.parse(args)?
+  l := tcp.listen(\"127.0.0.1\", p.get_i64(\"port\"))?
+  conn1 := l.accept()?
+  r1 := conn1.reader()
+  w1 := conn1.writer()
+  b1 := buffer(64)
+  n1 := r1.read(b1)?
+  w1.write(b1.bytes())?
+  conn2 := l.accept()?
+  r2 := conn2.reader()
+  w2 := conn2.writer()
+  b2 := buffer(64)
+  n2 := r2.read(b2)?
+  w2.write(b2.bytes())?
+  return Ok(())
+}
+";
+    let built = build_exe("m11net-listen-serve", prog);
+    let mut child = Command::new(&built.exe)
+        .args(["--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the Align server");
+
+    // Two sequential clients; each connects (with retry until the server is listening), sends its
+    // message, and reads the echo back.
+    for i in 0..2 {
+        let msg = format!("client{i}\n");
+        let mut sock = None;
+        for _ in 0..100 {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => {
+                    sock = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut sock = match sock {
+            Some(s) => s,
+            None => {
+                // The server never came up (e.g. the probe-port TOCTOU race lost) — surface stderr.
+                let _ = child.kill();
+                let out = child.wait_with_output().expect("wait server");
+                panic!("client {i} could not connect; server stderr: {}", String::from_utf8_lossy(&out.stderr));
+            }
+        };
+        sock.write_all(msg.as_bytes()).expect("client write");
+        let mut buf = [0u8; 64];
+        let n = sock.read(&mut buf).expect("client read");
+        assert_eq!(&buf[..n], msg.as_bytes(), "client {i} receives its echoed message");
+    }
+
+    let out = child.wait_with_output().expect("wait server");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the server accepts 2 clients and exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `tcp_listener` is an owned handle bound to one local — it cannot be collected into an array (a
+/// copied listener would double-`close` its fd), rejected at construction like `tcp_conn`.
+#[test]
+fn tcp_listener_rejected_as_array_element() {
+    let src = "\
+import std.net
+fn f(a: tcp_listener, b: tcp_listener) -> i64 {
+  xs := [a, b]
+  return xs.len()
+}
+pub fn main() -> i32 {
+  return 0
+}
+";
+    assert!(check_errs("m11net-listener-array", src), "a tcp_listener cannot be an array element");
+}
+
+/// `tcp.listen` is a syscall — impure. A closure that listens is never `Pure`, so `par_map` rejects
+/// it (the `tcp.connect` / `dns.resolve` impurity precedent).
+#[test]
+fn tcp_listen_rejected_by_par_map() {
+    let src = "\
+import std.net
+fn f(x: i64) -> i64 {
+  l := tcp.listen(\"127.0.0.1\", 8080) else { return x }
+  conn := l.accept() else { return x }
+  return x
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11net-listen-parmap", src), "a tcp.listen-using (impure) closure must be rejected by par_map");
+}
+
+/// P6: a `tcp_listener` is an owned Move handle — an unbound temporary (`tcp.listen(...)?.accept()`)
+/// is not dropped yet, so it cannot be a method receiver in v1. Bind it first. (Mirrors the
+/// `tcp_conn` bound-receiver restriction.)
+#[test]
+fn tcp_listener_unbound_temporary_receiver_rejected() {
+    let src = "\
+import std.net
+pub fn main() -> Result<(), Error> {
+  conn := tcp.listen(\"127.0.0.1\", 8080)?.accept()?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11net-listener-temp-recv", src), "accept on an unbound listener temporary must be rejected (bind first)");
+}
+
+/// `tcp.listen` requires `import std.net` (the capability-header rule).
+#[test]
+fn tcp_listen_requires_import() {
+    let src = "\
+pub fn main() -> Result<(), Error> {
+  l := tcp.listen(\"127.0.0.1\", 8080)?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11net-listen-noimport", src), "tcp.listen without `import std.net` must error");
+}
+
+/// Port `0` (kernel-assigned) is rejected in v1 — there is no way to read the bound port back yet, so
+/// `tcp.listen("127.0.0.1", 0)` is an `Err` (Error.Invalid) at runtime, never an abort. `main` exits
+/// non-zero.
+#[test]
+fn tcp_listen_port_zero_is_err() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.net
+pub fn main() -> Result<(), Error> {
+  l := tcp.listen(\"127.0.0.1\", 0)?
+  return Ok(())
+}
+";
+    let out = build_and_run("m11net-listen-port0", prog);
+    assert_ne!(out.status.code(), Some(0), "port 0 (kernel-assigned) is rejected in v1 (main exits non-zero), never an abort");
+}
+
 /// Adversarial-review F1: an owned reader constructed by a **direct** builtin (`fs.open`) inside a
 /// user function, called with only `Static`-region arguments (`args[1]` — an index into a
 /// parameter, never `Let`-bound to a shorter region), stays `Static` end to end. `region_of(Call)`

@@ -417,6 +417,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::TcpConnect { host, port, out } => format!("tcp_connect({}, {}, -> _{out})", operand_str(host), operand_str(port)),
         Rvalue::ConnReader(c) => format!("conn_reader({})", operand_str(c)),
         Rvalue::ConnWriter(c) => format!("conn_writer({})", operand_str(c)),
+        Rvalue::TcpListen { host, port, out } => format!("tcp_listen({}, {}, -> _{out})", operand_str(host), operand_str(port)),
+        Rvalue::TcpAccept { listener, out } => format!("tcp_accept({}, -> _{out})", operand_str(listener)),
         Rvalue::FsReadFileView { path, arena, out } => {
             format!("fs_read_file_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))
         }

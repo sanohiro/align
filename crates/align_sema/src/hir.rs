@@ -693,6 +693,18 @@ pub enum ExprKind {
     /// socket fd (`owns_fd: false`; only the conn's `Drop` closes it). The `ty` is
     /// [`crate::Ty::Writer`], its region bound to `conn`. `conn` is borrowed (never consumed).
     ConnWriter { conn: Box<Expr> },
+    /// `tcp.listen(host, port)` (`std.net`) — resolve `host` (via `getaddrinfo` with `AI_PASSIVE`; a
+    /// null/empty host binds the wildcard address) and open a listening TCP socket bound to `port`
+    /// (`SO_REUSEADDR` set before `bind`, then `listen` with a fixed backlog). The `ty` is
+    /// `Result<tcp_listener, Error>` (an owned Move handle owning the listening socket fd; `Drop`
+    /// closes it). `host` is a borrowed `str` (never consumed), `port` an `i64` (Copy). Impure (a
+    /// network syscall).
+    TcpListen { host: Box<Expr>, port: Box<Expr> },
+    /// `l.accept()` (`std.net`) — block until an inbound connection arrives on the `tcp_listener`
+    /// `listener`, returning a new **owned** `tcp_conn` (the Slice-2 type — its reader/writer/`Drop`
+    /// all just work). The `ty` is `Result<tcp_conn, Error>`. `EINTR` on `accept` is retried (accept
+    /// loops are the common case), unlike `connect`. `listener` is borrowed (never consumed).
+    TcpAccept { listener: Box<Expr> },
     /// `fs.read_file_view(path)` — mmap the regular file at `path` read-only into the enclosing arena,
     /// yielding a `str` view of its bytes. Requires an enclosing `arena {}` (like `heap.new`); the
     /// region is bound to the arena, and `munmap` runs at arena end. The `ty` is `Result<str, Error>`.

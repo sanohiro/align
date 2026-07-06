@@ -111,6 +111,36 @@ pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::pro
     std::process::Command::new(&exe).args(prog_args).output().expect("run")
 }
 
+/// A compiled Align executable plus a guard that removes its object + exe on drop. Returned by
+/// [`build_exe`] for tests that must **spawn** the program (rather than run-to-completion) — e.g. a
+/// long-running server the test drives as a client on another thread.
+pub struct BuiltExe {
+    pub exe: PathBuf,
+    _artifacts: TempArtifacts,
+}
+
+/// Compile `src` to a native executable and return its path (without running it). Unlike
+/// [`build_and_run`], the caller spawns the process itself, so a server program that blocks on
+/// `accept` can be driven by a client in the same test. Asserts the program type-checks; the temp
+/// object/exe are cleaned up when the returned [`BuiltExe`] is dropped (even on a later panic).
+pub fn build_exe(name: &str, src: &str) -> BuiltExe {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, name, src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let obj = dir.join(format!("align-test-{pid}-{name}.o"));
+    let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
+    emit_object_file(&mir, &obj, BuildTarget::Baseline).expect("codegen");
+    link_executable(&obj, &exe, &mir.link_libs).expect("link");
+    BuiltExe { exe: exe.clone(), _artifacts: TempArtifacts { obj, exe } }
+}
+
 /// The LLVM IR text for `src` (for asserting on the generated instructions).
 pub fn emit_llvm(src: &str) -> String {
     let mut sm = SourceMap::new();
