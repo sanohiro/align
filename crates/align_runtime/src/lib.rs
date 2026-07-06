@@ -574,7 +574,7 @@ pub unsafe extern "C" fn align_rt_chunks(src: *const u8, src_len: i64, n: i64, e
             .map(|o| o as usize)
             .unwrap_or_else(|| panic_abort("chunks offset overflow"));
         let ptr = unsafe { src.add(offset) };
-        unsafe { *buf.add(isize::try_from(i).unwrap_or(0) as usize) = AlignStr { ptr, len } };
+        unsafe { *buf.add(usize::try_from(i).unwrap()) = AlignStr { ptr, len } };
     }
     AlignStr { ptr: buf as *const u8, len: count }
 }
@@ -755,11 +755,7 @@ pub extern "C" fn align_rt_builder_new(arena: *mut Arena, capacity: i64) -> *mut
 pub unsafe extern "C" fn align_rt_builder_write(b: *mut Builder, ptr: *const u8, len: i64) {
     if b.is_null() { return; }
     let b = unsafe { &mut *b };
-    if let Ok(len_z) = isize::try_from(len) {
-        if len_z > 0 && !ptr.is_null() {
-            b.buf.extend_from_slice(unsafe { safe_slice(ptr, len_z as i64) });
-        }
-    }
+    b.buf.extend_from_slice(unsafe { safe_slice(ptr, len) });
 }
 
 fn builder_push_i64(buf: &mut Vec<u8>, v: i64) {
@@ -833,17 +829,9 @@ pub unsafe extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
 pub unsafe extern "C" fn align_rt_builder_write_str_int_str(b: *mut Builder, p1: *const u8, l1: i64, v: i64, p2: *const u8, l2: i64) {
     if b.is_null() { return; }
     let b = unsafe { &mut *b };
-    if let Ok(l1_z) = isize::try_from(l1) {
-        if l1_z > 0 && !p1.is_null() {
-            b.buf.extend_from_slice(unsafe { safe_slice(p1, l1_z as i64) });
-        }
-    }
+    b.buf.extend_from_slice(unsafe { safe_slice(p1, l1) });
     builder_push_i64(&mut b.buf, v);
-    if let Ok(l2_z) = isize::try_from(l2) {
-        if l2_z > 0 && !p2.is_null() {
-            b.buf.extend_from_slice(unsafe { safe_slice(p2, l2_z as i64) });
-        }
-    }
+    b.buf.extend_from_slice(unsafe { safe_slice(p2, l2) });
 }
 
 /// Append `true`/`false`.
@@ -2062,8 +2050,8 @@ unsafe fn group_agg_i64(
                 if count > cap as usize {
                     return -1;
                 }
-                if count * 4 > tsize * 3 {
-                    let ns = tsize * 2;
+                if count > tsize / 4 * 3 {
+                    let ns = tsize.checked_mul(2).unwrap_or_else(|| panic_abort("group_agg table overflow"));
                     let nm = ns - 1;
                     let mut nk = vec![0i64; ns];
                     let mut na = vec![0i64; ns];
@@ -2111,11 +2099,12 @@ unsafe fn group_agg_i64(
 /// `keys`/`vals` as `&[i64]` of `len`, or empty slices when degenerate (null / non-positive). The
 /// sum/min/max wrappers need `keys` and `vals` the same length.
 unsafe fn group_io<'a>(keys: *const i64, vals: *const i64, len: i64) -> (&'a [i64], &'a [i64]) {
-    if len <= 0 || keys.is_null() || vals.is_null() {
+    let keys_slice = unsafe { safe_slice(keys, len) };
+    let vals_slice = unsafe { safe_slice(vals, len) };
+    if keys_slice.is_empty() || vals_slice.is_empty() || keys_slice.len() != vals_slice.len() {
         (&[], &[])
     } else {
-        let n = len as usize;
-        unsafe { (std::slice::from_raw_parts(keys, n), std::slice::from_raw_parts(vals, n)) }
+        (keys_slice, vals_slice)
     }
 }
 
