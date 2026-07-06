@@ -5974,8 +5974,10 @@ pub unsafe extern "C" fn align_rt_child_kill(ch: *mut Child, sig: i64) -> i32 {
         return AL_INVALID;
     }
     let c = unsafe { &*ch };
-    if c.reaped {
-        // Reaped/recycled pid — never signal a possibly-unrelated process. Clean `Err`, no ESRCH race.
+    if c.reaped || c.pid <= 0 {
+        // Reaped/recycled or invalid pid — never signal a possibly-unrelated process. A pid of
+        // 0/-1 would broadcast to the process group / all processes (POSIX kill semantics);
+        // unreachable from a valid spawn (fork returns > 0 in the parent), guarded defensively.
         return AL_INVALID;
     }
     if !(0..=MAX_SIGNAL).contains(&sig) {

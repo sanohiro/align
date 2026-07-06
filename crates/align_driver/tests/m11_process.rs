@@ -437,7 +437,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 /// recycled pid, so no stray signal is sent. The first wait succeeds; the `kill`'s `Err` arm runs.
 #[test]
 fn kill_after_wait_is_err() {
-    if !backend_available() {
+    if !backend_available() || !std::path::Path::new("/bin/true").exists() {
         return;
     }
     let prog = "\
