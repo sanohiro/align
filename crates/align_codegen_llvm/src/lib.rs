@@ -5584,7 +5584,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn horizontal_minmax(&self, v: inkwell::values::VectorValue<'c>, elem: Ty, n: u32, max: bool) -> Result<BasicValueEnum<'c>, CodegenError> {
         assert!(n > 0, "vector width must be at least 1");
         let name = if matches!(elem, Ty::Float(_)) {
-            if max { "llvm.vector.reduce.fmax" } else { "llvm.vector.reduce.fmin" }
+            if max { "llvm.vector.reduce.fmaximum" } else { "llvm.vector.reduce.fminimum" }
         } else if is_signed(elem) {
             if max { "llvm.vector.reduce.smax" } else { "llvm.vector.reduce.smin" }
         } else {

@@ -6240,13 +6240,13 @@ impl<'a, 't> Checker<'a, 't> {
         if matches!(self.resolve(lhs_ty), Ty::Vec(..)) {
             return self.check_expr(rhs, None); // vec lhs: rhs self-types
         }
-        let r = self.check_expr(rhs, None);
+        let mark = self.diags.len();
+        let r = self.check_expr(rhs, Some(lhs_ty));
         if matches!(self.resolve(r.ty), Ty::Vec(..)) {
-            // RHS is a vector, so it self-types correctly without the scalar LHS hint.
-            return r;
+            self.diags.truncate(mark);
+            return self.check_expr(rhs, None);
         }
-        // RHS is a scalar/literal. Re-check it with the LHS hint to apply the expected type.
-        self.check_expr(rhs, Some(lhs_ty))
+        r
     }
 
     fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
