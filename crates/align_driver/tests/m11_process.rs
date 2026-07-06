@@ -71,13 +71,14 @@ fn abort_skips_cleanup_and_loses_buffered_output() {
 /// arena-end cleanup before terminating (no leak / no crash). A companion to the buffered-writer P1
 /// test on the arena-cleanup path.
 #[test]
-fn exit_after_arena_use_runs_clean() {
+fn exit_inside_arena_runs_the_pending_arena_end() {
     if !backend_available() {
         return;
     }
-    // Allocate a box in an arena, read it back (prints 42), then exit(0). The arena end is part of
-    // the exit cleanup; the program must run to completion with code 0.
-    let src = "import std.process\npub fn main() -> i32 {\n  arena {\n    b := heap.new(42)\n    print(b.get())\n  }\n  process.exit(0)\n  0\n}\n";
+    // Exit from INSIDE the arena block: the pending arena end must be emitted by the exit
+    // cleanup itself — the block's normal close is never reached (the exit terminates it).
+    // Prints 42, then exits 0.
+    let src = "import std.process\npub fn main() -> i32 {\n  arena {\n    b := heap.new(42)\n    print(b.get())\n    process.exit(0)\n  }\n  0\n}\n";
     let out = build_and_run("proc-exit-arena", src);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
