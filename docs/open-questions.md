@@ -2139,6 +2139,21 @@ run-Drops-then-exit vs. an immediate hard-exit API — both landed: the first as
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
+### Expression-depth cap (128) vs the full-pipeline stack ceiling (~40) — M12+
+
+**Recorded 2026-07-07 (surfaced by the std.crypto Slice-3 frame regression, #386).** The #296
+front-end cap `MAX_EXPR_DEPTH = 128` governs parse-time rejection, and front-end-only checking
+handles depth ~120 comfortably — but the **full parse→sema→MIR→codegen pipeline** overflows a
+default 2 MiB thread stack at `+`-chain depth **~41** (measured on main, debug profile; the gap is
+pre-existing, not introduced by any std slice). A machine-generated 41–128-deep expression
+type-checks under the cap yet can crash the compiler on a small stack. Candidates: lower the
+effective cap to the measured ceiling with margin; run lowering/codegen on a worker thread with an
+explicit larger stack; make MIR lowering iterative for left-associative chains. Standing
+mitigation convention (adopted during M11 crypto): recursive functions (`check_expr`,
+`lower_expr`, the sema walkers) must not gain match arms with inline locals — arm bodies go in
+`#[inline(never)]` free helpers, and wide MIR `Rvalue` payloads are boxed (debug builds reserve
+every arm's locals per frame, so one fat arm taxes every recursion level).
+
 ### Module / import system — design SETTLED (2026-06-25), implementation in progress
 **The last big language-core gap.** Today `module`/`import` are *parsed* into `File.module`/`File.imports` but otherwise **ignored** (single-file compilation; `core.*`/`std.*` are compiler builtins). Decided:
 
@@ -2890,6 +2905,15 @@ rule; aliasing BLAKE2b under the name is forbidden). The AEAD wrapper's mandator
 shape under EVP (internal buffer, SET_TAG before Final, `OPENSSL_cleanse` on failure, single
 opaque error) is specified in `impl/std-design/crypto.md` P2. Slice 1 (`constant_time_equal` +
 `crypto.random`, engine-independent) started the same day.
+
+**Status update (2026-07-07, evening): std.crypto COMPLETE (PRs #384–#388)** — and the hard
+requirement above was met as *verification*, not specification: `constant_time_equal`'s
+branchless property was confirmed by disassembling both shipped profiles (no content-dependent
+branch, no memcmp idiom; vectorized OR-reduction + `black_box` barrier + lone `sete`), and the
+AEAD all-or-nothing path was traced line-by-line with `OPENSSL_cleanse` confirmed live in the
+optimized artifact. Full shipped-feature record in the roadmap's M11 section. Deferred with
+record: blake3, zeroize-on-drop key buffers (P6), nonce-generating seal convenience (P3),
+`OSSL_set_max_threads`, fixed-size `array<u8; N>` returns.
 
 ### std.ndslice — strided multi-dimensional views (Future)
 

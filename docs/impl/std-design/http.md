@@ -61,11 +61,41 @@ status line) → `Error.Invalid`. A 4xx/5xx status is NOT an error — it's a va
 status (the caller branches on `resp.status()`); only transport/parse failures are `Err`. (This is
 a deliberate One-way call: HTTP status is data, not a Result error.)
 
+## Performance requirements (owner directive, 2026-07-07 — requirements, not aspirations)
+
+The owner wants std.http **fast**. The measured rails recorded in `open-questions.md` (external
+design-note review: keepalive 1.48×, pipelined write-then-read 19.1×, bounded-concurrency
+`get_many` 12.8× at 64 reqs) are engineering requirements for v1, plus the zero-copy discipline
+the rest of std already follows. Concretely:
+
+- **R1 — zero-copy response**: one owned response buffer; status line / headers / body are parsed
+  as an **offset table + views into that buffer** (no per-header `string` allocations, no body
+  copy). `resp.header()`/`resp.body()` already return region-bound views — the internal
+  representation must actually be zero-copy too.
+- **R2 — SIMD-backed scanning from day one**: header/line scanning rides the runtime's existing
+  memchr layer (#310: AVX2+NEON+scalar, already shipped for `str` search) — find CRLF / `:` via
+  memchr, never a byte-at-a-time scalar loop. The full simdjson-style structural scan (shared
+  byte-classifier with JSON) stays a recorded later optimization; memchr is free today.
+- **R3 — connection reuse by default**: the pool (Slice 3) is a requirement, not an option —
+  `cl.get()` to the same host:port reuses the live conn (keepalive) with zero opt-in. The
+  measured 1.48× is the floor; the pipelined 19.1× shape is what `get_many` batching builds on.
+- **R4 — syscall discipline on the hot path**: `TCP_NODELAY` on client conns (no Nagle-delayed
+  request tails); serialize the whole request (start-line + headers + body) into one buffer and
+  send it with **one write** (no per-header writes); socket reads go through the M9 buffered
+  reader (no per-line read syscalls).
+- **R5 — `get_many` = task_group + the ParPool claim loop** (#301) with bounded concurrency —
+  the measured 12.8× I/O-overlap shape; NOT a new async runtime; `io_uring` stays a later Linux
+  backend, per the recorded decision.
+- **R6 — benchmark-gated completion**: a `bench/http_client` harness (local plaintext server;
+  keepalive GET latency/throughput + `get_many` scaling) measured against a Rust baseline —
+  the module is not "done fast" until the numbers are in its README, per the repo's
+  measure-before-claiming rule.
+
 ## New machinery required
 
 Move types above + HTTP/1.1 parse/serialize over net sockets + connection pool reuse. NO new I/O
-path (net's reader/writer). TLS wrapper deferred (blocks HTTPS). Header parsing is scalar v1
-(simdjson-style structural scan is a later optimization, record only).
+path (net's reader/writer). TLS wrapper deferred (blocks HTTPS). Header parsing = memchr-backed
+scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for later).
 
 ## Slice breakdown
 
@@ -106,3 +136,4 @@ path (net's reader/writer). TLS wrapper deferred (blocks HTTPS). Header parsing 
 - pool reuses a conn across 2 gets
 - Move-rejection + unbound-receiver rejected
 - import-required
+- `bench/http_client` numbers recorded vs a Rust baseline (R6 — completion is benchmark-gated)

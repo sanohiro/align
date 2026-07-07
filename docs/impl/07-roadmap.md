@@ -1438,11 +1438,66 @@ and http last (needs net + TLS).
     both libs present (a build without them fails at link); feature-gating is the recorded
     option in compress.md P3. v1 scope is whole-buffer byte→byte per the design (streaming /
     dictionary surfaces were never in scope).
-- **`std.crypto` / `std.http`** — NEXT (crypto = a constant-time-audited engine with
-  `constant_time_equal` as the only self-hosted primitive, its constant-time property *verified*
-  not just specified; http needs net + TLS and stays plaintext-only v1 per http.md — `https://`
-  rejected, not downgraded — and builds `get_many` on the net substrate via task_group + the
-  par_map pool).
+- **`std.crypto` — DONE (2026-07-07, PRs #384–#388, one slice per PR + the #383 engine-decision
+  docs PR).** Engine: **OpenSSL libcrypto (EVP), floor ≥ 3.2, `-lcrypto` always-linked** — settled
+  pre-implementation via two independent design reviews (security + dependency lens, #383);
+  **blake3 deferred with record** (no system engine; no BLAKE2b aliasing). The module's hard
+  requirement — constant-time as *verified*, not specified — was met literally: every slice
+  passed an independent adversarial gate review, and the CT/security-critical properties were
+  checked against **compiled machine code**, not source.
+  - Slice 1 (#384) `constant_time_equal` + `crypto.random`: the ONE self-hosted primitive —
+    byte-diff OR-reduction (no early exit → no memcmp idiom) + `black_box` barrier, **disassembly-
+    verified branchless in both shipped profiles** (release: vectorized `pxor`/`por` + lone
+    `sete`; every conditional jump is on public length/loop bounds); length is public
+    (`sodium_memcmp` contract). Pure → allowed in `par_map` (pinned). `crypto.random` = the
+    generalized `fill_os_random` drain loop (getrandom short-read/EINTR; macOS 256-byte chunks)
+    shared with `rand.seed`; abort on failure (key material); Impure (pinned).
+  - Slice 2 (#385) sha256/sha512: shared one-shot `EVP_Q_digest` wrapper; owned `array<u8>`
+    digest via the RandSample `{ptr,len}` return path (fixed-size `array<u8; N>` not expressible
+    in the runtime-return ABI — documented dynamic fallback); engine failure aborts (no
+    invalid-input case, never a silent wrong digest); NIST vectors pinned. The gemini review's
+    three "may not compile" highs were disproven against the green build and rejected with
+    reasons (the #372 false-positive class).
+  - Slice 3 (#386) hmac_sha256 + hkdf_sha256: `EVP_Q_mac` one-shot; HKDF via `EVP_KDF` with a
+    hand-built `#[repr(C)] OsslParam` mirror of `ossl_param_st` (avoids by-value-struct FFI
+    returns; layout/constants/keys verified against core.h/params.h/core_names.h); public `len`
+    bounds 1..=8160 (RFC 5869) before the engine; RFC 4231 + RFC 5869 vectors pinned.
+    **Shipped only after a real regression was caught and root-caused**: the lowering arms'
+    locals, written inline in the recursive MIR `lower_expr`, inflated its per-recursion frame
+    (debug builds reserve all arms' locals) and overflowed the default 2 MiB test stack at
+    `+`-chain depth 40 — fixed by extracting `#[inline(never)]` free helpers (now the standing
+    convention), with measured frame parity vs main (ceiling exactly 40 both). Surfaced a
+    pre-existing gap recorded in open-questions: front-end depth cap 128 vs ~40 full-pipeline
+    default-stack ceiling.
+  - Slice 4 (#387) AEAD aes_gcm + chacha20_poly1305: one `CryptoAead {cipher, dir}` node, two
+    shared runtime impls over `EVP_CIPHER_fetch`, exhaustive 4-way dispatch (no default arm);
+    combined `ct || 16-byte tag` format; key 32 / nonce 12 validated pre-engine; 1 GiB cap with
+    `checked_add`. **The P2 all-or-nothing shape verified line-by-line**: staged plaintext via
+    internal buffer, `SET_TAG` before `DecryptFinal_ex`, publish only on `Final == 1`, and
+    `OPENSSL_cleanse` on the failure exit **confirmed present in the optimized artifact** (GOT
+    relocation + live call — not elided); total error opacity on open (every failure = the one
+    opaque `Error.Invalid`). KATs = NIST GCM Test Case 16 + RFC 8439 §2.8.2, independently
+    confirmed canonical. gemini's three dangling-ptr+len-0 "technically UB" findings were
+    rejected with reasons (valid-for-zero-length per Rust's own model; OpenSSL supports inl==0;
+    the shipped Slice-2/3 convention — one idiom, not piecemeal guards).
+  - Slice 5 (#388) argon2id: `EVP_KDF_fetch("ARGON2ID")`; **`argon2_params {m_cost, t_cost,
+    parallelism, len}` is the language's first builtin struct** (reserved-name injection like the
+    builtin `Error`, ordinary struct-literal machinery, zero special cases — non-literal paths
+    all work; redeclaration cleanly diagnosed). Bounds pre-engine: parallelism 1..=2^24-1
+    (checked first so `8*parallelism` can't overflow), t_cost 1..=u32max, m_cost
+    8·parallelism..=4 GiB-in-KiB, len 4..=1 GiB; engine `threads` pinned to 1. KAT = the
+    canonical phc-winner-argon2 reference vector, reproduced independently via the OpenSSL CLI.
+    Implementation self-caught two real bugs pre-review: a wrong `OSSL_PARAM_UNSIGNED_INTEGER`
+    constant (2, not 6) and an `Rvalue` enum-size growth re-triggering the expr-depth ceiling —
+    fixed by boxing the payload (`Argon2Args`).
+  - **Deferred with record (not blockers):** blake3 (#383); zeroize-on-drop key buffers (P6 —
+    buffer Drop just frees; callers holding key material should overwrite first; a zeroizing
+    buffer variant is the recorded candidate); a nonce-generating seal convenience (P3);
+    `OSSL_set_max_threads` for parallel argon2 lanes; fixed-size `array<u8; N>` digest returns
+    (needs a runtime-return ABI extension).
+- **`std.http`** — NEXT, the last M11 module (plaintext-only v1 per http.md — TLS deferred,
+  `https://` rejected not downgraded; builds `get_many` on the net substrate via task_group +
+  the par_map pool — the #301 claim-loop lesson).
 
 ## Design Issues to Settle in Parallel
 
