@@ -237,3 +237,165 @@ fn crypto_wrong_shape_rejected() {
         "constant_time_equal on non-byte-views must error"
     );
 }
+
+// --- sha256 / sha512 (Slice 2) ----------------------------------------------------------------
+//
+// `crypto.sha256(data: bytes) -> array<u8>` (32-byte digest) / `crypto.sha512(data) -> array<u8>`
+// (64-byte digest) via OpenSSL libcrypto's EVP one-shot. The owned digest array slices to a
+// `slice<u8>` (u8 is not a Move element), which `encoding.hex_encode` renders for comparison against
+// the NIST/RFC known-answer vectors. Impure (a C-engine call), so `par_map` rejects a hashing closure.
+
+/// `sha256` matches the NIST known-answer vectors for the empty string and `"abc"`, and the digest
+/// is 32 bytes.
+#[test]
+fn sha256_known_vectors() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  e := crypto.sha256(\"\")
+  print(e.len())
+  print(encoding.hex_encode(e[0..e.len()]))
+  a := crypto.sha256(\"abc\")
+  print(encoding.hex_encode(a[0..a.len()]))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-sha256-vec", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "32\n\
+         e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
+         ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"
+    );
+}
+
+/// `sha512` matches the RFC/FIPS known-answer vectors for `"abc"` and the empty string, and the
+/// digest is 64 bytes.
+#[test]
+fn sha512_known_vectors() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  a := crypto.sha512(\"abc\")
+  print(a.len())
+  print(encoding.hex_encode(a[0..a.len()]))
+  e := crypto.sha512(\"\")
+  print(encoding.hex_encode(e[0..e.len()]))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-sha512-vec", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "64\n\
+         ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\n\
+         cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e\n"
+    );
+}
+
+/// The digest accepts every byte-view form — a `str` literal, an owned `string` (from `hex_encode`,
+/// auto-borrowed), and `bytes` (a `slice<u8>` from `buffer.bytes()`) — and hashing the same bytes
+/// through different forms yields the same digest (compared in constant time). `sha256("41")`'s
+/// input `"41"` is the two ASCII bytes 0x34 0x31, matching neither the raw byte 0x41 nor `hex_encode`.
+#[test]
+fn sha256_byte_view_forms_agree() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  raw := encoding.hex_decode(\"6162\")?     // buffer of bytes {0x61, 0x62} == \"ab\"
+  from_str := crypto.sha256(\"ab\")          // str
+  from_slice := crypto.sha256(raw.bytes())  // slice<u8>
+  print(crypto.constant_time_equal(from_str[0..from_str.len()], from_slice[0..from_slice.len()]))
+  // An owned string as input (auto-borrowed): sha256(\"4142\") over the four ASCII digit bytes.
+  s := encoding.hex_encode(\"AB\")           // owned string \"4142\"
+  from_string := crypto.sha256(s)
+  from_literal := crypto.sha256(\"4142\")
+  print(crypto.constant_time_equal(from_string[0..from_string.len()], from_literal[0..from_literal.len()]))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-sha256-views", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\ntrue\n");
+}
+
+/// A large (~1 MiB) input hashes without crashing and is **deterministic**: hashing the same bytes
+/// twice yields identical digests (constant-time equal → `true`), while a one-byte-different input
+/// yields a different digest (`false`). Uses `crypto.random` to fill the big buffer (no giant literal).
+#[test]
+fn sha256_large_input_deterministic() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+pub fn main() -> Result<(), Error> {
+  b := buffer(1048576)
+  crypto.random(b)
+  print(b.len())                          // the input is 1 MiB
+  d1 := crypto.sha256(b.bytes())
+  d2 := crypto.sha256(b.bytes())
+  print(crypto.constant_time_equal(d1[0..d1.len()], d2[0..d2.len()]))  // same input → same digest
+  c := buffer(1048576)
+  crypto.random(c)
+  e := crypto.sha256(c.bytes())
+  print(crypto.constant_time_equal(d1[0..d1.len()], e[0..e.len()]))    // different input → differ
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-sha256-large", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1048576\ntrue\nfalse\n");
+}
+
+/// `crypto.sha256`/`sha512` call the libcrypto engine — Impure. A closure that hashes is never
+/// `Pure`, so `par_map` (which requires a Pure closure) rejects it (unlike the Pure `constant_time_equal`).
+#[test]
+fn sha_impure_rejected_by_par_map() {
+    let src = "\
+import std.crypto
+fn f(x: i64) -> i64 {
+  d := crypto.sha256(\"data\")
+  return x + d.len()
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11cr-sha-parmap-impure", src), "an impure sha256 closure must be rejected by par_map");
+}
+
+/// `sha256`/`sha512` require `import std.crypto` and take exactly one byte-view argument.
+#[test]
+fn sha_wrong_shape_rejected() {
+    assert!(
+        check_errs("m11cr-sha-noimport", "pub fn main() -> Result<(), Error> {\n  d := crypto.sha256(\"a\")\n  print(d.len())\n  return Ok(())\n}\n"),
+        "sha256 without `import std.crypto` must error"
+    );
+    assert!(
+        check_errs("m11cr-sha-arity", "import std.crypto\npub fn main() -> Result<(), Error> {\n  d := crypto.sha256(\"a\", \"b\")\n  print(d.len())\n  return Ok(())\n}\n"),
+        "sha256 with 2 arguments must error"
+    );
+    assert!(
+        check_errs("m11cr-sha-type", "import std.crypto\npub fn main() -> Result<(), Error> {\n  d := crypto.sha512(42)\n  print(d.len())\n  return Ok(())\n}\n"),
+        "sha512 on a non-byte-view must error"
+    );
+}

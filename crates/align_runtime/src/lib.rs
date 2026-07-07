@@ -7413,6 +7413,104 @@ pub unsafe extern "C" fn align_rt_crypto_random(b: *mut Buffer) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// std.crypto (M11 Slice 2) — sha256 / sha512 via OpenSSL libcrypto (EVP). The keystone-library
+// strategy (crypto.md): borrow the constant-time-audited engine rather than self-host a hash. Both
+// hashes share one wrapper over the EVP one-shot digest `EVP_Q_digest` (OpenSSL >= 3.0), which
+// fetches the algorithm by name and hashes the whole input in a single call — no `EVP_MD_CTX`
+// lifecycle to leak. The driver always links `-lcrypto` (crypto.md: a universal system lib in the
+// `-lz`/`-lzstd` always-link class). A digest failure here has no valid-input case (hashing any
+// byte string succeeds) — an `rc != 1` is an engine/programming error and **aborts** (the
+// total-or-abort class, like `rand.sample`'s bounds check), never a silent wrong digest.
+// ---------------------------------------------------------------------------------------------
+
+/// Longest EVP digest (`EVP_MAX_MD_SIZE` in `openssl/evp.h` — SHA-512's 64 bytes). The output
+/// buffer is sized to this so `EVP_Q_digest` can never overrun it, whatever algorithm is named.
+const EVP_MAX_MD_SIZE: usize = 64;
+
+#[link(name = "crypto")]
+unsafe extern "C" {
+    /// `EVP_Q_digest(libctx, name, propq, data, datalen, md, mdlen)` — one-shot message digest
+    /// (OpenSSL >= 3.0). Fetches the digest named `name` (e.g. `"SHA256"`), hashes `datalen` bytes
+    /// at `data`, writes the digest to `md` and its length to `*mdlen`. Returns `1` on success, `0`
+    /// on failure. `libctx`/`propq` are null for the default library context / no property query.
+    fn EVP_Q_digest(
+        libctx: *mut c_void,
+        name: *const c_char,
+        propq: *const c_char,
+        data: *const c_void,
+        datalen: usize,
+        md: *mut u8,
+        mdlen: *mut usize,
+    ) -> c_int;
+}
+
+/// Shared one-shot EVP digest, param-swapped by `name` (`c"SHA256"` / `c"SHA512"`) and its expected
+/// output length `expect_len` (32 / 64). Views the `{data_ptr, data_len}` byte argument (null /
+/// empty tolerated — the empty input is a valid, well-known hash), runs `EVP_Q_digest` into a stack
+/// buffer, then copies the digest into a freshly heap-allocated owned `array<u8>` `{ptr, len}` (the
+/// caller's bound local `Drop`-frees it via `align_rt_free`, like `rand.sample`'s array).
+///
+/// A `rc != 1` (engine failure — no valid-input path produces it) or a digest length that does not
+/// match `expect_len` (defensive: the fixed 32/64 the caller's type promises) **aborts** rather than
+/// return a wrong-length or wrong-value digest.
+///
+/// # Safety
+/// `data_ptr`/`data_len` must be a valid `{ptr,len}` byte view (or null with a non-positive length);
+/// `name` must be a NUL-terminated OpenSSL digest name and `expect_len <= EVP_MAX_MD_SIZE`.
+unsafe fn crypto_digest(name: &core::ffi::CStr, expect_len: usize, data_ptr: *const u8, data_len: i64) -> AlignStr {
+    // `bytes_view` clamps null / out-of-range (32-bit) / negative to an empty slice — never
+    // `from_raw_parts(null, 0)`, and its length is already a `usize` (no `as usize` truncation).
+    let data = unsafe { bytes_view(data_ptr, data_len) };
+    let mut md = [0u8; EVP_MAX_MD_SIZE];
+    let mut mdlen: usize = 0;
+    // An empty slice's `as_ptr()` is a non-null aligned dangling pointer; `datalen == 0` means
+    // OpenSSL never reads it, so the empty-input hash is well-defined.
+    let rc = unsafe {
+        EVP_Q_digest(
+            core::ptr::null_mut(),
+            name.as_ptr(),
+            core::ptr::null(),
+            data.as_ptr() as *const c_void,
+            data.len(),
+            md.as_mut_ptr(),
+            &mut mdlen,
+        )
+    };
+    if rc != 1 {
+        panic_abort("crypto: EVP digest failed");
+    }
+    // Defensive: the digest length must be exactly what the caller's `array<u8>` type promises, so a
+    // wrong-length digest can never underfill / over-read the allocation below.
+    if mdlen != expect_len {
+        panic_abort("crypto: EVP digest returned an unexpected length");
+    }
+    // Copy the digest into a fresh owned heap array (`expect_len > 0` -> non-null, or aborts on OOM).
+    let out = align_rt_alloc(expect_len as i64);
+    unsafe { core::ptr::copy_nonoverlapping(md.as_ptr(), out, expect_len) };
+    AlignStr { ptr: out as *const u8, len: expect_len as i64 }
+}
+
+/// `crypto.sha256(data)` — the 32-byte SHA-256 digest of the byte view `data`, as an owned
+/// `array<u8>`. Thin wrapper over [`crypto_digest`].
+///
+/// # Safety
+/// `data_ptr`/`data_len` must be a valid `{ptr,len}` byte view (or null with a non-positive length).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_sha256(data_ptr: *const u8, data_len: i64) -> AlignStr {
+    unsafe { crypto_digest(c"SHA256", 32, data_ptr, data_len) }
+}
+
+/// `crypto.sha512(data)` — the 64-byte SHA-512 digest of the byte view `data`, as an owned
+/// `array<u8>`. Thin wrapper over [`crypto_digest`].
+///
+/// # Safety
+/// `data_ptr`/`data_len` must be a valid `{ptr,len}` byte view (or null with a non-positive length).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_sha512(data_ptr: *const u8, data_len: i64) -> AlignStr {
+    unsafe { crypto_digest(c"SHA512", 64, data_ptr, data_len) }
+}
+
+// ---------------------------------------------------------------------------------------------
 // std.cli (M10 Slice 3) — a flag-registration parser over `main(args: array<str>)`'s `array<str>`
 // (the one argv source). Pure in-language (no syscalls — argv is already captured). A `cli command`
 // (`CliCommand`) is a Move handle owning its registered-flag table; `c.parse(args)` **borrows** it
@@ -10959,6 +11057,78 @@ mod tests {
         unsafe { align_rt_buffer_free(z) };
         // A null handle is a no-op (never dereferenced).
         unsafe { align_rt_crypto_random(std::ptr::null_mut()) };
+    }
+
+    // std.crypto Slice 2 — sha256 / sha512 (EVP one-shot). Drive the two entry points directly and
+    // compare the owned-array digest (returned as `{ptr,len}`) against the NIST/RFC known vectors.
+
+    /// Run a digest entry point over `data`, returning the digest as an owned `Vec<u8>` and freeing
+    /// the runtime allocation (the digest is a heap `array<u8>` the language would `Drop`).
+    fn digest(f: unsafe extern "C" fn(*const u8, i64) -> AlignStr, data: &[u8]) -> Vec<u8> {
+        let s = unsafe { f(data.as_ptr(), data.len() as i64) };
+        assert!(!s.ptr.is_null(), "a digest is a non-empty owned array");
+        let out = unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) }.to_vec();
+        unsafe { align_rt_free(s.ptr as *mut u8) };
+        out
+    }
+
+    #[test]
+    fn sha256_known_vectors() {
+        // NIST: sha256("") and sha256("abc"). The digest is 32 bytes.
+        let empty = digest(align_rt_crypto_sha256, b"");
+        assert_eq!(empty.len(), 32, "a SHA-256 digest is 32 bytes");
+        assert_eq!(
+            hex_encode_bytes(&empty),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex_encode_bytes(&digest(align_rt_crypto_sha256, b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn sha512_known_vectors() {
+        // FIPS/RFC: sha512("abc") and sha512(""). The digest is 64 bytes.
+        let abc = digest(align_rt_crypto_sha512, b"abc");
+        assert_eq!(abc.len(), 64, "a SHA-512 digest is 64 bytes");
+        assert_eq!(
+            hex_encode_bytes(&abc),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+        assert_eq!(
+            hex_encode_bytes(&digest(align_rt_crypto_sha512, b"")),
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        );
+    }
+
+    #[test]
+    fn sha_null_and_empty_input_are_the_empty_hash() {
+        // A `{null, positive-len}` view is clamped to empty by `bytes_view`, so it hashes as the
+        // empty input (never a wild read). Both the null view and a real empty slice give the empty
+        // digest — the well-known empty-string vectors.
+        let via_null = {
+            let s = unsafe { align_rt_crypto_sha256(std::ptr::null(), 4) };
+            let out = unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) }.to_vec();
+            unsafe { align_rt_free(s.ptr as *mut u8) };
+            out
+        };
+        assert_eq!(
+            hex_encode_bytes(&via_null),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "a clamped null view hashes as the empty input"
+        );
+        assert_eq!(via_null, digest(align_rt_crypto_sha256, b""));
+    }
+
+    /// Lower-case hex of a byte slice — a tiny local helper for the digest vector assertions (avoids
+    /// depending on the `align_rt_hex_encode` FFI shape in a pure-Rust unit test).
+    fn hex_encode_bytes(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
     }
 
     // --- std.cli --------------------------------------------------------------------------------

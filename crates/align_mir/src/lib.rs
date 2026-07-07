@@ -634,6 +634,11 @@ pub enum Rvalue {
     /// with OS CSPRNG bytes. Yields no value (the expression type is `()`); codegen emits the void
     /// call. A CSPRNG failure aborts in the runtime. Impure.
     CryptoRandom { out: Operand },
+    /// `crypto.sha256(data)` / `crypto.sha512(data)` — the cryptographic digest of the byte view
+    /// `data` (`{ptr,len}`), a fresh *owned* `array<u8>` of fixed length (32 / 64) returned by value
+    /// as a `{ptr,len}` (like [`Self::RandSample`]). `algo` param-swaps the EVP digest. The bound
+    /// local `Drop`-frees the array. Impure (a libcrypto call).
+    CryptoHash { algo: hir::HashAlgo, data: Operand },
     /// `rand.seed()` / `rand.seed_with(s)` — initialize an `rng` (four `i64`s, Xoshiro256++) into the
     /// slot `out`. `seed` is `None` for the OS-seeded form (`getrandom`), `Some(s)` for the
     /// deterministic form. Yields no value (the caller `Load`s `out` for the `rng` aggregate).
@@ -1720,6 +1725,15 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::CryptoRandom { out: o }));
             Operand::Const(Const::Unit)
+        }
+        // `crypto.sha256(data)` / `crypto.sha512(data)` → a fresh owned `array<u8>` `{ptr,len}`
+        // returned by value; the bound local `Drop`-frees it (same shape as `rand.sample`). The
+        // runtime allocates the digest buffer + aborts on an engine failure.
+        hir::ExprKind::CryptoHash { algo, data } => {
+            let dv = lower_expr(b, data);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::CryptoHash { algo: *algo, data: dv }));
+            Operand::Value(v)
         }
         // `rand.seed()` / `rand.seed_with(s)` → initialize the `rng` state into a temp slot (the
         // runtime writes through the pointer), then load the `[4 x i64]` aggregate as the value.
