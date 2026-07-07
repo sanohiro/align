@@ -57,7 +57,7 @@ crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-h
 `argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` is a **builtin struct**
 (reserved name, injected like the builtin `Error`; ordinary struct-literal construction and
 typechecking) — m_cost in KiB, t_cost iterations, parallelism lanes, len output bytes; validated
-before the engine (`parallelism 1..=2^24-1`, `t_cost 1..=u32max`, `m_cost 8*parallelism..=4 GiB`,
+before the engine (`parallelism 1..=2^24-1`, `t_cost 1..=u32max`, `m_cost 8*parallelism..=4 GiB-in-KiB` (= 4,194,304 KiB),
 `len 4..=1 GiB` → `Error.Invalid`; engine `threads` pinned to 1, `OSSL_set_max_threads` deferred).
 AEAD: both ciphers take 32-byte keys and 12-byte nonces (validated as public params →
 `Error.Invalid`); seal output is the **combined** `ciphertext || 16-byte tag` in one buffer; open

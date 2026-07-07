@@ -1485,7 +1485,7 @@ and http last (needs net + TLS).
     builtin `Error`, ordinary struct-literal machinery, zero special cases — non-literal paths
     all work; redeclaration cleanly diagnosed). Bounds pre-engine: parallelism 1..=2^24-1
     (checked first so `8*parallelism` can't overflow), t_cost 1..=u32max, m_cost
-    8·parallelism..=4 GiB-in-KiB, len 4..=1 GiB; engine `threads` pinned to 1. KAT = the
+    8*parallelism..=4 GiB-in-KiB, len 4..=1 GiB; engine `threads` pinned to 1. KAT = the
     canonical phc-winner-argon2 reference vector, reproduced independently via the OpenSSL CLI.
     Implementation self-caught two real bugs pre-review: a wrong `OSSL_PARAM_UNSIGNED_INTEGER`
     constant (2, not 6) and an `Rvalue` enum-size growth re-triggering the expr-depth ceiling —

@@ -56,7 +56,7 @@ crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-h
 `argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` は **builtin 構造体**である
 (予約名で、builtin の `Error` と同様に注入される。構造体リテラルによる通常の構築と型検査が使える) —
 m_cost は KiB、t_cost は反復回数、parallelism はレーン数、len は出力バイト数。エンジンに渡す前に
-検証する(`parallelism 1..=2^24-1`、`t_cost 1..=u32max`、`m_cost 8*parallelism..=4 GiB`、
+検証する(`parallelism 1..=2^24-1`、`t_cost 1..=u32max`、`m_cost 8*parallelism..=4 GiB-in-KiB`(= 4,194,304 KiB)、
 `len 4..=1 GiB` → `Error.Invalid`。エンジンの `threads` は 1 に固定し、`OSSL_set_max_threads` は見送り)。
 AEAD: どちらの暗号も 32 バイトの鍵と 12 バイトの nonce を取る(公開パラメータとして検証 → `Error.Invalid`)。
 seal の出力は **結合された** `ciphertext || 16 バイトの tag` を単一のバッファに収めたものである。open は
