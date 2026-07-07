@@ -100,7 +100,20 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
 ## Slice breakdown
 
 1. request/response structs + header list + HTTP/1.1 serialize/parse (no socket yet — pure
-   encode/decode, testable standalone).
+   encode/decode, testable standalone). **DONE** (branch `m11-http-slice1-parse`). Shipped surface:
+   `http.request(method, url)` (total — URL parsed at serialize, not here, so a runtime URL never
+   aborts the builder), `r.header(name, value)` / `r.body(data)` (mutate in place, bound receiver,
+   P6 CR/LF/NUL → abort), `http.parse(bytes) -> Result<response, Error>` (the response constructor +
+   codec primitive — Slice 2's client reuses the same engine; a permanent primitive, not throwaway),
+   `resp.status()` / `resp.header(name)` (case-insensitive `Option<str>` view) / `resp.body()`
+   (`slice<u8>` view) — both getters region-bound to `resp` (#297). serialize stays a **runtime-only
+   codec** (`align_rt_http_serialize`, one contiguous buffer per R4, unit-tested) — Slice 2's client
+   renders + one-writes it, not a language builtin yet. All Slice-1 ops **Pure** (no sockets). Auto
+   `Host` + `Content-Length` (iff body non-empty); a caller-supplied `Host`/`Content-Length` is
+   rejected (CL-duplication smuggling guard). `chunked` Transfer-Encoding → `Error.Invalid`
+   (Content-Length framing only in v1; R1-honouring de-chunking deferred). Caps: ≤ 128 headers,
+   ≤ 1 GiB body. R1 zero-copy: the response owns one byte buffer + an offset table; scanning rides
+   the `memchr` crate (R2).
 2. client + get/post over one net `tcp_conn` (plaintext).
 3. connection pool reuse (the rail — keepalive, reuse by default).
 4. server primitive (serve/accept, caller writes response).

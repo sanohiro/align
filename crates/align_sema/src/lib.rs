@@ -124,6 +124,11 @@ pub enum Scalar {
     /// `waitpid`, discarding the code, so it can't zombie). Opaque pointer, like [`Scalar::TcpConn`]
     /// — owned, never region-tracked. The one Move scalar backed by a pid, not an fd.
     Child,
+    /// A `response` payload (`Result<response, Error>` from `http.parse`). An owned **Move** handle
+    /// (one raw byte buffer + an offset table); the enclosing `Result`'s `Drop` frees it. Opaque
+    /// pointer, like [`Scalar::Buffer`] — owned, never region-tracked. (There is no
+    /// `Scalar::HttpRequest`: a `request` builder never rides an aggregate — it has no `Scalar`.)
+    HttpResponse,
 }
 
 impl Scalar {
@@ -132,7 +137,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, and a `udp_socket`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::HttpResponse)
     }
 }
 
@@ -351,6 +356,20 @@ pub enum Ty {
     /// exit code) and flips the reaped flag through the borrow so the later `Drop` is a no-op — the
     /// receiver is read, not consumed (mirrors `l.accept()`). Impure. Opaque pointer.
     Child,
+    /// An `http request` (`std.http`) — the request builder from `http.request(method, url)`. An
+    /// owned **Move** handle (like `reader`/`writer`/`buffer`/`cli command`) owning its method / url /
+    /// header list / body buffer, `Drop`-freed. `r.header(name, value)` / `r.body(data)` mutate it in
+    /// place through the handle (not consumed). Pure in this slice (no I/O — serialization is an
+    /// internal codec, the network client is Slice 2). Opaque pointer. Never rides an aggregate (no
+    /// `Scalar::HttpRequest`).
+    HttpRequest,
+    /// An `http response` (`std.http`) — a parsed HTTP/1.1 response, the `Ok` payload of `http.parse`'s
+    /// `Result<response, Error>`. An owned **Move** handle owning ONE raw byte buffer + an offset table
+    /// (zero-copy, http.md R1), `Drop`-freed. `resp.status()` reads the code; `resp.header(name)`
+    /// (case-insensitive) returns an `Option<str>` **view** and `resp.body()` a `slice<u8>` **view**,
+    /// both region-bound to `resp` (an escape past its `Drop` is a compile error, #297). Pure. Opaque
+    /// pointer.
+    HttpResponse,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -418,6 +437,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::UdpSocket => Some(Scalar::UdpSocket),
         // A `child` owned handle as the `Result` Ok payload of `process.spawn`.
         Ty::Child => Some(Scalar::Child),
+        // An `http response` owned handle as the `Result` Ok payload of `http.parse`. (An `http
+        // request` builder is never a payload — it has no `Scalar` and maps to `None` here.)
+        Ty::HttpResponse => Some(Scalar::HttpResponse),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -453,6 +475,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::TcpListener => Ty::TcpListener,
         Scalar::UdpSocket => Ty::UdpSocket,
         Scalar::Child => Ty::Child,
+        Scalar::HttpResponse => Ty::HttpResponse,
     }
 }
 
@@ -501,7 +524,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -533,7 +556,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -682,7 +705,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -754,7 +777,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2514,6 +2537,28 @@ impl EffectScan {
                 self.expr(name);
             }
             ExprKind::CliUsage { cmd } => self.expr(cmd),
+            // `std.http` (Slice 1) — **all pure** (no I/O; serialize/parse operate on owned/borrowed
+            // memory — the network client is Slice 2): recurse so an effect *inside* the operands is
+            // still counted.
+            ExprKind::HttpRequest { method, url } => {
+                self.expr(method);
+                self.expr(url);
+            }
+            ExprKind::HttpHeader { req, name, value } => {
+                self.expr(req);
+                self.expr(name);
+                self.expr(value);
+            }
+            ExprKind::HttpBody { req, data } => {
+                self.expr(req);
+                self.expr(data);
+            }
+            ExprKind::HttpParse { data } => self.expr(data),
+            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.expr(resp),
+            ExprKind::HttpRespHeader { resp, name } => {
+                self.expr(resp);
+                self.expr(name);
+            }
             // `std.crypto` — `constant_time_equal` is **Pure** (a branchless self-hosted computation,
             // no I/O), so it may run inside a `par_map` closure: recurse into the operands only.
             ExprKind::CryptoCtEqual { a, b } => {
@@ -3095,6 +3140,14 @@ impl<'a> EscapeCheck<'a> {
             // frame. Without this explicit arm the wildcard below mis-infers `Static`, letting the view
             // of a dropped `parsed` escape (the #297-class bug); `.clone()` copies out.
             ExprKind::CliGetStr { parsed, .. } => Region::Frame.shorter(self.region_of(parsed, depth)),
+            // `resp.header(name)` returns `Option<str>` and `resp.body()` a `slice<u8>`, both **views**
+            // into the `http response` handle's owned buffer (freed at frame exit). Like `CliGetStr` /
+            // `BufferBytes`, they are `Frame`-regioned and bound to `resp` (or shorter if `resp` is
+            // arena-scoped) — an escape past `resp`'s `Drop` reads freed memory (#297). Without these
+            // arms the wildcard mis-infers `Static`; `.clone()` (header) / a copy-out copies past `resp`.
+            ExprKind::HttpRespHeader { resp, .. } | ExprKind::HttpRespBody { resp } => {
+                Region::Frame.shorter(self.region_of(resp, depth))
+            }
             // `c.reader()` / `c.writer()` borrow the `tcp_conn`'s fd (`owns_fd: false` — only `c`'s
             // `Drop` closes it), so — like `BufferBytes` / `CliGetStr` — the returned stream is
             // region-bound to `c`: `Frame` (or shorter if `c` lives in an arena). It must not escape
@@ -3211,7 +3264,11 @@ impl<'a> EscapeCheck<'a> {
         match &e.kind {
             // `buf.bytes()` views storage owned by the `buffer` local (`Drop`-freed at frame exit),
             // so the `slice<u8>` is frame-local and must not be returned — like a slice of a local array.
-            ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } => true,
+            // `resp.body()` is a `slice<u8>` view into the `http response` handle's frame-local buffer
+            // — local-backed like `buf.bytes()`, so returning it is rejected (its region arm above also
+            // binds it to `resp`, but a `slice<u8>` of a numeric element is not `tracks_region`, so this
+            // local-backed check is the one that catches its escape).
+            ExprKind::ArrayToSlice(_) | ExprKind::ArrayLit { .. } | ExprKind::BufferBytes { .. } | ExprKind::HttpRespBody { .. } => true,
             ExprKind::Local(p) => self.local_backed_slice.contains(p),
             ExprKind::Call { args, .. } => args.iter().any(|a| self.slice_is_local(a)),
             ExprKind::Block(b) => b.value.as_ref().is_some_and(|v| self.slice_is_local(v)),
@@ -3440,6 +3497,25 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.walk(scrutinee, depth);
+                // A payload bound by an arm pattern (`Some(v)` / `Ok(v)` / `Variant(v)`) is extracted
+                // *out of* the scrutinee — for a region-tracked scrutinee it is a view into / part of
+                // the same storage, so the binding inherits the scrutinee's region. This mirrors
+                // `LetTuple` destructuring and the `OptionSome`/`Try` region pass-through in reverse.
+                // Without it, unwrapping an `Option<view>` / `Result<view>` through a `match` arm loses
+                // the region (`region_of(Local)` defaults to `Static`) and the view escapes — the
+                // general #297-class use-after-free that first bit `resp.header()`'s `Option<str>` view
+                // (env.get's `Option<string>` is owned/`Static`, so it never exposed this gap). A
+                // non-tracked (scalar) payload binding needs no region — the guard skips it, and a
+                // Copy binding's region is never consulted anyway.
+                if self.tracks_region(scrutinee.ty) {
+                    let sr = self.region_of(scrutinee, depth);
+                    for a in arms {
+                        for b in &a.bindings {
+                            self.decl_depth.insert(*b, depth);
+                            self.region.insert(*b, sr);
+                        }
+                    }
+                }
                 for a in arms {
                     self.walk(&a.body, depth);
                 }
@@ -3693,6 +3769,28 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(name, depth);
             }
             ExprKind::CliUsage { cmd } => self.walk(cmd, depth),
+            // `std.http`: the request / response handles are owned Move (never region-borrows); a
+            // `resp.header`/`resp.body` view borrows `resp` but its escape is caught by `region_of` /
+            // `slice_is_local`, not here — just recurse to check an escape *inside* the operands.
+            ExprKind::HttpRequest { method, url } => {
+                self.walk(method, depth);
+                self.walk(url, depth);
+            }
+            ExprKind::HttpHeader { req, name, value } => {
+                self.walk(req, depth);
+                self.walk(name, depth);
+                self.walk(value, depth);
+            }
+            ExprKind::HttpBody { req, data } => {
+                self.walk(req, depth);
+                self.walk(data, depth);
+            }
+            ExprKind::HttpParse { data } => self.walk(data, depth),
+            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.walk(resp, depth),
+            ExprKind::HttpRespHeader { resp, name } => {
+                self.walk(resp, depth);
+                self.walk(name, depth);
+            }
             // `std.crypto` — `constant_time_equal` returns a Copy `bool` (borrows nothing); `random`
             // fills the `buffer` in place (returns `()`, nothing escapes). Just recurse into the
             // operands so any escape *inside* them is still checked.
@@ -4140,6 +4238,26 @@ impl UnnecessaryHeapScan {
                 self.visit(name);
             }
             ExprKind::CliUsage { cmd } => self.visit(cmd),
+            // `std.http` — no heap-narrowing pattern of its own; recurse into the operands.
+            ExprKind::HttpRequest { method, url } => {
+                self.visit(method);
+                self.visit(url);
+            }
+            ExprKind::HttpHeader { req, name, value } => {
+                self.visit(req);
+                self.visit(name);
+                self.visit(value);
+            }
+            ExprKind::HttpBody { req, data } => {
+                self.visit(req);
+                self.visit(data);
+            }
+            ExprKind::HttpParse { data } => self.visit(data),
+            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.visit(resp),
+            ExprKind::HttpRespHeader { resp, name } => {
+                self.visit(resp);
+                self.visit(name);
+            }
             // `std.crypto` — recurse into the subexpressions (no heap-narrowing pattern of its own).
             ExprKind::CryptoCtEqual { a, b } => {
                 self.visit(a);
@@ -4881,6 +4999,29 @@ impl<'a> MoveCheck<'a> {
                 self.expr(name, moved, false, false);
             }
             ExprKind::CliUsage { cmd } => self.expr(cmd, moved, false, false),
+            // `std.http`: every receiver (`req` / `resp`) is **borrowed, never consumed** — `header`/
+            // `body` mutate the request in place, `serialize`/`status`/`header`/`body`/`parse` read.
+            // The `str`/byte args are borrowed too. Recurse non-consuming to catch a use-after-move
+            // *inside* the operands.
+            ExprKind::HttpRequest { method, url } => {
+                self.expr(method, moved, false, false);
+                self.expr(url, moved, false, false);
+            }
+            ExprKind::HttpHeader { req, name, value } => {
+                self.expr(req, moved, false, false);
+                self.expr(name, moved, false, false);
+                self.expr(value, moved, false, false);
+            }
+            ExprKind::HttpBody { req, data } => {
+                self.expr(req, moved, false, false);
+                self.expr(data, moved, false, false);
+            }
+            ExprKind::HttpParse { data } => self.expr(data, moved, false, false),
+            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.expr(resp, moved, false, false),
+            ExprKind::HttpRespHeader { resp, name } => {
+                self.expr(resp, moved, false, false);
+                self.expr(name, moved, false, false);
+            }
             // `std.crypto` borrows both byte views (`constant_time_equal`) / the `out` buffer
             // (`random`, filled in place) — nothing is consumed. Recurse non-consuming to catch a
             // use-after-move *inside* the operands.
@@ -7869,6 +8010,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.cli", "cli.command", span);
                 return self.check_cli_command(args, span);
             }
+            // `std.http` (Slice 1) — `http.request(method, url)` builds a Move `http request`; the
+            // `header`/`body` methods dispatch on the receiver type below. `http.parse(bytes)` parses a
+            // response buffer -> `Result<response, Error>` (the response's `status`/`header`/`body`
+            // methods also dispatch below). All Pure (no sockets in this slice).
+            if module == "http" && method == "request" {
+                self.require_import("std.http", "http.request", span);
+                return self.check_http_request(args, span);
+            }
+            if module == "http" && method == "parse" {
+                self.require_import("std.http", "http.parse", span);
+                return self.check_http_parse(args, span);
+            }
             // `std.crypto` — `constant_time_equal(a, b)` (the self-hosted branchless CT byte-compare,
             // Pure) / `random(out)` (fill a `buffer` from the OS CSPRNG, Impure) from Slice 1;
             // `sha256(data)` / `sha512(data)` (EVP digests via libcrypto, Impure) from Slice 2.
@@ -8220,6 +8373,16 @@ impl<'a, 't> Checker<'a, 't> {
             // successful parse; unregistered / wrong-kind aborts at runtime. Type-guarded, same as above.
             "get_bool" | "get_i64" | "get_str" if recv_ty == Ty::CliParsed => {
                 self.check_cli_parsed_method(recv_expr, method, args, span)
+            }
+            // `std.http` request methods on an `http request`: `r.header(name, value)` /
+            // `r.body(data)` mutate the builder in place. Type-guarded, same as the cli methods above.
+            "header" | "body" if recv_ty == Ty::HttpRequest => {
+                self.check_http_request_method(recv_expr, method, args, span)
+            }
+            // `std.http` response getters on an `http response`: `resp.status()` / `resp.header(name)`
+            // (case-insensitive `Option<str>` view) / `resp.body()` (`slice<u8>` view). Type-guarded.
+            "status" | "header" | "body" if recv_ty == Ty::HttpResponse => {
+                self.check_http_response_method(recv_expr, method, args, span)
             }
             _ => {
                 if recv_ty != Ty::Error {
@@ -8573,7 +8736,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) {
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -12267,6 +12430,168 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Type-check a `bytes` argument (`arg_ix` of `args`): accept a `str`, an owned `string`
+    /// (auto-borrowed to `str`), or a `bytes` `slice<u8>`; anything else is an error. `what` names the
+    /// call for the diagnostic. Returns the coerced `Expr` (`Ty::Error` on failure).
+    fn check_bytes_init(&mut self, arg: &ast::Expr, what: &str) -> Expr {
+        let mut e = self.check_expr(arg, None);
+        if e.ty == Ty::Error {
+            return e;
+        }
+        if e.ty == Ty::String {
+            let s = e.span;
+            e = Expr { kind: ExprKind::StrBorrow(Box::new(e)), ty: Ty::Str, span: s };
+        }
+        if e.ty != Ty::Str && e.ty != Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) {
+            self.diags
+                .error(format!("{what} expects bytes (a str, string, or slice<u8>), got {}", ty_name(e.ty)), arg.span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: arg.span };
+        }
+        e
+    }
+
+    /// `http.request(method, url)` — build a Move `http request` builder ([`Ty::HttpRequest`]). Both
+    /// `method` and `url` are `str`. Total (the URL is validated later, at serialize) — a module
+    /// function, dispatched like `cli.command`.
+    fn check_http_request(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'http.request' expects 2 arguments (method, url), got {}", args.len()), span);
+            return err;
+        }
+        let method = self.check_str_init(&args[0]);
+        let url = self.check_str_init(&args[1]);
+        if method.ty == Ty::Error || url.ty == Ty::Error {
+            return err;
+        }
+        Expr { kind: ExprKind::HttpRequest { method: Box::new(method), url: Box::new(url) }, ty: Ty::HttpRequest, span }
+    }
+
+    /// `r.header(name, value)` / `r.body(data)` on an `http request` ([`Ty::HttpRequest`]), the
+    /// receiver already evaluated. The receiver must be a **bound local** (the v1 Move-temporary gate,
+    /// `check_cli_command_method` precedent); both methods mutate the builder in place (no `mut`
+    /// needed) and yield `()`. A CR/LF/NUL in a header name/value aborts at runtime (P6).
+    fn check_http_request_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the http request to a local first, then call the method (`r := http.request(\"GET\", url)` then `r.header(...)`) — a temporary owned request handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        match method {
+            "header" => {
+                if args.len() != 2 {
+                    self.diags.error(format!("'.header()' takes 2 arguments (name, value), got {}", args.len()), span);
+                    return err;
+                }
+                let name = self.check_str_init(&args[0]);
+                let value = self.check_str_init(&args[1]);
+                if name.ty == Ty::Error || value.ty == Ty::Error {
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpHeader { req: Box::new(recv_expr), name: Box::new(name), value: Box::new(value) }, ty: Ty::Unit, span }
+            }
+            "body" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.body()' takes 1 argument (the body bytes), got {}", args.len()), span);
+                    return err;
+                }
+                let data = self.check_bytes_init(&args[0], "'.body()'");
+                if data.ty == Ty::Error {
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpBody { req: Box::new(recv_expr), data: Box::new(data) }, ty: Ty::Unit, span }
+            }
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on an http request (try header / body)"), span);
+                err
+            }
+        }
+    }
+
+    /// `http.parse(data)` — parse an HTTP/1.1 response buffer (a `bytes` view) into a Move
+    /// `http response` ([`Ty::HttpResponse`]), yielding `Result<response, Error>`. A module function.
+    fn check_http_parse(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'http.parse' expects 1 argument (the response bytes), got {}", args.len()), span);
+            return err;
+        }
+        let data = self.check_bytes_init(&args[0], "'http.parse'");
+        if data.ty == Ty::Error {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::HttpParse { data: Box::new(data) },
+            ty: Ty::Result(Scalar::HttpResponse, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `resp.status()` / `resp.header(name)` / `resp.body()` on an `http response`
+    /// ([`Ty::HttpResponse`]), the receiver already evaluated. The receiver must be a bound local (the
+    /// v1 gate). `status` yields `i64`; `header` yields `Option<str>` (case-insensitive) whose `str` is
+    /// a **view** into `resp` (region-bound — the `region_of` arm rejects an escape); `body` yields a
+    /// `slice<u8>` **view** into `resp` (local-backed — likewise not returnable).
+    fn check_http_response_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the http response to a local first, then read it (`resp := http.parse(bytes)?` then `resp.status()`) — a temporary owned response handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match method {
+            "status" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.status()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpRespStatus { resp: Box::new(recv_expr) }, ty: i64_ty, span }
+            }
+            "header" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.header()' takes 1 argument (the header name), got {}", args.len()), span);
+                    return err;
+                }
+                let name = self.check_str_init(&args[0]);
+                if name.ty == Ty::Error {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpRespHeader { resp: Box::new(recv_expr), name: Box::new(name) },
+                    ty: Ty::Option(Scalar::Str),
+                    span,
+                }
+            }
+            "body" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.body()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpRespBody { resp: Box::new(recv_expr) },
+                    ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+                    span,
+                }
+            }
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on an http response (try status / header / body)"), span);
+                err
+            }
+        }
+    }
+
     /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — a buffered `writer` over the
     /// given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
     fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
@@ -13513,6 +13838,25 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(name);
             }
             ExprKind::CliUsage { cmd } => self.finalize_expr(cmd),
+            ExprKind::HttpRequest { method, url } => {
+                self.finalize_expr(method);
+                self.finalize_expr(url);
+            }
+            ExprKind::HttpHeader { req, name, value } => {
+                self.finalize_expr(req);
+                self.finalize_expr(name);
+                self.finalize_expr(value);
+            }
+            ExprKind::HttpBody { req, data } => {
+                self.finalize_expr(req);
+                self.finalize_expr(data);
+            }
+            ExprKind::HttpParse { data } => self.finalize_expr(data),
+            ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.finalize_expr(resp),
+            ExprKind::HttpRespHeader { resp, name } => {
+                self.finalize_expr(resp);
+                self.finalize_expr(name);
+            }
             ExprKind::CryptoCtEqual { a, b } => {
                 self.finalize_expr(a);
                 self.finalize_expr(b);
@@ -13965,6 +14309,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::TcpListener => "tcp_listener".to_string(),
         Ty::UdpSocket => "udp_socket".to_string(),
         Ty::Child => "child".to_string(),
+        Ty::HttpRequest => "http request".to_string(),
+        Ty::HttpResponse => "http response".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -14139,7 +14485,7 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // payload (`tcp.connect`/`l.accept` for the conn, `tcp.listen` for the listener, `udp.bind` for
     // the socket) is fine, but never an array/slice/box element (a copied handle would
     // double-`close` its fd).
-    if matches!(ty, Ty::Buffer | Ty::CliCommand) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,

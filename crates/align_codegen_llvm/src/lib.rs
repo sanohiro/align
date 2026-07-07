@@ -1226,6 +1226,48 @@ fn build_module<'c>(
         "cli_parsed_free".to_string(),
         module.add_function("align_rt_cli_parsed_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
+    // `std.http` (Slice 1) — the request / response handles are opaque pointers. `request(method,url)`
+    // allocates a request; `header`/`body` mutate it (void); `parse(data{ptr,len}, out)` -> i32 status
+    // writes a response handle; `resp_status` -> i64; `resp_header(resp, name{ptr,len}, out)` -> i32
+    // present-flag writes a `str` view; `resp_body` -> a `{ptr,len}` view; the two `*_free` drop the
+    // handles. (`align_rt_http_serialize` is a runtime-only codec — Slice 2's client calls it — so it
+    // is not declared here.)
+    funcs.insert(
+        "http_request".to_string(),
+        module.add_function("align_rt_http_request_new", ptr.fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "http_header".to_string(),
+        module.add_function("align_rt_http_header", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "http_body".to_string(),
+        module.add_function("align_rt_http_body", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "http_parse".to_string(),
+        module.add_function("align_rt_http_parse", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        "http_resp_status".to_string(),
+        module.add_function("align_rt_http_resp_status", i64t2.fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "http_resp_header".to_string(),
+        module.add_function("align_rt_http_resp_header", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        "http_resp_body".to_string(),
+        module.add_function("align_rt_http_resp_body", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "http_request_free".to_string(),
+        module.add_function("align_rt_http_request_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "http_resp_free".to_string(),
+        module.add_function("align_rt_http_resp_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     // `core.string` trims → a borrowed sub-`str` `{ptr,len}` of the receiver (no allocation).
     for (key, sym) in [
         ("str_trim", "align_rt_str_trim"),
@@ -1672,7 +1714,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // A `reader`/`writer`/`buffer` / cli handle / `tcp_conn` payload is an opaque pointer.
-        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
@@ -2127,6 +2169,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Reader | Scalar::Writer => unreachable!("a reader/writer handle is not a box/array payload"),
         Scalar::Buffer => unreachable!("a buffer handle is not a box/array payload"),
         Scalar::CliParsed => unreachable!("a cli parsed handle is not a box/array payload"),
+        Scalar::HttpResponse => unreachable!("an http response handle is not a box/array payload"),
         Scalar::TcpConn => unreachable!("a tcp_conn handle is not a box/array payload"),
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
@@ -2779,7 +2822,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -2837,10 +2880,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) {
-                        // A writer flushes + closes; a reader closes; a buffer / cli handle frees; a
-                        // tcp_conn / tcp_listener / udp_socket closes its socket fd. Each runtime
-                        // `*_free` is null-safe (a moved-out / never-initialised slot drops harmlessly).
+                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse) {
+                        // A writer flushes + closes; a reader closes; a buffer / cli / http handle
+                        // frees; a tcp_conn / tcp_listener / udp_socket closes its socket fd. Each
+                        // runtime `*_free` is null-safe (a moved-out / never-initialised slot drops
+                        // harmlessly).
                         let free_fn = match ty {
                             Ty::Writer => "io_writer_free",
                             Ty::Reader => "io_reader_free",
@@ -2851,6 +2895,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             Ty::UdpSocket => "udp_socket_free",
                             // A `child` reaps its pid (a blocking `waitpid`) if not yet waited.
                             Ty::Child => "child_free",
+                            Ty::HttpRequest => "http_request_free",
+                            Ty::HttpResponse => "http_resp_free",
                             _ => "cli_parsed_free",
                         };
                         let p = self
@@ -2878,7 +2924,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) => {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) => {
                                     // The field is the handle pointer itself; each `*_free` is null-safe
                                     // (the inactive arm / a moved-out aggregate reads a null handle).
                                     let free_fn = match payload_field_scalar(ty, idx) {
@@ -2889,6 +2935,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         Some(Scalar::TcpListener) => "tcp_listener_free",
                                         Some(Scalar::UdpSocket) => "udp_socket_free",
                                         Some(Scalar::Child) => "child_free",
+                                        Some(Scalar::HttpResponse) => "http_resp_free",
                                         _ => "cli_parsed_free",
                                     };
                                     self.builder
@@ -5026,6 +5073,67 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["cli_usage"], &[c.into()], "cliusage")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("cli_usage returns a {ptr,len}")
+            }
+            // std.http — the request / response handles are opaque pointers passed by value.
+            Rvalue::HttpRequest { method, url } => {
+                let (mp, ml) = self.split_str(method)?;
+                let (up, ul) = self.split_str(url)?;
+                self.builder
+                    .build_call(self.funcs["http_request"], &[mp.into(), ml.into(), up.into(), ul.into()], "httpreq")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_request returns a handle pointer")
+            }
+            Rvalue::HttpHeader { req, name, value } => {
+                let r = self.operand(req).into_pointer_value();
+                let (np, nl) = self.split_str(name)?;
+                let (vp, vl) = self.split_str(value)?;
+                self.builder
+                    .build_call(self.funcs["http_header"], &[r.into(), np.into(), nl.into(), vp.into(), vl.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::HttpBody { req, data } => {
+                let r = self.operand(req).into_pointer_value();
+                let (dp, dl) = self.split_str(data)?;
+                self.builder
+                    .build_call(self.funcs["http_body"], &[r.into(), dp.into(), dl.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::HttpParse { data, out } => {
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (dp, dl) = self.split_str(data)?;
+                self.builder
+                    .build_call(self.funcs["http_parse"], &[dp.into(), dl.into(), out_ptr.into()], "httpparse")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_parse returns i32 status")
+            }
+            Rvalue::HttpRespStatus { resp } => {
+                let p = self.operand(resp).into_pointer_value();
+                self.builder
+                    .build_call(self.funcs["http_resp_status"], &[p.into()], "httpstatus")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_resp_status returns i64")
+            }
+            Rvalue::HttpRespHeader { resp, name, out } => {
+                let p = self.operand(resp).into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.funcs["http_resp_header"], &[p.into(), np.into(), nl.into(), out_ptr.into()], "httphdr")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_resp_header returns i32 present flag")
+            }
+            Rvalue::HttpRespBody { resp } => {
+                let p = self.operand(resp).into_pointer_value();
+                self.builder
+                    .build_call(self.funcs["http_resp_body"], &[p.into()], "httpbody")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_resp_body returns a {ptr,len}")
             }
             // env.get — write the owned value {ptr,len} into `out`, return an i32 present flag.
             Rvalue::EnvGet { name, out } => {

@@ -1495,9 +1495,49 @@ and http last (needs net + TLS).
     buffer variant is the recorded candidate); a nonce-generating seal convenience (P3);
     `OSSL_set_max_threads` for parallel argon2 lanes; fixed-size `array<u8; N>` digest returns
     (needs a runtime-return ABI extension).
-- **`std.http`** — NEXT, the last M11 module (plaintext-only v1 per http.md — TLS deferred,
-  `https://` rejected not downgraded; builds `get_many` on the net substrate via task_group +
-  the par_map pool — the #301 claim-loop lesson).
+- **`std.http`** — the last M11 module (plaintext-only v1 per http.md — TLS deferred, `https://`
+  rejected not downgraded; builds `get_many` on the net substrate via task_group + the par_map pool
+  — the #301 claim-loop lesson).
+  - **Slice 1 (request/response types + HTTP/1.1 serialize/parse, NO sockets) — DONE.** Two new
+    Move handle types `Ty::HttpRequest` / `Ty::HttpResponse` (+ `Scalar::HttpResponse`), full
+    twin-mirror Gate-1 sweep. Language surface behind `import std.http`: `http.request(method, url)`
+    (total — URL not parsed here), `r.header(name, value)` / `r.body(data)` (mutate in place, bound
+    receiver), `http.parse(bytes) -> Result<response, Error>`, `resp.status()` / `resp.header(name)`
+    (case-insensitive `Option<str>` view) / `resp.body()` (`slice<u8>` view) — the two getters
+    region-bound to `resp` (#297; escape past `resp`'s `Drop` is a compile error). All ops **Pure**
+    (no sockets in this slice — the Impure network client is Slice 2). Key decisions:
+    (a) **URL validation is deferred to serialize** (not `http.request`) so a runtime-supplied URL
+    never aborts the builder; `https://` / non-`http` / empty-authority / malformed → `Error.Invalid`
+    at serialize/send time (P1). (b) **`http.parse` is exposed** as the response constructor + codec
+    primitive (Slice 2's client reuses the same runtime engine) — needed so the response type +
+    getters + region-escape are reachable and test-pinned now; it is a permanent primitive, not a
+    throwaway. (c) **serialize stays a runtime-internal codec** (`align_rt_http_serialize`,
+    unit-tested; not a language builtin in Slice 1 — Slice 2's client renders + one-writes it, R4).
+    (d) **P6 (CR/LF/NUL header injection) aborts** at `r.header()` (build-time, total-or-abort).
+    (e) **Auto-header policy:** serialize emits `Host` (from the URL authority) and `Content-Length`
+    (iff body non-empty); a caller-supplied `Host` / `Content-Length` is **rejected** (`Error.Invalid`)
+    — CL duplication is a smuggling vector, safer than a silent override. (f) **chunked
+    Transfer-Encoding → `Error.Invalid`** (v1 is Content-Length framing only; de-chunking that
+    honours R1 is deferred, loud). (g) **Caps:** ≤ 128 headers, ≤ 1 GiB body → else `Error.Invalid`.
+    (h) **R1 zero-copy:** `HttpResponse` owns ONE byte buffer + an offset table (`HttpHeaderSpan`
+    name/value offsets + body_start/len); getters return views, no per-header `String`, no body copy;
+    scanning rides the `memchr` crate (R2). Tests: `crates/align_driver/tests/m11_http.rs` (16 —
+    builder build/drop, P6 abort, Move/unbound/array-element/import gates, parse round-trip,
+    case-insensitive header, 404-is-data P2, malformed-is-Err-not-abort, body + header view escape
+    #297 in both direct and `match`-arm-unwrap forms) + `align_runtime` units (9 — serialize golden
+    bytes, request-line/method injection reject, parse offsets/framing, conflicting-Content-Length
+    reject, error mapping, null-safe frees). **Adversarial-review fixes (post-first-cut):**
+    (i) **general pattern-binding region propagation** in `EscapeCheck` — a `match`-arm payload
+    binding now inherits the scrutinee's non-Static region (mirrors `LetTuple` + the `OptionSome`/`Try`
+    pass-through), closing a confirmed use-after-free where `resp.header()`'s `Option<str>` view
+    escaped via `match resp.header(..) { Some(v) => v, .. }` (the codebase's first `Option<borrowed
+    view>`; env.get's is owned so it never exposed the gap). The **ideal general fix**, not a point
+    patch — it closes it for every future `Option<view>`/`Result<view>`; no regression across the
+    cli/net/crypto view-escape suites. (ii) serialize now validates the **method is an RFC 7230
+    token** and the URL-derived authority/path carry **no CR/LF/NUL/SP** (the permanent codec must not
+    let `http://a/x\r\nEvil: 1` smuggle a header). (iii) parse **rejects a conflicting duplicate
+    Content-Length** (RFC 7230 §3.3.3; an identical repeat is accepted). **Slices 2–5 (client
+    get/post, pool reuse, server primitive, HTTPS) remain.**
 
 ## Design Issues to Settle in Parallel
 
