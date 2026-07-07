@@ -7752,6 +7752,409 @@ pub unsafe extern "C" fn align_rt_crypto_hkdf_sha256(
 }
 
 // ---------------------------------------------------------------------------------------------
+// std.crypto (M11 Slice 4) — AEAD (aes_gcm + chacha20_poly1305) via OpenSSL libcrypto's EVP_CIPHER.
+// The module's most security-critical slice. The same keystone-library strategy (crypto.md P5):
+// borrow the constant-time-audited engine, own the output. Two shared runtime impls (`aead_seal` /
+// `aead_open`), param-swapped by the fetched `EVP_CIPHER` name; four thin entry points select the
+// cipher. Both ciphers are 256-bit (32-byte key), 96-bit (12-byte) nonce, 128-bit (16-byte) tag.
+//
+// Combined format (the libsodium "combined" convention): a seal's output `buffer` is
+// `ciphertext || tag` (one buffer, the 16-byte tag appended); an open's input is that same
+// `ciphertext || tag`, so a valid open input is >= 16 bytes.
+//
+// All-or-nothing on open (crypto.md P2 — the defining constraint): `EVP_DecryptUpdate` releases
+// plaintext BEFORE the tag is checked by `EVP_DecryptFinal_ex`, so `aead_open` decrypts the WHOLE
+// ciphertext into an internal owned buffer (never streamed to the caller), sets the expected tag
+// via `EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_TAG)`, then calls `EVP_DecryptFinal_ex`, handing the
+// buffer to the caller ONLY on `Final == 1`. On ANY failure it `OPENSSL_cleanse`s the staged
+// plaintext, frees it, and returns the single opaque `Error.Invalid` — tag-mismatch, truncation,
+// and bad-length are indistinguishable (releasing unverified plaintext is the classic AEAD misuse).
+//
+// Nonce discipline (crypto.md P3): nonce reuse under the same key is catastrophic — for AES-GCM
+// especially, it destroys both confidentiality and forgery resistance. v1 does NOT auto-generate
+// nonces; the caller supplies one (e.g. from `crypto.random`). A nonce-generating convenience is a
+// recorded candidate.
+// ---------------------------------------------------------------------------------------------
+
+/// AEAD key length for both ciphers — 256-bit (32 bytes). Validated as a public value before any
+/// engine call (crypto.md P1); a mismatch → `Error.Invalid`.
+const AEAD_KEY_LEN: usize = 32;
+/// AEAD nonce length for both ciphers — 96-bit (12 bytes), the default IV length of AES-256-GCM and
+/// ChaCha20-Poly1305 (so no `EVP_CTRL_AEAD_SET_IVLEN` is needed). Validated public (P1).
+const AEAD_NONCE_LEN: usize = 12;
+/// AEAD authentication tag length — 128-bit (16 bytes), the tag appended to (seal) / stripped from
+/// (open) the combined `ciphertext || tag` buffer.
+const AEAD_TAG_LEN: usize = 16;
+/// Cap on the plaintext / ciphertext-body / aad length — 1 GiB, matching the gzip/zstd output cap.
+/// Keeps `pt_len + tag` from overflowing and every length within EVP's `c_int` update argument; over
+/// the cap → `Error.Invalid`.
+const AEAD_MAX_INPUT: usize = 1 << 30;
+/// `EVP_CTRL_AEAD_GET_TAG` (`openssl/evp.h`) — read the computed auth tag after `EVP_EncryptFinal_ex`.
+const EVP_CTRL_AEAD_GET_TAG: c_int = 0x10;
+/// `EVP_CTRL_AEAD_SET_TAG` (`openssl/evp.h`) — set the expected auth tag before `EVP_DecryptFinal_ex`.
+const EVP_CTRL_AEAD_SET_TAG: c_int = 0x11;
+
+#[link(name = "crypto")]
+unsafe extern "C" {
+    /// `EVP_CIPHER_fetch(libctx, algorithm, properties)` — fetch a cipher implementation by name
+    /// (`"AES-256-GCM"` / `"ChaCha20-Poly1305"`; the OpenSSL 3.x provider API). Returns a fetched
+    /// `EVP_CIPHER*` (freed with [`EVP_CIPHER_free`]) or `NULL` on failure.
+    fn EVP_CIPHER_fetch(libctx: *mut c_void, algorithm: *const c_char, properties: *const c_char) -> *mut c_void;
+    /// Free an `EVP_CIPHER*` from [`EVP_CIPHER_fetch`]. A null argument is a no-op.
+    fn EVP_CIPHER_free(cipher: *mut c_void);
+    /// `EVP_CIPHER_CTX_new()` — a fresh cipher context. `NULL` on allocation failure.
+    fn EVP_CIPHER_CTX_new() -> *mut c_void;
+    /// Free an `EVP_CIPHER_CTX*`. A null argument is a no-op.
+    fn EVP_CIPHER_CTX_free(ctx: *mut c_void);
+    /// `EVP_EncryptInit_ex(ctx, cipher, impl, key, iv)` — initialize `ctx` for encryption under
+    /// `cipher` with `key`/`iv`. `impl` is null (default provider). Returns `1` on success.
+    fn EVP_EncryptInit_ex(ctx: *mut c_void, cipher: *const c_void, imp: *mut c_void, key: *const u8, iv: *const u8) -> c_int;
+    /// `EVP_EncryptUpdate(ctx, out, outl, in, inl)` — encrypt `inl` bytes; a null `out` feeds AAD.
+    /// Writes the output length to `*outl`. Returns `1` on success.
+    fn EVP_EncryptUpdate(ctx: *mut c_void, out: *mut u8, outl: *mut c_int, inp: *const u8, inl: c_int) -> c_int;
+    /// `EVP_EncryptFinal_ex(ctx, out, outl)` — finalize (a stream AEAD emits no extra bytes). Returns
+    /// `1` on success.
+    fn EVP_EncryptFinal_ex(ctx: *mut c_void, out: *mut u8, outl: *mut c_int) -> c_int;
+    /// `EVP_DecryptInit_ex(ctx, cipher, impl, key, iv)` — initialize `ctx` for decryption. `1` on ok.
+    fn EVP_DecryptInit_ex(ctx: *mut c_void, cipher: *const c_void, imp: *mut c_void, key: *const u8, iv: *const u8) -> c_int;
+    /// `EVP_DecryptUpdate(ctx, out, outl, in, inl)` — decrypt `inl` bytes; a null `out` feeds AAD.
+    /// Releases plaintext BEFORE the tag is verified (see the P2 note). Returns `1` on success.
+    fn EVP_DecryptUpdate(ctx: *mut c_void, out: *mut u8, outl: *mut c_int, inp: *const u8, inl: c_int) -> c_int;
+    /// `EVP_DecryptFinal_ex(ctx, out, outl)` — the authentication gate: returns `1` **iff** the tag
+    /// set via `EVP_CTRL_AEAD_SET_TAG` verifies, else `0`. A stream AEAD emits no extra bytes.
+    fn EVP_DecryptFinal_ex(ctx: *mut c_void, out: *mut u8, outl: *mut c_int) -> c_int;
+    /// `EVP_CIPHER_CTX_ctrl(ctx, type, arg, ptr)` — the control channel; here `GET_TAG` (read the
+    /// computed tag, `ptr` writable) / `SET_TAG` (set the expected tag, `ptr` read-only). `1` on ok.
+    fn EVP_CIPHER_CTX_ctrl(ctx: *mut c_void, typ: c_int, arg: c_int, ptr: *mut c_void) -> c_int;
+    /// `OPENSSL_cleanse(ptr, len)` — zero `len` bytes at `ptr` in a way the optimizer cannot elide
+    /// (unlike a plain `memset` on a soon-freed buffer). Used to wipe unverified plaintext on an open
+    /// failure (P2).
+    fn OPENSSL_cleanse(ptr: *mut c_void, len: usize);
+}
+
+/// The engine steps of a seal, run with a live `ctx`/`cipher` — init, feed AAD, encrypt the whole
+/// plaintext into `out[..pt.len()]`, finalize, and append the 16-byte tag at `out[pt.len()..]`.
+/// Returns `true` only if every step succeeded and the stream AEAD produced exactly plaintext-length
+/// ciphertext (so the tag lands where `ciphertext || tag` expects). `out` is sized `pt.len() + 16`.
+///
+/// # Safety
+/// `ctx` must be a live `EVP_CIPHER_CTX` and `cipher` a live fetched `EVP_CIPHER`; `key`/`nonce` are
+/// the validated 32/12-byte views; `pt_c`/`aad_c` are `pt.len()`/`aad.len()` as `c_int`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn aead_seal_run(
+    ctx: *mut c_void,
+    cipher: *mut c_void,
+    key: &[u8],
+    nonce: &[u8],
+    pt: &[u8],
+    aad: &[u8],
+    out: &mut [u8],
+    pt_c: c_int,
+    aad_c: c_int,
+) -> bool {
+    // 12-byte nonce is the default IV length for both ciphers, so no `EVP_CTRL_AEAD_SET_IVLEN`.
+    if unsafe { EVP_EncryptInit_ex(ctx, cipher as *const c_void, core::ptr::null_mut(), key.as_ptr(), nonce.as_ptr()) } != 1 {
+        return false;
+    }
+    // AAD (if any) is fed with a null output pointer.
+    if !aad.is_empty() {
+        let mut adl: c_int = 0;
+        if unsafe { EVP_EncryptUpdate(ctx, core::ptr::null_mut(), &mut adl, aad.as_ptr(), aad_c) } != 1 {
+            return false;
+        }
+    }
+    // Encrypt the whole plaintext (a stream AEAD: ciphertext length == plaintext length).
+    let mut outl: c_int = 0;
+    if unsafe { EVP_EncryptUpdate(ctx, out.as_mut_ptr(), &mut outl, pt.as_ptr(), pt_c) } != 1 {
+        return false;
+    }
+    let Ok(written) = usize::try_from(outl) else { return false };
+    if written > pt.len() {
+        return false;
+    }
+    // Finalize into out[written..] (a stream AEAD emits no extra bytes).
+    let mut finl: c_int = 0;
+    if unsafe { EVP_EncryptFinal_ex(ctx, out[written..].as_mut_ptr(), &mut finl) } != 1 {
+        return false;
+    }
+    let Ok(fin) = usize::try_from(finl) else { return false };
+    // Defensive: exactly plaintext-length ciphertext, so the tag lands at out[pt.len()..].
+    if written + fin != pt.len() {
+        return false;
+    }
+    // Append the 16-byte tag right after the ciphertext.
+    let tag_rc = unsafe {
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, AEAD_TAG_LEN as c_int, out[pt.len()..].as_mut_ptr() as *mut c_void)
+    };
+    tag_rc == 1
+}
+
+/// Seal (authenticated-encrypt) `pt` under `key`/`nonce` with associated data `aad`, param-swapped by
+/// the fetched `cipher_name`. Public validation first (P1): `key` == 32, `nonce` == 12, and `pt`/`aad`
+/// within the 1 GiB cap → else `Error.Invalid` (`AL_INVALID`) before any engine call. Then fetch the
+/// cipher, encrypt, and return the owned `ciphertext || tag` buffer. Frees the ctx + cipher on EVERY
+/// path. A seal failure *after* param validation is an engine error → `Error.Code` (`AL_CODE`).
+fn aead_seal(cipher_name: &core::ffi::CStr, key: &[u8], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Result<Vec<u8>, i32> {
+    if key.len() != AEAD_KEY_LEN || nonce.len() != AEAD_NONCE_LEN {
+        return Err(AL_INVALID);
+    }
+    if pt.len() > AEAD_MAX_INPUT || aad.len() > AEAD_MAX_INPUT {
+        return Err(AL_INVALID);
+    }
+    // `pt.len() <= 1 GiB`, so these cannot actually fail; use the checked/`try_from` forms per the
+    // FFI-safety discipline (never a silent wrap or `as` truncation).
+    let out_cap = pt.len().checked_add(AEAD_TAG_LEN).ok_or(AL_INVALID)?;
+    let pt_c = c_int::try_from(pt.len()).map_err(|_| AL_INVALID)?;
+    let aad_c = c_int::try_from(aad.len()).map_err(|_| AL_INVALID)?;
+
+    let cipher = unsafe { EVP_CIPHER_fetch(core::ptr::null_mut(), cipher_name.as_ptr(), core::ptr::null()) };
+    if cipher.is_null() {
+        return Err(AL_CODE);
+    }
+    let ctx = unsafe { EVP_CIPHER_CTX_new() };
+    if ctx.is_null() {
+        unsafe { EVP_CIPHER_free(cipher) };
+        return Err(AL_CODE);
+    }
+    // Own the exact-length output (ciphertext || tag) via a fallible reserve (never `vec![0; n]`,
+    // which aborts on OOM). `resize` cannot reallocate — the capacity is already reserved.
+    let mut out: Vec<u8> = Vec::new();
+    if out.try_reserve_exact(out_cap).is_err() {
+        unsafe { EVP_CIPHER_CTX_free(ctx) };
+        unsafe { EVP_CIPHER_free(cipher) };
+        return Err(AL_CODE);
+    }
+    out.resize(out_cap, 0);
+
+    let ok = unsafe { aead_seal_run(ctx, cipher, key, nonce, pt, aad, &mut out, pt_c, aad_c) };
+    unsafe { EVP_CIPHER_CTX_free(ctx) };
+    unsafe { EVP_CIPHER_free(cipher) };
+    if ok { Ok(out) } else { Err(AL_CODE) }
+}
+
+/// The engine steps of an open, run with a live `ctx`/`cipher` — init, feed AAD, decrypt the whole
+/// ciphertext `body` into the staging buffer `plain`, set the expected `tag`, and finalize (the
+/// authentication gate). Returns `true` **iff** `EVP_DecryptFinal_ex` reported a verified tag and the
+/// stream AEAD produced exactly `body`-length plaintext. On `false`, `plain` may hold unverified
+/// plaintext — the caller MUST cleanse it (P2). `plain` is sized `body.len()`.
+///
+/// # Safety
+/// `ctx`/`cipher` live; `key`/`nonce` the validated 32/12-byte views; `tag` the trailing 16 bytes of
+/// the combined input; `body_c`/`aad_c` are `body.len()`/`aad.len()` as `c_int`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn aead_open_run(
+    ctx: *mut c_void,
+    cipher: *mut c_void,
+    key: &[u8],
+    nonce: &[u8],
+    body: &[u8],
+    aad: &[u8],
+    tag: &[u8],
+    plain: &mut [u8],
+    body_c: c_int,
+    aad_c: c_int,
+) -> bool {
+    if unsafe { EVP_DecryptInit_ex(ctx, cipher as *const c_void, core::ptr::null_mut(), key.as_ptr(), nonce.as_ptr()) } != 1 {
+        return false;
+    }
+    if !aad.is_empty() {
+        let mut adl: c_int = 0;
+        if unsafe { EVP_DecryptUpdate(ctx, core::ptr::null_mut(), &mut adl, aad.as_ptr(), aad_c) } != 1 {
+            return false;
+        }
+    }
+    // Decrypt the whole ciphertext into the internal staging buffer. This releases plaintext BEFORE
+    // the tag is checked below — exactly why we stage it internally and never stream it out (P2).
+    let mut outl: c_int = 0;
+    if unsafe { EVP_DecryptUpdate(ctx, plain.as_mut_ptr(), &mut outl, body.as_ptr(), body_c) } != 1 {
+        return false;
+    }
+    let Ok(written) = usize::try_from(outl) else { return false };
+    if written > plain.len() {
+        return false;
+    }
+    // Set the EXPECTED tag (the trailing 16 bytes of the combined input) before finalizing. `SET_TAG`
+    // only reads `ptr`, so casting away `const` is sound.
+    if unsafe { EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, AEAD_TAG_LEN as c_int, tag.as_ptr() as *mut c_void) } != 1 {
+        return false;
+    }
+    // The authentication gate: `EVP_DecryptFinal_ex` returns 1 iff the tag verifies.
+    let mut finl: c_int = 0;
+    if unsafe { EVP_DecryptFinal_ex(ctx, plain[written..].as_mut_ptr(), &mut finl) } != 1 {
+        return false;
+    }
+    let Ok(fin) = usize::try_from(finl) else { return false };
+    // Defensive: a stream AEAD emits exactly ciphertext-length plaintext.
+    written + fin == plain.len()
+}
+
+/// Open (verify + authenticated-decrypt) the combined `ciphertext || tag` input `ct` under
+/// `key`/`nonce` with associated data `aad`, param-swapped by `cipher_name`. **All-or-nothing** (P2):
+/// on ANY failure — bad key/nonce length, a too-short/oversized input, an engine error, or (the
+/// common case) a tag mismatch — the staged plaintext is `OPENSSL_cleanse`d and freed, and the single
+/// opaque `Error.Invalid` (`AL_INVALID`) is returned; the failure modes are indistinguishable, and no
+/// unverified plaintext ever reaches the caller. Frees the ctx + cipher on EVERY path.
+fn aead_open(cipher_name: &core::ffi::CStr, key: &[u8], nonce: &[u8], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>, i32> {
+    // Public validation (P1); every failure below is the single opaque `AL_INVALID` (P2).
+    if key.len() != AEAD_KEY_LEN || nonce.len() != AEAD_NONCE_LEN {
+        return Err(AL_INVALID);
+    }
+    // Combined format: input is `ciphertext || tag`, so it must hold at least the 16-byte tag.
+    if ct.len() < AEAD_TAG_LEN {
+        return Err(AL_INVALID);
+    }
+    let body_len = ct.len() - AEAD_TAG_LEN;
+    if body_len > AEAD_MAX_INPUT || aad.len() > AEAD_MAX_INPUT {
+        return Err(AL_INVALID);
+    }
+    let body_c = c_int::try_from(body_len).map_err(|_| AL_INVALID)?;
+    let aad_c = c_int::try_from(aad.len()).map_err(|_| AL_INVALID)?;
+    // `body` = the ciphertext, `tag` = the trailing 16 bytes.
+    let (body, tag) = ct.split_at(body_len);
+
+    let cipher = unsafe { EVP_CIPHER_fetch(core::ptr::null_mut(), cipher_name.as_ptr(), core::ptr::null()) };
+    if cipher.is_null() {
+        return Err(AL_INVALID);
+    }
+    let ctx = unsafe { EVP_CIPHER_CTX_new() };
+    if ctx.is_null() {
+        unsafe { EVP_CIPHER_free(cipher) };
+        return Err(AL_INVALID);
+    }
+    // Stage the WHOLE plaintext into an internal owned buffer (P2 — never streamed to the caller),
+    // fallibly reserved.
+    let mut plain: Vec<u8> = Vec::new();
+    if plain.try_reserve_exact(body_len).is_err() {
+        unsafe { EVP_CIPHER_CTX_free(ctx) };
+        unsafe { EVP_CIPHER_free(cipher) };
+        return Err(AL_INVALID);
+    }
+    plain.resize(body_len, 0);
+
+    let verified = unsafe { aead_open_run(ctx, cipher, key, nonce, body, aad, tag, &mut plain, body_c, aad_c) };
+    unsafe { EVP_CIPHER_CTX_free(ctx) };
+    unsafe { EVP_CIPHER_free(cipher) };
+
+    if verified {
+        Ok(plain)
+    } else {
+        // All-or-nothing (P2): cleanse the staged (unverified) plaintext so no bytes survive in freed
+        // memory, then drop it. Return the single opaque failure.
+        unsafe { OPENSSL_cleanse(plain.as_mut_ptr() as *mut c_void, plain.len()) };
+        drop(plain);
+        Err(AL_INVALID)
+    }
+}
+
+/// `crypto.aes_gcm_seal(key, nonce, plaintext, aad)` — AES-256-GCM seal → an owned `ciphertext || tag`
+/// `buffer`. See [`aead_seal`]. NONCE REUSE UNDER THE SAME KEY IS CATASTROPHIC for GCM (P3) — the
+/// caller must supply a unique nonce (e.g. `crypto.random`).
+///
+/// # Safety
+/// each `{ptr,len}` pair must be a valid byte view (or null with a non-positive length); `out` must
+/// point to a writable handle slot.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_aes_gcm_seal(
+    key_ptr: *const u8,
+    key_len: i64,
+    nonce_ptr: *const u8,
+    nonce_len: i64,
+    pt_ptr: *const u8,
+    pt_len: i64,
+    aad_ptr: *const u8,
+    aad_len: i64,
+    out: *mut *mut Buffer,
+) -> i32 {
+    let key = unsafe { bytes_view(key_ptr, key_len) };
+    let nonce = unsafe { bytes_view(nonce_ptr, nonce_len) };
+    let pt = unsafe { bytes_view(pt_ptr, pt_len) };
+    let aad = unsafe { bytes_view(aad_ptr, aad_len) };
+    unsafe { publish_buffer(aead_seal(c"AES-256-GCM", key, nonce, pt, aad), out) }
+}
+
+/// `crypto.aes_gcm_open(key, nonce, ciphertext, aad)` — AES-256-GCM open (verify + decrypt) of a
+/// combined `ciphertext || tag`. All-or-nothing (P2): any failure → the single opaque `Error.Invalid`,
+/// no partial plaintext. See [`aead_open`].
+///
+/// # Safety
+/// each `{ptr,len}` pair must be a valid byte view (or null with a non-positive length); `out` must
+/// point to a writable handle slot.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_aes_gcm_open(
+    key_ptr: *const u8,
+    key_len: i64,
+    nonce_ptr: *const u8,
+    nonce_len: i64,
+    ct_ptr: *const u8,
+    ct_len: i64,
+    aad_ptr: *const u8,
+    aad_len: i64,
+    out: *mut *mut Buffer,
+) -> i32 {
+    let key = unsafe { bytes_view(key_ptr, key_len) };
+    let nonce = unsafe { bytes_view(nonce_ptr, nonce_len) };
+    let ct = unsafe { bytes_view(ct_ptr, ct_len) };
+    let aad = unsafe { bytes_view(aad_ptr, aad_len) };
+    unsafe { publish_buffer(aead_open(c"AES-256-GCM", key, nonce, ct, aad), out) }
+}
+
+/// `crypto.chacha20_poly1305_seal(key, nonce, plaintext, aad)` — ChaCha20-Poly1305 seal → an owned
+/// `ciphertext || tag` `buffer`. See [`aead_seal`]. Nonce reuse under the same key is catastrophic
+/// (P3) — the caller supplies a unique nonce.
+///
+/// # Safety
+/// each `{ptr,len}` pair must be a valid byte view (or null with a non-positive length); `out` must
+/// point to a writable handle slot.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_chacha20_poly1305_seal(
+    key_ptr: *const u8,
+    key_len: i64,
+    nonce_ptr: *const u8,
+    nonce_len: i64,
+    pt_ptr: *const u8,
+    pt_len: i64,
+    aad_ptr: *const u8,
+    aad_len: i64,
+    out: *mut *mut Buffer,
+) -> i32 {
+    let key = unsafe { bytes_view(key_ptr, key_len) };
+    let nonce = unsafe { bytes_view(nonce_ptr, nonce_len) };
+    let pt = unsafe { bytes_view(pt_ptr, pt_len) };
+    let aad = unsafe { bytes_view(aad_ptr, aad_len) };
+    unsafe { publish_buffer(aead_seal(c"ChaCha20-Poly1305", key, nonce, pt, aad), out) }
+}
+
+/// `crypto.chacha20_poly1305_open(key, nonce, ciphertext, aad)` — ChaCha20-Poly1305 open of a combined
+/// `ciphertext || tag`. All-or-nothing (P2): any failure → the single opaque `Error.Invalid`. See
+/// [`aead_open`].
+///
+/// # Safety
+/// each `{ptr,len}` pair must be a valid byte view (or null with a non-positive length); `out` must
+/// point to a writable handle slot.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_chacha20_poly1305_open(
+    key_ptr: *const u8,
+    key_len: i64,
+    nonce_ptr: *const u8,
+    nonce_len: i64,
+    ct_ptr: *const u8,
+    ct_len: i64,
+    aad_ptr: *const u8,
+    aad_len: i64,
+    out: *mut *mut Buffer,
+) -> i32 {
+    let key = unsafe { bytes_view(key_ptr, key_len) };
+    let nonce = unsafe { bytes_view(nonce_ptr, nonce_len) };
+    let ct = unsafe { bytes_view(ct_ptr, ct_len) };
+    let aad = unsafe { bytes_view(aad_ptr, aad_len) };
+    unsafe { publish_buffer(aead_open(c"ChaCha20-Poly1305", key, nonce, ct, aad), out) }
+}
+
+// ---------------------------------------------------------------------------------------------
 // std.cli (M10 Slice 3) — a flag-registration parser over `main(args: array<str>)`'s `array<str>`
 // (the one argv source). Pure in-language (no syscalls — argv is already captured). A `cli command`
 // (`CliCommand`) is a Move handle owning its registered-flag table; `c.parse(args)` **borrows** it
@@ -11475,6 +11878,208 @@ mod tests {
         // Empty salt + empty info + empty ikm still derive (OpenSSL accepts a zero-length key).
         let out = hkdf(b"", b"", b"", 32).expect("empty inputs derive");
         assert_eq!(out.len(), 32);
+    }
+
+    // std.crypto Slice 4 — AEAD (aes_gcm + chacha20_poly1305). Drive the entry points directly
+    // against the NIST AES-256-GCM (GCM spec Test Case 16) / RFC 8439 §2.8.2 ChaCha20-Poly1305 known
+    // vectors, round-trips, the all-or-nothing tamper cases (P2), the public-length rejections (P1),
+    // and cross-cipher confusion — all with no leak.
+
+    /// Decode a lower-case hex string to bytes (test-only inverse of [`hex_encode_bytes`]).
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2), "hex must be even length");
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex")).collect()
+    }
+
+    /// The four AEAD entry points, indexed by (cipher, direction), for parameterized tests.
+    type AeadFn = unsafe extern "C" fn(*const u8, i64, *const u8, i64, *const u8, i64, *const u8, i64, *mut *mut Buffer) -> i32;
+
+    /// Drive a seal/open entry point and return the produced bytes (freeing the published `buffer`),
+    /// or the error status. A failed call must leave the out handle null (no leak).
+    fn aead_call(f: AeadFn, key: &[u8], nonce: &[u8], input: &[u8], aad: &[u8]) -> Result<Vec<u8>, i32> {
+        let mut out: *mut Buffer = std::ptr::null_mut();
+        let rc = unsafe {
+            f(
+                key.as_ptr(),
+                key.len() as i64,
+                nonce.as_ptr(),
+                nonce.len() as i64,
+                input.as_ptr(),
+                input.len() as i64,
+                aad.as_ptr(),
+                aad.len() as i64,
+                &mut out,
+            )
+        };
+        if rc != 0 {
+            assert!(out.is_null(), "a failed AEAD call leaves the out handle null (no leak)");
+            return Err(rc);
+        }
+        assert!(!out.is_null());
+        let b = unsafe { &*out };
+        let v = b.data[..b.len].to_vec();
+        unsafe { align_rt_buffer_free(out) };
+        Ok(v)
+    }
+
+    #[test]
+    fn aes_gcm_seal_nist_test_case_16() {
+        // NIST GCM spec (McGrew & Viega) Test Case 16 — AES-256-GCM with 60-byte plaintext + 20-byte
+        // AAD. The combined output is ciphertext || 16-byte tag.
+        let key = hex_bytes("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308");
+        let nonce = hex_bytes("cafebabefacedbaddecaf888");
+        let pt = hex_bytes(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39",
+        );
+        let aad = hex_bytes("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+        let ct = "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662";
+        let tag = "76fc6ece0f4e1768cddf8853bb2d551b";
+        let sealed = aead_call(align_rt_crypto_aes_gcm_seal, &key, &nonce, &pt, &aad).expect("seal");
+        assert_eq!(sealed.len(), pt.len() + 16);
+        assert_eq!(hex_encode_bytes(&sealed), format!("{ct}{tag}"), "combined ciphertext || tag");
+        // Round-trip: open recovers exactly the plaintext.
+        let opened = aead_call(align_rt_crypto_aes_gcm_open, &key, &nonce, &sealed, &aad).expect("open");
+        assert_eq!(opened, pt);
+    }
+
+    #[test]
+    fn chacha20_poly1305_seal_rfc8439_vector() {
+        // RFC 8439 §2.8.2 — ChaCha20-Poly1305 AEAD. Combined output = ciphertext || 16-byte tag.
+        let key = hex_bytes("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+        let nonce = hex_bytes("070000004041424344454647");
+        let aad = hex_bytes("50515253c0c1c2c3c4c5c6c7");
+        let pt = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let ct = "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116";
+        let tag = "1ae10b594f09e26a7e902ecbd0600691";
+        let sealed = aead_call(align_rt_crypto_chacha20_poly1305_seal, &key, &nonce, pt, &aad).expect("seal");
+        assert_eq!(hex_encode_bytes(&sealed), format!("{ct}{tag}"), "combined ciphertext || tag");
+        let opened = aead_call(align_rt_crypto_chacha20_poly1305_open, &key, &nonce, &sealed, &aad).expect("open");
+        assert_eq!(opened, pt.to_vec());
+    }
+
+    #[test]
+    fn aead_round_trips_edge_shapes() {
+        let key = [0x11u8; 32];
+        let nonce = [0x22u8; 12];
+        for (seal, open) in [
+            (align_rt_crypto_aes_gcm_seal as AeadFn, align_rt_crypto_aes_gcm_open as AeadFn),
+            (align_rt_crypto_chacha20_poly1305_seal as AeadFn, align_rt_crypto_chacha20_poly1305_open as AeadFn),
+        ] {
+            // Empty plaintext → a tag-only 16-byte output that round-trips to empty.
+            let sealed = aead_call(seal, &key, &nonce, b"", b"aad").expect("seal empty pt");
+            assert_eq!(sealed.len(), 16, "empty plaintext → 16-byte tag-only output");
+            assert_eq!(aead_call(open, &key, &nonce, &sealed, b"aad").expect("open empty pt"), Vec::<u8>::new());
+
+            // Empty aad round-trips.
+            let s2 = aead_call(seal, &key, &nonce, b"hello world", b"").expect("seal empty aad");
+            assert_eq!(aead_call(open, &key, &nonce, &s2, b"").expect("open empty aad"), b"hello world".to_vec());
+
+            // Large (~1 MiB) plaintext round-trips.
+            let big = vec![0x5au8; 1 << 20];
+            let s3 = aead_call(seal, &key, &nonce, &big, b"meta").expect("seal 1 MiB");
+            assert_eq!(s3.len(), big.len() + 16);
+            assert_eq!(aead_call(open, &key, &nonce, &s3, b"meta").expect("open 1 MiB"), big);
+        }
+    }
+
+    #[test]
+    fn aead_open_all_or_nothing_on_tamper() {
+        // P2: every tamper / truncation is the single opaque `Error.Invalid`, and the Err arm carries
+        // no plaintext (aead_call already asserts the out handle is null on Err).
+        let key = [0x33u8; 32];
+        let nonce = [0x44u8; 12];
+        for (seal, open) in [
+            (align_rt_crypto_aes_gcm_seal as AeadFn, align_rt_crypto_aes_gcm_open as AeadFn),
+            (align_rt_crypto_chacha20_poly1305_seal as AeadFn, align_rt_crypto_chacha20_poly1305_open as AeadFn),
+        ] {
+            let pt = b"attack at dawn";
+            let aad = b"context";
+            let sealed = aead_call(seal, &key, &nonce, pt, aad).expect("seal");
+
+            // Flip the last byte (the tag) → Invalid.
+            let mut t = sealed.clone();
+            *t.last_mut().unwrap() ^= 0x01;
+            assert_eq!(aead_call(open, &key, &nonce, &t, aad), Err(AL_INVALID), "flipped tag");
+
+            // Flip the first byte (the ciphertext) → Invalid.
+            let mut c = sealed.clone();
+            c[0] ^= 0x01;
+            assert_eq!(aead_call(open, &key, &nonce, &c, aad), Err(AL_INVALID), "flipped ciphertext");
+
+            // Flip the aad on open → Invalid (authenticated data mismatch).
+            assert_eq!(aead_call(open, &key, &nonce, &sealed, b"contexT"), Err(AL_INVALID), "flipped aad");
+
+            // Truncate to 15 bytes (< tag) → Invalid; truncate to 0 → Invalid.
+            assert_eq!(aead_call(open, &key, &nonce, &sealed[..15], aad), Err(AL_INVALID), "truncated to 15");
+            assert_eq!(aead_call(open, &key, &nonce, b"", aad), Err(AL_INVALID), "truncated to 0");
+
+            // A correct open still succeeds (the tamper cases didn't corrupt state).
+            assert_eq!(aead_call(open, &key, &nonce, &sealed, aad).expect("clean open"), pt.to_vec());
+        }
+    }
+
+    #[test]
+    fn aead_wrong_key_or_nonce_length_is_invalid_before_engine() {
+        // Public-value validation (P1): a key != 32 or nonce != 12 is `Error.Invalid` before any
+        // engine call, for both seal and open. (No plaintext/ciphertext is touched.)
+        for seal in [align_rt_crypto_aes_gcm_seal as AeadFn, align_rt_crypto_chacha20_poly1305_seal as AeadFn] {
+            let n = [0u8; 12];
+            for kl in [16usize, 31, 33] {
+                assert_eq!(aead_call(seal, &vec![0u8; kl], &n, b"pt", b""), Err(AL_INVALID), "key len {kl}");
+            }
+            let k = [0u8; 32];
+            for nl in [11usize, 13, 16] {
+                assert_eq!(aead_call(seal, &k, &vec![0u8; nl], b"pt", b""), Err(AL_INVALID), "nonce len {nl}");
+            }
+        }
+        // Open validates lengths too (a >=16-byte input so it's the length, not truncation, that fails).
+        let sixteen = [0u8; 16];
+        for open in [align_rt_crypto_aes_gcm_open as AeadFn, align_rt_crypto_chacha20_poly1305_open as AeadFn] {
+            assert_eq!(aead_call(open, &[0u8; 31], &[0u8; 12], &sixteen, b""), Err(AL_INVALID), "open key len 31");
+            assert_eq!(aead_call(open, &[0u8; 32], &[0u8; 13], &sixteen, b""), Err(AL_INVALID), "open nonce len 13");
+        }
+    }
+
+    #[test]
+    fn aead_cross_cipher_confusion_is_invalid() {
+        // Sealing with AES-256-GCM and opening with ChaCha20-Poly1305 (same key/nonce) → Invalid: the
+        // tag never verifies under the wrong cipher, and no plaintext leaks (P2).
+        let key = [0x77u8; 32];
+        let nonce = [0x88u8; 12];
+        let sealed = aead_call(align_rt_crypto_aes_gcm_seal, &key, &nonce, b"secret", b"aad").expect("seal aes");
+        assert_eq!(
+            aead_call(align_rt_crypto_chacha20_poly1305_open, &key, &nonce, &sealed, b"aad"),
+            Err(AL_INVALID),
+            "AES-GCM output opened as ChaCha20-Poly1305"
+        );
+        // And the reverse.
+        let sealed2 = aead_call(align_rt_crypto_chacha20_poly1305_seal, &key, &nonce, b"secret", b"aad").expect("seal chacha");
+        assert_eq!(
+            aead_call(align_rt_crypto_aes_gcm_open, &key, &nonce, &sealed2, b"aad"),
+            Err(AL_INVALID),
+            "ChaCha20-Poly1305 output opened as AES-GCM"
+        );
+    }
+
+    #[test]
+    fn aead_null_out_is_invalid() {
+        // A null out handle is rejected without deriving (Invalid, via publish_buffer).
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+        let rc = unsafe {
+            align_rt_crypto_aes_gcm_seal(
+                key.as_ptr(),
+                32,
+                nonce.as_ptr(),
+                12,
+                b"pt".as_ptr(),
+                2,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, AL_INVALID);
     }
 
     // --- std.cli --------------------------------------------------------------------------------

@@ -1072,6 +1072,26 @@ fn build_module<'c>(
             None,
         ),
     );
+    // `std.crypto` (M11 Slice 4) — AEAD. Each of the four `{aes_gcm,chacha20_poly1305}_{seal,open}`
+    // entry points takes four byte views (key/nonce/input/aad, each `{ptr,len}`) + an out handle slot,
+    // returns an i32 status, and writes an owned `buffer` handle (ciphertext||tag on seal, plaintext on
+    // open) into `out` (the `std.compress`/hkdf status shape).
+    for name in ["crypto_aes_gcm_seal", "crypto_aes_gcm_open", "crypto_chacha20_poly1305_seal", "crypto_chacha20_poly1305_open"] {
+        funcs.insert(
+            name.to_string(),
+            module.add_function(
+                &format!("align_rt_{name}"),
+                ctx.i32_type().fn_type(
+                    &[
+                        ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(),
+                        ptr.into(),
+                    ],
+                    false,
+                ),
+                None,
+            ),
+        );
+    }
     // `std.compress` — gzip via libz / zstd via libzstd. compress (data view `{ptr,len}`, i64 level,
     // out: *handle) and decompress (data view `{ptr,len}`, out: *handle) both return an i32 status
     // (0 ok / AL_INVALID / AL_CODE+n), writing an owned `buffer` handle into `out`. Both codecs share
@@ -4767,6 +4787,34 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     )
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("hkdf_sha256 returns i32 status")
+            }
+            // std.crypto (Slice 4) — AEAD. The four byte views (key/nonce/input/aad) split to
+            // `{ptr,len}`; the out handle slot is caller-zeroed (so the Err path frees nothing); the
+            // runtime entry point is selected from the (cipher, dir) pair. Returns an i32 status.
+            Rvalue::CryptoAead { cipher, dir, key, nonce, input, aad, out } => {
+                use align_sema::hir::{AeadCipher, AeadDir};
+                let fk = match (cipher, dir) {
+                    (AeadCipher::Aes256Gcm, AeadDir::Seal) => "crypto_aes_gcm_seal",
+                    (AeadCipher::Aes256Gcm, AeadDir::Open) => "crypto_aes_gcm_open",
+                    (AeadCipher::ChaCha20Poly1305, AeadDir::Seal) => "crypto_chacha20_poly1305_seal",
+                    (AeadCipher::ChaCha20Poly1305, AeadDir::Open) => "crypto_chacha20_poly1305_open",
+                };
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (kp, kl) = self.split_str(key)?;
+                let (np, nl) = self.split_str(nonce)?;
+                let (ip, il) = self.split_str(input)?;
+                let (ap, al) = self.split_str(aad)?;
+                self.builder
+                    .build_call(
+                        self.funcs[fk],
+                        &[kp.into(), kl.into(), np.into(), nl.into(), ip.into(), il.into(), ap.into(), al.into(), out_ptr.into()],
+                        "aead",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("crypto aead returns i32 status")
             }
             // std.compress — gzip via libz / zstd via libzstd. The data view splits to `{ptr,len}`;
             // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime

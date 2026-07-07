@@ -2513,6 +2513,15 @@ impl EffectScan {
                 self.expr(info);
                 self.expr(len);
             }
+            // `crypto.{aes_gcm,chacha20_poly1305}_{seal,open}` — libcrypto AEAD, inferred **Impure**
+            // (never `Pure`, so excluded from `par_map`). Recurse the four byte-view operands.
+            ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
+                self.impure_direct = true;
+                self.expr(key);
+                self.expr(nonce);
+                self.expr(input);
+                self.expr(aad);
+            }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 self.stage_funcs(stages);
@@ -3666,6 +3675,14 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(info, depth);
                 self.walk(len, depth);
             }
+            // AEAD seal/open return a fresh owned `buffer` inside a `Result` (borrows nothing) — freely
+            // returnable. Recurse into the operands so any escape inside them is still checked.
+            ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
+                self.walk(key, depth);
+                self.walk(nonce, depth);
+                self.walk(input, depth);
+                self.walk(aad, depth);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -4089,6 +4106,12 @@ impl UnnecessaryHeapScan {
                 self.visit(ikm);
                 self.visit(info);
                 self.visit(len);
+            }
+            ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
+                self.visit(key);
+                self.visit(nonce);
+                self.visit(input);
+                self.visit(aad);
             }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
@@ -4825,6 +4848,14 @@ impl<'a> MoveCheck<'a> {
                 self.expr(ikm, moved, false, false);
                 self.expr(info, moved, false, false);
                 self.expr(len, moved, false, false);
+            }
+            // AEAD seal/open borrow every operand (never consume). Recurse non-consuming to catch a
+            // use-after-move inside them.
+            ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
+                self.expr(key, moved, false, false);
+                self.expr(nonce, moved, false, false);
+                self.expr(input, moved, false, false);
+                self.expr(aad, moved, false, false);
             }
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
@@ -7777,9 +7808,23 @@ impl<'a, 't> Checker<'a, 't> {
             // Pure) / `random(out)` (fill a `buffer` from the OS CSPRNG, Impure) from Slice 1;
             // `sha256(data)` / `sha512(data)` (EVP digests via libcrypto, Impure) from Slice 2.
             // `hmac_sha256(key, data)` (owned `array<u8>` tag) / `hkdf_sha256(salt, ikm, info, len)`
-            // (`Result<buffer, Error>`) are Slice 3, both Impure libcrypto calls.
+            // (`Result<buffer, Error>`) are Slice 3, both Impure libcrypto calls. The four AEAD
+            // surfaces `{aes_gcm,chacha20_poly1305}_{seal,open}(key, nonce, data, aad)` (Slice 4,
+            // `Result<buffer, Error>`) are Impure libcrypto calls too.
             if module == "crypto"
-                && matches!(method, "constant_time_equal" | "random" | "sha256" | "sha512" | "hmac_sha256" | "hkdf_sha256")
+                && matches!(
+                    method,
+                    "constant_time_equal"
+                        | "random"
+                        | "sha256"
+                        | "sha512"
+                        | "hmac_sha256"
+                        | "hkdf_sha256"
+                        | "aes_gcm_seal"
+                        | "aes_gcm_open"
+                        | "chacha20_poly1305_seal"
+                        | "chacha20_poly1305_open"
+                )
             {
                 self.require_import("std.crypto", &format!("crypto.{method}"), span);
                 return self.check_crypto_op(method, args, span);
@@ -11609,6 +11654,10 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "hkdf_sha256" {
             return self.check_crypto_hkdf(args, span);
         }
+        // `{aes_gcm,chacha20_poly1305}_{seal,open}` (Slice 4) — the AEAD builder.
+        if matches!(method, "aes_gcm_seal" | "aes_gcm_open" | "chacha20_poly1305_seal" | "chacha20_poly1305_open") {
+            return self.check_crypto_aead(method, args, span);
+        }
         if method == "constant_time_equal" {
             if args.len() != 2 {
                 self.diags
@@ -11711,6 +11760,52 @@ impl<'a, 't> Checker<'a, 't> {
                 ikm: Box::new(ikm),
                 info: Box::new(info),
                 len: Box::new(len),
+            },
+            ty: result_ty,
+            span,
+        }
+    }
+
+    /// `std.crypto` (M11 Slice 4) — the four AEAD surfaces
+    /// `{aes_gcm,chacha20_poly1305}_{seal,open}(key, nonce, data, aad)`, authenticated
+    /// encryption/decryption via OpenSSL libcrypto's `EVP_CIPHER`. All four arguments are byte views
+    /// (the shared [`Self::check_byte_view`]); both directions yield a `Result<buffer, Error>` (the
+    /// `std.compress` status→owned-`buffer` machinery). One [`ExprKind::CryptoAead`] node serves all
+    /// four — the method name selects the [`hir::AeadCipher`] and [`hir::AeadDir`]. Key/nonce length
+    /// (32/12) and the combined-format checks are **runtime** public-value validations (`Error.Invalid`
+    /// before any engine call); `data` (plaintext/ciphertext) and `aad` may be empty. **Impure**.
+    fn check_crypto_aead(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // The method name is one of the four routed here (see the dispatcher / `check_crypto_op`).
+        let (cipher, dir) = match method {
+            "aes_gcm_seal" => (hir::AeadCipher::Aes256Gcm, hir::AeadDir::Seal),
+            "aes_gcm_open" => (hir::AeadCipher::Aes256Gcm, hir::AeadDir::Open),
+            "chacha20_poly1305_seal" => (hir::AeadCipher::ChaCha20Poly1305, hir::AeadDir::Seal),
+            "chacha20_poly1305_open" => (hir::AeadCipher::ChaCha20Poly1305, hir::AeadDir::Open),
+            _ => unreachable!("crypto AEAD dispatch gated by the method-name matches! above"),
+        };
+        // Seal takes the plaintext; open takes the ciphertext — name the third argument accordingly.
+        let data_name = if matches!(dir, hir::AeadDir::Seal) { "plaintext" } else { "ciphertext" };
+        if args.len() != 4 {
+            self.diags.error(
+                format!("'crypto.{method}' expects 4 arguments (key, nonce, {data_name}, aad), got {}", args.len()),
+                span,
+            );
+            return err;
+        }
+        let Some(key) = self.check_byte_view(&args[0], &format!("crypto.{method}")) else { return err };
+        let Some(nonce) = self.check_byte_view(&args[1], &format!("crypto.{method}")) else { return err };
+        let Some(input) = self.check_byte_view(&args[2], &format!("crypto.{method}")) else { return err };
+        let Some(aad) = self.check_byte_view(&args[3], &format!("crypto.{method}")) else { return err };
+        let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
+        Expr {
+            kind: ExprKind::CryptoAead {
+                cipher,
+                dir,
+                key: Box::new(key),
+                nonce: Box::new(nonce),
+                input: Box::new(input),
+                aad: Box::new(aad),
             },
             ty: result_ty,
             span,
@@ -13309,6 +13404,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(ikm);
                 self.finalize_expr(info);
                 self.finalize_expr(len);
+            }
+            ExprKind::CryptoAead { key, nonce, input, aad, .. } => {
+                self.finalize_expr(key);
+                self.finalize_expr(nonce);
+                self.finalize_expr(input);
+                self.finalize_expr(aad);
             }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);

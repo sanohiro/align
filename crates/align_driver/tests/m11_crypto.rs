@@ -610,3 +610,321 @@ fn hmac_hkdf_wrong_shape_rejected() {
         "hkdf_sha256 with a non-i64 len must error"
     );
 }
+
+// --- AEAD: aes_gcm + chacha20_poly1305 (Slice 4) ----------------------------------------------
+//
+// `crypto.aes_gcm_seal/open` + `crypto.chacha20_poly1305_seal/open(key, nonce, data, aad) ->
+// Result<buffer, Error>` via OpenSSL libcrypto's EVP_CIPHER. Combined format: seal → `ciphertext ||
+// tag` (one buffer, 16-byte tag appended); open takes that same combined input. key = 32 bytes,
+// nonce = 12 bytes (public values, validated before the engine → Error.Invalid on a mismatch).
+// All-or-nothing open (P2): any tamper / truncation → the single opaque Error.Invalid, never partial
+// plaintext. Both Impure (a C-engine call), so par_map rejects them. Byte inputs for the known
+// vectors are built with `encoding.hex_decode(...).bytes()`; outputs are `hex_encode`d and compared.
+
+/// `aes_gcm_seal` matches the NIST GCM spec Test Case 16 (AES-256-GCM, 60-byte plaintext + 20-byte
+/// AAD); the combined output is the 60-byte ciphertext followed by the 16-byte tag, and `aes_gcm_open`
+/// round-trips it back to the original plaintext.
+#[test]
+fn aes_gcm_seal_open_nist_vector() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  key := encoding.hex_decode(\"feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308\")?
+  nonce := encoding.hex_decode(\"cafebabefacedbaddecaf888\")?
+  pt := encoding.hex_decode(\"d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39\")?
+  aad := encoding.hex_decode(\"feedfacedeadbeeffeedfacedeadbeefabaddad2\")?
+  sealed := crypto.aes_gcm_seal(key.bytes(), nonce.bytes(), pt.bytes(), aad.bytes())?
+  print(sealed.len())
+  print(encoding.hex_encode(sealed.bytes()))
+  opened := crypto.aes_gcm_open(key.bytes(), nonce.bytes(), sealed.bytes(), aad.bytes())?
+  print(encoding.hex_encode(opened.bytes()))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-aesgcm-vec", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "76\n\
+         522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f66276fc6ece0f4e1768cddf8853bb2d551b\n\
+         d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39\n"
+    );
+}
+
+/// `chacha20_poly1305_seal` matches the RFC 8439 §2.8.2 known-answer vector (combined ciphertext ||
+/// tag), and `chacha20_poly1305_open` round-trips it back to the original plaintext.
+#[test]
+fn chacha20_poly1305_seal_open_rfc8439_vector() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  key := encoding.hex_decode(\"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f\")?
+  nonce := encoding.hex_decode(\"070000004041424344454647\")?
+  aad := encoding.hex_decode(\"50515253c0c1c2c3c4c5c6c7\")?
+  pt := \"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.\"
+  sealed := crypto.chacha20_poly1305_seal(key.bytes(), nonce.bytes(), pt, aad.bytes())?
+  print(encoding.hex_encode(sealed.bytes()))
+  opened := crypto.chacha20_poly1305_open(key.bytes(), nonce.bytes(), sealed.bytes(), aad.bytes())?
+  print(encoding.hex_encode(opened.bytes()))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-chacha-vec", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691\n\
+         4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e\n"
+    );
+}
+
+/// Round-trip edge shapes for both ciphers: empty plaintext (→ a 16-byte tag-only output that opens
+/// back to empty), empty aad, and a large (~1 MiB, filled by `crypto.random`) plaintext. Prints one
+/// `true` per successful round-trip (compared in constant time).
+#[test]
+fn aead_round_trips_both_ciphers() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+pub fn main() -> Result<(), Error> {
+  k := buffer(32)
+  crypto.random(k)
+  n := buffer(12)
+  crypto.random(n)
+  // Empty plaintext → 16-byte tag-only output; opens back to empty.
+  s0 := crypto.aes_gcm_seal(k.bytes(), n.bytes(), \"\", \"aad\")?
+  print(s0.len())
+  o0 := crypto.aes_gcm_open(k.bytes(), n.bytes(), s0.bytes(), \"aad\")?
+  print(o0.len())
+  // Empty aad round-trips (chacha).
+  s1 := crypto.chacha20_poly1305_seal(k.bytes(), n.bytes(), \"hello world\", \"\")?
+  o1 := crypto.chacha20_poly1305_open(k.bytes(), n.bytes(), s1.bytes(), \"\")?
+  print(crypto.constant_time_equal(o1.bytes(), \"hello world\"))
+  // Large ~1 MiB plaintext round-trips (aes).
+  big := buffer(1048576)
+  crypto.random(big)
+  s2 := crypto.aes_gcm_seal(k.bytes(), n.bytes(), big.bytes(), \"meta\")?
+  print(s2.len())
+  o2 := crypto.aes_gcm_open(k.bytes(), n.bytes(), s2.bytes(), \"meta\")?
+  print(crypto.constant_time_equal(o2.bytes(), big.bytes()))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-aead-roundtrip", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // s0=16, o0=0, chacha rt true, s2 = 1048576+16 = 1048592, aes rt true.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "16\n0\ntrue\n1048592\ntrue\n");
+}
+
+/// All-or-nothing (P2), observed at the language level: an `open` that fails returns
+/// `Err(Error.Invalid)`, propagated by `?` to exit code 2, and the plaintext binding is never reached
+/// — no partial plaintext is observable. The exhaustive byte-flip tamper cases (tag / ciphertext /
+/// aad, and truncation to 15 / 0) are pinned in the `align_runtime` unit tests (`aead_open_*`), which
+/// can mutate individual bytes; here we cover the realistic in-language failure inputs: a wrong aad,
+/// a wrong key, and truncation via slicing. Each case exits 2 (Error.Invalid via `?`); a matching
+/// `match` variant prints nothing before the failing `open`, so a leak would show as stdout.
+#[test]
+fn aead_open_failures_are_invalid_and_yield_nothing() {
+    if !backend_available() {
+        return;
+    }
+    // Body fragment that seals `"top secret"` under a fresh key/nonce, then runs the `<open>`
+    // expression with `?` — reaching `print` only if the (wrong) open unexpectedly succeeded.
+    let mk = |open_expr: &str| -> String {
+        format!(
+            "\
+import std.crypto
+pub fn main() -> Result<(), Error> {{
+  k := buffer(32)
+  crypto.random(k)
+  n := buffer(12)
+  crypto.random(n)
+  sealed := crypto.aes_gcm_seal(k.bytes(), n.bytes(), \"top secret\", \"ctx\")?
+  wrong := buffer(32)
+  crypto.random(wrong)
+  pt := {open_expr}?
+  print(pt.len())
+  return Ok(())
+}}
+"
+        )
+    };
+    let cases: [(&str, &str); 4] = [
+        // Correct key/nonce/ciphertext, but a different aad → auth fails.
+        ("wrong-aad", "crypto.aes_gcm_open(k.bytes(), n.bytes(), sealed.bytes(), \"CTX\")"),
+        // A wrong key → auth fails.
+        ("wrong-key", "crypto.aes_gcm_open(wrong.bytes(), n.bytes(), sealed.bytes(), \"ctx\")"),
+        // Truncated to 15 bytes (< the 16-byte tag) → Invalid.
+        ("trunc-15", "crypto.aes_gcm_open(k.bytes(), n.bytes(), sealed.bytes()[0..15], \"ctx\")"),
+        // Truncated to empty → Invalid.
+        ("trunc-0", "crypto.aes_gcm_open(k.bytes(), n.bytes(), sealed.bytes()[0..0], \"ctx\")"),
+    ];
+    for (tag, expr) in cases {
+        let out = build_and_run(&format!("m11cr-aead-fail-{tag}"), &mk(expr));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{tag}: a failed open must be Error.Invalid (exit 2), never partial plaintext; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{tag}: no plaintext must be observable before the failing open");
+    }
+}
+
+/// Cross-cipher confusion (P2): sealing with AES-256-GCM and opening with ChaCha20-Poly1305 under the
+/// same key/nonce fails — the tag never verifies under the wrong cipher — → `Error.Invalid` (exit 2),
+/// with no plaintext observable.
+#[test]
+fn aead_cross_cipher_confusion_is_invalid() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+pub fn main() -> Result<(), Error> {
+  k := buffer(32)
+  crypto.random(k)
+  n := buffer(12)
+  crypto.random(n)
+  sealed := crypto.aes_gcm_seal(k.bytes(), n.bytes(), \"secret\", \"aad\")?
+  pt := crypto.chacha20_poly1305_open(k.bytes(), n.bytes(), sealed.bytes(), \"aad\")?
+  print(pt.len())
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-aead-crosscipher", prog);
+    assert_eq!(out.status.code(), Some(2), "cross-cipher open must be Error.Invalid; stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+/// Public-value validation (P1): a wrong key length (16/31/33) or wrong nonce length (11/13/16) is
+/// `Error.Invalid` (exit 2), rejected before any engine call, for both seal and open.
+#[test]
+fn aead_wrong_key_or_nonce_length_is_invalid() {
+    if !backend_available() {
+        return;
+    }
+    // `k` is the right length; we slice it to make wrong-length views (a slice<u8> is a byte view).
+    let mk = |op: &str, key_slice: &str, nonce_slice: &str| -> String {
+        format!(
+            "\
+import std.crypto
+pub fn main() -> Result<(), Error> {{
+  k := buffer(64)
+  crypto.random(k)
+  input := buffer(64)
+  crypto.random(input)
+  r := crypto.{op}(k.bytes()[0..{key_slice}], k.bytes()[0..{nonce_slice}], input.bytes(), \"aad\")?
+  print(r.len())
+  return Ok(())
+}}
+"
+        )
+    };
+    // seal: wrong key lengths (16/31/33), then wrong nonce lengths (11/13/16). open: two samples.
+    let cases: [(&str, &str, &str); 8] = [
+        ("aes_gcm_seal", "16", "12"),
+        ("aes_gcm_seal", "31", "12"),
+        ("aes_gcm_seal", "33", "12"),
+        ("chacha20_poly1305_seal", "32", "11"),
+        ("chacha20_poly1305_seal", "32", "13"),
+        ("chacha20_poly1305_seal", "32", "16"),
+        ("aes_gcm_open", "31", "12"),
+        ("chacha20_poly1305_open", "32", "13"),
+    ];
+    for (i, (op, kl, nl)) in cases.iter().enumerate() {
+        let out = build_and_run(&format!("m11cr-aead-len-{i}"), &mk(op, kl, nl));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{op} key[0..{kl}] nonce[0..{nl}] must be Error.Invalid; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The AEAD ops call the libcrypto engine — Impure. A closure that seals or opens is never `Pure`, so
+/// `par_map` (which requires a Pure closure) rejects it (one direction suffices per the slice plan;
+/// here seal + open).
+#[test]
+fn aead_impure_rejected_by_par_map() {
+    let seal_src = "\
+import std.crypto
+fn f(x: i64) -> i64 {
+  k := buffer(32)
+  crypto.random(k)
+  n := buffer(12)
+  crypto.random(n)
+  r := crypto.aes_gcm_seal(k.bytes(), n.bytes(), \"pt\", \"\")
+  return x + match r { Ok(b) => b.len(), Err(_) => 0 }
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11cr-aesgcm-parmap", seal_src), "an impure aes_gcm_seal closure must be rejected by par_map");
+
+    let open_src = "\
+import std.crypto
+fn f(x: i64) -> i64 {
+  k := buffer(32)
+  crypto.random(k)
+  n := buffer(12)
+  crypto.random(n)
+  r := crypto.chacha20_poly1305_open(k.bytes(), n.bytes(), \"0123456789abcdef\", \"\")
+  return x + match r { Ok(b) => b.len(), Err(_) => 0 }
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11cr-chacha-parmap", open_src), "an impure chacha20_poly1305_open closure must be rejected by par_map");
+}
+
+/// The four AEAD surfaces require `import std.crypto` and take exactly 4 byte-view arguments; a wrong
+/// arity or a non-byte-view argument is a compile error.
+#[test]
+fn aead_wrong_shape_rejected() {
+    // import gate.
+    assert!(
+        check_errs(
+            "m11cr-aead-noimport",
+            "pub fn main() -> Result<(), Error> {\n  r := crypto.aes_gcm_seal(\"k\", \"n\", \"p\", \"a\")?\n  print(r.len())\n  return Ok(())\n}\n"
+        ),
+        "aes_gcm_seal without `import std.crypto` must error"
+    );
+    // arity (3 args).
+    assert!(
+        check_errs(
+            "m11cr-aead-arity",
+            "import std.crypto\npub fn main() -> Result<(), Error> {\n  r := crypto.aes_gcm_open(\"k\", \"n\", \"c\")?\n  print(r.len())\n  return Ok(())\n}\n"
+        ),
+        "aes_gcm_open with 3 arguments must error"
+    );
+    // a non-byte-view argument (an i64 nonce).
+    assert!(
+        check_errs(
+            "m11cr-aead-type",
+            "import std.crypto\npub fn main() -> Result<(), Error> {\n  r := crypto.chacha20_poly1305_seal(\"k\", 12, \"p\", \"a\")?\n  print(r.len())\n  return Ok(())\n}\n"
+        ),
+        "chacha20_poly1305_seal on a non-byte-view nonce must error"
+    );
+}

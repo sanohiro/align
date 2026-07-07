@@ -927,6 +927,56 @@ pub enum ExprKind {
     /// libcrypto's `EVP_KDF` HKDF path. **Impure** (a C-engine call). All four operands are borrowed,
     /// never consumed.
     CryptoHkdf { salt: Box<Expr>, ikm: Box<Expr>, info: Box<Expr>, len: Box<Expr> },
+    /// `crypto.aes_gcm_seal` / `aes_gcm_open` / `chacha20_poly1305_seal` / `chacha20_poly1305_open`
+    /// (M11 Slice 4) — authenticated encryption (AEAD) over OpenSSL libcrypto's `EVP_CIPHER`. One node
+    /// serves all four surfaces: `cipher` param-swaps the fetched cipher (`"AES-256-GCM"` /
+    /// `"ChaCha20-Poly1305"`) and `dir` picks seal (encrypt) vs open (decrypt) — mirroring the
+    /// [`CompressKind`]-carrying compress nodes. Both directions yield `Result<buffer, Error>` (the
+    /// status→owned-`buffer` shape as [`ExprKind::Decompress`]; the `ty` is [`crate::Ty::Result`] of
+    /// `buffer` / `Error`).
+    ///
+    /// Combined format (the libsodium convention): seal's output `buffer` is `ciphertext || tag`
+    /// (the 16-byte authentication tag appended), and open's `input` is that same `ciphertext || tag`.
+    /// `key` must be exactly 32 bytes (both ciphers are 256-bit) and `nonce` exactly 12 bytes — public
+    /// values validated before any engine call, a violation → `Error.Invalid`. `plaintext`/`ciphertext`
+    /// (`input`) and `aad` may be empty (empty plaintext → a tag-only 16-byte output that round-trips).
+    ///
+    /// **All-or-nothing on open** (crypto.md P2): open never yields partial plaintext — the whole
+    /// ciphertext is decrypted into an internal buffer and released to the caller ONLY after the tag
+    /// verifies, and any failure (tag mismatch, truncation, bad length, engine error) is the single
+    /// opaque `Error.Invalid` (indistinguishable). Seal engine failures (after param validation) →
+    /// `Error.Code`. **Impure** (a C-engine call — never `Pure`, so excluded from `par_map`). All four
+    /// operands are borrowed byte views, never consumed.
+    ///
+    /// **Nonce discipline** (crypto.md P3): nonce reuse under the same key is catastrophic (GCM
+    /// especially — it destroys confidentiality and forgery resistance). v1 does not auto-generate
+    /// nonces; the caller supplies one (e.g. via `crypto.random`). A nonce-generating convenience is a
+    /// recorded candidate.
+    CryptoAead { cipher: AeadCipher, dir: AeadDir, key: Box<Expr>, nonce: Box<Expr>, input: Box<Expr>, aad: Box<Expr> },
+}
+
+/// Which AEAD cipher an [`ExprKind::CryptoAead`] uses (M11 Slice 4). Both are 256-bit (32-byte key)
+/// with a 96-bit (12-byte) nonce and a 128-bit (16-byte) tag; the axis param-swaps the fetched
+/// `EVP_CIPHER` name only. The HIR-walking passes treat it opaquely (they match `..`); only sema
+/// dispatch and codegen distinguish the two (the runtime picks the cipher by its entry point).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AeadCipher {
+    /// AES-256-GCM (NIST SP 800-38D) — constant-time on AES-NI/PCLMULQDQ hardware. EVP name
+    /// `"AES-256-GCM"`.
+    Aes256Gcm,
+    /// ChaCha20-Poly1305 (RFC 8439) — a constant-time software AEAD. EVP name `"ChaCha20-Poly1305"`.
+    ChaCha20Poly1305,
+}
+
+/// Which direction an [`ExprKind::CryptoAead`] runs (M11 Slice 4): seal (authenticated encryption) or
+/// open (authenticated decryption). The direction is this `dir`, the cipher is [`AeadCipher`] — one
+/// node kind serves all four `{aes_gcm,chacha20_poly1305}_{seal,open}` surfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AeadDir {
+    /// `_seal(key, nonce, plaintext, aad)` — encrypt + authenticate → `ciphertext || tag`.
+    Seal,
+    /// `_open(key, nonce, ciphertext, aad)` — verify + decrypt `ciphertext || tag`, all-or-nothing.
+    Open,
 }
 
 /// Which cryptographic hash an [`ExprKind::CryptoHash`] computes (M11 Slice 2). One node kind serves

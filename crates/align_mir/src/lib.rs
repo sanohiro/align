@@ -649,6 +649,15 @@ pub enum Rvalue {
     /// `AL_CODE+n` engine failure — see [`make_error_from_status`]); the caller branches
     /// `Ok(<buffer>)` / `Err(<mapped>)` via [`emit_status_buffer_result`]. Impure.
     CryptoHkdf { salt: Operand, ikm: Operand, info: Operand, len: Operand, out: Slot },
+    /// `crypto.{aes_gcm,chacha20_poly1305}_{seal,open}(key, nonce, input, aad)` — AEAD over the byte
+    /// views `key` / `nonce` / `input` (plaintext on seal, `ciphertext || tag` on open) / `aad` (each
+    /// `{ptr,len}`). `cipher` param-swaps the fetched `EVP_CIPHER`; `dir` picks seal vs open (codegen
+    /// selects one of the four runtime entry points from the pair). The runtime writes an owned
+    /// `buffer` handle into `out` and returns an `i32` status (0 ok; `AL_INVALID` → `Error.Invalid`
+    /// for a bad key/nonce length, a too-short/corrupt open input, or an open auth failure — the
+    /// single opaque failure, P2; `AL_CODE+n` → `Error.Code` only for a **seal** engine failure). The
+    /// caller branches `Ok(<buffer>)` / `Err(<mapped>)` via [`emit_status_buffer_result`]. Impure.
+    CryptoAead { cipher: hir::AeadCipher, dir: hir::AeadDir, key: Operand, nonce: Operand, input: Operand, aad: Operand, out: Slot },
     /// `rand.seed()` / `rand.seed_with(s)` — initialize an `rng` (four `i64`s, Xoshiro256++) into the
     /// slot `out`. `seed` is `None` for the OS-seeded form (`getrandom`), `Some(s)` for the
     /// deterministic form. Yields no value (the caller `Load`s `out` for the `rng` aggregate).
@@ -1752,6 +1761,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // front (the `expr_depth` headroom the #296 cap was measured against).
         hir::ExprKind::CryptoHmac { key, data } => lower_crypto_hmac(b, key, data, e.ty),
         hir::ExprKind::CryptoHkdf { salt, ikm, info, len } => lower_crypto_hkdf(b, salt, ikm, info, len, e.ty),
+        hir::ExprKind::CryptoAead { cipher, dir, key, nonce, input, aad } => {
+            lower_crypto_aead(b, *cipher, *dir, key, nonce, input, aad, e.ty)
+        }
         // `rand.seed()` / `rand.seed_with(s)` → initialize the `rng` state into a temp slot (the
         // runtime writes through the pointer), then load the `[4 x i64]` aggregate as the value.
         hir::ExprKind::RandSeed | hir::ExprKind::RandSeedWith { .. } => {
@@ -5356,6 +5368,32 @@ fn lower_crypto_hkdf(b: &mut Builder, salt: &hir::Expr, ikm: &hir::Expr, info: &
     let lv = lower_expr(b, len);
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::CryptoHkdf { salt: sv, ikm: iv, info: nv, len: lv, out }));
+    emit_status_buffer_result(b, code, out, ty)
+}
+
+/// `crypto.{aes_gcm,chacha20_poly1305}_{seal,open}(key, nonce, input, aad)` → the runtime writes an
+/// owned `buffer` into `out` + returns an i32 status; branch `Ok(<buffer>)` / `Err(<mapped>)` via the
+/// shared `std.compress` machinery. Out-of-line (`#[inline(never)]`) so its locals stay off the
+/// recursive `lower_expr` frame (see the call site — the #296 `expr_depth` headroom).
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn lower_crypto_aead(
+    b: &mut Builder,
+    cipher: hir::AeadCipher,
+    dir: hir::AeadDir,
+    key: &hir::Expr,
+    nonce: &hir::Expr,
+    input: &hir::Expr,
+    aad: &hir::Expr,
+    ty: Ty,
+) -> Operand {
+    let out = b.new_slot(Ty::Buffer);
+    let kv = lower_expr(b, key);
+    let nv = lower_expr(b, nonce);
+    let iv = lower_expr(b, input);
+    let av = lower_expr(b, aad);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::CryptoAead { cipher, dir, key: kv, nonce: nv, input: iv, aad: av, out }));
     emit_status_buffer_result(b, code, out, ty)
 }
 
