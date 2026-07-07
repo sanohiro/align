@@ -2491,6 +2491,14 @@ impl EffectScan {
                 self.impure_direct = true;
                 self.expr(out);
             }
+            // `crypto.sha256`/`sha512` — a C-engine (libcrypto) call, inferred **Impure** (draft §15:
+            // any extern-calling fn is non-Pure), so a hashing closure is rejected by `par_map`
+            // (matching `std.compress`; hashing's determinism does not make it pure). Recurse into
+            // the byte view.
+            ExprKind::CryptoHash { data, .. } => {
+                self.impure_direct = true;
+                self.expr(data);
+            }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 self.stage_funcs(stages);
@@ -3627,6 +3635,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(b, depth);
             }
             ExprKind::CryptoRandom { out } => self.walk(out, depth),
+            // `crypto.sha256`/`sha512` return a fresh *owned* `array<u8>` that borrows nothing (it
+            // owns its heap buffer, `Drop`-freed) — freely returnable, like `rand.sample`. Just
+            // recurse into the byte view so any escape *inside* it is still checked.
+            ExprKind::CryptoHash { data, .. } => self.walk(data, depth),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -4040,6 +4052,7 @@ impl UnnecessaryHeapScan {
                 self.visit(b);
             }
             ExprKind::CryptoRandom { out } => self.visit(out),
+            ExprKind::CryptoHash { data, .. } => self.visit(data),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
@@ -4761,6 +4774,9 @@ impl<'a> MoveCheck<'a> {
                 self.expr(b, moved, false, false);
             }
             ExprKind::CryptoRandom { out } => self.expr(out, moved, false, false),
+            // `crypto.sha256`/`sha512` borrow the byte view (never consume it). Recurse non-consuming
+            // to catch a use-after-move *inside* the operand.
+            ExprKind::CryptoHash { data, .. } => self.expr(data, moved, false, false),
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -7708,9 +7724,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.cli", "cli.command", span);
                 return self.check_cli_command(args, span);
             }
-            // `std.crypto` (M11 Slice 1) — `constant_time_equal(a, b)` (the self-hosted branchless
-            // CT byte-compare, Pure) / `random(out)` (fill a `buffer` from the OS CSPRNG, Impure).
-            if module == "crypto" && matches!(method, "constant_time_equal" | "random") {
+            // `std.crypto` — `constant_time_equal(a, b)` (the self-hosted branchless CT byte-compare,
+            // Pure) / `random(out)` (fill a `buffer` from the OS CSPRNG, Impure) from Slice 1;
+            // `sha256(data)` / `sha512(data)` (EVP digests via libcrypto, Impure) from Slice 2.
+            if module == "crypto" && matches!(method, "constant_time_equal" | "random" | "sha256" | "sha512") {
                 self.require_import("std.crypto", &format!("crypto.{method}"), span);
                 return self.check_crypto_op(method, args, span);
             }
@@ -11514,8 +11531,9 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::Compress { kind, data: Box::new(data), level: Box::new(level) }, ty: result_ty, span }
     }
 
-    /// `std.crypto` (M11 Slice 1) — the self-hosted `constant_time_equal` and the OS-CSPRNG
-    /// `random`. Builtins, dispatched like the other `std` namespaces.
+    /// `std.crypto` — the self-hosted `constant_time_equal` and the OS-CSPRNG `random` (Slice 1),
+    /// plus the `sha256`/`sha512` EVP digests (Slice 2, delegated to [`Self::check_crypto_hash`]).
+    /// Builtins, dispatched like the other `std` namespaces.
     ///
     /// - `constant_time_equal(a: bytes, b: bytes) -> bool` — a constant-time byte-equality test. Both
     ///   operands are byte views (`str` / owned `string` auto-borrowed / `slice<u8>`), same as the
@@ -11527,6 +11545,10 @@ impl<'a, 't> Checker<'a, 't> {
     ///   `reader.read`'s buffer). **Impure** (reads OS entropy); yields [`Ty::Unit`].
     fn check_crypto_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        // `sha256`/`sha512` (Slice 2) — the EVP digests; delegate to the shared hash builder.
+        if matches!(method, "sha256" | "sha512") {
+            return self.check_crypto_hash(method, args, span);
+        }
         if method == "constant_time_equal" {
             if args.len() != 2 {
                 self.diags
@@ -11558,6 +11580,27 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         Expr { kind: ExprKind::CryptoRandom { out: Box::new(out) }, ty: Ty::Unit, span }
+    }
+
+    /// `std.crypto` (M11 Slice 2) — `sha256(data)` / `sha512(data)`, the cryptographic digests via
+    /// OpenSSL libcrypto's EVP one-shot. Both take one byte view (`str` / owned `string` auto-borrowed
+    /// / `slice<u8>`, the shared [`Self::check_byte_view`], same as `std.compress`) and yield a fresh
+    /// **owned** `array<u8>` of the algorithm's fixed length (SHA-256 → 32, SHA-512 → 64), the
+    /// `rand.sample` return machinery. **Impure** (a C-engine call). The fixed length is a property of
+    /// the algorithm — carried as a dynamic [`Ty::DynArray`] of `u8` (the runtime-return ABI hands
+    /// back a `{ptr,len}` heap array; the runtime re-checks the length matches).
+    fn check_crypto_hash(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let algo = if method == "sha256" { hir::HashAlgo::Sha256 } else { hir::HashAlgo::Sha512 };
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'crypto.{method}' expects 1 argument (the data), got {}", args.len()), span);
+            return err;
+        }
+        let Some(data) = self.check_byte_view(&args[0], &format!("crypto.{method}")) else { return err };
+        // An owned `array<u8>` of unsigned 8-bit elements — the SHA-256/512 digest bytes.
+        let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
+        Expr { kind: ExprKind::CryptoHash { algo, data: Box::new(data) }, ty: Ty::DynArray(u8s), span }
     }
 
     /// Require `ty` to be **exactly** `i64` (the `align_rt_rng_*` runtime ABI), binding a bare-int-
@@ -13142,6 +13185,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(b);
             }
             ExprKind::CryptoRandom { out } => self.finalize_expr(out),
+            ExprKind::CryptoHash { data, .. } => self.finalize_expr(data),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);

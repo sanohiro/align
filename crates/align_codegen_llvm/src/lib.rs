@@ -1038,6 +1038,17 @@ fn build_module<'c>(
         "crypto_random".to_string(),
         module.add_function("align_rt_crypto_random", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
+    // `std.crypto` (M11 Slice 2). sha256 / sha512 (data view `{ptr,len}`) -> a fresh owned `array<u8>`
+    // `{ptr,len}` (32 / 64 bytes; the digest, returned by value like `rng_sample`; the bound local
+    // `Drop`-frees it). Both wrap libcrypto's `EVP_Q_digest`; an engine failure aborts in the runtime.
+    funcs.insert(
+        "crypto_sha256".to_string(),
+        module.add_function("align_rt_crypto_sha256", slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "crypto_sha512".to_string(),
+        module.add_function("align_rt_crypto_sha512", slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
     // `std.compress` — gzip via libz / zstd via libzstd. compress (data view `{ptr,len}`, i64 level,
     // out: *handle) and decompress (data view `{ptr,len}`, out: *handle) both return an i32 status
     // (0 ok / AL_INVALID / AL_CODE+n), writing an owned `buffer` handle into `out`. Both codecs share
@@ -4689,6 +4700,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["crypto_random"], &[op], "")
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
+            }
+            // std.crypto — sha256/sha512 split the data byte view to `{ptr,len}` and return a fresh
+            // owned `array<u8>` `{ptr,len}` (the digest), by value like `rng_sample`.
+            Rvalue::CryptoHash { algo, data } => {
+                let (dp, dl) = self.split_str(data)?;
+                let f = match algo {
+                    align_sema::hir::HashAlgo::Sha256 => self.funcs["crypto_sha256"],
+                    align_sema::hir::HashAlgo::Sha512 => self.funcs["crypto_sha512"],
+                };
+                self.builder
+                    .build_call(f, &[dp.into(), dl.into()], "digest")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("crypto sha returns a {ptr,len}")
             }
             // std.compress — gzip via libz / zstd via libzstd. The data view splits to `{ptr,len}`;
             // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime
