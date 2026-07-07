@@ -53,6 +53,20 @@ crypto.chacha20_poly1305_seal(...) / _open(...)    // same shape as aes_gcm
 crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-hosted
 ```
 
+**Shipped surface details (implementation record, 2026-07-07, PRs #384–#388):**
+`argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` is a **builtin struct**
+(reserved name, injected like the builtin `Error`; ordinary struct-literal construction and
+typechecking) — m_cost in KiB, t_cost iterations, parallelism lanes, len output bytes; validated
+before the engine (`parallelism 1..=2^24-1`, `t_cost 1..=u32max`, `m_cost 8*parallelism..=4 GiB-in-KiB` (= 4,194,304 KiB),
+`len 4..=1 GiB` → `Error.Invalid`; engine `threads` pinned to 1, `OSSL_set_max_threads` deferred).
+AEAD: both ciphers take 32-byte keys and 12-byte nonces (validated as public params →
+`Error.Invalid`); seal output is the **combined** `ciphertext || 16-byte tag` in one buffer; open
+requires `len >= 16`. hkdf `len` is bounded `1..=8160` (RFC 5869 L ≤ 255·HashLen). Digest/tag
+returns are dynamic `array<u8>` with algorithm-fixed lengths (a fixed-size `array<u8; N>` is not
+expressible in the runtime-return ABI today). All FFI ops are Impure; `constant_time_equal` is
+Pure and its branchless property is **verified against the compiled machine code** (release +
+debug disassembly — no content-dependent branch, no memcmp idiom).
+
 ## Type & ownership classification
 
 byte→byte / byte→owned buffer or fixed `array<u8>`. No new Move type (reuses buffer/array).

@@ -62,11 +62,42 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
 のはトランスポート/パースの失敗だけである。(これは意図的な One-way の判断である: HTTP のステータスは
 データであって、Result のエラーではない。)
 
+## Performance requirements (owner directive, 2026-07-07 — requirements, not aspirations)
+
+オーナーは std.http を **速く** したいと考えている。`open-questions.md` に記録された計測済みのレール
+(外部の design-note レビュー: keepalive 1.48×、pipeline 化した write-then-read 19.1×、並行数を絞った
+`get_many` は 64 リクエストで 12.8×)は、std の残りがすでに従っているゼロコピーの規律に加えて、v1 の
+エンジニアリング要件である。具体的には次のとおり。
+
+- **R1 — ゼロコピーのレスポンス**: 所有するレスポンスバッファは 1 つ。status 行 / ヘッダー / ボディは
+  **オフセットテーブル + そのバッファへのビュー** としてパースする(ヘッダーごとの `string` 割り当ても、
+  ボディのコピーも無い)。`resp.header()`/`resp.body()` はすでにリージョン束縛のビューを返している —
+  内部表現も実際にゼロコピーでなければならない。
+- **R2 — 初日から SIMD 裏打ちのスキャン**: ヘッダー/行のスキャンは、ランタイム既存の memchr レイヤー
+  (#310: AVX2+NEON+scalar、`str` 検索向けにすでに出荷済み)に乗せる — CRLF / `:` は memchr で見つけ、
+  1 バイトずつのスカラーループは決して使わない。simdjson 流の完全な構造的スキャン(JSON と共有する
+  バイト分類器)は後日の最適化として記録にとどめる。memchr は今日ただで使える。
+- **R3 — デフォルトでコネクション再利用**: プール(Slice 3)はオプションではなく要件である —
+  同じ host:port への `cl.get()` は、オプトイン無しで生きているコネクションを再利用する(keepalive)。
+  計測された 1.48× は下限であり、pipeline 化した 19.1× の形は `get_many` のバッチ処理がその上に築くもの
+  である。
+- **R4 — ホットパスの syscall 規律**: クライアントのコネクションに `TCP_NODELAY`(Nagle でリクエストの
+  末尾を遅延させない)。リクエスト全体(start-line + ヘッダー + ボディ)を 1 つのバッファにシリアライズ
+  し、**1 回の write** で送る(ヘッダーごとの write は無し)。ソケットの読み出しは M9 のバッファ付き
+  reader を通す(行ごとの read syscall は無し)。
+- **R5 — `get_many` = task_group + ParPool の claim ループ**(#301)で並行数を絞る — 計測された 12.8× の
+  I/O オーバーラップの形。新しい async ランタイムでは**ない**。`io_uring` は記録済みの決定どおり、後日の
+  Linux バックエンドにとどめる。
+- **R6 — ベンチマークで完了をゲートする**: `bench/http_client` のハーネス(ローカルの平文サーバ。
+  keepalive GET のレイテンシ/スループット + `get_many` のスケーリング)を Rust ベースラインに照らして
+  計測する — このリポジトリの「主張の前に計測」ルールに従い、数値が README に載るまでモジュールは
+  「速く仕上がった」とは言わない。
+
 ## New machinery required
 
 上記の Move 型 + net のソケット上での HTTP/1.1 のパース/シリアライズ + コネクションプールの再利用。新しい
 I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは先送り(HTTPS を塞ぐ)。ヘッダーのパース
-は v1 ではスカラー処理とする(simdjson 流の構造的スキャンは後日の最適化であり、記録のみ)。
+は **R2** に従い memchr 裏打ちのスキャンとする(完全な構造的スキャン/バイト分類器への格上げは後日に記録)。
 
 ## Slice breakdown
 
@@ -108,3 +139,4 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
 - プールが 2 回の get にまたがって conn を再利用する
 - Move の拒否 + 束縛していないレシーバの拒否
 - import が必須であること
+- `bench/http_client` の数値を Rust ベースラインに照らして記録する(R6 — 完了はベンチマークでゲートする)

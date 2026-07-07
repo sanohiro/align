@@ -1906,20 +1906,31 @@ impossible.
 
 ### std.crypto
 
-Cryptographic use.
+Cryptographic use. The engine is OpenSSL libcrypto (EVP, floor ≥ 3.2, always-linked) — see
+`docs/impl/std-design/crypto.md` for the full design; `constant_time_equal` is the one
+self-hosted primitive and its branchless (constant-time) property is verified against the
+compiled machine code, not just the source.
 
 ```text
-crypto.random
-sha256
-sha512
-blake3
-hmac
-hkdf
-argon2id
-aes_gcm
-chacha20_poly1305
-constant_time_equal
+crypto.random(out: mut buffer)                                  // OS CSPRNG fill
+crypto.sha256(data: bytes) -> array<u8>                         // 32-byte digest
+crypto.sha512(data: bytes) -> array<u8>                         // 64-byte digest
+crypto.blake3                                                   // deferred: no system engine provides BLAKE3
+crypto.hmac_sha256(key: bytes, data: bytes) -> array<u8>        // 32-byte tag
+crypto.hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, len: i64) -> Result<buffer, Error>
+crypto.argon2id(password: bytes, salt: bytes, params: argon2_params) -> Result<buffer, Error>
+crypto.aes_gcm_seal(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> Result<buffer, Error>
+crypto.aes_gcm_open(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> Result<buffer, Error>
+crypto.chacha20_poly1305_seal(...) / _open(...)                 // same shape as aes_gcm
+crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-hosted
 ```
+
+`argon2_params { m_cost: i64, t_cost: i64, parallelism: i64, len: i64 }` is a builtin struct
+(reserved name, ordinary struct literal): memory cost in KiB, iterations, lanes, and output
+length in bytes. AEAD uses 32-byte keys and 12-byte nonces; seal output is
+`ciphertext || 16-byte tag` (one buffer), and `open` is all-or-nothing — any failure returns a
+single opaque `Error.Invalid` with zero plaintext bytes released. Nonce reuse under the same key
+is catastrophic; v1 does not auto-generate nonces (pair with `crypto.random`).
 
 ### std.http
 

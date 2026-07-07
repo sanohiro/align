@@ -5,38 +5,46 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-07 (M11 std.compress COMPLETE #380–#381; 2026-07-06: std.process
-COMPLETE #376–#378, std.net COMPLETE #371–#374)._
+_Last updated: 2026-07-07 evening (M11 std.crypto COMPLETE #383–#388; same day: std.compress
+COMPLETE #380–#382; 2026-07-06: std.process #376–#378, std.net #371–#374)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #380–#381
-(std.compress slices 1–2), plus this docs PR. `cargo test --workspace` ≈ **1493 green**; clippy
+**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #384–#388
+(std.crypto slices 1–5), plus this docs PR. `cargo test --workspace` ≈ **1559 green**; clippy
 clean at `-D warnings`.
 
-**M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), and `std.compress`
-(#380–#381) are DONE.** Full shipped-feature summaries + per-slice decisions + deferral lists
-live in the roadmap's **M11 section** (`docs/impl/07-roadmap.md`) — that is the record; don't
-duplicate it here. net/process headlines: 4 new Move types (`tcp_conn`/`tcp_listener`/
-`udp_socket` = fd + Drop-close; `child` = pid + Drop-reaps-via-waitpid), `dns.resolve`, borrowed
-reader/writer over the socket fd reusing M9 unchanged, `process.exit` = cleanup-then-exit,
-CLOEXEC on all Align fd constructors. compress headlines: first FFI-engine module (libz +
-libzstd wrapped in the runtime, `-lz -lzstd` always linked), gzip strict framing + zstd
-streaming decompress, owned `buffer` out (no new Move type), 1 GiB decompress-bomb cap enforced
-on `len` (the gemini-review hardening — allocator over-allocation makes capacity an unreliable
-cap proxy), level total-or-abort (gzip `0..=9`, zstd `0..=22`).
+**M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), `std.compress`
+(#380–#381), and `std.crypto` (#383–#388) are DONE.** Full shipped-feature summaries + per-slice
+decisions + deferral lists live in the roadmap's **M11 section** (`docs/impl/07-roadmap.md`) —
+that is the record; don't duplicate it here. crypto headlines: engine = OpenSSL libcrypto (EVP,
+floor ≥ 3.2, `-lcrypto` always-linked; settled by two independent design reviews, #383);
+`constant_time_equal` branchless-**verified by disassembly** of both shipped profiles; AEAD open
+is all-or-nothing with `OPENSSL_cleanse` confirmed live in the optimized artifact; all KATs
+canonical (NIST / RFC 4231 / RFC 5869 / RFC 8439 / phc-winner-argon2); **`argon2_params` is the
+language's first builtin struct** (reserved-name injection like `Error`); blake3 deferred (no
+system engine). Two standing engineering conventions came out of this module: (1) recursive
+compiler fns must not gain match arms with inline locals — `#[inline(never)]` free helpers + boxed
+wide `Rvalue` payloads (the Slice-3 frame regression, root-caused and measured); (2) the
+dangling-ptr+len-0 FFI convention is deliberate and formally defended (#387 gemini rejection).
+The expr-depth cap (128) vs full-pipeline stack ceiling (~40) gap is recorded as a new Open item.
 
-**Next: the M11 remainder — `std.crypto` / `std.http`** (designs at implementable depth in
-`docs/impl/std-design/{crypto,http}.md`). crypto = a constant-time-audited FFI engine with
-`constant_time_equal` as the only self-hosted primitive (its constant-time requirement must be
-*verified*, not just specified). http = plaintext-only v1 (TLS deferred, `https://` rejected not
-downgraded) and builds `get_many` on the net substrate (task_group + the par_map pool — the #301
-claim-loop lesson); it depends on net (done) and comes last per the roadmap order.
+**Next: `std.http` — the LAST M11 module** (design at implementable depth in
+`docs/impl/std-design/http.md`): plaintext-only v1 (TLS deferred, `https://` rejected not
+downgraded), builds on the net substrate (done), `get_many` = task_group + the par_map pool (the
+#301 claim-loop lesson). **The owner explicitly wants http to be FAST** — treat the design doc's
+performance notes as requirements to engineer for, not aspirations; benchmark-driven (the repo
+rule: measure before claiming a win).
 
-**std.compress process note (2026-07-07):** the slice-flow below ran twice more, clean — both
-slices came back zero-finding from the independent adversarial gate; PR #380's gemini review
-produced two valid highs (cap-on-`len` + inflate spare clamp), verified against the code and
-reflected pre-merge; #381's gemini review had zero findings.
+**std.crypto process note (2026-07-07):** the slice-flow ran five more times, clean. Adversarial
+gates: zero findings on all five slices (they also machine-code-verified the CT and cleanse
+properties). gemini: #384/#386/#388 zero findings; #385's three "may not compile" highs and
+#387's three dangling-ptr "UB" mediums were each verified against the code and **rejected with
+written reasons** (PR comments) — the reflect-before-merge rule includes rejecting wrong findings,
+not just applying right ones. One gemini review errored and was re-triggered with
+`/gemini review` (#387). The Slice-3 stack regression was caught by the orchestrator's default-env
+re-verify (the implementer had masked it with RUST_MIN_STACK — rejected), root-caused to
+recursive-frame inflation, fixed, and measured back to exact parity with main.
 
 **Slice-flow that worked (keep it):** deep-reasoner implements in an isolated worktree (one
 slice per PR; tell it explicitly to never touch the shared checkout) → orchestrator re-verifies
