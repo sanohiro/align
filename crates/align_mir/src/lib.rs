@@ -712,6 +712,28 @@ pub enum Rvalue {
     /// `c.usage()` — render the command handle `cmd`'s flag table into a fresh owned `string`,
     /// returned by value as a `{ptr,len}` (the bound local `Drop`-frees it). Pure.
     CliUsage { cmd: Operand },
+    /// `http.request(method, url)` — allocate an `http request` builder (opaque pointer), returned by
+    /// value (the bound local `Drop`-frees it via `http_request_free`). `method`/`url` are `str`
+    /// `{ptr,len}`. Pure.
+    HttpRequest { method: Operand, url: Operand },
+    /// `r.header(name, value)` — append a header to the request handle `req` (opaque pointer), in
+    /// place. `name`/`value` are `str` `{ptr,len}`. Aborts at runtime on CR/LF/NUL (P6). No value. Pure.
+    HttpHeader { req: Operand, name: Operand, value: Operand },
+    /// `r.body(data)` — copy the byte view `data` (`{ptr,len}`) into the request handle `req`'s body.
+    /// No value. Pure.
+    HttpBody { req: Operand, data: Operand },
+    /// `http.parse(data)` — parse the response byte view `data` (`{ptr,len}`) into an owned `http
+    /// response` handle written to `out`, returning an `i32` status (0 = ok, `AL_INVALID` ->
+    /// `Error.Invalid`). The caller branches `Ok(response)` / `Err`. Pure.
+    HttpParse { data: Operand, out: Slot },
+    /// `resp.status()` — the parsed status code (`i64`) of the response handle `resp`. Pure.
+    HttpRespStatus { resp: Operand },
+    /// `resp.header(name)` — a case-insensitive header lookup on `resp`, writing a `str` **view**
+    /// `{ptr,len}` (region-bound to `resp`) to `out` and returning an `i32` present flag (1/0). Pure.
+    HttpRespHeader { resp: Operand, name: Operand, out: Slot },
+    /// `resp.body()` — the response body as a `slice<u8>` **view** `{ptr,len}` into `resp`'s buffer
+    /// (region-bound to `resp`). Pure.
+    HttpRespBody { resp: Operand },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -1141,7 +1163,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -1898,6 +1920,18 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::CliUsage { cmd: cop }));
             Operand::Value(v)
         }
+        // `std.http` (Slice 1) — the seven request/response ops collapse into ONE `lower_expr` arm
+        // delegating to a single out-of-line (`#[inline(never)]`) dispatcher, so this giant recursive
+        // match grows by exactly one arm (not seven). A deep expression tree recurses through
+        // `lower_expr`, and rustc reserves every arm's locals per level (the `expr_depth` #296 headroom
+        // lesson — std.http is the last std module, so the cap's remaining headroom is thin).
+        hir::ExprKind::HttpRequest { .. }
+        | hir::ExprKind::HttpHeader { .. }
+        | hir::ExprKind::HttpBody { .. }
+        | hir::ExprKind::HttpParse { .. }
+        | hir::ExprKind::HttpRespStatus { .. }
+        | hir::ExprKind::HttpRespHeader { .. }
+        | hir::ExprKind::HttpRespBody { .. } => lower_http(b, e),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -5501,6 +5535,146 @@ fn lower_cli_parse(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty
     Operand::Value(r)
 }
 
+/// Lower any `std.http` (Slice 1) request/response op. Out-of-line (`#[inline(never)]`) and reached
+/// through a single `lower_expr` arm, so all its locals — and the seven ops' distinct shapes — stay
+/// off the recursive `lower_expr` frame (the `expr_depth` #296 headroom lesson). Never called for a
+/// non-http `e`.
+#[inline(never)]
+fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        // `http.request(method, url)` → an owned `http request` handle returned by value (the bound
+        // local `Drop`-frees it via `http_request_free`).
+        hir::ExprKind::HttpRequest { method, url } => {
+            let m = lower_expr(b, method);
+            let u = lower_expr(b, url);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::HttpRequest { method: m, url: u }));
+            Operand::Value(v)
+        }
+        // `r.header(name, value)` → append a header to the request handle in place; no value.
+        hir::ExprKind::HttpHeader { req, name, value } => {
+            let rq = lower_expr(b, req);
+            let nm = lower_expr(b, name);
+            let vl = lower_expr(b, value);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::HttpHeader { req: rq, name: nm, value: vl }));
+            Operand::Const(Const::Unit)
+        }
+        // `r.body(data)` → copy the byte view into the request handle's body; no value.
+        hir::ExprKind::HttpBody { req, data } => {
+            let rq = lower_expr(b, req);
+            let d = lower_expr(b, data);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::HttpBody { req: rq, data: d }));
+            Operand::Const(Const::Unit)
+        }
+        // `http.parse(data)` → `Result<response, Error>` (out-slot + i32 status; see below).
+        hir::ExprKind::HttpParse { data } => lower_http_parse(b, data, e.ty),
+        // `resp.status()` → the runtime returns the i64 status directly.
+        hir::ExprKind::HttpRespStatus { resp } => {
+            let rp = lower_expr(b, resp);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::HttpRespStatus { resp: rp }));
+            Operand::Value(v)
+        }
+        // `resp.header(name)` → `Option<str>` (out-slot + i32 present flag; see below).
+        hir::ExprKind::HttpRespHeader { resp, name } => lower_http_resp_header(b, resp, name, e.ty),
+        // `resp.body()` → a `slice<u8>` view `{ptr,len}` into the response buffer (region-bound to
+        // `resp`; not owned — no `Drop`).
+        hir::ExprKind::HttpRespBody { resp } => {
+            let rp = lower_expr(b, resp);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::HttpRespBody { resp: rp }));
+            Operand::Value(v)
+        }
+        _ => unreachable!("lower_http on a non-http expr"),
+    }
+}
+
+/// `http.parse(data)` → the runtime writes an owned `http response` handle into an out slot and
+/// returns an `i32` status (0 = ok; `AL_INVALID` -> `Error.Invalid`). Branch `Ok(<response>)` /
+/// `Err(<mapped status>)`. Mirrors [`lower_cli_parse`]; the wrapped `response` is owned — the
+/// unwrapped local `Drop`s it (`http_resp_free`). Out-of-line (`#[inline(never)]`) so its several
+/// block/slot locals stay off the recursive `lower_expr` frame (the `expr_depth` #296 lesson).
+#[inline(never)]
+fn lower_http_parse(b: &mut Builder, data: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::HttpResponse);
+    let d = lower_expr(b, data);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::HttpParse { data: d, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the response handle and wrap it (the unwrapped local owns it — `Drop` frees it).
+    b.cur = ok_bb;
+    let h = b.fresh_value(Ty::HttpResponse);
+    b.push(Stmt::Let(h, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(h))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (null handle) → nothing to free; map the status (`Error.Invalid`).
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `resp.header(name)` → the runtime writes a `str` view (`{ptr,len}`) into an out slot and returns
+/// an `i32` present flag; branch `Some(<view>)` / `None`. The view borrows `resp` (region-bound in
+/// sema). Mirrors [`lower_env_get`], but the payload is a borrowed `str` view (not an owned string —
+/// the None arm's zeroed out slot needs no free either way). Out-of-line for `expr_depth` headroom.
+#[inline(never)]
+fn lower_http_resp_header(b: &mut Builder, resp: &hir::Expr, name: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::Str);
+    let rp = lower_expr(b, resp);
+    let nm = lower_expr(b, name);
+    let flag = b.fresh_value(status_ty());
+    b.push(Stmt::Let(flag, Rvalue::HttpRespHeader { resp: rp, name: nm, out }));
+
+    let present = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    let some_bb = b.new_block();
+    let none_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+
+    // Some: load the `str` view and wrap it.
+    b.cur = some_bb;
+    let s = b.fresh_value(Ty::Str);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let somev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(somev, Rvalue::OptionSome(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(somev)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = none_bb;
+    let nonev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(nonev, Rvalue::OptionNone));
+    b.push(Stmt::Store(rslot, Operand::Value(nonev)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
 /// `r.read(b)` → the runtime returns an `i64`: bytes read (`>= 0`, `0` = EOF) or `-(status)` on
 /// error. Branch `Ok(<count>)` / `Err(<mapped status>)` on the sign.
 fn lower_reader_read(b: &mut Builder, reader: Operand, buffer: Operand, result_ty: Ty) -> Operand {
@@ -6018,6 +6192,8 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::TcpListener => "tcp_listener".to_string(),
         Ty::UdpSocket => "udp_socket".to_string(),
         Ty::Child => "child".to_string(),
+        Ty::HttpRequest => "http request".to_string(),
+        Ty::HttpResponse => "http response".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

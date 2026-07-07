@@ -885,6 +885,39 @@ pub enum ExprKind {
     /// `c.usage()` — render `cmd`'s flag table into a fresh owned `string` (the `ty` is
     /// [`crate::Ty::String`]). `cmd` is borrowed, not consumed. Pure.
     CliUsage { cmd: Box<Expr> },
+    /// `http.request(method, url)` — a fresh [`crate::Ty::HttpRequest`] builder (a **Move** handle
+    /// owning its method / url / header list / body buffer; `Drop`-freed). `method` / `url` are
+    /// borrowed `str` (copied into the handle). Total — the URL is not parsed here (validation is
+    /// deferred to `serialize`, so a runtime-supplied URL never aborts the builder). Pure (no I/O —
+    /// the network client is Slice 2).
+    HttpRequest { method: Box<Expr>, url: Box<Expr> },
+    /// `r.header(name, value)` — append a header to the request `req` (mutated in place through its
+    /// handle, not consumed — like a `buffer`/cli method). The `ty` is [`crate::Ty::Unit`]. A CR / LF
+    /// / NUL in the name or value (or an empty name) **aborts** at runtime (request-smuggling defence,
+    /// http.md P6 — header injection is a programmer error). `req` is a bound local; `name`/`value`
+    /// are borrowed `str`. Pure.
+    HttpHeader { req: Box<Expr>, name: Box<Expr>, value: Box<Expr> },
+    /// `r.body(data)` — set the request `req`'s body to a copy of `data` (a byte view — `str` /
+    /// `slice<u8>`), mutating in place. The `ty` is [`crate::Ty::Unit`]. `req` is a bound local. Pure.
+    HttpBody { req: Box<Expr>, data: Box<Expr> },
+    /// `http.parse(data)` — parse a complete HTTP/1.1 response buffer `data` (a byte view) into an
+    /// owned [`crate::Ty::HttpResponse`], yielding `Result<response, Error>` (the `ty`). A malformed
+    /// status line / non-numeric status / header without `:` / chunked encoding / bad or oversized
+    /// framing / header flood → `Error.Invalid`. The response owns ONE copy of the bytes (zero-copy
+    /// offset table, http.md R1). `data` is borrowed. Pure.
+    HttpParse { data: Box<Expr> },
+    /// `resp.status()` — the parsed status code of the response `resp` (the `ty` is `i64`). `resp` is
+    /// a bound [`crate::Ty::HttpResponse`] local. Pure.
+    HttpRespStatus { resp: Box<Expr> },
+    /// `resp.header(name)` — a **case-insensitive** header lookup on `resp`, yielding
+    /// `Option<str>` (the `ty`) whose `str` is a **view** into `resp`'s buffer (region-bound to
+    /// `resp` — an escape past `resp`'s `Drop` is a compile error). `resp` is a bound local; `name`
+    /// is borrowed. Pure.
+    HttpRespHeader { resp: Box<Expr>, name: Box<Expr> },
+    /// `resp.body()` — the response body as a `slice<u8>` **view** into `resp`'s buffer (the `ty` is
+    /// [`crate::Ty::Slice`] of `u8`), region-bound to `resp` (no copy, http.md R1). `resp` is a bound
+    /// local. Pure.
+    HttpRespBody { resp: Box<Expr> },
     /// `crypto.constant_time_equal(a, b)` — a constant-time byte-equality test over two byte views
     /// `a` / `b` (`str` / owned `string` auto-borrowed / `slice<u8>`); the `ty` is
     /// [`crate::Ty::Bool`]. The input *length* is **public** (crypto.md P1): differing lengths return

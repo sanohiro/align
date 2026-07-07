@@ -5,8 +5,9 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-07 evening (M11 std.crypto COMPLETE #383–#388; same day: std.compress
-COMPLETE #380–#382; 2026-07-06: std.process #376–#378, std.net #371–#374)._
+_Last updated: 2026-07-07 evening (M11 std.http Slice 1 DONE on branch `m11-http-slice1-parse`;
+same day: std.crypto COMPLETE #383–#388, std.compress COMPLETE #380–#382; 2026-07-06:
+std.process #376–#378, std.net #371–#374)._
 
 ## ▶ NEXT SESSION — start here
 
@@ -29,12 +30,23 @@ wide `Rvalue` payloads (the Slice-3 frame regression, root-caused and measured);
 dangling-ptr+len-0 FFI convention is deliberate and formally defended (#387 gemini rejection).
 The expr-depth cap (128) vs full-pipeline stack ceiling (~40) gap is recorded as a new Open item.
 
-**Next: `std.http` — the LAST M11 module** (design at implementable depth in
-`docs/impl/std-design/http.md`): plaintext-only v1 (TLS deferred, `https://` rejected not
-downgraded), builds on the net substrate (done), `get_many` = task_group + the par_map pool (the
-#301 claim-loop lesson). **The owner explicitly wants http to be FAST** — treat the design doc's
-performance notes as requirements to engineer for, not aspirations; benchmark-driven (the repo
-rule: measure before claiming a win).
+**`std.http` — the LAST M11 module — Slice 1 DONE (branch `m11-http-slice1-parse`).** Request/
+response Move types + HTTP/1.1 serialize/parse, NO sockets. Full details + the eight key decisions
+in the roadmap's std.http entry. Headlines: two Move types (`Ty::HttpRequest`/`HttpResponse` +
+`Scalar::HttpResponse`, full twin-mirror sweep); `http.request`/`r.header`/`r.body`/`http.parse`/
+`resp.{status,header,body}` exposed (Pure — sockets are Slice 2); **URL validation deferred to
+serialize** (runtime URLs never abort the builder); **`http.parse` exposed** as the response
+constructor+codec (Slice 2's client reuses the engine) while **serialize stays a runtime-internal
+codec** (`align_rt_http_serialize`, unit-tested, one-buffer R4); P6 CR/LF/NUL header injection
+**aborts**; auto Host+Content-Length, caller dup rejected; chunked → `Error.Invalid` (Content-Length
+only, v1); caps 128 headers / 1 GiB; R1 zero-copy offset table, `memchr`-backed scan (R2). Tests:
+`m11_http.rs` (14 driver) + 7 `align_runtime` units. **NOTE the `lower_expr` frame lesson bit again:**
+adding 7 http arms tipped the default-env expr_depth ceiling (baseline 5/5 → 4/5 overflow at the
+40-term full-pipeline chain); fixed by collapsing all 7 http ops into ONE `lower_expr` arm delegating
+to a single `#[inline(never)] lower_http(b, e)` dispatcher — back to 5/5. **Next: Slice 2** (client
+`http.client()` + `cl.get/post/request` over one net `tcp_conn`, plaintext; reuses `serialize` +
+`http.parse`). **The owner explicitly wants http FAST** — treat http.md's R1–R6 as requirements;
+benchmark-driven (measure before claiming). Slices 3–5 (pool reuse, server, HTTPS) after.
 
 **std.crypto process note (2026-07-07):** the slice-flow ran five more times, clean. Adversarial
 gates: zero findings on all five slices (they also machine-code-verified the CT and cleanse
