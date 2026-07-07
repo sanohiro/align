@@ -5,35 +5,38 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-06 night (M11 std.process COMPLETE #376–#378; same day: std.net COMPLETE
-#371–#374, Gemini fix wave #358–#368 audited SOUND, cleanup #369/#370)._
+_Last updated: 2026-07-07 (M11 std.compress COMPLETE #380–#381; 2026-07-06: std.process
+COMPLETE #376–#378, std.net COMPLETE #371–#374)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #376–#378
-(std.process slices 1–3), plus this docs PR. `cargo test --workspace` ≈ **1443 green**; clippy
+**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #380–#381
+(std.compress slices 1–2), plus this docs PR. `cargo test --workspace` ≈ **1493 green**; clippy
 clean at `-D warnings`.
 
-**M11 is IN PROGRESS — `std.net` (#371–#374) and `std.process` (#376–#378) are DONE
-(2026-07-06).** Full shipped-feature summaries + per-slice decisions + deferral lists live in
-the roadmap's **M11 section** (`docs/impl/07-roadmap.md`) — that is the record; don't duplicate
-it here. Headlines: 4 new Move types (`tcp_conn`/`tcp_listener`/`udp_socket` = fd + Drop-close;
-`child` = pid + Drop-reaps-via-waitpid), `dns.resolve`, borrowed reader/writer over the socket
-fd reusing M9 unchanged (`tracks_region(Reader/Writer)` now true — the #297-aware region arm),
-`process.exit` = cleanup-then-exit via the same `emit_exit_cleanup` a return uses (open-questions
-entry moved to Settled), CLOEXEC on all Align fd constructors, `process.exec` deliberately
-non-diverging (failure path runs). Notable deferrals: datagram peer + port-0 bind (need
-builtin-struct returns / a `local_addr()` accessor), `Ty::Never`, multi-frame exit unwind,
-`detach()`.
+**M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), and `std.compress`
+(#380–#381) are DONE.** Full shipped-feature summaries + per-slice decisions + deferral lists
+live in the roadmap's **M11 section** (`docs/impl/07-roadmap.md`) — that is the record; don't
+duplicate it here. net/process headlines: 4 new Move types (`tcp_conn`/`tcp_listener`/
+`udp_socket` = fd + Drop-close; `child` = pid + Drop-reaps-via-waitpid), `dns.resolve`, borrowed
+reader/writer over the socket fd reusing M9 unchanged, `process.exit` = cleanup-then-exit,
+CLOEXEC on all Align fd constructors. compress headlines: first FFI-engine module (libz +
+libzstd wrapped in the runtime, `-lz -lzstd` always linked), gzip strict framing + zstd
+streaming decompress, owned `buffer` out (no new Move type), 1 GiB decompress-bomb cap enforced
+on `len` (the gemini-review hardening — allocator over-allocation makes capacity an unreliable
+cap proxy), level total-or-abort (gzip `0..=9`, zstd `0..=22`).
 
-**Next: the M11 remainder — `std.compress` / `std.crypto` / `std.http`** (designs at
-implementable depth in `docs/impl/std-design/{compress,crypto,http}.md`). All three involve FFI
-engines: compress = `libzstd`/zlib-ng; crypto = a constant-time-audited engine with
+**Next: the M11 remainder — `std.crypto` / `std.http`** (designs at implementable depth in
+`docs/impl/std-design/{crypto,http}.md`). crypto = a constant-time-audited FFI engine with
 `constant_time_equal` as the only self-hosted primitive (its constant-time requirement must be
-*verified*, not just specified); http = plaintext-only v1 (TLS deferred, `https://` rejected not
+*verified*, not just specified). http = plaintext-only v1 (TLS deferred, `https://` rejected not
 downgraded) and builds `get_many` on the net substrate (task_group + the par_map pool — the #301
-claim-loop lesson). Pick compress first (smallest engine surface) unless the owner says
-otherwise.
+claim-loop lesson); it depends on net (done) and comes last per the roadmap order.
+
+**std.compress process note (2026-07-07):** the slice-flow below ran twice more, clean — both
+slices came back zero-finding from the independent adversarial gate; PR #380's gemini review
+produced two valid highs (cap-on-`len` + inflate spare clamp), verified against the code and
+reflected pre-merge; #381's gemini review had zero findings.
 
 **Slice-flow that worked (keep it):** deep-reasoner implements in an isolated worktree (one
 slice per PR; tell it explicitly to never touch the shared checkout) → orchestrator re-verifies
@@ -70,16 +73,6 @@ recovered post-hoc this time, but hold the gate for future Gemini-authored PRs t
 **M10 is COMPLETE and formally closed** (Slice 1 `std.encoding` #346, Slice 2 `std.rand` #347,
 Slice 3 `std.cli` #356 — see the roadmap's M10 section for the shipped-feature summary).
 `cargo test --workspace` ≈ **1349 green**.
-
-**Next: M11 — `std.net` / `std.http` / `std.process` / `std.compress` / `std.crypto`.** Each is
-already spec'd at implementable depth in **`docs/impl/std-design/*.md`** (the source of truth per
-module). Before implementing, settle the recorded blockers per the roadmap's M11+ deferral list:
-`std.process` needs the `process.exit` Drop/arena-cleanup Open item settled
-(`docs/open-questions.md` Open); `std.crypto` needs its constant-time requirement *verified* (not
-just specified); `std.http` depends on TLS (FFI engine) and is plaintext-only v1; `std.compress`
-depends on `libzstd`/`zlib-ng` (FFI). `std.net` is the natural first slice (new Move socket type,
-no external engine). Follow the M10 pattern: one module per PR, Move-sweep discipline,
-`/align-self-review`, gemini review reflected before merge (until its 2026-07-17 sunset).
 
 **std.cli slice 3 notes (2026-07-04, #356):** two new Move types `Ty::CliCommand`/`Ty::CliParsed` +
 `Scalar::CliParsed` payload; `parse` borrows the command (usage callable after `Err`); `get_*`

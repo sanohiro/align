@@ -1403,9 +1403,46 @@ and http last (needs net + TLS).
     multi-frame exit unwind; `detach()` for dropping a running child without blocking;
     posix_spawn / pre-resolved-PATH exec (the fork-from-multithreaded-parent allocator caveat,
     documented).
-- **`std.compress` / `std.crypto` / `std.http`** — NEXT (FFI engines: `libzstd`/zlib-ng, a
-  constant-time-audited crypto engine; http needs net + TLS and stays plaintext-only v1 per
-  http.md).
+- **`std.compress` — DONE (2026-07-07, PRs #380–#381, one slice per PR).** The first FFI-engine
+  module — own the memory wrappers, borrow the engine (draft §15): the runtime wraps `libz`/
+  `libzstd` via `extern "C"`, Align allocates the output. Byte→byte, borrowed `bytes` view in,
+  **owned `buffer` out** (reuses #346 — no new Move type); Impure (extern-calling →
+  par_map-rejected, test-pinned); both `-lz` and `-lzstd` join the driver's base link set
+  unconditionally (the runtime staticlib always carries the wrapper symbols; conditional linking
+  would need a per-module sema→driver flag — not worth it for universal system libs).
+  - Slice 1 gzip via libz (#380): `compress.gzip_compress(data: bytes, level: i64) ->
+    Result<buffer, Error>` / `gzip_decompress(data: bytes)` behind `import std.compress`.
+    Strict gzip framing both ways (windowBits 15+16 — zlib/raw streams rejected; magic
+    test-pinned); level `0..=9` total-or-abort (#345, mirrors `rand.range`), checked before any
+    allocation; **decompress-bomb guard** = hard 1 GiB output cap → `Error.Invalid` (compress
+    output is input-bounded, no cap); corrupt/truncated → `Error.Invalid`, genuine engine/OOM →
+    `Error.Code(|code|)` through the existing `AL_CODE` catch-all — no new `Error` variant.
+    MIR refactor: the status+buffer Result tail shared with `EncodingDecode` extracted into
+    `emit_status_buffer_result` (verbatim; encoding ABI unchanged). The gemini review's two
+    valid highs were reflected pre-merge: cap enforcement moved from `capacity` to `len`
+    (allocator over-allocation — `try_reserve_exact` may round up — makes capacity an unreliable
+    cap proxy) and the inflate spare clamped to `max_cap - len`, both regression-tested.
+  - Slice 2 zstd via libzstd (#381): `zstd_compress`/`zstd_decompress`, twin-mirror parity —
+    extends `CompressKind` (codegen kind-arms exhaustive `Gzip | Zstd`, a future codec is a
+    compile error; the 5 HIR-walking passes treat the kind opaquely by design — the codecs are
+    semantically identical). Level `0..=22` (`0` = zstd default; negative fast levels excluded —
+    one non-negative range). Compress = one-shot `ZSTD_compress` sized by `ZSTD_compressBound`;
+    decompress = streaming `ZSTD_decompressStream` through the shared hardened grow loop + the
+    same 1 GiB cap — `ZSTD_getFrameContentSize` is never trusted for allocation
+    (attacker-controlled header); `ZSTD_freeDStream` on every path; the hardcoded
+    `ZSTD_ErrorCode` constants (64/66) verified against `zstd_errors.h`'s stable section and
+    `ZSTD_getErrorCode` confirmed in the stable dynamic ABI. Trailing bytes after the first
+    complete frame are ignored (matches zlib's first-member semantics). Zero-finding adversarial
+    gate review and zero-finding gemini review.
+  - **Deferred with record (not a blocker):** a graceful libz/libzstd-absence story — v1 assumes
+    both libs present (a build without them fails at link); feature-gating is the recorded
+    option in compress.md P3. v1 scope is whole-buffer byte→byte per the design (streaming /
+    dictionary surfaces were never in scope).
+- **`std.crypto` / `std.http`** — NEXT (crypto = a constant-time-audited engine with
+  `constant_time_equal` as the only self-hosted primitive, its constant-time property *verified*
+  not just specified; http needs net + TLS and stays plaintext-only v1 per http.md — `https://`
+  rejected, not downgraded — and builds `get_many` on the net substrate via task_group + the
+  par_map pool).
 
 ## Design Issues to Settle in Parallel
 
