@@ -5,14 +5,64 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-07 evening (M11 std.crypto COMPLETE #383–#388; same day: std.compress
-COMPLETE #380–#382; 2026-07-06: std.process #376–#378, std.net #371–#374)._
+_Last updated: 2026-07-07 late (std.crypto COMPLETE #383–#388, docs #389; **std.http Slice 1
+IN FLIGHT — unmerged local branch, one CONFIRMED UAF being fixed, see the ⚠ block below**)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #384–#388
-(std.crypto slices 1–5), plus this docs PR. `cargo test --workspace` ≈ **1559 green**; clippy
-clean at `-D warnings`.
+**Repo state:** `main` clean at **813ce5d**, no open PRs. Last merges: #384–#388 (std.crypto
+slices 1–5) + #389 (docs: crypto record + http perf requirements). `main` `cargo test
+--workspace` ≈ **1559 green**; clippy clean at `-D warnings`.
+
+### ⚠ IN FLIGHT — std.http Slice 1 (unmerged, on a local worktree branch — do this FIRST)
+
+**Where the work is:** branch **`m11-http-slice1-parse`** in worktree
+`/home/hiro/prj/align/.claude/worktrees/agent-a7d59494a0678d8e3` (commit `cd5c5dc` at last
+snapshot). **NOT pushed** — it does not survive a `git clone` to another machine. If you are on a
+different machine and the worktree is gone, Slice 1 must be re-implemented from
+`docs/impl/std-design/http.md` (the design + all decisions below are recorded there and are
+current). If you are on THIS machine, the branch/worktree is where you left it.
+
+**What Slice 1 is:** request/response Move types + HTTP/1.1 serialize/parse, no sockets. It built
+green (1580 tests, expr_depth 5/5, clippy clean) and passed most of the adversarial gate — BUT the
+gate found a **CONFIRMED, runnable use-after-free that MUST be fixed before merge**:
+
+- **The UAF:** `resp.header(name) -> Option<str>` returns a `str` that VIEWS the response's owned
+  heap buffer. Direct return and `else`-unwrap are correctly region-rejected, but unwrapping the
+  `Option` through a **`match` arm** loses the region and the view escapes the function → the
+  response's Drop frees the buffer → UAF (proven: freed memory printed instead of the header
+  value). Root cause: this is the codebase's **first `Option<borrowed-view>`**, and `match` /
+  `if let` pattern-binding region propagation in `EscapeCheck` doesn't carry the scrutinee's region
+  into the arm's payload binding.
+- **Fix directive (owner-confirmed, ideal-form):** take the **general region-propagation fix** —
+  make every pattern binding (`match` arms, `if let`, destructuring) inherit
+  `Frame ∩ region_of(scrutinee)` when the scrutinee carries a non-Static region. Preference order,
+  explicit: (1) general fix [do this]; (2) if genuinely infeasible now, **defer the
+  `resp.header()` getter** (ship the rest of Slice 1 without it) with a recorded reason; (3) the
+  owned-`string` fallback for `resp.header()` is **REJECTED** (trades away R1 zero-copy to dodge
+  the real compiler gap). Add `match`-arm AND `if let` escape negative tests.
+- **Two more fixes bundled (permanent codec — Slice 2 exposes it):** the serializer
+  (`align_rt_http_serialize`/`http_split_url`) writes method/authority/path into the request line
+  with NO CR/LF/NUL check (only `r.header()` validates) — validate method is token-chars + reject
+  CR/LF/NUL in the URL-derived request line (→ `Error.Invalid`). And `align_rt_http_parse` accepts
+  duplicate `Content-Length` last-wins — a second differing CL must → `AL_INVALID` (RFC 7230
+  §3.3.3, response-smuggling; the serializer already rejects dup CL, so this makes them consistent).
+
+**A fix agent was dispatched (agentId `a7d59494a0678d8e3`, the original implementer, resumed) and
+may or may not have finished when this session ended.** On resume: check for its report / new
+commits on the branch (`git -C <worktree> log --oneline main..HEAD`), then run the STANDARD gate:
+default-env re-verify (`cargo build` → `cargo test --test expr_depth` must be 5/5 → full
+`cargo test --workspace` solo → clippy `-D warnings`) → an INDEPENDENT adversarial review
+**re-checking the UAF is truly closed** (drive the `match`-arm and `if let` escape repros through
+`alignc check` — they must now be rejected) **plus no regression in the cli/net/crypto view-escape
+tests** (EscapeCheck is shared) → PR → gemini reflected → squash-merge → clean up the worktree.
+Then continue Slice 2 (client `get`/`post` over one `tcp_conn` — "pure wiring," reuses
+`align_rt_http_serialize` + `http.parse`'s engine) → 3 (pool reuse) → 4 (server) → the `https://`
++ TLS slice stays deferred → `bench/http_client` for the R6 numbers.
+
+**Process win worth keeping:** the gate caught this UAF (and, on crypto Slice 3, a stack regression
+the implementer had masked with `RUST_MIN_STACK` — rejected and root-caused). The default-env
+re-verify + independent adversarial pass are load-bearing; do not skip them to save time.
 
 **M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), `std.compress`
 (#380–#381), and `std.crypto` (#383–#388) are DONE.** Full shipped-feature summaries + per-slice
