@@ -1049,6 +1049,29 @@ fn build_module<'c>(
         "crypto_sha512".to_string(),
         module.add_function("align_rt_crypto_sha512", slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into()], false), None),
     );
+    // `std.crypto` (M11 Slice 3). hmac_sha256 (key view + data view) -> a fresh owned `array<u8>`
+    // `{ptr,len}` (32-byte tag, returned by value like the digests). hkdf_sha256 (salt/ikm/info views
+    // + i64 len, out: *handle) returns an i32 status, writing an owned `buffer` handle into `out`
+    // (the `std.compress` status shape).
+    funcs.insert(
+        "crypto_hmac_sha256".to_string(),
+        module.add_function(
+            "align_rt_crypto_hmac_sha256",
+            slice_struct_type(ctx).fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "crypto_hkdf_sha256".to_string(),
+        module.add_function(
+            "align_rt_crypto_hkdf_sha256",
+            ctx.i32_type().fn_type(
+                &[ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into()],
+                false,
+            ),
+            None,
+        ),
+    );
     // `std.compress` — gzip via libz / zstd via libzstd. compress (data view `{ptr,len}`, i64 level,
     // out: *handle) and decompress (data view `{ptr,len}`, out: *handle) both return an i32 status
     // (0 ok / AL_INVALID / AL_CODE+n), writing an owned `buffer` handle into `out`. Both codecs share
@@ -4713,6 +4736,37 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(f, &[dp.into(), dl.into()], "digest")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("crypto sha returns a {ptr,len}")
+            }
+            // std.crypto — hmac_sha256 splits the key + data byte views to `{ptr,len}` and returns a
+            // fresh owned `array<u8>` `{ptr,len}` (the 32-byte tag), by value like the digests.
+            Rvalue::CryptoHmac { key, data } => {
+                let (kp, kl) = self.split_str(key)?;
+                let (dp, dl) = self.split_str(data)?;
+                self.builder
+                    .build_call(self.funcs["crypto_hmac_sha256"], &[kp.into(), kl.into(), dp.into(), dl.into()], "hmac")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("crypto hmac returns a {ptr,len}")
+            }
+            // std.crypto — hkdf_sha256 splits the salt/ikm/info byte views to `{ptr,len}`; the out
+            // handle slot is caller-zeroed (so the Err path frees nothing); the runtime returns an i32
+            // status.
+            Rvalue::CryptoHkdf { salt, ikm, info, len, out } => {
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (sp, sl) = self.split_str(salt)?;
+                let (ip, il) = self.split_str(ikm)?;
+                let (np, nl) = self.split_str(info)?;
+                let lv = self.operand(len);
+                self.builder
+                    .build_call(
+                        self.funcs["crypto_hkdf_sha256"],
+                        &[sp.into(), sl.into(), ip.into(), il.into(), np.into(), nl.into(), lv.into(), out_ptr.into()],
+                        "hkdf",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("hkdf_sha256 returns i32 status")
             }
             // std.compress — gzip via libz / zstd via libzstd. The data view splits to `{ptr,len}`;
             // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime

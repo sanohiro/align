@@ -7511,6 +7511,247 @@ pub unsafe extern "C" fn align_rt_crypto_sha512(data_ptr: *const u8, data_len: i
 }
 
 // ---------------------------------------------------------------------------------------------
+// std.crypto (M11 Slice 3) — hmac_sha256 + hkdf_sha256 via OpenSSL libcrypto. The same
+// keystone-library strategy (crypto.md P5): borrow the constant-time-audited engine, own the
+// output. HMAC uses the EVP one-shot convenience `EVP_Q_mac` (OpenSSL >= 3.0 — no `EVP_MAC_CTX`
+// lifecycle to leak). HKDF uses the `EVP_KDF` provider path (`EVP_KDF_fetch("HKDF")` + an
+// `OSSL_PARAM` array; OpenSSL >= 3.0), which the crypto.md engine decision (>= 3.2 floor) covers.
+// ---------------------------------------------------------------------------------------------
+
+#[link(name = "crypto")]
+unsafe extern "C" {
+    /// `EVP_Q_mac(libctx, name, propq, subalg, params, key, keylen, data, datalen, out, outsize,
+    /// outlen)` — one-shot MAC (OpenSSL >= 3.0). `name` selects the MAC (`"HMAC"`); `subalg` selects
+    /// its sub-algorithm (the digest, `"SHA256"`). Writes the tag to `out` (capacity `outsize`) and
+    /// its length to `*outlen`. Returns the `out` pointer on success, `NULL` on failure. `libctx`/
+    /// `propq`/`params` are null for the default context / no property query / no extra params.
+    fn EVP_Q_mac(
+        libctx: *mut c_void,
+        name: *const c_char,
+        propq: *const c_char,
+        subalg: *const c_char,
+        params: *const OsslParam,
+        key: *const c_void,
+        keylen: usize,
+        data: *const u8,
+        datalen: usize,
+        out: *mut u8,
+        outsize: usize,
+        outlen: *mut usize,
+    ) -> *mut u8;
+
+    /// `EVP_KDF_fetch(libctx, algorithm, properties)` — fetch a KDF implementation by name
+    /// (`"HKDF"`). Returns a fetched `EVP_KDF*` (freed with [`EVP_KDF_free`]) or `NULL` on failure.
+    fn EVP_KDF_fetch(libctx: *mut c_void, algorithm: *const c_char, properties: *const c_char) -> *mut c_void;
+    /// Free an `EVP_KDF*` from [`EVP_KDF_fetch`]. A null argument is a no-op.
+    fn EVP_KDF_free(kdf: *mut c_void);
+    /// `EVP_KDF_CTX_new(kdf)` — a derivation context over a fetched `EVP_KDF`. `NULL` on failure.
+    fn EVP_KDF_CTX_new(kdf: *mut c_void) -> *mut c_void;
+    /// Free an `EVP_KDF_CTX*`. A null argument is a no-op.
+    fn EVP_KDF_CTX_free(ctx: *mut c_void);
+    /// `EVP_KDF_derive(ctx, key, keylen, params)` — derive `keylen` bytes into `key` using the
+    /// `NULL`-terminated `OSSL_PARAM` array `params`. Returns `1` on success, `<= 0` on failure.
+    fn EVP_KDF_derive(ctx: *mut c_void, key: *mut u8, keylen: usize, params: *const OsslParam) -> c_int;
+}
+
+/// An `OSSL_PARAM` (`openssl/core.h` `struct ossl_param_st`) — a name/type/buffer descriptor for the
+/// provider parameter APIs. Built manually (rather than via the C `OSSL_PARAM_construct_*`
+/// convenience functions, which return the struct by value across the ABI) so the whole `params`
+/// array is a plain Rust value with no by-value-struct-return FFI. Layout mirrors the C struct
+/// exactly (`#[repr(C)]`).
+#[repr(C)]
+struct OsslParam {
+    /// Parameter name (a NUL-terminated `OSSL_KDF_PARAM_*` key), or null to terminate the array.
+    key: *const c_char,
+    /// `OSSL_PARAM_*` data type (`UTF8_STRING` = 4 / `OCTET_STRING` = 5 here).
+    data_type: c_uint,
+    /// The value buffer (read-only for these input params — cast away `const`, as OpenSSL's own
+    /// constructors do).
+    data: *mut c_void,
+    /// The value's byte length.
+    data_size: usize,
+    /// Provider-written output field; initialized to `OSSL_PARAM_UNMODIFIED` like the C constructors.
+    return_size: usize,
+}
+
+/// `OSSL_PARAM_UTF8_STRING` (`openssl/core.h`) — a NUL-terminated printable string parameter.
+const OSSL_PARAM_UTF8_STRING: c_uint = 4;
+/// `OSSL_PARAM_OCTET_STRING` (`openssl/core.h`) — an arbitrary byte-buffer parameter.
+const OSSL_PARAM_OCTET_STRING: c_uint = 5;
+/// `OSSL_PARAM_UNMODIFIED` (`openssl/params.h`, `SIZE_MAX`) — the initial `return_size` the C
+/// `OSSL_PARAM_construct_*` helpers stamp; a provider overwrites it when it reads the param.
+const OSSL_PARAM_UNMODIFIED: usize = usize::MAX;
+
+impl OsslParam {
+    /// A UTF8-string input param (e.g. the `"digest"` name). `val`'s bytes (excluding the NUL) are the
+    /// value; `val` must outlive the derive call.
+    fn utf8(key: &core::ffi::CStr, val: &core::ffi::CStr) -> OsslParam {
+        OsslParam {
+            key: key.as_ptr(),
+            data_type: OSSL_PARAM_UTF8_STRING,
+            data: val.as_ptr() as *mut c_void,
+            data_size: val.count_bytes(),
+            return_size: OSSL_PARAM_UNMODIFIED,
+        }
+    }
+    /// An octet-string (byte-buffer) input param (`key`/`salt`/`info`). An empty slice yields a
+    /// zero-length param (a non-null dangling `as_ptr()` OpenSSL never dereferences). `val` must
+    /// outlive the derive call.
+    fn octet(key: &core::ffi::CStr, val: &[u8]) -> OsslParam {
+        OsslParam {
+            key: key.as_ptr(),
+            data_type: OSSL_PARAM_OCTET_STRING,
+            data: val.as_ptr() as *mut c_void,
+            data_size: val.len(),
+            return_size: OSSL_PARAM_UNMODIFIED,
+        }
+    }
+    /// The `key == NULL` terminator that ends every `OSSL_PARAM` array.
+    fn end() -> OsslParam {
+        OsslParam { key: core::ptr::null(), data_type: 0, data: core::ptr::null_mut(), data_size: 0, return_size: 0 }
+    }
+}
+
+/// `crypto.hmac_sha256(key, data)` — the 32-byte HMAC-SHA-256 tag of the byte view `data` under
+/// `key`, as an owned `array<u8>` `{ptr,len}` (the `crypto.sha256` return shape; the bound local
+/// `Drop`-frees it). Empty `key` and empty `data` are both valid HMAC inputs. Wraps the EVP one-shot
+/// `EVP_Q_mac`. HMAC has no invalid-input case, so a NULL return (engine/programming error) or a tag
+/// length != 32 **aborts** (the total-or-abort class, like `crypto.sha256`), never a silent wrong tag.
+///
+/// # Safety
+/// `key_ptr`/`key_len` and `data_ptr`/`data_len` must each be a valid `{ptr,len}` byte view (or null
+/// with a non-positive length).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_hmac_sha256(
+    key_ptr: *const u8,
+    key_len: i64,
+    data_ptr: *const u8,
+    data_len: i64,
+) -> AlignStr {
+    // `bytes_view` clamps null / out-of-range / negative to an empty slice (no `as usize` truncation,
+    // never `from_raw_parts(null, 0)`). An empty key / empty data is a valid HMAC input.
+    let key = unsafe { bytes_view(key_ptr, key_len) };
+    let data = unsafe { bytes_view(data_ptr, data_len) };
+    let mut tag = [0u8; 32];
+    let mut taglen: usize = 0;
+    let r = unsafe {
+        EVP_Q_mac(
+            core::ptr::null_mut(),
+            c"HMAC".as_ptr(),
+            core::ptr::null(),
+            c"SHA256".as_ptr(),
+            core::ptr::null(),
+            key.as_ptr() as *const c_void,
+            key.len(),
+            data.as_ptr(),
+            data.len(),
+            tag.as_mut_ptr(),
+            tag.len(),
+            &mut taglen,
+        )
+    };
+    if r.is_null() {
+        panic_abort("crypto: HMAC-SHA256 failed");
+    }
+    // Defensive: HMAC-SHA-256 is always 32 bytes; a mismatch would underfill the `array<u8>` the
+    // caller's type promises.
+    if taglen != 32 {
+        panic_abort("crypto: HMAC-SHA256 returned an unexpected length");
+    }
+    let out = align_rt_alloc(32);
+    unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out, 32) };
+    AlignStr { ptr: out as *const u8, len: 32 }
+}
+
+/// RFC 5869 `L` limit for HKDF-SHA-256: `255 * HashLen` = `255 * 32` = 8160 bytes. A requested output
+/// length above this is a caller error (`Error.Invalid`), rejected before any engine call.
+const HKDF_SHA256_MAX_LEN: i64 = 255 * 32;
+
+/// Derive `len` bytes with HKDF-SHA-256 over `salt` / `ikm` / `info` (default extract-and-expand
+/// mode). Public param validation first (`len` in `1..=8160`), then the `EVP_KDF` provider path:
+/// `fetch("HKDF")` → `CTX_new` → `derive` with an `OSSL_PARAM` array (digest `"SHA256"`, `key` = ikm,
+/// `salt`, `info`). Frees the KDF + ctx on **every** path. Error split (crypto.md error policy):
+/// - a genuine **engine** failure (`fetch` / `CTX_new` null, or the output allocation) → [`AL_CODE`];
+/// - a **param** rejection at `derive` (bad/rejected caller inputs) → [`AL_INVALID`].
+///
+/// `salt` / `ikm` / `info` are borrowed for the whole call, so the `OSSL_PARAM` pointers into them
+/// stay valid across `derive`.
+fn hkdf_sha256_derive(salt: &[u8], ikm: &[u8], info: &[u8], len: i64) -> Result<Vec<u8>, i32> {
+    // Public value: reject a non-positive or over-limit length before touching the engine.
+    if len <= 0 || len > HKDF_SHA256_MAX_LEN {
+        return Err(AL_INVALID);
+    }
+    // `len` is validated to `1..=8160`, so `try_from` cannot fail; use it (never `as usize`) per the
+    // FFI-safety discipline.
+    let out_len = usize::try_from(len).map_err(|_| AL_INVALID)?;
+
+    // `OSSL_KDF_PARAM_*` keys (`openssl/core_names.h`): digest="digest", key="key", salt="salt",
+    // info="info". `key` carries the input keying material (ikm). Default HKDF mode is
+    // extract-and-expand, so no explicit "mode" param is needed.
+    let params = [
+        OsslParam::utf8(c"digest", c"SHA256"),
+        OsslParam::octet(c"key", ikm),
+        OsslParam::octet(c"salt", salt),
+        OsslParam::octet(c"info", info),
+        OsslParam::end(),
+    ];
+
+    let kdf = unsafe { EVP_KDF_fetch(core::ptr::null_mut(), c"HKDF".as_ptr(), core::ptr::null()) };
+    if kdf.is_null() {
+        // The HKDF provider is unavailable — a genuine engine failure, not a caller error.
+        return Err(AL_CODE);
+    }
+    let ctx = unsafe { EVP_KDF_CTX_new(kdf) };
+    if ctx.is_null() {
+        unsafe { EVP_KDF_free(kdf) };
+        return Err(AL_CODE);
+    }
+    // Own the exact-length output buffer via a fallible reserve (never `vec![0; len]`, which aborts
+    // on OOM); `resize` cannot reallocate since the capacity is already reserved.
+    let mut buf: Vec<u8> = Vec::new();
+    if buf.try_reserve_exact(out_len).is_err() {
+        unsafe { EVP_KDF_CTX_free(ctx) };
+        unsafe { EVP_KDF_free(kdf) };
+        return Err(AL_CODE);
+    }
+    buf.resize(out_len, 0);
+    let rc = unsafe { EVP_KDF_derive(ctx, buf.as_mut_ptr(), out_len, params.as_ptr()) };
+    // Free on every path (success and failure) — no leak.
+    unsafe { EVP_KDF_CTX_free(ctx) };
+    unsafe { EVP_KDF_free(kdf) };
+    if rc != 1 {
+        // The engine rejected the (public-length-validated) params — a caller-input error.
+        return Err(AL_INVALID);
+    }
+    Ok(buf)
+}
+
+/// `crypto.hkdf_sha256(salt, ikm, info, len)` — derive `len` bytes with HKDF-SHA-256, writing an
+/// owned `buffer` handle to `*out` and returning `0` (or an `AL_*` status, leaving `*out` null). See
+/// [`hkdf_sha256_derive`] for the validation + error split. `len` in `1..=8160` (RFC 5869 `L`);
+/// `salt` and `info` may be empty.
+///
+/// # Safety
+/// each `{ptr,len}` pair must be a valid byte view (or null with a non-positive length); `out` must
+/// point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_hkdf_sha256(
+    salt_ptr: *const u8,
+    salt_len: i64,
+    ikm_ptr: *const u8,
+    ikm_len: i64,
+    info_ptr: *const u8,
+    info_len: i64,
+    len: i64,
+    out: *mut *mut Buffer,
+) -> i32 {
+    let salt = unsafe { bytes_view(salt_ptr, salt_len) };
+    let ikm = unsafe { bytes_view(ikm_ptr, ikm_len) };
+    let info = unsafe { bytes_view(info_ptr, info_len) };
+    unsafe { publish_buffer(hkdf_sha256_derive(salt, ikm, info, len), out) }
+}
+
+// ---------------------------------------------------------------------------------------------
 // std.cli (M10 Slice 3) — a flag-registration parser over `main(args: array<str>)`'s `array<str>`
 // (the one argv source). Pure in-language (no syscalls — argv is already captured). A `cli command`
 // (`CliCommand`) is a Move handle owning its registered-flag table; `c.parse(args)` **borrows** it
@@ -11129,6 +11370,111 @@ mod tests {
             s.push_str(&format!("{b:02x}"));
         }
         s
+    }
+
+    // std.crypto Slice 3 — hmac_sha256 / hkdf_sha256. Drive the entry points directly against the
+    // RFC 4231 (HMAC) / RFC 5869 (HKDF) known vectors, and exercise every hkdf error path (no leak).
+
+    #[test]
+    fn hmac_sha256_rfc4231_vectors() {
+        // RFC 4231 Test Case 1: key = 0x0b x 20, data = "Hi There".
+        let key1 = [0x0bu8; 20];
+        let t1 = unsafe { align_rt_crypto_hmac_sha256(key1.as_ptr(), 20, b"Hi There".as_ptr(), 8) };
+        assert!(!t1.ptr.is_null());
+        assert_eq!(t1.len, 32, "an HMAC-SHA-256 tag is 32 bytes");
+        let v1 = unsafe { std::slice::from_raw_parts(t1.ptr, 32) }.to_vec();
+        unsafe { align_rt_free(t1.ptr as *mut u8) };
+        assert_eq!(hex_encode_bytes(&v1), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+
+        // RFC 4231 Test Case 2: key = "Jefe", data = "what do ya want for nothing?".
+        let t2 = unsafe {
+            align_rt_crypto_hmac_sha256(b"Jefe".as_ptr(), 4, b"what do ya want for nothing?".as_ptr(), 28)
+        };
+        let v2 = unsafe { std::slice::from_raw_parts(t2.ptr, 32) }.to_vec();
+        unsafe { align_rt_free(t2.ptr as *mut u8) };
+        assert_eq!(hex_encode_bytes(&v2), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    }
+
+    #[test]
+    fn hmac_sha256_empty_key_and_data_are_valid() {
+        // Both empty key and empty data are valid HMAC inputs (must not abort); tag stays 32 bytes.
+        let t = unsafe { align_rt_crypto_hmac_sha256(std::ptr::null(), 0, std::ptr::null(), 0) };
+        assert!(!t.ptr.is_null());
+        assert_eq!(t.len, 32);
+        // HMAC-SHA256(key="", msg="") — a fixed, well-defined value (all-zero padded key).
+        let v = unsafe { std::slice::from_raw_parts(t.ptr, 32) }.to_vec();
+        unsafe { align_rt_free(t.ptr as *mut u8) };
+        assert_eq!(hex_encode_bytes(&v), "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad");
+    }
+
+    /// Run hkdf and return the derived bytes (freeing the published `buffer`), or the error status.
+    fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], len: i64) -> Result<Vec<u8>, i32> {
+        let mut out: *mut Buffer = std::ptr::null_mut();
+        let rc = unsafe {
+            align_rt_crypto_hkdf_sha256(
+                salt.as_ptr(),
+                salt.len() as i64,
+                ikm.as_ptr(),
+                ikm.len() as i64,
+                info.as_ptr(),
+                info.len() as i64,
+                len,
+                &mut out,
+            )
+        };
+        if rc != 0 {
+            assert!(out.is_null(), "a failed hkdf leaves the out handle null");
+            return Err(rc);
+        }
+        assert!(!out.is_null());
+        let b = unsafe { &*out };
+        let v = b.data[..b.len].to_vec();
+        unsafe { align_rt_buffer_free(out) };
+        Ok(v)
+    }
+
+    #[test]
+    fn hkdf_sha256_rfc5869_vectors() {
+        // RFC 5869 Test Case 1.
+        let ikm = [0x0bu8; 22];
+        let salt: Vec<u8> = (0..=0x0cu8).collect();
+        let info: Vec<u8> = (0xf0u8..=0xf9u8).collect();
+        let out = hkdf(&salt, &ikm, &info, 42).expect("TC1 derives");
+        assert_eq!(out.len(), 42);
+        assert_eq!(
+            hex_encode_bytes(&out),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+        // RFC 5869 Test Case 3: empty salt + empty info.
+        let out3 = hkdf(b"", &ikm, b"", 42).expect("TC3 derives (empty salt + info)");
+        assert_eq!(
+            hex_encode_bytes(&out3),
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+        );
+    }
+
+    #[test]
+    fn hkdf_sha256_length_bounds() {
+        let ikm = [0x0bu8; 22];
+        // Non-positive and over-limit lengths are caller errors (Invalid), rejected before the engine.
+        assert_eq!(hkdf(b"s", &ikm, b"i", 0), Err(AL_INVALID));
+        assert_eq!(hkdf(b"s", &ikm, b"i", -1), Err(AL_INVALID));
+        assert_eq!(hkdf(b"s", &ikm, b"i", HKDF_SHA256_MAX_LEN + 1), Err(AL_INVALID));
+        // The exact RFC 5869 L limit (8160) is valid.
+        let ok = hkdf(b"s", &ikm, b"i", HKDF_SHA256_MAX_LEN).expect("8160 is the max valid length");
+        assert_eq!(ok.len(), HKDF_SHA256_MAX_LEN as usize);
+    }
+
+    #[test]
+    fn hkdf_sha256_null_out_and_empty_inputs() {
+        // A null out handle is rejected without deriving (Invalid, via publish_buffer).
+        let rc = unsafe {
+            align_rt_crypto_hkdf_sha256(std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), 0, 32, std::ptr::null_mut())
+        };
+        assert_eq!(rc, AL_INVALID);
+        // Empty salt + empty info + empty ikm still derive (OpenSSL accepts a zero-length key).
+        let out = hkdf(b"", b"", b"", 32).expect("empty inputs derive");
+        assert_eq!(out.len(), 32);
     }
 
     // --- std.cli --------------------------------------------------------------------------------

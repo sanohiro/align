@@ -399,3 +399,214 @@ fn sha_wrong_shape_rejected() {
         "sha512 on a non-byte-view must error"
     );
 }
+
+// --- hmac_sha256 / hkdf_sha256 (Slice 3) ------------------------------------------------------
+//
+// `crypto.hmac_sha256(key: bytes, data: bytes) -> array<u8>` (32-byte tag) and
+// `crypto.hkdf_sha256(salt, ikm, info, len) -> Result<buffer, Error>` (HKDF over libcrypto's
+// `EVP_KDF`). Both Impure (a C-engine call), so `par_map` rejects them. Byte keys/inputs for the
+// RFC vectors are built with `encoding.hex_decode(...).bytes()` (a `slice<u8>`); the outputs are
+// `hex_encode`d and compared against the RFC 4231 (HMAC) / RFC 5869 (HKDF) known-answer vectors.
+
+/// `hmac_sha256` matches RFC 4231 Test Case 1 (key = 0x0b x 20, data = "Hi There") and Test Case 2
+/// (key = "Jefe", data = "what do ya want for nothing?"); the tag is 32 bytes.
+#[test]
+fn hmac_sha256_rfc4231_vectors() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  key1 := encoding.hex_decode(\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\")?   // 0x0b x 20
+  t1 := crypto.hmac_sha256(key1.bytes(), \"Hi There\")
+  print(t1.len())
+  print(encoding.hex_encode(t1[0..t1.len()]))
+  t2 := crypto.hmac_sha256(\"Jefe\", \"what do ya want for nothing?\")
+  print(encoding.hex_encode(t2[0..t2.len()]))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-hmac-vec", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "32\n\
+         b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7\n\
+         5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843\n"
+    );
+}
+
+/// Empty key and empty data are both valid HMAC inputs (no abort); the tag is the well-defined
+/// HMAC-SHA256(key="", msg="") value.
+#[test]
+fn hmac_sha256_empty_key_and_data() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  t := crypto.hmac_sha256(\"\", \"\")
+  print(t.len())
+  print(encoding.hex_encode(t[0..t.len()]))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-hmac-empty", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "32\nb613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad\n"
+    );
+}
+
+/// `hkdf_sha256` matches RFC 5869 Test Case 1 (ikm = 0x0b x 22, salt = 0x00..0c, info = 0xf0..f9,
+/// L = 42) and Test Case 3 (empty salt + empty info, L = 42); the output is 42 bytes.
+#[test]
+fn hkdf_sha256_rfc5869_vectors() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  ikm := encoding.hex_decode(\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\")?   // 0x0b x 22
+  salt := encoding.hex_decode(\"000102030405060708090a0b0c\")?
+  info := encoding.hex_decode(\"f0f1f2f3f4f5f6f7f8f9\")?
+  ok1 := crypto.hkdf_sha256(salt.bytes(), ikm.bytes(), info.bytes(), 42)?
+  print(ok1.len())
+  print(encoding.hex_encode(ok1.bytes()))
+  // TC3: empty salt + empty info (salt defaults to zeros, info absent).
+  ok3 := crypto.hkdf_sha256(\"\", ikm.bytes(), \"\", 42)?
+  print(encoding.hex_encode(ok3.bytes()))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-hkdf-vec", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "42\n\
+         3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865\n\
+         8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8\n"
+    );
+}
+
+/// The exact RFC 5869 `L` limit (8160 = 255*32) is valid: it derives 8160 bytes.
+#[test]
+fn hkdf_sha256_max_length_ok() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+pub fn main() -> Result<(), Error> {
+  ikm := \"input keying material\"
+  out := crypto.hkdf_sha256(\"salt\", ikm, \"info\", 8160)?
+  print(out.len())
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-hkdf-max", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "8160\n");
+}
+
+/// A non-positive (`0`, negative) or over-limit (`8161 > 8160`) `len` is a public-value error →
+/// `Error.Invalid` (tag 1 → exit 2 via the propagated `?` at the `main` boundary), rejected before
+/// any engine call. Empty `salt`/`info` are still fine (covered by the vectors' TC3).
+#[test]
+fn hkdf_sha256_len_bounds_are_invalid() {
+    if !backend_available() {
+        return;
+    }
+    for (tag, len) in [("zero", "0"), ("neg", "-1"), ("over", "8161")] {
+        let prog = format!(
+            "\
+import std.crypto
+pub fn main() -> Result<(), Error> {{
+  out := crypto.hkdf_sha256(\"salt\", \"ikm\", \"info\", {len})?
+  print(out.len())
+  return Ok(())
+}}
+"
+        );
+        let out = build_and_run(&format!("m11cr-hkdf-len-{tag}"), &prog);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "hkdf len={len} → Error.Invalid (exit 2); stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// `hmac_sha256` / `hkdf_sha256` call the libcrypto engine — Impure. A closure that uses either is
+/// never `Pure`, so `par_map` (which requires a Pure closure) rejects it.
+#[test]
+fn hmac_hkdf_impure_rejected_by_par_map() {
+    let hmac_src = "\
+import std.crypto
+fn f(x: i64) -> i64 {
+  t := crypto.hmac_sha256(\"k\", \"data\")
+  return x + t.len()
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11cr-hmac-parmap", hmac_src), "an impure hmac_sha256 closure must be rejected by par_map");
+
+    let hkdf_src = "\
+import std.crypto
+fn f(x: i64) -> i64 {
+  r := crypto.hkdf_sha256(\"s\", \"ikm\", \"i\", 32)
+  return x + match r { Ok(b) => b.len(), Err(_) => 0 }
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11cr-hkdf-parmap", hkdf_src), "an impure hkdf_sha256 closure must be rejected by par_map");
+}
+
+/// `hmac_sha256` (2 byte-view args) / `hkdf_sha256` (3 byte-views + an i64) require `import
+/// std.crypto` and reject the wrong arity / argument types.
+#[test]
+fn hmac_hkdf_wrong_shape_rejected() {
+    // import gate.
+    assert!(
+        check_errs("m11cr-hmac-noimport", "pub fn main() -> Result<(), Error> {\n  t := crypto.hmac_sha256(\"k\", \"d\")\n  print(t.len())\n  return Ok(())\n}\n"),
+        "hmac_sha256 without `import std.crypto` must error"
+    );
+    // hmac arity + type.
+    assert!(
+        check_errs("m11cr-hmac-arity", "import std.crypto\npub fn main() -> Result<(), Error> {\n  t := crypto.hmac_sha256(\"k\")\n  print(t.len())\n  return Ok(())\n}\n"),
+        "hmac_sha256 with 1 argument must error"
+    );
+    assert!(
+        check_errs("m11cr-hmac-type", "import std.crypto\npub fn main() -> Result<(), Error> {\n  t := crypto.hmac_sha256(\"k\", 42)\n  print(t.len())\n  return Ok(())\n}\n"),
+        "hmac_sha256 on a non-byte-view data must error"
+    );
+    // hkdf arity + len-type (a non-i64 len).
+    assert!(
+        check_errs("m11cr-hkdf-arity", "import std.crypto\npub fn main() -> Result<(), Error> {\n  r := crypto.hkdf_sha256(\"s\", \"i\", \"n\")?\n  print(r.len())\n  return Ok(())\n}\n"),
+        "hkdf_sha256 with 3 arguments must error"
+    );
+    assert!(
+        check_errs("m11cr-hkdf-lentype", "import std.crypto\npub fn main() -> Result<(), Error> {\n  r := crypto.hkdf_sha256(\"s\", \"i\", \"n\", \"42\")?\n  print(r.len())\n  return Ok(())\n}\n"),
+        "hkdf_sha256 with a non-i64 len must error"
+    );
+}

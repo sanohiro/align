@@ -458,6 +458,16 @@ fn rvalue_str(rv: &Rvalue) -> String {
             };
             format!("crypto_{name}({})", operand_str(data))
         }
+        Rvalue::CryptoHmac { key, data } => {
+            format!("crypto_hmac_sha256({}, {})", operand_str(key), operand_str(data))
+        }
+        Rvalue::CryptoHkdf { salt, ikm, info, len, out } => format!(
+            "crypto_hkdf_sha256({}, {}, {}, {}, -> _{out})",
+            operand_str(salt),
+            operand_str(ikm),
+            operand_str(info),
+            operand_str(len)
+        ),
         Rvalue::RandSeed { seed: Some(s), out } => format!("rng_seed_with({}, -> _{out})", operand_str(s)),
         Rvalue::RandSeed { seed: None, out } => format!("rng_seed_os(-> _{out})"),
         Rvalue::RandNext { rng } => format!("rng_next(_{rng})"),
