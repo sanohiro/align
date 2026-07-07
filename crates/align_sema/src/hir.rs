@@ -911,6 +911,22 @@ pub enum ExprKind {
     /// so excluded from `par_map`, matching `std.compress`; the determinism of hashing does not make
     /// it pure). `data` is borrowed, never consumed.
     CryptoHash { algo: HashAlgo, data: Box<Expr> },
+    /// `crypto.hmac_sha256(key, data)` — the 32-byte HMAC-SHA-256 tag of the byte view `data` under
+    /// the byte view `key`, as a freshly heap-allocated owned `array<u8>` of length 32 (the same
+    /// owned-`array<u8>` shape as [`ExprKind::CryptoHash`]; the `ty` is [`crate::Ty::DynArray`] of
+    /// `u8`). Empty `key` and empty `data` are both valid HMAC inputs. Wraps OpenSSL libcrypto's
+    /// one-shot `EVP_Q_mac`. **Impure** (a C-engine call — never `Pure`, so excluded from `par_map`).
+    /// Both `key` and `data` are borrowed, never consumed.
+    CryptoHmac { key: Box<Expr>, data: Box<Expr> },
+    /// `crypto.hkdf_sha256(salt, ikm, info, len)` — derive `len` bytes with HKDF-SHA-256 over the byte
+    /// views `salt` / `ikm` (input keying material) / `info`, as a `Result<buffer, Error>` (the same
+    /// status→owned-`buffer` shape as [`ExprKind::Decompress`]; the `ty` is
+    /// [`crate::Ty::Result`] of `buffer` / `Error`). `len` is an `i64`; a non-positive or over-limit
+    /// (`> 255*32` = 8160, the RFC 5869 `L` limit for SHA-256) length → `Error.Invalid` (validated as
+    /// a **public** value before the engine); `salt` and `info` may be empty. Wraps OpenSSL
+    /// libcrypto's `EVP_KDF` HKDF path. **Impure** (a C-engine call). All four operands are borrowed,
+    /// never consumed.
+    CryptoHkdf { salt: Box<Expr>, ikm: Box<Expr>, info: Box<Expr>, len: Box<Expr> },
 }
 
 /// Which cryptographic hash an [`ExprKind::CryptoHash`] computes (M11 Slice 2). One node kind serves

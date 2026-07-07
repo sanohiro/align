@@ -639,6 +639,16 @@ pub enum Rvalue {
     /// as a `{ptr,len}` (like [`Self::RandSample`]). `algo` param-swaps the EVP digest. The bound
     /// local `Drop`-frees the array. Impure (a libcrypto call).
     CryptoHash { algo: hir::HashAlgo, data: Operand },
+    /// `crypto.hmac_sha256(key, data)` — the 32-byte HMAC-SHA-256 tag of the byte views `key` / `data`
+    /// (each `{ptr,len}`), a fresh *owned* `array<u8>` returned by value as a `{ptr,len}` (the
+    /// [`Self::CryptoHash`] shape). The bound local `Drop`-frees the array. Impure (a libcrypto call).
+    CryptoHmac { key: Operand, data: Operand },
+    /// `crypto.hkdf_sha256(salt, ikm, info, len)` — derive `len` bytes with HKDF-SHA-256 over the byte
+    /// views `salt` / `ikm` / `info` (each `{ptr,len}`). The runtime writes an owned `buffer` handle
+    /// into `out` and returns an `i32` status (0 ok, `AL_INVALID` bad-`len`/rejected-params,
+    /// `AL_CODE+n` engine failure — see [`make_error_from_status`]); the caller branches
+    /// `Ok(<buffer>)` / `Err(<mapped>)` via [`emit_status_buffer_result`]. Impure.
+    CryptoHkdf { salt: Operand, ikm: Operand, info: Operand, len: Operand, out: Slot },
     /// `rand.seed()` / `rand.seed_with(s)` — initialize an `rng` (four `i64`s, Xoshiro256++) into the
     /// slot `out`. `seed` is `None` for the OS-seeded form (`getrandom`), `Some(s)` for the
     /// deterministic form. Yields no value (the caller `Load`s `out` for the `rng` aggregate).
@@ -1735,6 +1745,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::CryptoHash { algo: *algo, data: dv }));
             Operand::Value(v)
         }
+        // `crypto.hmac_sha256(key, data)` / `crypto.hkdf_sha256(salt, ikm, info, len)` → out-of-line
+        // helpers. Their bodies bind several locals; kept out of this recursive `match` so those slots
+        // do not inflate `lower_expr`'s (per-recursion-level) stack frame in debug builds — a deep
+        // expression tree recurses through this function, and rustc reserves every arm's locals up
+        // front (the `expr_depth` headroom the #296 cap was measured against).
+        hir::ExprKind::CryptoHmac { key, data } => lower_crypto_hmac(b, key, data, e.ty),
+        hir::ExprKind::CryptoHkdf { salt, ikm, info, len } => lower_crypto_hkdf(b, salt, ikm, info, len, e.ty),
         // `rand.seed()` / `rand.seed_with(s)` → initialize the `rng` state into a temp slot (the
         // runtime writes through the pointer), then load the `[4 x i64]` aggregate as the value.
         hir::ExprKind::RandSeed | hir::ExprKind::RandSeedWith { .. } => {
@@ -5312,6 +5329,34 @@ fn emit_status_buffer_result(b: &mut Builder, code: ValueId, out: Slot, result_t
     let r = b.fresh_value(result_ty);
     b.push(Stmt::Let(r, Rvalue::Load(rslot)));
     Operand::Value(r)
+}
+
+/// `crypto.hmac_sha256(key, data)` → a fresh owned `array<u8>` `{ptr,len}` returned by value (the
+/// bound local `Drop`-frees it, same shape as `crypto.sha256`). Out-of-line (`#[inline(never)]`) so
+/// its locals stay off the recursive `lower_expr` frame (see the call site).
+#[inline(never)]
+fn lower_crypto_hmac(b: &mut Builder, key: &hir::Expr, data: &hir::Expr, ty: Ty) -> Operand {
+    let kv = lower_expr(b, key);
+    let dv = lower_expr(b, data);
+    let v = b.fresh_value(ty);
+    b.push(Stmt::Let(v, Rvalue::CryptoHmac { key: kv, data: dv }));
+    Operand::Value(v)
+}
+
+/// `crypto.hkdf_sha256(salt, ikm, info, len)` → the runtime writes an owned `buffer` into `out` +
+/// returns an i32 status; branch `Ok(<buffer>)` / `Err(<mapped>)` via the shared `std.compress`
+/// machinery. Out-of-line (`#[inline(never)]`) so its locals stay off the recursive `lower_expr`
+/// frame (see the call site).
+#[inline(never)]
+fn lower_crypto_hkdf(b: &mut Builder, salt: &hir::Expr, ikm: &hir::Expr, info: &hir::Expr, len: &hir::Expr, ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::Buffer);
+    let sv = lower_expr(b, salt);
+    let iv = lower_expr(b, ikm);
+    let nv = lower_expr(b, info);
+    let lv = lower_expr(b, len);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::CryptoHkdf { salt: sv, ikm: iv, info: nv, len: lv, out }));
+    emit_status_buffer_result(b, code, out, ty)
 }
 
 /// `c.parse(args)` → the runtime writes an owned `cli parsed` handle into an out slot and returns an

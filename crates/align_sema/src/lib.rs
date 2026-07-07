@@ -2499,6 +2499,20 @@ impl EffectScan {
                 self.impure_direct = true;
                 self.expr(data);
             }
+            // `crypto.hmac_sha256` / `crypto.hkdf_sha256` — libcrypto calls, inferred **Impure**
+            // (never `Pure`, so excluded from `par_map`, matching `crypto.sha256`). Recurse operands.
+            ExprKind::CryptoHmac { key, data } => {
+                self.impure_direct = true;
+                self.expr(key);
+                self.expr(data);
+            }
+            ExprKind::CryptoHkdf { salt, ikm, info, len } => {
+                self.impure_direct = true;
+                self.expr(salt);
+                self.expr(ikm);
+                self.expr(info);
+                self.expr(len);
+            }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 self.stage_funcs(stages);
@@ -3639,6 +3653,19 @@ impl<'a> EscapeCheck<'a> {
             // owns its heap buffer, `Drop`-freed) — freely returnable, like `rand.sample`. Just
             // recurse into the byte view so any escape *inside* it is still checked.
             ExprKind::CryptoHash { data, .. } => self.walk(data, depth),
+            // `crypto.hmac_sha256` returns a fresh owned `array<u8>` (borrows nothing);
+            // `crypto.hkdf_sha256` a fresh owned `buffer` inside a `Result` — both freely returnable.
+            // Recurse into the operands so any escape inside them is still checked.
+            ExprKind::CryptoHmac { key, data } => {
+                self.walk(key, depth);
+                self.walk(data, depth);
+            }
+            ExprKind::CryptoHkdf { salt, ikm, info, len } => {
+                self.walk(salt, depth);
+                self.walk(ikm, depth);
+                self.walk(info, depth);
+                self.walk(len, depth);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -4053,6 +4080,16 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::CryptoRandom { out } => self.visit(out),
             ExprKind::CryptoHash { data, .. } => self.visit(data),
+            ExprKind::CryptoHmac { key, data } => {
+                self.visit(key);
+                self.visit(data);
+            }
+            ExprKind::CryptoHkdf { salt, ikm, info, len } => {
+                self.visit(salt);
+                self.visit(ikm);
+                self.visit(info);
+                self.visit(len);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
@@ -4777,6 +4814,18 @@ impl<'a> MoveCheck<'a> {
             // `crypto.sha256`/`sha512` borrow the byte view (never consume it). Recurse non-consuming
             // to catch a use-after-move *inside* the operand.
             ExprKind::CryptoHash { data, .. } => self.expr(data, moved, false, false),
+            // `crypto.hmac_sha256`/`hkdf_sha256` borrow every operand (never consume). Recurse
+            // non-consuming to catch a use-after-move inside them.
+            ExprKind::CryptoHmac { key, data } => {
+                self.expr(key, moved, false, false);
+                self.expr(data, moved, false, false);
+            }
+            ExprKind::CryptoHkdf { salt, ikm, info, len } => {
+                self.expr(salt, moved, false, false);
+                self.expr(ikm, moved, false, false);
+                self.expr(info, moved, false, false);
+                self.expr(len, moved, false, false);
+            }
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -7727,7 +7776,11 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.crypto` — `constant_time_equal(a, b)` (the self-hosted branchless CT byte-compare,
             // Pure) / `random(out)` (fill a `buffer` from the OS CSPRNG, Impure) from Slice 1;
             // `sha256(data)` / `sha512(data)` (EVP digests via libcrypto, Impure) from Slice 2.
-            if module == "crypto" && matches!(method, "constant_time_equal" | "random" | "sha256" | "sha512") {
+            // `hmac_sha256(key, data)` (owned `array<u8>` tag) / `hkdf_sha256(salt, ikm, info, len)`
+            // (`Result<buffer, Error>`) are Slice 3, both Impure libcrypto calls.
+            if module == "crypto"
+                && matches!(method, "constant_time_equal" | "random" | "sha256" | "sha512" | "hmac_sha256" | "hkdf_sha256")
+            {
                 self.require_import("std.crypto", &format!("crypto.{method}"), span);
                 return self.check_crypto_op(method, args, span);
             }
@@ -11549,6 +11602,13 @@ impl<'a, 't> Checker<'a, 't> {
         if matches!(method, "sha256" | "sha512") {
             return self.check_crypto_hash(method, args, span);
         }
+        // `hmac_sha256`/`hkdf_sha256` (Slice 3) — delegate to their builders.
+        if method == "hmac_sha256" {
+            return self.check_crypto_hmac(args, span);
+        }
+        if method == "hkdf_sha256" {
+            return self.check_crypto_hkdf(args, span);
+        }
         if method == "constant_time_equal" {
             if args.len() != 2 {
                 self.diags
@@ -11601,6 +11661,60 @@ impl<'a, 't> Checker<'a, 't> {
         // An owned `array<u8>` of unsigned 8-bit elements — the SHA-256/512 digest bytes.
         let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
         Expr { kind: ExprKind::CryptoHash { algo, data: Box::new(data) }, ty: Ty::DynArray(u8s), span }
+    }
+
+    /// `std.crypto` (M11 Slice 3) — `hmac_sha256(key, data)`, the 32-byte HMAC-SHA-256 tag via
+    /// OpenSSL libcrypto's `EVP_Q_mac`. Both arguments are byte views (`str` / owned `string`
+    /// auto-borrowed / `slice<u8>`, the shared [`Self::check_byte_view`]); yields a fresh **owned**
+    /// `array<u8>` of length 32 (the `crypto.sha256` return machinery — a `{ptr,len}` heap array,
+    /// carried as [`Ty::DynArray`] of `u8`). **Impure** (a C-engine call). Empty key/data are valid.
+    fn check_crypto_hmac(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'crypto.hmac_sha256' expects 2 arguments (key, data), got {}", args.len()), span);
+            return err;
+        }
+        let Some(key) = self.check_byte_view(&args[0], "crypto.hmac_sha256") else { return err };
+        let Some(data) = self.check_byte_view(&args[1], "crypto.hmac_sha256") else { return err };
+        let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
+        Expr { kind: ExprKind::CryptoHmac { key: Box::new(key), data: Box::new(data) }, ty: Ty::DynArray(u8s), span }
+    }
+
+    /// `std.crypto` (M11 Slice 3) — `hkdf_sha256(salt, ikm, info, len)`, HKDF-SHA-256 key derivation
+    /// via OpenSSL libcrypto's `EVP_KDF`. The three byte views (`salt` / `ikm` / `info`, the shared
+    /// [`Self::check_byte_view`]) plus a `len` `i64` yield a `Result<buffer, Error>` (the
+    /// `std.compress` status→owned-`buffer` machinery). A non-positive / over-limit `len` →
+    /// `Error.Invalid` at runtime (a public value); `salt` and `info` may be empty. **Impure**.
+    fn check_crypto_hkdf(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 4 {
+            self.diags
+                .error(format!("'crypto.hkdf_sha256' expects 4 arguments (salt, ikm, info, len), got {}", args.len()), span);
+            return err;
+        }
+        let Some(salt) = self.check_byte_view(&args[0], "crypto.hkdf_sha256") else { return err };
+        let Some(ikm) = self.check_byte_view(&args[1], "crypto.hkdf_sha256") else { return err };
+        let Some(info) = self.check_byte_view(&args[2], "crypto.hkdf_sha256") else { return err };
+        // `len` must be exactly `i64` (the runtime ABI); the range is a runtime concern (`Error.Invalid`).
+        let len = self.check_expr(&args[3], None);
+        if len.ty == Ty::Error {
+            return err;
+        }
+        if !self.require_i64_arg(len.ty, args[3].span, "'crypto.hkdf_sha256' len") {
+            return err;
+        }
+        let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
+        Expr {
+            kind: ExprKind::CryptoHkdf {
+                salt: Box::new(salt),
+                ikm: Box::new(ikm),
+                info: Box::new(info),
+                len: Box::new(len),
+            },
+            ty: result_ty,
+            span,
+        }
     }
 
     /// Require `ty` to be **exactly** `i64` (the `align_rt_rng_*` runtime ABI), binding a bare-int-
@@ -13186,6 +13300,16 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::CryptoRandom { out } => self.finalize_expr(out),
             ExprKind::CryptoHash { data, .. } => self.finalize_expr(data),
+            ExprKind::CryptoHmac { key, data } => {
+                self.finalize_expr(key);
+                self.finalize_expr(data);
+            }
+            ExprKind::CryptoHkdf { salt, ikm, info, len } => {
+                self.finalize_expr(salt);
+                self.finalize_expr(ikm);
+                self.finalize_expr(info);
+                self.finalize_expr(len);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);
