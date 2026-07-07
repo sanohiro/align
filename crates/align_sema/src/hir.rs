@@ -913,12 +913,15 @@ pub enum EncodingKind {
 }
 
 /// Which `std.compress` codec an [`ExprKind::Compress`] / [`ExprKind::Decompress`] uses. gzip (libz)
-/// is the M11 Slice 1 codec; zstd (libzstd) is Slice 2 and adds a variant here — the direction is the
-/// node kind, the codec is this `kind` (mirroring [`EncodingKind`]).
+/// is the M11 Slice 1 codec; zstd (libzstd) is Slice 2 — the direction is the node kind, the codec
+/// is this `kind` (mirroring [`EncodingKind`]). The HIR-walking passes treat the codec opaquely
+/// (they match `..`); only sema dispatch, codegen, and the runtime distinguish the two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressKind {
     /// gzip framing (RFC 1952) over DEFLATE, via `libz` — windowBits 15+16 (the gzip wrapper).
     Gzip,
+    /// zstd framing (RFC 8878) via `libzstd` — one-shot `ZSTD_compress` / streaming decompress.
+    Zstd,
 }
 
 /// Which component `path.base` / `path.dir` / `path.ext` extracts — each a zero-copy `str` view

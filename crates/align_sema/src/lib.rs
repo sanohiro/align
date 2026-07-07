@@ -7652,9 +7652,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.encoding", &format!("encoding.{method}"), span);
                 return self.check_encoding_op(method, args, span);
             }
-            // `std.compress` — gzip via libz (M11 Slice 1). Pure byte→byte codecs (owned `buffer`
-            // output) wrapping the tuned C engine (draft §15 keystone strategy).
-            if module == "compress" && matches!(method, "gzip_compress" | "gzip_decompress") {
+            // `std.compress` — gzip via libz (M11 Slice 1) / zstd via libzstd (Slice 2). Impure
+            // byte→byte codecs (owned `buffer` output) wrapping the tuned C engines (draft §15
+            // keystone strategy). The codec is the method prefix; the direction is the suffix.
+            if module == "compress"
+                && matches!(method, "gzip_compress" | "gzip_decompress" | "zstd_compress" | "zstd_decompress")
+            {
                 self.require_import("std.compress", &format!("compress.{method}"), span);
                 return self.check_compress_op(method, args, span);
             }
@@ -11425,22 +11428,26 @@ impl<'a, 't> Checker<'a, 't> {
         Some(data)
     }
 
-    /// `std.compress` — gzip via libz (M11 Slice 1). The keystone-library strategy (draft §15): own
-    /// the memory (Align allocates the owned `buffer` output), borrow the engine (zlib's tuned
-    /// DEFLATE). Both codecs are byte→byte and yield `Result<buffer, Error>`:
-    /// - `gzip_compress(data, level)` — compress the byte view `data` (`str` / owned `string`
-    ///   auto-borrowed / `slice<u8>`) at `level` (an `i64`; the runtime aborts on a level outside
-    ///   `0..=9`, a programmer error like `rand.range`'s `lo >= hi`).
-    /// - `gzip_decompress(data)` — inflate a gzip byte view; corrupt/truncated input or a
-    ///   decompress-bomb over the runtime output cap → `Error.Invalid`.
+    /// `std.compress` — gzip via libz / zstd via libzstd (M11). The keystone-library strategy
+    /// (draft §15): own the memory (Align allocates the owned `buffer` output), borrow the engine
+    /// (zlib's DEFLATE / zstd). The codec is the method prefix (`gzip_` → [`hir::CompressKind::Gzip`],
+    /// `zstd_` → [`hir::CompressKind::Zstd`]); the direction is the suffix (`_compress` / `_decompress`).
+    /// Both codecs are byte→byte and yield `Result<buffer, Error>`:
+    /// - `*_compress(data, level)` — compress the byte view `data` (`str` / owned `string`
+    ///   auto-borrowed / `slice<u8>`) at `level` (an `i64`; the runtime aborts on an out-of-range
+    ///   level — `0..=9` for gzip, `0..=22` for zstd — a programmer error like `rand.range`'s `lo >= hi`).
+    /// - `*_decompress(data)` — inflate a byte view; corrupt/truncated input or a decompress-bomb
+    ///   over the runtime output cap → `Error.Invalid`.
     ///
     /// Builtins, dispatched like the other `std` namespaces.
     fn check_compress_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let kind = hir::CompressKind::Gzip;
+        // Codec = method prefix. The dispatcher only routes the four `{gzip,zstd}_{compress,decompress}`
+        // names here, so a `zstd_` prefix is the only non-gzip case.
+        let kind = if method.starts_with("zstd_") { hir::CompressKind::Zstd } else { hir::CompressKind::Gzip };
         let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
         let what = format!("compress.{method}");
-        if method == "gzip_decompress" {
+        if method.ends_with("_decompress") {
             if args.len() != 1 {
                 self.diags
                     .error(format!("'{what}' expects 1 argument (data), got {}", args.len()), span);
@@ -11449,7 +11456,7 @@ impl<'a, 't> Checker<'a, 't> {
             let Some(data) = self.check_byte_view(&args[0], &what) else { return err };
             return Expr { kind: ExprKind::Decompress { kind, data: Box::new(data) }, ty: result_ty, span };
         }
-        // `gzip_compress(data, level)`.
+        // `*_compress(data, level)`.
         if args.len() != 2 {
             self.diags
                 .error(format!("'{what}' expects 2 arguments (data, level), got {}", args.len()), span);
@@ -11461,7 +11468,7 @@ impl<'a, 't> Checker<'a, 't> {
         if level.ty == Ty::Error {
             return err;
         }
-        if !self.require_i64_arg(level.ty, args[1].span, "'compress.gzip_compress' level") {
+        if !self.require_i64_arg(level.ty, args[1].span, &format!("'{what}' level")) {
             return err;
         }
         Expr { kind: ExprKind::Compress { kind, data: Box::new(data), level: Box::new(level) }, ty: result_ty, span }

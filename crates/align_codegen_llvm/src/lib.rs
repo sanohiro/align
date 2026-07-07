@@ -1023,9 +1023,10 @@ fn build_module<'c>(
         "utf8_valid".to_string(),
         module.add_function("align_rt_utf8_valid", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
     );
-    // `std.compress` — gzip via libz. compress (data view `{ptr,len}`, i64 level, out: *handle) and
-    // decompress (data view `{ptr,len}`, out: *handle) both return an i32 status (0 ok / AL_INVALID /
-    // AL_CODE+n), writing an owned `buffer` handle into `out`.
+    // `std.compress` — gzip via libz / zstd via libzstd. compress (data view `{ptr,len}`, i64 level,
+    // out: *handle) and decompress (data view `{ptr,len}`, out: *handle) both return an i32 status
+    // (0 ok / AL_INVALID / AL_CODE+n), writing an owned `buffer` handle into `out`. Both codecs share
+    // the same ABI shape.
     funcs.insert(
         "compress_gzip_compress".to_string(),
         module.add_function(
@@ -1038,6 +1039,22 @@ fn build_module<'c>(
         "compress_gzip_decompress".to_string(),
         module.add_function(
             "align_rt_compress_gzip_decompress",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "compress_zstd_compress".to_string(),
+        module.add_function(
+            "align_rt_compress_zstd_compress",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "compress_zstd_decompress".to_string(),
+        module.add_function(
+            "align_rt_compress_zstd_decompress",
             ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
             None,
         ),
@@ -4641,11 +4658,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("utf8_valid returns i32")
             }
-            // std.compress — gzip via libz. The data view splits to `{ptr,len}`; the out handle slot
-            // is caller-zeroed (so the Err path frees nothing); the runtime returns an i32 status.
+            // std.compress — gzip via libz / zstd via libzstd. The data view splits to `{ptr,len}`;
+            // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime
+            // returns an i32 status.
             Rvalue::CompressCompress { kind, data, level, out } => {
                 let fk = match kind {
                     align_sema::hir::CompressKind::Gzip => "compress_gzip_compress",
+                    align_sema::hir::CompressKind::Zstd => "compress_zstd_compress",
                 };
                 let out_ptr = self.slots[out];
                 self.builder
@@ -4661,6 +4680,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CompressDecompress { kind, data, out } => {
                 let fk = match kind {
                     align_sema::hir::CompressKind::Gzip => "compress_gzip_decompress",
+                    align_sema::hir::CompressKind::Zstd => "compress_zstd_decompress",
                 };
                 let out_ptr = self.slots[out];
                 self.builder
