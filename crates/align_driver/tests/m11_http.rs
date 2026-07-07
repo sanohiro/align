@@ -246,6 +246,54 @@ pub fn main() -> i32 {
     assert!(d.contains("cannot return a view that borrows local storage"), "resp.header() view must not escape the response:\n{d}");
 }
 
+/// P3 (#297), the general pattern-binding region gap (the confirmed UAF): unwrapping the
+/// `Option<str>` view through a **`match` arm binding** (`Some(v) => v`) must ALSO carry the region —
+/// the bound `v` views `resp`'s buffer, so returning it past `resp`'s `Drop` is a use-after-free.
+/// (This is the codebase's first `Option<borrowed-view>`; the fix threads the scrutinee's non-Static
+/// region into every arm-payload binding, closing the gap for every future `Option<view>` /
+/// `Result<view>`, not just http — `env.get`'s `Option<string>` is owned, so it never exposed it.)
+#[test]
+fn resp_header_view_cannot_escape_via_match_binding() {
+    let src = "\
+import std.http
+fn steal(bytes: slice<u8>) -> Result<str, Error> {
+  resp := http.parse(bytes)?
+  h := match resp.header(\"X-A\") { Some(v) => v, None => \"x\" }
+  return Ok(h)
+}
+pub fn main() -> i32 {
+  return 0
+}
+";
+    let d = check_diagnostics("m11-http-header-match-escape", src);
+    assert!(
+        d.contains("cannot return a view that borrows local storage"),
+        "a header view unwrapped through a match arm must not escape the response:\n{d}"
+    );
+}
+
+/// The `slice<u8>` body view likewise cannot escape when bound out of a `match` arm and then
+/// returned (the same pattern-binding region path).
+#[test]
+fn resp_body_view_cannot_escape_via_match_binding() {
+    let src = "\
+import std.http
+fn steal(bytes: slice<u8>) -> slice<u8> {
+  match http.parse(bytes) {
+    Ok(resp) => {
+      b := resp.body()
+      b
+    }
+    Err(e) => bytes,
+  }
+}
+pub fn main() -> i32 {
+  return 0
+}
+";
+    assert!(check_errs("m11-http-body-match-escape", src), "a match-bound body view returned out of the frame must be rejected");
+}
+
 /// The response handle is Move: using a moved-out response is a compile error.
 #[test]
 fn response_use_after_move_rejected() {

@@ -43,7 +43,16 @@ only, v1); caps 128 headers / 1 GiB; R1 zero-copy offset table, `memchr`-backed 
 `m11_http.rs` (14 driver) + 7 `align_runtime` units. **NOTE the `lower_expr` frame lesson bit again:**
 adding 7 http arms tipped the default-env expr_depth ceiling (baseline 5/5 → 4/5 overflow at the
 40-term full-pipeline chain); fixed by collapsing all 7 http ops into ONE `lower_expr` arm delegating
-to a single `#[inline(never)] lower_http(b, e)` dispatcher — back to 5/5. **Next: Slice 2** (client
+to a single `#[inline(never)] lower_http(b, e)` dispatcher — back to 5/5. **Adversarial review then
+found + fixed 3 issues on-branch:** (1) a CONFIRMED use-after-free — `resp.header()`'s `Option<str>`
+view escaped when unwrapped through a `match` arm (`Some(v) => v`), because `EscapeCheck` never
+carried the scrutinee's region into arm-payload bindings (the codebase's first `Option<borrowed
+view>`). Fixed the **general** gap: a `match`-arm binding now inherits the scrutinee's non-Static
+region (like `LetTuple`), closing it for every future `Option<view>`/`Result<view>` — no regression
+across cli/net/crypto view-escape suites. (2) serialize now validates method = RFC 7230 token +
+authority/path have no CR/LF/NUL/SP (permanent-codec smuggling guard). (3) parse rejects a
+conflicting duplicate Content-Length (RFC 7230 §3.3.3). `cargo test --workspace` 1584 green,
+expr_depth 5/5 default env, clippy clean. **Next: Slice 2** (client
 `http.client()` + `cl.get/post/request` over one net `tcp_conn`, plaintext; reuses `serialize` +
 `http.parse`). **The owner explicitly wants http FAST** — treat http.md's R1–R6 as requirements;
 benchmark-driven (measure before claiming). Slices 3–5 (pool reuse, server, HTTPS) after.

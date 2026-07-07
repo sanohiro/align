@@ -8778,6 +8778,26 @@ pub unsafe extern "C" fn align_rt_http_body(req: *mut HttpRequest, data_ptr: *co
     r.body = unsafe { bytes_view(data_ptr, data_len) }.to_vec();
 }
 
+/// An RFC 7230 `token`: one or more `tchar` (ALPHA / DIGIT / a fixed set of symbols — no control
+/// char, no separator, no whitespace). Used to validate the request method so it cannot inject an
+/// extra request-line token or a CRLF (`GET /x HTTP/1.1\r\nEvil: 1` via a crafted method).
+fn http_is_token(s: &[u8]) -> bool {
+    !s.is_empty()
+        && s.iter().all(|&b| {
+            matches!(b,
+                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+        })
+}
+
+/// Whether a request-line field (the URL-derived authority / path) is free of bytes that would break
+/// or extend the start-line: CR / LF / NUL (header injection → request smuggling) and a raw SP (a
+/// space splits the `METHOD SP target SP HTTP/1.1` line — a valid request-target percent-encodes
+/// spaces, so a raw one is always a smuggling attempt / malformed URL).
+fn http_request_line_field_clean(s: &[u8]) -> bool {
+    !s.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0 || b == b' ')
+}
+
 /// Split a v1 URL `http://host[:port]/path` into `(authority, path)` where `authority` is
 /// `host[:port]` (the `Host:` header value) and `path` is the request-line target (defaulting to
 /// `/`). Returns `None` for a non-`http://` scheme (notably `https://`, unsupported in v1 — TLS
@@ -8823,6 +8843,12 @@ pub unsafe extern "C" fn align_rt_http_serialize(req: *const HttpRequest, out: *
     let Some((authority, path)) = http_split_url(&r.url) else {
         return AL_INVALID; // https:// (P1) / non-http scheme / empty authority / malformed
     };
+    // The URL-derived request-line fields must not carry start-line-breaking bytes (CR/LF/NUL/SP) —
+    // a crafted `http://a/x\r\nEvil: 1` would otherwise inject a header (request smuggling). Validated
+    // here (not only at `r.header()`) because this is the permanent codec Slice 2's client exposes.
+    if !http_request_line_field_clean(authority.as_bytes()) || !http_request_line_field_clean(path.as_bytes()) {
+        return AL_INVALID;
+    }
     // Reject a caller-supplied Host / Content-Length: both are auto-generated here, and a duplicate
     // Content-Length is a request-smuggling vector (RFC 7230 §3.3.2). Safer than a silent override.
     for (name, _) in &r.headers {
@@ -8831,6 +8857,11 @@ pub unsafe extern "C" fn align_rt_http_serialize(req: *const HttpRequest, out: *
         }
     }
     let method = if r.method.is_empty() { "GET" } else { r.method.as_str() };
+    // The method must be a bare RFC 7230 token — a space / CTL / CRLF would corrupt or extend the
+    // start-line (`<method> <target> HTTP/1.1`).
+    if !http_is_token(method.as_bytes()) {
+        return AL_INVALID;
+    }
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(method.as_bytes());
     buf.push(b' ');
@@ -8966,6 +8997,12 @@ pub unsafe extern "C" fn align_rt_http_parse(data_ptr: *const u8, data_len: i64,
             let Ok(n) = std::str::from_utf8(value).unwrap_or("x").parse::<usize>() else {
                 return AL_INVALID;
             };
+            // RFC 7230 §3.3.3: a second Content-Length whose value *conflicts* with the first is a
+            // response-smuggling vector (once Slice 2 reads off a socket, two proxies could frame the
+            // body differently) → reject. An identical repeat is harmless and accepted.
+            if content_length.is_some_and(|prev| prev != n) {
+                return AL_INVALID;
+            }
             content_length = Some(n);
         } else if name.eq_ignore_ascii_case(b"transfer-encoding")
             && value.to_ascii_lowercase().windows(7).any(|w| w == b"chunked")
@@ -8982,7 +9019,10 @@ pub unsafe extern "C" fn align_rt_http_parse(data_ptr: *const u8, data_len: i64,
     }
     let body_len = match content_length {
         Some(n) => {
-            if n > HTTP_MAX_BODY || body_start + n > src.len() {
+            // `checked_add` (Gate-2 discipline) rather than `body_start + n`: unreachable on 64-bit
+            // since `n <= HTTP_MAX_BODY` is checked first, but a wrap would otherwise turn an
+            // out-of-buffer body into an in-bounds one.
+            if n > HTTP_MAX_BODY || body_start.checked_add(n).is_none_or(|end| end > src.len()) {
                 return AL_INVALID; // over cap, or the declared body runs past the buffer
             }
             n
@@ -13291,6 +13331,47 @@ mod tests {
             assert!(out.is_null());
             unsafe { align_rt_http_request_free(req) };
         }
+    }
+
+    /// The serializer refuses to smuggle: a CR/LF in the URL request-line fields (a crafted
+    /// `http://a/x\r\nEvil: 1`), a non-token method (space / CRLF), leave `*out` null with
+    /// `AL_INVALID` — the request line cannot be corrupted or extended.
+    #[test]
+    fn http_serialize_rejects_request_line_injection() {
+        // A CRLF smuggled through the URL path.
+        let (mp, ml) = http_s("GET");
+        let (up, ul) = http_s("http://a/x\r\nEvil: 1");
+        let req = unsafe { align_rt_http_request_new(mp, ml, up, ul) };
+        let mut out: *mut Buffer = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serialize(req, &mut out) }, AL_INVALID);
+        assert!(out.is_null());
+        unsafe { align_rt_http_request_free(req) };
+        // A method carrying a space / CRLF is not a token → rejected.
+        for bad_method in ["GET /admin HTTP/1.1\r\nX", "BAD METHOD", "GET\r\n"] {
+            let (mp, ml) = http_s(bad_method);
+            let (up, ul) = http_s("http://a/");
+            let req = unsafe { align_rt_http_request_new(mp, ml, up, ul) };
+            let mut out: *mut Buffer = core::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_http_serialize(req, &mut out) }, AL_INVALID, "method {bad_method:?}");
+            assert!(out.is_null());
+            unsafe { align_rt_http_request_free(req) };
+        }
+    }
+
+    /// The parser rejects a *conflicting* duplicate Content-Length (RFC 7230 §3.3.3, response
+    /// smuggling) but accepts an identical repeat.
+    #[test]
+    fn http_parse_conflicting_content_length_rejected() {
+        let conflict = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello";
+        let mut out: *mut HttpResponse = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_parse(conflict.as_ptr(), conflict.len() as i64, &mut out) }, AL_INVALID);
+        assert!(out.is_null());
+        // An identical repeat is harmless and accepted.
+        let same = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        let mut out2: *mut HttpResponse = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_parse(same.as_ptr(), same.len() as i64, &mut out2) }, 0);
+        assert_eq!(unsafe { align_rt_http_resp_status(out2) }, 200);
+        unsafe { align_rt_http_resp_free(out2) };
     }
 
     /// Parse a well-formed response: the status is read, headers resolve case-insensitively to

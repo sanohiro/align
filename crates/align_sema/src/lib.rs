@@ -3497,6 +3497,25 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.walk(scrutinee, depth);
+                // A payload bound by an arm pattern (`Some(v)` / `Ok(v)` / `Variant(v)`) is extracted
+                // *out of* the scrutinee — for a region-tracked scrutinee it is a view into / part of
+                // the same storage, so the binding inherits the scrutinee's region. This mirrors
+                // `LetTuple` destructuring and the `OptionSome`/`Try` region pass-through in reverse.
+                // Without it, unwrapping an `Option<view>` / `Result<view>` through a `match` arm loses
+                // the region (`region_of(Local)` defaults to `Static`) and the view escapes — the
+                // general #297-class use-after-free that first bit `resp.header()`'s `Option<str>` view
+                // (env.get's `Option<string>` is owned/`Static`, so it never exposed this gap). A
+                // non-tracked (scalar) payload binding needs no region — the guard skips it, and a
+                // Copy binding's region is never consulted anyway.
+                if self.tracks_region(scrutinee.ty) {
+                    let sr = self.region_of(scrutinee, depth);
+                    for a in arms {
+                        for b in &a.bindings {
+                            self.decl_depth.insert(*b, depth);
+                            self.region.insert(*b, sr);
+                        }
+                    }
+                }
                 for a in arms {
                     self.walk(&a.body, depth);
                 }

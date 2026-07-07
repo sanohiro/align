@@ -1521,11 +1521,23 @@ and http last (needs net + TLS).
     honours R1 is deferred, loud). (g) **Caps:** ≤ 128 headers, ≤ 1 GiB body → else `Error.Invalid`.
     (h) **R1 zero-copy:** `HttpResponse` owns ONE byte buffer + an offset table (`HttpHeaderSpan`
     name/value offsets + body_start/len); getters return views, no per-header `String`, no body copy;
-    scanning rides the `memchr` crate (R2). Tests: `crates/align_driver/tests/m11_http.rs` (14 —
+    scanning rides the `memchr` crate (R2). Tests: `crates/align_driver/tests/m11_http.rs` (16 —
     builder build/drop, P6 abort, Move/unbound/array-element/import gates, parse round-trip,
     case-insensitive header, 404-is-data P2, malformed-is-Err-not-abort, body + header view escape
-    #297) + `align_runtime` units (7 — serialize golden bytes, parse offsets/framing, error mapping,
-    null-safe frees). **Slices 2–5 (client get/post, pool reuse, server primitive, HTTPS) remain.**
+    #297 in both direct and `match`-arm-unwrap forms) + `align_runtime` units (9 — serialize golden
+    bytes, request-line/method injection reject, parse offsets/framing, conflicting-Content-Length
+    reject, error mapping, null-safe frees). **Adversarial-review fixes (post-first-cut):**
+    (i) **general pattern-binding region propagation** in `EscapeCheck` — a `match`-arm payload
+    binding now inherits the scrutinee's non-Static region (mirrors `LetTuple` + the `OptionSome`/`Try`
+    pass-through), closing a confirmed use-after-free where `resp.header()`'s `Option<str>` view
+    escaped via `match resp.header(..) { Some(v) => v, .. }` (the codebase's first `Option<borrowed
+    view>`; env.get's is owned so it never exposed the gap). The **ideal general fix**, not a point
+    patch — it closes it for every future `Option<view>`/`Result<view>`; no regression across the
+    cli/net/crypto view-escape suites. (ii) serialize now validates the **method is an RFC 7230
+    token** and the URL-derived authority/path carry **no CR/LF/NUL/SP** (the permanent codec must not
+    let `http://a/x\r\nEvil: 1` smuggle a header). (iii) parse **rejects a conflicting duplicate
+    Content-Length** (RFC 7230 §3.3.3; an identical repeat is accepted). **Slices 2–5 (client
+    get/post, pool reuse, server primitive, HTTPS) remain.**
 
 ## Design Issues to Settle in Parallel
 
