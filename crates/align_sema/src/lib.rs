@@ -2419,6 +2419,18 @@ impl EffectScan {
             // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data),
             ExprKind::EncodingDecode { input, .. } => self.expr(input),
+            // `std.compress` — a C-engine (libz) call, inferred **Impure** (draft §15: any
+            // extern-calling fn is non-Pure), so a compress/decompress-using closure is rejected by
+            // `par_map`. Recurse into the operands.
+            ExprKind::Compress { data, level, .. } => {
+                self.impure_direct = true;
+                self.expr(data);
+                self.expr(level);
+            }
+            ExprKind::Decompress { data, .. } => {
+                self.impure_direct = true;
+                self.expr(data);
+            }
             // `std.rand` — **all impure**: `seed()` reads OS entropy; `seed_with`/`next`/`range`/
             // `shuffle`/`sample` produce or advance mutable RNG state. So an rng-using closure is
             // never `Pure` and is excluded from `par_map` (each thread would need its own generator).
@@ -3548,6 +3560,13 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
             ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
+            // `std.compress` — the owned `buffer` result borrows nothing from `data`; just recurse
+            // into the operands so any escape inside them is still checked.
+            ExprKind::Compress { data, level, .. } => {
+                self.walk(data, depth);
+                self.walk(level, depth);
+            }
+            ExprKind::Decompress { data, .. } => self.walk(data, depth),
             // `std.rand`: an `rng` is Copy/`Static` (borrows nothing); `sample` returns a fresh owned
             // `array<T>` that borrows nothing from `xs`. Nothing escapes — just recurse into the
             // subexpressions so any escape *inside* them (a captured local, etc.) is still checked.
@@ -3953,6 +3972,12 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.visit(data),
             ExprKind::EncodingDecode { input, .. } => self.visit(input),
+            // `std.compress` — recurse into the subexpressions (no heap-narrowing pattern of its own).
+            ExprKind::Compress { data, level, .. } => {
+                self.visit(data);
+                self.visit(level);
+            }
+            ExprKind::Decompress { data, .. } => self.visit(data),
             // `std.rand` — recurse into the subexpressions (no heap-narrowing pattern of its own).
             ExprKind::RandSeed => {}
             ExprKind::RandSeedWith { seed } => self.visit(seed),
@@ -4655,6 +4680,12 @@ impl<'a> MoveCheck<'a> {
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.expr(data, moved, false, false),
             ExprKind::EncodingDecode { input, .. } => self.expr(input, moved, false, false),
+            // `std.compress` borrows its byte-view `data` (never consumed) — like `encoding.*`.
+            ExprKind::Compress { data, level, .. } => {
+                self.expr(data, moved, false, false);
+                self.expr(level, moved, false, false);
+            }
+            ExprKind::Decompress { data, .. } => self.expr(data, moved, false, false),
             // `std.rand`: the `rng` receiver is Copy (advanced in place, never consumed) and `xs` is a
             // Copy slice view (borrowed), so nothing is moved — recurse non-consuming to catch a
             // use-after-move *inside* the operands.
@@ -7620,6 +7651,12 @@ impl<'a, 't> Checker<'a, 't> {
             {
                 self.require_import("std.encoding", &format!("encoding.{method}"), span);
                 return self.check_encoding_op(method, args, span);
+            }
+            // `std.compress` — gzip via libz (M11 Slice 1). Pure byte→byte codecs (owned `buffer`
+            // output) wrapping the tuned C engine (draft §15 keystone strategy).
+            if module == "compress" && matches!(method, "gzip_compress" | "gzip_decompress") {
+                self.require_import("std.compress", &format!("compress.{method}"), span);
+                return self.check_compress_op(method, args, span);
             }
             // `std.rand` — a Copy `rng`: `rand.seed()` (OS-seeded) / `rand.seed_with(s)`
             // (deterministic). The `r.next()`/`range`/`shuffle`/`sample` methods dispatch on the
@@ -11358,6 +11395,78 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::EncodingEncode { kind, data: Box::new(data) }, ty: Ty::String, span }
     }
 
+    /// Check a `bytes` argument that accepts any byte-view form — `str` / owned `string`
+    /// (auto-borrowed to a `str`) / `slice<u8>` — exactly `encoding.base64_encode`'s accepted forms.
+    /// Returns the (possibly `StrBorrow`-wrapped) expr, or `None` after erroring (`what` names the op
+    /// in the diagnostic). Shared by the `std.compress` codecs.
+    fn check_byte_view(&mut self, a: &ast::Expr, what: &str) -> Option<Expr> {
+        let mut data = self.check_expr(a, None);
+        let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
+        let resolved = self.resolve(data.ty);
+        let ok = match resolved {
+            Ty::Str => true,
+            Ty::String => {
+                let s = data.span;
+                data = Expr { kind: ExprKind::StrBorrow(Box::new(data)), ty: Ty::Str, span: s };
+                true
+            }
+            Ty::Slice(el) => el == u8s,
+            _ => false,
+        };
+        if !ok {
+            if resolved != Ty::Error {
+                self.diags.error(
+                    format!("'{what}' expects a str, string, or bytes (slice<u8>), got {}", ty_name(resolved)),
+                    a.span,
+                );
+            }
+            return None;
+        }
+        Some(data)
+    }
+
+    /// `std.compress` — gzip via libz (M11 Slice 1). The keystone-library strategy (draft §15): own
+    /// the memory (Align allocates the owned `buffer` output), borrow the engine (zlib's tuned
+    /// DEFLATE). Both codecs are byte→byte and yield `Result<buffer, Error>`:
+    /// - `gzip_compress(data, level)` — compress the byte view `data` (`str` / owned `string`
+    ///   auto-borrowed / `slice<u8>`) at `level` (an `i64`; the runtime aborts on a level outside
+    ///   `0..=9`, a programmer error like `rand.range`'s `lo >= hi`).
+    /// - `gzip_decompress(data)` — inflate a gzip byte view; corrupt/truncated input or a
+    ///   decompress-bomb over the runtime output cap → `Error.Invalid`.
+    ///
+    /// Builtins, dispatched like the other `std` namespaces.
+    fn check_compress_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let kind = hir::CompressKind::Gzip;
+        let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
+        let what = format!("compress.{method}");
+        if method == "gzip_decompress" {
+            if args.len() != 1 {
+                self.diags
+                    .error(format!("'{what}' expects 1 argument (data), got {}", args.len()), span);
+                return err;
+            }
+            let Some(data) = self.check_byte_view(&args[0], &what) else { return err };
+            return Expr { kind: ExprKind::Decompress { kind, data: Box::new(data) }, ty: result_ty, span };
+        }
+        // `gzip_compress(data, level)`.
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'{what}' expects 2 arguments (data, level), got {}", args.len()), span);
+            return err;
+        }
+        let Some(data) = self.check_byte_view(&args[0], &what) else { return err };
+        // `level` must be exactly `i64` (the runtime ABI); the range is a runtime concern (abort).
+        let level = self.check_expr(&args[1], None);
+        if level.ty == Ty::Error {
+            return err;
+        }
+        if !self.require_i64_arg(level.ty, args[1].span, "'compress.gzip_compress' level") {
+            return err;
+        }
+        Expr { kind: ExprKind::Compress { kind, data: Box::new(data), level: Box::new(level) }, ty: result_ty, span }
+    }
+
     /// Require `ty` to be **exactly** `i64` (the `align_rt_rng_*` runtime ABI), binding a bare-int-
     /// literal inference var to it — not merely int-like. A narrower `i32`/`u8` operand would build a
     /// node whose value width doesn't match the runtime signature (the `time.sleep` #343 discipline;
@@ -12896,6 +13005,11 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
             ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
+            ExprKind::Compress { data, level, .. } => {
+                self.finalize_expr(data);
+                self.finalize_expr(level);
+            }
+            ExprKind::Decompress { data, .. } => self.finalize_expr(data),
             ExprKind::RandSeed => {}
             ExprKind::RandSeedWith { seed } => self.finalize_expr(seed),
             ExprKind::RandNext { rng } => self.finalize_expr(rng),

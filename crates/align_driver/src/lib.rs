@@ -144,7 +144,12 @@ pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs:
     cmd.arg(&runtime)
         .arg("-o")
         .arg(exe)
-        .args(["-lpthread", "-ldl", "-lm"]);
+        // `-lz` (zlib) is always linked, alongside the Rust-std support libs: the runtime staticlib
+        // unconditionally contains the `std.compress` gzip wrappers (which reference libz's
+        // `deflate`/`inflate`), and zlib is a universal system library like libm. Linking it only
+        // when a program uses `std.compress` would need a magic per-module flag threaded from sema to
+        // the driver — the baseline set stays simple and unconditional (`docs/impl/std-design/compress.md`).
+        .args(["-lpthread", "-ldl", "-lm", "-lz"]);
     // User-declared external libraries (`extern "C" link("name")`) go after the objects that
     // reference them (`-l` resolves left-to-right against preceding objects). Each name is validated
     // in sema and passed as a single `-l<name>` argument (no shell/flag injection).
