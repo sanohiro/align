@@ -442,6 +442,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::TimeSleep { ns } => format!("time_sleep({})", operand_str(ns)),
         Rvalue::EncodingEncode { kind, data } => format!("encode_{kind:?}({})", operand_str(data)),
         Rvalue::EncodingDecode { kind, input, out } => format!("decode_{kind:?}({}, -> _{out})", operand_str(input)),
+        Rvalue::CompressCompress { kind, data, level, out } => {
+            format!("compress_{kind:?}({}, {}, -> _{out})", operand_str(data), operand_str(level))
+        }
+        Rvalue::CompressDecompress { kind, data, out } => {
+            format!("decompress_{kind:?}({}, -> _{out})", operand_str(data))
+        }
         Rvalue::Utf8Valid { data } => format!("utf8_valid({})", operand_str(data)),
         Rvalue::RandSeed { seed: Some(s), out } => format!("rng_seed_with({}, -> _{out})", operand_str(s)),
         Rvalue::RandSeed { seed: None, out } => format!("rng_seed_os(-> _{out})"),

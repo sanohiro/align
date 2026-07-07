@@ -613,6 +613,15 @@ pub enum Rvalue {
     /// (0 = ok, `AL_INVALID` -> `Error.Invalid`; see [`make_error_from_status`]). The caller branches
     /// `Ok(buffer)` / `Err`. Pure.
     EncodingDecode { kind: hir::EncodingKind, input: Operand, out: Slot },
+    /// `compress.gzip_compress(data, level)` — compress the byte view `data` at `level` (an i64).
+    /// The runtime writes an owned `buffer` handle into `out` and returns an i32 status (0 = ok;
+    /// `AL_INVALID` -> `Error.Invalid`; `>= AL_CODE` -> `Error.Code`). An out-of-range level aborts
+    /// in the runtime. Value = the i32 status; the wrapped buffer is owned (the local `Drop`s it).
+    CompressCompress { kind: hir::CompressKind, data: Operand, level: Operand, out: Slot },
+    /// `compress.gzip_decompress(data)` — inflate the gzip byte view `data`; the runtime writes an
+    /// owned `buffer` handle into `out` and returns an i32 status (corrupt/truncated/bomb ->
+    /// `AL_INVALID`). Value = the i32 status; the wrapped buffer is owned.
+    CompressDecompress { kind: hir::CompressKind, data: Operand, out: Slot },
     /// `encoding.utf8_valid(b)` — whether the byte view `b` (`{ptr,len}`) is valid UTF-8, an `i32`
     /// used directly as a `bool` (`1`/`0`). Pure.
     Utf8Valid { data: Operand },
@@ -1656,6 +1665,24 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `encoding.*_decode(s)` → `Result<buffer, Error>`: the runtime writes an owned `buffer`
         // handle into `out` and returns an i32 status; branch `Ok(<buffer>)` / `Err(<mapped>)`.
         hir::ExprKind::EncodingDecode { kind, input } => lower_encoding_decode(b, *kind, input, e.ty),
+        // `compress.gzip_compress(data, level)` / `gzip_decompress(data)` → `Result<buffer, Error>`:
+        // the runtime writes an owned `buffer` handle into `out` + returns an i32 status; branch
+        // `Ok(<buffer>)` / `Err(<mapped>)` via the shared status→result helper.
+        hir::ExprKind::Compress { kind, data, level } => {
+            let out = b.new_slot(Ty::Buffer);
+            let d = lower_expr(b, data);
+            let lv = lower_expr(b, level);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::CompressCompress { kind: *kind, data: d, level: lv, out }));
+            emit_status_buffer_result(b, code, out, e.ty)
+        }
+        hir::ExprKind::Decompress { kind, data } => {
+            let out = b.new_slot(Ty::Buffer);
+            let d = lower_expr(b, data);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::CompressDecompress { kind: *kind, data: d, out }));
+            emit_status_buffer_result(b, code, out, e.ty)
+        }
         // `encoding.utf8_valid(b)` → the runtime returns an `i32` (1/0); compare `!= 0` to a `bool`
         // (the same i32→bool bridge as `fs.exists`).
         hir::ExprKind::Utf8Valid { data } => {
@@ -5205,7 +5232,15 @@ fn lower_encoding_decode(b: &mut Builder, kind: hir::EncodingKind, input: &hir::
     let inp = lower_expr(b, input);
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::EncodingDecode { kind, input: inp, out }));
+    emit_status_buffer_result(b, code, out, result_ty)
+}
 
+/// Shared tail for a runtime op that writes an owned `buffer` handle into `out` and returns an i32
+/// `status` (0 = ok; `AL_INVALID` -> `Error.Invalid`; `>= AL_CODE` -> `Error.Code`): branch the
+/// already-emitted `code` into `Ok(<buffer>)` / `Err(<mapped status>)` of `result_ty`. The `out`
+/// slot must have been caller-zeroed by codegen so the `Err` path (null handle) frees nothing.
+/// Shared by `encoding.*_decode` and the `std.compress` codecs.
+fn emit_status_buffer_result(b: &mut Builder, code: ValueId, out: Slot, result_ty: Ty) -> Operand {
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
     let ok_bb = b.new_block();

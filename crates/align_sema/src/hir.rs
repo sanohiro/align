@@ -822,6 +822,16 @@ pub enum ExprKind {
     /// [`crate::Ty::Bool`]). A thin wrapper over the shared UTF-8 validator, for checking `bytes`
     /// before turning them into a `str`. Pure; `data` is borrowed.
     Utf8Valid { data: Box<Expr> },
+    /// `compress.gzip_compress(data, level)` — compress the byte view `data` (`str` / owned `string`
+    /// auto-borrowed / `slice<u8>`) at `level` (an `i64` in `0..=9`; out-of-range aborts at runtime,
+    /// a programmer error like `rand.range`) into an owned `buffer` (the `ty` is
+    /// `Result<buffer, Error>`). Wraps the libz DEFLATE engine (draft §15). **Impure** (a C-engine
+    /// call — never `Pure`, so excluded from `par_map`). `data` is borrowed, never consumed.
+    Compress { kind: CompressKind, data: Box<Expr>, level: Box<Expr> },
+    /// `compress.gzip_decompress(data)` — inflate the gzip byte view `data` into an owned `buffer`
+    /// (the `ty` is `Result<buffer, Error>`). Corrupt / truncated input, or a decompress "bomb" that
+    /// would exceed the runtime output cap, yields `Error.Invalid`. **Impure**; `data` is borrowed.
+    Decompress { kind: CompressKind, data: Box<Expr> },
     /// `rand.seed()` — a fresh [`crate::Ty::Rng`] seeded from the OS CSPRNG (`getrandom`). The `ty`
     /// is [`crate::Ty::Rng`], a **Copy** state-only value (no fd/ownership). Impure (reads OS
     /// entropy — a different sequence each run).
@@ -900,6 +910,15 @@ pub enum EncodingKind {
     Base64Url,
     /// Lower-case hex (`hex_encode`); `hex_decode` accepts both cases.
     Hex,
+}
+
+/// Which `std.compress` codec an [`ExprKind::Compress`] / [`ExprKind::Decompress`] uses. gzip (libz)
+/// is the M11 Slice 1 codec; zstd (libzstd) is Slice 2 and adds a variant here — the direction is the
+/// node kind, the codec is this `kind` (mirroring [`EncodingKind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressKind {
+    /// gzip framing (RFC 1952) over DEFLATE, via `libz` — windowBits 15+16 (the gzip wrapper).
+    Gzip,
 }
 
 /// Which component `path.base` / `path.dir` / `path.ext` extracts — each a zero-copy `str` view

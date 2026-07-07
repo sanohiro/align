@@ -1023,6 +1023,25 @@ fn build_module<'c>(
         "utf8_valid".to_string(),
         module.add_function("align_rt_utf8_valid", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
     );
+    // `std.compress` — gzip via libz. compress (data view `{ptr,len}`, i64 level, out: *handle) and
+    // decompress (data view `{ptr,len}`, out: *handle) both return an i32 status (0 ok / AL_INVALID /
+    // AL_CODE+n), writing an owned `buffer` handle into `out`.
+    funcs.insert(
+        "compress_gzip_compress".to_string(),
+        module.add_function(
+            "align_rt_compress_gzip_compress",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "compress_gzip_decompress".to_string(),
+        module.add_function(
+            "align_rt_compress_gzip_decompress",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
     // `std.rand` — the `rng` state is always passed by pointer to its `[4 x i64]` slot (mutated in
     // place). `seed_with(out, s)` / `seed_os(out)` initialize it; `next`/`range` advance + return an
     // i64; `shuffle`/`sample` take the slice `{ptr,len}` split into a raw pointer + length + element
@@ -4621,6 +4640,37 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["utf8_valid"], &[dp.into(), dl.into()], "u8v")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("utf8_valid returns i32")
+            }
+            // std.compress — gzip via libz. The data view splits to `{ptr,len}`; the out handle slot
+            // is caller-zeroed (so the Err path frees nothing); the runtime returns an i32 status.
+            Rvalue::CompressCompress { kind, data, level, out } => {
+                let fk = match kind {
+                    align_sema::hir::CompressKind::Gzip => "compress_gzip_compress",
+                };
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (dp, dl) = self.split_str(data)?;
+                let lv = self.operand(level);
+                self.builder
+                    .build_call(self.funcs[fk], &[dp.into(), dl.into(), lv.into(), out_ptr.into()], "gzc")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("gzip_compress returns i32 status")
+            }
+            Rvalue::CompressDecompress { kind, data, out } => {
+                let fk = match kind {
+                    align_sema::hir::CompressKind::Gzip => "compress_gzip_decompress",
+                };
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (dp, dl) = self.split_str(data)?;
+                self.builder
+                    .build_call(self.funcs[fk], &[dp.into(), dl.into(), out_ptr.into()], "gzd")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("gzip_decompress returns i32 status")
             }
             // std.rand — the rng state is passed by pointer to its slot (mutated in place).
             // `seed*` writes into `out`; `next`/`range` advance and return an i64; `shuffle`

@@ -5117,6 +5117,338 @@ pub unsafe extern "C" fn align_rt_utf8_valid(ptr: *const u8, len: i64) -> i32 {
     if validate_utf8(unsafe { bytes_view(ptr, len) }) { 1 } else { 0 }
 }
 
+// ---------------------------------------------------------------------------------------------
+// std.compress (M11 Slice 1) — gzip via libz. The keystone-library strategy (`draft.md` §15): own
+// the memory (Align allocates the owned `buffer` output), borrow the engine (zlib's tuned DEFLATE) —
+// wrap `libz` rather than reimplement DEFLATE. `gzip_compress(data, level)` / `gzip_decompress(data)`
+// return an owned `buffer` handle (Box, freed by `align_rt_buffer_free`), or an `AL_*` status:
+// corrupt/truncated input (and a decompress "bomb" over `GZIP_MAX_OUTPUT`) -> `AL_INVALID`
+// (`Error.Invalid`); an engine/OOM failure -> `Error.Code`. Strict gzip framing both ways
+// (windowBits 15+16), so a non-gzip input to decompress is rejected. The driver links `-lz`.
+// ---------------------------------------------------------------------------------------------
+
+use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+
+/// zlib's `z_stream` (`zlib.h`), `#[repr(C)]` so field order + padding match the C ABI exactly.
+/// `uInt` = `c_uint`, `uLong` = `c_ulong` (matches the linked libz on this platform), the three
+/// callback fields are pointer-sized (`alloc_func`/`free_func`/`voidpf`). `zalloc`/`zfree`/`opaque`
+/// left null → zlib uses its own allocator. The `stream_size` passed to init is `size_of` this, so a
+/// layout mismatch surfaces as `Z_VERSION_ERROR` at init (the round-trip unit tests are the ABI guard).
+#[repr(C)]
+struct ZStream {
+    next_in: *const u8,
+    avail_in: c_uint,
+    total_in: c_ulong,
+    next_out: *mut u8,
+    avail_out: c_uint,
+    total_out: c_ulong,
+    msg: *const c_char,
+    state: *mut c_void,
+    zalloc: *mut c_void,
+    zfree: *mut c_void,
+    opaque: *mut c_void,
+    data_type: c_int,
+    adler: c_ulong,
+    reserved: c_ulong,
+}
+
+impl ZStream {
+    /// A fully zeroed stream: null buffers, null allocator hooks (→ zlib's default malloc/free).
+    fn zeroed() -> ZStream {
+        ZStream {
+            next_in: core::ptr::null(),
+            avail_in: 0,
+            total_in: 0,
+            next_out: core::ptr::null_mut(),
+            avail_out: 0,
+            total_out: 0,
+            msg: core::ptr::null(),
+            state: core::ptr::null_mut(),
+            zalloc: core::ptr::null_mut(),
+            zfree: core::ptr::null_mut(),
+            opaque: core::ptr::null_mut(),
+            data_type: 0,
+            adler: 0,
+            reserved: 0,
+        }
+    }
+}
+
+// zlib return codes (`zlib.h`).
+const Z_OK: c_int = 0;
+const Z_STREAM_END: c_int = 1;
+const Z_NEED_DICT: c_int = 2;
+const Z_DATA_ERROR: c_int = -3;
+const Z_BUF_ERROR: c_int = -5;
+// zlib flush values.
+const Z_NO_FLUSH: c_int = 0;
+const Z_FINISH: c_int = 4;
+// deflate parameters.
+const Z_DEFLATED: c_int = 8;
+const Z_DEFAULT_STRATEGY: c_int = 0;
+/// 15-bit window + the gzip wrapper (`+16`): produces/consumes **gzip** framing (RFC 1952), not raw
+/// DEFLATE (`-15`) or zlib (`15`). Used for both `deflateInit2_` and `inflateInit2_` so decompress
+/// accepts only gzip streams (a zlib/raw input → `Z_DATA_ERROR` → `Error.Invalid`).
+const GZIP_WINDOW_BITS: c_int = 15 + 16;
+/// zlib's default `memLevel` (memory/speed tradeoff for the internal state).
+const GZIP_MEM_LEVEL: c_int = 8;
+
+/// zlib version string for `deflateInit2_`/`inflateInit2_`. zlib checks only that the **first byte**
+/// matches the linked library's major version (`1`) plus that `stream_size` matches, so any `1.x`
+/// string is accepted — the value is otherwise unused.
+const ZLIB_VERSION: &[u8] = b"1.2.11\0";
+
+/// Hard cap on decompressed output (the decompress-bomb guard, P2): a tiny gzip stream can inflate
+/// to gigabytes. 1 GiB — exceeding it fails with `AL_INVALID` (`Error.Invalid`) rather than
+/// exhausting memory. Only **decompression** is capped; compression output is bounded by the input
+/// size plus small framing overhead, so capping it would wrongly reject a legitimate large compress.
+const GZIP_MAX_OUTPUT: usize = 1 << 30;
+
+/// Output growth step for the compress/decompress loops (also the initial chunk). 64 KiB.
+const GZIP_OUT_CHUNK: usize = 64 * 1024;
+
+#[link(name = "z")]
+unsafe extern "C" {
+    fn deflateInit2_(
+        strm: *mut ZStream,
+        level: c_int,
+        method: c_int,
+        window_bits: c_int,
+        mem_level: c_int,
+        strategy: c_int,
+        version: *const c_char,
+        stream_size: c_int,
+    ) -> c_int;
+    fn deflate(strm: *mut ZStream, flush: c_int) -> c_int;
+    fn deflateEnd(strm: *mut ZStream) -> c_int;
+    fn inflateInit2_(strm: *mut ZStream, window_bits: c_int, version: *const c_char, stream_size: c_int) -> c_int;
+    fn inflate(strm: *mut ZStream, flush: c_int) -> c_int;
+    fn inflateEnd(strm: *mut ZStream) -> c_int;
+}
+
+/// Map a zlib return code to a shared `AL_*` status. Corrupt / truncated / preset-dictionary input
+/// (`Z_DATA_ERROR`/`Z_BUF_ERROR`/`Z_NEED_DICT`) is user-data invalid → `AL_INVALID` (`Error.Invalid`);
+/// a genuine engine/OOM failure (`Z_MEM_ERROR`/`Z_STREAM_ERROR`/`Z_VERSION_ERROR`/…) carries its
+/// (absolute) zlib code as `Error.Code` — the shared errno→Error table's catch-all arm, no new variant.
+fn zlib_error_to_status(ret: c_int) -> i32 {
+    match ret {
+        Z_DATA_ERROR | Z_BUF_ERROR | Z_NEED_DICT => AL_INVALID,
+        other => AL_CODE.saturating_add(other.unsigned_abs() as i32),
+    }
+}
+
+/// Ensure `out` has spare capacity for more bytes: if it is full, grow its capacity (exponential,
+/// so the loop is amortized O(n)), clamped to `max_cap`. Returns `Ok(false)` if the cap is already
+/// reached (no room can be added — the decompress-bomb signal), `Ok(true)` if there is now spare
+/// capacity, or `Err(AL_CODE)` on allocation failure. `try_reserve_exact` never overshoots `max_cap`.
+fn grow_output(out: &mut Vec<u8>, max_cap: usize) -> Result<bool, i32> {
+    if out.len() >= max_cap {
+        return Ok(false); // cap reached — caller decides (bomb → Error.Invalid)
+    }
+    if out.len() < out.capacity() {
+        return Ok(true); // spare capacity already available
+    }
+    // Exponential growth, clamped to the cap. Both operands are <= max_cap (<= 1 GiB for decompress,
+    // usize::MAX for compress), so `saturating_*` only guards the pathological upper end.
+    let want = out
+        .capacity()
+        .saturating_mul(2)
+        .max(out.capacity().saturating_add(GZIP_OUT_CHUNK))
+        .min(max_cap);
+    let add = want - out.capacity(); // > 0: reachable state here is len == capacity < max_cap, so want > capacity
+    out.try_reserve_exact(add).map_err(|_| AL_CODE)?;
+    Ok(true)
+}
+
+/// Compress `data` into a gzip stream at `level` (0..=9), returning the gzip bytes or an `AL_*`
+/// status. An out-of-range `level` is a **programmer error** (not attacker input), so it aborts with
+/// a clear message — the `rand.range` total-or-abort policy (#345), never a silent clamp / `Error`.
+fn gzip_deflate(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
+    if !(0..=9).contains(&level) {
+        panic_abort("compress.gzip_compress: level out of range (must be 0..=9)");
+    }
+    let level = level as c_int;
+    let mut strm = ZStream::zeroed();
+    let ret = unsafe {
+        deflateInit2_(
+            &mut strm,
+            level,
+            Z_DEFLATED,
+            GZIP_WINDOW_BITS,
+            GZIP_MEM_LEVEL,
+            Z_DEFAULT_STRATEGY,
+            ZLIB_VERSION.as_ptr() as *const c_char,
+            core::mem::size_of::<ZStream>() as c_int,
+        )
+    };
+    if ret != Z_OK {
+        // Init failed before any state was allocated → nothing to `deflateEnd`.
+        return Err(zlib_error_to_status(ret));
+    }
+    // From here `deflateEnd` must run on every path (it frees the internal state).
+    let result = deflate_run(&mut strm, data);
+    unsafe { deflateEnd(&mut strm) };
+    result
+}
+
+/// Drive `deflate` to completion over `input`, appending the gzip output to a fresh `Vec`. Input is
+/// fed in `u32`-sized chunks (`avail_in` is a `uInt`); output space is grown via [`grow_output`].
+/// Compression of any bytes always succeeds barring OOM, so the only `Err` is an allocation failure
+/// or an unexpected engine code.
+fn deflate_run(strm: &mut ZStream, input: &[u8]) -> Result<Vec<u8>, i32> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos: usize = 0; // input bytes already handed to zlib
+    loop {
+        // Refill the input window once zlib has drained it (chunked so `avail_in` fits a `uInt`).
+        if strm.avail_in == 0 && pos < input.len() {
+            let take = (input.len() - pos).min(c_uint::MAX as usize);
+            strm.next_in = input[pos..].as_ptr();
+            strm.avail_in = take as c_uint;
+            pos += take;
+        }
+        // Once all input has been handed over, ask zlib to finish the stream (header/trailer + flush).
+        let flush = if pos >= input.len() { Z_FINISH } else { Z_NO_FLUSH };
+        // Guarantee output space (grow when full). `usize::MAX` cap → never a bomb; always Ok(true)/Err.
+        if !grow_output(&mut out, usize::MAX)? {
+            return Err(AL_CODE); // unreachable (cap is usize::MAX), but never spins
+        }
+        let spare = (out.capacity() - out.len()).min(c_uint::MAX as usize);
+        unsafe {
+            strm.next_out = out.as_mut_ptr().add(out.len());
+            strm.avail_out = spare as c_uint;
+        }
+        let before = strm.avail_out;
+        let ret = unsafe { deflate(strm, flush) };
+        let produced = (before - strm.avail_out) as usize;
+        // SAFETY: zlib wrote `produced` bytes into the spare capacity we just pointed it at.
+        unsafe { out.set_len(out.len() + produced) };
+        match ret {
+            Z_STREAM_END => return Ok(out),
+            // Z_OK: more work to do. Z_BUF_ERROR under Z_FINISH means "needs more output room" — the
+            // loop grows `out` and retries; progress is guaranteed because we always add spare space.
+            Z_OK | Z_BUF_ERROR => {}
+            other => return Err(zlib_error_to_status(other)),
+        }
+    }
+}
+
+/// Decompress the gzip stream `data`, returning the inflated bytes or an `AL_*` status. Output is
+/// capped at [`GZIP_MAX_OUTPUT`] (the bomb guard): exceeding it → `AL_INVALID`. Truncated input
+/// (zlib needs more but none remains) and corrupt input both map to `AL_INVALID`.
+fn gzip_inflate(data: &[u8]) -> Result<Vec<u8>, i32> {
+    let mut strm = ZStream::zeroed();
+    let ret = unsafe {
+        inflateInit2_(
+            &mut strm,
+            GZIP_WINDOW_BITS,
+            ZLIB_VERSION.as_ptr() as *const c_char,
+            core::mem::size_of::<ZStream>() as c_int,
+        )
+    };
+    if ret != Z_OK {
+        return Err(zlib_error_to_status(ret));
+    }
+    let result = inflate_run(&mut strm, data, GZIP_MAX_OUTPUT);
+    unsafe { inflateEnd(&mut strm) };
+    result
+}
+
+/// Drive `inflate` to `Z_STREAM_END` over `data`, enforcing the `max_cap` output cap (the bomb
+/// guard). Input is fed in `u32`-sized chunks; output grows via [`grow_output`] up to `max_cap`.
+/// `max_cap` is a parameter (not the [`GZIP_MAX_OUTPUT`] constant directly) so a unit test can drive
+/// the bomb path with a tiny cap.
+fn inflate_run(strm: &mut ZStream, data: &[u8], max_cap: usize) -> Result<Vec<u8>, i32> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos: usize = 0;
+    loop {
+        if strm.avail_in == 0 {
+            if pos >= data.len() {
+                // zlib wants more input but the stream never reached `Z_STREAM_END` → truncated.
+                return Err(AL_INVALID);
+            }
+            let take = (data.len() - pos).min(c_uint::MAX as usize);
+            strm.next_in = data[pos..].as_ptr();
+            strm.avail_in = take as c_uint;
+            pos += take;
+        }
+        // Make output room, enforcing the cap. `false` = the cap is full but the stream isn't done →
+        // the output would exceed `max_cap` → a decompress bomb.
+        if !grow_output(&mut out, max_cap)? {
+            return Err(AL_INVALID);
+        }
+        // Clamp spare capacity to `max_cap - out.len()` too: `try_reserve_exact` may overshoot the
+        // requested amount (allocator over-allocation), so `capacity` alone is not a reliable cap
+        // proxy. The subtraction can't underflow — `grow_output` just returned `Ok(true)`, which
+        // guarantees `out.len() < max_cap`.
+        let spare = (out.capacity() - out.len())
+            .min(max_cap - out.len())
+            .min(c_uint::MAX as usize);
+        unsafe {
+            strm.next_out = out.as_mut_ptr().add(out.len());
+            strm.avail_out = spare as c_uint;
+        }
+        let before = strm.avail_out;
+        let ret = unsafe { inflate(strm, Z_NO_FLUSH) };
+        let produced = (before - strm.avail_out) as usize;
+        // SAFETY: zlib wrote `produced` bytes into the spare capacity we just pointed it at.
+        unsafe { out.set_len(out.len() + produced) };
+        match ret {
+            Z_STREAM_END => return Ok(out),
+            Z_OK => {} // progress made / possible — loop (refills input or grows output as needed)
+            // We always pass a non-empty output window, so `Z_BUF_ERROR` means "needs more input".
+            // Retry only if unconsumed input remains to feed; otherwise the stream is truncated or
+            // genuinely stuck — an invalid gzip stream, not a runtime error.
+            Z_BUF_ERROR if strm.avail_in == 0 && pos < data.len() => {}
+            Z_BUF_ERROR => return Err(AL_INVALID),
+            other => return Err(zlib_error_to_status(other)), // Z_DATA_ERROR / Z_NEED_DICT / … → Invalid
+        }
+    }
+}
+
+/// Publish a codec result: on `Ok(v)` write an owned `buffer` handle to `*out` and return `0`; on
+/// `Err(status)` leave `*out` null and return the status. Mirrors [`decode_into`], carrying an
+/// arbitrary `AL_*` status (encoding decode only ever fails with `AL_INVALID`).
+///
+/// # Safety
+/// `out` must point to a writable handle slot (or be null, handled here).
+unsafe fn publish_buffer(result: Result<Vec<u8>, i32>, out: *mut *mut Buffer) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    match result {
+        Ok(v) => {
+            unsafe { *out = buffer_from_vec(v) };
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// `compress.gzip_compress(data, level)` — gzip-compress the byte view `data` at `level` (0..=9),
+/// writing an owned `buffer` handle to `*out` and returning `0` (or an `AL_*` status, leaving `*out`
+/// null). An out-of-range `level` aborts (programmer error).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_gzip_compress(ptr: *const u8, len: i64, level: i64, out: *mut *mut Buffer) -> i32 {
+    let data = unsafe { bytes_view(ptr, len) };
+    unsafe { publish_buffer(gzip_deflate(data, level), out) }
+}
+
+/// `compress.gzip_decompress(data)` — inflate the gzip byte view `data`, writing an owned `buffer`
+/// handle to `*out` and returning `0` (or `AL_INVALID` on corrupt/truncated/bomb input, leaving
+/// `*out` null).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_gzip_decompress(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+    let data = unsafe { bytes_view(ptr, len) };
+    unsafe { publish_buffer(gzip_inflate(data), out) }
+}
+
 /// Byte-equality of two `str` views (M5). Returns 1 if equal, else 0.
 ///
 /// # Safety
@@ -10380,5 +10712,172 @@ mod tests {
         assert_eq!(unsafe { align_rt_cli_parse(cmd, argv.as_ptr(), argv.len() as i64, &mut out) }, 0);
         unsafe { align_rt_cli_parsed_free(out) };
         unsafe { align_rt_cli_command_free(cmd) };
+    }
+
+    // --- std.compress (M11 Slice 1) — gzip via libz ------------------------------------------
+
+    /// Compress `data` at `level` through the FFI entry, returning the owned gzip bytes (freeing the
+    /// `buffer` handle). Panics if the status is non-zero — the caller asserts success.
+    fn gz_compress(data: &[u8], level: i64) -> Vec<u8> {
+        let mut out: *mut Buffer = core::ptr::null_mut();
+        let st = unsafe { align_rt_compress_gzip_compress(data.as_ptr(), data.len() as i64, level, &mut out) };
+        assert_eq!(st, 0, "compress should succeed");
+        assert!(!out.is_null());
+        let bytes = unsafe { let b = &*out; b.data[..b.len].to_vec() };
+        unsafe { align_rt_buffer_free(out) };
+        bytes
+    }
+
+    /// Decompress `data` through the FFI entry, returning `Ok(bytes)` or `Err(status)`.
+    fn gz_decompress(data: &[u8]) -> Result<Vec<u8>, i32> {
+        let mut out: *mut Buffer = core::ptr::null_mut();
+        let st = unsafe { align_rt_compress_gzip_decompress(data.as_ptr(), data.len() as i64, &mut out) };
+        if st != 0 {
+            assert!(out.is_null(), "the Err path must leave the out handle null");
+            return Err(st);
+        }
+        assert!(!out.is_null());
+        let bytes = unsafe { let b = &*out; b.data[..b.len].to_vec() };
+        unsafe { align_rt_buffer_free(out) };
+        Ok(bytes)
+    }
+
+    /// Round-trip over empty / small / highly-compressible / ~1 MB pseudo-random data, at every level.
+    #[test]
+    fn gzip_round_trip_all_sizes_and_levels() {
+        // A cheap deterministic PRNG (xorshift) for the pseudo-random ~1 MB case (no rand dep).
+        let mut s: u64 = 0x9E3779B97F4A7C15;
+        let mut prng = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let random_1m: Vec<u8> = (0..1_000_003).map(|_| (prng() & 0xff) as u8).collect();
+        let cases: Vec<Vec<u8>> = vec![
+            Vec::new(),                                  // empty
+            b"hello, gzip".to_vec(),                     // small
+            vec![b'A'; 100_000],                         // highly compressible
+            random_1m,                                   // ~1 MB pseudo-random (near-incompressible)
+        ];
+        for data in &cases {
+            for level in 0..=9 {
+                let comp = gz_compress(data, level);
+                // gzip magic bytes pin the format (RFC 1952: 0x1f 0x8b).
+                assert!(comp.len() >= 2 && comp[0] == 0x1f && comp[1] == 0x8b, "gzip magic at level {level}");
+                let back = gz_decompress(&comp).expect("round trip");
+                assert_eq!(&back, data, "round trip mismatch at len {} level {level}", data.len());
+            }
+        }
+    }
+
+    /// Highly-compressible data actually shrinks (the engine is really running, not storing).
+    #[test]
+    fn gzip_compresses_repetitive_data() {
+        let data = vec![b'Z'; 50_000];
+        let comp = gz_compress(&data, 6);
+        assert!(comp.len() < data.len() / 10, "50k of one byte should compress hard, got {}", comp.len());
+    }
+
+    /// Corrupt input (valid gzip header, mangled body) → `AL_INVALID`.
+    #[test]
+    fn gzip_decompress_corrupt_is_invalid() {
+        let mut comp = gz_compress(b"the quick brown fox jumps over the lazy dog", 6);
+        // Flip bytes in the compressed body (past the 10-byte gzip header) to corrupt the DEFLATE data.
+        for b in comp.iter_mut().skip(10) {
+            *b ^= 0xff;
+        }
+        assert_eq!(gz_decompress(&comp), Err(AL_INVALID), "corrupt body → Error.Invalid");
+    }
+
+    /// Truncated input (a valid stream cut short) → `AL_INVALID`.
+    #[test]
+    fn gzip_decompress_truncated_is_invalid() {
+        let comp = gz_compress(&vec![b'x'; 10_000], 6);
+        let truncated = &comp[..comp.len() / 2];
+        assert_eq!(gz_decompress(truncated), Err(AL_INVALID), "truncated → Error.Invalid");
+    }
+
+    /// A non-gzip input (raw bytes with no gzip magic) → `AL_INVALID` (strict gzip framing).
+    #[test]
+    fn gzip_decompress_non_gzip_is_invalid() {
+        assert_eq!(gz_decompress(b"not a gzip stream at all"), Err(AL_INVALID));
+        assert_eq!(gz_decompress(&[]), Err(AL_INVALID), "empty input is not a valid gzip stream");
+    }
+
+    /// The decompress-bomb guard (P2): a tiny gzip stream that inflates past the cap → `AL_INVALID`.
+    /// Driven with a small `max_cap` via `inflate_run` directly (a real 1 GiB inflate is impractical);
+    /// the same wiring uses `GZIP_MAX_OUTPUT` in production.
+    #[test]
+    fn gzip_decompress_bomb_over_cap_is_invalid() {
+        // 1 MB of zeros compresses to a tiny gzip stream but inflates to 1 MB — over a 1 KiB cap.
+        let comp = gz_compress(&vec![0u8; 1_000_000], 9);
+        let mut strm = ZStream::zeroed();
+        let ret = unsafe {
+            inflateInit2_(
+                &mut strm,
+                GZIP_WINDOW_BITS,
+                ZLIB_VERSION.as_ptr() as *const c_char,
+                core::mem::size_of::<ZStream>() as c_int,
+            )
+        };
+        assert_eq!(ret, Z_OK, "inflateInit2 must succeed (ABI/struct-size guard)");
+        let capped = inflate_run(&mut strm, &comp, 1024);
+        unsafe { inflateEnd(&mut strm) };
+        assert_eq!(capped, Err(AL_INVALID), "inflating past the cap → Error.Invalid");
+        // The same stream under the real cap decompresses fine.
+        assert_eq!(gz_decompress(&comp).map(|v| v.len()), Ok(1_000_000));
+    }
+
+    /// `grow_output`'s cap contract (the exact bomb-detection mechanism): full-at-cap → `Ok(false)`,
+    /// and it never grows past the cap.
+    #[test]
+    fn grow_output_reports_cap_reached() {
+        let mut v: Vec<u8> = Vec::new();
+        // Grows from empty toward the cap; the exact reserve never overshoots it.
+        assert_eq!(grow_output(&mut v, 4096), Ok(true));
+        assert!(v.capacity() >= 1 && v.capacity() <= 4096, "grows within the cap, got {}", v.capacity());
+        // Fill it so len == capacity == cap, then the next grow reports "no more room".
+        let cap = v.capacity();
+        v.resize(cap, 0);
+        assert_eq!(grow_output(&mut v, cap), Ok(false), "cap reached → no room");
+    }
+
+    /// `grow_output` must enforce the cap on `len`, not `capacity`: `try_reserve_exact` may hand back
+    /// more capacity than requested (allocator over-allocation), so a vector can have `capacity() >
+    /// max_cap` while `len() < max_cap`. The old check order (`capacity >= max_cap` before the len
+    /// check) would wrongly report "cap reached" in that case; the fixed order must not.
+    #[test]
+    fn grow_output_cap_enforced_on_len_despite_overallocation() {
+        let cap = 4096usize;
+        let slack = 512usize;
+        // Over-allocate on purpose: capacity() can exceed `cap` even though len() will be exactly `cap`.
+        let mut v: Vec<u8> = Vec::with_capacity(cap + slack);
+        assert!(v.capacity() >= cap + slack);
+        v.resize(cap, 0);
+        assert_eq!(
+            grow_output(&mut v, cap),
+            Ok(false),
+            "len() == max_cap must report cap reached even though capacity() > max_cap"
+        );
+
+        // Positive case: len < cap and spare capacity already present → Ok(true), no reallocation.
+        let mut w: Vec<u8> = Vec::with_capacity(cap + slack);
+        w.resize(cap - 1, 0);
+        let cap_before = w.capacity();
+        assert_eq!(grow_output(&mut w, cap), Ok(true));
+        assert_eq!(w.capacity(), cap_before, "spare capacity was already available; no growth needed");
+    }
+
+    /// Every in-range compression level (`0..=9`) is accepted; the boundary values `0` and `9` both
+    /// round-trip. (An out-of-range level aborts — the total-or-abort programmer-error policy — which
+    /// a real `process::abort` would kill the test process for, so the abort is exercised end-to-end
+    /// in the driver integration test `m11_compress`, not here.)
+    #[test]
+    fn gzip_compress_accepts_all_valid_levels() {
+        for level in 0..=9i64 {
+            let comp = gz_compress(b"boundary levels round-trip", level);
+            assert_eq!(gz_decompress(&comp).as_deref(), Ok(&b"boundary levels round-trip"[..]));
+        }
     }
 }
