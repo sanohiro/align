@@ -1023,6 +1023,21 @@ fn build_module<'c>(
         "utf8_valid".to_string(),
         module.add_function("align_rt_utf8_valid", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
     );
+    // `std.crypto` (M11 Slice 1). constant_time_equal (a_ptr, a_len, b_ptr, b_len) -> i32 (1 equal /
+    // 0 not; length is public, the equal-length compare is branchless). random (buf: *Buffer) -> void
+    // (fills the buffer's full capacity from the OS CSPRNG; aborts on failure).
+    funcs.insert(
+        "crypto_ct_equal".to_string(),
+        module.add_function(
+            "align_rt_crypto_ct_equal",
+            ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), i64t2.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "crypto_random".to_string(),
+        module.add_function("align_rt_crypto_random", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     // `std.compress` — gzip via libz / zstd via libzstd. compress (data view `{ptr,len}`, i64 level,
     // out: *handle) and decompress (data view `{ptr,len}`, out: *handle) both return an i32 status
     // (0 ok / AL_INVALID / AL_CODE+n), writing an owned `buffer` handle into `out`. Both codecs share
@@ -4657,6 +4672,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["utf8_valid"], &[dp.into(), dl.into()], "u8v")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("utf8_valid returns i32")
+            }
+            // std.crypto — constant_time_equal splits both byte views to `{ptr,len}` and returns an
+            // i32 (1/0); random passes the `buffer` handle pointer and returns void (fills in place).
+            Rvalue::CryptoCtEqual { a, b } => {
+                let (ap, al) = self.split_str(a)?;
+                let (bp, bl) = self.split_str(b)?;
+                self.builder
+                    .build_call(self.funcs["crypto_ct_equal"], &[ap.into(), al.into(), bp.into(), bl.into()], "cteq")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("crypto_ct_equal returns i32")
+            }
+            Rvalue::CryptoRandom { out } => {
+                let op = self.operand(out).into();
+                self.builder
+                    .build_call(self.funcs["crypto_random"], &[op], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
             }
             // std.compress — gzip via libz / zstd via libzstd. The data view splits to `{ptr,len}`;
             // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime

@@ -885,6 +885,21 @@ pub enum ExprKind {
     /// `c.usage()` — render `cmd`'s flag table into a fresh owned `string` (the `ty` is
     /// [`crate::Ty::String`]). `cmd` is borrowed, not consumed. Pure.
     CliUsage { cmd: Box<Expr> },
+    /// `crypto.constant_time_equal(a, b)` — a constant-time byte-equality test over two byte views
+    /// `a` / `b` (`str` / owned `string` auto-borrowed / `slice<u8>`); the `ty` is
+    /// [`crate::Ty::Bool`]. The input *length* is **public** (crypto.md P1): differing lengths return
+    /// `false` immediately; the constant-time guarantee is over the *content* of equal-length inputs
+    /// (a byte-diff OR-reduction with no early return, no secret-dependent branch — the runtime
+    /// hardens the reduction against the compiler). **Pure** (a self-hosted branchless computation, no
+    /// I/O), so it is allowed inside a `par_map` closure. Both operands are borrowed, never consumed.
+    CryptoCtEqual { a: Box<Expr>, b: Box<Expr> },
+    /// `crypto.random(out)` — fill the whole `buffer` `out` (its full capacity) with OS CSPRNG bytes
+    /// (`getrandom` / `getentropy`, key-grade); the `ty` is [`crate::Ty::Unit`]. A CSPRNG failure is
+    /// rare and **aborts** (key material is not a recoverable `Result`, the `rand.seed` policy). `out`
+    /// is a **mut** [`crate::Ty::Buffer`], borrowed and mutated in place through its handle pointer
+    /// (not consumed — like `reader.read`'s buffer). **Impure** (reads OS entropy), so an
+    /// rng-filling closure is never `Pure` and is excluded from `par_map`.
+    CryptoRandom { out: Box<Expr> },
 }
 
 /// Which `std.cli` flag an [`ExprKind::CliFlag`] registers — the kind decides the value type and

@@ -449,6 +449,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("decompress_{kind:?}({}, -> _{out})", operand_str(data))
         }
         Rvalue::Utf8Valid { data } => format!("utf8_valid({})", operand_str(data)),
+        Rvalue::CryptoCtEqual { a, b } => format!("crypto_ct_equal({}, {})", operand_str(a), operand_str(b)),
+        Rvalue::CryptoRandom { out } => format!("crypto_random({})", operand_str(out)),
         Rvalue::RandSeed { seed: Some(s), out } => format!("rng_seed_with({}, -> _{out})", operand_str(s)),
         Rvalue::RandSeed { seed: None, out } => format!("rng_seed_os(-> _{out})"),
         Rvalue::RandNext { rng } => format!("rng_next(_{rng})"),

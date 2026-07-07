@@ -625,6 +625,15 @@ pub enum Rvalue {
     /// `encoding.utf8_valid(b)` — whether the byte view `b` (`{ptr,len}`) is valid UTF-8, an `i32`
     /// used directly as a `bool` (`1`/`0`). Pure.
     Utf8Valid { data: Operand },
+    /// `crypto.constant_time_equal(a, b)` — a constant-time byte-equality test over two byte views
+    /// (each `{ptr,len}`), an `i32` used directly as a `bool` (`1` = equal, `0` = not, like
+    /// [`Self::Utf8Valid`]). The input length is public (differing lengths → `0`); the runtime's
+    /// equal-length compare is branchless (no early return). Pure.
+    CryptoCtEqual { a: Operand, b: Operand },
+    /// `crypto.random(out)` — fill the whole `buffer` `out` (its full capacity, by handle pointer)
+    /// with OS CSPRNG bytes. Yields no value (the expression type is `()`); codegen emits the void
+    /// call. A CSPRNG failure aborts in the runtime. Impure.
+    CryptoRandom { out: Operand },
     /// `rand.seed()` / `rand.seed_with(s)` — initialize an `rng` (four `i64`s, Xoshiro256++) into the
     /// slot `out`. `seed` is `None` for the OS-seeded form (`getrandom`), `Some(s)` for the
     /// deterministic form. Yields no value (the caller `Load`s `out` for the `rng` aggregate).
@@ -1692,6 +1701,25 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let v = b.fresh_value(Ty::Bool);
             b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
             Operand::Value(v)
+        }
+        // `crypto.constant_time_equal(a, b)` → the runtime returns an `i32` (1/0); compare `!= 0` to
+        // a `bool` (the same i32→bool bridge as `utf8_valid`). Both operands are byte views.
+        hir::ExprKind::CryptoCtEqual { a, b: bb } => {
+            let av = lower_expr(b, a);
+            let bv = lower_expr(b, bb);
+            let c = b.fresh_value(status_ty());
+            b.push(Stmt::Let(c, Rvalue::CryptoCtEqual { a: av, b: bv }));
+            let v = b.fresh_value(Ty::Bool);
+            b.push(Stmt::Let(v, Rvalue::Bin(BinOp::Ne, Operand::Value(c), Operand::Const(Const::Int(0, status_ty())))));
+            Operand::Value(v)
+        }
+        // `crypto.random(out)` → a void runtime call that fills the buffer in place; the expression
+        // value is `()` (the same shape as `time.sleep`).
+        hir::ExprKind::CryptoRandom { out } => {
+            let o = lower_expr(b, out);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::CryptoRandom { out: o }));
+            Operand::Const(Const::Unit)
         }
         // `rand.seed()` / `rand.seed_with(s)` → initialize the `rng` state into a temp slot (the
         // runtime writes through the pointer), then load the `[4 x i64]` aggregate as the value.
