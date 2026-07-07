@@ -951,6 +951,11 @@ fn canonical_type_name(
         if bare == "Error" {
             return Some("Error".to_string());
         }
+        // `argon2_params` is the builtin std.crypto Argon2 parameters struct — likewise visible
+        // everywhere (a reserved type name), so `argon2_params{...}` is an ordinary struct literal.
+        if bare == "argon2_params" {
+            return Some("argon2_params".to_string());
+        }
         match table.get(cur_module).and_then(|m| m.get(bare)) {
             Some(e) => Some(e.canonical.clone()),
             None => {
@@ -1399,6 +1404,12 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             if bare == "Error" {
                 diags.error("'Error' is a reserved type name (the builtin error sum type)".to_string(), span);
             }
+            if bare == "argon2_params" {
+                diags.error(
+                    "'argon2_params' is a reserved type name (the builtin std.crypto Argon2 parameters struct)".to_string(),
+                    span,
+                );
+            }
             if tt.contains_key(bare) {
                 // Keep the first declaration; ignore this one so it cannot overwrite the valid
                 // `type_table` / `*_ids` entry and cascade into confusing secondary errors.
@@ -1484,6 +1495,30 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
             },
         ],
     });
+
+    // The builtin `argon2_params` struct (M11 std.crypto Slice 5) — a plain **Copy** struct of four
+    // `i64` tuning knobs for `crypto.argon2id` (`m_cost` KiB, `t_cost` iterations, `parallelism`
+    // lanes, `len` output bytes). Registered like the `Error` enum above: a reserved type name
+    // (rejected as a user declaration in pass 0a), visible everywhere, so `argon2_params{...}` is an
+    // ordinary struct literal — the security-tuning knobs are named, never positional. It occupies a
+    // reserved concrete-struct slot right after the user structs (`structs` currently holds exactly
+    // the `struct_decls.len()` reserved slots — pass 0b fills only those indices, leaving this one
+    // intact; monomorphs append after it, exactly as they do after the `Error` enum).
+    {
+        let i64_field = Ty::Int(IntTy { bits: 64, signed: true });
+        struct_ids.insert("argon2_params".to_string(), structs.len() as u32);
+        structs.push(StructDef {
+            name: "argon2_params".to_string(),
+            fields: vec![
+                FieldDef { name: "m_cost".to_string(), ty: i64_field },
+                FieldDef { name: "t_cost".to_string(), ty: i64_field },
+                FieldDef { name: "parallelism".to_string(), ty: i64_field },
+                FieldDef { name: "len".to_string(), ty: i64_field },
+            ],
+            align: None,
+            c_repr: false,
+        });
+    }
 
     // Build the generic templates: resolve each template's fields / payloads with its type
     // parameters in scope (so `T` becomes `Ty::Param`). A template may not (yet) reference another
@@ -2521,6 +2556,14 @@ impl EffectScan {
                 self.expr(nonce);
                 self.expr(input);
                 self.expr(aad);
+            }
+            // `crypto.argon2id` — a libcrypto call, inferred **Impure** (never `Pure`, so excluded
+            // from `par_map`). Recurse into all three operands (`params` is a Copy struct literal).
+            ExprKind::CryptoArgon2 { password, salt, params } => {
+                self.impure_direct = true;
+                self.expr(password);
+                self.expr(salt);
+                self.expr(params);
             }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
@@ -3683,6 +3726,13 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(input, depth);
                 self.walk(aad, depth);
             }
+            // `crypto.argon2id` returns a fresh owned `buffer` inside a `Result` (borrows nothing) —
+            // freely returnable. Recurse into the operands so any escape inside them is still checked.
+            ExprKind::CryptoArgon2 { password, salt, params } => {
+                self.walk(password, depth);
+                self.walk(salt, depth);
+                self.walk(params, depth);
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -4112,6 +4162,11 @@ impl UnnecessaryHeapScan {
                 self.visit(nonce);
                 self.visit(input);
                 self.visit(aad);
+            }
+            ExprKind::CryptoArgon2 { password, salt, params } => {
+                self.visit(password);
+                self.visit(salt);
+                self.visit(params);
             }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
@@ -4856,6 +4911,13 @@ impl<'a> MoveCheck<'a> {
                 self.expr(nonce, moved, false, false);
                 self.expr(input, moved, false, false);
                 self.expr(aad, moved, false, false);
+            }
+            // `crypto.argon2id` borrows every operand (never consumes — `params` is Copy). Recurse
+            // non-consuming to catch a use-after-move inside them.
+            ExprKind::CryptoArgon2 { password, salt, params } => {
+                self.expr(password, moved, false, false);
+                self.expr(salt, moved, false, false);
+                self.expr(params, moved, false, false);
             }
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
@@ -6513,6 +6575,9 @@ impl<'a, 't> Checker<'a, 't> {
         if bare == "Error" {
             return Some("Error".to_string());
         }
+        if bare == "argon2_params" {
+            return Some("argon2_params".to_string());
+        }
         self.type_table.get(&self.cur_module)?.get(bare).map(|e| e.canonical.clone())
     }
 
@@ -7810,7 +7875,9 @@ impl<'a, 't> Checker<'a, 't> {
             // `hmac_sha256(key, data)` (owned `array<u8>` tag) / `hkdf_sha256(salt, ikm, info, len)`
             // (`Result<buffer, Error>`) are Slice 3, both Impure libcrypto calls. The four AEAD
             // surfaces `{aes_gcm,chacha20_poly1305}_{seal,open}(key, nonce, data, aad)` (Slice 4,
-            // `Result<buffer, Error>`) are Impure libcrypto calls too.
+            // `Result<buffer, Error>`) are Impure libcrypto calls too. `argon2id(password, salt,
+            // params)` (Slice 5, `Result<buffer, Error>`, `params` = the builtin `argon2_params`
+            // struct) closes the module — an Impure `EVP_KDF("ARGON2ID")` call.
             if module == "crypto"
                 && matches!(
                     method,
@@ -7824,6 +7891,7 @@ impl<'a, 't> Checker<'a, 't> {
                         | "aes_gcm_open"
                         | "chacha20_poly1305_seal"
                         | "chacha20_poly1305_open"
+                        | "argon2id"
                 )
             {
                 self.require_import("std.crypto", &format!("crypto.{method}"), span);
@@ -11658,6 +11726,10 @@ impl<'a, 't> Checker<'a, 't> {
         if matches!(method, "aes_gcm_seal" | "aes_gcm_open" | "chacha20_poly1305_seal" | "chacha20_poly1305_open") {
             return self.check_crypto_aead(method, args, span);
         }
+        // `argon2id(password, salt, params)` (Slice 5) — the Argon2id builder.
+        if method == "argon2id" {
+            return self.check_crypto_argon2(args, span);
+        }
         if method == "constant_time_equal" {
             if args.len() != 2 {
                 self.diags
@@ -11806,6 +11878,58 @@ impl<'a, 't> Checker<'a, 't> {
                 nonce: Box::new(nonce),
                 input: Box::new(input),
                 aad: Box::new(aad),
+            },
+            ty: result_ty,
+            span,
+        }
+    }
+
+    /// `std.crypto` (M11 Slice 5) — `argon2id(password, salt, params)`, Argon2id password hashing /
+    /// KDF via OpenSSL libcrypto's `EVP_KDF_fetch("ARGON2ID")`. `password` / `salt` are byte views
+    /// (the shared [`Self::check_byte_view`]; empty `password` is valid, `salt` must be >= 8 bytes —
+    /// the engine's RFC-Argon2 minimum, mapped to `Error.Invalid`). `params` is the builtin **Copy**
+    /// struct `argon2_params { m_cost, t_cost, parallelism, len }` (all `i64`) — any expression of
+    /// that type (a literal or a variable), typically the struct literal `argon2_params{m_cost: …,
+    /// t_cost: …, parallelism: …, len: …}`. Yields a `Result<buffer, Error>` (the `crypto.hkdf_sha256`
+    /// status→owned-`buffer` machinery). Public param bounds are validated at runtime →
+    /// `Error.Invalid`. **Impure**.
+    fn check_crypto_argon2(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 3 {
+            self.diags.error(
+                format!("'crypto.argon2id' expects 3 arguments (password, salt, params), got {}", args.len()),
+                span,
+            );
+            return err;
+        }
+        let Some(password) = self.check_byte_view(&args[0], "crypto.argon2id") else { return err };
+        let Some(salt) = self.check_byte_view(&args[1], "crypto.argon2id") else { return err };
+        // The third argument must be the builtin `argon2_params` struct (always registered in sema
+        // setup — a miss is an internal invariant break, not a user error).
+        let Some(&pid) = self.struct_ids.get("argon2_params") else {
+            self.diags.error("internal: builtin 'argon2_params' struct is not registered".to_string(), span);
+            return err;
+        };
+        let params = self.check_expr(&args[2], Some(Ty::Struct(pid)));
+        // Resolve once, up front — then both the type gate and the diagnostic read the resolved type
+        // (never an unbound `?N` tyvar). `Ty::Error` short-circuits (the operand already erred).
+        let pty = self.resolve(params.ty);
+        if pty == Ty::Error {
+            return err;
+        }
+        if pty != Ty::Struct(pid) {
+            self.diags.error(
+                format!("'crypto.argon2id' expects an 'argon2_params' struct as the third argument, got {}", ty_name(pty)),
+                args[2].span,
+            );
+            return err;
+        }
+        let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
+        Expr {
+            kind: ExprKind::CryptoArgon2 {
+                password: Box::new(password),
+                salt: Box::new(salt),
+                params: Box::new(params),
             },
             ty: result_ty,
             span,
@@ -13410,6 +13534,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(nonce);
                 self.finalize_expr(input);
                 self.finalize_expr(aad);
+            }
+            ExprKind::CryptoArgon2 { password, salt, params } => {
+                self.finalize_expr(password);
+                self.finalize_expr(salt);
+                self.finalize_expr(params);
             }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);

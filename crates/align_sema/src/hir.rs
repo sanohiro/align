@@ -953,6 +953,18 @@ pub enum ExprKind {
     /// nonces; the caller supplies one (e.g. via `crypto.random`). A nonce-generating convenience is a
     /// recorded candidate.
     CryptoAead { cipher: AeadCipher, dir: AeadDir, key: Box<Expr>, nonce: Box<Expr>, input: Box<Expr>, aad: Box<Expr> },
+    /// `crypto.argon2id(password, salt, params)` — Argon2id password hashing / KDF via OpenSSL
+    /// libcrypto's `EVP_KDF_fetch("ARGON2ID")` (OpenSSL >= 3.2). `password` / `salt` are byte views;
+    /// `params` is the builtin **Copy** struct `argon2_params { m_cost, t_cost, parallelism, len }`
+    /// (all `i64`: `m_cost` KiB, `t_cost` iterations, `parallelism` lanes, `len` output bytes) — an
+    /// ordinary struct literal at the call site (`argon2_params{m_cost: 65536, t_cost: 3,
+    /// parallelism: 1, len: 32}`), so the four security-tuning knobs are named, never positional.
+    /// Yields a `Result<buffer, Error>` (the [`ExprKind::CryptoAead`] status→owned-`buffer` shape).
+    /// Public param bounds (`t_cost`/`parallelism`/`m_cost`/`len` ranges) are validated **before** the
+    /// engine → `Error.Invalid`; a genuine engine failure → `Error.Code`. **Impure** (a C-engine call
+    /// — never `Pure`, so excluded from `par_map`). All three operands are borrowed, never consumed
+    /// (`params` is a Copy struct).
+    CryptoArgon2 { password: Box<Expr>, salt: Box<Expr>, params: Box<Expr> },
 }
 
 /// Which AEAD cipher an [`ExprKind::CryptoAead`] uses (M11 Slice 4). Both are 256-bit (32-byte key)
