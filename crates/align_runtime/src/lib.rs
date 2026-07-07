@@ -5449,6 +5449,203 @@ pub unsafe extern "C" fn align_rt_compress_gzip_decompress(ptr: *const u8, len: 
     unsafe { publish_buffer(gzip_inflate(data), out) }
 }
 
+// ---------------------------------------------------------------------------------------------
+// std.compress (M11 Slice 2) — zstd via libzstd. Same keystone-library shape as gzip (own the owned
+// `buffer` output, borrow libzstd's engine). `zstd_compress(data, level)` uses one-shot
+// `ZSTD_compress` sized by `ZSTD_compressBound` (the input is fully buffered, so a single pass is
+// simplest and the output is input-bounded — no bomb cap on compress). `zstd_decompress(data)` uses
+// the **streaming** API (`ZSTD_createDStream`/`ZSTD_decompressStream`) with the shared `grow_output`
+// grow-retry loop + the same 1 GiB hard cap → `Error.Invalid` on exceed: `ZSTD_getFrameContentSize`
+// is attacker-controlled header data and must never size an allocation. The `DStream` is freed on
+// every return path. The driver links `-lzstd`.
+// ---------------------------------------------------------------------------------------------
+
+/// zstd's `ZSTD_inBuffer` (`zstd.h`), `#[repr(C)]` so the field order matches the C ABI. `pos` is
+/// read-write: `ZSTD_decompressStream` advances it as it consumes input.
+#[repr(C)]
+struct ZstdInBuffer {
+    src: *const c_void,
+    size: usize,
+    pos: usize,
+}
+
+/// zstd's `ZSTD_outBuffer` (`zstd.h`), `#[repr(C)]`. `pos` is advanced by the decoder to report how
+/// many bytes it wrote into `dst`.
+#[repr(C)]
+struct ZstdOutBuffer {
+    dst: *mut c_void,
+    size: usize,
+    pos: usize,
+}
+
+/// Max compression level accepted by `zstd_compress`. zstd's `ZSTD_maxCLevel()` is 22 for standard
+/// builds; `0` additionally selects zstd's default level (currently 3). The negative "fast" levels
+/// (down to `ZSTD_minCLevel()`) are a power-user niche and are deliberately excluded to keep the API
+/// one-way (a single non-negative range) — an out-of-range level aborts, mirroring gzip's `0..=9`.
+const ZSTD_MAX_CLEVEL: i64 = 22;
+
+/// Hard cap on zstd-decompressed output (the decompress-bomb guard, P2), identical to gzip's — 1 GiB.
+/// A tiny zstd frame can advertise/inflate to gigabytes; exceeding this fails with `AL_INVALID`
+/// rather than exhausting memory. Only decompression is capped (compress output is input-bounded).
+const ZSTD_MAX_OUTPUT: usize = 1 << 30;
+
+// Stable `ZSTD_ErrorCode` values (`zstd_errors.h`) used to split an engine/resource failure from
+// invalid input on the decompress path. These two are the only realistic non-input faults for a
+// fully-buffered, output-capped decompress; everything else zstd reports on `_decompress` is the
+// input's fault (bad magic / corruption / checksum / truncation / unsupported frame params).
+const ZSTD_ERROR_MEMORY_ALLOCATION: c_int = 64;
+const ZSTD_ERROR_WORKSPACE_TOO_SMALL: c_int = 66;
+
+#[link(name = "zstd")]
+unsafe extern "C" {
+    fn ZSTD_compressBound(src_size: usize) -> usize;
+    fn ZSTD_compress(dst: *mut c_void, dst_cap: usize, src: *const c_void, src_size: usize, level: c_int) -> usize;
+    fn ZSTD_isError(code: usize) -> c_uint;
+    fn ZSTD_getErrorCode(code: usize) -> c_int;
+    fn ZSTD_createDStream() -> *mut c_void;
+    fn ZSTD_freeDStream(zds: *mut c_void) -> usize;
+    fn ZSTD_initDStream(zds: *mut c_void) -> usize;
+    fn ZSTD_decompressStream(zds: *mut c_void, output: *mut ZstdOutBuffer, input: *mut ZstdInBuffer) -> usize;
+}
+
+/// Encode a zstd error result as `Error.Code`: `AL_CODE + ZSTD_ErrorCode` (the shared errno→Error
+/// table's catch-all arm — no new `Error` variant). `ZSTD_getErrorCode` maps a `size_t` result to a
+/// small non-negative enum value, so the `saturating_add` never overflows.
+fn zstd_error_code(ret: usize) -> i32 {
+    AL_CODE.saturating_add(unsafe { ZSTD_getErrorCode(ret) })
+}
+
+/// Map a **decompress** zstd error result to an `AL_*` status. A resource/engine fault
+/// (`memory_allocation`/`workSpace_tooSmall`) carries its code as `Error.Code`; every other error on
+/// a decompress — bad magic, corruption, checksum mismatch, truncation (`srcSize_wrong`), unsupported
+/// frame params — is the input's fault → `AL_INVALID` (`Error.Invalid`), mirroring gzip's policy.
+fn zstd_decompress_error_to_status(ret: usize) -> i32 {
+    match unsafe { ZSTD_getErrorCode(ret) } {
+        ZSTD_ERROR_MEMORY_ALLOCATION | ZSTD_ERROR_WORKSPACE_TOO_SMALL => zstd_error_code(ret),
+        _ => AL_INVALID,
+    }
+}
+
+/// `compress.zstd_compress(data, level)` — one-shot compress `data` into a zstd frame at `level`
+/// (`0..=22`, `0` = zstd default), returning the frame bytes or an `AL_*` status. An out-of-range
+/// `level` is a **programmer error** (not attacker input), so it aborts — the `rand.range`
+/// total-or-abort policy (#345), never a silent clamp / `Error`. The output is sized by
+/// `ZSTD_compressBound` (worst-case single-pass size) and bounded by the input, so no bomb cap.
+fn zstd_compress_impl(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
+    if !(0..=ZSTD_MAX_CLEVEL).contains(&level) {
+        panic_abort("compress.zstd_compress: level out of range (must be 0..=22; 0 = default)");
+    }
+    let level = level as c_int;
+    // `ZSTD_compressBound` is pure arithmetic on the length (never an error for a real in-memory
+    // length); it yields the worst-case compressed size for a single pass.
+    let bound = unsafe { ZSTD_compressBound(data.len()) };
+    let mut out: Vec<u8> = Vec::new();
+    // Fallible reserve so a pathological bound fails softly (Error.Code) instead of aborting on OOM.
+    out.try_reserve_exact(bound).map_err(|_| AL_CODE)?;
+    // `data.as_ptr()` is non-null even for an empty slice (a valid 0-length source); `out` has at
+    // least `bound` bytes of spare capacity, which zstd never overruns.
+    let written = unsafe {
+        ZSTD_compress(out.as_mut_ptr() as *mut c_void, bound, data.as_ptr() as *const c_void, data.len(), level)
+    };
+    if unsafe { ZSTD_isError(written) } != 0 {
+        // Compress runs on our own valid input into a `compressBound`-sized dst, so a failure here is
+        // an engine/resource fault (e.g. OOM), never invalid user data → Error.Code.
+        return Err(zstd_error_code(written));
+    }
+    debug_assert!(written <= bound, "zstd wrote past compressBound");
+    // SAFETY: zstd wrote `written` (<= bound <= capacity) bytes into the reserved spare capacity.
+    unsafe { out.set_len(written) };
+    Ok(out)
+}
+
+/// `compress.zstd_decompress(data)` — inflate the zstd frame `data` via the streaming API, returning
+/// the decompressed bytes or an `AL_*` status. Output is capped at [`ZSTD_MAX_OUTPUT`] (the bomb
+/// guard) — `ZSTD_getFrameContentSize` is never trusted for sizing. The `DStream` is freed on every
+/// path (init failure, decode error, success).
+fn zstd_decompress_impl(data: &[u8]) -> Result<Vec<u8>, i32> {
+    let zds = unsafe { ZSTD_createDStream() };
+    if zds.is_null() {
+        return Err(AL_CODE); // allocation failure creating the stream — engine fault
+    }
+    // Reset the stream for a fresh frame. On failure there is nothing decoded yet, but the created
+    // stream must still be freed.
+    let init = unsafe { ZSTD_initDStream(zds) };
+    if unsafe { ZSTD_isError(init) } != 0 {
+        let st = zstd_error_code(init);
+        unsafe { ZSTD_freeDStream(zds) };
+        return Err(st);
+    }
+    let result = zstd_decompress_stream(zds, data, ZSTD_MAX_OUTPUT);
+    unsafe { ZSTD_freeDStream(zds) };
+    result
+}
+
+/// Drive `ZSTD_decompressStream` to frame completion over `data`, enforcing the `max_cap` output cap
+/// (the bomb guard). The whole input is available at once (a fully-buffered byte view); output grows
+/// via the shared [`grow_output`] up to `max_cap`. `max_cap` is a parameter (not [`ZSTD_MAX_OUTPUT`]
+/// directly) so a unit test can drive the bomb path with a tiny cap. Never dereferences the stream
+/// after an error (the caller frees it).
+fn zstd_decompress_stream(zds: *mut c_void, data: &[u8], max_cap: usize) -> Result<Vec<u8>, i32> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut input = ZstdInBuffer { src: data.as_ptr() as *const c_void, size: data.len(), pos: 0 };
+    loop {
+        // Make output room, enforcing the cap. `false` = the cap is full but the frame isn't done →
+        // the output would exceed `max_cap` → a decompress bomb.
+        if !grow_output(&mut out, max_cap)? {
+            return Err(AL_INVALID);
+        }
+        // `grow_output` returned `Ok(true)`, so `out.len() < out.capacity()` and `out.len() < max_cap`
+        // both hold → `spare >= 1` and neither subtraction underflows.
+        let spare = (out.capacity() - out.len()).min(max_cap - out.len());
+        let mut output = ZstdOutBuffer {
+            dst: unsafe { out.as_mut_ptr().add(out.len()) as *mut c_void },
+            size: spare,
+            pos: 0,
+        };
+        let in_before = input.pos;
+        let ret = unsafe { ZSTD_decompressStream(zds, &mut output, &mut input) };
+        // SAFETY: zstd wrote `output.pos` bytes into the spare capacity we pointed it at.
+        unsafe { out.set_len(out.len() + output.pos) };
+        if unsafe { ZSTD_isError(ret) } != 0 {
+            return Err(zstd_decompress_error_to_status(ret));
+        }
+        if ret == 0 {
+            return Ok(out); // frame completely decoded and fully flushed
+        }
+        // `ret > 0`: more work. Require forward progress — if this call neither consumed input nor
+        // produced output and all input is gone, the frame needs bytes that never arrive → truncated
+        // (an invalid stream, not a runtime error). A non-empty output window (spare >= 1) means a
+        // stalled `output.pos == 0` is genuine, not a zero-window artifact.
+        if output.pos == 0 && input.pos == in_before && input.pos >= input.size {
+            return Err(AL_INVALID);
+        }
+    }
+}
+
+/// `compress.zstd_compress(data, level)` — zstd-compress the byte view `data` at `level` (0..=22),
+/// writing an owned `buffer` handle to `*out` and returning `0` (or an `AL_*` status, leaving `*out`
+/// null). An out-of-range `level` aborts (programmer error).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_zstd_compress(ptr: *const u8, len: i64, level: i64, out: *mut *mut Buffer) -> i32 {
+    let data = unsafe { bytes_view(ptr, len) };
+    unsafe { publish_buffer(zstd_compress_impl(data, level), out) }
+}
+
+/// `compress.zstd_decompress(data)` — inflate the zstd byte view `data`, writing an owned `buffer`
+/// handle to `*out` and returning `0` (or `AL_INVALID` on corrupt/truncated/bomb input, leaving
+/// `*out` null).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_zstd_decompress(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+    let data = unsafe { bytes_view(ptr, len) };
+    unsafe { publish_buffer(zstd_decompress_impl(data), out) }
+}
+
 /// Byte-equality of two `str` views (M5). Returns 1 if equal, else 0.
 ///
 /// # Safety
@@ -10878,6 +11075,142 @@ mod tests {
         for level in 0..=9i64 {
             let comp = gz_compress(b"boundary levels round-trip", level);
             assert_eq!(gz_decompress(&comp).as_deref(), Ok(&b"boundary levels round-trip"[..]));
+        }
+    }
+
+    // --- std.compress (M11 Slice 2) — zstd via libzstd ---------------------------------------
+
+    /// Compress `data` at `level` through the FFI entry, returning the owned zstd bytes (freeing the
+    /// `buffer` handle). Panics if the status is non-zero — the caller asserts success.
+    fn zst_compress(data: &[u8], level: i64) -> Vec<u8> {
+        let mut out: *mut Buffer = core::ptr::null_mut();
+        let st = unsafe { align_rt_compress_zstd_compress(data.as_ptr(), data.len() as i64, level, &mut out) };
+        assert_eq!(st, 0, "compress should succeed");
+        assert!(!out.is_null());
+        let bytes = unsafe { let b = &*out; b.data[..b.len].to_vec() };
+        unsafe { align_rt_buffer_free(out) };
+        bytes
+    }
+
+    /// Decompress `data` through the FFI entry, returning `Ok(bytes)` or `Err(status)`.
+    fn zst_decompress(data: &[u8]) -> Result<Vec<u8>, i32> {
+        let mut out: *mut Buffer = core::ptr::null_mut();
+        let st = unsafe { align_rt_compress_zstd_decompress(data.as_ptr(), data.len() as i64, &mut out) };
+        if st != 0 {
+            assert!(out.is_null(), "the Err path must leave the out handle null");
+            return Err(st);
+        }
+        assert!(!out.is_null());
+        let bytes = unsafe { let b = &*out; b.data[..b.len].to_vec() };
+        unsafe { align_rt_buffer_free(out) };
+        Ok(bytes)
+    }
+
+    /// Round-trip over empty / small / highly-compressible / ~1 MB pseudo-random data, at a spread
+    /// of levels including both boundaries (`0` = default, `1`, `22`).
+    #[test]
+    fn zstd_round_trip_all_sizes_and_levels() {
+        // A cheap deterministic PRNG (xorshift) for the pseudo-random ~1 MB case (no rand dep).
+        let mut s: u64 = 0x243F6A8885A308D3;
+        let mut prng = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let random_1m: Vec<u8> = (0..1_000_003).map(|_| (prng() & 0xff) as u8).collect();
+        let cases: Vec<Vec<u8>> = vec![
+            Vec::new(),                                  // empty
+            b"hello, zstd".to_vec(),                     // small
+            vec![b'A'; 100_000],                         // highly compressible
+            random_1m,                                   // ~1 MB pseudo-random (near-incompressible)
+        ];
+        for data in &cases {
+            for level in [0i64, 1, 3, 9, 19, 22] {
+                let comp = zst_compress(data, level);
+                // zstd magic pins the format (RFC 8878: 0x28 0xB5 0x2F 0xFD, little-endian 0xFD2FB528).
+                assert!(
+                    comp.len() >= 4 && comp[0] == 0x28 && comp[1] == 0xB5 && comp[2] == 0x2F && comp[3] == 0xFD,
+                    "zstd magic at level {level}"
+                );
+                let back = zst_decompress(&comp).expect("round trip");
+                assert_eq!(&back, data, "round trip mismatch at len {} level {level}", data.len());
+            }
+        }
+    }
+
+    /// Highly-compressible data actually shrinks (the engine is really running, not storing).
+    #[test]
+    fn zstd_compresses_repetitive_data() {
+        let data = vec![b'Z'; 50_000];
+        let comp = zst_compress(&data, 3);
+        assert!(comp.len() < data.len() / 10, "50k of one byte should compress hard, got {}", comp.len());
+    }
+
+    /// Corrupt input (valid zstd header, mangled body) → `AL_INVALID`.
+    #[test]
+    fn zstd_decompress_corrupt_is_invalid() {
+        let mut comp = zst_compress(b"the quick brown fox jumps over the lazy dog", 3);
+        // Flip bytes past the 4-byte magic to corrupt the frame body/checksum.
+        for b in comp.iter_mut().skip(4) {
+            *b ^= 0xff;
+        }
+        assert_eq!(zst_decompress(&comp), Err(AL_INVALID), "corrupt body → Error.Invalid");
+    }
+
+    /// Truncated input (a valid frame cut short) → `AL_INVALID`.
+    #[test]
+    fn zstd_decompress_truncated_is_invalid() {
+        let comp = zst_compress(&vec![b'x'; 10_000], 3);
+        let truncated = &comp[..comp.len() / 2];
+        assert_eq!(zst_decompress(truncated), Err(AL_INVALID), "truncated → Error.Invalid");
+    }
+
+    /// A non-zstd input (raw bytes with no zstd magic) → `AL_INVALID` (strict framing). Empty input
+    /// is likewise not a valid frame.
+    #[test]
+    fn zstd_decompress_non_zstd_is_invalid() {
+        assert_eq!(zst_decompress(b"not a zstd stream at all"), Err(AL_INVALID));
+        assert_eq!(zst_decompress(&[]), Err(AL_INVALID), "empty input is not a valid zstd frame");
+    }
+
+    /// Cross-format confusion: a gzip stream fed to `zstd_decompress` (and vice versa) is rejected as
+    /// invalid — the magic numbers differ (gzip `1f 8b`, zstd `28 b5 2f fd`).
+    #[test]
+    fn zstd_and_gzip_do_not_cross_decompress() {
+        let gz = gz_compress(b"payload", 6);
+        assert_eq!(zst_decompress(&gz), Err(AL_INVALID), "gzip bytes → zstd_decompress → Invalid");
+        let zst = zst_compress(b"payload", 3);
+        assert_eq!(gz_decompress(&zst), Err(AL_INVALID), "zstd bytes → gzip_decompress → Invalid");
+    }
+
+    /// The decompress-bomb guard (P2): a tiny zstd frame that inflates past the cap → `AL_INVALID`.
+    /// Driven with a small `max_cap` via `zstd_decompress_stream` directly (a real 1 GiB inflate is
+    /// impractical); the same wiring uses `ZSTD_MAX_OUTPUT` in production. Also exercises the
+    /// create/init/free `DStream` lifecycle on both the capped and the successful path.
+    #[test]
+    fn zstd_decompress_bomb_over_cap_is_invalid() {
+        // 1 MB of zeros compresses to a tiny zstd frame but inflates to 1 MB — over a 1 KiB cap.
+        let comp = zst_compress(&vec![0u8; 1_000_000], 19);
+        let zds = unsafe { ZSTD_createDStream() };
+        assert!(!zds.is_null(), "createDStream must succeed");
+        let init = unsafe { ZSTD_initDStream(zds) };
+        assert_eq!(unsafe { ZSTD_isError(init) }, 0, "initDStream must succeed");
+        let capped = zstd_decompress_stream(zds, &comp, 1024);
+        unsafe { ZSTD_freeDStream(zds) };
+        assert_eq!(capped, Err(AL_INVALID), "inflating past the cap → Error.Invalid");
+        // The same frame under the real cap decompresses fine.
+        assert_eq!(zst_decompress(&comp).map(|v| v.len()), Ok(1_000_000));
+    }
+
+    /// Every accepted level (`0`, `1`, …, `22`) is accepted and round-trips. (An out-of-range level
+    /// aborts — the total-or-abort programmer-error policy — exercised end-to-end in the driver
+    /// integration test `m11_compress`, not here, since an abort would kill the test process.)
+    #[test]
+    fn zstd_compress_accepts_all_valid_levels() {
+        for level in 0..=22i64 {
+            let comp = zst_compress(b"boundary levels round-trip", level);
+            assert_eq!(zst_decompress(&comp).as_deref(), Ok(&b"boundary levels round-trip"[..]));
         }
     }
 }
