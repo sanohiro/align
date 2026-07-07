@@ -1092,6 +1092,24 @@ fn build_module<'c>(
             ),
         );
     }
+    // `std.crypto` (M11 Slice 5) — argon2id. `argon2id` takes two byte views (password/salt, each
+    // `{ptr,len}`) + four i64 tuning knobs (m_cost/t_cost/parallelism/len) + an out handle slot,
+    // returns an i32 status, and writes an owned `buffer` handle (the derived tag) into `out` (the
+    // `std.compress`/hkdf status shape).
+    funcs.insert(
+        "crypto_argon2id".to_string(),
+        module.add_function(
+            "align_rt_crypto_argon2id",
+            ctx.i32_type().fn_type(
+                &[
+                    ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), i64t2.into(), i64t2.into(), i64t2.into(),
+                    i64t2.into(), ptr.into(),
+                ],
+                false,
+            ),
+            None,
+        ),
+    );
     // `std.compress` — gzip via libz / zstd via libzstd. compress (data view `{ptr,len}`, i64 level,
     // out: *handle) and decompress (data view `{ptr,len}`, out: *handle) both return an i32 status
     // (0 ok / AL_INVALID / AL_CODE+n), writing an owned `buffer` handle into `out`. Both codecs share
@@ -4815,6 +4833,29 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     )
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("crypto aead returns i32 status")
+            }
+            // std.crypto (Slice 5) — argon2id. The password/salt byte views split to `{ptr,len}`; the
+            // four i64 tuning knobs pass as scalars; the out handle slot is caller-zeroed (so the Err
+            // path frees nothing). The runtime validates the public bounds and returns an i32 status.
+            Rvalue::CryptoArgon2(a) => {
+                let out_ptr = self.slots[&a.out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                let (pp, pl) = self.split_str(&a.password)?;
+                let (sp, sl) = self.split_str(&a.salt)?;
+                let m = self.operand(&a.m_cost);
+                let t = self.operand(&a.t_cost);
+                let p = self.operand(&a.parallelism);
+                let l = self.operand(&a.len);
+                self.builder
+                    .build_call(
+                        self.funcs["crypto_argon2id"],
+                        &[pp.into(), pl.into(), sp.into(), sl.into(), m.into(), t.into(), p.into(), l.into(), out_ptr.into()],
+                        "argon2id",
+                    )
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("crypto argon2id returns i32 status")
             }
             // std.compress — gzip via libz / zstd via libzstd. The data view splits to `{ptr,len}`;
             // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime

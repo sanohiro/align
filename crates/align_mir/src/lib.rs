@@ -658,6 +658,18 @@ pub enum Rvalue {
     /// single opaque failure, P2; `AL_CODE+n` → `Error.Code` only for a **seal** engine failure). The
     /// caller branches `Ok(<buffer>)` / `Err(<mapped>)` via [`emit_status_buffer_result`]. Impure.
     CryptoAead { cipher: hir::AeadCipher, dir: hir::AeadDir, key: Operand, nonce: Operand, input: Operand, aad: Operand, out: Slot },
+    /// `crypto.argon2id(password, salt, params)` — Argon2id via OpenSSL's `EVP_KDF("ARGON2ID")`.
+    /// `password` / `salt` are byte views (`{ptr,len}`); the four `i64` tuning knobs are the fields of
+    /// the caller's `argon2_params` struct, read out at lowering (`m_cost` KiB, `t_cost` iterations,
+    /// `parallelism` lanes, `len` output bytes). The runtime validates the public param bounds, writes
+    /// an owned `buffer` handle into `out`, and returns an `i32` status (0 ok; `AL_INVALID` → a
+    /// public-param violation or an engine param rejection e.g. a too-short salt; `AL_CODE+n` → a
+    /// genuine engine failure — see [`make_error_from_status`]); the caller branches `Ok(<buffer>)` /
+    /// `Err(<mapped>)` via [`emit_status_buffer_result`]. Impure. The six-operand payload is **boxed**
+    /// (see [`Argon2Args`]) so this variant does not widen `Rvalue` — a wide variant inflates every
+    /// `lower_expr` stack frame (each holds an `Rvalue` temporary), regressing the recursive
+    /// `expr_depth` headroom (#296).
+    CryptoArgon2(Box<Argon2Args>),
     /// `rand.seed()` / `rand.seed_with(s)` — initialize an `rng` (four `i64`s, Xoshiro256++) into the
     /// slot `out`. `seed` is `None` for the OS-seeded form (`getrandom`), `Some(s)` for the
     /// deterministic form. Yields no value (the caller `Load`s `out` for the `rng` aggregate).
@@ -722,6 +734,21 @@ pub enum Operand {
     Value(ValueId),
     /// The i-th incoming function argument.
     Arg(u32),
+}
+
+/// The boxed operands of a [`Rvalue::CryptoArgon2`] — two byte views (`password` / `salt`) and the
+/// four `i64` Argon2 tuning knobs read out of the caller's `argon2_params` struct (`m_cost` KiB,
+/// `t_cost` iterations, `parallelism` lanes, `len` output bytes), plus the owned-`buffer` out slot.
+/// Boxed to keep [`Rvalue`] narrow (see the variant doc).
+#[derive(Clone, Debug)]
+pub struct Argon2Args {
+    pub password: Operand,
+    pub salt: Operand,
+    pub m_cost: Operand,
+    pub t_cost: Operand,
+    pub parallelism: Operand,
+    pub len: Operand,
+    pub out: Slot,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1763,6 +1790,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::CryptoHkdf { salt, ikm, info, len } => lower_crypto_hkdf(b, salt, ikm, info, len, e.ty),
         hir::ExprKind::CryptoAead { cipher, dir, key, nonce, input, aad } => {
             lower_crypto_aead(b, *cipher, *dir, key, nonce, input, aad, e.ty)
+        }
+        hir::ExprKind::CryptoArgon2 { password, salt, params } => {
+            lower_crypto_argon2(b, password, salt, params, e.ty)
         }
         // `rand.seed()` / `rand.seed_with(s)` → initialize the `rng` state into a temp slot (the
         // runtime writes through the pointer), then load the `[4 x i64]` aggregate as the value.
@@ -5397,6 +5427,38 @@ fn lower_crypto_aead(
     emit_status_buffer_result(b, code, out, ty)
 }
 
+/// `crypto.argon2id(password, salt, params)` → the runtime writes an owned `buffer` into `out` +
+/// returns an i32 status; branch `Ok(<buffer>)` / `Err(<mapped>)` via the shared `std.compress`
+/// machinery. The `argon2_params` struct is materialized into a temp slot (works for a struct literal
+/// *or* a variable) and its four `i64` fields are read out in declaration order (`m_cost`, `t_cost`,
+/// `parallelism`, `len` — the `StructDef` order; all `i64`, so layout order == declaration order),
+/// then passed to the runtime as flat scalars. Out-of-line (`#[inline(never)]`) so its locals stay
+/// off the recursive `lower_expr` frame (see the call site — the #296 `expr_depth` headroom).
+#[inline(never)]
+fn lower_crypto_argon2(b: &mut Builder, password: &hir::Expr, salt: &hir::Expr, params: &hir::Expr, ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::Buffer);
+    let pw = lower_expr(b, password);
+    let sv = lower_expr(b, salt);
+    // Materialize the `argon2_params` struct into a slot, then read its four `i64` fields.
+    let pslot = b.new_slot(params.ty);
+    store_value_at(b, pslot, &mut Vec::new(), params);
+    let read_field = |b: &mut Builder, idx: u32| {
+        let v = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(v, Rvalue::Field(pslot, vec![idx])));
+        Operand::Value(v)
+    };
+    let m_cost = read_field(b, 0);
+    let t_cost = read_field(b, 1);
+    let parallelism = read_field(b, 2);
+    let len = read_field(b, 3);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        code,
+        Rvalue::CryptoArgon2(Box::new(Argon2Args { password: pw, salt: sv, m_cost, t_cost, parallelism, len, out })),
+    ));
+    emit_status_buffer_result(b, code, out, ty)
+}
+
 /// `c.parse(args)` → the runtime writes an owned `cli parsed` handle into an out slot and returns an
 /// `i32` status (0 = ok; `AL_INVALID` -> `Error.Invalid`). Branch `Ok(<parsed>)` / `Err(<mapped
 /// status>)`. Mirrors [`lower_encoding_decode`], but the source is the command handle + the argv
@@ -6005,7 +6067,9 @@ mod tests {
     fn struct_lowers_to_field_stores_and_loads() {
         let src = "Point { x: i32, y: i32 }\nfn main() -> i32 {\n  p := Point { x: 3, y: 4 }\n  return p.x + p.y\n}\n";
         let p = lower(src);
-        assert_eq!(p.structs.len(), 1);
+        // `Point` plus the always-registered builtin `argon2_params` struct (the std.crypto Argon2
+        // parameters type — present in every program's struct table, like the builtin `Error` enum).
+        assert_eq!(p.structs.len(), 2);
         let f = &p.fns[0];
         let stmts: Vec<&Stmt> = f.blocks.iter().flat_map(|b| &b.stmts).collect();
         // Two field stores for the literal, two field loads for the reads.

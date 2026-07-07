@@ -484,6 +484,16 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 operand_str(aad)
             )
         }
+        Rvalue::CryptoArgon2(a) => format!(
+            "crypto_argon2id({}, {}, m={}, t={}, p={}, len={}, -> _{})",
+            operand_str(&a.password),
+            operand_str(&a.salt),
+            operand_str(&a.m_cost),
+            operand_str(&a.t_cost),
+            operand_str(&a.parallelism),
+            operand_str(&a.len),
+            a.out
+        ),
         Rvalue::RandSeed { seed: Some(s), out } => format!("rng_seed_with({}, -> _{out})", operand_str(s)),
         Rvalue::RandSeed { seed: None, out } => format!("rng_seed_os(-> _{out})"),
         Rvalue::RandNext { rng } => format!("rng_next(_{rng})"),

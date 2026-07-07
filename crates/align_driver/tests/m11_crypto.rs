@@ -928,3 +928,213 @@ fn aead_wrong_shape_rejected() {
         "chacha20_poly1305_seal on a non-byte-view nonce must error"
     );
 }
+
+// --- argon2id (Slice 5) -----------------------------------------------------------------------
+//
+// `crypto.argon2id(password: bytes, salt: bytes, params: argon2_params) -> Result<buffer, Error>`
+// via OpenSSL libcrypto's `EVP_KDF_fetch("ARGON2ID")`. `argon2_params` is a builtin **Copy** struct
+// `{ m_cost, t_cost, parallelism, len }` (all i64), constructed with an ordinary struct literal so
+// the security-tuning knobs are named, never positional. The canonical KAT is the phc-winner-argon2
+// reference test.c argon2id vector (v=0x13): password "password", salt "somesalt", t=2, m=65536
+// KiB, p=1, len=32. Public param bounds are validated before the engine → Error.Invalid. The full
+// bound matrix + determinism + param sensitivity are pinned in the align_runtime unit tests
+// (`argon2id_*`); these tests pin the language-level contract (the struct-literal call site, the
+// import/arity/type gates, purity, and one KAT end-to-end). (`docs/impl/std-design/crypto.md`.)
+
+/// The canonical reference vector round-trips end-to-end through an `argon2_params` struct literal:
+/// the 32-byte tag renders to the phc-winner-argon2 reference hex.
+#[test]
+fn argon2id_canonical_vector() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  tag := crypto.argon2id(\"password\", \"somesalt\", argon2_params{m_cost: 65536, t_cost: 2, parallelism: 1, len: 32})?
+  print(tag.len())
+  print(encoding.hex_encode(tag.bytes()))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-argon-kat", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "32\n09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7\n"
+    );
+}
+
+/// The `argon2_params` struct can be built in a variable (not only inline at the call site) and
+/// passed by value — it is an ordinary Copy struct. Same tiny-cost derivation twice is deterministic.
+#[test]
+fn argon2id_params_struct_is_a_first_class_value() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+import std.encoding
+pub fn main() -> Result<(), Error> {
+  p := argon2_params{m_cost: 64, t_cost: 1, parallelism: 1, len: 32}
+  a := crypto.argon2id(\"password\", \"somesalt\", p)?
+  b := crypto.argon2id(\"password\", \"somesalt\", p)?
+  print(crypto.constant_time_equal(a.bytes(), b.bytes()))   // same params/inputs → same tag
+  print(encoding.hex_encode(a.bytes()))
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-argon-var", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true\n729c7a54441bc13559bdca71348c4e554599e719c08a952601ed5c83618c1bbd\n"
+    );
+}
+
+/// Empty password is valid (salt still >= 8); it derives a 32-byte tag rather than erroring.
+#[test]
+fn argon2id_empty_password_ok() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+pub fn main() -> Result<(), Error> {
+  tag := crypto.argon2id(\"\", \"somesalt\", argon2_params{m_cost: 64, t_cost: 1, parallelism: 1, len: 32})?
+  print(tag.len())
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-argon-emptypw", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "32\n");
+}
+
+/// A violated public bound (t_cost < 1, parallelism < 1, m_cost < 8*parallelism, len < 4) or a salt
+/// shorter than the RFC 8-byte Argon2 minimum → `Error.Invalid` (tag 1 → exit 2 via the propagated
+/// `?` at the `main` boundary), before/at the engine, never a partial result.
+#[test]
+fn argon2id_invalid_params_are_error_invalid() {
+    if !backend_available() {
+        return;
+    }
+    // (tag, params-body, salt) — each row violates exactly one rule.
+    let cases = [
+        ("tcost0", "m_cost: 64, t_cost: 0, parallelism: 1, len: 32", "somesalt"),
+        ("par0", "m_cost: 64, t_cost: 1, parallelism: 0, len: 32", "somesalt"),
+        ("mtoolow", "m_cost: 15, t_cost: 1, parallelism: 2, len: 32", "somesalt"),
+        ("len3", "m_cost: 64, t_cost: 1, parallelism: 1, len: 3", "somesalt"),
+        ("shortsalt", "m_cost: 64, t_cost: 1, parallelism: 1, len: 32", "short"),
+    ];
+    for (tag, params, salt) in cases {
+        let prog = format!(
+            "\
+import std.crypto
+pub fn main() -> Result<(), Error> {{
+  out := crypto.argon2id(\"pw\", \"{salt}\", argon2_params{{{params}}})?
+  print(out.len())
+  return Ok(())
+}}
+"
+        );
+        let out = build_and_run(&format!("m11cr-argon-inv-{tag}"), &prog);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "argon2id {tag} → Error.Invalid (exit 2); stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The just-valid boundary of each bound derives (proves `>=`/`<=`, not `>`/`<`): m_cost == 8,
+/// m_cost == 8*parallelism, len == 4, salt == 8 bytes.
+#[test]
+fn argon2id_boundary_valid_params_ok() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.crypto
+pub fn main() -> Result<(), Error> {
+  a := crypto.argon2id(\"pw\", \"exactly8\", argon2_params{m_cost: 8, t_cost: 1, parallelism: 1, len: 32})?
+  b := crypto.argon2id(\"pw\", \"exactly8\", argon2_params{m_cost: 16, t_cost: 1, parallelism: 2, len: 4})?
+  print(a.len())
+  print(b.len())
+  return Ok(())
+}
+";
+    let out = build_and_run("m11cr-argon-boundary", prog);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "32\n4\n");
+}
+
+/// `argon2id` calls the libcrypto engine — Impure. A closure that uses it is never `Pure`, so
+/// `par_map` (which requires a Pure closure) rejects it.
+#[test]
+fn argon2id_impure_rejected_by_par_map() {
+    let src = "\
+import std.crypto
+fn f(x: i64) -> i64 {
+  r := crypto.argon2id(\"pw\", \"somesalt\", argon2_params{m_cost: 64, t_cost: 1, parallelism: 1, len: 32})
+  return x + match r { Ok(b) => b.len(), Err(_) => 0 }
+}
+pub fn main() -> i32 {
+  arena {
+    ys := [1, 2, 3, 4][0..4].par_map(f).to_array()
+    print(ys.len())
+  }
+  return 0
+}
+";
+    assert!(check_errs("m11cr-argon-parmap", src), "an impure argon2id closure must be rejected by par_map");
+}
+
+/// `argon2id` requires `import std.crypto` and takes exactly `(password, salt, params)` — a wrong
+/// arity, a non-byte-view password/salt, or a non-`argon2_params` third argument is a compile error.
+/// The `argon2_params` type name is reserved (a user cannot redeclare it).
+#[test]
+fn argon2id_wrong_shape_rejected() {
+    // import gate.
+    assert!(
+        check_errs(
+            "m11cr-argon-noimport",
+            "pub fn main() -> Result<(), Error> {\n  r := crypto.argon2id(\"pw\", \"somesalt\", argon2_params{m_cost: 64, t_cost: 1, parallelism: 1, len: 32})?\n  print(r.len())\n  return Ok(())\n}\n"
+        ),
+        "argon2id without `import std.crypto` must error"
+    );
+    // arity (2 args).
+    assert!(
+        check_errs(
+            "m11cr-argon-arity",
+            "import std.crypto\npub fn main() -> Result<(), Error> {\n  r := crypto.argon2id(\"pw\", \"somesalt\")?\n  print(r.len())\n  return Ok(())\n}\n"
+        ),
+        "argon2id with 2 arguments must error"
+    );
+    // a non-byte-view password (an i64).
+    assert!(
+        check_errs(
+            "m11cr-argon-pwtype",
+            "import std.crypto\npub fn main() -> Result<(), Error> {\n  r := crypto.argon2id(42, \"somesalt\", argon2_params{m_cost: 64, t_cost: 1, parallelism: 1, len: 32})?\n  print(r.len())\n  return Ok(())\n}\n"
+        ),
+        "argon2id on a non-byte-view password must error"
+    );
+    // a non-argon2_params third argument (an i64).
+    assert!(
+        check_errs(
+            "m11cr-argon-paramstype",
+            "import std.crypto\npub fn main() -> Result<(), Error> {\n  r := crypto.argon2id(\"pw\", \"somesalt\", 64)?\n  print(r.len())\n  return Ok(())\n}\n"
+        ),
+        "argon2id on a non-argon2_params third argument must error"
+    );
+    // `argon2_params` is a reserved builtin type name — a user struct declaration of it is rejected.
+    assert!(
+        check_errs(
+            "m11cr-argon-reserved",
+            "argon2_params { a: i64 }\npub fn main() -> i32 {\n  return 0\n}\n"
+        ),
+        "redeclaring the reserved `argon2_params` type must error"
+    );
+}

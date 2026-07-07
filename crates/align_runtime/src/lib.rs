@@ -7578,6 +7578,10 @@ struct OsslParam {
 const OSSL_PARAM_UTF8_STRING: c_uint = 4;
 /// `OSSL_PARAM_OCTET_STRING` (`openssl/core.h`) — an arbitrary byte-buffer parameter.
 const OSSL_PARAM_OCTET_STRING: c_uint = 5;
+/// `OSSL_PARAM_UNSIGNED_INTEGER` (`openssl/core.h`) — a native-endian unsigned-integer parameter
+/// (Argon2's `memcost`/`iter`/`lanes`/`threads`, each a `uint32`). NB: this is `2`; `4`/`5` are the
+/// UTF8/OCTET string types above and `6` is `UTF8_PTR`.
+const OSSL_PARAM_UNSIGNED_INTEGER: c_uint = 2;
 /// `OSSL_PARAM_UNMODIFIED` (`openssl/params.h`, `SIZE_MAX`) — the initial `return_size` the C
 /// `OSSL_PARAM_construct_*` helpers stamp; a provider overwrites it when it reads the param.
 const OSSL_PARAM_UNMODIFIED: usize = usize::MAX;
@@ -7603,6 +7607,18 @@ impl OsslParam {
             data_type: OSSL_PARAM_OCTET_STRING,
             data: val.as_ptr() as *mut c_void,
             data_size: val.len(),
+            return_size: OSSL_PARAM_UNMODIFIED,
+        }
+    }
+    /// A `u32` unsigned-integer input param (Argon2's `memcost`/`iter`/`lanes`/`threads`). Matches
+    /// `OSSL_PARAM_construct_uint32` (`data_type = OSSL_PARAM_UNSIGNED_INTEGER`, `data_size = 4`); the
+    /// provider reads it via `OSSL_PARAM_get_uint32`. `val` must outlive the derive call.
+    fn uint(key: &core::ffi::CStr, val: &u32) -> OsslParam {
+        OsslParam {
+            key: key.as_ptr(),
+            data_type: OSSL_PARAM_UNSIGNED_INTEGER,
+            data: (val as *const u32) as *mut c_void,
+            data_size: core::mem::size_of::<u32>(),
             return_size: OSSL_PARAM_UNMODIFIED,
         }
     }
@@ -8152,6 +8168,136 @@ pub unsafe extern "C" fn align_rt_crypto_chacha20_poly1305_open(
     let ct = unsafe { bytes_view(ct_ptr, ct_len) };
     let aad = unsafe { bytes_view(aad_ptr, aad_len) };
     unsafe { publish_buffer(aead_open(c"ChaCha20-Poly1305", key, nonce, ct, aad), out) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// std.crypto (M11 Slice 5) — argon2id via OpenSSL libcrypto's `EVP_KDF_fetch("ARGON2ID")`
+// (OpenSSL >= 3.2). Argon2id is the memory-hard password-hashing / KDF winner (RFC 9106); it is
+// expensive by design (that is the point — it resists GPU/ASIC brute force). Same keystone-library
+// strategy (crypto.md P5) and the `EVP_KDF` provider path as `hkdf_sha256`, param-swapped to
+// "ARGON2ID" with the Argon2 tuning knobs as `uint32` `OSSL_PARAM`s. `threads` is pinned to 1:
+// OpenSSL computes `lanes > 1` serially without a thread pool (deterministic and correct); wiring
+// `OSSL_set_max_threads` for parallel lane computation is a deferral (crypto.md).
+// ---------------------------------------------------------------------------------------------
+
+/// Argon2id memory-cost ceiling (KiB): 4 GiB worth = `4 * 1024 * 1024` = 4194304 KiB. A larger
+/// `m_cost` could OOM the process from a single bad literal → `Error.Invalid`.
+const ARGON2_MAX_MEMCOST_KIB: i64 = 4 * 1024 * 1024;
+/// Argon2id parallelism (lanes) ceiling: RFC 9106 bounds `p` to `1..=2^24 - 1`.
+const ARGON2_MAX_LANES: i64 = (1 << 24) - 1;
+/// Argon2id iteration (`t_cost`) ceiling: RFC 9106 bounds `t` to `1..=2^32 - 1` (the `uint32` param
+/// range). A large `t` is a *time* cost the caller chooses explicitly (like a big loop), not capped.
+const ARGON2_MAX_ITER: i64 = u32::MAX as i64;
+/// Argon2id output-length ceiling (bytes): the module's 1 GiB buffer convention (matches gzip/zstd).
+const ARGON2_MAX_OUT_LEN: i64 = 1024 * 1024 * 1024;
+/// Argon2id minimum output/tag length (bytes): RFC 9106 tag-length floor (OpenSSL also enforces 4).
+const ARGON2_MIN_OUT_LEN: i64 = 4;
+
+/// Derive `len` bytes with Argon2id over `password` / `salt` and the `(m_cost, t_cost, parallelism)`
+/// tuning knobs. **Public param validation first** (all → [`AL_INVALID`], before any engine call):
+/// `parallelism` in `1..=2^24-1`; `t_cost` in `1..=2^32-1`; `m_cost` in `8*parallelism ..= 4 GiB-KiB`
+/// (the Argon2 minimum-memory rule + an OOM ceiling); `len` in `4 ..= 1 GiB`. Then the `EVP_KDF`
+/// provider path: `fetch("ARGON2ID")` → `CTX_new` → `derive` with an `OSSL_PARAM` array (octet
+/// `pass`/`salt`; `uint32` `iter`/`memcost`/`lanes`/`threads=1`). Frees the KDF + ctx on **every**
+/// path. Error split (crypto.md): a genuine **engine** failure (`fetch`/`CTX_new` null, or the output
+/// allocation) → [`AL_CODE`]; a **param** rejection at `derive` (e.g. a salt shorter than the RFC
+/// 8-byte Argon2 minimum, which is validated engine-side, not here) → [`AL_INVALID`], a single opaque
+/// caller-input error. `password` / `salt` (and the `u32` locals) are borrowed for the whole call, so
+/// the `OSSL_PARAM` pointers into them stay valid across `derive`. Empty `password` is valid.
+fn argon2id_derive(password: &[u8], salt: &[u8], m_cost: i64, t_cost: i64, parallelism: i64, len: i64) -> Result<Vec<u8>, i32> {
+    // Public bounds, checked before the engine. `parallelism` first so `8 * parallelism` (the memory
+    // floor) cannot overflow `i64` (parallelism <= 2^24-1 → 8*p <= ~1.3e8).
+    if !(1..=ARGON2_MAX_LANES).contains(&parallelism) {
+        return Err(AL_INVALID);
+    }
+    if !(1..=ARGON2_MAX_ITER).contains(&t_cost) {
+        return Err(AL_INVALID);
+    }
+    // The Argon2 minimum-memory rule `m_cost >= 8 * parallelism` (>= 8 overall, since parallelism>=1),
+    // plus the OOM ceiling. A config whose floor exceeds the ceiling (huge parallelism) is unsatisfiable
+    // and correctly rejected here.
+    if !(8 * parallelism..=ARGON2_MAX_MEMCOST_KIB).contains(&m_cost) {
+        return Err(AL_INVALID);
+    }
+    if !(ARGON2_MIN_OUT_LEN..=ARGON2_MAX_OUT_LEN).contains(&len) {
+        return Err(AL_INVALID);
+    }
+    // Every value is now range-checked to fit its target width; use `try_from` (never `as`) per the
+    // FFI-safety discipline — a failure would be an internal bound/width mismatch, mapped defensively.
+    let out_len = usize::try_from(len).map_err(|_| AL_INVALID)?;
+    let iter = u32::try_from(t_cost).map_err(|_| AL_INVALID)?;
+    let memcost = u32::try_from(m_cost).map_err(|_| AL_INVALID)?;
+    let lanes = u32::try_from(parallelism).map_err(|_| AL_INVALID)?;
+    let threads: u32 = 1;
+
+    // `OSSL_KDF_PARAM_*` keys (`openssl/core_names.h`): pass="pass", salt="salt", iter="iter",
+    // memcost="memcost", lanes="lanes", threads="threads". `pass`/`salt` are octet strings; the four
+    // knobs are `uint32`s. The `u32` locals above outlive this array (and the `derive` below).
+    let params = [
+        OsslParam::octet(c"pass", password),
+        OsslParam::octet(c"salt", salt),
+        OsslParam::uint(c"iter", &iter),
+        OsslParam::uint(c"memcost", &memcost),
+        OsslParam::uint(c"lanes", &lanes),
+        OsslParam::uint(c"threads", &threads),
+        OsslParam::end(),
+    ];
+
+    let kdf = unsafe { EVP_KDF_fetch(core::ptr::null_mut(), c"ARGON2ID".as_ptr(), core::ptr::null()) };
+    if kdf.is_null() {
+        // The ARGON2ID provider is unavailable (OpenSSL < 3.2) — a genuine engine failure.
+        return Err(AL_CODE);
+    }
+    let ctx = unsafe { EVP_KDF_CTX_new(kdf) };
+    if ctx.is_null() {
+        unsafe { EVP_KDF_free(kdf) };
+        return Err(AL_CODE);
+    }
+    // Own the exact-length output via a fallible reserve (never `vec![0; len]`, which aborts on OOM);
+    // `resize` cannot reallocate since the capacity is already reserved.
+    let mut buf: Vec<u8> = Vec::new();
+    if buf.try_reserve_exact(out_len).is_err() {
+        unsafe { EVP_KDF_CTX_free(ctx) };
+        unsafe { EVP_KDF_free(kdf) };
+        return Err(AL_CODE);
+    }
+    buf.resize(out_len, 0);
+    let rc = unsafe { EVP_KDF_derive(ctx, buf.as_mut_ptr(), out_len, params.as_ptr()) };
+    // Free on every path (success and failure) — no leak.
+    unsafe { EVP_KDF_CTX_free(ctx) };
+    unsafe { EVP_KDF_free(kdf) };
+    if rc != 1 {
+        // The engine rejected the (public-validated) inputs — e.g. a salt shorter than the RFC
+        // 8-byte Argon2 minimum. A caller-input error, mapped to a single opaque Error.Invalid.
+        return Err(AL_INVALID);
+    }
+    Ok(buf)
+}
+
+/// `crypto.argon2id(password, salt, params)` — derive `params.len` bytes with Argon2id, writing an
+/// owned `buffer` handle to `*out` and returning `0` (or an `AL_*` status, leaving `*out` null). See
+/// [`argon2id_derive`] for the validation + error split. Empty `password` is valid; `salt` must be
+/// >= 8 bytes (the engine's RFC-Argon2 minimum, surfaced as `Error.Invalid`).
+///
+/// # Safety
+/// `password`/`salt` must each be a valid `{ptr,len}` byte view (or null with a non-positive length);
+/// `out` must point to a writable handle slot.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn align_rt_crypto_argon2id(
+    password_ptr: *const u8,
+    password_len: i64,
+    salt_ptr: *const u8,
+    salt_len: i64,
+    m_cost: i64,
+    t_cost: i64,
+    parallelism: i64,
+    len: i64,
+    out: *mut *mut Buffer,
+) -> i32 {
+    let password = unsafe { bytes_view(password_ptr, password_len) };
+    let salt = unsafe { bytes_view(salt_ptr, salt_len) };
+    unsafe { publish_buffer(argon2id_derive(password, salt, m_cost, t_cost, parallelism, len), out) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -12079,6 +12225,130 @@ mod tests {
                 std::ptr::null_mut(),
             )
         };
+        assert_eq!(rc, AL_INVALID);
+    }
+
+    // --- std.crypto Slice 5: argon2id -----------------------------------------------------------
+    //
+    // Drive `align_rt_crypto_argon2id` directly. The canonical known-answer vector is the
+    // phc-winner-argon2 reference `test.c` argon2id vector (v=0x13): password "password", salt
+    // "somesalt" (8 bytes), t=2, m=65536 KiB, p=1, len=32 →
+    // 09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7 — an EXTERNAL KAT, and it was
+    // reproduced by this machine's OpenSSL engine before implementation. All other expected hexes are
+    // ENGINE-DERIVED self-consistency locks (tiny cost params, for a fast suite), clearly marked.
+
+    /// Run argon2id and return the derived bytes (freeing the published `buffer`), or the error status.
+    fn argon2(pw: &[u8], salt: &[u8], m: i64, t: i64, p: i64, len: i64) -> Result<Vec<u8>, i32> {
+        let mut out: *mut Buffer = std::ptr::null_mut();
+        let rc = unsafe {
+            align_rt_crypto_argon2id(pw.as_ptr(), pw.len() as i64, salt.as_ptr(), salt.len() as i64, m, t, p, len, &mut out)
+        };
+        if rc != 0 {
+            assert!(out.is_null(), "a failed argon2id leaves the out handle null");
+            return Err(rc);
+        }
+        assert!(!out.is_null());
+        let b = unsafe { &*out };
+        let v = b.data[..b.len].to_vec();
+        unsafe { align_rt_buffer_free(out) };
+        Ok(v)
+    }
+
+    #[test]
+    fn argon2id_canonical_reference_vector() {
+        // EXTERNAL KAT — phc-winner-argon2 reference test.c argon2id vector (v=0x13).
+        let out = argon2(b"password", b"somesalt", 65536, 2, 1, 32).expect("canonical vector derives");
+        assert_eq!(out.len(), 32);
+        assert_eq!(hex_encode_bytes(&out), "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7");
+    }
+
+    #[test]
+    fn argon2id_tiny_cost_is_deterministic() {
+        // ENGINE-DERIVED self-consistency lock (tiny cost m=64/t=1/p=1, for a fast suite). Also proves
+        // determinism: identical inputs derive the identical output twice.
+        let a = argon2(b"password", b"somesalt", 64, 1, 1, 32).expect("tiny derives");
+        let b = argon2(b"password", b"somesalt", 64, 1, 1, 32).expect("tiny derives again");
+        assert_eq!(a, b, "argon2id is deterministic for identical inputs");
+        assert_eq!(hex_encode_bytes(&a), "729c7a54441bc13559bdca71348c4e554599e719c08a952601ed5c83618c1bbd");
+    }
+
+    #[test]
+    fn argon2id_each_param_changes_the_output() {
+        // Changing ANY of password / salt / m / t / p / len changes the derived output (all feed the
+        // hash). Base is the tiny-cost point.
+        let base = argon2(b"password", b"somesalt", 64, 1, 1, 32).unwrap();
+        assert_ne!(base, argon2(b"passwor0", b"somesalt", 64, 1, 1, 32).unwrap(), "password matters");
+        assert_ne!(base, argon2(b"password", b"othersalt", 64, 1, 1, 32).unwrap(), "salt matters");
+        assert_ne!(base, argon2(b"password", b"somesalt", 128, 1, 1, 32).unwrap(), "m_cost matters");
+        assert_ne!(base, argon2(b"password", b"somesalt", 64, 2, 1, 32).unwrap(), "t_cost matters");
+        assert_ne!(base, argon2(b"password", b"somesalt", 128, 1, 2, 32).unwrap(), "parallelism matters");
+        // A different len is a different-length output (its prefix need not match — Argon2 is not a
+        // stream), so length difference alone is the observable change.
+        assert_ne!(base.len(), argon2(b"password", b"somesalt", 64, 1, 1, 48).unwrap().len(), "len matters");
+    }
+
+    #[test]
+    fn argon2id_empty_password_is_valid() {
+        // Empty password is a valid Argon2 input (salt still >= 8). Must derive, not reject.
+        let out = argon2(b"", b"somesalt", 64, 1, 1, 32).expect("empty password derives");
+        assert_eq!(out.len(), 32);
+        // ENGINE-DERIVED self-consistency lock.
+        assert_eq!(hex_encode_bytes(&out), "1c52926f8d62e9fe93c74ac27f3e6fc68c8d5b09cd1f9b6272945209dafc3d76");
+    }
+
+    #[test]
+    fn argon2id_public_bounds_rejected_before_engine() {
+        // Each violated public bound → AL_INVALID, validated before the engine. m/t/p bounds use the
+        // minimum-satisfying neighbours so only the tested knob is out of range.
+        // t_cost < 1.
+        assert_eq!(argon2(b"pw", b"somesalt", 64, 0, 1, 32), Err(AL_INVALID));
+        // parallelism < 1.
+        assert_eq!(argon2(b"pw", b"somesalt", 64, 1, 0, 32), Err(AL_INVALID));
+        // parallelism > 2^24-1.
+        assert_eq!(argon2(b"pw", b"somesalt", 64, 1, 1 << 24, 32), Err(AL_INVALID));
+        // m_cost < 8 * parallelism (here 8*2 = 16 > 15).
+        assert_eq!(argon2(b"pw", b"somesalt", 15, 1, 2, 32), Err(AL_INVALID));
+        // m_cost > 4 GiB-in-KiB ceiling.
+        assert_eq!(argon2(b"pw", b"somesalt", ARGON2_MAX_MEMCOST_KIB + 1, 1, 1, 32), Err(AL_INVALID));
+        // len < 4.
+        assert_eq!(argon2(b"pw", b"somesalt", 64, 1, 1, 3), Err(AL_INVALID));
+        // len > 1 GiB ceiling.
+        assert_eq!(argon2(b"pw", b"somesalt", 64, 1, 1, ARGON2_MAX_OUT_LEN + 1), Err(AL_INVALID));
+    }
+
+    #[test]
+    fn argon2id_boundary_valid_params_ok() {
+        // Each bound's just-valid boundary derives (proves the check is `>=`/`<=`, not `>`/`<`). Kept
+        // at tiny cost so they stay fast (except where the bound itself forces size).
+        assert!(argon2(b"pw", b"somesalt", 8, 1, 1, 32).is_ok(), "m_cost == 8 (== 8*1) is valid");
+        assert!(argon2(b"pw", b"somesalt", 16, 1, 2, 32).is_ok(), "m_cost == 8*parallelism is valid");
+        assert!(argon2(b"pw", b"somesalt", 64, 1, 1, 4).is_ok(), "len == 4 (RFC minimum) is valid");
+    }
+
+    #[test]
+    fn argon2id_short_or_empty_salt_is_invalid() {
+        // The engine enforces the RFC Argon2 salt minimum of 8 bytes; a shorter / empty salt is a
+        // param rejection at derive, surfaced as the single opaque AL_INVALID (not AL_CODE).
+        assert_eq!(argon2(b"pw", b"", 64, 1, 1, 32), Err(AL_INVALID), "empty salt rejected");
+        assert_eq!(argon2(b"pw", b"short", 64, 1, 1, 32), Err(AL_INVALID), "salt < 8 bytes rejected");
+        assert!(argon2(b"pw", b"exactly8", 64, 1, 1, 32).is_ok(), "salt == 8 bytes is valid");
+    }
+
+    #[test]
+    fn argon2id_realistic_cost_params_work() {
+        // A realistic interactive-login cost point (m=64 MiB, t=3, p=1). Proves real-world params run;
+        // ~tens of ms. ENGINE-DERIVED self-consistency lock.
+        let out = argon2(b"correct horse battery staple", b"a-random-salt-16", 65536, 3, 1, 32)
+            .expect("realistic params derive");
+        assert_eq!(out.len(), 32);
+    }
+
+    #[test]
+    fn argon2id_null_out_is_invalid() {
+        // A null out handle is rejected via publish_buffer (Invalid), after a successful derive is
+        // published — no leak (publish_buffer frees the buffer when out is null).
+        let rc =
+            unsafe { align_rt_crypto_argon2id(b"pw".as_ptr(), 2, b"somesalt".as_ptr(), 8, 64, 1, 1, 32, std::ptr::null_mut()) };
         assert_eq!(rc, AL_INVALID);
     }
 
