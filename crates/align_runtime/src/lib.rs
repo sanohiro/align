@@ -5242,11 +5242,11 @@ fn zlib_error_to_status(ret: c_int) -> i32 {
 /// reached (no room can be added — the decompress-bomb signal), `Ok(true)` if there is now spare
 /// capacity, or `Err(AL_CODE)` on allocation failure. `try_reserve_exact` never overshoots `max_cap`.
 fn grow_output(out: &mut Vec<u8>, max_cap: usize) -> Result<bool, i32> {
+    if out.len() >= max_cap {
+        return Ok(false); // cap reached — caller decides (bomb → Error.Invalid)
+    }
     if out.len() < out.capacity() {
         return Ok(true); // spare capacity already available
-    }
-    if out.capacity() >= max_cap {
-        return Ok(false); // cap reached — caller decides (bomb → Error.Invalid)
     }
     // Exponential growth, clamped to the cap. Both operands are <= max_cap (<= 1 GiB for decompress,
     // usize::MAX for compress), so `saturating_*` only guards the pathological upper end.
@@ -5255,7 +5255,7 @@ fn grow_output(out: &mut Vec<u8>, max_cap: usize) -> Result<bool, i32> {
         .saturating_mul(2)
         .max(out.capacity().saturating_add(GZIP_OUT_CHUNK))
         .min(max_cap);
-    let add = want - out.capacity(); // > 0: capacity < max_cap and want > capacity
+    let add = want - out.capacity(); // > 0: reachable state here is len == capacity < max_cap, so want > capacity
     out.try_reserve_exact(add).map_err(|_| AL_CODE)?;
     Ok(true)
 }
@@ -5376,7 +5376,13 @@ fn inflate_run(strm: &mut ZStream, data: &[u8], max_cap: usize) -> Result<Vec<u8
         if !grow_output(&mut out, max_cap)? {
             return Err(AL_INVALID);
         }
-        let spare = (out.capacity() - out.len()).min(c_uint::MAX as usize);
+        // Clamp spare capacity to `max_cap - out.len()` too: `try_reserve_exact` may overshoot the
+        // requested amount (allocator over-allocation), so `capacity` alone is not a reliable cap
+        // proxy. The subtraction can't underflow — `grow_output` just returned `Ok(true)`, which
+        // guarantees `out.len() < max_cap`.
+        let spare = (out.capacity() - out.len())
+            .min(max_cap - out.len())
+            .min(c_uint::MAX as usize);
         unsafe {
             strm.next_out = out.as_mut_ptr().add(out.len());
             strm.avail_out = spare as c_uint;
@@ -10835,6 +10841,32 @@ mod tests {
         let cap = v.capacity();
         v.resize(cap, 0);
         assert_eq!(grow_output(&mut v, cap), Ok(false), "cap reached → no room");
+    }
+
+    /// `grow_output` must enforce the cap on `len`, not `capacity`: `try_reserve_exact` may hand back
+    /// more capacity than requested (allocator over-allocation), so a vector can have `capacity() >
+    /// max_cap` while `len() < max_cap`. The old check order (`capacity >= max_cap` before the len
+    /// check) would wrongly report "cap reached" in that case; the fixed order must not.
+    #[test]
+    fn grow_output_cap_enforced_on_len_despite_overallocation() {
+        let cap = 4096usize;
+        let slack = 512usize;
+        // Over-allocate on purpose: capacity() can exceed `cap` even though len() will be exactly `cap`.
+        let mut v: Vec<u8> = Vec::with_capacity(cap + slack);
+        assert!(v.capacity() >= cap + slack);
+        v.resize(cap, 0);
+        assert_eq!(
+            grow_output(&mut v, cap),
+            Ok(false),
+            "len() == max_cap must report cap reached even though capacity() > max_cap"
+        );
+
+        // Positive case: len < cap and spare capacity already present → Ok(true), no reallocation.
+        let mut w: Vec<u8> = Vec::with_capacity(cap + slack);
+        w.resize(cap - 1, 0);
+        let cap_before = w.capacity();
+        assert_eq!(grow_output(&mut w, cap), Ok(true));
+        assert_eq!(w.capacity(), cap_before, "spare capacity was already available; no growth needed");
     }
 
     /// Every in-range compression level (`0..=9`) is accepted; the boundary values `0` and `9` both
