@@ -468,6 +468,22 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(info),
             operand_str(len)
         ),
+        Rvalue::CryptoAead { cipher, dir, key, nonce, input, aad, out } => {
+            use align_sema::hir::{AeadCipher, AeadDir};
+            let name = match (cipher, dir) {
+                (AeadCipher::Aes256Gcm, AeadDir::Seal) => "aes_gcm_seal",
+                (AeadCipher::Aes256Gcm, AeadDir::Open) => "aes_gcm_open",
+                (AeadCipher::ChaCha20Poly1305, AeadDir::Seal) => "chacha20_poly1305_seal",
+                (AeadCipher::ChaCha20Poly1305, AeadDir::Open) => "chacha20_poly1305_open",
+            };
+            format!(
+                "crypto_{name}({}, {}, {}, {}, -> _{out})",
+                operand_str(key),
+                operand_str(nonce),
+                operand_str(input),
+                operand_str(aad)
+            )
+        }
         Rvalue::RandSeed { seed: Some(s), out } => format!("rng_seed_with({}, -> _{out})", operand_str(s)),
         Rvalue::RandSeed { seed: None, out } => format!("rng_seed_os(-> _{out})"),
         Rvalue::RandNext { rng } => format!("rng_next(_{rng})"),
