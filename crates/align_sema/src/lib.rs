@@ -2479,6 +2479,18 @@ impl EffectScan {
                 self.expr(name);
             }
             ExprKind::CliUsage { cmd } => self.expr(cmd),
+            // `std.crypto` — `constant_time_equal` is **Pure** (a branchless self-hosted computation,
+            // no I/O), so it may run inside a `par_map` closure: recurse into the operands only.
+            ExprKind::CryptoCtEqual { a, b } => {
+                self.expr(a);
+                self.expr(b);
+            }
+            // `crypto.random` reads OS entropy → **Impure**: an rng-filling closure is never `Pure`,
+            // so it is excluded from `par_map`.
+            ExprKind::CryptoRandom { out } => {
+                self.impure_direct = true;
+                self.expr(out);
+            }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
             ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
                 self.stage_funcs(stages);
@@ -3607,6 +3619,14 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(name, depth);
             }
             ExprKind::CliUsage { cmd } => self.walk(cmd, depth),
+            // `std.crypto` — `constant_time_equal` returns a Copy `bool` (borrows nothing); `random`
+            // fills the `buffer` in place (returns `()`, nothing escapes). Just recurse into the
+            // operands so any escape *inside* them is still checked.
+            ExprKind::CryptoCtEqual { a, b } => {
+                self.walk(a, depth);
+                self.walk(b, depth);
+            }
+            ExprKind::CryptoRandom { out } => self.walk(out, depth),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
@@ -4014,6 +4034,12 @@ impl UnnecessaryHeapScan {
                 self.visit(name);
             }
             ExprKind::CliUsage { cmd } => self.visit(cmd),
+            // `std.crypto` — recurse into the subexpressions (no heap-narrowing pattern of its own).
+            ExprKind::CryptoCtEqual { a, b } => {
+                self.visit(a);
+                self.visit(b);
+            }
+            ExprKind::CryptoRandom { out } => self.visit(out),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.visit(writer);
                 self.visit(arg);
@@ -4727,6 +4753,14 @@ impl<'a> MoveCheck<'a> {
                 self.expr(name, moved, false, false);
             }
             ExprKind::CliUsage { cmd } => self.expr(cmd, moved, false, false),
+            // `std.crypto` borrows both byte views (`constant_time_equal`) / the `out` buffer
+            // (`random`, filled in place) — nothing is consumed. Recurse non-consuming to catch a
+            // use-after-move *inside* the operands.
+            ExprKind::CryptoCtEqual { a, b } => {
+                self.expr(a, moved, false, false);
+                self.expr(b, moved, false, false);
+            }
+            ExprKind::CryptoRandom { out } => self.expr(out, moved, false, false),
             // PR1 tuple elements are primitive (Copy) — a tuple literal moves nothing; tuple index
             // borrows. Recurse to catch moves in element subexpressions.
             ExprKind::Tuple { elems, .. } => {
@@ -7673,6 +7707,12 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "cli" && method == "command" {
                 self.require_import("std.cli", "cli.command", span);
                 return self.check_cli_command(args, span);
+            }
+            // `std.crypto` (M11 Slice 1) — `constant_time_equal(a, b)` (the self-hosted branchless
+            // CT byte-compare, Pure) / `random(out)` (fill a `buffer` from the OS CSPRNG, Impure).
+            if module == "crypto" && matches!(method, "constant_time_equal" | "random") {
+                self.require_import("std.crypto", &format!("crypto.{method}"), span);
+                return self.check_crypto_op(method, args, span);
             }
         }
         // `io.stdout.buffered()` / `io.stderr.buffered()` — a buffered `writer` over a standard
@@ -11474,6 +11514,52 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::Compress { kind, data: Box::new(data), level: Box::new(level) }, ty: result_ty, span }
     }
 
+    /// `std.crypto` (M11 Slice 1) — the self-hosted `constant_time_equal` and the OS-CSPRNG
+    /// `random`. Builtins, dispatched like the other `std` namespaces.
+    ///
+    /// - `constant_time_equal(a: bytes, b: bytes) -> bool` — a constant-time byte-equality test. Both
+    ///   operands are byte views (`str` / owned `string` auto-borrowed / `slice<u8>`), same as the
+    ///   `std.compress` codecs. **Pure** (a branchless self-hosted computation), so it may run inside
+    ///   a `par_map` closure. The input length is **public** (crypto.md P1); the CT guarantee is over
+    ///   equal-length content (see [`hir::ExprKind::CryptoCtEqual`] / the runtime).
+    /// - `random(out: mut buffer)` — fill the whole `buffer` `out` with OS CSPRNG bytes. `out` is a
+    ///   `buffer` value, borrowed and filled in place through its handle (not consumed, like
+    ///   `reader.read`'s buffer). **Impure** (reads OS entropy); yields [`Ty::Unit`].
+    fn check_crypto_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if method == "constant_time_equal" {
+            if args.len() != 2 {
+                self.diags
+                    .error(format!("'crypto.constant_time_equal' expects 2 arguments (a, b), got {}", args.len()), span);
+                return err;
+            }
+            let Some(a) = self.check_byte_view(&args[0], "crypto.constant_time_equal") else { return err };
+            let Some(b) = self.check_byte_view(&args[1], "crypto.constant_time_equal") else { return err };
+            return Expr {
+                kind: ExprKind::CryptoCtEqual { a: Box::new(a), b: Box::new(b) },
+                ty: Ty::Bool,
+                span,
+            };
+        }
+        // `random(out)` — fill a `buffer` (mirrors `reader.read`'s mut-buffer argument: any expr of
+        // type `buffer`, filled in place, not consumed).
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'crypto.random' expects 1 argument (a mut buffer), got {}", args.len()), span);
+            return err;
+        }
+        let out = self.check_expr(&args[0], Some(Ty::Buffer));
+        if out.ty == Ty::Error {
+            return err;
+        }
+        if out.ty != Ty::Buffer {
+            self.diags
+                .error(format!("'crypto.random' fills a buffer, got {}", ty_name(out.ty)), args[0].span);
+            return err;
+        }
+        Expr { kind: ExprKind::CryptoRandom { out: Box::new(out) }, ty: Ty::Unit, span }
+    }
+
     /// Require `ty` to be **exactly** `i64` (the `align_rt_rng_*` runtime ABI), binding a bare-int-
     /// literal inference var to it — not merely int-like. A narrower `i32`/`u8` operand would build a
     /// node whose value width doesn't match the runtime signature (the `time.sleep` #343 discipline;
@@ -13051,6 +13137,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(name);
             }
             ExprKind::CliUsage { cmd } => self.finalize_expr(cmd),
+            ExprKind::CryptoCtEqual { a, b } => {
+                self.finalize_expr(a);
+                self.finalize_expr(b);
+            }
+            ExprKind::CryptoRandom { out } => self.finalize_expr(out),
             ExprKind::WriterWrite { writer, arg, .. } => {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);

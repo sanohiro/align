@@ -7150,14 +7150,18 @@ pub unsafe extern "C" fn align_rt_rng_seed_with(state: *mut u64, seed: i64) {
     unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), state, 4) };
 }
 
-/// Fill `buf` with OS CSPRNG entropy — the per-OS seed source (Linux `getrandom`, macOS
-/// `getentropy`). A failure is rare (the pool is initialized at boot) and **aborts** — seeding is
-/// not a fallible user-facing operation. On a platform with neither symbol this is a hard abort at
-/// runtime (the rest of `align_runtime` is Linux-only today anyway; the cfg keeps `rand` buildable).
-fn fill_os_entropy(buf: &mut [u8; 32]) {
+/// Fill `buf` (any length) with OS CSPRNG entropy — the per-OS source (Linux `getrandom`, macOS
+/// `getentropy`), key-grade. Shared by `rand.seed` (32-byte state seed) and `crypto.random`
+/// (arbitrary-length key material). A failure is rare (the pool is initialized at boot) and
+/// **aborts** — OS randomness is not a fallible user-facing operation. On a platform with neither
+/// symbol this is a hard abort at runtime (the rest of `align_runtime` is Linux-only today anyway;
+/// the cfg keeps `rand`/`crypto` buildable).
+fn fill_os_random(buf: &mut [u8]) {
     #[cfg(target_os = "linux")]
     {
-        // `getrandom(2)`: loop over short reads / `EINTR` until the 32 bytes are filled.
+        // `getrandom(2)`: loop over short reads / `EINTR` until every byte is filled. A single call
+        // fills at most 256 bytes without `GRND_NONBLOCK`, and may return fewer than requested when a
+        // signal interrupts it, so a large buffer requires this drain loop.
         let mut filled = 0usize;
         while filled < buf.len() {
             let n = unsafe {
@@ -7168,27 +7172,35 @@ fn fill_os_entropy(buf: &mut [u8; 32]) {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                panic_abort("rand.seed: getrandom failed");
+                panic_abort("OS CSPRNG: getrandom failed");
             }
             if n == 0 {
-                panic_abort("rand.seed: getrandom returned no bytes");
+                panic_abort("OS CSPRNG: getrandom returned no bytes");
             }
             filled += n as usize;
         }
     }
     #[cfg(target_os = "macos")]
     {
-        // `getentropy(2)` fills the whole buffer in one call (32 ≤ its 256-byte limit).
-        let rc = unsafe { getentropy(buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len()) };
-        if rc != 0 {
-            panic_abort("rand.seed: getentropy failed");
+        // `getentropy(2)` fills at most 256 bytes per call, so chunk a longer buffer.
+        for chunk in buf.chunks_mut(256) {
+            let rc = unsafe { getentropy(chunk.as_mut_ptr() as *mut core::ffi::c_void, chunk.len()) };
+            if rc != 0 {
+                panic_abort("OS CSPRNG: getentropy failed");
+            }
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = buf;
-        panic_abort("rand.seed: OS seeding unsupported on this platform");
+        panic_abort("OS CSPRNG: unsupported on this platform");
     }
+}
+
+/// Fill a fixed 32-byte seed buffer from the OS CSPRNG — the `rand.seed()` state source (a thin
+/// fixed-size wrapper over [`fill_os_random`]).
+fn fill_os_entropy(buf: &mut [u8; 32]) {
+    fill_os_random(buf);
 }
 
 /// `rand.seed()` — OS-seeded. Fills the 256-bit state from the OS CSPRNG (see [`fill_os_entropy`]).
@@ -7321,6 +7333,83 @@ pub unsafe extern "C" fn align_rt_rng_sample(
         unsafe { core::ptr::copy_nonoverlapping(srcp, dstp, es) };
     }
     AlignStr { ptr: out as *const u8, len: kk as i64 }
+}
+
+// ---------------------------------------------------------------------------------------------
+// std.crypto (M11 Slice 1) — the one self-hosted primitive (`constant_time_equal`) plus the
+// OS-CSPRNG key source (`crypto.random`). Everything else in `std.crypto` (hashes, HMAC, AEAD,
+// KDFs) borrows a constant-time-audited C engine via FFI (crypto.md, later slices); only the
+// trivially-auditable branchless byte-compare is self-hosted here.
+// ---------------------------------------------------------------------------------------------
+
+/// `crypto.constant_time_equal(a, b)` — a constant-time byte-equality test, returning `1` (equal) /
+/// `0` (not). The input **length is public** (crypto.md P1 — the intended use compares MAC tags /
+/// digests of fixed, publicly-known length, matching libsodium's `sodium_memcmp` contract): a length
+/// mismatch returns `0` immediately, and callers must never rely on the length itself being hidden.
+///
+/// Over equal-length content the compare is **constant-time**: a byte-diff OR-reduction across the
+/// *entire* length with **no early return and no secret-dependent branch or index** — every byte is
+/// touched regardless of where (or whether) the inputs differ. The accumulator is passed through
+/// [`core::hint::black_box`] before the final zero-test so LLVM cannot prove a value about it and
+/// retroactively fold the loop into an early-exiting `memcmp`/`bcmp`; the loop shape itself (a
+/// running `|=` with no exit) already denies the loop-idiom recognizer the inequality break it needs
+/// to form one. Vectorizing the OR-reduction is fine (still touches every byte, no data-dependent
+/// control flow) — the only thing forbidden is a branch on the secret content, which neither the
+/// source nor the hardened result permits. This is the simplest form that is defensible against the
+/// optimizer while staying readable (the discipline libsodium/`subtle` follow: accumulate, barrier,
+/// then compare).
+///
+/// # Safety
+/// `a`/`b` must each be a valid `{ptr,len}` byte view (or null with a non-positive length).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_ct_equal(a_ptr: *const u8, a_len: i64, b_ptr: *const u8, b_len: i64) -> i32 {
+    // Public-length precondition: differing lengths are not equal (and short-circuiting here leaks
+    // only the already-public length, never the content).
+    if a_len != b_len {
+        return 0;
+    }
+    let a = unsafe { bytes_view(a_ptr, a_len) };
+    let b = unsafe { bytes_view(b_ptr, b_len) };
+    // `bytes_view` clamps a null / out-of-range view to empty; re-check the lengths agree after the
+    // clamp so a `{null, n}` on one side alone can't read as equal to a real n-byte view.
+    if a.len() != b.len() {
+        return 0;
+    }
+    // Branchless OR-reduction over the full length: `diff` stays 0 iff every byte matched.
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    // Optimization barrier before the zero-test (see the doc comment): keeps the equal-length compare
+    // constant-time end to end.
+    i32::from(core::hint::black_box(diff) == 0)
+}
+
+/// `crypto.random(out)` — fill the whole `buffer` `out` (its full read-window capacity) with OS
+/// CSPRNG bytes (`getrandom`/`getentropy`, key-grade — see [`fill_os_random`]), overwriting its
+/// length to the capacity (like `reader.read`, `.bytes()` then views the fresh random bytes). A
+/// CSPRNG failure is rare and **aborts** inside `fill_os_random` (key material is not a recoverable
+/// `Result`, the `rand.seed` policy). A null / zero-capacity buffer fills nothing.
+///
+/// # Safety
+/// `b` must be null or a valid `Buffer` pointer (from [`align_rt_buffer_new`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_random(b: *mut Buffer) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    if b.cap == 0 {
+        b.len = 0;
+        return;
+    }
+    // Span the full capacity, exactly like `reader.read`. `buffer(cap)` already reserved `cap`, so
+    // this `resize` never reallocates (and so never fails).
+    if b.data.len() != b.cap {
+        b.data.resize(b.cap, 0);
+    }
+    fill_os_random(&mut b.data[..b.cap]);
+    b.len = b.cap;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -10784,6 +10873,92 @@ mod tests {
         got.sort();
         assert_eq!(got, src, "sampling n of n is a full permutation");
         unsafe { align_rt_free(full.ptr as *mut u8) };
+    }
+
+    // --- std.crypto ----------------------------------------------------------------------------
+
+    /// Drive the FFI `constant_time_equal` over two byte slices.
+    fn ct_eq(a: &[u8], b: &[u8]) -> i32 {
+        unsafe {
+            align_rt_crypto_ct_equal(a.as_ptr(), a.len() as i64, b.as_ptr(), b.len() as i64)
+        }
+    }
+
+    #[test]
+    fn ct_equal_truth_table() {
+        // Equal content → 1; any single-byte difference (first / middle / last) → 0.
+        assert_eq!(ct_eq(b"abcdef", b"abcdef"), 1, "identical bytes are equal");
+        assert_eq!(ct_eq(b"Xbcdef", b"abcdef"), 0, "a first-byte difference is not equal");
+        assert_eq!(ct_eq(b"abcXef", b"abcdef"), 0, "a middle-byte difference is not equal");
+        assert_eq!(ct_eq(b"abcdeX", b"abcdef"), 0, "a last-byte difference is not equal");
+        // Empty vs empty → 1; empty vs non-empty → 0.
+        assert_eq!(ct_eq(b"", b""), 1, "empty equals empty");
+        assert_eq!(ct_eq(b"", b"a"), 0, "empty is not equal to a non-empty view");
+        // Every 32-byte MAC-tag-shaped value equals itself and differs from a one-bit flip.
+        let tag = [0xA5u8; 32];
+        let mut flipped = tag;
+        flipped[17] ^= 0x01;
+        assert_eq!(ct_eq(&tag, &tag), 1);
+        assert_eq!(ct_eq(&tag, &flipped), 0, "a single flipped bit is caught");
+    }
+
+    #[test]
+    fn ct_equal_length_is_public_no_leak_on_mismatch() {
+        // Differing lengths return 0 immediately (length is public, crypto.md P1) — a prefix that
+        // matches must NOT read as equal, and the shorter/longer order is symmetric.
+        assert_eq!(ct_eq(b"abc", b"abcd"), 0, "a matching prefix of a longer view is not equal");
+        assert_eq!(ct_eq(b"abcd", b"abc"), 0, "symmetric: longer vs shorter");
+        assert_eq!(ct_eq(b"", b"abcdefgh"), 0);
+        // A `{null, positive-len}` view (clamped to empty by `bytes_view`) never reads as equal to a
+        // real non-empty view of that claimed length.
+        assert_eq!(
+            unsafe { align_rt_crypto_ct_equal(std::ptr::null(), 4, b"abcd".as_ptr(), 4) },
+            0,
+            "a null view must not equal a real 4-byte view"
+        );
+        // Two null views of equal (zero) effective length are equal (both empty).
+        assert_eq!(unsafe { align_rt_crypto_ct_equal(std::ptr::null(), 0, std::ptr::null(), 0) }, 1);
+    }
+
+    #[test]
+    fn crypto_random_fills_the_whole_capacity() {
+        // A 4096-byte fill spans the full capacity, is not left all-zero, and updates `len`.
+        let b = align_rt_buffer_new(4096);
+        unsafe { align_rt_crypto_random(b) };
+        let bref = unsafe { &*b };
+        assert_eq!(bref.len, 4096, "the whole capacity is filled (len == cap)");
+        assert_eq!(bref.data.len(), 4096, "the backing storage spans the capacity");
+        assert!(bref.data[..4096].iter().any(|&x| x != 0), "a CSPRNG fill is (almost surely) not all-zero");
+        // No short fill: the loop drains getrandom's 256-byte cap over many chunks. Sanity-check the
+        // tail bytes past the first chunk were written (extremely unlikely to be all zero by chance).
+        assert!(bref.data[256..4096].iter().any(|&x| x != 0), "bytes past the first 256-byte chunk are filled");
+        unsafe { align_rt_buffer_free(b) };
+    }
+
+    #[test]
+    fn crypto_random_two_fills_differ() {
+        // Two independent 32-byte fills are (almost surely) different key material.
+        let a = align_rt_buffer_new(32);
+        let b = align_rt_buffer_new(32);
+        unsafe { align_rt_crypto_random(a) };
+        unsafe { align_rt_crypto_random(b) };
+        let (ar, br) = unsafe { (&*a, &*b) };
+        assert_eq!(ar.len, 32);
+        assert_eq!(br.len, 32);
+        assert_ne!(ar.data[..32], br.data[..32], "two CSPRNG fills must (almost surely) differ");
+        unsafe { align_rt_buffer_free(a) };
+        unsafe { align_rt_buffer_free(b) };
+    }
+
+    #[test]
+    fn crypto_random_edge_cases() {
+        // A zero-capacity buffer fills nothing (len stays 0, no panic).
+        let z = align_rt_buffer_new(0);
+        unsafe { align_rt_crypto_random(z) };
+        assert_eq!(unsafe { &*z }.len, 0, "a zero-capacity buffer fills nothing");
+        unsafe { align_rt_buffer_free(z) };
+        // A null handle is a no-op (never dereferenced).
+        unsafe { align_rt_crypto_random(std::ptr::null_mut()) };
     }
 
     // --- std.cli --------------------------------------------------------------------------------
