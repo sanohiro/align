@@ -14,13 +14,28 @@ constant-time** (open-questions std.crypto — no secret-dependent branch or mem
 CMOV/bitwise only). This is the one domain where Align's branchless machinery is a CORRECTNESS
 requirement, not a perf choice.
 
-**Strategy**: **borrow the vetted engine**. AEAD (aes_gcm, chacha20_poly1305), hashes (sha256/512,
-blake3), KDF (hkdf, argon2id), hmac → FFI-wrap a constant-time-audited C library (libsodium /
-BoringSSL class) — inheriting its constant-time guarantees is far safer than self-hosting crypto
-and re-proving CT. `constant_time_equal` is the ONE trivial self-host (a branchless byte-diff-OR
-reduction — Align's `where`/mask machinery makes it natural and it's simple enough to audit).
-`crypto.random` → the OS CSPRNG (getrandom/getentropy — the rand.seed source, but here for key
-material, exposed as crypto-grade).
+**Strategy**: **borrow the vetted engine**. AEAD (aes_gcm, chacha20_poly1305), hashes (sha256/512),
+KDF (hkdf, argon2id), hmac → FFI-wrap a constant-time-audited C library — inheriting its
+constant-time guarantees is far safer than self-hosting crypto and re-proving CT.
+`constant_time_equal` is the ONE trivial self-host (a branchless byte-diff-OR reduction — Align's
+`where`/mask machinery makes it natural and it's simple enough to audit). `crypto.random` → the OS
+CSPRNG (getrandom/getentropy — the rand.seed source, but here for key material, exposed as
+crypto-grade).
+
+**Engine: OpenSSL libcrypto (EVP), decided 2026-07-07** (recorded in `open-questions.md` Settled;
+supersedes this doc's original "libsodium recommended"). Rationale, converged from independent
+security and dependency reviews: libcrypto natively covers *every* required primitive — including
+HKDF and Argon2id via `EVP_KDF` (**OpenSSL ≥ 3.2**, the documented floor) — in one trust surface
+with no engine mixing and no self-hosted-HKDF seam; it is a universal system lib in the same
+always-link class as libz/libzstd (`-lcrypto` joins the driver's base link set, the compress
+precedent); and its AES-GCM is constant-time on supported targets (AES-NI/PCLMULQDQ hardware path,
+constant-time vpaes fallback — never T-table AES on x86-64/aarch64) and is not API-gated on
+hardware, unlike libsodium's `crypto_aead_aes256gcm_*`. libsodium remains a fine engine in the
+abstract but loses on whole-system seams (no HKDF in 1.0.18-class releases, hardware-gated
+AES-GCM). **blake3 is deferred with record**: no system engine provides it (no Debian
+`libblake3-dev`; OpenSSL has no BLAKE3), self-hosting violates P5, and aliasing BLAKE2b under the
+`blake3` name is forbidden (misleading API) — it becomes a candidate again when a system lib
+exists, or a `pkg`-layer citizen.
 
 ## Signatures
 
@@ -28,7 +43,7 @@ material, exposed as crypto-grade).
 crypto.random(out: mut buffer)                                  // fill with CSPRNG bytes
 crypto.sha256(data: bytes) -> array<u8>    // 32-byte digest (fixed-size)
 crypto.sha512(data: bytes) -> array<u8>
-crypto.blake3(data: bytes) -> array<u8>
+crypto.blake3(data: bytes) -> array<u8>    // DEFERRED v1 (no system engine provides BLAKE3 — see Overview)
 crypto.hmac_sha256(key: bytes, data: bytes) -> array<u8>
 crypto.hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, len: i64) -> Result<buffer, Error>
 crypto.argon2id(password: bytes, salt: bytes, params: argon2_params) -> Result<buffer, Error>
@@ -56,15 +71,19 @@ opaque error.
 
 ## New machinery required
 
-FFI link to the crypto lib (libsodium recommended — single dep, constant-time audited, covers all
-primitives); the `constant_time_equal` self-host (branchless, no early return); `crypto.random`
-over the OS CSPRNG. Argon2 params struct.
+FFI link to **OpenSSL libcrypto** (`-lcrypto` always-linked, floor ≥ 3.2 — see Overview); ~6
+runtime wrappers over EVP: a shared one-shot digest (`EVP_Q_digest`, param-swapped by
+`EVP_sha256/512`), HMAC (`EVP_MAC` "HMAC"), HKDF (`EVP_KDF_fetch("HKDF")` + `OSSL_PARAM`
+salt/key/info), Argon2id (`EVP_KDF_fetch("ARGON2ID")` + `OSSL_KDF_PARAM_ARGON2_*`), and a shared
+AEAD seal/open pair (`EVP_CIPHER`, param-swapped AES-256-GCM / ChaCha20-Poly1305) with the P2
+all-or-nothing shape. Plus the `constant_time_equal` self-host (branchless, no early return) and
+`crypto.random` over the OS CSPRNG. Argon2 params struct.
 
 ## Slice breakdown
 
 1. `constant_time_equal` (self-host, branchless) + `crypto.random` (OS CSPRNG) — no external dep,
    validates the CT discipline.
-2. hashes (sha256/512, blake3) via FFI.
+2. hashes (sha256/512) via EVP; blake3 deferred (see Overview).
 3. hmac + hkdf.
 4. AEAD (aes_gcm, chacha20_poly1305) — the all-or-nothing auth.
 5. argon2id (KDF, expensive-by-design).
@@ -83,7 +102,14 @@ over the OS CSPRNG. Argon2 params struct.
     secret-length input expecting the length itself to be hidden.
 - **P2 (AEAD all-or-nothing)**: `open()` on auth failure returns `Error.Invalid` and ZERO
   plaintext bytes — never partial, never a distinguishable error. Releasing unverified plaintext
-  is the classic AEAD misuse.
+  is the classic AEAD misuse. **EVP-specific mandatory shape**: `EVP_DecryptUpdate` releases
+  plaintext BEFORE the tag is checked by `EVP_DecryptFinal_ex`, so the wrapper must decrypt the
+  whole ciphertext into an internal owned buffer (never streamed out), set the expected tag via
+  `EVP_CIPHER_CTX_ctrl(EVP_CTRL_AEAD_SET_TAG)`, call `EVP_DecryptFinal_ex`, and hand the buffer
+  to the caller ONLY on `Final == 1`; on failure, `OPENSSL_cleanse` the buffer, free it, and
+  return the single opaque `Error.Invalid` (tag-mismatch vs length/param errors must be
+  indistinguishable). Nonce/tag lengths are validated as *public* values (P1); the tag is fixed
+  16 bytes.
 - **P3 (nonce reuse)**: document that nonce reuse with the same key is catastrophic (esp.
   aes_gcm). v1 does NOT auto-generate nonces (caller supplies) — but the doc must warn, and a
   nonce-generating convenience is a candidate (record). Consider requiring nonce length
@@ -99,7 +125,7 @@ over the OS CSPRNG. Argon2 params struct.
 
 ## Test checklist
 
-- sha256/512/blake3 against known test vectors (NIST/RFC)
+- sha256/512 against known test vectors (NIST/RFC); blake3 deferred
 - hmac against RFC 4231 vectors
 - hkdf against RFC 5869
 - aes_gcm/chacha20 against their test vectors
@@ -108,4 +134,4 @@ over the OS CSPRNG. Argon2 params struct.
 - `crypto.random` fills distinct bytes
 - argon2id known-answer
 - import-required
-- (FFI tests gated on libsodium presence.)
+- (FFI slices assume libcrypto present — the compress always-link precedent; no feature-gating.)

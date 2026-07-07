@@ -2876,6 +2876,21 @@ becomes a correctness requirement, not a perf choice.
 specifically because the constant-time requirement above needs verification, not just
 specification, before implementation (`impl/07-roadmap.md` M10).
 
+**Status update (2026-07-07, M11 — engine decision SETTLED):** the FFI engine is **OpenSSL
+libcrypto (EVP), floor ≥ 3.2, always-linked `-lcrypto`** (the compress always-link precedent) —
+superseding the design doc's original "libsodium recommended". Decided from two independent
+reviews (security lens + dependency lens) that converged: libcrypto covers every required
+primitive natively in one trust surface (HKDF + Argon2id via `EVP_KDF` — libsodium 1.0.18-class
+has no HKDF, which would force a self-hosted HKDF seam or a second engine), its AES-GCM is
+constant-time on supported targets without libsodium's hardware API-gating (AES-NI/PCLMULQDQ path,
+CT vpaes fallback; T-table AES only on exotic targets — recorded as an unsupported-platform note),
+and it is a universal system lib (libsodium isn't even linkable on a default install). **blake3 is
+deferred with record** (no system engine provides it; self-hosting violates the borrow-the-engine
+rule; aliasing BLAKE2b under the name is forbidden). The AEAD wrapper's mandatory all-or-nothing
+shape under EVP (internal buffer, SET_TAG before Final, `OPENSSL_cleanse` on failure, single
+opaque error) is specified in `impl/std-design/crypto.md` P2. Slice 1 (`constant_time_equal` +
+`crypto.random`, engine-independent) started the same day.
+
 ### std.ndslice — strided multi-dimensional views (Future)
 
 **Recorded 2026-07-04 (external design-note review adoption).** A std-layer (not syntax) strided 2D+
