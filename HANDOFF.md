@@ -5,9 +5,9 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-07 evening (M11 std.http Slice 1 DONE on branch `m11-http-slice1-parse`;
-same day: std.crypto COMPLETE #383–#388, std.compress COMPLETE #380–#382; 2026-07-06:
-std.process #376–#378, std.net #371–#374)._
+_Last updated: 2026-07-08 (M11 std.http Slice 2 — the plaintext client — DONE on branch
+`m11-http-slice2-client`, not yet PR'd; Slice 1 was #391. Same week: std.crypto COMPLETE #383–#388,
+std.compress COMPLETE #380–#382; 2026-07-06: std.process #376–#378, std.net #371–#374)._
 
 ## ▶ NEXT SESSION — start here
 
@@ -52,10 +52,29 @@ region (like `LetTuple`), closing it for every future `Option<view>`/`Result<vie
 across cli/net/crypto view-escape suites. (2) serialize now validates method = RFC 7230 token +
 authority/path have no CR/LF/NUL/SP (permanent-codec smuggling guard). (3) parse rejects a
 conflicting duplicate Content-Length (RFC 7230 §3.3.3). `cargo test --workspace` 1584 green,
-expr_depth 5/5 default env, clippy clean. **Next: Slice 2** (client
-`http.client()` + `cl.get/post/request` over one net `tcp_conn`, plaintext; reuses `serialize` +
-`http.parse`). **The owner explicitly wants http FAST** — treat http.md's R1–R6 as requirements;
-benchmark-driven (measure before claiming). Slices 3–5 (pool reuse, server, HTTPS) after.
+expr_depth 5/5 default env, clippy clean.
+
+**`std.http` — Slice 2 DONE (branch `m11-http-slice2-client`; not yet PR'd — orchestrator gates first).**
+The plaintext HTTP/1.1 client: one new Move type `Ty::HttpClient` (a ZST in v1 — no `Scalar`, never
+rides an aggregate; full twin-mirror Gate-1 sweep). Surface behind `import std.http`, all **Impure**:
+`http.client()`, `cl.get(url)` / `cl.post(url, body)` / `cl.request(req)` → `Result<response, Error>`
+(bound-receiver gate; `cl` borrowed, `request` **consumes** its Move `req`, MIR nulls the slot). Each
+request = ONE fresh net `tcp_conn` (connect via `align_rt_tcp_connect` → **TCP_NODELAY** → **one
+write** of the Slice-1-serialized request → stream the response in 32 KiB reads to Content-Length →
+`http_parse_core` → close); NO pool yet (Slice 3), but the FFI already takes `*mut HttpClient` so
+Slice 3 adds keepalive behind the same surface. **R4 shipped, not aspirational.** P1: `https://` /
+malformed URL → `Error.Invalid` at request time (never a silent downgrade). P2: 4xx/5xx = `Ok`. The
+Slice-1 parser was refactored to an `Incomplete`/`Invalid` split so the streaming read distinguishes
+"read more" from "malformed" over ONE shared decoder (`http_parse_head` frames without copying the
+body). `http.client` is a **ZST** — the honest "no state yet" form (not a disabled half-pool);
+Box round-trip sound, Drop a null-safe no-op until Slice 3 (P5). Reused `lower_http` dispatcher (no
+new `lower_expr` frame arms — the #296 lesson). Tests: `m11_http.rs` +10 driver (get/post round-trips
+vs an in-process server, 404-is-Ok, https/malformed error, request-consumes-req, unbound/array/import
+gates, client-path body-view escape) + 7 `align_runtime` units. `cargo test --workspace` **1601 green**,
+expr_depth **5/5 default env**, clippy `-D warnings` clean. **Next: Slice 3** (connection pool /
+keepalive reuse — R3; the measured 1.48× floor). **The owner explicitly wants http FAST** — http.md's
+R1–R6 are requirements; R6 benchmark-gating (`bench/http_client` vs a Rust baseline) still owed.
+Slices 4–5 (server primitive, HTTPS/TLS) after.
 
 **std.crypto process note (2026-07-07):** the slice-flow ran five more times, clean. Adversarial
 gates: zero findings on all five slices (they also machine-code-verified the CT and cleanse

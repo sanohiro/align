@@ -370,6 +370,15 @@ pub enum Ty {
     /// both region-bound to `resp` (an escape past its `Drop` is a compile error, #297). Pure. Opaque
     /// pointer.
     HttpResponse,
+    /// A `client` (`std.http`) — the HTTP/1.1 client handle from `http.client()`. An owned **Move**
+    /// handle (like `reader`/`writer`/`tcp_conn`), `Drop`-freed. `cl.get(url)` / `cl.post(url, body)` /
+    /// `cl.request(req)` each perform ONE request over one fresh `tcp_conn` (connect → send → read →
+    /// parse → close) and return `Result<response, Error>` — a 4xx/5xx is `Ok` (status is data, #P2),
+    /// only transport/parse failures are `Err`. `cl` is borrowed by its methods (not consumed);
+    /// `request` **consumes** its `req` argument. **Impure** (network). In Slice 2 it owns no pooled
+    /// conns (one connection per request); Slice 3 adds a keepalive pool behind the same surface.
+    /// Opaque pointer; never rides an aggregate (no `Scalar::HttpClient`).
+    HttpClient,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -524,7 +533,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -556,7 +565,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -705,7 +714,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -777,7 +786,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2559,6 +2568,26 @@ impl EffectScan {
                 self.expr(resp);
                 self.expr(name);
             }
+            // `std.http` (Slice 2) — `http.client()` allocates a handle (no I/O — **Pure**), but every
+            // request op (`get`/`post`/`request`) hits the network (connect/write/read syscalls), so it
+            // is **Impure** — excluded from `par_map`, like `tcp.connect` / `io`.
+            ExprKind::HttpClient => {}
+            ExprKind::HttpClientGet { client, url } => {
+                self.impure_direct = true;
+                self.expr(client);
+                self.expr(url);
+            }
+            ExprKind::HttpClientPost { client, url, body } => {
+                self.impure_direct = true;
+                self.expr(client);
+                self.expr(url);
+                self.expr(body);
+            }
+            ExprKind::HttpClientRequest { client, req } => {
+                self.impure_direct = true;
+                self.expr(client);
+                self.expr(req);
+            }
             // `std.crypto` — `constant_time_equal` is **Pure** (a branchless self-hosted computation,
             // no I/O), so it may run inside a `par_map` closure: recurse into the operands only.
             ExprKind::CryptoCtEqual { a, b } => {
@@ -3791,6 +3820,24 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(resp, depth);
                 self.walk(name, depth);
             }
+            // `std.http` (Slice 2): `get`/`post`/`request` return `Result<response, Error>` whose
+            // `response` is **owned** (not a view) — it escapes fine, like `http.parse`'s result — so
+            // there is no `region_of` arm. `client`/`req` are owned handles (never region-borrows).
+            // Just recurse to catch an escape *inside* the operands.
+            ExprKind::HttpClient => {}
+            ExprKind::HttpClientGet { client, url } => {
+                self.walk(client, depth);
+                self.walk(url, depth);
+            }
+            ExprKind::HttpClientPost { client, url, body } => {
+                self.walk(client, depth);
+                self.walk(url, depth);
+                self.walk(body, depth);
+            }
+            ExprKind::HttpClientRequest { client, req } => {
+                self.walk(client, depth);
+                self.walk(req, depth);
+            }
             // `std.crypto` — `constant_time_equal` returns a Copy `bool` (borrows nothing); `random`
             // fills the `buffer` in place (returns `()`, nothing escapes). Just recurse into the
             // operands so any escape *inside* them is still checked.
@@ -4257,6 +4304,20 @@ impl UnnecessaryHeapScan {
             ExprKind::HttpRespHeader { resp, name } => {
                 self.visit(resp);
                 self.visit(name);
+            }
+            ExprKind::HttpClient => {}
+            ExprKind::HttpClientGet { client, url } => {
+                self.visit(client);
+                self.visit(url);
+            }
+            ExprKind::HttpClientPost { client, url, body } => {
+                self.visit(client);
+                self.visit(url);
+                self.visit(body);
+            }
+            ExprKind::HttpClientRequest { client, req } => {
+                self.visit(client);
+                self.visit(req);
             }
             // `std.crypto` — recurse into the subexpressions (no heap-narrowing pattern of its own).
             ExprKind::CryptoCtEqual { a, b } => {
@@ -5021,6 +5082,25 @@ impl<'a> MoveCheck<'a> {
             ExprKind::HttpRespHeader { resp, name } => {
                 self.expr(resp, moved, false, false);
                 self.expr(name, moved, false, false);
+            }
+            // `std.http` (Slice 2): the `client` receiver is **borrowed** (a client fires many
+            // requests — `get`/`post`/`request` read it, never consume). `get`/`post`'s `url`/`body`
+            // are borrowed views. `request`'s `req`, though, is a Move `http request` **consumed** by
+            // the call (the runtime frees it) — so it moves (a use-after-move of `req` is caught here,
+            // and the MIR nulls its slot so the exit `Drop` doesn't double-free).
+            ExprKind::HttpClient => {}
+            ExprKind::HttpClientGet { client, url } => {
+                self.expr(client, moved, false, false);
+                self.expr(url, moved, false, false);
+            }
+            ExprKind::HttpClientPost { client, url, body } => {
+                self.expr(client, moved, false, false);
+                self.expr(url, moved, false, false);
+                self.expr(body, moved, false, false);
+            }
+            ExprKind::HttpClientRequest { client, req } => {
+                self.expr(client, moved, false, false);
+                self.expr(req, moved, true, true);
             }
             // `std.crypto` borrows both byte views (`constant_time_equal`) / the `out` buffer
             // (`random`, filled in place) — nothing is consumed. Recurse non-consuming to catch a
@@ -8022,6 +8102,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.http", "http.parse", span);
                 return self.check_http_parse(args, span);
             }
+            // `std.http` (Slice 2) — `http.client()` builds a Move `http client`; the `get`/`post`/
+            // `request` methods dispatch on the receiver type below. Impure (network).
+            if module == "http" && method == "client" {
+                self.require_import("std.http", "http.client", span);
+                return self.check_http_client(args, span);
+            }
             // `std.crypto` — `constant_time_equal(a, b)` (the self-hosted branchless CT byte-compare,
             // Pure) / `random(out)` (fill a `buffer` from the OS CSPRNG, Impure) from Slice 1;
             // `sha256(data)` / `sha512(data)` (EVP digests via libcrypto, Impure) from Slice 2.
@@ -8349,7 +8435,9 @@ impl<'a, 't> Checker<'a, 't> {
         let recv_expr = self.check_expr(recv, recv_expected);
         let recv_ty = recv_expr.ty;
         match method {
-            "get" => self.check_box_get(recv_expr, recv_ty, args, span),
+            // `box<T>.get()` / `Task<R>.get()` — but NOT `http client.get(url)` (routed to the
+            // http-client arm below; `check_box_get` otherwise swallows it with a box-only error).
+            "get" if recv_ty != Ty::HttpClient => self.check_box_get(recv_expr, recv_ty, args, span),
             "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
             "contains" | "starts_with" | "ends_with" | "find" | "rfind" | "eq_ignore_ascii_case"
                 if matches!(recv_ty, Ty::Str | Ty::String) =>
@@ -8383,6 +8471,12 @@ impl<'a, 't> Checker<'a, 't> {
             // (case-insensitive `Option<str>` view) / `resp.body()` (`slice<u8>` view). Type-guarded.
             "status" | "header" | "body" if recv_ty == Ty::HttpResponse => {
                 self.check_http_response_method(recv_expr, method, args, span)
+            }
+            // `std.http` (Slice 2) client requests on an `http client`: `cl.get(url)` /
+            // `cl.post(url, body)` / `cl.request(req)` each yield `Result<response, Error>`. Impure
+            // (network). Type-guarded, same as the response getters above.
+            "get" | "post" | "request" if recv_ty == Ty::HttpClient => {
+                self.check_http_client_method(recv_expr, method, args, span)
             }
             _ => {
                 if recv_ty != Ty::Error {
@@ -8736,7 +8830,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse) {
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -12592,6 +12686,89 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `http.client()` — build a Move `http client` ([`Ty::HttpClient`]). No arguments. A module
+    /// function, dispatched like `cli.command` / `http.request`. Impure requests come from its methods.
+    fn check_http_client(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !args.is_empty() {
+            self.diags
+                .error(format!("'http.client' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        Expr { kind: ExprKind::HttpClient, ty: Ty::HttpClient, span }
+    }
+
+    /// `cl.get(url)` / `cl.post(url, body)` / `cl.request(req)` on an `http client`
+    /// ([`Ty::HttpClient`]), the receiver already evaluated. The receiver must be a **bound local**
+    /// (the v1 Move-temporary gate, the reader/writer/cli precedent); `cl` is borrowed (a client fires
+    /// many requests). Each yields `Result<response, Error>`. `get`/`post` take a `str` url (and `post`
+    /// a `bytes` body); `request` takes an `http request` (`Ty::HttpRequest`) that is **consumed**
+    /// (moved into the call — the runtime frees it). All Impure (network).
+    fn check_http_client_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the http client to a local first, then call the method (`cl := http.client()` then `cl.get(url)`) — a temporary owned client handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        let result_ty = Ty::Result(Scalar::HttpResponse, Scalar::Enum(self.error_enum_id));
+        match method {
+            "get" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.get()' takes 1 argument (the url), got {}", args.len()), span);
+                    return err;
+                }
+                let url = self.check_str_init(&args[0]);
+                if url.ty == Ty::Error {
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpClientGet { client: Box::new(recv_expr), url: Box::new(url) }, ty: result_ty, span }
+            }
+            "post" => {
+                if args.len() != 2 {
+                    self.diags.error(format!("'.post()' takes 2 arguments (url, body), got {}", args.len()), span);
+                    return err;
+                }
+                let url = self.check_str_init(&args[0]);
+                let body = self.check_bytes_init(&args[1], "'.post()'");
+                if url.ty == Ty::Error || body.ty == Ty::Error {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpClientPost { client: Box::new(recv_expr), url: Box::new(url), body: Box::new(body) },
+                    ty: result_ty,
+                    span,
+                }
+            }
+            "request" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.request()' takes 1 argument (an http request), got {}", args.len()), span);
+                    return err;
+                }
+                let req = self.check_expr(&args[0], None);
+                if req.ty == Ty::Error {
+                    return err;
+                }
+                if self.resolve(req.ty) != Ty::HttpRequest {
+                    self.diags.error(
+                        format!("'.request()' expects an http request (from `http.request(...)`), got {}", ty_name(req.ty)),
+                        args[0].span,
+                    );
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpClientRequest { client: Box::new(recv_expr), req: Box::new(req) }, ty: result_ty, span }
+            }
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on an http client (try get / post / request)"), span);
+                err
+            }
+        }
+    }
+
     /// `io.stdout.buffered()` (fd 1) / `io.stderr.buffered()` (fd 2) — a buffered `writer` over the
     /// given standard stream. `sink` names it for the diagnostic; `fd` is the lowered target.
     fn check_io_buffered(&mut self, sink: &str, fd: i32, args: &[ast::Expr], span: Span) -> Expr {
@@ -13857,6 +14034,20 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(resp);
                 self.finalize_expr(name);
             }
+            ExprKind::HttpClient => {}
+            ExprKind::HttpClientGet { client, url } => {
+                self.finalize_expr(client);
+                self.finalize_expr(url);
+            }
+            ExprKind::HttpClientPost { client, url, body } => {
+                self.finalize_expr(client);
+                self.finalize_expr(url);
+                self.finalize_expr(body);
+            }
+            ExprKind::HttpClientRequest { client, req } => {
+                self.finalize_expr(client);
+                self.finalize_expr(req);
+            }
             ExprKind::CryptoCtEqual { a, b } => {
                 self.finalize_expr(a);
                 self.finalize_expr(b);
@@ -14311,6 +14502,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Child => "child".to_string(),
         Ty::HttpRequest => "http request".to_string(),
         Ty::HttpResponse => "http response".to_string(),
+        Ty::HttpClient => "http client".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -14485,7 +14677,7 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // payload (`tcp.connect`/`l.accept` for the conn, `tcp.listen` for the listener, `udp.bind` for
     // the socket) is fine, but never an array/slice/box element (a copied handle would
     // double-`close` its fd).
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,

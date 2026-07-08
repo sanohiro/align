@@ -517,6 +517,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::HttpRespStatus { resp } => format!("http_resp_status({})", operand_str(resp)),
         Rvalue::HttpRespHeader { resp, name, out } => format!("http_resp_header({}, {}, -> _{out})", operand_str(resp), operand_str(name)),
         Rvalue::HttpRespBody { resp } => format!("http_resp_body({})", operand_str(resp)),
+        Rvalue::HttpClient => "http_client()".to_string(),
+        Rvalue::HttpClientGet { client, url, out } => format!("http_client_get({}, {}, -> _{out})", operand_str(client), operand_str(url)),
+        Rvalue::HttpClientPost { client, url, body, out } => {
+            format!("http_client_post({}, {}, {}, -> _{out})", operand_str(client), operand_str(url), operand_str(body))
+        }
+        Rvalue::HttpClientRequest { client, req, out } => format!("http_client_request({}, {}, -> _{out})", operand_str(client), operand_str(req)),
     }
 }
 

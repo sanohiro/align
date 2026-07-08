@@ -114,7 +114,23 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    (Content-Length framing only in v1; R1-honouring de-chunking deferred). Caps: ≤ 128 headers,
    ≤ 1 GiB body. R1 zero-copy: the response owns one byte buffer + an offset table; scanning rides
    the `memchr` crate (R2).
-2. client + get/post over one net `tcp_conn` (plaintext).
+2. client + get/post over one net `tcp_conn` (plaintext). **DONE** (branch
+   `m11-http-slice2-client`). Shipped surface (behind `import std.http`, all **Impure** — network):
+   `http.client()` (Move `http client` handle; a ZST in v1 — no pooled state yet, the FFI entry
+   points already take `*mut HttpClient` so Slice 3 adds the pool behind the same surface),
+   `cl.get(url) -> Result<response, Error>` / `cl.post(url, body) -> Result<response, Error>` /
+   `cl.request(req) -> Result<response, Error>` (bound-receiver gate; `cl` borrowed, `request`
+   **consumes** its Move `req`). Each performs ONE request over one fresh net `tcp_conn`: connect
+   (reuses `align_rt_tcp_connect` — DNS + connect + SO_KEEPALIVE) → **TCP_NODELAY** (R4) → **one
+   write** of the serialized request (R4, via the Slice-1 `http_serialize_core` — auto Host +
+   Content-Length, method/header/smuggling validation) → stream the response through the socket in
+   32 KiB reads (never per-line — R4) to Content-Length, then parse via the Slice-1
+   `http_parse_core` (R1 zero-copy). A 4xx/5xx is `Ok(response)` (P2); `https://` / a malformed URL
+   is `Error.Invalid` at request time (P1 — never a silent plaintext downgrade). Framing is
+   Content-Length (or read-to-close); chunked stays `Error.Invalid` (Slice-1 policy). The parser
+   was refactored to an `Incomplete`/`Invalid` split so the streaming read distinguishes "need more
+   bytes" from "malformed" over one shared decoder. NO pool yet (every request connects fresh and
+   closes — Slice 3 adds keepalive reuse); `get_many` / server / HTTPS remain.
 3. connection pool reuse (the rail — keepalive, reuse by default).
 4. server primitive (serve/accept, caller writes response).
 5. [DEFERRED to post-TLS] HTTPS via the FFI TLS wrapper.
