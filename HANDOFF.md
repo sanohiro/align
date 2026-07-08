@@ -13,7 +13,11 @@ Slice 1 was #391. Same week: std.crypto COMPLETE #383–#388, std.compress COMPL
 
 **Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #391 (std.http
 Slice 1) + #392 (std.http Slice 2). `cargo test --workspace` = **1601 green**; clippy clean at
-`-D warnings`.
+`-D warnings`. Housekeeping note: 7 stale local branches remain (`fix-*`/`*group-agg*` from the
+squash-merged Gemini wave #358–#368, and `handoff-http-slice1-inflight`, a pre-#391 stash) —
+squash merges hide them from `--merged`; verify content landed (`git diff main...<br>`) then
+force-delete at leisure. **Next: std.http Slice 3** (pool/keepalive — R3 — plus the R6
+`bench/http_client` harness; see the Slice-2 entry below).
 
 **M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), `std.compress`
 (#380–#381), and `std.crypto` (#383–#388) are DONE.** Full shipped-feature summaries + per-slice
