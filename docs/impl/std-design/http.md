@@ -89,7 +89,10 @@ the rest of std already follows. Concretely:
 - **R6 — benchmark-gated completion**: a `bench/http_client` harness (local plaintext server;
   keepalive GET latency/throughput + `get_many` scaling) measured against a Rust baseline —
   the module is not "done fast" until the numbers are in its README, per the repo's
-  measure-before-claiming rule.
+  measure-before-claiming rule. **R6 is NOT yet satisfied as of Slice 2** (DC-2): `bench/http_client`
+  does not exist, and it cannot land meaningfully until Slice 3 — keepalive is exactly what R6's
+  latency/throughput numbers measure, and `get_many` scaling comes later still. R6 gates **module**
+  completion, not Slice 2; the bench harness ships with the Slice-3 pool work.
 
 ## New machinery required
 
@@ -135,12 +138,35 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
 4. server primitive (serve/accept, caller writes response).
 5. [DEFERRED to post-TLS] HTTPS via the FFI TLS wrapper.
 
+## Known v1 limitations (Slice 2)
+
+- **No read/connect timeout (G3-1, medium, inherited).** A server that completes the TCP
+  handshake then stalls — sends nothing, dribbles bytes below the caps, or sends fewer than
+  `Content-Length` and holds the socket open — blocks the calling thread **indefinitely**. The
+  Slice-1 byte caps (256 KiB head / 1 GiB body) bound *memory*, not *time*. This is not a new bug
+  class: it is exactly the net rail's documented no-timeout behavior (see the `align_rt_tcp_connect`
+  doc comment: "sets no connect timeout — a hung/black-holed peer blocks indefinitely"), now
+  inherited by the http client on both connect **and** read. It was not previously noted for the
+  http client — recorded here. **Follow-up:** timeout support (connect + read deadlines) lands
+  alongside the Slice-3 pool work, where the pool already needs per-conn deadline bookkeeping; it is
+  the same non-blocking/deadline substrate net.md flags as a later backend, not a semantic change.
+- **`https://` rejection is coarse (DC-1, low).** `https://` is correctly rejected pre-connect (P1's
+  security intent is met — never a silent plaintext downgrade), but it maps to the **bare
+  `Error.Invalid`**, indistinguishable from any other malformed URL. The design's aspiration of a
+  clear "HTTPS not supported in v1 (TLS wrapper pending)" message is therefore **unmet**. This is
+  structural, not a fix we can slot in: the `Error` enum carries **no message payload**, so there is
+  no mechanism to attach the string. Do not invent a new one for this — the message-carrying error
+  story is a separate cross-cutting decision. Recorded as a known v1 limitation tied to the
+  message-less `Error` enum; revisit if/when `Error` grows a payload.
+
 ## Pitfalls
 
 - **P1 (TLS defer honesty)**: v1 is plaintext only. Do NOT silently accept `https://` URLs and
   send plaintext — reject `https://` with a clear "HTTPS not supported in v1 (TLS wrapper
   pending)" `Error.Invalid` until the TLS slice lands. Silent downgrade is a security footgun
-  (Nothing-hidden violation).
+  (Nothing-hidden violation). **v1 caveat (DC-1):** the rejection is correct but coarse — it is the
+  bare `Error.Invalid` with no attached message, so the "HTTPS not supported" wording above is an
+  aspiration the message-less `Error` enum cannot yet carry (see Known v1 limitations).
 - **P2 (status-is-data)**: 4xx/5xx must NOT map to `Err` — only transport/parse failures. A
   `get()` returning 404 is `Ok(response with status 404)`. Getting this wrong forces callers into
   awkward double-error handling.

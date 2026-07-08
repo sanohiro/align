@@ -1568,7 +1568,20 @@ and http last (needs net + TLS).
     view escape via the client path) + `align_runtime` units (+7 — `http_split_authority` forms,
     get/post/request socket round-trips against an in-process server, https/malformed reject,
     new/free/null-out safety). `cargo test --workspace` 1601 green; expr_depth 5/5 default env; clippy
-    `-D warnings` clean.
+    `-D warnings` clean. **Recorded Slice-2 limitations (docs-only, no code defect — an independent
+    adversarial review found none):** (i) **no read/connect timeout (G3-1, inherited):** a server that
+    completes the TCP handshake then stalls (sends nothing, dribbles under the caps, or sends less than
+    `Content-Length` and holds the socket) blocks the calling thread indefinitely — the byte caps bound
+    memory, not time; this is the net rail's documented no-timeout behavior (`align_rt_tcp_connect`),
+    now inherited on connect + read. Timeout support is a **follow-up landing with the Slice-3 pool
+    work** (same deadline substrate; not a semantic change). (ii) **`https://` rejection is coarse
+    (DC-1):** correctly rejected pre-connect (P1 honesty met) but as the bare `Error.Invalid` — no
+    "HTTPS not supported in v1" message, because the `Error` enum carries no payload; structural, tied
+    to the message-less error story, not a slot-in fix. (iii) **R6 perf gate NOT yet met (DC-2,
+    process):** `bench/http_client` does not exist yet and R6 (benchmark-gated latency/throughput +
+    `get_many` scaling vs a Rust baseline) gates **module** completion, not Slice 2 — the bench harness
+    lands with Slice 3, since keepalive is what R6 measures. No wording here claims the perf gate is
+    met. (Full detail: `docs/impl/std-design/http.md` "Known v1 limitations".)
 
 ## Design Issues to Settle in Parallel
 
