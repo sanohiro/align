@@ -1,0 +1,35 @@
+{
+  "name": "align",
+  "displayName": "Align",
+  "description": "Align language support",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "align",
+        "aliases": ["Align", "align"],
+        "extensions": [".align"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "align",
+        "scopeName": "source.align",
+        "path": "./syntaxes/align.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "align",
+        "path": "./snippets/align.json"
+      }
+    ]
+  }
+}

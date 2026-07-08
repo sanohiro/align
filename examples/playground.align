@@ -1,0 +1,30 @@
+module playground
+
+User {
+  id: i64,
+  active: bool,
+  score: f32,
+}
+
+fn process_users(users: slice<User>) -> f32 {
+  // Completion test: try typing `users.` or test built-in functions like `where`
+  total := users
+    .where(.active)
+    .score
+    .sum()
+
+  return total
+}
+
+fn main() -> i32 {
+  u1 := User { id: 1, active: true, score: 10.5 }
+  u2 := User { id: 2, active: false, score: 20.0 }
+
+  // Error test: intentionally use an undefined variable (check if Lint catches it)
+  // x := unknown_variable
+
+  // Format test: intentionally mess up indentation
+  result := process_users([u1, u2])
+
+  return 0
+}

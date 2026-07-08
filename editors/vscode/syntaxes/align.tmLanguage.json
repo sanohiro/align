@@ -1,0 +1,75 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Align",
+  "patterns": [
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#numbers"
+    }
+  ],
+  "repository": {
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.align",
+          "match": "\\b(fn|return|mut|pub|module|import|if|else|arena|box|task_group|match|template|unsafe|extern|as|out)\\b"
+        },
+        {
+          "name": "support.type.align",
+          "match": "\\b(i8|u8|i16|u16|i32|u32|i64|u64|f32|f64|bool|char|str|string|array|slice|raw|writer|reader|buffer|rng|tcp_conn|tcp_listener|udp_socket|child|soa|Option|Result|vec[248]|vec16|mask[248]|mask16)\\b"
+        },
+        {
+          "name": "constant.language.boolean.align",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "support.function.builtin.align",
+          "match": "\\b(map|par_map|where|reduce|scan|partition|group_by|sort|sort_by_key|chunks|sum|min|max|count|any|all|dot)\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.align",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.align",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.align",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.align",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "comments": {
+      "name": "comment.line.double-slash.align",
+      "match": "//.*$"
+    },
+    "numbers": {
+      "name": "constant.numeric.align",
+      "match": "\\b[0-9_]+(\\.[0-9_]+)?([eE][+-]?[0-9_]+)?\\b"
+    }
+  },
+  "scopeName": "source.align"
+}

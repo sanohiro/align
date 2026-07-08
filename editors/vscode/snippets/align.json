@@ -1,0 +1,143 @@
+{
+  "Main Function": {
+    "prefix": "main",
+    "body": [
+      "fn main() -> i32 {",
+      "\t$0",
+      "\treturn 0",
+      "}"
+    ],
+    "description": "Create a main function"
+  },
+  "Function Definition": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}(${2:args}) -> ${3:ret_type} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Define a new function"
+  },
+  "Struct Definition": {
+    "prefix": "struct",
+    "body": [
+      "${1:Name} {",
+      "\t${2:field}: ${3:type},",
+      "\t$0",
+      "}"
+    ],
+    "description": "Define a new struct"
+  },
+  "Match Statement": {
+    "prefix": "match",
+    "body": [
+      "match ${1:expr} {",
+      "\t${2:Pattern} => $0,",
+      "}"
+    ],
+    "description": "Match statement"
+  },
+  "If Statement": {
+    "prefix": "if",
+    "body": [
+      "if ${1:condition} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "If statement"
+  },
+  "Task Group": {
+    "prefix": "task_group",
+    "body": [
+      "task_group {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Spawn a task group"
+  },
+  "Array map": {
+    "prefix": "map",
+    "body": "map(${1:func})",
+    "description": "Array map (fused pipeline)"
+  },
+  "Array par_map": {
+    "prefix": "par_map",
+    "body": "par_map(${1:func})",
+    "description": "Array parallel map"
+  },
+  "Array where": {
+    "prefix": "where",
+    "body": "where(.${1:field})",
+    "description": "Array filter (where)"
+  },
+  "Array reduce": {
+    "prefix": "reduce",
+    "body": "reduce(${1:init}, ${2:func})",
+    "description": "Array reduce"
+  },
+  "Array scan": {
+    "prefix": "scan",
+    "body": "scan(${1:init}, ${2:func})",
+    "description": "Array scan"
+  },
+  "Array partition": {
+    "prefix": "partition",
+    "body": "partition(.${1:field})",
+    "description": "Array partition"
+  },
+  "Array group_by": {
+    "prefix": "group_by",
+    "body": "group_by(.${1:field})",
+    "description": "Array group_by"
+  },
+  "Array sort": {
+    "prefix": "sort",
+    "body": "sort()",
+    "description": "Array sort"
+  },
+  "Array sort_by_key": {
+    "prefix": "sort_by_key",
+    "body": "sort_by_key(.${1:field})",
+    "description": "Array sort by key"
+  },
+  "Array chunks": {
+    "prefix": "chunks",
+    "body": "chunks(${1:size})",
+    "description": "Array chunks"
+  },
+  "Array sum": {
+    "prefix": "sum",
+    "body": "sum()",
+    "description": "Array sum reduction"
+  },
+  "Array min": {
+    "prefix": "min",
+    "body": "min()",
+    "description": "Array min reduction"
+  },
+  "Array max": {
+    "prefix": "max",
+    "body": "max()",
+    "description": "Array max reduction"
+  },
+  "Array count": {
+    "prefix": "count",
+    "body": "count()",
+    "description": "Array count reduction"
+  },
+  "Array any": {
+    "prefix": "any",
+    "body": "any()",
+    "description": "Array any reduction"
+  },
+  "Array all": {
+    "prefix": "all",
+    "body": "all()",
+    "description": "Array all reduction"
+  },
+  "Array dot": {
+    "prefix": "dot",
+    "body": "dot(${1:other_array})",
+    "description": "Array dot product reduction"
+  }
+}
