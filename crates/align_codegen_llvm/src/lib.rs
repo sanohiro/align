@@ -1268,6 +1268,34 @@ fn build_module<'c>(
         "http_resp_free".to_string(),
         module.add_function("align_rt_http_resp_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
+    // `std.http` (Slice 2) — the client is an opaque pointer. `client()` allocates one (no args);
+    // `get(client, url{ptr,len}, out)` / `post(client, url{ptr,len}, body{ptr,len}, out)` /
+    // `request(client, req, out)` each -> i32 status, writing an `http response` handle to `out`;
+    // `client_free` drops the handle (and, from Slice 3, closes pooled conns).
+    funcs.insert(
+        "http_client_new".to_string(),
+        module.add_function("align_rt_http_client_new", ptr.fn_type(&[], false), None),
+    );
+    funcs.insert(
+        "http_client_get".to_string(),
+        module.add_function("align_rt_http_client_get", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        "http_client_post".to_string(),
+        module.add_function(
+            "align_rt_http_client_post",
+            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), ptr.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        "http_client_request".to_string(),
+        module.add_function("align_rt_http_client_request", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        "http_client_free".to_string(),
+        module.add_function("align_rt_http_client_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     // `core.string` trims → a borrowed sub-`str` `{ptr,len}` of the receiver (no allocation).
     for (key, sym) in [
         ("str_trim", "align_rt_str_trim"),
@@ -1714,7 +1742,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // A `reader`/`writer`/`buffer` / cli handle / `tcp_conn` payload is an opaque pointer.
-        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
@@ -2822,7 +2850,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -2880,7 +2908,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse) {
+                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient) {
                         // A writer flushes + closes; a reader closes; a buffer / cli / http handle
                         // frees; a tcp_conn / tcp_listener / udp_socket closes its socket fd. Each
                         // runtime `*_free` is null-safe (a moved-out / never-initialised slot drops
@@ -2897,6 +2925,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             Ty::Child => "child_free",
                             Ty::HttpRequest => "http_request_free",
                             Ty::HttpResponse => "http_resp_free",
+                            Ty::HttpClient => "http_client_free",
                             _ => "cli_parsed_free",
                         };
                         let p = self
@@ -5134,6 +5163,45 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["http_resp_body"], &[p.into()], "httpbody")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_resp_body returns a {ptr,len}")
+            }
+            // std.http (Slice 2) client — each request writes an owned `http response` handle into
+            // `out` and returns an i32 status. Null `out` first (the Err branch reads null → nothing to
+            // free), matching `http_parse`.
+            Rvalue::HttpClient => self
+                .builder
+                .build_call(self.funcs["http_client_new"], &[], "httpclient")
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value().basic().expect("http_client_new returns a handle pointer"),
+            Rvalue::HttpClientGet { client, url, out } => {
+                let c = self.operand(client).into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
+                let (up, ul) = self.split_str(url)?;
+                self.builder
+                    .build_call(self.funcs["http_client_get"], &[c.into(), up.into(), ul.into(), out_ptr.into()], "httpget")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_client_get returns i32 status")
+            }
+            Rvalue::HttpClientPost { client, url, body, out } => {
+                let c = self.operand(client).into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
+                let (up, ul) = self.split_str(url)?;
+                let (bp, bl) = self.split_str(body)?;
+                self.builder
+                    .build_call(self.funcs["http_client_post"], &[c.into(), up.into(), ul.into(), bp.into(), bl.into(), out_ptr.into()], "httppost")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_client_post returns i32 status")
+            }
+            Rvalue::HttpClientRequest { client, req, out } => {
+                let c = self.operand(client).into_pointer_value();
+                let r = self.operand(req).into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["http_client_request"], &[c.into(), r.into(), out_ptr.into()], "httpreqcall")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_client_request returns i32 status")
             }
             // env.get — write the owned value {ptr,len} into `out`, return an i32 present flag.
             Rvalue::EnvGet { name, out } => {

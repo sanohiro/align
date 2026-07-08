@@ -918,6 +918,23 @@ pub enum ExprKind {
     /// [`crate::Ty::Slice`] of `u8`), region-bound to `resp` (no copy, http.md R1). `resp` is a bound
     /// local. Pure.
     HttpRespBody { resp: Box<Expr> },
+    /// `http.client()` — a fresh [`crate::Ty::HttpClient`] handle (a **Move** handle; `Drop`-freed).
+    /// Slice 2 carries no pooled state. **Impure**? No — allocating the handle performs no I/O; the
+    /// *requests* (`get`/`post`/`request`) are Impure. No operands.
+    HttpClient,
+    /// `cl.get(url)` — perform a `GET url` over a fresh connection, yielding `Result<response, Error>`
+    /// (the `ty`). `cl` is a bound [`crate::Ty::HttpClient`] local (borrowed, not consumed); `url` is a
+    /// borrowed `str`. **Impure** (network I/O). A 4xx/5xx status is `Ok(response)` (http.md P2); a
+    /// `https://` / malformed URL is `Error.Invalid` (http.md P1).
+    HttpClientGet { client: Box<Expr>, url: Box<Expr> },
+    /// `cl.post(url, body)` — perform a `POST url` with `body` (auto `Content-Length`) over a fresh
+    /// connection, yielding `Result<response, Error>`. `cl` is a bound local (borrowed); `url` is a
+    /// borrowed `str`; `body` is a borrowed byte view (`str` / owned `string` / `slice<u8>`). **Impure**.
+    HttpClientPost { client: Box<Expr>, url: Box<Expr>, body: Box<Expr> },
+    /// `cl.request(req)` — perform the fully-built request `req` over a fresh connection, yielding
+    /// `Result<response, Error>`. `cl` is a bound local (borrowed); `req` is a
+    /// [`crate::Ty::HttpRequest`] **consumed** (moved into the call — the runtime frees it). **Impure**.
+    HttpClientRequest { client: Box<Expr>, req: Box<Expr> },
     /// `crypto.constant_time_equal(a, b)` — a constant-time byte-equality test over two byte views
     /// `a` / `b` (`str` / owned `string` auto-borrowed / `slice<u8>`); the `ty` is
     /// [`crate::Ty::Bool`]. The input *length* is **public** (crypto.md P1): differing lengths return

@@ -1536,8 +1536,52 @@ and http last (needs net + TLS).
     cli/net/crypto view-escape suites. (ii) serialize now validates the **method is an RFC 7230
     token** and the URL-derived authority/path carry **no CR/LF/NUL/SP** (the permanent codec must not
     let `http://a/x\r\nEvil: 1` smuggle a header). (iii) parse **rejects a conflicting duplicate
-    Content-Length** (RFC 7230 §3.3.3; an identical repeat is accepted). **Slices 2–5 (client
-    get/post, pool reuse, server primitive, HTTPS) remain.**
+    Content-Length** (RFC 7230 §3.3.3; an identical repeat is accepted). **Slices 3–5 (pool reuse,
+    server primitive, HTTPS) remain.**
+  - **Slice 2 (the plaintext HTTP/1.1 client — get/post/request over one net `tcp_conn`) — DONE.**
+    One new Move handle type `Ty::HttpClient` (a ZST in v1 — no `Scalar`, never rides an aggregate),
+    full twin-mirror Gate-1 sweep. Language surface behind `import std.http`, all **Impure**
+    (network): `http.client()`, `cl.get(url) -> Result<response, Error>` / `cl.post(url, body) ->
+    Result<response, Error>` / `cl.request(req) -> Result<response, Error>` (bound-receiver gate,
+    reader/writer/cli precedent; `cl` borrowed, `request` **consumes** its Move `req` — the runtime
+    frees it, MIR nulls the source slot). Key decisions: (a) **one request = one fresh `tcp_conn`**
+    (connect → send → read → parse → close), reusing the net rail (`align_rt_tcp_connect` — DNS +
+    connect + SO_KEEPALIVE) and the Slice-1 codec/parse core, with NO pool yet (Slice 3 keepalive) —
+    but the FFI entry points already take `*mut HttpClient` so Slice 3 adds pooling behind the same
+    language surface. (b) **R4 syscall discipline is shipped, not aspirational:** `TCP_NODELAY` on the
+    conn (`IPPROTO_TCP`/`TCP_NODELAY`, stable across Linux/macOS), the whole request rendered by the
+    Slice-1 `http_serialize_core` and sent with **one** `write_all`, and the response streamed in 32
+    KiB reads (never per-line) to Content-Length. (c) **P1 honesty:** `https://` / a malformed URL is
+    `Error.Invalid` at request time (split-URL rejects it before connect) — never a silent plaintext
+    downgrade. (d) **P2:** a 4xx/5xx is `Ok(response)` with that status; only transport/parse failures
+    are `Err` (the shared out-slot + i32-status lowering treats `0` = ok regardless of HTTP status).
+    (e) **Parser refactor to `Incomplete`/`Invalid`:** the Slice-1 `http_parse_core` was split so a
+    streaming read distinguishes "valid prefix, read more" from "malformed, stop" over ONE shared
+    decoder (no duplicated header scan; the framing helper `http_parse_head` computes the target
+    length without copying the body). Content-Length (or read-to-close) framing; chunked stays
+    `Error.Invalid`. (f) **`http.client` is a ZST Move handle** — Slice 2 genuinely has no client
+    state, so the honest representation is a unit struct (not a half-built disabled pool); the Box
+    round-trip is sound for a ZST, and `http_client_free`/Drop is a null-safe no-op until Slice 3 owns
+    pooled conns (P5). Tests: `crates/align_driver/tests/m11_http.rs` (+10 — get 200 round-trip with
+    body/header views, 404-is-Ok P2, post sends Content-Length + body, https/malformed URL error P1,
+    request-consumes-req use-after-move, unbound-receiver / array-element / import gates, response body
+    view escape via the client path) + `align_runtime` units (+7 — `http_split_authority` forms,
+    get/post/request socket round-trips against an in-process server, https/malformed reject,
+    new/free/null-out safety). `cargo test --workspace` 1601 green; expr_depth 5/5 default env; clippy
+    `-D warnings` clean. **Recorded Slice-2 limitations (docs-only, no code defect — an independent
+    adversarial review found none):** (i) **no read/connect timeout (G3-1, inherited):** a server that
+    completes the TCP handshake then stalls (sends nothing, dribbles under the caps, or sends less than
+    `Content-Length` and holds the socket) blocks the calling thread indefinitely — the byte caps bound
+    memory, not time; this is the net rail's documented no-timeout behavior (`align_rt_tcp_connect`),
+    now inherited on connect + read. Timeout support is a **follow-up landing with the Slice-3 pool
+    work** (same deadline substrate; not a semantic change). (ii) **`https://` rejection is coarse
+    (DC-1):** correctly rejected pre-connect (P1 honesty met) but as the bare `Error.Invalid` — no
+    "HTTPS not supported in v1" message, because the `Error` enum carries no payload; structural, tied
+    to the message-less error story, not a slot-in fix. (iii) **R6 perf gate NOT yet met (DC-2,
+    process):** `bench/http_client` does not exist yet and R6 (benchmark-gated latency/throughput +
+    `get_many` scaling vs a Rust baseline) gates **module** completion, not Slice 2 — the bench harness
+    lands with Slice 3, since keepalive is what R6 measures. No wording here claims the perf gate is
+    met. (Full detail: `docs/impl/std-design/http.md` "Known v1 limitations".)
 
 ## Design Issues to Settle in Parallel
 

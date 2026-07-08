@@ -91,7 +91,11 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
 - **R6 — ベンチマークで完了をゲートする**: `bench/http_client` のハーネス(ローカルの平文サーバ。
   keepalive GET のレイテンシ/スループット + `get_many` のスケーリング)を Rust ベースラインに照らして
   計測する — このリポジトリの「主張の前に計測」ルールに従い、数値が README に載るまでモジュールは
-  「速く仕上がった」とは言わない。
+  「速く仕上がった」とは言わない。**R6 はスライス 2 の時点ではまだ満たされていない**(DC-2):
+  `bench/http_client` は存在せず、スライス 3 まで意味のある形では入れられない — keepalive こそ R6 の
+  レイテンシ/スループット数値が測るものであり、`get_many` のスケーリングはさらに後になる。R6 が
+  ゲートするのは **モジュール** の完了であってスライス 2 ではない。ベンチハーネスはスライス 3 のプール
+  作業とともに出荷する。
 
 ## New machinery required
 
@@ -117,17 +121,57 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    `chunked` の Transfer-Encoding は `Error.Invalid`(v1 は Content-Length フレーミングのみ。R1 を守る
    デチャンクは先送り)。上限: ヘッダー 128 個以下、ボディ 1 GiB 以下。R1 ゼロコピー: response は 1 本の
    バイトバッファ + オフセット表を所有し、スキャンは `memchr` クレート(R2)に載せる。
-2. client + 1 つの net の `tcp_conn` 上での get/post(平文)。
+2. client + 1 つの net の `tcp_conn` 上での get/post(平文)。**完了**(ブランチ
+   `m11-http-slice2-client`)。提供する API(`import std.http` の下、すべて **非純粋** — ネットワーク):
+   `http.client()`(Move の `http client` ハンドル。v1 では ZST — プール状態はまだ持たないが、FFI
+   のエントリポイントはすでに `*mut HttpClient` を受け取るので、スライス 3 は同じ言語表面のままプールを
+   追加できる)、`cl.get(url) -> Result<response, Error>` / `cl.post(url, body) -> Result<response,
+   Error>` / `cl.request(req) -> Result<response, Error>`(バインド済みレシーバのゲート。`cl` は借用、
+   `request` は Move の `req` を**消費する**)。各リクエストは 1 本の新しい net `tcp_conn` 上で実行する:
+   connect(`align_rt_tcp_connect` を再利用 — DNS + connect + SO_KEEPALIVE)→ **TCP_NODELAY**(R4)→
+   シリアライズ済みリクエストの **1 回の write**(R4。スライス 1 の `http_serialize_core` 経由 — Host と
+   Content-Length を自動付与し、メソッド/ヘッダー/スマグリングを検証)→ レスポンスをソケットから 32 KiB
+   ずつ(1 行ずつではなく — R4)Content-Length まで読み、スライス 1 の `http_parse_core`(R1 ゼロコピー)で
+   パースする。4xx/5xx は `Ok(response)`(P2)。`https://` や不正な URL はリクエスト時点で `Error.Invalid`
+   (P1 — 黙って平文にダウングレードしない)。フレーミングは Content-Length(または read-to-close)。
+   chunked は `Error.Invalid` のまま(スライス 1 の方針)。パーサはストリーミング読み取りが「もっとバイトが
+   必要」と「不正」を 1 つの共通デコーダで区別できるよう、`Incomplete`/`Invalid` の 2 分岐にリファクタした。
+   プールはまだなし(各リクエストは新規接続して閉じる — keepalive の再利用はスライス 3)。`get_many` /
+   server / HTTPS は残る。
 3. コネクションプールの再利用(レール — keepalive、デフォルトで再利用)。
 4. server プリミティブ(serve/accept、レスポンスは呼び出し側が書く)。
 5. [TLS 実装後に先送り] FFI の TLS ラッパー経由の HTTPS。
+
+## Known v1 limitations (Slice 2)
+
+- **read/connect のタイムアウトが無い(G3-1, medium, 継承)。** TCP のハンドシェイクを完了させた後に
+  停止するサーバ — 何も送らない、上限より少ないバイトをちびちび送る、`Content-Length` より少なく送って
+  ソケットを握り続ける — は、呼び出しスレッドを**無期限に**ブロックする。スライス 1 のバイト上限
+  (head 256 KiB / body 1 GiB)が縛るのは*メモリ*であって*時間*ではない。これは新しいバグクラスではない:
+  net のレールが文書化している no-timeout の挙動そのもの(`align_rt_tcp_connect` のドキュメントコメント:
+  「connect タイムアウトを設定しない — 応答しない/ブラックホール化した相手は無期限にブロックする」)を、
+  http クライアントが connect **と** read の両方で継承したものである。これまで http クライアントについては
+  明記されていなかった — ここに記録する。**フォローアップ:** タイムアウト対応(connect + read の
+  デッドライン)は、プールがそもそも per-conn のデッドライン管理を必要とする **スライス 3 のプール作業と
+  ともに** 入れる。net.md が後日のバックエンドとして挙げている non-blocking/deadline の基盤と同じもので、
+  セマンティクスの変更ではない。
+- **`https://` の拒否が粗い(DC-1, low)。** `https://` は connect 前に正しく拒否されるが(P1 の
+  セキュリティ意図は満たされ、黙って平文にダウングレードすることはない)、**素の `Error.Invalid`** に
+  写るため、他の不正な URL と区別できない。したがって「HTTPS not supported in v1 (TLS wrapper pending)」
+  という明確なメッセージという設計上の望みは **満たされていない**。これはその場で埋められる修正ではなく
+  構造的な問題である: `Error` enum は **メッセージのペイロードを持たない** ため、その文字列を付ける手段が
+  無い。これのために新しい仕組みを発明してはならない — メッセージを運ぶエラーの話は別の横断的な決定である。
+  メッセージレスな `Error` enum に紐づく既知の v1 制約として記録する。`Error` がペイロードを持つように
+  なったら再検討する。
 
 ## Pitfalls
 
 - **P1 (TLS 先送りの誠実さ)**: v1 は平文のみである。`https://` の URL を黙って受理して平文で送っては
   **ならない** — TLS のスライスが入るまでは、`https://` を「HTTPS not supported in v1 (TLS wrapper
   pending)」という明確な `Error.Invalid` で拒否する。黙ってダウングレードするのはセキュリティ上の落とし穴
-  である(Nothing-hidden 違反)。
+  である(Nothing-hidden 違反)。**v1 の注意(DC-1):** 拒否は正しいが粗い — メッセージを付けられない素の
+  `Error.Invalid` なので、上の「HTTPS not supported」という文言は、メッセージレスな `Error` enum がまだ
+  運べない望みである(「Known v1 limitations」を参照)。
 - **P2 (ステータスはデータ)**: 4xx/5xx を `Err` に写してはならない — `Err` はトランスポート/パースの失敗
   だけである。`get()` が 404 を返すなら、それは `Ok(status 404 のレスポンス)` である。ここを取り違えると、
   呼び出し側が二重のエラー処理を強いられる厄介な設計になる。

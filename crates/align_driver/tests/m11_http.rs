@@ -8,9 +8,58 @@
 //! error (P2). All ops Pure (no sockets in this slice). The serialize codec + exact wire bytes are
 //! runtime-unit-tested in `align_runtime` (Slice 2's client calls `align_rt_http_serialize`).
 //! (`docs/impl/std-design/http.md`.)
+//!
+//! M11 std.http Slice 2 — the plaintext HTTP/1.1 client. `http.client()` opens a Move `http client`;
+//! `cl.get(url)` / `cl.post(url, body)` / `cl.request(req)` each perform ONE request over one fresh
+//! `tcp_conn` (connect → TCP_NODELAY → one write of the serialized request → stream the response to
+//! Content-Length → parse → close), reusing the net rail + the Slice-1 codec/parse engine. A 4xx/5xx
+//! is `Ok(response)` (P2); `https://` is `Error.Invalid` (P1, never a silent downgrade). Requests are
+//! Impure. Round-trips run against an in-process Rust server; the Gate-1 rejections (client unbound
+//! receiver / array element / use-after-move of a `request` / view escape / import) are compile checks.
+//! (`docs/impl/std-design/http.md` Slice 2.)
 
 mod common;
 use common::*;
+
+/// A one-shot in-process HTTP server on an ephemeral loopback port: accept ONE connection, read the
+/// whole request (head + any `Content-Length` body), write `response`, close. Returns
+/// `(port, handle)`; the handle yields the exact request bytes the client sent (for wire assertions).
+fn spawn_http_server(response: Vec<u8>) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut req: Vec<u8> = Vec::new();
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut tmp = [0u8; 512];
+            let mut want: Option<usize> = None; // total request length once the head is parsed
+            loop {
+                if let Some(t) = want {
+                    if req.len() >= t {
+                        break;
+                    }
+                } else if let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&req[..p]).to_ascii_lowercase();
+                    let cl = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                        .unwrap_or(0);
+                    want = Some(p + 4 + cl);
+                    if req.len() >= p + 4 + cl {
+                        break;
+                    }
+                }
+                match sock.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&tmp[..n]),
+                }
+            }
+            let _ = sock.write_all(&response);
+        }
+        req
+    });
+    (port, handle)
+}
 
 // --- request builder ---------------------------------------------------------------------------
 
@@ -337,4 +386,216 @@ pub fn main() -> Result<(), Error> {
 }
 ";
     assert!(check_errs("m11-http-parse-noimport", src), "http.parse without import std.http must be rejected");
+}
+
+// --- Slice 2: the plaintext HTTP/1.1 client ----------------------------------------------------
+
+/// `cl.get()` round-trips against a local plaintext server: a 200 with a body parses to a response
+/// whose `status()`/`body()` are correct, and the request went out as a well-formed GET. The URL
+/// (with the OS-assigned ephemeral port) is passed as a `--url` flag.
+#[test]
+fn client_get_round_trip_200() {
+    if !backend_available() {
+        return;
+    }
+    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello".to_vec();
+    let (port, server) = spawn_http_server(resp);
+    let prog = "\
+import std.http
+import std.io
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"get\")
+  c.flag_str(\"url\", \"\")
+  p := c.parse(args)?
+  cl := http.client()
+  resp := cl.get(p.get_str(\"url\"))?
+  print(resp.status())
+  io.stdout.write(resp.body())?
+  return Ok(())
+}
+";
+    let url = format!("http://127.0.0.1:{port}/path");
+    let out = build_and_run_args("m11-http-get-200", prog, &["--url", &url]);
+    let req = String::from_utf8_lossy(&server.join().unwrap()).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "200\nhello", "status + zero-copy body view");
+    assert!(req.starts_with("GET /path HTTP/1.1\r\n"), "request line: {req:?}");
+    assert!(req.contains(&format!("Host: 127.0.0.1:{port}\r\n")), "auto Host header: {req:?}");
+}
+
+/// P2: a 404 is a valid `Ok(response)` with status 404 — NOT an `Err`. The program branches on the
+/// status and exits 0.
+#[test]
+fn client_get_404_is_ok_not_err() {
+    if !backend_available() {
+        return;
+    }
+    let (port, server) = spawn_http_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec());
+    let prog = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"get\")
+  c.flag_str(\"url\", \"\")
+  p := c.parse(args)?
+  cl := http.client()
+  resp := cl.get(p.get_str(\"url\"))?
+  print(resp.status())
+  return Ok(())
+}
+";
+    let url = format!("http://127.0.0.1:{port}/missing");
+    let out = build_and_run_args("m11-http-get-404", prog, &["--url", &url]);
+    let _ = server.join();
+    assert_eq!(out.status.code(), Some(0), "a 404 is Ok, not an error (P2); stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "404\n");
+}
+
+/// `cl.post()` sends the body with an auto `Content-Length`; the server receives exactly those bytes.
+#[test]
+fn client_post_sends_content_length_and_body() {
+    if !backend_available() {
+        return;
+    }
+    let (port, server) = spawn_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
+    let prog = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"post\")
+  c.flag_str(\"url\", \"\")
+  p := c.parse(args)?
+  cl := http.client()
+  resp := cl.post(p.get_str(\"url\"), \"payload\")?
+  print(resp.status())
+  return Ok(())
+}
+";
+    let url = format!("http://127.0.0.1:{port}/submit");
+    let out = build_and_run_args("m11-http-post", prog, &["--url", &url]);
+    let req = String::from_utf8_lossy(&server.join().unwrap()).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "200\n");
+    assert!(req.starts_with("POST /submit HTTP/1.1\r\n"), "request line: {req:?}");
+    assert!(req.contains("Content-Length: 7\r\n"), "auto Content-Length: {req:?}");
+    assert!(req.ends_with("\r\npayload"), "body sent: {req:?}");
+}
+
+/// P1: a `https://` URL is `Error.Invalid` (never a silent plaintext downgrade) — the `?` propagates,
+/// so `main` exits non-zero. No server is contacted (rejected before connect).
+#[test]
+fn client_https_url_is_error() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  cl := http.client()
+  resp := cl.get(\"https://example.com/\")?
+  print(resp.status())
+  return Ok(())
+}
+";
+    let out = build_and_run("m11-http-https", prog);
+    assert!(!out.status.success(), "an https:// URL must be an error, never a plaintext downgrade (P1)");
+}
+
+/// A malformed URL (no scheme / no host) is `Error.Invalid` at request time; the `?` propagates.
+#[test]
+fn client_malformed_url_is_error() {
+    if !backend_available() {
+        return;
+    }
+    let prog = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  cl := http.client()
+  resp := cl.get(\"not-a-url\")?
+  print(resp.status())
+  return Ok(())
+}
+";
+    let out = build_and_run("m11-http-badurl", prog);
+    assert!(!out.status.success(), "a malformed URL must be an error");
+}
+
+/// `cl.request(req)` consumes the Move `http request`: using `req` afterwards is a compile error.
+#[test]
+fn client_request_consumes_request_use_after_move_rejected() {
+    let src = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  cl := http.client()
+  req := http.request(\"POST\", \"http://127.0.0.1/\")
+  resp := cl.request(req)?
+  req.header(\"X-After\", \"1\")
+  return Ok(())
+}
+";
+    assert!(check_errs("m11-http-req-uam", src), "using a moved-out http request after cl.request(req) must be rejected");
+}
+
+/// P4: an `http client` is an owned Move handle — an unbound temporary (`http.client().get(...)`) is
+/// not dropped yet, so it cannot be a method receiver in v1. Bind it first.
+#[test]
+fn client_unbound_temporary_receiver_rejected() {
+    let src = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  resp := http.client().get(\"http://127.0.0.1/\")?
+  return Ok(())
+}
+";
+    assert!(check_errs("m11-http-client-unbound", src), "a method on an unbound client temporary must be rejected (bind first)");
+}
+
+/// A `client` is an owned handle bound to one local — it cannot be collected into an array (a copied
+/// client would double-free), rejected at construction like the request / response / net handles.
+#[test]
+fn client_rejected_as_array_element() {
+    let src = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  xs := [http.client(), http.client()]
+  print(xs.len())
+  return Ok(())
+}
+";
+    assert!(check_errs("m11-http-client-array", src), "an http client cannot be an array element");
+}
+
+/// `http.client()` requires `import std.http`.
+#[test]
+fn client_requires_import() {
+    let src = "\
+pub fn main() -> Result<(), Error> {
+  cl := http.client()
+  return Ok(())
+}
+";
+    assert!(check_errs("m11-http-client-noimport", src), "http.client without import std.http must be rejected");
+}
+
+/// P3 (#297), via the client path: a `resp.body()` view from `cl.get()` cannot escape the response's
+/// `Drop` — returning it out of the frame is a use-after-free (the same region rule as the Slice-1
+/// `http.parse` path, exercised through the client).
+#[test]
+fn client_response_body_view_cannot_escape() {
+    let src = "\
+import std.http
+fn steal(fallback: slice<u8>) -> slice<u8> {
+  cl := http.client()
+  match cl.get(\"http://127.0.0.1/\") {
+    Ok(resp) => resp.body(),
+    Err(e) => fallback,
+  }
+}
+pub fn main() -> i32 {
+  return 0
+}
+";
+    let d = check_diagnostics("m11-http-client-body-escape", src);
+    assert!(d.contains("cannot return a slice that views a local"), "a client response body view must not escape:\n{d}");
 }
