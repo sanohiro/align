@@ -5,15 +5,15 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-08 (M11 std.http Slice 2 — the plaintext client — DONE on branch
-`m11-http-slice2-client`, not yet PR'd; Slice 1 was #391. Same week: std.crypto COMPLETE #383–#388,
-std.compress COMPLETE #380–#382; 2026-07-06: std.process #376–#378, std.net #371–#374)._
+_Last updated: 2026-07-08 (M11 std.http Slice 2 — the plaintext client — MERGED as #392;
+Slice 1 was #391. Same week: std.crypto COMPLETE #383–#388, std.compress COMPLETE #380–#382;
+2026-07-06: std.process #376–#378, std.net #371–#374)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #384–#388
-(std.crypto slices 1–5), plus this docs PR. `cargo test --workspace` ≈ **1559 green**; clippy
-clean at `-D warnings`.
+**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #391 (std.http
+Slice 1) + #392 (std.http Slice 2). `cargo test --workspace` = **1601 green**; clippy clean at
+`-D warnings`.
 
 **M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), `std.compress`
 (#380–#381), and `std.crypto` (#383–#388) are DONE.** Full shipped-feature summaries + per-slice
@@ -30,7 +30,7 @@ wide `Rvalue` payloads (the Slice-3 frame regression, root-caused and measured);
 dangling-ptr+len-0 FFI convention is deliberate and formally defended (#387 gemini rejection).
 The expr-depth cap (128) vs full-pipeline stack ceiling (~40) gap is recorded as a new Open item.
 
-**`std.http` — the LAST M11 module — Slice 1 DONE (branch `m11-http-slice1-parse`).** Request/
+**`std.http` — the LAST M11 module — Slice 1 DONE (merged as #391).** Request/
 response Move types + HTTP/1.1 serialize/parse, NO sockets. Full details + the eight key decisions
 in the roadmap's std.http entry. Headlines: two Move types (`Ty::HttpRequest`/`HttpResponse` +
 `Scalar::HttpResponse`, full twin-mirror sweep); `http.request`/`r.header`/`r.body`/`http.parse`/
@@ -54,7 +54,7 @@ authority/path have no CR/LF/NUL/SP (permanent-codec smuggling guard). (3) parse
 conflicting duplicate Content-Length (RFC 7230 §3.3.3). `cargo test --workspace` 1584 green,
 expr_depth 5/5 default env, clippy clean.
 
-**`std.http` — Slice 2 DONE (branch `m11-http-slice2-client`; not yet PR'd — orchestrator gates first).**
+**`std.http` — Slice 2 DONE (merged as #392).**
 The plaintext HTTP/1.1 client: one new Move type `Ty::HttpClient` (a ZST in v1 — no `Scalar`, never
 rides an aggregate; full twin-mirror Gate-1 sweep). Surface behind `import std.http`, all **Impure**:
 `http.client()`, `cl.get(url)` / `cl.post(url, body)` / `cl.request(req)` → `Result<response, Error>`
@@ -75,6 +75,20 @@ expr_depth **5/5 default env**, clippy `-D warnings` clean. **Next: Slice 3** (c
 keepalive reuse — R3; the measured 1.48× floor). **The owner explicitly wants http FAST** — http.md's
 R1–R6 are requirements; R6 benchmark-gating (`bench/http_client` vs a Rust baseline) still owed.
 Slices 4–5 (server primitive, HTTPS/TLS) after.
+
+**std.http Slice 2 process note (2026-07-08):** the slice-flow ran clean again. Adversarial gate:
+**no code defects** (Gate-1 twin-mirror verified complete incl. the correct omissions; fd-close
+proven on every error path); its three findings were docs-only and recorded on-branch — (1) no
+read/connect timeout (inherited from the net rail's documented no-timeout behavior; now an explicit
+"Known v1 limitations" section in http.md, follow-up tied to Slice 3), (2) `https://` maps to the
+bare message-less `Error.Invalid` (P1 security intent met, "clear message" recorded as a v1 limit),
+(3) R6 not yet satisfied — made explicit it gates *module* completion, bench lands with Slice 3.
+gemini on #392: 1 high + 2 mediums; the high (`_request` leaked its moved-in `req` on the
+defensive `out`-null early return) and one medium (multi-colon unbracketed authority parsed as
+garbage host instead of rejecting — also closed the adversarial pass's bare-`::1` note) were
+verified real and APPLIED; the other medium (`conn.is_null()` after `tcp_connect` returns 0) was
+REJECTED with a written PR reason — the invariant (0 returned only after `*out = Box::into_raw`)
+re-verified at the source, same provably-dead-guard class as the #364/#387 rejections.
 
 **std.crypto process note (2026-07-07):** the slice-flow ran five more times, clean. Adversarial
 gates: zero findings on all five slices (they also machine-code-verified the CT and cleanse
