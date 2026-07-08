@@ -51,6 +51,8 @@
 (defun align-fmt ()
   "Format the current align file."
   (interactive)
+  (when (buffer-modified-p)
+    (save-buffer))
   (let* ((proj-root (locate-dominating-file default-directory "Cargo.toml"))
          (cargo-cmd (if proj-root 
                         (format "cargo run -q --manifest-path %sCargo.toml --bin alignc -- fmt " proj-root)

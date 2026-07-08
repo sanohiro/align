@@ -7,7 +7,7 @@ User {
 }
 
 fn process_users(users: slice<User>) -> f32 {
-  // 補完テスト: users. と打ってみる、もしくは where などの組み込み関数を試す
+  // Completion test: try typing `users.` or test built-in functions like `where`
   total := users
     .where(.active)
     .score
@@ -20,10 +20,10 @@ fn main() -> i32 {
   u1 := User { id: 1, active: true, score: 10.5 }
   u2 := User { id: 2, active: false, score: 20.0 }
 
-  // エラーテスト: わざと未定義の変数を使ってみる（Lintでキャッチされるか確認）
+  // Error test: intentionally use an undefined variable (check if Lint catches it)
   // x := unknown_variable
 
-  // フォーマットテスト: わざとインデントを崩してみる
+  // Format test: intentionally mess up indentation
   result := process_users([u1, u2])
 
   return 0
