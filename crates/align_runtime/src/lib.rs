@@ -9262,7 +9262,10 @@ fn http_split_authority(authority: &str) -> Option<(String, i64)> {
         match authority.rfind(':') {
             Some(i) => {
                 let host = &authority[..i];
-                if host.is_empty() {
+                // An unbracketed host must not itself contain a colon: RFC 3986 requires the only
+                // colon-bearing host — an IPv6 literal — to be bracketed (`[::1]`). So a second colon
+                // here (`example.com:80:80`, or a bare `::1`) is malformed, not a `host:port` split.
+                if host.is_empty() || host.contains(':') {
                     return None;
                 }
                 Some((host.to_string(), parse_port(&authority[i..])?))
@@ -9466,15 +9469,17 @@ pub unsafe extern "C" fn align_rt_http_client_request(
     req: *mut HttpRequest,
     out: *mut *mut HttpResponse,
 ) -> i32 {
+    // Take ownership of the moved-in request FIRST, so EVERY early return still frees it: the
+    // language nulled the caller's `req` slot on the move, so nobody else will (a leak otherwise —
+    // even on the defensive `out`-null / null-`req` paths).
+    let owned = if req.is_null() { None } else { Some(unsafe { Box::from_raw(req) }) };
     if out.is_null() {
-        return AL_INVALID;
+        return AL_INVALID; // `owned` drops here → the moved-in request is freed, not leaked
     }
     unsafe { *out = core::ptr::null_mut() };
-    if req.is_null() {
-        return AL_INVALID;
-    }
-    // Take ownership of the moved-in request (freed at the end of this scope).
-    let owned = unsafe { Box::from_raw(req) };
+    let Some(owned) = owned else {
+        return AL_INVALID; // a null request handle
+    };
     unsafe { http_client_perform(client, &owned, out) }
 }
 
@@ -13848,6 +13853,11 @@ mod tests {
         assert_eq!(http_split_authority("h:99999"), None); // out of range
         assert_eq!(http_split_authority("h:abc"), None); // non-numeric
         assert_eq!(http_split_authority("[::1]"), Some(("::1".to_string(), 80)));
+        // A multi-colon UNBRACKETED authority is malformed (RFC 3986 — a colon-bearing host must be
+        // bracketed): reject, never split at the last colon into a garbage host.
+        assert_eq!(http_split_authority("example.com:80:80"), None); // second colon, no brackets
+        assert_eq!(http_split_authority("::1"), None); // bare (unbracketed) IPv6 literal
+        assert_eq!(http_split_authority("::1:8080"), None);
     }
 
     /// A one-shot loopback HTTP server: accept ONE connection, read the whole request (head + any
@@ -14015,6 +14025,14 @@ mod tests {
         let mut out: *mut HttpResponse = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_http_client_request(c2, std::ptr::null_mut(), &mut out) }, AL_INVALID);
         assert!(out.is_null());
+        // A valid moved-in request with a NULL out slot must still FREE the request (it was moved in —
+        // nobody else frees it), not leak. We can't observe a leak in a plain test, but this exercises
+        // the ownership-taken-before-out-check path with no double-free / crash (miri would catch a
+        // leak or use-after-free here).
+        let (mp, ml) = http_s("GET");
+        let (up, ul) = http_s("http://127.0.0.1:1/");
+        let req = unsafe { align_rt_http_request_new(mp, ml, up, ul) };
+        assert_eq!(unsafe { align_rt_http_client_request(c2, req, std::ptr::null_mut()) }, AL_INVALID);
         unsafe { align_rt_http_client_free(c2) };
     }
 }
