@@ -1,0 +1,8 @@
+--langdef=align
+--langmap=align:.align
+--kinddef-align=f,function,functions
+--kinddef-align=s,struct,structs
+--kinddef-align=m,module,modules
+--regex-align=/^[ \t]*fn[ \t]+([a-zA-Z0-9_]+)/\1/f/
+--regex-align=/^[ \t]*([a-zA-Z0-9_]+)[ \t]*\{/\1/s/
+--regex-align=/^[ \t]*module[ \t]+([a-zA-Z0-9_]+)/\1/m/

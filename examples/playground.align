@@ -1,0 +1,30 @@
+module playground
+
+User {
+  id: i64,
+  active: bool,
+  score: f32,
+}
+
+fn process_users(users: slice<User>) -> f32 {
+  // 補完テスト: users. と打ってみる、もしくは where などの組み込み関数を試す
+  total := users
+    .where(.active)
+    .score
+    .sum()
+
+  return total
+}
+
+fn main() -> i32 {
+  u1 := User { id: 1, active: true, score: 10.5 }
+  u2 := User { id: 2, active: false, score: 20.0 }
+
+  // エラーテスト: わざと未定義の変数を使ってみる（Lintでキャッチされるか確認）
+  // x := unknown_variable
+
+  // フォーマットテスト: わざとインデントを崩してみる
+  result := process_users([u1, u2])
+
+  return 0
+}

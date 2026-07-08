@@ -1,0 +1,47 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Align: Check (Lint)",
+            "type": "shell",
+            "command": "cargo run -q --bin alignc -- check ${file}",
+            "group": "build",
+            "problemMatcher": {
+                "owner": "align",
+                "fileLocation": ["relative", "${workspaceFolder}"],
+                "pattern": {
+                    "regexp": "^(.*?):(\\d+):(\\d+):\\s+(error|warning):\\s+(.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            }
+        },
+        {
+            "label": "Align: Format Current File",
+            "type": "shell",
+            "command": "cargo run -q --bin alignc -- fmt ${file} --write",
+            "problemMatcher": [],
+            "presentation": { "reveal": "never" }
+        },
+        {
+            "label": "Align: Run",
+            "type": "shell",
+            "command": "cargo run -q --bin alignc -- run ${file}",
+            "problemMatcher": {
+                "owner": "align",
+                "fileLocation": ["relative", "${workspaceFolder}"],
+                "pattern": {
+                    "regexp": "^(.*?):(\\d+):(\\d+):\\s+(error|warning):\\s+(.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            }
+        }
+    ]
+}
