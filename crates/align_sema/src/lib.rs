@@ -5528,6 +5528,47 @@ impl<'a, 't> Checker<'a, 't> {
             .map(|(_, id)| *id)
     }
 
+    /// The no-shadowing rule (`draft.md` §4 Variables; `open-questions.md` Settled 2026-07-09): a
+    /// name binds **once** per scope chain. Emit an error at `span` if declaring `name` would shadow
+    /// a binding that is already visible — a local/parameter below `floor` in the current scope, an
+    /// enclosing (capturable) binding when inside a lambda body, or a top-level constant of the
+    /// current module. `floor` is normally the full current scope length (so a same-scope re-`:=` or
+    /// a duplicate parameter is caught); a `match` arm passes its pre-arm length so intra-pattern
+    /// duplicates (`Rect(w, w)`) stay owned by the pattern's own duplicate-binding check. Disjoint
+    /// sibling blocks reuse a name freely because each is truncated out of `scope` on exit, so a
+    /// sibling's binding is never visible here. `_` (discard) never shadows.
+    ///
+    /// Every user-named binding site must call this before [`Checker::declare`]; synthetic names
+    /// (the `_drop{i}` tuple-drop placeholders, error-recovery declares) skip it deliberately.
+    fn check_shadow(&mut self, name: &str, span: Span, floor: usize) {
+        if name == "_" {
+            return;
+        }
+        let floor = floor.min(self.scope.len());
+        let in_scope = self.scope[..floor].iter().any(|(n, _)| n == name);
+        // Lambda captures are single-level today (`enclosing` is a snapshot of the immediate
+        // enclosing scope only; a nested lambda does not chain into its grandparent's capture),
+        // so checking just this one snapshot is exactly as deep as name visibility reaches. If
+        // transitive/multi-level capture is ever implemented, this must walk the enclosing chain
+        // transitively, or shadowing through a grandparent scope becomes silently accepted.
+        let in_enclosing = || {
+            self.capture
+                .as_ref()
+                .is_some_and(|c| c.enclosing.iter().any(|(n, _, _)| n == name))
+        };
+        let is_const = || {
+            matches!(self.consts.resolve(&self.cur_module, name, &self.cur_module), Ok(Some(_)))
+        };
+        if in_scope || in_enclosing() || is_const() {
+            self.diags.error(
+                format!(
+                    "`{name}` is already bound in this scope chain; a name binds once (no shadowing) — use `mut` for a value that changes, or a new name"
+                ),
+                span,
+            );
+        }
+    }
+
     /// Resolve a name to a local, capturing an enclosing local if we are in a lambda body. A miss
     /// in the lambda's own scope that resolves to an enclosing local becomes a capture: a synthetic
     /// value parameter of the lifted function (reused on repeat references). The captured local's
@@ -5656,6 +5697,7 @@ impl<'a, 't> Checker<'a, 't> {
                     p.ty.span(),
                 );
             }
+            self.check_shadow(&p.name.name, p.name.span, self.scope.len());
             let id = self.declare(&p.name.name, ty, p.is_out);
             self.locals[id as usize].is_param = true;
             params.push(id);
@@ -5718,6 +5760,7 @@ impl<'a, 't> Checker<'a, 't> {
                         },
                     };
                     let local_ty = ann.unwrap_or(init.ty);
+                    self.check_shadow(&name.name, name.span, self.scope.len());
                     let local = self.declare(&name.name, local_ty, *is_mut);
                     // An `align(N) data := [...]` over-alignment prefix: restricted to a scalar
                     // fixed-array binding (the aligned-vector-load enabler). `N` is already a
@@ -5769,6 +5812,7 @@ impl<'a, 't> Checker<'a, 't> {
                             let ety = elem_tys.get(i).copied().unwrap_or(Ty::Error);
                             match n {
                                 Some(name) => {
+                                    self.check_shadow(&name.name, name.span, self.scope.len());
                                     locals.push(Some(self.declare(&name.name, ety, false)));
                                 }
                                 // An *ignored* (`_`) owned element must still be dropped, not leaked:
@@ -9013,8 +9057,16 @@ impl<'a, 't> Checker<'a, 't> {
         self.task_group_depth = 0;
         self.capture = Some(CaptureScope { enclosing, captured: Vec::new() });
 
-        let mut param_ids: Vec<LocalId> =
-            params.iter().zip(&param_tys).map(|(p, ty)| self.declare(&p.name.name, *ty, false)).collect();
+        let mut param_ids: Vec<LocalId> = params
+            .iter()
+            .zip(&param_tys)
+            .map(|(p, ty)| {
+                // A lambda parameter shadows if it collides with another parameter of this lambda or
+                // with an enclosing (capturable) binding of the surrounding function.
+                self.check_shadow(&p.name.name, p.name.span, self.scope.len());
+                self.declare(&p.name.name, *ty, false)
+            })
+            .collect();
         let checked = self.check_block(body, expected_ret);
         let ret = match expected_ret {
             Some(t) => t,
@@ -13559,6 +13611,11 @@ impl<'a, 't> Checker<'a, 't> {
                         .map(|(i, b)| {
                             if !seen_bindings.insert(&b.name) {
                                 self.diags.error(format!("duplicate binding '{}' in pattern", b.name), b.span);
+                            } else {
+                                // A pattern binding that shadows an outer binding/parameter is an
+                                // error; the pre-arm `scope_mark` floor excludes this arm's own
+                                // bindings (intra-pattern dupes are the branch above).
+                                self.check_shadow(&b.name, b.span, scope_mark);
                             }
                             let ty = payload.get(i).map(|&s| scalar_to_ty(s)).unwrap_or(Ty::Error);
                             self.declare(&b.name, ty, false)
