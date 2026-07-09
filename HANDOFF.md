@@ -40,12 +40,13 @@ call sites needed fixing; single-level-capture coupling invariant documented in 
 "locals may share a top-level fn name" recorded as a new Open item. Both adversarially gate-
 reviewed (zero CONFIRMED findings), mutation-checked, gemini reflected (#396 zero findings; #397's
 one medium — eager lookups in `check_shadow` — verified and applied). `cargo test --workspace`
-**1628 green**; clippy clean at `-D warnings`. **Next, pick one (nothing below is started):**
-(a) **std.http Slice 3** (pool/keepalive — R3 — plus the R6 `bench/http_client` harness; see the
-Slice-2 entry below) — the standing M11 plan; or (b) the remaining **2026-07-09 owed
-implementation deltas**: the `loop` slice, the lexer escape-set gaps, `Ord(str)` + `else`-on-
-`Result` implementation, then the align-LLM runway A-list (`fs.read_bytes_view` + bytes binary
-decode/encode first).
+**1628 green**; clippy clean at `-D warnings`. **Next, pick one:**
+(a) **std.http Slice 4** (the server primitive `serve`/`accept`, caller writes the response), then
+Slice 5 (HTTPS/TLS) and `get_many` (R5) — the standing M11 plan (**Slice 3 pool/keepalive + the R6
+`bench/http_client` harness is now DONE on branch `http-slice3-pool`, not yet PR'd — see the std.http
+Slice 3 paragraph below**); or (b) the remaining **2026-07-09 owed implementation deltas**: the `loop`
+slice, the lexer escape-set gaps, `Ord(str)` + `else`-on-`Result` implementation, then the align-LLM
+runway A-list (`fs.read_bytes_view` + bytes binary decode/encode first).
 
 **Design settled 2026-07-09: the `loop` expression** (docs-only, no code). One narrow sequential-control construct — `loop { ... break value }`, an expression; no `for`/`while`/`continue`/labels; recursion is explicitly not iteration (the spec now guarantees no TCO — scope-end drops and `?` kill tail position). The pipeline owns the data path; `loop` owns the control path. Updated: `draft.md` §4 "Loop" + §7, `language-spec.md`, `design-notes.md` → "The loop philosophy", `history.md`, `open-questions.md` (Settled → "Sequential control"), guide ch00/02/06/13/17, little-aligner ch11 **rewritten** as `11-do-it-until.md` (it taught recursion-as-iteration and overclaimed TCO), + `ja/` mirrors. Implementation is an unscheduled future slice (lexer/parser `loop`/`break`, break-type unification like match arms, per-iteration drops, block-value escape rule); the deferred M8 frequency lints gain their firing surface when it lands.
 
@@ -115,6 +116,32 @@ across cli/net/crypto view-escape suites. (2) serialize now validates method = R
 authority/path have no CR/LF/NUL/SP (permanent-codec smuggling guard). (3) parse rejects a
 conflicting duplicate Content-Length (RFC 7230 §3.3.3). `cargo test --workspace` 1584 green,
 expr_depth 5/5 default env, clippy clean.
+
+**`std.http` — Slice 3 DONE (keepalive connection pool + R6 benchmark; branch `http-slice3-pool`, not
+yet PR'd).** `Ty::HttpClient` goes from a ZST to a real Move type owning a keepalive pool
+(`Mutex<HashMap<(host,port), Vec<IdleConn>>>`) — and this was a **pure runtime change**: the compiler
+already treats `HttpClient` as an opaque handle pointer (codegen emits a pointer; Drop already calls
+`align_rt_http_client_free`), so ZST→state is invisible to sema/MIR/codegen (the Slice-2 "ZST behind
+the same FFI" design paid off — zero compiler edits). **R3 reuse by default:** consecutive
+`get`/`post`/`request` to the same `(host,port)` reuse a live idle conn, zero opt-in, surface + FFI
+unchanged. **Reuse verdict (correctness-critical — a dirty conn reused misframes the next response):**
+pool a finished conn IFF keep-alive (HTTP/1.1 default; `Connection: close`/non-1.1 → no, via
+`http_head_keep_alive`) AND Content-Length-framed (read-to-close → no) AND no leftover bytes beyond the
+framed message. **Stale-conn retry:** a reused idle conn the server dropped fails before any response
+byte → retried once on a fresh conn (idle-close race, request never processed); a fresh conn's failure
+or a mid-response failure surfaces directly. **SIGPIPE:** client writes use `send(MSG_NOSIGNAL)`
+(Linux) / `SO_NOSIGPIPE` (macOS) so writing a dropped conn returns `EPIPE` (→ retry), never kills the
+process (no global handler). **Drop closes all pooled conns (P5).** **Bounds:** ≤ 8 idle/host;
+idle-expiry reaps conns idle > 90 s on take. **I/O timeouts stay deferred** (ideal-form call: connect
+timeout belongs to the net-rail non-blocking substrate; read timeout has no v1 config surface without
+expanding frozen signatures — the pool's idle-expiry ≠ an I/O deadline; recorded in http.md "Known v1
+limitations"). **R6 MET:** `bench/http_client/` (drives the shipped pool's C-ABI vs a plain-Rust
+`std::net` baseline over a localhost server) records **2.86× keepalive speedup** (floor 1.48×) and
+**parity with hand-written Rust** on the reuse path. Tests: `align_runtime` units (reuse across 3 gets;
+`Connection: close` not pooled; stale-conn retry; `http_head_keep_alive` table) + a driver test (2 gets
+reuse 1 conn, via the server's accept count). `cargo test --workspace` green; clippy `-D warnings`
+clean. **Next: Slice 4** (server primitive `serve`/`accept`), then Slice 5 (HTTPS/TLS). `get_many`
+(R5) also remains.
 
 **`std.http` — Slice 2 DONE (merged as #392).**
 The plaintext HTTP/1.1 client: one new Move type `Ty::HttpClient` (a ZST in v1 — no `Scalar`, never
