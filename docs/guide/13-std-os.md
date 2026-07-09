@@ -45,16 +45,17 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 ## Streams: `reader`, `writer`, `buffer`
 
-The streaming tier, for data bigger than memory:
+The streaming tier, for data bigger than memory. The shape is the `loop` expression from chapter [02](02-language-basics.md) (**implementation in progress** — today this pump lives inside `io.copy` below):
 
 ```align
 import std.fs
 
 fn pump(r: reader, w: writer, buf: buffer) -> Result<(), Error> {
-    n := r.read(buf)?               // fill buf to capacity; 0 = EOF
-    if n == 0 { return Ok(()) }
-    w.write(buf.bytes())?
-    return pump(r, w, buf)          // tail call — the loop
+    loop {
+        n := r.read(buf)?           // fill buf to capacity; 0 = EOF
+        if n == 0 { break Ok(()) }  // break carries the loop's value out
+        w.write(buf.bytes())?
+    }
 }
 
 pub fn main(args: array<str>) -> Result<(), Error> {

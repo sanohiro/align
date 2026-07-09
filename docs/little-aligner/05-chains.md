@@ -106,7 +106,7 @@ src.map(dbl).map_into(dst)
 
 **Q11.** The habit, then. You are about to write a loop. What do you ask first?
 
-**A11.** *"What is the transformation?"* Then you write it as stages: change-each → keep-some → collapse. If you cannot name the stages, chapter 11 (recursion) is waiting — but ask the question first, every time.
+**A11.** *"What is the transformation?"* Then you write it as stages: change-each → keep-some → collapse. If you cannot name the stages, chapter 11 (`loop`) is waiting — but ask the question first, every time.
 
 ---
 

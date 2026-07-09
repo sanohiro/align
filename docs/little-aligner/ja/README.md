@@ -24,6 +24,6 @@
 8. [Whose Is It?](08-whose-is-it.md) — Copy、Move、arena、そして `.clone()`
 9. [Turn It Sideways](09-turn-it-sideways.md) — `soa`: 列としてのデータ
 10. [Count Me by Name](10-count-me-by-name.md) — `group_by`、`agg`、`dict_encode`
-11. [There Is No Loop](11-there-is-no-loop.md) — 再帰、pipeline で言い表せないとき
+11. [Do It Until](11-do-it-until.md) — `loop` 式、pipeline で言い表せないとき
 
-ここにあるものはすべて、いまの `alignc` で動きます。では、召し上がれ。
+ここにあるものはすべて、いまの `alignc` で動きます(11章の `loop` を除く。これは設計済みですがまだ実装中で、その旨は該当箇所に書いてあります)。では、召し上がれ。

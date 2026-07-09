@@ -45,16 +45,17 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 ## ストリーム: `reader`、`writer`、`buffer`
 
-メモリより大きなデータのためのストリーミング階層です。
+メモリより大きなデータのためのストリーミング階層です。その形は、第 [02](02-language-basics.md) 章の `loop` 式です(**implementation in progress** — 現時点では、このポンプ処理は下の `io.copy` の中に収められています)。
 
 ```align
 import std.fs
 
 fn pump(r: reader, w: writer, buf: buffer) -> Result<(), Error> {
-    n := r.read(buf)?               // fill buf to capacity; 0 = EOF
-    if n == 0 { return Ok(()) }
-    w.write(buf.bytes())?
-    return pump(r, w, buf)          // tail call — the loop
+    loop {
+        n := r.read(buf)?           // fill buf to capacity; 0 = EOF
+        if n == 0 { break Ok(()) }  // break carries the loop's value out
+        w.write(buf.bytes())?
+    }
 }
 
 pub fn main(args: array<str>) -> Result<(), Error> {

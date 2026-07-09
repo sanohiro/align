@@ -24,6 +24,6 @@ Some answers are one word. Some questions look identical to the one before — t
 8. [Whose Is It?](08-whose-is-it.md) — Copy, Move, arenas, and `.clone()`
 9. [Turn It Sideways](09-turn-it-sideways.md) — `soa`: data as columns
 10. [Count Me by Name](10-count-me-by-name.md) — `group_by`, `agg`, `dict_encode`
-11. [There Is No Loop](11-there-is-no-loop.md) — recursion, when a pipeline can't say it
+11. [Do It Until](11-do-it-until.md) — the `loop` expression, when a pipeline can't say it
 
-Everything here runs with today's `alignc`. Bon appétit.
+Everything here runs with today's `alignc` (except chapter 11's `loop`, which is designed but still being built — it says so there). Bon appétit.

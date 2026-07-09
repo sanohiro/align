@@ -971,7 +971,9 @@ false-positive: unhandled-`Result` (#138), huge-struct-copy (#234), lossy-cast +
 wasteful-default-element (#313), unnecessary-heap narrow form (#323). **Not blockers, tracked as
 post-M8 backlog** (own section below): the frequency-dependent lints (allocation-in-loop, the
 broader unnecessary-clone/unnecessary-heap forms, branch-in-hot-loop, string re-scan, implicit
-copy), `prefer-pipeline-over-vecN` (no firing surface — Align has no loop construct to convert),
+copy), `prefer-pipeline-over-vecN` (no firing surface — Align has no loop construct to convert) (Update
+2026-07-09: a `loop` expression is now design-settled — `open-questions.md` Settled → "Sequential
+control" — so this lint gains its firing surface once `loop` is implemented.),
 and the hot/cold field-split suggestion (needs heuristic design).
 
 - the official formatter (mandatory, `draft.md` §16). — **DONE** (`alignc fmt`, the `align_fmt`
@@ -1027,7 +1029,9 @@ and the hot/cold field-split suggestion (needs heuristic design).
     `vecN<T>` expression (`a + b` over `vec4<i32>`) is the *correct* hand-tuned-kernel use, not a
     convert-to-pipeline candidate. So there is no mechanical "hand-written vecN loop" form to detect in
     the current language; the firing condition is recorded (with a proposed shape for when a
-    kernel/loop surface exists) in `open-questions.md` under the M8 lint candidates.
+    kernel/loop surface exists) in `open-questions.md` under the M8 lint candidates. (Update
+    2026-07-09: a `loop` expression is now design-settled — `open-questions.md` Settled →
+    "Sequential control" — so this lint gains its firing surface once `loop` is implemented.)
 - `unsafe` blocks and `raw.*`. — **first slice DONE.** `unsafe {}` is a block expression (a plain
   marker block — no region, no runtime effect, strictly simpler than `arena`); the only new mechanism
   is an `unsafe_depth` counter that gates the `raw.*` ops. Shipped: `unsafe {}` + `raw.alloc(size)`
@@ -1100,7 +1104,9 @@ proposals already live in `docs/open-questions.md` → "M8 lint candidates".
 - **`prefer-pipeline-over-vecN`** — no firing surface exists: Align has no loop construct, so the
   lint's target (a hand-written `vecN<T>` loop) cannot be written today; a bare `vecN<T>` expression
   is the correct hand-tuned-kernel use, not a lint candidate. Deferred until a loop/kernel surface
-  exists.
+  exists. (Update 2026-07-09: a `loop` expression is now design-settled — `open-questions.md`
+  Settled → "Sequential control" — so this lint gains its firing surface once `loop` is
+  implemented.)
 - **Hot/cold field-split suggestion** — needs heuristic design (when the mix of scanned vs
   rarely-read fields actually matters) before it can ship without noise; suggestion-only, never an
   automatic layout change (explicit layout is Settled).
@@ -1146,7 +1152,9 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   + one MIR decode (`make_error_from_status`, branchless), shared by `fs.read_file`/`fs.open`/
   `fs.create`/read/write/flush. **Completion condition met:** an Align program byte-exact-copies a
   file through a tail-recursive `read`/`write` loop (`fs.open` → `reader.read(buf)` loop →
-  `fs.create` → `writer.write(buf.bytes())`), plus per-method tests (EOF, `NotFound`/`Denied`
+  `fs.create` → `writer.write(buf.bytes())`; historical shape — this idiom migrates to the `loop`
+  expression once it is implemented, per the 2026-07-09 sequential-control decision), plus
+  per-method tests (EOF, `NotFound`/`Denied`
   mapping, `io.stdin`, moved-reader rejection, buffer-view escape rejection) — `tests/m9_io.rs`.
   Known minor gap (a general MIR limitation, not std.io-specific): an **unbound Move temporary**
   isn't dropped, so a one-shot `io.stdout.write(x)?` leaks its ~40-byte writer handle (bound writers

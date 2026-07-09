@@ -93,23 +93,24 @@ fn main() -> i32 {
 
 Two body forms, nothing else: a block with `return`, or `= expr` for single-expression functions. Parameters are immutable values. Small values are copied; what happens with owning types is chapter [05](05-memory.md).
 
-## There is no loop keyword
+## There is no `for`
 
-Align has no `for`, no `while`. This is not an omission — it is the language's center of gravity. Iteration over data is a **pipeline** (`xs.map(f).where(p).sum()`, chapter [06](06-pipelines.md)), which the compiler fuses into a single vectorizable loop. For the rare genuinely sequential process, use **recursion**:
+Align has no `for` and no `while`. This is not an omission — it is the language's center of gravity. Iteration over data is a **pipeline** (`xs.map(f).where(p).sum()`, chapter [06](06-pipelines.md)), which the compiler fuses into a single vectorizable loop. If you are about to walk a collection by hand, stop: name the transformation instead.
+
+What remains — iteration whose trip count is decided *by the iteration itself*, like reading until EOF or retrying until success — has exactly one construct: the **`loop` expression** (**implementation in progress**). It repeats its block until a `break` runs; `break value` ends the loop with that value, so `loop`, like `if` and `match`, is an expression:
 
 ```align
-fn sum_to(n: i64, acc: i64) -> i64 {
-    if n == 0 { return acc }
-    return sum_to(n - 1, acc + n)   // tail call — compiles to a jump, not a stack frame
-}
-
-fn main() -> i32 {
-    print(sum_to(10, 0))    // 55
-    return 0
+mut total := 0
+n_read := loop {
+    n := r.read(buf)?               // errors still exit the function, as always
+    if n == 0 { break total }       // break is the only loop exit
+    total = total + n
 }
 ```
 
-When you feel the urge to write a loop, first ask what the *transformation* is — nine times out of ten it is a pipeline. The tenth time, write the recursion with an accumulator, as above.
+There is no `continue` and no labeled break — skip-to-next is an `if` around the rest of the body, and a nested loop that wants a two-level exit is a function waiting to be extracted. Loop state lives in `mut` locals declared before the loop.
+
+The division of labor is strict: **the pipeline owns the data path; `loop` owns the control path.** When you feel the urge to write a loop, first ask what the *transformation* is — nine times out of ten it is a pipeline, and walking an array by index inside a `loop` draws a lint. (Recursion exists too, but it is for genuinely recursive problems — parsers, trees — not for iteration: Align guarantees no tail-call optimization, so a recursive "loop" costs stack.)
 
 ## Named constants
 

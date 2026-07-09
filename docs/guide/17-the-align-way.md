@@ -6,7 +6,7 @@ The idioms, collected. Each of these was earned somewhere in the previous sixtee
 
 ## Describe transformations, don't iterate
 
-Reach for `map`/`where`/`reduce` before you even think the word "loop" — there is no loop keyword to reach for anyway. The pipeline fuses to one vectorized pass. Genuinely sequential state is recursion with an accumulator; bulk keyed aggregation is `group_by`. If you're simulating iteration with recursion over an index, you've missed a pipeline.
+Reach for `map`/`where`/`reduce` before you even think the word "loop" — there is no `for` or `while` to reach for anyway. The pipeline fuses to one vectorized pass. Genuinely sequential control — pump to EOF, retry, converge — is the one `loop` expression with a `break value`; bulk keyed aggregation is `group_by`; recursion is for recursive problems (parsers, trees), never for iteration. If you're walking an index inside a `loop`, you've missed a pipeline.
 
 ```align
 total := xs.map(f).where(p).sum()

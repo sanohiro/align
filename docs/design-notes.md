@@ -256,6 +256,53 @@ Purity is inferred, never annotated.
 
 ---
 
+## The loop philosophy
+
+Align has exactly one loop construct, and it is deliberately narrow: `loop { ... break value }`.
+**The pipeline owns the data path; `loop` owns the control path.** Traversing a collection is
+`map` / `where` / `reduce` — that is not a style preference but what lets the compiler see
+*which* data-parallel operation the code is (SIMD, fusion, offload). So `for x in xs` does not
+exist: it would compete with the pipeline for the same territory, split the culture, and hide the
+map/filter/reduce structure the compiler needs. What the pipeline cannot express is iteration
+whose trip count is decided by the iteration itself — read until EOF, retry with backoff, drive a
+protocol, pump a state machine to convergence. That category needs exactly one tool, and `loop`
+is it.
+
+**Why not recursion?** "No loops, use tail recursion" was considered and rejected — not on taste,
+but because guaranteed tail-call optimization structurally conflicts with four load-bearing
+decisions:
+
+1. **Drops and regions kill tail position.** Move types drop at scope end and arenas free at
+   scope end, so any frame holding one cannot tail-call — the cleanup runs *after* the call. This
+   is the same reason Rust rejected implicit TCO. I/O pump loops are exactly the frames that hold
+   Move values (`reader`, `buffer`), so TCO fails precisely where loops are most needed.
+2. **`?` kills tail position.** The one error model makes sequential loops fallible, and
+   `r.read(buf)?` followed by anything is not a tail call. An error model and a recursion-based
+   loop model fight each other.
+3. **Nothing hidden.** Whether a call is in tail position is invisible in source; a one-line
+   refactor silently turns O(1) stack into O(n) and surfaces as a runtime stack overflow. Align
+   does not build hidden failure modes into its basic iteration idiom.
+4. **Compiler- and AI-hostile.** A loop back-edge is the friendliest CFG LLVM can get;
+   reconstructing loops from recursion is the fragile inverse. And accumulator-threaded tail
+   recursion is a known bug source for both humans and models, while `loop` + `mut` state is not.
+   Recursion-as-iteration loses on all four alignment axes at once.
+
+Recursion itself remains legal — a parser or a tree walk is genuinely recursive — but it is for
+recursive *problems*, never a substitute for iteration, and Align guarantees no TCO.
+
+**Why not `while`?** `while cond` is a second loop form that cannot yield a value; `loop` with
+`break value` subsumes it and stays an expression like `if` / `match` / `arena`. **Why no
+`continue` or labels?** Minimality with an exit: skip-to-next is an `if` around the rest of the
+body, and a nested loop needing a two-level exit is a function waiting to be extracted. Both can
+be revisited on real-code evidence; starting without them is the smaller regret.
+
+The boundary is enforced, not hoped for: walking an array by index inside a `loop` draws a
+"write it as a pipeline" lint — the same pattern as the unnecessary-heap and unhandled-`Result`
+lints. `loop` also finally gives the deferred frequency-dependent lints
+(allocation-in-loop, branch-in-hot-loop, `prefer-pipeline-over-vecN`) their firing surface.
+
+---
+
 ## The SIMD philosophy
 
 Align does not try to make developers write SIMD.

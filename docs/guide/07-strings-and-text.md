@@ -26,7 +26,7 @@ The default in signatures is `str`: take views, return views when the data alrea
 
 ## Literals, escapes, bytes
 
-Double quotes, with `\n`, `\t`, `\"` escapes. `char` literals use single quotes (`'A'`, `'あ'`) and hold one Unicode scalar. Strings are UTF-8, and `.len()` is the **byte** length:
+Double quotes, single-line, with `\n` `\t` `\r` `\0` `\\` `\"` and `\u{...}` escapes — an unknown escape is a compile error (`\r` `\0` `\u{...}` and that error are **implementation in progress**; `\n` `\t` `\"` `\\` work today). `char` literals use single quotes (`'A'`, `'あ'`) and hold one Unicode scalar. Strings are UTF-8, and `.len()` is the **byte** length:
 
 ```align
 print("あ".len())    // 3 — UTF-8 bytes, not characters

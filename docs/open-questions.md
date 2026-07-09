@@ -1172,7 +1172,9 @@ Beyond the JSON→SoA / field-skip thrust (which both external reviews converged
 recursion *must* match a Rust loop. Verified: `fn sum_to(n, acc) = if n==0 {acc} else {sum_to(n-1,
 acc+n)}` compiles to a **call-free 14-instruction tight loop** (`run(1e6)` correct) — LLVM converts
 the tail recursion to a loop at O2. So the loop-less design is not a perf liability for tail-recursive
-algorithms.
+algorithms. (Superseded 2026-07-09: sequential control is now the `loop` expression and the spec
+guarantees no TCO — see Settled → "Sequential control"; this audit stays as the record that LLVM
+*did* optimize the old tail-recursive form.)
 
 ### External idea-generation review — Gemini (2026-06-27, UNVERIFIED candidates)
 Gemini was asked for Rust-beating perf/architecture ideas (advanced-model pass). Treated as
@@ -2135,9 +2137,190 @@ run-Drops-then-exit vs. an immediate hard-exit API — both landed: the first as
 
 ---
 
+### Sequential control — the `loop` expression (design SETTLED 2026-07-09; implementation deferred)
+
+**Decision: one narrow `loop` expression; no `for`, no `while`; recursion is not iteration.**
+Surfaced by an external design discussion (Codex) on loop elimination: the spec banned counting
+loops in one parenthetical and said nothing else — sequential control was a design *vacuum*, masked
+because every sequential loop lived inside the Rust runtime (`io.copy`'s pump, the HTTP client's
+read-until-EOF, `getrandom`'s EINTR retry). M11's `net.tcp_conn` made it milestone-real: a user
+protocol client cannot be written in Align source without it.
+
+- **Surface:** `loop { ... }` is an expression; `break expr` yields the loop's value (bare `break`
+  = `()`); breaks unify like `match` arms; a `loop` with no `break` diverges. No `continue`, no
+  labels (an `if` covers skip; a two-level exit is a function waiting to be extracted — both
+  revisitable on real-code evidence). `?`/`return` exit the function, `break` is the only loop
+  exit; `break` cannot cross a lambda boundary. Per-iteration locals drop each pass; a `break`
+  value must not borrow from one (block-value escape rule). Normative text: `draft.md` §4 "Loop".
+- **Boundary:** the pipeline owns the data path; `loop` owns the control path (EOF pumps, retry/
+  backoff, protocol drivers, convergence). Walking an array by index inside a `loop` is a lint
+  ("write it as a pipeline"). `loop` finally gives the deferred frequency-dependent M8 lints
+  (allocation-in-loop, branch-in-hot-loop, `prefer-pipeline-over-vecN`) their firing surface.
+- **Recursion-with-TCO was rejected on structure, not taste** — it conflicts with four settled
+  pillars: scope-end drops/region frees kill tail position (the Rust reason); `?` kills tail
+  position (the one error model makes loops fallible); TCO-or-not is invisible in source (a hidden
+  O(1)→O(n) stack failure mode, against Nothing hidden); and a back-edge CFG is compiler-friendly
+  while loop-reconstruction-from-recursion is the fragile inverse, with accumulator-threading a
+  known human/LLM bug source. Recursion stays legal for recursive *problems* (parsers, trees);
+  **the spec now explicitly guarantees no TCO.** Full rationale: `design-notes.md` → "The loop
+  philosophy".
+- **Docs updated 2026-07-09** (design-first, implementation deferred — no timing pressure, per
+  ideal-form-or-defer): `draft.md` §4/§7, `language-spec.md`, `design-notes.md`, `history.md`,
+  guide ch00/02/06/13/17, little-aligner ch11 (rewritten — it taught recursion-as-iteration and
+  overclaimed TCO), + `ja/` mirrors. Implementation is a future slice (lexer `loop`/`break` +
+  HIR/MIR back-edge + break-type unification + escape/drop wiring); not scheduled inside M11.
+  Implementer notes from the design review: loop-carried `mut` Move state needs drop-on-reassign
+  each iteration (the existing `drop_old` machinery), and a per-iteration owned local carried out
+  by `break` needs path-sensitive move-vs-drop (move on the break edge, drop on the back edge) —
+  both reuse existing mechanisms, neither needs new spec text.
+
+### Spec-vacuum sweep — five settlements (2026-07-09)
+
+**Trigger:** the `loop` decision exposed a failure pattern — the guides teaching semantics the
+authoritative spec never states. A two-track audit (recorded-items inventory + adversarial vacuum
+hunt over `draft.md`) found 12 unrecorded holes. The five that were ripe are settled here
+(normative text landed in `draft.md`); the remainder is recorded under Open → "Unrecorded spec
+vacuums — remainder". Each settlement codifies or refines what is already shipped/taught;
+implementation deltas are noted.
+
+1. **`print` + value display** (`draft.md` §4 "print and Value Display"): primitives only;
+   per-type display contract (floats = shortest round-trip; `bool` = `true`/`false`; strings
+   verbatim); printing an aggregate is a compile error (no magic deep-formatter); the contract is
+   shared with template interpolation; `print` is Impure. Matches the guide and shipped behavior.
+2. **Literals & escapes** (§12 "Literals and Escapes"): string literals single-line; `char` = one
+   Unicode scalar (surrogates rejected); escape set `\n \t \r \0 \\ \" \' \u{...}`; unknown
+   escape = compile error. Shipped today: `\n \t \" \\`; the lexer still owes `\r \0 \u{}` + the
+   explicit single-line / unknown-escape errors.
+3. **Equality = scalars + strings only** (§5 "Equality and Ordering"): no structural `==` on
+   struct/tuple/array/sum — explicit field comparison / `match` / pipeline instead (nothing
+   hidden; the `match`-is-for-variants boundary). **Implementation bug found while settling:**
+   sema lets struct `==` through to codegen, which **panics** (ICE — `align_codegen_llvm`
+   "expected the IntValue variant"). Needs a clean sema diagnostic; priority fix.
+4. **No shadowing** (§4 Variables): a name binds once per scope chain — same-scope re-`:=` and
+   inner-scope shadowing of a visible binding/parameter are compile errors; disjoint sibling
+   blocks may reuse a name. Rationale: rebinding hides a state change (a known human/LLM bug
+   source) and `mut`/a-new-name cover every need. **Implementation currently accepts both
+   silently** — becomes a diagnostic.
+5. **Float semantics = IEEE 754, total, never aborts** (§5 "Float Semantics"): `x/0.0` → `±inf`,
+   `0.0/0.0` → NaN, NaN ≠ everything incl. itself, scalar `frem` unguarded like the vector form;
+   only *integer* division aborts. Same zero-cost/never-blocks-SIMD rationale as wrap-on-overflow.
+   Matches shipped behavior (`1.0/0.0` prints `inf` today).
+
+### `Ord(str)` + `else` on `Result` — SETTLED (2026-07-09, owner-directed follow-up)
+
+Two more settlements from the same session, decided under the owner's re-affirmed criteria: no
+freedom that blocks optimization, no complexity, no soundness breaks; inconvenience is acceptable
+(most code will be AI-written) but the language must stay human-*understandable*.
+
+1. **`str`/`string` join `Ord`** (`draft.md` §5 "Equality and Ordering" + Generics bounds):
+   `<`/`<=`/`>`/`>=` on strings, and string keys in `sort_by_key`, with **byte-lexicographic**
+   order (= Unicode scalar order for valid UTF-8). Deterministic, locale-free, one `memcmp` —
+   dictionary/locale collation is a `pkg` concern, never the operator. Motivation: a
+   data-oriented language must sort by a name column; `Eq(str)` was already byte-based, so this
+   is the consistent completion. Implementation deferred: sema (Ord accepts str) + a runtime
+   string-compare for the sort paths.
+2. **`else` works on `Result`** (`draft.md` §5 Result; guide ch04 rewritten): `v := f() else
+   fallback` yields `Ok`'s value or deliberately discards the error — visible handling, so the
+   unhandled-`Result` error never fires on it; no error binding (needing the error *is* the
+   signal to `match`). Completes the intent triangle **`?` propagates / `else` falls back /
+   `match` inspects**, symmetric for `Option` and `Result`. This **overturns a guide-invented
+   doctrine** ("else is Option-only — don't paper over errors"; the spec was silent — the same
+   vacuum pattern as `loop`): that doctrine conflated *accidental* ignoring (still impossible)
+   with *deliberate* fallback (legitimate; without one visible form, users wrap fallible APIs in
+   `Option` helpers and the culture splits). Implementation deferred: sema accepts `else` on a
+   `Result` scrutinee (drop the discarded `Err` payload when enum Move payloads land).
+
 ## Open (to be decided)
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
+
+### Unrecorded spec vacuums — remainder (recorded 2026-07-09; settle-next priority)
+
+From the same audit as the sweep above. Leans are recorded so the next design session can settle
+fast; "spec-debt" = no decision needed, just transcribe implemented truth into `draft.md`.
+
+- **`assert`** — no user-level defined-abort-with-message exists. Lean: an `assert(cond)` builtin
+  that aborts with source location (same trap class as bounds checks); a test runner is separate
+  (toolchain, M12+).
+- **`str` character access** — byte-first is deliberate, but "get/iterate Unicode scalars" has no
+  answer *and no recorded rejection*. Lean: document as a deliberate omission (bytes + `find` +
+  ranges cover the data path); add a scalar iterator only on concrete evidence.
+- **Operator precedence table** — only the bitwise/shift slice is documented; the full table
+  (unary ops, `as`, postfix `?`, `.`, comparisons vs `&&`/`||`) is spec-debt: transcribe from the
+  parser into §5.
+- **Stack-overflow behavior** — a "no UB" language must say: defined abort or not. Lean: verify
+  the guard-page trap is a clean abort on all supported targets, then spec "aborts".
+- **`main` signature set** — three forms appear in examples; the legal set is never enumerated.
+  Spec-debt: transcribe from sema.
+- **Reserved words + identifier grammar** — no keyword list exists; may a local be named `loop`?
+  Are non-ASCII identifiers legal? Spec-debt from the lexer, plus one decision — lean: ASCII-only
+  identifiers for v1 (AI/tooling-friendly, matches the English-only source policy).
+- **C→Align (reverse FFI)** — general embedding (a C program hosting Align as a library) =
+  **non-goal** (owner decision 2026-07-09): Align is an application language; exporting a stable
+  C surface drags in closure-ABI + runtime-init questions for no aligned use case. The one real
+  use is **callbacks** — passing an Align function to a C API during an Align-initiated FFI call
+  (signal handlers; callback-style C libraries). Deferred with a trigger: a concrete std/pkg
+  consumer that cannot use a stepped/non-callback C API. Ideal shape when triggered: a
+  **top-level non-capturing `fn` only** (a plain function pointer — extern-compatible params, no
+  closure environment, no new mechanism).
+
+### align-LLM runway — std/language items pulled by the inference-engine north star (recorded 2026-07-09)
+
+The owner's align-LLM spec (v0.4, out-of-repo; see Future → "Resource-oriented north star +
+local LLM inference") is the planned killer app: a GGUF-input, tiered-memory (VRAM/DRAM/NVMe),
+PGO-relayout local LLM inference engine, Phases 0–4 of which (GGUF inspect / expert trace
+aggregation / cache simulator / alignpack generation) are pure data-oriented Align programs.
+Working backward from it yields three lists. Items marked *(general)* are ordinary
+fast-systems-programming needs that any Align user hits, not engine-specific.
+
+**A. Build next (the M12 std-wave candidates, lean = build in this order):**
+
+1. **`fs.read_bytes_view`** — a binary mmap view. `read_file_view` UTF-8-validates and returns
+   `str`, so a multi-GB binary file (GGUF) cannot be mmap'd today; same mmap path minus
+   validation, returning an arena-scoped `bytes`. Cheap; unblocks Phase 0. *(general — any
+   binary-file work)*
+2. **Binary decode/encode surface on `bytes`/`buffer`** — bounds-checked, endian-explicit
+   `b.u32_le(off)` / `u64_le` / `f32_le` reads and the matching `buffer` writes
+   (`put_u32_le`, …). Core-adjacent (pure computation); GGUF headers and `alignpack`/`alignidx`
+   emission are the consumers. *(general — any binary format)*
+3. **`loop` implementation slice** — the settled design (Settled → "Sequential control") now has
+   consumer pressure: streaming parses, the gateway server loop, the runtime scheduler. First
+   unimplemented settle to build.
+4. **`std.io` seek/pread/pwrite** (offset-addressed access) — `align-pack` is a
+   read-at-X-write-at-Y relayout tool; sequential readers can't express it. *(general)*
+5. **`std.http` server slice (Slice 4) + streaming (SSE/chunked) response write** — the
+   align-gateway is an OpenAI-compatible SSE-streaming local server; Slice 4's design should be
+   written against that requirement.
+6. **Growable `array<T>`** *(general)* — the missing sibling of `buffer` (which stays
+   byte-specialized per the settled `bytes`/`buffer` design): push/append + freeze to owned
+   `array<T>`. Becomes acute the moment `loop` lands (accumulate-unknown-count is the natural
+   loop output; today only bytes and strings can grow).
+7. **Streaming line/record reads** *(general)* — `read_line`-class chunked record iteration over
+   a reader; multi-GB `expert_trace.jsonl` is the concrete consumer for the already-recorded
+   post-M9 "streaming×pipeline integration" backlog item.
+8. **Arena checkpoint/rollback** *(general)* — already Open (see its entry); the consumer
+   arrived: a long-running server loop resetting its arena per request (gateway, or any server).
+
+**B. Design stances to record now (implement with their consumers):**
+
+- **Async = `task_group` + blocking I/O on worker threads; async/await is NOT adopted.**
+  Overlapped NVMe reads / PCIe copies / compute are expressible as structured concurrency with
+  blocking syscalls on workers — no function coloring (consistent with non-goals'
+  "async-everywhere" exclusion). `io_uring` remains a runtime implementation detail behind
+  `std.io`, never a language surface.
+- **Shared mutable state across tasks — lean: channels (CSP), not user-facing atomics.** The
+  engine's cache/scheduler state is genuinely shared-mutable, outside today's
+  by-value-capture model. A channel is One-Way-compatible (one visible mechanism, Go precedent);
+  raw atomics stay sealed unless channels are measured insufficient.
+
+**C. Explicit non-adoption boundaries (do NOT let the engine pull these into the core):**
+
+- **No `MemoryTier`/pinned/VRAM in the language.** Engine memory tiers are std/pkg **Move
+  handles** (opaque FFI-backed resources — the `std.crypto`-over-OpenSSL pattern applied to VRAM
+  buffers). The language memory model stays value/arena/heap; the killer app is a *consumer* of
+  Align, not a shareholder in its core semantics.
+- **`f16`/`bf16` stay Future.** Dequantization is the borrowed kernel's job (ggml); the engine
+  adds no pressure to pull half-precision arithmetic forward.
 
 ### Expression-depth cap (128) vs the full-pipeline stack ceiling (~40) — M12+
 
@@ -2414,7 +2597,7 @@ one owned element out of a bound tuple, per-field move tracking). What remains i
 `(value, index)` reductions.
 
 ### Arena checkpoint / rollback — std arena API, after MMv2
-A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. The runtime arena already bump-allocates; this exposes a reset-to-mark on top. (Digested from `work/proposals/library-foundations.md` §3; used by the streaming-parse story in `http-optimization.md` §5.)
+A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. The runtime arena already bump-allocates; this exposes a reset-to-mark on top. (Digested from `work/proposals/library-foundations.md` §3; used by the streaming-parse story in `http-optimization.md` §5.) **Consumer arrived 2026-07-09:** a long-running server loop resetting its arena per request — the align-LLM gateway, or any server (see Open → "align-LLM runway", item A8).
 
 ### Build system / package layout
 Visibility (`pub`), import, and module are decided (`impl/02-frontend.md`). What remains is the design of the build system, package layout, and dependency resolution.
@@ -2833,6 +3016,8 @@ individual review entries. None block anything; pick up when the lint suite is a
   hand-tuned-kernel use, not a convert-to-pipeline candidate — flagging it would be a false positive
   against `vecN<T>`'s reason to exist. Any purely-mechanical single-expression trigger would be wrong;
   the heuristic "bulk scan expressed as vecN" is only meaningful once a loop/kernel form exists.
+  (Update 2026-07-09: the `loop` expression is now design-settled — Settled → "Sequential control" —
+  so this lint gains its firing surface once `loop` is implemented.)
   Firing-condition proposal for then: a counted loop over an array whose body is *exactly* {vec-load a
   contiguous chunk → one elementwise arithmetic op → vec-store the chunk}, with no other statements and
   no cross-lane/reduction op — that mechanical shape is a portable `map`; anything richer (shuffles,

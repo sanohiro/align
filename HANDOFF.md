@@ -5,19 +5,59 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-08 (M11 std.http Slice 2 — the plaintext client — MERGED as #392;
+_Last updated: 2026-07-09 (loop design settled — docs-only sweep; previously 2026-07-08 M11 std.http Slice 2 — the plaintext client — MERGED as #392;
 Slice 1 was #391. Same week: std.crypto COMPLETE #383–#388, std.compress COMPLETE #380–#382;
 2026-07-06: std.process #376–#378, std.net #371–#374)._
 
 ## ▶ NEXT SESSION — start here
 
 **Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #391 (std.http
-Slice 1) + #392 (std.http Slice 2). `cargo test --workspace` = **1601 green**; clippy clean at
-`-D warnings`. Housekeeping note: 7 stale local branches remain (`fix-*`/`*group-agg*` from the
-squash-merged Gemini wave #358–#368, and `handoff-http-slice1-inflight`, a pre-#391 stash) —
-squash merges hide them from `--merged`; verify content landed (`git diff main...<br>`) then
-force-delete at leisure. **Next: std.http Slice 3** (pool/keepalive — R3 — plus the R6
-`bench/http_client` harness; see the Slice-2 entry below).
+Slice 1) + #392 (std.http Slice 2); after them a **docs-only design wave committed directly to
+main on 2026-07-09** (see the three 2026-07-09 paragraphs below: `loop` settled, spec-vacuum
+sweep + 7 settlements total, align-LLM runway). **No code changed this session** — `cargo test
+--workspace` should still be **1601 green**; clippy clean at `-D warnings`. Housekeeping note: 7
+stale local branches remain (`fix-*`/`*group-agg*` from the squash-merged Gemini wave #358–#368,
+and `handoff-http-slice1-inflight`, a pre-#391 stash) — squash merges hide them from `--merged`;
+verify content landed (`git diff main...<br>`) then force-delete at leisure. Two stray untracked
+files at root (`examples/double_free.align`, `wait_for_review.sh`) were left untouched — not this
+session's work; triage or gitignore at leisure. **Next, pick one (owner deferred all
+implementation on token budget — nothing below is started):** (a) **std.http Slice 3**
+(pool/keepalive — R3 — plus the R6 `bench/http_client` harness; see the Slice-2 entry below) —
+the standing M11 plan; or (b) the **2026-07-09 owed implementation deltas**, best-first:
+struct-`==` ICE → sema diagnostic (small, priority bugfix), shadowing → compile error, the `loop`
+slice, then the align-LLM runway A-list (`fs.read_bytes_view` + bytes binary decode/encode
+first).
+
+**Design settled 2026-07-09: the `loop` expression** (docs-only, no code). One narrow sequential-control construct — `loop { ... break value }`, an expression; no `for`/`while`/`continue`/labels; recursion is explicitly not iteration (the spec now guarantees no TCO — scope-end drops and `?` kill tail position). The pipeline owns the data path; `loop` owns the control path. Updated: `draft.md` §4 "Loop" + §7, `language-spec.md`, `design-notes.md` → "The loop philosophy", `history.md`, `open-questions.md` (Settled → "Sequential control"), guide ch00/02/06/13/17, little-aligner ch11 **rewritten** as `11-do-it-until.md` (it taught recursion-as-iteration and overclaimed TCO), + `ja/` mirrors. Implementation is an unscheduled future slice (lexer/parser `loop`/`break`, break-type unification like match arms, per-iteration drops, block-value escape rule); the deferred M8 frequency lints gain their firing surface when it lands.
+
+**Spec-vacuum sweep (2026-07-09, same session, docs-only):** a two-track audit closed the "guide
+teaches what the spec never states" class. **Five settlements** written into the spec:
+`print`/display contract, literals+escapes (single-line strings, `\u{...}`, unknown = error),
+**`==` = scalars+strings only** (no structural equality), **no shadowing**, **floats = IEEE,
+never abort** — full record in `open-questions.md` Settled → "Spec-vacuum sweep". The remainder
+is recorded as Open → "Unrecorded spec vacuums — remainder" (assert, str char access, precedence
+table, stack-overflow contract, main signature set, reserved words + ASCII-only-identifier lean,
+C→Align: embedding = non-goal / callbacks deferred-with-trigger). **Two implementation deltas are
+now owed, PRIORITY when coding resumes:** (1) struct `==` reaches codegen and **ICEs**
+(`align_codegen_llvm` "expected the IntValue variant" panic) — needs a sema diagnostic; (2)
+shadowing (same-scope re-`:=` and inner-scope) is currently accepted silently — becomes a compile
+error per the settle. Plus the `loop` implementation slice itself, and the lexer escape-set gaps
+(`\r \0 \u{}`, unknown-escape error, single-line enforcement). **Two owner-directed follow-up
+settlements (same day):** `Ord(str)` — byte-lexicographic string comparison + `sort_by_key` string
+keys — and **`else` on `Result`** (deliberate error-discarding fallback; overturns guide ch04's
+old "Option-only" doctrine, guide rewritten en+ja). Record: `open-questions.md` Settled →
+"`Ord(str)` + `else` on `Result`". Both unimplemented (sema + runtime compare; sema else-on-Result).
+
+**align-LLM runway recorded (2026-07-09, docs-only — owner deferred all implementation on token
+budget):** the owner's align-LLM inference-engine spec (v0.4, out-of-repo) is the planned killer
+app; working backward from it, `open-questions.md` Open → "align-LLM runway" now records the M12
+std-wave candidates (A1–A8: `fs.read_bytes_view` binary mmap, bytes/buffer binary decode+encode,
+the `loop` implementation slice, seek/pread, http server+SSE slice, growable `array<T>`,
+streaming line reads, arena checkpoint — the last three are general fast-systems needs, not
+engine-specific), two design stances (async = task_group + blocking workers, NO async/await;
+shared state lean = channels, atomics sealed), and two explicit non-adoption boundaries (no
+MemoryTier/pinned/VRAM in the language core — std/pkg Move handles instead; f16/bf16 stays
+Future). **None of it is implemented; nothing here is started.**
 
 **M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), `std.compress`
 (#380–#381), and `std.crypto` (#383–#388) are DONE.** Full shipped-feature summaries + per-slice
@@ -161,7 +201,7 @@ track **`docs/little-aligner/`** was added — a *Little Schemer*-style Q&A dril
 bilingual (EN original + `ja/` mirror, deep-reasoner natural-JA translation); `docs/impl/
 std-design/ja/` and `README.ja.md` retranslated to natural Japanese; English-side cross-links now
 say "Japanese" (not 日本語). Implementation-behavior facts discovered while verifying examples
-(worth knowing when writing docs/tests): `else`-unwrap is **Option-only** (not Result);
+(worth knowing when writing docs/tests): `else`-unwrap is **Option-only** in the implementation (the spec now says Result too — settled 2026-07-09, unimplemented);
 `to_soa()` requires an enclosing `arena {}`; string literals are single-line; `group_by(...).agg`
 /`dict_encode` need a *dynamic* `array<Struct>` source (fixed-size literal arrays are rejected);
 generic fn over generic struct (`fn f<T>(p: Pair<T>)`) not supported yet; `Result<buffer,_>`

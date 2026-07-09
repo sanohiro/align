@@ -45,6 +45,8 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 - **Ownership = a property of the type** (array/string/buffer/heap are Move; primitives/small-structs/slice are Copy). No `owned` keyword. Lifetimes are inferred (regions), never written.
 - **Purity is inferred** (effect inference); `par_map`-style closures must be Pure.
 - **Formatter normalizes only meaningless variation** (spacing, `;` placement, trailing comma, alignment); it does NOT force one-line ↔ multi-line. "One way" = one correct *formatting* per layout, not one allowed layout.
+- **Sequential control = one `loop` expression** (`loop { ... break value }`; breaks unify like `match` arms; no `for`/`while`/`continue`/labels). The pipeline owns the data path; `loop` owns the control path. Recursion is not iteration — **no TCO is guaranteed** (scope-end drops and `?` make tail position fragile). Implementation deferred; design in `draft.md` §4 "Loop".
+- **2026-07-09 spec-vacuum settlements:** `print`/display contract (primitives only, floats shortest-round-trip, aggregates unprintable); literal/escape set (single-line strings, `\u{...}`, unknown escape = error); **`==` = scalars + strings only** (no structural equality); **no shadowing** (one binding per name per scope chain); **floats = IEEE 754, never abort** (only integer division aborts); **`Ord(str)`** (byte-lexicographic — strings sort/compare; collation = pkg); **`else` on `Result`** (deliberate fallback discards the error; `?` propagates / `else` falls back / `match` inspects). Remaining unrecorded holes: `open-questions.md` Open → "Unrecorded spec vacuums — remainder".
 
 ## Current status & next step (handoff)
 

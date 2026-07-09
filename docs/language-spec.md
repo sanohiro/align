@@ -140,6 +140,30 @@ area := match s {
 }
 ```
 
+### Loop
+
+`loop { ... }` is the one sequential-control construct, and an expression: `break expr` ends the
+loop with that value (bare `break` = `()`); all breaks in one loop unify like `match` arms; a
+`loop` with no `break` diverges. There is no `for`, no `while`, no `continue`, no labeled break.
+`?`/`return` exit the function; `break` is the only loop exit and cannot cross a lambda boundary.
+The pipeline owns the data path; `loop` owns the control path (EOF pumps, retry, convergence) —
+walking an array by index inside a `loop` is a lint. Recursion stays legal for recursive problems
+(parsers, trees) but is not iteration: no tail-call optimization is guaranteed. See `draft.md` §4
+"Loop".
+
+### Display, literals, equality, shadowing, floats (2026-07-09)
+
+`print(x)` takes primitives only, with a stable per-type display contract (floats = shortest
+round-trip; `bool` = `true`/`false`; strings verbatim); printing an aggregate is a compile error.
+String literals are single-line; escapes are `\n \t \r \0 \\ \" \' \u{...}` and an unknown escape
+is a compile error; a `char` literal holds one Unicode scalar. `==` is scalars + strings only —
+no structural equality (explicit fields / `match` / pipeline instead). No shadowing: a name binds
+once per scope chain. Floats are IEEE 754 and never abort (`x/0.0` → `±inf`, NaN ≠ NaN); only
+integer division aborts. `str`/`string` are `Ord` (byte-lexicographic; locale collation is a
+library concern), so strings sort and compare. `else` works on `Result` as well as `Option` —
+the intent triangle is `?` propagates / `else` falls back / `match` inspects. Details:
+`draft.md` §4 / §5 / §12.
+
 ### Generics
 
 A function may declare type parameters — `fn f<T>(...)` — and is **monomorphized** per distinct
@@ -250,7 +274,8 @@ position is re-checked against the declared set and rejected). See `draft.md` §
 borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no
 allocation, region-tied to the source. Bounds may be omitted (`xs[a..]`, `xs[..b]`, `xs[..]`);
 `0 <= start <= end <= len` is checked at runtime (a violation aborts). `..` is slicing-only — not a
-first-class value (the language has no counting loops). See `draft.md` §8.
+first-class value (the language has no counting loops; sequential control is `loop`). See
+`draft.md` §7.
 
 ### Strings
 

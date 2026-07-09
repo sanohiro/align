@@ -136,4 +136,4 @@ A hand-written version in a scalar language walks memory once per step and alloc
 
 ## When the vocabulary genuinely can't say it
 
-Sequential state that must cross elements in arbitrary ways — a parser, a state machine — is recursion (chapter [02](02-language-basics.md)), and bulk grouped aggregation is `group_by` (chapter [11](11-data-oriented.md)). Those two cover nearly everything that tempts you toward a `for`. If you are about to simulate a loop with recursion over an index, stop and re-ask what the transformation is — the answer is usually a pipeline you haven't seen yet in this chapter.
+Sequential control whose trip count is decided by the run itself — pumping a stream to EOF, retrying with backoff, driving a state machine — is the `loop` expression (chapter [02](02-language-basics.md)), and bulk grouped aggregation is `group_by` (chapter [11](11-data-oriented.md)). Those two cover nearly everything that tempts you toward a `for`. If you are about to walk an index inside a `loop`, stop and re-ask what the transformation is — the answer is usually a pipeline you haven't seen yet in this chapter.

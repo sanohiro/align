@@ -24,7 +24,7 @@ The center of Align is not the object — it is the array. Real programs spend t
 
 ## What this means when you write Align
 
-- You will write very few explicit loops. In fact Align has **no loop keyword at all**: you describe transformations as pipelines, and for the rare genuinely sequential process you use recursion.
+- You will write very few explicit loops. Align has **no `for` and no `while`**: you describe transformations as pipelines, and the one `loop` expression is reserved for genuinely sequential control — read until EOF, retry until success.
 - You will not manage memory by hand, but you will decide *where* data lives (a value, an arena, the heap).
 - You will handle errors as values, with `?`, not with try/catch.
 - You will lay data out as structure-of-arrays when it's processed in bulk, and the compiler rewards you for it.

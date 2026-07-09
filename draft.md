@@ -118,6 +118,11 @@ count = count + 1
 
 The default is immutable.
 
+A name binds **once** per scope chain: re-declaring a name already visible — in the same scope,
+or shadowing an outer binding or a parameter — is a compile error. Rebinding hides a state change
+from the reader; use `mut` for a value that changes, a new name for a new thing. Two *disjoint*
+sibling blocks may each declare the same name (no point in the program sees two bindings).
+
 ### Type Annotation
 
 ```align
@@ -273,9 +278,67 @@ warm := match signal {
 `match` also works on `Option` / `Result`; `else`-unwrap and `?` are the ergonomic shorthands for the
 common unwrap / propagate cases.
 
----
+### Loop
 
-## 5. Types
+`loop` is the one sequential-control construct: it repeats its block until a `break` executes.
+Like `if` / `match` / `arena`, it is an expression — `break expr` ends the loop and `expr` becomes
+the loop's value (a bare `break` yields `()`). Every `break` in one loop must carry the same type,
+exactly like `match` arms. A `loop` containing no `break` diverges (a server's accept loop): it
+never yields, and like a `match` whose arms all diverge it satisfies any expected type.
+
+```align
+mut total := 0
+n_read := loop {
+  n := r.read(buf)?
+  if n == 0 { break total }
+  total = total + n
+}
+```
+
+The division of labor is strict: **the pipeline owns the data path; `loop` owns the control
+path.** Traversing a collection is `map` / `where` / `reduce` — there is no `for`, no `while`, no
+counting loop, and `loop` does not change that (walking an array by index inside a `loop` is a
+lint, §16). `loop` exists for what a pipeline cannot express: iteration whose trip count is
+decided by the iteration itself — reading until EOF, retrying with backoff, driving a protocol,
+pumping a state machine to convergence.
+
+Rules:
+
+- `break` binds to the innermost enclosing `loop`, and must appear lexically inside one in the
+  same function. A lambda body is its own function — `break` cannot cross it.
+- There is no `continue` and no labeled break. Skip-to-next-iteration is an `if` around the rest
+  of the body; a nested loop needing a two-level exit is a function waiting to be extracted.
+- `?` and `return` inside a loop behave as everywhere else: they exit the **function**, not the
+  loop. `break` is the only loop exit.
+- Loop-carried state lives in `mut` locals declared before the loop. Locals declared inside the
+  body are per-iteration — they drop at the end of each pass. A `break` value therefore must not
+  borrow from a per-iteration local (the block-value escape rule applies); moving an owned
+  per-iteration value out through `break` is fine.
+- **Recursion is not iteration.** Functions may recurse (a parser, a tree walk), but Align
+  guarantees no tail-call optimization — scope-end drops and `?` make tail position fragile — so
+  a recursive "loop" costs stack proportional to the trip count. Iteration is the pipeline for
+  data and `loop` for control, never recursion. (Rationale: `design-notes.md`.)
+
+### print and Value Display
+
+`print(x)` is the builtin output primitive: it writes one value and a newline to stdout. It
+accepts **primitive values only** — integers, floats, `bool`, `char`, `str`/`string`. Printing an
+aggregate (struct / tuple / array / sum value) is a compile error: compose text explicitly with a
+template string (§13) or a `builder` (§12) — a magic deep-formatter would be a hidden recursive
+walk.
+
+The display of each printable type is a language contract — identical in every build and on every
+target, and shared by `print` and template-string interpolation:
+
+```text
+integers     decimal, - sign for negatives
+floats       shortest round-trip decimal (1.0 prints as 1.0; reparsing yields the same bits)
+bool         true / false
+char         the character itself (UTF-8)
+str/string   the bytes verbatim (no quotes, no escaping)
+```
+
+`print` is Impure (it is I/O — effect inference, §11).
 
 ### Primitive Types
 
@@ -333,6 +396,19 @@ Arithmetic errors other than overflow, such as division by zero, are handled sep
 
 Unary negation `-x` is a **signed** operation: applying it to an unsigned type (e.g. a `-5` literal given an unsigned type by context, `x: u32 := -5`) is a **compile error**, not a silent wrap — a negative value cannot have an unsigned type. Convert explicitly (`(-5) as u32`) if the wrapped bit pattern is actually wanted. (This is distinct from unsigned *subtraction* `a - b`, which is ordinary defined two's-complement wrap.)
 
+### Float Semantics
+
+Floats are **IEEE 754** (`f32`/`f64`) and float arithmetic is total: `x / 0.0` is `±inf`,
+`0.0 / 0.0` is NaN, overflow rounds to `±inf`, and NaN propagates through arithmetic. No float
+operation aborts — the mirror image of the integer rules above, for the same reason: defined,
+zero-cost semantics that never block vectorization (a per-lane guard would). Scalar `%` on floats
+is IEEE remainder (`frem`), unguarded, like its vector form (§9).
+
+Comparison follows IEEE: NaN compares unequal to everything **including itself** (`x == x` is
+`false` iff `x` is NaN), and `<` / `<=` / `>` / `>=` are all `false` when either side is NaN. The
+`min`/`max` reducers' NaN policy is specified with the reducers (§8). Only conversion leaves pure
+IEEE behavior: `as` saturates and maps NaN to `0` (next section).
+
 ### Numeric Conversion
 
 There is **no implicit numeric coercion** — not even widening. A value changes type only through the explicit `as` operator, so every conversion is visible in source ("nothing hidden"):
@@ -386,6 +462,23 @@ true). This is what makes a guard like `i < xs.len() && xs[i] > 0` safe — the 
 `xs[i]` is never evaluated when `i` is out of range. (The bitwise `&` / `|` are unconditional — they
 always evaluate both integer operands; only the logical operators are lazy.)
 
+### Equality and Ordering
+
+`==` / `!=` are defined for **scalars and strings only**: numbers, `bool`, `char`, and
+`str`/`string` (byte equality; a `str` and a `string` with the same bytes are equal). There is
+**no structural equality** — comparing structs, tuples, arrays/slices, or sum values with `==` is
+a compile error. A struct comparison is written out field by field (the cost stays visible); a
+sum value is tested with `match` (one way: `match` = variants, `if` = conditions); arrays are
+compared element-wise as a pipeline. So `==` is always a flat comparison — string bytes are the
+one visible-length case — never a hidden recursive walk, and generic `Eq` (§ Generics) stays
+exactly the scalar hierarchy it declares.
+
+Ordering (`<` `<=` `>` `>=`) follows the same shape: defined for numbers, `char`, and — the same
+one visible-length case — `str`/`string`, whose order is **byte-lexicographic** (for valid UTF-8
+this equals Unicode scalar order). It is deterministic and locale-free; dictionary/locale
+collation is a library concern (`pkg`), never the operator. A `sort_by_key` key is anything
+`Ord`: a number, a `char`, or a string. Aggregates have no order, exactly as they have no `==`.
+
 ### Optional
 
 ```align
@@ -419,6 +512,13 @@ conversion — that would be hidden); to change the error type, convert it expli
 ```align
 v := inner().map_err(to_error)?
 ```
+
+`else` — the unwrap-with-fallback form (§ Optional) — works on a `Result` too: `v := f() else
+fallback` yields the `Ok` value, or evaluates the fallback and **discards the error value**. The
+discard is deliberate and visible — this form says "the reason does not matter here" — and it
+still counts as handling (the unhandled-`Result` error never fires on it). `else` binds no error
+variable; needing the error *is* the signal to `match`. So each intent has exactly one form, for
+`Option` and `Result` alike: **`?` propagates, `else` falls back, `match` inspects.**
 
 `Error` is the canonical builtin error sum type — universal categories plus a generic code:
 
@@ -498,8 +598,9 @@ fn same<T: Eq>(a: T, b: T) -> bool = a == b           // Eq  → equality
 ```
 
 The bounds are a small fixed hierarchy — **`Num` ⊃ `Ord` ⊃ `Eq`**: `Num` grants arithmetic,
-ordering, and equality (the numeric types); `Ord` grants ordering and equality (numbers and
-`char`); `Eq` grants equality (numbers, `char`, `bool`, `str`). A type argument that does not
+ordering, and equality (the numeric types); `Ord` grants ordering and equality (numbers, `char`,
+and `str`/`string` — byte-lexicographic, § Equality and Ordering); `Eq` grants equality (numbers,
+`char`, `bool`, `str`/`string`). A type argument that does not
 satisfy a parameter's bound is a compile error at the call. There are **no user-defined
 trait-style bounds** — deliberately, for AI-friendliness and *one way*.
 
@@ -635,7 +736,7 @@ allocation, region-tied to the source so it cannot outlive it. Either bound may 
 `xs[start..]` runs to the length, `xs[..end]` from `0`, `xs[..]` is the whole thing. The bounds
 `0 <= start <= end <= len` are checked at runtime; a violation aborts like an out-of-range index.
 `..` is a slicing construct only — there is no first-class range value (the language has no
-counting loops; iteration is the array pipeline).
+counting loops; collection iteration is the array pipeline, and sequential control is `loop`, §4).
 
 For a `str` the bounds are **byte** offsets, and because a `str` is always valid UTF-8 (§12), each
 bound must also land on a UTF-8 scalar boundary — a `start`/`end` that would split a multi-byte
@@ -1087,6 +1188,24 @@ operation that produces a `str` preserves it (a range slice that would split a s
 The byte types `bytes` / `buffer` carry **no** UTF-8 obligation and are where arbitrary-byte work
 lives (`s.bytes()` views a `str`'s bytes without the invariant).
 
+### Literals and Escapes
+
+A string literal is double-quoted and **single-line** — a raw newline inside a literal is a
+compile error (multi-line text is composed with `\n` or a `builder`). A `char` literal is
+single-quoted and holds exactly **one Unicode scalar value** (`'A'`, `'あ'`; surrogates are not
+scalar values and are rejected).
+
+The escape set — the same in both forms, `\"` in strings, `\'` in chars:
+
+```text
+\n \t \r \0    newline / tab / carriage return / NUL
+\\             backslash
+\" or \'       the delimiter
+\u{...}        1-6 hex digits, any Unicode scalar value
+```
+
+An unknown escape is a **compile error**, never passed through silently.
+
 ### No Implicit Concatenation Allocation
 
 `str + str` is a **hard compile error** — `+` never concatenates strings. A concatenation is a heap
@@ -1434,6 +1553,7 @@ string re-scan
 implicit copy
 lossy conversion       (narrowing / float->int / wide-int->float / char narrowing `as`)
 wasteful default type  (large literal array left to the i64/f64 default)
+index-walk in loop     (walking an array by index inside `loop` — write it as a pipeline, §4 Loop)
 ```
 
 ### Convergence Over Expression

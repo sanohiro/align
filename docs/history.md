@@ -173,6 +173,36 @@ pkg contains frameworks and the ecosystem.
 
 ---
 
+## Sequential control
+
+For a long time the language had no loop construct at all.
+
+Collection iteration was the pipeline; the rest was said to be recursion.
+
+Recursion-as-iteration was rejected (2026-07-09).
+
+The reasons:
+
+```text
+scope-end drops kill tail position
+? kills tail position
+TCO is invisible in source
+loop back-edges are what compilers want
+```
+
+`for` and `while` were also rejected — `for` competes with the pipeline,
+`while` is a second loop form that cannot yield a value.
+
+The direction chosen:
+
+```text
+loop { ... break value }
+```
+
+One narrow expression. The pipeline owns the data path; `loop` owns the control path.
+
+---
+
 ## Naming
 
 Several names were considered.
