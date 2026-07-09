@@ -2287,10 +2287,19 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
 
 **A. Build next (the M12 std-wave candidates, lean = build in this order):**
 
-1. **`fs.read_bytes_view`** — a binary mmap view. `read_file_view` UTF-8-validates and returns
-   `str`, so a multi-GB binary file (GGUF) cannot be mmap'd today; same mmap path minus
+1. **`fs.read_bytes_view`** — a binary mmap view. **DONE.** `read_file_view` UTF-8-validates and
+   returns `str`, so a multi-GB binary file (GGUF) cannot be mmap'd today; same mmap path minus
    validation, returning an arena-scoped `bytes`. Cheap; unblocks Phase 0. *(general — any
-   binary-file work)*
+   binary-file work)* **Shipped:** `fs.read_bytes_view(path) -> Result<bytes, Error>` shares the
+   `read_file_view` runtime (one `fs_read_view_impl` with a `validate` flag — regular-file fast
+   path, owned-copy fallback, `munmap` at arena end, no `SIGBUS` handler), same arena region rule
+   and errno mapping. The new `Scalar::Slice(PrimScalar)` payload lets a `slice` ride a `Result`
+   (the borrowed-view sibling of `Scalar::Str`); a `slice<u8>` stays out of `tracks_region`
+   (numeric slices remain freely returnable), so a new `region_bearing` predicate routes the
+   escape check — a `bytes` view is caught escaping its arena through return / arena-block-value /
+   match-arm-unwrap of `Result<slice<u8>, Error>`. `box<slice>` and array-literal-of-slices are
+   deferred (rejected) like other views. Tests in `crates/align_driver/tests/m9_fs.rs`
+   (byte-exact non-UTF-8 read, multi-page, empty, missing→NotFound, + four escape rejections).
 2. **Binary decode/encode surface on `bytes`/`buffer`** — bounds-checked, endian-explicit
    `b.u32_le(off)` / `u64_le` / `f32_le` reads and the matching `buffer` writes
    (`put_u32_le`, …). Core-adjacent (pure computation); GGUF headers and `alignpack`/`alignidx`

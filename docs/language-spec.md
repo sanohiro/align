@@ -468,8 +468,9 @@ separate type. `r.read(b: mut buffer) -> Result<i64, Error>` fills `b` up to its
 EOF); `w.write(str|bytes|builder)` / `w.flush()`; `io.copy(r, w) -> Result<i64, Error>` is always
 `O(buffer)` memory (a portable fixed-buffer loop is the v1/reference; a `sendfile`/`splice`/mmap
 fast path may follow without an API change). `std.fs`: `read_file`/`write_file`/`open`/`create`/
-`exists`/`remove`/`read_dir`, plus `read_file_view` (an mmap view — requires an enclosing arena,
-escapes via `.clone()`). `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
+`exists`/`remove`/`read_dir`, plus `read_file_view` (a `str` mmap view — requires an enclosing
+arena, escapes via `.clone()`) and `read_bytes_view` (its binary sibling — the same arena mmap
+without UTF-8 validation, returning a `bytes` view so a GGUF/binary asset maps zero-copy). `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
 substring views). `std.env`: `get`/`set` only — `args` comes solely from `main(args: array<str>)`,
 there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no `Duration` type — `now()`
 (wall), `instant()` (monotonic), `sleep(ns)`. Every `std` fn returns `Result<T, Error>`; a failing

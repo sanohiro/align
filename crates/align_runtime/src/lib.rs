@@ -1147,14 +1147,17 @@ pub unsafe extern "C" fn align_rt_udp_recv_from(sock: *mut UdpSocket, buf: *mut 
 }
 
 /// Read the whole file at `path` into a fresh **arena** allocation, writing a `{ptr,len}` view to
-/// `out` — the [`align_rt_fs_read_file_view`] fallback for special / zero-length files. Returns `0`
-/// or a mapped errno; an empty file yields `{null,0}`. Unlike `fs.read_file` (heap-owned,
-/// `Drop`-freed), this buffer is arena-owned (bulk-freed at arena end), so the returned view follows
-/// the same region rule as the mmap path — no separate `Drop`.
+/// `out` — the [`align_rt_fs_read_file_view`] / [`align_rt_fs_read_bytes_view`] fallback for special
+/// / zero-length files. Returns `0` or a mapped errno; an empty file yields `{null,0}`. Unlike
+/// `fs.read_file` (heap-owned, `Drop`-freed), this buffer is arena-owned (bulk-freed at arena end),
+/// so the returned view follows the same region rule as the mmap path — no separate `Drop`.
+///
+/// `validate` gates the UTF-8 check: a `str` view (`read_file_view`) must be valid UTF-8, while a
+/// `bytes` view (`read_bytes_view`) accepts arbitrary binary content.
 ///
 /// # Safety
 /// `arena` must be a valid arena handle; `out` must point to a writable `{ptr,len}` slot.
-unsafe fn read_file_view_into_arena(path: &str, arena: *mut Arena, out: *mut AlignStr) -> i32 {
+unsafe fn read_file_view_into_arena(path: &str, arena: *mut Arena, out: *mut AlignStr, validate: bool) -> i32 {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => return io_error_to_status(&e),
@@ -1162,9 +1165,10 @@ unsafe fn read_file_view_into_arena(path: &str, arena: *mut Arena, out: *mut Ali
     if data.is_empty() {
         return 0; // already {null,0}
     }
-    // A `str` is always valid UTF-8 (draft §7/§12) — reject binary content (read via
-    // `reader.read(buffer)`) before it becomes an arena-owned `str` view. `Error.Invalid`.
-    if !validate_utf8(&data) {
+    // A `str` view is always valid UTF-8 (draft §7/§12) — reject binary content (read via
+    // `read_bytes_view` / `reader.read(buffer)`) before it becomes an arena-owned `str` view.
+    // A `bytes` view skips this (`validate == false`): binary content is exactly its purpose.
+    if validate && !validate_utf8(&data) {
         return AL_INVALID;
     }
     let Ok(len_z) = isize::try_from(data.len()) else { return AL_INVALID };
@@ -1200,11 +1204,13 @@ unsafe fn read_file_view_into_arena(path: &str, arena: *mut Arena, out: *mut Ali
 ///   hidden"), and per-mapping recovery needs `sigsetjmp`/`siglongjmp` machinery out of v1 scope.
 ///   Concurrent truncation of a mapped file is the caller's contract to avoid.
 ///
+/// `validate` gates the mapped bytes: a `str` view (`read_file_view`) requires valid UTF-8, a
+/// `bytes` view (`read_bytes_view`) accepts arbitrary binary content.
+///
 /// # Safety
 /// `path` must describe a valid byte range; `arena` must be a valid arena handle; `out` must point
 /// to a writable `{ptr,len}` slot.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_fs_read_file_view(path: *const u8, path_len: i64, arena: *mut Arena, out: *mut AlignStr) -> i32 {
+unsafe fn fs_read_view_impl(path: *const u8, path_len: i64, arena: *mut Arena, out: *mut AlignStr, validate: bool) -> i32 {
     if out.is_null() {
         return AL_INVALID;
     }
@@ -1232,13 +1238,15 @@ pub unsafe extern "C" fn align_rt_fs_read_file_view(path: *const u8, path_len: i
                 mmap(core::ptr::null_mut(), len_u, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0)
             };
             if addr != MAP_FAILED && !addr.is_null() {
-                // A `str` is always valid UTF-8 (draft §7/§12). Validate the mapped bytes before the
-                // view escapes; invalid → `munmap` immediately (it was never registered on the arena)
-                // and fail with `Error.Invalid`. Binary files take the `reader.read(buffer)` path.
-                let mapped = unsafe { core::slice::from_raw_parts(addr as *const u8, len_u) };
-                if !validate_utf8(mapped) {
-                    unsafe { munmap(addr, len_u) };
-                    return AL_INVALID;
+                // A `str` view is always valid UTF-8 (draft §7/§12). When validating, check the
+                // mapped bytes before the view escapes; invalid → `munmap` immediately (it was never
+                // registered on the arena) and fail with `Error.Invalid`. A `bytes` view skips this.
+                if validate {
+                    let mapped = unsafe { core::slice::from_raw_parts(addr as *const u8, len_u) };
+                    if !validate_utf8(mapped) {
+                        unsafe { munmap(addr, len_u) };
+                        return AL_INVALID;
+                    }
                 }
                 // Register on the arena for bulk `munmap` at arena end (every exit path).
                 unsafe { (*arena).maps.push((addr, len_u)) };
@@ -1252,7 +1260,30 @@ pub unsafe extern "C" fn align_rt_fs_read_file_view(path: *const u8, path_len: i
     // failed mmap). A directory errors here (`std::fs::read` on a dir → mapped errno). Re-reads by
     // path, so dropping `file` first is fine.
     drop(file);
-    unsafe { read_file_view_into_arena(&path_str, arena, out) }
+    unsafe { read_file_view_into_arena(&path_str, arena, out, validate) }
+}
+
+/// # Safety
+/// `path` must describe a valid byte range; `arena` must be a valid arena handle; `out` must point
+/// to a writable `{ptr,len}` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_read_file_view(path: *const u8, path_len: i64, arena: *mut Arena, out: *mut AlignStr) -> i32 {
+    unsafe { fs_read_view_impl(path, path_len, arena, out, true) }
+}
+
+/// `fs.read_bytes_view(path)` — the binary sibling of [`align_rt_fs_read_file_view`]: the same
+/// arena `mmap` (regular-file fast path, owned-copy fallback for special / zero-length files,
+/// `munmap` at arena end, no `SIGBUS` handler) minus the UTF-8 validation, so binary content (a
+/// GGUF model, a packed index) is accepted as a `bytes` (`slice<u8>`) view. Same `{ptr,len}` out
+/// layout as the `str` view. Returns `0` on success, else a mapped errno (leaving `out` =
+/// `{null,0}`).
+///
+/// # Safety
+/// `path` must describe a valid byte range; `arena` must be a valid arena handle; `out` must point
+/// to a writable `{ptr,len}` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_read_bytes_view(path: *const u8, path_len: i64, arena: *mut Arena, out: *mut AlignStr) -> i32 {
+    unsafe { fs_read_view_impl(path, path_len, arena, out, false) }
 }
 
 /// Build the `args: array<str>` value for `main` from the C `argc`/`argv`. Returns the owned

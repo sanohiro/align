@@ -43,6 +43,24 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 `read_file_view` はファイルをマップし、その `str` ビューを渡します。これは**囲む `arena` を要求します**。マッピングの寿命はアリーナであり、アンマップはアリーナのクリーンアップであり、ビューは外へ逃がせません(一部を生き残らせたいなら `.clone()` します)。第 [05](05-memory.md) 章のメモリモデルは mmap のために特別ケースを増やしたりはしていません。mmap の方がモデルに収まったのです。
 
+`read_file_view` は `str` を返すため、バイト列を UTF-8 として検証し、バイナリファイルは拒否します。GGUF モデルやパック済みインデックスといったバイナリ資産には、その兄弟である `read_bytes_view` を使います。検証なしで同じアリーナ mmap を行い、`bytes`(`slice<u8>`)ビューを返します。
+
+```align
+import std.fs
+import std.io
+
+pub fn main(args: array<str>) -> Result<(), Error> {
+    arena {
+        raw := fs.read_bytes_view(args[1])?   // バイナリ mmap — 検証なし、ゼロコピー
+        print(raw.len())
+        io.stdout.write(raw)?
+    }
+    return Ok(())
+}
+```
+
+アリーナ規則は同じ(`bytes` ビューはアリーナより長生きできません)で、v1 の制限も `read_file_view` と同じです。特殊ファイルや長さ 0 のファイルは真のゼロコピーマップではなくアリーナ内へのコピーにフォールバックし、マップ済みファイルが並行して切り詰められると `SIGBUS` が発生し得ます(Align はシグナルハンドラを一切インストールしません。プロセス全体にかかるハンドラは、まさに言語が禁じる隠れた副作用だからです)。`bytes.clone()` はまだ無いので、一部をアリーナの外へ残したい場合はビューをコピーするのではなく書き出してください(`fs.write_file` や `buffer`)。
+
 ## ストリーム: `reader`、`writer`、`buffer`
 
 メモリより大きなデータのためのストリーミング階層です。その形は、第 [02](02-language-basics.md) 章の `loop` 式です(**implementation in progress** — 現時点では、このポンプ処理は下の `io.copy` の中に収められています)。

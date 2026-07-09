@@ -417,6 +417,194 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert_eq!(out.stdout, content, "the cloned string escapes and prints");
 }
 
+// --- read_bytes_view (binary mmap) ------------------------------------------------------------
+// The binary sibling of `read_file_view` (align-LLM runway A1): the same arena-scoped mmap minus
+// UTF-8 validation, returning a `bytes` (`slice<u8>`) view — so a GGUF / packed-binary asset can be
+// zero-copy mapped, which a `str` view (validated) would reject.
+
+/// The headline: `fs.read_bytes_view` maps **non-UTF-8** content (a `read_file_view` would reject it
+/// with `Error.Invalid`) and the `slice<u8>` view reads byte-exact through `io.stdout.write`.
+#[test]
+fn read_bytes_view_binary_is_byte_exact() {
+    if !backend_available() {
+        return;
+    }
+    // Deliberately not valid UTF-8: a lone 0xFF/0xFE/0x80, embedded NULs — a GGUF-ish header.
+    let content: &[u8] = b"GGUF\x00\x01\xff\xfe\x80\x00\x2a\x7f";
+    let src = TempFile::new("bytesview-bin", content);
+    let prog = "\
+import std.fs
+import std.io
+pub fn main(args: array<str>) -> Result<(), Error> {
+  arena {
+    v := fs.read_bytes_view(args[1])?
+    io.stdout.write(v)?
+  }
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m9fs-bytesview-bin", prog, &[&src.str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, content, "the binary view reads byte-exact (no UTF-8 validation)");
+}
+
+/// A larger-than-a-page binary file (so mmap spans multiple pages) still reads byte-exact; the
+/// content cycles all 256 byte values, none of which the view is allowed to reject.
+#[test]
+fn read_bytes_view_multi_page_binary() {
+    if !backend_available() {
+        return;
+    }
+    let content: Vec<u8> = (0..100 * 1024).map(|i| (i % 256) as u8).collect();
+    let src = TempFile::new("bytesview-big", &content);
+    let dst = TempFile::out("bytesview-big-out");
+    let prog = "\
+import std.fs
+pub fn main(args: array<str>) -> Result<(), Error> {
+  arena {
+    v := fs.read_bytes_view(args[1])?
+    w := fs.create(args[2])?
+    w.write(v)?
+  }
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m9fs-bytesview-big", prog, &[&src.str(), &dst.str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read(&dst.path).expect("read dst"), content, "multi-page binary view is byte-exact");
+}
+
+/// A zero-length file yields an empty view (`len() == 0`) via the copy fallback — no error, no mmap.
+#[test]
+fn read_bytes_view_empty_file_is_empty_view() {
+    if !backend_available() {
+        return;
+    }
+    let src = TempFile::new("bytesview-empty", b"");
+    let prog = "\
+import std.fs
+pub fn main(args: array<str>) -> Result<(), Error> {
+  arena {
+    v := fs.read_bytes_view(args[1])?
+    print(v.len())
+  }
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m9fs-bytesview-empty", prog, &[&src.str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n", "empty file yields an empty view");
+}
+
+/// `read_bytes_view` of a missing path maps `ENOENT` to `Error.NotFound` (tag 0 → main exits 1),
+/// exactly like `read_file_view` (shared errno mapping).
+#[test]
+fn read_bytes_view_missing_maps_to_not_found() {
+    if !backend_available() {
+        return;
+    }
+    let missing = std::env::temp_dir().join(format!("align-m9fs-bytesview-absent-{}", std::process::id()));
+    let prog = "\
+import std.fs
+pub fn main(args: array<str>) -> Result<(), Error> {
+  arena {
+    v := fs.read_bytes_view(args[1])?
+    print(v.len())
+  }
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m9fs-bytesview-notfound", prog, &[&missing.display().to_string()]);
+    assert_eq!(out.status.code(), Some(1), "a missing file is Error.NotFound (tag 0 -> exit 1)");
+}
+
+// --- read_bytes_view region / arena guardrails (compile-time) ---------------------------------
+
+/// Like `read_file_view`, `read_bytes_view` requires an enclosing `arena {}` (the view is
+/// `munmap`ped at arena end) — using it outside any arena is a compile error.
+#[test]
+fn read_bytes_view_outside_arena_is_rejected() {
+    let prog = "\
+import std.fs
+pub fn main(args: array<str>) -> Result<(), Error> {
+  v := fs.read_bytes_view(args[1])?
+  print(v.len())
+  return Ok(())
+}
+";
+    assert!(check_errs("m9fs-bytesview-no-arena", prog), "read_bytes_view outside an arena must be rejected");
+}
+
+/// The `bytes` view is bound to its arena's region: returning it out of the arena is an escape and
+/// rejected at compile time. A `slice<u8>` is not `tracks_region` (numeric element), so this is the
+/// `region_bearing` path — the reason the view must carry its arena region explicitly.
+#[test]
+fn read_bytes_view_escaping_its_arena_is_rejected() {
+    let prog = "\
+import std.fs
+fn leak(p: str) -> Result<slice<u8>, Error> {
+  arena {
+    v := fs.read_bytes_view(p)?
+    return Ok(v)
+  }
+}
+pub fn main() -> i32 { return 0 }
+";
+    let d = check_diagnostics("m9fs-bytesview-escape", prog);
+    assert!(
+        d.contains("allocated in an arena"),
+        "returning an arena-bound bytes view must be an arena escape (not e.g. a payload-type error):\n{d}"
+    );
+}
+
+/// Escaping the arena as the **block's value** (bound to a shallower binding) is also rejected — the
+/// arena-block-value escape check now covers arena-backed slices, not only `str`/struct views.
+#[test]
+fn read_bytes_view_escape_as_block_value_is_rejected() {
+    let prog = "\
+import std.fs
+fn leak(p: str) -> Result<slice<u8>, Error> {
+  outer := arena {
+    v := fs.read_bytes_view(p)?
+    v
+  }
+  return Ok(outer)
+}
+pub fn main() -> i32 { return 0 }
+";
+    let d = check_diagnostics("m9fs-bytesview-block-escape", prog);
+    assert!(
+        d.contains("cannot escape as the block's value"),
+        "a bytes view escaping as the arena block value must be rejected:\n{d}"
+    );
+}
+
+/// The emphasized regression: unwrapping the `Result<slice<u8>, Error>` through a **match arm** must
+/// still bind the arena region to the payload, so escaping the unwrapped view is rejected (the
+/// general `Option<view>`/`Result<view>` match-arm region gap closed for `bytes` too).
+#[test]
+fn read_bytes_view_escape_via_match_arm_is_rejected() {
+    // The `Ok(v) => Ok(v)` arm re-wraps the payload unwrapped from `Result<slice<u8>, Error>`; the
+    // match-arm binding `v` must inherit the arena region so the re-wrapped view is caught escaping.
+    let prog = "\
+import std.fs
+fn leak(p: str) -> Result<slice<u8>, Error> {
+  arena {
+    return match fs.read_bytes_view(p) {
+      Ok(v) => Ok(v),
+      Err(e) => Err(e),
+    }
+  }
+}
+pub fn main() -> i32 { return 0 }
+";
+    let d = check_diagnostics("m9fs-bytesview-match-escape", prog);
+    assert!(
+        d.contains("allocated in an arena"),
+        "a bytes view unwrapped via a match arm must be rejected as an arena escape:\n{d}"
+    );
+}
+
 // --- §19 completion condition -----------------------------------------------------------------
 
 /// The `draft.md` §19 type program: `fs.read_file` → `json.decode<array<User>>` → a fused pipeline

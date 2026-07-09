@@ -581,6 +581,11 @@ pub enum Rvalue {
     /// `str` view `{ptr,len}` into `out`. Yields an `i32` errno-status (0 = ok). The mapping is
     /// `munmap`ped at arena end (the region rule) — no `Drop`.
     FsReadFileView { path: Operand, arena: Operand, out: Slot },
+    /// `fs.read_bytes_view(path)` — the binary sibling of [`Self::FsReadFileView`]: the same
+    /// arena `mmap` (regular-file fast path + owned-copy fallback, `munmap` at arena end) minus the
+    /// UTF-8 validation, writing the `bytes` (`slice<u8>`) view `{ptr,len}` into `out`. Yields an
+    /// `i32` errno-status (0 = ok). No `Drop` — the view aliases the arena.
+    FsReadBytesView { path: Operand, arena: Operand, out: Slot },
     /// `path.join(a, b)` — join two path fragments into a freshly heap-allocated owned `string`,
     /// returned by value as a `{ptr,len}` (like `str_clone`). Pure.
     PathJoin { a: Operand, b: Operand },
@@ -1677,6 +1682,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
         // runtime registers the mmap for `munmap` at arena end.
         hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
+        hir::ExprKind::FsReadBytesView { path } => lower_fs_read_bytes_view(b, path, e.ty),
         // `path.join(a, b)` → an owned `string` `{ptr,len}` returned by value (like `str_clone`).
         hir::ExprKind::PathJoin { a, b: pb } => {
             let ao = lower_expr(b, a);
@@ -5311,6 +5317,50 @@ fn lower_fs_read_file_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> 
     // Ok: load the mapped `str` view and wrap it (arena-owned — no `Drop`).
     b.cur = ok_bb;
     let s = b.fresh_value(Ty::Str);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (`{null,0}`); map the status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `fs.read_bytes_view(path)` → the binary sibling of [`lower_fs_read_file_view`]: the runtime
+/// mmaps the file into the enclosing arena and writes the `bytes` (`slice<u8>`) view `{ptr,len}`
+/// into an out slot, returning an errno-status; branch `Ok(<view>)` / `Err(<mapped status>)`. Same
+/// shape as the `str` view (identical `{ptr,len}` payload, no `Drop` — it borrows the arena); the
+/// only difference is the runtime skips UTF-8 validation, so binary content is accepted.
+fn lower_fs_read_bytes_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
+    let arena = *b.arenas.last().expect("read_bytes_view outside an arena (sema-checked)");
+    let elem = align_sema::Scalar::Int(IntTy { bits: 8, signed: false });
+    let out = b.new_slot(Ty::Slice(elem));
+    let p = lower_expr(b, path);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::FsReadBytesView { path: p, arena: Operand::Value(arena), out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the mapped `slice<u8>` view and wrap it (arena-owned — no `Drop`).
+    b.cur = ok_bb;
+    let s = b.fresh_value(Ty::Slice(elem));
     b.push(Stmt::Let(s, Rvalue::Load(out)));
     let okv = b.fresh_value(result_ty);
     b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));

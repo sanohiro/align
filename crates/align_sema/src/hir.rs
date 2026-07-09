@@ -729,6 +729,14 @@ pub enum ExprKind {
     /// region is bound to the arena, and `munmap` runs at arena end. The `ty` is `Result<str, Error>`.
     /// Escapes the region via `.clone()`. Impure.
     FsReadFileView { path: Box<Expr> },
+    /// `fs.read_bytes_view(path)` — the **binary sibling** of [`Self::FsReadFileView`]: the same
+    /// arena-scoped `mmap` (regular-file fast path, owned-copy fallback for special / zero-length
+    /// files, `munmap` at arena end) minus the UTF-8 validation, yielding a `bytes` (`slice<u8>`)
+    /// view of the raw file bytes. This is the way to zero-copy `mmap` a binary asset (a GGUF model
+    /// file, a packed index) — content a `str` view would reject. Requires an enclosing `arena {}`;
+    /// the view is region-bound to the arena and cannot escape it. The `ty` is
+    /// `Result<slice<u8>, Error>`. Impure.
+    FsReadBytesView { path: Box<Expr> },
     /// `path.join(a, b)` — join two path fragments with a single `/` separator into a freshly
     /// heap-allocated owned `string` (the `ty` is [`crate::Ty::String`]). Pure string manipulation
     /// (no OS access); the separator is collapsed at the boundary (`a`'s trailing `/` and `b`'s

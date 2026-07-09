@@ -771,6 +771,11 @@ fn build_module<'c>(
         module.add_function("align_rt_fs_read_file_view", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false), None),
     );
     funcs.insert(
+        // fs.read_bytes_view (path_ptr, path_len, arena: *Arena, out: *{ptr,len}) -> i32 errno-status.
+        "fs_read_bytes_view".to_string(),
+        module.add_function("align_rt_fs_read_bytes_view", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
         // drop(array<string>) (ptr, len) -> void; deep free (each element's buffer, then the header).
         "free_string_array".to_string(),
         module.add_function("align_rt_free_string_array", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
@@ -2191,6 +2196,10 @@ fn scalar_bytes(s: Scalar) -> u64 {
         // `array<str>` element — a `{ptr,len}` view, 16 bytes (the established str size, as in the
         // json field descriptor). Used to size a `group_by(.str_key)` output key buffer.
         Scalar::Str => 16,
+        // A `slice<T>` view is a `{ptr,len}` — 16 bytes, like `Str`. Not a box/array payload today
+        // (it only rides an `Option`/`Result`, e.g. `read_bytes_view`), but sizing it correctly (vs.
+        // `unreachable!`) keeps this total should a slice element ever be sized here.
+        Scalar::Slice(_) => 16,
         Scalar::Soa(_) => unreachable!("a soa view is not a box payload"),
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
@@ -4755,6 +4764,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["fs_read_file_view"], &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frfv")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_read_file_view returns i32")
+            }
+            // fs.read_bytes_view — the binary sibling: same mmap-into-arena call, writing the
+            // `slice<u8>` view `{ptr,len}` into `out` (identical layout to the `str` view), return i32.
+            Rvalue::FsReadBytesView { path, arena, out } => {
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let (p_ptr, p_len) = self.split_str(path)?;
+                let ah = self.operand(arena).into();
+                self.builder
+                    .build_call(self.funcs["fs_read_bytes_view"], &[p_ptr.into(), p_len.into(), ah, out_ptr.into()], "frbv")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("fs_read_bytes_view returns i32")
             }
             // std.path — join/normalize return an owned `{ptr,len}`; base/dir/ext a borrowed view.
             Rvalue::PathJoin { a, b } => {
