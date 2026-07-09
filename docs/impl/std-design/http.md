@@ -146,15 +146,20 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    misframe the next response):** a finished conn is returned to the pool **iff** it was keep-alive
    (HTTP/1.1 default; `Connection: close` or a non-1.1 version → not reused — decided by
    `http_head_keep_alive` from the response head), **Content-Length-framed** (read-to-close responses
-   end at the conn close → not reused), **and** carried **no bytes beyond the framed message** (leftover
-   ⇒ dirty ⇒ dropped). **Stale-conn retry:** a reused idle conn the server has since dropped fails
-   before any response byte; that ONE case is transparently retried once on a fresh conn (the request
-   was almost certainly never processed — the failure is the idle-close race). A fresh conn's failure,
-   or any mid-response failure, surfaces directly. **SIGPIPE:** the client write path uses
-   `send(MSG_NOSIGNAL)` (Linux) / `SO_NOSIGPIPE` (macOS) so writing to a dropped reused conn returns
-   `EPIPE` (→ retry) instead of killing the process — no global signal handler installed. **Pool
-   bounds:** ≤ 8 idle conns per host (overflow closed, not pooled); an idle conn older than 90 s is
-   reaped on take (avoids a doomed reuse+retry). **R6 met:** `bench/http_client` (below) records the
+   end at the conn close → not reused), carried **no bytes beyond the framed message** (leftover ⇒
+   dirty ⇒ dropped), **and** its response **fully parsed** — the pool decision runs *after*
+   `http_parse_core`, so a conn whose response the streaming pass admitted but the owning parse rejects
+   (an untrustworthy stream) is closed, never pooled. **Stale-conn retry:** a reused idle conn the
+   server has since dropped fails before any response byte; that ONE case is transparently retried once
+   on a fresh conn — and the retry **bypasses the pool** (a fresh connect, never a second pooled conn,
+   since the same host can hold several corpses after a server restart). A fresh conn's failure, or any
+   mid-response failure, surfaces directly. **SIGPIPE:** the client write path uses `send(MSG_NOSIGNAL)`
+   (Linux) / `SO_NOSIGPIPE` (macOS) so writing to a dropped reused conn returns `EPIPE` (→ retry)
+   instead of killing the process — no global signal handler installed. **Pool bounds / hygiene:** ≤ 8
+   idle conns per host; an idle conn older than 90 s is reaped — on `take` *and* on `put` (so a fresh
+   conn is never dropped in favour of stale ones), with the overflow conn closed only after reaping; an
+   emptied bucket's key is removed from the map (no unbounded empty-`Vec` growth across many hosts).
+   **R6 met:** `bench/http_client` (below) records the
    pool at **2.86× keepalive speedup** (floor 1.48×) and **parity with hand-written Rust `std::net`**.
    Tests: `align_runtime` units (pool reuses one conn across 3 gets; `Connection: close` not pooled;
    stale-conn retry; `http_head_keep_alive` decision table) + a driver test (two gets reuse one conn,

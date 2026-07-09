@@ -9265,7 +9265,8 @@ pub struct HttpClient {
 
 impl HttpClient {
     /// Take a live idle conn for `key`, closing any that have been idle past [`HTTP_POOL_IDLE_TIMEOUT`]
-    /// (assumed dead) as it scans. `None` if the bucket is empty or holds only stale conns.
+    /// (assumed dead) as it scans. `None` if the bucket is empty or holds only stale conns; an emptied
+    /// bucket's key is removed from the map so connecting to many distinct hosts can't leak empty `Vec`s.
     ///
     /// (Caveat: a stale conn's `close()` syscall runs under the lock. It is a local fd close, not
     /// network I/O, so it is fast and never blocks — the "lock held only for O(1) take/put" claim holds
@@ -9273,21 +9274,35 @@ impl HttpClient {
     fn take_idle(&self, key: &(String, i64)) -> Option<i32> {
         let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bucket = map.get_mut(key)?;
+        let mut found = None;
         while let Some(c) = bucket.pop() {
             if c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT {
-                return Some(c.fd);
+                found = Some(c.fd);
+                break;
             }
             unsafe { close(c.fd) }; // stale — reap and keep looking
         }
-        None
+        if bucket.is_empty() {
+            map.remove(key); // don't accumulate empty buckets across many hosts
+        }
+        found
     }
 
-    /// Return a reusable conn `fd` to `key`'s idle bucket, or close it if the bucket is already at
-    /// [`HTTP_POOL_MAX_IDLE_PER_HOST`] (a bound on idle fds). (Caveat as in [`Self::take_idle`]: an
-    /// overflow `close()` syscall may run under the lock; a local fd close, not network I/O.)
+    /// Return a reusable conn `fd` to `key`'s idle bucket. Expired idle conns in the bucket are reaped
+    /// **first** (so a fresh conn is never dropped in favour of stale ones); only if the bucket is
+    /// still at [`HTTP_POOL_MAX_IDLE_PER_HOST`] after reaping is the new `fd` closed instead of pooled.
+    /// (Caveat as in [`Self::take_idle`]: a stale/overflow `close()` may run under the lock; a local fd
+    /// close, not network I/O.)
     fn put_idle(&self, key: (String, i64), fd: i32) {
         let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bucket = map.entry(key).or_default();
+        bucket.retain(|c| {
+            let live = c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT;
+            if !live {
+                unsafe { close(c.fd) };
+            }
+            live
+        });
         if bucket.len() >= HTTP_POOL_MAX_IDLE_PER_HOST {
             unsafe { close(fd) };
             return;
@@ -9604,19 +9619,27 @@ unsafe fn http_client_perform(client: *mut HttpClient, req: &HttpRequest, out: *
         // Exchange over this conn.
         match unsafe { http_socket_exchange(fd, &request_bytes) } {
             HttpExchange::Complete { bytes, reusable } => {
-                // Return a reusable conn to the pool (http.md R3); else close it.
-                match (reusable, client_ref) {
-                    (true, Some(c)) => c.put_idle(key.clone(), fd),
-                    _ => {
-                        unsafe { close(fd) };
-                    }
-                }
+                // Parse BEFORE deciding the conn's fate: a conn is only safe to pool if its response
+                // fully parsed. A parse failure (a protocol violation `http_parse_head`'s streaming
+                // pass let through — e.g. a body over the 1 GiB cap the looser streaming bound allowed)
+                // means the stream is untrustworthy; pooling it would risk response smuggling. On
+                // failure close the conn and return `AL_INVALID` (no retry — bytes were received, this
+                // is a protocol error, not the stale-conn race).
                 return match http_parse_core(&bytes) {
                     Ok(resp) => {
+                        match (reusable, client_ref) {
+                            (true, Some(c)) => c.put_idle(key.clone(), fd),
+                            _ => {
+                                unsafe { close(fd) };
+                            }
+                        }
                         unsafe { *out = Box::into_raw(Box::new(resp)) };
                         0
                     }
-                    Err(_) => AL_INVALID,
+                    Err(_) => {
+                        unsafe { close(fd) };
+                        AL_INVALID
+                    }
                 };
             }
             HttpExchange::Failed { status, received_any } => {
@@ -14477,5 +14500,56 @@ mod tests {
         unsafe { align_rt_http_resp_free(out) };
         unsafe { align_rt_http_client_free(client) }; // closes the remaining (2nd) seeded corpse — no leak
         assert_eq!(server.join().unwrap(), 1, "exactly one real connection was made (the fresh retry)");
+    }
+
+    /// An emptied idle bucket's key is removed from the pool map, so connecting to many distinct hosts
+    /// does not leak empty `Vec`s (gemini finding 3).
+    #[test]
+    fn http_pool_removes_emptied_bucket() {
+        let client = align_rt_http_client_new();
+        let cref = unsafe { &*client };
+        let key = ("example.com".to_string(), 80i64);
+        let fd = dead_fd();
+        cref.put_idle(key.clone(), fd);
+        assert!(cref.idle.lock().unwrap().contains_key(&key), "put creates the bucket");
+        assert_eq!(cref.take_idle(&key), Some(fd), "take returns the pooled fd");
+        assert!(!cref.idle.lock().unwrap().contains_key(&key), "an emptied bucket's key is removed");
+        unsafe { close(fd) }; // we took it out of the pool — close it ourselves
+        unsafe { align_rt_http_client_free(client) };
+    }
+
+    /// `put_idle` reaps stale (idle-expired) conns BEFORE the capacity check, so a fresh conn is kept
+    /// rather than dropped in favour of stale ones (gemini finding 2).
+    #[test]
+    fn http_pool_put_reaps_stale_before_capacity() {
+        // Fabricate a stale instant; on a machine whose uptime is below the timeout this underflows —
+        // skip (a boot-time-only rarity, never on CI).
+        let Some(old) = std::time::Instant::now().checked_sub(HTTP_POOL_IDLE_TIMEOUT + std::time::Duration::from_secs(1))
+        else {
+            return;
+        };
+        let client = align_rt_http_client_new();
+        let cref = unsafe { &*client };
+        let key = ("h".to_string(), 80i64);
+        // Fill the bucket to capacity with STALE conns.
+        let stale: Vec<i32> = (0..HTTP_POOL_MAX_IDLE_PER_HOST).map(|_| dead_fd()).collect();
+        {
+            let mut map = cref.idle.lock().unwrap();
+            let bucket = map.entry(key.clone()).or_default();
+            for &fd in &stale {
+                bucket.push(IdleConn { fd, idle_since: old });
+            }
+        }
+        // A fresh put must reap all 8 stale conns and keep the fresh one (not drop it at capacity).
+        let fresh = dead_fd();
+        cref.put_idle(key.clone(), fresh);
+        {
+            let map = cref.idle.lock().unwrap();
+            let bucket = map.get(&key).expect("bucket present");
+            assert_eq!(bucket.len(), 1, "8 stale conns reaped, the fresh one kept");
+            assert_eq!(bucket[0].fd, fresh, "the retained conn is the fresh one");
+        }
+        // The 8 stale fds were closed by put_idle's reap; free() closes `fresh`. No double-close.
+        unsafe { align_rt_http_client_free(client) };
     }
 }
