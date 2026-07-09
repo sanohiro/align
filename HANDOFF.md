@@ -8,7 +8,7 @@ Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 _Last updated: 2026-07-10 (staleness sweep: recorded the missed #393/#394 merges, re-verified
 test count, fixed the memory-path key; previously 2026-07-09 loop design settled — docs-only
 sweep; 2026-07-08 M11 std.http Slice 2 — the plaintext client — MERGED as #392; Slice 1 was
-#391. Same week: std.crypto COMPLETE #383–#388, std.compress COMPLETE #380–#382; 2026-07-06:
+#391. Same week: std.crypto COMPLETE #383–#388, std.compress COMPLETE #380–#381; 2026-07-06:
 std.process #376–#378, std.net #371–#374)._
 
 ## ▶ NEXT SESSION — start here
