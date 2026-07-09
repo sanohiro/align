@@ -5551,13 +5551,15 @@ impl<'a, 't> Checker<'a, 't> {
         // so checking just this one snapshot is exactly as deep as name visibility reaches. If
         // transitive/multi-level capture is ever implemented, this must walk the enclosing chain
         // transitively, or shadowing through a grandparent scope becomes silently accepted.
-        let in_enclosing = self
-            .capture
-            .as_ref()
-            .is_some_and(|c| c.enclosing.iter().any(|(n, _, _)| n == name));
-        let is_const =
-            matches!(self.consts.resolve(&self.cur_module, name, &self.cur_module), Ok(Some(_)));
-        if in_scope || in_enclosing || is_const {
+        let in_enclosing = || {
+            self.capture
+                .as_ref()
+                .is_some_and(|c| c.enclosing.iter().any(|(n, _, _)| n == name))
+        };
+        let is_const = || {
+            matches!(self.consts.resolve(&self.cur_module, name, &self.cur_module), Ok(Some(_)))
+        };
+        if in_scope || in_enclosing() || is_const() {
             self.diags.error(
                 format!(
                     "`{name}` is already bound in this scope chain; a name binds once (no shadowing) — use `mut` for a value that changes, or a new name"
