@@ -5,11 +5,11 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10 (owed-delta wave: **#396** struct-`==` ICE → sema diagnostic and
-**#397** no-shadowing enforcement MERGED — the two priority deltas from the 2026-07-09 sweep are
-done; earlier same day: staleness sweep #395 recording the missed #393/#394 merges; previously
-2026-07-09 loop design settled — docs-only sweep; 2026-07-08 M11 std.http Slice 2 — the
-plaintext client — MERGED as #392; Slice 1 was #391)._
+_Last updated: 2026-07-10 (**#398** std.http Slice 3 — keepalive pool + R6 bench — MERGED, R3/R6
+both met; same day, owed-delta wave: **#396** struct-`==` ICE → sema diagnostic and **#397**
+no-shadowing enforcement MERGED — the two priority deltas from the 2026-07-09 sweep are done;
+earlier same day: staleness sweep #395; previously 2026-07-09 loop design settled — docs-only
+sweep; 2026-07-08 M11 std.http Slice 2 MERGED as #392; Slice 1 was #391)._
 
 ## ▶ NEXT SESSION — start here
 
@@ -40,13 +40,14 @@ call sites needed fixing; single-level-capture coupling invariant documented in 
 "locals may share a top-level fn name" recorded as a new Open item. Both adversarially gate-
 reviewed (zero CONFIRMED findings), mutation-checked, gemini reflected (#396 zero findings; #397's
 one medium — eager lookups in `check_shadow` — verified and applied). `cargo test --workspace`
-**1628 green**; clippy clean at `-D warnings`. **Next, pick one:**
+**1628 green**; clippy clean at `-D warnings`. **std.http Slice 3 is now MERGED as #398**
+(keepalive pool + R6 bench, both gates met — see the std.http Slice 3 paragraph below);
+`cargo test --workspace` **1637 green** post-#398. **Next, pick one:**
 (a) **std.http Slice 4** (the server primitive `serve`/`accept`, caller writes the response), then
-Slice 5 (HTTPS/TLS) and `get_many` (R5) — the standing M11 plan (**Slice 3 pool/keepalive + the R6
-`bench/http_client` harness is now DONE on branch `http-slice3-pool`, not yet PR'd — see the std.http
-Slice 3 paragraph below**); or (b) the remaining **2026-07-09 owed implementation deltas**: the `loop`
-slice, the lexer escape-set gaps, `Ord(str)` + `else`-on-`Result` implementation, then the align-LLM
-runway A-list (`fs.read_bytes_view` + bytes binary decode/encode first).
+Slice 5 (HTTPS/TLS) and `get_many` (R5) — the standing M11 plan; or (b) the remaining
+**2026-07-09 owed implementation deltas**: the `loop` slice, the lexer escape-set gaps,
+`Ord(str)` + `else`-on-`Result` implementation, then the align-LLM runway A-list
+(`fs.read_bytes_view` + bytes binary decode/encode first).
 
 **Design settled 2026-07-09: the `loop` expression** (docs-only, no code). One narrow sequential-control construct — `loop { ... break value }`, an expression; no `for`/`while`/`continue`/labels; recursion is explicitly not iteration (the spec now guarantees no TCO — scope-end drops and `?` kill tail position). The pipeline owns the data path; `loop` owns the control path. Updated: `draft.md` §4 "Loop" + §7, `language-spec.md`, `design-notes.md` → "The loop philosophy", `history.md`, `open-questions.md` (Settled → "Sequential control"), guide ch00/02/06/13/17, little-aligner ch11 **rewritten** as `11-do-it-until.md` (it taught recursion-as-iteration and overclaimed TCO), + `ja/` mirrors. Implementation is an unscheduled future slice (lexer/parser `loop`/`break`, break-type unification like match arms, per-iteration drops, block-value escape rule); the deferred M8 frequency lints gain their firing surface when it lands.
 
@@ -117,8 +118,8 @@ authority/path have no CR/LF/NUL/SP (permanent-codec smuggling guard). (3) parse
 conflicting duplicate Content-Length (RFC 7230 §3.3.3). `cargo test --workspace` 1584 green,
 expr_depth 5/5 default env, clippy clean.
 
-**`std.http` — Slice 3 DONE (keepalive connection pool + R6 benchmark; branch `http-slice3-pool`, not
-yet PR'd).** `Ty::HttpClient` goes from a ZST to a real Move type owning a keepalive pool
+**`std.http` — Slice 3 DONE (merged as #398: keepalive connection pool + R6 benchmark).**
+`Ty::HttpClient` goes from a ZST to a real Move type owning a keepalive pool
 (`Mutex<HashMap<(host,port), Vec<IdleConn>>>`) — and this was a **pure runtime change**: the compiler
 already treats `HttpClient` as an opaque handle pointer (codegen emits a pointer; Drop already calls
 `align_rt_http_client_free`), so ZST→state is invisible to sema/MIR/codegen (the Slice-2 "ZST behind
@@ -139,7 +140,13 @@ limitations"). **R6 MET:** `bench/http_client/` (drives the shipped pool's C-ABI
 `std::net` baseline over a localhost server) records **2.86× keepalive speedup** (floor 1.48×) and
 **parity with hand-written Rust** on the reuse path. Tests: `align_runtime` units (reuse across 3 gets;
 `Connection: close` not pooled; stale-conn retry; `http_head_keep_alive` table) + a driver test (2 gets
-reuse 1 conn, via the server's accept count). `cargo test --workspace` green; clippy `-D warnings`
+reuse 1 conn, via the server's accept count). **Review wave (all reflected pre-merge):** the
+adversarial gate CONFIRMED one defect — the stale-conn retry re-entered the pool (could grab a
+second dead conn) instead of forcing a fresh connect — fixed + regression-tested; it also flagged
+the bare leftover-bytes check, now mutation-verified by a dedicated test. gemini's 3 findings all
+verified valid and applied: pool only after `http_parse_core` succeeds (poisoning guard; the one
+reachable divergence was a >1 GiB body), `put_idle` reaps stale conns before the capacity check,
+`take_idle` removes emptied buckets. `cargo test --workspace` **1637 green**; clippy `-D warnings`
 clean. **Next: Slice 4** (server primitive `serve`/`accept`), then Slice 5 (HTTPS/TLS). `get_many`
 (R5) also remains.
 
