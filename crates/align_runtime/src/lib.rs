@@ -6948,6 +6948,12 @@ unsafe extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     fn connect(sockfd: i32, addr: *const u8, addrlen: u32) -> i32;
     fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *const core::ffi::c_void, optlen: u32) -> i32;
+    // `send` — a socket write that can suppress `SIGPIPE` via `MSG_NOSIGNAL` (Linux). Writing to a
+    // peer that has closed its read half would otherwise raise `SIGPIPE` and kill the whole process —
+    // the common case when the http pool reuses a keepalive conn the server has since dropped. On
+    // macOS/BSD there is no `MSG_NOSIGNAL`; `SO_NOSIGPIPE` is set on the socket instead (see the http
+    // client), so `flags` is `0` there. Identical prototype on Linux and macOS/BSD.
+    fn send(sockfd: i32, buf: *const core::ffi::c_void, len: usize, flags: i32) -> isize;
     // `bind`/`listen`/`accept` — the BSD server-side socket calls (identical prototypes on Linux and
     // macOS/BSD). `accept` with null `addr`/`addrlen` returns the connected fd without the peer
     // address. `bind` takes the `sockaddr` `getaddrinfo` filled. On Linux the CLOEXEC-atomic `accept4`
@@ -8965,6 +8971,11 @@ struct HttpHead {
     body_start: usize,
     /// The declared `Content-Length`, or `None` for read-to-close framing (no CL, not chunked).
     content_length: Option<usize>,
+    /// `true` iff the status line is exactly `HTTP/1.1` — the persistence default (keep-alive unless
+    /// `Connection: close`). Any other version (`1.0`, or an unknown version) is `false`, so the
+    /// keepalive default is close (conservative — the pool only reuses a conn it is sure about;
+    /// http.md R3). Used only by the client's reuse decision ([`http_head_keep_alive`]).
+    http_1_1: bool,
 }
 
 /// Scan the status line + header block of `src` (up to and including the blank line), WITHOUT copying
@@ -8984,6 +8995,9 @@ fn http_parse_head(src: &[u8]) -> Result<HttpHead, HttpParseErr> {
     let Some(sp) = memchr::memchr(b' ', status_line) else {
         return Err(HttpParseErr::Invalid);
     };
+    // The version token is between `HTTP/` and that first space. Only exact `HTTP/1.1` defaults to
+    // keepalive; every other version (1.0 or unknown) defaults to close for the reuse decision.
+    let http_1_1 = &status_line[..sp] == b"HTTP/1.1";
     let after = &status_line[sp + 1..];
     let code_end = memchr::memchr(b' ', after).unwrap_or(after.len());
     let code_bytes = &after[..code_end];
@@ -9043,7 +9057,7 @@ fn http_parse_head(src: &[u8]) -> Result<HttpHead, HttpParseErr> {
     if is_chunked {
         return Err(HttpParseErr::Invalid); // `chunked` de-chunking is deferred (v1 = Content-Length only)
     }
-    Ok(HttpHead { status, headers, body_start, content_length })
+    Ok(HttpHead { status, headers, body_start, content_length, http_1_1 })
 }
 
 /// Parse a COMPLETE HTTP/1.1 response buffer into an owned [`HttpResponse`] (http.md R1 — one owned
@@ -9203,36 +9217,178 @@ pub unsafe extern "C" fn align_rt_http_resp_free(resp: *mut HttpResponse) {
 const IPPROTO_TCP: i32 = 6;
 const TCP_NODELAY: i32 = 1;
 
+// SIGPIPE suppression on the client write path. On Linux, `send(..., MSG_NOSIGNAL)` never raises
+// `SIGPIPE` (a write to a peer that closed its read half returns `EPIPE` instead). On macOS/BSD there
+// is no such flag; `SO_NOSIGPIPE` is set once on the socket (at `IPPROTO_TCP`'s sibling `SOL_SOCKET`).
+// This matters most for the pool: reusing a keepalive conn the server has since dropped writes to a
+// dead peer, which must fail cleanly (→ retry on a fresh conn) rather than kill the process.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+const MSG_NOSIGNAL: i32 = 0x4000; // Linux
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const SO_NOSIGPIPE: i32 = 0x1022; // macOS/BSD socket option (SOL_SOCKET)
+
 /// The cap on a response's status line + header block: a response whose header block is not terminated
 /// within this many bytes is rejected (`AL_INVALID`) — a bound against an adversarial server that
 /// never sends the blank line (an unbounded read otherwise). 256 KiB dwarfs any real header block.
 const HTTP_MAX_HEADER_BLOCK: usize = 256 * 1024;
 
-/// A `client` (`std.http`) — the HTTP/1.1 client handle from `http.client()`. An owned **Move** handle
-/// (like `reader`/`writer`/`tcp_conn`). In Slice 2 it carries NO persistent state: every request opens
-/// one fresh `tcp_conn` and closes it. Slice 3 will add the keepalive connection pool as a field here
-/// (a host:port → idle-conn map, closed on `Drop` — http.md P5) with no change to the language surface
-/// (`get`/`post`/`request`) or the FFI entry points (they already take `*mut HttpClient`). A ZST today:
-/// its handle pointer is an opaque, non-null token.
-pub struct HttpClient;
+/// Max idle keepalive conns retained per host:port (http.md R3/P5). Beyond this, a finished conn is
+/// closed rather than pooled — a bound on fd growth when many requests to one host finish at once.
+const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 8;
 
-/// `http.client()` — allocate a client handle. Slice 2 has no pooled state; the handle is a Move token
-/// whose `Drop` ([`align_rt_http_client_free`]) is a no-op until Slice 3 owns pooled conns.
-#[unsafe(no_mangle)]
-pub extern "C" fn align_rt_http_client_new() -> *mut HttpClient {
-    Box::into_raw(Box::new(HttpClient))
+/// A pooled conn idle longer than this is assumed dead (a server keepalive idle timeout is typically
+/// 5–75 s) and closed on *take* rather than reused — avoiding a doomed reuse+retry round-trip. This is
+/// pool-side idle bookkeeping only; it is NOT a request/connect I/O deadline (see http.md "Known v1
+/// limitations" — I/O timeouts stay a net-rail follow-up).
+const HTTP_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// One pooled idle keepalive connection: an owned socket fd plus the instant it went idle. The pool
+/// owns the fd directly (NOT a `TcpConn` box — the fd was lifted out at connect) and closes it on
+/// staleness eviction, per-host overflow, or client `Drop`.
+struct IdleConn {
+    fd: i32,
+    idle_since: std::time::Instant,
 }
 
-/// Free a `client`. Null-safe (a moved-out / never-initialised owned slot drops harmlessly). Slice 3
-/// closes every pooled conn here (http.md P5); Slice 2 has none.
+/// A `client` (`std.http`) — the HTTP/1.1 client handle from `http.client()`. An owned **Move** handle
+/// (like `reader`/`writer`/`tcp_conn`). It owns a **keepalive connection pool** (http.md R3): idle
+/// conns keyed by the connect target `(host, port)`, reused by `get`/`post`/`request` to the same
+/// authority with zero opt-in, and all closed on `Drop` (http.md P5 — no fd leak across pool churn).
+///
+/// The map is behind a `Mutex` so a future `get_many` (task_group over shared workers) can share one
+/// client across threads; the v1 bound-receiver norm is single-threaded and never contends. A conn is
+/// only ever *idle* in the map between requests — an in-flight exchange holds it out, so the lock is
+/// held only for the O(1) take/put, never across blocking I/O.
+pub struct HttpClient {
+    idle: std::sync::Mutex<std::collections::HashMap<(String, i64), Vec<IdleConn>>>,
+}
+
+impl HttpClient {
+    /// Take a live idle conn for `key`, closing any that have been idle past [`HTTP_POOL_IDLE_TIMEOUT`]
+    /// (assumed dead) as it scans. `None` if the bucket is empty or holds only stale conns; an emptied
+    /// bucket's key is removed from the map so connecting to many distinct hosts can't leak empty `Vec`s.
+    ///
+    /// (Caveat: a stale conn's `close()` syscall runs under the lock. It is a local fd close, not
+    /// network I/O, so it is fast and never blocks — the "lock held only for O(1) take/put" claim holds
+    /// in spirit; the close is bounded, not a round-trip.)
+    fn take_idle(&self, key: &(String, i64)) -> Option<i32> {
+        let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bucket = map.get_mut(key)?;
+        let mut found = None;
+        while let Some(c) = bucket.pop() {
+            if c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT {
+                found = Some(c.fd);
+                break;
+            }
+            unsafe { close(c.fd) }; // stale — reap and keep looking
+        }
+        if bucket.is_empty() {
+            map.remove(key); // don't accumulate empty buckets across many hosts
+        }
+        found
+    }
+
+    /// Return a reusable conn `fd` to `key`'s idle bucket. Expired idle conns in the bucket are reaped
+    /// **first** (so a fresh conn is never dropped in favour of stale ones); only if the bucket is
+    /// still at [`HTTP_POOL_MAX_IDLE_PER_HOST`] after reaping is the new `fd` closed instead of pooled.
+    /// (Caveat as in [`Self::take_idle`]: a stale/overflow `close()` may run under the lock; a local fd
+    /// close, not network I/O.)
+    fn put_idle(&self, key: (String, i64), fd: i32) {
+        let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bucket = map.entry(key).or_default();
+        bucket.retain(|c| {
+            let live = c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT;
+            if !live {
+                unsafe { close(c.fd) };
+            }
+            live
+        });
+        if bucket.len() >= HTTP_POOL_MAX_IDLE_PER_HOST {
+            unsafe { close(fd) };
+            return;
+        }
+        bucket.push(IdleConn { fd, idle_since: std::time::Instant::now() });
+    }
+}
+
+/// `http.client()` — allocate a client handle owning an empty keepalive pool.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_http_client_new() -> *mut HttpClient {
+    Box::into_raw(Box::new(HttpClient { idle: std::sync::Mutex::new(std::collections::HashMap::new()) }))
+}
+
+/// Free a `client`, closing every pooled idle conn (http.md P5 — no fd leak across pool churn).
+/// Null-safe (a moved-out / never-initialised owned slot drops harmlessly).
 ///
 /// # Safety
 /// `c` must be null or a pointer from [`align_rt_http_client_new`], not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_client_free(c: *mut HttpClient) {
-    if !c.is_null() {
-        drop(unsafe { Box::from_raw(c) });
+    if c.is_null() {
+        return;
     }
+    let client = unsafe { Box::from_raw(c) };
+    let mut map = client.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (_key, conns) in map.drain() {
+        for conn in conns {
+            unsafe { close(conn.fd) };
+        }
+    }
+    drop(map); // release before `client` (and its now-empty map) drops
+}
+
+/// Decide whether a connection may be kept alive for reuse from the response head (http.md R3). An
+/// `HTTP/1.1` response defaults to keep-alive (reuse unless `Connection: close`); any other version
+/// defaults to close (reuse only on an explicit `Connection: keep-alive`). `Connection` is a
+/// comma-separated token list; a `close` token anywhere forces close (wins over a later `keep-alive`).
+fn http_head_keep_alive(head: &HttpHead, buf: &[u8]) -> bool {
+    let mut keep = head.http_1_1;
+    for h in &head.headers {
+        let name = &buf[h.name_start..h.name_start + h.name_len];
+        if !name.eq_ignore_ascii_case(b"connection") {
+            continue;
+        }
+        let value = &buf[h.value_start..h.value_start + h.value_len];
+        for tok in value.split(|&b| b == b',') {
+            let tok = tok.trim_ascii();
+            if tok.eq_ignore_ascii_case(b"close") {
+                return false;
+            }
+            if tok.eq_ignore_ascii_case(b"keep-alive") {
+                keep = true;
+            }
+        }
+    }
+    keep
+}
+
+/// Write all of `bytes` to the connected socket `fd` **without ever raising `SIGPIPE`** — the pool's
+/// reused-conn write path must fail cleanly (not kill the process) when the server has closed the
+/// peer. On Linux this is `send(..., MSG_NOSIGNAL)`; on macOS/BSD the socket carries `SO_NOSIGPIPE`
+/// (set at connect) so a plain `send` suffices. Loops over partial writes, retries `EINTR`. Returns
+/// `0` on success, else the errno mapped through [`io_error_to_status`] (`EPIPE`/`ECONNRESET` for a
+/// dead peer).
+///
+/// # Safety
+/// `fd` must be a valid connected socket.
+unsafe fn http_send_all(fd: i32, mut bytes: &[u8]) -> i32 {
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let flags = MSG_NOSIGNAL;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let flags = 0;
+    while !bytes.is_empty() {
+        let n = unsafe { send(fd, bytes.as_ptr() as *const core::ffi::c_void, bytes.len(), flags) };
+        if n > 0 {
+            bytes = &bytes[n as usize..];
+        } else {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return io_error_to_status(&e);
+        }
+    }
+    0
 }
 
 /// Split an HTTP authority `host[:port]` into `(host, port)` for the socket connect, handling a
@@ -9280,54 +9436,78 @@ fn http_split_authority(authority: &str) -> Option<(String, i64)> {
     }
 }
 
-/// Send `request` (the serialized bytes, one `write` — http.md R4) on the connected socket `fd`, then
-/// stream the response through the socket into one growing buffer, stopping at the Content-Length-framed
-/// end (or at EOF for a read-to-close response). Returns the raw response bytes, or a mapped
-/// transport/protocol status (`AL_INVALID` for a malformed head / over-cap; an errno via
-/// [`io_error_to_status`] for a socket error). Reads go in 32 KiB chunks — never a per-line read
-/// (http.md R4). Does NOT close `fd` (the caller owns the `tcp_conn`).
+/// The outcome of one request/response exchange over a socket — carrying, beyond the bytes, the two
+/// facts the pool needs (http.md R3): whether the conn stays reusable, and (on failure) whether ANY
+/// response byte was seen (a reused idle conn that fails with zero bytes is an idle-close race → retry
+/// once on a fresh conn; a fresh conn's failure, or a mid-response failure, is returned as-is).
+enum HttpExchange {
+    /// A complete response was read. `reusable` = keep-alive AND Content-Length-framed AND no bytes
+    /// beyond the framed message (a keepalive server sends exactly one response per request; a
+    /// read-to-close response, a `Connection: close`, or leftover bytes make the conn non-reusable).
+    Complete { bytes: Vec<u8>, reusable: bool },
+    /// The exchange failed. `received_any` distinguishes a pre-response failure (retryable on a reused
+    /// conn) from a mid-response one.
+    Failed { status: i32, received_any: bool },
+}
+
+/// Send `request` (the serialized bytes, one write — http.md R4) on the connected socket `fd`, then
+/// stream the response into one growing buffer, stopping at the Content-Length-framed end (or at EOF
+/// for a read-to-close response). Reads go in 32 KiB chunks — never a per-line read (http.md R4). Does
+/// NOT close `fd` (the caller decides pool-return vs close). Returns an [`HttpExchange`] carrying the
+/// bytes + reuse verdict, or a failure + whether any byte was received.
 ///
 /// # Safety
 /// `fd` must be a valid connected socket.
-unsafe fn http_socket_exchange(fd: i32, request: &[u8]) -> Result<Vec<u8>, i32> {
-    // One write of the whole request (start-line + headers + body already in one buffer).
-    let ws = write_all_fd(fd, request);
+unsafe fn http_socket_exchange(fd: i32, request: &[u8]) -> HttpExchange {
+    // One SIGPIPE-safe write of the whole request (start-line + headers + body already in one buffer).
+    let ws = unsafe { http_send_all(fd, request) };
     if ws != 0 {
-        return Err(ws);
+        // The write itself failed (a dead reused conn typically fails here with EPIPE/ECONNRESET):
+        // nothing was received.
+        return HttpExchange::Failed { status: ws, received_any: false };
     }
     let mut buf: Vec<u8> = Vec::new();
-    let mut target: Option<usize> = None; // total message length under Content-Length framing
-    let mut read_to_close = false; // headers done, no Content-Length → consume until EOF
+    // Framing, decided ONCE the header block is available: `Some((target, keep_alive))` under
+    // Content-Length framing, or read-to-close (`None` here after `read_to_close` is set).
+    let mut target: Option<(usize, bool)> = None;
+    let mut read_to_close = false;
     let mut chunk = [0u8; 32 * 1024];
     loop {
-        // Decide the framing ONCE the header block is available, then just read to the target length
-        // (no re-scan of the head per chunk — http.md R1/R4).
+        // Decide the framing once, then just read to the target length (no per-chunk head re-scan —
+        // http.md R1/R4). `keep_alive` is computed here while the head spans still index `buf`.
         if target.is_none() && !read_to_close {
             match http_parse_head(&buf) {
-                Ok(head) => match head.content_length {
-                    Some(cl) => {
-                        // The complete message spans the header block plus the declared body.
-                        match head.body_start.checked_add(cl) {
-                            Some(t) if t <= HTTP_MAX_BODY.saturating_add(HTTP_MAX_HEADER_BLOCK) => target = Some(t),
-                            _ => return Err(AL_INVALID), // oversized / overflow
-                        }
-                    }
-                    None => read_to_close = true,
-                },
-                Err(HttpParseErr::Incomplete) => {
-                    // The header block is not terminated yet — bound the pre-body read.
-                    if buf.len() > HTTP_MAX_HEADER_BLOCK {
-                        return Err(AL_INVALID);
+                Ok(head) => {
+                    let keep_alive = http_head_keep_alive(&head, &buf);
+                    match head.content_length {
+                        Some(cl) => match head.body_start.checked_add(cl) {
+                            Some(t) if t <= HTTP_MAX_BODY.saturating_add(HTTP_MAX_HEADER_BLOCK) => {
+                                target = Some((t, keep_alive));
+                            }
+                            _ => return HttpExchange::Failed { status: AL_INVALID, received_any: !buf.is_empty() },
+                        },
+                        // No Content-Length → read-to-close framing: the conn is never reusable (its
+                        // end is the connection close).
+                        None => read_to_close = true,
                     }
                 }
-                Err(HttpParseErr::Invalid) => return Err(AL_INVALID),
+                Err(HttpParseErr::Incomplete) => {
+                    if buf.len() > HTTP_MAX_HEADER_BLOCK {
+                        return HttpExchange::Failed { status: AL_INVALID, received_any: !buf.is_empty() };
+                    }
+                }
+                Err(HttpParseErr::Invalid) => return HttpExchange::Failed { status: AL_INVALID, received_any: !buf.is_empty() },
             }
         }
-        if let Some(t) = target
+        if let Some((t, keep_alive)) = target
             && buf.len() >= t
         {
-            buf.truncate(t); // a keepalive server may have sent the next response's head; drop it
-            break;
+            // Reusable only if keep-alive AND no bytes beyond the framed message. A keepalive server
+            // sends exactly one response per request; leftover bytes mean a dirty conn (reusing it
+            // would misframe the NEXT response — a data-corruption class bug), so drop the conn.
+            let reusable = keep_alive && buf.len() == t;
+            buf.truncate(t);
+            return HttpExchange::Complete { bytes: buf, reusable };
         }
         // One read syscall (retries EINTR); a real error maps through the errno table.
         let n = loop {
@@ -9339,31 +9519,71 @@ unsafe fn http_socket_exchange(fd: i32, request: &[u8]) -> Result<Vec<u8>, i32> 
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(io_error_to_status(&e));
+            return HttpExchange::Failed { status: io_error_to_status(&e), received_any: !buf.is_empty() };
         };
         if n == 0 {
-            // EOF: ends a read-to-close body; a Content-Length body not yet complete is a truncated
-            // read, which the final `http_parse_core` rejects.
-            break;
+            // EOF. Nothing received at all → a closed conn before any response (a reused idle conn the
+            // server dropped) → retryable failure. A read-to-close body ends here (never reusable). A
+            // Content-Length body not yet complete is a truncated read → malformed.
+            if buf.is_empty() {
+                return HttpExchange::Failed { status: AL_INVALID, received_any: false };
+            }
+            if read_to_close {
+                return HttpExchange::Complete { bytes: buf, reusable: false };
+            }
+            return HttpExchange::Failed { status: AL_INVALID, received_any: true };
         }
         buf.extend_from_slice(&chunk[..n as usize]);
         // Defensive memory bound for read-to-close (no declared Content-Length).
         if read_to_close && buf.len() > HTTP_MAX_BODY.saturating_add(HTTP_MAX_HEADER_BLOCK) {
-            return Err(AL_INVALID);
+            return HttpExchange::Failed { status: AL_INVALID, received_any: true };
         }
     }
-    Ok(buf)
 }
 
-/// Perform ONE HTTP/1.1 request/response exchange over ONE fresh TCP connection and write the parsed
-/// [`HttpResponse`] to `*out`, returning `0`; else a mapped status (`AL_INVALID` for a bad URL / head,
-/// an errno for a socket failure) leaving `*out` null. A 4xx/5xx status is success (status is data —
-/// http.md P2). `_client` is unused in Slice 2 (no pool); Slice 3 routes the connect through its
-/// keepalive pool. `out` must already be null-initialised by the caller.
+/// Connect a fresh TCP conn to `(host, port)` and lift its fd out of the net rail's `TcpConn` box (the
+/// pool owns the fd's lifetime from here — `TcpConn` has no `Drop`, so dropping the box frees only its
+/// bytes and leaves the fd open). Sets `TCP_NODELAY` (http.md R4) and, on macOS/BSD, `SO_NOSIGPIPE`.
+/// Returns the fd, or a mapped connect status.
+///
+/// # Safety
+/// Callers must eventually pool or `close` the returned fd.
+unsafe fn http_connect_fd(host: &str, port: i64) -> Result<i32, i32> {
+    let mut conn: *mut TcpConn = core::ptr::null_mut();
+    let rc = unsafe { align_rt_tcp_connect(host.as_ptr(), host.len() as i64, port, &mut conn) };
+    if rc != 0 {
+        return Err(rc);
+    }
+    // Lift the fd out; drop the box (no `Drop` → the fd stays open, no leak of the 4-byte box).
+    let fd = unsafe { Box::from_raw(conn) }.fd;
+    let on: i32 = 1;
+    // Disable Nagle so the request tail is sent immediately (http.md R4). Best-effort like keepalive.
+    unsafe {
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+    }
+    // macOS/BSD: suppress SIGPIPE per-socket (Linux uses MSG_NOSIGNAL on `send`, see `http_send_all`).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+    }
+    Ok(fd)
+}
+
+/// Perform ONE HTTP/1.1 request/response exchange for `req` and write the parsed [`HttpResponse`] to
+/// `*out`, returning `0`; else a mapped status (`AL_INVALID` for a bad URL / head, an errno for a
+/// socket failure) leaving `*out` null. A 4xx/5xx status is success (status is data — http.md P2).
+///
+/// **Connection reuse (http.md R3):** the exchange runs over a pooled keepalive conn to the same
+/// `(host, port)` when one is idle, else a fresh conn; a reusable finished conn (keep-alive,
+/// Content-Length-framed, no leftover) is returned to `client`'s pool. A reused idle conn the server
+/// has since dropped fails before any response byte — that ONE case is retried once on a fresh conn
+/// (the request was almost certainly never processed: the failure is the idle-close race, not a
+/// server-side effect). A fresh conn's failure, or any mid-response failure, is returned as-is.
+/// `out` must already be null-initialised by the caller.
 ///
 /// # Safety
 /// `out` must point to a writable `*mut HttpResponse` slot.
-unsafe fn http_client_perform(_client: *mut HttpClient, req: &HttpRequest, out: *mut *mut HttpResponse) -> i32 {
+unsafe fn http_client_perform(client: *mut HttpClient, req: &HttpRequest, out: *mut *mut HttpResponse) -> i32 {
     // 1. Split the URL: rejects `https://` (P1) / a non-http scheme / an empty authority / malformed.
     let Some((authority, _path)) = http_split_url(&req.url) else {
         return AL_INVALID;
@@ -9377,33 +9597,62 @@ unsafe fn http_client_perform(_client: *mut HttpClient, req: &HttpRequest, out: 
         Ok(b) => b,
         Err(s) => return s,
     };
-    // 4. Connect (reuses the net rail: DNS + connect + SO_KEEPALIVE, per-address fallback).
-    let mut conn: *mut TcpConn = core::ptr::null_mut();
-    let rc = unsafe { align_rt_tcp_connect(host.as_ptr(), host.len() as i64, port, &mut conn) };
-    if rc != 0 {
-        return rc;
-    }
-    let fd = unsafe { (*conn).fd };
-    // 5. Disable Nagle so the request tail is sent immediately (http.md R4). Best-effort, like
-    //    `SO_KEEPALIVE` — a failure does not make the connection unusable.
-    let on: i32 = 1;
-    unsafe {
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
-    }
-    // 6/7. One write + streamed read.
-    let exchanged = unsafe { http_socket_exchange(fd, &request_bytes) };
-    // 8. Close the conn (Slice 2: no pool — every request connects fresh and closes).
-    unsafe { align_rt_tcp_conn_free(conn) };
-    // 9. Parse the complete response buffer into an owned handle (http.md R1).
-    match exchanged {
-        Err(s) => s,
-        Ok(bytes) => match http_parse_core(&bytes) {
-            Ok(resp) => {
-                unsafe { *out = Box::into_raw(Box::new(resp)) };
-                0
+    let client_ref: Option<&HttpClient> = unsafe { client.as_ref() };
+    let key = (host, port);
+
+    // Up to two attempts: attempt 0 may reuse a pooled conn; a stale-conn failure (zero bytes) falls
+    // through to attempt 1 on a guaranteed-fresh conn.
+    let mut attempt = 0u32;
+    loop {
+        // Acquire a connection: on attempt 0, a live pooled idle conn (reused), else a fresh connect.
+        // On the retry (attempt 1) the pool is BYPASSED — a stale pooled conn is exactly what failed,
+        // and the same host can hold several dead idle conns (e.g. after a server restart), so re-taking
+        // from the pool could hand back another corpse. The retry must reach a guaranteed-fresh connect.
+        let pooled = if attempt == 0 { client_ref.and_then(|c| c.take_idle(&key)) } else { None };
+        let (fd, reused) = match pooled {
+            Some(fd) => (fd, true),
+            None => match unsafe { http_connect_fd(&key.0, key.1) } {
+                Ok(fd) => (fd, false),
+                Err(s) => return s,
+            },
+        };
+        // Exchange over this conn.
+        match unsafe { http_socket_exchange(fd, &request_bytes) } {
+            HttpExchange::Complete { bytes, reusable } => {
+                // Parse BEFORE deciding the conn's fate: a conn is only safe to pool if its response
+                // fully parsed. A parse failure (a protocol violation `http_parse_head`'s streaming
+                // pass let through — e.g. a body over the 1 GiB cap the looser streaming bound allowed)
+                // means the stream is untrustworthy; pooling it would risk response smuggling. On
+                // failure close the conn and return `AL_INVALID` (no retry — bytes were received, this
+                // is a protocol error, not the stale-conn race).
+                return match http_parse_core(&bytes) {
+                    Ok(resp) => {
+                        match (reusable, client_ref) {
+                            (true, Some(c)) => c.put_idle(key.clone(), fd),
+                            _ => {
+                                unsafe { close(fd) };
+                            }
+                        }
+                        unsafe { *out = Box::into_raw(Box::new(resp)) };
+                        0
+                    }
+                    Err(_) => {
+                        unsafe { close(fd) };
+                        AL_INVALID
+                    }
+                };
             }
-            Err(_) => AL_INVALID,
-        },
+            HttpExchange::Failed { status, received_any } => {
+                unsafe { close(fd) };
+                // Retry once, ONLY when a *reused* conn failed before any response byte: the idle-close
+                // race. A fresh conn (or a mid-response failure) surfaces the error directly.
+                if reused && !received_any && attempt == 0 {
+                    attempt += 1;
+                    continue;
+                }
+                return status;
+            }
+        }
     }
 }
 
@@ -14034,5 +14283,273 @@ mod tests {
         let req = unsafe { align_rt_http_request_new(mp, ml, up, ul) };
         assert_eq!(unsafe { align_rt_http_client_request(c2, req, std::ptr::null_mut()) }, AL_INVALID);
         unsafe { align_rt_http_client_free(c2) };
+    }
+
+    /// `http_head_keep_alive` — the reuse decision from the response head: HTTP/1.1 defaults keep-alive,
+    /// HTTP/1.0 defaults close, and an explicit `Connection` token (in a comma list, any case) wins,
+    /// with `close` beating a later `keep-alive`.
+    #[test]
+    fn http_head_keep_alive_decision() {
+        let ka = |raw: &[u8]| -> bool {
+            let Ok(head) = http_parse_head(raw) else { panic!("valid head") };
+            http_head_keep_alive(&head, raw)
+        };
+        assert!(ka(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"), "1.1 defaults keep-alive");
+        assert!(!ka(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"), "1.0 defaults close");
+        assert!(ka(b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"), "1.0 + explicit keep-alive");
+        assert!(!ka(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"), "1.1 + close");
+        assert!(!ka(b"HTTP/1.1 200 OK\r\nConnection: KEEP-ALIVE, Close\r\nContent-Length: 0\r\n\r\n"), "close in a list wins, any case");
+        assert!(ka(b"HTTP/1.1 200 OK\r\nconnection: keep-alive\r\nContent-Length: 0\r\n\r\n"), "case-insensitive name");
+    }
+
+    /// A persistent loopback keepalive HTTP server for pool tests. Accepts up to `stop_after_conns`
+    /// connections; on each it handles requests (read a full request head + `Content-Length` body,
+    /// write `response`) either until the client closes (`close_after_each = false`, HTTP/1.1
+    /// keepalive) or after exactly ONE request (`close_after_each = true`, simulating a server that
+    /// closes the conn — a `Connection: close` server, or a keepalive conn dropped by an idle timeout).
+    /// Returns `(port, handle)`; the handle yields the number of ACCEPTED connections — the observable
+    /// that distinguishes reuse (few) from fresh-per-request (many). Non-blocking accept + a read
+    /// timeout bound the test so a pool regression can never hang CI (it fails on the count instead).
+    fn http_serve_pool(response: Vec<u8>, stop_after_conns: usize, close_after_each: bool) -> (u16, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut accepted = 0usize;
+            while accepted < stop_after_conns && std::time::Instant::now() < deadline {
+                let mut sock = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                accepted += 1;
+                sock.set_nonblocking(false).unwrap();
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                // Handle requests on this connection.
+                let mut req: Vec<u8> = Vec::new();
+                loop {
+                    // Read one complete request (head + any Content-Length body).
+                    let mut want: Option<usize> = None;
+                    let got_one = loop {
+                        if let Some(t) = want {
+                            if req.len() >= t {
+                                break true;
+                            }
+                        } else if let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&req[..p]).to_ascii_lowercase();
+                            let cl = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                .unwrap_or(0);
+                            want = Some(p + 4 + cl);
+                            if req.len() >= p + 4 + cl {
+                                break true;
+                            }
+                        }
+                        let mut tmp = [0u8; 512];
+                        match sock.read(&mut tmp) {
+                            Ok(0) | Err(_) => break false, // client closed / timed out
+                            Ok(n) => req.extend_from_slice(&tmp[..n]),
+                        }
+                    };
+                    if !got_one {
+                        break; // client closed with no further request — done with this conn
+                    }
+                    let _ = sock.write_all(&response);
+                    // Drop the consumed request bytes (a keepalive conn may carry the next request).
+                    let consumed = want.unwrap();
+                    req.drain(..consumed);
+                    if close_after_each {
+                        break; // close the conn after one request (Connection: close / stale sim)
+                    }
+                }
+                // `sock` drops here → the conn closes (client sees EOF).
+            }
+            accepted
+        });
+        (port, handle)
+    }
+
+    /// http.md R3: consecutive `get`s to the same host:port over ONE client reuse a single pooled
+    /// keepalive connection — the server accepts exactly ONE connection for three requests.
+    #[test]
+    fn http_client_pool_reuses_connection() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let (port, server) = http_serve_pool(resp, 1, false);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        for _ in 0..3 {
+            let mut out: *mut HttpResponse = std::ptr::null_mut();
+            let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+            assert_eq!(rc, 0, "each pooled GET succeeds");
+            assert_eq!(unsafe { align_rt_http_resp_status(out) }, 200);
+            let body = unsafe { align_rt_http_resp_body(out) };
+            assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"hi");
+            unsafe { align_rt_http_resp_free(out) };
+        }
+        unsafe { align_rt_http_client_free(client) }; // closes the pooled conn → server's read hits EOF
+        assert_eq!(server.join().unwrap(), 1, "3 gets reused ONE connection (R3)");
+    }
+
+    /// A response with `Connection: close` must NOT be pooled — the next `get` opens a fresh conn, so
+    /// the server accepts TWO connections for two requests.
+    #[test]
+    fn http_client_no_reuse_on_connection_close() {
+        let resp = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let (port, server) = http_serve_pool(resp, 2, true);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let mut out: *mut HttpResponse = std::ptr::null_mut();
+            let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+            assert_eq!(rc, 0);
+            assert_eq!(unsafe { align_rt_http_resp_status(out) }, 200);
+            unsafe { align_rt_http_resp_free(out) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 2, "Connection: close is never pooled");
+    }
+
+    /// The stale-conn retry: a keepalive server that nonetheless drops the conn after each response
+    /// (an idle-timeout race) — the client pools conn #1, finds it dead on the 2nd get (write/read
+    /// fails before any response byte), and transparently retries on a fresh conn. Both gets succeed;
+    /// the server accepts TWO connections.
+    #[test]
+    fn http_client_retries_stale_pooled_connection() {
+        // Keep-alive-looking response (no Connection: close → the client WILL pool it), but the server
+        // closes the conn after each request, so the pooled conn is dead by the next get.
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let (port, server) = http_serve_pool(resp, 2, true);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let mut out: *mut HttpResponse = std::ptr::null_mut();
+            let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+            assert_eq!(rc, 0, "the 2nd get transparently retries the stale pooled conn");
+            assert_eq!(unsafe { align_rt_http_resp_status(out) }, 200);
+            unsafe { align_rt_http_resp_free(out) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 2, "the stale conn was retried on a fresh one");
+    }
+
+    /// A keepalive response carrying EXTRA bytes past its Content-Length (sent in the same segment) is
+    /// a **dirty** conn — reusing it would misframe the next response (a data-corruption bug). Such a
+    /// conn must NOT be pooled, so the next get opens a fresh conn (the server accepts TWO). This pins
+    /// the `buf.len() == t` leftover check (mutating it to `>= t` would pool the dirty conn → 1 accept).
+    #[test]
+    fn http_client_does_not_pool_conn_with_leftover_bytes() {
+        // A valid keepalive 200 (Content-Length: 2, body "hi") followed by 8 stray bytes on the wire.
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        resp.extend_from_slice(b"LEFTOVER");
+        let (port, server) = http_serve_pool(resp, 2, false);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let mut out: *mut HttpResponse = std::ptr::null_mut();
+            let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+            assert_eq!(rc, 0);
+            assert_eq!(unsafe { align_rt_http_resp_status(out) }, 200);
+            let body = unsafe { align_rt_http_resp_body(out) };
+            assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"hi", "the body is exactly the framed bytes, leftover excluded");
+            unsafe { align_rt_http_resp_free(out) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 2, "a conn with bytes past Content-Length must not be pooled");
+    }
+
+    /// A raw fd whose peer has already closed — writing to it fails (EPIPE) and reading returns EOF.
+    /// Used to seed the pool with dead conns.
+    fn dead_fd() -> i32 {
+        use std::os::fd::IntoRawFd;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (s, _) = l.accept().unwrap();
+        drop(s); // the peer closes → `c` is now a dead conn (read → EOF, write → EPIPE)
+        std::thread::sleep(std::time::Duration::from_millis(10)); // let the FIN land
+        c.into_raw_fd() // ownership transferred out of Rust; the pool/perform will close it
+    }
+
+    /// C1: the stale-conn retry must reach a **fresh connect**, never a second pooled corpse. Seed the
+    /// pool with TWO dead conns for the target host (a server-restart scenario), then a single get:
+    /// attempt 0 takes one corpse (fails), and the retry must BYPASS the pool and connect fresh to the
+    /// live server — succeeding. (Without the fix, the retry would take the 2nd corpse and fail.)
+    #[test]
+    fn http_client_retry_bypasses_pool_reaches_fresh_connect() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let (port, server) = http_serve_pool(resp, 1, false); // exactly one REAL connect: the retry
+        let client = align_rt_http_client_new();
+        // Seed two dead idle conns under the exact key perform computes for this URL's authority.
+        let key = ("127.0.0.1".to_string(), port as i64);
+        unsafe {
+            let cref = &*client;
+            cref.put_idle(key.clone(), dead_fd());
+            cref.put_idle(key.clone(), dead_fd());
+        }
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        assert_eq!(rc, 0, "the retry must reach a FRESH connect, not a 2nd dead pooled conn (C1)");
+        assert_eq!(unsafe { align_rt_http_resp_status(out) }, 200);
+        unsafe { align_rt_http_resp_free(out) };
+        unsafe { align_rt_http_client_free(client) }; // closes the remaining (2nd) seeded corpse — no leak
+        assert_eq!(server.join().unwrap(), 1, "exactly one real connection was made (the fresh retry)");
+    }
+
+    /// An emptied idle bucket's key is removed from the pool map, so connecting to many distinct hosts
+    /// does not leak empty `Vec`s (gemini finding 3).
+    #[test]
+    fn http_pool_removes_emptied_bucket() {
+        let client = align_rt_http_client_new();
+        let cref = unsafe { &*client };
+        let key = ("example.com".to_string(), 80i64);
+        let fd = dead_fd();
+        cref.put_idle(key.clone(), fd);
+        assert!(cref.idle.lock().unwrap().contains_key(&key), "put creates the bucket");
+        assert_eq!(cref.take_idle(&key), Some(fd), "take returns the pooled fd");
+        assert!(!cref.idle.lock().unwrap().contains_key(&key), "an emptied bucket's key is removed");
+        unsafe { close(fd) }; // we took it out of the pool — close it ourselves
+        unsafe { align_rt_http_client_free(client) };
+    }
+
+    /// `put_idle` reaps stale (idle-expired) conns BEFORE the capacity check, so a fresh conn is kept
+    /// rather than dropped in favour of stale ones (gemini finding 2).
+    #[test]
+    fn http_pool_put_reaps_stale_before_capacity() {
+        // Fabricate a stale instant; on a machine whose uptime is below the timeout this underflows —
+        // skip (a boot-time-only rarity, never on CI).
+        let Some(old) = std::time::Instant::now().checked_sub(HTTP_POOL_IDLE_TIMEOUT + std::time::Duration::from_secs(1))
+        else {
+            return;
+        };
+        let client = align_rt_http_client_new();
+        let cref = unsafe { &*client };
+        let key = ("h".to_string(), 80i64);
+        // Fill the bucket to capacity with STALE conns.
+        let stale: Vec<i32> = (0..HTTP_POOL_MAX_IDLE_PER_HOST).map(|_| dead_fd()).collect();
+        {
+            let mut map = cref.idle.lock().unwrap();
+            let bucket = map.entry(key.clone()).or_default();
+            for &fd in &stale {
+                bucket.push(IdleConn { fd, idle_since: old });
+            }
+        }
+        // A fresh put must reap all 8 stale conns and keep the fresh one (not drop it at capacity).
+        let fresh = dead_fd();
+        cref.put_idle(key.clone(), fresh);
+        {
+            let map = cref.idle.lock().unwrap();
+            let bucket = map.get(&key).expect("bucket present");
+            assert_eq!(bucket.len(), 1, "8 stale conns reaped, the fresh one kept");
+            assert_eq!(bucket[0].fd, fresh, "the retained conn is the fresh one");
+        }
+        // The 8 stale fds were closed by put_idle's reap; free() closes `fresh`. No double-close.
+        unsafe { align_rt_http_client_free(client) };
     }
 }

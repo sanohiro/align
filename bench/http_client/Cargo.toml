@@ -1,0 +1,17 @@
+[package]
+name = "http-client-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Detach from the parent Align workspace: this bench depends on `align_runtime` as an ordinary Rust
+# path dependency (it calls the pool's C-ABI entry points directly), so keep its build isolated.
+[workspace]
+
+[dependencies]
+align_runtime = { path = "../../crates/align_runtime" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

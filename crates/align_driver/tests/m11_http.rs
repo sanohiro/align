@@ -599,3 +599,101 @@ pub fn main() -> i32 {
     let d = check_diagnostics("m11-http-client-body-escape", src);
     assert!(d.contains("cannot return a slice that views a local"), "a client response body view must not escape:\n{d}");
 }
+
+/// A persistent loopback keepalive server: accepts up to `max_conns` connections, handling every
+/// request on each conn (HTTP/1.1 keepalive) until the client closes it. Returns the number of
+/// ACCEPTED connections — the observable that shows the client reused one conn across gets (Slice-3
+/// R3). Non-blocking accept + a per-read timeout bound the thread so a pool regression fails the count
+/// rather than hanging the test.
+fn spawn_keepalive_server(response: Vec<u8>, max_conns: usize) -> (u16, std::thread::JoinHandle<usize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut accepted = 0usize;
+        while accepted < max_conns && std::time::Instant::now() < deadline {
+            let mut sock = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            accepted += 1;
+            sock.set_nonblocking(false).unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut req: Vec<u8> = Vec::new();
+            loop {
+                let mut want: Option<usize> = None;
+                let got_one = loop {
+                    if let Some(t) = want {
+                        if req.len() >= t {
+                            break true;
+                        }
+                    } else if let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&req[..p]).to_ascii_lowercase();
+                        let cl = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        want = Some(p + 4 + cl);
+                        if req.len() >= p + 4 + cl {
+                            break true;
+                        }
+                    }
+                    let mut tmp = [0u8; 512];
+                    match sock.read(&mut tmp) {
+                        Ok(0) | Err(_) => break false,
+                        Ok(n) => req.extend_from_slice(&tmp[..n]),
+                    }
+                };
+                if !got_one {
+                    break;
+                }
+                let _ = sock.write_all(&response);
+                req.drain(..want.unwrap());
+            }
+        }
+        accepted
+    });
+    (port, handle)
+}
+
+/// Slice-3 R3, end-to-end through the language: two `cl.get()`s on ONE bound client to the same
+/// host:port reuse a single pooled keepalive connection — the server accepts exactly ONE connection
+/// for the two requests, and both responses parse correctly.
+#[test]
+fn client_pool_reuses_connection_across_gets() {
+    if !backend_available() {
+        return;
+    }
+    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+    // max_conns = 1: with reuse working the server accepts one conn, handles both requests, then
+    // exits on the client's EOF (fast — no deadline wait). If reuse were broken, the 2nd get would
+    // open a 2nd conn the server no longer accepts → the get fails → the status assert below catches it.
+    let (port, server) = spawn_keepalive_server(resp, 1);
+    let prog = "\
+import std.http
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"get\")
+  c.flag_str(\"url\", \"\")
+  p := c.parse(args)?
+  cl := http.client()
+  r1 := cl.get(p.get_str(\"url\"))?
+  print(r1.status())
+  r2 := cl.get(p.get_str(\"url\"))?
+  print(r2.status())
+  return Ok(())
+}
+";
+    let url = format!("http://127.0.0.1:{port}/");
+    let out = build_and_run_args("m11-http-keepalive", prog, &["--url", &url]);
+    let accepted = server.join().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "200\n200\n");
+    assert_eq!(accepted, 1, "two gets on one client reused a single pooled connection (R3)");
+}

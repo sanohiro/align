@@ -23,10 +23,11 @@ purity + `task_group` on real threads), M8 tooling (`align_fmt`, `unsafe`/`raw.*
 FFI, the profile-independent lint slice), M9 std phase 1 (`io`/`fs`/`path`/`env`/`time`), and
 M10 std phase 2 (`encoding`/`rand`/`cli`). **M11 (std third wave) is IN PROGRESS:** `std.net` /
 `std.process` / `std.compress` / `std.crypto` COMPLETE; `std.http` Slices 1–2 merged
-(#391/#392), Slices 3–5 (pool/keepalive + the R6 bench gate, server, TLS) remain — see the M11
-section below.
+(#391/#392), Slice 3 (keepalive pool + R6 bench, R3 met) DONE on branch `http-slice3-pool`,
+Slices 4–5 (server, TLS) + `get_many` (R5) remain — see the M11 section below.
 
-**Next (in order):** std.http Slice 3 (pool/keepalive R3 + the `bench/http_client` R6 gate);
+**Next (in order):** std.http Slice 4 (server primitive `serve`/`accept`), then Slice 5 (HTTPS/TLS)
+and `get_many` (R5) — Slice 3 (pool/keepalive R3 + the `bench/http_client` R6 gate) is DONE;
 the 2026-07-09 owed implementation deltas (struct-`==` sema diagnostic, no-shadowing error, the
 `loop` slice, the lexer escape-set gaps); then the M12 candidates recorded in
 `open-questions.md` Open → "align-LLM runway".
@@ -1598,6 +1599,40 @@ and http last (needs net + TLS).
     `get_many` scaling vs a Rust baseline) gates **module** completion, not Slice 2 — the bench harness
     lands with Slice 3, since keepalive is what R6 measures. No wording here claims the perf gate is
     met. (Full detail: `docs/impl/std-design/http.md` "Known v1 limitations".)
+  - **Slice 3 (the keepalive connection pool + the R6 benchmark) — DONE.** `Ty::HttpClient` goes
+    from a ZST to a real Move type owning a **keepalive connection pool** — and, notably, this is a
+    **pure runtime change**: the compiler already treats `HttpClient` as an opaque handle pointer
+    (codegen emits a pointer; Drop already calls `align_rt_http_client_free`), so the ZST→state change
+    is invisible to sema/MIR/codegen (no compiler edits — the Slice-2 "ZST behind the same FFI" design
+    paying off exactly as planned). Key decisions: (a) **pool shape** — `Mutex<HashMap<(host, port),
+    Vec<IdleConn>>>` (the `Mutex` future-proofs a shared-across-threads `get_many`; single-threaded
+    v1 never contends; the lock is held only for the O(1) take/put, never across I/O). (b) **reuse by
+    default (R3)** — consecutive `get`/`post`/`request` to the same `(host, port)` reuse a live idle
+    conn with zero opt-in; the language surface + FFI ABI are unchanged. (c) **reuse verdict
+    (correctness-critical)** — a finished conn is pooled **iff** keep-alive (HTTP/1.1 default;
+    `Connection: close` / non-1.1 → not reused, via `http_head_keep_alive` on the response head) AND
+    Content-Length-framed (read-to-close ends at the conn close → not reused) AND no leftover bytes
+    beyond the framed message (leftover ⇒ dirty conn ⇒ dropped — reusing it would misframe the next
+    response, a data-corruption class bug). (d) **stale-conn retry** — a reused idle conn the server
+    dropped fails before any response byte; that one case is transparently retried once on a fresh
+    conn (the request was almost certainly never processed — the idle-close race); a fresh conn's
+    failure, or a mid-response failure, surfaces directly. (e) **SIGPIPE safety** — the client write
+    path uses `send(MSG_NOSIGNAL)` (Linux) / `SO_NOSIGPIPE` (macOS), so writing to a dropped reused
+    conn returns `EPIPE` (→ retry) instead of killing the process; no global signal handler installed.
+    (f) **Drop closes all pooled conns (P5)** — no fd leak across pool churn. (g) **bounds** — ≤ 8
+    idle conns/host (overflow closed); idle-expiry reaps conns idle > 90 s on take. (h) **I/O timeouts
+    stay deferred** — the Slice-2 note tied a connect/read timeout follow-up to "the Slice-3 pool's
+    per-conn deadline bookkeeping," but that conflated the pool's *idle-expiry* (shipped) with an *I/O
+    deadline* (a separable, larger change whose ideal home for connect is the net rail's non-blocking
+    substrate, and whose read side has no v1 config surface without expanding the frozen signatures);
+    per "ideal form, or defer," it is recorded as the standing v1 limitation, not half-shipped. **R6
+    met:** `bench/http_client` (a standalone harness driving the shipped pool's C-ABI vs a plain-Rust
+    `std::net` baseline over a localhost server) records **2.86× keepalive speedup** (floor 1.48× —
+    MET) and **parity with hand-written Rust** on the reuse path (`bench/http_client/README.md`).
+    Tests: `align_runtime` units (pool reuses one conn across 3 gets; `Connection: close` not pooled;
+    stale-conn retry; `http_head_keep_alive` decision table) + a driver test (two gets reuse one conn,
+    observed via the server's accept count). `cargo test --workspace` green; clippy `-D warnings`
+    clean. **Slices 4–5 (server primitive, HTTPS/TLS) remain.**
 
 ## Design Issues to Settle in Parallel
 

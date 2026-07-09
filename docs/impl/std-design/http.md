@@ -89,10 +89,12 @@ the rest of std already follows. Concretely:
 - **R6 — benchmark-gated completion**: a `bench/http_client` harness (local plaintext server;
   keepalive GET latency/throughput + `get_many` scaling) measured against a Rust baseline —
   the module is not "done fast" until the numbers are in its README, per the repo's
-  measure-before-claiming rule. **R6 is NOT yet satisfied as of Slice 2** (DC-2): `bench/http_client`
-  does not exist, and it cannot land meaningfully until Slice 3 — keepalive is exactly what R6's
-  latency/throughput numbers measure, and `get_many` scaling comes later still. R6 gates **module**
-  completion, not Slice 2; the bench harness ships with the Slice-3 pool work.
+  measure-before-claiming rule. **R6 is SATISFIED as of Slice 3:** `bench/http_client` ships (drives
+  the shipped pool via its C-ABI entry points against an in-process localhost server) and records
+  **2.86× keepalive speedup** (floor 1.48× — MET) and **parity with hand-written Rust `std::net`** on
+  the reuse path (see `bench/http_client/README.md`). The `get_many` bounded-concurrency scaling shape
+  (R5) is a later slice; R6's keepalive latency/throughput gate — the part that gates **module**
+  completion — is met.
 
 ## New machinery required
 
@@ -134,22 +136,65 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    was refactored to an `Incomplete`/`Invalid` split so the streaming read distinguishes "need more
    bytes" from "malformed" over one shared decoder. NO pool yet (every request connects fresh and
    closes — Slice 3 adds keepalive reuse); `get_many` / server / HTTPS remain.
-3. connection pool reuse (the rail — keepalive, reuse by default).
+3. connection pool reuse (the rail — keepalive, reuse by default). **DONE** (branch
+   `http-slice3-pool`). `http.client()` is no longer a ZST: it owns a **keepalive connection pool**
+   (`Mutex<HashMap<(host, port), Vec<IdleConn>>>`) behind the unchanged language surface and FFI ABI
+   (the compiler already treats `HttpClient` as an opaque handle pointer, so this slice is purely a
+   runtime change — no sema/MIR/codegen edits). Consecutive `get`/`post`/`request` calls to the same
+   `(host, port)` **reuse a live idle conn with zero opt-in** (R3); `Drop` (`align_rt_http_client_free`)
+   closes every pooled conn (P5). **Reuse-verdict (correctness-critical — a dirty conn reused would
+   misframe the next response):** a finished conn is returned to the pool **iff** it was keep-alive
+   (HTTP/1.1 default; `Connection: close` or a non-1.1 version → not reused — decided by
+   `http_head_keep_alive` from the response head), **Content-Length-framed** (read-to-close responses
+   end at the conn close → not reused), carried **no bytes beyond the framed message** (leftover ⇒
+   dirty ⇒ dropped), **and** its response **fully parsed** — the pool decision runs *after*
+   `http_parse_core`, so a conn whose response the streaming pass admitted but the owning parse rejects
+   (an untrustworthy stream) is closed, never pooled. **Stale-conn retry:** a reused idle conn the
+   server has since dropped fails before any response byte; that ONE case is transparently retried once
+   on a fresh conn — and the retry **bypasses the pool** (a fresh connect, never a second pooled conn,
+   since the same host can hold several corpses after a server restart). A fresh conn's failure, or any
+   mid-response failure, surfaces directly. **SIGPIPE:** the client write path uses `send(MSG_NOSIGNAL)`
+   (Linux) / `SO_NOSIGPIPE` (macOS) so writing to a dropped reused conn returns `EPIPE` (→ retry)
+   instead of killing the process — no global signal handler installed. **Pool bounds / hygiene:** ≤ 8
+   idle conns per host; an idle conn older than 90 s is reaped — on `take` *and* on `put` (so a fresh
+   conn is never dropped in favour of stale ones), with the overflow conn closed only after reaping; an
+   emptied bucket's key is removed from the map (no unbounded empty-`Vec` growth across many hosts).
+   **R6 met:** `bench/http_client` (below) records the
+   pool at **2.86× keepalive speedup** (floor 1.48×) and **parity with hand-written Rust `std::net`**.
+   Tests: `align_runtime` units (pool reuses one conn across 3 gets; `Connection: close` not pooled;
+   stale-conn retry; `http_head_keep_alive` decision table) + a driver test (two gets reuse one conn,
+   observed via the server's accept count).
 4. server primitive (serve/accept, caller writes response).
 5. [DEFERRED to post-TLS] HTTPS via the FFI TLS wrapper.
 
-## Known v1 limitations (Slice 2)
+## Known v1 limitations (Slice 2/3)
 
-- **No read/connect timeout (G3-1, medium, inherited).** A server that completes the TCP
-  handshake then stalls — sends nothing, dribbles bytes below the caps, or sends fewer than
-  `Content-Length` and holds the socket open — blocks the calling thread **indefinitely**. The
-  Slice-1 byte caps (256 KiB head / 1 GiB body) bound *memory*, not *time*. This is not a new bug
-  class: it is exactly the net rail's documented no-timeout behavior (see the `align_rt_tcp_connect`
-  doc comment: "sets no connect timeout — a hung/black-holed peer blocks indefinitely"), now
-  inherited by the http client on both connect **and** read. It was not previously noted for the
-  http client — recorded here. **Follow-up:** timeout support (connect + read deadlines) lands
-  alongside the Slice-3 pool work, where the pool already needs per-conn deadline bookkeeping; it is
-  the same non-blocking/deadline substrate net.md flags as a later backend, not a semantic change.
+- **No read/connect I/O timeout (G3-1, medium, inherited) — DELIBERATELY DEFERRED past Slice 3.**
+  A server that completes the TCP handshake then stalls — sends nothing, dribbles bytes below the
+  caps, or sends fewer than `Content-Length` and holds the socket open — blocks the calling thread
+  **indefinitely**. The byte caps (256 KiB head / 1 GiB body) bound *memory*, not *time*. This is the
+  net rail's documented no-timeout behavior (`align_rt_tcp_connect`), inherited on connect **and**
+  read. **Slice 3 decision (recorded, not implemented):** the Slice-2 note said the timeout follow-up
+  would land "alongside the Slice-3 pool work, where the pool already needs per-conn deadline
+  bookkeeping." On implementing Slice 3 that phrasing proved to conflate two different things. The
+  pool's deadline bookkeeping is **idle-expiry** (don't reuse a conn idle > 90 s) — which Slice 3
+  **does** ship — not an **I/O deadline** on connect/read. Adding real I/O timeouts is a separable,
+  larger change that does not have an ideal *http-local* form: (1) a **connect** timeout's ideal home
+  is the net rail (a non-blocking `connect` + `poll` substrate — net.md already flags this as a later
+  backend); doing it half-in-http would be a second, partial mechanism. (2) A **read** timeout is a
+  few lines (`SO_RCVTIMEO`), but a *fixed* one silently breaks a legitimate slow/large transfer, and
+  v1 has **no configuration surface** to make it per-request without expanding the frozen
+  `get`/`post`/`request` signatures — a separate design decision. Per "ideal form, or defer," Slice 3
+  ships the pool's idle-expiry and the SIGPIPE-safe/stale-retry robustness, and **defers I/O timeouts
+  to the net-rail non-blocking/deadline substrate** (unchanged from a semantics standpoint), rather
+  than bolting in a half-measure. Recorded here as the standing v1 limitation.
+  - **Sub-case — HEAD / 304 framing (inherited from Slice 1/2).** A `HEAD` response, or a `304 Not
+    Modified`, legitimately carries a `Content-Length` header **but no body**. The v1 read loop frames
+    purely by `Content-Length` (it does not special-case the request method or status), so it would
+    wait for body bytes that never arrive → the same indefinite block as above. v1's surface does not
+    expose `HEAD` conveniently (only `get`/`post`/`request`), but a caller-built `request` with method
+    `HEAD` hits this. Method/status-aware framing (no-body for HEAD/1xx/204/304) lands with the same
+    slice that adds de-chunking; recorded here, not fixed in Slice 3.
 - **`https://` rejection is coarse (DC-1, low).** `https://` is correctly rejected pre-connect (P1's
   security intent is met — never a silent plaintext downgrade), but it maps to the **bare
   `Error.Invalid`**, indistinguishable from any other malformed URL. The design's aspiration of a
