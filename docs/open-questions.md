@@ -205,6 +205,13 @@ Decomposition: **④a** scope + the task region + `spawn` (fresh region env per 
 - **Error reporting via the worker's return value (no shared state).** The per-`R` trampoline returns an `i32` error code (`0` = ok): infallible → store `R`, return `0`; fallible → match the `Result`, on `Ok(v)` store `v` and return `0`, on `Err(e)` return `e`. `align_rt_tg_wait` (already `thread::scope`) collects each worker's returned code via `ScopedJoinHandle::join` and returns the first nonzero — no shared error cell, no extra aliasing.
 - **`wait()?`**: codegen builds `Result<(), Error>` from `tg_wait`'s code (`Ok(())` if `0`, else `Err(code)`); `?` propagates as usual. `get()` (already `wait`-gated by ④c-1) then reads the `Ok` slot.
 
+**Known soundness gap in this deferred area (found 2026-07-10, A1 adversarial review): a lambda
+capturing an arena-backed view escapes the arena unchecked → use-after-free.** `f := arena { v :=
+fs.read_bytes_view(p)?; fn { v[0] } }` passes `check` and SIGSEGVs at `f()` — `region_bearing`/
+`tracks_region` are `false` for `Ty::Fn` and `region_of` never inspects a closure's captures.
+Pre-existing (the M9 `read_file_view` str view reproduces it identically); the escaping-fn-values
+implementation must region-check captured views (str and bytes alike) when it lands.
+
 ### `bytes` / `buffer` — design SETTLED; minimal `buffer` BUILT with M9 std.io (2026-07-03)
 **Decision (2026-06-23): `bytes` is `slice<u8>`; `buffer` is a distinct growable owned byte container.** Resolving the two forks left by `draft.md` §12 (which names the types but specs no operations):
 - **`bytes` = `slice<u8>`** — a read-only `{ptr,len}` view of `u8` elements (bytes), structurally identical to a slice of bytes (no UTF-8 invariant — that is what distinguishes it from `str`/`string`). Introducing a *separate* structural type would violate **One way** (two names for one thing), so `bytes` is the conventional spelling of `slice<u8>` in byte/I/O contexts, lowered as `slice<u8>`. `s.bytes()` yields a `slice<u8>` view of a string's UTF-8 bytes; `bytes.to_string()` is the UTF-8-validating inverse (`Result<string, Error>`). (FFI already treats `bytes` as a view handed to C by raw pointer — consistent.)
