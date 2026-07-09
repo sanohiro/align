@@ -605,6 +605,54 @@ pub fn main() -> i32 { return 0 }
     );
 }
 
+/// A `bytes` view cannot be smuggled out of its arena inside a **struct**: a struct field cannot be
+/// a `slice` in the first place (rejected at declaration), so the escape is unreachable today. This
+/// locks that assumption — `mentions_slice`/`ty_mentions_slice` walks struct fields defensively, so
+/// if slice fields ever land the arena escape would still be caught rather than fail open.
+#[test]
+fn read_bytes_view_slice_struct_field_is_rejected() {
+    let prog = "\
+import std.fs
+Holder { data: slice<u8> }
+fn leak(p: str) -> Result<Holder, Error> {
+  arena {
+    v := fs.read_bytes_view(p)?
+    return Ok(Holder { data: v })
+  }
+}
+pub fn main() -> i32 { return 0 }
+";
+    let d = check_diagnostics("m9fs-bytesview-struct-field", prog);
+    assert!(
+        d.contains("struct fields must be"),
+        "a struct field cannot be a slice view (the struct-escape path stays unreachable):\n{d}"
+    );
+}
+
+/// A `bytes` view cannot ride an array literal even wrapped in a `Result`/`Option`: the array-literal
+/// element guard walks wrappers (`ty_mentions_slice`) and rejects it, so `array<Result<slice, Error>>`
+/// cannot smuggle an arena view past the direct-slice guard (defense in depth with the
+/// composite-payload rule).
+#[test]
+fn read_bytes_view_array_of_wrapped_slice_is_rejected() {
+    let prog = "\
+import std.fs
+fn leak(p: str) -> i64 {
+  arena {
+    r := fs.read_bytes_view(p)
+    xs := [r]
+    return xs.len()
+  }
+}
+pub fn main() -> i32 { return 0 }
+";
+    let d = check_diagnostics("m9fs-bytesview-array-wrapped", prog);
+    assert!(
+        d.contains("cannot be an array literal element"),
+        "an array literal of `Result<slice, Error>` must be rejected:\n{d}"
+    );
+}
+
 // --- §19 completion condition -----------------------------------------------------------------
 
 /// The `draft.md` §19 type program: `fs.read_file` → `json.decode<array<User>>` → a fused pipeline

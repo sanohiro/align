@@ -535,6 +535,29 @@ fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
     matches!(ty, Ty::Tuple(id) if tuples[id as usize].elems.iter().any(|s| s.is_move()))
 }
 
+/// Whether `ty` **is**, or transitively contains through a `Result` / `Option` / tuple / struct, a
+/// `slice` view. A slice is always a borrow whose escape is decided by `region_of`; this routes the
+/// arena-escape check ([`EscapeCheck::region_bearing`]) and the array-literal reject for an
+/// arena-backed `bytes` view that rides a wrapper. **Defensive on `Ty::Struct`:** a struct field
+/// cannot be a `slice` today (construction rejects it — "struct fields must be a primitive scalar,
+/// str, or a plain struct"), so this arm is currently unreachable, but walking fields keeps the
+/// check fail-safe (not fail-open) should struct slice fields ever land — the same "defensive /
+/// currently-dead" spirit as the tuple arm. Recursion terminates: a struct without a `box`
+/// indirection cannot contain itself (rejected at declaration), and `box` fields are scalars, never
+/// slices.
+fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+    match ty {
+        Ty::Slice(_) => true,
+        Ty::Option(s) => ty_mentions_slice(scalar_to_ty(s), structs, tuples),
+        Ty::Result(o, e) => {
+            ty_mentions_slice(scalar_to_ty(o), structs, tuples) || ty_mentions_slice(scalar_to_ty(e), structs, tuples)
+        }
+        Ty::Tuple(id) => tuples[id as usize].elems.iter().any(|s| ty_mentions_slice(scalar_to_ty(*s), structs, tuples)),
+        Ty::Struct(id) => structs[id as usize].fields.iter().any(|f| ty_mentions_slice(f.ty, structs, tuples)),
+        _ => false,
+    }
+}
+
 /// Parse an explicit-overflow arithmetic method name into its op and overflow mode (`core.math`).
 /// `None` mode = `wrapping_*` (the default wrapping arithmetic — lowered to a plain `Binary`);
 /// `Some(_)` = `saturating_*` / `checked_*`. Returns `None` for any other method name.
@@ -3045,17 +3068,12 @@ impl<'a> EscapeCheck<'a> {
         self.tracks_region(ty) || self.mentions_slice(ty)
     }
 
-    /// Whether `ty` is a `slice`, or a `Result` / `Option` / tuple whose payload mentions one.
-    /// Used only by [`Self::region_bearing`] to route the escape check for a `bytes` view that
-    /// rides an aggregate; the region itself comes from `region_of`.
+    /// Whether `ty` is a `slice`, or a `Result` / `Option` / tuple / struct whose payload mentions
+    /// one. Used only by [`Self::region_bearing`] to route the escape check for a `bytes` view that
+    /// rides an aggregate; the region itself comes from `region_of`. Delegates to the shared
+    /// [`ty_mentions_slice`] (which also covers `Ty::Struct` defensively).
     fn mentions_slice(&self, ty: Ty) -> bool {
-        match ty {
-            Ty::Slice(_) => true,
-            Ty::Option(s) => self.mentions_slice(scalar_to_ty(s)),
-            Ty::Result(o, e) => self.mentions_slice(scalar_to_ty(o)) || self.mentions_slice(scalar_to_ty(e)),
-            Ty::Tuple(id) => self.tuples[id as usize].elems.iter().any(|s| self.mentions_slice(scalar_to_ty(*s))),
-            _ => false,
-        }
+        ty_mentions_slice(ty, self.structs, self.tuples)
     }
 
     /// Whether struct `id` has any `str` column — the field that turns a `soa<Struct>` from a
@@ -8980,8 +8998,11 @@ impl<'a, 't> Checker<'a, 't> {
         // A `slice` view element is deferred, like `box<slice>`: an `array<slice<T>>` literal would
         // need per-element view-region tracking (each element could borrow a different source). The
         // only slice values today are `bytes` views (`fs.read_bytes_view` / `buffer.bytes()`); a
-        // literal collecting them is rejected at construction rather than mis-lowered.
-        if matches!(self.resolve(elem_ty), Ty::Slice(_)) {
+        // literal collecting them is rejected at construction rather than mis-lowered. Checked
+        // transparently through `Result`/`Option`/tuple/struct wrappers so an `array<Option<slice>>`
+        // / `array<Result<slice, Error>>` can't smuggle an arena view past the direct-slice guard
+        // (both are also blocked by the composite-payload rule below — this is defense in depth).
+        if ty_mentions_slice(self.resolve(elem_ty), self.structs, self.tuples) {
             self.diags.error(
                 format!("`{}` cannot be an array literal element yet (a slice view is a borrow, not collectible)", ty_name(elem_ty)),
                 span,
