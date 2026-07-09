@@ -4554,7 +4554,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::BufferBytes(buf) => {
                 // The runtime writes the `{ptr,len}` view into a stack slot; load it back.
                 let bp = self.operand(buf).into();
-                let slot = self.builder.build_alloca(slice_struct_type(self.ctx), "bytesslot").map_err(|e| self.err(e))?;
+                let slot = self.alloca_at_entry(slice_struct_type(self.ctx).into(), "bytesslot")?;
                 self.builder
                     .build_call(self.funcs["buffer_bytes"], &[bp, slot.into()], "")
                     .map_err(|e| self.err(e))?;
