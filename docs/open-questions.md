@@ -2205,8 +2205,10 @@ implementation deltas are noted.
 4. **No shadowing** (§4 Variables): a name binds once per scope chain — same-scope re-`:=` and
    inner-scope shadowing of a visible binding/parameter are compile errors; disjoint sibling
    blocks may reuse a name. Rationale: rebinding hides a state change (a known human/LLM bug
-   source) and `mut`/a-new-name cover every need. **Implementation currently accepts both
-   silently** — becomes a diagnostic.
+   source) and `mut`/a-new-name cover every need. **Implemented:** sema's `check_shadow` rejects a
+   binding whose name is already visible — a local/parameter in scope, an enclosing binding a lambda
+   could capture, or a top-level constant of the module (also catches duplicate parameters and
+   `(a, a) := …`); disjoint sibling blocks / `match` arms stay legal.
 5. **Float semantics = IEEE 754, total, never aborts** (§5 "Float Semantics"): `x/0.0` → `±inf`,
    `0.0/0.0` → NaN, NaN ≠ everything incl. itself, scalar `frem` unguarded like the vector form;
    only *integer* division aborts. Same zero-cost/never-blocks-SIMD rationale as wrap-on-overflow.
