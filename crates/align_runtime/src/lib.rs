@@ -9266,6 +9266,10 @@ pub struct HttpClient {
 impl HttpClient {
     /// Take a live idle conn for `key`, closing any that have been idle past [`HTTP_POOL_IDLE_TIMEOUT`]
     /// (assumed dead) as it scans. `None` if the bucket is empty or holds only stale conns.
+    ///
+    /// (Caveat: a stale conn's `close()` syscall runs under the lock. It is a local fd close, not
+    /// network I/O, so it is fast and never blocks — the "lock held only for O(1) take/put" claim holds
+    /// in spirit; the close is bounded, not a round-trip.)
     fn take_idle(&self, key: &(String, i64)) -> Option<i32> {
         let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bucket = map.get_mut(key)?;
@@ -9279,7 +9283,8 @@ impl HttpClient {
     }
 
     /// Return a reusable conn `fd` to `key`'s idle bucket, or close it if the bucket is already at
-    /// [`HTTP_POOL_MAX_IDLE_PER_HOST`] (a bound on idle fds).
+    /// [`HTTP_POOL_MAX_IDLE_PER_HOST`] (a bound on idle fds). (Caveat as in [`Self::take_idle`]: an
+    /// overflow `close()` syscall may run under the lock; a local fd close, not network I/O.)
     fn put_idle(&self, key: (String, i64), fd: i32) {
         let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bucket = map.entry(key).or_default();
@@ -9584,8 +9589,11 @@ unsafe fn http_client_perform(client: *mut HttpClient, req: &HttpRequest, out: *
     // through to attempt 1 on a guaranteed-fresh conn.
     let mut attempt = 0u32;
     loop {
-        // Acquire a connection: a live pooled idle conn (reused), else a fresh connect.
-        let pooled = client_ref.and_then(|c| c.take_idle(&key));
+        // Acquire a connection: on attempt 0, a live pooled idle conn (reused), else a fresh connect.
+        // On the retry (attempt 1) the pool is BYPASSED — a stale pooled conn is exactly what failed,
+        // and the same host can hold several dead idle conns (e.g. after a server restart), so re-taking
+        // from the pool could hand back another corpse. The retry must reach a guaranteed-fresh connect.
+        let pooled = if attempt == 0 { client_ref.and_then(|c| c.take_idle(&key)) } else { None };
         let (fd, reused) = match pooled {
             Some(fd) => (fd, true),
             None => match unsafe { http_connect_fd(&key.0, key.1) } {
@@ -14405,5 +14413,69 @@ mod tests {
         }
         unsafe { align_rt_http_client_free(client) };
         assert_eq!(server.join().unwrap(), 2, "the stale conn was retried on a fresh one");
+    }
+
+    /// A keepalive response carrying EXTRA bytes past its Content-Length (sent in the same segment) is
+    /// a **dirty** conn — reusing it would misframe the next response (a data-corruption bug). Such a
+    /// conn must NOT be pooled, so the next get opens a fresh conn (the server accepts TWO). This pins
+    /// the `buf.len() == t` leftover check (mutating it to `>= t` would pool the dirty conn → 1 accept).
+    #[test]
+    fn http_client_does_not_pool_conn_with_leftover_bytes() {
+        // A valid keepalive 200 (Content-Length: 2, body "hi") followed by 8 stray bytes on the wire.
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        resp.extend_from_slice(b"LEFTOVER");
+        let (port, server) = http_serve_pool(resp, 2, false);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let mut out: *mut HttpResponse = std::ptr::null_mut();
+            let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+            assert_eq!(rc, 0);
+            assert_eq!(unsafe { align_rt_http_resp_status(out) }, 200);
+            let body = unsafe { align_rt_http_resp_body(out) };
+            assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"hi", "the body is exactly the framed bytes, leftover excluded");
+            unsafe { align_rt_http_resp_free(out) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 2, "a conn with bytes past Content-Length must not be pooled");
+    }
+
+    /// A raw fd whose peer has already closed — writing to it fails (EPIPE) and reading returns EOF.
+    /// Used to seed the pool with dead conns.
+    fn dead_fd() -> i32 {
+        use std::os::fd::IntoRawFd;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (s, _) = l.accept().unwrap();
+        drop(s); // the peer closes → `c` is now a dead conn (read → EOF, write → EPIPE)
+        std::thread::sleep(std::time::Duration::from_millis(10)); // let the FIN land
+        c.into_raw_fd() // ownership transferred out of Rust; the pool/perform will close it
+    }
+
+    /// C1: the stale-conn retry must reach a **fresh connect**, never a second pooled corpse. Seed the
+    /// pool with TWO dead conns for the target host (a server-restart scenario), then a single get:
+    /// attempt 0 takes one corpse (fails), and the retry must BYPASS the pool and connect fresh to the
+    /// live server — succeeding. (Without the fix, the retry would take the 2nd corpse and fail.)
+    #[test]
+    fn http_client_retry_bypasses_pool_reaches_fresh_connect() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let (port, server) = http_serve_pool(resp, 1, false); // exactly one REAL connect: the retry
+        let client = align_rt_http_client_new();
+        // Seed two dead idle conns under the exact key perform computes for this URL's authority.
+        let key = ("127.0.0.1".to_string(), port as i64);
+        unsafe {
+            let cref = &*client;
+            cref.put_idle(key.clone(), dead_fd());
+            cref.put_idle(key.clone(), dead_fd());
+        }
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        assert_eq!(rc, 0, "the retry must reach a FRESH connect, not a 2nd dead pooled conn (C1)");
+        assert_eq!(unsafe { align_rt_http_resp_status(out) }, 200);
+        unsafe { align_rt_http_resp_free(out) };
+        unsafe { align_rt_http_client_free(client) }; // closes the remaining (2nd) seeded corpse — no leak
+        assert_eq!(server.join().unwrap(), 1, "exactly one real connection was made (the fresh retry)");
     }
 }

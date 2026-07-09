@@ -183,6 +183,13 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
   ships the pool's idle-expiry and the SIGPIPE-safe/stale-retry robustness, and **defers I/O timeouts
   to the net-rail non-blocking/deadline substrate** (unchanged from a semantics standpoint), rather
   than bolting in a half-measure. Recorded here as the standing v1 limitation.
+  - **Sub-case — HEAD / 304 framing (inherited from Slice 1/2).** A `HEAD` response, or a `304 Not
+    Modified`, legitimately carries a `Content-Length` header **but no body**. The v1 read loop frames
+    purely by `Content-Length` (it does not special-case the request method or status), so it would
+    wait for body bytes that never arrive → the same indefinite block as above. v1's surface does not
+    expose `HEAD` conveniently (only `get`/`post`/`request`), but a caller-built `request` with method
+    `HEAD` hits this. Method/status-aware framing (no-body for HEAD/1xx/204/304) lands with the same
+    slice that adds de-chunking; recorded here, not fixed in Slice 3.
 - **`https://` rejection is coarse (DC-1, low).** `https://` is correctly rejected pre-connect (P1's
   security intent is met — never a silent plaintext downgrade), but it maps to the **bare
   `Error.Invalid`**, indistinguishable from any other malformed URL. The design's aspiration of a
