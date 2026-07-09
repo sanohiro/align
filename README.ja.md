@@ -58,7 +58,7 @@ cargo run --bin alignc -- run examples/pipeline.align  # fused map/where/sum; ex
 
 ## ステータス
 
-まだ初期段階ですが、パイプラインは端から端まで動きます(`lexer → parser → sema → MIR → LLVM → native`)。関数と制御フロー、構造体、プリミティブ型のフルセット、`?` を伴う `Option`/`Result`、move・エスケープチェック付きの `arena`/`box`、融合された配列パイプライン、文字列と `json`、SIMD(`vecN`/`soa`/`group_by`)、実スレッド上の `par_map`/`task_group`、`unsafe`/FFI、そして拡充中の標準ライブラリ(`io`/`fs`/`path`/`env`/`time`/`encoding`/`rand`)まで揃っています。マイルストーンの詳細は `docs/impl/07-roadmap.md` を参照してください。
+まだ初期段階ですが、パイプラインは端から端まで動きます(`lexer → parser → sema → MIR → LLVM → native`)。関数と制御フロー、構造体、プリミティブ型のフルセット、`?` を伴う `Option`/`Result`、move・エスケープチェック付きの `arena`/`box`、融合された配列パイプライン、文字列と `json`、SIMD(`vecN`/`soa`/`group_by`)、実スレッド上の `par_map`/`task_group`、`unsafe`/FFI、そして拡充中の標準ライブラリ(`io`/`fs`/`path`/`env`/`time`/`encoding`/`rand`/`cli`/`net`/`process`/`compress`/`crypto`、`http` は実装中)まで揃っています。マイルストーンの詳細は `docs/impl/07-roadmap.md` を参照してください。
 
 ## パフォーマンスと移植性
 
@@ -71,6 +71,7 @@ cargo run --bin alignc -- run examples/pipeline.align  # fused map/where/sum; ex
 - `docs/little-aligner/` —— *The Little Schemer* スタイルの Q&A ドリル・ワークブック(英語 + 日本語)
 - `docs/` —— 設計の根拠、経緯、非目標、未解決の論点
 - `docs/impl/` —— コンパイラ実装計画 + 標準ライブラリのモジュール設計仕様
+- `editors/` —— Vim / Emacs / VS Code 対応(シンタックスハイライト、スニペット)
 - `crates/` —— `alignc` コンパイラのワークスペース
 
 ## ライセンス

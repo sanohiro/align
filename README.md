@@ -57,7 +57,7 @@ cargo run --bin alignc -- run examples/pipeline.align  # fused map/where/sum; ex
 
 ## Status
 
-Early-stage, but the pipeline runs end to end (`lexer → parser → sema → MIR → LLVM → native`): functions and control flow, structs, the full primitive set, `Option`/`Result` with `?`, `arena`/`box` with move & escape checking, fused array pipelines, strings + `json`, SIMD (`vecN`/`soa`/`group_by`), `par_map`/`task_group` on real threads, `unsafe`/FFI, and a growing std library (`io`/`fs`/`path`/`env`/`time`/`encoding`/`rand`). See `docs/impl/07-roadmap.md` for the milestone detail.
+Early-stage, but the pipeline runs end to end (`lexer → parser → sema → MIR → LLVM → native`): functions and control flow, structs, the full primitive set, `Option`/`Result` with `?`, `arena`/`box` with move & escape checking, fused array pipelines, strings + `json`, SIMD (`vecN`/`soa`/`group_by`), `par_map`/`task_group` on real threads, `unsafe`/FFI, and a growing std library (`io`/`fs`/`path`/`env`/`time`/`encoding`/`rand`/`cli`/`net`/`process`/`compress`/`crypto`, with `http` in progress). See `docs/impl/07-roadmap.md` for the milestone detail.
 
 ## Performance & portability
 
@@ -70,6 +70,7 @@ The default build uses a **safe, portable per-architecture baseline** (`x86-64-v
 - `docs/little-aligner/` — Q&A drill workbook in the style of *The Little Schemer* (English + Japanese)
 - `docs/` — design rationale, history, non-goals, open questions
 - `docs/impl/` — compiler implementation plan + std module design specs
+- `editors/` — Vim / Emacs / VS Code support (syntax, snippets)
 - `crates/` — the `alignc` compiler workspace
 
 ## License
