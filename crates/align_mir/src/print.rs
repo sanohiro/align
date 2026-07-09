@@ -429,6 +429,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsReadFileView { path, arena, out } => {
             format!("fs_read_file_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))
         }
+        Rvalue::FsReadBytesView { path, arena, out } => {
+            format!("fs_read_bytes_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))
+        }
         Rvalue::MakeError { enum_id, tag, code } => {
             format!("make_error(enum#{enum_id}, tag={}, code={})", operand_str(tag), operand_str(code))
         }

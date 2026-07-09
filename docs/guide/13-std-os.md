@@ -43,6 +43,24 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 `read_file_view` maps the file and hands you a `str` view of it. It **requires an enclosing `arena`** — the mapping's lifetime is the arena, the unmap is the arena's cleanup, and the view can't escape (`.clone()` if a piece must survive). The memory model from chapter [05](05-memory.md) didn't grow a special case for mmap; mmap fit the model.
 
+Because it returns a `str`, `read_file_view` validates the bytes as UTF-8 and rejects a binary file. For binary assets — a GGUF model, a packed index — use its sibling `read_bytes_view`, which does the same arena mmap without validation and hands you a `bytes` (`slice<u8>`) view:
+
+```align
+import std.fs
+import std.io
+
+pub fn main(args: array<str>) -> Result<(), Error> {
+    arena {
+        raw := fs.read_bytes_view(args[1])?   // binary mmap — no validation, zero copy
+        print(raw.len())
+        io.stdout.write(raw)?
+    }
+    return Ok(())
+}
+```
+
+Same arena rule (the `bytes` view can't outlive the arena), same v1 limitations as `read_file_view`: a special or zero-length file falls back to an owned arena copy rather than a true zero-copy map, and concurrent truncation of a mapped file can raise `SIGBUS` (Align installs no signal handler — a process-global handler is exactly the hidden side effect the language forbids). There is no `bytes.clone()` yet, so to keep a piece past the arena, write it out (`fs.write_file` / a `buffer`) rather than copying the view.
+
 ## Streams: `reader`, `writer`, `buffer`
 
 The streaming tier, for data bigger than memory. The shape is the `loop` expression from chapter [02](02-language-basics.md) (**implementation in progress** — today this pump lives inside `io.copy` below):

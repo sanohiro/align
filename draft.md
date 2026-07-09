@@ -1865,6 +1865,11 @@ fs.read_file(path: str)      -> Result<string, Error>
 fs.read_file_view(path: str) -> Result<str, Error>
   // an mmap view: requires an enclosing arena — the region is bound to the arena, munmap runs at
   // arena end (the same shape as M3's heap.new requiring an arena). Escapes the region via .clone().
+fs.read_bytes_view(path: str) -> Result<bytes, Error>
+  // the binary sibling of read_file_view: the same arena mmap (regular-file fast path, owned-copy
+  // fallback for special / zero-length files, munmap at arena end) minus the UTF-8 validation, so a
+  // binary asset (a GGUF model, a packed index) maps zero-copy as a `bytes` (slice<u8>) view that a
+  // `str` view would reject. Same arena region rule — the view cannot escape the arena.
 fs.write_file(path: str, data: str | bytes | builder) -> Result<(), Error>
 fs.open(path: str)   -> Result<reader, Error>
 fs.create(path: str) -> Result<writer, Error>
@@ -1873,7 +1878,7 @@ fs.remove(path: str) -> Result<(), Error>
 fs.read_dir(path: str) -> Result<array<string>, Error>   // v1: owned strings
 ```
 
-Any read that yields a `str`/`string` (`read_file`, `read_file_view`, and a decoded `str` from `json.decode`) validates the bytes as UTF-8 — `str` is always valid UTF-8 (§7, §12), so non-UTF-8 content fails with `Error.Invalid`; read binary with `reader.read(buffer)` instead, since `bytes`/`buffer` carry no UTF-8 invariant. For the same reason `read_dir` **excludes** any directory entry whose name is not valid UTF-8 (it cannot be a `string`, and is unreachable through a `str` path regardless).
+Any read that yields a `str`/`string` (`read_file`, `read_file_view`, and a decoded `str` from `json.decode`) validates the bytes as UTF-8 — `str` is always valid UTF-8 (§7, §12), so non-UTF-8 content fails with `Error.Invalid`; read binary zero-copy with `read_bytes_view` (a `bytes` mmap view, no validation) or into an owned buffer with `reader.read(buffer)` — `bytes`/`buffer` carry no UTF-8 invariant. `read_bytes_view` shares `read_file_view`'s v1 limitations: special / zero-length files fall back to an owned arena copy (not zero-copy), and concurrent truncation of a mapped file can raise `SIGBUS` (no handler is installed — a process-global signal handler is the hidden side effect Align forbids). For the same reason `read_dir` **excludes** any directory entry whose name is not valid UTF-8 (it cannot be a `string`, and is unreachable through a `str` path regardless).
 
 ### std.path
 

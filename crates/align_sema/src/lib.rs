@@ -77,6 +77,15 @@ pub enum Scalar {
     /// (`tracks_region`), exactly the struct-with-`str`-field rule extended to scalars. Unlike
     /// `String`, it is never dropped (it borrows). A `box<str>` is rejected (a view is not boxable).
     Str,
+    /// A `slice<T>` **view** payload (a `{ptr,len}` borrow over a contiguous run of `T`) — the
+    /// borrowed-collection sibling of [`Scalar::Str`] (a borrowed `str` view) and of
+    /// [`Scalar::DynArray`] (an *owned* array). **Copy, not Move** (it owns nothing), never dropped.
+    /// Lets a `slice` ride an `Option`/`Result`: the `Result<slice<u8>, Error>` returned by
+    /// `fs.read_bytes_view` (an arena-backed `bytes` mmap view). The element is a [`PrimScalar`]
+    /// (non-recursive, so `Scalar` stays `Copy`). Region-tracking is by producer, not type — a
+    /// `slice<numeric>` is not `tracks_region` (numeric slices stay freely returnable), so the
+    /// arena binding of a `bytes` view is enforced through `region_of` + `region_bearing`.
+    Slice(PrimScalar),
     /// A sum-type payload (the enum's id) — a Copy tagged struct, like [`Scalar::Struct`]. Lets
     /// `Option`/`Result` carry an enum, notably `Result<T, MyError>` (4b). Non-recursive (just the
     /// id), so `Scalar` stays `Copy`.
@@ -430,6 +439,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // later concern (so `Scalar::DynStructArray` stays layout-free — always AoS).
         Ty::DynStructArray(id, Layout::Aos) => Some(Scalar::DynStructArray(id)),
         Ty::Str => Some(Scalar::Str),
+        // A `slice<T>` **view** is a payload only when its element is primitive — today only the
+        // `slice<u8>` `bytes` view from `fs.read_bytes_view` (`Result<slice<u8>, Error>`).
+        Ty::Slice(elem) => scalar_to_prim(elem).map(Scalar::Slice),
         // A `reader`/`writer` owned handle as a `Result` Ok payload (`fs.open`/`fs.create`).
         Ty::Reader => Some(Scalar::Reader),
         Ty::Writer => Some(Scalar::Writer),
@@ -461,6 +473,19 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
     }
 }
 
+/// [`ty_to_scalar`] for a **first-class function-value / lambda signature**: the same payload-scalar
+/// mapping, but a `slice<T>` maps to `None`. A slice is a legitimate `Option`/`Result` payload (so it
+/// belongs in `ty_to_scalar` — `Result<slice<u8>, Error>` from `fs.read_bytes_view`), yet fn values
+/// take only true scalar / owned parameters today; a borrowed-slice parameter or return stays with
+/// the rest of the deferred non-scalar fn-value surface (`fn_values.rs`). Using this at the fn-value
+/// sites keeps that restriction after `Scalar::Slice` joined `ty_to_scalar`.
+pub fn fn_sig_scalar(ty: Ty) -> Option<Scalar> {
+    match ty_to_scalar(ty) {
+        Some(Scalar::Slice(_)) => None,
+        other => other,
+    }
+}
+
 pub fn scalar_to_ty(s: Scalar) -> Ty {
     match s {
         Scalar::Int(it) => Ty::Int(it),
@@ -473,6 +498,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::DynArray(elem) => Ty::DynArray(prim_to_scalar(elem)),
         Scalar::DynStructArray(id) => Ty::DynStructArray(id, Layout::Aos),
         Scalar::Str => Ty::Str,
+        Scalar::Slice(elem) => Ty::Slice(prim_to_scalar(elem)),
         Scalar::Enum(id) => Ty::Enum(id),
         Scalar::Soa(id) => Ty::Soa(id),
         Scalar::Param(i) => Ty::Param(i),
@@ -507,6 +533,29 @@ pub fn payload_is_move(ty: Ty) -> bool {
 /// cut — returned or destructured — so they never occupy a drop slot; see `check`/`check_fn`.)
 fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
     matches!(ty, Ty::Tuple(id) if tuples[id as usize].elems.iter().any(|s| s.is_move()))
+}
+
+/// Whether `ty` **is**, or transitively contains through a `Result` / `Option` / tuple / struct, a
+/// `slice` view. A slice is always a borrow whose escape is decided by `region_of`; this routes the
+/// arena-escape check ([`EscapeCheck::region_bearing`]) and the array-literal reject for an
+/// arena-backed `bytes` view that rides a wrapper. **Defensive on `Ty::Struct`:** a struct field
+/// cannot be a `slice` today (construction rejects it — "struct fields must be a primitive scalar,
+/// str, or a plain struct"), so this arm is currently unreachable, but walking fields keeps the
+/// check fail-safe (not fail-open) should struct slice fields ever land — the same "defensive /
+/// currently-dead" spirit as the tuple arm. Recursion terminates: a struct without a `box`
+/// indirection cannot contain itself (rejected at declaration), and `box` fields are scalars, never
+/// slices.
+fn ty_mentions_slice(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
+    match ty {
+        Ty::Slice(_) => true,
+        Ty::Option(s) => ty_mentions_slice(scalar_to_ty(s), structs, tuples),
+        Ty::Result(o, e) => {
+            ty_mentions_slice(scalar_to_ty(o), structs, tuples) || ty_mentions_slice(scalar_to_ty(e), structs, tuples)
+        }
+        Ty::Tuple(id) => tuples[id as usize].elems.iter().any(|s| ty_mentions_slice(scalar_to_ty(*s), structs, tuples)),
+        Ty::Struct(id) => structs[id as usize].fields.iter().any(|f| ty_mentions_slice(f.ty, structs, tuples)),
+        _ => false,
+    }
 }
 
 /// Parse an explicit-overflow arithmetic method name into its op and overflow mode (`core.math`).
@@ -2380,7 +2429,7 @@ impl EffectScan {
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } => {
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => {
                 self.impure_direct = true;
                 self.expr(path);
             }
@@ -2930,7 +2979,12 @@ impl<'a> EscapeCheck<'a> {
     /// `.clone()`) from an arena allocation.
     fn check_return_escape(&mut self, e: &Expr, depth: u32) {
         let r = self.region_of(e, depth);
-        if self.tracks_region(e.ty) && !r.outlives(Region::Static) {
+        // A frame-local slice (a `slice` of a local `array`, `buffer.bytes()`, `resp.body()`) keeps
+        // its dedicated message below; the region branch skips it so the diagnostic is unchanged and
+        // not duplicated. An **arena-backed `bytes` view** (`fs.read_bytes_view`) is *not*
+        // local-backed, so it flows to the region branch and gets the "allocated in an arena" message.
+        let local_backed = matches!(e.ty, Ty::Slice(_)) && self.slice_is_local(e);
+        if self.region_bearing(e.ty) && !r.outlives(Region::Static) && !local_backed {
             let msg = if r == Region::Frame {
                 "cannot return a view that borrows local storage (it is freed when the function returns); use `.clone()` to return an owned value"
             } else {
@@ -2938,7 +2992,7 @@ impl<'a> EscapeCheck<'a> {
             };
             self.diags.error(msg.to_string(), e.span);
         }
-        if matches!(e.ty, Ty::Slice(_)) && self.slice_is_local(e) {
+        if local_backed {
             self.diags.error(
                 "cannot return a slice that views a local array (it is freed when the function returns)".to_string(),
                 e.span,
@@ -3000,6 +3054,28 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    /// Whether a value of `ty` must be escape-checked against its inferred [`Region`]: it is
+    /// `tracks_region` (box / str / struct / owned collection / …) **or** it mentions a `slice`.
+    ///
+    /// A `slice` is always a borrow, so whether it escapes is decided by `region_of`, not by the
+    /// type: a returnable parameter slice (or a sub-slice of one) is `Static` and never fires, while
+    /// an **arena-backed `bytes` view** (`fs.read_bytes_view` — a `slice<u8>`, deliberately kept out
+    /// of `tracks_region` so plain numeric slices stay unboxed and freely returnable) is caught the
+    /// moment it tries to outlive its arena. Looking *through* `Result` / `Option` / tuple wrappers
+    /// closes the `?` / `match`-arm unwrap path (`Result<slice<u8>, Error>` from `read_bytes_view`),
+    /// mirroring the region pass-through `tracks_region` already gives a `str` payload.
+    fn region_bearing(&self, ty: Ty) -> bool {
+        self.tracks_region(ty) || self.mentions_slice(ty)
+    }
+
+    /// Whether `ty` is a `slice`, or a `Result` / `Option` / tuple / struct whose payload mentions
+    /// one. Used only by [`Self::region_bearing`] to route the escape check for a `bytes` view that
+    /// rides an aggregate; the region itself comes from `region_of`. Delegates to the shared
+    /// [`ty_mentions_slice`] (which also covers `Ty::Struct` defensively).
+    fn mentions_slice(&self, ty: Ty) -> bool {
+        ty_mentions_slice(ty, self.structs, self.tuples)
+    }
+
     /// Whether struct `id` has any `str` column — the field that turns a `soa<Struct>` from a
     /// self-contained, arena-only value into one whose columns hold zero-copy `str` views borrowing
     /// the decode input (or `to_soa` source). A str-bearing soa must be region-tied to that borrow;
@@ -3021,6 +3097,11 @@ impl<'a> EscapeCheck<'a> {
             // must not escape it — `.clone()` copies out. `fs.read_dir` / `fs.write_file` / `fs.exists`
             // / `fs.remove` return owned / non-region values and stay `Static` (the wildcard below).
             ExprKind::FsReadFileView { .. } => Region::arena(depth),
+            // `fs.read_bytes_view(p)` returns a `bytes` (`slice<u8>`) view of the same mmap, so it is
+            // arena-bound exactly like `read_file_view`'s `str` view. Unlike a `str`, a `slice<u8>` is
+            // not `tracks_region` (its element is numeric), so `region_bearing` is what routes the
+            // escape check here — this arm gives the view its Arena region.
+            ExprKind::FsReadBytesView { .. } => Region::arena(depth),
             // A spawned task's handle is a box in the enclosing `task_group` region.
             ExprKind::Spawn { .. } => Region::arena(depth),
             // `.to_array()` bump-allocates the owned array in the enclosing arena. `reduce` folds
@@ -3339,7 +3420,7 @@ impl<'a> EscapeCheck<'a> {
             Stmt::Let { local, init } => {
                 self.walk(init, depth);
                 self.decl_depth.insert(*local, depth);
-                if self.tracks_region(init.ty) {
+                if self.region_bearing(init.ty) {
                     let mut r = self.region_of(init, depth);
                     // A Move-struct array is a *frame* slot whose elements' heap buffers are freed
                     // when the array is dropped — at **function exit** (`drop_locals`), not by an
@@ -3373,7 +3454,7 @@ impl<'a> EscapeCheck<'a> {
             | Stmt::AssignElem { base, index, value, .. } => {
                 self.walk(index, depth);
                 self.walk(value, depth);
-                if self.tracks_region(value.ty) {
+                if self.region_bearing(value.ty) {
                     let target = self.region.get(base).copied().unwrap_or(Region::Static);
                     if !self.region_of(value, depth).outlives(target) {
                         self.diags.error(
@@ -3404,7 +3485,7 @@ impl<'a> EscapeCheck<'a> {
                 if matches!(value.ty, Ty::Slice(_)) && self.slice_is_local(value) {
                     self.local_backed_slice.insert(*local);
                 }
-                if self.tracks_region(value.ty) {
+                if self.region_bearing(value.ty) {
                     let r = self.region_of(value, depth);
                     // The binding's scope: at least the frame (a depth-0 binding lives the whole
                     // frame, region `Frame`), or the enclosing arena if declared inside one. Using
@@ -3427,7 +3508,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(value, depth);
                 // The base struct lives at its own (fixed) region; a stored value must outlive
                 // it, else the value would escape its region via the longer-lived struct.
-                if self.tracks_region(value.ty) {
+                if self.region_bearing(value.ty) {
                     let target = self.region.get(root).copied().unwrap_or(Region::Static);
                     if !self.region_of(value, depth).outlives(target) {
                         self.diags.error(
@@ -3453,7 +3534,7 @@ impl<'a> EscapeCheck<'a> {
             // region, so the tuple's region is exact; per-element regions are a later refinement.)
             Stmt::LetTuple { locals, init, .. } => {
                 self.walk(init, depth);
-                if self.tracks_region(init.ty) {
+                if self.region_bearing(init.ty) {
                     let r = self.region_of(init, depth);
                     for l in locals.iter().flatten() {
                         self.decl_depth.insert(*l, depth);
@@ -3494,7 +3575,7 @@ impl<'a> EscapeCheck<'a> {
                 if let Some(v) = &b.value {
                     // The block's value escapes to the enclosing region (`Region::arena(depth)`);
                     // a value bound to this inner arena cannot outlive it.
-                    if self.tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
+                    if self.region_bearing(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
                         self.diags.error(
                             "a value allocated in this arena cannot escape as the block's value".to_string(),
                             v.span,
@@ -3511,7 +3592,7 @@ impl<'a> EscapeCheck<'a> {
                 let inner = depth + 1;
                 self.block(b, inner);
                 if let Some(v) = &b.value
-                    && self.tracks_region(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
+                    && self.region_bearing(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
                         self.diags.error(
                             "a value from this task_group cannot escape as the block's value".to_string(),
                             v.span,
@@ -3535,8 +3616,10 @@ impl<'a> EscapeCheck<'a> {
                 // general #297-class use-after-free that first bit `resp.header()`'s `Option<str>` view
                 // (env.get's `Option<string>` is owned/`Static`, so it never exposed this gap). A
                 // non-tracked (scalar) payload binding needs no region — the guard skips it, and a
-                // Copy binding's region is never consulted anyway.
-                if self.tracks_region(scrutinee.ty) {
+                // Copy binding's region is never consulted anyway. `region_bearing` (not just
+                // `tracks_region`) also carries the region into an arm that unwraps a
+                // `Result<slice<u8>, Error>` / `Option<slice<u8>>` — the `bytes`-view match path.
+                if self.region_bearing(scrutinee.ty) {
                     let sr = self.region_of(scrutinee, depth);
                     for a in arms {
                         for b in &a.bindings {
@@ -3686,7 +3769,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.walk(input, depth),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } => self.walk(path, depth),
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => self.walk(path, depth),
             ExprKind::DnsResolve { host } => self.walk(host, depth),
             ExprKind::TcpConnect { host, port } => {
                 self.walk(host, depth);
@@ -4184,7 +4267,7 @@ impl UnnecessaryHeapScan {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.visit(input),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } => self.visit(path),
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => self.visit(path),
             ExprKind::DnsResolve { host } => self.visit(host),
             ExprKind::TcpConnect { host, port } => {
                 self.visit(host);
@@ -4935,7 +5018,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.expr(input, moved, false, false),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } => self.expr(path, moved, false, false),
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => self.expr(path, moved, false, false),
             // `dns.resolve(host)` borrows its `str` host (never consumed).
             ExprKind::DnsResolve { host } => self.expr(host, moved, false, false),
             // `tcp.connect(host, port)` borrows `host` (str, never consumed); `port` is a Copy i64.
@@ -6561,8 +6644,8 @@ impl<'a, 't> Checker<'a, 't> {
             // in the current module to its mangled codegen name (cross-module fn values are later).
             if let Some(mangled) = self.resolve_local_fn(base) {
                 let sig = &self.sigs[&mangled];
-                let params: Option<Vec<Scalar>> = sig.params.iter().map(|t| ty_to_scalar(*t)).collect();
-                let ret = ty_to_scalar(sig.ret);
+                let params: Option<Vec<Scalar>> = sig.params.iter().map(|t| fn_sig_scalar(*t)).collect();
+                let ret = fn_sig_scalar(sig.ret);
                 match (params, ret) {
                     (Some(ps), Some(r)) if !sig.out.iter().any(|o| *o) => {
                         let fid = intern_fn_type(self.fn_types, ps, r);
@@ -7337,8 +7420,8 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Scalar signature only (slice ②a), matching named function values. The captures are
         // hidden from the closure's *type* — only the explicit parameters appear in `Ty::Fn`.
-        let pscalars: Option<Vec<Scalar>> = param_tys.iter().map(|t| ty_to_scalar(self.finalize(*t))).collect();
-        let rscalar = ty_to_scalar(self.finalize(ret));
+        let pscalars: Option<Vec<Scalar>> = param_tys.iter().map(|t| fn_sig_scalar(self.finalize(*t))).collect();
+        let rscalar = fn_sig_scalar(self.finalize(ret));
         let (Some(ps), Some(r)) = (pscalars, rscalar) else {
             self.diags.error("a lambda value supports only scalar parameters and return type".to_string(), span);
             return err;
@@ -8071,7 +8154,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `fs.exists(path)` -> bool; `fs.remove(path)` / `fs.read_dir(path)` / `fs.read_file_view(path)`
             // — the single-path std.fs ops.
-            if module == "fs" && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view") {
+            if module == "fs" && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view" | "read_bytes_view") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_path_op(method, args, span);
             }
@@ -8908,6 +8991,20 @@ impl<'a, 't> Checker<'a, 't> {
         if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        // A `slice` view element is deferred, like `box<slice>`: an `array<slice<T>>` literal would
+        // need per-element view-region tracking (each element could borrow a different source). The
+        // only slice values today are `bytes` views (`fs.read_bytes_view` / `buffer.bytes()`); a
+        // literal collecting them is rejected at construction rather than mis-lowered. Checked
+        // transparently through `Result`/`Option`/tuple/struct wrappers so an `array<Option<slice>>`
+        // / `array<Result<slice, Error>>` can't smuggle an arena view past the direct-slice guard
+        // (both are also blocked by the composite-payload rule below — this is defense in depth).
+        if ty_mentions_slice(self.resolve(elem_ty), self.structs, self.tuples) {
+            self.diags.error(
+                format!("`{}` cannot be an array literal element yet (a slice view is a borrow, not collectible)", ty_name(elem_ty)),
                 span,
             );
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -10687,6 +10784,10 @@ impl<'a, 't> Checker<'a, 't> {
             Scalar::Struct(_) => Some("struct boxes are not supported".to_string()),
             Scalar::Enum(_) => Some("sum-type boxes are not supported".to_string()),
             Scalar::Str => Some("a `str` view is not boxable".to_string()),
+            // A `slice` view is a borrow (`{ptr,len}`) — not boxable, exactly like `str`. (Now that a
+            // slice is a payload scalar for `Result<slice<u8>, Error>`, it must be rejected here too,
+            // or `scalar_bytes` would size a non-existent box payload.)
+            Scalar::Slice(_) => Some("a `slice` view is not boxable".to_string()),
             _ => None,
         };
         if let Some(why) = reject {
@@ -11313,11 +11414,12 @@ impl<'a, 't> Checker<'a, 't> {
     /// (owned strings); `fs.read_file_view(path)` -> `Result<str, Error>` (an mmap view — **requires an
     /// enclosing `arena {}`**, like `heap.new`, its region bound to that arena). Builtins.
     fn check_fs_path_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
-        // `read_file_view`'s returned `str` views an mmap that is `munmap`ped at arena end, so it must
-        // live inside an arena — checked here, exactly like `heap.new` (same diagnostic shape).
-        if method == "read_file_view" && self.arena_depth == 0 {
+        // `read_file_view`/`read_bytes_view`'s returned view aliases an mmap that is `munmap`ped at
+        // arena end, so it must live inside an arena — checked here, exactly like `heap.new` (same
+        // diagnostic shape).
+        if matches!(method, "read_file_view" | "read_bytes_view") && self.arena_depth == 0 {
             self.diags
-                .error("fs.read_file_view must be used inside an `arena {}` block (the view is unmapped at arena end)".to_string(), span);
+                .error(format!("fs.{method} must be used inside an `arena {{}}` block (the view is unmapped at arena end)"), span);
         }
         if args.len() != 1 {
             self.diags
@@ -11343,7 +11445,14 @@ impl<'a, 't> Checker<'a, 't> {
                 ty: Ty::Result(Scalar::Str, err_enum),
                 span,
             },
-            _ => unreachable!("check_fs_path_op is only dispatched for exists/remove/read_dir/read_file_view"),
+            // `read_bytes_view` returns a `bytes` (`slice<u8>`) view — the binary sibling, no UTF-8
+            // validation. The arena-region binding (`region_of`) keeps the view from escaping.
+            "read_bytes_view" => Expr {
+                kind: ExprKind::FsReadBytesView { path },
+                ty: Ty::Result(Scalar::Slice(PrimScalar::Int(IntTy { bits: 8, signed: false })), err_enum),
+                span,
+            },
+            _ => unreachable!("check_fs_path_op is only dispatched for exists/remove/read_dir/read_file_view/read_bytes_view"),
         }
     }
 
@@ -14005,7 +14114,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.finalize_expr(input),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } => self.finalize_expr(path),
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => self.finalize_expr(path),
             ExprKind::DnsResolve { host } => self.finalize_expr(host),
             ExprKind::TcpConnect { host, port } => {
                 self.finalize_expr(host);
