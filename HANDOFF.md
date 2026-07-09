@@ -5,28 +5,37 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-09 (loop design settled — docs-only sweep; previously 2026-07-08 M11 std.http Slice 2 — the plaintext client — MERGED as #392;
-Slice 1 was #391. Same week: std.crypto COMPLETE #383–#388, std.compress COMPLETE #380–#382;
-2026-07-06: std.process #376–#378, std.net #371–#374)._
+_Last updated: 2026-07-10 (staleness sweep: recorded the missed #393/#394 merges, re-verified
+test count, fixed the memory-path key; previously 2026-07-09 loop design settled — docs-only
+sweep; 2026-07-08 M11 std.http Slice 2 — the plaintext client — MERGED as #392; Slice 1 was
+#391. Same week: std.crypto COMPLETE #383–#388, std.compress COMPLETE #380–#381; 2026-07-06:
+std.process #376–#378, std.net #371–#374)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state:** `main` clean, no open PRs, no stray worktrees. Last merges: #391 (std.http
-Slice 1) + #392 (std.http Slice 2); after them a **docs-only design wave committed directly to
-main on 2026-07-09** (see the three 2026-07-09 paragraphs below: `loop` settled, spec-vacuum
-sweep + 7 settlements total, align-LLM runway). **No code changed this session** — `cargo test
---workspace` should still be **1601 green**; clippy clean at `-D warnings`. Housekeeping note: 7
-stale local branches remain (`fix-*`/`*group-agg*` from the squash-merged Gemini wave #358–#368,
-and `handoff-http-slice1-inflight`, a pre-#391 stash) — squash merges hide them from `--merged`;
+**Repo state (re-verified 2026-07-10):** `main` clean, no open PRs. Newest commit is the
+**docs-only design wave committed directly to main on 2026-07-09** (see the three 2026-07-09
+paragraphs below: `loop` settled, spec-vacuum sweep + 7 settlements total, align-LLM runway).
+Two code merges landed between #392 and that wave, easy to miss: **#393** (editor support —
+`editors/` Vim/Emacs/VS Code syntax + snippets, `.ctags`, `.vscode/tasks.json`,
+`examples/playground.align`; the stray `.playground.align.swp` it committed was removed in the
+docs-wave commit, blob stays in history) and **#394** (one-line codegen fix — the BufferBytes
+alloca moved to the entry block, stopping a per-iteration stack overflow). `cargo test
+--workspace` re-verified **1601 green** on 2026-07-10 (post-#394); clippy clean at `-D
+warnings`. Housekeeping note: **8** stale local branches remain (`fix-*`/`*group-agg*` from the
+squash-merged Gemini wave #358–#368; `handoff-http-slice1-inflight`, a pre-#391 stash; and
+`fix-codegen-bufferbytes-alloca`, merged as #394) — squash merges hide them from `--merged`;
 verify content landed (`git diff main...<br>`) then force-delete at leisure. Two stray untracked
 files at root (`examples/double_free.align`, `wait_for_review.sh`) were left untouched — not this
-session's work; triage or gitignore at leisure. **Next, pick one (owner deferred all
-implementation on token budget — nothing below is started):** (a) **std.http Slice 3**
-(pool/keepalive — R3 — plus the R6 `bench/http_client` harness; see the Slice-2 entry below) —
-the standing M11 plan; or (b) the **2026-07-09 owed implementation deltas**, best-first:
-struct-`==` ICE → sema diagnostic (small, priority bugfix), shadowing → compile error, the `loop`
-slice, then the align-LLM runway A-list (`fs.read_bytes_view` + bytes binary decode/encode
-first).
+session's work; triage or gitignore at leisure. **In flight (2026-07-10): a parallel session
+opened two worktrees** (branches `fix-struct-eq-diagnostic` / `fix-no-shadowing`, empty at last
+check) for the first two owed implementation deltas — coordinate before touching those two items
+or deleting the worktrees. **Next, pick one (nothing else below is started):** (a) **std.http
+Slice 3** (pool/keepalive — R3 — plus the R6 `bench/http_client` harness; see the Slice-2 entry
+below) — the standing M11 plan; or (b) the remaining **2026-07-09 owed implementation deltas**:
+the `loop` slice, then the align-LLM runway A-list (`fs.read_bytes_view` + bytes binary
+decode/encode first) — struct-`==` ICE → sema diagnostic and shadowing → compile error are the
+in-flight worktrees above.
 
 **Design settled 2026-07-09: the `loop` expression** (docs-only, no code). One narrow sequential-control construct — `loop { ... break value }`, an expression; no `for`/`while`/`continue`/labels; recursion is explicitly not iteration (the spec now guarantees no TCO — scope-end drops and `?` kill tail position). The pipeline owns the data path; `loop` owns the control path. Updated: `draft.md` §4 "Loop" + §7, `language-spec.md`, `design-notes.md` → "The loop philosophy", `history.md`, `open-questions.md` (Settled → "Sequential control"), guide ch00/02/06/13/17, little-aligner ch11 **rewritten** as `11-do-it-until.md` (it taught recursion-as-iteration and overclaimed TCO), + `ja/` mirrors. Implementation is an unscheduled future slice (lexer/parser `loop`/`break`, break-type unification like match arms, per-iteration drops, block-value escape rule); the deferred M8 frequency lints gain their firing surface when it lands.
 
@@ -423,11 +432,11 @@ purity-as-effect-bit) tracked **open** in `docs/open-questions.md`. See memory
 ## Setup on the new machine
 
 ```bash
-git clone https://github.com/sanohiro/align            # ideally into /home/<user>/project/align
+git clone https://github.com/sanohiro/align            # ideally into /home/<user>/prj/align
 cd align
 # Toolchain: Rust 1.96 + LLVM 19 (inkwell llvm19-1). Debian: apt install llvm-19 llvm-19-dev
 # .cargo/config.toml already sets LLVM_SYS_191_PREFER_DYNAMIC=1 (Debian llvm-19 is shared-only).
-cargo build && cargo test       # expect all green (~994 tests)
+cargo build && cargo test       # expect all green (1600+ tests)
 ```
 
 The compiler is `./target/debug/alignc` (or `./target/release/alignc` after `--release`) — not on
@@ -563,17 +572,17 @@ the lever (#178); par_map persistent worker pool (#179); group_by table-interlea
 
 ## Memory (does NOT travel with `git clone`)
 
-Claude's cross-session memory lives at `~/.claude/projects/-home-hiro-project-align/memory/` (13
-files: PR-review workflow, perf model, benchmark findings, language-completion status, etc.). The
+Claude's cross-session memory lives at `~/.claude/projects/-home-hiro-prj-align/memory/` (10
+files; see its `MEMORY.md` index). The
 repo is self-sufficient without it, but to carry it over:
 
 ```bash
 # old machine (note the leading ./ — the dir name starts with '-', which tar would else read as flags):
-tar czf align-memory.tgz -C ~/.claude/projects ./-home-hiro-project-align
+tar czf align-memory.tgz -C ~/.claude/projects ./-home-hiro-prj-align
 # new machine:
 tar xzf align-memory.tgz -C ~/.claude/projects
 ```
-The project key (`-home-hiro-project-align`) is derived from the clone path. Clone to the **same**
-path (`/home/<user>/project/align`) so it matches. If the new machine's user/path differs, the key
-changes (e.g. `-home-bob-project-align`) — rename the extracted folder to that new key, or Claude
+The project key (`-home-hiro-prj-align`) is derived from the clone path. Clone to the **same**
+path (`/home/<user>/prj/align`) so it matches. If the new machine's user/path differs, the key
+changes (e.g. `-home-bob-prj-align`) — rename the extracted folder to that new key, or Claude
 Code won't pick the memory up.

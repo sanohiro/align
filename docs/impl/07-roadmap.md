@@ -16,16 +16,24 @@ but read the order from here.
 - **No backward compatibility** (pre-release) — change APIs outright; no aliases / shims / dual paths.
 - **Finish all of `core` + the language before `std`** — the OS-boundary layer (`std`/`pkg`) waits.
 
-**Done:** M0–M3 (skeleton · functions/control/struct/bool · Result/Option/`?` · move/value/arena) ·
-**Memory Model v2** (borrow-region propagation + owned heap/drop) · **M4** (array-processing core) ·
-**M5** (strings, templates, `json.encode`/`decode`). Cross-cutting since: first-class **tuples**
-(incl. partial field moves); **lambdas** in every stage & reducer with **capture** (lifted,
-escape-driven design settled); **`sort_by_key`**; whole-struct **`arr[i]`** by value (struct fields
-enforced Copy-only); and **M7** — `par_map` (real threads) + `chunks` + purity inference +
-first-class closures (①–③) + `task_group`/`spawn`/`wait()?` (real threads). Only **fully-escaping
-fn values** (return / struct-field / array-element) stay deferred.
+**Done (as of 2026-07-10):** **M0–M10 are complete and formally closed** — the language core
+(M0–M5 + Memory Model v2, tuples, lambdas/closures, sum types + `Error`, minimal generics), M6
+SIMD (`vecN`/`maskN`/`soa`/columnar `group_by`/`align(N)`), M7 concurrency (`par_map`/`chunks`/
+purity + `task_group` on real threads), M8 tooling (`align_fmt`, `unsafe`/`raw.*`, `extern "C"`
+FFI, the profile-independent lint slice), M9 std phase 1 (`io`/`fs`/`path`/`env`/`time`), and
+M10 std phase 2 (`encoding`/`rand`/`cli`). **M11 (std third wave) is IN PROGRESS:** `std.net` /
+`std.process` / `std.compress` / `std.crypto` COMPLETE; `std.http` Slices 1–2 merged
+(#391/#392), Slices 3–5 (pool/keepalive + the R6 bench gate, server, TLS) remain — see the M11
+section below.
 
-**Forward plan (ordered — finish the language, then std):**
+**Next (in order):** std.http Slice 3 (pool/keepalive R3 + the `bench/http_client` R6 gate);
+the 2026-07-09 owed implementation deltas (struct-`==` sema diagnostic, no-shadowing error, the
+`loop` slice, the lexer escape-set gaps); then the M12 candidates recorded in
+`open-questions.md` Open → "align-LLM runway".
+
+**Historical build sequence (2026-06 snapshot — kept for the build-order and decision record;
+every item below has since completed as recorded in the per-milestone sections, except
+`core.bitset` in item 6, still unbuilt for lack of a consumer):**
 1. **core.math** — explicit-overflow arithmetic `checked_*` / `saturating_*` / `wrapping_*` for
    add/sub/mul **DONE** (methods on integers; `checked_*` → `Option<T>`, via LLVM `.sat` /
    `.with.overflow`). Scalar `abs` / `min` / `max` **DONE** (methods on numerics; `a.min(b)`
