@@ -13790,7 +13790,7 @@ impl<'a, 't> Checker<'a, 't> {
                             for (i, (arg, bound)) in type_args.iter().zip(&bounds).enumerate() {
                                 if !bound.satisfied_by(*arg) {
                                     self.diags.error(
-                                        format!("type argument {} = `{}` does not satisfy the `{}` bound of '{func}'", i + 1, ty_name(*arg), bound.name()),
+                                        format!("type argument {} = `{}` does not satisfy the `{}` bound of '{func}'", i + 1, self.ty_display(*arg), bound.name()),
                                         span,
                                     );
                                 }

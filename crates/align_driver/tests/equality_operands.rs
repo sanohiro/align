@@ -168,3 +168,68 @@ fn main() -> i32 {
 ";
     assert!(check_errs("struct-eq-e2e", src), "struct `==` must be a compile error, not an ICE");
 }
+
+// --- generic-instantiation bypass: a struct `T` reaching `==` through a monomorphized `Eq` bound
+//     must be the same clean diagnostic, never an ICE (the direct-operand checks above run on
+//     concrete `==` exprs; a generic template's `a == b` is only concrete after monomorphization) ---
+
+#[test]
+fn generic_eq_bound_instantiated_with_struct_rejected() {
+    // `eq<T: Eq>` monomorphized at `Point` (not `Eq`): the instantiation-site bound check must
+    // reject it with a clean diagnostic naming the struct, not an ICE in codegen.
+    let src = "\
+Point { x: i32, y: i32 }
+fn eq<T: Eq>(a: T, b: T) -> bool = a == b
+fn main() -> i32 {
+  a := Point { x: 1, y: 2 }
+  b := Point { x: 1, y: 2 }
+  if eq(a, b) { return 1 }
+  return 0
+}
+";
+    let text = check_msg("gen-eq-bound-struct", src);
+    assert!(text.contains("does not satisfy"), "struct instantiation of `T: Eq` must be rejected, got:\n{text}");
+    // The user's type name, not the compiler-internal `struct#N` placeholder.
+    assert!(text.contains("Point"), "message should name the struct, got:\n{text}");
+    assert!(!text.contains("struct#"), "must not leak the internal `struct#N` name, got:\n{text}");
+}
+
+#[test]
+fn generic_eq_bound_instantiated_with_struct_does_not_ice_end_to_end() {
+    // Same bug as `struct_equality_does_not_ice_end_to_end`, but reached through a generic
+    // instantiation rather than a direct `==` — the original adversarial-review finding.
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+Point { x: i32, y: i32 }
+fn eq<T: Eq>(a: T, b: T) -> bool = a == b
+fn main() -> i32 {
+  a := Point { x: 1, y: 2 }
+  b := Point { x: 1, y: 2 }
+  if eq(a, b) { return 1 }
+  return 0
+}
+";
+    assert!(check_errs("gen-eq-bound-struct-e2e", src), "generic `T: Eq` instantiated with a struct must be a compile error, not an ICE");
+}
+
+#[test]
+fn transitive_generic_eq_bound_instantiated_with_struct_rejected() {
+    // `outer<U>` carries no bound itself but calls `inner<T: Eq>`; instantiating `outer` at
+    // `Point` transitively instantiates `inner` at `Point` too, and must fail the same way.
+    let src = "\
+Point { x: i32, y: i32 }
+fn inner<T: Eq>(a: T, b: T) -> bool = a == b
+fn outer<U>(a: U, b: U) -> bool = inner(a, b)
+fn main() -> i32 {
+  a := Point { x: 1, y: 2 }
+  b := Point { x: 1, y: 2 }
+  if outer(a, b) { return 1 }
+  return 0
+}
+";
+    let text = check_msg("gen-eq-bound-transitive", src);
+    assert!(text.contains("does not satisfy"), "transitive struct instantiation of `T: Eq` must be rejected, got:\n{text}");
+    assert!(text.contains("Point") && !text.contains("struct#"), "should name the struct, got:\n{text}");
+}
