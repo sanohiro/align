@@ -5546,6 +5546,11 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let floor = floor.min(self.scope.len());
         let in_scope = self.scope[..floor].iter().any(|(n, _)| n == name);
+        // Lambda captures are single-level today (`enclosing` is a snapshot of the immediate
+        // enclosing scope only; a nested lambda does not chain into its grandparent's capture),
+        // so checking just this one snapshot is exactly as deep as name visibility reaches. If
+        // transitive/multi-level capture is ever implemented, this must walk the enclosing chain
+        // transitively, or shadowing through a grandparent scope becomes silently accepted.
         let in_enclosing = self
             .capture
             .as_ref()

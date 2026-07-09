@@ -2271,6 +2271,10 @@ fast; "spec-debt" = no decision needed, just transcribe implemented truth into `
   consumer that cannot use a stepped/non-callback C API. Ideal shape when triggered: a
   **top-level non-capturing `fn` only** (a plain function pointer — extern-compatible params, no
   closure environment, no new mechanism).
+- **No-shadowing vs. function names** — a local/parameter may currently share a name with a
+  top-level function (functions and values are separate namespaces today; fn-values are not yet
+  first-class), which the no-shadowing settlement's wording (Settled → "No shadowing") does not
+  explicitly cover. Decide whether function names join the shadowing check once fn-values land.
 
 ### align-LLM runway — std/language items pulled by the inference-engine north star (recorded 2026-07-09)
 
