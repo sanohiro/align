@@ -5,11 +5,11 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10 (staleness sweep: recorded the missed #393/#394 merges, re-verified
-test count, fixed the memory-path key; previously 2026-07-09 loop design settled — docs-only
-sweep; 2026-07-08 M11 std.http Slice 2 — the plaintext client — MERGED as #392; Slice 1 was
-#391. Same week: std.crypto COMPLETE #383–#388, std.compress COMPLETE #380–#381; 2026-07-06:
-std.process #376–#378, std.net #371–#374)._
+_Last updated: 2026-07-10 (owed-delta wave: **#396** struct-`==` ICE → sema diagnostic and
+**#397** no-shadowing enforcement MERGED — the two priority deltas from the 2026-07-09 sweep are
+done; earlier same day: staleness sweep #395 recording the missed #393/#394 merges; previously
+2026-07-09 loop design settled — docs-only sweep; 2026-07-08 M11 std.http Slice 2 — the
+plaintext client — MERGED as #392; Slice 1 was #391)._
 
 ## ▶ NEXT SESSION — start here
 
@@ -27,15 +27,25 @@ squash-merged Gemini wave #358–#368; `handoff-http-slice1-inflight`, a pre-#39
 `fix-codegen-bufferbytes-alloca`, merged as #394) — squash merges hide them from `--merged`;
 verify content landed (`git diff main...<br>`) then force-delete at leisure. Two stray untracked
 files at root (`examples/double_free.align`, `wait_for_review.sh`) were left untouched — not this
-session's work; triage or gitignore at leisure. **In flight (2026-07-10): a parallel session
-opened two worktrees** (branches `fix-struct-eq-diagnostic` / `fix-no-shadowing`, empty at last
-check) for the first two owed implementation deltas — coordinate before touching those two items
-or deleting the worktrees. **Next, pick one (nothing else below is started):** (a) **std.http
-Slice 3** (pool/keepalive — R3 — plus the R6 `bench/http_client` harness; see the Slice-2 entry
-below) — the standing M11 plan; or (b) the remaining **2026-07-09 owed implementation deltas**:
-the `loop` slice, then the align-LLM runway A-list (`fs.read_bytes_view` + bytes binary
-decode/encode first) — struct-`==` ICE → sema diagnostic and shadowing → compile error are the
-in-flight worktrees above.
+session's work; triage or gitignore at leisure. **DONE 2026-07-10 (this wave): the two priority
+owed deltas.** **#396** — struct/tuple/array/sum/owned-`string` `==` no longer ICEs in codegen;
+sema enforces a fail-closed allow-list (equality = numeric+bool+char+str via
+`Bound::Eq.satisfied_by`; ordering = numeric+char; owned-`string` compare deferred with a clear
+message; `bool <` now rejected per spec; the generic `T: Eq`-instantiated-with-struct bypass
+verified closed at two layers + regression-tested; the bound diagnostic's `struct#N` leak fixed
+via `ty_display`). **#397** — no-shadowing enforced: `check_shadow` at all 5 user-named binding
+sites (coverage proven complete — every local goes through `declare()`); sibling scopes/arms/
+lambdas stay legal for free (`scope` is the live chain); module constants included; zero corpus
+call sites needed fixing; single-level-capture coupling invariant documented in a comment, and
+"locals may share a top-level fn name" recorded as a new Open item. Both adversarially gate-
+reviewed (zero CONFIRMED findings), mutation-checked, gemini reflected (#396 zero findings; #397's
+one medium — eager lookups in `check_shadow` — verified and applied). `cargo test --workspace`
+**1628 green**; clippy clean at `-D warnings`. **Next, pick one (nothing below is started):**
+(a) **std.http Slice 3** (pool/keepalive — R3 — plus the R6 `bench/http_client` harness; see the
+Slice-2 entry below) — the standing M11 plan; or (b) the remaining **2026-07-09 owed
+implementation deltas**: the `loop` slice, the lexer escape-set gaps, `Ord(str)` + `else`-on-
+`Result` implementation, then the align-LLM runway A-list (`fs.read_bytes_view` + bytes binary
+decode/encode first).
 
 **Design settled 2026-07-09: the `loop` expression** (docs-only, no code). One narrow sequential-control construct — `loop { ... break value }`, an expression; no `for`/`while`/`continue`/labels; recursion is explicitly not iteration (the spec now guarantees no TCO — scope-end drops and `?` kill tail position). The pipeline owns the data path; `loop` owns the control path. Updated: `draft.md` §4 "Loop" + §7, `language-spec.md`, `design-notes.md` → "The loop philosophy", `history.md`, `open-questions.md` (Settled → "Sequential control"), guide ch00/02/06/13/17, little-aligner ch11 **rewritten** as `11-do-it-until.md` (it taught recursion-as-iteration and overclaimed TCO), + `ja/` mirrors. Implementation is an unscheduled future slice (lexer/parser `loop`/`break`, break-type unification like match arms, per-iteration drops, block-value escape rule); the deferred M8 frequency lints gain their firing surface when it lands.
 
@@ -46,11 +56,10 @@ teaches what the spec never states" class. **Five settlements** written into the
 never abort** — full record in `open-questions.md` Settled → "Spec-vacuum sweep". The remainder
 is recorded as Open → "Unrecorded spec vacuums — remainder" (assert, str char access, precedence
 table, stack-overflow contract, main signature set, reserved words + ASCII-only-identifier lean,
-C→Align: embedding = non-goal / callbacks deferred-with-trigger). **Two implementation deltas are
-now owed, PRIORITY when coding resumes:** (1) struct `==` reaches codegen and **ICEs**
-(`align_codegen_llvm` "expected the IntValue variant" panic) — needs a sema diagnostic; (2)
-shadowing (same-scope re-`:=` and inner-scope) is currently accepted silently — becomes a compile
-error per the settle. Plus the `loop` implementation slice itself, and the lexer escape-set gaps
+C→Align: embedding = non-goal / callbacks deferred-with-trigger). **The two priority
+implementation deltas are DONE (2026-07-10):** (1) struct `==` ICE → sema diagnostic shipped as
+**#396**; (2) shadowing → compile error shipped as **#397** (details in the NEXT SESSION block
+above). Still owed: the `loop` implementation slice itself, and the lexer escape-set gaps
 (`\r \0 \u{}`, unknown-escape error, single-line enforcement). **Two owner-directed follow-up
 settlements (same day):** `Ord(str)` — byte-lexicographic string comparison + `sort_by_key` string
 keys — and **`else` on `Result`** (deliberate error-discarding fallback; overturns guide ch04's
