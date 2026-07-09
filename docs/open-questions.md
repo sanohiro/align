@@ -2193,9 +2193,15 @@ implementation deltas are noted.
    explicit single-line / unknown-escape errors.
 3. **Equality = scalars + strings only** (§5 "Equality and Ordering"): no structural `==` on
    struct/tuple/array/sum — explicit field comparison / `match` / pipeline instead (nothing
-   hidden; the `match`-is-for-variants boundary). **Implementation bug found while settling:**
-   sema lets struct `==` through to codegen, which **panics** (ICE — `align_codegen_llvm`
-   "expected the IntValue variant"). Needs a clean sema diagnostic; priority fix.
+   hidden; the `match`-is-for-variants boundary). **Implementation bug found while settling
+   — FIXED:** sema used to let struct `==` through to codegen, which **panicked** (ICE —
+   `align_codegen_llvm` "expected the IntValue variant"). sema now rejects every non-scalar /
+   non-string comparison operand up front with a clean diagnostic, via a *positive* allow-list
+   (the `Eq` / `Ord` bound predicate — numbers / `bool` / `char` / `str`, never a fail-open
+   pass-through): struct / tuple / array / slice / sum / `Option` / `Result` / owned `string`
+   `==` `!=` `<` `<=` `>` `>=` are all compile errors, not ICEs (`bool` ordering too — ordering
+   is numbers + `char` only). Owned `string` equality stays deferred (its own "not directly
+   comparable yet" message; only the `str` view is comparable today).
 4. **No shadowing** (§4 Variables): a name binds once per scope chain — same-scope re-`:=` and
    inner-scope shadowing of a visible binding/parameter are compile errors; disjoint sibling
    blocks may reuse a name. Rationale: rebinding hides a state change (a known human/LLM bug

@@ -7062,6 +7062,37 @@ impl<'a, 't> Checker<'a, 't> {
                         // `str` supports only equality (no ordering yet).
                         self.diags
                             .error("str supports only == and != (ordering is not available)".to_string(), span);
+                    } else if t == Ty::String {
+                        // Owned `string` comparison is not implemented yet (only the `str` view is
+                        // comparable). Comparing it would otherwise fall through to codegen's integer
+                        // path and ICE — reject it here with a clear "not yet" message (the same
+                        // "deferred, not structural" treatment as `str` ordering above).
+                        self.diags.error(
+                            "owned `string` values are not directly comparable yet — take a `str` view of each (numbers, bool, char, and `str` are the comparable types)".to_string(),
+                            span,
+                        );
+                    } else if t != Ty::Error {
+                        // A concrete non-generic operand. Equality is defined for scalars + `str`
+                        // only, ordering for numbers + `char` (+ `str` once available) — there is NO
+                        // structural comparison (draft.md §5 "Equality and Ordering"). Reject every
+                        // other type — struct / tuple / array / slice / sum / Option / Result / box /
+                        // soa / vector-header / handle — here, so a non-comparable operand is a clean
+                        // compile error instead of an `IntValue`-variant ICE in `align_codegen_llvm`.
+                        // The allow-list is a *positive* set (the exact `Eq` / `Ord` bound predicate,
+                        // one source of truth) — never "unknown types pass through" (the fail-open
+                        // bug class this repo has a history of).
+                        let ok = if is_eq { Bound::Eq.satisfied_by(t) } else { Bound::Ord.satisfied_by(t) };
+                        if !ok {
+                            let shown = self.ty_display(t);
+                            let msg = if is_eq {
+                                format!(
+                                    "`==` and `!=` compare scalars and strings only (numbers, bool, char, str); {shown} has no equality — compare a struct's fields explicitly, `match` on a sum value, or compare arrays element-wise as a pipeline",
+                                )
+                            } else {
+                                format!("`<`, `<=`, `>`, `>=` order numbers and char only; {shown} has no ordering")
+                            };
+                            self.diags.error(msg, span);
+                        }
                     }
                     ty = Ty::Bool;
                 }
