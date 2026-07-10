@@ -185,6 +185,64 @@ fn file_move_and_consume_gates_are_rejected() {
     ), "comparing files with == must be rejected");
 }
 
+/// `file` must be nameable as a surface type (gate F1 regression): a helper fn taking a `file`
+/// parameter (by value — the file *moves* into the helper) `pwrite`s through it, called from
+/// `main` with a freshly created file. Full compile+run round-trip, verified against the on-disk
+/// bytes. A separate negative assert covers the move: using the original binding after the call
+/// (which consumed it) must be rejected, mirroring the `reader`/`writer` param-threading gates.
+#[test]
+fn file_param_threading_through_helper_fn() {
+    if !backend_available() {
+        return;
+    }
+    let f = TempFile::out("param");
+    let prog = "\
+import std.fs
+fn write_at(f: file, off: i64) -> Result<(), Error> {
+  f.pwrite(\"hi\", off)?
+  return Ok(())
+}
+pub fn main(args: array<str>) -> Result<(), Error> {
+  f := fs.create_rw(args[1])?
+  write_at(f, 3)?
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m12-file-param-threading", prog, &[&f.str()]);
+    assert_eq!(out.status.code(), Some(0), "program exits 0; stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let mut expected = vec![0u8; 3];
+    expected.extend_from_slice(b"hi");
+    assert_eq!(std::fs::read(&f.path).unwrap(), expected, "the helper's pwrite must land through the threaded param");
+
+    // Use-after-call: `f` moved into `write_at`, so using it again in `main` must be rejected.
+    assert!(check_errs(
+        "m12-file-param-use-after-call",
+        "import std.fs\nfn write_at(f: file, off: i64) -> Result<(), Error> {\n  f.pwrite(\"hi\", off)?\n  return Ok(())\n}\npub fn main(args: array<str>) -> Result<(), Error> {\n  f := fs.create_rw(args[1])?\n  write_at(f, 3)?\n  f.pwrite(\"x\", 0)?\n  return Ok(())\n}\n",
+    ), "using a file after moving it into a helper fn's `file` parameter must be rejected");
+}
+
+/// `file` must be nameable as a surface *return* type (the gate's exact repro): a helper fn
+/// returning `Result<file, Error>` from `fs.create_rw`, bound and used from `main`.
+#[test]
+fn file_returned_from_helper_fn() {
+    if !backend_available() {
+        return;
+    }
+    let f = TempFile::out("ret");
+    let prog = "\
+import std.fs
+fn mk(p: str) -> Result<file, Error> = fs.create_rw(p)
+pub fn main(args: array<str>) -> Result<(), Error> {
+  f := mk(args[1])?
+  f.pwrite(\"hello\", 0)?
+  return Ok(())
+}
+";
+    let out = build_and_run_args("m12-file-return", prog, &[&f.str()]);
+    assert_eq!(out.status.code(), Some(0), "program exits 0; stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read(&f.path).unwrap(), b"hello", "the file returned from the helper must be usable in main");
+}
+
 /// The import gate: `fs.create_rw` / `fs.open_rw` require `import std.fs`.
 #[test]
 fn file_constructors_require_std_fs_import() {

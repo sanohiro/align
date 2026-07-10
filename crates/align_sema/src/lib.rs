@@ -16514,6 +16514,15 @@ fn resolve_type(
             }
             Ty::Buffer
         }
+        // `file` (`std.fs`) — an offset-addressed file Move handle (`fs.create_rw` et al.). A surface
+        // type name so it can be threaded through functions (a Move handle; passed by value).
+        "file" => {
+            if !args.is_empty() {
+                diags.error("file takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::File
+        }
         // `rng` (`std.rand`) — a Copy state-only random-generator value. A surface type name so it
         // can be a `let` annotation / function parameter (an rng is Copy, passed/returned by value).
         "rng" => {
