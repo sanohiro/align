@@ -5,7 +5,10 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10 (**#401** align-LLM runway A2 binary decode/encode MERGED — 18
+_Last updated: 2026-07-10 (**#402** the `loop` expression MERGED — full slice, lexer→MIR: break
+unification via match running-unify, two-pass loop-back MoveCheck, per-iteration drops via
+sema-recorded LocalId ranges, Static-only break-value escape rule; the deferred M8 frequency
+lints now have their firing surface. Earlier: **#401** align-LLM runway A2 binary decode/encode MERGED — 18
 endian-explicit `bytes` reads inline-lowered + `buffer.put_*`/`append`; **#400** lexer escape
 set landed same day (other session); **#399** runway A1 `fs.read_bytes_view` MERGED — first
 arena-backed slice view, `Scalar::Slice` + `region_bearing`; **#398** std.http Slice 3 —
@@ -99,7 +102,20 @@ out-of-range **aborts** like `slice[i]` (the `off+width` i64-overflow case prova
 the signed `start>end` arm); **copy-out/owned-bytes not needed, deferred**. Adversarial gate:
 zero defects (par_map race structurally impossible — Move buffers can't be captured); gemini's
 2 mediums (defensive bswap width guard, bulk BE append) applied. `cargo test --workspace`
-**1661 green**. **A3+ (the `loop` slice is next best) are not started.**
+**1661 green**. **A3 — the `loop` expression — is DONE (merged as #402, 2026-07-10):** full
+ideal-form slice (lexer/parser/fmt/sema/MIR): `loop { ... break v }` expression, break unification
+reusing the match running-unify, break-less loop diverges (exit = Unreachable), `for`/`while`/
+`continue` get clear diagnostics; **two-pass fixpoint loop-back MoveCheck** (2nd-iteration
+use-after-move caught; two passes proven sufficient by the adversarial gate); **per-iteration
+drops** via sema-recorded loop-body LocalId ranges intersected with `drop_locals` (the gemini
+review caught the original HIR-walk collector's fail-open wildcard leaking nested owned locals —
+reproduced, redesigned, regression-tested); break value must be `Static` (conservative v1;
+enclosing-arena views need `.clone()`); break from an arena/task_group nested in the loop =
+rejected-with-diagnostic (region-unwind-on-break is a recorded future slice). Review side
+discoveries recorded in open-questions: value-position array literals panic in lower_expr
+(if/match arms, pre-existing), value-position block exprs miscompile (pre-existing).
+`cargo test --workspace` **1680 green**. **A4+ (seek/pread, http server+SSE, growable array,
+streaming line reads, arena checkpoint) are not started.**
 
 **M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), `std.compress`
 (#380–#381), and `std.crypto` (#383–#388) are DONE.** Full shipped-feature summaries + per-slice
