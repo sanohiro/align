@@ -13,10 +13,17 @@
 //! `cl.get(url)` / `cl.post(url, body)` / `cl.request(req)` each perform ONE request over one fresh
 //! `tcp_conn` (connect → TCP_NODELAY → one write of the serialized request → stream the response to
 //! Content-Length → parse → close), reusing the net rail + the Slice-1 codec/parse engine. A 4xx/5xx
-//! is `Ok(response)` (P2); `https://` is `Error.Invalid` (P1, never a silent downgrade). Requests are
-//! Impure. Round-trips run against an in-process Rust server; the Gate-1 rejections (client unbound
-//! receiver / array element / use-after-move of a `request` / view escape / import) are compile checks.
-//! (`docs/impl/std-design/http.md` Slice 2.)
+//! is `Ok(response)` (P2). Requests are Impure. Round-trips run against an in-process Rust server; the
+//! Gate-1 rejections (client unbound receiver / array element / use-after-move of a `request` / view
+//! escape / import) are compile checks. (`docs/impl/std-design/http.md` Slice 2.)
+//!
+//! M11 std.http Slice 5 — HTTPS/TLS on the client (OpenSSL libssl). `https://` now routes to a
+//! verified TLS connection through the SAME `cl.get/post/request` + `cl.get_many` surface (no new
+//! user surface); certs are verified against the system trust store with mandatory hostname binding,
+//! so a verify failure → `Error.Denied`. The positive round-trip is unit-tested in `align_runtime`
+//! (a local TLS server + the `#[cfg(test)]` trust hook); the driver test here proves the ROUTING
+//! change (`https://` connects instead of being rejected pre-connect). (`docs/impl/std-design/http.md`
+//! Slice 5.)
 
 mod common;
 use common::*;
@@ -482,24 +489,54 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert!(req.ends_with("\r\npayload"), "body sent: {req:?}");
 }
 
-/// P1: a `https://` URL is `Error.Invalid` (never a silent plaintext downgrade) — the `?` propagates,
-/// so `main` exits non-zero. No server is contacted (rejected before connect).
+/// Slice 5: a `https://` URL now ROUTES to a verified TLS connection (retiring the old DC-1
+/// pre-connect rejection). We can't drive a positive TLS round-trip from the driver harness — the
+/// runtime's test-only trust hook is `#[cfg(test)]`, compiled OUT of the runtime linked into a
+/// driver-built executable, so a self-signed local server can't be trusted here (that positive path
+/// is covered by the `align_runtime` `https_*` unit tests). Instead we prove the ROUTING change:
+/// point `https://` at a local plaintext server and assert it observes a connection attempt (a TLS
+/// ClientHello). Under the old behavior `https://` was rejected pre-connect → ZERO accepts; now it is
+/// a real TLS connection → exactly ONE. The handshake then fails (a plaintext peer), so `main` still
+/// exits non-zero — but the connection was made, which is the point.
 #[test]
-fn client_https_url_is_error() {
+fn client_https_routes_to_tls_not_preconnect_reject() {
     if !backend_available() {
         return;
     }
-    let prog = "\
+    // A plaintext server that counts a single accept then closes (the client's ClientHello arrives as
+    // garbage; the closed peer makes the client's handshake fail fast rather than hang).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((_s, _)) => return 1usize, // one TLS connection attempt observed; `_s` drops → close
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+        0usize
+    });
+    let prog = format!(
+        "\
 import std.http
-pub fn main() -> Result<(), Error> {
+pub fn main() -> Result<(), Error> {{
   cl := http.client()
-  resp := cl.get(\"https://example.com/\")?
+  resp := cl.get(\"https://127.0.0.1:{port}/\")?
   print(resp.status())
   return Ok(())
-}
-";
-    let out = build_and_run("m11-http-https", prog);
-    assert!(!out.status.success(), "an https:// URL must be an error, never a plaintext downgrade (P1)");
+}}
+"
+    );
+    let out = build_and_run("m11-http-https-routes", &prog);
+    // The handshake against a plaintext peer fails → `?` propagates → non-zero exit. The routing is
+    // what we assert: the server saw the connection.
+    assert!(!out.status.success(), "https to a plaintext peer fails the handshake (still an Err)");
+    assert_eq!(handle.join().unwrap(), 1, "https:// now routes to a TLS connection (old: rejected pre-connect, 0 accepts)");
 }
 
 /// A malformed URL (no scheme / no host) is `Error.Invalid` at request time; the `?` propagates.

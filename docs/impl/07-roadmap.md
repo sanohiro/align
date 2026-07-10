@@ -22,19 +22,22 @@ SIMD (`vecN`/`maskN`/`soa`/columnar `group_by`/`align(N)`), M7 concurrency (`par
 purity + `task_group` on real threads), M8 tooling (`align_fmt`, `unsafe`/`raw.*`, `extern "C"`
 FFI, the profile-independent lint slice), M9 std phase 1 (`io`/`fs`/`path`/`env`/`time`), and
 M10 std phase 2 (`encoding`/`rand`/`cli`). **M11 (std third wave) is IN PROGRESS:** `std.net` /
-`std.process` / `std.compress` / `std.crypto` COMPLETE; `std.http` Slices 1–2 merged
-(#391/#392), Slice 3 (keepalive pool + R6 bench, R3 met) DONE on branch `http-slice3-pool`,
+`std.process` / `std.compress` / `std.crypto` COMPLETE; **`std.http` is now COMPLETE** — Slices 1–2
+merged (#391/#392), Slice 3 (keepalive pool + R6 bench, R3 met) on branch `http-slice3-pool`,
 Slice 4 (server primitive `serve`/`accept`/`respond` + `response_builder` + the five inbound
-smuggling guards) DONE on branch `http-slice4-server`; `get_many` (R5) DONE on branch
-`http-get-many` (input-order all-or-Err batch on a dedicated bounded blocking-I/O claim-loop pool
-+ the prerequisite `array<response>` opaque-Move-handle-array capability + the R5 bench — 15.4×
-overlap at degree 16, Rust-pool parity; R6 now met in full); Slice 5 (TLS) remains — see the M11
-section below.
+smuggling guards) on branch `http-slice4-server`, `get_many` (R5) on branch `http-get-many`
+(input-order all-or-Err batch on a dedicated bounded blocking-I/O claim-loop pool + the prerequisite
+`array<response>` opaque-Move-handle-array capability + the R5 bench — 15.4× overlap at degree 16,
+Rust-pool parity; R6 met in full), and **Slice 5 (HTTPS/TLS, client-side) DONE on branch
+`http-slice5-tls`** — `https://` over OpenSSL libssl through the unchanged `cl.get/post/request` +
+`cl.get_many` surface, mandatory system-trust verification + hostname binding, `(scheme,host,port)`
+pool key with the live `SSL*` pooled, per-thread `pthread_sigmask` SIGPIPE discipline, and the
+Denied/Code/Invalid taxonomy. With std.http done, **all M11 std-module work is complete** — the
+formal M11 close is the orchestrator's call (verify against `open-questions.md` before flipping the
+milestone header).
 
-**Next (in order):** std.http Slice 5 (HTTPS/TLS) — the LAST M11 item; Slices 1–4 and `get_many`
-(R5, incl. the R6 scaling bench) are DONE;
-the 2026-07-09 owed implementation deltas (struct-`==` sema diagnostic, no-shadowing error, the
-`loop` slice, the lexer escape-set gaps); then the M12 candidates recorded in
+**Next (in order):** the 2026-07-09 owed implementation deltas (struct-`==` sema diagnostic,
+no-shadowing error, the `loop` slice, the lexer escape-set gaps); then the M12 candidates recorded in
 `open-questions.md` Open → "align-LLM runway".
 
 **Historical build sequence (2026-06 snapshot — kept for the build-order and decision record;
@@ -1517,9 +1520,10 @@ and http last (needs net + TLS).
     buffer variant is the recorded candidate); a nonce-generating seal convenience (P3);
     `OSSL_set_max_threads` for parallel argon2 lanes; fixed-size `array<u8; N>` digest returns
     (needs a runtime-return ABI extension).
-- **`std.http`** — the last M11 module (plaintext-only v1 per http.md — TLS deferred, `https://`
-  rejected not downgraded; builds `get_many` on the net substrate via task_group + the par_map pool
-  — the #301 claim-loop lesson).
+- **`std.http`** — the last M11 module, now **COMPLETE** (Slices 1–5 + `get_many`). Client-side
+  HTTPS/TLS ships (Slice 5, OpenSSL libssl, mandatory verification — `https://` connects over TLS,
+  never a plaintext downgrade); server-side TLS + revocation stay recorded post-v1. `get_many` builds
+  on the net substrate via a dedicated bounded blocking-I/O claim-loop pool — the #301 lesson.
   - **Slice 1 (request/response types + HTTP/1.1 serialize/parse, NO sockets) — DONE.** Two new
     Move handle types `Ty::HttpRequest` / `Ty::HttpResponse` (+ `Scalar::HttpResponse`), full
     twin-mirror Gate-1 sweep. Language surface behind `import std.http`: `http.request(method, url)`
