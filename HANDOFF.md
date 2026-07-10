@@ -16,9 +16,12 @@ dogfood test = compiled Align client ↔ Align server over loopback; fd-leak-fre
 /proc/self/fd; expr-depth 5/5 kept. v1 limits recorded: sequential accept loop
 (Move-capture-into-spawn = the concurrency prerequisite), trusted-network caveat (no read
 deadline → slow-loris), SSE = future sibling op `respond_stream` (runway A5 landing pinned).
-Known follow-up: the CLIENT response parser has the same Content-Length `+` hole
-(align_runtime lib.rs ~9149) — matters for keepalive-pool framing. `cargo test --workspace`
-**1719 green**, clippy clean. Next std.http: Slice 5 (HTTPS/TLS) + `get_many` (R5). Earlier same
+The client-side Content-Length `+` hole flagged during that reflection is CLOSED too (**#410**
+MERGED — digits-only pre-check in `http_parse_head`, mirror of the server guard; the one gemini
+"critical" on it was a false positive — a neighboring same-theme test misread as a duplicate —
+rejected with written proof). The ja http.md mirror is fully re-synced (5bf98e4: the stale R6
+status + shipped Slice-4 state). `cargo test --workspace` **1720 green**, clippy clean.
+Next std.http: Slice 5 (HTTPS/TLS) + `get_many` (R5). Earlier same
 day, third wave — **#408 MERGED — `Ord(str)` + `else` on `Result`**, the last
 2026-07-09 owed implementation delta: byte-lexicographic `<`/`<=`/`>`/`>=` on `str` via
 `align_rt_str_cmp` + `sort_by_key` str keys (owned-`string` ordering and bare `sort()` on str arrays
