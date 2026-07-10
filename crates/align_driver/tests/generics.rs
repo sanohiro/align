@@ -362,3 +362,15 @@ fn concrete_nested_mismatch_rejected() {
     let src = "fn f<T>(r: Result<T, i32>) -> i32 = 0\nfn main() -> i32 {\n  x: Result<f64, bool> := Ok(1.0)\n  return f(x)\n}\n";
     assert!(check_errs("gen-nested-mismatch", src));
 }
+
+#[test]
+fn array_literal_in_generic_call() {
+    let src = "
+fn foo<T>(x: T) {}
+fn main() -> i32 {
+    foo([1, 2, 3])
+    return 0
+}
+";
+    assert!(common::check_errs("array_literal_in_generic_call", src));
+}

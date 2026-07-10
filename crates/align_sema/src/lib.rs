@@ -7979,6 +7979,7 @@ impl<'a, 't> Checker<'a, 't> {
             // A position mentioning a type parameter applies no coercion (the type is unknown), so
             // check the argument unconstrained; a fully concrete parameter checks against it.
             let ce = if ty_mentions_param(declared) {
+                self.reject_bare_array_value(a, None, "a generic argument");
                 self.check_expr(a, None)
             } else {
                 self.check_arg(a, Some(declared))
