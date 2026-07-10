@@ -10071,16 +10071,13 @@ fn http_parse_request_head(src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> 
         let Some(colon) = memchr::memchr(b':', hline) else {
             return Err(HttpParseErr::Invalid); // a header line must have a `:`
         };
-        // Guard 2: NO whitespace between the field-name and the colon, and no obs-fold leading WS. The
-        // raw name is `hline[..colon]`; a leading or trailing SP/HTAB (or an empty name) is rejected —
-        // an RFC 9110 server MUST. (The response parser OWS-trims here; the server does not.)
+        // Guard 2: the field-name must be a full RFC 9110 `token` (tchar+). This subsumes the
+        // no-whitespace-before-the-colon rule and additionally rejects any control/separator byte
+        // *mid-name* (e.g. `Fo@o:`), which the old first/last-char SP/HTAB check let through — a
+        // header-name smuggling class. (The response parser is deliberately lenient here; the server
+        // is strict.)
         let raw_name = &hline[..colon];
-        if raw_name.is_empty()
-            || raw_name[0] == b' '
-            || raw_name[0] == b'\t'
-            || raw_name[raw_name.len() - 1] == b' '
-            || raw_name[raw_name.len() - 1] == b'\t'
-        {
+        if !http_is_token(raw_name) {
             return Err(HttpParseErr::Invalid);
         }
         let name_start = ls;
@@ -10088,7 +10085,22 @@ fn http_parse_request_head(src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> 
         let (value_start, value_len) = http_trim_ows(src, ls + colon + 1, ll - colon - 1);
         let name = &src[name_start..name_start + name_len];
         let value = &src[value_start..value_start + value_len];
+        // Guard 6: a header value must not carry a request-smuggling byte — NUL or a stray CR (a bare
+        // LF is already impossible: `http_next_line_strict` ends the line at the CRLF and rejects any
+        // bare LF outright). `http_field_is_clean` rejects exactly CR/LF/NUL and permits SP/HTAB, so a
+        // legitimate space-bearing value like `User-Agent: foo bar` is untouched.
+        if !http_field_is_clean(value) {
+            return Err(HttpParseErr::Invalid);
+        }
         if name.eq_ignore_ascii_case(b"content-length") {
+            // RFC 9112 §6.2: Content-Length is a bare sequence of ASCII digits. `parse::<usize>`
+            // alone would accept a leading `+` (`+3` → 3), a framing differential vs. stricter peers
+            // (smuggling), so require digits-only first; an empty value is likewise rejected.
+            if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                return Err(HttpParseErr::Invalid);
+            }
+            // Digits-only above ⇒ valid UTF-8; parse still guards against a usize overflow (→ Invalid,
+            // never a panic) for an absurdly long digit run.
             let Ok(n) = std::str::from_utf8(value).unwrap_or("x").parse::<usize>() else {
                 return Err(HttpParseErr::Invalid);
             };
@@ -10477,7 +10489,10 @@ fn http_serialize_response(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
     }
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"HTTP/1.1 ");
-    buf.extend_from_slice(rb.status.to_string().as_bytes());
+    // Status is exactly three digits (guarded `100..=599` above), so render it into a 3-byte stack
+    // array instead of heap-allocating a `String` on this hot serialize path.
+    let s = rb.status as u32;
+    buf.extend_from_slice(&[b'0' + (s / 100) as u8, b'0' + (s / 10 % 10) as u8, b'0' + (s % 10) as u8]);
     buf.push(b' ');
     buf.extend_from_slice(http_reason_phrase(rb.status).as_bytes());
     buf.extend_from_slice(b"\r\n");
@@ -15499,6 +15514,38 @@ mod tests {
         assert!(matches!(http_parse_request_head(b"GET /"), Err(HttpParseErr::Incomplete)));
     }
 
+    /// The PR-review hardening guards: full-token field-names (reject a mid-name non-tchar), clean
+    /// header values (reject NUL / stray CR, but keep legitimate SP-bearing values), and a
+    /// digits-only Content-Length (reject a leading `+` / non-digit).
+    #[test]
+    fn http_parse_request_head_hardening_guards() {
+        let invalid = |raw: &[u8], why: &str| {
+            assert!(matches!(http_parse_request_head(raw), Err(HttpParseErr::Invalid)), "should reject: {why}");
+        };
+        // Field-name = RFC token: a mid-name `@` is now rejected (the old first/last-char check let it
+        // through — a header-name smuggling class).
+        invalid(b"GET / HTTP/1.1\r\nFo@o: bar\r\n\r\n", "non-token char mid-name");
+        // Header value must be CR/LF/NUL-free.
+        invalid(b"GET / HTTP/1.1\r\nX-Tag: a\x00b\r\n\r\n", "NUL in header value");
+        invalid(b"GET / HTTP/1.1\r\nX-Tag: a\rb\r\n\r\n", "stray CR in header value");
+        // A legitimate space-bearing value is still accepted (no SP over-reject).
+        let ok = b"GET / HTTP/1.1\r\nUser-Agent: foo bar baz\r\n\r\n";
+        let h = http_parse_request_head(ok).expect("SP-bearing value accepted");
+        let ua = h
+            .headers
+            .iter()
+            .find(|s| ok[s.name_start..s.name_start + s.name_len].eq_ignore_ascii_case(b"user-agent"))
+            .expect("User-Agent present");
+        assert_eq!(&ok[ua.value_start..ua.value_start + ua.value_len], b"foo bar baz");
+        // Content-Length: digits only — a leading `+`, sign, or non-digit is rejected; a plain run of
+        // digits still parses.
+        invalid(b"POST / HTTP/1.1\r\nContent-Length: +3\r\n\r\nabc", "leading + in CL");
+        invalid(b"POST / HTTP/1.1\r\nContent-Length: 3a\r\n\r\nabc", "non-digit in CL");
+        invalid(b"POST / HTTP/1.1\r\nContent-Length: \r\n\r\n", "empty CL");
+        let good = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+        assert_eq!(http_parse_request_head(good).expect("plain CL parses").content_length, Some(3));
+    }
+
     /// A raw-socket client that sends `req` and returns the full response bytes the server wrote.
     fn raw_http_client(port: u16, req: &[u8]) -> std::thread::JoinHandle<Vec<u8>> {
         use std::io::{Read, Write};
@@ -15622,6 +15669,12 @@ mod tests {
         let odd = ResponseBuilder { status: 250, headers: vec![], body: None };
         let s3 = String::from_utf8(http_serialize_response(&odd).unwrap()).unwrap();
         assert!(s3.starts_with("HTTP/1.1 250 \r\n"), "empty reason phrase: {s3:?}");
+        // The alloc-free 3-digit status render is exact at both range extremes.
+        for st in [100i64, 599] {
+            let rb = ResponseBuilder { status: st, headers: vec![], body: None };
+            let out = String::from_utf8(http_serialize_response(&rb).unwrap()).unwrap();
+            assert!(out.starts_with(&format!("HTTP/1.1 {st} ")), "3-digit render at {st}: {out:?}");
+        }
     }
 
     /// Null-safety across the server FFI surface.
