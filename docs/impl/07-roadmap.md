@@ -24,10 +24,12 @@ FFI, the profile-independent lint slice), M9 std phase 1 (`io`/`fs`/`path`/`env`
 M10 std phase 2 (`encoding`/`rand`/`cli`). **M11 (std third wave) is IN PROGRESS:** `std.net` /
 `std.process` / `std.compress` / `std.crypto` COMPLETE; `std.http` Slices 1–2 merged
 (#391/#392), Slice 3 (keepalive pool + R6 bench, R3 met) DONE on branch `http-slice3-pool`,
-Slices 4–5 (server, TLS) + `get_many` (R5) remain — see the M11 section below.
+Slice 4 (server primitive `serve`/`accept`/`respond` + `response_builder` + the five inbound
+smuggling guards) DONE on branch `http-slice4-server`; Slice 5 (TLS) + `get_many` (R5) remain —
+see the M11 section below.
 
-**Next (in order):** std.http Slice 4 (server primitive `serve`/`accept`), then Slice 5 (HTTPS/TLS)
-and `get_many` (R5) — Slice 3 (pool/keepalive R3 + the `bench/http_client` R6 gate) is DONE;
+**Next (in order):** std.http Slice 5 (HTTPS/TLS) and `get_many` (R5) — Slice 4 (the server
+primitive) and Slice 3 (pool/keepalive R3 + the `bench/http_client` R6 gate) are DONE;
 the 2026-07-09 owed implementation deltas (struct-`==` sema diagnostic, no-shadowing error, the
 `loop` slice, the lexer escape-set gaps); then the M12 candidates recorded in
 `open-questions.md` Open → "align-LLM runway".
@@ -1632,7 +1634,33 @@ and http last (needs net + TLS).
     Tests: `align_runtime` units (pool reuses one conn across 3 gets; `Connection: close` not pooled;
     stale-conn retry; `http_head_keep_alive` decision table) + a driver test (two gets reuse one conn,
     observed via the server's accept count). `cargo test --workspace` green; clippy `-D warnings`
-    clean. **Slices 4–5 (server primitive, HTTPS/TLS) remain.**
+    clean.
+  - **Slice 4 (the server primitive) — DONE** (branch `http-slice4-server`). Three new Move types
+    (`http_server`, `http_request_ctx`, `response_builder`) took the full Gate-1 twin-mirror sweep —
+    `Ty` for all three; `Scalar` for the two `Result` Ok payloads (`http_server` from `http.serve`,
+    `http_request_ctx` from `srv.accept`); `response_builder` is `Ty`-only (returned directly, like
+    `http request`). Surface: `http.serve(host, port) -> Result<http_server, Error>` (wraps net's
+    `tcp.listen` — SO_REUSEADDR + backlog 128 — then lifts the listening fd out); `srv.accept() ->
+    Result<http_request_ctx, Error>` (streams the request, parses via the **new**
+    `http_parse_request_head`, closes the conn + returns `Error.Invalid` on a malformed request while
+    the listener keeps serving); `ctx.method()/path()/header(name)/body()` (views region-bound to
+    `ctx`, #297); `http.response(status)` -> `response_builder` + `rb.header`/`rb.body`;
+    `ctx.respond(rb) -> Result<(), Error>` (**consumes both**, one-write R4, closes the fd). The
+    request-head parser adds the **five inbound smuggling guards** the client-lenient response parser
+    lacks (strict CRLF / no space-before-colon / no Transfer-Encoding / origin-form target only /
+    method-token+CR-LF-NUL). `respond` mirrors the client serialize (auto Content-Length iff a body
+    was set; caller `Content-Length`/`Transfer-Encoding`/`Connection` rejected; no auto Date/Server)
+    and additionally always emits `Connection: close` (RFC 9112 §9.6 mandate for v1's one-request-per-
+    conn close). The `null_moved_source` MIR arm for the respond double-consume was the one
+    easy-to-miss twin-mirror site. **Security caveat (recorded in http.md):** the blocking single
+    accept loop is a slow-loris DoS on an untrusted network — v1's trust assumption is a
+    localhost/trusted-network gateway; a read/accept deadline is the first post-v1 hardening. Tests:
+    `align_runtime` units (the request-head parser + each of the five guards + serialize framing +
+    fd-leak across N accept/respond cycles) + driver e2e (`m11_http_server.rs`: an Align server driven
+    by a Rust client, **plus a dogfood run of the shipped Align `cl.get` client against the Align
+    server**, plus the Gate-1 compile rejections). `cargo test --workspace` green (1718); clippy
+    `-D warnings` clean; expr-depth driver test still 5/5. **Slice 5 (HTTPS/TLS) + `get_many` (R5)
+    remain.**
 
 ## Design Issues to Settle in Parallel
 
