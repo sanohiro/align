@@ -5,7 +5,16 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10, second wave (**soundness-triage wave DONE**: another session's three
+_Last updated: 2026-07-10, third wave (**#408 MERGED — `Ord(str)` + `else` on `Result`**, the last
+2026-07-09 owed implementation delta: byte-lexicographic `<`/`<=`/`>`/`>=` on `str` via
+`align_rt_str_cmp` + `sort_by_key` str keys (owned-`string` ordering and bare `sort()` on str arrays
+stay deferred per the record); `else` accepts `Result<T,E>` — shared `ElseUnwrap` node so every
+structural pass covers it by construction; Move **error** payload `else` rejected-with-diagnostic
+(discard would leak; every builtin `Error` is Copy so the common case is whole). Adversarial gate
+SHIP zero findings; gemini's two "won't compile" highs disproven-by-green-build and rejected with
+written reasons. `cargo test --workspace` **1701 green**, clippy clean. **std.http Slice 4 (server
+primitive) implementation is IN FLIGHT** on branch `http-slice4-server`. Earlier same day, second
+wave — **soundness-triage wave DONE**: another session's three
 open PRs triaged — **#405** MERGED (bare array literal as generic arg: ICE → sema diagnostic),
 **#406** MERGED (closure capturing an arena view escapes → rejected; `Ty::Fn` now `tracks_region`
 + capture-region fold; retires the #399-gate UAF record), **#404** CLOSED-superseded by **#407**
