@@ -5,7 +5,18 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, second wave (**M12 Slice A6 MERGED as #414** — `array_builder<T>`,
+_Last updated: 2026-07-11, third wave (**M12 Slice A7 MERGED as #415** — streaming line reads:
+`r.buffered()` (the read dual of the buffered writer; drain-before-fd interleaving contract) +
+`r.read_line(mut buffer)` (body-with-`\r?\n`-stripped, consumed-incl-terminator, 0=EOF, 64 MiB
+cap, split-CRLF-across-refill verified) + the generic validating view `bytes.as_str()`. Gate SHIP
+zero soundness defects — the novel buffered-provenance set is over-strict on rebind/if-expr/
+fn-return (recorded UX limitation) but NEVER unsound (runtime defensively upgrades). gemini's
+null-guard medium rejected (the #413 class). `cargo test --workspace` **1799 green**.
+**align-LLM Phase-2 language prerequisites are now COMPLETE** (read_line → as_str → json.decode →
+array_builder). **A5-SSE design SETTLED** (3100742, http.md item 7 — send("")=no-op, Drop=
+close-only amendment, finish() sole terminator, HTTP/1.0 close-delimited raw mode via threaded
+version info) — implement next; then the A8 arena-checkpoint design round closes M12. Earlier:
+second wave (**M12 Slice A6 MERGED as #414** — `array_builder<T>`,
 the third grow-then-freeze member: annotation-inferred element type, Pure mut-receiver
 `push`/`append`, consuming zero-copy `.build() -> array<T>` via the new `align_rt_realloc`;
 elements v1 = Copy scalars + `string` (moves in, deep-freed on unfrozen drop — leak-guarded by a
