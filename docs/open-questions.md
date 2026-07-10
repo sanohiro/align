@@ -205,12 +205,14 @@ Decomposition: **④a** scope + the task region + `spawn` (fresh region env per 
 - **Error reporting via the worker's return value (no shared state).** The per-`R` trampoline returns an `i32` error code (`0` = ok): infallible → store `R`, return `0`; fallible → match the `Result`, on `Ok(v)` store `v` and return `0`, on `Err(e)` return `e`. `align_rt_tg_wait` (already `thread::scope`) collects each worker's returned code via `ScopedJoinHandle::join` and returns the first nonzero — no shared error cell, no extra aliasing.
 - **`wait()?`**: codegen builds `Result<(), Error>` from `tg_wait`'s code (`Ok(())` if `0`, else `Err(code)`); `?` propagates as usual. `get()` (already `wait`-gated by ④c-1) then reads the `Ok` slot.
 
-**Known soundness gap in this deferred area (found 2026-07-10, A1 adversarial review): a lambda
-capturing an arena-backed view escapes the arena unchecked → use-after-free.** `f := arena { v :=
-fs.read_bytes_view(p)?; fn { v[0] } }` passes `check` and SIGSEGVs at `f()` — `region_bearing`/
-`tracks_region` are `false` for `Ty::Fn` and `region_of` never inspects a closure's captures.
-Pre-existing (the M9 `read_file_view` str view reproduces it identically); the escaping-fn-values
-implementation must region-check captured views (str and bytes alike) when it lands.
+**Closure-captured arena-view escape — FIXED (2026-07-10, PR #406).** The gap the A1 adversarial
+review recorded here (a lambda capturing an arena-backed view escaped the arena unchecked →
+use-after-free; `f := arena { v := fs.read_bytes_view(p)?; fn { v[0] } }` passed `check` and
+SIGSEGVed at `f()`) is closed: `Ty::Fn` is now `tracks_region`, and `region_of` folds a closure's
+region over its captures, so that program is rejected at `check`. Zero-capture closures stay
+`Static`; closures used entirely within the arena stay legal. When fully-escaping fn values
+(return / struct-field / array-element) land, this capture-region fold is the machinery they
+must preserve.
 
 ### `bytes` / `buffer` — design SETTLED; minimal `buffer` BUILT with M9 std.io (2026-07-03)
 **Decision (2026-06-23): `bytes` is `slice<u8>`; `buffer` is a distinct growable owned byte container.** Resolving the two forks left by `draft.md` §12 (which names the types but specs no operations):
@@ -1885,6 +1887,8 @@ A 7-agent audit on another machine (frontend / sema-types / sema-flow / MIR+code
 Record: `crates/align_sema` (the analyses), `tests/analysis_coverage.rs`, `align-self-review` Gate 1.
 
 **Borrow-liveness gap (recorded 2026-07-06, net Slice 2 review):** the region analysis tracks *where* a borrow may point, not *how long its source stays live* — intra-frame borrow invalidation is not modeled. A `Frame`-region borrow (`c.reader()`/`c.writer()` on a `tcp_conn`, `buffer.bytes()`, `cli.get_str`, a `str`-borrow of a `string` field) stays type-checked as usable for the rest of the frame even after its source is reassigned (`drop_old` closes/frees the underlying resource) or moved out — a use-after-close/use-after-free window the checker doesn't see. For sockets (std.net Slice 2) the consequence is sharper than for files/buffers: a reassigned `tcp_conn` frees its fd back to the kernel, so a stale reader/writer can silently read/write a **reused fd** (a different, unrelated connection) instead of merely crashing. The fix is the same borrow-liveness dataflow the escape-check → MIR-dataflow structural item above already calls for — recorded here so the socket-fd-reuse sharpening isn't lost.
+
+**Wrapper-hidden local-slice escape through a function return (found 2026-07-10, #406 review).** `fn f() -> Result<slice<i64>, Error> { xs := [1, 2, 3]; return Ok(xs[..]) }` passes `check` today — a frame-local array's slice escapes the function inside a `Result`/`Option` wrapper → use-after-free. The bare form (`return xs[..]`) is rejected at function boundaries via `slice_is_local`, but that check is not wrapper-transparent. Correct fix: a wrapper-transparent local-slice check at `check_return_escape`/`check_break_escape`, mirroring `region_bearing`'s transparency. Do NOT fix it by folding frame-local slices into `region_of` (gemini's #406 suggestion): empirically proven to over-reject safe programs — a slice of an arena-local array escaping an inner arena while staying in the function gets wrongly rejected, because `Region::Frame` is folded without fixing the `arena(0)`-vs-`Static` conflation.
 
 ### 2026-07-02 internal review (multi-agent: 4 deep-dive tracks + independent Opus/Codex design passes)
 

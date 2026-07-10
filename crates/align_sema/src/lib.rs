@@ -3086,7 +3086,7 @@ impl<'a> EscapeCheck<'a> {
             // structural follow-up (`docs/open-questions.md` "External soundness audit"). This arm
             // only makes the escape check *consult* the region either way. (A `tcp_conn` itself is
             // always owned, never a borrow, so it is deliberately NOT here.)
-            Ty::Reader | Ty::Writer => true,
+            Ty::Reader | Ty::Writer | Ty::Fn(_) => true,
             _ => false,
         }
     }
@@ -3378,6 +3378,9 @@ impl<'a> EscapeCheck<'a> {
             // (If the `break`-escape rule is ever loosened to let an arena/frame view escape the loop,
             // this must become the shorter of the break values' regions instead.)
             ExprKind::Loop { .. } => Region::Static,
+            ExprKind::Closure { captures, .. } => captures
+                .iter()
+                .fold(Region::Static, |acc, c| acc.shorter(self.region_of(c, depth))),
             _ => Region::Static,
         }
     }
