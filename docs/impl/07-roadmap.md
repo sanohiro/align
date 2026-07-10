@@ -1756,7 +1756,12 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
   *(general — the natural `loop` accumulate-unknown-count output)*
 - **Slice A7 — streaming line reads — DONE (2026-07-11).** Shipped exactly the settled record:
   `r.buffered()` (the read dual of the buffered writer — a per-local buffered-provenance set in sema
-  statically enforces the buffered receiver, both stay `Ty::Reader`), `r.read_line(b: mut buffer)`
+  statically enforces the buffered receiver, both stay `Ty::Reader`). **Known v1 limitation of that
+  provenance set (gate-review finding): it marks only direct `let`-inits, so a rebind, an
+  `if`/`match`-expression init, or a fn-returned buffered reader is over-REJECTED ("call
+  `.buffered()` first") even though the value is buffered — a UX false-negative, never unsound
+  (the runtime defensively upgrades any reader on `read_line` entry, so even a stale sema mark
+  cannot corrupt).** `r.read_line(b: mut buffer)`
   (memchr-scanned, refill across boundaries, one `\r?\n` stripped, grows to a 64 MiB cap →
   `Error.Invalid`, `0` = EOF), the interleaving contract (a buffered `read` drains the lookahead
   first; unbuffered path byte-identical), and the generic `bytes.as_str()` validating region-bound
