@@ -14205,6 +14205,20 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return value.map(|e| self.check_expr(e, None));
         }
+        // A bare array literal materializes only as a `let` initializer or pipeline source — MIR has
+        // no lowering for one in a free value position and would panic. A `break [..]` is such a
+        // position, so reject it and point at bind-then-break. (The same gap exists for a bare array
+        // literal in an `if`/`match` arm — a general limitation recorded in `open-questions.md`.)
+        if let Some(v) = value
+            && matches!(v.kind, ast::ExprKind::ArrayLit(_))
+        {
+            self.diags.error(
+                "a bare array literal cannot be a `break` value (a fixed `[…]` materializes only as a `let` initializer or pipeline source); bind it to a local first, then `break` the local".to_string(),
+                v.span,
+            );
+            self.loops.last_mut().unwrap().saw_break = true;
+            return Some(self.check_expr(v, None));
+        }
         let expected = self.loops.last().unwrap().break_ty;
         let v = value.map(|e| self.check_expr(e, expected));
         let v_ty = v.as_ref().map(|x| x.ty).unwrap_or(Ty::Unit);

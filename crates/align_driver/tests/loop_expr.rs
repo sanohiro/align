@@ -118,6 +118,15 @@ fn a_bare_break_conflicts_with_a_valued_break() {
 }
 
 #[test]
+fn a_bare_array_literal_break_value_is_a_clean_error_not_a_panic() {
+    // A bare `[…]` has no free-value MIR lowering (only a `let` initializer / pipeline source), so a
+    // `break [1, 2, 3]` must be a sema diagnostic, never a compiler panic.
+    let src = "fn main() {\n  x := loop {\n    break [1, 2, 3]\n  }\n  print(x[0])\n}\n";
+    let out = check_diagnostics("loop-bare-array", src);
+    assert!(out.contains("bare array literal cannot be a `break` value"), "expected a clean bare-array-literal error:\n{out}");
+}
+
+#[test]
 fn a_break_outside_a_loop_is_an_error() {
     let src = "fn main() {\n  break 5\n}\n";
     let out = check_diagnostics("break-outside", src);

@@ -2271,6 +2271,21 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
+### Bare array literal in a value position (general lowering gap)
+
+Surfaced by the `loop` adversarial review (2026-07-10). A bare array literal `[…]` is lowerable only
+as a `let` initializer or a pipeline source; in any other **value** position it reaches
+`lower_expr`'s `ArrayLit` arm and the `unreachable!` there panics the compiler (exit 101). The
+`loop` slice patched the `break` case (`check_break` now rejects a bare-array-literal `break` value
+with a sema diagnostic), but the same panic remains reachable via an `if`/`match` **arm** whose
+value is a bare array literal (e.g. `x := if c { [1, 2, 3] } else { … }`). Fix options: a general
+sema diagnostic rejecting a bare array literal in any free value position (bind it to a local /
+`.to_array()` first), or a generalized lowering that materializes it into a fresh frame slot.
+Two lower-priority review notes recorded alongside, both **not** defects: (1) a diverging (`break`-
+less) `loop` bound to a `str`-annotated `let` can report a type mismatch — consistent with existing
+diverging-value-position behavior (`return` in the same spot behaves the same), not loop-specific;
+(2) the `break`-escape diagnostic wording is a nit (it reuses the return-escape phrasing shape).
+
 ### Unrecorded spec vacuums — remainder (recorded 2026-07-09; settle-next priority)
 
 From the same audit as the sweep above. Leans are recorded so the next design session can settle
