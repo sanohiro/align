@@ -533,6 +533,22 @@ pub enum Rvalue {
     /// `buf.append(data)` — append the raw `slice<u8>` operand `data` (copied) to the growable
     /// `buffer` operand, growing it.
     BufferAppend { buffer: Operand, data: Operand },
+    /// `array_builder<T>()` (M12 A6) — open an empty typed array builder, yielding an opaque handle.
+    /// `elem_size` is the element stride in bytes (16 for a `string` element).
+    ArrayBuilderNew { elem_size: i64 },
+    /// `b.push(v)` — append one Copy-scalar element (the `value` operand, passed as its raw bits in an
+    /// `i64`; `elem_size` sets how many low bytes) to the growable `array_builder` operand.
+    ArrayBuilderPush { builder: Operand, value: Operand, scalar: Ty },
+    /// `b.push(s)` — append one moved-in `string` element (the `value` operand, a `{ptr,len}`) to the
+    /// growable `array_builder` operand. The source string is nulled at the move site.
+    ArrayBuilderPushStr { builder: Operand, value: Operand },
+    /// `b.append(xs)` — bulk-append the `slice<T>` operand `data` (`{ptr,len}` of Copy-scalar
+    /// elements) to the growable `array_builder` operand. `data`'s `len` is the element count; the
+    /// element stride is stored in the builder header (set at construction), so no stride here.
+    ArrayBuilderAppend { builder: Operand, data: Operand },
+    /// `b.build()` — freeze the `array_builder` operand into an owned `array<T>` `{ptr,len}` (a
+    /// zero-copy ptr+len retype), consuming the builder (its slot is nulled at the move site).
+    ArrayBuilderBuild { builder: Operand },
     /// `fs.write_file(path, data)` — write all of the `str`/`bytes` operand `data` to `path`, then
     /// close. Yields an `i32` errno-status (0 = ok).
     FsWriteFile { path: Operand, data: Operand },
@@ -1266,7 +1282,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -1736,6 +1752,11 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::BytesRead { bytes, offset, be } => lower_bytes_read(b, bytes, offset, *be, e.ty),
         hir::ExprKind::BufferPut { buffer, value, be } => lower_buffer_put(b, buffer, value, *be),
         hir::ExprKind::BufferAppend { buffer, data } => lower_buffer_append(b, buffer, data),
+        // `array_builder<T>` (M12 A6) — new/push/append/build go through ONE `#[inline(never)]`
+        // dispatcher so they add a single tiny arm to the recursive `lower_expr` frame, not four
+        // inline bodies (the #296 expr-depth lesson).
+        hir::ExprKind::ArrayBuilderNew { .. } | hir::ExprKind::ArrayBuilderPush { .. }
+        | hir::ExprKind::ArrayBuilderAppend { .. } | hir::ExprKind::ArrayBuilderBuild(_) => lower_array_builder_expr(b, e),
         // `fs.write_file(path, data)` yields `Result<(), Error>` from an i32 errno-status (str/bytes
         // vs builder pick the runtime fn, like `writer.write`).
         hir::ExprKind::FsWriteFile { path, data, builder } => {
@@ -2950,6 +2971,70 @@ fn lower_bytes_read(b: &mut Builder, bytes: &hir::Expr, offset: &hir::Expr, be: 
 
 /// `buf.put_<scalar>_<le|be>(v)` → append `v`'s bytes to the growable buffer. A unit-valued
 /// side-effecting rvalue (the runtime grows the buffer); returns `()`.
+/// The element stride (bytes) an `array_builder<T>` stores per element — its
+/// `align_rt_alloc`/`align_rt_realloc` buffer is `len * elem_size` bytes. A `string` element is a
+/// 16-byte `{ptr,len}` (`AlignStr`); a Copy scalar is its machine width. Only the v1 element set
+/// (Copy scalar or `string`) reaches here — anything else was rejected at the type.
+fn array_builder_elem_size(elem: align_sema::Scalar) -> i64 {
+    use align_sema::Scalar;
+    match elem {
+        Scalar::Int(it) => (it.bits / 8).max(1) as i64,
+        Scalar::Float(ft) => (ft.bits / 8).max(1) as i64,
+        Scalar::Bool => 1,
+        Scalar::Char => 4,
+        Scalar::String => 16,
+        _ => 16,
+    }
+}
+
+/// Lower an `array_builder<T>` op (M12 A6): new opens a builder sized to the element stride;
+/// push/append grow it (`push` of a `string` element moves the value in — null its source slot);
+/// build freezes it into an owned `array<T>` (consuming — null the builder slot). Out-of-line
+/// (`#[inline(never)]`) so its arm locals stay off the recursive `lower_expr` frame (#296).
+#[inline(never)]
+fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        hir::ExprKind::ArrayBuilderNew { elem } => {
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::ArrayBuilderNew { elem_size: array_builder_elem_size(*elem) }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::ArrayBuilderPush { builder, value, moves_value } => {
+            let bop = lower_expr(b, builder);
+            let val = lower_expr(b, value);
+            let t = b.fresh_value(Ty::Unit);
+            if *moves_value {
+                // A `string` element is moved into the builder; null its source slot so the source's
+                // exit `Drop` frees null (the builder now owns the buffer, deep-freed on its Drop).
+                null_moved_source(b, value);
+                b.push(Stmt::Let(t, Rvalue::ArrayBuilderPushStr { builder: bop, value: val }));
+            } else {
+                b.push(Stmt::Let(t, Rvalue::ArrayBuilderPush { builder: bop, value: val, scalar: value.ty }));
+            }
+            Operand::Const(Const::Unit)
+        }
+        hir::ExprKind::ArrayBuilderAppend { builder, data } => {
+            // `data` is a `slice<T>` `{ptr,len}`; the runtime appends `len` elements at the builder's
+            // stored element stride.
+            let bop = lower_expr(b, builder);
+            let dop = lower_expr(b, data);
+            let t = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(t, Rvalue::ArrayBuilderAppend { builder: bop, data: dop }));
+            Operand::Const(Const::Unit)
+        }
+        hir::ExprKind::ArrayBuilderBuild(builder) => {
+            let bop = lower_expr(b, builder);
+            // The builder is consumed: null its slot so the exit `Drop` of an unfrozen builder is a
+            // no-op, and the frozen `array<T>` owns the storage.
+            null_moved_source(b, builder);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::ArrayBuilderBuild { builder: bop }));
+            Operand::Value(v)
+        }
+        _ => unreachable!("lower_array_builder_expr on a non-array_builder op"),
+    }
+}
+
 fn lower_buffer_put(b: &mut Builder, buffer: &hir::Expr, value: &hir::Expr, be: bool) -> Operand {
     let scalar = value.ty;
     let bufop = lower_expr(b, buffer);
@@ -6761,6 +6846,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
+        Ty::ArrayBuilder(_) => "array_builder".to_string(),
         Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
         Ty::CliCommand => "cli command".to_string(),

@@ -1716,8 +1716,28 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
   (`copy_file_range`-class zero-copy fast path — the io.copy sendfile-dispatch pattern),
   read-only opens, any buffering. v1 is structurally single-threaded (Move → no par_map/spawn
   capture). *(general)*
-- **Slice A6 — growable `array_builder<T>` → owned `array<T>` (design SETTLED 2026-07-11,
-  same review).** The third member of the grow-then-freeze family (`builder`→`string`,
+- **Slice A6 — growable `array_builder<T>` → owned `array<T>` — DONE (shipped 2026-07-11;
+  design SETTLED 2026-07-11, same review).** Shipped exactly to the settled record: new Move
+  type `Ty::ArrayBuilder(Scalar)` (no `Scalar::ArrayBuilder` — never rides an aggregate);
+  `array_builder()` constructor with the element type inferred from the binding annotation
+  (`b: array_builder<i64> := array_builder()` — the `json.decode` context-inference precedent,
+  no turbofish); `b.push(v)` / `b.append(xs: slice<T>)` on a `mut`-bound receiver (Pure);
+  `b.build()` consumes into `array<T>` (zero-copy ptr+len retype). Storage is
+  `align_rt_alloc`-family memory grown via the NEW `align_rt_realloc` (amortized doubling,
+  `checked_mul` growth math); the runtime header `{data,len,cap,elem_size}` is a `Box`, `build`
+  hands off `data` and frees only the header. Element set v1 = Copy scalars + `string`
+  (`string` push MOVES the source in and nulls it; the builder's `Drop` deep-frees
+  pushed-not-frozen strings via `align_rt_array_builder_free_strings`, the `free_string_array`
+  class; scalar builders free flat via `align_rt_array_builder_free`). `append` is scalar-only
+  (a borrowed `slice<string>` can't be bulk-moved — string elements use `push`). Twin-mirrored
+  through every Move-handle pass (capture/move/drop/region/null-source/llvm-type); new
+  ExprKinds/Rvalues routed through `#[inline(never)]` dispatchers in all five sema visitors +
+  `lower_expr` + `gen_rvalue` (the #296 frame lesson — expr-depth 5/5 holds). 19 driver tests
+  (`m12_array_builder.rs`) incl. both mandatory guardrails (builder-outside-loop survives
+  per-iteration drops; capture into `spawn`/`par_map` rejected); `cargo test --workspace` = 1781
+  green. `draft.md` §18.1 core.array_builder. **Deferred:** Copy-struct elements
+  (struct-array store path unverified); `append` of `string` elements. The third member of the
+  grow-then-freeze family (`builder`→`string`,
   `buffer`→bytes, now typed): a builder holds **no views**, so amortized realloc can never
   invalidate one — memory-safe by construction, which is exactly why growable `array<T>`
   itself was rejected. Surface: `array_builder<T>()`; `b.push(v)` / `b.append(xs: slice<T>)`

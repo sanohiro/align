@@ -1704,6 +1704,7 @@ core.string
 core.bytes
 core.buffer
 core.builder
+core.array_builder
 
 core.arena
 
@@ -1760,6 +1761,55 @@ eq_ignore_ascii_case
 ```
 
 Has a SIMD fast path in the standard implementation.
+
+### core.array_builder
+
+```text
+array_builder<T>()      // open an empty growable typed builder
+b.push(v)               // append one element (mut receiver)
+b.append(xs: slice<T>)  // bulk-append Copy-scalar elements (mut receiver)
+b.build() -> array<T>   // freeze into an owned array<T> (consumes the builder)
+```
+
+`array_builder<T>` is the **typed** member of the grow-then-freeze family — `builder`
+grows a `string`, `buffer` grows bytes, `array_builder<T>` grows an `array<T>`. It is
+the answer to "accumulate an unknown number of elements, then hand back one owned
+array": the `loop`-and-collect output that a fixed array literal and the
+pipeline's `.to_array()` (which needs its length known up front) cannot express.
+
+```align
+mut b: array_builder<i64> := array_builder()
+mut i := 0
+loop {
+  b.push(i * i)
+  i = i + 1
+  if i >= n { break }
+}
+squares := b.build()          // owned array<i64>, fed to the pipeline
+total := squares.sum()
+```
+
+It is an owned **Move** handle bound to one `mut` local (like `buffer`/`builder`):
+it never rides an `Option`/`Result`/array/tuple, is not `print`/`==`-able, and
+cannot be captured into a `par_map`/`spawn` closure. `push`/`append` grow it in
+place (amortized doubling) and are **Pure** (in-memory growth, no I/O); `build`
+**consumes** it (using it afterward is a moved-value error). Freeze is **zero-copy**:
+the builder's storage is heap memory grown in place, and `build` is a pointer+length
+retype into the `array<T>` — no element copy, and the array's own `Drop` frees the
+whole buffer (a deep free for `array<string>`).
+
+Crucially, an `array_builder` holds **no views** — nothing a growth reallocation
+could invalidate — which is exactly why a directly growable `array<T>` was rejected:
+a live element/slice borrow would dangle across a `push`. The builder confines
+growth to a phase with no outstanding borrows, then freezes to the immutable,
+borrowable `array<T>`.
+
+Element set v1 = **Copy scalars** (int/float/bool/char) **+ `string`**. A `string`
+element is **moved** into the builder by `push` (its source is nulled; the builder's
+`Drop` deep-frees any pushed-but-not-frozen strings), so `append` — which bulk-copies
+a borrowed `slice<T>` — is offered only for Copy-scalar elements. Owned collections,
+`str` views, structs, and other Move handles as the element type are rejected at the
+type argument (the settled v1 boundary).
 
 ### core.json
 

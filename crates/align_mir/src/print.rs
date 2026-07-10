@@ -420,6 +420,11 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("buffer_put{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(buffer), operand_str(value))
         }
         Rvalue::BufferAppend { buffer, data } => format!("buffer_append({}, {})", operand_str(buffer), operand_str(data)),
+        Rvalue::ArrayBuilderNew { elem_size } => format!("array_builder_new(elem_size={elem_size})"),
+        Rvalue::ArrayBuilderPush { builder, value, .. } => format!("array_builder_push({}, {})", operand_str(builder), operand_str(value)),
+        Rvalue::ArrayBuilderPushStr { builder, value } => format!("array_builder_push_str({}, {})", operand_str(builder), operand_str(value)),
+        Rvalue::ArrayBuilderAppend { builder, data } => format!("array_builder_append({}, {})", operand_str(builder), operand_str(data)),
+        Rvalue::ArrayBuilderBuild { builder } => format!("array_builder_build({})", operand_str(builder)),
         Rvalue::FsWriteFile { path, data } => format!("fs_write_file({}, {})", operand_str(path), operand_str(data)),
         Rvalue::FsWriteFileBuilder { path, builder } => format!("fs_write_file_builder({}, {})", operand_str(path), operand_str(builder)),
         Rvalue::FsExists { path } => format!("fs_exists({})", operand_str(path)),

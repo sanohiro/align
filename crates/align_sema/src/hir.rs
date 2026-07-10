@@ -711,6 +711,22 @@ pub enum ExprKind {
     /// the bytes in and growing it. The `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut
     /// buffer` local; `data` is borrowed (copied, not consumed). Pure (in-memory growth).
     BufferAppend { buffer: Box<Expr>, data: Box<Expr> },
+    /// `array_builder()` — open an empty growable typed array builder (M12 A6). The `ty` is
+    /// [`crate::Ty::ArrayBuilder`] (an owned Move handle, `Drop`-freed); the element type is carried
+    /// by that `ty`. Pure (allocation only), like `BuilderNew`/`BufferNew`.
+    ArrayBuilderNew { elem: crate::Scalar },
+    /// `b.push(v)` — append one element to a growable `array_builder`, growing it (amortized). The
+    /// `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut array_builder` local (mutated in
+    /// place). `moves_value` is set for a `string` element: `v` is **moved** into the builder (its
+    /// source is nulled), so MoveCheck consumes it; a Copy-scalar element borrows `v`. Pure (growth).
+    ArrayBuilderPush { builder: Box<Expr>, value: Box<Expr>, moves_value: bool },
+    /// `b.append(xs)` — bulk-append a `slice<T>` of Copy-scalar elements to a growable
+    /// `array_builder`, copying them in and growing it. The `ty` is [`crate::Ty::Unit`]. The receiver
+    /// must be a `mut array_builder` local; `data` is borrowed (copied, not consumed). Pure (growth).
+    ArrayBuilderAppend { builder: Box<Expr>, data: Box<Expr> },
+    /// `b.build()` — freeze an `array_builder` into an owned `array<T>`, **consuming** (moving) the
+    /// builder (a zero-copy ptr+len retype). The `ty` is [`crate::Ty::DynArray`] of the element.
+    ArrayBuilderBuild(Box<Expr>),
     /// `fs.write_file(path, data)` — create/truncate `path` (a `str`) and write all of `data`, then
     /// close. `data` is a `str`/`bytes` (`slice<u8>`) view, or — when `builder` is set — a `builder`'s
     /// accumulated bytes (borrowed, not consumed). The `ty` is `Result<(), Error>`. Impure.

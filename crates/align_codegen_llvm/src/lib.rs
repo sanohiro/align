@@ -902,6 +902,42 @@ fn build_module<'c>(
         "buffer_append".to_string(),
         module.add_function("align_rt_buffer_append", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
     );
+    // array_builder<T> (M12 A6): new/push/push_str/append/build + the two Drop frees.
+    funcs.insert(
+        // array_builder(elem_size: i64) -> *ArrayBuilder (opaque handle).
+        "array_builder_new".to_string(),
+        module.add_function("align_rt_array_builder_new", ptr.fn_type(&[i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // b.push(v) (b: *ArrayBuilder, bits: i64) -> void; append one scalar element.
+        "array_builder_push".to_string(),
+        module.add_function("align_rt_array_builder_push", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // b.push(s) (b: *ArrayBuilder, ptr: *u8, len: i64) -> void; append one moved-in string.
+        "array_builder_push_str".to_string(),
+        module.add_function("align_rt_array_builder_push_str", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // b.append(xs) (b: *ArrayBuilder, src: *u8, count: i64) -> void; bulk-append scalar elements.
+        "array_builder_append".to_string(),
+        module.add_function("align_rt_array_builder_append", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // b.build() (b: *ArrayBuilder) -> {ptr,len}; freeze into an owned array<T> (zero-copy).
+        "array_builder_build".to_string(),
+        module.add_function("align_rt_array_builder_build", slice_struct_type(ctx).fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // drop(b) scalar element (b: *ArrayBuilder) -> void; free storage + header.
+        "array_builder_free".to_string(),
+        module.add_function("align_rt_array_builder_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // drop(b) string element (b: *ArrayBuilder) -> void; deep-free each string, then storage.
+        "array_builder_free_strings".to_string(),
+        module.add_function("align_rt_array_builder_free_strings", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     funcs.insert(
         // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len},
         // phf, phf_len, phf_seed) -> i32 status (MMv2 slice 8d; trailing 3 = perfect-hash table).
@@ -1965,7 +2001,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -2981,7 +3017,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -3038,6 +3074,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|e| self.err(e))?;
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    } else if let Ty::ArrayBuilder(elem) = ty {
+                        // An unfrozen `array_builder<T>`: free its storage + header. A `string` element
+                        // builder deep-frees each pushed-not-frozen string first (the same
+                        // `free_string_array`-class helper); a scalar builder frees the flat storage.
+                        // Both are null-safe (a moved-out / never-grown slot drops harmlessly — the
+                        // slot was nulled at `build`'s move site).
+                        let free_fn = if elem == align_sema::Scalar::String {
+                            "array_builder_free_strings"
+                        } else {
+                            "array_builder_free"
+                        };
+                        let p = self
+                            .builder
+                            .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropab")
+                            .map_err(|e| self.err(e))?;
+                        self.builder
+                            .build_call(self.funcs[free_fn], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
                         // A writer flushes + closes; a reader closes; a buffer / cli / http handle
@@ -4799,6 +4853,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
+            // `array_builder<T>` (M12 A6) new/push/push_str/append/build go through ONE
+            // `#[inline(never)]` dispatcher, so `gen_rvalue` gains a single tiny arm rather than five
+            // inline bodies (the #296 expr-depth lesson, mirroring the file-rvalue dispatcher).
+            Rvalue::ArrayBuilderNew { .. } | Rvalue::ArrayBuilderPush { .. } | Rvalue::ArrayBuilderPushStr { .. }
+            | Rvalue::ArrayBuilderAppend { .. } | Rvalue::ArrayBuilderBuild { .. } => return self.gen_array_builder_rvalue(rv),
             // fs.write_file — marshal the path `{ptr,len}` and the str/bytes data `{ptr,len}`, return
             // an i32 errno-status.
             Rvalue::FsWriteFile { path, data } => {
@@ -5840,7 +5899,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
@@ -6589,6 +6648,79 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .try_as_basic_value()
             .basic()
             .expect("builder_finish returns a str"))
+    }
+
+    /// All `array_builder<T>` (M12 A6) rvalues (new/push/push_str/append/build). `#[inline(never)]`
+    /// so `gen_rvalue` stays flat (the #296 expr-depth lesson, mirroring `gen_file_rvalue`). Returns
+    /// `Some` for the value-producing ops (new/build) and `None` for the void growth ops.
+    #[inline(never)]
+    fn gen_array_builder_rvalue(&mut self, rv: &Rvalue) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        match rv {
+            // `array_builder<T>()` — open an empty typed builder sized to the element stride.
+            Rvalue::ArrayBuilderNew { elem_size } => {
+                let es = self.ctx.i64_type().const_int(*elem_size as u64, false);
+                let v = self
+                    .builder
+                    .build_call(self.funcs["array_builder_new"], &[es.into()], "ab")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("array_builder_new returns a pointer");
+                Ok(Some(v))
+            }
+            // `b.push(v)` (Copy scalar) — reinterpret `v` to its raw i64 bits (a float bit-casts; a
+            // narrower int/bool/char zero-extends, so its low `elem_size` bytes are its value), then
+            // hand the bits to the runtime, which writes the element's `elem_size` low bytes.
+            Rvalue::ArrayBuilderPush { builder, value, scalar } => {
+                let bp = self.operand(builder).into();
+                let i64t = self.ctx.i64_type();
+                let bits = if matches!(scalar, Ty::Float(_)) {
+                    let fv = self.operand(value).into_float_value();
+                    let int_bits = match scalar { Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(), _ => i64t };
+                    let as_int = self.builder.build_bit_cast(fv, int_bits, "fbits").map_err(|e| self.err(e))?.into_int_value();
+                    self.builder.build_int_z_extend_or_bit_cast(as_int, i64t, "bits64").map_err(|e| self.err(e))?
+                } else {
+                    let iv = self.operand(value).into_int_value();
+                    self.builder.build_int_z_extend_or_bit_cast(iv, i64t, "bits64").map_err(|e| self.err(e))?
+                };
+                self.builder
+                    .build_call(self.funcs["array_builder_push"], &[bp, bits.into()], "")
+                    .map_err(|e| self.err(e))?;
+                Ok(None)
+            }
+            // `b.push(s)` (string element) — split the moved-in `string` `{ptr,len}` and hand it to the
+            // runtime, which stores it as one element (its source slot was nulled at the move site).
+            Rvalue::ArrayBuilderPushStr { builder, value } => {
+                let bp = self.operand(builder).into();
+                let agg = self.operand(value).into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "sptr").map_err(|e| self.err(e))?;
+                let len = self.builder.build_extract_value(agg, 1, "slen").map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["array_builder_push_str"], &[bp, ptr.into(), len.into()], "")
+                    .map_err(|e| self.err(e))?;
+                Ok(None)
+            }
+            // `b.append(xs)` — hand the `slice<T>` `{ptr, count}` to the runtime, which bulk-copies
+            // `count` elements at the builder's stored stride.
+            Rvalue::ArrayBuilderAppend { builder, data } => {
+                let bp = self.operand(builder).into();
+                let (ptr, count) = self.split_str(data)?;
+                self.builder
+                    .build_call(self.funcs["array_builder_append"], &[bp, ptr.into(), count.into()], "")
+                    .map_err(|e| self.err(e))?;
+                Ok(None)
+            }
+            // `b.build()` — freeze into an owned `array<T>` `{ptr,len}` (zero-copy); the runtime hands
+            // off the storage and frees only the builder header.
+            Rvalue::ArrayBuilderBuild { builder } => {
+                let bp = self.operand(builder).into();
+                let v = self
+                    .builder
+                    .build_call(self.funcs["array_builder_build"], &[bp], "abbuild")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("array_builder_build returns a {ptr,len}");
+                Ok(Some(v))
+            }
+            _ => unreachable!("gen_array_builder_rvalue on a non-array_builder rvalue"),
+        }
     }
 
     /// `str == str` / `str != str` via the runtime `align_rt_str_eq`.

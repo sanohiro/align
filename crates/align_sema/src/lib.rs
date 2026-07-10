@@ -352,6 +352,17 @@ pub enum Ty {
     /// `slice<u8>` borrow), `.len()` is its byte count; `Drop`-freed. Constructing / reading it is
     /// pure (no I/O).
     Buffer,
+    /// `array_builder<T>` (`core`, M12 A6) — a growable typed array builder, the typed member of the
+    /// grow-then-freeze family (`builder`->`string`, `buffer`->bytes, this->`array<T>`). An opaque
+    /// owned **Move** handle to a heap builder object; the payload [`Scalar`] is the element type
+    /// (a Copy scalar or `string` in v1). `array_builder()` opens it, `b.push(v)` / `b.append(xs)`
+    /// grow it (amortized doubling, in-place through the handle), `b.build()` **consumes** it into an
+    /// owned `array<T>` (a zero-copy ptr+len retype — the storage is `align_rt_alloc`-family memory
+    /// grown via `align_rt_realloc`, freed whole by the array's `Drop`). An unfrozen builder is
+    /// `Drop`-freed at scope exit (deep-free for a `string` element). Holds **no views**, so a
+    /// realloc can never invalidate a borrow. Never rides an aggregate (no `Scalar::ArrayBuilder`):
+    /// bound to one local, like `builder`/`buffer`.
+    ArrayBuilder(Scalar),
     /// A `file` (`std.fs`/`std.io`) — the random-access block read+write handle (align-LLM runway
     /// A4). An opaque owned **Move** handle to a heap object owning a read+write fd, produced by
     /// `fs.create_rw(path)` (`O_RDWR|O_CREAT|O_TRUNC`) / `fs.open_rw(path)` (`O_RDWR`, must exist).
@@ -655,7 +666,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -687,7 +698,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -836,7 +847,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -908,7 +919,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2461,6 +2472,25 @@ impl EffectScan {
         }
     }
 
+    /// Walk an `array_builder` op's sub-exprs for the effect check (all pure). `#[inline(never)]` so
+    /// its arm locals stay out of the recursive [`Self::expr`] frame (#296).
+    #[inline(never)]
+    fn effect_array_builder(&mut self, kind: &ExprKind) {
+        match kind {
+            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderPush { builder, value, .. } => {
+                self.expr(builder);
+                self.expr(value);
+            }
+            ExprKind::ArrayBuilderAppend { builder, data } => {
+                self.expr(builder);
+                self.expr(data);
+            }
+            ExprKind::ArrayBuilderBuild(i) => self.expr(i),
+            _ => unreachable!("effect_array_builder on a non-array_builder op"),
+        }
+    }
+
     fn expr(&mut self, e: &Expr) {
         // A reducer node may carry capture operands (a lifted lambda's captured enclosing locals);
         // walk them so no call edge / effect they contain is missed. (Stage captures are walked by
@@ -2539,6 +2569,10 @@ impl EffectScan {
                 self.expr(buffer);
                 self.expr(data);
             }
+            // `array_builder` new/push/append/build are all pure in-memory growth; walk the sub-exprs
+            // in an `#[inline(never)]` helper so the arm locals stay out of this recursive frame (#296).
+            k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.effect_array_builder(k),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
@@ -3810,6 +3844,25 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    /// Walk an `array_builder` op's sub-exprs for the escape walk. `#[inline(never)]` so its arm
+    /// locals stay out of the recursive [`Self::walk`] frame (#296).
+    #[inline(never)]
+    fn walk_array_builder(&mut self, kind: &ExprKind, depth: u32) {
+        match kind {
+            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderPush { builder, value, .. } => {
+                self.walk(builder, depth);
+                self.walk(value, depth);
+            }
+            ExprKind::ArrayBuilderAppend { builder, data } => {
+                self.walk(builder, depth);
+                self.walk(data, depth);
+            }
+            ExprKind::ArrayBuilderBuild(i) => self.walk(i, depth),
+            _ => unreachable!("walk_array_builder on a non-array_builder op"),
+        }
+    }
+
     /// Recurse to find nested arenas and value positions that let a box escape.
     fn walk(&mut self, e: &Expr, depth: u32) {
         // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
@@ -4292,6 +4345,8 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(data, depth);
             }
             ExprKind::BufferNew { capacity } => self.walk(capacity, depth),
+            k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.walk_array_builder(k, depth),
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
                     self.walk(c, depth);
@@ -4421,6 +4476,25 @@ impl UnnecessaryHeapScan {
             }
             ExprKind::FileLen { file } => self.visit(file),
             _ => unreachable!("visit_file_op on a non-file op"),
+        }
+    }
+
+    /// Visit an `array_builder` op's sub-exprs. `#[inline(never)]` so its arm locals stay out of the
+    /// recursive [`Self::visit`] frame (#296).
+    #[inline(never)]
+    fn visit_array_builder(&mut self, kind: &ExprKind) {
+        match kind {
+            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderPush { builder, value, .. } => {
+                self.visit(builder);
+                self.visit(value);
+            }
+            ExprKind::ArrayBuilderAppend { builder, data } => {
+                self.visit(builder);
+                self.visit(data);
+            }
+            ExprKind::ArrayBuilderBuild(i) => self.visit(i),
+            _ => unreachable!("visit_array_builder on a non-array_builder op"),
         }
     }
 
@@ -4825,6 +4899,8 @@ impl UnnecessaryHeapScan {
                 self.visit(data);
             }
             ExprKind::BufferNew { capacity } => self.visit(capacity),
+            k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.visit_array_builder(k),
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
                     self.visit(c);
@@ -5146,6 +5222,26 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// Move-check an `array_builder` op (M12 A6). `#[inline(never)]` so its arm locals stay out of the
+    /// recursive [`Self::expr`] frame (#296). The builder is borrowed by push/append (grown in place);
+    /// push's value is consumed (a `string` moves in); build consumes the builder.
+    #[inline(never)]
+    fn move_array_builder(&mut self, kind: &ExprKind, moved: &mut MovedSet) {
+        match kind {
+            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderPush { builder, value, .. } => {
+                self.expr(builder, moved, false, false);
+                self.expr(value, moved, true, true);
+            }
+            ExprKind::ArrayBuilderAppend { builder, data } => {
+                self.expr(builder, moved, false, false);
+                self.expr(data, moved, false, false);
+            }
+            ExprKind::ArrayBuilderBuild(i) => self.expr(i, moved, true, true),
+            _ => unreachable!("move_array_builder on a non-array_builder op"),
+        }
+    }
+
     fn expr(
         &mut self,
         e: &Expr,
@@ -5333,6 +5429,13 @@ impl<'a> MoveCheck<'a> {
                 self.expr(data, moved, false, false);
             }
             ExprKind::BufferNew { capacity } => self.expr(capacity, moved, false, false),
+            // `array_builder` growth ops — the consume semantics live in an `#[inline(never)]` helper
+            // so its arm locals stay out of this recursive frame (#296): the builder is **borrowed**
+            // (grown in place); `push`'s value is **consumed** (a `string` moves in, a Copy scalar's
+            // consume is a harmless no-op); `append`'s slice is borrowed; `build` **consumes** the
+            // builder into the frozen `array<T>`.
+            k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.move_array_builder(k, moved),
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
             // Both operands are borrowed (read for bytes), never consumed.
             ExprKind::StrPredicate { haystack, needle, .. } => {
@@ -8179,6 +8282,9 @@ impl<'a, 't> Checker<'a, 't> {
         if name == "builder" {
             return self.check_builder_new(args, span);
         }
+        if name == "array_builder" {
+            return self.check_array_builder_new(args, expected, span);
+        }
         if name == "buffer" {
             return self.check_buffer_new(args, span);
         }
@@ -9072,7 +9178,25 @@ impl<'a, 't> Checker<'a, 't> {
             && let Some((scalar, be)) = binary_scalar_suffix(suffix) {
             return self.check_buffer_put(recv, scalar, be, method, args, span);
         }
+        // `array_builder<T>` (M12 A6) methods. `push`/`build` are unique to it (routed only when the
+        // receiver is an array_builder, so a stray `x.push()` on another type still reports "no
+        // method"); `append` is shared with `buffer`, so dispatch it on the receiver type.
+        if matches!(method, "push" | "build")
+            && let Some((_, rty)) = self.place_local(recv)
+            && matches!(self.resolve(rty), Ty::ArrayBuilder(_))
+        {
+            if method == "push" {
+                return self.check_array_builder_push(recv, args, span);
+            }
+            let recv_expr = self.check_expr(recv, None);
+            return self.check_array_builder_build(recv_expr, args, span);
+        }
         if method == "append" {
+            if let Some((_, rty)) = self.place_local(recv)
+                && matches!(self.resolve(rty), Ty::ArrayBuilder(_))
+            {
+                return self.check_array_builder_append(recv, args, span);
+            }
             return self.check_buffer_append(recv, args, span);
         }
         // Binary **decode** on a `bytes` (`slice<u8>`) view: `b.u32_le(off)` / `b.f64_be(off)` /
@@ -11375,6 +11499,135 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::BufferNew { capacity: Box::new(c) }, ty: Ty::Buffer, span }
     }
 
+    /// `array_builder()` (M12 A6) — open an empty growable typed array builder. Takes no value
+    /// arguments; the element type is inferred from the expected type (a binding/return annotation
+    /// `array_builder<T>`), mirroring `json.decode`'s context-driven target. Fail-closed: with no
+    /// inferable element type, a clean error (rather than a silent default).
+    fn check_array_builder_new(&mut self, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !args.is_empty() {
+            self.diags.error(format!("'array_builder' takes no arguments (the element type is inferred from the binding), got {}", args.len()), span);
+            return err;
+        }
+        let Some(Ty::ArrayBuilder(elem)) = expected.map(|t| self.resolve(t)) else {
+            self.diags.error(
+                "cannot infer the array_builder element type; annotate the binding, e.g. `b: array_builder<i64> := array_builder()`".to_string(),
+                span,
+            );
+            return err;
+        };
+        Expr { kind: ExprKind::ArrayBuilderNew { elem }, ty: Ty::ArrayBuilder(elem), span }
+    }
+
+    /// The `mut`-bound-`array_builder`-local check shared by `push`/`append` (they grow the builder in
+    /// place through its handle). Returns the builder's element scalar on success. Mirrors the
+    /// `buffer` `put_*`/`append` receiver rule.
+    fn array_builder_mut_receiver(&mut self, recv: &ast::Expr, method: &str) -> Option<(Scalar, Expr)> {
+        let recv_expr = self.check_expr(recv, None);
+        let Ty::ArrayBuilder(elem) = self.resolve(recv_expr.ty) else {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(format!("'.{method}()' grows an `array_builder`, but the receiver is {}", ty_name(recv_expr.ty)), recv.span);
+            }
+            return None;
+        };
+        let Some((bid, _)) = self.place_local(recv) else {
+            self.diags.error(
+                format!("'.{method}()' needs a `mut` array_builder local (bind it first: `mut b: array_builder<T> := array_builder()`, then `b.{method}(...)`) — it grows the builder in place"),
+                recv.span,
+            );
+            return None;
+        };
+        if !self.locals[bid as usize].is_mut {
+            let name = self.locals[bid as usize].name.clone();
+            self.diags.error(
+                format!("cannot grow immutable array_builder '{name}' (declare with `mut`) — '.{method}()' appends in place"),
+                recv.span,
+            );
+            return None;
+        }
+        Some((elem, recv_expr))
+    }
+
+    /// `b.push(v)` (M12 A6) — append one element to a growable `array_builder`, borrowing the builder
+    /// (mutated through its handle, not consumed). The receiver must be a `mut`-bound `array_builder`
+    /// local. For a Copy-scalar element `v` is copied in; for a `string` element `v` is **moved** in
+    /// (its source nulled — the builder then owns the buffer, deep-freed on Drop). Pure (growth).
+    fn check_array_builder_push(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some((elem, recv_expr)) = self.array_builder_mut_receiver(recv, "push") else {
+            return err;
+        };
+        let [v] = args else {
+            self.diags.error(format!("'.push()' takes 1 argument (the element), got {}", args.len()), span);
+            return err;
+        };
+        let elem_ty = scalar_to_ty(elem);
+        let value = self.check_expr(v, Some(elem_ty));
+        if value.ty == Ty::Error {
+            return err;
+        }
+        if self.resolve(value.ty) != elem_ty {
+            self.diags.error(format!("'.push()' expects a {} element, got {}", ty_name(elem_ty), ty_name(value.ty)), v.span);
+            return err;
+        }
+        Expr { kind: ExprKind::ArrayBuilderPush { builder: Box::new(recv_expr), value: Box::new(value), moves_value: elem == Scalar::String }, ty: Ty::Unit, span }
+    }
+
+    /// `b.append(xs)` (M12 A6) — bulk-append a `slice<T>` of Copy-scalar elements to a growable
+    /// `array_builder`, borrowing the builder (mutated in place) and copying `xs` in. Only Copy-scalar
+    /// elements are appendable (a `string` element is added one at a time via `push`, which moves it
+    /// in — a borrowed `slice<string>` could not be bulk-moved). Pure (growth).
+    fn check_array_builder_append(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Some((elem, recv_expr)) = self.array_builder_mut_receiver(recv, "append") else {
+            return err;
+        };
+        if elem == Scalar::String {
+            self.diags.error(
+                "'.append()' is not available on an array_builder<string> (append bulk-copies a borrowed slice; a `string` element is added with `push`, which moves it in)".to_string(),
+                span,
+            );
+            return err;
+        }
+        let [xs] = args else {
+            self.diags.error(format!("'.append()' takes 1 argument (a slice of elements), got {}", args.len()), span);
+            return err;
+        };
+        let want = Ty::Slice(elem);
+        let data = self.check_expr(xs, Some(want));
+        if data.ty == Ty::Error {
+            return err;
+        }
+        if self.resolve(data.ty) != want {
+            self.diags.error(format!("'.append()' expects a {}, got {}", ty_name(want), ty_name(data.ty)), xs.span);
+            return err;
+        }
+        Expr { kind: ExprKind::ArrayBuilderAppend { builder: Box::new(recv_expr), data: Box::new(data) }, ty: Ty::Unit, span }
+    }
+
+    /// `b.build()` (M12 A6) — freeze an `array_builder<T>` into an owned `array<T>`, **consuming**
+    /// (moving) the builder. A zero-copy ptr+len retype: the builder's storage becomes the array
+    /// buffer. The element `string` freezes into an `array<string>` (deep-drop owned by the array).
+    fn check_array_builder_build(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let Ty::ArrayBuilder(elem) = self.resolve(recv_expr.ty) else {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(format!("'.build()' is an array_builder method, got {}", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        };
+        if !args.is_empty() {
+            self.diags.error(format!("'.build()' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        // Every valid element scalar is a `PrimScalar` (Copy scalar or `string`) — the array element.
+        let Some(prim) = scalar_to_prim(elem) else {
+            self.diags.error(format!("array_builder<{}> cannot be built into an array", scalar_name(elem)), span);
+            return err;
+        };
+        Expr { kind: ExprKind::ArrayBuilderBuild(Box::new(recv_expr)), ty: Ty::DynArray(prim_to_scalar(prim)), span }
+    }
+
     /// `b.write(s)` / `b.write_int(n)` / `b.write_bool(v)` / `b.write_char(c)` /
     /// `b.write_float(x)` — append to a builder (MMv2 slice 7c/7d). The builder is borrowed
     /// (mutated through its handle, not consumed). Each writer takes the matching scalar; `write`
@@ -11921,7 +12174,7 @@ impl<'a, 't> Checker<'a, 't> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child)
+        if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child)
             || payload_is_move(elem)
             || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs))
         {
@@ -11971,7 +12224,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // unconstructible today (each handle is rejected as an array element at construction),
                 // so this arm can't currently be reached — kept in sync so a future array-of-handle
                 // path can't slip past this guard silently.
-                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) || payload_is_move(elem) {
+                if matches!(elem, Ty::Box(_) | Ty::DynArray(_) | Ty::String | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) || payload_is_move(elem) {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
                         span,
@@ -14506,7 +14759,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Any other Move leaf (a `box`/owned-collection/builder field) can't occur — struct fields are
         // scalar / `str` / `string` / plain-struct only — but guard defensively against a copy-without-
         // ownership-transfer double-free if that ever changes.
-        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) || payload_is_move(leaf_ty) {
+        if matches!(leaf_ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::Builder | Ty::Reader | Ty::Writer | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child) || payload_is_move(leaf_ty) {
             self.diags.error(
                 format!("reading a Move-type field {} out of an array element is not supported yet", ty_name(leaf_ty)),
                 span,
@@ -15168,6 +15421,25 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Finalize an `array_builder` op's sub-exprs. `#[inline(never)]` so its arm locals stay out of
+    /// the recursive [`Self::finalize_expr`] frame (#296).
+    #[inline(never)]
+    fn finalize_array_builder(&mut self, kind: &mut ExprKind) {
+        match kind {
+            ExprKind::ArrayBuilderNew { .. } => {}
+            ExprKind::ArrayBuilderPush { builder, value, .. } => {
+                self.finalize_expr(builder);
+                self.finalize_expr(value);
+            }
+            ExprKind::ArrayBuilderAppend { builder, data } => {
+                self.finalize_expr(builder);
+                self.finalize_expr(data);
+            }
+            ExprKind::ArrayBuilderBuild(i) => self.finalize_expr(i),
+            _ => unreachable!("finalize_array_builder on a non-array_builder op"),
+        }
+    }
+
     fn finalize_expr(&mut self, e: &mut Expr) {
         let cur_ty = self.finalize(e.ty);
         e.ty = cur_ty;
@@ -15659,6 +15931,8 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(data);
             }
             ExprKind::BufferNew { capacity } => self.finalize_expr(capacity),
+            k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
+            | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.finalize_array_builder(k),
             ExprKind::StrPredicate { haystack, needle, .. } => {
                 self.finalize_expr(haystack);
                 self.finalize_expr(needle);
@@ -16095,6 +16369,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
+        Ty::ArrayBuilder(s) => format!("array_builder<{}>", scalar_name(s)),
         Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
         Ty::CliCommand => "cli command".to_string(),
@@ -16513,6 +16788,36 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::Buffer
+        }
+        // `array_builder<T>` (M12 A6) — a growable typed array builder that freezes into `array<T>`.
+        // Element set v1 = **Copy scalars + `string`** (the settled set). A `str` view, struct, soa,
+        // or any Move handle is fail-closed rejected here (a clean sema error at the type argument),
+        // never type-checked then panicking downstream.
+        "array_builder" => {
+            let inner = match args {
+                [a] => resolve_type(a, cx, type_params, diags),
+                _ => {
+                    diags.error("array_builder takes exactly one type argument".to_string(), span);
+                    return Ty::Error;
+                }
+            };
+            match inner {
+                Ty::Error => Ty::Error,
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::String => {
+                    // ty_to_scalar is total on these — an Int/Float/Bool/Char/String all map.
+                    Ty::ArrayBuilder(ty_to_scalar(inner).expect("scalar element"))
+                }
+                other => {
+                    diags.error(
+                        format!(
+                            "array_builder<T> element must be a Copy scalar (int/float/bool/char) or `string`, got {} (str views, structs, and owned handles are not supported)",
+                            ty_name(other)
+                        ),
+                        span,
+                    );
+                    Ty::Error
+                }
+            }
         }
         // `file` (`std.fs`) — an offset-addressed file Move handle (`fs.create_rw` et al.). A surface
         // type name so it can be threaded through functions (a Move handle; passed by value).
