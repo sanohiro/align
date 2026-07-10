@@ -710,7 +710,7 @@ pub unsafe extern "C" fn align_rt_tcp_conn_reader(c: *mut TcpConn) -> *mut Reade
         return core::ptr::null_mut();
     }
     let fd = unsafe { (*c).fd };
-    Box::into_raw(Box::new(Reader { fd, owns_fd: false }))
+    Box::into_raw(Box::new(Reader::unbuffered(fd, false)))
 }
 
 /// `c.writer()` — a **borrowed**, unbuffered M9 `Writer` over the conn's socket fd
@@ -4528,15 +4528,66 @@ unsafe fn path_from_view(ptr: *const u8, len: i64) -> Option<String> {
 
 /// A `reader` (`std.io`) — a Move handle owning a file descriptor; `Drop` (`align_rt_io_reader_free`)
 /// closes it iff `owns_fd` (a `fs.open` file, not a borrowed `io.stdin`).
+///
+/// When `buffered` (built by `r.buffered()`, the read dual of the buffered *writer*), the reader
+/// carries a lookahead over the fd: bytes past a `\n` survive to the next call, so `read_line` can
+/// scan across chunk boundaries and a following `read` still sees the retained surplus (the
+/// interleaving contract). The valid lookahead is `buf[start..filled]`; empty (`start == filled`)
+/// or unallocated (`buf.is_empty()`) on an unbuffered reader — its `read` path is byte-identical to
+/// before.
 pub struct Reader {
     fd: i32,
     owns_fd: bool,
+    buffered: bool,
+    /// Lookahead storage. Valid bytes are `buf[start..filled]`. Sized to `READ_LINE_CHUNK` once the
+    /// reader is made buffered; empty on an unbuffered reader.
+    buf: Vec<u8>,
+    start: usize,
+    filled: usize,
 }
+
+impl Reader {
+    /// A fresh **unbuffered** reader over `fd` (no lookahead). `r.buffered()` upgrades it in place.
+    fn unbuffered(fd: i32, owns_fd: bool) -> Self {
+        Reader { fd, owns_fd, buffered: false, buf: Vec::new(), start: 0, filled: 0 }
+    }
+
+    /// Refill the (fully consumed) lookahead from the fd, retrying `EINTR`. Returns the number of
+    /// bytes read (`0` = EOF) on success, or the mapped errno-status on error. Only called when the
+    /// lookahead is empty (`start == filled`), so no unconsumed bytes are lost.
+    fn refill(&mut self) -> Result<usize, i32> {
+        self.start = 0;
+        self.filled = 0;
+        if self.buf.len() != READ_LINE_CHUNK {
+            self.buf.resize(READ_LINE_CHUNK, 0);
+        }
+        loop {
+            let n = unsafe { read(self.fd, self.buf.as_mut_ptr() as *mut core::ffi::c_void, READ_LINE_CHUNK) };
+            if n >= 0 {
+                self.filled = n as usize;
+                return Ok(n as usize);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io_error_to_status(&e));
+        }
+    }
+}
+
+/// The internal refill chunk for a buffered reader's lookahead — 64 KiB, matching the buffered
+/// writer / `io.copy` transfer size (amortize the `read` syscall, stay in cache).
+const READ_LINE_CHUNK: usize = 64 * 1024;
+/// The `read_line` line-length cap — 64 MiB. A terminator-free (binary / pathological) input would
+/// otherwise grow the caller's buffer without bound; a *record*-sized ceiling, deliberately below
+/// the HTTP 1 GiB *body* ceiling. Breach → `Error.Invalid`.
+const READ_LINE_CAP: usize = 64 * 1024 * 1024;
 
 /// `io.stdin` — a `reader` over fd 0. Borrows the fd (does not close it on `Drop`).
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_io_reader_stdin() -> *mut Reader {
-    Box::into_raw(Box::new(Reader { fd: 0, owns_fd: false }))
+    Box::into_raw(Box::new(Reader::unbuffered(0, false)))
 }
 
 /// `fs.open(path)` — open `path` (a `str` view) for reading, writing the owned `reader` handle to
@@ -4557,7 +4608,7 @@ pub unsafe extern "C" fn align_rt_io_reader_open(path: *const u8, path_len: i64,
     use std::os::fd::IntoRawFd;
     match std::fs::File::open(&path_str) {
         Ok(f) => {
-            unsafe { *out = Box::into_raw(Box::new(Reader { fd: f.into_raw_fd(), owns_fd: true })) };
+            unsafe { *out = Box::into_raw(Box::new(Reader::unbuffered(f.into_raw_fd(), true))) };
             0
         }
         Err(e) => io_error_to_status(&e),
@@ -4576,11 +4627,26 @@ pub unsafe extern "C" fn align_rt_io_reader_read(r: *mut Reader, b: *mut Buffer)
     if r.is_null() || b.is_null() {
         return -(AL_INVALID as i64);
     }
-    let r = unsafe { &*r };
+    let r = unsafe { &mut *r };
     let b = unsafe { &mut *b };
     if b.cap == 0 {
         b.len = 0;
         return 0;
+    }
+    // Interleaving contract: on a buffered reader, drain any retained lookahead (bytes a prior
+    // `read_line` scanned past) BEFORE touching the fd — so a `read` after a `read_line` sees the
+    // surplus, never fd-fresh bytes. Serves at most one lookahead chunk (up to `cap`); the caller
+    // loops for more, exactly as with a short `read`. The unbuffered path below is byte-identical
+    // to before (an unbuffered reader has an empty lookahead, so this is skipped).
+    if r.buffered && r.start < r.filled {
+        let n = (r.filled - r.start).min(b.cap);
+        if b.data.len() < n {
+            b.data.resize(n, 0);
+        }
+        b.data[..n].copy_from_slice(&r.buf[r.start..r.start + n]);
+        b.len = n;
+        r.start += n;
+        return n as i64;
     }
     // Ensure the backing storage spans the full capacity (read fills up to `cap`).
     if b.data.len() != b.cap {
@@ -4599,6 +4665,146 @@ pub unsafe extern "C" fn align_rt_io_reader_read(r: *mut Reader, b: *mut Buffer)
         b.len = 0;
         return -(io_error_to_status(&e) as i64);
     }
+}
+
+/// `r.buffered()` — upgrade a `reader` to carry a lookahead (the read dual of the buffered
+/// *writer*), returning the **same** handle (Move: the caller's binding is consumed, the new one
+/// owns the identical fd — one `Drop`, one close). Idempotent: re-buffering keeps the existing
+/// lookahead. After this, `read_line` is available and every `read` drains the lookahead first.
+///
+/// # Safety
+/// `r` must be a valid `Reader` pointer (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_reader_buffered(r: *mut Reader) -> *mut Reader {
+    if r.is_null() {
+        return r;
+    }
+    let rr = unsafe { &mut *r };
+    rr.buffered = true;
+    if rr.buf.is_empty() {
+        rr.buf.resize(READ_LINE_CHUNK, 0);
+        rr.start = 0;
+        rr.filled = 0;
+    }
+    r
+}
+
+/// `r.read_line(b: mut buffer)` — read the next line into `b`, its **terminator already stripped**
+/// (`b.len()` = the body length). Returns the number of bytes consumed from the stream **including**
+/// the terminator, or `0` at EOF; `< 0` (`-(status)`) on error. An empty line returns `1` with body
+/// length `0`; a final unterminated line yields its body as-is and returns its bare length. Exactly
+/// one `\r?\n` is stripped (a lone `\r` is not a terminator; a BOM is never stripped). The buffer
+/// **grows** as needed — unlike `read`, a line has no caller-chosen bound — up to a 64 MiB line cap
+/// ([`READ_LINE_CAP`]) → `Error.Invalid`. One memcpy per line (from the lookahead into `b`); the
+/// refill `read`s retry `EINTR`; I/O errors are errno-mapped.
+///
+/// Requires a buffered reader (sema-enforced); defensively upgrades one in place if reached
+/// unbuffered, so the runtime never reads a stale/absent lookahead.
+///
+/// # Safety
+/// `r` and `b` must be valid handles for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_reader_read_line(r: *mut Reader, b: *mut Buffer) -> i64 {
+    if r.is_null() || b.is_null() {
+        return -(AL_INVALID as i64);
+    }
+    let r = unsafe { &mut *r };
+    let b = unsafe { &mut *b };
+    // Defensive lookahead init (sema guarantees `buffered`, but never trust the caller).
+    if !r.buffered || r.buf.is_empty() {
+        r.buffered = true;
+        if r.buf.is_empty() {
+            r.buf.resize(READ_LINE_CHUNK, 0);
+            r.start = 0;
+            r.filled = 0;
+        }
+    }
+    // `b` is the output sink: reset it to the line body we accumulate (one memcpy per refill span).
+    b.data.clear();
+    b.len = 0;
+    // Bytes consumed from the stream, INCLUDING the terminator — the return value.
+    let mut consumed: i64 = 0;
+    loop {
+        // Scan the lookahead for the `\n` terminator (rides `memchr`'s AVX2/NEON/scalar dispatch —
+        // never a byte-at-a-time loop, #310).
+        let hay = &r.buf[r.start..r.filled];
+        if let Some(rel) = memchr::memchr(b'\n', hay) {
+            // Line body is `buf[start..start+rel]` (everything before the `\n`).
+            b.data.extend_from_slice(&r.buf[r.start..r.start + rel]);
+            // Strip exactly one trailing `\r` (CRLF). Checking the *accumulated* output (not just
+            // this span) handles a `\r` that landed in a previous refill with the `\n` at a span
+            // boundary. A lone `\r` mid-body, or a `\r` not immediately before the `\n`, is kept.
+            if b.data.last() == Some(&b'\r') {
+                b.data.pop();
+            }
+            consumed += rel as i64 + 1; // body span + the `\n` (the stripped `\r`, if any, is inside `rel`)
+            r.start += rel + 1;
+            if b.data.len() > READ_LINE_CAP {
+                b.data.clear();
+                b.len = 0;
+                return -(AL_INVALID as i64);
+            }
+            b.len = b.data.len();
+            b.cap = b.cap.max(b.len);
+            return consumed;
+        }
+        // No `\n` in the lookahead: take all of it into the body, then refill.
+        b.data.extend_from_slice(hay);
+        consumed += hay.len() as i64;
+        r.start = r.filled; // fully consumed
+        if b.data.len() > READ_LINE_CAP {
+            b.data.clear();
+            b.len = 0;
+            return -(AL_INVALID as i64);
+        }
+        match r.refill() {
+            Ok(0) => {
+                // EOF. No bytes at all → true end (return 0). Otherwise a final unterminated line:
+                // its body as-is, returning the bare body length (no terminator was consumed).
+                if consumed == 0 {
+                    b.len = 0;
+                    return 0;
+                }
+                b.len = b.data.len();
+                b.cap = b.cap.max(b.len);
+                return consumed;
+            }
+            Ok(_) => {} // lookahead refilled (`start = 0`, `filled = n`); loop and rescan
+            Err(status) => {
+                b.data.clear();
+                b.len = 0;
+                return -(status as i64);
+            }
+        }
+    }
+}
+
+/// `bytes.as_str()` — the validating VIEW at the bytes→text boundary: check `ptr[..len]` is valid
+/// UTF-8 (the shipped SIMD validator) and, on success, write the **same** `{ptr,len}` back to `out`
+/// as a `str` view (zero-copy — the view stays region-bound to whatever backs `bytes`). Returns `0`
+/// on success, or `AL_INVALID` (→ `Error.Invalid`) on invalid UTF-8, leaving `*out` the caller's
+/// zeroed `{null,0}`. Works on any `bytes` value.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range (or be null / `<= 0`); `out` must point to a
+/// writable `{ptr,len}` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_bytes_as_str(ptr: *const u8, len: i64, out: *mut AlignStr) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+    // An empty (or null) view is trivially valid UTF-8 → an empty `str`.
+    let n = match usize::try_from(len) {
+        Ok(n) if n > 0 && !ptr.is_null() => n,
+        _ => return 0,
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, n) };
+    if !validate_utf8(bytes) {
+        return AL_INVALID;
+    }
+    unsafe { *out = AlignStr { ptr, len: n as i64 } };
+    0
 }
 
 /// Free a `reader`, closing its fd first iff owned. Null-safe (a never-initialised owned slot
@@ -11784,6 +11990,139 @@ mod tests {
         unsafe { align_rt_io_reader_free(r) };
         let _ = std::fs::remove_file(&path);
     }
+
+    // --- buffered reader + read_line (A7) ------------------------------------------------------
+
+    /// Open a **buffered** reader over a temp file holding `content`; returns `(reader, path)`. The
+    /// caller frees the reader and removes the path.
+    fn buffered_reader_over(tag: &str, content: &[u8]) -> (*mut Reader, std::path::PathBuf) {
+        use std::io::Write;
+        let mut path = std::env::temp_dir();
+        path.push(format!("align_rt_a7_{tag}_{}", std::process::id()));
+        std::fs::File::create(&path).unwrap().write_all(content).unwrap();
+        let pb = path.to_str().unwrap().as_bytes();
+        let mut r: *mut Reader = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_reader_open(pb.as_ptr(), pb.len() as i64, &mut r) }, 0);
+        let r = unsafe { align_rt_io_reader_buffered(r) };
+        (r, path)
+    }
+
+    /// One `read_line` → `(return value, body bytes)`.
+    fn read_one_line(r: *mut Reader, b: *mut Buffer) -> (i64, Vec<u8>) {
+        let n = unsafe { align_rt_io_reader_read_line(r, b) };
+        let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
+        unsafe { align_rt_buffer_bytes(b, &mut view) };
+        let body = unsafe { safe_slice(view.ptr, view.len) }.to_vec();
+        (n, body)
+    }
+
+    /// The strip/count table: `\n`, `\r\n`, an empty line, a bare (unterminated) EOF tail, then EOF.
+    /// Each line's body has its terminator stripped; the return counts bytes consumed INCLUDING it.
+    #[test]
+    fn read_line_strip_and_count_table() {
+        // "a\n" | "\r\n" (empty via CRLF) | "\n" (empty via LF) | "bc\r\n" | "tail" (EOF, no term).
+        let (r, path) = buffered_reader_over("table", b"a\n\r\n\nbc\r\ntail");
+        let b = align_rt_buffer_new(4);
+
+        assert_eq!(read_one_line(r, b), (2, b"a".to_vec()), "'a\\n' → body 'a', consumed 2");
+        assert_eq!(read_one_line(r, b), (2, b"".to_vec()), "'\\r\\n' → empty body, consumed 2");
+        assert_eq!(read_one_line(r, b), (1, b"".to_vec()), "'\\n' → empty body, consumed 1");
+        assert_eq!(read_one_line(r, b), (4, b"bc".to_vec()), "'bc\\r\\n' → 'bc', consumed 4");
+        assert_eq!(read_one_line(r, b), (4, b"tail".to_vec()), "final unterminated → 'tail', bare length 4");
+        assert_eq!(read_one_line(r, b), (0, b"".to_vec()), "EOF → 0");
+        // Idempotent at EOF.
+        assert_eq!(read_one_line(r, b), (0, b"".to_vec()), "still 0 past EOF");
+
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_reader_free(r) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An empty file: `read_line` returns 0 immediately.
+    #[test]
+    fn read_line_empty_file_is_eof() {
+        let (r, path) = buffered_reader_over("emptyfile", b"");
+        let b = align_rt_buffer_new(4);
+        assert_eq!(read_one_line(r, b), (0, b"".to_vec()));
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_reader_free(r) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The interleaving contract at the runtime boundary: a `read_line` drains the first line, then a
+    /// plain `read` returns the retained lookahead surplus (not fd-fresh bytes).
+    #[test]
+    fn read_after_read_line_serves_lookahead() {
+        let (r, path) = buffered_reader_over("interleave", b"AB\nCDEFG");
+        let b = align_rt_buffer_new(64);
+        assert_eq!(read_one_line(r, b), (3, b"AB".to_vec()));
+        // The surplus "CDEFG" lives in the lookahead; a plain read must serve it.
+        let n = unsafe { align_rt_io_reader_read(r, b) };
+        assert_eq!(n, 5);
+        let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
+        unsafe { align_rt_buffer_bytes(b, &mut view) };
+        assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"CDEFG");
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_reader_free(r) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A line body spanning multiple 64 KiB refills is reassembled whole (one logical line across
+    /// several `read`s of the lookahead).
+    #[test]
+    fn read_line_reassembles_across_refills() {
+        let mut content = vec![b'x'; READ_LINE_CHUNK * 2 + 123];
+        let body_len = content.len();
+        content.push(b'\n');
+        let (r, path) = buffered_reader_over("spanning", &content);
+        let b = align_rt_buffer_new(16);
+        let (n, body) = read_one_line(r, b);
+        assert_eq!(n, body_len as i64 + 1, "consumed = body + '\\n'");
+        assert_eq!(body.len(), body_len);
+        assert!(body.iter().all(|&c| c == b'x'));
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_reader_free(r) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Growth across the 64 MiB line cap: a terminator-free input longer than [`READ_LINE_CAP`] is
+    /// `Error.Invalid` (`-(AL_INVALID)`), bounding the caller's buffer growth. (One heavy test.)
+    #[test]
+    fn read_line_over_cap_is_invalid() {
+        // Just over the cap, no newline anywhere.
+        let content = vec![b'z'; READ_LINE_CAP + 4096];
+        let (r, path) = buffered_reader_over("cap", &content);
+        let b = align_rt_buffer_new(16);
+        let n = unsafe { align_rt_io_reader_read_line(r, b) };
+        assert_eq!(n, -(AL_INVALID as i64), "a line past the 64 MiB cap → Error.Invalid");
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_reader_free(r) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `bytes.as_str()`: valid UTF-8 round-trips the same view; invalid UTF-8 is `AL_INVALID`; the
+    /// empty view is valid.
+    #[test]
+    fn bytes_as_str_validates_and_views() {
+        // Valid.
+        let s = b"h\xc3\xa9llo"; // "héllo"
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_bytes_as_str(s.as_ptr(), s.len() as i64, &mut out) }, 0);
+        assert_eq!(out.ptr, s.as_ptr(), "zero-copy: the view aliases the same storage");
+        assert_eq!(out.len, s.len() as i64);
+        // Invalid.
+        let bad = [0xFFu8, 0xFE, 0x00];
+        let mut out2 = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_bytes_as_str(bad.as_ptr(), bad.len() as i64, &mut out2) }, AL_INVALID);
+        assert!(out2.ptr.is_null(), "the out slot stays zeroed on error");
+        // Empty.
+        let mut out3 = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_bytes_as_str(std::ptr::null(), 0, &mut out3) }, 0);
+        assert_eq!(out3.len, 0);
+    }
+
+    // Note: the `read_line` refill retries `EINTR` by construction (`Reader::refill`'s loop, mirroring
+    // `align_rt_io_reader_read`); there is no live-signal test here, matching the existing reader.
 
     // --- file (offset-addressed read/write, A4) ------------------------------------------------
 

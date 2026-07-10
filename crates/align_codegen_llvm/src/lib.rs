@@ -799,6 +799,21 @@ fn build_module<'c>(
         module.add_function("align_rt_io_reader_read", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
     );
     funcs.insert(
+        // r.buffered() (r: *Reader) -> *Reader (same handle, now buffered).
+        "io_reader_buffered".to_string(),
+        module.add_function("align_rt_io_reader_buffered", ptr.fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // r.read_line(b) (r: *Reader, b: *Buffer) -> i64 (consumed incl. terminator, 0 = EOF, or -(status)).
+        "io_reader_read_line".to_string(),
+        module.add_function("align_rt_io_reader_read_line", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // bytes.as_str() (ptr, len, out: *{ptr,len}) -> i32 errno-status (AL_INVALID on bad UTF-8).
+        "bytes_as_str".to_string(),
+        module.add_function("align_rt_bytes_as_str", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
         // drop(r) (r: *Reader) -> void; close if owned.
         "io_reader_free".to_string(),
         module.add_function("align_rt_io_reader_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
@@ -4725,6 +4740,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_reader_read returns i64")
             }
+            // The three A7 line-read rvalues (`.buffered()` / `.read_line()` / `.as_str()`) go
+            // through ONE `#[inline(never)]` helper, so `gen_rvalue` gains a single tiny arm rather
+            // than three inline bodies — `gen_rvalue` is depth-recursive (via operand
+            // materialization), so keeping its frame flat preserves the expr-depth budget (the #296
+            // lesson, mirroring the file / array_builder rvalue dispatchers).
+            Rvalue::ReaderBuffered(_) | Rvalue::ReaderReadLine(..) | Rvalue::BytesAsStr { .. } => {
+                return self.gen_reader_line_rvalue(rv);
+            }
             Rvalue::IoCopy(r, w) => {
                 let rp = self.operand(r).into();
                 let wp = self.operand(w).into();
@@ -6497,6 +6520,43 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_call(self.funcs["fs_read_file"], &[p_ptr.into(), p_len.into(), out_ptr.into()], "frf")
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("fs_read_file returns i32"))
+    }
+
+    /// The three A7 line-read rvalues off `gen_rvalue`'s hot path (the #296 expr-depth lesson): each
+    /// yields a value, so all return `Ok(Some(..))`.
+    #[inline(never)]
+    fn gen_reader_line_rvalue(&mut self, rv: &Rvalue) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        let v = match rv {
+            // r.buffered() — upgrade the reader in place, return the (same) handle pointer.
+            Rvalue::ReaderBuffered(r) => {
+                let rp = self.operand(r).into();
+                self.builder
+                    .build_call(self.funcs["io_reader_buffered"], &[rp], "buffered")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_reader_buffered returns a pointer")
+            }
+            // r.read_line(b) — fill the buffer with the stripped line body, return i64 consumed-or-status.
+            Rvalue::ReaderReadLine(r, buf) => {
+                let rp = self.operand(r).into();
+                let bp = self.operand(buf).into();
+                self.builder
+                    .build_call(self.funcs["io_reader_read_line"], &[rp, bp], "readline")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_reader_read_line returns i64")
+            }
+            // bytes.as_str() — validate UTF-8, write the `str` view `{ptr,len}` into `out`, return i32.
+            Rvalue::BytesAsStr { bytes, out } => {
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let (b_ptr, b_len) = self.split_str(bytes)?;
+                self.builder
+                    .build_call(self.funcs["bytes_as_str"], &[b_ptr.into(), b_len.into(), out_ptr.into()], "asstr")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("bytes_as_str returns i32")
+            }
+            _ => return Err(self.err("gen_reader_line_rvalue on a non-A7 op")),
+        };
+        Ok(Some(v))
     }
 
     /// All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len). `#[inline(never)]` so the

@@ -485,6 +485,20 @@ pub enum Rvalue {
     /// `r.read(b)` — read up to `b`'s capacity into the `buffer` `b`, borrowing both reader and
     /// buffer. Yields an `i64`: bytes read (`0` = EOF) on success, or `-(status)` on error.
     ReaderRead(Operand, Operand),
+    /// `r.buffered()` — upgrade the `reader` operand to carry a lookahead, **consuming** it (the
+    /// source slot is nulled at the lowering site) and yielding the (same) buffered reader handle.
+    /// A6-realloc-free allocation only, no I/O. (A7.)
+    ReaderBuffered(Operand),
+    /// `r.read_line(b)` — read one line from the buffered `reader` operand into the `buffer` `b`
+    /// (terminator stripped; the buffer grows), borrowing both. Yields an `i64`: bytes consumed
+    /// including the terminator (`0` = EOF) on success, or `-(status)` on error (the
+    /// [`Self::ReaderRead`] sign convention). (A7.)
+    ReaderReadLine(Operand, Operand),
+    /// `bytes.as_str()` — validate the `bytes` (`slice<u8>`) operand is UTF-8 and, on success, write
+    /// the zero-copy `str` view `{ptr,len}` (the same storage) into `out`. Yields an `i32`
+    /// errno-status (0 = ok, `AL_INVALID` on bad UTF-8). Mirrors [`Self::FsReadBytesView`]'s
+    /// out-slot-view + status shape, minus the arena/mmap. (A7.)
+    BytesAsStr { bytes: Operand, out: Slot },
     /// `w.write(x)` — append a `str`/`bytes` operand's bytes to a `writer`. Yields an `i32`
     /// errno-status (0 = ok).
     WriterWrite(Operand, Operand),
@@ -1703,6 +1717,14 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let rop = lower_expr(b, reader);
             let bop = lower_expr(b, buffer);
             lower_reader_read(b, rop, bop, e.ty)
+        }
+        // All three A7 line-read ops (`r.buffered()` / `r.read_line(b)` / `bytes.as_str()`) go
+        // through ONE `#[inline(never)]` dispatcher, so `lower_expr` gains a single tiny arm rather
+        // than three inline bodies — `lower_expr` is depth-multiplied, so keeping its frame flat
+        // preserves the expr-depth budget (the #296 lesson, mirroring the file / array_builder
+        // dispatchers).
+        hir::ExprKind::ReaderBuffered { .. } | hir::ExprKind::ReaderReadLine { .. } | hir::ExprKind::BytesAsStr { .. } => {
+            lower_reader_line_expr(b, e)
         }
         // `io.copy(r, w)` yields `Result<i64, Error>` from the runtime's i64 (bytes transferred, or
         // `-(status)` on error) — the same sign convention (and lowering) as `reader.read`.
@@ -5669,6 +5691,77 @@ fn lower_fs_read_bytes_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) ->
     // Ok: load the mapped `slice<u8>` view and wrap it (arena-owned — no `Drop`).
     b.cur = ok_bb;
     let s = b.fresh_value(Ty::Slice(elem));
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (`{null,0}`); map the status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// The three A7 line-read ops off `lower_expr`'s hot path (the #296 expr-depth lesson): `.buffered()`
+/// consumes+re-emits the reader; `.read_line()` folds the runtime i64 into `Result<i64, Error>`
+/// (the `reader.read` sign convention); `.as_str()` delegates to [`lower_bytes_as_str`].
+#[inline(never)]
+fn lower_reader_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    match &e.kind {
+        // `r.buffered()` consumes the source reader (null its slot so it isn't double-freed — the
+        // buffered handle, the same pointer, is the sole owner) and yields the buffered reader.
+        hir::ExprKind::ReaderBuffered { reader } => {
+            let rop = lower_expr(b, reader);
+            null_moved_source(b, reader);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::ReaderBuffered(rop)));
+            Operand::Value(v)
+        }
+        // `r.read_line(b)` yields `Result<i64, Error>` from the runtime's i64 (bytes consumed incl.
+        // terminator `>= 0` = `Ok`, `0` = EOF; `< 0` encodes `-(status)`).
+        hir::ExprKind::ReaderReadLine { reader, buffer } => {
+            let rop = lower_expr(b, reader);
+            let bop = lower_expr(b, buffer);
+            let n = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(n, Rvalue::ReaderReadLine(rop, bop)));
+            lower_count_or_status_result(b, n, e.ty)
+        }
+        hir::ExprKind::BytesAsStr { bytes } => lower_bytes_as_str(b, bytes, e.ty),
+        _ => unreachable!("lower_reader_line_expr on a non-A7 op"),
+    }
+}
+
+/// `bytes.as_str()` → the runtime validates the `bytes` (`slice<u8>`) operand is UTF-8 and writes
+/// the zero-copy `str` view `{ptr,len}` into an out slot, returning an errno-status (`AL_INVALID`
+/// on bad UTF-8); branch `Ok(<view>)` / `Err(<mapped status>)`. The `str` view aliases the same
+/// storage `bytes` did (no copy), so its region is inherited (sema's `region_of`) — no `Drop`. The
+/// out-slot-view + status shape mirrors [`lower_fs_read_bytes_view`] minus the arena/mmap.
+fn lower_bytes_as_str(b: &mut Builder, bytes: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::Str);
+    let src = lower_expr(b, bytes);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::BytesAsStr { bytes: src, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the validated `str` view and wrap it (a borrow — no `Drop`).
+    b.cur = ok_bb;
+    let s = b.fresh_value(Ty::Str);
     b.push(Stmt::Let(s, Rvalue::Load(out)));
     let okv = b.fresh_value(result_ty);
     b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));

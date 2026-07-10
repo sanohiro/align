@@ -654,6 +654,26 @@ pub enum ExprKind {
     /// borrowing both `reader` and `buffer` (neither consumed). The `ty` is `Result<i64, Error>`
     /// (bytes read; `0` = EOF). Impure.
     ReaderRead { reader: Box<Expr>, buffer: Box<Expr> },
+    /// `r.buffered()` — upgrade a `reader` to carry a lookahead (the read dual of the buffered
+    /// *writer*), **consuming** (moving) the source reader and yielding a buffered `reader` over the
+    /// same fd. The `ty` is [`crate::Ty::Reader`]. Pure (allocation only — the lookahead buffer, no
+    /// I/O), like `BufferNew`. Its region inherits the source reader's (a `c.reader().buffered()`
+    /// stays conn-bound). Only a buffered reader may `read_line`.
+    ReaderBuffered { reader: Box<Expr> },
+    /// `r.read_line(b: mut buffer)` — read the next line into `b` with its `\r?\n` terminator
+    /// stripped (`b.len()` = body length), borrowing both `reader` and `buffer` (neither consumed;
+    /// the buffer is filled in place and **grows** as needed). The `ty` is `Result<i64, Error>`:
+    /// bytes consumed including the terminator, `0` = EOF (`< 0` errors are folded into `Err` in
+    /// lowering, the `reader.read` sign convention). Requires a **buffered** receiver (sema-enforced).
+    /// Impure. A buffer-mutating op (registered like `BufferAppend` in every analysis pass).
+    ReaderReadLine { reader: Box<Expr>, buffer: Box<Expr> },
+    /// `bytes.as_str()` — the validating VIEW at the bytes→text boundary (the view sibling of
+    /// `bytes.to_string()`): checks `bytes` is valid UTF-8 and yields a zero-copy `str` view of the
+    /// same storage. The `ty` is `Result<str, Error>` (`Error.Invalid` on invalid UTF-8). The `str`
+    /// view is region-bound through the receiver (`region_of` inherits `bytes`'s region — a view of
+    /// `buf.bytes()` stays pinned to the buffer). Pure (a memcpy-class validation, no I/O). `bytes`
+    /// is borrowed, not consumed. Works on any `bytes` (`slice<u8>`) value.
+    BytesAsStr { bytes: Box<Expr> },
     /// `w.write(x)` — append a `str`/`bytes` (`slice<u8>`) value or a `builder`'s bytes to a
     /// `writer`, borrowing it (not consumed). `builder` marks the builder-source form (its bytes are
     /// written directly). The `ty` is `Result<(), Error>`. Impure.

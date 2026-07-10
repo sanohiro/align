@@ -1925,6 +1925,17 @@ io.stderr                   -> writer
 io.stdout.buffered()        -> writer   // buffering is a writer, not a separate type — "one way"
 r.read(b: mut buffer)       -> Result<i64, Error>   // fills b up to its capacity, overwrites b's len;
                                                      // returns bytes read, 0 = EOF
+r.buffered()                -> reader   // upgrade a reader to carry a lookahead (the read dual of the
+                                        // buffered writer); consumes r, yields a buffered reader over
+                                        // the same fd. Required before read_line.
+r.read_line(b: mut buffer)  -> Result<i64, Error>   // (buffered reader only) fills b with the next line
+                                                     // BODY, terminator already stripped (b.len() = body
+                                                     // length); returns bytes consumed incl. terminator,
+                                                     // 0 = EOF. b GROWS as needed (up to a 64 MiB line
+                                                     // cap -> Error.Invalid).
+bytes.as_str()              -> Result<str, Error>   // validate UTF-8, yield a zero-copy str VIEW of the
+                                                     // same bytes (region-bound); Error.Invalid on bad
+                                                     // UTF-8. The one bytes->text path.
 w.write(x: str | bytes | builder) -> Result<(), Error>
 w.flush()                   -> Result<(), Error>
 io.copy(r: reader, w: writer) -> Result<i64, Error>   // returns bytes transferred; memory is always
@@ -1961,6 +1972,29 @@ subject to the same rule as an owned handle: it accumulates bytes that reach the
 `flush`/`Drop`, so it must be bound to a local (`w := io.stdout.buffered()` then `w.write(d)?` /
 `io.copy(r, w)?`) — an unbound temporary would silently drop its tail chunk. This restriction lifts
 once Move *temporaries* get a `Drop`.
+
+**Streaming line reads.** Line reading needs *lookahead* (bytes past a `\n` must survive to the next
+call), so it is built explicitly rather than hidden on the raw handle: `r.buffered()` is the read dual
+of the buffered `writer` (one type, many constructors), and `read_line` is a **buffered-reader-only**
+method — a sema error on an unbuffered reader. On a buffered reader every `read`/`read_line` drains the
+lookahead before touching the fd (a `read` after a `read_line` sees the retained surplus, never
+fd-fresh bytes). `read_line` fills `b` with the line **body**, its terminator already stripped: exactly
+one `\r?\n` is removed (a lone `\r` is *not* a terminator; a BOM is *never* stripped — no hidden
+transformation, so `json.decode` fails on line 1 if a BOM is present and stripping it is the consumer's
+call), so `b.len()` is the body length and the return is the bytes consumed including the terminator (`0`
+= EOF, an empty line returns `1` with body length `0`, a final unterminated line returns its bare
+length). **Growth asymmetry:** unlike `r.read`, which caps at the buffer's capacity, `read_line`
+**grows** `b` as needed — a line has no caller-chosen bound — up to a 64 MiB line cap (`Error.Invalid`
+beyond it, so a terminator-free/binary input can't grow the buffer without bound). The canonical loop is
+`loop { n := r.read_line(buf)?; if n == 0 { break }; line := buf.bytes().as_str()?; … }`. **Warning:** the
+per-iteration line view (`buf.bytes()` / its `as_str`) must **not** be hoisted across iterations — the
+next `read_line` overwrites `buf`, so a view kept from a previous line reads stale/overwritten bytes
+(a borrow-liveness gap not yet caught by the compiler; `.clone()` a line you need to keep).
+
+`bytes.as_str()` is the one validating bytes→text boundary op (the zero-copy **view** counterpart of a
+copying `bytes`→`string` conversion): it checks the bytes are UTF-8 and returns a `str` view of the same
+storage, region-bound through the receiver — a view of `buf.bytes()` stays pinned to the buffer, so it
+cannot escape past the buffer's `Drop`. It works on any `bytes` (`slice<u8>`) value, not just a buffer's.
 
 ### std.fs
 

@@ -2544,6 +2544,16 @@ impl EffectScan {
                 self.expr(reader);
                 self.expr(buffer);
             }
+            // `r.read_line(b)` reads the fd — Impure, like `reader.read`. `r.buffered()` only
+            // allocates a lookahead (no I/O) — pure, like `BufferNew`.
+            ExprKind::ReaderReadLine { reader, buffer } => {
+                self.impure_direct = true;
+                self.expr(reader);
+                self.expr(buffer);
+            }
+            ExprKind::ReaderBuffered { reader } => self.expr(reader),
+            // `bytes.as_str()` validates UTF-8 in memory (no I/O) — pure, like `BufferBytes`.
+            ExprKind::BytesAsStr { bytes } => self.expr(bytes),
             ExprKind::IoCopy { reader, writer } => {
                 self.impure_direct = true;
                 self.expr(reader);
@@ -3459,6 +3469,17 @@ impl<'a> EscapeCheck<'a> {
             // `buf.bytes()` is a `slice<u8>` view of the `buffer` local's heap storage (freed at
             // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
             ExprKind::BufferBytes { buffer } => Region::Frame.shorter(self.region_of(buffer, depth)),
+            // `bytes.as_str()` is a zero-copy `str` view of the SAME storage `bytes` viewed, so it
+            // lives exactly as long as its receiver — inherit its region directly (like `StrTrim` /
+            // `PathComponent`). A view of `buf.bytes()` (Frame) stays Frame; a view of an arena
+            // `read_bytes_view` (Arena) stays Arena. `?` preserves it (the `Try` arm above). Without
+            // this arm the wildcard mis-infers `Static`, letting a view of a dropped buffer escape (#297).
+            ExprKind::BytesAsStr { bytes } => self.region_of(bytes, depth),
+            // `r.buffered()` yields an owned `reader` over the source reader's fd, so it inherits the
+            // source's region (a `c.reader().buffered()` stays conn-bound; a `fs.open(...)` reader is
+            // owned/`Static`). A plain `read_line` result is a Copy `i64` (not region-tracked → the
+            // wildcard `Static`), so no arm is needed for it.
+            ExprKind::ReaderBuffered { reader } => self.region_of(reader, depth),
             // `p.get_str(name)` is a `str` view into the `cli parsed` handle's owned storage (freed at
             // frame exit), so — like `BufferBytes` — it is `Frame`-regioned and cannot escape the
             // frame. Without this explicit arm the wildcard below mis-infers `Static`, letting the view
@@ -4326,6 +4347,12 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(reader, depth);
                 self.walk(buffer, depth);
             }
+            ExprKind::ReaderReadLine { reader, buffer } => {
+                self.walk(reader, depth);
+                self.walk(buffer, depth);
+            }
+            ExprKind::ReaderBuffered { reader } => self.walk(reader, depth),
+            ExprKind::BytesAsStr { bytes } => self.walk(bytes, depth),
             ExprKind::IoCopy { reader, writer } => {
                 self.walk(reader, depth);
                 self.walk(writer, depth);
@@ -4880,6 +4907,12 @@ impl UnnecessaryHeapScan {
                 self.visit(reader);
                 self.visit(buffer);
             }
+            ExprKind::ReaderReadLine { reader, buffer } => {
+                self.visit(reader);
+                self.visit(buffer);
+            }
+            ExprKind::ReaderBuffered { reader } => self.visit(reader),
+            ExprKind::BytesAsStr { bytes } => self.visit(bytes),
             ExprKind::IoCopy { reader, writer } => {
                 self.visit(reader);
                 self.visit(writer);
@@ -5402,6 +5435,17 @@ impl<'a> MoveCheck<'a> {
                 self.expr(reader, moved, false, false);
                 self.expr(buffer, moved, false, false);
             }
+            // `r.read_line(b)` **borrows** the reader (used repeatedly in a loop) and fills the buffer
+            // in place — neither consumed, like `reader.read`.
+            ExprKind::ReaderReadLine { reader, buffer } => {
+                self.expr(reader, moved, false, false);
+                self.expr(buffer, moved, false, false);
+            }
+            // `r.buffered()` **consumes** the reader (Move — one fd, one owner; the buffered handle
+            // takes it over), exactly like `array_builder.build()`.
+            ExprKind::ReaderBuffered { reader } => self.expr(reader, moved, true, true),
+            // `bytes.as_str()` borrows the byte view (a validating re-view, not consumed).
+            ExprKind::BytesAsStr { bytes } => self.expr(bytes, moved, false, false),
             // `io.copy(r, w)` borrows both handles (fd ownership does not move — neither is
             // consumed, so both stay usable after the call), like `print`'s argument. NOT a
             // consuming call, even though `reader`/`writer` are Move types.
@@ -5979,6 +6023,11 @@ struct Checker<'a, 't> {
     /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
     /// is caught even though `s` and `a` are different locals.
     slice_bases: std::collections::HashMap<LocalId, LocalId>,
+    /// Reader locals bound from `r.buffered()` (or `?`/block tails thereof). `read_line` requires a
+    /// buffered receiver; since a buffered and an unbuffered reader share [`Ty::Reader`] (mirroring
+    /// the buffered *writer* — one type, many constructors), this per-local provenance set is what
+    /// statically enforces the "call `.buffered()` first" rule. Reset at a lambda boundary.
+    buffered_readers: std::collections::HashSet<LocalId>,
     /// Stack of enclosing `loop`s in the current function body (innermost last). A `break` binds to
     /// the top; its value type is unified into the frame's `break_ty` (like `match` arms). Reset to
     /// empty at a lambda boundary (a `break` cannot cross a lambda). `draft.md` §4.
@@ -6098,6 +6147,7 @@ impl<'a, 't> Checker<'a, 't> {
             wait_state: Vec::new(),
             task_group_fallible: Vec::new(),
             slice_bases: std::collections::HashMap::new(),
+            buffered_readers: std::collections::HashSet::new(),
             loops: Vec::new(),
             cur_fn: String::new(),
             type_params,
@@ -6530,6 +6580,11 @@ impl<'a, 't> Checker<'a, 't> {
                         && let Some(root) = self.expr_root_local(&init) {
                             self.slice_bases.insert(local, root);
                         }
+                    // Record buffered-reader provenance (`br := r.buffered()` → `br` may `read_line`).
+                    // Statically distinguishes a buffered from an unbuffered `reader` (same `Ty`).
+                    if local_ty == Ty::Reader && init_is_buffered_reader(&init) {
+                        self.buffered_readers.insert(local);
+                    }
                     stmts.push(Stmt::Let { local, init });
                 }
                 ast::Stmt::LetTuple { names, init, span } => {
@@ -9171,6 +9226,36 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
+        // `r.buffered()` (build a lookahead reader) / `r.read_line(b)` (streaming line read) on a
+        // `reader` (A7). Dispatched on the receiver type so the names stay free on other values.
+        // `buffered` here is the reader-value form; the `io.stdout.buffered()` constructor was
+        // already intercepted above (a `FieldAccess`, before the receiver is evaluated).
+        if matches!(method, "buffered" | "read_line") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::Reader {
+                return self.check_reader_buffered_method(recv, recv_expr, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.{method}()' is not a method on {} (it is a `reader` method)", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        // `bytes.as_str()` — the validating bytes→text VIEW (A7). Dispatched on a `bytes` (`slice<u8>`)
+        // receiver so the name stays free on other values.
+        if method == "as_str" {
+            let recv_expr = self.check_expr(recv, None);
+            if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
+                return self.check_bytes_as_str(recv_expr, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.as_str()' validates a `bytes` (slice<u8>) view into a `str`, but the receiver is {}", ty_name(recv_expr.ty)),
+                    span,
+                );
+            }
+            return err;
+        }
         // Binary **encode** on a `buffer`: `b.put_u32_le(v)` / `b.append(data)` (align-LLM runway
         // A2). Checked before the decode reads so a `put_`-prefixed name never falls through to the
         // read grammar. Both grow the buffer in place (a `mut buffer` local).
@@ -9954,6 +10039,7 @@ impl<'a, 't> Checker<'a, 't> {
         // enclosing function. Reset the loop stack for the lambda body, restoring it afterward.
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_bases = std::mem::take(&mut self.slice_bases);
+        let saved_buffered_readers = std::mem::take(&mut self.buffered_readers);
         let saved_capture = self.capture.take();
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
         self.arena_depth = 0;
@@ -10028,6 +10114,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.task_group_fallible = saved_tg_fallible;
         self.loops = saved_loops;
         self.slice_bases = saved_bases;
+        self.buffered_readers = saved_buffered_readers;
         self.capture = saved_capture;
         // A lambda must not return a function value: the returned closure's environment is
         // frame-local to *this* lifted function and would dangle once it returns (the same rule as
@@ -14382,6 +14469,72 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `r.buffered()` / `r.read_line(b: mut buffer)` on a `reader` ([`Ty::Reader`]), the receiver
+    /// already evaluated as `recv_expr` (and its AST as `recv`, for the buffered-provenance lookup).
+    ///
+    /// - `buffered()` **consumes** the reader (Move — like `array_builder.build()`) and yields a
+    ///   buffered `reader` over the same fd; no bound-local gate is needed (the result captures the
+    ///   fd's ownership, so even a temporary receiver leaks nothing). Its `let`-binding is what marks
+    ///   the new local as buffered (`init_is_buffered_reader`).
+    /// - `read_line(b)` **borrows** the reader and requires a **buffered** receiver — a bound local
+    ///   recorded in `buffered_readers`. An unbuffered reader (or a non-local receiver) is a clean
+    ///   sema error. Yields `Result<i64, Error>` (bytes consumed incl. terminator; `0` = EOF).
+    fn check_reader_buffered_method(&mut self, recv: &ast::Expr, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if method == "buffered" {
+            if !args.is_empty() {
+                self.diags.error(format!("'.buffered()' takes no arguments, got {}", args.len()), span);
+                return err;
+            }
+            return Expr { kind: ExprKind::ReaderBuffered { reader: Box::new(recv_expr) }, ty: Ty::Reader, span };
+        }
+        // `read_line`: the receiver must be a bound local built by `.buffered()`.
+        let is_buffered = self.place_local(recv).is_some_and(|(id, _)| self.buffered_readers.contains(&id));
+        if !is_buffered {
+            self.diags.error(
+                "read_line requires a buffered reader — call .buffered() first (`br := r.buffered()` then `br.read_line(...)`)".to_string(),
+                span,
+            );
+            return err;
+        }
+        if args.len() != 1 {
+            self.diags.error(format!("'.read_line()' takes 1 argument (a mut buffer), got {}", args.len()), span);
+            return err;
+        }
+        let buffer = self.check_expr(&args[0], Some(Ty::Buffer));
+        if buffer.ty == Ty::Error {
+            return err;
+        }
+        if buffer.ty != Ty::Buffer {
+            self.diags.error(format!("'.read_line()' fills a buffer, got {}", ty_name(buffer.ty)), args[0].span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ReaderReadLine { reader: Box::new(recv_expr), buffer: Box::new(buffer) },
+            ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `bytes.as_str()` on a `bytes` (`slice<u8>`) view ([`Ty::Slice`] of `u8`), the receiver already
+    /// evaluated. Validates the bytes are UTF-8 and yields a zero-copy `str` **view** of the same
+    /// storage (`Result<str, Error>`; `Error.Invalid` on bad UTF-8). The `str` inherits the receiver's
+    /// region (`region_of`), so a view of `buf.bytes()` stays pinned to the buffer — an escape past
+    /// its `Drop` is caught (#297). No binding restriction: the result borrows the same storage the
+    /// `bytes` view already did.
+    fn check_bytes_as_str(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !args.is_empty() {
+            self.diags.error(format!("'.as_str()' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        Expr {
+            kind: ExprKind::BytesAsStr { bytes: Box::new(recv_expr) },
+            ty: Ty::Result(Scalar::Str, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
     /// `f.pread(b: mut buffer, off)` / `f.pwrite(data, off)` / `f.len()` on a `file` ([`Ty::File`]),
     /// the receiver already evaluated. Each **borrows** the file (never consumed — no move-out) and
     /// yields `Result<i64, Error>` (`pread`/`len` a count, `pwrite` the full byte count written). A
@@ -15912,6 +16065,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(reader);
                 self.finalize_expr(buffer);
             }
+            ExprKind::ReaderReadLine { reader, buffer } => {
+                self.finalize_expr(reader);
+                self.finalize_expr(buffer);
+            }
+            ExprKind::ReaderBuffered { reader } => self.finalize_expr(reader),
+            ExprKind::BytesAsStr { bytes } => self.finalize_expr(bytes),
             ExprKind::IoCopy { reader, writer } => {
                 self.finalize_expr(reader);
                 self.finalize_expr(writer);
@@ -16285,6 +16444,19 @@ fn is_printable(ty: Ty) -> bool {
 }
 
 /// Map a method name to the builder writer it denotes (MMv2 slice 7c/7d), if any.
+/// Whether a `let` initializer produces a buffered `reader` (`r.buffered()`), seeing through
+/// `block`/`arena`/`unsafe` tails (its trailing expression is the value). `.buffered()` returns a
+/// `reader` (not a `Result`), so there is no `?` wrapper to unwrap here.
+fn init_is_buffered_reader(e: &hir::Expr) -> bool {
+    match &e.kind {
+        hir::ExprKind::ReaderBuffered { .. } => true,
+        hir::ExprKind::Block(b) | hir::ExprKind::Arena(b) | hir::ExprKind::Unsafe(b) => {
+            b.value.as_ref().is_some_and(|v| init_is_buffered_reader(v))
+        }
+        _ => false,
+    }
+}
+
 fn builder_write_kind(method: &str) -> Option<BuilderWriteKind> {
     Some(match method {
         "write" => BuilderWriteKind::Str,
