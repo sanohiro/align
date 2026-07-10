@@ -36,6 +36,10 @@ pub enum TokKind {
     Arena,
     TaskGroup,
     Match,
+    /// `loop` — the one sequential-control construct (`loop { ... break value }`). An expression.
+    Loop,
+    /// `break` — the only loop exit; `break expr` yields the enclosing loop's value.
+    Break,
     Template,
     /// `unsafe` — introduces an `unsafe { ... }` block, the only place `raw.*` ops are allowed.
     Unsafe,
@@ -99,6 +103,9 @@ impl TokKind {
                 | TokKind::RBrace
                 | TokKind::RBracket
                 | TokKind::Question
+                // A bare `break` (no value) at end of line terminates its statement, so a
+                // following statement is not mis-parsed as the break's value.
+                | TokKind::Break
         )
     }
 }
@@ -583,6 +590,8 @@ impl<'a> Lexer<'a> {
             "arena" => TokKind::Arena,
             "task_group" => TokKind::TaskGroup,
             "match" => TokKind::Match,
+            "loop" => TokKind::Loop,
+            "break" => TokKind::Break,
             "template" => TokKind::Template,
             "unsafe" => TokKind::Unsafe,
             "extern" => TokKind::Extern,

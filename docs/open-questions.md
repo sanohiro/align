@@ -2181,6 +2181,27 @@ protocol client cannot be written in Align source without it.
   each iteration (the existing `drop_old` machinery), and a per-iteration owned local carried out
   by `break` needs path-sensitive move-vs-drop (move on the break edge, drop on the back edge) —
   both reuse existing mechanisms, neither needs new spec text.
+- **Implemented 2026-07-10** (the design above shipped as code). Lexer `loop`/`break` keywords;
+  parser `loop` expression + `break` statement; `for`/`while`/`continue` rejected at statement
+  position with a pointer to `loop`/pipelines. Break-type unification reuses the `match`-arm
+  running-unify (a `LoopCtx` stack seeded from the loop's expected type; a break-less loop diverges
+  via `hir_expr_diverges`, like an all-diverging `match`). MIR lowers a header/back-edge/exit CFG;
+  per-iteration owned locals (body-declared ∩ `drop_locals`) are `Drop`+null-reset at the back-edge
+  and at each `break` (the moved-out break value is nulled first, so it is not double-freed). The
+  loop-back `MoveCheck` is a two-pass fixpoint: a suppressed probe pass finds the fall-through
+  (back-edge) moves, then the real pass runs from `entry ∪ back-edge` so a 2nd-iteration use of an
+  enclosing owned local moved by the 1st is caught; the post-loop state is the union of the `break`
+  snapshots. `break` cannot cross a lambda (the loop stack resets at each lambda body).
+  **Two deliberate deferrals, each cleanly rejected/conservative, not half-measures:** (1) a `break`
+  lexically inside an `arena`/`task_group` nested in the loop is rejected with a clear diagnostic
+  (the scoped region-unwind-on-break wiring is a separate slice); (2) the `break`-value escape rule
+  is enforced as "must be `Static`" (identical to the return-escape rule — a `break` leaves the loop
+  as a `return` leaves the function), which soundly rejects a view of a per-iteration owned local
+  but conservatively also rejects breaking an enclosing-arena / outer-frame view out of the loop
+  (`.clone()` to copy out) — loosening that is a future refinement. New tests:
+  `crates/align_driver/tests/loop_expr.rs`. The `expr_depth` headroom lesson recurred: the new
+  `lower_expr` arm is bindings-free and delegates to an out-of-line `#[inline(never)]` `lower_loop`,
+  and `MoveCheck`'s loop code is an out-of-line helper, so neither bloats its recursive frame.
 
 ### Spec-vacuum sweep — five settlements (2026-07-09)
 
@@ -2249,6 +2270,31 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
 ## Open (to be decided)
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
+
+### Bare array literal in a value position (general lowering gap)
+
+Surfaced by the `loop` adversarial review (2026-07-10). A bare array literal `[…]` is lowerable only
+as a `let` initializer or a pipeline source; in any other **value** position it reaches
+`lower_expr`'s `ArrayLit` arm and the `unreachable!` there panics the compiler (exit 101). The
+`loop` slice patched the `break` case (`check_break` now rejects a bare-array-literal `break` value
+with a sema diagnostic), but the same panic remains reachable via an `if`/`match` **arm** whose
+value is a bare array literal (e.g. `x := if c { [1, 2, 3] } else { … }`). Fix options: a general
+sema diagnostic rejecting a bare array literal in any free value position (bind it to a local /
+`.to_array()` first), or a generalized lowering that materializes it into a fresh frame slot.
+Two lower-priority review notes recorded alongside, both **not** defects: (1) a diverging (`break`-
+less) `loop` bound to a `str`-annotated `let` can report a type mismatch — consistent with existing
+diverging-value-position behavior (`return` in the same spot behaves the same), not loop-specific;
+(2) the `break`-escape diagnostic wording is a nit (it reuses the return-escape phrasing shape).
+
+**Separately found (pre-existing, loop-independent):** a plain block expression carrying an owned
+`let` in a **value position** — e.g. `take({ s := make_string(); s.len() })` as a call argument —
+miscompiles even with no loop (a loop-free program returns a garbage exit code, not `0`), so the
+owned local's frame-exit drop / block-value handling is wrong for blocks nested in call-arg / tuple /
+operand positions. Present on `main` before the `loop` work; it entangled with the `loop`
+per-iteration-drop review (the review's example rides this same broken feature). The `loop` slice's
+per-iteration drops are now correct regardless (the drop set is the body's declared-`LocalId` range
+∩ `drop_locals`, so a `let` at any nesting/position is captured); the block-in-value-position
+miscompile itself is the separate fix needed here.
 
 ### Unrecorded spec vacuums — remainder (recorded 2026-07-09; settle-next priority)
 

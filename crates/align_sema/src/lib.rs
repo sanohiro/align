@@ -2214,7 +2214,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
     let tuples: &[hir::TupleDef] = tuples;
     let structs: &[StructDef] = structs;
     for f in fns.iter_mut() {
-        MoveCheck { f, diags, tuples, structs }.check();
+        MoveCheck { f, diags, tuples, structs, loop_breaks: Vec::new() }.check();
         let region = {
             let mut ec = EscapeCheck {
                 f,
@@ -2358,8 +2358,8 @@ impl EffectScan {
                     self.expr(value);
                 }
                 Stmt::AssignVecLane { value, .. } => self.expr(value),
-                Stmt::Return(Some(e)) | Stmt::Expr(e) => self.expr(e),
-                Stmt::Return(None) => {}
+                Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.expr(e),
+                Stmt::Return(None) | Stmt::Break(None) => {}
             }
         }
         if let Some(v) = &b.value {
@@ -2807,7 +2807,7 @@ impl EffectScan {
                 self.expr(builder);
                 self.expr(arg);
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => self.block(b),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Loop { body: b, .. } => self.block(b),
             // An `unsafe {}` block (and any `raw.*` op) makes the function impure — it can never be a
             // Pure `par_map` callee. This is the "unsafe must be visible/traceable" rule, reusing the
             // existing binary purity flag (unsafe is conflated with I/O-impure for now).
@@ -3009,6 +3009,29 @@ impl<'a> EscapeCheck<'a> {
         if local_backed {
             self.diags.error(
                 "cannot return a slice that views a local array (it is freed when the function returns)".to_string(),
+                e.span,
+            );
+        }
+    }
+
+    /// Escape check for a `break` value: it leaves the loop just as a returned value leaves the
+    /// function, so it must be `Static` (a Frame/arena view — including a view into a per-iteration
+    /// owned local dropped at the `break` — would dangle). Same rule as [`check_return_escape`],
+    /// with a `break`-specific message.
+    fn check_break_escape(&mut self, e: &Expr, depth: u32) {
+        let r = self.region_of(e, depth);
+        let local_backed = matches!(e.ty, Ty::Slice(_)) && self.slice_is_local(e);
+        if self.region_bearing(e.ty) && !r.outlives(Region::Static) && !local_backed {
+            let msg = if r == Region::Frame {
+                "cannot `break` a view that borrows local storage out of the loop (it is dropped at the end of the iteration); use `.clone()` to break an owned value"
+            } else {
+                "cannot `break` a value allocated in an arena out of the loop (it is freed at block end); use `.clone()` to break an owned value"
+            };
+            self.diags.error(msg.to_string(), e.span);
+        }
+        if local_backed {
+            self.diags.error(
+                "cannot `break` a slice that views a local array out of the loop (it is freed at the end of the iteration)".to_string(),
                 e.span,
             );
         }
@@ -3349,6 +3372,12 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Call { args, .. } => args
                 .iter()
                 .fold(Region::Static, |acc, a| acc.shorter(self.region_of(a, depth))),
+            // A `loop` yields one of its `break` values (scattered as `Stmt::Break` in the body, not
+            // reachable from this node). Each is escape-checked directly (`check_break_escape`), which
+            // requires a `break` value to be `Static` — so the loop's value is provably `Static` here.
+            // (If the `break`-escape rule is ever loosened to let an arena/frame view escape the loop,
+            // this must become the shorter of the break values' regions instead.)
+            ExprKind::Loop { .. } => Region::Static,
             _ => Region::Static,
         }
     }
@@ -3416,6 +3445,12 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Arena(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
                 b.value.as_ref().is_some_and(|v| self.slice_is_local(v))
             }
+            // A `loop` yields one of its `break` values, but they are scattered as `Stmt::Break` in
+            // the body, not reachable from this node. Each `break` value is escape-checked directly
+            // (`check_break_escape`), which rejects a local-backed slice at the `break` — so a loop's
+            // value is provably never local-backed, and `false` here is sound. (If the `break`-escape
+            // rule is ever loosened to let a frame-local view escape the loop, revisit this arm.)
+            ExprKind::Loop { .. } => false,
             _ => false,
         }
     }
@@ -3556,6 +3591,17 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
+            // `break e` carries `e` out of the loop, so `e` escapes the loop exactly as a returned
+            // value escapes the function: it must be `Static`-region (a borrowed Frame/arena view
+            // would dangle — a per-iteration owned local is dropped at the `break`). Same rule and
+            // check as a return; `.clone()` copies a view out. (Loosening this to let an
+            // enclosing-arena / outer-frame view escape the loop is a future refinement.)
+            Stmt::Break(value) => {
+                if let Some(e) = value {
+                    self.walk(e, depth);
+                    self.check_break_escape(e, depth);
+                }
+            }
         }
     }
 
@@ -3598,6 +3644,9 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             ExprKind::Block(b) => self.block(b, depth),
+            // A `loop` opens no region (it is not an arena), so walk its body at the same depth. Its
+            // per-iteration `break`-escape rule is enforced per `Stmt::Break` in `stmt` above.
+            ExprKind::Loop { body, .. } => self.block(body, depth),
             // `unsafe {}` is a plain marker block for escape purposes — walk it at the same depth.
             ExprKind::Unsafe(b) => self.block(b, depth),
             // ④b: `task_group` opens a region (its task boxes live there), like `arena {}` — so a
@@ -4109,8 +4158,8 @@ impl UnnecessaryHeapScan {
             // Destructure binds fresh locals (definitions, and never `box` — no producer yields a
             // tuple of boxes); just visit the init.
             Stmt::LetTuple { init, .. } => self.visit(init),
-            Stmt::Return(Some(e)) | Stmt::Expr(e) => self.visit(e),
-            Stmt::Return(None) => {}
+            Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.visit(e),
+            Stmt::Return(None) | Stmt::Break(None) => {}
         }
     }
 
@@ -4150,7 +4199,7 @@ impl UnnecessaryHeapScan {
                 }
             }
             ExprKind::TupleIndex { recv, .. } => self.visit(recv),
-            ExprKind::Arena(b) | ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
+            ExprKind::Arena(b) | ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) | ExprKind::Loop { body: b, .. } => {
                 self.block(b);
             }
             ExprKind::Spawn { closure, .. } => self.visit(closure),
@@ -4541,7 +4590,9 @@ impl UnnecessaryHeapScan {
 /// evaluates does.
 fn hir_stmt_diverges(s: &hir::Stmt) -> bool {
     match s {
-        hir::Stmt::Return(_) => true,
+        // `return` leaves the function; `break` leaves the loop — either way control never falls
+        // through to the next statement in this block.
+        hir::Stmt::Return(_) | hir::Stmt::Break(_) => true,
         hir::Stmt::Let { init, .. } | hir::Stmt::LetTuple { init, .. } => hir_expr_diverges(init),
         hir::Stmt::Assign { value, .. } | hir::Stmt::AssignField { value, .. } => hir_expr_diverges(value),
         hir::Stmt::AssignIndex { index, value, .. }
@@ -4574,6 +4625,9 @@ fn hir_expr_diverges(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::If { then, els, .. } => hir_block_diverges(then) && hir_block_diverges(els),
         ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) => hir_block_diverges(b),
+        // A `loop` with no `break` never yields and control never reaches past it (it either loops
+        // forever or exits the function via `return`/`?`). A loop *with* a `break` may fall through.
+        ExprKind::Loop { diverges, .. } => *diverges,
         _ => false,
     }
 }
@@ -4590,6 +4644,10 @@ struct MoveCheck<'a> {
     /// Struct defs — so a Move struct (one that owns a `string`/owned field, transitively) is
     /// recognised as a Move type for use-after-move tracking (Slice 3).
     structs: &'a [StructDef],
+    /// Stack of enclosing `loop`s (innermost last). Each entry collects the moved-set snapshot at
+    /// every `break` bound to that loop; their union is the move state after the loop (code past a
+    /// loop runs only after a `break`, so a local moved on *any* break path is possibly-moved).
+    loop_breaks: Vec<Vec<MovedSet>>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -4641,6 +4699,50 @@ impl<'a> MoveCheck<'a> {
         match self.f.locals.get(id as usize).map(|l| l.ty) {
             Some(ty) => self.is_move_ty(ty),
             None => false,
+        }
+    }
+
+    /// Loop-back use-after-move analysis for `loop { body }`. See the call site in `expr` for the
+    /// full rationale. Kept `#[inline(never)]` so its large locals do not enlarge the recursive
+    /// `expr` stack frame.
+    #[inline(never)]
+    fn loop_moves(&mut self, body: &Block, moved: &mut MovedSet) {
+        let entry = moved.clone();
+        // Probe pass: discover which locals a fall-through iteration moves, with diagnostics
+        // suppressed by swapping in a throwaway sink (restored after).
+        let mut probe = entry.clone();
+        let mut sink = Diagnostics::new();
+        std::mem::swap(self.diags, &mut sink);
+        self.loop_breaks.push(Vec::new());
+        self.block(body, &mut probe, false, false);
+        self.loop_breaks.pop();
+        std::mem::swap(self.diags, &mut sink); // restore real diagnostics; discard probe's
+        // The back-edge is reached only on a fall-through path (one that neither `break`s nor
+        // `return`s). Conditional `break`/`return` moves are already excluded from `probe` by the
+        // `if`/`match` diverging-branch join; but if the body *always* diverges (an unconditional
+        // top-level `break`/`return`), it never falls through — there is no back-edge, so a value
+        // moved out by that lone `break` must not be seeded as moved for a (nonexistent) second
+        // iteration. `probe`'s end state includes it (statements are walked linearly), so zero the
+        // back-edge in that case.
+        let back_edge: MovedSet = if hir_block_diverges(body) {
+            MovedSet::new()
+        } else {
+            probe.difference(&entry).copied().collect()
+        };
+        // Real pass from the back-edge fixpoint, collecting `break` snapshots.
+        let mut body_state = &entry | &back_edge;
+        self.loop_breaks.push(Vec::new());
+        self.block(body, &mut body_state, false, false);
+        let breaks = self.loop_breaks.pop().expect("loop-break frame balanced");
+        // Code after the loop runs only after a `break`; a local moved on *any* break path is
+        // possibly-moved (union). A break-less loop diverges — the code after is unreachable, so
+        // leave `moved` unchanged.
+        if let Some((first, rest)) = breaks.split_first() {
+            let mut post = first.clone();
+            for b in rest {
+                post = &post | b;
+            }
+            *moved = post;
         }
     }
 
@@ -4702,6 +4804,17 @@ impl<'a> MoveCheck<'a> {
                 Stmt::AssignVecLane { value, .. } => self.expr(value, moved, false, false),
                 Stmt::Return(Some(e)) => self.expr(e, moved, true, true),
                 Stmt::Return(None) => {}
+                // `break e` moves `e` out of the loop, exactly like `return` moves a value out of the
+                // function (a direct, consuming move site). Then snapshot the move state for the
+                // loop's post-state union (`break` is the only way control reaches past the loop).
+                Stmt::Break(value) => {
+                    if let Some(e) = value {
+                        self.expr(e, moved, true, true);
+                    }
+                    if let Some(frame) = self.loop_breaks.last_mut() {
+                        frame.push(moved.clone());
+                    }
+                }
                 Stmt::Expr(e) => self.expr(e, moved, false, false),
                 // Destructure consumes its tuple source whole (see the `Local` arm in `expr`).
                 Stmt::LetTuple { locals, init, .. } => {
@@ -4986,6 +5099,22 @@ impl<'a> MoveCheck<'a> {
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
             ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.block(b, moved, consuming, direct),
+            // A `loop` runs its body repeatedly, so a value moved out of an *enclosing* (pre-loop)
+            // local by one iteration is already moved at the start of the next — a use there is a
+            // use-after-move on the loop back-edge. Two passes make this sound (moves are monotonic;
+            // control flow does not depend on move state, so one probe pass finds the exact back-edge
+            // set): (1) a **probe** pass with diagnostics suppressed discovers which locals a
+            // fall-through iteration moves (`break`/`return` paths diverge and are excluded from the
+            // fall-through by the `if`/`match`/`hir_*_diverges` machinery, so they never enter the
+            // back-edge); (2) the **real** pass runs from `entry ∪ back-edge`, so a back-edge-moved
+            // local seeded as already-moved is flagged when used/re-moved at the top of the body — and
+            // a per-iteration local (declared *inside* the body) is harmlessly re-cleared by its own
+            // `let` each pass, so it needs no special-casing. The body's tail value is discarded each
+            // iteration (non-consuming). Post-loop state is the union of the `break` snapshots.
+            // Extracted into an `#[inline(never)]` helper so its large locals — a `Diagnostics` sink
+            // and several `MovedSet`s — do not bloat this recursive `expr` frame (a deep expression
+            // chain would otherwise overflow the stack; see `expr_depth` test).
+            ExprKind::Loop { body, .. } => self.loop_moves(body, moved),
             // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.expr(e, moved, false, false),
             // `raw.load`/`raw.store` operands are Copy (raw ptr + int offset + scalar value), never moved.
@@ -5320,6 +5449,16 @@ impl<'a> MoveCheck<'a> {
     }
 }
 
+/// One enclosing `loop` while type-checking a function body. A `break` bound to this loop unifies
+/// its value type into `break_ty` (seeded from the loop's expected type), exactly like `match` arms
+/// running-unify their bodies. `arena_depth` records the `arena`/`task_group` nesting at loop entry
+/// so a `break` inside a region nested within the loop can be rejected (deferred — see `check_break`).
+struct LoopCtx {
+    break_ty: Option<Ty>,
+    saw_break: bool,
+    arena_depth: u32,
+}
+
 struct Checker<'a, 't> {
     diags: &'a mut Diagnostics,
     sigs: &'a HashMap<String, FnSig>,
@@ -5381,6 +5520,10 @@ struct Checker<'a, 't> {
     /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
     /// is caught even though `s` and `a` are different locals.
     slice_bases: std::collections::HashMap<LocalId, LocalId>,
+    /// Stack of enclosing `loop`s in the current function body (innermost last). A `break` binds to
+    /// the top; its value type is unified into the frame's `break_ty` (like `match` arms). Reset to
+    /// empty at a lambda boundary (a `break` cannot cross a lambda). `draft.md` §4.
+    loops: Vec<LoopCtx>,
     /// The enclosing function's name — used to generate unique names for lifted lambdas.
     cur_fn: String,
     /// The enclosing function's generic type-parameter names (`fn f<T, U>` → `["T", "U"]`); empty
@@ -5496,6 +5639,7 @@ impl<'a, 't> Checker<'a, 't> {
             wait_state: Vec::new(),
             task_group_fallible: Vec::new(),
             slice_bases: std::collections::HashMap::new(),
+            loops: Vec::new(),
             cur_fn: String::new(),
             type_params,
             param_bounds,
@@ -5982,6 +6126,12 @@ impl<'a, 't> Checker<'a, 't> {
                     // thread it via `expected` of the body block (M1: one level).
                     let v = value.as_ref().map(|e| self.check_expr(e, Some(self.ret_hint)));
                     stmts.push(Stmt::Return(v));
+                }
+                ast::Stmt::Break { value, span } => {
+                    // `break` binds to the innermost enclosing `loop`; its value type unifies into
+                    // the loop's value (`check_break`). Rejected outside a loop / across a lambda.
+                    let v = self.check_break(value.as_ref(), *span);
+                    stmts.push(Stmt::Break(v));
                 }
                 ast::Stmt::Expr(e) => {
                     let te = self.check_expr(e, None);
@@ -6536,6 +6686,7 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::Tuple(elems) => self.check_tuple(elems, expected, e.span),
             ast::ExprKind::TupleIndex { recv, index } => self.check_tuple_index(recv, *index, expected, e.span),
             ast::ExprKind::If { cond, then, els } => self.check_if(cond, then, els.as_deref(), expected, e.span),
+            ast::ExprKind::Loop(b) => self.check_loop(b, expected, e.span),
             ast::ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expected, e.span),
             ast::ExprKind::Block(b) => {
                 // A block that always returns never yields a value; let it take the
@@ -9225,6 +9376,9 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_tg_depth = self.task_group_depth;
         let saved_wait_state = std::mem::take(&mut self.wait_state);
         let saved_tg_fallible = std::mem::take(&mut self.task_group_fallible);
+        // A lambda body is a separate function: a `break` inside it cannot bind to a `loop` in the
+        // enclosing function. Reset the loop stack for the lambda body, restoring it afterward.
+        let saved_loops = std::mem::take(&mut self.loops);
         let saved_bases = std::mem::take(&mut self.slice_bases);
         let saved_capture = self.capture.take();
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
@@ -9298,6 +9452,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.task_group_depth = saved_tg_depth;
         self.wait_state = saved_wait_state;
         self.task_group_fallible = saved_tg_fallible;
+        self.loops = saved_loops;
         self.slice_bases = saved_bases;
         self.capture = saved_capture;
         // A lambda must not return a function value: the returned closure's environment is
@@ -14003,6 +14158,97 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::If { cond: Box::new(c), then: then_b, els: els_b }, ty, span }
     }
 
+    /// `loop { ... }` — the one sequential-control construct. Its value is the unified type of every
+    /// `break` bound to it (`break_ty`, seeded from `expected` and running-unified exactly like
+    /// `match` arms). A `loop` with no `break` **diverges**: it never yields, so — like a `match`
+    /// whose arms all diverge — it satisfies any expected type, and the code after it is unreachable.
+    /// The body's trailing value is discarded each iteration (checked with no expected type).
+    fn check_loop(&mut self, b: &ast::Block, expected: Option<Ty>, span: Span) -> Expr {
+        self.loops.push(LoopCtx { break_ty: expected, saw_break: false, arena_depth: self.arena_depth });
+        // The body is a per-iteration statement sequence: its tail value is discarded, so no
+        // expected type is threaded to it. `break` statements inside drive the loop's value.
+        // Bracket the body check with the `self.locals` length: every local declared inside the body
+        // (at any nesting / expression position; lifted lambdas swap their own `locals` in and out)
+        // lands in `[lo, hi)`. MIR intersects this with `drop_locals` for the per-iteration drops —
+        // robust without a per-`ExprKind` walk.
+        let lo = self.locals.len() as LocalId;
+        let body = self.check_block(b, None);
+        let hi = self.locals.len() as LocalId;
+        let body_locals = lo..hi;
+        let ctx = self.loops.pop().expect("loop context balanced");
+        if ctx.saw_break {
+            let ty = ctx.break_ty.unwrap_or(Ty::Unit);
+            self.constrain(ty, expected, span);
+            Expr { kind: ExprKind::Loop { body, diverges: false, body_locals }, ty, span }
+        } else {
+            // No `break`: the loop diverges. It yields no value, so it takes the expected type (like
+            // a diverging `match`) — the code after it is unreachable.
+            let ty = expected.unwrap_or(Ty::Unit);
+            Expr { kind: ExprKind::Loop { body, diverges: true, body_locals }, ty, span }
+        }
+    }
+
+    /// `break` / `break expr` — bind to the innermost enclosing `loop` and unify the value type into
+    /// its `break_ty` (running-unify like `match` arms; a bare `break` contributes `()`). Rejected
+    /// outside a loop, or when it would cross a lambda boundary (the `loops` stack is reset at each
+    /// lambda), or when it sits inside an `arena`/`task_group` nested within the loop (deferred).
+    fn check_break(&mut self, value: Option<&ast::Expr>, span: Span) -> Option<Expr> {
+        if self.loops.is_empty() {
+            self.diags.error(
+                "`break` outside of a `loop` (it cannot cross a lambda boundary; `?`/`return` exit the function instead)".to_string(),
+                span,
+            );
+            // Still check the value so nested errors surface; discard the result.
+            return value.map(|e| self.check_expr(e, None));
+        }
+        // Deferred: a `break` inside an `arena {}` / `task_group {}` that is itself inside the loop
+        // would have to unwind (bulk-free) those regions on the jump to the loop exit — the scoped
+        // region-cleanup-on-break wiring is a separate slice. Reject cleanly for now.
+        let loop_arena_depth = self.loops.last().unwrap().arena_depth;
+        if self.arena_depth > loop_arena_depth {
+            self.diags.error(
+                "a `break` inside an `arena`/`task_group` nested in the loop is not supported yet; move the `break` out of the region (restructure so the region ends before the `break`)".to_string(),
+                span,
+            );
+            return value.map(|e| self.check_expr(e, None));
+        }
+        // A bare array literal materializes only as a `let` initializer or pipeline source — MIR has
+        // no lowering for one in a free value position and would panic. A `break [..]` is such a
+        // position, so reject it and point at bind-then-break. (The same gap exists for a bare array
+        // literal in an `if`/`match` arm — a general limitation recorded in `open-questions.md`.)
+        if let Some(v) = value
+            && matches!(v.kind, ast::ExprKind::ArrayLit(_))
+        {
+            self.diags.error(
+                "a bare array literal cannot be a `break` value (a fixed `[…]` materializes only as a `let` initializer or pipeline source); bind it to a local first, then `break` the local".to_string(),
+                v.span,
+            );
+            self.loops.last_mut().unwrap().saw_break = true;
+            return Some(self.check_expr(v, None));
+        }
+        let expected = self.loops.last().unwrap().break_ty;
+        let v = value.map(|e| self.check_expr(e, expected));
+        let v_ty = v.as_ref().map(|x| x.ty).unwrap_or(Ty::Unit);
+        match expected {
+            // First break with a value fixes the loop's type (a present value was already
+            // constrained by `check_expr` above; a bare `break` contributes `()`).
+            None => {
+                if v_ty != Ty::Error {
+                    self.loops.last_mut().unwrap().break_ty = Some(v_ty);
+                }
+            }
+            // The type is already fixed. A present value was unified by `check_expr(e, Some(exp))`;
+            // a bare `break` still needs its `()` unified against the fixed type.
+            Some(exp) => {
+                if value.is_none() {
+                    self.unify(v_ty, exp, span);
+                }
+            }
+        }
+        self.loops.last_mut().unwrap().saw_break = true;
+        v
+    }
+
     // --- finalize ---
 
     /// A compile-time integer literal whose value provably does not fit its resolved type is a hard
@@ -14037,8 +14283,8 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(value);
                 }
                 Stmt::AssignVecLane { value, .. } => self.finalize_expr(value),
-                Stmt::Return(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
-                Stmt::Return(None) => {}
+                Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.finalize_expr(e),
+                Stmt::Return(None) | Stmt::Break(None) => {}
                 Stmt::LetTuple { init, .. } => self.finalize_expr(init),
             }
         }
@@ -14197,7 +14443,7 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(f);
                 }
             }
-            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => self.finalize_block(b),
+            ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) | ExprKind::Loop { body: b, .. } => self.finalize_block(b),
             ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => self.finalize_expr(e),
             ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
                 self.finalize_expr(ptr);
@@ -14702,8 +14948,8 @@ fn walk_block(b: &ast::Block, out: &mut std::collections::HashSet<String>) {
                 walk_expr(place, out);
                 walk_expr(value, out);
             }
-            ast::Stmt::Return(Some(e)) | ast::Stmt::Expr(e) => walk_expr(e, out),
-            ast::Stmt::Return(None) => {}
+            ast::Stmt::Return(Some(e)) | ast::Stmt::Break { value: Some(e), .. } | ast::Stmt::Expr(e) => walk_expr(e, out),
+            ast::Stmt::Return(None) | ast::Stmt::Break { value: None, .. } => {}
         }
     }
     if let Some(tail) = &b.tail {
@@ -14748,7 +14994,7 @@ fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
                 walk_expr(e, out);
             }
         }
-        K::Block(b) | K::Arena(b) | K::TaskGroup(b) | K::Unsafe(b) => walk_block(b, out),
+        K::Block(b) | K::Arena(b) | K::TaskGroup(b) | K::Unsafe(b) | K::Loop(b) => walk_block(b, out),
         K::StructLit { name, fields } => {
             if let Some(prefix) = path_module_prefix(name) {
                 out.insert(prefix);
