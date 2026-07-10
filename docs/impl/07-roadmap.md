@@ -1754,9 +1754,17 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
   Mandatory tests: a builder declared outside a `loop` body survives per-iteration drops
   (#402 `body_locals` range); capture into `par_map`/`spawn` rejected (`ty_capture_is_move`).
   *(general — the natural `loop` accumulate-unknown-count output)*
-- **Slice A7 — streaming line reads (design SETTLED 2026-07-11; two-critic review, Fable
-  synthesis).** Consumer = the multi-GB `expert_trace.jsonl` per-line decode loop (align-LLM
-  Phase 2); *(general — any log/JSONL/record processing)*.
+- **Slice A7 — streaming line reads — DONE (2026-07-11).** Shipped exactly the settled record:
+  `r.buffered()` (the read dual of the buffered writer — a per-local buffered-provenance set in sema
+  statically enforces the buffered receiver, both stay `Ty::Reader`), `r.read_line(b: mut buffer)`
+  (memchr-scanned, refill across boundaries, one `\r?\n` stripped, grows to a 64 MiB cap →
+  `Error.Invalid`, `0` = EOF), the interleaving contract (a buffered `read` drains the lookahead
+  first; unbuffered path byte-identical), and the generic `bytes.as_str()` validating region-bound
+  view. New runtime FFI: `align_rt_io_reader_buffered` / `_read_line` / `align_rt_bytes_as_str`; new
+  HIR/Rvalues `ReaderBuffered`/`ReaderReadLine`/`BytesAsStr` registered through every sema pass +
+  the MIR/codegen `#[inline(never)]` dispatchers (the #296 expr-depth budget held at 5/5). Consumer
+  = the multi-GB `expert_trace.jsonl` per-line decode loop (align-LLM Phase 2); *(general — any
+  log/JSONL/record processing)*.
   - **Prerequisite half: the buffered READER.** The shipped `reader` is a bare fd handle;
     line reading needs lookahead (bytes past the `\n` must survive to the next call), and
     hidden lookahead bolted onto the raw reader would silently corrupt `read`/`read_line`
