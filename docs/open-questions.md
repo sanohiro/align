@@ -2373,10 +2373,17 @@ fast; "spec-debt" = no decision needed, just transcribe implemented truth into `
 
 ### align-LLM runway — std/language items pulled by the inference-engine north star (recorded 2026-07-09)
 
-The owner's align-LLM spec (v0.4, out-of-repo; see Future → "Resource-oriented north star +
-local LLM inference") is the planned killer app: a GGUF-input, tiered-memory (VRAM/DRAM/NVMe),
-PGO-relayout local LLM inference engine, Phases 0–4 of which (GGUF inspect / expert trace
-aggregation / cache simulator / alignpack generation) are pure data-oriented Align programs.
+The owner's align-LLM spec (**v1.0 FINAL as of 2026-07-11**, out-of-repo; see Future →
+"Resource-oriented north star + local LLM inference") is the planned killer app: a GGUF-input,
+tiered-memory (VRAM/DRAM/NVMe), PGO-relayout local LLM inference engine, Phases 0–4 of which
+(GGUF inspect / expert trace aggregation / cache simulator / alignpack generation) are pure
+data-oriented Align programs. **v1.0 confirms the A-list unchanged** — Phase 0 is READY on
+A1–A3 (the spec's §13.1 bytes API shipped as A2's method form), Phase 4 = A4, Phase 2 = A6+A7,
+the gateway = A5-SSE + A8 — and adds one watch item: `json.encode` is flat-struct-only while
+the gateway's OpenAI-compatible chat-completion payloads are nested; deferred until that
+consumer arrives (builder/template can hand-build JSON in v1). The engine's tokenizer +
+prefix-token hashing needs are covered by borrowed-via-FFI tokenizers and the shipped
+`hash64/128`, not new language surface.
 Working backward from it yields three lists. Items marked *(general)* are ordinary
 fast-systems-programming needs that any Align user hits, not engine-specific.
 
