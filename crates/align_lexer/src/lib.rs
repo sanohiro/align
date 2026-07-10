@@ -362,7 +362,7 @@ impl<'a> Lexer<'a> {
         let mut s = String::new();
         loop {
             match self.peek() {
-                None | Some(b'\n') => {
+                None | Some(b'\n' | b'\r') => {
                     diags.error("unterminated string literal".to_string(), self.span(start, self.pos));
                     break;
                 }
@@ -374,25 +374,12 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                     // A `\` immediately before EOF or a newline: the string is unterminated. Report
                     // that (once), rather than misreporting the absent escaped char as `'\?'`.
-                    if matches!(self.peek(), None | Some(b'\n')) {
+                    if matches!(self.peek(), None | Some(b'\n' | b'\r')) {
                         diags.error("unterminated string literal".to_string(), self.span(start, self.pos));
                         break;
                     }
-                    let e = self.peek();
-                    self.pos += 1;
-                    match e {
-                        Some(b'n') => s.push('\n'),
-                        Some(b't') => s.push('\t'),
-                        Some(b'r') => s.push('\r'),
-                        Some(b'0') => s.push('\0'),
-                        Some(b'\\') => s.push('\\'),
-                        Some(b'"') => s.push('"'),
-                        other => {
-                            diags.error(
-                                format!("unknown string escape: '\\{}'", other.map(|b| b as char).unwrap_or('?')),
-                                self.span(start, self.pos),
-                            );
-                        }
+                    if let Some(ch) = self.lex_escape("string", diags) {
+                        s.push(ch);
                     }
                 }
                 Some(_) => {
@@ -434,23 +421,15 @@ impl<'a> Lexer<'a> {
         let ch = match self.peek() {
             Some(b'\\') => {
                 self.pos += 1;
-                let e = self.peek();
-                self.pos += 1;
-                match e {
-                    Some(b'n') => '\n',
-                    Some(b't') => '\t',
-                    Some(b'r') => '\r',
-                    Some(b'0') => '\0',
-                    Some(b'\\') => '\\',
-                    Some(b'\'') => '\'',
-                    other => {
-                        diags.error(
-                            format!("unknown character escape: '\\{}'", other.map(|b| b as char).unwrap_or('?')),
-                            self.span(start, self.pos),
-                        );
-                        '\u{FFFD}'
-                    }
+                if matches!(self.peek(), None | Some(b'\n' | b'\r')) {
+                    diags.error("unterminated character literal".to_string(), self.span(start, self.pos));
+                    return;
                 }
+                self.lex_escape("character", diags).unwrap_or('\u{FFFD}')
+            }
+            None | Some(b'\n' | b'\r') => {
+                diags.error("unterminated character literal".to_string(), self.span(start, self.pos));
+                return;
             }
             Some(_) => {
                 // Decode one UTF-8 scalar from the remaining bytes.
@@ -481,20 +460,104 @@ impl<'a> Lexer<'a> {
                     }
                 }
             }
-            None => {
-                diags.error("unterminated character literal".to_string(), self.span(start, self.pos));
-                return;
-            }
         };
-        if self.peek() == Some(b'\'') {
-            self.pos += 1;
-        } else {
-            diags.error(
-                "character literal must contain exactly one character".to_string(),
-                self.span(start, self.pos),
-            );
+        match self.peek() {
+            Some(b'\'') => self.pos += 1,
+            None | Some(b'\n' | b'\r') => {
+                diags.error("unterminated character literal".to_string(), self.span(start, self.pos));
+            }
+            _ => {
+                diags.error(
+                    "character literal must contain exactly one character".to_string(),
+                    self.span(start, self.pos),
+                );
+            }
         }
         self.push(TokKind::Char(ch as u32), start);
+    }
+
+    /// Decode one escape after the leading backslash has already been consumed.
+    ///
+    /// The accepted set is the spec's closed set: `\n \t \r \0 \\ \" \' \u{...}`. Unknown escapes
+    /// are errors, and the lexer recovers by consuming the escaped byte and returning no character.
+    fn lex_escape(&mut self, literal: &str, diags: &mut Diagnostics) -> Option<char> {
+        let esc_start = self.pos;
+        let e = self.peek()?;
+        self.pos += 1;
+        match e {
+            b'n' => Some('\n'),
+            b't' => Some('\t'),
+            b'r' => Some('\r'),
+            b'0' => Some('\0'),
+            b'\\' => Some('\\'),
+            b'"' => Some('"'),
+            b'\'' => Some('\''),
+            b'u' => self.lex_unicode_escape(literal, esc_start, diags),
+            other => {
+                diags.error(
+                    format!("unknown {literal} escape: '\\{}'", display_escape_byte(other)),
+                    self.span(esc_start - 1, self.pos),
+                );
+                None
+            }
+        }
+    }
+
+    /// Decode the `{...}` tail of a `\u{...}` escape. `esc_start` points at the `u` byte.
+    fn lex_unicode_escape(&mut self, literal: &str, esc_start: usize, diags: &mut Diagnostics) -> Option<char> {
+        if self.peek() != Some(b'{') {
+            diags.error(
+                format!("invalid {literal} unicode escape: expected '{{' after '\\u'"),
+                self.span(esc_start - 1, self.pos),
+            );
+            return None;
+        }
+        self.pos += 1; // '{'
+        let digits_start = self.pos;
+        while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+            self.pos += 1;
+        }
+        let digit_count = self.pos - digits_start;
+        if digit_count == 0 {
+            diags.error(
+                format!("invalid {literal} unicode escape: expected 1-6 hex digits"),
+                self.span(esc_start - 1, self.pos),
+            );
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+            }
+            return None;
+        }
+        if digit_count > 6 {
+            diags.error(
+                format!("invalid {literal} unicode escape: expected at most 6 hex digits"),
+                self.span(esc_start - 1, self.pos),
+            );
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+            }
+            return None;
+        }
+        if self.peek() != Some(b'}') {
+            diags.error(
+                format!("invalid {literal} unicode escape: expected '}}'"),
+                self.span(esc_start - 1, self.pos),
+            );
+            return None;
+        }
+        self.pos += 1; // '}'
+        let digits = std::str::from_utf8(&self.src[digits_start..digits_start + digit_count]).unwrap_or("");
+        let value = u32::from_str_radix(digits, 16).unwrap_or(0x11_0000);
+        match char::from_u32(value) {
+            Some(ch) => Some(ch),
+            None => {
+                diags.error(
+                    format!("invalid {literal} unicode escape: not a Unicode scalar value"),
+                    self.span(esc_start - 1, self.pos),
+                );
+                None
+            }
+        }
     }
 
     fn lex_ident(&mut self, start: usize) {
@@ -617,6 +680,14 @@ fn is_ident_continue(c: u8) -> bool {
     c == b'_' || c.is_ascii_alphanumeric()
 }
 
+fn display_escape_byte(b: u8) -> String {
+    if b.is_ascii_graphic() || b == b' ' {
+        (b as char).to_string()
+    } else {
+        format!("byte 0x{b:02x}")
+    }
+}
+
 /// If `text` ends in a numeric type-suffix tail — `i`/`u`/`f` then ASCII digits, preceded by at
 /// least one digit (`10i32`, `FFu8`) — split it into `(leading_digits, suffix)`. Used to give the
 /// "suffixes are not supported; use `as`" hint for a radix literal whose digits failed to parse.
@@ -674,6 +745,42 @@ mod tests {
         let es = errs("\"abc\\");
         assert!(es.iter().any(|m| m.contains("unterminated string literal")), "got {es:?}");
         assert!(!es.iter().any(|m| m.contains("unknown string escape")), "no bogus escape error, got {es:?}");
+    }
+
+    #[test]
+    fn literal_escape_set_matches_the_spec() {
+        assert_eq!(
+            kinds("\"\\n\\t\\r\\0\\\\\\\"\\'\\u{41}\\u{1F600}\"\n"),
+            vec![
+                TokKind::Str("\n\t\r\0\\\"'A😀".into()),
+                TokKind::End,
+                TokKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("'\\u{3042}'\n"),
+            vec![TokKind::Char('あ' as u32), TokKind::End, TokKind::Eof]
+        );
+        assert_eq!(
+            kinds("'\\\"'\n"),
+            vec![TokKind::Char('"' as u32), TokKind::End, TokKind::Eof]
+        );
+    }
+
+    #[test]
+    fn invalid_literal_escapes_are_diagnosed() {
+        let es = errs("\"\\x\" '\\u{}' '\\u{110000}' '\\u{1234567}'");
+        assert!(es.iter().any(|m| m.contains("unknown string escape: '\\x'")), "got {es:?}");
+        assert!(es.iter().any(|m| m.contains("expected 1-6 hex digits")), "got {es:?}");
+        assert!(es.iter().any(|m| m.contains("not a Unicode scalar value")), "got {es:?}");
+        assert!(es.iter().any(|m| m.contains("expected at most 6 hex digits")), "got {es:?}");
+    }
+
+    #[test]
+    fn raw_newlines_make_string_and_char_literals_unterminated() {
+        let es = errs("\"a\n'c\n");
+        assert!(es.iter().any(|m| m.contains("unterminated string literal")), "got {es:?}");
+        assert!(es.iter().any(|m| m.contains("unterminated character literal")), "got {es:?}");
     }
 
     #[test]
