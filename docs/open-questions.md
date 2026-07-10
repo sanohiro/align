@@ -2437,7 +2437,15 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    read-at-X-write-at-Y relayout tool; sequential readers can't express it. *(general)*
 5. **`std.http` server slice (Slice 4) + streaming (SSE/chunked) response write** — the
    align-gateway is an OpenAI-compatible SSE-streaming local server; Slice 4's design should be
-   written against that requirement.
+   written against that requirement. **Slice-4 surface SETTLED 2026-07-10** (two-lens design
+   review; full record in `http.md` Signatures + slice plan): `serve`/`accept`/`response_builder`/
+   `ctx.respond`. The SSE commitment is pinned: streaming lands as a **sibling op**
+   `ctx.respond_stream(rb) -> Result<http_stream, Error>` with Move `http_stream.send(chunk)` +
+   Drop-terminates (needs a chunked *write* path; the v1 surface already admits it — `.body()` is
+   optional). Two recorded prerequisites: **Move-capture-into-spawn** for *concurrent* serving
+   (v1 = sequential accept loop, sufficient for the single-GPU gateway; distinct from the deferred
+   fully-escaping fn values), and the v1 server's **trusted-network security caveat** (no read
+   deadline → slow-loris DoS; recorded in `http.md` Known v1 limitations).
 6. **Growable `array<T>`** *(general)* — the missing sibling of `buffer` (which stays
    byte-specialized per the settled `bytes`/`buffer` design): push/append + freeze to owned
    `array<T>`. Becomes acute the moment `loop` lands (accumulate-unknown-count is the natural

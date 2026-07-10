@@ -32,18 +32,35 @@ r.body(data: bytes)
 resp.status() -> i64
 resp.header(name: str) -> Option<str>       // view into resp
 resp.body() -> bytes                         // view into resp (region-bound)
-// Server primitive (not a framework)
+// Server primitive (not a framework) — surface settled 2026-07-10 (two-lens design review)
 srv := http.serve(host: str, port: i64) -> Result<http_server, Error>
 srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response
+ctx.method() -> str                          // view into ctx (region-bound)
+ctx.path() -> str                            // view into ctx (region-bound)
+ctx.header(name: str) -> Option<str>         // view into ctx (region-bound)
+ctx.body() -> bytes                          // view into ctx (region-bound)
+rb := http.response(status: i64)             // response_builder (Move — owns header list + body buf;
+                                             // the build-dual of `request`; named apart from the
+                                             // parsed read-view `response`)
+rb.header(name: str, value: str)             // bound receiver; CR/LF/NUL aborts (P6)
+rb.body(data: bytes)                         // optional — a header-only response is legal
+ctx.respond(rb) -> Result<(), Error>         // consumes BOTH ctx and rb; one-write serialize (R4);
+                                             // closes the accepted fd (v1: one request per conn)
 // Batched client (the rail — moved here from net; see Concurrency in net.md)
 cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, Error>
 ```
 
 ## Type & ownership classification
 
-- `client`, `request`, `http_server`, `http_request_ctx` are **Move types** (own pooled conns /
-  header lists / body buffers / the accepted socket). reader/writer Move precedent + the net Move
-  types they wrap.
+- `client`, `request`, `http_server`, `http_request_ctx`, `response_builder` are **Move types**
+  (own pooled conns / header lists / body buffers / the listening or accepted socket). reader/writer
+  Move precedent + the net Move types they wrap. `response_builder` is deliberately a distinct type
+  from the parsed read-view `response`: build (header-list → serialize) and parse (offset-table →
+  views) never share a usage site, so one overloaded type would add an internal Parsed|Built branch
+  to every getter for zero convergence gain. The symmetry that matters is by direction and holds:
+  `response_builder` ≅ `request` (builders), `http_request_ctx` reads ≅ `response` reads (views).
+- `ctx.method()/path()/header()/body()` return **views region-bound to ctx** (#297 arm), the exact
+  read-duals of `resp.status()/header()/body()`.
 - `response` owns its header block + body buffer (Move); `resp.header()`/`resp.body()` return
   **views region-bound to resp** (#297-aware `region_of` arm — same as net's borrowed
   reader/writer and `json.decode`).
@@ -164,11 +181,57 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    Tests: `align_runtime` units (pool reuses one conn across 3 gets; `Connection: close` not pooled;
    stale-conn retry; `http_head_keep_alive` decision table) + a driver test (two gets reuse one conn,
    observed via the server's accept count).
-4. server primitive (serve/accept, caller writes response).
+4. server primitive (serve/accept, caller writes response). **Surface settled 2026-07-10** (two
+   independent design reviews: language-purity lens + systems-evolution lens; both ratified — full
+   surface in Signatures above). The settled decisions:
+   - **Response building = `response_builder`** (`http.response(status)` + `.header` + `.body` +
+     `ctx.respond(rb)`), the exact mirror of the client `request` builder — status is a
+     construction-time field like method/url; an args-form `respond(status, headers, body)` is
+     inexpressible (no varargs/dict literal) and a header-less `respond(status, body)` is too
+     limited for a primitive (no Content-Type).
+   - **`respond` consumes both ctx and rb** (precedent: `cl.request(req)` consumes its Move `req`):
+     statically forbids respond-twice and use-after-close; one-write serialize (R4).
+   - **Auto-header policy (mirror of client serialize):** auto `Content-Length` iff a body was set;
+     caller-supplied Content-Length rejected (smuggling guard); **no auto Date/Server** — editorial
+     headers are the caller's (framework = pkg territory).
+   - **v1 = one request per accepted connection** (`respond` closes the fd). Server-side keepalive
+     later lands invisibly behind this surface: `respond`'s close becomes close-or-pool per the
+     client Slice-3 reuse-verdict mirror, and `accept()` yields the next request off a kept-alive
+     conn — no signature change (the ZST→pool precedent).
+   - **`http_parse_request_head` is NEW** (the response head parser keys on `HTTP/` + status and is
+     not reusable for `METHOD SP target SP HTTP/1.1`). The Incomplete/Invalid streaming split, the
+     header-block scan, and the caps (256 KiB head / 128 headers / 1 GiB body) ARE reused. The
+     server parse side MUST add the five inbound smuggling guards the client-lenient response
+     parser lacks: (1) strict CRLF line endings — reject bare LF; (2) reject whitespace between
+     field-name and colon (RFC 9110 server MUST); (3) reject Content-Length + Transfer-Encoding
+     together (TE alone already → `Error.Invalid`, CL-only framing); (4) explicit target forms —
+     accept origin-form (`/path`), reject absolute-/authority-/asterisk-form with `Error.Invalid`
+     (v1); (5) mirror the serialize-side method-token + CR/LF/NUL guards on the inbound line.
+   - **Concurrency: v1 is a sequential accept→respond loop.** `spawn` captures are Copy/scalar-only
+     today, so a Move ctx cannot cross into a task — **Move-capture-into-spawn is the recorded
+     prerequisite for concurrent serving** (tied to that consumer; not a Slice-4 blocker — the A5
+     single-GPU gateway serializes inference anyway).
+   - **SSE/streaming (runway A5) is committed to land as a sibling op, not a change to `respond`:**
+     future `ctx.respond_stream(rb) -> Result<http_stream, Error>` (rb built header-only) with Move
+     `http_stream.send(chunk) -> Result<(), Error>` + Drop = terminal chunk + close. Needs a
+     chunked **write** path (new, non-conflicting with CL-only parse). The v1 surface already
+     admits it (`.body()` is optional), so nothing is painted in.
+   - **R-requirements: R1/R2/R4 apply and are required** (zero-copy request offset table; memchr
+     scan; one-write respond). No server bench gate in v1 — a light accept→respond round-trip bench
+     arrives with keepalive/concurrency, where a reuse path first exists.
 5. [DEFERRED to post-TLS] HTTPS via the FFI TLS wrapper.
 
 ## Known v1 limitations (Slice 2/3)
 
+- **SERVER-SIDE ESCALATION of the timeout gap (Slice 4, security caveat — settled 2026-07-10).**
+  On the client the missing I/O deadline is a robustness gap; on the **server** it is a security
+  boundary: one slow-loris client (connects, then stalls or dribbles below the caps) holds the
+  single blocking accept thread forever — with v1's sequential accept loop that is a trivial
+  whole-server denial of service. **The v1 server primitive is therefore unsafe on untrusted
+  networks**; its recorded trust assumption is a **localhost / trusted-network gateway** (the
+  align-LLM runway A5 consumer), where slow-loris is out of the threat model. A read/accept
+  deadline is the **first post-v1 server hardening**, ranked above the client-side timeout note
+  below.
 - **No read/connect I/O timeout (G3-1, medium, inherited) — DELIBERATELY DEFERRED past Slice 3.**
   A server that completes the TCP handshake then stalls — sends nothing, dribbles bytes below the
   caps, or sends fewer than `Content-Length` and holds the socket open — blocks the calling thread
