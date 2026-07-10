@@ -6197,12 +6197,26 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
 
-        let value = b
-            .tail
-            .as_ref()
-            .map(|e| Box::new(self.check_expr(e, expected)));
+        let value = b.tail.as_ref().map(|e| {
+            self.reject_bare_array_value(e, expected, "block value");
+            Box::new(self.check_expr(e, expected))
+        });
         self.scope.truncate(scope_mark);
         Block { stmts, value }
+    }
+
+    fn reject_bare_array_value(&mut self, e: &ast::Expr, expected: Option<Ty>, context: &str) -> bool {
+        if matches!(expected.map(|t| self.resolve(t)), Some(Ty::Vec(..))) {
+            return false;
+        }
+        if matches!(e.kind, ast::ExprKind::ArrayLit(_)) {
+            self.diags.error(
+                format!("a bare array literal cannot be used as a {context} (a fixed `[…]` materializes only as a `let` initializer, slice borrow, or pipeline source); bind it to a local first"),
+                e.span,
+            );
+            return true;
+        }
+        false
     }
 
     /// The declared bound of type parameter `i` in the function being checked.
@@ -14098,6 +14112,7 @@ impl<'a, 't> Checker<'a, 't> {
             };
             // Each arm body is checked against the running result type, so the constraint (and any
             // mismatch error) comes from `check_expr`; the first non-error arm fixes the type.
+            self.reject_bare_array_value(&arm.body, result_ty, "`match` arm value");
             let body = self.check_expr(&arm.body, result_ty);
             if result_ty.is_none() && body.ty != Ty::Error {
                 result_ty = Some(body.ty);
@@ -14139,6 +14154,7 @@ impl<'a, 't> Checker<'a, 't> {
             Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block(b, expected),
             Some(e) => {
                 // `else if` chain: check as an expression and wrap as a block value.
+                self.reject_bare_array_value(e, expected, "`else` value");
                 let v = self.check_expr(e, expected);
                 Block { stmts: Vec::new(), value: Some(Box::new(v)) }
             }
@@ -14212,21 +14228,15 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return value.map(|e| self.check_expr(e, None));
         }
-        // A bare array literal materializes only as a `let` initializer or pipeline source — MIR has
-        // no lowering for one in a free value position and would panic. A `break [..]` is such a
-        // position, so reject it and point at bind-then-break. (The same gap exists for a bare array
-        // literal in an `if`/`match` arm — a general limitation recorded in `open-questions.md`.)
+        // A bare array literal materializes only as a `let` initializer, slice borrow, or pipeline
+        // source — MIR has no lowering for one in a free value position and would panic.
+        let expected = self.loops.last().unwrap().break_ty;
         if let Some(v) = value
-            && matches!(v.kind, ast::ExprKind::ArrayLit(_))
+            && self.reject_bare_array_value(v, expected, "`break` value")
         {
-            self.diags.error(
-                "a bare array literal cannot be a `break` value (a fixed `[…]` materializes only as a `let` initializer or pipeline source); bind it to a local first, then `break` the local".to_string(),
-                v.span,
-            );
             self.loops.last_mut().unwrap().saw_break = true;
             return Some(self.check_expr(v, None));
         }
-        let expected = self.loops.last().unwrap().break_ty;
         let v = value.map(|e| self.check_expr(e, expected));
         let v_ty = v.as_ref().map(|x| x.ty).unwrap_or(Ty::Unit);
         match expected {

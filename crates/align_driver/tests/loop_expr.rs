@@ -139,7 +139,7 @@ fn a_bare_array_literal_break_value_is_a_clean_error_not_a_panic() {
     // `break [1, 2, 3]` must be a sema diagnostic, never a compiler panic.
     let src = "fn main() {\n  x := loop {\n    break [1, 2, 3]\n  }\n  print(x[0])\n}\n";
     let out = check_diagnostics("loop-bare-array", src);
-    assert!(out.contains("bare array literal cannot be a `break` value"), "expected a clean bare-array-literal error:\n{out}");
+    assert!(out.contains("bare array literal cannot be used as a `break` value"), "expected a clean bare-array-literal error:\n{out}");
 }
 
 #[test]
