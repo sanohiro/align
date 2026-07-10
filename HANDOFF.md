@@ -5,7 +5,21 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10, third wave (**#408 MERGED — `Ord(str)` + `else` on `Result`**, the last
+_Last updated: 2026-07-10, fourth wave (**#409 MERGED — std.http Slice 4, the server primitive**:
+`http.serve`/`srv.accept`/`http.response(status)` → `response_builder`/`ctx.respond(rb)`
+double-consume one-write; the surface was **settled the same day by a two-lens design review**
+(record: http.md Signatures + slice-plan item 4, commit 3ee3ad7 + ja mirror 3524fde) after the
+implementer correctly STOPped on the undesigned response surface. NEW `http_parse_request_head`
+with the five inbound smuggling guards (+ gemini hardening: RFC-token header names, CR/NUL-clean
+values, digits-only Content-Length, alloc-free status line); 3 new Move types full-twin-mirrored;
+dogfood test = compiled Align client ↔ Align server over loopback; fd-leak-free proven via
+/proc/self/fd; expr-depth 5/5 kept. v1 limits recorded: sequential accept loop
+(Move-capture-into-spawn = the concurrency prerequisite), trusted-network caveat (no read
+deadline → slow-loris), SSE = future sibling op `respond_stream` (runway A5 landing pinned).
+Known follow-up: the CLIENT response parser has the same Content-Length `+` hole
+(align_runtime lib.rs ~9149) — matters for keepalive-pool framing. `cargo test --workspace`
+**1719 green**, clippy clean. Next std.http: Slice 5 (HTTPS/TLS) + `get_many` (R5). Earlier same
+day, third wave — **#408 MERGED — `Ord(str)` + `else` on `Result`**, the last
 2026-07-09 owed implementation delta: byte-lexicographic `<`/`<=`/`>`/`>=` on `str` via
 `align_rt_str_cmp` + `sort_by_key` str keys (owned-`string` ordering and bare `sort()` on str arrays
 stay deferred per the record); `else` accepts `Result<T,E>` — shared `ElseUnwrap` node so every
