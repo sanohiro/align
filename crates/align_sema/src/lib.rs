@@ -6198,7 +6198,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
 
         let value = b.tail.as_ref().map(|e| {
-            self.reject_bare_array_value(e, expected, "block value");
+            self.reject_bare_array_value(e, expected, "a block value");
             Box::new(self.check_expr(e, expected))
         });
         self.scope.truncate(scope_mark);
@@ -6206,12 +6206,12 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn reject_bare_array_value(&mut self, e: &ast::Expr, expected: Option<Ty>, context: &str) -> bool {
-        if matches!(expected.map(|t| self.resolve(t)), Some(Ty::Vec(..))) {
+        if matches!(expected.map(|t| self.resolve(t)), Some(Ty::Error | Ty::Vec(..))) {
             return false;
         }
         if matches!(e.kind, ast::ExprKind::ArrayLit(_)) {
             self.diags.error(
-                format!("a bare array literal cannot be used as a {context} (a fixed `[…]` materializes only as a `let` initializer, slice borrow, or pipeline source); bind it to a local first"),
+                format!("a bare array literal cannot be used as {context} (a fixed `[…]` materializes only as a `let` initializer, slice borrow, or pipeline source); bind it to a local first"),
                 e.span,
             );
             return true;
@@ -14112,7 +14112,7 @@ impl<'a, 't> Checker<'a, 't> {
             };
             // Each arm body is checked against the running result type, so the constraint (and any
             // mismatch error) comes from `check_expr`; the first non-error arm fixes the type.
-            self.reject_bare_array_value(&arm.body, result_ty, "`match` arm value");
+            self.reject_bare_array_value(&arm.body, result_ty, "a `match` arm value");
             let body = self.check_expr(&arm.body, result_ty);
             if result_ty.is_none() && body.ty != Ty::Error {
                 result_ty = Some(body.ty);
@@ -14154,7 +14154,7 @@ impl<'a, 't> Checker<'a, 't> {
             Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block(b, expected),
             Some(e) => {
                 // `else if` chain: check as an expression and wrap as a block value.
-                self.reject_bare_array_value(e, expected, "`else` value");
+                self.reject_bare_array_value(e, expected, "an `else` value");
                 let v = self.check_expr(e, expected);
                 Block { stmts: Vec::new(), value: Some(Box::new(v)) }
             }
@@ -14232,7 +14232,7 @@ impl<'a, 't> Checker<'a, 't> {
         // source — MIR has no lowering for one in a free value position and would panic.
         let expected = self.loops.last().unwrap().break_ty;
         if let Some(v) = value
-            && self.reject_bare_array_value(v, expected, "`break` value")
+            && self.reject_bare_array_value(v, expected, "a `break` value")
         {
             self.loops.last_mut().unwrap().saw_break = true;
             return Some(self.check_expr(v, None));
