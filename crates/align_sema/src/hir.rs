@@ -975,6 +975,53 @@ pub enum ExprKind {
     /// `Result<response, Error>`. `cl` is a bound local (borrowed); `req` is a
     /// [`crate::Ty::HttpRequest`] **consumed** (moved into the call — the runtime frees it). **Impure**.
     HttpClientRequest { client: Box<Expr>, req: Box<Expr> },
+    /// `http.serve(host, port)` — bind a listening socket and yield `Result<http_server, Error>` (the
+    /// `ty`). The `http_server` ([`crate::Ty::HttpServer`]) is an owned **Move** handle owning the
+    /// listening fd (`Drop`-closed). `host` is a borrowed `str` (empty → wildcard); `port` is an `i64`.
+    /// **Impure** (opens a socket). Wraps the net rail's `tcp.listen` (SO_REUSEADDR, backlog 128).
+    HttpServe { host: Box<Expr>, port: Box<Expr> },
+    /// `srv.accept()` — block for one inbound connection, read + parse its request, and yield
+    /// `Result<http_request_ctx, Error>` (the `ty`). The `http_request_ctx`
+    /// ([`crate::Ty::HttpRequestCtx`]) is an owned **Move** handle owning the accepted fd + the parsed
+    /// request (zero-copy offset table, http.md R1). A malformed / smuggling request is `Error.Invalid`
+    /// (the listener stays alive). `srv` is a bound [`crate::Ty::HttpServer`] local (borrowed, not
+    /// consumed — a server accepts many). **Impure** (network I/O).
+    HttpAccept { server: Box<Expr> },
+    /// `ctx.method()` — the request method as a `str` **view** into `ctx`'s buffer (the `ty` is
+    /// [`crate::Ty::Str`]), region-bound to `ctx`. `ctx` is a bound [`crate::Ty::HttpRequestCtx`] local.
+    /// Pure.
+    HttpCtxMethod { ctx: Box<Expr> },
+    /// `ctx.path()` — the request target (origin-form path) as a `str` **view** into `ctx`'s buffer (the
+    /// `ty` is [`crate::Ty::Str`]), region-bound to `ctx`. `ctx` is a bound local. Pure.
+    HttpCtxPath { ctx: Box<Expr> },
+    /// `ctx.header(name)` — a **case-insensitive** request-header lookup on `ctx`, yielding
+    /// `Option<str>` (the `ty`) whose `str` is a **view** into `ctx`'s buffer (region-bound to `ctx`).
+    /// `ctx` is a bound local; `name` is borrowed. Pure. The read-dual of [`HttpRespHeader`].
+    HttpCtxHeader { ctx: Box<Expr>, name: Box<Expr> },
+    /// `ctx.body()` — the request body as a `slice<u8>` **view** into `ctx`'s buffer (the `ty` is
+    /// [`crate::Ty::Slice`] of `u8`), region-bound to `ctx`. `ctx` is a bound local. Pure. The read-dual
+    /// of [`HttpRespBody`].
+    HttpCtxBody { ctx: Box<Expr> },
+    /// `http.response(status)` — a fresh [`crate::Ty::ResponseBuilder`] (a **Move** handle owning a
+    /// status + header list + optional body; `Drop`-freed). The build-dual of [`HttpRequest`], named
+    /// apart from the parsed read-view [`crate::Ty::HttpResponse`]. Total (the status is validated at
+    /// `respond`). `status` is an `i64`. Pure (no I/O — the write is at `respond`).
+    HttpResponseBuilder { status: Box<Expr> },
+    /// `rb.header(name, value)` — append a header to the response builder `rb` (mutated in place through
+    /// its handle, not consumed). The `ty` is [`crate::Ty::Unit`]. A CR / LF / NUL in the name or value
+    /// (or an empty name) **aborts** at runtime (http.md P6). `rb` is a bound local; `name`/`value` are
+    /// borrowed `str`. Pure. The build-dual of [`HttpHeader`].
+    HttpRbHeader { rb: Box<Expr>, name: Box<Expr>, value: Box<Expr> },
+    /// `rb.body(data)` — set the response builder `rb`'s body to a copy of `data` (a byte view),
+    /// mutating in place; setting the body is what makes `respond` auto-emit `Content-Length`. The `ty`
+    /// is [`crate::Ty::Unit`]. `rb` is a bound local. Pure. The build-dual of [`HttpBody`].
+    HttpRbBody { rb: Box<Expr>, data: Box<Expr> },
+    /// `ctx.respond(rb)` — serialize `rb` and write the response to `ctx`'s connection in one write,
+    /// then close the fd (v1: one request per conn), yielding `Result<(), Error>` (the `ty`). **Consumes
+    /// BOTH** `ctx` ([`crate::Ty::HttpRequestCtx`]) and `rb` ([`crate::Ty::ResponseBuilder`]) — the
+    /// runtime frees both (like [`HttpClientRequest`]'s `req`). A caller-supplied Content-Length / a bad
+    /// status is `Error.Invalid`. **Impure** (network I/O).
+    HttpRespond { ctx: Box<Expr>, rb: Box<Expr> },
     /// `crypto.constant_time_equal(a, b)` — a constant-time byte-equality test over two byte views
     /// `a` / `b` (`str` / owned `string` auto-borrowed / `slice<u8>`); the `ty` is
     /// [`crate::Ty::Bool`]. The input *length* is **public** (crypto.md P1): differing lengths return

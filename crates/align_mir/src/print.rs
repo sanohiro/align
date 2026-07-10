@@ -533,6 +533,16 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("http_client_post({}, {}, {}, -> _{out})", operand_str(client), operand_str(url), operand_str(body))
         }
         Rvalue::HttpClientRequest { client, req, out } => format!("http_client_request({}, {}, -> _{out})", operand_str(client), operand_str(req)),
+        Rvalue::HttpServe { host, port, out } => format!("http_serve({}, {}, -> _{out})", operand_str(host), operand_str(port)),
+        Rvalue::HttpAccept { server, out } => format!("http_accept({}, -> _{out})", operand_str(server)),
+        Rvalue::HttpCtxMethod { ctx } => format!("http_ctx_method({})", operand_str(ctx)),
+        Rvalue::HttpCtxPath { ctx } => format!("http_ctx_path({})", operand_str(ctx)),
+        Rvalue::HttpCtxHeader { ctx, name, out } => format!("http_ctx_header({}, {}, -> _{out})", operand_str(ctx), operand_str(name)),
+        Rvalue::HttpCtxBody { ctx } => format!("http_ctx_body({})", operand_str(ctx)),
+        Rvalue::HttpResponseBuilder { status } => format!("http_response({})", operand_str(status)),
+        Rvalue::HttpRbHeader { rb, name, value } => format!("http_rb_header({}, {}, {})", operand_str(rb), operand_str(name), operand_str(value)),
+        Rvalue::HttpRbBody { rb, data } => format!("http_rb_body({}, {})", operand_str(rb), operand_str(data)),
+        Rvalue::HttpRespond { ctx, rb } => format!("http_respond({}, {})", operand_str(ctx), operand_str(rb)),
     }
 }
 

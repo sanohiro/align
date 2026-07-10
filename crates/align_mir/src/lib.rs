@@ -767,6 +767,37 @@ pub enum Rvalue {
     /// in** — the runtime frees it, so the MIR nulls its source slot). Same out-slot + i32-status
     /// contract as [`Rvalue::HttpClientGet`]. Impure.
     HttpClientRequest { client: Operand, req: Operand, out: Slot },
+    /// `http.serve(host, port)` — bind a listening socket: the runtime writes an owned `http_server`
+    /// handle (opaque pointer) to `out` and returns an `i32` status (0 = ok; else `AL_INVALID` / errno →
+    /// `Error`). The caller branches `Ok(http_server)` / `Err`. Impure.
+    HttpServe { host: Operand, port: Operand, out: Slot },
+    /// `srv.accept()` — accept + parse one request: the runtime writes an owned `http_request_ctx`
+    /// handle (opaque pointer) to `out` and returns an `i32` status (0 = ok; else `AL_INVALID` / errno →
+    /// `Error`). The caller branches `Ok(http_request_ctx)` / `Err`. Impure.
+    HttpAccept { server: Operand, out: Slot },
+    /// `ctx.method()` / `ctx.path()` — the request method / target as a `str` **view** `{ptr,len}` into
+    /// `ctx`'s buffer (region-bound to `ctx`). Pure.
+    HttpCtxMethod { ctx: Operand },
+    HttpCtxPath { ctx: Operand },
+    /// `ctx.header(name)` — a case-insensitive request-header lookup on `ctx`, writing a `str` **view**
+    /// `{ptr,len}` (region-bound to `ctx`) to `out` and returning an `i32` present flag (1/0). Pure.
+    HttpCtxHeader { ctx: Operand, name: Operand, out: Slot },
+    /// `ctx.body()` — the request body as a `slice<u8>` **view** `{ptr,len}` into `ctx`'s buffer
+    /// (region-bound to `ctx`). Pure.
+    HttpCtxBody { ctx: Operand },
+    /// `http.response(status)` — allocate a `response_builder` handle (opaque pointer), returned by
+    /// value (the bound local `Drop`-frees it via `http_response_free`). Pure.
+    HttpResponseBuilder { status: Operand },
+    /// `rb.header(name, value)` — append a header to the response builder `rb` (mutated in place; aborts
+    /// on CR/LF/NUL, P6). Yields `()`. Pure.
+    HttpRbHeader { rb: Operand, name: Operand, value: Operand },
+    /// `rb.body(data)` — set the response builder `rb`'s body to a copy of `data`. Yields `()`. Pure.
+    HttpRbBody { rb: Operand, data: Operand },
+    /// `ctx.respond(rb)` — serialize `rb`, write the response to `ctx`'s connection, close the fd.
+    /// **Both** `ctx` and `rb` are opaque pointers **moved in** (the runtime frees both, so the MIR nulls
+    /// both source slots). Returns an `i32` status (0 = ok; else `AL_INVALID` / errno → `Error`); the
+    /// caller branches `Ok(())` / `Err`. Impure.
+    HttpRespond { ctx: Operand, rb: Operand },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -1211,7 +1242,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -2011,7 +2042,17 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpClient
         | hir::ExprKind::HttpClientGet { .. }
         | hir::ExprKind::HttpClientPost { .. }
-        | hir::ExprKind::HttpClientRequest { .. } => lower_http(b, e),
+        | hir::ExprKind::HttpClientRequest { .. }
+        | hir::ExprKind::HttpServe { .. }
+        | hir::ExprKind::HttpAccept { .. }
+        | hir::ExprKind::HttpCtxMethod { .. }
+        | hir::ExprKind::HttpCtxPath { .. }
+        | hir::ExprKind::HttpCtxHeader { .. }
+        | hir::ExprKind::HttpCtxBody { .. }
+        | hir::ExprKind::HttpResponseBuilder { .. }
+        | hir::ExprKind::HttpRbHeader { .. }
+        | hir::ExprKind::HttpRbBody { .. }
+        | hir::ExprKind::HttpRespond { .. } => lower_http(b, e),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -5776,7 +5817,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let out = b.new_slot(Ty::HttpResponse);
             let c = lower_expr(b, client);
             let u = lower_expr(b, url);
-            lower_http_response_result(b, Rvalue::HttpClientGet { client: c, url: u, out }, out, e.ty)
+            lower_http_response_result(b, Rvalue::HttpClientGet { client: c, url: u, out }, out, Ty::HttpResponse, e.ty)
         }
         // `cl.post(url, body)` → `Result<response, Error>`. `url`/`body` are byte views.
         hir::ExprKind::HttpClientPost { client, url, body } => {
@@ -5784,7 +5825,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let c = lower_expr(b, client);
             let u = lower_expr(b, url);
             let bd = lower_expr(b, body);
-            lower_http_response_result(b, Rvalue::HttpClientPost { client: c, url: u, body: bd, out }, out, e.ty)
+            lower_http_response_result(b, Rvalue::HttpClientPost { client: c, url: u, body: bd, out }, out, Ty::HttpResponse, e.ty)
         }
         // `cl.request(req)` → `Result<response, Error>`. `req` is a Move `http request` **consumed** by
         // the call (the runtime frees it): null its source slot so the exit `Drop` doesn't double-free.
@@ -5793,7 +5834,81 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let c = lower_expr(b, client);
             let rq = lower_expr(b, req);
             null_moved_source(b, req);
-            lower_http_response_result(b, Rvalue::HttpClientRequest { client: c, req: rq, out }, out, e.ty)
+            lower_http_response_result(b, Rvalue::HttpClientRequest { client: c, req: rq, out }, out, Ty::HttpResponse, e.ty)
+        }
+        // `http.serve(host, port)` → `Result<http_server, Error>` (shared out-slot + i32-status
+        // lowering, `ok_ty = HttpServer`). `host`/`port` are read.
+        hir::ExprKind::HttpServe { host, port } => {
+            let out = b.new_slot(Ty::HttpServer);
+            let h = lower_expr(b, host);
+            let p = lower_expr(b, port);
+            lower_http_response_result(b, Rvalue::HttpServe { host: h, port: p, out }, out, Ty::HttpServer, e.ty)
+        }
+        // `srv.accept()` → `Result<http_request_ctx, Error>` (`ok_ty = HttpRequestCtx`). `server` is
+        // borrowed (a server accepts many).
+        hir::ExprKind::HttpAccept { server } => {
+            let out = b.new_slot(Ty::HttpRequestCtx);
+            let s = lower_expr(b, server);
+            lower_http_response_result(b, Rvalue::HttpAccept { server: s, out }, out, Ty::HttpRequestCtx, e.ty)
+        }
+        // `ctx.method()` / `ctx.path()` → a `str` view `{ptr,len}` into the ctx buffer (region-bound to
+        // `ctx`; not owned — no `Drop`).
+        hir::ExprKind::HttpCtxMethod { ctx } => {
+            let cx = lower_expr(b, ctx);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::HttpCtxMethod { ctx: cx }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::HttpCtxPath { ctx } => {
+            let cx = lower_expr(b, ctx);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::HttpCtxPath { ctx: cx }));
+            Operand::Value(v)
+        }
+        // `ctx.header(name)` → `Option<str>` (out-slot + i32 present flag; see below).
+        hir::ExprKind::HttpCtxHeader { ctx, name } => lower_http_ctx_header(b, ctx, name, e.ty),
+        // `ctx.body()` → a `slice<u8>` view `{ptr,len}` into the ctx buffer (region-bound to `ctx`).
+        hir::ExprKind::HttpCtxBody { ctx } => {
+            let cx = lower_expr(b, ctx);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::HttpCtxBody { ctx: cx }));
+            Operand::Value(v)
+        }
+        // `http.response(status)` → an owned `response_builder` handle returned by value (the bound
+        // local `Drop`-frees it via `http_response_free`).
+        hir::ExprKind::HttpResponseBuilder { status } => {
+            let s = lower_expr(b, status);
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::HttpResponseBuilder { status: s }));
+            Operand::Value(v)
+        }
+        // `rb.header(name, value)` → `()`. `rb` is borrowed (mutated in place); `name`/`value` are views.
+        hir::ExprKind::HttpRbHeader { rb, name, value } => {
+            let r = lower_expr(b, rb);
+            let nm = lower_expr(b, name);
+            let vl = lower_expr(b, value);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::HttpRbHeader { rb: r, name: nm, value: vl }));
+            Operand::Value(v)
+        }
+        // `rb.body(data)` → `()`. `rb` is borrowed (mutated in place); `data` is a byte view.
+        hir::ExprKind::HttpRbBody { rb, data } => {
+            let r = lower_expr(b, rb);
+            let d = lower_expr(b, data);
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::HttpRbBody { rb: r, data: d }));
+            Operand::Value(v)
+        }
+        // `ctx.respond(rb)` → `Result<(), Error>`. BOTH `ctx` and `rb` are **consumed** by the call (the
+        // runtime frees both): null both source slots so the exit `Drop` doesn't double-free.
+        hir::ExprKind::HttpRespond { ctx, rb } => {
+            let cx = lower_expr(b, ctx);
+            let r = lower_expr(b, rb);
+            null_moved_source(b, ctx);
+            null_moved_source(b, rb);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpRespond { ctx: cx, rb: r }));
+            lower_status_result(b, code, e.ty)
         }
         _ => unreachable!("lower_http on a non-http expr"),
     }
@@ -5803,18 +5918,19 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
 fn lower_http_parse(b: &mut Builder, data: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::HttpResponse);
     let d = lower_expr(b, data);
-    lower_http_response_result(b, Rvalue::HttpParse { data: d, out }, out, result_ty)
+    lower_http_response_result(b, Rvalue::HttpParse { data: d, out }, out, Ty::HttpResponse, result_ty)
 }
 
-/// The shared Ok/Err lowering for the four ops that write an owned `http response` into `out` and
+/// The shared Ok/Err lowering for the ops that write an owned handle of type `ok_ty` into `out` and
 /// return an `i32` status (`code_rv` is the runtime-call Rvalue, its `out` slot already set to `out`):
-/// `http.parse` and the Slice-2 client `get`/`post`/`request`. `0` = ok (a 4xx/5xx status is STILL ok
-/// — status is data, http.md P2); else `AL_INVALID` -> `Error.Invalid` / an errno -> `Error`. Branches
-/// `Ok(<response>)` (the unwrapped local owns it — `Drop`s via `http_resp_free`) / `Err(<mapped
-/// status>)`. Out-of-line (`#[inline(never)]`) so its block/slot locals stay off the recursive
-/// `lower_expr` frame (the `expr_depth` #296 lesson).
+/// `http.parse` and the Slice-2 client `get`/`post`/`request` (`ok_ty = HttpResponse`), plus the Slice-4
+/// server `http.serve` (`HttpServer`) / `srv.accept()` (`HttpRequestCtx`). `0` = ok (a 4xx/5xx status is
+/// STILL ok — status is data, http.md P2); else `AL_INVALID` -> `Error.Invalid` / an errno -> `Error`.
+/// Branches `Ok(<handle>)` (the unwrapped local owns it — `Drop`s via the handle's free fn) /
+/// `Err(<mapped status>)`. Out-of-line (`#[inline(never)]`) so its block/slot locals stay off the
+/// recursive `lower_expr` frame (the `expr_depth` #296 lesson).
 #[inline(never)]
-fn lower_http_response_result(b: &mut Builder, code_rv: Rvalue, out: Slot, result_ty: Ty) -> Operand {
+fn lower_http_response_result(b: &mut Builder, code_rv: Rvalue, out: Slot, ok_ty: Ty, result_ty: Ty) -> Operand {
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, code_rv));
 
@@ -5826,9 +5942,9 @@ fn lower_http_response_result(b: &mut Builder, code_rv: Rvalue, out: Slot, resul
     let rslot = b.new_slot(result_ty);
     b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
 
-    // Ok: load the response handle and wrap it (the unwrapped local owns it — `Drop` frees it).
+    // Ok: load the owned handle and wrap it (the unwrapped local owns it — `Drop` frees it).
     b.cur = ok_bb;
-    let h = b.fresh_value(Ty::HttpResponse);
+    let h = b.fresh_value(ok_ty);
     b.push(Stmt::Let(h, Rvalue::Load(out)));
     let okv = b.fresh_value(result_ty);
     b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(h))));
@@ -5860,6 +5976,46 @@ fn lower_http_resp_header(b: &mut Builder, resp: &hir::Expr, name: &hir::Expr, r
     let nm = lower_expr(b, name);
     let flag = b.fresh_value(status_ty());
     b.push(Stmt::Let(flag, Rvalue::HttpRespHeader { resp: rp, name: nm, out }));
+
+    let present = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    let some_bb = b.new_block();
+    let none_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+
+    // Some: load the `str` view and wrap it.
+    b.cur = some_bb;
+    let s = b.fresh_value(Ty::Str);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let somev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(somev, Rvalue::OptionSome(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(somev)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = none_bb;
+    let nonev = b.fresh_value(result_ty);
+    b.push(Stmt::Let(nonev, Rvalue::OptionNone));
+    b.push(Stmt::Store(rslot, Operand::Value(nonev)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
+/// `ctx.header(name)` → the runtime writes a `str` view (`{ptr,len}`) into an out slot and returns an
+/// `i32` present flag; branch `Some(<view>)` / `None`. The view borrows `ctx` (region-bound in sema).
+/// The exact read-dual of [`lower_http_resp_header`]. Out-of-line for `expr_depth` headroom.
+#[inline(never)]
+fn lower_http_ctx_header(b: &mut Builder, ctx: &hir::Expr, name: &hir::Expr, result_ty: Ty) -> Operand {
+    let out = b.new_slot(Ty::Str);
+    let cx = lower_expr(b, ctx);
+    let nm = lower_expr(b, name);
+    let flag = b.fresh_value(status_ty());
+    b.push(Stmt::Let(flag, Rvalue::HttpCtxHeader { ctx: cx, name: nm, out }));
 
     let present = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
@@ -6478,6 +6634,9 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::HttpRequest => "http request".to_string(),
         Ty::HttpResponse => "http response".to_string(),
         Ty::HttpClient => "http client".to_string(),
+        Ty::HttpServer => "http_server".to_string(),
+        Ty::HttpRequestCtx => "http_request_ctx".to_string(),
+        Ty::ResponseBuilder => "response_builder".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

@@ -9059,6 +9059,7 @@ fn http_next_line(src: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
 /// while `Invalid` means "malformed — stop". The complete-buffer FFI ([`align_rt_http_parse`])
 /// collapses both to `AL_INVALID` (it is handed a finished buffer, so `Incomplete` there *is* a
 /// truncation).
+#[derive(Debug, PartialEq, Eq)]
 enum HttpParseErr {
     /// A valid-so-far prefix: the status line / header block isn't terminated yet, or a
     /// `Content-Length` body isn't fully present. The client reads more; the FFI treats it as invalid.
@@ -9839,6 +9840,708 @@ pub unsafe extern "C" fn align_rt_http_client_request(
         return AL_INVALID; // a null request handle
     };
     unsafe { http_client_perform(client, &owned, out) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// std.http (M11 Slice 4) — the plaintext HTTP/1.1 SERVER primitive (NOT a framework). Three Move
+// handle types:
+//   * `HttpServer` — the listening handle (`http.serve(host, port)`), owning the listening socket fd
+//     (lifted out of the net rail's `align_rt_tcp_listen` — SO_REUSEADDR, backlog 128). `accept()`
+//     blocks for one inbound connection; `Drop` closes the listening fd.
+//   * `HttpRequestCtx` — one accepted request (`srv.accept()`), owning the accepted socket fd plus the
+//     parsed request as ONE raw byte buffer + an offset table (mirror of `HttpResponse`, http.md R1 —
+//     zero-copy; no per-header `String`, no body copy). `method()`/`path()` are `str` views;
+//     `header(name)` a case-insensitive `Option<str>` view; `body()` a `slice<u8>` view — all borrowing
+//     the buffer. `respond(rb)` serializes + one-writes the response and closes the fd (v1: one request
+//     per conn); a `Drop` without `respond` closes the fd + frees the buffer.
+//   * `ResponseBuilder` — the response builder (`http.response(status)`), the build-dual of
+//     `HttpRequest` (deliberately a distinct type from the parsed read-view `HttpResponse`). Owns a
+//     status + header list + optional body. `rb.header(name, value)` aborts on CR/LF/NUL (http.md P6);
+//     `rb.body(data)` sets the body (optional — a header-only response is legal).
+//
+// The inbound parse is a NEW request-head parser (`http_parse_request_head` — the response head parser
+// keys on `HTTP/` + status and is not reusable for `METHOD SP target SP HTTP/1.1`). It adds the five
+// inbound smuggling guards the client-lenient response parser lacks: (1) strict CRLF — a bare LF is
+// rejected; (2) no whitespace between a field-name and its colon (and no obs-fold leading WS);
+// (3) any `Transfer-Encoding` on the inbound request is rejected (TE alone → Invalid; TE+CL is the
+// classic smuggling pair — v1 frames by Content-Length only); (4) origin-form targets only (a leading
+// `/` — absolute-/authority-/asterisk-form targets are rejected); (5) the serialize-side method-token +
+// CR/LF/NUL/SP guards mirrored inbound. The Incomplete/Invalid streaming split, the header-block scan,
+// and the caps (256 KiB head / 128 headers / 1 GiB body) ARE reused. **All server ops are Impure**
+// (network syscalls). **v1 security caveat (http.md):** the blocking single accept loop is unsafe on
+// untrusted networks (a slow-loris client stalls the whole server) — the recorded trust assumption is a
+// localhost / trusted-network gateway.
+// ---------------------------------------------------------------------------------------------
+
+/// A `http_server` (`std.http`) — a Move handle owning the listening TCP socket fd from `http.serve`.
+/// `Drop` closes the fd (so `align_rt_http_server_free` is just `Box::from_raw` + drop). The fd was
+/// lifted out of a net `TcpListener` (which has no `Drop`), so the pool/listen bookkeeping is entirely
+/// this handle's.
+pub struct HttpServer {
+    fd: i32,
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { close(self.fd) };
+        }
+    }
+}
+
+/// A parsed inbound request PLUS the accepted connection fd — the `http_request_ctx` from
+/// `srv.accept()`. Owns ONE raw byte buffer + an offset table (mirror of [`HttpResponse`], http.md R1)
+/// and the accepted socket fd. The getters hand back zero-copy views into `buf` (region-bound to the
+/// handle in sema); `respond` consumes it; `Drop` closes the fd (`respond`'s close-after-write, or a
+/// never-responded ctx's cleanup, both go through this).
+pub struct HttpRequestCtx {
+    fd: i32,
+    buf: Vec<u8>,
+    method_start: usize,
+    method_len: usize,
+    target_start: usize,
+    target_len: usize,
+    headers: Vec<HttpHeaderSpan>,
+    body_start: usize,
+    body_len: usize,
+}
+
+impl Drop for HttpRequestCtx {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { close(self.fd) };
+        }
+    }
+}
+
+/// A `response_builder` (`std.http`) — the build-dual of [`HttpRequest`] (a Move handle), owning a
+/// status code, a header list (insertion order preserved), and an optional body. Deliberately a
+/// distinct type from the parsed read-view [`HttpResponse`]: build (header-list → serialize) and parse
+/// (offset-table → views) never share a usage site. `Drop`-freed by [`align_rt_http_response_free`].
+pub struct ResponseBuilder {
+    status: i64,
+    headers: Vec<(String, String)>,
+    /// `Some` iff `rb.body(...)` was called — the `Content-Length` is auto-emitted iff a body was set
+    /// (a set-but-empty body still frames as `Content-Length: 0`; an unset body emits no length).
+    body: Option<Vec<u8>>,
+}
+
+/// `http.serve(host, port)` — open a listening socket and write the owned `http_server` handle to
+/// `*out`, returning `0`; or a mapped status (`AL_INVALID` for a bad port / host, or the last
+/// `bind`/`listen` errno such as `EADDRINUSE`) leaving `*out` null. Wraps the net rail's
+/// [`align_rt_tcp_listen`] (SO_REUSEADDR, backlog 128, wildcard bind on an empty host), then lifts the
+/// listening fd out of the returned `TcpListener` (which has no `Drop`, so dropping its box leaves the
+/// fd open — the `HttpServer` owns it from here).
+///
+/// # Safety
+/// `host_ptr`/`host_len` must describe a valid byte range (or `{null,<=0}`); `out` must point to a
+/// writable `*mut HttpServer` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_serve(host_ptr: *const u8, host_len: i64, port: i64, out: *mut *mut HttpServer) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    let mut listener: *mut TcpListener = core::ptr::null_mut();
+    let rc = unsafe { align_rt_tcp_listen(host_ptr, host_len, port, &mut listener) };
+    if rc != 0 {
+        return rc; // *out already null; nothing to free (listen left `listener` null on failure)
+    }
+    // Lift the fd out of the net `TcpListener` box (no `Drop` → the fd stays open, no leak of the box).
+    let fd = unsafe { Box::from_raw(listener) }.fd;
+    unsafe { *out = Box::into_raw(Box::new(HttpServer { fd })) };
+    0
+}
+
+/// Free a `http_server`, closing its listening socket fd (via `Drop`). Null-safe.
+///
+/// # Safety
+/// `srv` must be null or a pointer from [`align_rt_http_serve`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_server_free(srv: *mut HttpServer) {
+    if !srv.is_null() {
+        drop(unsafe { Box::from_raw(srv) }); // `Drop` closes the fd
+    }
+}
+
+/// The parsed request line + header block of an inbound request plus the body-framing decision. The
+/// spans index the same `src` the caller scanned (no copy — http.md R1). The request-line dual of
+/// [`HttpHead`]; produced by [`http_parse_request_head`].
+struct HttpRequestHead {
+    method_start: usize,
+    method_len: usize,
+    target_start: usize,
+    target_len: usize,
+    headers: Vec<HttpHeaderSpan>,
+    /// Offset in `src` just past the blank line terminating the header block (the body start).
+    body_start: usize,
+    /// The declared `Content-Length`, or `None` (framed as no body — a request without CL/TE has no
+    /// body in v1).
+    content_length: Option<usize>,
+}
+
+/// Parse one **strict-CRLF**-terminated line starting at `pos` in `src`, returning
+/// `Ok(Some((line_start, line_len, next_pos)))` where the line content excludes the terminating CRLF.
+/// A bare LF (an `\n` not immediately preceded by `\r`) is **rejected** with `Err(())` — the server-side
+/// strict-line-ending smuggling guard (http.md Slice 4, guard 1). `Ok(None)` if there is no `\n` at or
+/// after `pos` yet (a valid-so-far prefix — read more). Scans with `memchr` (http.md R2).
+fn http_next_line_strict(src: &[u8], pos: usize) -> Result<Option<(usize, usize, usize)>, ()> {
+    match memchr::memchr(b'\n', &src[pos..]) {
+        None => Ok(None), // no line terminator yet — incomplete
+        Some(rel) => {
+            let nl = rel + pos;
+            // Strict CRLF: the byte before `\n` must be `\r` (and there must be one — an `\n` at `pos`
+            // is a bare LF). A lone `\n` is a request-smuggling vector some proxies accept and others
+            // don't; a strict server rejects it.
+            if nl == pos || src[nl - 1] != b'\r' {
+                return Err(()); // bare LF
+            }
+            Ok(Some((pos, nl - 1 - pos, nl + 1)))
+        }
+    }
+}
+
+/// Parse the request line + header block of an inbound `METHOD SP target SP HTTP/1.x` request WITHOUT
+/// copying the body — the NEW server-side head parser (the response head parser keys on `HTTP/` +
+/// status and is not reusable here). Implements the five inbound smuggling guards (see the module
+/// banner). Framing is Content-Length only (any `Transfer-Encoding` → `Invalid`). `Incomplete` while
+/// the request line / header block is not yet terminated; `Invalid` on any malformed line or guard
+/// violation. Scanning rides `memchr` (http.md R2).
+fn http_parse_request_head(src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> {
+    // --- request line: `METHOD SP target SP HTTP/1.x` (strict CRLF, guard 1) ---
+    let (rl_start, rl_len, mut pos) = match http_next_line_strict(src, 0) {
+        Ok(Some(x)) => x,
+        Ok(None) => return Err(HttpParseErr::Incomplete),
+        Err(()) => return Err(HttpParseErr::Invalid), // bare LF
+    };
+    let line = &src[rl_start..rl_start + rl_len];
+    // Exactly three SP-separated tokens: METHOD, target, version. (The target is origin-form and
+    // percent-encodes spaces, so it never itself contains a raw SP — guard 5 re-checks that.)
+    let Some(sp1) = memchr::memchr(b' ', line) else {
+        return Err(HttpParseErr::Invalid);
+    };
+    let method = &line[..sp1];
+    let rest = &line[sp1 + 1..];
+    let Some(sp2) = memchr::memchr(b' ', rest) else {
+        return Err(HttpParseErr::Invalid);
+    };
+    let target = &rest[..sp2];
+    let version = &rest[sp2 + 1..];
+    // Guard 5: the method must be a bare RFC 7230 token; the target must carry no start-line-breaking
+    // byte (CR/LF/NUL/SP — the serialize-side inbound mirror).
+    if !http_is_token(method) {
+        return Err(HttpParseErr::Invalid);
+    }
+    if target.is_empty() || !http_request_line_field_clean(target) {
+        return Err(HttpParseErr::Invalid);
+    }
+    // Guard 4: origin-form targets only — a leading `/`. Absolute-form (`http://...`), authority-form
+    // (`host:port`, CONNECT), and asterisk-form (`*`, OPTIONS) are rejected in v1.
+    if target[0] != b'/' {
+        return Err(HttpParseErr::Invalid);
+    }
+    // Version: HTTP/1.1 or HTTP/1.0 only (v1 always closes the conn, so 1.0 vs 1.1 persistence is moot;
+    // any other/garbage version is malformed).
+    if version != b"HTTP/1.1" && version != b"HTTP/1.0" {
+        return Err(HttpParseErr::Invalid);
+    }
+    let method_start = rl_start;
+    let method_len = method.len();
+    let target_start = rl_start + sp1 + 1;
+    let target_len = target.len();
+
+    // --- headers: strict-CRLF lines up to the first empty line ---
+    let mut headers: Vec<HttpHeaderSpan> = Vec::new();
+    let mut content_length: Option<usize> = None;
+    let body_start;
+    loop {
+        let (ls, ll, next) = match http_next_line_strict(src, pos) {
+            Ok(Some(x)) => x,
+            Ok(None) => return Err(HttpParseErr::Incomplete), // header block truncated — read more
+            Err(()) => return Err(HttpParseErr::Invalid),     // bare LF (guard 1)
+        };
+        if ll == 0 {
+            body_start = next; // the blank line terminates the header block
+            break;
+        }
+        if headers.len() >= HTTP_MAX_HEADERS {
+            return Err(HttpParseErr::Invalid); // header flood
+        }
+        let hline = &src[ls..ls + ll];
+        let Some(colon) = memchr::memchr(b':', hline) else {
+            return Err(HttpParseErr::Invalid); // a header line must have a `:`
+        };
+        // Guard 2: the field-name must be a full RFC 9110 `token` (tchar+). This subsumes the
+        // no-whitespace-before-the-colon rule and additionally rejects any control/separator byte
+        // *mid-name* (e.g. `Fo@o:`), which the old first/last-char SP/HTAB check let through — a
+        // header-name smuggling class. (The response parser is deliberately lenient here; the server
+        // is strict.)
+        let raw_name = &hline[..colon];
+        if !http_is_token(raw_name) {
+            return Err(HttpParseErr::Invalid);
+        }
+        let name_start = ls;
+        let name_len = colon;
+        let (value_start, value_len) = http_trim_ows(src, ls + colon + 1, ll - colon - 1);
+        let name = &src[name_start..name_start + name_len];
+        let value = &src[value_start..value_start + value_len];
+        // Guard 6: a header value must not carry a request-smuggling byte — NUL or a stray CR (a bare
+        // LF is already impossible: `http_next_line_strict` ends the line at the CRLF and rejects any
+        // bare LF outright). `http_field_is_clean` rejects exactly CR/LF/NUL and permits SP/HTAB, so a
+        // legitimate space-bearing value like `User-Agent: foo bar` is untouched.
+        if !http_field_is_clean(value) {
+            return Err(HttpParseErr::Invalid);
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            // RFC 9112 §6.2: Content-Length is a bare sequence of ASCII digits. `parse::<usize>`
+            // alone would accept a leading `+` (`+3` → 3), a framing differential vs. stricter peers
+            // (smuggling), so require digits-only first; an empty value is likewise rejected.
+            if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                return Err(HttpParseErr::Invalid);
+            }
+            // Digits-only above ⇒ valid UTF-8; parse still guards against a usize overflow (→ Invalid,
+            // never a panic) for an absurdly long digit run.
+            let Ok(n) = std::str::from_utf8(value).unwrap_or("x").parse::<usize>() else {
+                return Err(HttpParseErr::Invalid);
+            };
+            // A second Content-Length whose value conflicts with the first is a smuggling vector →
+            // reject; an identical repeat is harmless.
+            if content_length.is_some_and(|prev| prev != n) {
+                return Err(HttpParseErr::Invalid);
+            }
+            content_length = Some(n);
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            // Guard 3: any inbound Transfer-Encoding → Invalid. This covers both TE-alone (v1 frames by
+            // Content-Length only — no chunked de-framing) and the CL+TE smuggling pair (TE is rejected
+            // whether or not a CL is also present).
+            return Err(HttpParseErr::Invalid);
+        }
+        headers.push(HttpHeaderSpan { name_start, name_len, value_start, value_len });
+        pos = next;
+    }
+    Ok(HttpRequestHead { method_start, method_len, target_start, target_len, headers, body_start, content_length })
+}
+
+/// Read + parse one inbound request over the accepted socket `fd`: stream 32 KiB reads (never per-line —
+/// http.md R4) to the head's end via [`http_parse_request_head`], then frame the body by Content-Length
+/// (a request without CL has no body). Returns the built [`HttpRequestCtx`] (owning `fd` + the buffer +
+/// the offset table), or a mapped status (`AL_INVALID` for a malformed / smuggling / truncated request,
+/// an errno for a transport failure). On `Ok` the ctx owns `fd`; on `Err` the caller closes it.
+///
+/// # Safety
+/// `fd` must be a valid connected socket.
+unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut head: Option<HttpRequestHead> = None;
+    let mut chunk = [0u8; 32 * 1024];
+    loop {
+        // Parse the head once (framing decided once), then just read to the framed length.
+        if head.is_none() {
+            match http_parse_request_head(&buf) {
+                Ok(h) => head = Some(h),
+                Err(HttpParseErr::Incomplete) => {
+                    if buf.len() > HTTP_MAX_HEADER_BLOCK {
+                        return Err(AL_INVALID); // header block never terminated within the cap
+                    }
+                }
+                Err(HttpParseErr::Invalid) => return Err(AL_INVALID),
+            }
+        }
+        // If the head is parsed, compute the framed end; complete once `buf` reaches it.
+        let complete_need = if let Some(h) = head.as_ref() {
+            let need = match h.content_length {
+                Some(n) => {
+                    if n > HTTP_MAX_BODY {
+                        return Err(AL_INVALID); // over cap
+                    }
+                    // `checked_add` (Gate-2): a wrap would turn an out-of-buffer body into an in-bounds
+                    // one. `body_start + n` never wraps here (both bounded), but be explicit.
+                    match h.body_start.checked_add(n) {
+                        Some(t) => t,
+                        None => return Err(AL_INVALID),
+                    }
+                }
+                None => h.body_start, // no Content-Length → no body
+            };
+            if buf.len() >= need {
+                Some(need)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(need) = complete_need {
+            let h = head.take().unwrap();
+            buf.truncate(need); // discard any pipelined bytes (v1: one request per conn)
+            let body_len = need - h.body_start;
+            return Ok(HttpRequestCtx {
+                fd,
+                buf,
+                method_start: h.method_start,
+                method_len: h.method_len,
+                target_start: h.target_start,
+                target_len: h.target_len,
+                headers: h.headers,
+                body_start: h.body_start,
+                body_len,
+            });
+        }
+        // Read more (retries EINTR).
+        let n = loop {
+            let r = unsafe { read(fd, chunk.as_mut_ptr() as *mut core::ffi::c_void, chunk.len()) };
+            if r >= 0 {
+                break r;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io_error_to_status(&e));
+        };
+        if n == 0 {
+            // EOF before a complete request (client closed / truncated head or body) → malformed.
+            return Err(AL_INVALID);
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+        // Bound the pre-head scan region too (an adversary that never sends the blank line).
+        if head.is_none() && buf.len() > HTTP_MAX_HEADER_BLOCK {
+            return Err(AL_INVALID);
+        }
+    }
+}
+
+/// `srv.accept()` — block for one inbound connection, read + parse its request, and write the owned
+/// `http_request_ctx` handle to `*out`, returning `0`; else a mapped status leaving `*out` null. A
+/// malformed / smuggling request closes the accepted fd and returns `AL_INVALID` — the **listener stays
+/// alive**, so the caller's accept loop keeps serving. An `EINTR`-interrupted accept is retried (the
+/// server-loop shape; parity with `align_rt_tcp_accept`).
+///
+/// # Safety
+/// `srv` must be a valid `HttpServer` (or null); `out` must point to a writable `*mut HttpRequestCtx`
+/// slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *mut HttpRequestCtx) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    if srv.is_null() {
+        return AL_INVALID;
+    }
+    let lfd = unsafe { (*srv).fd };
+    // Accept a connection (cloexec, EINTR-retried).
+    let fd = loop {
+        let f = unsafe { cloexec_accept(lfd) };
+        if f >= 0 {
+            break f;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return io_error_to_status(&e);
+    };
+    // Disable Nagle so the response tail is sent immediately (http.md R4); best-effort.
+    let on: i32 = 1;
+    unsafe {
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+    }
+    // macOS/BSD: suppress SIGPIPE per-socket for the response write (Linux uses MSG_NOSIGNAL on `send`).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+    }
+    match unsafe { http_read_request(fd) } {
+        Ok(ctx) => {
+            unsafe { *out = Box::into_raw(Box::new(ctx)) };
+            0
+        }
+        Err(status) => {
+            unsafe { close(fd) }; // malformed request → close this conn; the listener keeps serving
+            status
+        }
+    }
+}
+
+/// `ctx.method()` — the request method as a `str` **view** into the ctx buffer (zero copy; region-bound
+/// in sema). Returns `{null,0}` on a null handle.
+///
+/// # Safety
+/// `ctx` must be a valid `HttpRequestCtx` (or null). The view borrows `ctx`, which must outlive it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_ctx_method(ctx: *const HttpRequestCtx) -> AlignStr {
+    if ctx.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let c = unsafe { &*ctx };
+    let ptr = unsafe { c.buf.as_ptr().add(c.method_start) };
+    AlignStr { ptr, len: c.method_len as i64 }
+}
+
+/// `ctx.path()` — the request target (origin-form path) as a `str` **view** into the ctx buffer.
+/// Returns `{null,0}` on a null handle.
+///
+/// # Safety
+/// `ctx` must be a valid `HttpRequestCtx` (or null). The view borrows `ctx`, which must outlive it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_ctx_path(ctx: *const HttpRequestCtx) -> AlignStr {
+    if ctx.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let c = unsafe { &*ctx };
+    let ptr = unsafe { c.buf.as_ptr().add(c.target_start) };
+    AlignStr { ptr, len: c.target_len as i64 }
+}
+
+/// `ctx.header(name)` — a case-insensitive header lookup (request header names are case-insensitive).
+/// Writes a `str` **view** into the ctx buffer to `*out` and returns `1` when present, else `0` leaving
+/// `*out` untouched. The first matching header wins. Mirrors [`align_rt_http_resp_header`].
+///
+/// # Safety
+/// `ctx` must be a valid `HttpRequestCtx` (or null); `name_ptr`/`name_len` a valid byte range; `out` a
+/// writable `AlignStr` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_ctx_header(
+    ctx: *const HttpRequestCtx,
+    name_ptr: *const u8,
+    name_len: i64,
+    out: *mut AlignStr,
+) -> i32 {
+    if ctx.is_null() || out.is_null() {
+        return 0;
+    }
+    let c = unsafe { &*ctx };
+    let want = unsafe { bytes_view(name_ptr, name_len) };
+    for h in &c.headers {
+        let name = &c.buf[h.name_start..h.name_start + h.name_len];
+        if name.eq_ignore_ascii_case(want) {
+            let vptr = unsafe { c.buf.as_ptr().add(h.value_start) };
+            unsafe { *out = AlignStr { ptr: vptr, len: h.value_len as i64 } };
+            return 1;
+        }
+    }
+    0
+}
+
+/// `ctx.body()` — a `slice<u8>` **view** over the request body (zero copy; region-bound in sema).
+/// Returns `{null,0}` on a null handle or an empty body.
+///
+/// # Safety
+/// `ctx` must be a valid `HttpRequestCtx` (or null). The view borrows `ctx`, which must outlive it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_ctx_body(ctx: *const HttpRequestCtx) -> AlignStr {
+    if ctx.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let c = unsafe { &*ctx };
+    if c.body_len == 0 {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let ptr = unsafe { c.buf.as_ptr().add(c.body_start) };
+    AlignStr { ptr, len: c.body_len as i64 }
+}
+
+/// Free a `http_request_ctx` (closing the accepted fd via `Drop` + freeing the buffer). Null-safe. This
+/// is the `Drop` path for a ctx that was **never** `respond`ed — the language moved it into `respond`
+/// otherwise (which consumes it, nulling this slot).
+///
+/// # Safety
+/// `ctx` must be null or a pointer from [`align_rt_http_accept`], not yet freed / responded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_ctx_free(ctx: *mut HttpRequestCtx) {
+    if !ctx.is_null() {
+        drop(unsafe { Box::from_raw(ctx) }); // `Drop` closes the fd
+    }
+}
+
+/// `http.response(status)` — allocate a response builder with `status` and an empty header list / no
+/// body. Total (the status is validated at `respond` time, mirroring `http.request`'s URL). `status` is
+/// copied in.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_http_response_new(status: i64) -> *mut ResponseBuilder {
+    Box::into_raw(Box::new(ResponseBuilder { status, headers: Vec::new(), body: None }))
+}
+
+/// `rb.header(name, value)` — append a response header. **Aborts** (http.md P6) if the name or value
+/// contains CR / LF / NUL, or if the name is empty. Null-safe on `rb`. Mirrors [`align_rt_http_header`].
+///
+/// # Safety
+/// `rb` must be a valid `ResponseBuilder` (or null); the two byte ranges must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_rb_header(
+    rb: *mut ResponseBuilder,
+    name_ptr: *const u8,
+    name_len: i64,
+    value_ptr: *const u8,
+    value_len: i64,
+) {
+    if rb.is_null() {
+        return;
+    }
+    let name = unsafe { bytes_view(name_ptr, name_len) };
+    let value = unsafe { bytes_view(value_ptr, value_len) };
+    if name.is_empty() {
+        panic_abort("http.response header: a header name must not be empty");
+    }
+    if !http_field_is_clean(name) {
+        http_header_abort("name");
+    }
+    if !http_field_is_clean(value) {
+        http_header_abort("value");
+    }
+    let r = unsafe { &mut *rb };
+    r.headers.push((
+        String::from_utf8_lossy(name).into_owned(),
+        String::from_utf8_lossy(value).into_owned(),
+    ));
+}
+
+/// `rb.body(data)` — set the response body to a copy of `data` (replacing any prior body). Setting the
+/// body is what makes `respond` auto-emit `Content-Length` (a header-only response leaves it unset).
+/// Null-safe on `rb`.
+///
+/// # Safety
+/// `rb` must be a valid `ResponseBuilder` (or null); `data_ptr`/`data_len` a valid byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_rb_body(rb: *mut ResponseBuilder, data_ptr: *const u8, data_len: i64) {
+    if rb.is_null() {
+        return;
+    }
+    let r = unsafe { &mut *rb };
+    r.body = Some(unsafe { bytes_view(data_ptr, data_len) }.to_vec());
+}
+
+/// Free a `response_builder` (its header list + body). Null-safe. The `Drop` path for a builder that was
+/// **never** passed to `respond` (which consumes it, nulling this slot).
+///
+/// # Safety
+/// `rb` must be null or a pointer from [`align_rt_http_response_new`], not yet freed / responded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_response_free(rb: *mut ResponseBuilder) {
+    if !rb.is_null() {
+        drop(unsafe { Box::from_raw(rb) });
+    }
+}
+
+/// The canonical reason phrase for a status code (a small table of the common codes; `""` for the rest,
+/// which serializes as `HTTP/1.1 <code> \r\n` — a valid empty reason phrase per RFC 9112). Editorial
+/// only; the client ignores it.
+fn http_reason_phrase(status: i64) -> &'static str {
+    match status {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        409 => "Conflict",
+        410 => "Gone",
+        413 => "Payload Too Large",
+        414 => "URI Too Long",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    }
+}
+
+/// Render a response builder into ONE contiguous buffer (http.md R4), or `Err(AL_INVALID)` on an
+/// out-of-range status (`100..=599`) or a caller-supplied framing / connection-management header
+/// (`Content-Length` / `Transfer-Encoding` / `Connection` — all auto-generated below; a duplicate is a
+/// response-smuggling vector, so it is rejected rather than silently overridden — mirror of the client
+/// serialize). Layout:
+/// `HTTP/1.1 <status> <reason>\r\n<caller headers>\r\nConnection: close\r\n[Content-Length: <n>\r\n]\r\n<body>`.
+/// `Content-Length` is emitted iff a body was set; `Connection: close` is always emitted (v1 closes the
+/// conn after every response — the RFC 9112 §9.6 mandated signal for a non-persistent server). NO auto
+/// `Date`/`Server` (editorial headers are the caller's — framework territory).
+fn http_serialize_response(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
+    // A valid HTTP status code is `100..=599`.
+    if !(100..=599).contains(&rb.status) {
+        return Err(AL_INVALID);
+    }
+    // Reject a caller-supplied framing / connection header — all auto-generated.
+    for (name, _) in &rb.headers {
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("connection")
+        {
+            return Err(AL_INVALID);
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"HTTP/1.1 ");
+    // Status is exactly three digits (guarded `100..=599` above), so render it into a 3-byte stack
+    // array instead of heap-allocating a `String` on this hot serialize path.
+    let s = rb.status as u32;
+    buf.extend_from_slice(&[b'0' + (s / 100) as u8, b'0' + (s / 10 % 10) as u8, b'0' + (s % 10) as u8]);
+    buf.push(b' ');
+    buf.extend_from_slice(http_reason_phrase(rb.status).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    for (name, value) in &rb.headers {
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    // v1 closes the conn after each response → signal it (RFC 9112 §9.6). Server-side keepalive later
+    // drops this and pools the conn, invisibly behind the same surface.
+    buf.extend_from_slice(b"Connection: close\r\n");
+    if let Some(body) = &rb.body {
+        buf.extend_from_slice(b"Content-Length: ");
+        buf.extend_from_slice(body.len().to_string().as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(b"\r\n");
+    if let Some(body) = &rb.body {
+        buf.extend_from_slice(body);
+    }
+    Ok(buf)
+}
+
+/// `ctx.respond(rb)` — serialize `rb` and write it to the accepted connection in ONE write (http.md R4),
+/// then close the fd (v1: one request per conn). **Consumes BOTH** `ctx` and `rb` (the language moved
+/// them in, nulling both caller slots — the runtime frees them). Returns `0` on success, else a mapped
+/// status (`AL_INVALID` for a bad status / caller framing header, or the `send` errno) — the fd is
+/// closed on **every** path (via the ctx `Drop`). SIGPIPE-safe (`MSG_NOSIGNAL` / `SO_NOSIGPIPE`).
+///
+/// # Safety
+/// `ctx` a pointer from [`align_rt_http_accept`] (moved in — freed here), or null; `rb` a pointer from
+/// [`align_rt_http_response_new`] (moved in — freed here), or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mut ResponseBuilder) -> i32 {
+    // Take ownership of BOTH moved-in handles FIRST, so every early return frees them (mirror
+    // `http_client_request`): the ctx's `Drop` closes its fd; the builder's `Drop` frees its buffers.
+    let ctx_owned = if ctx.is_null() { None } else { Some(unsafe { Box::from_raw(ctx) }) };
+    let rb_owned = if rb.is_null() { None } else { Some(unsafe { Box::from_raw(rb) }) };
+    let (Some(c), Some(r)) = (ctx_owned, rb_owned) else {
+        return AL_INVALID; // a null handle — both `Drop` here (fd closed, buffers freed)
+    };
+    let bytes = match http_serialize_response(&r) {
+        Ok(b) => b,
+        Err(s) => return s, // `c` drops → the accepted fd is closed
+    };
+    // One SIGPIPE-safe write of the whole response; then `c` (and its fd) drops at scope end → the
+    // accepted conn is closed (v1: one request per conn). `r`'s buffers likewise drop here.
+    unsafe { http_send_all(c.fd, &bytes) }
 }
 
 #[cfg(test)]
@@ -14735,5 +15438,286 @@ mod tests {
         }
         // The 8 stale fds were closed by put_idle's reap; free() closes `fresh`. No double-close.
         unsafe { align_rt_http_client_free(client) };
+    }
+
+    // --- std.http Slice 4: the server primitive ------------------------------------------------
+
+    /// A free loopback port via the probe pattern (bind :0, read the port, drop) — `http.serve` rejects
+    /// port 0, so a concrete port is needed.
+    fn free_loopback_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        port
+    }
+
+    /// The request-head parser accepts a well-formed request and lays out method / target / header /
+    /// body spans over ONE buffer (zero-copy, R1).
+    #[test]
+    fn http_parse_request_head_accepts_well_formed() {
+        let raw = b"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\nabc";
+        let head = http_parse_request_head(raw).expect("well-formed request parses");
+        assert_eq!(&raw[head.method_start..head.method_start + head.method_len], b"POST");
+        assert_eq!(&raw[head.target_start..head.target_start + head.target_len], b"/submit");
+        assert_eq!(head.content_length, Some(3));
+        // The Host header span points into the same buffer (no copy).
+        let hosts: Vec<_> = head
+            .headers
+            .iter()
+            .filter(|h| raw[h.name_start..h.name_start + h.name_len].eq_ignore_ascii_case(b"host"))
+            .collect();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(&raw[hosts[0].value_start..hosts[0].value_start + hosts[0].value_len], b"example.com");
+        // A GET with HTTP/1.0 and no body frames as empty.
+        let g = b"GET / HTTP/1.0\r\nHost: x\r\n\r\n";
+        let gh = http_parse_request_head(g).expect("HTTP/1.0 GET parses");
+        assert_eq!(gh.content_length, None);
+        assert_eq!(&g[gh.target_start..gh.target_start + gh.target_len], b"/");
+    }
+
+    /// The five inbound smuggling guards each reject with `Invalid`.
+    #[test]
+    fn http_parse_request_head_rejects_each_smuggling_guard() {
+        let invalid = |raw: &[u8], why: &str| {
+            assert!(matches!(http_parse_request_head(raw), Err(HttpParseErr::Invalid)), "should reject: {why}");
+        };
+        // Guard 1: bare LF anywhere (request line + header line).
+        invalid(b"GET / HTTP/1.1\nHost: x\r\n\r\n", "bare LF on request line");
+        invalid(b"GET / HTTP/1.1\r\nHost: x\n\r\n", "bare LF on header line");
+        // Guard 2: whitespace between field-name and colon (and obs-fold leading WS).
+        invalid(b"GET / HTTP/1.1\r\nHost : x\r\n\r\n", "space before colon");
+        invalid(b"GET / HTTP/1.1\r\n Host: x\r\n\r\n", "obs-fold / leading WS name");
+        // Guard 3: Transfer-Encoding (alone) and Content-Length + Transfer-Encoding together.
+        invalid(b"GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", "TE alone");
+        invalid(
+            b"POST / HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc",
+            "CL + TE together",
+        );
+        // Guard 4: non-origin-form targets (absolute / authority / asterisk).
+        invalid(b"GET http://evil/ HTTP/1.1\r\nHost: x\r\n\r\n", "absolute-form target");
+        invalid(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n", "authority-form target");
+        invalid(b"OPTIONS * HTTP/1.1\r\n\r\n", "asterisk-form target");
+        // Guard 5: method-token + target CR/LF/NUL guards mirrored inbound.
+        invalid(b"GE\x01T / HTTP/1.1\r\nHost: x\r\n\r\n", "non-token method (control char)");
+        invalid(b"GET /a\x00b HTTP/1.1\r\nHost: x\r\n\r\n", "NUL in target");
+        // A garbage version is malformed too.
+        invalid(b"GET / HTTP/2.0\r\nHost: x\r\n\r\n", "unsupported version");
+        // A conflicting duplicate Content-Length is a smuggling vector.
+        invalid(b"POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc", "conflicting duplicate CL");
+    }
+
+    /// A valid-so-far prefix is `Incomplete` (the streaming read distinguishes "read more" from
+    /// "malformed").
+    #[test]
+    fn http_parse_request_head_incomplete_prefix() {
+        assert!(matches!(http_parse_request_head(b"GET / HTTP/1.1\r\nHost: x"), Err(HttpParseErr::Incomplete)));
+        assert!(matches!(http_parse_request_head(b"GET /"), Err(HttpParseErr::Incomplete)));
+    }
+
+    /// The PR-review hardening guards: full-token field-names (reject a mid-name non-tchar), clean
+    /// header values (reject NUL / stray CR, but keep legitimate SP-bearing values), and a
+    /// digits-only Content-Length (reject a leading `+` / non-digit).
+    #[test]
+    fn http_parse_request_head_hardening_guards() {
+        let invalid = |raw: &[u8], why: &str| {
+            assert!(matches!(http_parse_request_head(raw), Err(HttpParseErr::Invalid)), "should reject: {why}");
+        };
+        // Field-name = RFC token: a mid-name `@` is now rejected (the old first/last-char check let it
+        // through — a header-name smuggling class).
+        invalid(b"GET / HTTP/1.1\r\nFo@o: bar\r\n\r\n", "non-token char mid-name");
+        // Header value must be CR/LF/NUL-free.
+        invalid(b"GET / HTTP/1.1\r\nX-Tag: a\x00b\r\n\r\n", "NUL in header value");
+        invalid(b"GET / HTTP/1.1\r\nX-Tag: a\rb\r\n\r\n", "stray CR in header value");
+        // A legitimate space-bearing value is still accepted (no SP over-reject).
+        let ok = b"GET / HTTP/1.1\r\nUser-Agent: foo bar baz\r\n\r\n";
+        let h = http_parse_request_head(ok).expect("SP-bearing value accepted");
+        let ua = h
+            .headers
+            .iter()
+            .find(|s| ok[s.name_start..s.name_start + s.name_len].eq_ignore_ascii_case(b"user-agent"))
+            .expect("User-Agent present");
+        assert_eq!(&ok[ua.value_start..ua.value_start + ua.value_len], b"foo bar baz");
+        // Content-Length: digits only — a leading `+`, sign, or non-digit is rejected; a plain run of
+        // digits still parses.
+        invalid(b"POST / HTTP/1.1\r\nContent-Length: +3\r\n\r\nabc", "leading + in CL");
+        invalid(b"POST / HTTP/1.1\r\nContent-Length: 3a\r\n\r\nabc", "non-digit in CL");
+        invalid(b"POST / HTTP/1.1\r\nContent-Length: \r\n\r\n", "empty CL");
+        let good = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+        assert_eq!(http_parse_request_head(good).expect("plain CL parses").content_length, Some(3));
+    }
+
+    /// A raw-socket client that sends `req` and returns the full response bytes the server wrote.
+    fn raw_http_client(port: u16, req: &[u8]) -> std::thread::JoinHandle<Vec<u8>> {
+        use std::io::{Read, Write};
+        let req = req.to_vec();
+        std::thread::spawn(move || {
+            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            sock.write_all(&req).expect("write request");
+            let mut resp = Vec::new();
+            let _ = sock.read_to_end(&mut resp); // server closes after respond → read to EOF
+            resp
+        })
+    }
+
+    /// serve → accept → read the parsed request via the getters → respond: a full round-trip. The
+    /// client sees the exact serialized response (status line + headers + auto Content-Length +
+    /// Connection: close + body).
+    #[test]
+    fn http_server_serve_accept_respond_round_trip() {
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0, "serve binds");
+        assert!(!srv.is_null());
+
+        let client = raw_http_client(port, b"POST /echo HTTP/1.1\r\nHost: h\r\nX-Tag: hi\r\nContent-Length: 5\r\n\r\nhello");
+
+        let mut ctx: *mut HttpRequestCtx = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, 0, "accept parses the request");
+        assert!(!ctx.is_null());
+        // Getters — zero-copy views into the ctx buffer.
+        let m = unsafe { align_rt_http_ctx_method(ctx) };
+        assert_eq!(unsafe { safe_slice(m.ptr, m.len) }, b"POST");
+        let p = unsafe { align_rt_http_ctx_path(ctx) };
+        assert_eq!(unsafe { safe_slice(p.ptr, p.len) }, b"/echo");
+        let mut hv = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_http_ctx_header(ctx, http_s("x-TAG").0, http_s("x-TAG").1, &mut hv) }, 1);
+        assert_eq!(unsafe { safe_slice(hv.ptr, hv.len) }, b"hi");
+        let mut miss = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_http_ctx_header(ctx, http_s("x-nope").0, http_s("x-nope").1, &mut miss) }, 0);
+        let b = unsafe { align_rt_http_ctx_body(ctx) };
+        assert_eq!(unsafe { safe_slice(b.ptr, b.len) }, b"hello");
+
+        // Build + respond (consumes ctx and rb).
+        let rb = align_rt_http_response_new(200);
+        unsafe { align_rt_http_rb_header(rb, http_s("Content-Type").0, http_s("Content-Type").1, http_s("text/plain").0, http_s("text/plain").1) };
+        unsafe { align_rt_http_rb_body(rb, b"world".as_ptr(), 5) };
+        assert_eq!(unsafe { align_rt_http_respond(ctx, rb) }, 0, "respond writes the response");
+
+        let resp = client.join().unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "status line: {text:?}");
+        assert!(text.contains("Content-Type: text/plain\r\n"), "caller header: {text:?}");
+        assert!(text.contains("Content-Length: 5\r\n"), "auto Content-Length: {text:?}");
+        assert!(text.contains("Connection: close\r\n"), "Connection: close: {text:?}");
+        assert!(text.ends_with("\r\n\r\nworld"), "body: {text:?}");
+        assert!(!text.to_ascii_lowercase().contains("date:"), "no auto Date");
+        assert!(!text.to_ascii_lowercase().contains("server:"), "no auto Server");
+        unsafe { align_rt_http_server_free(srv) };
+    }
+
+    /// A malformed request → `accept` returns `AL_INVALID` (closing that conn) but the LISTENER stays
+    /// alive: a subsequent well-formed client is served.
+    #[test]
+    fn http_server_rejects_malformed_then_keeps_serving() {
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+
+        // A bare-LF (smuggling) request → accept rejects it, closing the conn.
+        let bad = raw_http_client(port, b"GET / HTTP/1.1\nHost: h\r\n\r\n");
+        let mut ctx: *mut HttpRequestCtx = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, AL_INVALID, "malformed request rejected");
+        assert!(ctx.is_null());
+        let _ = bad.join(); // the client sees the closed conn (empty read)
+
+        // The server still serves the next connection.
+        let good = raw_http_client(port, b"GET /ok HTTP/1.1\r\nHost: h\r\n\r\n");
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, 0, "server keeps serving after a bad request");
+        assert!(!ctx.is_null());
+        let rb = align_rt_http_response_new(204);
+        assert_eq!(unsafe { align_rt_http_respond(ctx, rb) }, 0);
+        let resp = good.join().unwrap();
+        assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 204 No Content\r\n"));
+        unsafe { align_rt_http_server_free(srv) };
+    }
+
+    /// `respond` rejects a caller-supplied Content-Length (smuggling guard) — the fd is still closed.
+    #[test]
+    fn http_respond_rejects_caller_framing_header() {
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+        let client = raw_http_client(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+        let mut ctx: *mut HttpRequestCtx = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, 0);
+        let rb = align_rt_http_response_new(200);
+        unsafe { align_rt_http_rb_header(rb, http_s("Content-Length").0, http_s("Content-Length").1, http_s("10").0, http_s("10").1) };
+        assert_eq!(unsafe { align_rt_http_respond(ctx, rb) }, AL_INVALID, "caller Content-Length rejected");
+        let _ = client.join(); // conn closed, empty response
+        unsafe { align_rt_http_server_free(srv) };
+    }
+
+    /// An out-of-range status is rejected at respond; the builder's Option body drives Content-Length.
+    #[test]
+    fn http_serialize_response_status_and_body_framing() {
+        // Header-only (no body) → no Content-Length; a set-but-empty body → Content-Length: 0.
+        let hdr_only = ResponseBuilder { status: 200, headers: vec![], body: None };
+        let s = String::from_utf8(http_serialize_response(&hdr_only).unwrap()).unwrap();
+        assert!(!s.to_ascii_lowercase().contains("content-length"), "header-only has no CL: {s:?}");
+        let empty_body = ResponseBuilder { status: 200, headers: vec![], body: Some(vec![]) };
+        let s2 = String::from_utf8(http_serialize_response(&empty_body).unwrap()).unwrap();
+        assert!(s2.contains("Content-Length: 0\r\n"), "set-but-empty body frames as CL 0: {s2:?}");
+        // Out-of-range status rejected.
+        for bad in [0i64, 99, 600, -5, 1000] {
+            let rb = ResponseBuilder { status: bad, headers: vec![], body: None };
+            assert_eq!(http_serialize_response(&rb), Err(AL_INVALID), "status {bad} rejected");
+        }
+        // An unknown-but-valid status serializes with an empty reason phrase.
+        let odd = ResponseBuilder { status: 250, headers: vec![], body: None };
+        let s3 = String::from_utf8(http_serialize_response(&odd).unwrap()).unwrap();
+        assert!(s3.starts_with("HTTP/1.1 250 \r\n"), "empty reason phrase: {s3:?}");
+        // The alloc-free 3-digit status render is exact at both range extremes.
+        for st in [100i64, 599] {
+            let rb = ResponseBuilder { status: st, headers: vec![], body: None };
+            let out = String::from_utf8(http_serialize_response(&rb).unwrap()).unwrap();
+            assert!(out.starts_with(&format!("HTTP/1.1 {st} ")), "3-digit render at {st}: {out:?}");
+        }
+    }
+
+    /// Null-safety across the server FFI surface.
+    #[test]
+    fn http_server_null_safe() {
+        unsafe { align_rt_http_server_free(std::ptr::null_mut()) };
+        unsafe { align_rt_http_ctx_free(std::ptr::null_mut()) };
+        unsafe { align_rt_http_response_free(std::ptr::null_mut()) };
+        let mut ctx: *mut HttpRequestCtx = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_accept(std::ptr::null_mut(), &mut ctx) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_http_serve(view_of("127.0.0.1").0, view_of("127.0.0.1").1, 8080, std::ptr::null_mut()) }, AL_INVALID);
+        let m = unsafe { align_rt_http_ctx_method(std::ptr::null()) };
+        assert!(m.ptr.is_null());
+        let bd = unsafe { align_rt_http_ctx_body(std::ptr::null()) };
+        assert!(bd.ptr.is_null());
+        // A null rb into respond with a real ctx-less call — both null → AL_INVALID, no crash.
+        assert_eq!(unsafe { align_rt_http_respond(std::ptr::null_mut(), std::ptr::null_mut()) }, AL_INVALID);
+        // rb.body / rb.header null-safe.
+        unsafe { align_rt_http_rb_body(std::ptr::null_mut(), b"x".as_ptr(), 1) };
+        unsafe { align_rt_http_rb_header(std::ptr::null_mut(), b"a".as_ptr(), 1, b"b".as_ptr(), 1) };
+    }
+
+    /// N accept→respond cycles do not leak fds (the accepted conn is closed by respond on every cycle).
+    /// Linux-only (uses `/proc/self/fd`); a no-op elsewhere.
+    #[test]
+    fn http_server_no_fd_leak_across_cycles() {
+        let count_fds = || -> Option<usize> { std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count()) };
+        let Some(before) = count_fds() else { return }; // not Linux — skip
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+        for _ in 0..12 {
+            let client = raw_http_client(port, b"GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+            let mut ctx: *mut HttpRequestCtx = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, 0);
+            let rb = align_rt_http_response_new(200);
+            assert_eq!(unsafe { align_rt_http_respond(ctx, rb) }, 0);
+            let _ = client.join();
+        }
+        unsafe { align_rt_http_server_free(srv) };
+        let after = count_fds().unwrap();
+        // Allow a small slack for runtime bookkeeping, but a per-cycle leak (12+) must not show.
+        assert!(after <= before + 2, "fd leak across accept/respond cycles: {before} -> {after}");
     }
 }

@@ -181,9 +181,38 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    Tests: `align_runtime` units (pool reuses one conn across 3 gets; `Connection: close` not pooled;
    stale-conn retry; `http_head_keep_alive` decision table) + a driver test (two gets reuse one conn,
    observed via the server's accept count).
-4. server primitive (serve/accept, caller writes response). **Surface settled 2026-07-10** (two
-   independent design reviews: language-purity lens + systems-evolution lens; both ratified — full
-   surface in Signatures above). The settled decisions:
+4. server primitive (serve/accept, caller writes response). **DONE** (branch `http-slice4-server`).
+   Shipped surface (behind `import std.http`, the server ops **Impure**): `http.serve(host, port) ->
+   Result<http_server, Error>` (Move handle owning the listening fd — wraps net's `tcp.listen`,
+   SO_REUSEADDR + backlog 128, then lifts the fd out); `srv.accept() -> Result<http_request_ctx,
+   Error>` (Move handle owning the accepted fd + the request parsed to a zero-copy offset table,
+   mirror of `HttpResponse` R1 — streaming 32 KiB reads to the head's end + Content-Length body
+   framing, reusing the Incomplete/Invalid split and the 256 KiB-head / 128-header / 1 GiB-body caps;
+   a malformed request closes that conn and returns `Error.Invalid`, the listener stays alive);
+   `ctx.method()/path()` (`str` views), `ctx.header(name)` (case-insensitive `Option<str>` view),
+   `ctx.body()` (`slice<u8>` view) — all region-bound to `ctx` (#297); `http.response(status)` ->
+   `response_builder` (Move, distinct Ty + display name from the parsed `response`) + `rb.header(name,
+   value)` (bound receiver, P6 CR/LF/NUL **abort**) + `rb.body(data)` (optional); `ctx.respond(rb) ->
+   Result<(), Error>` (**consumes BOTH** ctx and rb — MIR nulls both slots like `cl.request(req)`;
+   serialize = status line + headers + auto Content-Length iff a body was set; ONE write, R4;
+   MSG_NOSIGNAL/SO_NOSIGPIPE; closes the fd, v1 one-request-per-conn). The **NEW**
+   `http_parse_request_head` for `METHOD SP target SP HTTP/1.1` implements all five inbound smuggling
+   guards below. **Three new Move types** (`http_server`/`http_request_ctx`/`response_builder`) took
+   the full Gate-1 twin-mirror sweep (Ty + Scalar for the two Result payloads; `response_builder` is
+   Ty-only like `http request`; `null_moved_source` for the respond double-consume was the one
+   easy-to-miss arm). Tests: `align_runtime` units (the request-head parser + each of the five guards
+   + serialize framing + fd-leak across N cycles) + driver e2e (`m11_http_server.rs`: an Align server
+   driven by a Rust client, **and a dogfood run of the shipped Align `cl.get` client against the Align
+   server**, plus the Gate-1 compile rejections). **Two adjustments from the settled record, both
+   recorded here:** (1) the request-line parser accepts `HTTP/1.0` **and** `HTTP/1.1` (v1 always closes
+   the conn, so 1.0-vs-1.1 persistence is moot; not a guard weakening — the five guards are unchanged);
+   (2) `respond` always emits `Connection: close` (RFC 9112 §9.6 **mandates** it for a non-persistent
+   server — the connection-management dual of the auto Content-Length, NOT an editorial `Date`/`Server`
+   header) and rejects a caller-supplied `Connection` / `Transfer-Encoding` at respond time alongside
+   the settled caller-`Content-Length` rejection. HTTPS/server-keepalive/concurrent-serving stay
+   deferred exactly as recorded. The settled surface (2026-07-10; two independent design reviews:
+   language-purity lens + systems-evolution lens; both ratified — full surface in Signatures above)
+   with its decisions:
    - **Response building = `response_builder`** (`http.response(status)` + `.header` + `.body` +
      `ctx.respond(rb)`), the exact mirror of the client `request` builder — status is a
      construction-time field like method/url; an args-form `respond(status, headers, body)` is
