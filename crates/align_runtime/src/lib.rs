@@ -4904,9 +4904,9 @@ pub unsafe extern "C" fn align_rt_buffer_put(b: *mut Buffer, bits: u64, width: i
     b.data.truncate(b.len);
     let le = bits.to_le_bytes();
     if be != 0 {
-        for i in (0..w).rev() {
-            b.data.push(le[i]);
-        }
+        let mut tmp = le;
+        tmp[..w].reverse();
+        b.data.extend_from_slice(&tmp[..w]);
     } else {
         b.data.extend_from_slice(&le[..w]);
     }

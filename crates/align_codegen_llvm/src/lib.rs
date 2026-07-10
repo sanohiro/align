@@ -4614,7 +4614,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .ok_or_else(|| self.err("bytes read load is not an instruction"))?
                     .set_alignment(1)
                     .map_err(|_| self.err("set bytes-read load alignment"))?;
-                let bits = if *be {
+                // llvm.bswap is only defined for widths > 8; sema never builds an 8-bit `_be`
+                // read, but guard defensively so a future gap cannot become an LLVM crash.
+                let bits = if *be && load_int_ty.get_bit_width() > 8 {
                     self.call_intrinsic("llvm.bswap", &[load_int_ty.into()], &[loaded.into()])?.into_int_value()
                 } else {
                     loaded.into_int_value()
