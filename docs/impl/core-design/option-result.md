@@ -18,7 +18,8 @@ plus exactly three conveniences (`else`, `?`, `map_err`).
 ```text
 Some(x) / None                     // Option constructors — bare, not qualified
 Ok(x)   / Err(e)                   // Result constructors — bare
-opt else fallback   -> T           // Option-ONLY unwrap-with-fallback (dedicated syntax, not a method)
+v else fallback     -> T           // unwrap-with-fallback on Option (Some/None) OR Result (Ok/Err);
+                                   //   on Result it yields Ok's value, discarding the (Copy) error
 expr?                              // Try: unwrap Ok/Some, else early-return Err/None to the caller
 r.map_err(f)        -> Result<T,F> // Result-only; f: fn(E) -> F; Ok passes through untouched
 match v { Some(x) => …, None => … }        // exhaustive, payload binds positionally
@@ -62,8 +63,10 @@ None of their own; a payload view (`str` in an `Ok`) keeps its own region.
   *stance*, not a gap-by-accident: `match` + `else` + `?` cover the uses without growing a
   second, combinator-flavored control-flow dialect. Adding any of them is a design decision
   (One-way review) — record in `open-questions.md` before implementing.
-- `else` on `Result` is rejected by design ("`else` unwrap expects an Option") — a `Result`
-  carries a reason that should be read or passed on, not defaulted away silently.
+- **Move-error `else`**: `else` on a `Result` whose error is a *Move* type (`Result<T, string>`)
+  is rejected for now — the discarded buffer would leak (enum/Result Move payloads have no
+  discard-drop yet). Every `Result` error today is a Copy enum (`Error` / a user error enum), so
+  the common case is fully supported; this lifts when Move payloads gain their discard-drop.
 
 ## Pitfalls
 
@@ -81,6 +84,8 @@ None of their own; a payload view (`str` in an `Ok`) keeps its own region.
 
 `crates/align_driver/tests/enum_match.rs` (Error variants, `error(c)` → exit code, `map_err`
 conversion, no-implicit-`?`-coercion, exhaustiveness); `m1.rs`/`m2.rs` Option/Result basics +
-`?`; `generics.rs:229` (`o else d` in a generic fn); `lint_unhandled_result.rs`; #308 main-error
+`?`; `generics.rs:229` (`o else d` in a generic fn); `else_result.rs` (`else` on `Result` — Ok
+passthrough / Err fallback / nested chains / Move-Ok no double-free / Move-error deferral);
+`lint_unhandled_result.rs`; #308 main-error
 restriction tests; examples `option.align`, `result.align`, `match_option_result.align`,
 `error_enum.align`.

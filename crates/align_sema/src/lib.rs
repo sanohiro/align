@@ -5126,9 +5126,9 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
                 // The fallback is an arm value: it inherits this position's `consuming` but is
-                // not a direct move site (like an `if`/`else` arm). Today Option payloads are
-                // scalar-only, so a Move-typed unwrap result is not constructible — but treating
-                // the fallback consistently keeps the analysis sound if that ever changes.
+                // not a direct move site (like an `if`/`else` arm). A `Result<string, Error> else`
+                // yields a Move (`string`) result, moved at its binding site — treating the fallback
+                // consistently (arm value, not a direct move) keeps that sound.
                 self.expr(fallback, moved, consuming, false);
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
@@ -13911,10 +13911,25 @@ impl<'a, 't> Checker<'a, 't> {
         let w_snapshot = self.wait_state.last().copied();
         let payload = match self.resolve(o.ty) {
             Ty::Option(s) => scalar_to_ty(s),
+            // `else` on a `Result` yields `Ok`'s value, deliberately discarding the error (the
+            // intent triangle: `?` propagates / `else` falls back / `match` inspects). Settled
+            // 2026-07-09. The error is dropped on the fallback path, which today needs it to be a
+            // Copy scalar (every `Result` error — the `Error` enum, a user error enum — is Copy):
+            // an owned-buffer error would leak, since enum/Result Move payloads have no discard-drop
+            // yet. Reject a Move error with a clear "not yet", the same deferral shape as elsewhere.
+            Ty::Result(ok, e) => {
+                if e.is_move() {
+                    self.diags.error(
+                        "`else` on a Result whose error owns a value (a Move payload) is not supported yet — its discarded buffer would leak; `match` on the error, or map it to a Copy error type first".to_string(),
+                        span,
+                    );
+                }
+                scalar_to_ty(ok)
+            }
             Ty::Error => Ty::Error,
             other => {
                 self.diags
-                    .error(format!("`else` unwrap expects an Option, got {}", ty_name(other)), span);
+                    .error(format!("`else` unwrap expects an Option or Result, got {}", ty_name(other)), span);
                 Ty::Error
             }
         };
@@ -16177,10 +16192,16 @@ mod tests {
     }
 
     #[test]
-    fn else_unwrap_requires_option() {
-        // `else`-unwrap on a non-Option is an error.
+    fn else_unwrap_requires_option_or_result() {
+        // `else`-unwrap on a plain (non-Option/Result) value is an error.
         let (_p, d) = check("fn f() -> i32 {\n  return 1 else 0\n}\n");
         assert!(d.has_errors(), "else-unwrap on a plain int must error");
+        // `else` on a `Result` yields Ok's value, discarding the error (settled 2026-07-09).
+        let (_q, ok) = check("fn g(n: i32) -> Result<i32, Error> {\n  return Ok(n)\n}\nfn f() -> i32 {\n  return g(2) else 0\n}\n");
+        assert!(!ok.has_errors(), "else on Result<i32, Error> should check");
+        // A Move error is deferred (its discarded buffer would leak) — rejected with a clear message.
+        let (_r, mov) = check("fn g() -> Result<i32, string> {\n  return Err(\"x\".clone())\n}\nfn f() -> i32 {\n  return g() else 0\n}\n");
+        assert!(mov.has_errors(), "else on a Result with a Move error must be rejected");
     }
 
     #[test]

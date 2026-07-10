@@ -6049,27 +6049,35 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
 /// `opt else fallback` → branch on the Option tag; `Some` unwraps the payload into the
 /// result slot, `None` evaluates the fallback (which writes the slot or diverges).
 fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty: Ty) -> Operand {
+    // `else` unwraps an `Option` (Some/None) or a `Result` (Ok/Err) — the same two-way shape, just
+    // a different discriminant/unwrap rvalue. The `Err` case discards the error; sema restricts the
+    // error to a Copy scalar, so there is nothing to drop on the fallback path (a bound-local
+    // scrutinee with a Move *Ok* payload is nulled below, exactly like `Option<string>`).
+    let is_result = matches!(opt.ty, Ty::Result(..));
     let result_slot = b.new_slot(ty);
     let opt_op = lower_expr(b, opt);
 
-    let is_some = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(is_some, Rvalue::OptionIsSome(opt_op.clone())));
+    let is_pos = b.fresh_value(Ty::Bool);
+    let test = if is_result { Rvalue::ResultIsOk(opt_op.clone()) } else { Rvalue::OptionIsSome(opt_op.clone()) };
+    b.push(Stmt::Let(is_pos, test));
     let some_bb = b.new_block();
     let none_bb = b.new_block();
     let join_bb = b.new_block();
-    b.terminate(Term::Branch(Operand::Value(is_some), some_bb, none_bb));
+    b.terminate(Term::Branch(Operand::Value(is_pos), some_bb, none_bb));
 
-    // Some: unwrap the payload into the result slot. If the source was a bound local with an
-    // owned payload (`opt: Option<string>`), null it — the payload moved into the result slot, so
-    // its exit `Drop` must free null (the `None` edge already has a {null,0} payload).
+    // Some/Ok: unwrap the payload into the result slot. If the source was a bound local with an
+    // owned payload (`opt: Option<string>` / `Result<string, Error>`), null it — the payload moved
+    // into the result slot, so its exit `Drop` must free null (the None/Err edge already has a
+    // {null,0} payload).
     b.cur = some_bb;
     let val = b.fresh_value(ty);
-    b.push(Stmt::Let(val, Rvalue::OptionUnwrap(opt_op)));
+    let unwrap = if is_result { Rvalue::ResultUnwrapOk(opt_op) } else { Rvalue::OptionUnwrap(opt_op) };
+    b.push(Stmt::Let(val, unwrap));
     b.push(Stmt::Store(result_slot, Operand::Value(val)));
     null_moved_source(b, opt);
     b.terminate(Term::Goto(join_bb));
 
-    // None: the fallback yields the value, or diverges (then the block is already
+    // None/Err: the fallback yields the value, or diverges (then the block is already
     // terminated and the store/goto are skipped).
     b.cur = none_bb;
     let fb = lower_expr(b, fallback);

@@ -2300,8 +2300,13 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    doctrine** ("else is Option-only — don't paper over errors"; the spec was silent — the same
    vacuum pattern as `loop`): that doctrine conflated *accidental* ignoring (still impossible)
    with *deliberate* fallback (legitimate; without one visible form, users wrap fallible APIs in
-   `Option` helpers and the culture splits). Implementation deferred: sema accepts `else` on a
-   `Result` scrutinee (drop the discarded `Err` payload when enum Move payloads land).
+   `Option` helpers and the culture splits). **IMPLEMENTED** (sema's `check_else_unwrap` accepts a
+   `Result` scrutinee and yields `Ok`'s type; MIR's `lower_else_unwrap` reuses the two-way Option
+   shape on the `ResultIsOk`/`ResultUnwrapOk` discriminant). The discarded `Err` must be a **Copy**
+   scalar — every `Result` error today is (the `Error` enum / a user error enum) — so there is
+   nothing to drop on the fallback path; a **Move** error (`Result<T, string>`) is rejected with a
+   clear "not yet" (its discarded buffer would leak) and lands when enum/Result Move payloads gain
+   discard-drop support.
 
 ## Open (to be decided)
 

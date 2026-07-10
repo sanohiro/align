@@ -51,7 +51,7 @@ fn main() -> i32 {
 }
 ```
 
-`?` is the whole story of propagation: unwrap an `Ok`, or return the `Err` to the caller immediately. The happy path reads top to bottom; the error path is the cold edge, and the compiler literally lays it out as the cold branch. At the point where you finally *consume* a `Result`, you have two forms: `match` when the error's *content* matters, and `else` when it doesn't — `v := f() else fallback` takes the `Ok` value or deliberately discards the error for the fallback (**implementation in progress**). Each intent has exactly one form: `?` propagates, `else` falls back, `match` inspects.
+`?` is the whole story of propagation: unwrap an `Ok`, or return the `Err` to the caller immediately. The happy path reads top to bottom; the error path is the cold edge, and the compiler literally lays it out as the cold branch. At the point where you finally *consume* a `Result`, you have two forms: `match` when the error's *content* matters, and `else` when it doesn't — `v := f() else fallback` takes the `Ok` value or deliberately discards the error for the fallback. Each intent has exactly one form: `?` propagates, `else` falls back, `match` inspects.
 
 ## Errors cannot be silently dropped
 
