@@ -9903,21 +9903,34 @@ impl HttpClient {
     /// `None` if the bucket is empty or holds only stale conns; an emptied bucket's key is removed so
     /// connecting to many distinct hosts/schemes can't leak empty `Vec`s.
     ///
-    /// (Caveat: a stale conn's teardown — up to `SSL_shutdown`+`SSL_free`+`close` — runs under the
-    /// lock. `SSL_shutdown` is one-way and local; the teardown is bounded, not a network round-trip.)
+    /// (A stale conn's teardown — up to `SSL_shutdown`+`SSL_free`+`close`, which can WRITE a
+    /// close_notify record and block on a full/dead socket — runs OUTSIDE the lock: reaped conns are
+    /// collected under the lock and closed after releasing it, so blocking TLS teardown never stalls a
+    /// concurrent `get_many` worker. This preserves the plaintext pool's no-I/O-under-lock property.)
     fn take_idle(&self, key: &(HttpScheme, String, i64)) -> Option<(i32, *mut c_void)> {
-        let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let bucket = map.get_mut(key)?;
-        let mut found = None;
-        while let Some(c) = bucket.pop() {
-            if c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT {
-                found = Some((c.fd, c.ssl));
-                break;
+        let mut stale: Vec<(i32, *mut c_void)> = Vec::new();
+        let found = {
+            let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match map.get_mut(key) {
+                None => None,
+                Some(bucket) => {
+                    let mut found = None;
+                    while let Some(c) = bucket.pop() {
+                        if c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT {
+                            found = Some((c.fd, c.ssl));
+                            break;
+                        }
+                        stale.push((c.fd, c.ssl)); // stale — reap (TLS-aware) OUTSIDE the lock
+                    }
+                    if bucket.is_empty() {
+                        map.remove(key); // don't accumulate empty buckets across many hosts/schemes
+                    }
+                    found
+                }
             }
-            unsafe { close_tls(c.ssl, c.fd) }; // stale — reap (TLS-aware) and keep looking
-        }
-        if bucket.is_empty() {
-            map.remove(key); // don't accumulate empty buckets across many hosts/schemes
+        }; // lock released here — the blocking teardown below runs unlocked
+        for (fd, ssl) in stale {
+            unsafe { close_tls(ssl, fd) };
         }
         found
     }
@@ -9925,21 +9938,32 @@ impl HttpClient {
     /// Return a reusable conn `(fd, ssl)` to `key`'s idle bucket. Expired idle conns are reaped
     /// **first** (so a fresh conn is never dropped in favour of stale ones); only if the bucket is
     /// still at [`HTTP_POOL_MAX_IDLE_PER_HOST`] after reaping is the new conn freed instead of pooled.
+    /// Every conn to be freed (reaped stale + a possibly-overflowing new conn) is collected under the
+    /// lock and torn down AFTER releasing it — a TLS `close_tls` can WRITE a close_notify and block, so
+    /// it must never run under the pool lock (preserving the no-I/O-under-lock property).
     fn put_idle(&self, key: (HttpScheme, String, i64), fd: i32, ssl: *mut c_void) {
-        let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let bucket = map.entry(key).or_default();
-        bucket.retain(|c| {
-            let live = c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT;
-            if !live {
-                unsafe { close_tls(c.ssl, c.fd) };
+        let mut to_close: Vec<(i32, *mut c_void)> = Vec::new();
+        {
+            let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bucket = map.entry(key).or_default();
+            bucket.retain(|c| {
+                let live = c.idle_since.elapsed() < HTTP_POOL_IDLE_TIMEOUT;
+                if !live {
+                    to_close.push((c.fd, c.ssl)); // reap stale FIRST, close outside the lock
+                }
+                live
+            });
+            // Capacity check runs AFTER the reap above, so a fresh conn is never dropped in favour of
+            // stale ones.
+            if bucket.len() >= HTTP_POOL_MAX_IDLE_PER_HOST {
+                to_close.push((fd, ssl)); // bucket full even after reaping — free the new conn
+            } else {
+                bucket.push(IdleConn { fd, ssl, idle_since: std::time::Instant::now() });
             }
-            live
-        });
-        if bucket.len() >= HTTP_POOL_MAX_IDLE_PER_HOST {
+        } // lock released here — the blocking teardown below runs unlocked
+        for (fd, ssl) in to_close {
             unsafe { close_tls(ssl, fd) };
-            return;
         }
-        bucket.push(IdleConn { fd, ssl, idle_since: std::time::Instant::now() });
     }
 }
 
@@ -9960,13 +9984,16 @@ pub unsafe extern "C" fn align_rt_http_client_free(c: *mut HttpClient) {
         return;
     }
     let client = unsafe { Box::from_raw(c) };
-    let mut map = client.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    for (_key, conns) in map.drain() {
-        for conn in conns {
-            unsafe { close_tls(conn.ssl, conn.fd) }; // TLS-aware (ssl null → just close the fd)
-        }
+    // Drain the pool under the lock, then tear conns down AFTER releasing it: a TLS `close_tls` can
+    // WRITE a close_notify and block on a dead socket, so it must not run under the pool lock (keeps
+    // the no-I/O-under-lock property uniform across every close_tls caller).
+    let conns: Vec<(i32, *mut c_void)> = {
+        let mut map = client.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.drain().flat_map(|(_key, v)| v.into_iter().map(|c| (c.fd, c.ssl))).collect()
+    };
+    for (fd, ssl) in conns {
+        unsafe { close_tls(ssl, fd) }; // TLS-aware (ssl null → just close the fd)
     }
-    drop(map); // release before `client` (and its now-empty map) drops
 }
 
 /// Decide whether a connection may be kept alive for reuse from the response head (http.md R3). An
@@ -16172,6 +16199,51 @@ mod tests {
         }
         // The 8 stale fds were closed by put_idle's reap; free() closes `fresh`. No double-close.
         unsafe { align_rt_http_client_free(client) };
+    }
+
+    /// Regression probe pinning the platform behaviour our TLS cleanup RELIES ON: OpenSSL's
+    /// `SSL_set_fd` attaches its socket BIO with **BIO_NOCLOSE**, so `SSL_free` does NOT close the
+    /// underlying fd — the runtime MUST `close(fd)` itself (which `close_tls` does). The PR #412
+    /// gemini review claimed the opposite (BIO_CLOSE → `SSL_free` closes the fd → our explicit
+    /// `close` is a double-close, CWE-1341); this probe empirically REJECTS that finding and pins the
+    /// real behaviour, so a future OpenSSL/platform change that ever flips it fails loudly HERE
+    /// instead of silently double-closing (or, symmetrically, leaking).
+    #[test]
+    fn ssl_free_does_not_close_fd_probe() {
+        use std::os::fd::IntoRawFd;
+        // Build a THROWAWAY client `SSL_CTX` — deliberately NOT `tls_client_ctx()`, whose process-wide
+        // `OnceLock` the positive-path tests must init AFTER `TLS_TEST_CA_FILE` is set; touching it here
+        // could race and cache a ctx without the test CA. This probe needs no trust config at all.
+        let ctx = unsafe {
+            let method = TLS_client_method();
+            assert!(!method.is_null(), "TLS_client_method");
+            let ctx = SSL_CTX_new(method);
+            assert!(!ctx.is_null(), "throwaway client SSL_CTX_new");
+            ctx
+        };
+        // A real connected TCP fd — `SSL_set_fd` wants a socket to wrap in its BIO.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_s, _) = l.accept().unwrap(); // keep the server end alive for the probe's lifetime
+        let fd = c.into_raw_fd();
+        unsafe {
+            let ssl = SSL_new(ctx);
+            assert!(!ssl.is_null(), "SSL_new");
+            assert_eq!(SSL_set_fd(ssl, fd), 1, "SSL_set_fd attaches the socket BIO");
+            SSL_free(ssl); // frees the SSL + its BIO
+        }
+        // Had `SSL_free` closed the fd (BIO_CLOSE — the review's claim), `F_GETFD` would now report
+        // EBADF (-1). It stays open (BIO_NOCLOSE), so `close_tls`'s explicit `close` is REQUIRED, not
+        // a double-close.
+        let flags = unsafe { fcntl(fd, T_F_GETFD) };
+        assert!(
+            flags >= 0,
+            "SSL_free must NOT close the fd (BIO_NOCLOSE); fcntl F_GETFD returned {flags} \
+             (< 0 / EBADF would mean the review was right and our close_tls double-closes)"
+        );
+        unsafe { close(fd) }; // our required cleanup — closes the fd exactly once
+        unsafe { SSL_CTX_free(ctx) }; // free the throwaway ctx
     }
 
     // --- std.http Slice 5: HTTPS/TLS client ----------------------------------------------------
