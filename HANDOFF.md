@@ -5,11 +5,12 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10 (**#399** align-LLM runway A1 `fs.read_bytes_view` MERGED — first
+_Last updated: 2026-07-10 (**#401** align-LLM runway A2 binary decode/encode MERGED — 18
+endian-explicit `bytes` reads inline-lowered + `buffer.put_*`/`append`; **#400** lexer escape
+set landed same day (other session); **#399** runway A1 `fs.read_bytes_view` MERGED — first
 arena-backed slice view, `Scalar::Slice` + `region_bearing`; **#398** std.http Slice 3 —
-keepalive pool + R6 bench — MERGED, R3/R6 both met; same day, owed-delta wave: **#396**
-struct-`==` ICE → sema diagnostic and **#397** no-shadowing enforcement MERGED; earlier same
-day: staleness sweep #395)._
+keepalive pool + R6 bench — MERGED, R3/R6 both met; same day, owed-delta wave: **#396** + **#397**;
+staleness sweep #395)._
 
 ## ▶ NEXT SESSION — start here
 
@@ -88,8 +89,17 @@ replacing the `tracks_region` gate at every EscapeCheck site. Adversarial gate: 
 programs all rejected, no new hole; the one CONFIRMED finding is the **pre-existing**
 closure-captured-arena-view UAF (also reproduces on M9 `read_file_view`), recorded in
 open-questions under the escaping-fn-values deferral. `cargo test --workspace` **1647 green**.
-A2 design note for next time: no owned-bytes/copy-out exists yet — a view cannot leave its arena;
-A2's decode/encode surface should decide that shape. **A2–A8 are not started.**
+**A2 is DONE (merged as #401, 2026-07-10):** binary codec — decode `bytes.u8/i8(off)` +
+`{u16..u64,i16..i64,f32,f64}_{le,be}(off)` (18 offset-explicit Copy-scalar reads, **inline**
+codegen: align-1 load + `llvm.bswap` for `_be` + float bit-cast — no FFI barrier in descriptor
+loops); encode `buffer.put_*(v)` (same 18-name set) + `buffer.append(bytes/str)` on a `mut`
+bound buffer (the deferred M9 buffer op set landing with its designed consumer). Settled and
+recorded (draft.md §12 + open-questions): endianness always explicit (no hidden default);
+out-of-range **aborts** like `slice[i]` (the `off+width` i64-overflow case provably caught by
+the signed `start>end` arm); **copy-out/owned-bytes not needed, deferred**. Adversarial gate:
+zero defects (par_map race structurally impossible — Move buffers can't be captured); gemini's
+2 mediums (defensive bswap width guard, bulk BE append) applied. `cargo test --workspace`
+**1661 green**. **A3+ (the `loop` slice is next best) are not started.**
 
 **M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), `std.compress`
 (#380–#381), and `std.crypto` (#383–#388) are DONE.** Full shipped-feature summaries + per-slice
