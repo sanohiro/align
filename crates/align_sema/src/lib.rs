@@ -14167,17 +14167,24 @@ impl<'a, 't> Checker<'a, 't> {
         self.loops.push(LoopCtx { break_ty: expected, saw_break: false, arena_depth: self.arena_depth });
         // The body is a per-iteration statement sequence: its tail value is discarded, so no
         // expected type is threaded to it. `break` statements inside drive the loop's value.
+        // Bracket the body check with the `self.locals` length: every local declared inside the body
+        // (at any nesting / expression position; lifted lambdas swap their own `locals` in and out)
+        // lands in `[lo, hi)`. MIR intersects this with `drop_locals` for the per-iteration drops —
+        // robust without a per-`ExprKind` walk.
+        let lo = self.locals.len() as LocalId;
         let body = self.check_block(b, None);
+        let hi = self.locals.len() as LocalId;
+        let body_locals = lo..hi;
         let ctx = self.loops.pop().expect("loop context balanced");
         if ctx.saw_break {
             let ty = ctx.break_ty.unwrap_or(Ty::Unit);
             self.constrain(ty, expected, span);
-            Expr { kind: ExprKind::Loop { body, diverges: false }, ty, span }
+            Expr { kind: ExprKind::Loop { body, diverges: false, body_locals }, ty, span }
         } else {
             // No `break`: the loop diverges. It yields no value, so it takes the expected type (like
             // a diverging `match`) — the code after it is unreachable.
             let ty = expected.unwrap_or(Ty::Unit);
-            Expr { kind: ExprKind::Loop { body, diverges: true }, ty, span }
+            Expr { kind: ExprKind::Loop { body, diverges: true, body_locals }, ty, span }
         }
     }
 

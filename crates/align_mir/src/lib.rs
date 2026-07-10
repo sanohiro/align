@@ -6331,69 +6331,13 @@ fn lower_short_circuit(b: &mut Builder, op: BinOp, lhs: &hir::Expr, rhs: &hir::E
     Operand::Value(v)
 }
 
-/// Collect the free-standing owned locals (a subset of `drop_locals`) declared *inside* `body` —
-/// the loop's per-iteration locals, dropped each pass. Walks the whole body subtree (nested
-/// blocks/ifs/loops/matches) collecting `let`/destructure/match-arm binding slots; lifted lambdas
-/// are separate functions and never appear inline, so recursion stays within this loop.
-fn collect_iter_drops(b: &Builder, body: &hir::Block) -> Vec<Slot> {
-    let mut declared = std::collections::HashSet::new();
-    collect_block_decls(body, &mut declared);
-    // Keep declaration order stable and restrict to owned-drop locals.
-    b.drop_locals.iter().copied().filter(|s| declared.contains(s)).collect()
-}
-
-fn collect_block_decls(blk: &hir::Block, out: &mut std::collections::HashSet<Slot>) {
-    for s in &blk.stmts {
-        match s {
-            hir::Stmt::Let { local, init } => {
-                out.insert(*local);
-                collect_expr_decls(init, out);
-            }
-            hir::Stmt::LetTuple { locals, init, .. } => {
-                for l in locals.iter().flatten() {
-                    out.insert(*l);
-                }
-                collect_expr_decls(init, out);
-            }
-            hir::Stmt::Assign { value, .. }
-            | hir::Stmt::AssignField { value, .. }
-            | hir::Stmt::AssignVecLane { value, .. } => collect_expr_decls(value, out),
-            hir::Stmt::AssignIndex { index, value, .. }
-            | hir::Stmt::AssignElemField { index, value, .. }
-            | hir::Stmt::AssignElem { index, value, .. } => {
-                collect_expr_decls(index, out);
-                collect_expr_decls(value, out);
-            }
-            hir::Stmt::Return(Some(e)) | hir::Stmt::Break(Some(e)) | hir::Stmt::Expr(e) => collect_expr_decls(e, out),
-            hir::Stmt::Return(None) | hir::Stmt::Break(None) => {}
-        }
-    }
-    if let Some(v) = &blk.value {
-        collect_expr_decls(v, out);
-    }
-}
-
-fn collect_expr_decls(e: &hir::Expr, out: &mut std::collections::HashSet<Slot>) {
-    match &e.kind {
-        hir::ExprKind::Block(blk)
-        | hir::ExprKind::Arena(blk)
-        | hir::ExprKind::Unsafe(blk)
-        | hir::ExprKind::TaskGroup(blk)
-        | hir::ExprKind::Loop { body: blk, .. } => collect_block_decls(blk, out),
-        hir::ExprKind::If { then, els, .. } => {
-            collect_block_decls(then, out);
-            collect_block_decls(els, out);
-        }
-        hir::ExprKind::Match { arms, .. } => {
-            for a in arms {
-                for &binding in &a.bindings {
-                    out.insert(binding);
-                }
-                collect_expr_decls(&a.body, out);
-            }
-        }
-        _ => {}
-    }
+/// The free-standing owned locals (a subset of `drop_locals`) declared inside a loop body — its
+/// per-iteration locals, dropped each pass. Taken from the loop's `body_locals` range (every local
+/// declared anywhere in the body, recorded by sema; see `hir::ExprKind::Loop`), intersected with
+/// `drop_locals` in declaration order — no fragile per-`ExprKind` walk that could miss a `let`
+/// nested in a call argument / tuple / operand.
+fn loop_iter_drops(b: &Builder, body_locals: &std::ops::Range<u32>) -> Vec<Slot> {
+    b.drop_locals.iter().copied().filter(|s| body_locals.contains(s)).collect()
 }
 
 /// `loop { ... }` — a header block, the body, a back-edge to the header, and an exit block that
@@ -6407,12 +6351,12 @@ fn collect_expr_decls(e: &hir::Expr, out: &mut std::collections::HashSet<Slot>) 
 /// frame (a deep expression chain descends `lower_expr` once per level; see the `expr_depth` test).
 #[inline(never)]
 fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
-    let hir::ExprKind::Loop { body, diverges } = &e.kind else {
+    let hir::ExprKind::Loop { body, diverges, body_locals } = &e.kind else {
         unreachable!("lower_loop on a non-loop expression");
     };
     let (diverges, ty) = (*diverges, e.ty);
     let result_slot = (ty != Ty::Unit && !diverges).then(|| b.new_slot(ty));
-    let iter_drops = collect_iter_drops(b, body);
+    let iter_drops = loop_iter_drops(b, body_locals);
     let header = b.new_block();
     let exit = b.new_block();
     b.terminate(Term::Goto(header));

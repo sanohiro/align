@@ -399,7 +399,14 @@ pub enum ExprKind {
     /// (it never yields — like a `match` whose arms all diverge), so it satisfies any expected type
     /// and control never reaches the code after it. The body's trailing value is discarded each
     /// iteration; per-iteration owned locals drop at each pass (handled in MIR lowering).
-    Loop { body: Block, diverges: bool },
+    ///
+    /// `body_locals` is the half-open `LocalId` range of every local **declared inside** `body` —
+    /// recorded by sema as the `self.locals` growth across checking the body, so it captures locals
+    /// nested at any depth / any expression position (a `let` inside a block that is itself a call
+    /// argument, tuple element, `if`/`match` arm, …) without a fragile per-`ExprKind` walk, and
+    /// excludes lifted-lambda locals (a lambda swaps its own `locals` in/out). MIR intersects it with
+    /// `drop_locals` to drop the loop's per-iteration owned locals each pass.
+    Loop { body: Block, diverges: bool, body_locals: std::ops::Range<LocalId> },
     /// `arena { ... }` — a region; allocations inside are bulk-freed at block end.
     Arena(Block),
     /// `unsafe { ... }` — a marker block permitting `raw.*` ops. No runtime effect; lowers to its

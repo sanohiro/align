@@ -2286,6 +2286,16 @@ less) `loop` bound to a `str`-annotated `let` can report a type mismatch — con
 diverging-value-position behavior (`return` in the same spot behaves the same), not loop-specific;
 (2) the `break`-escape diagnostic wording is a nit (it reuses the return-escape phrasing shape).
 
+**Separately found (pre-existing, loop-independent):** a plain block expression carrying an owned
+`let` in a **value position** — e.g. `take({ s := make_string(); s.len() })` as a call argument —
+miscompiles even with no loop (a loop-free program returns a garbage exit code, not `0`), so the
+owned local's frame-exit drop / block-value handling is wrong for blocks nested in call-arg / tuple /
+operand positions. Present on `main` before the `loop` work; it entangled with the `loop`
+per-iteration-drop review (the review's example rides this same broken feature). The `loop` slice's
+per-iteration drops are now correct regardless (the drop set is the body's declared-`LocalId` range
+∩ `drop_locals`, so a `let` at any nesting/position is captured); the block-in-value-position
+miscompile itself is the separate fix needed here.
+
 ### Unrecorded spec vacuums — remainder (recorded 2026-07-09; settle-next priority)
 
 From the same audit as the sweep above. Leans are recorded so the next design session can settle

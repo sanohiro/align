@@ -78,6 +78,22 @@ fn a_per_iteration_owned_string_is_freed_each_pass() {
 }
 
 #[test]
+fn a_per_iteration_owned_local_nested_in_an_expression_is_freed_each_pass() {
+    if !backend_available() {
+        return;
+    }
+    // The per-iteration owned `string` is declared inside a block that is itself a *call argument*
+    // (a value position, not a top-level body statement). Its drop must still fire each pass — the
+    // loop's per-iteration drop set is the body's declared-local range, so it captures a `let` at
+    // any nesting depth, not only body-level statements. (Before the range-based fix, the
+    // `ExprKind`-walking collector missed this `let` and the slot leaked/corrupted each iteration.)
+    let src = "fn make() -> string {\n  mut b := builder()\n  b.write(\"hello\")\n  b.to_string()\n}\nfn take(n: i64) -> i64 = n\nfn main() -> i32 {\n  mut i := 0\n  loop {\n    r := take({ s := make(); s.len() })\n    print(r)\n    i = i + 1\n    if i >= 3 { break }\n  }\n  return 0\n}\n";
+    let out = build_and_run("loop-nested-drop", src);
+    assert_eq!(out.status.code(), Some(0), "a per-iteration owned local nested in a call arg must drop each pass, not leak/corrupt");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n5\n5\n");
+}
+
+#[test]
 fn a_per_iteration_owned_move_is_allowed() {
     if !backend_available() {
         return;
