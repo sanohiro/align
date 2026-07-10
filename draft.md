@@ -118,6 +118,12 @@ count = count + 1
 
 The default is immutable.
 
+A `mut` binding's **memory region is fixed at its initialization**: reassigning it with a value from
+a different region — an `arena`-allocated value where the binding holds a heap one, or vice versa —
+is a compile error (the drop/free schedule is bound to the region, so a region change would leak or
+double-free). Reassignment within the same region is fine. Allocate the new value in the same region,
+or use a separate binding.
+
 A name binds **once** per scope chain: re-declaring a name already visible — in the same scope,
 or shadowing an outer binding or a parameter — is a compile error. Rebinding hides a state change
 from the reader; use `mut` for a value that changes, a new name for a new thing. Two *disjoint*
