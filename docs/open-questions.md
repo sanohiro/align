@@ -234,6 +234,35 @@ Record: `draft.md` §18.2, `crates/align_runtime/src/lib.rs` (`validate_utf8` + 
 **Decision: ownership is a property of the type, not a keyword.** `array<T>`/`string`/`buffer`/heap are Move; primitives/small structs/`slice` (view) are Copy. No `owned` modifier is introduced. Lifetimes are inferred and lifetime syntax is not surfaced.
 Record: `impl/03-types.md` §6–§7
 
+### A `mut` binding's region is fixed at initialization — SETTLED + DONE (2026-07-10)
+**A `mut` binding's memory region (heap `Static` / `arena` / frame) is pinned at its initialization;
+a reassignment must not change it (conservative fail-closed v1).** Motivated by audit item **1-3**
+(below): the escape check tracks each local's region **flow-insensitively**, so an owned-Move local
+(`array`/`string`/`buffer`/Move struct) reassigned across regions — `arena → heap` — would enter the
+exit drop set while a bypassed branch still holds the arena pointer, and the arena bulk-free plus the
+exit drop then **double-free** it. The reverse — a shorter region silently upgrading a view (`str`/
+`slice`) — is an **escape hole**: a `mut v` holding an arena `str` reassigned with a `Static` literal
+on one branch, then returned, borrows freed arena memory on the bypassed branch (verified: it
+compiled + ran on `main`). Two rules, split by drop-ness:
+- **Owned Move locals** — a reassignment whose RHS region differs from the binding's current region
+  is a **sema error** ("reassigning this binding changes the value's memory region … a `mut`
+  binding's region is fixed at its initialization"). Same-region reassign (heap→heap, same-arena→
+  same-arena) stays legal and keeps its `drop_old` behavior.
+- **Copy region-bearing views** (`str`/`slice`/`bytes`) — no drop, so the concern is escape only:
+  **intersect** the regions (keep the binding pinned to the shortest it can hold on any path), which
+  is exactly the sound escape bound and closes the return/store hole above.
+The rule is deliberately conservative: it rejects some safe programs (a region change that is in fact
+unreachable on the surviving path) in exchange for a one-line, flow-insensitive check. **Future
+flow-sensitive slice:** per-path drop flags (drop a slot iff it was actually written on this path) —
+this needs the escape/drop analysis moved onto **MIR dataflow**, the same structural follow-up the
+External soundness audit records (§6 "Move escape/region checking off per-`ExprKind` enumeration onto
+a MIR dataflow pass"). Until then, fail closed. Known residual of the same class (pre-existing, found
+by the gate review): a mixed-region `if` *expression* value (`xs = if c { arena_val } else
+{ heap_val }`) is tracked as the shorter (arena) region, so the heap branch's buffer **leaks** at
+runtime when taken — a leak, never UB; owned by the same flow-sensitive slice.
+Record: `crates/align_sema` (`EscapeCheck::stmt`, `Stmt::Assign`), `tests/reassign_drop.rs`,
+`draft.md` §4 (Loop / mut reassignment).
+
 ### SIMD exposure (basic policy)
 **First slice DONE (M6 slice 1) — explicit `vecN<T>`.** The fixed-width vector type
 `vec2`/`vec4`/`vec8`/`vec16` of a numeric scalar (`Ty::Vec(Scalar, N)`, Copy/`Static`, LLVM
@@ -1868,7 +1897,7 @@ A 7-agent audit on another machine (frontend / sema-types / sema-flow / MIR+code
 - **NEW-3** (found here) a *false* "use of moved value" when mutually-exclusive `match` arms consume the same value (`MoveCheck` shared one moved-set across arms instead of clone+join like `if`/`else`).
 
 **Confirmed — still open (tracked in the Open section / their milestones):**
-- **1-3** `arena { mut xs := […].to_array(); xs = make() }` double-frees. Reproduced as `free(): double free detected in tcache` once the arrays are large enough to trip glibc's tcache (a small case survives silently; macOS aborts immediately). The `to_array` arena-bump result and the reassignment `drop_old` / arena bulk-free don't reconcile. **Highest-priority remaining bug.**
+- **1-3 — FIXED (2026-07-10).** `arena { mut xs := […].to_array(); xs = make() }` double-frees (`free(): double free detected in tcache` once the arrays trip glibc's tcache; macOS aborts immediately) — the `to_array` arena-bump result and the reassignment `drop_old` / arena bulk-free don't reconcile. Fixed by pinning a `mut` binding's region at initialization: a region-changing reassign of an owned Move local is now a sema error, and a view's region is intersected (not upgraded) — see Settled "A `mut` binding's region is fixed at initialization". A flow-sensitive relaxation (per-path drop flags) is deferred to the MIR-dataflow structural follow-up below.
 - **3-1** `&&` / `||` are **not short-circuit** — MIR lowers them as a strict `Rvalue::Bin`, so `i < len && arr[i]` still evaluates `arr[i]` and can trap. (Confirms the audit's "requires-verification" item.)
 - **2-1** a type-annotated `let` at an `if`-body head (`if flag { x: i32 := 5 … }`) misparses as a struct literal (no `no_struct_literal` context flag on the condition).
 - **2-2** `x as u32 < 5` won't parse (`parse_type` greedily eats `<` as generic args; a cast target is always a concrete primitive).

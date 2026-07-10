@@ -3546,14 +3546,45 @@ impl<'a> EscapeCheck<'a> {
                     // frame is still caught by the return / struct-field-store checks. A deeper
                     // arena value assigned to a shallower binding stays rejected.
                     let target = Region::Frame.shorter(Region::arena(*self.decl_depth.get(local).unwrap_or(&0)));
+                    let old_r = self.region.get(local).copied().unwrap_or(Region::Static);
                     if !r.outlives(target) {
                         self.diags.error(
                             "this value is bound to an arena block and cannot escape it".to_string(),
                             value.span,
                         );
+                    } else if is_owned_droppable(value.ty, self.structs) && old_r != r {
+                        // Rule 1 (fail-closed v1): an *owned* Move local (array / string / buffer /
+                        // Move struct …) is individually dropped at scope end, and whether that drop
+                        // runs is decided by its region (a `Static` heap value is freed by
+                        // `drop_locals`; an `Arena` value is bulk-freed with the arena, never
+                        // individually). This region is tracked flow-insensitively, so a reassignment
+                        // that *changes* it — e.g. `Arena → Static` on a conditional path — would put
+                        // the binding into `drop_locals` even when a bypassed branch leaves it holding
+                        // the original arena pointer: the arena bulk-free plus the exit drop then
+                        // double-free it. There is no per-path drop flag yet, so pin the region at
+                        // initialization and reject any region-changing reassign. Same-region
+                        // reassignment (heap → heap, same-arena → same-arena) stays legal and keeps its
+                        // `drop_old` behavior. (A flow-sensitive relaxation — per-path drop flags via
+                        // MIR dataflow — is the recorded future slice.)
+                        self.diags.error(
+                            "reassigning this binding changes the value's memory region (e.g. arena vs \
+                             heap); a `mut` binding's region is fixed at its initialization — use a \
+                             separate binding, or allocate the new value in the same region"
+                                .to_string(),
+                            value.span,
+                        );
+                    } else {
+                        // Track the reassigned binding's region for later uses. Intersect (take the
+                        // shorter-lived of the old and new regions) rather than overwrite: a Copy
+                        // region-bearing view (`str`/`slice`/`bytes`) has no drop, so the concern is
+                        // escape, and a flow-insensitive upgrade (`Arena → Static` on one path) would
+                        // let the binding be returned / stored while a bypassed branch still holds the
+                        // shorter-lived arena view (a use-after-free). The intersection keeps the
+                        // binding pinned to the shortest region it can hold on any path — exactly the
+                        // sound escape bound. (Owned Move locals never reach here on a region change:
+                        // Rule 1 above rejects them.)
+                        self.region.insert(*local, old_r.shorter(r));
                     }
-                    // Track the reassigned binding's region for later uses.
-                    self.region.insert(*local, r);
                 }
             }
             Stmt::AssignField { root, value, .. } => {

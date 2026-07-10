@@ -120,31 +120,91 @@ fn reassign_consuming_runtime_no_double_free() {
     assert_eq!(build_and_run("reassign-consume", src).status.code(), Some(4));
 }
 
-#[test]
-fn arena_owned_array_reassign_no_double_free() {
-    if !backend_available() {
-        return;
+/// Whether `src` is rejected by sema with the region-change reassignment diagnostic (Rule 1).
+fn rejects_region_change(src: &str) -> bool {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "reassign.align", src);
+    if !checked.diags.has_errors() {
+        return false;
     }
-    // 1-3: `mut xs := […].to_array()` allocated in an arena, reassigned to another owned array.
-    // The overwritten value is arena-bump memory (bulk-freed by the arena), so it must NOT get a
-    // reassign-drop — freeing an interior arena pointer individually corrupts the allocator
-    // (the observed `double free detected in tcache`). Running to completion proves it doesn't.
-    let src = "fn id64(x: i64) -> i64 = x\n\
-fn make() -> array<i64> {\n  ys := [7, 8, 9, 10, 11, 12, 13, 14].map(id64).to_array()\n  return ys\n}\n\
-fn main() -> i32 {\n  arena {\n    mut xs := [1, 2, 3, 4, 5, 6, 7, 8].map(id64).to_array()\n    xs = make()\n    xs = make()\n    print(xs[0])\n  }\n  return 0\n}\n";
-    assert_eq!(build_and_run("arena-reassign", src).status.code(), Some(0));
+    align_driver::format_diagnostics(&sm, &checked.diags).contains("changes the value's memory region")
 }
 
 #[test]
-fn arena_owned_array_reassign_suppresses_reassign_drop_in_mir() {
-    // The two reassigns of the arena-allocated `xs` must emit no reassign-drop (arena memory is
-    // bulk-freed); only the single exit drop of the final, heap-owned value remains.
+fn arena_owned_array_reassign_region_change_rejected() {
+    // An arena-allocated owned array reassigned with a *heap* (`Static`) value is a region change
+    // (`Arena -> Static`). The old value is arena-bump memory (bulk-freed with the arena, never
+    // individually); flow-insensitively upgrading `xs` to `Static` would enter it into `drop_locals`
+    // and — on a bypassed branch that still holds the arena pointer — double-free it (the observed
+    // `double free or corruption`). Rule 1 pins a `mut` binding's region at init and rejects this.
+    // Both the conditional shape (the actual crash) and the unconditional shape are rejected.
+    let cond = "fn make() -> array<i64> = [1, 2, 3].to_array()\n\
+fn main() -> i32 {\n  arena {\n    mut xs := [10, 20, 30, 40].to_array()\n    if xs[0] > 100 { xs = make() }\n  }\n  return 0\n}\n";
+    let uncond = "fn make() -> array<i64> = [1, 2, 3].to_array()\n\
+fn main() -> i32 {\n  arena {\n    mut xs := [10, 20, 30, 40].to_array()\n    xs = make()\n  }\n  return 0\n}\n";
+    assert!(rejects_region_change(cond), "conditional Arena->Static reassign must be a sema error");
+    assert!(rejects_region_change(uncond), "unconditional Arena->Static reassign must be a sema error");
+}
+
+#[test]
+fn arena_owned_array_reassign_region_change_rejected_in_loop() {
+    // Rule 1 fires the same inside a `loop` body: an arena binding reassigned with a heap value on
+    // any iteration would be a region change (and, in a loop, an unbounded leak/double-free). The
+    // two-pass loop-back MoveCheck (#402) does not exempt it.
+    let src = "fn make() -> array<i64> = [1, 2, 3].to_array()\n\
+fn main() -> i32 {\n  arena {\n    mut xs := [10, 20].to_array()\n    mut i := 0\n    loop {\n      if i >= 3 { break 0 }\n      xs = make()\n      i = i + 1\n    }\n  }\n  return 0\n}\n";
+    assert!(rejects_region_change(src), "a region-changing reassign in a loop body must be a sema error");
+}
+
+#[test]
+fn same_arena_owned_array_reassign_no_drop_in_mir() {
+    // Same-region reassignment stays legal: an arena binding reassigned with another *same-arena*
+    // owned array is not a region change (`Arena -> Arena`), so it keeps its `drop_old` suppression
+    // (arena memory is bulk-freed) — no reassign-drop, and no exit drop either (the final value is
+    // still arena memory, freed by the arena, never by `drop_locals`).
     let text = mir_text(
-        "fn id64(x: i64) -> i64 = x\n\
-fn make() -> array<i64> {\n  ys := [7, 8, 9].map(id64).to_array()\n  return ys\n}\n\
-fn main() -> i32 {\n  arena {\n    mut xs := [1, 2].map(id64).to_array()\n    xs = make()\n    print(xs[0])\n  }\n  return 0\n}\n",
+        "fn main() -> i32 {\n  arena {\n    mut xs := [1, 2].to_array()\n    xs = [3, 4, 5].to_array()\n    print(xs[0])\n  }\n  return 0\n}\n",
     );
-    assert_eq!(count_slot_drops(&text, "_0"), 1, "only the exit drop, no reassign-drop:\n{text}");
+    assert_eq!(count_slot_drops(&text, "_0"), 0, "no reassign-drop and no exit drop for arena memory:\n{text}");
+}
+
+#[test]
+fn same_arena_owned_array_reassign_runtime_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // The same-arena reassign runs clean (the arena bulk-frees once); the final value is `xs[0]` of
+    // the last array. A stray individual free of arena memory would abort the process.
+    let src = "fn main() -> i32 {\n  arena {\n    mut xs := [1, 2].to_array()\n    xs = [7, 8, 9].to_array()\n    return xs[0] as i32\n  }\n}\n";
+    assert_eq!(build_and_run("arena-same-region-reassign", src).status.code(), Some(7));
+}
+
+#[test]
+fn heap_owned_array_reassign_in_loop_runtime_no_double_free() {
+    if !backend_available() {
+        return;
+    }
+    // Heap -> heap is same-region (`Static -> Static`): legal, and the overwritten buffer is freed
+    // once per reassign (a reassign-drop). Inside a `loop` body this exercises Rule 1's legal path
+    // against the loop-back MoveCheck. After 3 iterations `xs` holds `make(2)`, so `xs[0]` = 2.
+    let src = "fn make(n: i64) -> array<i64> = [n, n, n].to_array()\n\
+fn main() -> i32 {\n  mut xs := make(1)\n  mut i := 0\n  loop {\n    if i >= 3 { break 0 }\n    xs = make(i)\n    i = i + 1\n  }\n  return xs[0] as i32\n}\n";
+    assert_eq!(build_and_run("heap-loop-reassign", src).status.code(), Some(2));
+}
+
+#[test]
+fn view_reassign_region_upgrade_escape_rejected() {
+    // A Copy region-bearing *view* (`str`) has no drop, but the same flow-insensitive tracking would
+    // let a conditional `Arena -> Static` upgrade slip an escape: a `mut v` holding an arena `str`,
+    // reassigned with a `Static` literal on one branch, then returned — on the bypassed branch `v`
+    // still borrows the arena buffer (a use-after-free). Rule 2 intersects the regions (keeps `v`
+    // pinned to the shortest it can hold on any path), so the return-escape check fires.
+    let mut sm = SourceMap::new();
+    let src = "fn f(cond: bool) -> str {\n  arena {\n    mut v := \"a\" + \"b\"\n    if cond { v = \"static\" }\n    return v\n  }\n}\nfn main() -> i32 {\n  print(f(false).len())\n  return 0\n}\n";
+    let checked = check(&mut sm, "view-reassign.align", src);
+    assert!(checked.diags.has_errors(), "an arena view escaping via a region-upgraded reassign must be rejected");
+    let msg = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(msg.contains("allocated in an arena"), "expected the arena-escape diagnostic, got:\n{msg}");
 }
 
 #[test]
