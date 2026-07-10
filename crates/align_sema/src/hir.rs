@@ -975,6 +975,12 @@ pub enum ExprKind {
     /// `Result<response, Error>`. `cl` is a bound local (borrowed); `req` is a
     /// [`crate::Ty::HttpRequest`] **consumed** (moved into the call — the runtime frees it). **Impure**.
     HttpClientRequest { client: Box<Expr>, req: Box<Expr> },
+    /// `cl.get_many(urls, max_concurrency)` — perform a batch of GETs over bounded concurrency,
+    /// yielding `Result<array<response>, Error>` (the `ty` — an owned [`crate::Ty::DynResponseArray`]
+    /// Ok payload; results in input order, all-or-Err). `cl` is a bound [`crate::Ty::HttpClient`] local
+    /// (borrowed, shared across the workers); `urls` is a borrowed `slice<str>`; `max_concurrency` is an
+    /// `i64` (`<= 0` aborts at runtime). **Impure** (network I/O). std.http item 6 / R5.
+    HttpGetMany { client: Box<Expr>, urls: Box<Expr>, max_concurrency: Box<Expr> },
     /// `http.serve(host, port)` — bind a listening socket and yield `Result<http_server, Error>` (the
     /// `ty`). The `http_server` ([`crate::Ty::HttpServer`]) is an owned **Move** handle owning the
     /// listening fd (`Drop`-closed). `host` is a borrowed `str` (empty → wildcard); `port` is an `i64`.

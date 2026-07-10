@@ -8815,6 +8815,17 @@ pub struct HttpResponse {
     body_len: usize,
 }
 
+/// Test-only live-count of allocated [`HttpResponse`] handles: incremented at every
+/// `Box::into_raw(Box::new(resp))` site (`align_rt_http_parse` and the client's `http_client_perform`)
+/// and decremented in [`align_rt_http_resp_free`] (the ONE free path — `align_rt_free_response_array`
+/// frees each element through it too). Makes a batch-error free path observable in a unit test: a
+/// leaked handle shows up as a nonzero delta against a snapshot taken before the batch, whereas
+/// asserting only `rc`/`out` (as `http_get_many_one_failure_fails_batch_no_leak` used to) cannot catch
+/// a deleted free — the successful responses' backing allocations are simply never reclaimed, which
+/// only a leak sanitizer or this counter observes.
+#[cfg(test)]
+static LIVE_HTTP_RESPONSES: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
 /// Abort the process on a build-time request-smuggling attempt (CR/LF/NUL in a header name/value) —
 /// the http.md P6 policy. Header injection is a programmer error (unsanitised data must not flow
 /// into a header name/value), so it aborts like an OOB index, never a silent skip (Nothing-hidden).
@@ -9237,6 +9248,8 @@ pub unsafe extern "C" fn align_rt_http_parse(data_ptr: *const u8, data_len: i64,
     match http_parse_core(src) {
         Ok(resp) => {
             unsafe { *out = Box::into_raw(Box::new(resp)) };
+            #[cfg(test)]
+            LIVE_HTTP_RESPONSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             0
         }
         Err(_) => AL_INVALID, // Incomplete (truncated) or Invalid — both are a bad complete buffer
@@ -9313,6 +9326,8 @@ pub unsafe extern "C" fn align_rt_http_resp_body(resp: *const HttpResponse) -> A
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_resp_free(resp: *mut HttpResponse) {
     if !resp.is_null() {
+        #[cfg(test)]
+        LIVE_HTTP_RESPONSES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         drop(unsafe { Box::from_raw(resp) });
     }
 }
@@ -9752,6 +9767,8 @@ unsafe fn http_client_perform(client: *mut HttpClient, req: &HttpRequest, out: *
                             }
                         }
                         unsafe { *out = Box::into_raw(Box::new(resp)) };
+                        #[cfg(test)]
+                        LIVE_HTTP_RESPONSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         0
                     }
                     Err(_) => {
@@ -9795,6 +9812,169 @@ pub unsafe extern "C" fn align_rt_http_client_get(
     let url = String::from_utf8_lossy(unsafe { bytes_view(url_ptr, url_len) }).into_owned();
     let req = HttpRequest { method: "GET".to_string(), url, headers: Vec::new(), body: Vec::new() };
     unsafe { http_client_perform(client, &req, out) }
+}
+
+/// `cl.get_many(urls, max_concurrency)` (http.md item 6 / R5) — perform a batch of `GET`s over
+/// **bounded concurrency**, writing an owned `array<response>` (`{ptr,len}`: a heap buffer of `len`
+/// `*mut HttpResponse` handles, one per URL, in **input order**) to `out` and returning `0`; or, on
+/// **any** transport/parse failure, the **lowest-index** error status (all-or-Err — matches the
+/// `tg_wait` convention), leaving `out` = `{null,0}` after freeing every response that did succeed.
+///
+/// **Mechanism (http.md item 6):** a dedicated bounded blocking-I/O worker pool — `min(max_concurrency,
+/// urls.len())` scoped workers (`std::thread::scope`) claim URL indices off a shared atomic counter
+/// and run the ordinary [`http_client_perform`] exchange against the **shared** `client`, whose pool
+/// ops are `Mutex`-guarded (O(1), never held across blocking I/O — see [`HttpClient`]). Results slot
+/// into a preallocated per-index array, so the batch is deterministic regardless of completion order.
+/// Run-to-completion: there is no cancellation, so on failure the remaining workers still finish and
+/// their responses are freed. `max_concurrency <= 0` **aborts** (a programmer bug, the `rand.range`
+/// class). Empty `urls` → `Ok` empty (`{null,0}`). Plaintext only (an `https://` URL fails with the
+/// bare `Error.Invalid`, which — all-or-Err — fails the whole batch, per http.md P1).
+///
+/// The array is `Drop`-freed by [`align_rt_free_response_array`] (each handle, then the header).
+///
+/// # Safety
+/// `client` must be null or a valid [`HttpClient`] (shared across the workers — its interior is
+/// `Mutex`-guarded); `urls_ptr`/`urls_len` a valid range of `AlignStr` `str` views; `out` a writable
+/// `{ptr,len}` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_get_many(
+    client: *mut HttpClient,
+    urls_ptr: *const AlignStr,
+    urls_len: i64,
+    max_concurrency: i64,
+    out: *mut AlignStr,
+) -> i32 {
+    use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering};
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+    // A non-positive concurrency degree is a programmer bug, not a runtime error (the `rand.range`
+    // total-or-abort class) — abort rather than silently pick a degree.
+    if max_concurrency <= 0 {
+        panic_abort("http.get_many: max_concurrency must be >= 1");
+    }
+    let Ok(n) = safe_len(urls_len) else {
+        return AL_INVALID;
+    };
+    if n == 0 {
+        return 0; // empty batch → Ok empty {null,0}
+    }
+    // Materialize each URL as an owned `String` up front (a worker builds a GET request from it; owned
+    // strings are `Send` and outlive the scope, so no per-request borrow of the caller's views).
+    let views = unsafe { safe_slice(urls_ptr, urls_len) };
+    if views.len() != n {
+        return AL_INVALID; // a null/short view range under a positive len — malformed
+    }
+    let urls: Vec<String> =
+        views.iter().map(|s| String::from_utf8_lossy(unsafe { bytes_view(s.ptr, s.len) }).into_owned()).collect();
+
+    // Per-index result slots (input order) + per-index status (0 = ok). Atomics so the workers write
+    // disjoint slots without a lock; each index is claimed by exactly one worker.
+    let results: Vec<AtomicPtr<HttpResponse>> = (0..n).map(|_| AtomicPtr::new(core::ptr::null_mut())).collect();
+    let statuses: Vec<AtomicI32> = (0..n).map(|_| AtomicI32::new(0)).collect();
+    let next = AtomicUsize::new(0);
+    let workers = (max_concurrency as usize).min(n); // >= 1 (n >= 1 and max_concurrency >= 1)
+
+    // The `client` is shared read-only across workers (its pool is `Mutex`-guarded, so a shared raw
+    // pointer is sound — no `&mut` aliasing, interior mutation only). A `Send`/`Sync` shim carries it
+    // into the scoped workers; the pointee's own synchronization makes this safe.
+    #[derive(Clone, Copy)]
+    struct SharedClient(*mut HttpClient);
+    unsafe impl Send for SharedClient {}
+    unsafe impl Sync for SharedClient {}
+    impl SharedClient {
+        // A `&self` accessor so a worker closure captures the WHOLE `SharedClient` (whose `Sync` impl
+        // asserts the pointee is safe to share) rather than disjointly capturing the bare
+        // `*mut HttpClient` field (which is not `Sync`, and would make the closure non-`Send`).
+        fn ptr(&self) -> *mut HttpClient {
+            self.0
+        }
+    }
+    let shared = SharedClient(client);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let req =
+                        HttpRequest { method: "GET".to_string(), url: urls[i].clone(), headers: Vec::new(), body: Vec::new() };
+                    let mut resp: *mut HttpResponse = core::ptr::null_mut();
+                    let code = unsafe { http_client_perform(shared.ptr(), &req, &mut resp) };
+                    if code == 0 {
+                        results[i].store(resp, Ordering::Relaxed);
+                    } else {
+                        // Record the failure; `resp` is null on a non-zero return (contract of
+                        // `http_client_perform`), so there is nothing to free here.
+                        statuses[i].store(code, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+
+    // All workers joined. All-or-Err: the lowest-index failure fails the whole batch (deterministic).
+    let first_err = (0..n).find_map(|i| {
+        let s = statuses[i].load(Ordering::Relaxed);
+        if s != 0 { Some(s) } else { None }
+    });
+    if let Some(code) = first_err {
+        // Free every response that DID succeed, then report the lowest-index error (no leak).
+        for slot in &results {
+            let p = slot.load(Ordering::Relaxed);
+            if !p.is_null() {
+                unsafe { align_rt_http_resp_free(p) };
+            }
+        }
+        return code;
+    }
+
+    // Success: build the owned header buffer of `n` response handles, in input order. `checked_mul`
+    // guards a size overflow that would otherwise under-allocate and heap-overflow the store loop.
+    let Some(hdr_bytes) =
+        n.checked_mul(core::mem::size_of::<*mut HttpResponse>()).and_then(|b| i64::try_from(b).ok())
+    else {
+        for slot in &results {
+            let p = slot.load(Ordering::Relaxed);
+            if !p.is_null() {
+                unsafe { align_rt_http_resp_free(p) };
+            }
+        }
+        return AL_INVALID;
+    };
+    let hdr = align_rt_alloc(hdr_bytes) as *mut *mut HttpResponse;
+    for (i, slot) in results.iter().enumerate() {
+        unsafe { *hdr.add(i) = slot.load(Ordering::Relaxed) };
+    }
+    unsafe { *out = AlignStr { ptr: hdr as *const u8, len: n as i64 } };
+    0
+}
+
+/// Free an owned `array<response>` (`cl.get_many`): free each element handle, then the header buffer.
+/// Null-safe (a moved-out / never-initialised `{null,0}` frees nothing). This is the deep `Drop` for
+/// `array<response>` — like [`align_rt_free_string_array`], but each element is a `*mut HttpResponse`
+/// handle (freed via [`align_rt_http_resp_free`], itself null-safe) rather than a `{ptr,len}` string.
+///
+/// # Safety
+/// `ptr` must be null or a header buffer from [`align_rt_http_get_many`] of `len` `*mut HttpResponse`
+/// entries (each a handle from the exchange, or null), not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_free_response_array(ptr: *mut u8, len: i64) {
+    if ptr.is_null() {
+        return;
+    }
+    if let Ok(n) = safe_len(len) {
+        let hdr = ptr as *mut *mut HttpResponse;
+        for i in 0..n {
+            let p = unsafe { *hdr.add(i) };
+            unsafe { align_rt_http_resp_free(p) }; // null-safe per element
+        }
+    }
+    unsafe { align_rt_free(ptr) };
 }
 
 /// `cl.post(url, body)` — perform a `POST url` with `body` (auto `Content-Length`) over a fresh
@@ -15463,6 +15643,256 @@ mod tests {
             assert_eq!(bucket[0].fd, fresh, "the retained conn is the fresh one");
         }
         // The 8 stale fds were closed by put_idle's reap; free() closes `fresh`. No double-close.
+        unsafe { align_rt_http_client_free(client) };
+    }
+
+    // --- std.http item 6: cl.get_many (R5) -----------------------------------------------------
+
+    /// Serializes the get_many tests that spawn a loopback server (or sample the process fd count):
+    /// `cargo test` runs tests concurrently in ONE process (a shared fd table), so a detached echo
+    /// server's fds in one test would otherwise inflate another's fd-leak assertion. Held for each
+    /// such test's duration.
+    static GET_MANY_SERVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A `{ptr,len}` `AlignStr` view over an owned string, for the `slice<str>` FFI argument of
+    /// `align_rt_http_get_many`. The returned `AlignStr` borrows `s` — keep `s` alive across the call.
+    fn as_view(s: &str) -> AlignStr {
+        AlignStr { ptr: s.as_ptr(), len: s.len() as i64 }
+    }
+
+    /// A concurrent loopback server for `get_many`: accepts up to `accepts` connections, **spawning a
+    /// handler thread per connection** (so `min(max_concurrency, n)` workers overlap rather than
+    /// serialize), and echoes each request's target path back as the response body after an injected
+    /// `latency` (surfacing the I/O-overlap win the way a real network RTT would). Returns
+    /// `(port, handle)`; the handle yields the number of ACCEPTED connections (the reuse observable).
+    /// Bounded by a wall-clock deadline so a regression fails on the count rather than hanging CI.
+    fn http_serve_echo_path(accepts: usize, latency: std::time::Duration) -> (u16, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut accepted = 0usize;
+            let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            while accepted < accepts && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        accepted += 1;
+                        workers.push(std::thread::spawn(move || {
+                            sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                            let mut buf: Vec<u8> = Vec::new();
+                            let mut tmp = [0u8; 512];
+                            loop {
+                                // Read one full request head (GETs carry no body).
+                                let end = loop {
+                                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                        break Some(p + 4);
+                                    }
+                                    match sock.read(&mut tmp) {
+                                        Ok(0) | Err(_) => break None,
+                                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                                    }
+                                };
+                                let Some(p) = end else { break };
+                                // Echo the request target (between the first two spaces of the request line).
+                                let head = &buf[..p];
+                                let line_end = head.windows(2).position(|w| w == b"\r\n").unwrap_or(head.len());
+                                let line = &head[..line_end];
+                                let target = line
+                                    .split(|&b| b == b' ')
+                                    .nth(1)
+                                    .map(|t| String::from_utf8_lossy(t).into_owned())
+                                    .unwrap_or_default();
+                                std::thread::sleep(latency);
+                                let body = target.into_bytes();
+                                let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                                if sock.write_all(resp.as_bytes()).is_err() || sock.write_all(&body).is_err() {
+                                    break;
+                                }
+                                buf.drain(..p);
+                            }
+                        }));
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for w in workers {
+                let _ = w.join();
+            }
+            accepted
+        });
+        (port, handle)
+    }
+
+    /// The result `array<response>` header `align_rt_http_get_many` writes into `out` — the `n`
+    /// `*mut HttpResponse` handles it owns, in input order (or empty on `{null,0}`).
+    unsafe fn resp_array(out: AlignStr) -> Vec<*mut HttpResponse> {
+        if out.ptr.is_null() || out.len == 0 {
+            return Vec::new();
+        }
+        let hdr = out.ptr as *const *mut HttpResponse;
+        (0..out.len as usize).map(|i| unsafe { *hdr.add(i) }).collect()
+    }
+
+    /// get_many round-trip: N GETs concurrently, results in INPUT ORDER regardless of completion
+    /// order — verified by echoing each request's distinct path back as its body. Injected latency +
+    /// concurrency > 1 forces real overlap (and reordering pressure) so the claim-loop's index slotting
+    /// is what makes order deterministic, not luck.
+    #[test]
+    fn http_get_many_results_in_input_order() {
+        let _server_lock = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        const N: usize = 24;
+        let (port, server) = http_serve_echo_path(N, std::time::Duration::from_millis(8));
+        let urls: Vec<String> = (0..N).map(|i| format!("http://127.0.0.1:{port}/item-{i}")).collect();
+        let views: Vec<AlignStr> = urls.iter().map(|u| as_view(u)).collect();
+        let client = align_rt_http_client_new();
+        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
+        let rc = unsafe { align_rt_http_get_many(client, views.as_ptr(), views.len() as i64, 8, &mut out) };
+        assert_eq!(rc, 0, "the whole batch succeeds");
+        let handles = unsafe { resp_array(out) };
+        assert_eq!(handles.len(), N, "one response per URL");
+        for (i, &h) in handles.iter().enumerate() {
+            assert!(!h.is_null(), "response {i} present");
+            assert_eq!(unsafe { align_rt_http_resp_status(h) }, 200);
+            let body = unsafe { align_rt_http_resp_body(h) };
+            let got = unsafe { safe_slice(body.ptr, body.len) };
+            assert_eq!(got, format!("/item-{i}").as_bytes(), "result {i} is url {i}'s response (input order)");
+        }
+        unsafe { align_rt_free_response_array(out.ptr as *mut u8, out.len) };
+        unsafe { align_rt_http_client_free(client) };
+        // Pooling makes the exact connection count unpredictable, so the server may still await its
+        // remaining `accepts`; detach it (it self-terminates at its deadline). The server lock keeps
+        // its lingering fds from polluting the fd-count test.
+        drop(server);
+    }
+
+    /// Empty `urls` → `Ok` empty array (`{null,0}`), no server contact, no allocation.
+    #[test]
+    fn http_get_many_empty_urls_is_ok_empty() {
+        let client = align_rt_http_client_new();
+        let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+        let rc = unsafe { align_rt_http_get_many(client, core::ptr::null(), 0, 4, &mut out) };
+        assert_eq!(rc, 0, "empty batch is Ok");
+        assert!(out.ptr.is_null() && out.len == 0, "Ok empty is {{null,0}}");
+        unsafe { align_rt_free_response_array(out.ptr as *mut u8, out.len) }; // null-safe no-op
+        unsafe { align_rt_http_client_free(client) };
+    }
+
+    /// All-or-Err: one URL to a closed port fails the WHOLE batch with a transport error, every
+    /// successful response is freed (verified via [`LIVE_HTTP_RESPONSES`], not just `rc`/`out` — the
+    /// F1 gate finding: deleting the `first_err` branch's free loop makes no assertion here fail,
+    /// because `rc`/`out` are correct either way and the batch has nothing left to free from the
+    /// *caller's* side; only the live-handle count exposes the leaked successful responses), and `out`
+    /// stays `{null,0}` (no partial array). The error is the lowest-index failure.
+    #[test]
+    fn http_get_many_one_failure_fails_batch_no_leak() {
+        let _server_lock = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = LIVE_HTTP_RESPONSES.load(core::sync::atomic::Ordering::Relaxed);
+        // A guaranteed-refused port: bind then drop, so connects are refused (ECONNREFUSED).
+        let dead_port = {
+            let p = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = p.local_addr().unwrap().port();
+            drop(p);
+            port
+        };
+        let (port, server) = http_serve_echo_path(8, std::time::Duration::from_millis(2));
+        // index 0 = live, index 1 = dead (the lowest-index failure is index 1's connect error), 2.. live.
+        // 5 of the 6 URLs succeed, so a leaked free path would grow the live count by 5 — far past the
+        // small cross-test slack allowed below.
+        let mut urls: Vec<String> = vec![format!("http://127.0.0.1:{port}/a")];
+        urls.push(format!("http://127.0.0.1:{dead_port}/refused"));
+        for i in 2..6 {
+            urls.push(format!("http://127.0.0.1:{port}/live-{i}"));
+        }
+        let views: Vec<AlignStr> = urls.iter().map(|u| as_view(u)).collect();
+        let client = align_rt_http_client_new();
+        let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+        let rc = unsafe { align_rt_http_get_many(client, views.as_ptr(), views.len() as i64, 4, &mut out) };
+        assert_ne!(rc, 0, "a single failure fails the whole batch (all-or-Err)");
+        assert!(out.ptr.is_null() && out.len == 0, "no partial array is returned on error");
+        // The successful responses were freed internally (no leak) — nothing for the caller to free.
+        unsafe { align_rt_http_client_free(client) };
+        // The connection count under pooling is not deterministic here, so the echo server may still be
+        // waiting for its remaining `accepts`; detach it (it self-terminates at its deadline) rather
+        // than block the test on a join that can't be predicted.
+        drop(server);
+        let after = LIVE_HTTP_RESPONSES.load(core::sync::atomic::Ordering::Relaxed);
+        // `LIVE_HTTP_RESPONSES` is process-wide (shared with every other concurrently-running test in
+        // this file), so a small slack absorbs an unrelated test's handle that is momentarily live at
+        // the sampling instant — mirroring the fd-count tolerance in `http_get_many_error_path_no_fd_leak`
+        // just below. A real leak here is 5 (every successful response in this batch), far past the slack.
+        assert!(
+            after <= before + 2,
+            "the batch-error path must free every successful response (no leak): {before} -> {after}"
+        );
+    }
+
+    /// Pool reuse across the batch: `max_concurrency = 1` runs the N GETs on ONE worker to the same
+    /// host, so the keepalive pool reuses a single connection — the server accepts exactly ONE. (The
+    /// accept-count is the reuse observable, mirroring `http_client_pool_reuses_connection`.)
+    #[test]
+    fn http_get_many_reuses_pool_at_concurrency_one() {
+        let _server_lock = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (port, server) = http_serve_echo_path(1, std::time::Duration::from_millis(0));
+        let urls: Vec<String> = (0..5).map(|i| format!("http://127.0.0.1:{port}/r{i}")).collect();
+        let views: Vec<AlignStr> = urls.iter().map(|u| as_view(u)).collect();
+        let client = align_rt_http_client_new();
+        let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+        let rc = unsafe { align_rt_http_get_many(client, views.as_ptr(), views.len() as i64, 1, &mut out) };
+        assert_eq!(rc, 0);
+        assert_eq!(unsafe { resp_array(out) }.len(), 5);
+        unsafe { align_rt_free_response_array(out.ptr as *mut u8, out.len) };
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1, "concurrency 1 reuses one pooled conn for all 5 GETs");
+    }
+
+    /// No fd leak across repeated erroring batches: every worker connection an erroring `get_many`
+    /// opens must be closed (a refused connect leaves no fd; a successful conn is pooled then closed by
+    /// `client_free`). Uses **only refused ports** so the assertion is immune to server-side handler
+    /// fds lingering from other concurrent tests (this process shares one fd table). Linux-only
+    /// (`/proc/self/fd`). The free-every-successful-response-on-error path is covered separately by
+    /// `http_get_many_one_failure_fails_batch_no_leak` (no fd assertion, so no cross-test noise).
+    #[test]
+    fn http_get_many_error_path_no_fd_leak() {
+        let _server_lock = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count_fds = || -> Option<usize> { std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count()) };
+        let Some(before) = count_fds() else { return }; // not Linux — skip
+        // Several refused ports (bind then drop) — every connect fails with ECONNREFUSED, so no fd is
+        // held past the failed attempt; a per-batch leak of worker conns would still show as growth.
+        let dead_ports: Vec<u16> = (0..4)
+            .map(|_| {
+                let p = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = p.local_addr().unwrap().port();
+                drop(p);
+                port
+            })
+            .collect();
+        for _ in 0..16 {
+            let urls: Vec<String> = dead_ports.iter().map(|p| format!("http://127.0.0.1:{p}/dead")).collect();
+            let views: Vec<AlignStr> = urls.iter().map(|u| as_view(u)).collect();
+            let client = align_rt_http_client_new();
+            let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+            let rc = unsafe { align_rt_http_get_many(client, views.as_ptr(), views.len() as i64, 4, &mut out) };
+            assert_ne!(rc, 0, "the all-refused batch fails");
+            assert!(out.ptr.is_null(), "no partial array on error");
+            unsafe { align_rt_http_client_free(client) };
+        }
+        let after = count_fds().unwrap();
+        assert!(after <= before + 2, "fd leak across erroring get_many batches: {before} -> {after}");
+    }
+
+    /// A null `out` slot is rejected (defensive) without touching the network.
+    #[test]
+    fn http_get_many_null_out_is_invalid() {
+        let client = align_rt_http_client_new();
+        assert_eq!(
+            unsafe { align_rt_http_get_many(client, core::ptr::null(), 0, 4, core::ptr::null_mut()) },
+            AL_INVALID
+        );
         unsafe { align_rt_http_client_free(client) };
     }
 

@@ -71,6 +71,14 @@ pub enum Scalar {
     /// whose decoded `str` fields are zero-copy views into the input — so unlike a scalar
     /// `array<T>`, a struct array is region-tied to that input and cannot escape it.
     DynStructArray(u32),
+    /// An owned, dynamic-length `array<response>` payload — a buffer of opaque `response` **Move**
+    /// handles, the batched-`get_many` result riding a `Result` (`Result<array<response>, Error>`).
+    /// Same `{ptr,len}` layout as [`Scalar::DynStructArray`], Move, dropped/freed as a unit — but its
+    /// `Drop` is **deep** (each element is an owned `http response` handle, freed via
+    /// `align_rt_http_resp_free`, then the header). Non-recursive (no payload — `response` is opaque),
+    /// so `Scalar` stays `Copy`. Constructed **only** by `cl.get_many` (the runtime); there is no
+    /// user-side `array<response>` literal, no `slice<response>`, no nesting — the one closed shape.
+    DynResponseArray,
     /// A `str` view payload (`array<str>` / `slice<str>` element, `Option<str>` / `Result<str,E>`
     /// payload). A `{ptr,len}` borrow — **Copy, not Move** (no heap buffer of its own), but
     /// **region-tracked**: a composite carrying a `str` lives only as long as that `str`'s source
@@ -156,7 +164,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, and a `udp_socket`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx)
     }
 }
 
@@ -294,6 +302,15 @@ pub enum Ty {
     /// (`{ T* ptr, i64 len }`) but Move and region-tracked. MMv2 slice 3: produced by a
     /// materializing terminal (`.to_array()`) and (this slice) arena-bump-allocated.
     DynArray(Scalar),
+    /// `array<response>` — an *owned*, dynamic-length array of opaque `http response` **Move**
+    /// handles, laid out like a slice (`{ response* ptr, i64 len }`), Move but **not** region-tracked
+    /// (freshly owned, like `array<string>` — it borrows nothing). Produced **only** by `cl.get_many`
+    /// (std.http item 6 / R5); there is no user-side literal, `slice<response>`, or nesting. `Drop` is
+    /// **deep** — each element handle is freed (`align_rt_http_resp_free`), then the header buffer
+    /// (`align_rt_free_response_array`). `rs[i]` in receiver position borrows an element (region-bound
+    /// to the array, #297); moving an element out is rejected in v1. The response dual of the owned
+    /// `array<string>` (`DynArray(Scalar::String)`) — deep-free, whole-array move/drop.
+    DynResponseArray,
     /// `str` — an immutable string view `{ u8* ptr, i64 len }`. Copy. M5.
     Str,
     /// `string` — an *owned* string `{ u8* ptr, i64 len }`, laid out like `str` but Move and
@@ -468,6 +485,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // Only an AoS array is payload-able today; an SoA array as an Option/Result payload is a
         // later concern (so `Scalar::DynStructArray` stays layout-free — always AoS).
         Ty::DynStructArray(id, Layout::Aos) => Some(Scalar::DynStructArray(id)),
+        // An owned `array<response>` as the Ok payload of `cl.get_many`'s `Result`.
+        Ty::DynResponseArray => Some(Scalar::DynResponseArray),
         Ty::Str => Some(Scalar::Str),
         // A `slice<T>` **view** is a payload only when its element is primitive — today only the
         // `slice<u8>` `bytes` view from `fs.read_bytes_view` (`Result<slice<u8>, Error>`).
@@ -531,6 +550,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::String => Ty::String,
         Scalar::DynArray(elem) => Ty::DynArray(prim_to_scalar(elem)),
         Scalar::DynStructArray(id) => Ty::DynStructArray(id, Layout::Aos),
+        Scalar::DynResponseArray => Ty::DynResponseArray,
         Scalar::Str => Ty::Str,
         Scalar::Slice(elem) => Ty::Slice(prim_to_scalar(elem)),
         Scalar::Enum(id) => Ty::Enum(id),
@@ -618,7 +638,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -650,7 +670,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -799,7 +819,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -871,7 +891,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2687,6 +2707,12 @@ impl EffectScan {
                 self.expr(client);
                 self.expr(req);
             }
+            ExprKind::HttpGetMany { client, urls, max_concurrency } => {
+                self.impure_direct = true;
+                self.expr(client);
+                self.expr(urls);
+                self.expr(max_concurrency);
+            }
             // `std.http` (Slice 4) — the server primitive. `serve`/`accept`/`respond` hit the network
             // (bind/accept/write syscalls) → **Impure** (excluded from `par_map`, like the client). The
             // response builder ops and the ctx getters are **Pure** (build/read owned memory): recurse
@@ -3113,6 +3139,11 @@ impl<'a> EscapeCheck<'a> {
     fn tracks_region(&self, ty: Ty) -> bool {
         match ty {
             Ty::Box(_) | Ty::Str | Ty::String | Ty::Struct(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) => true,
+            // An owned `array<response>` is escape-checked in the same lane as every owned collection.
+            // It borrows nothing, so its `region_of` is `Static` (the wildcard) — the check passes and
+            // the array is freely returnable (like `array<string>` from `fs.read_dir`); tracking keeps
+            // it from silently skipping the escape pass if a future producer gives it a region.
+            Ty::DynResponseArray => true,
             // A `dict_encoded` value's `dict`/`source` slices borrow the source AoS, so it is
             // region-tracked — it must not outlive the array it encodes.
             Ty::DictEncoded(..) => true,
@@ -4095,6 +4126,11 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(client, depth);
                 self.walk(req, depth);
             }
+            ExprKind::HttpGetMany { client, urls, max_concurrency } => {
+                self.walk(client, depth);
+                self.walk(urls, depth);
+                self.walk(max_concurrency, depth);
+            }
             // `std.http` (Slice 4): `serve`/`accept` return `Result<http_server / http_request_ctx,
             // Error>` whose payload is **owned** (not a view — escapes fine, like `http.parse`'s result);
             // `respond` returns `Result<(), Error>`. The `ctx.*` view getters' escapes are caught by
@@ -4616,6 +4652,11 @@ impl UnnecessaryHeapScan {
             ExprKind::HttpClientRequest { client, req } => {
                 self.visit(client);
                 self.visit(req);
+            }
+            ExprKind::HttpGetMany { client, urls, max_concurrency } => {
+                self.visit(client);
+                self.visit(urls);
+                self.visit(max_concurrency);
             }
             // `std.http` (Slice 4) — no heap-narrowing pattern of its own; recurse into the operands.
             ExprKind::HttpServe { host, port } => {
@@ -5530,6 +5571,13 @@ impl<'a> MoveCheck<'a> {
             ExprKind::HttpClientRequest { client, req } => {
                 self.expr(client, moved, false, false);
                 self.expr(req, moved, true, true);
+            }
+            ExprKind::HttpGetMany { client, urls, max_concurrency } => {
+                // `client`/`urls`/`max_concurrency` are all borrowed — nothing is consumed (the client
+                // fires many batches; the URL slice is read-only; the degree is a scalar).
+                self.expr(client, moved, false, false);
+                self.expr(urls, moved, false, false);
+                self.expr(max_concurrency, moved, false, false);
             }
             // `std.http` (Slice 4): `serve`'s args and `accept`'s `server` are borrowed (a server accepts
             // many, never consumed — like the client). The response builder ops mutate `rb` in place
@@ -9026,6 +9074,40 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
+        // `rs[i].status()` / `rs[i].header(name)` / `rs[i].body()` — a **borrow** of an
+        // `array<response>` element (`cl.get_many`, std.http item 6). `rs[i]` is legal only in receiver
+        // position: intercept it here so the general `check_index` (which rejects `r := rs[i]` as a
+        // response move-out) is bypassed. The element handle's region inherits the array's (`region_of`
+        // of an `Index` inherits its receiver, #297), so a view read past the array's `Drop` is caught.
+        if let ast::ExprKind::Index { recv: arr, index } = &recv.kind
+            && matches!(method, "status" | "header" | "body")
+        {
+            let arr_expr = self.check_expr(arr, None);
+            if arr_expr.ty == Ty::Error {
+                // Already diagnosed; falling through would re-check `arr` on the normal
+                // path and emit the same diagnostic twice.
+                return err;
+            }
+            if self.resolve(arr_expr.ty) == Ty::DynResponseArray {
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let idx = self.check_expr(index, Some(i64_ty));
+                if idx.ty == Ty::Error {
+                    return err;
+                }
+                if !idx.ty.is_int_like() {
+                    self.diags.error(format!("an array index must be an integer, got {}", ty_name(idx.ty)), index.span);
+                    return err;
+                }
+                let elem = Expr {
+                    kind: ExprKind::Index { recv: Box::new(arr_expr), index: Box::new(idx) },
+                    ty: Ty::HttpResponse,
+                    span: recv.span,
+                };
+                return self.check_http_response_method(elem, method, args, span);
+            }
+            // Not an `array<response>` — fall through. (`arr` is re-checked by the normal path below;
+            // for the common `rs`/`arr` = a bound local that is idempotent and emits nothing twice.)
+        }
         // For `box.get()` / `box.clone()` whose receiver is a fresh `heap.new(...)`, thread the
         // caller's expected type inward so the boxed literal's payload infers from context
         // (`v: i32 := heap.new(7).get()` → `box<i32>`) instead of defaulting the literal to i64 and
@@ -9086,7 +9168,7 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.http` (Slice 2) client requests on an `http client`: `cl.get(url)` /
             // `cl.post(url, body)` / `cl.request(req)` each yield `Result<response, Error>`. Impure
             // (network). Type-guarded, same as the response getters above.
-            "get" | "post" | "request" if recv_ty == Ty::HttpClient => {
+            "get" | "post" | "request" | "get_many" if recv_ty == Ty::HttpClient => {
                 self.check_http_client_method(recv_expr, method, args, span)
             }
             // (`srv.accept()` on an `http_server` is dispatched by the early `method == "accept"`
@@ -11613,7 +11695,7 @@ impl<'a, 't> Checker<'a, 't> {
         match r.ty {
             // `str`/`slice`/`soa` carry a runtime length in their `{ ptr, len }` view (a `soa`'s
             // length is its row count).
-            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::Soa(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
+            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::Soa(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
             // A `buffer`'s length is its current byte count (the last read's size). Same v1
             // bound-receiver restriction as `.bytes()` (uniform across buffer methods, until Move
             // temporaries drop): reject `buffer(n).len()` on an unbound temporary.
@@ -11683,6 +11765,17 @@ impl<'a, 't> Checker<'a, 't> {
             // (`Static`); a struct with a `str` column gathers `str` views borrowing the soa's
             // buffer/input, so `region_of` ties the gathered value to the soa's region.
             Ty::Soa(id) => Ty::Struct(id),
+            // `array<response>` (`cl.get_many`): `rs[i]` is legal ONLY in receiver position, where it
+            // is a *borrow* of the element (intercepted in `check_method_call` → `rs[i].status()` etc.).
+            // Reaching `check_index` means `rs[i]` is used as a value (`r := rs[i]`), which would move a
+            // response out of the array — rejected in v1 (a copy of the handle would double-free).
+            Ty::DynResponseArray => {
+                self.diags.error(
+                    "moving a response out of an `array<response>` is not supported in v1 — call a method directly on the element instead (`rs[i].status()` / `rs[i].header(name)` / `rs[i].body()`)".to_string(),
+                    span,
+                );
+                return err;
+            }
             Ty::Error => return err,
             other => {
                 self.diags.error(format!("cannot index {} (only array / slice / owned array)", ty_name(other)), span);
@@ -13299,7 +13392,13 @@ impl<'a, 't> Checker<'a, 't> {
     /// `slice<u8>` **view** into `resp` (local-backed — likewise not returnable).
     fn check_http_response_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+        // The receiver is a bound `response` local (`resp := http.parse(bytes)?`) OR an
+        // `array<response>` element borrow (`rs[i]`, from `cl.get_many` — built only by the
+        // receiver-position intercept in `check_method_call`, region-bound to the array). Both are
+        // stable places; a bare temporary owned response handle is not dropped yet and is rejected.
+        let ok_recv = matches!(recv_expr.kind, ExprKind::Local(_))
+            || matches!(&recv_expr.kind, ExprKind::Index { recv, .. } if matches!(recv.kind, ExprKind::Local(_)));
+        if !ok_recv {
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
                     "bind the http response to a local first, then read it (`resp := http.parse(bytes)?` then `resp.status()`) — a temporary owned response handle is not dropped yet".to_string(),
@@ -13426,8 +13525,41 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::HttpClientRequest { client: Box::new(recv_expr), req: Box::new(req) }, ty: result_ty, span }
             }
+            "get_many" => {
+                // `cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, Error>`
+                // (std.http item 6 / R5). `urls` is borrowed (read-only), `cl` is borrowed (shared
+                // across the workers). Results are input-order, all-or-Err.
+                if args.len() != 2 {
+                    self.diags.error(
+                        format!("'.get_many()' takes 2 arguments (the urls and max_concurrency), got {}", args.len()),
+                        span,
+                    );
+                    return err;
+                }
+                let urls = self.check_slice_init(&args[0], Scalar::Str);
+                let max_concurrency = self.check_expr(&args[1], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                if urls.ty == Ty::Error || max_concurrency.ty == Ty::Error {
+                    return err;
+                }
+                if !max_concurrency.ty.is_int_like() {
+                    self.diags.error(
+                        format!("'.get_many()' max_concurrency must be an integer, got {}", ty_name(max_concurrency.ty)),
+                        args[1].span,
+                    );
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpGetMany {
+                        client: Box::new(recv_expr),
+                        urls: Box::new(urls),
+                        max_concurrency: Box::new(max_concurrency),
+                    },
+                    ty: Ty::Result(Scalar::DynResponseArray, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http client (try get / post / request)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http client (try get / post / request / get_many)"), span);
                 err
             }
         }
@@ -15164,6 +15296,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(client);
                 self.finalize_expr(req);
             }
+            ExprKind::HttpGetMany { client, urls, max_concurrency } => {
+                self.finalize_expr(client);
+                self.finalize_expr(urls);
+                self.finalize_expr(max_concurrency);
+            }
             ExprKind::HttpServe { host, port } => {
                 self.finalize_expr(host);
                 self.finalize_expr(port);
@@ -15668,6 +15805,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
         Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
+        Ty::DynResponseArray => "array<response>".to_string(),
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),

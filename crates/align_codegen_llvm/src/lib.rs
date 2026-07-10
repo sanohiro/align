@@ -1314,6 +1314,21 @@ fn build_module<'c>(
         module.add_function("align_rt_http_client_request", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false), None),
     );
     funcs.insert(
+        // cl.get_many (client, urls_ptr, urls_len, max_concurrency, out: *{ptr,len}) -> i32 status.
+        // Writes an owned `array<response>` `{ptr,len}` header (buffer of response handles) into `out`.
+        "http_get_many".to_string(),
+        module.add_function(
+            "align_rt_http_get_many",
+            ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into(), ptr.into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // drop(array<response>) (ptr, len) -> void; deep free (each response handle, then the header).
+        "free_response_array".to_string(),
+        module.add_function("align_rt_free_response_array", ctx.void_type().fn_type(&[ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
         "http_client_free".to_string(),
         module.add_function("align_rt_http_client_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
@@ -1816,7 +1831,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
         // arm go non-exhaustive (a compile error pointing exactly here).
-        Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
+        Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(ctx).into(),
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // A `reader`/`writer`/`buffer` / cli handle / `tcp_conn` payload is an opaque pointer.
@@ -1926,7 +1941,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
         Ty::Fn(_) => closure_struct_type(ctx).into(),
         Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
-        Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(ctx).into(),
+        Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(ctx).into(),
         _ => scalar_type(ctx, ty, sx, ex),
     }
 }
@@ -2265,6 +2280,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::String => unreachable!("an owned string is not a box payload"),
         Scalar::DynArray(_) => unreachable!("an owned array is not a box payload"),
         Scalar::DynStructArray(_) => unreachable!("an owned struct array is not a box payload"),
+        Scalar::DynResponseArray => unreachable!("an owned response array is not a box/array payload"),
         // A `str` view is never a `box` payload (`box<str>` is rejected), but it *is* a valid
         // `array<str>` element — a `{ptr,len}` view, 16 bytes (the established str size, as in the
         // json field descriptor). Used to size a `group_by(.str_key)` output key buffer.
@@ -3151,6 +3167,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let len = self.builder.build_extract_value(agg, 1, "dropstrarrlen").map_err(|e| self.err(e))?;
                         self.builder
                             .build_call(self.funcs["free_string_array"], &[ptr.into(), len.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    } else if matches!(ty, Ty::DynResponseArray) {
+                        // An owned `array<response>` (`cl.get_many`): each element is an owned `http
+                        // response` handle, so the `Drop` is a **deep** free —
+                        // `align_rt_free_response_array(base, len)` frees every handle, then the header.
+                        // Null-safe (a moved-out `{null,0}` frees nothing). The response dual of the
+                        // `array<string>` deep-free above.
+                        let agg = self
+                            .builder
+                            .build_load(slice_struct_type(self.ctx), self.slots[slot], "droprsparr")
+                            .map_err(|e| self.err(e))?
+                            .into_struct_value();
+                        let ptr = self.builder.build_extract_value(agg, 0, "droprsparrptr").map_err(|e| self.err(e))?;
+                        let len = self.builder.build_extract_value(agg, 1, "droprsparrlen").map_err(|e| self.err(e))?;
+                        self.builder
+                            .build_call(self.funcs["free_response_array"], &[ptr.into(), len.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else {
                         // Load the owned `{ptr, len}`, extract the buffer pointer, free it (null-safe).
@@ -5376,6 +5408,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_client_request returns i32 status")
             }
+            // cl.get_many — the runtime writes an owned `array<response>` `{ptr,len}` header into `out`
+            // and returns an i32 status (0 = ok; else the lowest-index error). Zero the out slot first
+            // (the Err branch reads `{null,0}` → nothing to free), like `fs.read_dir`. `urls` is a
+            // `slice<str>` (split to ptr+len); `max_concurrency` is an i64.
+            Rvalue::HttpGetMany { client, urls, max_concurrency, out } => {
+                let c = self.operand(client).into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
+                let (up, ul) = self.split_str(urls)?;
+                let mc = self.operand(max_concurrency).into();
+                self.builder
+                    .build_call(self.funcs["http_get_many"], &[c.into(), up.into(), ul.into(), mc, out_ptr.into()], "httpgetmany")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_get_many returns i32 status")
+            }
             // std.http (Slice 4) server — `serve`/`accept` write an owned handle into `out` + return an
             // i32 status (null `out` first, like the client); `respond` returns i32 (no out); the ctx
             // getters return a `{ptr,len}` view (or write one to `out` for `header`); `response` allocates
@@ -5760,7 +5807,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
             Ty::Slice(_) | Ty::Soa(_) | Ty::Str | Ty::String | Ty::DynArray(_) => slice_struct_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
-            Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) => slice_struct_type(self.ctx).into(),
+            Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(self.ctx).into(),
             Ty::DictEncoded(..) => dictenc_struct_type(self.ctx).into(),
             // `rng` — the Xoshiro256++ state, `[4 x i64]` (a Copy by-value aggregate).
             Ty::Rng => rng_llvm_type(self.ctx),

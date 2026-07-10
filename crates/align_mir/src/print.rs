@@ -533,6 +533,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("http_client_post({}, {}, {}, -> _{out})", operand_str(client), operand_str(url), operand_str(body))
         }
         Rvalue::HttpClientRequest { client, req, out } => format!("http_client_request({}, {}, -> _{out})", operand_str(client), operand_str(req)),
+        Rvalue::HttpGetMany { client, urls, max_concurrency, out } => format!(
+            "http_get_many({}, {}, {}, -> _{out})",
+            operand_str(client),
+            operand_str(urls),
+            operand_str(max_concurrency)
+        ),
         Rvalue::HttpServe { host, port, out } => format!("http_serve({}, {}, -> _{out})", operand_str(host), operand_str(port)),
         Rvalue::HttpAccept { server, out } => format!("http_accept({}, -> _{out})", operand_str(server)),
         Rvalue::HttpCtxMethod { ctx } => format!("http_ctx_method({})", operand_str(ctx)),

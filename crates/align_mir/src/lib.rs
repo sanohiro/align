@@ -767,6 +767,12 @@ pub enum Rvalue {
     /// in** — the runtime frees it, so the MIR nulls its source slot). Same out-slot + i32-status
     /// contract as [`Rvalue::HttpClientGet`]. Impure.
     HttpClientRequest { client: Operand, req: Operand, out: Slot },
+    /// `cl.get_many(urls, max_concurrency)` — batched concurrent GET: the runtime writes an owned
+    /// `array<response>` `{ptr,len}` header (a buffer of `response` handles, input order) to `out` and
+    /// returns an `i32` status (0 = ok; else the lowest-index transport/parse error). `client` is
+    /// borrowed (shared across the workers); `urls` is a `slice<str>` view; `max_concurrency` is an
+    /// `i64` (`<= 0` aborts). The caller branches `Ok(array<response>)` / `Err`. Impure. std.http R5.
+    HttpGetMany { client: Operand, urls: Operand, max_concurrency: Operand, out: Slot },
     /// `http.serve(host, port)` — bind a listening socket: the runtime writes an owned `http_server`
     /// handle (opaque pointer) to `out` and returns an `i32` status (0 = ok; else `AL_INVALID` / errno →
     /// `Error`). The caller branches `Ok(http_server)` / `Err`. Impure.
@@ -1242,7 +1248,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -2043,6 +2049,7 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpClientGet { .. }
         | hir::ExprKind::HttpClientPost { .. }
         | hir::ExprKind::HttpClientRequest { .. }
+        | hir::ExprKind::HttpGetMany { .. }
         | hir::ExprKind::HttpServe { .. }
         | hir::ExprKind::HttpAccept { .. }
         | hir::ExprKind::HttpCtxMethod { .. }
@@ -2971,8 +2978,10 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
     let (src, len): (Src, Operand) = match recv.ty {
         // A `{ptr,len}` value: scalar `slice`/owned `array` loads a scalar element; an
         // `array<slice<T>>` (`chunks` result) loads a whole `slice<T>` element; an owned dynamic
-        // `array<Struct>` loads a whole struct element (all by `elem_ty` via `SliceIndex`).
-        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(..) => {
+        // `array<Struct>` loads a whole struct element; an `array<response>` loads a `response` handle
+        // pointer (the receiver-borrow of `rs[i].status()` etc. — `elem_ty` = `HttpResponse`). All by
+        // `elem_ty` via `SliceIndex`.
+        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray => {
             let sv = lower_expr(b, recv);
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
@@ -5836,6 +5845,12 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             null_moved_source(b, req);
             lower_http_response_result(b, Rvalue::HttpClientRequest { client: c, req: rq, out }, out, Ty::HttpResponse, e.ty)
         }
+        // `cl.get_many(urls, max_concurrency)` → `Result<array<response>, Error>`. The runtime writes an
+        // owned `array<response>` into an out slot + returns an i32 status; branch Ok(array)/Err — the
+        // owned-array-from-runtime shape of `fs.read_dir`, not the single-handle `lower_http_response_result`.
+        hir::ExprKind::HttpGetMany { client, urls, max_concurrency } => {
+            lower_http_get_many(b, client, urls, max_concurrency, e.ty)
+        }
         // `http.serve(host, port)` → `Result<http_server, Error>` (shared out-slot + i32-status
         // lowering, `ok_ty = HttpServer`). `host`/`port` are read.
         hir::ExprKind::HttpServe { host, port } => {
@@ -5919,6 +5934,61 @@ fn lower_http_parse(b: &mut Builder, data: &hir::Expr, result_ty: Ty) -> Operand
     let out = b.new_slot(Ty::HttpResponse);
     let d = lower_expr(b, data);
     lower_http_response_result(b, Rvalue::HttpParse { data: d, out }, out, Ty::HttpResponse, result_ty)
+}
+
+/// `cl.get_many(urls, max_concurrency)` → `Result<array<response>, Error>`. The runtime writes an owned
+/// `array<response>` (`{ptr,len}` header) into an out slot and returns an i32 status; branch
+/// `Ok(array<response>)` / `Err(<lowest-index status>)`. The owned-array-from-runtime shape of
+/// [`lower_fs_read_dir`] (out slot + i32 status + Ok(load)/Err), with a [`Ty::DynResponseArray`]
+/// payload. `client` is borrowed (shared across the workers); `urls`/`max_concurrency` are read — none
+/// consumed. Out-of-line (`#[inline(never)]`) to keep its block/slot locals off the recursive
+/// `lower_expr` frame (the `expr_depth` #296 lesson).
+#[inline(never)]
+fn lower_http_get_many(
+    b: &mut Builder,
+    client: &hir::Expr,
+    urls: &hir::Expr,
+    max_concurrency: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
+    let out = b.new_slot(Ty::DynResponseArray);
+    let c = lower_expr(b, client);
+    let u = lower_expr(b, urls);
+    let mc = lower_expr(b, max_concurrency);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::HttpGetMany { client: c, urls: u, max_concurrency: mc, out }));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the materialized `{ptr,len}` owned array and wrap it (the unwrapped local owns the
+    // responses now — its `Drop` deep-frees each handle, then the header).
+    b.cur = ok_bb;
+    let a = b.fresh_value(Ty::DynResponseArray);
+    b.push(Stmt::Let(a, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(a))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: the out slot was zeroed (`{null,0}`) and the runtime freed every response it did fetch →
+    // nothing to free here; map the lowest-index status.
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
 }
 
 /// The shared Ok/Err lowering for the ops that write an owned handle of type `ok_ty` into `out` and
@@ -6617,6 +6687,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::DynArray(_) => "array".to_string(),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(_) => "array<slice>".to_string(),
+        Ty::DynResponseArray => "array<response>".to_string(),
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "arena".to_string(),
