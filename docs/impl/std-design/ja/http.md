@@ -10,10 +10,16 @@
 
 HTTP/1.1 のプリミティブであって、フレームワークではない(draft §18.2)。std.net のソケットの上に構築す
 る。メンバーは request、response、header、method、status、client、server プリミティブ。コネクション再利用
-は net のレールに従う。**隠れた依存は TLS である**: HTTPS には FFI 経由の TLS エンジン(BoringSSL/
-rustls-ffi クラス。compress/crypto の「エンジンを借用する」方式と同じ)が要る。v1 は **平文の HTTP/1.1
-のみ**とし、HTTPS は TLS の FFI ラッパーが入るまで M11 内で先送りする(中途半端に出荷せず、記録にとどめ
-る)。HTTP/3、ルーティング、ミドルウェアは std ではなく pkg である。
+は net のレールに従う。**クライアント側の HTTPS/TLS は出荷済み**(スライス 5):`https://` は
+`cl.get/post/request` + `cl.get_many` を通じてそのまま動作し、OpenSSL libssl 上で(システム信頼ストアに
+対する必須の検証 + ホスト名バインディングを伴って)crypto の libcrypto と並んで動的リンクされる。サーバ側
+TLS はクライアント優先で先送り。HTTP/3、ルーティング、ミドルウェアは std ではなく pkg である。
+
+**モジュール状態:COMPLETE**(スライス 1–6 出荷済み。クライアント側 TLS はスライス 5)。サーバ側 TLS、
+クライアント証明書、カスタム CA、セッション再開、失効確認は記録済みの v1 後バックログ。
+
+> 注記(2026-07-10):この日本語ミラーはスライス 5 の詳細部分について英語版に追随中である(英語版が正)。
+> 上記の状態行は最新だが、スライス 5 の実装詳細は英語版 `../http.md` を参照のこと。
 
 ## Signatures
 
@@ -252,7 +258,16 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    - **R 要件: R1/R2/R4 が適用され、必須である**(ゼロコピーのリクエストオフセットテーブル。memchr
      スキャン。1 回の write の respond)。v1 にサーバのベンチゲートは無い — 軽い accept→respond の往復ベンチは
      再利用パスが初めて存在する keepalive/並行性とともに入る。
-5. [TLS 実装後に先送り] FFI の TLS ラッパー経由の HTTPS。
+5. **HTTPS/TLS(クライアント側)— 出荷済み 2026-07-10**(ブランチ `http-slice5-tls`)。新しいユーザー
+   向けの表面はゼロ — `https://` が `cl.get/post/request` と `cl.get_many` を通じて動き出す(`http://`
+   はバイト単位で不変)。エンジンは OpenSSL libssl。1 つの共有 `SSL_CTX`(システム信頼ストア + TLS 1.2 下限)、
+   接続ごとに `SSL_VERIFY_PEER` + ハンドシェイク前のホスト名バインディング(DNS 名は `SSL_set1_host` +
+   SNI、IP リテラルは `X509_VERIFY_PARAM_set1_ip_asc`、SNI なし)+ ALPN `http/1.1`。エラー分類:検証失敗 →
+   `Error.Denied`、トランスポート syscall → `Error.Code`、TLS アラート/プロトコル違反 → `Error.Invalid`
+   (どのエラー経路でも `SSL*` と fd を解放)。SIGPIPE はスレッドごとの `pthread_sigmask` でブロック。プール
+   のキーは `(scheme, host, port)` になり、TLS 接続は生きた `SSL*` ごとプールされる(再ハンドシェイクなし)。
+   内部の 1 つの `Conn` 抽象(`Plain`/`Tls`)によりストリーミング読み取りループが単一ソース化される。
+   **詳細は英語版が正**(このミラーは要約)。
 
 ## Known v1 limitations (Slice 2/3)
 
@@ -289,23 +304,21 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
     手軽には出していない(`get`/`post`/`request` のみ)が、メソッド `HEAD` で組んだ `request` はこれに
     当たる。メソッド/ステータスを見たフレーミング(HEAD/1xx/204/304 はボディ無し)は、de-chunking を足す
     のと同じスライスで入れる。スライス 3 では修正せず、ここに記録する。
-- **`https://` の拒否が粗い(DC-1, low)。** `https://` は connect 前に正しく拒否されるが(P1 の
-  セキュリティ意図は満たされ、黙って平文にダウングレードすることはない)、**素の `Error.Invalid`** に
-  写るため、他の不正な URL と区別できない。したがって「HTTPS not supported in v1 (TLS wrapper pending)」
-  という明確なメッセージという設計上の望みは **満たされていない**。これはその場で埋められる修正ではなく
-  構造的な問題である: `Error` enum は **メッセージのペイロードを持たない** ため、その文字列を付ける手段が
-  無い。これのために新しい仕組みを発明してはならない — メッセージを運ぶエラーの話は別の横断的な決定である。
-  メッセージレスな `Error` enum に紐づく既知の v1 制約として記録する。`Error` がペイロードを持つように
-  なったら再検討する。
+- **~~`https://` の拒否が粗い(DC-1, low)。~~ スライス 5 で解消。** `https://` はもはや `Error.Invalid`
+  に写らず、検証済み TLS 経路にルーティングされる。検証失敗は明確な `Error.Denied`、TLS トランスポート不良は
+  `Error.Code`、プロトコル違反は `Error.Invalid`。(メッセージレスな `Error` enum はより広い別課題として残る
+  が、DC-1 の「HTTPS 未対応」負債は解消 — HTTPS は *対応済み*。)
+- **HTTPS はクライアント側のみ / 失効確認なし / システム信頼ストア前提(スライス 5)。** サーバ側 TLS は
+  先送り。失効確認(CRL/OCSP)はしない。信頼ルートは `SSL_CTX_set_default_verify_paths()`(ハードコードなし)
+  から来るため、OS の `ca-certificates` が無いとストアが空になり、**全ての** HTTPS ハンドシェイクが
+  fail-closed(`Error.Denied`)する — 正しい姿勢だが配備上の前提として記録する。
 
 ## Pitfalls
 
-- **P1 (TLS 先送りの誠実さ)**: v1 は平文のみである。`https://` の URL を黙って受理して平文で送っては
-  **ならない** — TLS のスライスが入るまでは、`https://` を「HTTPS not supported in v1 (TLS wrapper
-  pending)」という明確な `Error.Invalid` で拒否する。黙ってダウングレードするのはセキュリティ上の落とし穴
-  である(Nothing-hidden 違反)。**v1 の注意(DC-1):** 拒否は正しいが粗い — メッセージを付けられない素の
-  `Error.Invalid` なので、上の「HTTPS not supported」という文言は、メッセージレスな `Error` enum がまだ
-  運べない望みである(「Known v1 limitations」を参照)。
+- **P1 (黙ってダウングレードしない — 実 TLS で)**: `https://` は決して平文で送ってはならない。スライス 5
+  はこれを、スキームを拒否するのではなく検証済み TLS で接続すること(必須の証明書 + ホスト名検証、
+  fail-closed → `Error.Denied`)で満たす。黙ってダウングレードするのはセキュリティ上の落とし穴のままである
+  (Nothing-hidden 違反)。保証は「https は TLS を意味する」であり、エンジンが強制する。
 - **P2 (ステータスはデータ)**: 4xx/5xx を `Err` に写してはならない — `Err` はトランスポート/パースの失敗
   だけである。`get()` が 404 を返すなら、それは `Ok(status 404 のレスポンス)` である。ここを取り違えると、
   呼び出し側が二重のエラー処理を強いられる厄介な設計になる。
@@ -325,7 +338,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
 - 既知のレスポンスをパースする → status/headers/body が取れる
 - ローカルの平文サーバに対する `get()` → 200 の往復
 - 404 → `Err` ではなく `Ok(status 404)`(P2)
-- `https://` → `Error.Invalid`(P1)
+- `https://` → 検証済み TLS の往復(スライス 5)。信頼できない/ホスト名不一致の証明書 → `Error.Denied`
 - ヘッダー中の CRLF → 拒否(P6)
 - resp を越えて escape するレスポンスボディのビュー → コンパイルエラー(P3)
 - プールが 2 回の get にまたがって conn を再利用する

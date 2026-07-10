@@ -10,10 +10,13 @@ module.
 
 An HTTP/1.1 primitive, NOT a framework (draft §18.2). Built on std.net sockets. Members: request,
 response, header, method, status, client, server primitive. Connection reuse per the net rail.
-**TLS is the hidden dependency**: HTTPS needs an FFI TLS engine (BoringSSL/rustls-ffi class, like
-compress/crypto's borrow-the-engine). v1 is **plaintext HTTP/1.1 only**; HTTPS is deferred within
-M11 until the TLS FFI wrapper lands (record, don't half-ship). HTTP/3, routing, middleware = pkg,
-not std.
+**HTTPS/TLS on the client is SHIPPED** (Slice 5): `https://` works transparently through
+`cl.get/post/request` + `cl.get_many` over OpenSSL libssl (mandatory verification against the system
+trust store + hostname binding), dynamically linked alongside crypto's libcrypto. Server-side TLS
+stays deferred (client-first). HTTP/3, routing, middleware = pkg, not std.
+
+**Module status: COMPLETE** (Slices 1–6 shipped; client-side TLS is Slice 5). Server-side TLS,
+client certs, custom CA, session resumption, and revocation are the recorded post-v1 backlog.
 
 ## Signatures
 
@@ -250,10 +253,51 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    - **R-requirements: R1/R2/R4 apply and are required** (zero-copy request offset table; memchr
      scan; one-write respond). No server bench gate in v1 — a light accept→respond round-trip bench
      arrives with keepalive/concurrency, where a reuse path first exists.
-5. **HTTPS/TLS (client-side) — design SETTLED 2026-07-10** (two-lens review: language-purity +
-   systems-security; both ratified with the adjustments below). Zero new user-facing surface —
-   `https://` simply starts working through `cl.get/post/request` (the URL scheme is the only input
-   that should change behavior); the DC-1 coarse-`https://`-rejection debt retires naturally.
+5. **HTTPS/TLS (client-side) — SHIPPED 2026-07-10** (design settled + implemented; branch
+   `http-slice5-tls`). Zero new user-facing surface — `https://` starts working through
+   `cl.get/post/request` **and** `cl.get_many` (its workers share the exchange path, so HTTPS is
+   transparent in a batch); `http://` is byte-for-byte unchanged. The DC-1 coarse-`https://`-rejection
+   debt retired. **Implementation notes (as built):**
+   - **Conn abstraction:** one internal `Conn` enum (`Plain { fd }` / `Tls { ssl, fd }`) with
+     `write_all` / `read` (→ a source-agnostic `ConnRead` = `Data`/`Eof`/`Err`) / `close` methods, so
+     the streaming response loop and its Incomplete/Invalid framing split are single-sourced across
+     plaintext and TLS — the client-lenient parse never forks. `http_socket_exchange` takes `&mut Conn`.
+   - **Engine:** OpenSSL libssl, one `#[link(name = "ssl")]` extern block mirroring libcrypto's
+     wrappers; the driver links `-lssl` alongside `-lcrypto`. One process-wide `SSL_CTX` in a
+     `OnceLock`, built lazily with `SSL_CTX_set_default_verify_paths` (system store) + TLS-1.2 floor;
+     thread-safe for the concurrent `SSL_new` the `get_many` workers issue.
+   - **Per-conn verification (in `http_tls_connect`, all BEFORE the handshake):** `SSL_VERIFY_PEER`;
+     for a DNS authority `SSL_set1_host` + `X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS` + SNI
+     (`SSL_set_tlsext_host_name`); for an IP-literal authority `X509_VERIFY_PARAM_set1_ip_asc` and NO
+     SNI (RFC 6066); ALPN advertises `http/1.1`. Default port 443 (http = 80).
+   - **Error taxonomy:** verify failure (`SSL_get_verify_result != X509_V_OK`, checked first) →
+     `Error.Denied`; handshake/transport syscall → errno-mapped `Error.Code`; TLS alert / protocol
+     violation → `Error.Invalid`. `SSL*` AND fd freed on every error path (`close_tls` = one-way
+     `SSL_shutdown` + `SSL_free` + `close`). `SSL_read`/`SSL_write` wrapped in `SSL_get_error`
+     (`WANT_*` retry on the blocking socket, `ZERO_RETURN` = EOF, `SYSCALL`-with-errno-0 = unclean EOF).
+   - **SIGPIPE:** per-thread `pthread_sigmask` block around the whole HTTPS exchange
+     (handshake + I/O + teardown), draining a pending SIGPIPE via zero-timeout `sigtimedwait` before
+     restoring the prior mask (a `SigpipeBlock` RAII guard, held for the perform only when the scheme
+     is https). On macOS/BSD the guard is a no-op ZST — the per-socket `SO_NOSIGPIPE` set at connect
+     already covers the SSL BIO's `write(2)`. Plaintext keeps `MSG_NOSIGNAL`, unchanged.
+   - **Pool:** key is now `(scheme, host, port)` — a TLS conn never satisfies a plaintext bucket or
+     vice versa; `IdleConn` carries the live `SSL*` (reuse = same `SSL`, no re-handshake); every
+     constructor/consumer (`take_idle`/`put_idle`/client `Drop`/stale-reap/overflow) is TLS-aware.
+     The stale-retry logic ports unchanged — handshake failures happen only on the fresh path, so
+     they are never wrongly retried.
+   - **Tests:** `align_runtime` units — taxonomy (self-signed → Denied, wrong-host-cert → Denied,
+     refused → Code, garbage-TLS-server → Invalid), positive round-trips (IP path + DNS/SNI path),
+     TLS pool reuse (one conn / two gets), pool scheme-keying, `get_many` over mixed http+https, and
+     `/proc/self/fd` no-leak across N TLS cycles — against a local libssl test server with embedded
+     PEM fixtures. The positive path uses a **test-only trust hook**: a `#[cfg(test)]` `OnceLock`
+     (`TLS_TEST_CA_FILE`) that adds the test CA to the client store; it is compiled OUT of the shipped
+     runtime (structurally, not a runtime guard), so release builds have no trust hook at all —
+     verification stays mandatory. A driver test proves the routing change (`https://` connects
+     instead of being rejected pre-connect); the positive TLS round-trip is not drivable from the
+     driver harness because the `#[cfg(test)]` trust hook is absent in the driver-linked runtime.
+
+   **Settled design (as ratified):** Zero new user-facing surface — `https://` simply starts working
+   through `cl.get/post/request` (the URL scheme is the only input that should change behavior).
    - **Engine = OpenSSL libssl** (same package + ≥3.2 floor as crypto's settled libcrypto,
      dynamically linked like `-lcrypto`). The *linkage* reuses crypto's settlement; the **trust
      decision is a genuinely new semantic and gets its own record (this one)**: certificates are
@@ -329,8 +373,21 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      factor + the machine's core count + parity-vs-Rust at equal degree — NOT a
      hardware-independent 12.8× claim.
 
-## Known v1 limitations (Slice 2/3)
+## Known v1 limitations (Slice 2/3/5)
 
+- **HTTPS is CLIENT-SIDE ONLY (Slice 5).** Server-side TLS is deferred — `http.serve` is plaintext,
+  and its recorded trusted-network caveat (below) stands. Client-first matches the align-LLM A5
+  consumer; server TLS is coherent post-v1 work, not a half-ship.
+- **No certificate revocation checking (Slice 5).** Verification is chain + hostname against the
+  system trust store; there is no CRL / OCSP / OCSP-stapling check. A revoked-but-not-expired cert
+  that still chains to a trusted root is accepted. Revocation is recorded post-v1 backlog (alongside
+  client certs, custom CA, and session resumption — none of which have a config surface in the frozen
+  signatures).
+- **The system trust store must be present (Slice 5 deployment note).** Trust roots come from
+  `SSL_CTX_set_default_verify_paths()` (never a hardcoded path). If the OS `ca-certificates` package
+  (or equivalent) is absent, the store is empty and **every** HTTPS handshake fails CLOSED with
+  `Error.Denied` — the correct fail-closed posture, but a deployment prerequisite worth stating: ship
+  `ca-certificates` in any container/image that makes HTTPS requests.
 - **SERVER-SIDE ESCALATION of the timeout gap (Slice 4, security caveat — settled 2026-07-10).**
   On the client the missing I/O deadline is a robustness gap; on the **server** it is a security
   boundary: one slow-loris client (connects, then stalls or dribbles below the caps) holds the
@@ -366,23 +423,18 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
     expose `HEAD` conveniently (only `get`/`post`/`request`), but a caller-built `request` with method
     `HEAD` hits this. Method/status-aware framing (no-body for HEAD/1xx/204/304) lands with the same
     slice that adds de-chunking; recorded here, not fixed in Slice 3.
-- **`https://` rejection is coarse (DC-1, low).** `https://` is correctly rejected pre-connect (P1's
-  security intent is met — never a silent plaintext downgrade), but it maps to the **bare
-  `Error.Invalid`**, indistinguishable from any other malformed URL. The design's aspiration of a
-  clear "HTTPS not supported in v1 (TLS wrapper pending)" message is therefore **unmet**. This is
-  structural, not a fix we can slot in: the `Error` enum carries **no message payload**, so there is
-  no mechanism to attach the string. Do not invent a new one for this — the message-carrying error
-  story is a separate cross-cutting decision. Recorded as a known v1 limitation tied to the
-  message-less `Error` enum; revisit if/when `Error` grows a payload.
+- **~~`https://` rejection is coarse (DC-1, low).~~ RESOLVED by Slice 5.** `https://` no longer maps
+  to `Error.Invalid` at all — it routes to the verified TLS path. A verification failure is now the
+  distinct `Error.Denied`; a bad TLS transport is `Error.Code`; a protocol violation is
+  `Error.Invalid`. (The message-less `Error` enum is still a broader story, but the specific DC-1
+  "HTTPS not supported" debt is gone — HTTPS *is* supported.)
 
 ## Pitfalls
 
-- **P1 (TLS defer honesty)**: v1 is plaintext only. Do NOT silently accept `https://` URLs and
-  send plaintext — reject `https://` with a clear "HTTPS not supported in v1 (TLS wrapper
-  pending)" `Error.Invalid` until the TLS slice lands. Silent downgrade is a security footgun
-  (Nothing-hidden violation). **v1 caveat (DC-1):** the rejection is correct but coarse — it is the
-  bare `Error.Invalid` with no attached message, so the "HTTPS not supported" wording above is an
-  aspiration the message-less `Error` enum cannot yet carry (see Known v1 limitations).
+- **P1 (no silent downgrade — now via real TLS)**: `https://` must NEVER be sent as plaintext.
+  Slice 5 satisfies this by connecting over verified TLS (mandatory cert + hostname verification,
+  fail-closed → `Error.Denied`), not by rejecting the scheme. Silent downgrade remains a security
+  footgun (Nothing-hidden violation); the guarantee is now "https means TLS," enforced by the engine.
 - **P2 (status-is-data)**: 4xx/5xx must NOT map to `Err` — only transport/parse failures. A
   `get()` returning 404 is `Ok(response with status 404)`. Getting this wrong forces callers into
   awkward double-error handling.
@@ -401,7 +453,7 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
 - parse a known response → status/headers/body
 - `get()` against a local plaintext server → 200 round-trip
 - 404 → `Ok(status 404)` not `Err` (P2)
-- `https://` → `Error.Invalid` (P1)
+- `https://` → verified TLS round-trip (Slice 5); untrusted / wrong-host cert → `Error.Denied`
 - CRLF in header → rejected (P6)
 - response body view escaping resp → compile error (P3)
 - pool reuses a conn across 2 gets
