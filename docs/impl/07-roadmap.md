@@ -1754,8 +1754,50 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
   Mandatory tests: a builder declared outside a `loop` body survives per-iteration drops
   (#402 `body_locals` range); capture into `par_map`/`spawn` rejected (`ty_capture_is_move`).
   *(general — the natural `loop` accumulate-unknown-count output)*
-- **A7 — streaming line/record reads** *(general)*: design not yet settled; the
-  multi-GB `expert_trace.jsonl` consumer; ties to the post-M9 streaming×pipeline backlog.
+- **Slice A7 — streaming line reads (design SETTLED 2026-07-11; two-critic review, Fable
+  synthesis).** Consumer = the multi-GB `expert_trace.jsonl` per-line decode loop (align-LLM
+  Phase 2); *(general — any log/JSONL/record processing)*.
+  - **Prerequisite half: the buffered READER.** The shipped `reader` is a bare fd handle;
+    line reading needs lookahead (bytes past the `\n` must survive to the next call), and
+    hidden lookahead bolted onto the raw reader would silently corrupt `read`/`read_line`
+    interleaving. So the lookahead is **explicitly constructed**: `r.buffered() -> reader` —
+    the read dual of the settled buffered *writer* (mirror its surface exactly). On a buffered
+    reader **every read drains the lookahead before touching the fd** (the interleaving
+    contract); `read_line` on an unbuffered reader is a **sema error** ("call .buffered()
+    first"). One-way + nothing-hidden both hold: you built the buffer, so it exists.
+  - **`r.read_line(b: mut buffer) -> Result<i64, Error>`** (buffered receiver only): fills
+    `b` with the **line body, terminator already stripped** (`b.len()` = body length — the
+    strip lives in read_line, which alone knows where the `\n` was; no `line(n)` companion
+    call, no `n-1` trap); **returns bytes consumed including the terminator, 0 = EOF** (an
+    empty line returns 1 with body length 0 — unambiguous). A final unterminated line yields
+    its body as-is and returns its bare length. **One memcpy per line** from the lookahead
+    into the caller's buffer — a zero-copy view into the lookahead was REJECTED (invalidated
+    by the next refill; the A6 view-invalidation class). The buffer **grows** as needed —
+    unlike `r.read`, which caps at capacity: a line has no caller-chosen bound (state this
+    asymmetry in draft.md §18.2) — up to a **64 MiB line cap** → `Error.Invalid` (bounds
+    growth on a terminator-free/binary input; a *record*-sized cap, deliberately below the
+    http 1 GiB *body* ceiling — each cap is sized to its thing).
+  - **NEW generic boundary op `bytes.as_str() -> Result<str, Error>`** — the validating
+    VIEW sibling of the settled `bytes.to_string()`; region-bound through the receiver chain
+    (the #297 arm; a view of a buffer's bytes stays pinned to the buffer). This is the one
+    bytes→text path; a bespoke line-view op on `buffer` was REJECTED (a second bytes→str
+    path, and a text op leaking into the deliberately-binary container).
+  - Canonical loop: `loop { n := r.read_line(buf)?; if n == 0 { break };
+    line := buf.bytes().as_str()?; rec := json.decode(line)?; …array_builder… }`.
+  - Documented edges: exactly one `\r?\n` is stripped; a lone `\r` (old-Mac) is not a
+    terminator; a BOM is never stripped (no hidden transformation — json fails line 1;
+    stripping is the consumer's call); a garbage line is an ordinary `Err` — skip-and-continue
+    is already expressible with `match` instead of `?`; the per-iteration line view must not
+    be hoisted across iterations (the next `read_line` invalidates it — currently uncaught,
+    the recorded Borrow-liveness gap; one warning sentence in draft.md).
+  - Recorded perf follow-up (not this slice): `json.decode` re-validates its already-invariant
+    `str` input, so the JSONL hot loop validates each line twice (as_str + decode). After an
+    audit that no unvalidated str-mint path exists (unsafe/FFI seams), decode may skip
+    validation — one validation per line. Cheap either way (validation is memcpy-class).
+  - Engineering notes: `read_line` is a buffer-MUTATING op (the push/put view-invalidation
+    class — register it with their sema handling; a new mutator that skips that pass is the
+    "new IR variant skips a pass" bug class); needs one new FFI write path (grow + set len);
+    reader struct gains the lookahead fields behind the `buffered` flag.
 - **A8 — arena checkpoint/rollback** *(general)*: design not yet settled (its own Open
   entry); consumer = a long-running server loop resetting per request.
 - **A5 remainder — SSE/chunked streaming response** (`ctx.respond_stream` + `http_stream`):

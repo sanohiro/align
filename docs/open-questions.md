@@ -2473,6 +2473,14 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
 7. **Streaming line/record reads** *(general)* — `read_line`-class chunked record iteration over
    a reader; multi-GB `expert_trace.jsonl` is the concrete consumer for the already-recorded
    post-M9 "streaming×pipeline integration" backlog item.
+   **Design SETTLED 2026-07-11 (two-critic review, Fable synthesis; full record = roadmap M12
+   Slice A7):** the buffered READER (`r.buffered()`, the read dual of the buffered writer;
+   lookahead is explicitly constructed, drain-before-fd interleaving contract) +
+   `r.read_line(mut buffer)` (body-with-terminator-stripped into the buffer, returns
+   consumed-incl-terminator, 0 = EOF; grows to a 64 MiB line cap) + the generic
+   `bytes.as_str()` validating view (the view sibling of `bytes.to_string()`). Zero-copy
+   views into the lookahead and a bespoke buffer `line()` op were both rejected. Perf
+   follow-up recorded: json.decode's redundant re-validation of invariant str input.
 8. **Arena checkpoint/rollback** *(general)* — already Open (see its entry); the consumer
    arrived: a long-running server loop resetting its arena per request (gateway, or any server).
 
