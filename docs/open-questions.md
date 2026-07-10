@@ -217,6 +217,7 @@ implementation must region-check captured views (str and bytes alike) when it la
 - **`bytes` = `slice<u8>`** — a read-only `{ptr,len}` view of `u8` elements (bytes), structurally identical to a slice of bytes (no UTF-8 invariant — that is what distinguishes it from `str`/`string`). Introducing a *separate* structural type would violate **One way** (two names for one thing), so `bytes` is the conventional spelling of `slice<u8>` in byte/I/O contexts, lowered as `slice<u8>`. `s.bytes()` yields a `slice<u8>` view of a string's UTF-8 bytes; `bytes.to_string()` is the UTF-8-validating inverse (`Result<string, Error>`). (FFI already treats `bytes` as a view handed to C by raw pointer — consistent.)
 - **`buffer` = a distinct Move type**: an owned, **growable**, mutable sequence of `u8` (the byte analog of a `Vec<u8>`). It is *not* `array<u8>` (fixed length) nor `builder` (an append-only *text* writer that produces a `string`); `buffer` is random-access + growable + freezable raw bytes for the *binary* domain. Ops: `buffer()` / `buffer(cap)`, `.push(b)`, `.append(slice<u8>)`, `.len()`, `buf[i]` read/write, `.bytes()` (view), and freeze → owned `array<u8>` or `.to_string()` (UTF-8 validate). It is the first growable container.
 - **Build (was deferred until a consumer) — the minimal `buffer` landed with its first consumer, M9 std.io Slice 1 (2026-07-03).** `Ty::Buffer` is an owned Move handle to a growable heap `Vec<u8>` (`Drop`-freed); the shipped ops are the subset `reader.read` needs — `buffer(cap)` (a read window), `.bytes()` (the `slice<u8>` view, region-tracked to the buffer so it can't escape), `.len()`. The rest of the settled op set (`.push`/`.append`/`buf[i]` read/write/freeze → `array<u8>`/`.to_string()`) is still deferred to its next consumer (`core.hash` / binary parsing) — same "build ahead of a consumer risks the wrong shape" rationale, now applied per-op. `bytes` remains `slice<u8>` (no separate structural type).
+  - **Binary parsing arrived (2026-07-10, align-LLM runway A2, branch `runway-a2-binary-codec`).** The consumer settled the byte-level op shape as **typed binary decode/encode** rather than the originally-listed raw `.push(b)` / `buf[i]` ops: reads `bytes.<scalar>_<le|be>(off)` and writes `buffer.put_<scalar>_<le|be>(v)` (the endian-explicit typed pair — see the Open → "align-LLM runway" A2 record for the full design), plus `buffer.append(bytes)` for a raw blob. `put_u8` **supersedes** the settled `.push(b)` (a typed single-byte append), and `.append(slice<u8>)` shipped as specified. Still deferred (no A2 consumer): `buf[i]` random-access read/write and `freeze → array<u8>` / `.to_string()` — a growable-then-freeze output is the `loop` / growable-`array<T>` story, not binary parsing.
 Record: `draft.md` §12/§18.2, `impl/07-roadmap.md` M9 Slice 1, `crates/align_driver/tests/m9_io.rs`.
 
 ### `str` I/O UTF-8 validation — SETTLED + BUILT (2026-07-04)
@@ -2310,7 +2311,38 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
 2. **Binary decode/encode surface on `bytes`/`buffer`** — bounds-checked, endian-explicit
    `b.u32_le(off)` / `u64_le` / `f32_le` reads and the matching `buffer` writes
    (`put_u32_le`, …). Core-adjacent (pure computation); GGUF headers and `alignpack`/`alignidx`
-   emission are the consumers. *(general — any binary format)*
+   emission are the consumers. *(general — any binary format)* **DONE (design SETTLED + BUILT,
+   branch `runway-a2-binary-codec`).** Design confirmed:
+   - **Endianness = both LE and BE, explicit `_le` / `_be` suffix; never implicit.** GGUF /
+     safetensors / ONNX are little-endian, but network/other formats are big-endian, so both are
+     offered — and each `_le`/`_be` is a *distinct operation* (different result), not two spellings
+     of one, so this is One-Way-compatible (like `select` vs `where`). A bare `b.u32(off)` that
+     defaulted to LE would hide the byte order — rejected. Single-byte `u8`/`i8` carry no suffix.
+   - **API.** Read on a `bytes` (`slice<u8>`) view: `bytes.<scalar>(off) -> scalar` for `scalar` in
+     `u8, i8, u16_le, u16_be, i16_le, i16_be, u32_le, u32_be, i32_le, i32_be, u64_le, u64_be,
+     i64_le, i64_be, f32_le, f32_be, f64_le, f64_be`. Encode on a growable `buffer` (a `mut` local):
+     `buffer.put_<scalar>(v) -> ()` (the same 18-name set, `put_`-prefixed) plus
+     `buffer.append(data) -> ()` (copy a raw `bytes`/`str`/`string` blob). Read-back via the existing
+     `.bytes()` / `.len()`.
+   - **Out-of-range policy = abort** (`off < 0` or `off + width > len`), reusing the slice
+     range-bounds check — the **same fail-closed policy as `slice[i]`** (not a `Result`): a
+     structural over-read is a bug, and a parser checks `.len()` first exactly as it checks a
+     slice's length before indexing. (Overflowing `off + width` is caught by the `start > end` arm,
+     so no out-of-range address is ever formed.)
+   - **copy-out = not needed, deferred.** A decode read returns a **Copy scalar** (it never carries
+     the view's region — so it composes freely and needs no owned-bytes), and encode grows an
+     **owned `buffer`** whose `.bytes()` view stays in scope. Neither path needs a value to leave its
+     arena, so the still-absent owned-bytes/copy-out shape (HANDOFF A1 note) is genuinely
+     unnecessary here; it stays deferred until a consumer needs a `bytes` value to escape.
+   - **Lowering.** Decode is **inline codegen** (a new `Rvalue::BytesRead` → an alignment-1 load,
+     plus an `llvm.bswap` for `_be`; a float loads its bits then bit-casts), not an FFI call — a
+     per-scalar call would be an optimizer barrier in a descriptor loop, against the data-oriented
+     "lowers well" invariant. Encode is a runtime call (`align_rt_buffer_put` / `_append`) because a
+     `buffer` is an opaque growable heap handle (like `.push`). Host little-endianness is assumed
+     (x86-64 / aarch64), as elsewhere in the backend. `put`/`append` truncate the buffer to its
+     logical `len` before appending, so encoding after a `reader.read` is well-defined. Records:
+     `draft.md` §12 "Binary decode and encode"; `crates/align_driver/tests/runway_a2_binary_codec.rs`
+     + runtime unit tests in `align_runtime`.
 3. **`loop` implementation slice** — the settled design (Settled → "Sequential control") now has
    consumer pressure: streaming parses, the gateway server loop, the runtime scheduler. First
    unimplemented settle to build.

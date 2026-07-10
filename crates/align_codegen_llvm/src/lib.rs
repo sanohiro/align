@@ -857,6 +857,20 @@ fn build_module<'c>(
         module.add_function("align_rt_buffer_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
     );
     funcs.insert(
+        // b.put_*(v) (b: *Buffer, bits: i64, width: i64, be: i32) -> void; append `width` bytes.
+        "buffer_put".to_string(),
+        module.add_function(
+            "align_rt_buffer_put",
+            ctx.void_type().fn_type(&[ptr.into(), i64t2.into(), i64t2.into(), ctx.i32_type().into()], false),
+            None,
+        ),
+    );
+    funcs.insert(
+        // b.append(data) (b: *Buffer, ptr: *u8, len: i64) -> void; copy-append a byte blob.
+        "buffer_append".to_string(),
+        module.add_function("align_rt_buffer_append", ctx.void_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
         // json.decode into array<Struct> (input, input_len, fields, n, elem_size, out: *{ptr,len},
         // phf, phf_len, phf_seed) -> i32 status (MMv2 slice 8d; trailing 3 = perfect-hash table).
         "json_decode_struct_array".to_string(),
@@ -4575,6 +4589,78 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["buffer_len"], &[bp], "buflen")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("buffer_len returns i64")
+            }
+            // `bytes.<scalar>_<le|be>(off)` — inline binary scalar read. The byte address is a plain
+            // (non-`inbounds`) GEP into the bounds-checked `slice<u8>` view; the load is alignment-1
+            // (the offset is arbitrary). A `be` read byte-swaps into host order (single-byte reads
+            // carry `be:false`, so `bswap` never applies to `i8`). A float loads its bits then
+            // bit-casts. Host little-endianness is assumed (x86-64 / aarch64), as elsewhere.
+            Rvalue::BytesRead { bytes, offset, scalar, be } => {
+                let (ptr, _len) = self.split_str(bytes)?;
+                let ptr = ptr.into_pointer_value();
+                let off = self.operand(offset).into_int_value();
+                let addr = unsafe {
+                    self.builder.build_gep(self.ctx.i8_type(), ptr, &[off], "byteaddr").map_err(|e| self.err(e))?
+                };
+                let is_float = matches!(scalar, Ty::Float(_));
+                let load_int_ty = if is_float {
+                    match scalar { Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(), _ => self.ctx.i64_type() }
+                } else {
+                    int_type(self.ctx, *scalar)
+                };
+                let loaded = self.builder.build_load(load_int_ty, addr, "rawbits").map_err(|e| self.err(e))?;
+                loaded
+                    .as_instruction_value()
+                    .ok_or_else(|| self.err("bytes read load is not an instruction"))?
+                    .set_alignment(1)
+                    .map_err(|_| self.err("set bytes-read load alignment"))?;
+                // llvm.bswap is only defined for widths > 8; sema never builds an 8-bit `_be`
+                // read, but guard defensively so a future gap cannot become an LLVM crash.
+                let bits = if *be && load_int_ty.get_bit_width() > 8 {
+                    self.call_intrinsic("llvm.bswap", &[load_int_ty.into()], &[loaded.into()])?.into_int_value()
+                } else {
+                    loaded.into_int_value()
+                };
+                if is_float {
+                    self.builder.build_bit_cast(bits, float_type(self.ctx, *scalar), "asfloat").map_err(|e| self.err(e))?
+                } else {
+                    bits.into()
+                }
+            }
+            // `buf.put_<scalar>_<le|be>(v)` — reinterpret `v` to its raw i64 bits (a float bit-casts;
+            // a narrower int zero-extends, so its low `width` bytes are the two's-complement value),
+            // then hand (bits, width, be) to the runtime, which appends `width` bytes in order.
+            Rvalue::BufferPut { buffer, value, scalar, be } => {
+                let bp = self.operand(buffer).into();
+                let width = match scalar {
+                    Ty::Int(IntTy { bits, .. }) | Ty::Float(FloatTy { bits }) => u64::from(*bits) / 8,
+                    _ => return Err(self.err("buffer put scalar must be a fixed-width int/float")),
+                };
+                let i64t = self.ctx.i64_type();
+                let bits = if matches!(scalar, Ty::Float(_)) {
+                    let fv = self.operand(value).into_float_value();
+                    let int_bits = match scalar { Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(), _ => i64t };
+                    let as_int = self.builder.build_bit_cast(fv, int_bits, "fbits").map_err(|e| self.err(e))?.into_int_value();
+                    self.builder.build_int_z_extend_or_bit_cast(as_int, i64t, "bits64").map_err(|e| self.err(e))?
+                } else {
+                    let iv = self.operand(value).into_int_value();
+                    self.builder.build_int_z_extend_or_bit_cast(iv, i64t, "bits64").map_err(|e| self.err(e))?
+                };
+                let width_c = i64t.const_int(width, false);
+                let be_c = self.ctx.i32_type().const_int(u64::from(*be), false);
+                self.builder
+                    .build_call(self.funcs["buffer_put"], &[bp, bits.into(), width_c.into(), be_c.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            // `buf.append(data)` — copy the raw `slice<u8>` bytes onto the growable buffer.
+            Rvalue::BufferAppend { buffer, data } => {
+                let bp = self.operand(buffer).into();
+                let (ptr, len) = self.split_str(data)?;
+                self.builder
+                    .build_call(self.funcs["buffer_append"], &[bp, ptr.into(), len.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
             }
             // fs.write_file — marshal the path `{ptr,len}` and the str/bytes data `{ptr,len}`, return
             // an i32 errno-status.

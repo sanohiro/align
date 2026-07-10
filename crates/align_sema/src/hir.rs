@@ -661,6 +661,22 @@ pub enum ExprKind {
     BufferBytes { buffer: Box<Expr> },
     /// `b.len()` — the buffer's current byte count (an `i64`). Pure.
     BufferLen { buffer: Box<Expr> },
+    /// `bytes.<scalar>_<le|be>(off)` — a bounds-checked binary scalar **read** from a `bytes`
+    /// (`slice<u8>`) view at byte offset `off`. The `ty` is the read scalar (`u8`/`i8`/…/`f64`);
+    /// its width (1/2/4/8 bytes) comes from `ty`. `be` selects big-endian byte order (single-byte
+    /// reads carry `be:false`). Out-of-range (`off < 0` or `off + width > len`) **aborts** — the
+    /// same policy as `slice[i]` (a structural over-read is a bug; a parser checks `.len()` first).
+    /// Pure (a memory read, like an index). The `bytes` view and `off` are borrowed, not consumed.
+    BytesRead { bytes: Box<Expr>, offset: Box<Expr>, be: bool },
+    /// `buf.put_<scalar>_<le|be>(v)` — append `v`'s bytes to a growable `buffer` in the given byte
+    /// order, growing it (the encode dual of [`BytesRead`]). `v`'s scalar type sets the width; `be`
+    /// selects big-endian. The `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut buffer`
+    /// local (mutated in place). Pure (in-memory growth, no I/O — like a `mut` array store).
+    BufferPut { buffer: Box<Expr>, value: Box<Expr>, be: bool },
+    /// `buf.append(data)` — append a raw `bytes` (`slice<u8>`) blob to a growable `buffer`, copying
+    /// the bytes in and growing it. The `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut
+    /// buffer` local; `data` is borrowed (copied, not consumed). Pure (in-memory growth).
+    BufferAppend { buffer: Box<Expr>, data: Box<Expr> },
     /// `fs.write_file(path, data)` — create/truncate `path` (a `str`) and write all of `data`, then
     /// close. `data` is a `str`/`bytes` (`slice<u8>`) view, or — when `builder` is set — a `builder`'s
     /// accumulated bytes (borrowed, not consumed). The `ty` is `Result<(), Error>`. Impure.

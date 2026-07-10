@@ -408,6 +408,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BufferNew(cap) => format!("buffer_new({})", operand_str(cap)),
         Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
         Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),
+        Rvalue::BytesRead { bytes, offset, be, .. } => {
+            format!("bytes_read{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(bytes), operand_str(offset))
+        }
+        Rvalue::BufferPut { buffer, value, be, .. } => {
+            format!("buffer_put{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(buffer), operand_str(value))
+        }
+        Rvalue::BufferAppend { buffer, data } => format!("buffer_append({}, {})", operand_str(buffer), operand_str(data)),
         Rvalue::FsWriteFile { path, data } => format!("fs_write_file({}, {})", operand_str(path), operand_str(data)),
         Rvalue::FsWriteFileBuilder { path, builder } => format!("fs_write_file_builder({}, {})", operand_str(path), operand_str(builder)),
         Rvalue::FsExists { path } => format!("fs_exists({})", operand_str(path)),
