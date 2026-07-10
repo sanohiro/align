@@ -9146,6 +9146,14 @@ fn http_parse_head(src: &[u8]) -> Result<HttpHead, HttpParseErr> {
         let name = &src[name_start..name_start + name_len];
         let value = &src[value_start..value_start + value_len];
         if name.eq_ignore_ascii_case(b"content-length") {
+            // RFC 9112 §6.2: Content-Length is a bare sequence of ASCII digits. `parse::<usize>`
+            // alone would accept a leading `+` (`+3` → 3), a framing differential vs. stricter peers
+            // (smuggling), so require digits-only first; an empty value is likewise rejected.
+            if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                return Err(HttpParseErr::Invalid);
+            }
+            // Digits-only above ⇒ valid UTF-8; parse still guards against a usize overflow (→ Invalid,
+            // never a panic) for an absurdly long digit run.
             let Ok(n) = std::str::from_utf8(value).unwrap_or("x").parse::<usize>() else {
                 return Err(HttpParseErr::Invalid);
             };
@@ -14872,6 +14880,24 @@ mod tests {
         let same = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
         let mut out2: *mut HttpResponse = core::ptr::null_mut();
         assert_eq!(unsafe { align_rt_http_parse(same.as_ptr(), same.len() as i64, &mut out2) }, 0);
+        assert_eq!(unsafe { align_rt_http_resp_status(out2) }, 200);
+        unsafe { align_rt_http_resp_free(out2) };
+    }
+
+    /// RFC 9112 §6.2: a response Content-Length must be a bare digit run — a leading `+` (or any
+    /// other non-digit) is rejected, mirroring the server-side request-head guard
+    /// (`http_parse_request_head_hardening_guards`). A plain digit run still parses.
+    #[test]
+    fn http_parse_response_content_length_digits_only() {
+        let plus = b"HTTP/1.1 200 OK\r\nContent-Length: +3\r\n\r\nabc";
+        let mut out: *mut HttpResponse = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_parse(plus.as_ptr(), plus.len() as i64, &mut out) }, AL_INVALID, "leading + in CL");
+        assert!(out.is_null());
+
+        let good = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+        let mut out2: *mut HttpResponse = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_parse(good.as_ptr(), good.len() as i64, &mut out2) }, 0);
+        assert!(!out2.is_null());
         assert_eq!(unsafe { align_rt_http_resp_status(out2) }, 200);
         unsafe { align_rt_http_resp_free(out2) };
     }
