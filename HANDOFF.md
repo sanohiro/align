@@ -5,11 +5,11 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10 (**#398** std.http Slice 3 — keepalive pool + R6 bench — MERGED, R3/R6
-both met; same day, owed-delta wave: **#396** struct-`==` ICE → sema diagnostic and **#397**
-no-shadowing enforcement MERGED — the two priority deltas from the 2026-07-09 sweep are done;
-earlier same day: staleness sweep #395; previously 2026-07-09 loop design settled — docs-only
-sweep; 2026-07-08 M11 std.http Slice 2 MERGED as #392; Slice 1 was #391)._
+_Last updated: 2026-07-10 (**#399** align-LLM runway A1 `fs.read_bytes_view` MERGED — first
+arena-backed slice view, `Scalar::Slice` + `region_bearing`; **#398** std.http Slice 3 —
+keepalive pool + R6 bench — MERGED, R3/R6 both met; same day, owed-delta wave: **#396**
+struct-`==` ICE → sema diagnostic and **#397** no-shadowing enforcement MERGED; earlier same
+day: staleness sweep #395)._
 
 ## ▶ NEXT SESSION — start here
 
@@ -77,7 +77,19 @@ streaming line reads, arena checkpoint — the last three are general fast-syste
 engine-specific), two design stances (async = task_group + blocking workers, NO async/await;
 shared state lean = channels, atomics sealed), and two explicit non-adoption boundaries (no
 MemoryTier/pinned/VRAM in the language core — std/pkg Move handles instead; f16/bf16 stays
-Future). **None of it is implemented; nothing here is started.**
+Future). **A1 is DONE (merged as #399, 2026-07-10):** `fs.read_bytes_view(path) ->
+Result<bytes, Error>` — arena-scoped binary mmap view, no UTF-8 validation; runtime shares
+`fs_read_view_impl` with `read_file_view`. The compiler substance: the **first arena-backed
+slice view** — new `Scalar::Slice(PrimScalar)` (twin-mirror swept: Copy, not on move/drop,
+excluded from `==`/print/fn-values/box/array-literals) and the `region_bearing` predicate
+(`tracks_region || ty_mentions_slice`, transparent through Result/Option/tuple **and struct
+fields + array elements** — the gemini defensive hardening, both verified unreachable today)
+replacing the `tracks_region` gate at every EscapeCheck site. Adversarial gate: ~25 escape-bypass
+programs all rejected, no new hole; the one CONFIRMED finding is the **pre-existing**
+closure-captured-arena-view UAF (also reproduces on M9 `read_file_view`), recorded in
+open-questions under the escaping-fn-values deferral. `cargo test --workspace` **1647 green**.
+A2 design note for next time: no owned-bytes/copy-out exists yet — a view cannot leave its arena;
+A2's decode/encode surface should decide that shape. **A2–A8 are not started.**
 
 **M11 is IN PROGRESS — `std.net` (#371–#374), `std.process` (#376–#378), `std.compress`
 (#380–#381), and `std.crypto` (#383–#388) are DONE.** Full shipped-feature summaries + per-slice
