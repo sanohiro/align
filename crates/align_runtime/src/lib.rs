@@ -390,6 +390,15 @@ pub unsafe extern "C" fn align_rt_free_string_array(ptr: *mut u8, len: i64) {
         for i in 0..n {
             let entry = unsafe { *hdr.add(i) };
             unsafe { align_rt_free(entry.ptr as *mut u8) };
+            // This is also the frozen `array<string>` free path for a `string`-element
+            // `array_builder` that *did* `build()` (§ M12 Slice A6) — decrement
+            // `LIVE_ARRAY_BUILDER_STRINGS` here too so the counter balances for either fate of a
+            // pushed entry (builder's own deep-free, or via this shared array-drop path). Entries
+            // that arrived here from `fs.read_dir` (never incremented) just make the counter dip
+            // below zero for those tests' own before/after window — harmless, since every test
+            // reads its own delta rather than an absolute value.
+            #[cfg(test)]
+            LIVE_ARRAY_BUILDER_STRINGS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
     unsafe { align_rt_free(ptr) };
@@ -7200,6 +7209,7 @@ pub unsafe extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
     fn free(ptr: *mut core::ffi::c_void);
+    fn realloc(ptr: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
     // POSIX `write(2)` — a `writer` streams straight to its fd, bypassing the `std::io::Stdout`
     // lock + line-buffering that `print` pays per call.
     fn write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
@@ -7386,6 +7396,235 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
     unsafe { free(ptr as *mut core::ffi::c_void) }
+}
+
+/// Grow/shrink a heap buffer from the [`align_rt_alloc`] family (C `realloc`). `realloc(null, n)` is
+/// `alloc(n)` (so a fresh builder grows from a null pointer); `new_size <= 0` frees `ptr` and returns
+/// null. On OOM (`realloc` returns null for a positive request) we abort — like [`align_rt_alloc`],
+/// never handing back a null the caller would store into. The returned pointer is
+/// [`align_rt_free`]-compatible (the same C allocator), so a builder's frozen storage crosses
+/// straight into the `array<T>` that the size-less C-free frees.
+///
+/// # Safety
+/// `ptr` must be null or a pointer previously returned by [`align_rt_alloc`] / [`align_rt_realloc`]
+/// and not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_realloc(ptr: *mut u8, new_size: i64) -> *mut u8 {
+    if new_size <= 0 {
+        unsafe { free(ptr as *mut core::ffi::c_void) };
+        return core::ptr::null_mut();
+    }
+    let p = unsafe { realloc(ptr as *mut core::ffi::c_void, new_size as usize) as *mut u8 };
+    if p.is_null() {
+        panic_abort("out of memory");
+    }
+    p
+}
+
+// ── array_builder<T> (M12 Slice A6) ──────────────────────────────────────────────────────────────
+//
+// The typed grow-then-freeze member (`builder`->`string`, `buffer`->bytes, now `array_builder`->
+// `array<T>`). `push`/`append` grow amortized (doubling); `build` hands the raw storage off as an
+// owned `array<T>` (a zero-copy ptr+len retype). Storage is [`align_rt_alloc`]/[`align_rt_realloc`]
+// memory — the same C allocator that frees `array<T>` — so `build` never copies and the capacity
+// slack is freed whole by the size-less C-free. `elem_size` is the element stride in bytes (16 for a
+// `string` element: an `AlignStr` `{ptr,len}` moved in per element). The builder holds no views, so a
+// realloc can never invalidate a borrow (the soundness rationale for the whole type).
+
+/// Test-only live-count of pushed-but-not-yet-freed `string` entries stored in an `array_builder`
+/// (via [`align_rt_array_builder_push_str`]): incremented there, decremented wherever that entry's
+/// buffer is actually reclaimed — the builder's own deep-free loop
+/// ([`align_rt_array_builder_free_strings`], for a builder dropped before `build`) or the frozen
+/// `array<string>`'s deep-free loop ([`align_rt_free_string_array`], for a builder that *did*
+/// `build` and whose resulting array later drops). Mirrors the [`LIVE_HTTP_RESPONSES`] precedent:
+/// makes a deleted per-entry free loop observable in a unit test — `rc`/`len` assertions alone
+/// cannot catch it, because the pushed strings' backing allocations are simply never reclaimed,
+/// which only a leak sanitizer or this counter observes.
+#[cfg(test)]
+static LIVE_ARRAY_BUILDER_STRINGS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// A growable typed array builder (`array_builder<T>`). `data` is `align_rt_alloc`/`align_rt_realloc`
+/// storage (null while `cap == 0`); `len`/`cap` count elements; `elem_size` is the byte stride.
+#[repr(C)]
+pub struct ArrayBuilder {
+    data: *mut u8,
+    len: usize,
+    cap: usize,
+    elem_size: usize,
+}
+
+impl ArrayBuilder {
+    /// Ensure room for `additional` more elements, growing by amortized doubling. Aborts on a
+    /// capacity/byte-size overflow (the `checked_*` FFI-growth-math rule) or OOM (via
+    /// [`align_rt_realloc`]).
+    unsafe fn reserve(&mut self, additional: usize) {
+        let needed = match self.len.checked_add(additional) {
+            Some(n) => n,
+            None => panic_abort("array_builder capacity overflow"),
+        };
+        if needed <= self.cap {
+            return;
+        }
+        // Amortized doubling with a small floor, so tiny builders don't realloc on every push.
+        let mut new_cap = self.cap.max(4);
+        while new_cap < needed {
+            new_cap = match new_cap.checked_mul(2) {
+                Some(c) => c,
+                None => needed, // doubling overflowed — fall back to the exact need
+            };
+        }
+        let bytes = match new_cap.checked_mul(self.elem_size) {
+            Some(b) if (b as u64) <= isize::MAX as u64 => b,
+            _ => panic_abort("array_builder allocation too large"),
+        };
+        self.data = unsafe { align_rt_realloc(self.data, bytes as i64) };
+        self.cap = new_cap;
+    }
+}
+
+/// `array_builder<T>()` — open an empty builder whose element stride is `elem_size` bytes (`>= 1`;
+/// 16 for a `string` element). Growth is deferred to the first `push`/`append`.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_array_builder_new(elem_size: i64) -> *mut ArrayBuilder {
+    let es = safe_len(elem_size).unwrap_or(0).max(1);
+    Box::into_raw(Box::new(ArrayBuilder { data: core::ptr::null_mut(), len: 0, cap: 0, elem_size: es }))
+}
+
+/// `b.push(v)` for a Copy-scalar element — append `elem_size` (`<= 8`) bytes of the scalar `bits`
+/// (its raw value in the low bytes, little-endian — a float bit-reinterpreted, a narrower int
+/// zero/sign-extended, like [`align_rt_buffer_put`]). Grows amortized. Null-safe.
+///
+/// # Safety
+/// `b` must be null or a valid [`ArrayBuilder`] whose `elem_size <= 8` (a scalar element).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_push(b: *mut ArrayBuilder, bits: u64) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    debug_assert!(b.elem_size <= 8, "elem_size must be <= 8 for scalar push");
+    unsafe { b.reserve(1) };
+    let le = bits.to_le_bytes();
+    let w = b.elem_size.min(8);
+    unsafe {
+        let dst = b.data.add(b.len * b.elem_size);
+        core::ptr::copy_nonoverlapping(le.as_ptr(), dst, w);
+    }
+    b.len += 1;
+}
+
+/// `b.push(s)` for a `string` element — store the moved-in owned string as a 16-byte `AlignStr`
+/// `{ptr,len}` entry (the caller has already nulled the source; the builder now owns the buffer).
+/// Grows amortized. Null-safe.
+///
+/// # Safety
+/// `b` must be null or a valid [`ArrayBuilder`] with `elem_size == 16` (a `string` element);
+/// `ptr`/`len` are an owned `string`'s `{ptr,len}` whose buffer ownership transfers to the builder.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_push_str(b: *mut ArrayBuilder, ptr: *const u8, len: i64) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    debug_assert_eq!(b.elem_size, core::mem::size_of::<AlignStr>(), "elem_size must match AlignStr size");
+    unsafe { b.reserve(1) };
+    let entry = AlignStr { ptr, len };
+    unsafe {
+        let dst = b.data.add(b.len * b.elem_size) as *mut AlignStr;
+        core::ptr::write_unaligned(dst, entry);
+    }
+    b.len += 1;
+    #[cfg(test)]
+    LIVE_ARRAY_BUILDER_STRINGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// `b.append(xs)` — bulk-copy `count` Copy-scalar elements (`count * elem_size` bytes) from `src`
+/// onto the builder. A null `src` or non-positive `count` appends nothing. Grows amortized.
+/// Null-safe.
+///
+/// # Safety
+/// `b` must be null or a valid scalar-element [`ArrayBuilder`]; `src`/`count` must describe a
+/// readable run of `count` elements of `elem_size` bytes each (or be null / `<= 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_append(b: *mut ArrayBuilder, src: *const u8, count: i64) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    let Ok(n) = safe_len(count) else {
+        return;
+    };
+    if n == 0 || src.is_null() {
+        return;
+    }
+    debug_assert!(b.elem_size <= 8, "elem_size must be <= 8 for scalar append");
+    unsafe { b.reserve(n) };
+    let bytes = match n.checked_mul(b.elem_size) {
+        Some(x) => x,
+        None => return,
+    };
+    unsafe {
+        let dst = b.data.add(b.len * b.elem_size);
+        core::ptr::copy_nonoverlapping(src, dst, bytes);
+    }
+    b.len += n;
+}
+
+/// `b.build()` — freeze into an owned `array<T>` `{ptr,len}` (a zero-copy ptr+len retype). Hands the
+/// raw storage off as the array buffer (the caller's `array<T>` `Drop` frees it — deep-free for a
+/// `string` element array via `align_rt_free_string_array`), then frees only the builder header. The
+/// capacity slack rides along and is freed whole by the size-less C-free. Null-safe (a moved-out
+/// builder yields `{null,0}`).
+///
+/// # Safety
+/// `b` must be null or a valid [`ArrayBuilder`] from [`align_rt_array_builder_new`], not yet frozen.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_build(b: *mut ArrayBuilder) -> AlignStr {
+    if b.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    // Take the header back; its raw `data` pointer becomes the array buffer (NOT freed here).
+    let bx = unsafe { Box::from_raw(b) };
+    AlignStr { ptr: bx.data as *const u8, len: bx.len as i64 }
+}
+
+/// Drop an unfrozen scalar-element `array_builder` — free its storage, then the header. Null-safe (a
+/// moved-out / never-grown builder drops harmlessly).
+///
+/// # Safety
+/// `b` must be null or a valid scalar-element [`ArrayBuilder`], not yet frozen.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_free(b: *mut ArrayBuilder) {
+    if b.is_null() {
+        return;
+    }
+    let bx = unsafe { Box::from_raw(b) };
+    unsafe { free(bx.data as *mut core::ffi::c_void) };
+}
+
+/// Drop an unfrozen `string`-element `array_builder` — deep-free each pushed string, then the
+/// storage + header. Mirrors [`align_rt_free_string_array`] over the builder's live `len` entries
+/// (the capacity slack holds no initialized entries). Null-safe.
+///
+/// # Safety
+/// `b` must be null or a valid `string`-element [`ArrayBuilder`] (`elem_size == 16`), not yet frozen.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_free_strings(b: *mut ArrayBuilder) {
+    if b.is_null() {
+        return;
+    }
+    let bx = unsafe { Box::from_raw(b) };
+    debug_assert_eq!(bx.elem_size, core::mem::size_of::<AlignStr>(), "elem_size must match AlignStr size");
+    if !bx.data.is_null() {
+        let base = bx.data as *const AlignStr;
+        for i in 0..bx.len {
+            let entry = unsafe { core::ptr::read_unaligned(base.add(i)) };
+            unsafe { free(entry.ptr as *mut core::ffi::c_void) };
+            #[cfg(test)]
+            LIVE_ARRAY_BUILDER_STRINGS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        unsafe { free(bx.data as *mut core::ffi::c_void) };
+    }
 }
 
 // ── std.rand — Xoshiro256++ ────────────────────────────────────────────────────────────────────
@@ -17558,5 +17797,77 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let after = count_fds().unwrap();
         // Allow a small slack for runtime bookkeeping, but a per-cycle leak (12+) must not show.
         assert!(after <= before + 2, "fd leak across accept/respond cycles: {before} -> {after}");
+    }
+
+    // --- array_builder<string> deep-free leak guard (M12 Slice A6) ------------------------------
+
+    /// Allocate an `align_rt_alloc` buffer holding `s`'s bytes and hand back an owned `{ptr,len}` —
+    /// what codegen passes to [`align_rt_array_builder_push_str`] for an already-owned `string`
+    /// (the caller has nulled its own source; ownership of the buffer transfers to the builder).
+    fn owned_string_buf(s: &str) -> (*const u8, i64) {
+        let len = s.len() as i64;
+        if len == 0 {
+            return (core::ptr::null(), 0);
+        }
+        let dst = align_rt_alloc(len);
+        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len()) };
+        (dst as *const u8, len)
+    }
+
+    /// The gate finding this test guards: `array_builder<string>`'s own `Drop`
+    /// ([`align_rt_array_builder_free_strings`]) must deep-free every pushed-but-not-frozen string,
+    /// not just the header/storage. Deleting that per-entry free loop leaves every existing `rc`/
+    /// `len` assertion in `crates/align_driver/tests/m12_array_builder.rs` green (the builder's
+    /// public API surface never observes a leaked buffer) — only [`LIVE_ARRAY_BUILDER_STRINGS`], a
+    /// live count of pushed-but-unfreed string entries incremented in
+    /// [`align_rt_array_builder_push_str`] and decremented in the deep-free loop, exposes it.
+    ///
+    /// 100 cycles x 4 strings = 400 entries pushed-and-dropped this run. A deleted free loop leaves
+    /// every one of those 400 live (delta +400) — a >6x margin over the slack below, which only
+    /// needs to absorb other concurrently-running tests that also touch this process-wide counter
+    /// (the handful of `fs_read_dir_*` tests sharing the [`align_rt_free_string_array`] decrement,
+    /// plus this file's other `array_builder_*` test) over the run's whole duration, not just one
+    /// instant (mirrors `http_get_many_one_failure_fails_batch_no_leak`'s cross-test tolerance for
+    /// the process-wide [`LIVE_HTTP_RESPONSES`] counter).
+    #[test]
+    fn array_builder_unfrozen_string_drop_frees_pushed_strings_no_leak() {
+        let before = LIVE_ARRAY_BUILDER_STRINGS.load(core::sync::atomic::Ordering::Relaxed);
+        for _ in 0..100 {
+            let b = align_rt_array_builder_new(16);
+            for s in ["alpha", "beta", "gamma", "delta"] {
+                let (ptr, len) = owned_string_buf(s);
+                unsafe { align_rt_array_builder_push_str(b, ptr, len) };
+            }
+            unsafe { align_rt_array_builder_free_strings(b) };
+        }
+        let after = LIVE_ARRAY_BUILDER_STRINGS.load(core::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (after - before).abs() <= 50,
+            "array_builder<string>'s Drop must free every pushed-but-not-frozen entry (no leak): {before} -> {after}"
+        );
+    }
+
+    /// Companion check for the builder's *other* fate: `build()` into a frozen `array<string>`, then
+    /// dropped via the shared [`align_rt_free_string_array`] deep-free path (the same function
+    /// `array<string>`'s codegen `Drop` calls, per `align_codegen_llvm`'s `DynArray(Scalar::String)`
+    /// case). Confirms the counter instrumentation added alongside the gate finding above stays
+    /// balanced for both consumption paths of a pushed entry, not just the unfrozen-drop path.
+    #[test]
+    fn array_builder_string_build_then_array_drop_no_leak() {
+        let before = LIVE_ARRAY_BUILDER_STRINGS.load(core::sync::atomic::Ordering::Relaxed);
+        for _ in 0..100 {
+            let b = align_rt_array_builder_new(16);
+            for s in ["one", "two", "three"] {
+                let (ptr, len) = owned_string_buf(s);
+                unsafe { align_rt_array_builder_push_str(b, ptr, len) };
+            }
+            let frozen = unsafe { align_rt_array_builder_build(b) };
+            unsafe { align_rt_free_string_array(frozen.ptr as *mut u8, frozen.len) };
+        }
+        let after = LIVE_ARRAY_BUILDER_STRINGS.load(core::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (after - before).abs() <= 50,
+            "array<string> built from array_builder must free every element (no leak): {before} -> {after}"
+        );
     }
 }
