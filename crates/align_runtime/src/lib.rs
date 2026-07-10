@@ -7502,6 +7502,7 @@ pub unsafe extern "C" fn align_rt_array_builder_push(b: *mut ArrayBuilder, bits:
         return;
     }
     let b = unsafe { &mut *b };
+    debug_assert!(b.elem_size <= 8, "elem_size must be <= 8 for scalar push");
     unsafe { b.reserve(1) };
     let le = bits.to_le_bytes();
     let w = b.elem_size.min(8);
@@ -7525,6 +7526,7 @@ pub unsafe extern "C" fn align_rt_array_builder_push_str(b: *mut ArrayBuilder, p
         return;
     }
     let b = unsafe { &mut *b };
+    debug_assert_eq!(b.elem_size, core::mem::size_of::<AlignStr>(), "elem_size must match AlignStr size");
     unsafe { b.reserve(1) };
     let entry = AlignStr { ptr, len };
     unsafe {
@@ -7555,6 +7557,7 @@ pub unsafe extern "C" fn align_rt_array_builder_append(b: *mut ArrayBuilder, src
     if n == 0 || src.is_null() {
         return;
     }
+    debug_assert!(b.elem_size <= 8, "elem_size must be <= 8 for scalar append");
     unsafe { b.reserve(n) };
     let bytes = match n.checked_mul(b.elem_size) {
         Some(x) => x,
@@ -7611,6 +7614,7 @@ pub unsafe extern "C" fn align_rt_array_builder_free_strings(b: *mut ArrayBuilde
         return;
     }
     let bx = unsafe { Box::from_raw(b) };
+    debug_assert_eq!(bx.elem_size, core::mem::size_of::<AlignStr>(), "elem_size must match AlignStr size");
     if !bx.data.is_null() {
         let base = bx.data as *const AlignStr;
         for i in 0..bx.len {
