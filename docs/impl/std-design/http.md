@@ -246,10 +246,10 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      prerequisite for concurrent serving** (tied to that consumer; not a Slice-4 blocker — the A5
      single-GPU gateway serializes inference anyway).
    - **SSE/streaming (runway A5) is committed to land as a sibling op, not a change to `respond`:**
-     future `ctx.respond_stream(rb) -> Result<http_stream, Error>` (rb built header-only) with Move
-     `http_stream.send(chunk) -> Result<(), Error>` + Drop = terminal chunk + close. Needs a
-     chunked **write** path (new, non-conflicting with CL-only parse). The v1 surface already
-     admits it (`.body()` is optional), so nothing is painted in.
+     `ctx.respond_stream(rb) -> Result<http_stream, Error>` — full settled design in slice-plan
+     item 7 below (2026-07-11; it AMENDS this bullet's original "Drop = terminal chunk + close":
+     Drop is now close-only, `finish()` is the sole clean terminator — rationale there). The v1
+     surface already admits it (`.body()` is optional), so nothing was painted in.
    - **R-requirements: R1/R2/R4 apply and are required** (zero-copy request offset table; memchr
      scan; one-write respond). No server bench gate in v1 — a light accept→respond round-trip bench
      arrives with keepalive/concurrency, where a reuse path first exists.
@@ -372,6 +372,47 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      baseline using an equal-degree fixed thread pool. Honest reporting: the measured overlap
      factor + the machine's core count + parity-vs-Rust at equal degree — NOT a
      hardware-independent 12.8× claim.
+7. **SSE/chunked streaming response (`respond_stream`, the runway A5 remainder) — design SETTLED
+   2026-07-11** (two-critic review, Fable synthesis). The gateway token-streaming layer: the
+   caller writes SSE `data: …\n\n` lines as body content; std.http ships the **transfer framing
+   only** (the framework boundary holds).
+   - `ctx.respond_stream(rb) -> Result<http_stream, Error>` — consumes BOTH ctx and rb (the
+     `respond` precedent). rb must be **header-only**: a body already set is a programmer
+     contract bug → **abort** (`respond` is the bodied path; the `rand.range` abort class —
+     code-structure-driven, not client data). Head serialize = status + headers + auto
+     `Transfer-Encoding: chunked` + auto `Connection: close` (the auto-CL mirror); **the head
+     serializer is single-sourced with `respond`'s** (one shared head fn incl. the
+     caller-CL/TE/Connection rejection loop and the P6 guards; respond appends CL+body,
+     respond_stream appends TE).
+   - **HTTP/1.0 clients (required, found by review — the version is currently parsed then
+     DISCARDED):** thread the request's HTTP version parse→head→ctx→stream. For a 1.0 request
+     chunked is illegal — the stream is constructed in **close-delimited raw mode** (`framed:
+     bool` on the stream): no TE header, `send` writes payload bytes unframed, `finish`/Drop
+     just close (read-to-close IS valid 1.0 framing).
+   - **`http_stream`** (Move, owns the fd lifted out of ctx; free-standing — borrows nothing
+     from ctx, no region binding; standard Move-handle exclusions). `s.send(chunk: bytes) ->
+     Result<(), Error>` — one chunk frame (lowercase hex length, no `0x`, CRLF payload CRLF)
+     assembled in one buffer, ONE write via `http_send_all` (MSG_NOSIGNAL/EINTR/partial-write
+     discipline; EPIPE → Error). **`send("")` is a no-op returning Ok** — an empty chunk is
+     the protocol TERMINATOR, and empty output steps are foreseeable gateway data (a multi-byte
+     UTF-8 codepoint split across tokens detokenizes to zero bytes), not a programmer bug;
+     writing nothing is the honest semantics. TCP_NODELAY is already set at accept — one send
+     = one immediately-visible event (the token-streaming latency requirement).
+   - **`s.finish() -> Result<(), Error>` is the SOLE clean terminator** — consumes the stream
+     (a new `null_moved_source` arm, the easy-to-miss one), writes `0\r\n\r\n` (framed mode;
+     trailers omitted — conformant per RFC 9112 §7.1), closes, surfaces errors. **Drop =
+     close-only, NO terminal write** — this deliberately AMENDS the earlier committed bullet:
+     with no write deadline in v1, a terminal write on Drop to a stalled peer would block the
+     single accept loop unboundedly, and a missing terminal chunk is exactly how a chunked
+     sender signals truncation — abrupt close is both safer and truncation-honest (the
+     explicit-op-surfaces-errors / Drop-is-silent split, the file/conn precedent). A
+     **`poisoned` flag** set by any failed `send` makes `finish` skip the terminal write,
+     close, and return Err (the stream did not terminate cleanly).
+   - Streaming restates the slow-loris caveat: a stream holds the single blocking accept
+     thread for the whole generation by design — the trusted-network posture is load-bearing,
+     not just an attack caveat.
+   - Client parse stays CL-only (chunked → `Error.Invalid` on align's own client — the
+     recorded asymmetry; the gateway's clients are external).
 
 ## Known v1 limitations (Slice 2/3/5)
 

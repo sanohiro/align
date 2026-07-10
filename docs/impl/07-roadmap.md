@@ -1800,8 +1800,12 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
     reader struct gains the lookahead fields behind the `buffered` flag.
 - **A8 — arena checkpoint/rollback** *(general)*: design not yet settled (its own Open
   entry); consumer = a long-running server loop resetting per request.
-- **A5 remainder — SSE/chunked streaming response** (`ctx.respond_stream` + `http_stream`):
-  the committed landing recorded in http.md item 5 / the runway; needs the chunked write path.
+- **A5 remainder — SSE/chunked streaming response (design SETTLED 2026-07-11; full record =
+  http.md slice-plan item 7):** `ctx.respond_stream(rb)` (header-only rb, consumes both, auto-TE,
+  single-sourced head serializer) + Move `http_stream` (`send` one-frame-one-write via
+  http_send_all; `send("")` = no-op; HTTP/1.0 → close-delimited raw mode via threaded version
+  info) + **`finish()` as the sole clean terminator** (Drop = close-only — amends the original
+  Drop-terminates commitment; poisoned flag on failed sends). Implement after A7.
 
 
 ## Design Issues to Settle in Parallel
