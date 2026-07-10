@@ -109,9 +109,11 @@ the rest of std already follows. Concretely:
   measure-before-claiming rule. **R6 is SATISFIED as of Slice 3:** `bench/http_client` ships (drives
   the shipped pool via its C-ABI entry points against an in-process localhost server) and records
   **2.86× keepalive speedup** (floor 1.48× — MET) and **parity with hand-written Rust `std::net`** on
-  the reuse path (see `bench/http_client/README.md`). The `get_many` bounded-concurrency scaling shape
-  (R5) is a later slice; R6's keepalive latency/throughput gate — the part that gates **module**
-  completion — is met.
+  the reuse path (see `bench/http_client/README.md`). **The `get_many` scaling part is
+  now ALSO MET (2026-07-10, the R5 slice):** 64 GETs at degree 16 with 12 ms injected latency —
+  **15.4× overlap** (ideal ≈ degree) and **1.01× of an equal-degree Rust thread pool** (parity);
+  honest-reporting caveats in the bench README (quote with degree + core count). R6 is now met in
+  full.
 
 ## New machinery required
 
@@ -285,8 +287,11 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      truncation attacks moot (a short body is already `Error.Invalid`).
    - **Server-side TLS stays DEFERRED** — coherent, not half-shipped: the server primitive carries
      its recorded trusted-network caveat; client-first matches the align-LLM A5 consumer.
-6. **`cl.get_many(urls, max_concurrency)` (R5) — design SETTLED 2026-07-10** (same two-lens
-   review). Semantics:
+6. **`cl.get_many(urls, max_concurrency)` (R5) — design SETTLED + SHIPPED 2026-07-10** (same
+   two-lens review; implementation on branch `http-get-many`). Shipped exactly as settled below,
+   including the prerequisite `array<response>` opaque-Move-handle-array capability (runtime-only
+   construction, `rs[i]` borrow-in-receiver-position, per-element drop) and the R5 bench (15.4×
+   overlap at degree 16, Rust-pool parity — see R6 above). Settled record:
    - **Results in input order** (`urls[i]` → `results[i]`); **all-or-Err**: any transport/parse
      failure fails the whole batch with the **lowest-index** error (deterministic — matches the
      `tg_wait` convention). Per-element `array<Result<response, Error>>` is **inexpressible**

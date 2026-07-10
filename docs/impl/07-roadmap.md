@@ -25,11 +25,14 @@ M10 std phase 2 (`encoding`/`rand`/`cli`). **M11 (std third wave) is IN PROGRESS
 `std.process` / `std.compress` / `std.crypto` COMPLETE; `std.http` Slices 1–2 merged
 (#391/#392), Slice 3 (keepalive pool + R6 bench, R3 met) DONE on branch `http-slice3-pool`,
 Slice 4 (server primitive `serve`/`accept`/`respond` + `response_builder` + the five inbound
-smuggling guards) DONE on branch `http-slice4-server`; Slice 5 (TLS) + `get_many` (R5) remain —
-see the M11 section below.
+smuggling guards) DONE on branch `http-slice4-server`; `get_many` (R5) DONE on branch
+`http-get-many` (input-order all-or-Err batch on a dedicated bounded blocking-I/O claim-loop pool
++ the prerequisite `array<response>` opaque-Move-handle-array capability + the R5 bench — 15.4×
+overlap at degree 16, Rust-pool parity; R6 now met in full); Slice 5 (TLS) remains — see the M11
+section below.
 
-**Next (in order):** std.http Slice 5 (HTTPS/TLS) and `get_many` (R5) — Slice 4 (the server
-primitive) and Slice 3 (pool/keepalive R3 + the `bench/http_client` R6 gate) are DONE;
+**Next (in order):** std.http Slice 5 (HTTPS/TLS) — the LAST M11 item; Slices 1–4 and `get_many`
+(R5, incl. the R6 scaling bench) are DONE;
 the 2026-07-09 owed implementation deltas (struct-`==` sema diagnostic, no-shadowing error, the
 `loop` slice, the lexer escape-set gaps); then the M12 candidates recorded in
 `open-questions.md` Open → "align-LLM runway".

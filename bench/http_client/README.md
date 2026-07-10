@@ -57,3 +57,52 @@ competitive with hand-rolled Rust on the reuse path.
 
 Numbers are loopback-bound and machine-specific; re-run before quoting. The point is the two ratios,
 not the absolute µs.
+
+## R5 — `cl.get_many` bounded-concurrency scaling
+
+The same harness also measures **R5** (`docs/impl/std-design/http.md` item 6): the batched
+`cl.get_many(urls, max_concurrency)` path, which spawns `min(max_concurrency, urls.len())` scoped
+blocking-I/O workers that claim URL indices off a shared counter and run the ordinary exchange against
+the **shared** keepalive pool. The overlap win only appears against real per-request latency — a
+localhost RTT ≈ 0 would mask it — so this server variant **injects a fixed sleep per request**
+(default 12 ms). Three loops, best-of-N (min):
+
+- `align-getmany` — one `cl.get_many(urls, degree)` over `GM_N` URLs at concurrency `GM_DEGREE`
+  (the shipped runtime batch path via its C-ABI).
+- `align-sequential` — one client, `GM_N` GETs one after another (no overlap — every request pays the
+  full injected latency serially).
+- `rust-pool` — a hand-written **equal-degree** Rust thread pool: `degree` threads claim URL indices
+  off a shared counter, each reusing one keepalive `TcpStream`. The same bounded-concurrency shape as
+  `get_many`, so the ratio against it is the honest parity number.
+
+```sh
+GM_N=64 GM_DEGREE=16 GM_LATENCY_MS=12 GM_TRIALS=5 bench/http_client/run.sh
+```
+
+### Result (2026-07-10, native, loopback, 64 GETs, degree 16, 12 ms injected latency/req, best of 3)
+
+```
+  align-getmany            50.7 ms
+  align-sequential        779.9 ms
+  rust-pool                50.3 ms
+
+  overlap factor (align-sequential / align-getmany) = 15.4x   (ideal ≈ degree 16)
+  align-getmany / rust-pool (equal degree)          = 1.01x   (<1 = Align faster; ~1 = parity)
+```
+
+**Findings (honest reporting — machine + degree dependent, NOT a hardware-independent claim):**
+
+- **Machine: 32 logical cores.** The measured **overlap factor is 15.4×** at degree 16 — essentially
+  the ideal `degree` (64 requests × 12 ms ÷ 16 ≈ 48 ms vs 64 × 12 ms ≈ 768 ms sequential). Because the
+  work is **I/O-bound** (workers block on the injected sleep, not the CPU), the overlap tracks the
+  concurrency degree and can exceed the core count — raising `GM_DEGREE` raises the factor until the
+  server or the network saturates. This is why the mechanism uses a **dedicated bounded blocking-I/O
+  worker pool**, not the CPU-sized `par_map` pool (which would cap overlap at core count — the wrong
+  shape for I/O batching). Quote the factor *with* the degree and core count, never as a bare number.
+- **Parity with hand-written Rust at equal degree.** `align-getmany` (50.7 ms) tracks `rust-pool`
+  (50.3 ms) within ~1% — Align's batch path carries no structural overhead over an idiomatic Rust
+  fixed thread pool. Both are latency-bound; the shared `Mutex`-guarded pool adds only an O(1) locked
+  take/put per request off the I/O path.
+
+The absolute overlap depends on `GM_DEGREE`, the injected latency, and the machine; re-run before
+quoting. The point is the two ratios (overlap ≈ degree; parity ≈ 1×), not the absolute ms.
