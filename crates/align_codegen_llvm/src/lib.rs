@@ -490,11 +490,13 @@ fn build_module<'c>(
             None,
         ),
     );
-    // `core.string` byte predicates — all share the `i32 (ptr, i64, ptr, i64)` signature of `str_eq`.
+    // `core.string` byte predicates + the `Ord(str)` comparator — all share the
+    // `i32 (ptr, i64, ptr, i64)` signature of `str_eq` (`str_cmp` returns -1/0/1 instead of 0/1).
     for (key, sym) in [
         ("str_contains", "align_rt_str_contains"),
         ("str_starts_with", "align_rt_str_starts_with"),
         ("str_ends_with", "align_rt_str_ends_with"),
+        ("str_cmp", "align_rt_str_cmp"),
     ] {
         funcs.insert(
             key.to_string(),
@@ -5906,7 +5908,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     fn gen_bin(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
         if self.f.operand_ty(a) == Ty::Str {
-            return self.gen_str_eq(op, a, b);
+            // `==`/`!=` use the length-fast-path `str_eq`; the four ordering ops use the
+            // byte-lexicographic `str_cmp` (`Ord(str)`).
+            return match op {
+                BinOp::Eq | BinOp::Ne => self.gen_str_eq(op, a, b),
+                _ => self.gen_str_cmp(op, a, b),
+            };
         }
         // A `vecN<T>` operand (M6): a comparison yields a `<N x i1>` mask, arithmetic stays a vector.
         // Either operand may be the vector — `operand_as_vector` splats the scalar one (broadcast),
@@ -6335,6 +6342,40 @@ impl<'c, 'a> FnGen<'c, 'a> {
             BinOp::Ne => self.builder.build_not(eq, "ne").map_err(|e| self.err(e))?,
             _ => return Err(self.err("str supports only == / !=")),
         };
+        Ok(v.into())
+    }
+
+    /// `str < str` / `<=` / `>` / `>=` (`Ord(str)`) via `align_rt_str_cmp`, which returns -1/0/1
+    /// (byte-lexicographic). The operator becomes a signed compare of that result against 0 —
+    /// `a < b` ⇔ `cmp < 0`, `a <= b` ⇔ `cmp <= 0`, etc. Also backs `sort`'s `str`-key comparator
+    /// (the sort loop lowers a `BinOp::Gt` on `str` operands, routed here by `gen_bin`).
+    fn gen_str_cmp(&mut self, op: BinOp, a: &Operand, b: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let sa = self.operand(a).into_struct_value();
+        let sb = self.operand(b).into_struct_value();
+        let ext = |b: &Builder<'c>, v: inkwell::values::StructValue<'c>, i, n| {
+            b.build_extract_value(v, i, n)
+        };
+        let pa = ext(self.builder, sa, 0, "pa").map_err(|e| self.err(e))?;
+        let la = ext(self.builder, sa, 1, "la").map_err(|e| self.err(e))?;
+        let pb = ext(self.builder, sb, 0, "pb").map_err(|e| self.err(e))?;
+        let lb = ext(self.builder, sb, 1, "lb").map_err(|e| self.err(e))?;
+        let cmp = self
+            .builder
+            .build_call(self.funcs["str_cmp"], &[pa.into(), la.into(), pb.into(), lb.into()], "strcmp")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .expect("str_cmp returns i32")
+            .into_int_value();
+        let zero = self.ctx.i32_type().const_zero();
+        let pred = match op {
+            BinOp::Lt => IntPredicate::SLT,
+            BinOp::Le => IntPredicate::SLE,
+            BinOp::Gt => IntPredicate::SGT,
+            BinOp::Ge => IntPredicate::SGE,
+            _ => return Err(self.err("gen_str_cmp expects an ordering operator")),
+        };
+        let v = self.builder.build_int_compare(pred, cmp, zero, "strord").map_err(|e| self.err(e))?;
         Ok(v.into())
     }
 

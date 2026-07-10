@@ -5760,6 +5760,26 @@ pub unsafe extern "C" fn align_rt_str_eq(a: *const u8, alen: i64, b: *const u8, 
     (x == y) as i32
 }
 
+/// Byte-lexicographic order of two `str` views (`Ord(str)`, 2026-07-09): returns -1 if `a < b`,
+/// 0 if equal, 1 if `a > b`. This is `memcmp` over the shared prefix with the shorter string
+/// ordering first on a tie (Rust's `<[u8]>::cmp` is exactly this) — deterministic and locale-free
+/// (= Unicode scalar order for valid UTF-8). Backs the `<`/`<=`/`>`/`>=` operators and `sort`'s
+/// `str`-key comparator; `str_eq` keeps its own length-fast-path for `==`/`!=`.
+///
+/// # Safety
+/// Both `ptr`/`len` pairs must describe valid byte ranges for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_cmp(a: *const u8, alen: i64, b: *const u8, blen: i64) -> i32 {
+    // `safe_slice` returns an empty slice for a null/zero/negative-length view, so an out-of-range
+    // FFI length degrades to an empty operand rather than UB (real lengths are >= 0).
+    let (x, y) = unsafe { (safe_slice(a, alen), safe_slice(b, blen)) };
+    match x.cmp(y) {
+        core::cmp::Ordering::Less => -1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => 1,
+    }
+}
+
 /// `s.contains(needle)` (M5, `core.string`) — 1 if `needle`'s bytes occur in `s`, else 0. An
 /// empty needle is always present. Backed by `memchr::memmem` (its own AVX2/NEON dispatch), the
 /// byte-oriented scan the spec mandates over a `chars()` walk.
@@ -11511,6 +11531,40 @@ mod tests {
             let n: Vec<u8> = (0..nlen).map(|_| b'a' + (rng() % 3) as u8).collect();
             check(&h, &n);
         }
+    }
+
+    #[test]
+    fn str_cmp_matches_byte_lexicographic_order() {
+        // `align_rt_str_cmp` must equal `<[u8]>::cmp` mapped to -1/0/1 (byte-lexicographic, shorter
+        // string first on a prefix tie) for every case, including empties and length tiebreaks.
+        let cmp = |a: &[u8], b: &[u8]| unsafe {
+            align_rt_str_cmp(a.as_ptr(), a.len() as i64, b.as_ptr(), b.len() as i64)
+        };
+        let expect = |a: &[u8], b: &[u8]| -> i32 {
+            match a.cmp(b) {
+                core::cmp::Ordering::Less => -1,
+                core::cmp::Ordering::Equal => 0,
+                core::cmp::Ordering::Greater => 1,
+            }
+        };
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"apple", b"banana"),
+            (b"banana", b"apple"),
+            (b"apple", b"apple"),
+            (b"ab", b"abc"),   // prefix < longer
+            (b"abc", b"ab"),   // longer > prefix
+            (b"", b"a"),       // empty is smallest
+            (b"a", b""),
+            (b"", b""),
+            (b"abcd", b"abd"), // differ at index 2
+            ("café".as_bytes(), "cafe".as_bytes()), // multibyte 'é' > 'e'
+        ];
+        for (a, b) in cases {
+            assert_eq!(cmp(a, b), expect(a, b), "str_cmp({a:?}, {b:?})");
+        }
+        // A null / zero-length view degrades to an empty operand (no UB), so it orders as "".
+        assert_eq!(unsafe { align_rt_str_cmp(core::ptr::null(), 0, b"a".as_ptr(), 1) }, -1);
+        assert_eq!(unsafe { align_rt_str_cmp(b"a".as_ptr(), 1, core::ptr::null(), 0) }, 1);
     }
 
     #[test]

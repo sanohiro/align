@@ -2287,8 +2287,11 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    order (= Unicode scalar order for valid UTF-8). Deterministic, locale-free, one `memcmp` —
    dictionary/locale collation is a `pkg` concern, never the operator. Motivation: a
    data-oriented language must sort by a name column; `Eq(str)` was already byte-based, so this
-   is the consistent completion. Implementation deferred: sema (Ord accepts str) + a runtime
-   string-compare for the sort paths.
+   is the consistent completion. **IMPLEMENTED** (`Bound::Ord.satisfied_by` accepts `str`; a
+   runtime `align_rt_str_cmp` returns -1/0/1 backing the four ordering operators and the `sort`/
+   `sort_by_key` `str`-key comparator — `str_eq` keeps its own length-fast-path for `==`/`!=`).
+   Owned `string` ordering stays deferred with its existing "take a `str` view" diagnostic (the
+   `str` view is the only comparable string form).
 2. **`else` works on `Result`** (`draft.md` §5 Result; guide ch04 rewritten): `v := f() else
    fallback` yields `Ok`'s value or deliberately discards the error — visible handling, so the
    unhandled-`Result` error never fires on it; no error binding (needing the error *is* the
