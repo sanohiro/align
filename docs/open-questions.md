@@ -256,7 +256,10 @@ unreachable on the surviving path) in exchange for a one-line, flow-insensitive 
 flow-sensitive slice:** per-path drop flags (drop a slot iff it was actually written on this path) —
 this needs the escape/drop analysis moved onto **MIR dataflow**, the same structural follow-up the
 External soundness audit records (§6 "Move escape/region checking off per-`ExprKind` enumeration onto
-a MIR dataflow pass"). Until then, fail closed.
+a MIR dataflow pass"). Until then, fail closed. Known residual of the same class (pre-existing, found
+by the gate review): a mixed-region `if` *expression* value (`xs = if c { arena_val } else
+{ heap_val }`) is tracked as the shorter (arena) region, so the heap branch's buffer **leaks** at
+runtime when taken — a leak, never UB; owned by the same flow-sensitive slice.
 Record: `crates/align_sema` (`EscapeCheck::stmt`, `Stmt::Assign`), `tests/reassign_drop.rs`,
 `draft.md` §4 (Loop / mut reassignment).
 
