@@ -8815,6 +8815,17 @@ pub struct HttpResponse {
     body_len: usize,
 }
 
+/// Test-only live-count of allocated [`HttpResponse`] handles: incremented at every
+/// `Box::into_raw(Box::new(resp))` site (`align_rt_http_parse` and the client's `http_client_perform`)
+/// and decremented in [`align_rt_http_resp_free`] (the ONE free path — `align_rt_free_response_array`
+/// frees each element through it too). Makes a batch-error free path observable in a unit test: a
+/// leaked handle shows up as a nonzero delta against a snapshot taken before the batch, whereas
+/// asserting only `rc`/`out` (as `http_get_many_one_failure_fails_batch_no_leak` used to) cannot catch
+/// a deleted free — the successful responses' backing allocations are simply never reclaimed, which
+/// only a leak sanitizer or this counter observes.
+#[cfg(test)]
+static LIVE_HTTP_RESPONSES: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
 /// Abort the process on a build-time request-smuggling attempt (CR/LF/NUL in a header name/value) —
 /// the http.md P6 policy. Header injection is a programmer error (unsanitised data must not flow
 /// into a header name/value), so it aborts like an OOB index, never a silent skip (Nothing-hidden).
@@ -9237,6 +9248,8 @@ pub unsafe extern "C" fn align_rt_http_parse(data_ptr: *const u8, data_len: i64,
     match http_parse_core(src) {
         Ok(resp) => {
             unsafe { *out = Box::into_raw(Box::new(resp)) };
+            #[cfg(test)]
+            LIVE_HTTP_RESPONSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             0
         }
         Err(_) => AL_INVALID, // Incomplete (truncated) or Invalid — both are a bad complete buffer
@@ -9313,6 +9326,8 @@ pub unsafe extern "C" fn align_rt_http_resp_body(resp: *const HttpResponse) -> A
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_resp_free(resp: *mut HttpResponse) {
     if !resp.is_null() {
+        #[cfg(test)]
+        LIVE_HTTP_RESPONSES.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         drop(unsafe { Box::from_raw(resp) });
     }
 }
@@ -9752,6 +9767,8 @@ unsafe fn http_client_perform(client: *mut HttpClient, req: &HttpRequest, out: *
                             }
                         }
                         unsafe { *out = Box::into_raw(Box::new(resp)) };
+                        #[cfg(test)]
+                        LIVE_HTTP_RESPONSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         0
                     }
                     Err(_) => {
@@ -15766,11 +15783,15 @@ mod tests {
     }
 
     /// All-or-Err: one URL to a closed port fails the WHOLE batch with a transport error, every
-    /// successful response is freed, and `out` stays `{null,0}` (no partial array, no leak of the
-    /// responses that did complete). The error is the lowest-index failure.
+    /// successful response is freed (verified via [`LIVE_HTTP_RESPONSES`], not just `rc`/`out` — the
+    /// F1 gate finding: deleting the `first_err` branch's free loop makes no assertion here fail,
+    /// because `rc`/`out` are correct either way and the batch has nothing left to free from the
+    /// *caller's* side; only the live-handle count exposes the leaked successful responses), and `out`
+    /// stays `{null,0}` (no partial array). The error is the lowest-index failure.
     #[test]
     fn http_get_many_one_failure_fails_batch_no_leak() {
         let _server_lock = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = LIVE_HTTP_RESPONSES.load(core::sync::atomic::Ordering::Relaxed);
         // A guaranteed-refused port: bind then drop, so connects are refused (ECONNREFUSED).
         let dead_port = {
             let p = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -15780,6 +15801,8 @@ mod tests {
         };
         let (port, server) = http_serve_echo_path(8, std::time::Duration::from_millis(2));
         // index 0 = live, index 1 = dead (the lowest-index failure is index 1's connect error), 2.. live.
+        // 5 of the 6 URLs succeed, so a leaked free path would grow the live count by 5 — far past the
+        // small cross-test slack allowed below.
         let mut urls: Vec<String> = vec![format!("http://127.0.0.1:{port}/a")];
         urls.push(format!("http://127.0.0.1:{dead_port}/refused"));
         for i in 2..6 {
@@ -15797,6 +15820,15 @@ mod tests {
         // waiting for its remaining `accepts`; detach it (it self-terminates at its deadline) rather
         // than block the test on a join that can't be predicted.
         drop(server);
+        let after = LIVE_HTTP_RESPONSES.load(core::sync::atomic::Ordering::Relaxed);
+        // `LIVE_HTTP_RESPONSES` is process-wide (shared with every other concurrently-running test in
+        // this file), so a small slack absorbs an unrelated test's handle that is momentarily live at
+        // the sampling instant — mirroring the fd-count tolerance in `http_get_many_error_path_no_fd_leak`
+        // just below. A real leak here is 5 (every successful response in this batch), far past the slack.
+        assert!(
+            after <= before + 2,
+            "the batch-error path must free every successful response (no leak): {before} -> {after}"
+        );
     }
 
     /// Pool reuse across the batch: `max_concurrency = 1` runs the N GETs on ONE worker to the same
