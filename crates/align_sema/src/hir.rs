@@ -234,6 +234,9 @@ pub enum Stmt {
     /// plain-old-data (flat primitive-scalar fields), so the value is Copy — no region/move/drop.
     AssignElem { base: LocalId, index: Expr, struct_id: u32, soa: bool, value: Expr },
     Return(Option<Expr>),
+    /// `break expr` — end the innermost enclosing `loop`, yielding `expr` (a bare `break` yields
+    /// `()`). Diverges (control leaves to the loop's exit); the only loop exit.
+    Break(Option<Expr>),
     Expr(Expr),
 }
 
@@ -391,6 +394,12 @@ pub enum ExprKind {
     /// `expr?` — Result propagation; `ty` is the unwrapped ok payload type. Lowered
     /// against the enclosing function's return type (carried by MIR).
     Try(Box<Expr>),
+    /// `loop { ... }` — the one sequential-control construct. Repeats `body` until a `break`; the
+    /// loop's value is the (unified) break value. `diverges` is true when the loop has no `break`
+    /// (it never yields — like a `match` whose arms all diverge), so it satisfies any expected type
+    /// and control never reaches the code after it. The body's trailing value is discarded each
+    /// iteration; per-iteration owned locals drop at each pass (handled in MIR lowering).
+    Loop { body: Block, diverges: bool },
     /// `arena { ... }` — a region; allocations inside are bulk-freed at block end.
     Arena(Block),
     /// `unsafe { ... }` — a marker block permitting `raw.*` ops. No runtime effect; lowers to its

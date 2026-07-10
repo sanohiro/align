@@ -252,6 +252,10 @@ pub enum Stmt {
         value: Expr,
     },
     Return(Option<Expr>),
+    /// `break expr` — end the innermost enclosing `loop`, yielding `expr` (a bare `break` yields
+    /// `()`). The only loop exit; `return`/`?` exit the function instead. `break` cannot cross a
+    /// lambda boundary. `span` covers the `break` keyword for diagnostics. `draft.md` §4 "Loop".
+    Break { value: Option<Expr>, span: Span },
     Expr(Expr),
 }
 
@@ -359,6 +363,11 @@ pub enum ExprKind {
     /// `expr?` — Result propagation. `Ok(v)` yields `v`; `Err(e)` early-returns
     /// `Err(e)` from the enclosing function.
     Try(Box<Expr>),
+    /// `loop { ... }` — the one sequential-control construct: repeats its block until a `break`.
+    /// An expression: `break expr` ends it and `expr` becomes its value; every `break` must carry
+    /// the same type (unified like `match` arms); a bare `break` yields `()`; a `loop` with no
+    /// `break` diverges (like a `match` whose arms all diverge). `draft.md` §4 "Loop".
+    Loop(Block),
     /// `arena { ... }` — a region whose allocations are freed in bulk at block end.
     Arena(Block),
     /// `unsafe { ... }` — a block in which `raw.*` operations (raw allocation, unchecked casts,

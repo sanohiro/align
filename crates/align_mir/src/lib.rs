@@ -1021,6 +1021,20 @@ struct Builder {
     /// so codegen tags the source load and the `dst` store of the *same* loop with the same
     /// scoped-`noalias` metadata. Per-function (the Builder is per-function).
     alias_scope: u32,
+    /// Stack of enclosing `loop` expressions (innermost last), for lowering `break`: its `exit`
+    /// block, `result_slot` (where a `break` value is stored, `None` for a unit loop), and
+    /// `iter_drops` (owned locals declared in the body, dropped each iteration / at each `break`).
+    loops: Vec<LoopFrame>,
+}
+
+/// A `loop` being lowered — the target of a `break` inside its body. See [`Builder::loops`].
+struct LoopFrame {
+    exit: BlockId,
+    result_slot: Option<Slot>,
+    /// Owned free-standing locals declared inside the loop body (a subset of `drop_locals`). They
+    /// are dropped and null-reset at the back-edge of each iteration and at each `break`, so a
+    /// per-iteration allocation is freed once per pass instead of leaking when the slot is reused.
+    iter_drops: Vec<Slot>,
 }
 
 impl Builder {
@@ -1106,6 +1120,7 @@ fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -
         tuples: tuples.to_vec(),
         structs: structs.to_vec(),
         alias_scope: 0,
+        loops: Vec::new(),
     };
     let entry = b.new_block();
     b.cur = entry;
@@ -1501,6 +1516,30 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             b.terminate(Term::Return(op));
             // The current block is now terminated; `lower_block` stops here, so no dead
             // block is created and callers can see the divergence via `is_terminated`.
+        }
+        hir::Stmt::Break(value) => {
+            // `break e` ends the innermost loop: evaluate `e`, store it into the loop's result slot,
+            // then jump to the loop's exit. A moved-out owned value has its source slot nulled so the
+            // per-iteration drops below (and the exit cleanup) free null, not the transferred buffer.
+            let op = value.as_ref().map(|e| lower_expr(b, e));
+            let frame = b.loops.last().expect("`break` inside a `loop` (sema-checked)");
+            let (result_slot, iter_drops) = (frame.result_slot, frame.iter_drops.clone());
+            if let (Some(slot), Some(op)) = (result_slot, op) {
+                b.push(Stmt::Store(slot, op));
+            }
+            if let Some(e) = value {
+                null_moved_source(b, e);
+            }
+            // Drop this iteration's per-iteration owned locals (null-resetting so the function-exit
+            // cleanup — these are still in `drop_locals` — frees null, not the freed buffer). The
+            // moved-out `break` value was already nulled, so its `Drop` is a no-op. Sema forbids a
+            // `break` inside an `arena`/`task_group` nested in the loop, so no region unwinding here.
+            for s in &iter_drops {
+                b.push(Stmt::Drop(*s));
+                b.push(Stmt::DropFlagInit(*s));
+            }
+            let exit = b.loops.last().unwrap().exit;
+            b.terminate(Term::Goto(exit));
         }
         hir::Stmt::LetTuple { locals, init, .. } => {
             // Evaluate the tuple once, then extract each bound element into its slot (`_` skipped).
@@ -2082,6 +2121,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty),
+        // Delegated to an out-of-line (`#[inline(never)]`) helper taking only `(b, e)` — no locals in
+        // this arm — so it does not enlarge this giant recursive `lower_expr` frame (the `expr_depth`
+        // headroom lesson: rustc reserves every arm's locals per level at opt-0).
+        hir::ExprKind::Loop { .. } => lower_loop(b, e),
         // `Type.Variant(payload…)` — build the sum-type aggregate `{ i32 tag, … }`.
         hir::ExprKind::EnumValue { enum_id, variant, payload } => {
             let ops: Vec<Operand> = payload.iter().map(|p| lower_expr(b, p)).collect();
@@ -6286,6 +6329,122 @@ fn lower_short_circuit(b: &mut Builder, op: BinOp, lhs: &hir::Expr, rhs: &hir::E
     let v = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(v, Rvalue::Load(slot)));
     Operand::Value(v)
+}
+
+/// Collect the free-standing owned locals (a subset of `drop_locals`) declared *inside* `body` —
+/// the loop's per-iteration locals, dropped each pass. Walks the whole body subtree (nested
+/// blocks/ifs/loops/matches) collecting `let`/destructure/match-arm binding slots; lifted lambdas
+/// are separate functions and never appear inline, so recursion stays within this loop.
+fn collect_iter_drops(b: &Builder, body: &hir::Block) -> Vec<Slot> {
+    let mut declared = std::collections::HashSet::new();
+    collect_block_decls(body, &mut declared);
+    // Keep declaration order stable and restrict to owned-drop locals.
+    b.drop_locals.iter().copied().filter(|s| declared.contains(s)).collect()
+}
+
+fn collect_block_decls(blk: &hir::Block, out: &mut std::collections::HashSet<Slot>) {
+    for s in &blk.stmts {
+        match s {
+            hir::Stmt::Let { local, init } => {
+                out.insert(*local);
+                collect_expr_decls(init, out);
+            }
+            hir::Stmt::LetTuple { locals, init, .. } => {
+                for l in locals.iter().flatten() {
+                    out.insert(*l);
+                }
+                collect_expr_decls(init, out);
+            }
+            hir::Stmt::Assign { value, .. }
+            | hir::Stmt::AssignField { value, .. }
+            | hir::Stmt::AssignVecLane { value, .. } => collect_expr_decls(value, out),
+            hir::Stmt::AssignIndex { index, value, .. }
+            | hir::Stmt::AssignElemField { index, value, .. }
+            | hir::Stmt::AssignElem { index, value, .. } => {
+                collect_expr_decls(index, out);
+                collect_expr_decls(value, out);
+            }
+            hir::Stmt::Return(Some(e)) | hir::Stmt::Break(Some(e)) | hir::Stmt::Expr(e) => collect_expr_decls(e, out),
+            hir::Stmt::Return(None) | hir::Stmt::Break(None) => {}
+        }
+    }
+    if let Some(v) = &blk.value {
+        collect_expr_decls(v, out);
+    }
+}
+
+fn collect_expr_decls(e: &hir::Expr, out: &mut std::collections::HashSet<Slot>) {
+    match &e.kind {
+        hir::ExprKind::Block(blk)
+        | hir::ExprKind::Arena(blk)
+        | hir::ExprKind::Unsafe(blk)
+        | hir::ExprKind::TaskGroup(blk)
+        | hir::ExprKind::Loop { body: blk, .. } => collect_block_decls(blk, out),
+        hir::ExprKind::If { then, els, .. } => {
+            collect_block_decls(then, out);
+            collect_block_decls(els, out);
+        }
+        hir::ExprKind::Match { arms, .. } => {
+            for a in arms {
+                for &binding in &a.bindings {
+                    out.insert(binding);
+                }
+                collect_expr_decls(&a.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `loop { ... }` — a header block, the body, a back-edge to the header, and an exit block that
+/// `break` targets. The loop's value is stored into `result_slot` at each `break` and loaded at the
+/// exit. Per-iteration owned locals are dropped (and null-reset) at the back-edge and at each `break`
+/// so a per-iteration allocation is freed once per pass. A loop with no `break` (`diverges`) never
+/// reaches its exit — the header always loops back — so the exit is `Unreachable`.
+///
+/// `#[inline(never)]` and reached through a bindings-free `lower_expr` arm (taking `e`, destructured
+/// here) so neither this large-framed helper nor any arm locals enlarge the recursive `lower_expr`
+/// frame (a deep expression chain descends `lower_expr` once per level; see the `expr_depth` test).
+#[inline(never)]
+fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let hir::ExprKind::Loop { body, diverges } = &e.kind else {
+        unreachable!("lower_loop on a non-loop expression");
+    };
+    let (diverges, ty) = (*diverges, e.ty);
+    let result_slot = (ty != Ty::Unit && !diverges).then(|| b.new_slot(ty));
+    let iter_drops = collect_iter_drops(b, body);
+    let header = b.new_block();
+    let exit = b.new_block();
+    b.terminate(Term::Goto(header));
+    b.cur = header;
+    b.loops.push(LoopFrame { exit, result_slot, iter_drops: iter_drops.clone() });
+    let _ = lower_block(b, body); // the body's trailing value is discarded each iteration
+    // Fall-through end of an iteration: drop this pass's per-iteration owned locals (null-resetting
+    // so the next pass — or a path that never re-allocated — frees null), then loop back.
+    if !b.is_terminated() {
+        for s in &iter_drops {
+            b.push(Stmt::Drop(*s));
+            b.push(Stmt::DropFlagInit(*s));
+        }
+        b.terminate(Term::Goto(header));
+    }
+    b.loops.pop();
+    b.cur = exit;
+    if diverges {
+        // No `break`: the exit is unreachable. Terminate it so the CFG is well-formed; the returned
+        // operand is never used (code after a diverging loop is dead — `lower_block` stops here).
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Bool(false));
+    }
+    match result_slot {
+        Some(slot) => {
+            let v = b.fresh_value(ty);
+            b.push(Stmt::Let(v, Rvalue::Load(slot)));
+            Operand::Value(v)
+        }
+        // A unit-valued loop: the value is unused by the caller (statement position).
+        None => Operand::Const(Const::Bool(false)),
+    }
 }
 
 fn lower_if(

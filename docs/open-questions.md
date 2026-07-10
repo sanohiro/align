@@ -2181,6 +2181,27 @@ protocol client cannot be written in Align source without it.
   each iteration (the existing `drop_old` machinery), and a per-iteration owned local carried out
   by `break` needs path-sensitive move-vs-drop (move on the break edge, drop on the back edge) —
   both reuse existing mechanisms, neither needs new spec text.
+- **Implemented 2026-07-10** (the design above shipped as code). Lexer `loop`/`break` keywords;
+  parser `loop` expression + `break` statement; `for`/`while`/`continue` rejected at statement
+  position with a pointer to `loop`/pipelines. Break-type unification reuses the `match`-arm
+  running-unify (a `LoopCtx` stack seeded from the loop's expected type; a break-less loop diverges
+  via `hir_expr_diverges`, like an all-diverging `match`). MIR lowers a header/back-edge/exit CFG;
+  per-iteration owned locals (body-declared ∩ `drop_locals`) are `Drop`+null-reset at the back-edge
+  and at each `break` (the moved-out break value is nulled first, so it is not double-freed). The
+  loop-back `MoveCheck` is a two-pass fixpoint: a suppressed probe pass finds the fall-through
+  (back-edge) moves, then the real pass runs from `entry ∪ back-edge` so a 2nd-iteration use of an
+  enclosing owned local moved by the 1st is caught; the post-loop state is the union of the `break`
+  snapshots. `break` cannot cross a lambda (the loop stack resets at each lambda body).
+  **Two deliberate deferrals, each cleanly rejected/conservative, not half-measures:** (1) a `break`
+  lexically inside an `arena`/`task_group` nested in the loop is rejected with a clear diagnostic
+  (the scoped region-unwind-on-break wiring is a separate slice); (2) the `break`-value escape rule
+  is enforced as "must be `Static`" (identical to the return-escape rule — a `break` leaves the loop
+  as a `return` leaves the function), which soundly rejects a view of a per-iteration owned local
+  but conservatively also rejects breaking an enclosing-arena / outer-frame view out of the loop
+  (`.clone()` to copy out) — loosening that is a future refinement. New tests:
+  `crates/align_driver/tests/loop_expr.rs`. The `expr_depth` headroom lesson recurred: the new
+  `lower_expr` arm is bindings-free and delegates to an out-of-line `#[inline(never)]` `lower_loop`,
+  and `MoveCheck`'s loop code is an out-of-line helper, so neither bloats its recursive frame.
 
 ### Spec-vacuum sweep — five settlements (2026-07-09)
 

@@ -164,9 +164,11 @@ fn cap_expr_depth(e: &mut Expr, depth: u32, diags: &mut Diagnostics) {
                 cap_expr_depth(e, d, diags);
             }
         }
-        ExprKind::Block(b) | ExprKind::Arena(b) | ExprKind::Unsafe(b) | ExprKind::TaskGroup(b) => {
-            cap_block_depth(b, d, diags)
-        }
+        ExprKind::Block(b)
+        | ExprKind::Arena(b)
+        | ExprKind::Unsafe(b)
+        | ExprKind::TaskGroup(b)
+        | ExprKind::Loop(b) => cap_block_depth(b, d, diags),
         ExprKind::Lambda { body, .. } => cap_block_depth(body, d, diags),
         ExprKind::StructLit { fields, .. } => {
             for f in fields {
@@ -230,8 +232,8 @@ fn cap_block_depth(b: &mut Block, depth: u32, diags: &mut Diagnostics) {
                 cap_expr_depth(place, d, diags);
                 cap_expr_depth(value, d, diags);
             }
-            Stmt::Return(Some(e)) => cap_expr_depth(e, d, diags),
-            Stmt::Return(None) => {}
+            Stmt::Return(Some(e)) | Stmt::Break { value: Some(e), .. } => cap_expr_depth(e, d, diags),
+            Stmt::Return(None) | Stmt::Break { value: None, .. } => {}
             Stmt::Expr(e) => cap_expr_depth(e, d, diags),
         }
     }
@@ -781,6 +783,21 @@ impl<'a> Parser<'a> {
             if self.at(&TokKind::RBrace) || self.at(&TokKind::Eof) {
                 break;
             }
+            // `for` / `while` / `continue` do not exist in Align: there is one sequential-control
+            // construct, `loop`, and one loop exit, `break` (`draft.md` §4). Reject the C/Rust
+            // spellings at statement position with a clear pointer rather than a confusing cascade.
+            if let TokKind::Ident(name) = self.peek()
+                && matches!(name.as_str(), "for" | "while" | "continue")
+            {
+                let kw = name.clone();
+                let hint = if kw == "continue" {
+                    "there is no `continue`; guard the rest of the iteration with an `if`"
+                } else {
+                    "traverse data with a pipeline (`map`/`where`/`reduce`), or use `loop { ... break }` for control flow"
+                };
+                self.diags.error(format!("`{kw}` does not exist in Align: {hint}"), self.span());
+                return None;
+            }
             // A tuple destructuring `let`: `(a, b, ...) := expr`. Detected by lookahead (a
             // parenthesized name list followed by `:=`) so a parenthesized expression statement
             // stays unambiguous.
@@ -810,6 +827,11 @@ impl<'a> Parser<'a> {
             }
             if self.at(&TokKind::Return) {
                 let s = self.parse_return()?;
+                stmts.push(s);
+                continue;
+            }
+            if self.at(&TokKind::Break) {
+                let s = self.parse_break()?;
                 stmts.push(s);
                 continue;
             }
@@ -956,6 +978,20 @@ impl<'a> Parser<'a> {
         };
         self.expect_stmt_end();
         Some(Stmt::Return(value))
+    }
+
+    /// `break` / `break expr` — the loop exit. A bare `break` (immediately followed by an `End` or
+    /// the block's `}`) yields `()`; otherwise the value is on the same line, like `return`.
+    fn parse_break(&mut self) -> Option<Stmt> {
+        let span = self.span();
+        self.bump(); // break
+        let value = if self.at(&TokKind::End) || self.at(&TokKind::RBrace) {
+            None
+        } else {
+            Some(self.parse_expr(0)?)
+        };
+        self.expect_stmt_end();
+        Some(Stmt::Break { value, span })
     }
 
     // --- expressions (Pratt) ---
@@ -1351,6 +1387,13 @@ impl<'a> Parser<'a> {
                 Some(Expr { kind: ExprKind::Lambda { params, body }, span })
             }
             TokKind::If => self.parse_if(),
+            TokKind::Loop => {
+                let start = self.span();
+                self.bump();
+                let block = self.parse_block()?;
+                let span = start.merge(self.prev_span());
+                Some(Expr { kind: ExprKind::Loop(block), span })
+            }
             TokKind::Arena => {
                 let start = self.span();
                 self.bump();
