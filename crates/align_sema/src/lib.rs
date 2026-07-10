@@ -9083,6 +9083,11 @@ impl<'a, 't> Checker<'a, 't> {
             && matches!(method, "status" | "header" | "body")
         {
             let arr_expr = self.check_expr(arr, None);
+            if arr_expr.ty == Ty::Error {
+                // Already diagnosed; falling through would re-check `arr` on the normal
+                // path and emit the same diagnostic twice.
+                return err;
+            }
             if self.resolve(arr_expr.ty) == Ty::DynResponseArray {
                 let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
                 let idx = self.check_expr(index, Some(i64_ty));
