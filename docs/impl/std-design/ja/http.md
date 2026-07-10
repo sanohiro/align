@@ -32,18 +32,36 @@ r.body(data: bytes)
 resp.status() -> i64
 resp.header(name: str) -> Option<str>       // view into resp
 resp.body() -> bytes                         // view into resp (region-bound)
-// Server primitive (not a framework)
+// Server primitive (not a framework) — surface settled 2026-07-10 (two-lens design review)
 srv := http.serve(host: str, port: i64) -> Result<http_server, Error>
 srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response
+ctx.method() -> str                          // view into ctx (region-bound)
+ctx.path() -> str                            // view into ctx (region-bound)
+ctx.header(name: str) -> Option<str>         // view into ctx (region-bound)
+ctx.body() -> bytes                          // view into ctx (region-bound)
+rb := http.response(status: i64)             // response_builder (Move — owns header list + body buf;
+                                             // the build-dual of `request`; named apart from the
+                                             // parsed read-view `response`)
+rb.header(name: str, value: str)             // bound receiver; CR/LF/NUL aborts (P6)
+rb.body(data: bytes)                         // optional — a header-only response is legal
+ctx.respond(rb) -> Result<(), Error>         // consumes BOTH ctx and rb; one-write serialize (R4);
+                                             // closes the accepted fd (v1: one request per conn)
 // Batched client (the rail — moved here from net; see Concurrency in net.md)
 cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, Error>
 ```
 
 ## Type & ownership classification
 
-- `client`、`request`、`http_server`、`http_request_ctx` は **Move 型** である(プールしたコネクション、
-  ヘッダーリスト、ボディバッファ、accept 済みソケットを所有する)。根拠は reader/writer の Move の前例に
-  加えて、これらが包む net の Move 型である。
+- `client`、`request`、`http_server`、`http_request_ctx`、`response_builder` は **Move 型** である
+  (プールしたコネクション、ヘッダーリスト、ボディバッファ、listen 中または accept 済みのソケットを所有
+  する)。根拠は reader/writer の Move の前例に加えて、これらが包む net の Move 型である。`response_builder`
+  は、パース済みの読み取りビューである `response` とはあえて別の型にしている: build(ヘッダーリスト →
+  シリアライズ)と parse(オフセットテーブル → ビュー)が同じ利用箇所を共有することは決してないので、
+  1 つの型に多重定義するとすべてのゲッターに内部の Parsed|Built 分岐を足すだけで、収束の利得はゼロになる。
+  意味のある対称性は方向によるものであり、それは保たれている: `response_builder` ≅ `request`(ビルダー)、
+  `http_request_ctx` の読み取り ≅ `response` の読み取り(ビュー)。
+- `ctx.method()/path()/header()/body()` は **ctx にリージョン束縛されたビュー** を返す(#297 の分岐)。
+  これらは `resp.status()/header()/body()` のちょうど読み取り側の双対である。
 - `response` は自身のヘッダーブロックとボディバッファを所有する(Move)。`resp.header()`/`resp.body()` は
   **resp にリージョン束縛されたビュー** を返す(#297 を意識した `region_of` 分岐 — net の借用した
   reader/writer や `json.decode` と同じ)。
@@ -166,11 +184,56 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    `align_runtime` のユニット(1 コネクションで 3 gets を再利用/ `Connection: close` はプールしない/
    スタール再試行/ `http_head_keep_alive` の判定表)+ ドライバテスト(2 gets が 1 コネクションを再利用、
    サーバの accept 数で観測)。
-4. server プリミティブ(serve/accept、レスポンスは呼び出し側が書く)。
+4. server プリミティブ(serve/accept、レスポンスは呼び出し側が書く)。**表面はスライス 2026-07-10 に確定**
+   (2 つの独立した設計レビュー: 言語の純粋性のレンズ + システム進化のレンズ。どちらも批准 — 完全な表面は
+   上の Signatures を参照)。確定した決定は次のとおり。
+   - **レスポンスの構築 = `response_builder`**(`http.response(status)` + `.header` + `.body` +
+     `ctx.respond(rb)`)。これはクライアントの `request` ビルダーのちょうど鏡像である — status は
+     method/url と同じく構築時のフィールドである。引数形式の `respond(status, headers, body)` は
+     表現できず(可変長引数も dict リテラルも無い)、ヘッダー無しの `respond(status, body)` は
+     プリミティブとしては制限が強すぎる(Content-Type を付けられない)。
+   - **`respond` は ctx と rb の両方を消費する**(前例: `cl.request(req)` は Move の `req` を消費する):
+     二重 respond と close 後の使用を静的に禁じる。1 回の write でシリアライズする(R4)。
+   - **自動ヘッダーの方針(クライアントのシリアライズの鏡像):** ボディがセットされた場合にのみ
+     `Content-Length` を自動付与する。呼び出し側が指定した Content-Length は拒否する(スマグリング対策)。
+     **Date/Server は自動付与しない** — 編集的なヘッダーは呼び出し側のもの(フレームワーク = pkg の領分)。
+   - **v1 は accept したコネクション 1 本につき 1 リクエスト**(`respond` が fd を閉じる)。サーバ側の
+     keepalive は後日、この表面の裏に見えない形で入る: `respond` の close はクライアントのスライス 3 の
+     再利用判定を鏡像にした close-or-pool になり、`accept()` は生かしたコネクションから次のリクエストを
+     取り出す — シグネチャの変更は無い(ZST→プールの前例)。
+   - **`http_parse_request_head` は新規**(レスポンスのヘッダパーサは `HTTP/` + status を手がかりにして
+     おり、`METHOD SP target SP HTTP/1.1` には再利用できない)。Incomplete/Invalid のストリーミング分岐、
+     ヘッダーブロックのスキャン、上限(head 256 KiB / ヘッダー 128 個 / body 1 GiB)は再利用する。サーバの
+     パース側は、クライアント寛容なレスポンスパーサに欠けている 5 つの inbound スマグリング対策を足さなければ
+     ならない:(1)厳格な CRLF 行末 — 素の LF は拒否する。(2)フィールド名とコロンの間の空白を拒否する
+     (RFC 9110 のサーバ MUST)。(3)Content-Length + Transfer-Encoding の同時指定を拒否する(TE 単独は
+     すでに → `Error.Invalid`、CL のみのフレーミング)。(4)明示的な target 形式 — origin-form(`/path`)は
+     受理し、absolute-/authority-/asterisk-form は `Error.Invalid` で拒否する(v1)。(5)シリアライズ側の
+     メソッドトークン + CR/LF/NUL のガードを inbound の行にも鏡像適用する。
+   - **並行性: v1 は逐次の accept→respond ループである。** `spawn` のキャプチャは今日 Copy/スカラーのみなので、
+     Move の ctx はタスクへ渡せない — **Move-capture-into-spawn は並行サービングの記録済み前提条件である**
+     (その消費者に紐づく。スライス 4 のブロッカーではない — A5 の単一 GPU ゲートウェイはいずれにせよ推論を
+     直列化する)。
+   - **SSE/ストリーミング(ランウェイ A5)は `respond` の変更ではなく兄弟の演算として入ることを確約する:**
+     将来の `ctx.respond_stream(rb) -> Result<http_stream, Error>`(rb はヘッダーのみで構築)と、Move の
+     `http_stream.send(chunk) -> Result<(), Error>` + Drop = 終端チャンク + close。chunked な **write**
+     パス(新規、CL のみのパースとは非衝突)が必要になる。v1 の表面はすでにそれを許容している
+     (`.body()` は任意)ので、何も塗り込んでいない。
+   - **R 要件: R1/R2/R4 が適用され、必須である**(ゼロコピーのリクエストオフセットテーブル。memchr
+     スキャン。1 回の write の respond)。v1 にサーバのベンチゲートは無い — 軽い accept→respond の往復ベンチは
+     再利用パスが初めて存在する keepalive/並行性とともに入る。
 5. [TLS 実装後に先送り] FFI の TLS ラッパー経由の HTTPS。
 
 ## Known v1 limitations (Slice 2/3)
 
+- **タイムアウトのギャップのサーバ側へのエスカレーション(スライス 4、セキュリティ上の注意 — 2026-07-10 に
+  確定)。** クライアントでは I/O デッドラインの欠如は堅牢性のギャップだが、**サーバ**ではセキュリティ境界に
+  なる: 1 つの slow-loris クライアント(接続だけして、その後停止するか上限より下でちびちび送る)が、
+  唯一のブロッキング accept スレッドを永久に握る — v1 の逐次 accept ループでは、これは容易にサーバ全体の
+  denial of service になる。**したがって v1 のサーバプリミティブは信頼できないネットワーク上では安全でない**。
+  その記録済みの信頼前提は **localhost / 信頼済みネットワークのゲートウェイ**(align-LLM のランウェイ A5 の
+  消費者)であり、そこでは slow-loris は脅威モデルの対象外である。read/accept のデッドラインは
+  **v1 後のサーバ堅牢化の第一歩**であり、下のクライアント側タイムアウトの注記より優先度が高い。
 - **read/connect の I/O タイムアウトが無い(G3-1, medium, 継承)— スライス 3 を越えて意図的に先送り。**
   TCP のハンドシェイクを完了させた後に停止するサーバ — 何も送らない、上限より少ないバイトをちびちび
   送る、`Content-Length` より少なく送ってソケットを握り続ける — は、呼び出しスレッドを**無期限に**
