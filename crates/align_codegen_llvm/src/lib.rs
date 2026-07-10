@@ -839,6 +839,36 @@ fn build_module<'c>(
         module.add_function("align_rt_io_copy", i64t2.fn_type(&[ptr.into(), ptr.into()], false), None),
     );
     funcs.insert(
+        // fs.create_rw (path_ptr, path_len, out: **RwFile) -> i32 errno-status.
+        "io_file_create".to_string(),
+        module.add_function("align_rt_io_file_create", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // fs.open_rw (path_ptr, path_len, out: **RwFile) -> i32 errno-status.
+        "io_file_open".to_string(),
+        module.add_function("align_rt_io_file_open", ctx.i32_type().fn_type(&[ptr.into(), i64t2.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        // f.pread(b, off) (f: *RwFile, b: *Buffer, off: i64) -> i64 (count, or -(status)).
+        "io_file_pread".to_string(),
+        module.add_function("align_rt_io_file_pread", i64t2.fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // f.pwrite(data, off) (f: *RwFile, ptr, len, off: i64) -> i64 (full count, or -(status)).
+        "io_file_pwrite".to_string(),
+        module.add_function("align_rt_io_file_pwrite", i64t2.fn_type(&[ptr.into(), ptr.into(), i64t2.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        // f.len() (f: *RwFile) -> i64 (length, or -(status)).
+        "io_file_len".to_string(),
+        module.add_function("align_rt_io_file_len", i64t2.fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        // drop(f) (f: *RwFile) -> void; close the fd.
+        "io_file_free".to_string(),
+        module.add_function("align_rt_io_file_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
         // buffer(cap) (cap: i64) -> *Buffer (opaque handle).
         "buffer_new".to_string(),
         module.add_function("align_rt_buffer_new", ptr.fn_type(&[i64t2.into()], false), None),
@@ -1835,7 +1865,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // A `reader`/`writer`/`buffer` / cli handle / `tcp_conn` payload is an opaque pointer.
-        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
@@ -1935,7 +1965,7 @@ fn abi_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[StructTyp
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex).into(),
-        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => ctx.ptr_type(AddressSpace::default()).into(),
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
@@ -2294,6 +2324,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
         Scalar::Reader | Scalar::Writer => unreachable!("a reader/writer handle is not a box/array payload"),
         Scalar::Buffer => unreachable!("a buffer handle is not a box/array payload"),
+        Scalar::File => unreachable!("a file handle is not a box/array payload"),
         Scalar::CliParsed => unreachable!("a cli parsed handle is not a box/array payload"),
         Scalar::HttpResponse => unreachable!("an http response handle is not a box/array payload"),
         Scalar::HttpServer => unreachable!("an http_server handle is not a box/array payload"),
@@ -2950,7 +2981,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -3008,7 +3039,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs["builder_free"], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
+                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
                         // A writer flushes + closes; a reader closes; a buffer / cli / http handle
                         // frees; a tcp_conn / tcp_listener / udp_socket closes its socket fd. Each
                         // runtime `*_free` is null-safe (a moved-out / never-initialised slot drops
@@ -3017,6 +3048,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             Ty::Writer => "io_writer_free",
                             Ty::Reader => "io_reader_free",
                             Ty::Buffer => "buffer_free",
+                            Ty::File => "io_file_free",
                             Ty::CliCommand => "cli_command_free",
                             Ty::TcpConn => "tcp_conn_free",
                             Ty::TcpListener => "tcp_listener_free",
@@ -3056,13 +3088,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) => {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) => {
                                     // The field is the handle pointer itself; each `*_free` is null-safe
                                     // (the inactive arm / a moved-out aggregate reads a null handle).
                                     let free_fn = match payload_field_scalar(ty, idx) {
                                         Some(Scalar::Writer) => "io_writer_free",
                                         Some(Scalar::Reader) => "io_reader_free",
                                         Some(Scalar::Buffer) => "buffer_free",
+                                        Some(Scalar::File) => "io_file_free",
                                         Some(Scalar::TcpConn) => "tcp_conn_free",
                                         Some(Scalar::TcpListener) => "tcp_listener_free",
                                         Some(Scalar::UdpSocket) => "udp_socket_free",
@@ -4611,6 +4644,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle("io_reader_open", path, *out)?,
             Rvalue::WriterCreate { path, out } => self.gen_open_handle("io_writer_create", path, *out)?,
+            // All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len) go through ONE
+            // `#[inline(never)]` helper, so `gen_rvalue` gains a single tiny arm rather than five inline
+            // bodies — `gen_rvalue` is depth-recursive (via operand materialization), so keeping its
+            // frame flat preserves the expr-depth budget (the #296 lesson, mirroring MIR's dispatcher).
+            Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. }
+            | Rvalue::FilePread { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } => self.gen_file_rvalue(rv)?,
             Rvalue::ReaderStdin => self
                 .builder
                 .build_call(self.funcs["io_reader_stdin"], &[], "stdin")
@@ -5801,7 +5840,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Tuple(id) => self.tuple_types[id as usize].into(),
             Ty::Option(s) => option_struct_type(self.ctx, s, self.struct_types, self.enum_types).into(),
             Ty::Result(o, e) => result_struct_type(self.ctx, o, e, self.struct_types, self.enum_types).into(),
-            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Box(_) | Ty::ArenaHandle | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::Raw => self.ctx.ptr_type(AddressSpace::default()).into(),
             Ty::Fn(_) => closure_struct_type(self.ctx).into(),
             Ty::Array(s, n) => scalar_type(self.ctx, scalar_to_ty(s), self.struct_types, self.enum_types).array_type(n).into(),
             Ty::StructArray(id, n) => self.struct_types[id as usize].array_type(n).into(),
@@ -6399,6 +6438,49 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_call(self.funcs["fs_read_file"], &[p_ptr.into(), p_len.into(), out_ptr.into()], "frf")
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("fs_read_file returns i32"))
+    }
+
+    /// All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len). `#[inline(never)]` so the
+    /// depth-recursive `gen_rvalue` gains one small arm, not five inline bodies (the #296 expr-depth
+    /// frame lesson). Constructors mirror `fs.open` (write the handle into `out`, return i32 status);
+    /// the methods call the runtime with the borrowed file + operands and return the i64 count-or-status.
+    #[inline(never)]
+    fn gen_file_rvalue(&mut self, rv: &Rvalue) -> Result<BasicValueEnum<'c>, CodegenError> {
+        Ok(match rv {
+            Rvalue::FileCreateRw { path, out } => self.gen_open_handle("io_file_create", path, *out)?,
+            Rvalue::FileOpenRw { path, out } => self.gen_open_handle("io_file_open", path, *out)?,
+            // f.pread(b, off) — the runtime fills the buffer window at `off`, returns i64 count-or-status.
+            Rvalue::FilePread { file, buffer, offset } => {
+                let fp = self.operand(file).into();
+                let bp = self.operand(buffer).into();
+                let off = self.operand(offset).into();
+                self.builder
+                    .build_call(self.funcs["io_file_pread"], &[fp, bp, off], "pread")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_file_pread returns i64")
+            }
+            // f.pwrite(data, off) — split the `bytes` operand into ptr+len, return i64 count-or-status.
+            Rvalue::FilePwrite { file, data, offset } => {
+                let fp = self.operand(file).into();
+                let agg = self.operand(data).into_struct_value();
+                let ptr = self.builder.build_extract_value(agg, 0, "pwptr").map_err(|e| self.err(e))?;
+                let len = self.builder.build_extract_value(agg, 1, "pwlen").map_err(|e| self.err(e))?;
+                let off = self.operand(offset).into();
+                self.builder
+                    .build_call(self.funcs["io_file_pwrite"], &[fp, ptr.into(), len.into(), off], "pwrite")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_file_pwrite returns i64")
+            }
+            // f.len() — a live fstat, returns i64 length-or-status.
+            Rvalue::FileLen { file } => {
+                let fp = self.operand(file).into();
+                self.builder
+                    .build_call(self.funcs["io_file_len"], &[fp], "flen")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("io_file_len returns i64")
+            }
+            _ => unreachable!("gen_file_rvalue on a non-file rvalue"),
+        })
     }
 
     /// `fs.open` / `fs.create`: zero the out handle slot (so a failed open leaves null — its `Drop`

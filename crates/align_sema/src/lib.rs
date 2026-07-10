@@ -141,6 +141,11 @@ pub enum Scalar {
     /// `waitpid`, discarding the code, so it can't zombie). Opaque pointer, like [`Scalar::TcpConn`]
     /// — owned, never region-tracked. The one Move scalar backed by a pid, not an fd.
     Child,
+    /// A `file` payload (`Result<file, Error>` from `fs.create_rw`/`fs.open_rw`). An owned **Move**
+    /// handle (a read+write fd for positionless `pread`/`pwrite`); the enclosing `Result`'s `Drop`
+    /// closes it. Opaque pointer, like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never
+    /// region-tracked (a `file` has no borrowed variant).
+    File,
     /// A `response` payload (`Result<response, Error>` from `http.parse`). An owned **Move** handle
     /// (one raw byte buffer + an offset table); the enclosing `Result`'s `Drop` frees it. Opaque
     /// pointer, like [`Scalar::Buffer`] — owned, never region-tracked. (There is no
@@ -164,7 +169,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, and a `udp_socket`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx)
     }
 }
 
@@ -347,6 +352,15 @@ pub enum Ty {
     /// `slice<u8>` borrow), `.len()` is its byte count; `Drop`-freed. Constructing / reading it is
     /// pure (no I/O).
     Buffer,
+    /// A `file` (`std.fs`/`std.io`) — the random-access block read+write handle (align-LLM runway
+    /// A4). An opaque owned **Move** handle to a heap object owning a read+write fd, produced by
+    /// `fs.create_rw(path)` (`O_RDWR|O_CREAT|O_TRUNC`) / `fs.open_rw(path)` (`O_RDWR`, must exist).
+    /// `f.pread(b: mut buffer, off)` reads at an explicit offset (mirrors `reader.read`);
+    /// `f.pwrite(data, off)` writes-all at an offset; `f.len()` is a live `fstat`. **No cursor / no
+    /// `seek`** (every access carries `off`) and **no read-only constructor** (random reads stay
+    /// `reader` / mmap). Its I/O is Impure; `Drop` closes the fd. Owned, **never** region-tracked
+    /// (no borrowed variant), unlike `reader`/`writer`. Opaque pointer.
+    File,
     /// `rng` (`std.rand`) — a non-cryptographic random generator. A **Copy** state-only value (the
     /// 256-bit Xoshiro256++ state, four `i64`s) — deliberately unlike the Move `reader`/`writer`
     /// handles: it owns no external resource (no fd), so Copy is the right default. `Static` region
@@ -496,6 +510,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Writer => Some(Scalar::Writer),
         // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
         Ty::Buffer => Some(Scalar::Buffer),
+        // A `file` owned handle as a `Result` Ok payload (`fs.create_rw`/`fs.open_rw`).
+        Ty::File => Some(Scalar::File),
         // A `cli parsed` owned handle as the `Result` Ok payload of `c.parse(args)`. (A `cli command`
         // is never a payload — it has no `Scalar` and maps to `None` here.)
         Ty::CliParsed => Some(Scalar::CliParsed),
@@ -559,6 +575,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Reader => Ty::Reader,
         Scalar::Writer => Ty::Writer,
         Scalar::Buffer => Ty::Buffer,
+        Scalar::File => Ty::File,
         Scalar::CliParsed => Ty::CliParsed,
         Scalar::TcpConn => Ty::TcpConn,
         Scalar::TcpListener => Ty::TcpListener,
@@ -638,7 +655,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -670,7 +687,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -819,7 +836,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -891,7 +908,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2423,6 +2440,27 @@ impl EffectScan {
         }
     }
 
+    /// Effect of a `file` op (`pread`/`pwrite`/`len`, A4): each is a syscall → Impure. Split out
+    /// `#[inline(never)]` so its arm locals stay out of the recursive [`Self::expr`] frame (#296).
+    #[inline(never)]
+    fn effect_file_op(&mut self, kind: &ExprKind) {
+        self.impure_direct = true;
+        match kind {
+            ExprKind::FilePread { file, buffer, offset } => {
+                self.expr(file);
+                self.expr(buffer);
+                self.expr(offset);
+            }
+            ExprKind::FilePwrite { file, data, offset } => {
+                self.expr(file);
+                self.expr(data);
+                self.expr(offset);
+            }
+            ExprKind::FileLen { file } => self.expr(file),
+            _ => unreachable!("effect_file_op on a non-file op"),
+        }
+    }
+
     fn expr(&mut self, e: &Expr) {
         // A reducer node may carry capture operands (a lifted lambda's captured enclosing locals);
         // walk them so no call edge / effect they contain is missed. (Stage captures are walked by
@@ -2481,6 +2519,10 @@ impl EffectScan {
                 self.expr(reader);
                 self.expr(writer);
             }
+            // `f.pread` / `f.pwrite` / `f.len` are syscalls (I/O / fstat) — Impure, like `reader.read`.
+            // Off in an `#[inline(never)]` helper so its arm locals stay out of this recursive frame
+            // (the #296 expr-depth lesson).
+            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.effect_file_op(&e.kind),
             // `.bytes()` / `.len()` on a buffer read owned memory — pure (no I/O), like a field read.
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer),
             // Binary decode/encode (A2) are pure in-memory reads/growth (no I/O — a buffer `put`
@@ -2499,7 +2541,8 @@ impl EffectScan {
             }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => {
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => {
                 self.impure_direct = true;
                 self.expr(path);
             }
@@ -3747,6 +3790,26 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    /// Walk a `file` op's sub-exprs (A4). `#[inline(never)]` so its arm locals stay out of the
+    /// recursive [`Self::walk`] frame (#296).
+    #[inline(never)]
+    fn walk_file_op(&mut self, kind: &ExprKind, depth: u32) {
+        match kind {
+            ExprKind::FilePread { file, buffer, offset } => {
+                self.walk(file, depth);
+                self.walk(buffer, depth);
+                self.walk(offset, depth);
+            }
+            ExprKind::FilePwrite { file, data, offset } => {
+                self.walk(file, depth);
+                self.walk(data, depth);
+                self.walk(offset, depth);
+            }
+            ExprKind::FileLen { file } => self.walk(file, depth),
+            _ => unreachable!("walk_file_op on a non-file op"),
+        }
+    }
+
     /// Recurse to find nested arenas and value positions that let a box escape.
     fn walk(&mut self, e: &Expr, depth: u32) {
         // A pipeline stage or reducer may carry capture operands (a lifted lambda's captured
@@ -3974,7 +4037,8 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.walk(input, depth),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => self.walk(path, depth),
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.walk(path, depth),
             ExprKind::DnsResolve { host } => self.walk(host, depth),
             ExprKind::TcpConnect { host, port } => {
                 self.walk(host, depth);
@@ -4213,6 +4277,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(reader, depth);
                 self.walk(writer, depth);
             }
+            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.walk_file_op(&e.kind, depth),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.walk(buffer, depth),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.walk(bytes, depth);
@@ -4336,6 +4401,26 @@ impl UnnecessaryHeapScan {
             Stmt::LetTuple { init, .. } => self.visit(init),
             Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Expr(e) => self.visit(e),
             Stmt::Return(None) | Stmt::Break(None) => {}
+        }
+    }
+
+    /// Walk a `file` op's sub-exprs (A4). `#[inline(never)]` so its arm locals stay out of the
+    /// recursive [`Self::visit`] frame (#296).
+    #[inline(never)]
+    fn visit_file_op(&mut self, kind: &ExprKind) {
+        match kind {
+            ExprKind::FilePread { file, buffer, offset } => {
+                self.visit(file);
+                self.visit(buffer);
+                self.visit(offset);
+            }
+            ExprKind::FilePwrite { file, data, offset } => {
+                self.visit(file);
+                self.visit(data);
+                self.visit(offset);
+            }
+            ExprKind::FileLen { file } => self.visit(file),
+            _ => unreachable!("visit_file_op on a non-file op"),
         }
     }
 
@@ -4518,7 +4603,8 @@ impl UnnecessaryHeapScan {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.visit(input),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => self.visit(path),
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.visit(path),
             ExprKind::DnsResolve { host } => self.visit(host),
             ExprKind::TcpConnect { host, port } => {
                 self.visit(host);
@@ -4724,6 +4810,7 @@ impl UnnecessaryHeapScan {
                 self.visit(reader);
                 self.visit(writer);
             }
+            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.visit_file_op(&e.kind),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.visit(buffer),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.visit(bytes);
@@ -5039,6 +5126,26 @@ impl<'a> MoveCheck<'a> {
     /// `consuming` = this position takes a Move value by value (so it moves it). `direct` = the
     /// consuming position is a direct move site (see [`block`]); a non-direct owned-local move
     /// is a deferred-feature error.
+    /// Move-check a `file` op's sub-exprs (A4) — all borrowed (the file is never consumed).
+    /// `#[inline(never)]` so its arm locals stay out of the recursive [`Self::expr`] frame (#296).
+    #[inline(never)]
+    fn move_file_op(&mut self, kind: &ExprKind, moved: &mut MovedSet) {
+        match kind {
+            ExprKind::FilePread { file, buffer, offset } => {
+                self.expr(file, moved, false, false);
+                self.expr(buffer, moved, false, false);
+                self.expr(offset, moved, false, false);
+            }
+            ExprKind::FilePwrite { file, data, offset } => {
+                self.expr(file, moved, false, false);
+                self.expr(data, moved, false, false);
+                self.expr(offset, moved, false, false);
+            }
+            ExprKind::FileLen { file } => self.expr(file, moved, false, false),
+            _ => unreachable!("move_file_op on a non-file op"),
+        }
+    }
+
     fn expr(
         &mut self,
         e: &Expr,
@@ -5206,6 +5313,10 @@ impl<'a> MoveCheck<'a> {
                 self.expr(reader, moved, false, false);
                 self.expr(writer, moved, false, false);
             }
+            // `f.pread(b, off)` / `f.pwrite(data, off)` / `f.len()` all **borrow** the file (never
+            // consumed — no move-out); the buffer is filled in place and the data/offset are read.
+            // Split out `#[inline(never)]` so its arm locals stay out of this recursive frame (#296).
+            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.move_file_op(&e.kind, moved),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer, moved, false, false),
             // Binary decode/encode (A2): every operand is borrowed (a read, or a buffer grown in
             // place), never consumed.
@@ -5405,7 +5516,8 @@ impl<'a> MoveCheck<'a> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.expr(input, moved, false, false),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => self.expr(path, moved, false, false),
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.expr(path, moved, false, false),
             // `dns.resolve(host)` borrows its `str` host (never consumed).
             ExprKind::DnsResolve { host } => self.expr(host, moved, false, false),
             // `tcp.connect(host, port)` borrows `host` (str, never consumed); `port` is a Copy i64.
@@ -8605,6 +8717,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_open_create(method == "create", args, span);
             }
+            // `fs.create_rw(path)` (O_RDWR|O_CREAT|O_TRUNC) / `fs.open_rw(path)` (O_RDWR, must exist)
+            // -> Result<file, Error> — the offset-addressed block I/O handle (A4).
+            if module == "fs" && (method == "create_rw" || method == "open_rw") {
+                self.require_import("std.fs", &format!("fs.{method}"), span);
+                return self.check_fs_create_open_rw(method == "create_rw", args, span);
+            }
             // `fs.write_file(path, data)` -> Result<(), Error> (data: str | bytes | builder).
             if module == "fs" && method == "write_file" {
                 self.require_import("std.fs", "fs.write_file", span);
@@ -8970,6 +9088,20 @@ impl<'a, 't> Checker<'a, 't> {
                     format!("'.{method}()' is a binary read on a `bytes` (slice<u8>) view, but the receiver is {}", ty_name(recv_expr.ty)),
                     span,
                 );
+            }
+            return err;
+        }
+        // `std.fs`/`std.io` offset-addressed file I/O on a `file`: `f.pread(b, off)` / `f.pwrite(data,
+        // off)` (A4). Dispatched on the receiver type so the names stay free on other values. (`f.len()`
+        // dispatches through `check_len` like the other `.len()` receivers.)
+        if matches!(method, "pread" | "pwrite") {
+            let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::File {
+                return self.check_file_method(recv_expr, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags
+                    .error(format!("'.{method}()' is not a method on {} (it is a `file` method)", ty_name(recv_expr.ty)), span);
             }
             return err;
         }
@@ -9535,7 +9667,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -11709,6 +11841,9 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::BufferLen { buffer: Box::new(r) }, ty: i64_ty, span }
             }
+            // A `file`'s length is a **live** `fstat` — `Result<i64, Error>`, not a bare `i64` (unlike
+            // a buffer's cached byte count). Same bound-receiver gate as the other `file` methods.
+            Ty::File => self.check_file_method(r, "len", args, span),
             // A fixed array's length is known at compile time.
             Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
             Ty::Error => Expr { kind: ExprKind::Int(0), ty: Ty::Error, span },
@@ -11928,6 +12063,30 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind,
             ty: Ty::Result(ok, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `fs.create_rw(path)` (`O_RDWR|O_CREAT|O_TRUNC`) / `fs.open_rw(path)` (`O_RDWR`, must exist) ->
+    /// `Result<file, Error>` (A4). The offset-addressed block read+write handle; the `file` owns its
+    /// fd (closed on `Drop`). Mirrors [`Self::check_fs_open_create`]; the path is a `str` (owned
+    /// `string` auto-borrowed).
+    fn check_fs_create_open_rw(&mut self, create: bool, args: &[ast::Expr], span: Span) -> Expr {
+        let name = if create { "fs.create_rw" } else { "fs.open_rw" };
+        if args.len() != 1 {
+            self.diags
+                .error(format!("'{name}' expects 1 argument (the path), got {}", args.len()), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let path = self.check_str_init(&args[0]);
+        let kind = if create {
+            ExprKind::FileCreateRw { path: Box::new(path) }
+        } else {
+            ExprKind::FileOpenRw { path: Box::new(path) }
+        };
+        Expr {
+            kind,
+            ty: Ty::Result(Scalar::File, Scalar::Enum(self.error_enum_id)),
             span,
         }
     }
@@ -13970,6 +14129,105 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `f.pread(b: mut buffer, off)` / `f.pwrite(data, off)` / `f.len()` on a `file` ([`Ty::File`]),
+    /// the receiver already evaluated. Each **borrows** the file (never consumed — no move-out) and
+    /// yields `Result<i64, Error>` (`pread`/`len` a count, `pwrite` the full byte count written). A
+    /// `file` has no borrowed variant, so — like `check_reader_method` — the receiver must be a bound
+    /// local (an unbound owned-file temporary would leak its fd; lifted when Move temporaries drop).
+    /// `pread` mirrors `reader.read`'s buffer-window discipline; `pwrite` accepts the same byte-source
+    /// forms as `buffer.append` (`bytes`/`str`/`string`). A negative offset aborts at runtime.
+    fn check_file_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let i64_result = Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id));
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the file to a local first, then call the method (`f := fs.create_rw(...)?` then `f.pwrite(...)`) — a temporary owned file handle is not dropped yet, so its fd would leak".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        match method {
+            "len" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.len()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::FileLen { file: Box::new(recv_expr) }, ty: i64_result, span }
+            }
+            "pread" => {
+                let [buf_arg, off_arg] = args else {
+                    self.diags.error(format!("'.pread()' takes 2 arguments (a mut buffer and an offset), got {}", args.len()), span);
+                    return err;
+                };
+                let buffer = self.check_expr(buf_arg, Some(Ty::Buffer));
+                if buffer.ty == Ty::Error {
+                    return err;
+                }
+                if buffer.ty != Ty::Buffer {
+                    self.diags.error(format!("'.pread()' fills a buffer, got {}", ty_name(buffer.ty)), buf_arg.span);
+                    return err;
+                }
+                let offset = self.check_expr(off_arg, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                if offset.ty == Ty::Error {
+                    return err;
+                }
+                if !self.require_i64_arg(offset.ty, off_arg.span, "'.pread()' offset") {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::FilePread { file: Box::new(recv_expr), buffer: Box::new(buffer), offset: Box::new(offset) },
+                    ty: i64_result,
+                    span,
+                }
+            }
+            "pwrite" => {
+                let [data_arg, off_arg] = args else {
+                    self.diags.error(format!("'.pwrite()' takes 2 arguments (bytes and an offset), got {}", args.len()), span);
+                    return err;
+                };
+                let mut data = self.check_expr(data_arg, None);
+                if data.ty == Ty::Error {
+                    return err;
+                }
+                // The same byte-source forms as `buffer.append`: `bytes` (slice<u8>) as-is, a `str`
+                // as-is, an owned `string` auto-borrowed (not consumed).
+                let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
+                let ok = match self.resolve(data.ty) {
+                    Ty::Str => true,
+                    Ty::String => {
+                        let s = data.span;
+                        data = Expr { kind: ExprKind::StrBorrow(Box::new(data)), ty: Ty::Str, span: s };
+                        true
+                    }
+                    Ty::Slice(el) => el == u8s,
+                    _ => false,
+                };
+                if !ok {
+                    self.diags.error(format!("'.pwrite()' expects a bytes (slice<u8>), str, or string, got {}", ty_name(data.ty)), data_arg.span);
+                    return err;
+                }
+                let offset = self.check_expr(off_arg, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                if offset.ty == Ty::Error {
+                    return err;
+                }
+                if !self.require_i64_arg(offset.ty, off_arg.span, "'.pwrite()' offset") {
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::FilePwrite { file: Box::new(recv_expr), data: Box::new(data), offset: Box::new(offset) },
+                    ty: i64_result,
+                    span,
+                }
+            }
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on a file (try pread / pwrite / len)"), span);
+                err
+            }
+        }
+    }
+
     /// `io.copy(r: reader, w: writer)` — stream all of `r` into `w` through a fixed-size buffer,
     /// yielding `Result<i64, Error>` (bytes transferred; memory is O(buffer), never O(file size)).
     /// **Non-consuming**: both handles are borrowed (fd ownership does not move — like `print`'s
@@ -14890,6 +15148,26 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Finalize a `file` op's sub-exprs (A4). `#[inline(never)]` so its arm locals stay out of the
+    /// recursive [`Self::finalize_expr`] frame (#296).
+    #[inline(never)]
+    fn finalize_file_op(&mut self, kind: &mut ExprKind) {
+        match kind {
+            ExprKind::FilePread { file, buffer, offset } => {
+                self.finalize_expr(file);
+                self.finalize_expr(buffer);
+                self.finalize_expr(offset);
+            }
+            ExprKind::FilePwrite { file, data, offset } => {
+                self.finalize_expr(file);
+                self.finalize_expr(data);
+                self.finalize_expr(offset);
+            }
+            ExprKind::FileLen { file } => self.finalize_expr(file),
+            _ => unreachable!("finalize_file_op on a non-file op"),
+        }
+    }
+
     fn finalize_expr(&mut self, e: &mut Expr) {
         let cur_ty = self.finalize(e.ty);
         e.ty = cur_ty;
@@ -15165,7 +15443,8 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } => self.finalize_expr(input),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
-            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => self.finalize_expr(path),
+            | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.finalize_expr(path),
             ExprKind::DnsResolve { host } => self.finalize_expr(host),
             ExprKind::TcpConnect { host, port } => {
                 self.finalize_expr(host);
@@ -15365,6 +15644,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(reader);
                 self.finalize_expr(writer);
             }
+            k @ (ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. }) => self.finalize_file_op(k),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.finalize_expr(buffer),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.finalize_expr(bytes);
@@ -15815,6 +16095,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
+        Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
         Ty::CliCommand => "cli command".to_string(),
         Ty::CliParsed => "cli parsed".to_string(),

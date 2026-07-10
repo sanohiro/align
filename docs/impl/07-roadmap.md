@@ -1684,8 +1684,21 @@ runway"; A1–A3 + A5's server half shipped pre-M12 as #399/#401/#402/#409). Ite
 *(general)* are ordinary fast-systems needs, not engine-specific. Build order below. Both new
 Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries have no Drop).
 
-- **Slice A4 — `std.fs`/`std.io` offset-addressed file I/O (design SETTLED 2026-07-11,
-  two-lens review).** A new Move type **`file`** = the random-access block-WRITE handle with
+- **Slice A4 — `std.fs`/`std.io` offset-addressed file I/O — DONE (2026-07-11).** Shipped the
+  new Move type **`file`** (`Ty::File`/`Scalar::File`): `fs.create_rw`/`fs.open_rw` →
+  `Result<file, Error>`; `f.pread(b: mut buffer, off)` (buffer-window discipline mirrored from
+  `reader.read`, actual count / 0=EOF), `f.pwrite(data, off)` (loops-to-full via `write_all_at`,
+  past-EOF extends), `f.len()` (live fstat); negative offset aborts; Drop closes the fd; owned →
+  Static, never region-tracked (full twin-mirror vs Reader/Writer). Constructors land in `std.fs`
+  (import-gated), the type + methods are io-family handles (dispatched on receiver type like the cli
+  precedent; `f.len()` via `check_len`). MIR/codegen file ops route through one `#[inline(never)]`
+  dispatcher each (the #296 expr-depth frame lesson — the delegate arm takes `(b, e)` to stay
+  frame-flat; verified expr-depth 5/5). Tests: driver `m12_file_io.rs` (create/pwrite-at-offsets/
+  past-EOF-hole/pread-back/len/open_rw-missing-Err/negative-offset-abort + the move/print/==/import
+  gates) + `align_runtime` units (pwrite/pread roundtrip, short-read-at-EOF, in-place update,
+  fd-leak across N cycles). `cargo test --workspace` green; clippy `-D warnings` clean. Deferred:
+  `copy_range`, `open_ro`, buffering.
+  <br>Original settled design (2026-07-11, two-lens review): A new Move type **`file`** = the random-access block-WRITE handle with
   read-back; **no `seek` ever** (a settable cursor is hidden mutable state — every access takes
   an explicit `off`), and **no read-only constructor** (pure random reads stay reader | mmap
   `fs.read_bytes_view`; a third read path would break One-way — if a VA-constrained consumer

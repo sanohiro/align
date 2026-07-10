@@ -1864,6 +1864,7 @@ EINVAL           -> Error.Invalid
 ```text
 reader
 writer
+file      // random-access block read+write handle (offset-addressed; no cursor / no seek)
 stream    // surface not yet specified
 ```
 
@@ -1878,7 +1879,20 @@ w.write(x: str | bytes | builder) -> Result<(), Error>
 w.flush()                   -> Result<(), Error>
 io.copy(r: reader, w: writer) -> Result<i64, Error>   // returns bytes transferred; memory is always
                                                        // O(buffer), never O(file size)
+f.pread(b: mut buffer, off: i64)  -> Result<i64, Error>   // one positionless read at off into b's
+                                                          // window; returns the actual count, 0 = EOF
+f.pwrite(data: bytes, off: i64)   -> Result<i64, Error>   // writes ALL of data at off (loops to full);
+                                                          // returns the full len; past-EOF extends
+f.len()                           -> Result<i64, Error>   // live fstat (not cached)
 ```
+
+`file` is the offset-addressed block read+write handle (`fs.create_rw` / `fs.open_rw`, below). Every
+access carries an explicit `off` — there is **no cursor and no `seek`** (a settable cursor is hidden
+mutable state), and there is **no read-only constructor** (pure random reads stay `reader` or the
+`fs.read_bytes_view` mmap view — a third read path would break "one way"). A **negative** offset is a
+programmer bug and **aborts**. `file` is Move (owns its fd, `Drop` closes it) and structurally
+single-threaded (no `par_map`/`spawn` capture); it never rides an aggregate other than its
+constructor's `Result<file, Error>`.
 
 `reader`/`writer` are the concrete Move types from "I/O design principles" above. `io.copy`
 dispatches on fd kind internally (a portable fixed-buffer loop is the v1 / reference
@@ -1913,6 +1927,8 @@ fs.read_bytes_view(path: str) -> Result<bytes, Error>
 fs.write_file(path: str, data: str | bytes | builder) -> Result<(), Error>
 fs.open(path: str)   -> Result<reader, Error>
 fs.create(path: str) -> Result<writer, Error>
+fs.create_rw(path: str) -> Result<file, Error>   // O_RDWR|O_CREAT|O_TRUNC — a fresh random-access file
+fs.open_rw(path: str)   -> Result<file, Error>   // O_RDWR, must exist — in-place update (see std.io `file`)
 fs.exists(path: str) -> bool
 fs.remove(path: str) -> Result<(), Error>
 fs.read_dir(path: str) -> Result<array<string>, Error>   // v1: owned strings
