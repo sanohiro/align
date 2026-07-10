@@ -248,7 +248,81 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    - **R-requirements: R1/R2/R4 apply and are required** (zero-copy request offset table; memchr
      scan; one-write respond). No server bench gate in v1 — a light accept→respond round-trip bench
      arrives with keepalive/concurrency, where a reuse path first exists.
-5. [DEFERRED to post-TLS] HTTPS via the FFI TLS wrapper.
+5. **HTTPS/TLS (client-side) — design SETTLED 2026-07-10** (two-lens review: language-purity +
+   systems-security; both ratified with the adjustments below). Zero new user-facing surface —
+   `https://` simply starts working through `cl.get/post/request` (the URL scheme is the only input
+   that should change behavior); the DC-1 coarse-`https://`-rejection debt retires naturally.
+   - **Engine = OpenSSL libssl** (same package + ≥3.2 floor as crypto's settled libcrypto,
+     dynamically linked like `-lcrypto`). The *linkage* reuses crypto's settlement; the **trust
+     decision is a genuinely new semantic and gets its own record (this one)**: certificates are
+     **always verified** against the **system trust store** (`SSL_CTX_set_default_verify_paths()`,
+     never a hardcoded path; deployment note: the `ca-certificates` package must be present or
+     every handshake fails closed). No disable/custom-CA/client-cert/resumption surface in v1 (no
+     config surface exists — consistent with the frozen signatures). Fail closed, always.
+   - **Hostname binding is REQUIRED, not optional — chain-verify-only is a defect.** The record
+     mandates the exact APIs: `SSL_set_verify(SSL_VERIFY_PEER)` + `SSL_set1_host(host)` (DNS names;
+     with `SSL_set_hostflags(X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS)`) or
+     `X509_VERIFY_PARAM_set1_ip_asc(host)` for IP-literal authorities, set **before** the
+     handshake so OpenSSL folds hostname matching into verification; `SSL_set_tlsext_host_name`
+     (SNI) from the URL host; ALPN advertises `http/1.1`; TLS ≥ 1.2.
+   - **Error taxonomy:** certificate/hostname/trust verification failure → **`Error.Denied`** (a
+     refused trust decision — distinguishes verify-fail from a malformed URL with zero new
+     variants); handshake/transport syscall failure → the errno-mapped `Error.Code`; a TLS alert or
+     protocol violation mid-response → `Error.Invalid`. fd **and** `SSL*` freed on every error
+     path (crypto's discipline). Read loop wraps `SSL_read`/`SSL_write` in `SSL_get_error`
+     (`WANT_*` retry / `ZERO_RETURN` = EOF / `SYSCALL` → errno / `SSL` → Invalid); the
+     Incomplete/Invalid split is source-agnostic and ports unchanged.
+   - **SIGPIPE:** `MSG_NOSIGNAL` cannot reach `SSL_write` (BIO writes carry no flags) and Linux has
+     no `SO_NOSIGPIPE`. A process-global `signal(SIGPIPE, SIG_IGN)` was considered and REJECTED —
+     it would break the recorded no-global-handler discipline. Settled mechanism: **per-thread
+     `pthread_sigmask`** — block `SIGPIPE` around the TLS exchange (worker threads block it at
+     start), drain a pending signal via zero-timeout `sigtimedwait` before restoring.
+   - **Pool:** the key becomes **(scheme, host, port)** — a TLS conn must never satisfy a plaintext
+     bucket or vice versa. Reuse = reusing the live `SSL*` (no re-handshake; not session
+     resumption). The stale-retry verdict ports cleanly (handshake failures happen only on the
+     fresh path, so they are never wrongly retried). Drop/expiry: best-effort one-way
+     `SSL_shutdown` (don't wait for the peer), `SSL_free`, `close` — Content-Length framing makes
+     truncation attacks moot (a short body is already `Error.Invalid`).
+   - **Server-side TLS stays DEFERRED** — coherent, not half-shipped: the server primitive carries
+     its recorded trusted-network caveat; client-first matches the align-LLM A5 consumer.
+6. **`cl.get_many(urls, max_concurrency)` (R5) — design SETTLED 2026-07-10** (same two-lens
+   review). Semantics:
+   - **Results in input order** (`urls[i]` → `results[i]`); **all-or-Err**: any transport/parse
+     failure fails the whole batch with the **lowest-index** error (deterministic — matches the
+     `tg_wait` convention). Per-element `array<Result<response, Error>>` is **inexpressible**
+     (`Result` is a `Ty`, never a `Scalar`; array elements are `Scalar`s) — all-or-Err is the only
+     honest form, recorded with a future pointer (per-slot errors wait on a `Scalar::Result`-class
+     capability, if ever). 4xx/5xx stay `Ok` data. Empty `urls` → `Ok` empty array. GET-only
+     (`request_many` deferred-until-consumer — the rail, not the verb set, is R5's substance).
+     `max_concurrency <= 0` **aborts** (programmer bug, the `rand.range` class).
+   - **Run-to-completion, no short-circuit:** there is no cancellation primitive and blocking reads
+     cannot be interrupted, so on failure the remaining workers finish and their results are
+     discarded; the first (lowest-index) error is reported. The no-timeout limitation is therefore
+     **amplified** by batching (one stalled server holds the whole batch) — recorded; the fix
+     belongs to the future deadline/structured-cancellation slice.
+   - **Mechanism: a dedicated bounded blocking-I/O worker pool, NOT the CPU-sized ParPool.** The
+     R5 draft said "task_group + the ParPool claim loop", but the ParPool is sized to
+     `available_parallelism()` and caps I/O overlap at core count — wrong shape for I/O-bound
+     batching (you want overlap ≫ cores). Settled: the runtime spawns `min(max_concurrency,
+     urls.len())` scoped blocking workers that claim URL indices off a shared counter and slot
+     results input-order. This is exactly the settled "async = task_group + blocking workers"
+     stance; live fds are bounded by the worker count (+ ≤8 idle/host pooled on completion). The
+     pipelined 19.1× rail is NOT a get_many deliverable (Slice-3's reuse verdict forbids
+     undrained-conn reuse) — the 12.8× multi-conn overlap shape is.
+   - **Prerequisite capability (compiler): `array<response>` — a dynamic array of opaque Move
+     handles.** Today `response` is rejected as an array element (the owned-handle exclusion), so
+     the frozen return type needs a narrow new capability, shipped WITH get_many as its consumer
+     (the #399 `Scalar::Slice`+consumer precedent): construction **by runtime only** (user-side
+     `[resp1, resp2]` literals stay rejected); `rs[i]` in receiver position is a **borrow** (bound
+     method calls — `rs[i].status()`, `rs[i].body()` — views region-bound to the array; the
+     owned-field-borrow precedent), moving an element out is rejected in v1; whole-array move nulls
+     the source; Drop = per-element `http_resp_free` loop + storage free. Full twin-mirror sweep
+     required for the new element class.
+   - **Bench (closes R6's get_many part):** 64 URLs against an in-process localhost server with
+     **injected per-request latency** (localhost RTT ≈ 0 would mask the overlap win), vs a Rust
+     baseline using an equal-degree fixed thread pool. Honest reporting: the measured overlap
+     factor + the machine's core count + parity-vs-Rust at equal degree — NOT a
+     hardware-independent 12.8× claim.
 
 ## Known v1 limitations (Slice 2/3)
 

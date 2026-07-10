@@ -116,10 +116,12 @@ just supplies the `task_group` + blocking-pool substrate, already available.)
   `owns_fd:false` so only the conn's Drop closes. Verify no path closes twice.
 - **P4 (batching lives in http, not net)**: the batched `get_many` takes HTTP request/response
   types, so it belongs in `std.http` (`cl.get_many`), NOT `std.net` — putting it here would make
-  net depend on http (a layering violation / circular dependency). net only exposes the substrate
-  (task_group + the `par_map` blocking pool). When http implements it: reuse that pool (no
-  thread-per-request), bound by `max_concurrency`, a failed request → that slot is an Err not a
-  whole-batch abort, and avoid nested `task_group` deadlock (the #301 work-claiming lesson).
+  net depend on http (a layering violation / circular dependency). net only exposes the substrate.
+  *(Superseded detail, corrected 2026-07-10 when the get_many design settled — see http.md slice-plan
+  item 6: the CPU-sized `par_map` pool is the wrong shape for I/O-bound batching, so get_many uses
+  its own bounded blocking-worker claim loop; and per-slot `Err` is inexpressible — `Result` is a
+  `Ty`, not a `Scalar`, so array elements can't carry it — making the batch **all-or-Err** with the
+  lowest-index error, matching the frozen `Result<array<response>, Error>` signature.)*
 - **P5 (DNS owned strings deep-drop)**: `array<string>` from `resolve` must deep-free each IP
   string (`read_dir` #339 template).
 - **P6 (bound-receiver, #337/#338)**: conn/listener/socket are owned Move — unbound temporaries
