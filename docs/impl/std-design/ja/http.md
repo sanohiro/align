@@ -109,11 +109,12 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
 - **R6 — ベンチマークで完了をゲートする**: `bench/http_client` のハーネス(ローカルの平文サーバ。
   keepalive GET のレイテンシ/スループット + `get_many` のスケーリング)を Rust ベースラインに照らして
   計測する — このリポジトリの「主張の前に計測」ルールに従い、数値が README に載るまでモジュールは
-  「速く仕上がった」とは言わない。**R6 はスライス 2 の時点ではまだ満たされていない**(DC-2):
-  `bench/http_client` は存在せず、スライス 3 まで意味のある形では入れられない — keepalive こそ R6 の
-  レイテンシ/スループット数値が測るものであり、`get_many` のスケーリングはさらに後になる。R6 が
-  ゲートするのは **モジュール** の完了であってスライス 2 ではない。ベンチハーネスはスライス 3 のプール
-  作業とともに出荷する。
+  「速く仕上がった」とは言わない。**R6 はスライス 3 の時点で満たされた:** `bench/http_client` は出荷済みで
+  (出荷したプールをその C-ABI エントリポイント経由でインプロセスの localhost サーバに対して駆動する)、
+  **keepalive で 2.86× 高速化**(下限 1.48× — 達成)と、再利用パスでの **手書き Rust `std::net` と同等**を
+  記録している(`bench/http_client/README.md` を参照)。`get_many` の並行数を絞ったスケーリングの形(R5)は
+  さらに後のスライス。R6 の keepalive レイテンシ/スループットのゲート — **モジュール** の完了をゲートする
+  部分 — は満たされている。
 
 ## New machinery required
 
@@ -184,9 +185,38 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    `align_runtime` のユニット(1 コネクションで 3 gets を再利用/ `Connection: close` はプールしない/
    スタール再試行/ `http_head_keep_alive` の判定表)+ ドライバテスト(2 gets が 1 コネクションを再利用、
    サーバの accept 数で観測)。
-4. server プリミティブ(serve/accept、レスポンスは呼び出し側が書く)。**表面はスライス 2026-07-10 に確定**
-   (2 つの独立した設計レビュー: 言語の純粋性のレンズ + システム進化のレンズ。どちらも批准 — 完全な表面は
-   上の Signatures を参照)。確定した決定は次のとおり。
+4. server プリミティブ(serve/accept、レスポンスは呼び出し側が書く)。**完了**(ブランチ
+   `http-slice4-server`)。提供する API(`import std.http` の下、server の演算は **非純粋**):
+   `http.serve(host, port) -> Result<http_server, Error>`(listen 中の fd を所有する Move ハンドル —
+   net の `tcp.listen` を包み、SO_REUSEADDR + backlog 128 の後に fd を取り出す)。`srv.accept() ->
+   Result<http_request_ctx, Error>`(accept 済みの fd + ゼロコピーのオフセットテーブルにパースしたリクエストを
+   所有する Move ハンドル。`HttpResponse` の R1 の鏡像 — head の終端まで 32 KiB ずつストリーミング read +
+   Content-Length によるボディフレーミング。Incomplete/Invalid の分岐と 256 KiB-head / 128-header /
+   1 GiB-body の上限を再利用する。不正なリクエストはそのコネクションを閉じて `Error.Invalid` を返し、
+   リスナーは生き続ける)。`ctx.method()/path()`(`str` ビュー)、`ctx.header(name)`(大文字小文字を無視する
+   `Option<str>` ビュー)、`ctx.body()`(`slice<u8>` ビュー)— すべて `ctx` にリージョン束縛される(#297)。
+   `http.response(status)` -> `response_builder`(Move。パース済みの `response` とは別の Ty + 表示名)+
+   `rb.header(name, value)`(バインド済みレシーバ、P6 の CR/LF/NUL は **abort**)+ `rb.body(data)`(任意)。
+   `ctx.respond(rb) -> Result<(), Error>`(ctx と rb の **両方を消費する** — `cl.request(req)` と同様に
+   MIR が両スロットを null にする。シリアライズ = ステータス行 + ヘッダー + ボディがセットされた場合にのみ
+   自動 Content-Length。1 回の write、R4。MSG_NOSIGNAL/SO_NOSIGPIPE。fd を閉じる、v1 は 1 コネクション
+   1 リクエスト)。`METHOD SP target SP HTTP/1.1` 向けの **新規** `http_parse_request_head` が、下記の
+   5 つの inbound スマグリング対策をすべて実装する。**3 つの新しい Move 型**
+   (`http_server`/`http_request_ctx`/`response_builder`)は Gate-1 の twin-mirror スイープ一式を通した
+   (2 つの Result ペイロード向けの Ty + Scalar。`response_builder` は `http request` と同じく Ty のみ。
+   respond の二重消費に対する `null_moved_source` が見落としやすい分岐だった)。テスト: `align_runtime` の
+   ユニット(request-head パーサ + 5 つのガードそれぞれ + シリアライズのフレーミング + N サイクルにわたる
+   fd リーク)+ ドライバの e2e(`m11_http_server.rs`: Rust クライアントで駆動する Align サーバ、**さらに
+   出荷した Align の `cl.get` クライアントを Align サーバに対して回すドッグフード実行**、加えて Gate-1 の
+   コンパイル拒否)。**確定した記録からの調整が 2 点、いずれもここに記録する:**(1)リクエスト行のパーサは
+   `HTTP/1.0` **と** `HTTP/1.1` を受理する(v1 は常にコネクションを閉じるので 1.0 か 1.1 かの永続性は無関係。
+   ガードの弱体化ではない — 5 つのガードは不変)。(2)`respond` は常に `Connection: close` を出す
+   (RFC 9112 §9.6 が非永続サーバに対して **義務付ける** — 自動 Content-Length のコネクション管理側の双対で
+   あり、編集的な `Date`/`Server` ヘッダーではない)。また respond 時に呼び出し側指定の `Connection` /
+   `Transfer-Encoding` を、確定済みの呼び出し側 `Content-Length` 拒否と並んで拒否する。HTTPS/サーバ側
+   keepalive/並行サービングは記録どおりそのまま先送りする。確定した表面(2026-07-10。2 つの独立した設計
+   レビュー: 言語の純粋性のレンズ + システム進化のレンズ。どちらも批准 — 完全な表面は上の Signatures を
+   参照)とその決定は次のとおり。
    - **レスポンスの構築 = `response_builder`**(`http.response(status)` + `.header` + `.body` +
      `ctx.respond(rb)`)。これはクライアントの `request` ビルダーのちょうど鏡像である — status は
      method/url と同じく構築時のフィールドである。引数形式の `respond(status, headers, body)` は
