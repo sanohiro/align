@@ -5,7 +5,20 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10, sixth wave (**#412 MERGED — std.http Slice 5, HTTPS/TLS client — and
+_Last updated: 2026-07-11 (**M12 opened and Slice A4 MERGED as #413** — offset-addressed file
+I/O: the `file` Move type, `fs.create_rw`/`open_rw` (CLOEXEC), `f.pread` (actual-count/EOF=0) /
+`f.pwrite` (loops-to-full, sparse-verified past-EOF extension) / `f.len()` (live fstat); **no
+seek** (hidden cursor) and **no read-only open** (reads stay reader|mmap) per the settled design;
+negative offset aborts; `file` is a nameable surface type (the gate's one CONFIRMED finding —
+the missing type-name arm — fixed pre-merge with threading tests). The align-LLM Phase-4
+(alignpack relayout) enabler. gemini's null-guard medium rejected on the sibling-convention +
+dead-guard grounds. `cargo test --workspace` **1762 green**, clippy clean. **M12 scoped in the
+roadmap** (= runway remainder A4✓/A6/A7/A8/A5-SSE; A4+A6 designs settled by a two-lens review,
+d10c627). **The owner's align-LLM spec is now v1.0 FINAL** (out-of-repo; runway record updated
+4744a61 — A-list confirmed unchanged; watch item: flat-only `json.encode` vs nested gateway
+payloads, deferred-until-consumer). **Next: A6 `array_builder<T>`** (settled design in roadmap
+M12), then A7 streaming line reads / A8 arena checkpoint / A5-SSE. Earlier: 2026-07-10, sixth
+wave (**#412 MERGED — std.http Slice 5, HTTPS/TLS client — and
 M11 FORMALLY CLOSED**: `https://` works transparently through `cl.get/post/request/get_many` over
 OpenSSL libssl; mandatory verification = system trust store + hostname binding (`SSL_set1_host` /
 `set1_ip_asc` for IP literals, both mutation-pinned by negative tests incl. the gate-requested
