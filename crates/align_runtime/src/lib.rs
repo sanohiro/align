@@ -16402,6 +16402,28 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let _ = server.join();
     }
 
+    /// A cert with a VALID chain (signed by the trusted test CA) but the WRONG host, connected via a
+    /// **DNS name** (`localhost`, resolved to the loopback-bound server) against a cert whose SAN is
+    /// `wrong.example`/`10.0.0.1` → **`Error.Denied`**. `https_wrong_host_is_denied` above connects via
+    /// the IP literal `127.0.0.1`, so it only pins `X509_VERIFY_PARAM_set1_ip_asc`; connecting via
+    /// `localhost` takes the DNS-name branch (`SSL_set1_host` + SNI), so this pins THAT binding
+    /// specifically — chain-verify-only, or a no-op `set1_host`, would wrongly accept this.
+    #[test]
+    fn https_wrong_dns_host_is_denied() {
+        let _net_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tls_test_setup();
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let (port, server) = tls_serve(TLS_WRONG_CERT, TLS_WRONG_KEY, resp, 1, true);
+        let url = format!("https://localhost:{port}/");
+        let client = align_rt_http_client_new();
+        let mut out: *mut HttpResponse = std::ptr::null_mut();
+        let rc = unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) };
+        assert_eq!(rc, AL_DENIED, "a valid chain but wrong DNS host → Denied (set1_host binding is mandatory)");
+        assert!(out.is_null());
+        unsafe { align_rt_http_client_free(client) };
+        let _ = server.join();
+    }
+
     /// A refused connection (`https://` to a closed port) → the errno-mapped **`Error.Code`**, NOT
     /// `Error.Invalid`. This also proves `https://` now ROUTES to TLS/connect — the old pre-connect
     /// `Error.Invalid` rejection (DC-1) is retired.
