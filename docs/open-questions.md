@@ -2435,6 +2435,12 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    unimplemented settle to build.
 4. **`std.io` seek/pread/pwrite** (offset-addressed access) — `align-pack` is a
    read-at-X-write-at-Y relayout tool; sequential readers can't express it. *(general)*
+   **Design SETTLED 2026-07-11 (two-lens review; full record = roadmap M12 Slice A4):** a Move
+   `file` = the random-access WRITE handle (`fs.create_rw`/`fs.open_rw`, O_CLOEXEC) with
+   `pread(mut buffer, off)` read-back (actual count, 0 = EOF) / `pwrite(bytes, off)`
+   (loops-to-full) / `len()`; **no `seek`** (hidden cursor state) and **no read-only
+   constructor** (reads stay reader | mmap; `fs.open_ro` = the deferred-with-trigger escape
+   hatch); negative offset aborts; `copy_range` deferred.
 5. **`std.http` server slice (Slice 4) + streaming (SSE/chunked) response write** — the
    align-gateway is an OpenAI-compatible SSE-streaming local server; Slice 4's design should be
    written against that requirement. **Slice-4 surface SETTLED 2026-07-10** (two-lens design
@@ -2450,6 +2456,13 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    byte-specialized per the settled `bytes`/`buffer` design): push/append + freeze to owned
    `array<T>`. Becomes acute the moment `loop` lands (accumulate-unknown-count is the natural
    loop output; today only bytes and strings can grow).
+   **Design SETTLED 2026-07-11 (same review; full record = roadmap M12 Slice A6):**
+   `array_builder<T>()` + `mut`-receiver `push`/`append` (Pure) + consuming `.build() ->
+   array<T>` — the third grow-then-freeze member (no views until freeze → realloc-safe by
+   construction; growable `array<T>` itself rejected on exactly that view-invalidation
+   ground). Zero-copy freeze via a new `align_rt_realloc` (a Rust-`Vec` store was rejected —
+   allocator-boundary mismatch with the C-free that frees `array<T>`). Elements v1 = Copy
+   scalars + `string`; Copy structs deferred; Move handles excluded.
 7. **Streaming line/record reads** *(general)* — `read_line`-class chunked record iteration over
    a reader; multi-GB `expert_trace.jsonl` is the concrete consumer for the already-recorded
    post-M9 "streaming×pipeline integration" backlog item.

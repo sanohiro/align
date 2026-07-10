@@ -36,8 +36,9 @@ Denied/Code/Invalid taxonomy. With std.http done, **all M11 std-module work is c
 formal M11 close is the orchestrator's call (verify against `open-questions.md` before flipping the
 milestone header).
 
-**Next (in order):** the M12 candidates recorded in
-`open-questions.md` Open → "align-LLM runway".
+**Next (in order):** M12 (the align-LLM runway remainder — see the M12 section: A4 offset file
+I/O, then A6 `array_builder<T>`, then A7 streaming line reads / A8 arena checkpoint / the A5 SSE
+remainder).
 
 **Historical build sequence (2026-06 snapshot — kept for the build-order and decision record;
 every item below has since completed as recorded in the per-milestone sections, except
@@ -1675,6 +1676,58 @@ and http last (needs net + TLS).
     server**, plus the Gate-1 compile rejections). `cargo test --workspace` green (1718); clippy
     `-D warnings` clean; expr-depth driver test still 5/5. **Slice 5 (HTTPS/TLS) + `get_many` (R5)
     remain.**
+
+## M12: align-LLM runway — offset I/O / typed accumulation / streaming / arena checkpoint (IN PROGRESS)
+
+The M12 set = the align-LLM runway A-list remainder (`open-questions.md` Open → "align-LLM
+runway"; A1–A3 + A5's server half shipped pre-M12 as #399/#401/#402/#409). Items marked
+*(general)* are ordinary fast-systems needs, not engine-specific. Build order below. Both new
+Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries have no Drop).
+
+- **Slice A4 — `std.fs`/`std.io` offset-addressed file I/O (design SETTLED 2026-07-11,
+  two-lens review).** A new Move type **`file`** = the random-access block-WRITE handle with
+  read-back; **no `seek` ever** (a settable cursor is hidden mutable state — every access takes
+  an explicit `off`), and **no read-only constructor** (pure random reads stay reader | mmap
+  `fs.read_bytes_view`; a third read path would break One-way — if a VA-constrained consumer
+  ever needs non-mmap random reads, `fs.open_ro` is the recorded escape hatch,
+  deferred-with-trigger). Surface: `fs.create_rw(path) -> Result<file, Error>`
+  (O_RDWR|O_CREAT|O_TRUNC — the fresh-alignpack output) and `fs.open_rw(path)` (O_RDWR, must
+  exist — in-place update), both O_CLOEXEC (the net/process fd discipline);
+  `f.pread(b: mut buffer, off) -> Result<i64, Error>` (returns the ACTUAL count; 0 = EOF —
+  the `reader.read` precedent; a file's length is not statically knowable, so no
+  out-of-range abort, unlike `bytes.u32_le(off)`); `f.pwrite(data: bytes, off) ->
+  Result<i64, Error>` (**loops to full internally** — a relayout must never silently
+  short-write; the `write_all` precedent; past-EOF extends per POSIX); `f.len() ->
+  Result<i64, Error>` (live fstat, not cached — your own pwrite changes it); Drop closes.
+  Negative offset = **abort** (programmer bug). Deferred: `copy_range`
+  (`copy_file_range`-class zero-copy fast path — the io.copy sendfile-dispatch pattern),
+  read-only opens, any buffering. v1 is structurally single-threaded (Move → no par_map/spawn
+  capture). *(general)*
+- **Slice A6 — growable `array_builder<T>` → owned `array<T>` (design SETTLED 2026-07-11,
+  same review).** The third member of the grow-then-freeze family (`builder`→`string`,
+  `buffer`→bytes, now typed): a builder holds **no views**, so amortized realloc can never
+  invalidate one — memory-safe by construction, which is exactly why growable `array<T>`
+  itself was rejected. Surface: `array_builder<T>()`; `b.push(v)` / `b.append(xs: slice<T>)`
+  on a `mut`-bound receiver (**Pure** — in-memory growth, the `BufferPut` class);
+  `b.build() -> array<T>` consumes the builder (`.to_array()` rejected — it already means
+  eager-materialize). **Freeze is zero-copy**: storage is `align_rt_alloc`-family memory grown
+  via a NEW `align_rt_realloc` (amortized doubling), so `.build()` is a pure ptr+len retype
+  (a Rust-`Vec`-backed store was rejected — its buffer cannot cross the allocator boundary to
+  the C-free that frees `array<T>`). Element set v1 = **Copy scalars + `string`**
+  (`array<string>` deep-drop is shipped end-to-end via read_dir; the builder's own Drop
+  deep-frees pushed-not-frozen strings via the same helper); Copy structs deferred
+  (struct-array store path unverified), Move handles excluded (the settled exclusion).
+  Standard Move-handle exclusions (no Result/Option/array riding, print/== rejected).
+  Mandatory tests: a builder declared outside a `loop` body survives per-iteration drops
+  (#402 `body_locals` range); capture into `par_map`/`spawn` rejected (`ty_capture_is_move`).
+  *(general — the natural `loop` accumulate-unknown-count output)*
+- **A7 — streaming line/record reads** *(general)*: design not yet settled; the
+  multi-GB `expert_trace.jsonl` consumer; ties to the post-M9 streaming×pipeline backlog.
+- **A8 — arena checkpoint/rollback** *(general)*: design not yet settled (its own Open
+  entry); consumer = a long-running server loop resetting per request.
+- **A5 remainder — SSE/chunked streaming response** (`ctx.respond_stream` + `http_stream`):
+  the committed landing recorded in http.md item 5 / the runway; needs the chunked write path.
+
 
 ## Design Issues to Settle in Parallel
 
