@@ -2287,8 +2287,11 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    order (= Unicode scalar order for valid UTF-8). Deterministic, locale-free, one `memcmp` —
    dictionary/locale collation is a `pkg` concern, never the operator. Motivation: a
    data-oriented language must sort by a name column; `Eq(str)` was already byte-based, so this
-   is the consistent completion. Implementation deferred: sema (Ord accepts str) + a runtime
-   string-compare for the sort paths.
+   is the consistent completion. **IMPLEMENTED** (`Bound::Ord.satisfied_by` accepts `str`; a
+   runtime `align_rt_str_cmp` returns -1/0/1 backing the four ordering operators and the `sort`/
+   `sort_by_key` `str`-key comparator — `str_eq` keeps its own length-fast-path for `==`/`!=`).
+   Owned `string` ordering stays deferred with its existing "take a `str` view" diagnostic (the
+   `str` view is the only comparable string form).
 2. **`else` works on `Result`** (`draft.md` §5 Result; guide ch04 rewritten): `v := f() else
    fallback` yields `Ok`'s value or deliberately discards the error — visible handling, so the
    unhandled-`Result` error never fires on it; no error binding (needing the error *is* the
@@ -2297,8 +2300,13 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    doctrine** ("else is Option-only — don't paper over errors"; the spec was silent — the same
    vacuum pattern as `loop`): that doctrine conflated *accidental* ignoring (still impossible)
    with *deliberate* fallback (legitimate; without one visible form, users wrap fallible APIs in
-   `Option` helpers and the culture splits). Implementation deferred: sema accepts `else` on a
-   `Result` scrutinee (drop the discarded `Err` payload when enum Move payloads land).
+   `Option` helpers and the culture splits). **IMPLEMENTED** (sema's `check_else_unwrap` accepts a
+   `Result` scrutinee and yields `Ok`'s type; MIR's `lower_else_unwrap` reuses the two-way Option
+   shape on the `ResultIsOk`/`ResultUnwrapOk` discriminant). The discarded `Err` must be a **Copy**
+   scalar — every `Result` error today is (the `Error` enum / a user error enum) — so there is
+   nothing to drop on the fallback path; a **Move** error (`Result<T, string>`) is rejected with a
+   clear "not yet" (its discarded buffer would leak) and lands when enum/Result Move payloads gain
+   discard-drop support.
 
 ## Open (to be decided)
 

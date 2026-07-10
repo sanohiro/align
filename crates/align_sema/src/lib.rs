@@ -898,13 +898,13 @@ impl Bound {
         }
     }
     /// Whether a concrete type satisfies this bound (checked at instantiation). `Eq` = anything with
-    /// `==` (int/float/char/bool/str); `Ord` = the ordered scalars (int/float/char — `str` has only
-    /// `==`); `Num` = the numerics (int/float).
+    /// `==` (int/float/char/bool/str); `Ord` = the ordered scalars (int/float/char) plus `str`
+    /// (byte-lexicographic — the ordered completion of `Eq(str)`); `Num` = the numerics (int/float).
     fn satisfied_by(self, ty: Ty) -> bool {
         match self {
             Bound::Unconstrained => true,
             Bound::Eq => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Bool | Ty::Str),
-            Bound::Ord => ty.is_numeric() || ty == Ty::Char,
+            Bound::Ord => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Str),
             Bound::Num => ty.is_numeric(),
         }
     }
@@ -5126,9 +5126,9 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ElseUnwrap { opt, fallback } => {
                 self.expr(opt, moved, true, true);
                 // The fallback is an arm value: it inherits this position's `consuming` but is
-                // not a direct move site (like an `if`/`else` arm). Today Option payloads are
-                // scalar-only, so a Move-typed unwrap result is not constructible — but treating
-                // the fallback consistently keeps the analysis sound if that ever changes.
+                // not a direct move site (like an `if`/`else` arm). A `Result<string, Error> else`
+                // yields a Move (`string`) result, moved at its binding site — treating the fallback
+                // consistently (arm value, not a direct move) keeps that sound.
                 self.expr(fallback, moved, consuming, false);
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
@@ -7436,22 +7436,18 @@ impl<'a, 't> Checker<'a, 't> {
                             let what = if is_eq { "equality" } else { "ordering" };
                             self.diags.error(self.bound_needed_msg(i, what, needed), span);
                         }
-                    } else if t == Ty::Str && !is_eq {
-                        // `str` supports only equality (no ordering yet).
-                        self.diags
-                            .error("str supports only == and != (ordering is not available)".to_string(), span);
                     } else if t == Ty::String {
-                        // Owned `string` comparison is not implemented yet (only the `str` view is
-                        // comparable). Comparing it would otherwise fall through to codegen's integer
-                        // path and ICE — reject it here with a clear "not yet" message (the same
-                        // "deferred, not structural" treatment as `str` ordering above).
+                        // Owned `string` comparison (`==`/`!=` and ordering) is not implemented yet
+                        // (only the `str` view is comparable). Comparing it would otherwise fall
+                        // through to codegen's integer path and ICE — reject it here with a clear "not
+                        // yet" message (the same "deferred, not structural" treatment as before).
                         self.diags.error(
                             "owned `string` values are not directly comparable yet — take a `str` view of each (numbers, bool, char, and `str` are the comparable types)".to_string(),
                             span,
                         );
                     } else if t != Ty::Error {
-                        // A concrete non-generic operand. Equality is defined for scalars + `str`
-                        // only, ordering for numbers + `char` (+ `str` once available) — there is NO
+                        // A concrete non-generic operand. Equality is defined for scalars + `str`,
+                        // ordering for numbers + `char` + `str` (byte-lexicographic) — there is NO
                         // structural comparison (draft.md §5 "Equality and Ordering"). Reject every
                         // other type — struct / tuple / array / slice / sum / Option / Result / box /
                         // soa / vector-header / handle — here, so a non-comparable operand is a clean
@@ -7467,7 +7463,7 @@ impl<'a, 't> Checker<'a, 't> {
                                     "`==` and `!=` compare scalars and strings only (numbers, bool, char, str); {shown} has no equality — compare a struct's fields explicitly, `match` on a sum value, or compare arrays element-wise as a pipeline",
                                 )
                             } else {
-                                format!("`<`, `<=`, `>`, `>=` order numbers and char only; {shown} has no ordering")
+                                format!("`<`, `<=`, `>`, `>=` order numbers, char, and str only; {shown} has no ordering")
                             };
                             self.diags.error(msg, span);
                         }
@@ -10673,8 +10669,8 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `source.….sort_by_key(f)` — materialize the surviving (primitive scalar) elements and sort
     /// them ascending by `f(element)`. Unlike `sort`, the element need not be numeric (it is ordered
-    /// by the key); the key `f` must return an orderable scalar (int/float/char). `f` may be a named
-    /// function or a lambda (which may capture).
+    /// by the key); the key `f` must return an orderable value (int/float/char, or a `str` compared
+    /// byte-lexicographically). `f` may be a named function or a lambda (which may capture).
     fn check_array_sort_by_key(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [fn_arg] = args else {
@@ -10704,9 +10700,12 @@ impl<'a, 't> Checker<'a, 't> {
         if key_ty == Ty::Error {
             return err;
         }
-        if !(key_ty.is_numeric() || key_ty == Ty::Char) {
+        // The key must be an orderable type: a numeric/char scalar, or a `str` (byte-lexicographic —
+        // sorting a name column is the motivating case; `Bound::Ord.satisfied_by` is the shared
+        // source of truth for what "orderable" means).
+        if !Bound::Ord.satisfied_by(key_ty) {
             self.diags.error(
-                format!("'sort_by_key' key must be an orderable scalar (int/float/char), got {}", ty_name(key_ty)),
+                format!("'sort_by_key' key must be an orderable scalar (int/float/char/str), got {}", ty_name(key_ty)),
                 span,
             );
             return err;
@@ -13912,10 +13911,25 @@ impl<'a, 't> Checker<'a, 't> {
         let w_snapshot = self.wait_state.last().copied();
         let payload = match self.resolve(o.ty) {
             Ty::Option(s) => scalar_to_ty(s),
+            // `else` on a `Result` yields `Ok`'s value, deliberately discarding the error (the
+            // intent triangle: `?` propagates / `else` falls back / `match` inspects). Settled
+            // 2026-07-09. The error is dropped on the fallback path, which today needs it to be a
+            // Copy scalar (every `Result` error — the `Error` enum, a user error enum — is Copy):
+            // an owned-buffer error would leak, since enum/Result Move payloads have no discard-drop
+            // yet. Reject a Move error with a clear "not yet", the same deferral shape as elsewhere.
+            Ty::Result(ok, e) => {
+                if e.is_move() {
+                    self.diags.error(
+                        "`else` on a Result whose error owns a value (a Move payload) is not supported yet — its discarded buffer would leak; `match` on the error, or map it to a Copy error type first".to_string(),
+                        span,
+                    );
+                }
+                scalar_to_ty(ok)
+            }
             Ty::Error => Ty::Error,
             other => {
                 self.diags
-                    .error(format!("`else` unwrap expects an Option, got {}", ty_name(other)), span);
+                    .error(format!("`else` unwrap expects an Option or Result, got {}", ty_name(other)), span);
                 Ty::Error
             }
         };
@@ -16178,10 +16192,16 @@ mod tests {
     }
 
     #[test]
-    fn else_unwrap_requires_option() {
-        // `else`-unwrap on a non-Option is an error.
+    fn else_unwrap_requires_option_or_result() {
+        // `else`-unwrap on a plain (non-Option/Result) value is an error.
         let (_p, d) = check("fn f() -> i32 {\n  return 1 else 0\n}\n");
         assert!(d.has_errors(), "else-unwrap on a plain int must error");
+        // `else` on a `Result` yields Ok's value, discarding the error (settled 2026-07-09).
+        let (_q, ok) = check("fn g(n: i32) -> Result<i32, Error> {\n  return Ok(n)\n}\nfn f() -> i32 {\n  return g(2) else 0\n}\n");
+        assert!(!ok.has_errors(), "else on Result<i32, Error> should check");
+        // A Move error is deferred (its discarded buffer would leak) — rejected with a clear message.
+        let (_r, mov) = check("fn g() -> Result<i32, string> {\n  return Err(\"x\".clone())\n}\nfn f() -> i32 {\n  return g() else 0\n}\n");
+        assert!(mov.has_errors(), "else on a Result with a Move error must be rejected");
     }
 
     #[test]
@@ -16276,11 +16296,17 @@ mod tests {
     }
 
     #[test]
-    fn str_equality_checks_but_ordering_errors() {
+    fn str_equality_and_ordering_check() {
         let (_p, ok) = check("fn f(s: str) -> bool = s == \"x\"\n");
         assert!(!ok.has_errors(), "str == str should check");
-        let (_q, bad) = check("fn f(s: str) -> bool = s < \"x\"\n");
-        assert!(bad.has_errors(), "str ordering must error");
+        // `Ord(str)` (settled 2026-07-09): byte-lexicographic ordering on `str` now checks.
+        let (_q, lt) = check("fn f(s: str) -> bool = s < \"x\"\n");
+        assert!(!lt.has_errors(), "str ordering (`<`) should check");
+        let (_r, ge) = check("fn f(s: str) -> bool = s >= \"x\"\n");
+        assert!(!ge.has_errors(), "str ordering (`>=`) should check");
+        // Owned `string` ordering stays deferred (only the `str` view is comparable).
+        let (_s, owned) = check("fn f() -> bool {\n  a := \"x\".clone()\n  b := \"y\".clone()\n  return a < b\n}\n");
+        assert!(owned.has_errors(), "owned `string` ordering must still error");
     }
 
     #[test]
