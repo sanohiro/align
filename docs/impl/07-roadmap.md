@@ -1811,8 +1811,51 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
     class — register it with their sema handling; a new mutator that skips that pass is the
     "new IR variant skips a pass" bug class); needs one new FFI write path (grow + set len);
     reader struct gains the lookahead fields behind the `buffered` flag.
-- **A8 — arena checkpoint/rollback** *(general)*: design not yet settled (its own Open
-  entry); consumer = a long-running server loop resetting per request.
+- **Slice A8 — per-request arena reuse (design SETTLED 2026-07-11; two-critic review, Fable
+  synthesis).** Consumer = a long-running server loop resetting per request (the gateway);
+  *(general — any flat-footprint request/event loop)*.
+  - **The `checkpoint()`/`rollback(cp)` API is REJECTED for v1, with a precise reopen
+    trigger.** Grounds: (1) it would be a second way — `loop { arena { …transients… } }`
+    already composes two shipped constructs into the per-iteration bulk-free shape
+    (empirically verified working; `break` sits outside the arena block, so the #402
+    restriction never bites); (2) it is unsound without flow-sensitive epoch tracking (a
+    view allocated after the checkpoint and used after rollback dangles — exactly the
+    MIR-dataflow escape work still Open). Honest framing: the scoped block is not the full
+    checkpoint pattern — it **restricts to the safe subset** (no survivors interleaved with
+    rollback victims), and that restriction is what makes it sound with zero new machinery.
+    The one shape it cannot express is **data-dependent checkpoint depth** (speculative /
+    backtracking stream parsers — the Open entry's original citation); recursion expresses
+    it, but the no-TCO guarantee makes deep backtracking fragile. **Reopen iff BOTH: the
+    MIR-dataflow escape checker lands, AND a measured streaming-parser consumer appears
+    that recursion + pooling cannot serve.** (The old "after MMv2" gate is moot — MMv2 is
+    complete.) The flagship consumer has zero friction: requests are independent (no
+    cross-iteration accumulator); durable state visibly lives outside the arena
+    (Static / `array_builder`) — the aligned form anyway. No guide/spec doc teaches
+    checkpoint-style thinking (grep-verified), so nothing rewrites.
+  - **The missing piece is pure runtime (~30–50 LOC, no MIR/codegen change — begin/end
+    symbols unchanged):** today every `arena_begin`/`end` pair mallocs AND memsets fresh
+    fixed-size 64 KiB chunks (no doubling — so bumpalo's keep-largest-chunk does NOT
+    transfer; the memset, ∝ CHUNK not request size and above glibc tcache, is the real
+    per-iteration cost). Settled mechanism: a **`thread_local!` one-slot pool of the whole
+    `Box<Arena>`** — `arena_end` runs `unmap_all` (mandatory, unchanged — `maps` are never
+    pooled; every exit path still munmaps), resets `off = 0`, and stashes the Box (chunks +
+    Vec capacities + the Box itself reused) **iff under the pool cap: only 64 KiB chunks are
+    pooled, total ≤ a few MiB — an oversized single-alloc chunk (a 1 GiB body) is never
+    pooled** (it would pin that memory per worker thread forever). `arena_begin` pops the
+    slot. **Reused chunks are RE-ZEROED in v1** — fresh chunks' incidental zero-init has no
+    LLVM-level contract but may be relied on; dropping the re-zero is a separate,
+    provably-safe follow-up, not this slice. Thread-locality is sound: an arena block's
+    begin/end are lexically paired (the MIR arena stack), and par_map thunks carry no arena
+    handle, so a pooled chunk never crosses threads (this also preserves malloc's per-thread
+    tcache locality). `align_rt_arena_reset` (exported, never emitted by codegen today)
+    stays pool-agnostic.
+  - **Measure-first gate (the benchmark-driven rule):** bench the gateway shape (KB-class
+    per-iteration template/parse allocations, iterations amortized) across (a) main,
+    (b) pooled + re-zero, (c) pooled no-re-zero (upper bound), (d) Rust `bumpalo` reset,
+    (e) plain Rust malloc/free. **Ship iff (b) ≥ ~1.15× over (a); else record-and-close**
+    (the builder-capacity / group_by-interleave negative-result precedent). Honest
+    expectation: ~1.2–1.5× on the realistic shape — the recorded ≈3× belongs to
+    alloc-dominated micro-loops, and must not be claimed for the gateway.
 - **A5 remainder — SSE/chunked streaming response (design SETTLED 2026-07-11; full record =
   http.md slice-plan item 7):** `ctx.respond_stream(rb)` (header-only rb, consumes both, auto-TE,
   single-sourced head serializer) + Move `http_stream` (`send` one-frame-one-write via

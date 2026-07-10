@@ -2483,6 +2483,11 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    follow-up recorded: json.decode's redundant re-validation of invariant str input.
 8. **Arena checkpoint/rollback** *(general)* — already Open (see its entry); the consumer
    arrived: a long-running server loop resetting its arena per request (gateway, or any server).
+   **Design SETTLED 2026-07-11 (two-critic review, Fable synthesis; full record = roadmap M12
+   Slice A8):** the checkpoint API is REJECTED-with-reopen-trigger (second way + unsound without
+   flow-sensitive epochs); `loop { arena {} }` is the safe-subset scoped form, and the slice is a
+   pure-runtime thread-local `Box<Arena>` pool (unmap-first, chunks-only, re-zeroed, capped) behind
+   a measure-first ship gate (≥ ~1.15× on the gateway shape, else record-and-close).
 
 **B. Design stances to record now (implement with their consumers):**
 
@@ -2779,8 +2784,17 @@ one owned element out of a bound tuple, per-field move tracking). What remains i
 *implementation*, not design: one more potential consumer — `min_with_index`-style
 `(value, index)` reductions.
 
-### Arena checkpoint / rollback — std arena API, after MMv2
-A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. The runtime arena already bump-allocates; this exposes a reset-to-mark on top. (Digested from `work/proposals/library-foundations.md` §3; used by the streaming-parse story in `http-optimization.md` §5.) **Consumer arrived 2026-07-09:** a long-running server loop resetting its arena per request — the align-LLM gateway, or any server (see Open → "align-LLM runway", item A8).
+### Arena checkpoint / rollback — SETTLED 2026-07-11: API rejected-with-reopen-trigger; scoped reuse instead
+A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. (Digested from `work/proposals/library-foundations.md` §3 + the `http-optimization.md` §5 streaming-parse story; the consumer arrived 2026-07-09 — the gateway per-request reset.)
+**Settled (full record = roadmap M12 Slice A8):** the imperative API is REJECTED for v1 — it is a
+second way (`loop { arena {} }` already expresses per-iteration bulk-free, verified working) and it
+is unsound without flow-sensitive epoch tracking in the escape checker (a post-checkpoint view used
+after rollback dangles — the MIR-dataflow follow-up). The scoped form restricts to the safe subset;
+what ships is a pure-runtime **thread-local `Box<Arena>` pool** (unmap_all-first, 64 KiB-chunks-only,
+re-zeroed on reuse, size-capped) behind a **measure-first gate**. The one inexpressible shape —
+data-dependent checkpoint depth (speculative/backtracking parsers) — is the recorded **reopen
+trigger**: revisit iff the MIR-dataflow escape checker lands AND a measured parser consumer appears
+that recursion + pooling cannot serve. (The old "after MMv2" gate is moot — MMv2 completed.)
 
 ### Build system / package layout
 Visibility (`pub`), import, and module are decided (`impl/02-frontend.md`). What remains is the design of the build system, package layout, and dependency resolution.
