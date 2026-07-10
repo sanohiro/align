@@ -7088,11 +7088,101 @@ impl Arena {
             // `len` is the mapping length passed to `mmap`; `munmap` on a valid `(addr,len)` cannot
             // fail here (the pair came straight from a successful `mmap`), so the return is ignored.
             unsafe { munmap(addr, len) };
+            // Test-only tally so the arena-pool suite can assert every registered mapping is
+            // `munmap`ped on the pooled `arena_end` path (`maps` is never pooled).
+            #[cfg(test)]
+            MUNMAP_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
 
 const CHUNK: usize = 64 * 1024;
+
+/// Test-only count of `munmap`s performed by [`Arena::unmap_all`] (incremented per drained mapping).
+#[cfg(test)]
+static MUNMAP_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+// ---------------------------------------------------------------------------------------------
+// Per-request arena reuse (M12 Slice A8).
+//
+// A server request loop is `loop { arena { …transients… } }`: every iteration opens and closes an
+// arena. Today each `arena_begin`/`end` pair mallocs AND memsets fresh fixed-size 64 KiB chunks and
+// frees them at end. The memset (∝ CHUNK, above glibc's tcache) is the real per-iteration cost. So
+// we keep the whole `Box<Arena>` — chunks, Vec capacities, and the Box itself — in a **per-thread,
+// one-slot pool** and hand it back on the next `begin`. Thread-locality is sound: an arena block's
+// begin/end are lexically paired (the MIR arena stack), and `par_map` / `task_group` thunks carry no
+// arena handle, so a pooled chunk never crosses threads.
+//
+// The whole mechanism is gated on the `arena_pool` feature (default ON = shipped) so the A/B baseline
+// in `bench/arena_pool` can compile it out. With the feature off, `begin` always allocates fresh and
+// `end` always drops — exactly the pre-A8 behavior.
+// ---------------------------------------------------------------------------------------------
+
+/// Upper bound on the memory a single thread's pool slot may retain: at most this many bytes of
+/// standard 64 KiB chunks. An arena whose live chunks exceed this — or that holds an oversized
+/// single-alloc chunk (a huge body carved as one `> CHUNK` chunk) — is dropped at `end` instead of
+/// pooled, so a burst request cannot pin megabytes per worker thread forever. 4 MiB = 64 chunks.
+#[cfg(feature = "arena_pool")]
+const ARENA_POOL_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(feature = "arena_pool")]
+thread_local! {
+    /// One-slot pool of a whole reusable `Box<Arena>` for the current thread (see the block comment).
+    static ARENA_POOL: core::cell::Cell<Option<Box<Arena>>> = const { core::cell::Cell::new(None) };
+}
+
+/// Take the pooled arena for this thread, if any, re-zeroing its reused chunks first.
+///
+/// v1 preserves the incidental fresh-chunk zeroing **exactly**: a freshly `vec![0u8; …]` chunk is
+/// zero-filled, and code may (incidentally) rely on that, so every reused chunk is memset back to 0
+/// here. Dropping the re-zero is a separately provable follow-up, not this slice. `off`/`maps` were
+/// already normalized when the arena was stashed (asserted in tests).
+#[cfg(feature = "arena_pool")]
+fn arena_pool_take() -> Option<Box<Arena>> {
+    ARENA_POOL.with(|slot| slot.take()).map(|mut arena| {
+        for chunk in &mut arena.chunks {
+            chunk.fill(0);
+        }
+        arena
+    })
+}
+
+#[cfg(not(feature = "arena_pool"))]
+fn arena_pool_take() -> Option<Box<Arena>> {
+    None
+}
+
+/// Return an ended arena to this thread's pool slot if it qualifies, else drop it (freeing its
+/// chunks as today). The caller MUST have already run [`Arena::unmap_all`] — `maps` is never pooled.
+///
+/// Qualifies iff: `maps` is empty, the total retained bytes are within [`ARENA_POOL_CAP_BYTES`], and
+/// every chunk is a standard 64 KiB chunk (an oversized single-alloc chunk is never pooled). The slot
+/// holds at most one arena; a still-occupied slot means an outer arena is already pooled, so this one
+/// is dropped rather than growing the pool past one slot.
+#[cfg(feature = "arena_pool")]
+fn arena_pool_stash(mut arena: Box<Arena>) {
+    let total: usize = arena.chunks.iter().map(|c| c.len()).sum();
+    let poolable = arena.maps.is_empty()
+        && total <= ARENA_POOL_CAP_BYTES
+        && arena.chunks.iter().all(|c| c.len() == CHUNK);
+    if !poolable {
+        return; // drop `arena` — frees its chunks / unmapped maps exactly as pre-A8
+    }
+    arena.off = 0;
+    ARENA_POOL.with(|slot| match slot.take() {
+        // Slot already full: keep the resident arena, drop this one at scope end.
+        Some(resident) => slot.set(Some(resident)),
+        None => slot.set(Some(arena)),
+    });
+}
+
+// The `Box<Arena>` parameter mirrors the pooled variant's signature (which genuinely needs to own
+// the box to stash it); here the box is simply dropped, so `boxed_local` does not apply.
+#[cfg(not(feature = "arena_pool"))]
+#[allow(clippy::boxed_local)]
+fn arena_pool_stash(_arena: Box<Arena>) {
+    // No pool: `_arena` drops here, freeing its chunks — exactly the pre-A8 `arena_end`.
+}
 
 impl Arena {
     fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
@@ -7127,8 +7217,14 @@ impl Arena {
 }
 
 /// Open a new arena. The returned handle is freed by [`align_rt_arena_end`].
+///
+/// Reuses this thread's pooled `Box<Arena>` (chunks + capacities) if one is parked (M12 Slice A8);
+/// its chunks are re-zeroed so reused arena memory reads as fresh. Otherwise allocates a new arena.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_arena_begin() -> *mut Arena {
+    if let Some(arena) = arena_pool_take() {
+        return Box::into_raw(arena);
+    }
     Box::into_raw(Box::new(Arena { chunks: Vec::new(), off: 0, maps: Vec::new() }))
 }
 
@@ -7178,11 +7274,192 @@ pub unsafe extern "C" fn align_rt_arena_reset(arena: *mut Arena) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_arena_end(arena: *mut Arena) {
     let mut arena = unsafe { Box::from_raw(arena) };
-    // Release every `fs.read_file_view` mapping before the arena's own memory is dropped. This is the
-    // munmap path for *all* arena exits — the block end, an early `return`, and `?` all lower to
-    // `ArenaEnd(handle)` (`align_mir::emit_exit_cleanup`), which codegen lowers to this call.
+    // Release every `fs.read_file_view` mapping FIRST, before pooling or dropping — this is the munmap
+    // path for *all* arena exits (the block end, an early `return`, and `?` all lower to
+    // `ArenaEnd(handle)` → this call). `maps` is never pooled, so `unmap_all` must run on every path.
     arena.unmap_all();
-    drop(arena);
+    // Return the arena to this thread's one-slot pool for reuse if it qualifies (M12 Slice A8), else
+    // drop it here — which frees its chunks exactly as the pre-pool `drop(arena)` did.
+    arena_pool_stash(arena);
+}
+
+/// Per-request arena reuse (M12 Slice A8). Each test runs on its own spawned thread so it starts
+/// with a clean thread-local pool slot (and, together, they cover cross-thread isolation).
+#[cfg(all(test, feature = "arena_pool"))]
+mod arena_pool_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    /// True iff this thread's pool slot is currently empty (non-destructive peek).
+    fn pool_is_empty() -> bool {
+        ARENA_POOL.with(|slot| {
+            let v = slot.take();
+            let empty = v.is_none();
+            slot.set(v);
+            empty
+        })
+    }
+
+    /// First chunk's base pointer (as `usize` so it can cross the closure boundary), for identity.
+    fn first_chunk_addr(a: *mut Arena) -> usize {
+        let arena = unsafe { &*a };
+        arena.chunks[0].as_ptr() as usize
+    }
+
+    #[test]
+    fn reuse_round_trip_returns_pooled_chunks() {
+        thread::spawn(|| {
+            assert!(pool_is_empty());
+            let a = align_rt_arena_begin();
+            let _ = unsafe { align_rt_arena_alloc(a, 1000, 8) }; // forces one standard 64 KiB chunk
+            let addr1 = first_chunk_addr(a);
+            unsafe { align_rt_arena_end(a) };
+            assert!(!pool_is_empty(), "a standard-chunk arena must be pooled");
+
+            let b = align_rt_arena_begin();
+            let addr2 = first_chunk_addr(b);
+            assert_eq!(addr1, addr2, "begin must hand back the pooled chunk (same address)");
+            assert!(pool_is_empty(), "begin must have popped the slot");
+            unsafe { align_rt_arena_end(b) };
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn reused_chunk_is_re_zeroed() {
+        thread::spawn(|| {
+            let a = align_rt_arena_begin();
+            let p = unsafe { align_rt_arena_alloc(a, 4096, 1) };
+            // Scribble garbage across the whole standard chunk, not just the requested bytes.
+            unsafe { &mut *a }.chunks[0].fill(0xAB);
+            unsafe { core::ptr::write_bytes(p, 0xCD, 4096) };
+            unsafe { align_rt_arena_end(a) };
+
+            let b = align_rt_arena_begin();
+            let chunk = &unsafe { &*b }.chunks[0];
+            assert!(chunk.iter().all(|&x| x == 0), "reused chunk must be re-zeroed on begin");
+            unsafe { align_rt_arena_end(b) };
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn oversized_chunk_is_not_pooled() {
+        thread::spawn(|| {
+            let a = align_rt_arena_begin();
+            // A single alloc larger than CHUNK carves one oversized (`> CHUNK`) chunk.
+            let _ = unsafe { align_rt_arena_alloc(a, (CHUNK + 4096) as i64, 8) };
+            assert!(unsafe { &*a }.chunks[0].len() > CHUNK);
+            unsafe { align_rt_arena_end(a) };
+            assert!(pool_is_empty(), "an oversized-chunk arena must never be pooled");
+
+            let b = align_rt_arena_begin();
+            assert!(unsafe { &*b }.chunks.is_empty(), "begin got a fresh (empty) arena, not the oversized one");
+            unsafe { align_rt_arena_end(b) };
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn over_cap_arena_is_not_pooled() {
+        thread::spawn(|| {
+            let a = align_rt_arena_begin();
+            // 60000-byte allocs each overflow the current chunk → one fresh standard chunk apiece.
+            // 65 standard chunks = 65 * 64 KiB > ARENA_POOL_CAP_BYTES (64 * 64 KiB), so drop, not pool.
+            let per = 60_000i64;
+            for _ in 0..65 {
+                let _ = unsafe { align_rt_arena_alloc(a, per, 8) };
+            }
+            let n = unsafe { &*a }.chunks.len();
+            assert!(n > ARENA_POOL_CAP_BYTES / CHUNK, "test must exceed the cap (got {n} chunks)");
+            unsafe { align_rt_arena_end(a) };
+            assert!(pool_is_empty(), "an arena over the pool cap must not be pooled");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn maps_are_unmapped_on_the_pooled_path() {
+        // Linux MAP_ANONYMOUS; the anonymous mapping keeps the test self-contained (no filesystem).
+        #[cfg(target_os = "linux")]
+        thread::spawn(|| {
+            const MAP_ANONYMOUS: i32 = 0x20;
+            const PROT_WRITE: i32 = 0x2;
+            let len = 4096usize;
+            let addr = unsafe {
+                mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+            };
+            assert_ne!(addr, MAP_FAILED, "test mmap failed");
+
+            let a = align_rt_arena_begin();
+            let _ = unsafe { align_rt_arena_alloc(a, 1000, 8) }; // a standard chunk so the arena still pools
+            unsafe { &mut *a }.maps.push((addr, len));
+            let before = MUNMAP_CALLS.load(Ordering::Relaxed);
+            unsafe { align_rt_arena_end(a) };
+            assert_eq!(MUNMAP_CALLS.load(Ordering::Relaxed), before + 1, "the registered mapping must be munmapped");
+
+            // The arena still qualifies (maps drained, standard chunk) and must carry no mappings.
+            assert!(!pool_is_empty());
+            let empty_maps = ARENA_POOL.with(|slot| {
+                let v = slot.take();
+                let ok = v.as_ref().map(|ar| ar.maps.is_empty()).unwrap_or(false);
+                slot.set(v);
+                ok
+            });
+            assert!(empty_maps, "a pooled arena must never retain a mapping");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn reset_never_touches_the_pool() {
+        thread::spawn(|| {
+            assert!(pool_is_empty());
+            let a = align_rt_arena_begin();
+            let _ = unsafe { align_rt_arena_alloc(a, 1000, 8) };
+            unsafe { align_rt_arena_reset(a) };
+            assert!(pool_is_empty(), "reset must be pool-agnostic (never stash)");
+            // The arena is still live and reusable after reset.
+            let _ = unsafe { align_rt_arena_alloc(a, 1000, 8) };
+            unsafe { align_rt_arena_end(a) };
+            assert!(!pool_is_empty(), "end after reset still pools normally");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn pool_is_thread_local() {
+        // Thread A pools an arena and parks (keeping its slot alive); thread B must NOT receive it.
+        let barrier = Arc::new(Barrier::new(2));
+        let ba = barrier.clone();
+        let a = thread::spawn(move || {
+            let ar = align_rt_arena_begin();
+            let _ = unsafe { align_rt_arena_alloc(ar, 1000, 8) };
+            unsafe { align_rt_arena_end(ar) }; // A's slot now holds a pooled arena
+            assert!(!pool_is_empty());
+            ba.wait(); // (1) A has pooled — release B
+            ba.wait(); // (2) hold A (and its thread-local slot) alive until B has checked
+        });
+        let bb = barrier.clone();
+        let b = thread::spawn(move || {
+            bb.wait(); // (1) wait until A pooled
+            let ar = align_rt_arena_begin(); // B's own empty slot → a fresh arena
+            let fresh = unsafe { &*ar }.chunks.is_empty();
+            unsafe { align_rt_arena_end(ar) };
+            bb.wait(); // (2) release A
+            fresh
+        });
+        a.join().unwrap();
+        assert!(b.join().unwrap(), "thread B must not see thread A's pooled arena");
+    }
 }
 
 // `task_group` runtime (slice ④b). A `TaskGroup` owns a region (arena) holding each spawned

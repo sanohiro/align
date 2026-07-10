@@ -1,0 +1,27 @@
+[package]
+name = "arena-pool-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Detach from the parent Align workspace: this bench depends on `align_runtime` as an ordinary Rust
+# path dependency and drives the arena pool's C-ABI entry points directly, so it measures the
+# *shipped* runtime code. Keep its build isolated from the compiler crates.
+[workspace]
+
+[features]
+# `pool` maps onto the runtime's `arena_pool` feature. Default ON → the (b) pooled build; run with
+# `--no-default-features` for the (a) pre-pool baseline (`begin` always mallocs, `end` always drops).
+default = ["pool"]
+pool = ["align_runtime/arena_pool"]
+
+[dependencies]
+# `default-features = false` so *this* crate's `pool` feature is the single switch controlling the
+# runtime's pool (rather than the runtime's own default winning).
+align_runtime = { path = "../../crates/align_runtime", default-features = false }
+bumpalo = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

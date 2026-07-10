@@ -13,6 +13,15 @@ license.workspace = true
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
 
+[features]
+# `arena_pool` (default ON — the shipped behavior): a per-thread one-slot pool of the whole
+# `Box<Arena>` (M12 Slice A8), so a server request loop (`loop { arena { … } }`) reuses its 64 KiB
+# chunks across iterations instead of re-mallocing + re-zeroing them each time. The only reason the
+# feature exists is to compile the pool *out* for the A/B baseline in `bench/arena_pool`; production
+# always builds it in.
+default = ["arena_pool"]
+arena_pool = []
+
 [dependencies]
 align_hash = { path = "../align_hash" }
 memchr = "2.8.2"
