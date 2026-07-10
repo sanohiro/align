@@ -162,3 +162,18 @@ fn main() -> i32 {
 ";
     assert!(check_errs("task-group-escape", src), "a task value must not escape its task_group");
 }
+
+#[test]
+fn lambda_capturing_arena_view_cannot_escape() {
+    let src = "\
+fn main() -> i32 {
+  f := arena {
+    n := 5
+    v := template \"hello {n}\"
+    fn { v.len() as i32 }
+  }
+  return f()
+}
+";
+    assert!(check_errs("lambda-capture-escape", src), "a lambda capturing an arena view must not escape the arena");
+}
