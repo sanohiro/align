@@ -4881,6 +4881,64 @@ pub unsafe extern "C" fn align_rt_buffer_free(b: *mut Buffer) {
     }
 }
 
+/// `b.put_<scalar>_<le|be>(v)` — append `width` (1/2/4/8) bytes of the scalar `bits` to the buffer,
+/// growing it. `bits` holds the value's raw bits in its low `width` bytes (little-endian order — a
+/// float is bit-reinterpreted, a narrower int zero-extended, so the low bytes are its
+/// two's-complement value). `be != 0` writes them big-endian (reversed). The write cursor is `len`
+/// (the buffer is truncated to its logical length first), so encoding after a `reader.read` appends
+/// cleanly after the read content. Updates `len` to the new content length. Null-safe; an invalid
+/// `width` is a no-op.
+///
+/// # Safety
+/// `b` must be null or a valid [`Buffer`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_buffer_put(b: *mut Buffer, bits: u64, width: i64, be: i32) {
+    if b.is_null() {
+        return;
+    }
+    let w = match usize::try_from(width) {
+        Ok(w) if (1..=8).contains(&w) => w,
+        _ => return,
+    };
+    let b = unsafe { &mut *b };
+    b.data.truncate(b.len);
+    let le = bits.to_le_bytes();
+    if be != 0 {
+        for i in (0..w).rev() {
+            b.data.push(le[i]);
+        }
+    } else {
+        b.data.extend_from_slice(&le[..w]);
+    }
+    b.len = b.data.len();
+    b.cap = b.cap.max(b.len);
+}
+
+/// `b.append(data)` — copy a raw `slice<u8>` blob onto the growable buffer, growing it. Like
+/// [`align_rt_buffer_put`] the write cursor is `len` (truncate-to-logical-length first). A null
+/// pointer or non-positive length appends nothing. Updates `len`.
+///
+/// # Safety
+/// `b` must be null or a valid [`Buffer`]; `ptr`/`len` must describe a readable byte range (or be
+/// null / `<= 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_buffer_append(b: *mut Buffer, ptr: *const u8, len: i64) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    b.data.truncate(b.len);
+    if let Ok(n) = usize::try_from(len)
+        && n > 0
+        && !ptr.is_null()
+    {
+        let src = unsafe { core::slice::from_raw_parts(ptr, n) };
+        b.data.extend_from_slice(src);
+    }
+    b.len = b.data.len();
+    b.cap = b.cap.max(b.len);
+}
+
 // ---------------------------------------------------------------------------------------------
 // std.encoding (M10 Slice 1) — Base64 (standard + URL-safe), hex, and UTF-8 validation. Pure
 // functions over `bytes`/`str`: encode returns an owned `string` (a fresh `align_rt_alloc` buffer,
@@ -9856,6 +9914,47 @@ mod tests {
         let b2 = align_rt_buffer_new(-5);
         assert_eq!(unsafe { &*b2 }.cap, 0);
         unsafe { align_rt_buffer_free(b2) };
+    }
+
+    #[test]
+    fn buffer_put_and_append_layout_and_endianness() {
+        // A2 encode: typed puts append `width` bytes in the requested order; `append` copies a raw
+        // blob after. LE writes the low bytes first, BE reverses; a single byte is order-agnostic.
+        let b = align_rt_buffer_new(0);
+        unsafe {
+            align_rt_buffer_put(b, 0x41, 1, 0); // u8 -> 41
+            align_rt_buffer_put(b, 0x1234, 2, 0); // u16 LE -> 34 12
+            align_rt_buffer_put(b, 0x1234, 2, 1); // u16 BE -> 12 34
+            align_rt_buffer_put(b, 0x0102_0304_0506_0708, 8, 0); // u64 LE -> 08..01
+            align_rt_buffer_append(b, b"!!".as_ptr(), 2); // -> 21 21
+        }
+        let bref = unsafe { &*b };
+        assert_eq!(
+            &bref.data[..bref.len],
+            &[0x41, 0x34, 0x12, 0x12, 0x34, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x21, 0x21]
+        );
+        assert_eq!(unsafe { align_rt_buffer_len(b) } as usize, bref.len);
+        unsafe { align_rt_buffer_free(b) };
+    }
+
+    #[test]
+    fn buffer_put_append_are_null_and_bounds_safe() {
+        // Null handle / pointer, invalid width, and non-positive length are all no-ops (never a
+        // wrapping `as usize`, a panic, or a null deref) — Gate 2.
+        unsafe {
+            align_rt_buffer_put(core::ptr::null_mut(), 0, 4, 0); // null handle: no-op
+            align_rt_buffer_append(core::ptr::null_mut(), b"x".as_ptr(), 1);
+        }
+        let b = align_rt_buffer_new(0);
+        unsafe {
+            align_rt_buffer_put(b, 0xdead, 0, 0); // width 0 -> no-op
+            align_rt_buffer_put(b, 0xdead, 9, 0); // width > 8 -> no-op
+            align_rt_buffer_put(b, 0xdead, -1, 0); // negative width -> no-op
+            align_rt_buffer_append(b, core::ptr::null(), 4); // null blob -> no-op
+            align_rt_buffer_append(b, b"x".as_ptr(), -1); // negative len -> no-op
+        }
+        assert_eq!(unsafe { align_rt_buffer_len(b) }, 0, "every invalid put/append left the buffer empty");
+        unsafe { align_rt_buffer_free(b) };
     }
 
     // --- std.encoding (M10 Slice 1) ----------------------------------------------------------

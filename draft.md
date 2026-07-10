@@ -1188,6 +1188,40 @@ operation that produces a `str` preserves it (a range slice that would split a s
 The byte types `bytes` / `buffer` carry **no** UTF-8 obligation and are where arbitrary-byte work
 lives (`s.bytes()` views a `str`'s bytes without the invariant).
 
+### Binary decode and encode
+
+Binary formats (GGUF headers, `alignpack`/`alignidx`, any packed record) are read from a `bytes`
+view and written into a growable `buffer` with **bounds-checked, endian-explicit** scalar
+operations. Endianness is **never implicit**: every multi-byte read/write names its byte order with
+a `_le` / `_be` suffix, so a format's byte order is visible in the source (Nothing hidden). Single
+bytes (`u8` / `i8`) carry no suffix.
+
+```align
+// decode — read a scalar from a `bytes` (slice<u8>) view at a byte offset
+h := fs.read_bytes_view("model.gguf")?     // bytes
+magic  := h.u32_le(0)                       // u32, little-endian
+count  := h.u64_le(8)                       // u64
+tag    := h.u8(4)                           // u8 (no endian suffix)
+weight := h.f32_le(off)                     // f32 (reads its bits, reinterprets)
+
+// encode — append a scalar to a growable `buffer` (grows in place; needs a `mut` binding)
+mut out := buffer(0)
+out.put_u32_le(magic)
+out.put_u64_be(count)
+out.put_f32_le(weight)
+out.append(payload)                         // copy a raw bytes/str blob in
+data := out.bytes()                         // view the accumulated bytes
+```
+
+The read/write scalar set is `u8`, `i8`, and — with an explicit `_le` / `_be` — `u16`/`i16`,
+`u32`/`i32`, `u64`/`i64`, `f32`, `f64`. A read is `bytes.<scalar>(off)` and its encode dual is
+`buffer.put_<scalar>(v)`; `buffer.append(data)` writes a raw `bytes` / `str` blob. The value handed
+to `put_*` must match the writer's scalar type exactly (no silent coercion). An **out-of-range**
+read (`off < 0`, or `off + width > len`) **aborts** — the same fail-closed policy as `slice[i]`, so
+a parser checks `.len()` before reading, exactly as it checks a slice's length before indexing. A
+read returns a Copy scalar (it never carries the view's region), so it composes freely; the
+`bytes`/`buffer` themselves stay borrowed (never consumed).
+
 ### Literals and Escapes
 
 A string literal is double-quoted and **single-line** — a raw newline inside a literal is a

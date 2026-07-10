@@ -2427,6 +2427,20 @@ impl EffectScan {
             }
             // `.bytes()` / `.len()` on a buffer read owned memory — pure (no I/O), like a field read.
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer),
+            // Binary decode/encode (A2) are pure in-memory reads/growth (no I/O — a buffer `put`
+            // mutates local heap like a `mut` array store, never a syscall). Walk the sub-exprs.
+            ExprKind::BytesRead { bytes, offset, .. } => {
+                self.expr(bytes);
+                self.expr(offset);
+            }
+            ExprKind::BufferPut { buffer, value, .. } => {
+                self.expr(buffer);
+                self.expr(value);
+            }
+            ExprKind::BufferAppend { buffer, data } => {
+                self.expr(buffer);
+                self.expr(data);
+            }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path } => {
@@ -3975,6 +3989,18 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(writer, depth);
             }
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.walk(buffer, depth),
+            ExprKind::BytesRead { bytes, offset, .. } => {
+                self.walk(bytes, depth);
+                self.walk(offset, depth);
+            }
+            ExprKind::BufferPut { buffer, value, .. } => {
+                self.walk(buffer, depth);
+                self.walk(value, depth);
+            }
+            ExprKind::BufferAppend { buffer, data } => {
+                self.walk(buffer, depth);
+                self.walk(data, depth);
+            }
             ExprKind::BufferNew { capacity } => self.walk(capacity, depth),
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
@@ -4444,6 +4470,18 @@ impl UnnecessaryHeapScan {
                 self.visit(writer);
             }
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.visit(buffer),
+            ExprKind::BytesRead { bytes, offset, .. } => {
+                self.visit(bytes);
+                self.visit(offset);
+            }
+            ExprKind::BufferPut { buffer, value, .. } => {
+                self.visit(buffer);
+                self.visit(value);
+            }
+            ExprKind::BufferAppend { buffer, data } => {
+                self.visit(buffer);
+                self.visit(data);
+            }
             ExprKind::BufferNew { capacity } => self.visit(capacity),
             ExprKind::BuilderNew { capacity } => {
                 if let Some(c) = capacity {
@@ -4850,6 +4888,20 @@ impl<'a> MoveCheck<'a> {
                 self.expr(writer, moved, false, false);
             }
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.expr(buffer, moved, false, false),
+            // Binary decode/encode (A2): every operand is borrowed (a read, or a buffer grown in
+            // place), never consumed.
+            ExprKind::BytesRead { bytes, offset, .. } => {
+                self.expr(bytes, moved, false, false);
+                self.expr(offset, moved, false, false);
+            }
+            ExprKind::BufferPut { buffer, value, .. } => {
+                self.expr(buffer, moved, false, false);
+                self.expr(value, moved, false, false);
+            }
+            ExprKind::BufferAppend { buffer, data } => {
+                self.expr(buffer, moved, false, false);
+                self.expr(data, moved, false, false);
+            }
             ExprKind::BufferNew { capacity } => self.expr(capacity, moved, false, false),
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
             // Both operands are borrowed (read for bytes), never consumed.
@@ -8474,6 +8526,32 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty != Ty::Error {
                 self.diags
                     .error(format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)), span);
+            }
+            return err;
+        }
+        // Binary **encode** on a `buffer`: `b.put_u32_le(v)` / `b.append(data)` (align-LLM runway
+        // A2). Checked before the decode reads so a `put_`-prefixed name never falls through to the
+        // read grammar. Both grow the buffer in place (a `mut buffer` local).
+        if let Some(suffix) = method.strip_prefix("put_")
+            && let Some((scalar, be)) = binary_scalar_suffix(suffix) {
+            return self.check_buffer_put(recv, scalar, be, method, args, span);
+        }
+        if method == "append" {
+            return self.check_buffer_append(recv, args, span);
+        }
+        // Binary **decode** on a `bytes` (`slice<u8>`) view: `b.u32_le(off)` / `b.f64_be(off)` /
+        // `b.u8(off)` (A2). Bounds-checked scalar reads at an explicit byte offset; the method name
+        // is the scalar+endian suffix. Type-guarded on the receiver so the names stay free elsewhere.
+        if let Some((scalar, be)) = binary_scalar_suffix(method) {
+            let recv_expr = self.check_expr(recv, None);
+            if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
+                return self.check_bytes_read(recv_expr, scalar, be, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.{method}()' is a binary read on a `bytes` (slice<u8>) view, but the receiver is {}", ty_name(recv_expr.ty)),
+                    span,
+                );
             }
             return err;
         }
@@ -13233,6 +13311,136 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `bytes.<scalar>_<le|be>(off)` — a bounds-checked binary scalar **read** from a `bytes`
+    /// (`slice<u8>`) view (align-LLM runway A2). `recv_expr` is the already-checked `bytes` value;
+    /// `scalar`/`be` come from the method-name suffix. The result is the read scalar (Copy — no
+    /// region), so a `bytes` view from any source (a `mut buffer.bytes()`, `fs.read_bytes_view`, a
+    /// `str.bytes()`) can be read without a binding restriction. Out-of-range aborts (the MIR range
+    /// check) — the same policy as `slice[i]`.
+    fn check_bytes_read(&mut self, recv_expr: Expr, scalar: Ty, be: bool, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [off_arg] = args else {
+            self.diags.error(format!("'.{method}()' takes 1 argument (a byte offset), got {}", args.len()), span);
+            return err;
+        };
+        let off = self.check_expr(off_arg, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if off.ty == Ty::Error {
+            return err;
+        }
+        if !self.require_i64_arg(off.ty, off_arg.span, &format!("'.{method}()' offset")) {
+            return err;
+        }
+        Expr { kind: ExprKind::BytesRead { bytes: Box::new(recv_expr), offset: Box::new(off), be }, ty: scalar, span }
+    }
+
+    /// `buf.put_<scalar>_<le|be>(v)` — append `v`'s bytes to a growable `buffer` (A2, the encode dual
+    /// of [`Self::check_bytes_read`]). The receiver must be a `mut buffer` local (mutated in place,
+    /// like an `rng` method); `v` must match the scalar `scalar` exactly.
+    fn check_buffer_put(&mut self, recv: &ast::Expr, scalar: Ty, be: bool, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let recv_expr = self.check_expr(recv, None);
+        if self.resolve(recv_expr.ty) != Ty::Buffer {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.{method}()' appends to a `buffer`, but the receiver is {}", ty_name(recv_expr.ty)),
+                    recv.span,
+                );
+            }
+            return err;
+        }
+        // The receiver must be a bound **mut** local — the write grows the buffer in place.
+        let Some((bid, _)) = self.place_local(recv) else {
+            self.diags.error(
+                format!("'.{method}()' needs a `mut` buffer local (bind it first: `mut b := buffer(0)`, then `b.{method}(...)`) — it grows the buffer in place"),
+                recv.span,
+            );
+            return err;
+        };
+        if !self.locals[bid as usize].is_mut {
+            let name = self.locals[bid as usize].name.clone();
+            self.diags.error(
+                format!("cannot grow immutable buffer '{name}' (declare with `mut`) — '.{method}()' appends in place"),
+                recv.span,
+            );
+            return err;
+        }
+        let [v_arg] = args else {
+            self.diags.error(format!("'.{method}()' takes 1 argument (the value to append), got {}", args.len()), span);
+            return err;
+        };
+        let value = self.check_expr(v_arg, Some(scalar));
+        if value.ty == Ty::Error {
+            return err;
+        }
+        if self.resolve(value.ty) != scalar {
+            self.diags.error(
+                format!("'.{method}()' expects a {}, got {}", ty_name(scalar), ty_name(value.ty)),
+                v_arg.span,
+            );
+            return err;
+        }
+        Expr { kind: ExprKind::BufferPut { buffer: Box::new(recv_expr), value: Box::new(value), be }, ty: Ty::Unit, span }
+    }
+
+    /// `buf.append(data)` — copy a raw `bytes` (`slice<u8>`) blob onto a growable `buffer` (A2). The
+    /// receiver must be a `mut buffer` local; `data` is a `str`/`string`/`slice<u8>` view (borrowed,
+    /// copied in).
+    fn check_buffer_append(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let recv_expr = self.check_expr(recv, None);
+        if self.resolve(recv_expr.ty) != Ty::Buffer {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.append()' appends to a `buffer`, but the receiver is {} (it is a `buffer` method)", ty_name(recv_expr.ty)),
+                    recv.span,
+                );
+            }
+            return err;
+        }
+        let Some((bid, _)) = self.place_local(recv) else {
+            self.diags.error(
+                "'.append()' needs a `mut` buffer local (bind it first: `mut b := buffer(0)`, then `b.append(...)`) — it grows the buffer in place".to_string(),
+                recv.span,
+            );
+            return err;
+        };
+        if !self.locals[bid as usize].is_mut {
+            let name = self.locals[bid as usize].name.clone();
+            self.diags.error(
+                format!("cannot grow immutable buffer '{name}' (declare with `mut`) — '.append()' appends in place"),
+                recv.span,
+            );
+            return err;
+        }
+        let [data_arg] = args else {
+            self.diags.error(format!("'.append()' takes 1 argument (a bytes/str blob), got {}", args.len()), span);
+            return err;
+        };
+        let mut data = self.check_expr(data_arg, None);
+        if data.ty == Ty::Error {
+            return err;
+        }
+        let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
+        let ok = match self.resolve(data.ty) {
+            Ty::Str => true,
+            Ty::String => {
+                let s = data.span;
+                data = Expr { kind: ExprKind::StrBorrow(Box::new(data)), ty: Ty::Str, span: s };
+                true
+            }
+            Ty::Slice(el) => el == u8s,
+            _ => false,
+        };
+        if !ok {
+            self.diags.error(
+                format!("'.append()' expects a bytes (slice<u8>), str, or string, got {}", ty_name(data.ty)),
+                data_arg.span,
+            );
+            return err;
+        }
+        Expr { kind: ExprKind::BufferAppend { buffer: Box::new(recv_expr), data: Box::new(data) }, ty: Ty::Unit, span }
+    }
+
     /// `arr[index].field` — field access on a struct-array element (MMv2 slice 8f). Fused into one
     /// bounds-checked element-field load; only the field (a scalar or a `str` view) is read. The
     /// result inherits the array's region (a `str` field views the array's input), so it cannot
@@ -14286,6 +14494,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(writer);
             }
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.finalize_expr(buffer),
+            ExprKind::BytesRead { bytes, offset, .. } => {
+                self.finalize_expr(bytes);
+                self.finalize_expr(offset);
+            }
+            ExprKind::BufferPut { buffer, value, .. } => {
+                self.finalize_expr(buffer);
+                self.finalize_expr(value);
+            }
+            ExprKind::BufferAppend { buffer, data } => {
+                self.finalize_expr(buffer);
+                self.finalize_expr(data);
+            }
             ExprKind::BufferNew { capacity } => self.finalize_expr(capacity),
             ExprKind::StrPredicate { haystack, needle, .. } => {
                 self.finalize_expr(haystack);
@@ -14648,6 +14868,38 @@ fn builder_write_kind(method: &str) -> Option<BuilderWriteKind> {
         "write_float" => BuilderWriteKind::Float,
         _ => return None,
     })
+}
+
+/// Parse a binary decode/encode scalar suffix into `(scalar type, big-endian?)`. The read methods
+/// on a `bytes` view (`u32_le`, `f64_be`, …) *are* this suffix; the write methods on a `buffer`
+/// (`put_u32_le`, …) are `put_` + this suffix. The single-byte forms `u8`/`i8` carry no endian tag
+/// (`be = false`); every wider width requires an explicit `_le` / `_be` (endianness is never
+/// implicit — "Nothing hidden"). Returns `None` for any other name.
+fn binary_scalar_suffix(name: &str) -> Option<(Ty, bool)> {
+    match name {
+        "u8" => return Some((Ty::Int(IntTy { bits: 8, signed: false }), false)),
+        "i8" => return Some((Ty::Int(IntTy { bits: 8, signed: true }), false)),
+        _ => {}
+    }
+    let (stem, be) = if let Some(s) = name.strip_suffix("_le") {
+        (s, false)
+    } else if let Some(s) = name.strip_suffix("_be") {
+        (s, true)
+    } else {
+        return None;
+    };
+    let ty = match stem {
+        "u16" => Ty::Int(IntTy { bits: 16, signed: false }),
+        "i16" => Ty::Int(IntTy { bits: 16, signed: true }),
+        "u32" => Ty::Int(IntTy { bits: 32, signed: false }),
+        "i32" => Ty::Int(IntTy { bits: 32, signed: true }),
+        "u64" => Ty::Int(IntTy { bits: 64, signed: false }),
+        "i64" => Ty::Int(IntTy { bits: 64, signed: true }),
+        "f32" => Ty::Float(FloatTy { bits: 32 }),
+        "f64" => Ty::Float(FloatTy { bits: 64 }),
+        _ => return None,
+    };
+    Some((ty, be))
 }
 
 /// The surface method name of a builder writer (for diagnostics).

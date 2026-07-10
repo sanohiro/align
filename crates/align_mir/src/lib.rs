@@ -502,6 +502,19 @@ pub enum Rvalue {
     BufferBytes(Operand),
     /// `b.len()` — the buffer's current byte count (`i64`).
     BufferLen(Operand),
+    /// `bytes.<scalar>_<le|be>(off)` — a binary scalar read from the `slice<u8>` operand at byte
+    /// offset `off`. `scalar` is the result type (its width sets how many bytes are loaded); `be`
+    /// selects big-endian. Bounds are checked (`emit_range_bounds_check`) **before** this rvalue, so
+    /// the load itself is unguarded. Lowers to an alignment-1 load (+ a `bswap` for `be`; a float
+    /// loads its bits then bitcasts).
+    BytesRead { bytes: Operand, offset: Operand, scalar: Ty, be: bool },
+    /// `buf.put_<scalar>_<le|be>(v)` — append the `value` operand's bytes to the growable `buffer`
+    /// operand in the given byte order. `scalar` is `value`'s type (sets the width; a float is
+    /// bit-reinterpreted); `be` selects big-endian. Grows the buffer.
+    BufferPut { buffer: Operand, value: Operand, scalar: Ty, be: bool },
+    /// `buf.append(data)` — append the raw `slice<u8>` operand `data` (copied) to the growable
+    /// `buffer` operand, growing it.
+    BufferAppend { buffer: Operand, data: Operand },
     /// `fs.write_file(path, data)` — write all of the `str`/`bytes` operand `data` to `path`, then
     /// close. Yields an `i32` errno-status (0 = ok).
     FsWriteFile { path: Operand, data: Operand },
@@ -1619,6 +1632,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::BufferLen(bop)));
             Operand::Value(v)
         }
+        hir::ExprKind::BytesRead { bytes, offset, be } => lower_bytes_read(b, bytes, offset, *be, e.ty),
+        hir::ExprKind::BufferPut { buffer, value, be } => lower_buffer_put(b, buffer, value, *be),
+        hir::ExprKind::BufferAppend { buffer, data } => lower_buffer_append(b, buffer, data),
         // `fs.write_file(path, data)` yields `Result<(), Error>` from an i32 errno-status (str/bytes
         // vs builder pick the runtime fn, like `writer.write`).
         hir::ExprKind::FsWriteFile { path, data, builder } => {
@@ -2786,6 +2802,54 @@ fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) {
     b.terminate(Term::Unreachable);
 
     b.cur = ok;
+}
+
+/// The byte width (1/2/4/8) of a binary scalar read/written by [`Rvalue::BytesRead`] /
+/// [`Rvalue::BufferPut`]. Sema restricts these to fixed-width int/float scalars, so any other type
+/// is unreachable.
+fn binary_scalar_width(scalar: Ty) -> i128 {
+    match scalar {
+        Ty::Int(IntTy { bits, .. }) | Ty::Float(FloatTy { bits }) => (bits / 8) as i128,
+        _ => unreachable!("sema restricts a binary read/write scalar to a fixed-width int/float"),
+    }
+}
+
+/// `bytes.<scalar>_<le|be>(off)` → a bounds-checked binary scalar read from a `slice<u8>` view.
+/// The range check `0 <= off <= off+width <= len` aborts on violation (like `slice[i]`); the load
+/// itself is then unguarded. `off + width` uses wrapping add, but the `start > end` arm of the
+/// range check catches an overflowing `off`, so no out-of-range address is ever formed.
+fn lower_bytes_read(b: &mut Builder, bytes: &hir::Expr, offset: &hir::Expr, be: bool, scalar: Ty) -> Operand {
+    let width = binary_scalar_width(scalar);
+    let sv = lower_expr(b, bytes);
+    let off = lower_expr(b, offset);
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+    let end = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(end, Rvalue::Bin(BinOp::Add, off.clone(), Operand::Const(Const::Int(width, i64_ty())))));
+    emit_range_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len));
+    let v = b.fresh_value(scalar);
+    b.push(Stmt::Let(v, Rvalue::BytesRead { bytes: sv, offset: off, scalar, be }));
+    Operand::Value(v)
+}
+
+/// `buf.put_<scalar>_<le|be>(v)` → append `v`'s bytes to the growable buffer. A unit-valued
+/// side-effecting rvalue (the runtime grows the buffer); returns `()`.
+fn lower_buffer_put(b: &mut Builder, buffer: &hir::Expr, value: &hir::Expr, be: bool) -> Operand {
+    let scalar = value.ty;
+    let bufop = lower_expr(b, buffer);
+    let val = lower_expr(b, value);
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(t, Rvalue::BufferPut { buffer: bufop, value: val, scalar, be }));
+    Operand::Const(Const::Unit)
+}
+
+/// `buf.append(data)` → copy a raw `slice<u8>` blob onto the growable buffer. Unit-valued.
+fn lower_buffer_append(b: &mut Builder, buffer: &hir::Expr, data: &hir::Expr) -> Operand {
+    let bufop = lower_expr(b, buffer);
+    let dop = lower_expr(b, data);
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(t, Rvalue::BufferAppend { buffer: bufop, data: dop }));
+    Operand::Const(Const::Unit)
 }
 
 /// `recv[index]` → a bounds-checked scalar element load. A scalar `array<T>` / `slice` loads
