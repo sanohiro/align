@@ -1129,10 +1129,11 @@ fn string_escapes() {
     if !backend_available() {
         return;
     }
-    // \t and \n inside a literal are decoded by the lexer.
-    let src = "fn main() -> i32 {\n  print(\"a\\tb\")\n  return 0\n}\n";
+    // The closed literal escape set is decoded by the lexer and then emitted as UTF-8 constants.
+    let src = "fn main() -> i32 {\n  print(\"a\\tb\")\n  print(\"\\u{41}\\u{1F600}\")\n  print('\\u{41}')\n  return \"\\r\\0\\\\\\\"\\'\".len() as i32\n}\n";
     let out = build_and_run("str-escape", src);
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\tb\n");
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\tb\nA😀\nA\n");
 }
 
 #[test]
