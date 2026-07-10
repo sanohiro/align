@@ -5,15 +5,20 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10 (**#402** the `loop` expression MERGED — full slice, lexer→MIR: break
-unification via match running-unify, two-pass loop-back MoveCheck, per-iteration drops via
-sema-recorded LocalId ranges, Static-only break-value escape rule; the deferred M8 frequency
-lints now have their firing surface. Earlier: **#401** align-LLM runway A2 binary decode/encode MERGED — 18
-endian-explicit `bytes` reads inline-lowered + `buffer.put_*`/`append`; **#400** lexer escape
-set landed same day (other session); **#399** runway A1 `fs.read_bytes_view` MERGED — first
-arena-backed slice view, `Scalar::Slice` + `region_bearing`; **#398** std.http Slice 3 —
-keepalive pool + R6 bench — MERGED, R3/R6 both met; same day, owed-delta wave: **#396** + **#397**;
-staleness sweep #395)._
+_Last updated: 2026-07-10, second wave (**soundness-triage wave DONE**: another session's three
+open PRs triaged — **#405** MERGED (bare array literal as generic arg: ICE → sema diagnostic),
+**#406** MERGED (closure capturing an arena view escapes → rejected; `Ty::Fn` now `tracks_region`
++ capture-region fold; retires the #399-gate UAF record), **#404** CLOSED-superseded by **#407**
+MERGED (a `mut` binding's region is now **fixed at initialization** — region-changing reassign of
+an owned Move local = sema error, view regions intersect; kills a confirmed double-free AND a
+confirmed view-UAF on main; #404's intersect-everything fix traded the UB for an unbounded leak and
+was rejected). `cargo test --workspace` **1687 green**, clippy clean. New Open items recorded:
+wrapper-hidden local-slice escape through a fn return (`return Ok(xs[..])`, pre-existing UAF), and
+the if-expression mixed-region leak (pre-existing, flow-sensitive-slice class). Root stray files
+triaged + deleted. Earlier same day: **#402** the `loop` expression MERGED (full slice, lexer→MIR);
+**#401** runway A2 binary decode/encode; **#400** lexer escape set (other session); **#399** runway
+A1 `fs.read_bytes_view`; **#398** std.http Slice 3 keepalive pool + R6 bench; **#396**/**#397**
+owed-delta wave; staleness sweep #395)._
 
 ## ▶ NEXT SESSION — start here
 
@@ -46,12 +51,13 @@ reviewed (zero CONFIRMED findings), mutation-checked, gemini reflected (#396 zer
 one medium — eager lookups in `check_shadow` — verified and applied). `cargo test --workspace`
 **1628 green**; clippy clean at `-D warnings`. **std.http Slice 3 is now MERGED as #398**
 (keepalive pool + R6 bench, both gates met — see the std.http Slice 3 paragraph below);
-`cargo test --workspace` **1637 green** post-#398. **Next, pick one:**
+`cargo test --workspace` **1637 green** post-#398. **Next (updated after the 2026-07-10 waves —
+the `loop` slice, lexer escapes, and runway A1/A2 are all DONE), pick one:**
 (a) **std.http Slice 4** (the server primitive `serve`/`accept`, caller writes the response), then
-Slice 5 (HTTPS/TLS) and `get_many` (R5) — the standing M11 plan; or (b) the remaining
-**2026-07-09 owed implementation deltas**: the `loop` slice, the lexer escape-set gaps,
-`Ord(str)` + `else`-on-`Result` implementation, then the align-LLM runway A-list
-(`fs.read_bytes_view` + bytes binary decode/encode first).
+Slice 5 (HTTPS/TLS) and `get_many` (R5) — the standing M11 plan, and Slice 4 doubles as the
+align-LLM runway A5 substrate (http server+SSE); or (b) the last
+**2026-07-09 owed implementation delta**: `Ord(str)` + `else`-on-`Result` implementation, then the
+align-LLM runway A4+ (seek/pread, growable `array<T>`, streaming line reads, arena checkpoint).
 
 **Design settled 2026-07-09: the `loop` expression** (docs-only, no code). One narrow sequential-control construct — `loop { ... break value }`, an expression; no `for`/`while`/`continue`/labels; recursion is explicitly not iteration (the spec now guarantees no TCO — scope-end drops and `?` kill tail position). The pipeline owns the data path; `loop` owns the control path. Updated: `draft.md` §4 "Loop" + §7, `language-spec.md`, `design-notes.md` → "The loop philosophy", `history.md`, `open-questions.md` (Settled → "Sequential control"), guide ch00/02/06/13/17, little-aligner ch11 **rewritten** as `11-do-it-until.md` (it taught recursion-as-iteration and overclaimed TCO), + `ja/` mirrors. Implementation is an unscheduled future slice (lexer/parser `loop`/`break`, break-type unification like match arms, per-iteration drops, block-value escape rule); the deferred M8 frequency lints gain their firing surface when it lands.
 
