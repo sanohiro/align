@@ -5,7 +5,17 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11 (**M12 opened and Slice A4 MERGED as #413** — offset-addressed file
+_Last updated: 2026-07-11, second wave (**M12 Slice A6 MERGED as #414** — `array_builder<T>`,
+the third grow-then-freeze member: annotation-inferred element type, Pure mut-receiver
+`push`/`append`, consuming zero-copy `.build() -> array<T>` via the new `align_rt_realloc`;
+elements v1 = Copy scalars + `string` (moves in, deep-freed on unfrozen drop — leak-guarded by a
+cfg(test) live-counter after the gate's mutation survivor); recorded rejections enforced
+fail-closed (Copy structs, string append, Move handles, str views — no arena-view laundering).
+Gate SHIP zero defects (stride matrix all widths, 200k-iter double-free stress, ~40 probes);
+gemini's 4 debug_assert mediums verified-true-then-applied. `cargo test --workspace` **1783
+green**, clippy clean. The align-LLM Phase-2 accumulate side is ready; **next: A7 streaming
+line reads** (design NOT yet settled — two-lens review first), then A8 arena checkpoint /
+A5-SSE. Earlier: **M12 opened and Slice A4 MERGED as #413** — offset-addressed file
 I/O: the `file` Move type, `fs.create_rw`/`open_rw` (CLOEXEC), `f.pread` (actual-count/EOF=0) /
 `f.pwrite` (loops-to-full, sparse-verified past-EOF extension) / `f.len()` (live fstat); **no
 seek** (hidden cursor) and **no read-only open** (reads stay reader|mmap) per the settled design;
