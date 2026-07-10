@@ -5,7 +5,21 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10, fourth wave (**#409 MERGED — std.http Slice 4, the server primitive**:
+_Last updated: 2026-07-10, fifth wave (**#411 MERGED — `cl.get_many` (R5) + the `array<response>`
+opaque-Move-handle-array capability**; design settled same day by a second two-lens review
+(record: http.md item 6, f04cb96) — input-order **all-or-Err** (per-slot Result is inexpressible:
+`Result` is a `Ty`, never a `Scalar`), lowest-index error, run-to-completion, dedicated bounded
+blocking-I/O claim-loop workers (the CPU-sized ParPool was proven the wrong shape for I/O overlap),
+`rs[i]` borrow-in-receiver-position with per-element drop. Bench: **15.4× overlap** at degree 16
+(12 ms injected latency, 32-core machine) + **1.01× of an equal-degree Rust pool** — **R6 now met
+in full**. Salvage note: the implementer session died at its usage limit with everything
+uncommitted; the orchestrator verified (1735 green), doc-finished, committed, and the gate ran as
+usual (SHIP; its one test-gap finding — the batch-error free path survived mutation — was closed
+with a cfg(test) live-response counter, mutation-verified). gemini: 1 valid duplicate-diagnostic
+medium applied; 1 dead-null-guard high rejected (would have broken empty→Ok-empty). New
+open-questions note: the pre-existing view-across-reassign dangle (Borrow-liveness entry).
+**Slice 5 HTTPS/TLS is the LAST M11 item**, design settled in the same f04cb96 record. Earlier
+same day, fourth wave — **#409 MERGED — std.http Slice 4, the server primitive**:
 `http.serve`/`srv.accept`/`http.response(status)` → `response_builder`/`ctx.respond(rb)`
 double-consume one-write; the surface was **settled the same day by a two-lens design review**
 (record: http.md Signatures + slice-plan item 4, commit 3ee3ad7 + ja mirror 3524fde) after the
