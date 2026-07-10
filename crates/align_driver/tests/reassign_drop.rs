@@ -144,7 +144,7 @@ fn arena_owned_array_reassign_suppresses_reassign_drop_in_mir() {
 fn make() -> array<i64> {\n  ys := [7, 8, 9].map(id64).to_array()\n  return ys\n}\n\
 fn main() -> i32 {\n  arena {\n    mut xs := [1, 2].map(id64).to_array()\n    xs = make()\n    print(xs[0])\n  }\n  return 0\n}\n",
     );
-    assert_eq!(count_slot_drops(&text, "_0"), 1, "only the exit drop, no reassign-drop:\n{text}");
+    assert_eq!(count_slot_drops(&text, "_0"), 0, "no exit drop, no reassign-drop:\n{text}");
 }
 
 #[test]

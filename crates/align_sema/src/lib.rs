@@ -3549,8 +3549,12 @@ impl<'a> EscapeCheck<'a> {
                             value.span,
                         );
                     }
-                    // Track the reassigned binding's region for later uses.
-                    self.region.insert(*local, r);
+                    // Combine the regions (intersection of lifetimes). Upgrading a region
+                    // flow-insensitively (e.g. Arena -> Static) would cause the local to enter
+                    // `drop_locals` even if the assignment is conditional, double-freeing the
+                    // original arena pointer if the branch is bypassed.
+                    let old_r = self.region.get(local).copied().unwrap_or(Region::Static);
+                    self.region.insert(*local, old_r.shorter(r));
                 }
             }
             Stmt::AssignField { root, value, .. } => {
