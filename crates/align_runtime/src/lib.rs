@@ -4813,6 +4813,193 @@ pub unsafe extern "C" fn align_rt_io_copy(r: *mut Reader, w: *mut Writer) -> i64
     total
 }
 
+// --- file (offset-addressed read/write) -------------------------------------------------------
+
+/// A `file` (`std.fs`/`std.io`) — a Move handle owning a read+write file descriptor for
+/// positionless (`pread`/`pwrite`) block I/O. Unlike `Reader`/`Writer` it has no borrowed variant
+/// (`fs.create_rw`/`fs.open_rw` always own the fd) and no cursor (every access carries its own
+/// explicit offset). `Drop` (`align_rt_io_file_free`) closes the fd.
+pub struct RwFile {
+    fd: i32,
+}
+
+/// `fs.create_rw(path)` — open `path` (a `str` view) `O_RDWR|O_CREAT|O_TRUNC` (mode 0644;
+/// `O_CLOEXEC` comes from Rust std's default open flags), writing the owned `file` handle to `out`.
+/// The fresh-alignpack output path. Returns `0` on success, else the errno mapped through
+/// [`io_error_to_status`] (leaving `*out` null). The fd is owned — `Drop` closes it.
+///
+/// # Safety
+/// `path`/`path_len` must describe a valid byte range; `out` must point to a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_create(path: *const u8, path_len: i64, out: *mut *mut RwFile) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+        return AL_INVALID;
+    };
+    use std::os::fd::IntoRawFd;
+    match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path_str) {
+        Ok(f) => {
+            unsafe { *out = Box::into_raw(Box::new(RwFile { fd: f.into_raw_fd() })) };
+            0
+        }
+        Err(e) => io_error_to_status(&e),
+    }
+}
+
+/// `fs.open_rw(path)` — open an existing `path` (a `str` view) `O_RDWR` (`O_CLOEXEC` via Rust std;
+/// no create/truncate — the in-place update path), writing the owned `file` handle to `out`. A
+/// missing file surfaces as `Error.NotFound`. Returns `0` on success, else the mapped errno (leaving
+/// `*out` null). The fd is owned — `Drop` closes it.
+///
+/// # Safety
+/// `path`/`path_len` must describe a valid byte range; `out` must point to a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_open(path: *const u8, path_len: i64, out: *mut *mut RwFile) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    let Some(path_str) = (unsafe { path_from_view(path, path_len) }) else {
+        return AL_INVALID;
+    };
+    use std::os::fd::IntoRawFd;
+    match std::fs::OpenOptions::new().read(true).write(true).open(&path_str) {
+        Ok(f) => {
+            unsafe { *out = Box::into_raw(Box::new(RwFile { fd: f.into_raw_fd() })) };
+            0
+        }
+        Err(e) => io_error_to_status(&e),
+    }
+}
+
+/// Borrow a `std::fs::File` over an owned raw fd **without** taking ownership of it — the returned
+/// [`ManuallyDrop`] is never dropped, so the fd stays owned by the caller's `RwFile` (its `Drop`
+/// closes it exactly once). The idiomatic "operate on a raw fd through the std `File` API" bridge.
+///
+/// # Safety
+/// `fd` must be a valid, open file descriptor for the duration of the borrow.
+unsafe fn borrow_file(fd: i32) -> std::mem::ManuallyDrop<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// `f.pread(b: mut buffer, off)` — one positionless `pread(2)` into `b`'s window at file offset
+/// `off`, overwriting `b`'s length (mirrors [`align_rt_io_reader_read`]'s buffer-window discipline).
+/// Returns the actual number of bytes read (`0` = EOF; a short read surfaces as-is — a file's length
+/// is not statically knowable) on success, or `-(status)` where `status` is the errno mapped through
+/// [`io_error_to_status`] (the `reader.read` sign convention). Retries `EINTR`. A **negative** `off`
+/// aborts (a programmer bug, like a negative slice index).
+///
+/// # Safety
+/// `f` must be a valid `RwFile` and `b` a valid `Buffer` for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_pread(f: *mut RwFile, b: *mut Buffer, off: i64) -> i64 {
+    if f.is_null() || b.is_null() {
+        return -(AL_INVALID as i64);
+    }
+    if off < 0 {
+        panic_abort("file.pread: negative offset");
+    }
+    let fd = unsafe { (*f).fd };
+    let b = unsafe { &mut *b };
+    if b.cap == 0 {
+        b.len = 0;
+        return 0;
+    }
+    // Ensure the backing storage spans the full capacity (the read fills up to `cap`) — the exact
+    // discipline `reader.read` uses.
+    if b.data.len() != b.cap {
+        b.data.resize(b.cap, 0);
+    }
+    use std::os::unix::fs::FileExt;
+    let file = unsafe { borrow_file(fd) };
+    let cap = b.cap;
+    loop {
+        match file.read_at(&mut b.data[..cap], off as u64) {
+            Ok(n) => {
+                b.len = n;
+                return n as i64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                b.len = 0;
+                return -(io_error_to_status(&e) as i64);
+            }
+        }
+    }
+}
+
+/// `f.pwrite(data, off)` — write **all** of `data` at file offset `off`, looping over partial
+/// `pwrite(2)`s internally (each partial write advances the target offset; a write past EOF extends
+/// the file per POSIX) and retrying `EINTR` — the `write_all` precedent: a relayout must never
+/// silently short-write. Returns the full byte count written (`== len`) on success, or `-(status)`
+/// on error (the `reader.read` sign convention). A **negative** `off` aborts.
+///
+/// # Safety
+/// `f` must be a valid `RwFile`; `ptr`/`len` must describe a valid byte range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_pwrite(f: *mut RwFile, ptr: *const u8, len: i64, off: i64) -> i64 {
+    if f.is_null() {
+        return -(AL_INVALID as i64);
+    }
+    if off < 0 {
+        panic_abort("file.pwrite: negative offset");
+    }
+    if len <= 0 || ptr.is_null() {
+        return 0; // nothing to write — success (0 bytes)
+    }
+    let Ok(n) = safe_len(len) else {
+        return -(AL_INVALID as i64);
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
+    let fd = unsafe { (*f).fd };
+    use std::os::unix::fs::FileExt;
+    let file = unsafe { borrow_file(fd) };
+    // `write_all_at` loops to full (advancing the offset by each partial write) and ignores `EINTR`
+    // — the positional analog of `write_all`. It never touches the fd's own offset (`pwrite`).
+    match file.write_all_at(bytes, off as u64) {
+        Ok(()) => n as i64,
+        Err(e) => -(io_error_to_status(&e) as i64),
+    }
+}
+
+/// `f.len()` — the file's current byte length via a **live** `fstat` (`metadata()`; never cached —
+/// the caller's own `pwrite` changes it). Returns the length (`>= 0`) on success, or `-(status)` on
+/// error (the `reader.read` sign convention). A length that does not fit `i64` saturates to
+/// `i64::MAX` (unreachable for a real file, but keeps the sign convention total).
+///
+/// # Safety
+/// `f` must be a valid `RwFile` pointer for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_len(f: *mut RwFile) -> i64 {
+    if f.is_null() {
+        return -(AL_INVALID as i64);
+    }
+    let fd = unsafe { (*f).fd };
+    let file = unsafe { borrow_file(fd) };
+    match file.metadata() {
+        Ok(m) => i64::try_from(m.len()).unwrap_or(i64::MAX),
+        Err(e) => -(io_error_to_status(&e) as i64),
+    }
+}
+
+/// Free a `file`, closing its fd. Null-safe (a never-initialised owned slot drops harmlessly).
+///
+/// # Safety
+/// `f` must be null or a pointer from [`align_rt_io_file_create`] / [`align_rt_io_file_open`], not
+/// yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_free(f: *mut RwFile) {
+    if f.is_null() {
+        return;
+    }
+    let f = unsafe { Box::from_raw(f) };
+    unsafe { close(f.fd) };
+}
+
 // --- buffer -----------------------------------------------------------------------------------
 
 /// A `buffer` (`core.buffer`) — an owned, growable byte container (the byte analog of `Vec<u8>`),
@@ -11356,6 +11543,172 @@ mod tests {
 
         unsafe { align_rt_buffer_free(b) };
         unsafe { align_rt_io_reader_free(r) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- file (offset-addressed read/write, A4) ------------------------------------------------
+
+    #[test]
+    fn file_pwrite_pread_roundtrip_and_len_tracks_growth() {
+        // create_rw → pwrite at offsets (incl. a past-EOF extension) → pread back at offsets → len.
+        let mut path = std::env::temp_dir();
+        path.push(format!("align_rt_file_rw_{}", std::process::id()));
+        let pb = path.to_str().unwrap().as_bytes();
+
+        let mut f: *mut RwFile = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_file_create(pb.as_ptr(), pb.len() as i64, &mut f) }, 0);
+        assert!(!f.is_null());
+
+        // pwrite "Hello, " at 0 then "World!" at 7 (contiguous) — each returns the full length.
+        assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"Hello, ".as_ptr(), 7, 0) }, 7);
+        assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"World!".as_ptr(), 6, 7) }, 6);
+        // len tracks the growth — a live fstat, not cached.
+        assert_eq!(unsafe { align_rt_io_file_len(f) }, 13);
+
+        // A pwrite past EOF extends the file (a 13..20 hole of zeros).
+        assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"Z".as_ptr(), 1, 20) }, 1);
+        assert_eq!(unsafe { align_rt_io_file_len(f) }, 21);
+
+        // pread "World!" back at offset 7 into a 6-byte window.
+        let b = align_rt_buffer_new(6);
+        assert_eq!(unsafe { align_rt_io_file_pread(f, b, 7) }, 6);
+        let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
+        unsafe { align_rt_buffer_bytes(b, &mut view) };
+        assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"World!");
+
+        // The hole reads back as zeros.
+        assert_eq!(unsafe { align_rt_io_file_pread(f, b, 13) }, 6);
+        unsafe { align_rt_buffer_bytes(b, &mut view) };
+        assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"\0\0\0\0\0\0");
+
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_file_free(f) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_pread_short_at_eof_returns_actual_count() {
+        // A short read near EOF surfaces the actual count (not the window size); reading at/past EOF
+        // returns 0. (A file's length is not statically knowable, so no out-of-range abort.)
+        let mut path = std::env::temp_dir();
+        path.push(format!("align_rt_file_short_{}", std::process::id()));
+        let pb = path.to_str().unwrap().as_bytes();
+
+        let mut f: *mut RwFile = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_file_create(pb.as_ptr(), pb.len() as i64, &mut f) }, 0);
+        assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"abcde".as_ptr(), 5, 0) }, 5);
+
+        // An 8-byte window at offset 2: only 3 bytes remain ("cde") — the actual count.
+        let b = align_rt_buffer_new(8);
+        assert_eq!(unsafe { align_rt_io_file_pread(f, b, 2) }, 3);
+        let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
+        unsafe { align_rt_buffer_bytes(b, &mut view) };
+        assert_eq!(unsafe { safe_slice(view.ptr, view.len) }, b"cde");
+        // At EOF (5) and well past it (100) the read is 0.
+        assert_eq!(unsafe { align_rt_io_file_pread(f, b, 5) }, 0);
+        assert_eq!(unsafe { align_rt_io_file_pread(f, b, 100) }, 0);
+
+        unsafe { align_rt_buffer_free(b) };
+        unsafe { align_rt_io_file_free(f) };
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_open_rw_missing_maps_to_not_found() {
+        // `fs.open_rw` requires the file to exist — a missing path is `Error.NotFound` (no create).
+        let path = "/nonexistent-align-dir/align_rt_file_missing";
+        let mut f: *mut RwFile = std::ptr::null_mut();
+        let s = unsafe { align_rt_io_file_open(path.as_ptr(), path.len() as i64, &mut f) };
+        assert_eq!(s, AL_NOT_FOUND);
+        assert!(f.is_null(), "the out slot stays null on error");
+    }
+
+    #[test]
+    fn file_open_rw_updates_in_place() {
+        // `fs.open_rw` reopens an existing file O_RDWR without truncating — an in-place region update.
+        let mut path = std::env::temp_dir();
+        path.push(format!("align_rt_file_inplace_{}", std::process::id()));
+        let pb = path.to_str().unwrap().as_bytes();
+
+        let mut f: *mut RwFile = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_file_create(pb.as_ptr(), pb.len() as i64, &mut f) }, 0);
+        assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"aaaaaa".as_ptr(), 6, 0) }, 6);
+        unsafe { align_rt_io_file_free(f) };
+
+        // Reopen (must exist, no truncate) and overwrite the middle two bytes.
+        let mut g: *mut RwFile = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_file_open(pb.as_ptr(), pb.len() as i64, &mut g) }, 0);
+        assert_eq!(unsafe { align_rt_io_file_len(g) }, 6, "open_rw does not truncate");
+        assert_eq!(unsafe { align_rt_io_file_pwrite(g, b"XY".as_ptr(), 2, 2) }, 2);
+        unsafe { align_rt_io_file_free(g) };
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"aaXYaa");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_negative_offset_is_rejected_at_the_ffi_boundary() {
+        // A negative offset aborts the process (a programmer bug). The abort itself can't be caught
+        // here, so verify the pre-abort FFI guards: a null handle is `-(AL_INVALID)`, and a valid
+        // non-negative write succeeds — the abort path is exercised end-to-end by the driver test.
+        assert_eq!(unsafe { align_rt_io_file_pwrite(std::ptr::null_mut(), b"x".as_ptr(), 1, 0) }, -(AL_INVALID as i64));
+        assert_eq!(unsafe { align_rt_io_file_pread(std::ptr::null_mut(), std::ptr::null_mut(), 0) }, -(AL_INVALID as i64));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_no_fd_leak_across_cycles() {
+        // N create_rw → pwrite → pread → free cycles must NOT accumulate open fds (the fd is closed on
+        // every `Drop`). Samples `/proc/self/fd`. This runs in the shared test binary alongside
+        // parallel tests, so the global fd count is perturbed by a bounded amount; hold the fd-sensitive
+        // tests' lock (the dominant perturbers are the network tests) and assert the delta stays far
+        // below `N` — a real leak (one fd per cycle) would grow the count by `N`, which no transient
+        // parallel noise approaches.
+        let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count_fds = || -> Option<usize> { std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count()) };
+        let mut path = std::env::temp_dir();
+        path.push(format!("align_rt_file_leak_{}", std::process::id()));
+        let pb = path.to_str().unwrap().as_bytes();
+
+        const N: usize = 128;
+        let before = count_fds();
+        for _ in 0..N {
+            let mut f: *mut RwFile = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_io_file_create(pb.as_ptr(), pb.len() as i64, &mut f) }, 0);
+            assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"payload".as_ptr(), 7, 0) }, 7);
+            let b = align_rt_buffer_new(7);
+            assert_eq!(unsafe { align_rt_io_file_pread(f, b, 0) }, 7);
+            unsafe { align_rt_buffer_free(b) };
+            unsafe { align_rt_io_file_free(f) };
+        }
+        if let (Some(before), Some(after)) = (before, count_fds()) {
+            assert!(
+                after <= before + N / 2,
+                "create_rw/free cycles must not leak fds: before={before} after={after} (N={N}); a real leak would be ~+{N}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn file_fds_are_cloexec() {
+        // A `create_rw` / `open_rw` fd must be `O_CLOEXEC` (the net/process fd discipline) — Rust std's
+        // `OpenOptions` sets it by default, preserved by `into_raw_fd`. A leaked fd across an `exec`
+        // would be a resource/security bug.
+        let mut path = std::env::temp_dir();
+        path.push(format!("align_rt_file_cloexec_{}", std::process::id()));
+        let pb = path.to_str().unwrap().as_bytes();
+
+        let mut f: *mut RwFile = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_file_create(pb.as_ptr(), pb.len() as i64, &mut f) }, 0);
+        assert!(fd_is_cloexec(unsafe { (*f).fd }), "a fs.create_rw fd must be CLOEXEC");
+        unsafe { align_rt_io_file_free(f) };
+
+        let mut g: *mut RwFile = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_file_open(pb.as_ptr(), pb.len() as i64, &mut g) }, 0);
+        assert!(fd_is_cloexec(unsafe { (*g).fd }), "a fs.open_rw fd must be CLOEXEC");
+        unsafe { align_rt_io_file_free(g) };
         let _ = std::fs::remove_file(&path);
     }
 

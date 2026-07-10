@@ -668,6 +668,24 @@ pub enum ExprKind {
     /// loop; `sendfile`/`splice` fast paths stay post-M9 (`open-questions.md` "Transparent
     /// zero-copy I/O"), added without changing this node.
     IoCopy { reader: Box<Expr>, writer: Box<Expr> },
+    /// `fs.create_rw(path)` — open `path` (a `str`) `O_RDWR|O_CREAT|O_TRUNC` for offset-addressed
+    /// block I/O; the `ty` is `Result<file, Error>`. The returned `file` owns its fd (closed on
+    /// `Drop`). Impure (touches the filesystem). (align-LLM runway A4.)
+    FileCreateRw { path: Box<Expr> },
+    /// `fs.open_rw(path)` — open an existing `path` (a `str`) `O_RDWR` for in-place update; the `ty`
+    /// is `Result<file, Error>`. The returned `file` owns its fd (closed on `Drop`). Impure. (A4.)
+    FileOpenRw { path: Box<Expr> },
+    /// `f.pread(b: mut buffer, off)` — one positionless read at file offset `off` into `b`
+    /// (overwriting its length), borrowing both `file` and `buffer` (neither consumed). The `ty` is
+    /// `Result<i64, Error>` (actual bytes read; `0` = EOF). Impure. A negative `off` aborts. (A4.)
+    FilePread { file: Box<Expr>, buffer: Box<Expr>, offset: Box<Expr> },
+    /// `f.pwrite(data, off)` — write **all** of `data` (a `bytes` view) at file offset `off`,
+    /// borrowing `file` (not consumed). The `ty` is `Result<i64, Error>` (the full byte count).
+    /// Impure. A negative `off` aborts; a write past EOF extends the file. (A4.)
+    FilePwrite { file: Box<Expr>, data: Box<Expr>, offset: Box<Expr> },
+    /// `f.len()` — the file's live byte length (a fresh `fstat`), borrowing `file`. The `ty` is
+    /// `Result<i64, Error>`. Impure (a syscall — the length is not cached). (A4.)
+    FileLen { file: Box<Expr> },
     /// `buffer(cap)` — open an owned growable byte buffer with read window `cap` (a `str`-less byte
     /// sink for `reader.read`). The `ty` is [`crate::Ty::Buffer`] (an owned Move handle, `Drop`-freed).
     /// Pure (allocation only), like `BuilderNew`.

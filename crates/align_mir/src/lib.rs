@@ -496,6 +496,24 @@ pub enum Rvalue {
     /// fixed-size buffer (O(buffer) memory), borrowing both. Yields an `i64`: bytes transferred on
     /// success, or `-(status)` on error (same sign convention as [`Self::ReaderRead`]).
     IoCopy(Operand, Operand),
+    /// `fs.create_rw(path)`: open `path` `O_RDWR|O_CREAT|O_TRUNC`, writing the owned `file` handle
+    /// into `out`. Yields an `i32` errno-status (0 = ok). Mirrors [`Self::ReaderOpen`]. (A4.)
+    FileCreateRw { path: Operand, out: Slot },
+    /// `fs.open_rw(path)`: open an existing `path` `O_RDWR`, writing the owned `file` handle into
+    /// `out`. Yields an `i32` errno-status (0 = ok). (A4.)
+    FileOpenRw { path: Operand, out: Slot },
+    /// `f.pread(b, off)` — one positionless read at file offset `off` into the `buffer` `b`,
+    /// borrowing both. Yields an `i64`: actual bytes read (`0` = EOF) on success, or `-(status)` on
+    /// error (the [`Self::ReaderRead`] sign convention). A negative `off` aborts in the runtime. (A4.)
+    FilePread { file: Operand, buffer: Operand, offset: Operand },
+    /// `f.pwrite(data, off)` — write **all** of the `data` (`bytes`) operand at file offset `off`,
+    /// borrowing the file. Yields an `i64`: the full byte count on success, or `-(status)` on error
+    /// (the [`Self::ReaderRead`] sign convention). A negative `off` aborts in the runtime. (A4.)
+    FilePwrite { file: Operand, data: Operand, offset: Operand },
+    /// `f.len()` — the file's live byte length (a fresh `fstat`), borrowing the file. Yields an
+    /// `i64`: the length (`>= 0`) on success, or `-(status)` on error (the [`Self::ReaderRead`] sign
+    /// convention). (A4.)
+    FileLen { file: Operand },
     /// `buffer(cap)` — open an owned byte buffer with read window `cap`, yielding an opaque handle.
     BufferNew(Operand),
     /// `b.bytes()` — a `slice<u8>` view `{ptr,len}` of the buffer's current contents (borrow).
@@ -1248,7 +1266,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -1646,6 +1664,13 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).
         hir::ExprKind::ReaderOpen { path } => lower_open_handle(b, path, Ty::Reader, e.ty, |p, out| Rvalue::ReaderOpen { path: p, out }),
         hir::ExprKind::WriterCreate { path } => lower_open_handle(b, path, Ty::Writer, e.ty, |p, out| Rvalue::WriterCreate { path: p, out }),
+        // All A4 `file` ops — the two constructors (`fs.create_rw`/`fs.open_rw`, `Result<file, Error>`)
+        // and the three methods (`pread`/`pwrite`/`len`, `Result<i64, Error>`) — go through ONE
+        // `#[inline(never)]` dispatcher, so they add a single tiny arm to the recursive `lower_expr`
+        // frame rather than five inline bodies (the #296 expr-depth lesson; `lower_expr`'s debug frame
+        // is depth-multiplied, so keeping it flat matters).
+        hir::ExprKind::FileCreateRw { .. } | hir::ExprKind::FileOpenRw { .. }
+        | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePwrite { .. } | hir::ExprKind::FileLen { .. } => lower_file_expr(b, e),
         hir::ExprKind::ReaderStdin => {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::ReaderStdin));
@@ -5416,6 +5441,47 @@ fn lower_process_spawn(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, resul
     Operand::Value(r)
 }
 
+/// All A4 `file` ops (`fs.create_rw`/`fs.open_rw` constructors + `pread`/`pwrite`/`len` methods).
+/// `#[inline(never)]` so the recursive `lower_expr` gains one tiny arm, not five inline bodies (the
+/// #296 expr-depth frame lesson). The constructors mirror `fs.open` (`Result<file, Error>`); the
+/// methods yield the runtime i64 count-or-status wrapped into `Result<i64, Error>` (the `reader.read`
+/// sign convention); the file is borrowed (never consumed).
+#[inline(never)]
+fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let result_ty = e.ty;
+    match &e.kind {
+        hir::ExprKind::FileCreateRw { path } => {
+            lower_open_handle(b, path, Ty::File, result_ty, |p, out| Rvalue::FileCreateRw { path: p, out })
+        }
+        hir::ExprKind::FileOpenRw { path } => {
+            lower_open_handle(b, path, Ty::File, result_ty, |p, out| Rvalue::FileOpenRw { path: p, out })
+        }
+        hir::ExprKind::FilePread { file, buffer, offset } => {
+            let fop = lower_expr(b, file);
+            let bop = lower_expr(b, buffer);
+            let oop = lower_expr(b, offset);
+            let n = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(n, Rvalue::FilePread { file: fop, buffer: bop, offset: oop }));
+            lower_count_or_status_result(b, n, result_ty)
+        }
+        hir::ExprKind::FilePwrite { file, data, offset } => {
+            let fop = lower_expr(b, file);
+            let dop = lower_expr(b, data);
+            let oop = lower_expr(b, offset);
+            let n = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(n, Rvalue::FilePwrite { file: fop, data: dop, offset: oop }));
+            lower_count_or_status_result(b, n, result_ty)
+        }
+        hir::ExprKind::FileLen { file } => {
+            let fop = lower_expr(b, file);
+            let n = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(n, Rvalue::FileLen { file: fop }));
+            lower_count_or_status_result(b, n, result_ty)
+        }
+        _ => unreachable!("lower_file_expr on a non-file op"),
+    }
+}
+
 /// `ch.wait()` → the runtime `waitpid`s (marking the child reaped through the borrow), returning the
 /// exit code (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
 /// helper (the `reader.read` sign convention). `child` is borrowed (never consumed — no move-out).
@@ -6695,6 +6761,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Writer => "writer".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
+        Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
         Ty::CliCommand => "cli command".to_string(),
         Ty::CliParsed => "cli parsed".to_string(),
