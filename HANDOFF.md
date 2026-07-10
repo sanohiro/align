@@ -5,7 +5,21 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-10, fifth wave (**#411 MERGED — `cl.get_many` (R5) + the `array<response>`
+_Last updated: 2026-07-10, sixth wave (**#412 MERGED — std.http Slice 5, HTTPS/TLS client — and
+M11 FORMALLY CLOSED**: `https://` works transparently through `cl.get/post/request/get_many` over
+OpenSSL libssl; mandatory verification = system trust store + hostname binding (`SSL_set1_host` /
+`set1_ip_asc` for IP literals, both mutation-pinned by negative tests incl. the gate-requested
+wrong-DNS-host case); Denied/Code/Invalid taxonomy; `(scheme,host,port)` pool key with live `SSL*`
+pooled; per-thread sigmask SIGPIPE. Security-weighted adversarial gate: SHIP, verification-bypass
+hunt clean. gemini: its security-critical "double-close" claim was **empirically disproven**
+(`SSL_set_fd` = BIO_NOCLOSE; `SSL_free` does NOT close the fd — the probe is now a permanent
+regression test) and its two valid mediums applied (pooled-conn teardown moved outside the pool
+Mutex). `cargo test --workspace` **1747 green**, clippy clean. **std.http COMPLETE, R1–R6 all met;
+M11 closed in the roadmap + CLAUDE.md.** Known follow-up: ja/http.md needs the natural-JA
+translation of the Slice-5 detail (status lines already synced). **Next: the align-LLM runway A4+**
+(seek/pread, growable `array<T>`, streaming line reads, arena checkpoint — open-questions →
+"align-LLM runway") **or M12 scoping.** Earlier same day, fifth wave (**#411 MERGED — `cl.get_many`
+(R5) + the `array<response>`
 opaque-Move-handle-array capability**; design settled same day by a second two-lens review
 (record: http.md item 6, f04cb96) — input-order **all-or-Err** (per-slot Result is inexpressible:
 `Result` is a `Ty`, never a `Scalar`), lowest-index error, run-to-completion, dedicated bounded

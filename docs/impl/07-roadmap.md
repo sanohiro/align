@@ -36,8 +36,7 @@ Denied/Code/Invalid taxonomy. With std.http done, **all M11 std-module work is c
 formal M11 close is the orchestrator's call (verify against `open-questions.md` before flipping the
 milestone header).
 
-**Next (in order):** the 2026-07-09 owed implementation deltas (struct-`==` sema diagnostic,
-no-shadowing error, the `loop` slice, the lexer escape-set gaps); then the M12 candidates recorded in
+**Next (in order):** the M12 candidates recorded in
 `open-questions.md` Open → "align-LLM runway".
 
 **Historical build sequence (2026-06 snapshot — kept for the build-order and decision record;
@@ -1352,7 +1351,15 @@ constant-time requirement verified, not just specified; `std.http` depends on TL
 `std.compress` depends on `libzstd`/`zlib-ng` (FFI). encoding/rand/cli ship first specifically
 because they close over already-existing mechanisms.
 
-## M11: std third wave — net / process / compress / crypto / http (IN PROGRESS)
+## M11: std third wave — net / process / compress / crypto / http — COMPLETE (formally closed 2026-07-10)
+
+All five modules are DONE with reviews reflected and their per-module completion conditions met:
+`std.net` (#371–#374), `std.process` (#376–#378), `std.compress` (#380–#381), `std.crypto`
+(#383–#388), and `std.http` in full — Slices 1–5 + `get_many` (#391, #392, #398, #409, #411, #412),
+with **R1–R6 all met** (keepalive 2.86×, get_many 15.4× overlap at degree 16 + Rust-pool parity,
+benches in `bench/http_client/README.md`). Deferral lists live per-module below; none gated
+completion (verified against `open-questions.md` at close — the loop slice shipped separately as
+#402, `process.exit` semantics settled+built, the crypto engine settlement stands).
 
 Design source of truth per module: `docs/impl/std-design/*.md` (#348). Order: net first (new
 Move types, no external engine), then process, then the FFI-engine modules (compress/crypto)
