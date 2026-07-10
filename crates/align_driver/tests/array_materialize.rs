@@ -66,6 +66,29 @@ fn bare_literal_in_owned_array_context_is_rejected() {
 }
 
 #[test]
+fn bare_literal_in_value_position_is_rejected() {
+    // A fixed array literal has no free-value MIR lowering; it can initialize a local or feed an
+    // array pipeline, but it cannot be the materialized value of a block/if/match expression.
+    let block = check_diagnostics(
+        "bare-array-block-value",
+        "fn main() {\n  xs := { [1, 2, 3] }\n  print(xs[0])\n}\n",
+    );
+    assert!(block.contains("bare array literal cannot be used as a block value"), "expected a block-value diagnostic:\n{block}");
+
+    let if_value = check_diagnostics(
+        "bare-array-if-value",
+        "fn main() {\n  xs := if true { [1, 2] } else { [3, 4] }\n  print(xs[0])\n}\n",
+    );
+    assert!(if_value.contains("bare array literal cannot be used as a block value"), "expected an if-branch value diagnostic:\n{if_value}");
+
+    let match_value = check_diagnostics(
+        "bare-array-match-value",
+        "fn pick(x: Option<i64>) {\n  xs := match x {\n    Some(_) => [1, 2]\n    None => [3, 4]\n  }\n  print(xs[0])\n}\nfn main() {}\n",
+    );
+    assert!(match_value.contains("bare array literal cannot be used as a `match` arm value"), "expected a match-arm value diagnostic:\n{match_value}");
+}
+
+#[test]
 fn fixed_array_literal_as_a_local_still_works() {
     if !backend_available() {
         return;
