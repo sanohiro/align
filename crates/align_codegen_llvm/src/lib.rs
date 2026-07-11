@@ -107,11 +107,16 @@ fn create_target_machine(target: &BuildTarget) -> Result<TargetMachine, CodegenE
 }
 
 /// Write the program as an object file.
+///
+/// Creates exactly one `TargetMachine` for the whole compile and threads it through both
+/// `build_module` (data layout / triple / ABI classification) and `write_object` (optimization +
+/// object emission), so the two stages always agree on the same target settings.
 pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    build_module(&ctx, &module, program, target)?;
-    write_object(&module, out, target)
+    let tm = create_target_machine(target)?;
+    build_module(&ctx, &module, program, &tm)?;
+    write_object(&module, out, &tm)
 }
 
 /// Render the program as textual LLVM IR (`alignc emit-llvm`).
@@ -120,12 +125,15 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget) -> Resul
 /// pre-optimization, the traditional `emit-llvm` view; `true` (`--stage optimized`) runs the same
 /// `-O2` middle-end pipeline `write_object` uses (via [`run_opt_pipeline`]) before printing, so the
 /// output is "what LLVM did" — inlined lambdas, fused loops, vectorized `<N x T>` bodies.
+///
+/// Creates exactly one `TargetMachine` for the whole call and reuses it for both `build_module`
+/// and (when `optimized`) the opt pipeline.
 pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    build_module(&ctx, &module, program, target)?;
+    let tm = create_target_machine(target)?;
+    build_module(&ctx, &module, program, &tm)?;
     if optimized {
-        let tm = create_target_machine(target)?;
         run_opt_pipeline(&module, &tm, "default<O2>")?;
     }
     Ok(module.print_to_string().to_string())
@@ -135,11 +143,10 @@ fn build_module<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
     program: &Program,
-    target: &BuildTarget,
+    tm: &TargetMachine,
 ) -> Result<(), CodegenError> {
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
-    let tm = create_target_machine(target)?;
     let target_data = tm.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
     // Pin the target triple too, so emitted IR (`alignc emit-llvm`) is self-describing: an external
@@ -7159,9 +7166,8 @@ fn run_opt_pipeline(module: &Module, tm: &TargetMachine, pipeline: &str) -> Resu
         .map_err(|e| CodegenError::Target(format!("optimization pipeline: {e}")))
 }
 
-fn write_object(module: &Module, out: &Path, target: &BuildTarget) -> Result<(), CodegenError> {
-    let tm = create_target_machine(target)?;
-    run_opt_pipeline(module, &tm, "default<O2>")?;
+fn write_object(module: &Module, out: &Path, tm: &TargetMachine) -> Result<(), CodegenError> {
+    run_opt_pipeline(module, tm, "default<O2>")?;
     tm.write_to_file(module, FileType::Object, out)
         .map_err(|e| CodegenError::Target(e.to_string()))
 }

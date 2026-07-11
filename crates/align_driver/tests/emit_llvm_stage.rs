@@ -3,9 +3,27 @@
 //! runs the `-O2` pipeline first, and any other `--stage` value is a clean argument error (exit 1
 //! with a diagnostic), never a panic.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn write_src(test_name: &str) -> std::path::PathBuf {
+/// A source file under `std::env::temp_dir()` that removes itself on drop — so a test file is
+/// cleaned up even if an assertion panics partway through (a bare `let _ =
+/// std::fs::remove_file(...)` right after the process runs never gets a chance to execute then).
+struct TempFile(PathBuf);
+
+impl TempFile {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn write_src(test_name: &str) -> TempFile {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("align-stage-{}-{}.align", std::process::id(), test_name));
     std::fs::write(
@@ -20,7 +38,7 @@ fn write_src(test_name: &str) -> std::path::PathBuf {
          }\n",
     )
     .expect("write src");
-    path
+    TempFile(path)
 }
 
 fn alignc() -> Command {
@@ -35,11 +53,10 @@ fn stage_optimized_runs_the_pipeline() {
     let src = write_src("stage_optimized_runs_the_pipeline");
     let out = alignc()
         .args(["emit-llvm"])
-        .arg(&src)
+        .arg(src.path())
         .args(["--stage", "optimized", "--target-cpu", "x86-64-v3"])
         .output()
         .expect("run alignc");
-    let _ = std::fs::remove_file(&src);
     assert!(out.status.success(), "exit: {:?}", out.status.code());
     let ir = String::from_utf8_lossy(&out.stdout);
     // Optimized: the loop vectorizer has run.
@@ -53,8 +70,7 @@ fn stage_raw_is_the_default_and_unoptimized() {
     }
     let src = write_src("stage_raw_is_the_default_and_unoptimized");
     // No `--stage` flag → default `raw`.
-    let out = alignc().args(["emit-llvm"]).arg(&src).output().expect("run alignc");
-    let _ = std::fs::remove_file(&src);
+    let out = alignc().args(["emit-llvm"]).arg(src.path()).output().expect("run alignc");
     assert!(out.status.success(), "exit: {:?}", out.status.code());
     let ir = String::from_utf8_lossy(&out.stdout);
     assert!(ir.contains("define"), "expected LLVM IR on stdout:\n{ir}");
@@ -66,11 +82,10 @@ fn stage_unknown_value_is_a_diagnostic_not_a_panic() {
     let src = write_src("stage_unknown_value_is_a_diagnostic_not_a_panic");
     let out = alignc()
         .args(["emit-llvm"])
-        .arg(&src)
+        .arg(src.path())
         .args(["--stage", "bogus"])
         .output()
         .expect("run alignc");
-    let _ = std::fs::remove_file(&src);
     assert_eq!(out.status.code(), Some(1), "a bad --stage value must fail cleanly");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("unknown --stage"), "want a stage diagnostic:\n{err}");
