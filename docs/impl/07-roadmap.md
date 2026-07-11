@@ -1996,10 +1996,38 @@ regression net that validates the upgrade.
     double-invocation); its one robustness note (RAII detach guard for the diagnostic handler —
     unwind-safe by construction) applied pre-merge. gemini: zero findings. Full outcome +
     deviations in `09-explain-opt.md`.
-- **Slice 4 — build profiles.** `--profile dev/release/fast/small/tiny` →
-  `default<O0|O2|O3|Os|Oz>` (deliberately the STOCK pipelines — no custom pass order until
-  remarks+benchmarks justify one) + per-profile linker flags (gc-sections/as-needed/strip) +
-  `alignc size` report (per-section, largest symbols, relocation and dynamic-dep counts).
+- **Slice 4 — build profiles + `alignc size` — DONE.** `--profile dev/release/fast/small/tiny`
+  selects the STOCK pipeline `default<O0|O2|O3|Os|Oz>` (no custom pass order — the consultation's
+  "deliberately NOT a custom pipeline" clause) + the profile-dependent strip choice. The whole
+  mechanism is **one enum**, `Profile` (in `align_codegen_llvm`, re-exported by the driver): it owns
+  the pipeline string (`Profile::pipeline`, threaded through the Slice-3a `run_opt_pipeline`) *and*
+  the linker strip decision (`Profile::strip`) — no scattered `match profile` ifs.
+  - **Default = `release`** (= today's `default<O2>`): no behavior change without the flag. Exact
+    names only, no aliases; a bad `--profile` is a diagnostic + exit 1, never a panic.
+  - **Linker flags**: `--gc-sections`/`--as-needed` stay unconditional for **every** profile
+    (correctness-neutral hygiene, not worth a second link path — even `dev` keeps them). `--strip-all`
+    is applied only by the **size** profiles (`small`/`tiny`); the speed profiles (`dev`/`release`/
+    `fast`) keep symbols so a crash backtrace / `perf` stays useful. (Pre-release, changeable.)
+  - **explain-opt + `emit-llvm --stage optimized` stay pinned at `default<O2>`** — they are
+    diagnostic *lenses* ("what release does"), not builds, so they do NOT take a profile (this also
+    keeps the 3a `vectorize_shapes` gate on its exact O2 path). Documented at `run_opt_pipeline`.
+  - **`alignc size <file.align> [--profile p]`** builds the source with the profile, then reports on
+    the produced executable: total size, per-section sizes (largest first), the top-10 largest
+    symbols, the relocation count, and the `DT_NEEDED` list. Input = an Align source (builds it), not
+    a pre-built binary — `size` tracks the profile that made the artifact. Implemented by shelling to
+    **binutils** (`readelf`/`nm` — already implicit toolchain deps via `cc`/`ld`); no new crate dep;
+    every tool call is failure-tolerant (a missing/erroring tool degrades one report block to a note).
+  - **Tests** (`build_profiles.rs`, +9; +1 `group_digits` unit): the enum mapping pinned exactly
+    (pipeline strings / strip set / exact-name parse / default = release); an in-process
+    codegen-differs check (O0 vs O3 objects differ → the pipeline reaches LLVM); subprocess CLI tests
+    for the `size` report shape, the `tiny` strip note, and the bad-`--profile` diagnostic. 1868 green
+    (+10); clippy `-D warnings` clean; the 3a gate stays green on its pinned O2 path.
+  - **Bench** (`bench/binary_size/profiles.sh`, + a `pipe.align` pipeline prog): per-profile size +
+    stripped-state + gated-deps table. Representative (x86-64, release runtime): `hello`
+    dev/release/fast ≈ 4,274,568 B (symbols) → small/tiny = 324,496 B (stripped); `pipe`
+    ≈ 4,290,816 B → 336,784 B. The strip win dominates (the runtime staticlib's symbol/debug info);
+    the O-level difference is negligible on these runtime-dominated programs. LLVM does NOT guarantee
+    `Oz ≤ Os ≤ O2` byte-for-byte, so the table reports reality, asserts no fragile ordering.
 - **Slice 5 — internal ABI + argument attributes (the big one; may split at implementation
   time).** Flatten slice/str/Option/Result/closure-env into scalar SSA components inside the
   internal ABI (aggregates only at external boundaries); derive per-argument attributes from

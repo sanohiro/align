@@ -1,0 +1,9 @@
+// A data-oriented pipeline kernel (map/filter/reduce over a runtime-length slice) — the code the
+// profile's optimization level actually acts on. Kept live via `print` so nothing folds away.
+fn main(args: array<str>) -> Result<(), Error> {
+  a := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  s : slice<i64> := a[0..args.len()]
+  total := s.map(fn x: i64 { x * 3 }).where(fn x: i64 { x > 5 }).sum()
+  print(total)
+  return Ok(())
+}
