@@ -2091,11 +2091,45 @@ regression net that validates the upgrade.
   exists; generated and user-wrap arithmetic are the same `Rvalue::Bin` — a sound version is a
   large new pass for a benefit SCEV largely recovers post-inline, at the highest miscompile
   risk in the slice).
-- **Slice V — verification bundle.** (a) `BuildTarget::Cpu(name)` passes an empty feature string —
-  objdump-verify the CPU name alone selects the right ISA per target, or fix; (b) cold-edge
-  `!prof` weights on `?`/bounds/abort edges — MEASURE first, ship iff it wins (the A8 gate
-  precedent); (c) the Clang-IR comparison harness (compile semantically-equal C with the same
-  LLVM, diff optimized IR/assembly) for 3–5 core kernels.
+- **Slice V — verification bundle — DONE 2026-07-11.** (a) `BuildTarget::Cpu(name)` passes an
+  empty feature string — objdump-verify the CPU name alone selects the right ISA per target, or
+  fix; (b) cold-edge `!prof` weights on `?`/bounds/abort edges — MEASURE first, ship iff it wins
+  (the A8 gate precedent); (c) the Clang-IR comparison harness (compile semantically-equal C with
+  the same LLVM, diff optimized IR/assembly) for 3–5 core kernels. **Verdicts:**
+  - **(a) empty feature string is CORRECT — no fix; PINNED.** `create_target_machine(cpu, "")`
+    derives the ISA feature set from the CPU *name* itself (LLVM `getFeaturesForCPU`), so
+    `x86-64-v3` enables AVX2 and the backend selects `ymm`/`vpaddq`; `x86-64-v2` stays SSE
+    (`xmm`/`paddq`, no `ymm`); a named CPU (`skylake`) enables AVX2 too. `vectorize_shapes.rs`
+    already pinned the *IR* widths (`<4 x i64>` at v3, `<2 x i64>` at v2); the new
+    `target_cpu_isa.rs` pins the residual — actual **instruction selection** — via objdump,
+    gated on x86-64 host + backend + `objdump` (skips cleanly otherwise).
+  - **(b) cold-edge `!prof` — MOOT; below-gate; SHIPPED NOTHING.** Gate stated before measuring:
+    ship iff a targeted microbench wins consistently >3% OR objdump shows a better hot-path
+    layout. Finding: LLVM already infers the coldness. Bounds/abort/div branches have their
+    taken-successor block end in `unreachable` (MIR emits it after the diverging call), and Slice
+    5 marked the fail family `noreturn` — so BranchProbabilityInfo's unreachable/noreturn
+    heuristics already assign the edge ~0 probability and MachineBlockPlacement already sinks the
+    fail path off the hot fall-through. A prototype that attached explicit `!prof branch_weights`
+    to exactly those branches produced **byte-for-byte identical machine code** across three
+    kernel shapes (vectorized bounds loop, scalar gather with data-dependent index, div-checked
+    loop) — a strictly stronger result than a wall-clock tie. Reverted; the mechanism that makes
+    it moot (`noreturn` on the fail family) is already pinned by Slice 5's `rt_contract` test.
+    (`?`-propagation edges are NOT cold — an `Err` is an ordinary value returned, not
+    `unreachable` — so they correctly received no weight; the roadmap's grouping of `?` with
+    bounds/abort was optimistic.)
+  - **(c) harness SHIPPED at `bench/clang_ir_compare/`.** Five kernel pairs (map+sum, masked
+    where+sum, map_into two-slice, hash-fold recurrence, scan negative control) compiled through
+    the same LLVM 19 (Align `emit-llvm --stage optimized` vs `clang-19 -O2`, same
+    `--target-cpu`/`-march`), diffing the load-bearing optimized-IR shape (vectorized? width?
+    reduction intrinsic? memcheck?). **Baseline: all five MATCH** — Align's declarative pipeline
+    lowers to the same optimized vector shape as idiomatic C. Divergences recorded (findings, not
+    fixed): clang interleaves the vector loop more aggressively (same width/reduction, more ops
+    per body — a throughput lead); clang `-O2` emits *numbered* blocks so the `vector.body`/
+    `vector.memcheck` *strings* don't transfer cross-toolchain (Align keeps LLVM's named blocks —
+    so `vectorize_shapes.rs`'s string assertions are Align-internal only; cross-toolchain signals
+    must be semantic); and Align's `out dst` gives k3 its no-alias (no memcheck) for free at the
+    type level where C needs `restrict`. A `clang_ir_compare.rs` smoke test runs the harness when
+    clang-19 is present (skips otherwise).
 
 **Completion condition:** all slices merged with the standing slice-flow; the shape/size/bench
 regression net is green and becomes the LLVM-upgrade gate.

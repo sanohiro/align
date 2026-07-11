@@ -1,0 +1,13 @@
+// K5 — prefix scan (NEGATIVE CONTROL). Loop-carried (element i depends on i-1): must NOT
+// vectorize. Confirms the harness reports a scalar loop where one is expected, on both sides.
+fn add(a: i64, x: i64) -> i64 = a + x
+fn run(xs: slice<i64>) -> i64 {
+  ps := xs.scan(0, add)
+  ps[xs.len() - 1]
+}
+fn main(args: array<str>) -> Result<(), Error> {
+  a := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  s : slice<i64> := a[0..args.len()]
+  print(run(s))
+  return Ok(())
+}
