@@ -1955,15 +1955,29 @@ regression net that validates the upgrade.
   crypto/tls (→ `libcrypto` alone) needs a runtime-crate split by feature area — see
   `open-questions.md` Open → "Runtime staticlib feature-split". This entry supersedes the
   "always-linked" linking notes in `std-design/{compress,crypto,http}.md`.
-- **Slice 3 — optimized-IR emission + remarks translation.** `emit-llvm --stage raw|optimized`
-  (today only pre-`run_passes` IR exists); capture LLVM `-Rpass*`-class remarks and translate
-  them to Align-language diagnostics (`alignc explain-opt`: "the pipeline at app.align:42 was not
-  vectorized — source and destination may overlap; use an `out` parameter"). Build the
-  **vectorization IR-shape suite** from the Vectorizers.html catalog (unknown-trip-count /
-  reduction / if-conversion / noalias-two-slices / masked-filter / pointer-induction …) — the
-  LLVM-upgrade gate. Design the remark surface so the recorded follow-on (the AI optimization
-  loop: `--format json` machine-readable reports, the itemized optimization score report, and
-  CI count-regression gates — see the consultation digest) can grow out of it without rework.
+- **Slice 3 — optimized-IR emission + remarks translation. Design SETTLED 2026-07-11** by a
+  two-lens review (compiler-integration / user-surface+AI-loop), integrated record =
+  **`docs/impl/09-explain-opt.md`** (the implementation source of truth). Split in two:
+  - **Slice 3a — `emit-llvm --stage raw|optimized` + the vectorization IR-shape suite.**
+    Extract `run_opt_pipeline` from `write_object`; default `--stage raw`. 8-kernel suite
+    (`vectorize_shapes.rs`, pinned `x86-64-v3`; 3 kernels already empirically verified —
+    map+sum/where+sum vectorize, scan is the loop-carried negative control) asserting on
+    OPTIMIZED IR — **this suite is the LLVM-upgrade gate**; pins reality incl. negative
+    controls. Needs neither remarks nor debug info; ships first.
+  - **Slice 3b — debug-loc anchoring + remarks capture + `alignc explain-opt`.** Empirically
+    confirmed prerequisites: codegen emits zero DILocations and MIR is span-free → remarks
+    anchor at `<unknown>:0:0` today; fix = per-block `stmt_lines` MIR plumbing + opt-in inkwell
+    DI emission (only under explain-opt; normal builds byte-identical). Capture = the only
+    C-API path: process-global `LLVMParseCommandLineOptions(-pass-remarks*)` behind `Once` +
+    `LLVMContextSetDiagnosticHandler` (flat `file:line:col: message` strings — no structured
+    RemarkName without a C++ shim, deferred with record). Surface: new verb `explain-opt`
+    (report not build; exit 0 regardless of miss count), missed/actionable by default +
+    one-line success summary + bucket count, `--verbose` for passed/raw/internal; v1
+    translation scope = loop-vectorize (full) + pipeline-critical inline misses + slp passed;
+    honesty rule (never upgrade a cost-model decline into a cause; no fabricated suggestions);
+    internal locations suppressed, never fabricated. Build `Vec<OptRecord>` first, render
+    second — `--format json` / score / CI gates stay pure extensions (deferral list in the
+    design doc).
 - **Slice 4 — build profiles.** `--profile dev/release/fast/small/tiny` →
   `default<O0|O2|O3|Os|Oz>` (deliberately the STOCK pipelines — no custom pass order until
   remarks+benchmarks justify one) + per-profile linker flags (gc-sections/as-needed/strip) +
