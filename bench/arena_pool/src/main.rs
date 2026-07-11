@@ -42,12 +42,14 @@ fn run_arena(iters: usize) -> (Duration, u64) {
         // The big template buffer — write a byte pattern and fold a couple of bytes into the checksum
         // so the allocation + touch cannot be optimized away.
         let big = unsafe { align_rt_arena_alloc(a, BIG as i64, 8) };
+        assert!(!big.is_null(), "arena alloc failed");
         unsafe {
             core::ptr::write_bytes(big, (i & 0xff) as u8, BIG);
             sum = sum.wrapping_add(*big as u64).wrapping_add(*big.add(BIG - 1) as u64);
         }
         for k in 0..SMALL_COUNT {
             let p = unsafe { align_rt_arena_alloc(a, SMALL as i64, 8) };
+            assert!(!p.is_null(), "arena alloc failed");
             unsafe {
                 core::ptr::write_bytes(p, (k & 0xff) as u8, SMALL);
                 sum = sum.wrapping_add(*p as u64);
