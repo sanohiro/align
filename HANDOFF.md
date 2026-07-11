@@ -5,7 +5,20 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, fourth wave (**the roadmap beyond M12 is now PLANNED, 8a47cc0**: the
+_Last updated: 2026-07-11, fifth wave (**M12 COMPLETE — A5-SSE MERGED as #417**, the last M12
+slice. `ctx.respond_stream(rb)` (header-only rb → abort, consumes both, auto TE:chunked for 1.1 /
+close-delimited raw for 1.0 via a threaded version bool, single-sourced `http_serialize_head` with
+`respond`) + Move `http_stream` (`send` = one length-driven chunk frame per write, `send("")` =
+no-op, EPIPE → poison; `finish()` = the sole clean terminator `0\r\n\r\n`; Drop = close-only — the
+settled amendment). Protocol-weighted adversarial gate SHIP zero defects (framing proven
+length-driven by raw-socket decode — a payload that IS a fake `0\r\n\r\n` survives; hex lowercase;
+poison/truncation/leak all confirmed). gemini's 3 mediums applied (target-independent hex buffer,
+poison short-circuit placed after the empty-noop check to keep send("")=Ok, pre-sized send buffer).
+Rebased past the day's docs commits (roadmap A8 record-and-close kept, A5→DONE). `cargo test
+--workspace` **1813 green**. **M12 is now fully closed** (A4 #413 / A6 #414 / A7 #415 / A8 #416
+below-gate / A5-SSE #417) — the align-LLM Phase-0→4 + gateway language prerequisites are all in
+place. **Next: M13** (codegen quality & link hygiene — see below). Earlier: fourth wave (**the
+roadmap beyond M12 is now PLANNED, 8a47cc0**: the
 owner's out-of-repo GPT-5.6 optimization consultation was read in full by Fable, three claimed
 gaps empirically confirmed (zero linkage settings in codegen; `emit-llvm` is pre-opt only; the
 unconditional `-lz -lzstd -lcrypto -lssl …` link), and the whole thing triaged into an

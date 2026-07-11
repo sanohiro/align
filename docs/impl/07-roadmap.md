@@ -1680,12 +1680,19 @@ and http last (needs net + TLS).
     `-D warnings` clean; expr-depth driver test still 5/5. **Slice 5 (HTTPS/TLS) + `get_many` (R5)
     remain.**
 
-## M12: align-LLM runway — offset I/O / typed accumulation / streaming / arena checkpoint (IN PROGRESS)
+## M12: align-LLM runway — offset I/O / typed accumulation / streaming / arena checkpoint — COMPLETE (2026-07-11)
 
 The M12 set = the align-LLM runway A-list remainder (`open-questions.md` Open → "align-LLM
 runway"; A1–A3 + A5's server half shipped pre-M12 as #399/#401/#402/#409). Items marked
-*(general)* are ordinary fast-systems needs, not engine-specific. Build order below. Both new
-Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries have no Drop).
+*(general)* are ordinary fast-systems needs, not engine-specific. Both new Move types inherit
+the standing v1 bind-to-local rule (unbound Move temporaries have no Drop). **All slices resolved:**
+A4 offset file I/O (#413), A6 `array_builder<T>` (#414), A7 streaming line reads (#415), A8
+per-request arena reuse (#416, measured-below-gate record-and-close — the drop-the-re-zero
+follow-up carries the 13.5× upper bound), A5-SSE `respond_stream`/`http_stream` (#417). With this,
+**the align-LLM Phase-0→4 + gateway (Phase 7) language prerequisites are all in place** (GGUF
+inspect, trace aggregation via read_line→array_builder, alignpack relayout via offset I/O, the
+gateway's http server + get_many + client TLS + SSE streaming). `cargo test --workspace` 1813
+green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave).
 
 - **Slice A4 — `std.fs`/`std.io` offset-addressed file I/O — DONE (2026-07-11).** Shipped the
   new Move type **`file`** (`Ty::File`/`Scalar::File`): `fs.create_rw`/`fs.open_rw` →
