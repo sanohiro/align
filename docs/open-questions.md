@@ -2488,6 +2488,12 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    flow-sensitive epochs); `loop { arena {} }` is the safe-subset scoped form, and the slice is a
    pure-runtime thread-local `Box<Arena>` pool (unmap-first, chunks-only, re-zeroed, capped) behind
    a measure-first ship gate (≥ ~1.15× on the gateway shape, else record-and-close).
+   **OUTCOME 2026-07-11: MEASURED, BELOW GATE, RECORD-AND-CLOSE — the pool was built to spec and
+   benchmarked at ~1.06× over pre-pool (`bench/arena_pool`), short of the ≥ ~1.15× gate, so it was
+   reverted (not shipped).** The mandated full-64-KiB re-zero (≈480 ns) dwarfs the ≈32 ns of
+   malloc/free pooling removes; the no-re-zero variant is 13.5× (the recorded drop-the-re-zero
+   follow-up), so the win lives entirely in that separate slice, not this one. Full record + measured
+   matrix = roadmap M12 Slice A8; the feature-gated prototype is preserved in git history.
 
 **B. Design stances to record now (implement with their consumers):**
 

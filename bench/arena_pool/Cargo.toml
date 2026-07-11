@@ -1,0 +1,22 @@
+[package]
+name = "arena-pool-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Detach from the parent Align workspace: this bench depends on `align_runtime` as an ordinary Rust
+# path dependency and drives the arena's C-ABI entry points directly, so it measures the *shipped*
+# runtime code. Keep its build isolated from the compiler crates.
+[workspace]
+
+# The arena pool (M12 A8) was measured below the ship gate and reverted (see README.md); as shipped
+# this bench times the pre-pool arena vs bumpalo vs malloc. The (a)/(b)/(c) pool comparison is
+# reproducible from the prototype commit in this branch's git history (the feature-gated variant).
+[dependencies]
+align_runtime = { path = "../../crates/align_runtime" }
+bumpalo = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
