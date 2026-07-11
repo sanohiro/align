@@ -1019,12 +1019,16 @@ fn collect_capability_libs(fns: &[Function]) -> Vec<String> {
             }
         }
     }
+    // Emit in a fixed canonical order (dependent-first: ssl -> crypto -> zstd -> z),
+    // independent of MIR discovery order. With shared libraries the order is not
+    // load-bearing (each lib's own DT_NEEDED resolves its dependencies — verified
+    // empirically: a crypto-before-http program links fine either way), but a fixed
+    // order keeps the link line deterministic across code motion and stays correct
+    // if these libs are ever linked as static archives.
     let mut libs: Vec<String> = Vec::new();
-    for cap in caps {
-        for l in cap.link_libs() {
-            if !libs.iter().any(|x| x == l) {
-                libs.push((*l).to_string());
-            }
+    for l in ["ssl", "crypto", "zstd", "z"] {
+        if caps.iter().any(|cap| cap.link_libs().contains(&l)) {
+            libs.push(l.to_string());
         }
     }
     libs
