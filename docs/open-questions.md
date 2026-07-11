@@ -2374,6 +2374,37 @@ driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Dis
   for the foreseeable future — public repo but sole user; interface/spec changes need no compat
   shims (the CLAUDE.md rule extends indefinitely until stated otherwise).
 
+### Side-effecting iteration & pipeline sinks — `each`/Sink terminal + `range(n)` source
+
+Direction SETTLED + owner-ratified 2026-07-11 (grew out of the map-vs-loop discussion; also the
+consultation digest's Sink/Source item above). The gap: today the only pipeline terminals are
+reductions (`.sum()` etc.), so "do a side effect per element" (write each row to a `writer`, run
+each record through a handler) has no pipeline form and falls to `loop` + a manual index — the
+段差 the owner flagged. The resolution is **pipeline vocabulary, never a `for` construct** (`for`
+would be a second data-path way and would erase the intent — filter/projection — that lets the
+pipeline fuse). Two additions, both **consumer-gated** (first consumers = the align-LLM gateway
+per-token write and the trace-processing per-line handler; they do NOT block M13):
+
+- **`each` / Sink terminal** — `xs.each(fn x { w.write(x)? })`, or a typed sink terminal
+  (`xs.write_to(w)`). **Impure, and deliberately OUTSIDE the fusion/vectorization performance
+  contract** — it is the structured *exit* from the data path, not a fused stage; documenting it
+  as contract-external keeps "pipelines are allocation-free/fused" honest. This is the concrete
+  surface of the recorded **Sink/Source MIR vocabulary** (`JsonEncode(_, Sink::Writer)`,
+  `Template(_, Sink::Response)` — encode/template writing straight to a writer with no intermediate
+  `string`; the streaming×pipeline backlog's shape).
+- **`range(n)` pipeline source** — `range(n).map(...)`, `range(lo, hi)` — kills the loop-index
+  ceremony for count/index iteration and carries cardinality **`Exact(n)`**, feeding the recorded
+  `array_builder` auto-capacity work.
+
+`loop` stays purified to control-only (retry / accept / read-until-EOF / convergence) — the owner
+endorsed keeping it narrow. **Owner flexibility clause** (see [[owner-design-criteria]]): where the
+pure `each`/sink path would be grossly inefficient, a structured escape is allowed (e.g. the
+recorded `for_each_line` scoped zero-copy callback when the per-line copy is measured to dominate)
+— structured and visible, never a general `for`. Design still open: exact spelling
+(`each`/`for_each`/`write_to`), whether `each` returns `Result<(), E>` accumulating the first error
+(the `?`-in-body case), and the Sink type set (writer / buffer / builder / response / hash /
+size-counter — the consultation's sink list).
+
 ### Bare array literal in a value position (general lowering gap)
 
 Surfaced by the `loop` adversarial review (2026-07-10). A bare array literal `[…]` is lowerable only
