@@ -1,0 +1,9 @@
+// K2 — masked where + sum. Expected: if-converted `<N x i1>` mask + vectorized reduction.
+fn big(x: i64) -> bool = x > 6
+fn run(xs: slice<i64>) -> i64 = xs.where(big).sum()
+fn main(args: array<str>) -> Result<(), Error> {
+  a := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  s : slice<i64> := a[0..args.len()]
+  print(run(s))
+  return Ok(())
+}

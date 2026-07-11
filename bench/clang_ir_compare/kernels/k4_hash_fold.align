@@ -1,0 +1,10 @@
+// K4 — hash-style fold (linear recurrence `h = h*31 + x`). Loop-carried: expected NOT to
+// vectorize on either toolchain. A control for "same non-vectorization verdict".
+fn mix(h: i64, x: i64) -> i64 = h * 31 + x
+fn run(xs: slice<i64>) -> i64 = xs.reduce(0, mix)
+fn main(args: array<str>) -> Result<(), Error> {
+  a := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  s : slice<i64> := a[0..args.len()]
+  print(run(s))
+  return Ok(())
+}
