@@ -60,6 +60,18 @@ during the design review.
 | 7 | `src.map(dbl).map_into(dst)` two-slice — pre-Slice-5 control | today no `noalias` on the fn (confirmed absent): scalar or `vector.memcheck` guard; flips to clean vectorization when Slice 5 lands `noalias` | verify at impl |
 | 8 | plain `xs.map(dbl)` materialize (pointer-induction copy) | `<N x i64>` store loop or `llvm.memcpy` | verify at impl |
 
+**Implementation outcome (Slice 3a shipped as #420, 2026-07-11 — suite = `vectorize_shapes.rs`,
+12 tests):** kernels 4/5 vectorize (`reduce.smin` / `reduce.mul` over i64); kernel 6 confirmed
+the negative prediction (ordered FP sum stays scalar); kernel 8 = vectorized store loop.
+Two divergences pinned as reality: **k4 runs over i64** (an i32 slice is not
+literal-constructible today — `array<i32>` annotation on a literal is rejected; DX note); and
+**k7 diverged from the prediction**: `map_into` ALREADY vectorizes cleanly with zero
+`vector.memcheck` — the scoped `!alias.scope`/`!noalias` metadata emitted by the fused
+`map_into` lowering is present in raw IR and plausibly contributes, though full inlining +
+distinct-alloca provenance may prove non-alias independently (mechanism not isolated; the
+non-inlined case is untested). **Consequence: Slice 5's fn-level `noalias` is NOT the unlock for
+this pattern — its motivation re-scopes to cross-function / opaque-provenance cases.**
+
 Kernels 1–3 lock now; 4–8 get a one-pass empirical confirmation at implementation time — the
 suite pins **reality**, not aspiration (a kernel that doesn't vectorize today becomes a negative
 control with a comment, not a wish). Negative controls (3, 6, 7-today) catch spurious

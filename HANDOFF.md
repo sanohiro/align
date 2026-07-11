@@ -5,7 +5,33 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, seventh wave (**M13 Slice 2 MERGED as #419** — capability-based linking
+_Last updated: 2026-07-11, eighth wave (**M13 Slice 3 design SETTLED + Slice 3a MERGED as #420**).
+The Slice 3 design was settled by a two-lens review and recorded in the new
+**`docs/impl/09-explain-opt.md`** (the implementation source of truth for 3a/3b): split into
+3a (optimized-IR emission + the vectorization IR-shape suite = the LLVM-upgrade gate) and 3b
+(debug-loc anchoring + remarks capture + `alignc explain-opt`). Key settled facts: codegen emits
+ZERO DILocations and MIR is span-free (remarks anchor `<unknown>:0:0` today → 3b needs per-block
+`stmt_lines` plumbing + opt-in DI emission); the C API has NO structured-remark path (diagnostic
+handler = flat `file:line:col: message` strings; C++ shim deferred with record) → v1 translation
+keys on LLVM-19 message patterns; explain-opt = a new verb (report, not build; exit 0 regardless
+of miss count), honesty rule (never upgrade a cost-model decline into a cause), internal
+locations suppressed never fabricated, build `Vec<OptRecord>` first render second (JSON/score/CI
+gates stay pure extensions); One-way boundary vs the M8 frequency lints (knowable from Align IR →
+lint; needs the LLVM verdict → explain-opt). **Slice 3a then shipped (#420):** shared
+`run_opt_pipeline`, `emit-llvm --stage raw|optimized` (default raw, byte-identical), and
+`vectorize_shapes.rs` (12 tests, 8 kernels pinned at `x86-64-v3`, presence+absence asserts,
+2 mutation tests) — map+sum/where+sum/where+min/reduce-mul/`map_into`/`.to_array()` vectorize;
+`scan` + ordered-FP-sum are negative controls. **k7 empirical surprise recorded:** `map_into`
+already vectorizes with zero `vector.memcheck` → Slice 5's fn-level `noalias` motivation
+re-scopes to cross-function/opaque-provenance cases (mechanism vs inlined-alloca provenance not
+isolated; honestly documented). Gate SHIP zero blocking defects (raw path proven byte-identical,
+suite teeth mutation-verified); its 2 notes applied (per-test temp filenames — a real
+remove-before-read race; honest k7 wording). gemini's 2 mediums verified and applied (one
+`TargetMachine` per compile — also removed the pre-existing double-creation on the object path;
+RAII test temp files). `cargo test --workspace` **1844 green** (1829 + 15), clippy clean.
+**Next: M13 Slice 3b** (debug-loc + remarks + explain-opt, per `09-explain-opt.md`) or Slice 4
+(build profiles) — 3b is the natural continuation; Slices 4/5/V remain. Earlier: seventh wave
+(**M13 Slice 2 MERGED as #419** — capability-based linking
 + link hygiene). The unconditional `-lz -lzstd -lcrypto -lssl` link is GONE: MIR now collects an
 `align_mir::Capability` (Zlib/Zstd/Crypto/Tls) from the builtin `Rvalue`s a program uses
 (`rvalue_capability`, collection point = MIR, appended to `Program.link_libs` in `lower_program`),

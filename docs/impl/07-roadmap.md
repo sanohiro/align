@@ -1958,12 +1958,21 @@ regression net that validates the upgrade.
 - **Slice 3 — optimized-IR emission + remarks translation. Design SETTLED 2026-07-11** by a
   two-lens review (compiler-integration / user-surface+AI-loop), integrated record =
   **`docs/impl/09-explain-opt.md`** (the implementation source of truth). Split in two:
-  - **Slice 3a — `emit-llvm --stage raw|optimized` + the vectorization IR-shape suite.**
-    Extract `run_opt_pipeline` from `write_object`; default `--stage raw`. 8-kernel suite
-    (`vectorize_shapes.rs`, pinned `x86-64-v3`; 3 kernels already empirically verified —
-    map+sum/where+sum vectorize, scan is the loop-carried negative control) asserting on
-    OPTIMIZED IR — **this suite is the LLVM-upgrade gate**; pins reality incl. negative
-    controls. Needs neither remarks nor debug info; ships first.
+  - **Slice 3a — `emit-llvm --stage raw|optimized` + the vectorization IR-shape suite.
+    DONE (#420, 2026-07-11).** Shared `run_opt_pipeline` extracted from `write_object`;
+    `--stage raw` (default, byte-identical to the old output) | `optimized` (the `default<O2>`
+    view); panic-free CLI. The 8-kernel suite (`vectorize_shapes.rs`, 12 tests, pinned
+    `x86-64-v3` + `v2` variants, x86-64-gated) asserts presence AND absence on OPTIMIZED IR,
+    2 mutation tests prove it reads optimized IR — **this suite is the LLVM-upgrade gate**.
+    Pinned reality: map+sum / where+sum / where+min (`reduce.smin`) / map+reduce-mul /
+    `map_into` / `.to_array()` vectorize; `scan` (loop-carried) and ordered-FP sum are the
+    negative controls. **Empirical findings recorded in `09-explain-opt.md`:** k7 — `map_into`
+    already vectorizes with ZERO `vector.memcheck` (scoped `!alias.scope` metadata present;
+    mechanism vs inlined-alloca provenance not isolated) → **Slice 5's fn-level `noalias`
+    re-scopes to cross-function/opaque-provenance cases**; k4 pinned over i64 (i32 slices not
+    literal-constructible — DX note). Follow-up applied from review: one `TargetMachine` per
+    compile (`build_module`/`write_object` take `&TargetMachine`). Gate: SHIP zero blocking
+    defects; gemini's 2 mediums verified and applied. 1844 green (+15).
   - **Slice 3b — debug-loc anchoring + remarks capture + `alignc explain-opt`.** Empirically
     confirmed prerequisites: codegen emits zero DILocations and MIR is span-free → remarks
     anchor at `<unknown>:0:0` today; fix = per-block `stmt_lines` MIR plumbing + opt-in inkwell
