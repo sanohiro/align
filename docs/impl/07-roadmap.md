@@ -1918,7 +1918,7 @@ regression net that validates the upgrade.
   decision site: Align has no separate compilation — one `Program` → one object, `pub` resolves
   at sema — so `emit-obj` output is a whole-program object, not a separately-linkable unit.
   Adversarial gate: SHIP, zero CONFIRMED findings.
-- **Slice 2 — capability-based linking + link hygiene. DONE (2026-07-11).** The unconditional
+- **Slice 2 — capability-based linking + link hygiene. DONE (#419, 2026-07-11).** The unconditional
   `-lz -lzstd -lcrypto -lssl` link is gone; those four are now GATED. MIR collects an
   `align_mir::Capability` (`Zlib`/`Zstd`/`Crypto`/`Tls`) from the builtin `Rvalue`s a program uses
   (`rvalue_capability` — a focused match; `CompressCompress/Decompress{kind}` → Zlib/Zstd,
@@ -1943,9 +1943,15 @@ regression net that validates the upgrade.
   `Tls ⊇ Crypto ⊇ {compress}`; always correct — `--as-needed` drops any truly-unused lib from
   `DT_NEEDED`). Completion conditions BOTH met: `capability_linking.rs` asserts (via `readelf -d`)
   that `fn main() -> i32 = 0` AND `hello` link none of z/zstd/crypto/ssl while `gzip` keeps only
-  `libz`; `bench/binary_size/` records before/after. Release numbers: `hello` 5.52 MB / 4 gated deps
-  → 4.27 MB / **0** gated deps (−22.6 %), `gzip` → libz only, `https` → all four (correct). Full
-  suite green (1828, +9). **Deferred (not blocking):** fine-grained per-C-library isolation for
+  `libz`; `bench/binary_size/` records before/after (fail-loud on build errors). Release numbers:
+  `hello` 5.52 MB / 4 gated deps → 4.27 MB / **0** gated deps (−22.6 %), `gzip` → libz only,
+  `https` → all four (correct). Full suite green (1829, +10 — the gate review added a binary-level
+  crypto-superset pin and a gzip libzstd-absence assert). Adversarial gate: SHIP, zero defects
+  (fail-closed proven by mutation — unmapping Compress fails `m11_compress` at link; server/net/SSE
+  proven to reach no SSL/EVP symbol). gemini's link-order "high" was empirically disproven (shared
+  libs resolve their own deps — a crypto-before-http program links fine) but its canonical
+  dependent-first emission order (ssl → crypto → zstd → z) was applied on determinism +
+  static-archive-robustness grounds. **Deferred (not blocking):** fine-grained per-C-library isolation for
   crypto/tls (→ `libcrypto` alone) needs a runtime-crate split by feature area — see
   `open-questions.md` Open → "Runtime staticlib feature-split". This entry supersedes the
   "always-linked" linking notes in `std-design/{compress,crypto,http}.md`.

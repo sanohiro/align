@@ -5,8 +5,8 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, seventh wave (**M13 Slice 2 DONE — capability-based linking + link
-hygiene**). The unconditional `-lz -lzstd -lcrypto -lssl` link is GONE: MIR now collects an
+_Last updated: 2026-07-11, seventh wave (**M13 Slice 2 MERGED as #419** — capability-based linking
++ link hygiene). The unconditional `-lz -lzstd -lcrypto -lssl` link is GONE: MIR now collects an
 `align_mir::Capability` (Zlib/Zstd/Crypto/Tls) from the builtin `Rvalue`s a program uses
 (`rvalue_capability`, collection point = MIR, appended to `Program.link_libs` in `lower_program`),
 so the driver links only what's used; it also passes `-Wl,--gc-sections -Wl,--as-needed`
@@ -15,12 +15,19 @@ one crate → one archive member; `--gc-sections` over Rust's per-function secti
 feature, not member granularity). Capability collection + gc-sections are COUPLED (a GNU-ld quirk
 retains the member's other C-lib refs once one lib resolves → `Capability::link_libs` is a monotonic
 superset; always correct, `--as-needed` drops truly-unused libs). Both completion conditions met:
-`capability_linking.rs` (9 tests, `readelf`-checked) proves `fn main()->i32=0` AND `hello` link none
+`capability_linking.rs` (10 tests, `readelf`-checked — the gate review added a binary-level
+crypto-superset pin + a gzip libzstd-absence assert) proves `fn main()->i32=0` AND `hello` link none
 of z/zstd/crypto/ssl while `gzip` keeps only `libz`; `bench/binary_size/` records before/after
-(`hello` −22.6 %: 5.52 MB/4 gated deps → 4.27 MB/0). `cargo test --workspace` **1828 green** (1819 +
-9), clippy clean. Deferred: fine-grained crypto/tls isolation → needs a runtime feature-split
-(`open-questions.md` Open → "Runtime staticlib feature-split"). **Next: M13 Slice 3** (optimized-IR
-emission + LLVM-remarks→Align translation, the vectorization IR-shape suite). Earlier: sixth wave
+(`hello` −22.6 %: 5.52 MB/4 gated deps → 4.27 MB/0; fail-loud on build errors). Adversarial gate
+SHIP zero defects (fail-closed proven by mutation — unmapping Compress fails `m11_compress` at
+link; http server/net/SSE proven to reach no SSL/EVP symbol — the TLS server code is cfg(test)).
+gemini's link-order "high" empirically disproven (shared libs resolve their own deps; a
+crypto-before-http program links fine) but its canonical dependent-first order (ssl → crypto →
+zstd → z) applied for determinism + static-archive robustness. `cargo test --workspace` **1829
+green** (1819 + 10), clippy clean. Deferred: fine-grained crypto/tls isolation → needs a runtime
+feature-split (`open-questions.md` Open → "Runtime staticlib feature-split"). **Next: M13 Slice 3**
+(optimized-IR emission + LLVM-remarks→Align translation, the vectorization IR-shape suite —
+per the roadmap M13 section; then Slices 4/5/V). Earlier: sixth wave
 (**M13 Slice 1 MERGED as #418**, symbol
 internalization + constant hygiene: codegen previously set ZERO linkage; now the C entry `main`
 (incl. the Result-main wrapper) is the SOLE external definition — `align_main` + all program fns +
