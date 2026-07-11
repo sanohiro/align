@@ -151,7 +151,7 @@ pub fn emit_llvm(src: &str) -> String {
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
-    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline).expect("emit llvm ir")
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, false).expect("emit llvm ir")
 }
 
 /// Whether checking `src` produces any error (for negative tests).

@@ -115,10 +115,19 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget) -> Resul
 }
 
 /// Render the program as textual LLVM IR (`alignc emit-llvm`).
-pub fn emit_llvm_ir(program: &Program, target: &BuildTarget) -> Result<String, CodegenError> {
+///
+/// `optimized` selects the lens: `false` (`--stage raw`) prints exactly what codegen emitted —
+/// pre-optimization, the traditional `emit-llvm` view; `true` (`--stage optimized`) runs the same
+/// `-O2` middle-end pipeline `write_object` uses (via [`run_opt_pipeline`]) before printing, so the
+/// output is "what LLVM did" — inlined lambdas, fused loops, vectorized `<N x T>` bodies.
+pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
     build_module(&ctx, &module, program, target)?;
+    if optimized {
+        let tm = create_target_machine(target)?;
+        run_opt_pipeline(&module, &tm, "default<O2>")?;
+    }
     Ok(module.print_to_string().to_string())
 }
 
@@ -7134,18 +7143,25 @@ fn pred(signed: bool, c: Cmp) -> IntPredicate {
     }
 }
 
+/// Run the LLVM middle-end optimization pipeline over `module` in place. Without this, only the
+/// backend codegen passes run — the lifted-lambda calls, fused `map`/`reduce`/`where` loops, and
+/// bounds checks are left un-inlined and un-vectorized. The `default<O2>` pipeline inlines the
+/// per-element calls, hoists invariants (LICM), and runs the loop / SLP vectorizers, so the
+/// data-oriented core actually lowers to SIMD. Purely additive — no IR is generated differently.
+///
+/// Shared by object emission (`write_object`) and the optimized-IR lens
+/// (`emit_llvm_ir(.., optimized = true)`), so the two views agree on exactly one pipeline. The
+/// `pipeline` string stays the one hardcode (`"default<O2>"`) until the profile pipeline is threaded
+/// through here (`docs/impl/09-explain-opt.md`, Slice 4).
+fn run_opt_pipeline(module: &Module, tm: &TargetMachine, pipeline: &str) -> Result<(), CodegenError> {
+    module
+        .run_passes(pipeline, tm, PassBuilderOptions::create())
+        .map_err(|e| CodegenError::Target(format!("optimization pipeline: {e}")))
+}
+
 fn write_object(module: &Module, out: &Path, target: &BuildTarget) -> Result<(), CodegenError> {
     let tm = create_target_machine(target)?;
-
-    // Run the LLVM middle-end optimization pipeline (`-O2`) before emitting. Without this, only the
-    // backend codegen passes run — the lifted-lambda calls, fused `map`/`reduce`/`where` loops, and
-    // bounds checks are left un-inlined and un-vectorized. The default `-O2` pipeline inlines the
-    // per-element calls, hoists invariants (LICM), and runs the loop / SLP vectorizers, so the
-    // data-oriented core actually lowers to SIMD. Purely additive — no IR is generated differently.
-    module
-        .run_passes("default<O2>", &tm, PassBuilderOptions::create())
-        .map_err(|e| CodegenError::Target(format!("optimization pipeline: {e}")))?;
-
+    run_opt_pipeline(module, &tm, "default<O2>")?;
     tm.write_to_file(module, FileType::Object, out)
         .map_err(|e| CodegenError::Target(e.to_string()))
 }
@@ -7165,7 +7181,7 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
-        emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline).unwrap()
+        emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false).unwrap()
     }
 
     /// Layout parity: the sema `(size, align)` computation (`align_sema::ty_size_align` /

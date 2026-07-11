@@ -189,7 +189,7 @@ fn oversized_struct_param_is_rejected_in_codegen() {
     let checked = check(&mut sm, "byval-big", src);
     assert!(!checked.diags.has_errors(), "a `layout(C)` struct is a valid FFI type at the language level");
     let mir = lower_to_mir(&checked.hir);
-    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline);
+    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, false);
     assert!(ir.is_err(), "a > 16-byte by-value struct param must be rejected in codegen");
     assert!(
         ir.unwrap_err().contains("16-byte"),
@@ -207,7 +207,7 @@ fn oversized_struct_return_is_rejected_in_codegen() {
     let checked = check(&mut sm, "byval-big-ret", src);
     assert!(!checked.diags.has_errors());
     let mir = lower_to_mir(&checked.hir);
-    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline);
+    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, false);
     assert!(ir.is_err(), "a > 16-byte by-value struct return must be rejected in codegen");
     assert!(
         ir.unwrap_err().contains("16-byte"),
@@ -292,7 +292,7 @@ fn pressure_five_preceding_int_is_rejected() {
     let checked = check(&mut sm, "byval-press-5", src);
     assert!(!checked.diags.has_errors(), "the signature type-checks; the ABI limit is a codegen concern");
     let mir = lower_to_mir(&checked.hir);
-    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline);
+    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, false);
     assert!(ir.is_err(), "a struct arg that falls to MEMORY under register pressure must be rejected");
     let err = ir.unwrap_err();
     assert!(err.contains("passed in memory") && err.contains("register"), "got: {err}");
@@ -309,7 +309,7 @@ fn pressure_seven_preceding_sse_is_rejected() {
     let checked = check(&mut sm, "byval-press-sse7", src);
     assert!(!checked.diags.has_errors());
     let mir = lower_to_mir(&checked.hir);
-    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline);
+    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, false);
     assert!(ir.is_err(), "an SSE struct arg that falls to MEMORY under register pressure must be rejected");
     assert!(ir.unwrap_err().contains("passed in memory"));
 }

@@ -3,7 +3,7 @@
 //! Subcommands:
 //!   alignc check     <file>   lexer -> parser -> sema. Print diagnostics
 //!   alignc emit-mir  <file>   Print MIR as text
-//!   alignc emit-llvm <file>   Print LLVM IR as text
+//!   alignc emit-llvm <file>   Print LLVM IR as text (--stage raw|optimized; default raw)
 //!   alignc emit-obj  <file>   Write an object file (no link, no `main` required)
 //!   alignc build     <file>   Build an executable (<stem> in cwd)
 //!   alignc run       <file>   Build, run, and return its exit code
@@ -28,7 +28,7 @@ fn main() -> ExitCode {
     match (cmd, path) {
         (Some("check"), Some(p)) => run_check(p),
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
-        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, target),
+        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target),
         // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
         // (a library / benchmark kernel). Default output is `<stem>.o`.
         (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target),
@@ -83,7 +83,7 @@ fn usage() {
          commands:\n  \
            check      check through lexer/parser/sema\n  \
            emit-mir   print MIR as text\n  \
-           emit-llvm  print LLVM IR as text\n  \
+           emit-llvm  print LLVM IR as text (--stage raw|optimized; default raw)\n  \
            emit-obj   write an object file (<file> [out.o]; no link, no `main` needed)\n  \
            fmt        format source (prints to stdout; --write rewrites in place)\n  \
            build      build an executable\n  \
@@ -167,11 +167,21 @@ fn run_emit_mir(path: &str) -> ExitCode {
     }
 }
 
-fn run_emit_llvm(path: &str, target: BuildTarget) -> ExitCode {
+fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget) -> ExitCode {
+    // `--stage raw|optimized` picks the lens (default `raw` = today's semantics, the pre-opt IR
+    // codegen emitted). `optimized` runs the `-O2` pipeline first (what LLVM did: inlined, fused,
+    // vectorized). Any other value is a hard argument error, not a panic.
+    let optimized = match parse_stage(rest) {
+        Ok(v) => v,
+        Err(bad) => {
+            eprintln!("alignc: unknown --stage '{bad}' (expected `raw` or `optimized`)");
+            return ExitCode::FAILURE;
+        }
+    };
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
-    match emit_llvm_ir(&mir, target) {
+    match emit_llvm_ir(&mir, target, optimized) {
         Ok(ir) => {
             print!("{ir}");
             ExitCode::SUCCESS
@@ -181,6 +191,36 @@ fn run_emit_llvm(path: &str, target: BuildTarget) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse `--stage raw|optimized` (or `--stage=…`) out of the trailing `emit-llvm` args. Returns
+/// `Ok(true)` for `optimized`, `Ok(false)` for `raw` or when absent (the default lens), or
+/// `Err(bad_value)` for any other `--stage` value. A missing value after a bare `--stage` reads as
+/// the empty string, which is rejected like any other unknown value.
+fn parse_stage(rest: &[String]) -> Result<bool, String> {
+    let mut i = 0;
+    let mut optimized = false;
+    while i < rest.len() {
+        let a = &rest[i];
+        let value = if let Some(v) = a.strip_prefix("--stage=") {
+            Some(v.to_string())
+        } else if a == "--stage" {
+            let v = rest.get(i + 1).map(String::as_str).unwrap_or("");
+            i += 1;
+            Some(v.to_string())
+        } else {
+            None
+        };
+        if let Some(v) = value {
+            optimized = match v.as_str() {
+                "raw" => false,
+                "optimized" => true,
+                other => return Err(other.to_string()),
+            };
+        }
+        i += 1;
+    }
+    Ok(optimized)
 }
 
 fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget) -> ExitCode {
