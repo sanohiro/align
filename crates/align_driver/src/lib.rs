@@ -6,7 +6,7 @@
 
 use align_diag::{Diagnostics, Severity};
 use align_span::SourceMap;
-pub use align_codegen_llvm::{BuildTarget, DebugInfo};
+pub use align_codegen_llvm::{BuildTarget, DebugInfo, Profile};
 /// The lowered MIR program type (re-exported so callers can name it without depending on
 /// `align_mir` directly).
 pub use align_mir::Program as MirProgram;
@@ -135,9 +135,9 @@ pub fn collect_opt_remarks(
 }
 
 /// Write MIR out to an object file (codegen). `target` selects the CPU baseline (portable default
-/// vs. host-`native`).
-pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget) -> Result<(), String> {
-    align_codegen_llvm::emit_object(mir, obj, &target).map_err(|e| e.to_string())
+/// vs. host-`native`); `profile` selects the middle-end pipeline (`default<O0|O2|O3|Os|Oz>`).
+pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile) -> Result<(), String> {
+    align_codegen_llvm::emit_object(mir, obj, &target, profile).map_err(|e| e.to_string())
 }
 
 /// MIR to LLVM IR text (`alignc emit-llvm`). `optimized` picks the lens: `false` (`--stage raw`)
@@ -152,15 +152,15 @@ pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, optimized: bo
 ///
 /// The thin runtime (`libalign_runtime.a`, e.g. the builtin `print`) is linked in too.
 /// Being a Rust staticlib, it needs the usual std support libraries (`pthread`/`dl`/`m`).
-pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: &[String]) -> Result<(), String> {
-    link_objects(&[obj], exe, link_libs)
+pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
+    link_objects(&[obj], exe, link_libs, profile)
 }
 
 /// Link one or more object files (plus the Align runtime and the always-linked C libraries) into an
 /// executable. The single-object [`link_executable`] is the common case; multiple objects are used
 /// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
 /// callee), and by any future multi-translation-unit build.
-pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String]) -> Result<(), String> {
+pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
     let runtime = runtime_archive()?;
     let mut cmd = std::process::Command::new("cc");
     for obj in objs {
@@ -175,8 +175,18 @@ pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs:
         // eliminating its `libz`/`libzstd`/`libcrypto`/`libssl` references so those libraries are not
         // needed at all. `--as-needed` then records `DT_NEEDED` only for libraries that actually
         // satisfy a surviving reference (a no-op for the merged-libc support libs below on modern
-        // glibc, a portable win on older systems). Both are safe unconditionally — no build profile.
-        .args(["-Wl,--gc-sections", "-Wl,--as-needed"])
+        // glibc, a portable win on older systems). Both are correctness-neutral hygiene, kept for
+        // EVERY profile (M13 Slice 4) — even `dev`: the potential link-speed saving of dropping
+        // `--gc-sections` is not worth a second link-flag path, and a `dev` binary that silently
+        // links dead `libssl` etc. would be a surprising difference from `release`.
+        .args(["-Wl,--gc-sections", "-Wl,--as-needed"]);
+    // Per-profile strip (M13 Slice 4). The size profiles (`small`/`tiny`) drop the whole symbol
+    // table via `-Wl,--strip-all`; the speed profiles (`dev`/`release`/`fast`) keep symbols so a
+    // crash backtrace / `perf` stays useful. One decision, owned by `Profile::strip`.
+    if profile.strip() {
+        cmd.arg("-Wl,--strip-all");
+    }
+    cmd
         // `libpthread`/`libdl`/`libm` are linked unconditionally: they are Rust-std support libraries
         // the runtime *core* may reference (threads, dlopen, math) independent of any Align feature,
         // and modern glibc merges them into libc so they cost nothing (`--as-needed` drops any that

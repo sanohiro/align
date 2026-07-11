@@ -73,6 +73,81 @@ pub enum BuildTarget {
     Cpu(String),
 }
 
+/// A build profile (`--profile`): the single knob that selects the optimization/size trade-off. It
+/// is the one mechanism through which the profile plumbs — it owns *both* the middle-end pipeline
+/// string ([`Profile::pipeline`]) and the profile-dependent linker choices ([`Profile::strip`]), so
+/// no scattered `match profile` ifs live in the driver (`docs/impl/07-roadmap.md` M13 Slice 4).
+///
+/// Deliberately the **stock** LLVM pipelines (`default<O0|O2|O3|Os|Oz>`), not a custom pass order —
+/// per the external-optimization consultation, no custom pipeline until remarks + benchmarks justify
+/// one (`docs/open-questions.md` → "External optimization consultation").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// `dev` → `default<O0>`: no optimization, fastest builds, best debuggability. Symbols kept.
+    Dev,
+    /// `release` → `default<O2>`: the balanced default. This is today's behavior (a build with no
+    /// `--profile` flag runs `default<O2>`), so `release` is the default → no behavior change without
+    /// the flag. Symbols kept (a stack trace / `perf` on a crashing release binary stays useful).
+    #[default]
+    Release,
+    /// `fast` → `default<O3>`: maximum speed (more aggressive inlining / vectorization / unrolling),
+    /// larger code. Symbols kept.
+    Fast,
+    /// `small` → `default<Os>`: optimize for size while keeping O2-like speed. Stripped.
+    Small,
+    /// `tiny` → `default<Oz>`: minimize size at any cost. Stripped.
+    Tiny,
+}
+
+impl Profile {
+    /// The stock LLVM pass-pipeline string this profile runs (fed verbatim to
+    /// `Module::run_passes` via [`run_opt_pipeline`]). Exactly the `default<O*>` set — no custom order.
+    pub fn pipeline(self) -> &'static str {
+        match self {
+            Profile::Dev => "default<O0>",
+            Profile::Release => "default<O2>",
+            Profile::Fast => "default<O3>",
+            Profile::Small => "default<Os>",
+            Profile::Tiny => "default<Oz>",
+        }
+    }
+
+    /// Whether the linker should strip all symbols (`-Wl,--strip-all`) from the final image. The
+    /// size profiles (`small`/`tiny`) strip — the symbol table is pure size a size build does not
+    /// want; the speed profiles (`dev`/`release`/`fast`) keep symbols so a crash backtrace / `perf`
+    /// stays useful. (Pre-release, changeable — documented at the decision site.)
+    pub fn strip(self) -> bool {
+        matches!(self, Profile::Small | Profile::Tiny)
+    }
+
+    /// The exact profile name (the spelling accepted on the CLI). No aliases.
+    pub fn name(self) -> &'static str {
+        match self {
+            Profile::Dev => "dev",
+            Profile::Release => "release",
+            Profile::Fast => "fast",
+            Profile::Small => "small",
+            Profile::Tiny => "tiny",
+        }
+    }
+
+    /// Parse a `--profile` value. Exact names only (no aliases, no prefixes); any other value returns
+    /// `None` so the caller emits a diagnostic rather than silently guessing.
+    pub fn parse(s: &str) -> Option<Profile> {
+        match s {
+            "dev" => Some(Profile::Dev),
+            "release" => Some(Profile::Release),
+            "fast" => Some(Profile::Fast),
+            "small" => Some(Profile::Small),
+            "tiny" => Some(Profile::Tiny),
+            _ => None,
+        }
+    }
+
+    /// All profile names, for usage/diagnostic text (kept in sync with [`Profile::parse`]).
+    pub const NAMES: &'static str = "dev, release, fast, small, tiny";
+}
+
 /// Build the `TargetMachine` for `target` — the one place that picks the CPU / feature string, so
 /// the data-layout machine (`build_module`) and the emission machine (`write_object`) always agree.
 fn create_target_machine(target: &BuildTarget) -> Result<TargetMachine, CodegenError> {
@@ -115,12 +190,12 @@ fn create_target_machine(target: &BuildTarget) -> Result<TargetMachine, CodegenE
 /// Creates exactly one `TargetMachine` for the whole compile and threads it through both
 /// `build_module` (data layout / triple / ABI classification) and `write_object` (optimization +
 /// object emission), so the two stages always agree on the same target settings.
-pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget) -> Result<(), CodegenError> {
+pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile: Profile) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
     let tm = create_target_machine(target)?;
     build_module(&ctx, &module, program, &tm, None)?;
-    write_object(&module, out, &tm)
+    write_object(&module, out, &tm, profile.pipeline())
 }
 
 /// Render the program as textual LLVM IR (`alignc emit-llvm`).
@@ -7410,18 +7485,20 @@ fn pred(signed: bool, c: Cmp) -> IntPredicate {
 /// per-element calls, hoists invariants (LICM), and runs the loop / SLP vectorizers, so the
 /// data-oriented core actually lowers to SIMD. Purely additive — no IR is generated differently.
 ///
-/// Shared by object emission (`write_object`) and the optimized-IR lens
-/// (`emit_llvm_ir(.., optimized = true)`), so the two views agree on exactly one pipeline. The
-/// `pipeline` string stays the one hardcode (`"default<O2>"`) until the profile pipeline is threaded
-/// through here (`docs/impl/09-explain-opt.md`, Slice 4).
+/// Shared by object emission (`write_object`, which threads the build [`Profile`]'s pipeline) and the
+/// optimized-IR lens (`emit_llvm_ir(.., optimized = true)` / `collect_opt_remarks`, both pinned to the
+/// release `"default<O2>"` view — those are diagnostic lenses, not builds, so they stay at the one
+/// canonical "what release does" pipeline regardless of `--profile`; Slice 4).
 fn run_opt_pipeline(module: &Module, tm: &TargetMachine, pipeline: &str) -> Result<(), CodegenError> {
     module
         .run_passes(pipeline, tm, PassBuilderOptions::create())
         .map_err(|e| CodegenError::Target(format!("optimization pipeline: {e}")))
 }
 
-fn write_object(module: &Module, out: &Path, tm: &TargetMachine) -> Result<(), CodegenError> {
-    run_opt_pipeline(module, tm, "default<O2>")?;
+/// Run `pipeline` (the build [`Profile`]'s stock `default<O*>` string) then emit the object. The
+/// profile's *linker* choices (strip) are applied later, by the driver at link time.
+fn write_object(module: &Module, out: &Path, tm: &TargetMachine, pipeline: &str) -> Result<(), CodegenError> {
+    run_opt_pipeline(module, tm, pipeline)?;
     tm.write_to_file(module, FileType::Object, out)
         .map_err(|e| CodegenError::Target(e.to_string()))
 }

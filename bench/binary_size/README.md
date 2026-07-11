@@ -35,3 +35,31 @@ For each program under `progs/` the script links the same object + release runti
   library from `DT_NEEDED`).
 
 `https` is built, not run (no network).
+
+## Per-profile sizes (M13 Slice 4)
+
+```
+bench/binary_size/profiles.sh [prog ...]
+```
+
+Builds each program at every `--profile` (`dev`/`release`/`fast`/`small`/`tiny`) with `alignc build`
+and reports the file size, whether the image keeps a `.symtab` (stripped state), and the gated
+`DT_NEEDED` set. The pipeline is the stock `default<O0|O2|O3|Os|Oz>`; `small`/`tiny` are additionally
+stripped (`-Wl,--strip-all`).
+
+Representative result (x86-64, glibc 2.41, release runtime):
+
+| program | profile          | size    | symbols  |
+|---------|------------------|--------:|----------|
+| hello   | dev/release/fast | 4,274,568 | symbols  |
+| hello   | small/tiny       |   324,496 | stripped |
+| pipe    | dev              | 4,291,008 | symbols  |
+| pipe    | release/fast     | 4,290,816 | symbols  |
+| pipe    | small/tiny       |   336,784 | stripped |
+
+- The **strip** step (size profiles) is the dominant lever here — it drops the runtime staticlib's
+  symbol/debug info (~4.3 MB → ~0.32 MB).
+- The **O-level** difference is negligible on these runtime-dominated programs (the Align code is
+  tiny next to the linked runtime). LLVM does **not** guarantee `Oz ≤ Os ≤ O2` byte-for-byte, so the
+  table reports the real numbers and asserts no ordering.
+- Speed profiles keep symbols (useful backtrace / `perf`); size profiles strip.

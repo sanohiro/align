@@ -7,7 +7,7 @@
 
 pub use align_driver::{
     backend_available, check, emit_llvm_ir, emit_object_file, link_executable, link_objects,
-    lower_to_mir, BuildTarget,
+    lower_to_mir, BuildTarget, Profile,
 };
 pub use align_span::SourceMap;
 
@@ -55,7 +55,7 @@ pub fn build_and_run_with_c(name: &str, align_src: &str, c_src: &str) -> std::pr
         }
     }
     let _guard = Cleanup(vec![a_obj.clone(), c_src_path.clone(), c_obj.clone(), exe.clone()]);
-    emit_object_file(&mir, &a_obj, BuildTarget::Baseline).expect("codegen");
+    emit_object_file(&mir, &a_obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
     std::fs::write(&c_src_path, c_src).expect("write c helper");
     let cc_status = std::process::Command::new("cc")
         .args(["-c", "-O0"])
@@ -65,7 +65,7 @@ pub fn build_and_run_with_c(name: &str, align_src: &str, c_src: &str) -> std::pr
         .status()
         .expect("launch cc");
     assert!(cc_status.success(), "compiling the C helper failed");
-    link_objects(&[&a_obj, &c_obj], &exe, &mir.link_libs).expect("link");
+    link_objects(&[&a_obj, &c_obj], &exe, &mir.link_libs, Profile::Release).expect("link");
     std::process::Command::new(&exe).output().expect("run")
 }
 
@@ -117,8 +117,8 @@ fn emit_link_run(mir: &align_driver::MirProgram, name: &str, prog_args: &[&str])
     let obj = dir.join(format!("align-test-{pid}-{name}.o"));
     let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
     let _artifacts = TempArtifacts { obj: obj.clone(), exe: exe.clone() };
-    emit_object_file(mir, &obj, BuildTarget::Baseline).expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs).expect("link");
+    emit_object_file(mir, &obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
+    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     std::process::Command::new(&exe).args(prog_args).output().expect("run")
 }
 
@@ -147,8 +147,8 @@ pub fn build_exe(name: &str, src: &str) -> BuiltExe {
     let pid = std::process::id();
     let obj = dir.join(format!("align-test-{pid}-{name}.o"));
     let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline).expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs).expect("link");
+    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
+    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     BuiltExe { exe: exe.clone(), _artifacts: TempArtifacts { obj, exe } }
 }
 
@@ -230,8 +230,8 @@ pub fn build_and_run_multi(name: &str, files: &[(&str, &str)], entry: &str) -> s
     let pid = std::process::id();
     let obj = proj.dir.join(format!("align-mtest-{pid}-{name}.o"));
     let exe = proj.dir.join(format!("align-mtest-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline).expect("codegen");
-    link_executable(&obj, &exe, &mir.link_libs).expect("link");
+    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
+    link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     std::process::Command::new(&exe).output().expect("run")
 }
 

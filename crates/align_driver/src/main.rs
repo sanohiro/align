@@ -8,21 +8,36 @@
 //!   alignc explain-opt <file> Report the -O2 optimizer's data-path decisions (--verbose)
 //!   alignc build     <file>   Build an executable (<stem> in cwd)
 //!   alignc run       <file>   Build, run, and return its exit code
+//!   alignc size      <file>   Build then report the executable's size breakdown
+//!
+//! A `--profile dev|release|fast|small|tiny` flag selects the optimization/size trade-off for the
+//! build-producing subcommands (`build`/`run`/`emit-obj`/`size`); default `release`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use align_driver::{
     check, emit_llvm_ir, emit_object_file, format_diagnostics, link_executable, lower_to_mir,
-    BuildTarget,
+    BuildTarget, Profile,
 };
 use align_span::SourceMap;
+
+mod size;
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().collect();
     // Pull the `--target-cpu` flag out before positional parsing (so it may sit anywhere up to the
     // program's own args, and `run` does not forward it to the built program).
     let (target, args) = parse_target(&raw);
+    // Pull `--profile <name>` next (also anywhere before the program's own args). A bad value is a
+    // hard error here, not a silent fallback.
+    let (profile, args) = match parse_profile(&args) {
+        Ok(v) => v,
+        Err(bad) => {
+            eprintln!("alignc: unknown --profile '{bad}' (expected one of: {})", Profile::NAMES);
+            return ExitCode::FAILURE;
+        }
+    };
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
 
@@ -32,7 +47,9 @@ fn main() -> ExitCode {
         (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target),
         // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
         // (a library / benchmark kernel). Default output is `<stem>.o`.
-        (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target),
+        (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile),
+        // `size <file>` — build with the profile, then report the executable's size breakdown.
+        (Some("size"), Some(p)) => size::run_size(p, target, profile),
         // `explain-opt <file> [--verbose]` — report what the `-O2` middle-end did to the data path
         // (vectorized / not, with the reason), translated into the compiler's diagnostic voice.
         (Some("explain-opt"), Some(p)) => {
@@ -41,9 +58,9 @@ fn main() -> ExitCode {
         }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
-        (Some("build"), Some(p)) => run_build(p, target),
+        (Some("build"), Some(p)) => run_build(p, target, profile),
         // `run` forwards any trailing arguments to the built program (its `main(args)`).
-        (Some("run"), Some(p)) => run_run(p, &args[3..], target),
+        (Some("run"), Some(p)) => run_run(p, &args[3..], target, profile),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -83,6 +100,35 @@ fn parse_target(args: &[String]) -> (BuildTarget, Vec<String>) {
     (target, rest)
 }
 
+/// Pull `--profile <name>` (or `--profile=…`) out of `args`, returning the chosen profile and the
+/// remaining (positional) arguments. Default = `release` (today's behavior — a build with no flag
+/// runs `default<O2>`, so there is no behavior change without the flag). Exact names only; any other
+/// value is `Err(value)` so the caller emits a diagnostic rather than guessing. A bare `--profile`
+/// with no following value reads as the empty string, which is rejected like any unknown value.
+fn parse_profile(args: &[String]) -> Result<(Profile, Vec<String>), String> {
+    let mut profile = Profile::default();
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let value = if let Some(v) = a.strip_prefix("--profile=") {
+            Some(v.to_string())
+        } else if a == "--profile" {
+            let v = args.get(i + 1).map(String::as_str).unwrap_or("").to_string();
+            i += 1;
+            Some(v)
+        } else {
+            rest.push(a.clone());
+            None
+        };
+        if let Some(v) = value {
+            profile = Profile::parse(&v).ok_or(v)?;
+        }
+        i += 1;
+    }
+    Ok((profile, rest))
+}
+
 fn usage() {
     eprintln!(
         "usage: alignc <command> <file.align> [--target-cpu baseline|native]\n\
@@ -96,9 +142,11 @@ fn usage() {
            fmt        format source (prints to stdout; --write rewrites in place)\n  \
            build      build an executable\n  \
            run        build and run (returns the exit code)\n  \
+           size       build then report the executable's size breakdown\n  \
          \n\
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
-                       or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)"
+                       or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \
+         --profile     dev (O0), release (O2, default), fast (O3), small (Os), tiny (Oz)"
     );
 }
 
@@ -231,12 +279,12 @@ fn parse_stage(rest: &[String]) -> Result<bool, String> {
     Ok(optimized)
 }
 
-fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget) -> ExitCode {
+fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget, profile: Profile) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
     let obj = PathBuf::from(out.map(String::from).unwrap_or_else(|| format!("{}.o", stem(path))));
-    match emit_object_file(&mir, &obj, target) {
+    match emit_object_file(&mir, &obj, target, profile) {
         Ok(()) => {
             println!("alignc: wrote object: {}", obj.display());
             ExitCode::SUCCESS
@@ -256,26 +304,27 @@ fn stem(path: &str) -> String {
         .unwrap_or_else(|| "a".to_string())
 }
 
-/// Turn MIR into an object and link it into an executable. Returns the `exe` path.
-fn build_to(path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarget) -> Result<(), ExitCode> {
+/// Turn MIR into an object and link it into an executable. Returns the `exe` path. `profile` selects
+/// both the codegen pipeline and the link-time strip choice (one mechanism, `Profile`).
+fn build_to(path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarget, profile: Profile) -> Result<(), ExitCode> {
     let obj = std::env::temp_dir().join(format!("align-{}.o", stem(path)));
-    if let Err(e) = emit_object_file(mir, &obj, target) {
+    if let Err(e) = emit_object_file(mir, &obj, target, profile) {
         eprintln!("alignc: codegen failed: {e}");
         return Err(ExitCode::FAILURE);
     }
-    if let Err(e) = link_executable(&obj, exe, &mir.link_libs) {
+    if let Err(e) = link_executable(&obj, exe, &mir.link_libs, profile) {
         eprintln!("alignc: {e}");
         return Err(ExitCode::FAILURE);
     }
     Ok(())
 }
 
-fn run_build(path: &str, target: BuildTarget) -> ExitCode {
+fn run_build(path: &str, target: BuildTarget, profile: Profile) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
     let exe = PathBuf::from(stem(path));
-    match build_to(path, &mir, &exe, target) {
+    match build_to(path, &mir, &exe, target, profile) {
         Ok(()) => {
             println!("alignc: built executable: {}", exe.display());
             ExitCode::SUCCESS
@@ -284,12 +333,12 @@ fn run_build(path: &str, target: BuildTarget) -> ExitCode {
     }
 }
 
-fn run_run(path: &str, prog_args: &[String], target: BuildTarget) -> ExitCode {
+fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
     let exe = std::env::temp_dir().join(format!("align-{}", stem(path)));
-    if let Err(code) = build_to(path, &mir, &exe, target) {
+    if let Err(code) = build_to(path, &mir, &exe, target, profile) {
         return code;
     }
     // Forward trailing args so they reach the program's `main(args: array<str>)` (argv[0] is the
