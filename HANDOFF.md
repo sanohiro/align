@@ -6,7 +6,19 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-11, twelfth wave (**M13 COMPLETE — Slice V MERGED as #424**, the last
-slice; the milestone is formally closed in the roadmap). Slice V outcomes: (a) `--target-cpu`
+slice; the milestone is formally closed in the roadmap). **Upgrade-target decision (owner,
+2026-07-11, end of session): LLVM 22 from apt.llvm.org** (`llvm-toolchain-trixie-22`; the owner
+installs `llvm-22 llvm-22-dev clang-22` themselves) — NOT Debian backports' 21: inkwell 0.9
+supports `llvm22-1(-prefer-dynamic)`, llvm-sys 221 exists, and landing on the newest before the
+post-upgrade bitcode work (ThinLTO/runtime-bitcode) avoids a second version jump; Homebrew's
+default `llvm` formula is already 22.1.8 so a Mac build needs nothing special (keg-only
+`LLVM_SYS_221_PREFIX` only). **LLVM 19 stays installed** (rollback + shape-diff triage).
+Upgrade to-do next session: `Cargo.toml` `llvm19-1` → `llvm22-1`, `.cargo/config.toml`
+`LLVM_SYS_191_PREFER_DYNAMIC` → `LLVM_SYS_221_PREFER_DYNAMIC` (re-verify the shared-only
+stance), point the clang-IR harness + `clang_ir_compare.rs` at clang-22 (same-LLVM requirement),
+then run the whole M13 net (1878 tests + vectorize_shapes/target_cpu_isa/link_hygiene/
+capability_linking + bench/binary_size + bench/clang_ir_compare) and re-measure per the roadmap
+checkpoint. Slice V outcomes: (a) `--target-cpu`
 empty-feature-string VERIFIED CORRECT (LLVM derives the ISA set from the CPU name; objdump: v2 →
 SSE `paddq` zero `ymm`, v3/skylake → AVX2 `vpaddq`/`ymm`) and pinned by `target_cpu_isa.rs`
 (3 tool-gated tests, gate-mutation-verified BOTH directions); (b) cold-edge `!prof` closed
