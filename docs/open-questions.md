@@ -2338,7 +2338,13 @@ driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Dis
   filter/projection pushdown + dense/sparse execution (selection vector / bitset / index list);
   algorithm portfolio + `Exact/AtMost` cardinality in MIR (→ auto `array_builder` capacity);
   Sink/Source as MIR vocabulary (template/encode → writer without intermediate strings — the
-  streaming×pipeline backlog's concrete shape); `for_each_line` scoped zero-copy callback (the
+  streaming×pipeline backlog's concrete shape); **the pipeline answer to the map-vs-loop gap
+  (settled direction 2026-07-11):** side-effecting iteration gets pipeline vocabulary, NOT a
+  `for` construct — an `each`/Sink terminal (`xs.each(fn x { w.write(x)? })` — Impure,
+  deliberately OUTSIDE the fusion/vectorization contract, the structured exit) and a `range(n)`
+  pipeline source (kills the loop index ceremony; cardinality `Exact(n)` feeds capacity
+  inference). `loop` stays narrow (retry/accept/EOF/convergence); the consultation's
+  "classified loop forms" land as pipeline ops, never as loop-syntax variants; `for_each_line` scoped zero-copy callback (the
   safe form of A7's rejected lookahead view — noted in the A7 record); cache-locality lints
   (useful-byte ratio, pointer-indirection, false-sharing — the M8 frequency-lints family);
   string blob + offset tables / error-message tables / relative-offset metadata (binary-size,

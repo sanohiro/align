@@ -483,6 +483,35 @@ Dangerous code should be isolated.
 
 ---
 
+## The performance philosophy
+
+Stated by the owner (2026-07-11, the optimization consultation): the ideal is that
+
+> normally-written Align compiles to what an expert would have hand-tuned in Rust.
+
+Three consequences shape every performance decision:
+
+- **Constraints buy information.** The reason a pipeline can fuse, vectorize, and skip bounds
+  checks is that `map/where/sum` LEAVES the intent standing — a hand-written loop destroys it and
+  forces rediscovery. Every "one way" restriction is a promise kept to the optimizer (and, dually,
+  to the adversarial reviewer: the same legibility that enables optimization makes verification
+  converge).
+- **Data movement before instruction execution.** Align optimizes what is read, in what order,
+  from how few cache lines — before it optimizes how it is computed. The measured wins bear this
+  out: the soa column scan beats Rust 8–10× as a *cache* win, not a SIMD win. Contiguous by
+  default; indirection visible in the type; only needed fields loaded; hot and cold data apart;
+  memory traffic weighed alongside asymptotic complexity.
+- **The benchmark target is a triple.** Align-normal vs Rust-normal vs Rust-expert. Winning every
+  case against Rust-expert is not the bar (both end in the same LLVM); the bar is
+  **Align-normal ≈ Rust-expert at a fraction of the effort** — with the receipts (benches, and
+  eventually the per-build optimization report) checked in.
+
+Speed alone is not the moat — expert Rust catches up. The moat is speed that is **explainable**
+(the compiler says why a loop did or didn't vectorize), **verifiable** (shape tests pin the fast
+form), and **non-regressable** (CI gates on allocation/fusion counts). Fast, and provably so.
+
+---
+
 ## The AI philosophy
 
 AI-friendliness is not a feature.
