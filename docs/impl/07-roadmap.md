@@ -1811,8 +1811,21 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
     class — register it with their sema handling; a new mutator that skips that pass is the
     "new IR variant skips a pass" bug class); needs one new FFI write path (grow + set len);
     reader struct gains the lookahead fields behind the `buffered` flag.
-- **Slice A8 — per-request arena reuse (design SETTLED 2026-07-11; two-critic review, Fable
-  synthesis).** Consumer = a long-running server loop resetting per request (the gateway);
+- **Slice A8 — per-request arena reuse — MEASURED, BELOW GATE, RECORD-AND-CLOSE (2026-07-11).**
+  The pool was built exactly to the settled design and benchmarked on the gateway shape; it came in
+  at **~1.06×** over the pre-pool baseline — short of the **≥ ~1.15×** ship gate — so it was
+  **reverted (not shipped)**. The shipped runtime is byte-identical to pre-A8. Measured matrix
+  (Ryzen 9 5950X, 500k iters, best-of-15, `bench/arena_pool`): (a) pre-pool **555.8 ns/iter**;
+  (b) pooled + re-zero **523.9 ns/iter** (1.06×); (c) pooled *no* re-zero **41.2 ns/iter** (13.5×);
+  (d) `bumpalo` reset **19.2 ns**; (e) `malloc`/`free` **23.7 ns**. Diagnosis: the mandated re-zero
+  is a full-64-KiB memset that costs ≈480 ns and dwarfs the ≈32 ns of malloc/free the pool removes —
+  so pooling *with* the re-zero cannot clear the gate. (b) vs (c) shows the whole win lives in the
+  recorded **drop-the-re-zero follow-up** (13.5× upper bound), which is a separate, provably-safe
+  slice — not this one. The bench + `bench/arena_pool/README.md` are the durable negative record; the
+  full feature-gated prototype (runtime pool + 7 unit tests) is preserved in this branch's git
+  history for that follow-up. Original settled design (retained for the follow-up) below.
+
+  Consumer = a long-running server loop resetting per request (the gateway);
   *(general — any flat-footprint request/event loop)*.
   - **The `checkpoint()`/`rollback(cp)` API is REJECTED for v1, with a precise reopen
     trigger.** Grounds: (1) it would be a second way — `loop { arena { …transients… } }`

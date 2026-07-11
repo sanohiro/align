@@ -14,10 +14,11 @@
 //!   (d) Rust `bumpalo` reset loop — the same shape on a keep-largest-chunk bump allocator
 //!   (e) plain Rust malloc/free    — the same shape with `Vec` allocations freed each iteration
 //!
-//! The gate: ship the pool iff (b) >= ~1.15x over (a) on this realistic shape. (a)/(b) come from two
-//! `run.sh` invocations with the pool feature on/off; (d)/(e) are feature-independent and print in
-//! both runs as a stable sanity check. All numbers are best-of-TRIALS (min — the least-noise
-//! estimator for a microbench). Drives the runtime's C-ABI directly, so it times shipped code.
+//! The gate: ship the pool iff (b) >= ~1.15x over (a) on this realistic shape. **It measured ~1.06x
+//! — below the gate — so the pool was reverted (record-and-close; see README.md).** As shipped, this
+//! harness times the pre-pool arena (a) vs `bumpalo` (d) vs `malloc` (e); the (b)/(c) pool variants
+//! are reproducible from the prototype commit in this branch's git history. All numbers are
+//! best-of-TRIALS (min — the least-noise estimator for a microbench), driving the shipped C-ABI.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -29,13 +30,10 @@ const BIG: usize = 2048; // a rendered-template output buffer
 const SMALL: usize = 48; // a parse-table-ish small alloc
 const SMALL_COUNT: usize = 8; // several of them
 
-#[cfg(feature = "pool")]
-const ARENA_LABEL: &str = "(b) align arena  — POOLED + re-zero";
-#[cfg(not(feature = "pool"))]
-const ARENA_LABEL: &str = "(a) align arena  — BASELINE (pre-pool)";
+const ARENA_LABEL: &str = "(a) align arena  — shipped (pre-pool)";
 
-/// The align-arena variant ((a) or (b) depending on the compiled `pool` feature). One `arena { … }`
-/// per iteration, driving the runtime's C-ABI begin/alloc/end.
+/// The align-arena variant (the shipped pre-pool arena). One `arena { … }` per iteration, driving
+/// the runtime's C-ABI begin/alloc/end.
 fn run_arena(iters: usize) -> (Duration, u64) {
     let mut sum = 0u64;
     let t = Instant::now();
@@ -114,7 +112,7 @@ fn main() {
     let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(300_000);
     let trials: usize = std::env::var("TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(9);
 
-    // Warm up (first-chunk malloc, page faults, the pool priming).
+    // Warm up (first-chunk malloc, page faults, the allocator's per-thread bins).
     let _ = run_arena(black_box(10_000));
 
     let (arena_ns, _) = best_of(trials, iters, run_arena);
