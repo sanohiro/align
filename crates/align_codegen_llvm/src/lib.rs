@@ -173,22 +173,37 @@ pub fn collect_opt_remarks(
     let mut sink: Box<Vec<String>> = Box::default();
     let sink_ptr = (&mut *sink as *mut Vec<String>).cast::<std::ffi::c_void>();
     // SAFETY: `diag_handler` only reads the remark severity + description (disposing the C string)
-    // and pushes into the `Vec<String>` behind `sink_ptr`. `sink` outlives the handler: we detach
-    // the handler (below) before `sink` is dropped, so no callback can fire after it is freed.
+    // and pushes into the `Vec<String>` behind `sink_ptr`. `sink` outlives the handler: the guard
+    // below detaches the handler before `sink` is dropped, so no callback can fire after it is freed.
     unsafe {
         llvm_sys::core::LLVMContextSetDiagnosticHandler(ctx.raw(), Some(diag_handler), sink_ptr);
     }
+    // RAII guard: detaches the handler on every exit path, including unwind (a panic inside
+    // `build_module` / `run_opt_pipeline`), so a panic can never leave the handler dangling while
+    // `sink` is freed.
+    let _detach_guard = DiagnosticHandlerGuard { ctx: ctx.raw() };
 
     let built = build_module(&ctx, &module, program, &tm, Some(debug));
     let ran = built.and_then(|()| run_opt_pipeline(&module, &tm, "default<O2>"));
 
-    // Detach the handler before `sink` drops, so a late diagnostic can never write freed memory.
-    // SAFETY: clears the handler registered above on the same context.
-    unsafe {
-        llvm_sys::core::LLVMContextSetDiagnosticHandler(ctx.raw(), None, std::ptr::null_mut());
-    }
+    drop(_detach_guard);
     ran?;
     Ok(*sink)
+}
+
+/// Detaches the context diagnostic handler on drop. Ensures the handler is cleared before its
+/// userdata (the remarks sink) can be freed on any exit path, including unwind.
+struct DiagnosticHandlerGuard {
+    ctx: llvm_sys::prelude::LLVMContextRef,
+}
+
+impl Drop for DiagnosticHandlerGuard {
+    fn drop(&mut self) {
+        // SAFETY: clears the handler registered on this same context in `collect_opt_remarks`.
+        unsafe {
+            llvm_sys::core::LLVMContextSetDiagnosticHandler(self.ctx, None, std::ptr::null_mut());
+        }
+    }
 }
 
 /// Enable LLVM's optimization-remark emission once per process. `-pass-remarks*` are `cl::opt`
