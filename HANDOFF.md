@@ -5,7 +5,32 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, tenth wave (**M13 Slice 4 MERGED as #422** — build profiles +
+_Last updated: 2026-07-11, eleventh wave (**M13 Slice 5 MERGED as #423** — runtime-declare
+contract attributes + regression net, after the slice was **RE-SCOPED by a two-lens design
+review** the same day: the original flatten-ABI + per-arg-attribute plan was contradicted by
+the whole-program reality — LLVM FunctionAttrs already infers program-fn attrs for the
+non-inlined survivors (IR-verified on fib/parthunk), SROA already scalarizes the by-value
+aggregates (hand-flattening measured no-op), so flattening / type-derived fn-arg attrs /
+`AddProvenNoOverflow` are all DEFERRED to post-M14-ThinLTO with written reasons in the roadmap.
+What shipped: **5A** — the curated `rt_contract` table on the opaque `align_rt_*` declares (the
+one non-inline-redundant lever): `memory(argmem: read)` + `willreturn nofree nosync` +
+`nocapture readonly` on `hash64/128` + the str-compare family; memory WITHHELD on
+`utf8_valid`/`str_contains/find/rfind` (SIMD feature-detect cache = non-argument memory;
+`nosync` kept — memchr 2.8.2 is Relaxed-only, gate-verified); `noreturn` on the 6 abort decls;
+fail-safe default = nothing. **The A8 gate came in ABOVE-gate**: a loop-invariant `hash64` call
+was per-iteration and blocked vectorization; attributed, it LICM-hoists to the pre-header AND
+the loop vectorizes to `<4 x i64>` — pinned by an IR-shape test that fails if the table is
+emptied (mutation-proven). **5B** — alloca-in-entry audit, bool/tag storage pin (SSA+stack `i1`;
+Result/Option tag `i8`, user sum tag `i32`), ~3 canonical-loop-skeleton assertions folded into
+`vectorize_shapes`. nsw scratch probe recorded below-gate (zero shape change — kernels already
+vectorize). Gate SHIP (attribute soundness re-verified entry-by-entry: `safe_slice` never aborts
+→ `willreturn` sound); gemini 2 mediums applied (no-alloc name check; a REAL `fn_body`
+test-helper bug — first-occurrence match could extract the wrong function). `cargo test
+--workspace` **1874 green** (1868 + 6), clippy clean. **Next: M13 Slice V** (verification
+bundle: (a) `BuildTarget::Cpu(name)` empty-feature-string objdump check, (b) cold-edge `!prof`
+weights — MEASURE first, A8 gate, (c) the Clang-IR comparison harness for 3–5 kernels) — the
+LAST M13 slice; then M13 closes and the LLVM/inkwell upgrade checkpoint follows. Earlier: tenth
+wave (**M13 Slice 4 MERGED as #422** — build profiles +
 `alignc size`). `--profile dev|release|fast|small|tiny` → STOCK `default<O0|O2|O3|Os|Oz>`
 (one `Profile` enum owns `pipeline()` + `strip()`; default = `release` = today's O2, the no-flag
 path proven bit-for-bit unchanged by the gate); gc-sections/as-needed all profiles; `--strip-all`

@@ -2058,7 +2058,10 @@ regression net that validates the upgrade.
     would be duplicate coverage, so fold, don't add.
   - **Measurements to record while there:** the nsw/nuw scratch probe (hack `nsw` onto index
     adds locally, diff the shape suite; kernels already vectorize → expected below-gate).
-  - **LANDED 2026-07-11.** 5A shipped as one table-driven mechanism (`rt_contract` +
+  - **LANDED 2026-07-11 (#423; adversarial gate SHIP — every attribute entry independently
+    re-verified against the runtime source, A8 test mutation-proven; gemini 2 mediums applied
+    incl. a real fn_body test-helper anchoring bug; 1874 green).** 5A shipped as one
+    table-driven mechanism (`rt_contract` +
     `apply_rt_contract_attrs` in `align_codegen_llvm`, applied to every `align_rt_*` declare;
     fail-safe = no attribute). Curated set: `memory(argmem: read)` + `willreturn`/`nofree`/`nosync`
     + `ptr nocapture readonly` on `hash64`/`hash128` and the `str_eq`/`str_cmp`/`eq_ignore_case`/
