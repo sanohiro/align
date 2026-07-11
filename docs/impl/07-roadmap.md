@@ -1875,12 +1875,16 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
     (the builder-capacity / group_by-interleave negative-result precedent). Honest
     expectation: ~1.2–1.5× on the realistic shape — the recorded ≈3× belongs to
     alloc-dominated micro-loops, and must not be claimed for the gateway.
-- **A5 remainder — SSE/chunked streaming response (design SETTLED 2026-07-11; full record =
-  http.md slice-plan item 7):** `ctx.respond_stream(rb)` (header-only rb, consumes both, auto-TE,
-  single-sourced head serializer) + Move `http_stream` (`send` one-frame-one-write via
-  http_send_all; `send("")` = no-op; HTTP/1.0 → close-delimited raw mode via threaded version
-  info) + **`finish()` as the sole clean terminator** (Drop = close-only — amends the original
-  Drop-terminates commitment; poisoned flag on failed sends). Implement after A7.
+- **A5 remainder — SSE/chunked streaming response — DONE** (design SETTLED 2026-07-11, shipped;
+  full record = http.md slice-plan item 7): `ctx.respond_stream(rb)` (header-only rb → abort,
+  consumes both, auto-TE, single-sourced head serializer `http_serialize_head`) + Move `http_stream`
+  (`send` one-frame-one-write via http_send_all; `send("")` = no-op; HTTP/1.0 → close-delimited raw
+  mode via threaded version info) + **`finish()` as the sole clean terminator** (Drop = close-only —
+  amends the original Drop-terminates commitment; poisoned flag on failed sends). Ships the new
+  `Ty::HttpStream`/`Scalar::HttpStream` Move handle riding the `Result` Ok payload, `send`/`finish`
+  bound-receiver methods, and the runtime `http_respond_stream`/`http_stream_send`/`_finish`/`_free`
+  FFI. `cargo test` green (runtime frame-encoder/version/poison units + an end-to-end 1.1-chunked /
+  1.0-raw / truncation / poison driver suite in `m12_http_stream.rs`).
 
 
 ## M13: Codegen quality & link hygiene — the pre-LLVM-upgrade wave (PLANNED)

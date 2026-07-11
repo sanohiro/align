@@ -373,7 +373,16 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      factor + the machine's core count + parity-vs-Rust at equal degree — NOT a
      hardware-independent 12.8× claim.
 7. **SSE/chunked streaming response (`respond_stream`, the runway A5 remainder) — design SETTLED
-   2026-07-11** (two-critic review, Fable synthesis). The gateway token-streaming layer: the
+   2026-07-11, SHIPPED.** Runtime: `HttpStream { fd, framed, poisoned }` + `align_rt_http_respond_stream`
+   / `_stream_send` / `_stream_finish` / `_stream_free`; the head serializer is single-sourced as
+   `http_serialize_head` (respond appends CL+body, respond_stream appends TE); the request's HTTP
+   version is threaded parse → `HttpRequestHead.http11` → `HttpRequestCtx.http11` → the stream's
+   `framed`. Compiler: `Ty::HttpStream`/`Scalar::HttpStream` (a Move handle riding the `Result` Ok
+   payload, the accept precedent), HIR `HttpRespondStream`/`HttpStreamSend`/`HttpStreamFinish`, all
+   routed through `lower_http`. Tested by runtime units (frame encoder, version, shared-head parity,
+   poison, empty-send no-op) + `crates/align_driver/tests/m12_http_stream.rs` (1.1 chunked / 1.0 raw /
+   truncation / poison / the align-client-rejects-chunked asymmetry / the double-consume + bodied-abort
+   gates). (Two-critic review, Fable synthesis.) The gateway token-streaming layer: the
    caller writes SSE `data: …\n\n` lines as body content; std.http ships the **transfer framing
    only** (the framework boundary holds).
    - `ctx.respond_stream(rb) -> Result<http_stream, Error>` — consumes BOTH ctx and rb (the

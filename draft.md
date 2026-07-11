@@ -2211,6 +2211,18 @@ client
 server primitive
 ```
 
+The server primitive streams a response via `http_stream` (SSE / chunked). `respond_stream` consumes
+both the request context and a **header-only** response builder (a bodied builder aborts — the body is
+streamed, not preset); a 1.1 client gets `Transfer-Encoding: chunked`, a 1.0 client close-delimited
+raw. `finish` is the sole clean terminator (Drop closes without a terminal chunk — abrupt close is
+chunked's own truncation signal).
+
+```text
+ctx.respond_stream(rb: response_builder) -> Result<http_stream, Error>  // consumes ctx + rb
+s.send(chunk: bytes) -> Result<(), Error>       // one chunk frame, one write; send("") = no-op
+s.finish() -> Result<(), Error>                 // consumes s; writes 0\r\n\r\n (framed) + closes
+```
+
 ---
 
 ## 18.3 pkg
