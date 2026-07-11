@@ -30,7 +30,10 @@ pub fn run_size(path: &str, target: BuildTarget, profile: Profile) -> ExitCode {
     if let Err(code) = crate::build_to(path, &mir, &exe, target, profile) {
         return code;
     }
-    match report(&exe, profile) {
+    let res = report(&exe, profile);
+    // The exe is purely transient (the report is the product) — don't accumulate in temp_dir.
+    let _ = std::fs::remove_file(&exe);
+    match res {
         Ok(text) => {
             print!("{text}");
             ExitCode::SUCCESS

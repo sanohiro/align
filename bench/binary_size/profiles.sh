@@ -41,7 +41,7 @@ for name in "${progs[@]}"; do
     ( cd "$tmp" && "$ALIGNC" build "$src" --profile "$p" >/dev/null ) \
       || { echo "error: build failed: $name --profile $p" >&2; exit 1; }
     bin="$tmp/$name"
-    sz=$(stat -c%s "$bin" 2>/dev/null || echo 0)
+    sz=$(stat -c%s "$bin" 2>/dev/null || stat -f%z "$bin" 2>/dev/null || echo 0)
     printf '%-8s | %-8s | %10d | %-8s | %s\n' "$name" "$p" "$sz" "$(stripped "$bin")" "$(gated "$bin")"
     rm -f "$bin"
   done
