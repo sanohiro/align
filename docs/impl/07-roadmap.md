@@ -1908,7 +1908,9 @@ regression net that validates the upgrade.
   compiler-generated helpers → `private`; string/descriptor constants → `private unnamed_addr`.
   Unlocks LLVM IPO/DCE/inlining/`constmerge`. Completion: an IR-shape test pins the linkage map
   (main/pub/extern = external, everything else internal/private) and a before/after size+perf
-  smoke shows no regression.
+  smoke shows no regression. Note (recorded at implementation): Align has no separate
+  compilation — one `Program` → one object, `pub` resolves at sema — so `emit-obj` output is a
+  whole-program object, not a separately-linkable unit; `main` is the sole external definition.
 - **Slice 2 — capability-based linking + runtime split.** Collect `UsedCapability`
   (Threads/Zlib/Zstd/Crypto/Tls/Dl/Math/…) from builtin usage into the existing
   `Program.link_libs` mechanism; the driver links ONLY what is used. Function/data sections +
