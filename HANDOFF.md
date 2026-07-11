@@ -5,7 +5,25 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, fifth wave (**M12 COMPLETE — A5-SSE MERGED as #417**, the last M12
+_Last updated: 2026-07-11, sixth wave (**M13 OPENED — Slice 1 MERGED as #418**, symbol
+internalization + constant hygiene: codegen previously set ZERO linkage; now the C entry `main`
+(incl. the Result-main wrapper) is the SOLE external definition — `align_main` + all program fns +
+lifted lambdas = `internal`, the four thunk classes (`$fnval`/`$clos`/`tramp$R`/`$parthunk`) =
+`private`, `@str`/`@jfields`/`@jphf` constants = `private unnamed_addr constant`; runtime/
+`extern "C"` declares stay external. Three documented free helpers in `align_codegen_llvm`
+(no recursive-fn match arms — frame pitfall avoided). IR-shape test `link_hygiene.rs` (6 tests,
+mutation-checked: neutered `mark_internal` fails 3, dropped `unnamed_addr` fails 2) pins the map;
+size smoke `pipe.o` −33%, no regressions. Key fact recorded (roadmap + decision site): Align has
+no separate compilation — one `Program` → one object, `pub` resolves at sema, so `emit-obj`
+output is a whole-program object and internalizing is safe by construction; `unnamed_addr` safe
+because string `==` is content compare (`align_rt_str_eq`), never address identity. Adversarial
+gate SHIP zero CONFIRMED findings (completeness sweep over every `add_function`/`add_global`
+site; FFI proven import-only; the multi-object C-helper link path still works). gemini: 1 medium
+(explicit `'c` lifetime for sibling-helper consistency) verified and applied. `cargo test
+--workspace` **1819 green** (1813 + 6), clippy `-D warnings` clean. **Next: M13 Slice 2**
+(capability-based linking + runtime split — `fn main() -> i32 = 0` must link none of
+z/zstd/crypto/ssl; `empty`/`hello` size benchmarks), then Slices 3/4/5/V per the roadmap M13
+section. Earlier: fifth wave (**M12 COMPLETE — A5-SSE MERGED as #417**, the last M12
 slice. `ctx.respond_stream(rb)` (header-only rb → abort, consumes both, auto TE:chunked for 1.1 /
 close-delimited raw for 1.0 via a threaded version bool, single-sourced `http_serialize_head` with
 `respond`) + Move `http_stream` (`send` = one length-driven chunk frame per write, `send("")` =

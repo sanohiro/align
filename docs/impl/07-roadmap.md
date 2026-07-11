@@ -1894,7 +1894,7 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   1.0-raw / truncation / poison driver suite in `m12_http_stream.rs`).
 
 
-## M13: Codegen quality & link hygiene — the pre-LLVM-upgrade wave (PLANNED)
+## M13: Codegen quality & link hygiene — the pre-LLVM-upgrade wave (IN PROGRESS)
 
 Source: the 2026-07-11 external optimization consultation (adoption record in
 `open-questions.md` Open → "External optimization consultation"). Three gaps were empirically
@@ -1904,13 +1904,20 @@ full: breaking interface changes are fine, no compat shims. **This wave delibera
 the LLVM/inkwell upgrade** — its IR-shape tests, size benchmarks, and remarks tooling are the
 regression net that validates the upgrade.
 
-- **Slice 1 — symbol internalization + constant hygiene.** Non-exported functions → `internal`;
-  compiler-generated helpers → `private`; string/descriptor constants → `private unnamed_addr`.
-  Unlocks LLVM IPO/DCE/inlining/`constmerge`. Completion: an IR-shape test pins the linkage map
-  (main/pub/extern = external, everything else internal/private) and a before/after size+perf
-  smoke shows no regression. Note (recorded at implementation): Align has no separate
-  compilation — one `Program` → one object, `pub` resolves at sema — so `emit-obj` output is a
-  whole-program object, not a separately-linkable unit; `main` is the sole external definition.
+- **Slice 1 — symbol internalization + constant hygiene. DONE (#418, 2026-07-11).**
+  Non-exported functions → `internal`; compiler-generated helpers → `private`;
+  string/descriptor constants → `private unnamed_addr`. Unlocks LLVM
+  IPO/DCE/inlining/`constmerge`. Both completion conditions met: the IR-shape test
+  (`align_driver/tests/link_hygiene.rs`, 6 tests, mutation-checked) pins the linkage map — the C
+  entry `main` (incl. the Result-main wrapper) is the SOLE external definition; `align_main` +
+  all program fns + lifted lambdas = internal; the four thunk classes (`$fnval`/`$clos`/
+  `tramp$R`/`$parthunk`) = private; runtime/`extern "C"` declares stay external (undefined);
+  `@str`/`@jfields`/`@jphf` = private unnamed_addr constant (safe — string `==` is content
+  compare via `align_rt_str_eq`, never address identity). Size smoke: `pipe.o` −33%, no
+  regressions; O0 machine code unchanged (linkage is metadata). Key fact recorded at the
+  decision site: Align has no separate compilation — one `Program` → one object, `pub` resolves
+  at sema — so `emit-obj` output is a whole-program object, not a separately-linkable unit.
+  Adversarial gate: SHIP, zero CONFIRMED findings.
 - **Slice 2 — capability-based linking + runtime split.** Collect `UsedCapability`
   (Threads/Zlib/Zstd/Crypto/Tls/Dl/Math/…) from builtin usage into the existing
   `Program.link_libs` mechanism; the driver links ONLY what is used. Function/data sections +
