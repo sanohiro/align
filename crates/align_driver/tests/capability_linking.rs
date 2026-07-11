@@ -143,9 +143,11 @@ fn hello_binary_links_no_gated_library() {
     if !backend_available() || !cc_available() || !readelf_available() {
         return;
     }
-    // The substantive case: a program that pulls the runtime core (`print` → the single runtime
-    // member that also references z/zstd/crypto/ssl) still links none of them — `--gc-sections`
-    // removes the dead compress/crypto/tls code and its external references.
+    // The substantive case: a program that pulls the runtime core (`print`, which never touches
+    // compress/crypto/tls) requests none of the gated libraries in the first place — capability
+    // gating (empty `link_libs`) is what drives the empty DT_NEEDED here. `--gc-sections` is a
+    // separate, independent mechanism: it drops the runtime's dead compress/crypto/tls code (and
+    // its external references) so that the link succeeds even though those libraries aren't passed.
     let exe = build_exe("cap-elf-hello", "fn main() {\n  print(\"hello\")\n}\n");
     let libs = dt_needed(&exe.exe);
     assert!(!needs_any_gated(&libs), "hello binary must not link any gated library, got {libs:?}");
@@ -161,7 +163,29 @@ fn gzip_binary_links_libz_and_not_the_others() {
     let libs = dt_needed(&exe.exe);
     assert!(libs.iter().any(|l| l.starts_with("libz.")), "gzip binary must link libz, got {libs:?}");
     assert!(
+        !libs.iter().any(|l| l.starts_with("libzstd.")),
+        "gzip binary must not link libzstd, got {libs:?}"
+    );
+    assert!(
         !libs.iter().any(|l| l.starts_with("libssl.") || l.starts_with("libcrypto.")),
         "gzip binary must not link ssl/crypto, got {libs:?}"
     );
+}
+
+#[test]
+fn crypto_binary_links_the_superset_and_not_ssl() {
+    if !backend_available() || !cc_available() || !readelf_available() {
+        return;
+    }
+    // Mirrors `crypto_requests_crypto_and_the_compress_libs` at the binary level: the single-member
+    // runtime co-locates crypto with compress, so `--gc-sections` cannot drop the compress libraries
+    // once crypto is used — DT_NEEDED must show libcrypto + libz + libzstd, but not libssl (which
+    // only the HTTPS client path pulls in).
+    let src = "import std.crypto\nfn main() -> Result<(), Error> {\n  h := crypto.sha256(\"hi\")\n  print(h.len() as i64)\n  return Ok(())\n}\n";
+    let exe = build_exe("cap-elf-crypto", src);
+    let libs = dt_needed(&exe.exe);
+    assert!(libs.iter().any(|l| l.starts_with("libcrypto.")), "crypto binary must link libcrypto, got {libs:?}");
+    assert!(libs.iter().any(|l| l.starts_with("libz.")), "crypto binary must link libz, got {libs:?}");
+    assert!(libs.iter().any(|l| l.starts_with("libzstd.")), "crypto binary must link libzstd, got {libs:?}");
+    assert!(!libs.iter().any(|l| l.starts_with("libssl.")), "crypto binary must not link libssl, got {libs:?}");
 }

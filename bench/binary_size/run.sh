@@ -37,11 +37,12 @@ printf -- '----------+-------------------------------------------+--------------
 progdir="$(pwd)/progs"
 for f in progs/*.align; do
   name="$(basename "${f%.align}")"
-  "$ALIGNC" emit-obj "$f" "$tmp/$name.o" >/dev/null 2>&1
+  "$ALIGNC" emit-obj "$f" "$tmp/$name.o" >/dev/null || { echo "error: emit-obj failed for $f" >&2; exit 1; }
   # BEFORE: legacy unconditional libs, no link hygiene.
   cc "$tmp/$name.o" "$RT" -o "$tmp/${name}_before" "${BEFORE_LIBS[@]}" 2>/dev/null
   # AFTER: the real driver (`alignc build` writes the exe named <stem> into the cwd).
-  ( cd "$tmp" && "$ALIGNC" build "$progdir/$name.align" >/dev/null 2>&1 )
+  ( cd "$tmp" && "$ALIGNC" build "$progdir/$name.align" >/dev/null ) \
+    || { echo "error: alignc build failed for $f" >&2; exit 1; }
   mv "$tmp/$name" "$tmp/${name}_after" 2>/dev/null || true
   bsz=$(stat -c%s "$tmp/${name}_before" 2>/dev/null || echo 0)
   asz=$(stat -c%s "$tmp/${name}_after"  2>/dev/null || echo 0)
