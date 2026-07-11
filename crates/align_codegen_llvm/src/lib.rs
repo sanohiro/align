@@ -2558,7 +2558,7 @@ fn mark_private_helper<'c>(f: FunctionValue<'c>) {
 /// by the pointer we return. `unnamed_addr` declares the *address* is not significant (only the
 /// contents are), which lets LLVM's `constmerge` fold byte-identical constants (e.g. two equal
 /// string literals) into one. The caller sets `constant` where the data is immutable.
-fn mark_private_unnamed_addr(g: inkwell::values::GlobalValue) {
+fn mark_private_unnamed_addr<'c>(g: inkwell::values::GlobalValue<'c>) {
     g.set_linkage(Linkage::Private);
     g.set_unnamed_address(inkwell::values::UnnamedAddress::Global);
 }
