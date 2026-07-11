@@ -2343,7 +2343,13 @@ driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Dis
   (useful-byte ratio, pointer-indirection, false-sharing — the M8 frequency-lints family);
   string blob + offset tables / error-message tables / relative-offset metadata (binary-size,
   alignpack-adjacent); performance contracts spelled in draft.md as Guaranteed /
-  Target-dependent / Profile-dependent tiers; `f.len()`-in-loop syscall lint.
+  Target-dependent / Profile-dependent tiers; `f.len()`-in-loop syscall lint; **the AI
+  optimization loop** — a machine-readable performance report (`alignc explain-opt --format
+  json`: per-loop {fused, vectorized, why-not, suggestions}), a per-build optimization score
+  report (allocations / materializations / hot-loop bounds checks / indirect calls / fused
+  pipelines — itemized, not a single number), and CI perf-regression gates that fail a PR on
+  allocation/fusion/vectorization-count regressions (grows out of M13 Slice 3's explain-opt;
+  the count-gates piggyback on the M13 IR-shape suite).
 - **Post-LLVM-upgrade (order matters — bitcode compat):** ThinLTO → runtime-as-bitcode (LLVM
   version alignment is the known wall) → instrument PGO → sample PGO / BOLT.
 - **REJECTED (do not re-litigate; reasons):** NaN boxing / general SSO / runtime string interning

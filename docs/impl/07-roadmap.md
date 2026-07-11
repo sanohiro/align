@@ -1911,7 +1911,9 @@ regression net that validates the upgrade.
   vectorized — source and destination may overlap; use an `out` parameter"). Build the
   **vectorization IR-shape suite** from the Vectorizers.html catalog (unknown-trip-count /
   reduction / if-conversion / noalias-two-slices / masked-filter / pointer-induction …) — the
-  LLVM-upgrade gate.
+  LLVM-upgrade gate. Design the remark surface so the recorded follow-on (the AI optimization
+  loop: `--format json` machine-readable reports, the itemized optimization score report, and
+  CI count-regression gates — see the consultation digest) can grow out of it without rework.
 - **Slice 4 — build profiles.** `--profile dev/release/fast/small/tiny` →
   `default<O0|O2|O3|Os|Oz>` (deliberately the STOCK pipelines — no custom pass order until
   remarks+benchmarks justify one) + per-profile linker flags (gc-sections/as-needed/strip) +
