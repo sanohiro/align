@@ -1996,7 +1996,9 @@ regression net that validates the upgrade.
     double-invocation); its one robustness note (RAII detach guard for the diagnostic handler —
     unwind-safe by construction) applied pre-merge. gemini: zero findings. Full outcome +
     deviations in `09-explain-opt.md`.
-- **Slice 4 — build profiles + `alignc size` — DONE.** `--profile dev/release/fast/small/tiny`
+- **Slice 4 — build profiles + `alignc size` — DONE (#422, 2026-07-11; adversarial gate SHIP —
+  default-path invariance proven bit-for-bit vs main, all 4 test mutations caught; gemini 2
+  applied / 1 rejected-with-reason; 1868 green).** `--profile dev/release/fast/small/tiny`
   selects the STOCK pipeline `default<O0|O2|O3|Os|Oz>` (no custom pass order — the consultation's
   "deliberately NOT a custom pipeline" clause) + the profile-dependent strip choice. The whole
   mechanism is **one enum**, `Profile` (in `align_codegen_llvm`, re-exported by the driver): it owns

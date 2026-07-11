@@ -5,7 +5,27 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, ninth wave (**M13 Slice 3b MERGED as #421 — Slice 3 COMPLETE**:
+_Last updated: 2026-07-11, tenth wave (**M13 Slice 4 MERGED as #422** — build profiles +
+`alignc size`). `--profile dev|release|fast|small|tiny` → STOCK `default<O0|O2|O3|Os|Oz>`
+(one `Profile` enum owns `pipeline()` + `strip()`; default = `release` = today's O2, the no-flag
+path proven bit-for-bit unchanged by the gate); gc-sections/as-needed all profiles; `--strip-all`
+only small/tiny (speed profiles keep symbols); `explain-opt`/`emit-llvm --stage optimized` stay
+PINNED at `default<O2>` (diagnostic lenses, not builds — keeps the 3a gate path exact). New
+`alignc size <file.align> [--profile p]`: builds then reports total/per-section/top-10-symbols/
+relocs/DT_NEEDED via binutils (`LC_ALL=C`-pinned, failure-degrades-to-note, transient exe removed).
+Numbers: hello 4.27 MB → **324 KB** small/tiny (strip dominates; O-level negligible on
+runtime-dominated programs — the unstripped bulk is the runtime staticlib's symbol/debug info,
+ties into the recorded runtime-split follow-up). Gate SHIP (default-path invariance bit-for-bit;
+strip keeps DT_NEEDED — a stripped crypto program runs; size.rs probed under ja_JP locale/missing
+binutils/compile failure; all 4 mutations caught). gemini: 2 applied (transient-exe cleanup, BSD
+stat fallback), 1 REJECTED with written reason (`is_multiple_of` MSRV — toolchain pinned 1.96 and
+the suggested modulo form would trip clippy's `manual_is_multiple_of` at `-D warnings`).
+`cargo test --workspace` **1868 green** (1858 + 10), clippy clean. **Next: M13 Slice 5**
+(internal ABI + argument attributes — the big one, may split; NOTE the 3a k7 finding re-scoped
+its `noalias` motivation to cross-function/opaque-provenance cases) **then Slice V**
+(verification bundle: Cpu-feature objdump check, measured cold `!prof` weights, Clang-IR
+comparison harness) — those two close M13, and the LLVM/inkwell upgrade checkpoint follows.
+Earlier: ninth wave (**M13 Slice 3b MERGED as #421 — Slice 3 COMPLETE**:
 `alignc explain-opt` ships). Per-block `stmt_lines` MIR plumbing (populated only by
 `lower_program_located`; single push site keeps the parallel invariant by construction) + opt-in
 inkwell DI emission (`"Debug Info Version"` module flag stamped MANUALLY — the design doc's
