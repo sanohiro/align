@@ -6,7 +6,12 @@
 
 use align_diag::{Diagnostics, Severity};
 use align_span::SourceMap;
-pub use align_codegen_llvm::BuildTarget;
+pub use align_codegen_llvm::{BuildTarget, DebugInfo};
+/// The lowered MIR program type (re-exported so callers can name it without depending on
+/// `align_mir` directly).
+pub use align_mir::Program as MirProgram;
+
+pub mod explain;
 
 /// Result of running the pipeline through sema.
 pub struct Checked {
@@ -106,9 +111,27 @@ pub fn lower_to_mir(hir: &align_sema::Program) -> align_mir::Program {
     align_mir::lower_program(hir)
 }
 
+/// Lower to MIR with source locations (each statement records the line/col it came from), for
+/// `explain-opt` / debug-info emission. Identical to [`lower_to_mir`] but with populated
+/// `stmt_lines`.
+pub fn lower_to_mir_located(hir: &align_sema::Program, source_map: &SourceMap) -> align_mir::Program {
+    align_mir::lower_program_located(hir, source_map)
+}
+
 /// Whether the LLVM backend is available (codegen is wired up).
 pub fn backend_available() -> bool {
     align_codegen_llvm::is_available()
+}
+
+/// Compile `mir` with debug locations, run `-O2`, and return LLVM's raw optimization-remark strings
+/// (`"<file>:<line>:<col>: <message>"`). Process-global side effect — see
+/// [`align_codegen_llvm::collect_opt_remarks`]. Used only by `explain-opt`.
+pub fn collect_opt_remarks(
+    mir: &align_mir::Program,
+    target: BuildTarget,
+    debug: &DebugInfo,
+) -> Result<Vec<String>, String> {
+    align_codegen_llvm::collect_opt_remarks(mir, &target, debug).map_err(|e| e.to_string())
 }
 
 /// Write MIR out to an object file (codegen). `target` selects the CPU baseline (portable default

@@ -181,6 +181,53 @@ verdict → explain-opt.** Where both could speak (e.g. an invariant call in a l
 owns it and explain-opt stays silent — no double reporting. explain-opt never fires during a
 plain `build`.
 
+### Implementation outcome (Slice 3b shipped — `m13-slice3b-explain-opt`)
+
+Built to the contract above; the C-API remarks path and DILocation anchoring both work. The real
+LLVM-19 remark strings captured from the design's probe kernels (`x86-64-v3`) and keyed on:
+
+```text
+probe.align:2:33: vectorized loop (vectorization width: 4, interleaved count: 1)      # passed
+probe.align:1:33: loop not vectorized: cannot prove it is safe to reorder floating-point operations
+probe.align:2:40: loop not vectorized: value that could not be identified as reduction is used outside the loop
+probe.align:2:33: 'dbl' inlined into 'run' with (cost=-15030, threshold=337) ...      # inline passed
+probe.align:6:3:  align_rt_print_i64 will not be inlined into align_main ...           # runtime inline miss
+probe.align:4:8:  Stores SLP vectorized with cost -2 and with tree size 2             # slp passed
+<unknown>:0:0:    'align_main' inlined into 'main' ...                                 # compiler-internal
+```
+
+Deviations from the design, all documented in code:
+
+- **The "Debug Info Version" module flag is stamped manually** (`module.add_basic_value_flag`) —
+  inkwell's `create_debug_info_builder(true, …)` does **not** stamp it (the design's claim was
+  inaccurate); without it the verifier strips all debug metadata and no remark anchors.
+- **`stmt_lines` is populated at statement / block-value granularity, not per sub-expression.**
+  `lower_expr` is a very large, deeply recursive function; setting the span inside it (even one
+  field write, or a save/restore wrapper) grew its debug-build frame enough to overflow the 2 MB
+  test thread on machine-generated deep expressions (`expr_depth`). Setting the span in the shallow
+  `lower_stmt`/`lower_block` instead anchors every pipeline / loop / call site (a single-expression
+  function body's pipeline lowers from one block-value expression) with zero hot-path cost. Line
+  tracking is populated only in located mode; a normal build's `push` is byte-identical to before,
+  and the block-value's `emit-llvm`/`emit-mir` output is unchanged (verified).
+- **`reason_code` gained `FpReorder`** — the ordered-FP-reduction decline is a distinct, mappable
+  cause with a concrete remedy (integer reduction), so it earns its own honest code rather than
+  collapsing into `ReductionNotRecognized`.
+- **Inline misses → bucket (not actionable).** Every Align pipeline lambda inlines in practice, so
+  no lambda-inline-miss string was observed to key on; v1 buckets inline misses (runtime callees to
+  a library/runtime sub-bucket) rather than key on an unverified pattern. The lambda-inline-miss →
+  actionable-record path is deferred until a real string exists.
+- **`slp-vectorize` passed feeds the summary only**; the bare redundant `loop not vectorized`
+  decline (LLVM also emits a specific-reason remark) is deduped into the bucket, not double-reported.
+
+Default view = the missed/actionable one-liners + a one-line success summary (`N loop(s)
+vectorized (M not); K call(s) inlined; J store group(s) SLP-vectorized`) + a trailing bucket count;
+`--verbose` adds the raw `[llvm …]` passthrough (library/runtime, other, and compiler-internal
+sub-lists). Exit 0 when compiled+reported, 1 on compile error / bad args / unreadable file. The
+report is built as a `Vec<OptRecord>` and rendered second, so `--format json` / score / CI gates
+stay pure extensions. A test-only note: `common::build_and_run`'s post-lowering work was moved into
+its own frame (`emit_link_run`) so the deep MIR lowering it drives keeps its 2 MB-thread margin — a
+behaviour-preserving robustness fix that helps every deep-lowering test, not just explain-opt.
+
 ## Deferrals (recorded)
 
 - The C++ remark shim (structured `(pass, RemarkName, args)` keying) — revisit at the LLVM

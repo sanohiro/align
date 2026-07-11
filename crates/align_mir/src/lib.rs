@@ -12,8 +12,56 @@
 
 use align_ast::{BinOp, UnOp};
 use align_sema::{hir, payload_is_move, struct_is_move, FloatTy, IntTy, Layout, Ty};
+use align_span::{SourceMap, Span};
+use std::rc::Rc;
 
 pub mod print;
+
+/// A byte-offset → (line, col) index over every source file, built once from the [`SourceMap`] and
+/// threaded (via [`Rc`]) into lowering so each MIR statement can record the 1-based source
+/// (line, col) it came from. Used only for debug locations (`alignc explain-opt` / a future `-g`);
+/// a normal build lowers with `None` and every `stmt_line` is `(0, 0)`. Column is byte-based within
+/// the line (cheap; matches the diagnostic column convention closely enough for anchoring).
+pub struct SourceLines {
+    /// Per `FileId` (index == id): sorted byte offsets where each 1-based line begins. `starts[0]`
+    /// is always 0 (line 1 starts at offset 0).
+    per_file: Vec<Vec<u32>>,
+}
+
+impl SourceLines {
+    /// Build the line-start table for every file currently in `sm`.
+    pub fn from_map(sm: &SourceMap) -> SourceLines {
+        let per_file = sm
+            .files()
+            .iter()
+            .map(|f| {
+                let mut starts = vec![0u32];
+                for (i, b) in f.src.bytes().enumerate() {
+                    if b == b'\n' {
+                        starts.push((i + 1) as u32);
+                    }
+                }
+                starts
+            })
+            .collect();
+        SourceLines { per_file }
+    }
+
+    /// The 1-based (line, col) of the start of `span`, or `(0, 0)` if the file is unknown. Column is
+    /// the byte offset within the line, plus 1.
+    fn locate(&self, span: Span) -> (u32, u32) {
+        let Some(starts) = self.per_file.get(span.file as usize) else {
+            return (0, 0);
+        };
+        // Last line-start that is <= the span's low offset.
+        let line = starts.partition_point(|&s| s <= span.lo);
+        if line == 0 {
+            return (0, 0);
+        }
+        let col = span.lo - starts[line - 1] + 1;
+        (line as u32, col)
+    }
+}
 
 /// SSA-like temporary value (defined once).
 pub type ValueId = u32;
@@ -77,6 +125,12 @@ impl Function {
 pub struct Block {
     pub id: BlockId,
     pub stmts: Vec<Stmt>,
+    /// Parallel to `stmts` (same length): the 1-based source (line, col) each statement lowered
+    /// from, or `(0, 0)` when unknown / lowered without a [`SourceMap`]. Codegen consumes this only
+    /// under `explain-opt` / debug-info emission to attach `DILocation`s; the MIR text printer
+    /// ignores it, so `emit-mir` output is unchanged. It is **not** part of the MIR value contract —
+    /// index defensively (`stmt_lines.get(i)`), since a block-mutating pass may leave it short.
+    pub stmt_lines: Vec<(u32, u32)>,
     pub term: Term,
 }
 
@@ -1035,12 +1089,28 @@ fn collect_capability_libs(fns: &[Function]) -> Vec<String> {
 }
 
 /// typed HIR -> MIR.
+/// Lower a whole HIR program to MIR (a normal build: no source lines — `Block::stmt_lines` stays
+/// empty).
 pub fn lower_program(program: &hir::Program) -> Program {
+    lower_program_impl(program, None)
+}
+
+/// Lower with source locations, so each MIR statement records the (line, col) it came from. Used by
+/// `alignc explain-opt` (and a future `-g`) to attach debug info; a normal build calls
+/// [`lower_program`]. The only difference is populated `Block::stmt_lines`.
+pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program {
+    lower_program_impl(program, Some(Rc::new(SourceLines::from_map(sm))))
+}
+
+// Inlined into the two thin entry points above so a normal build gains no extra call frame at the
+// base of the deep `lower_fn`/`lower_expr` recursion (`expr_depth` stack margin).
+#[inline]
+fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>) -> Program {
     let fns: Vec<Function> = program
         .fns
         .iter()
         .map(|f| {
-            let mut mf = lower_fn(f, &program.tuples, &program.structs);
+            let mut mf = lower_fn(f, &program.tuples, &program.structs, lines.as_ref());
             fuse_builder_writes(&mut mf);
             mf
         })
@@ -1169,6 +1239,17 @@ fn fuse_builder_writes(f: &mut Function) {
             idx += 1;
             keep
         });
+        // Keep the parallel `stmt_lines` in lock-step with the retained `stmts` (same drop set), so
+        // codegen's index pairing stays valid after fusion. The kept fused call lands at index `k`
+        // (a survivor), so its line is preserved.
+        if block.stmt_lines.len() == idx {
+            let mut idx = 0;
+            block.stmt_lines.retain(|_| {
+                let keep = !drop.contains(&idx);
+                idx += 1;
+                keep
+            });
+        }
     }
 }
 
@@ -1209,6 +1290,8 @@ fn find_next_write(
 
 struct BBuild {
     stmts: Vec<Stmt>,
+    /// Parallel source (line, col) per statement (see [`Block::stmt_lines`]).
+    stmt_lines: Vec<(u32, u32)>,
     term: Option<Term>,
 }
 
@@ -1244,6 +1327,20 @@ struct Builder {
     /// block, `result_slot` (where a `break` value is stored, `None` for a unit loop), and
     /// `iter_drops` (owned locals declared in the body, dropped each iteration / at each `break`).
     loops: Vec<LoopFrame>,
+    /// All source-line-tracking state (explain-opt / debug info), or `None` in a normal build.
+    /// Boxed into a single optional pointer so the `Builder` — which sits at the base of
+    /// `lower_expr`'s deep recursion — grows by only one word vs. a no-debug-info build, preserving
+    /// its stack margin (`expr_depth`). `None` also makes every span update a trivial skipped check.
+    dbg: Option<Box<LineCtx>>,
+}
+
+/// Located-lowering state carried through one function's `Builder` (see [`Builder::dbg`]).
+struct LineCtx {
+    /// Byte-offset → (line, col) table over every source file (shared read-only).
+    lines: Rc<SourceLines>,
+    /// The source span of the HIR node currently being lowered; each [`Builder::push`] records its
+    /// (line, col) into the block's parallel `stmt_lines`.
+    cur_span: Option<Span>,
 }
 
 /// A `loop` being lowered — the target of a `break` inside its body. See [`Builder::loops`].
@@ -1282,9 +1379,29 @@ impl Builder {
         let id = self.blocks.len() as BlockId;
         self.blocks.push(BBuild {
             stmts: Vec::new(),
+            stmt_lines: Vec::new(),
             term: None,
         });
         id
+    }
+
+    /// The (line, col) of the node currently being lowered, or `(0, 0)` when lowering without a
+    /// source table (a normal build) or before any span is set.
+    fn cur_line(&self) -> (u32, u32) {
+        match &self.dbg {
+            Some(d) => match d.cur_span {
+                Some(sp) => d.lines.locate(sp),
+                None => (0, 0),
+            },
+            None => (0, 0),
+        }
+    }
+
+    /// Set the current source span (a no-op in a normal build, where `dbg` is `None`).
+    fn set_span(&mut self, sp: Span) {
+        if let Some(d) = &mut self.dbg {
+            d.cur_span = Some(sp);
+        }
     }
 
     fn fresh_value(&mut self, ty: Ty) -> ValueId {
@@ -1310,7 +1427,24 @@ impl Builder {
     }
 
     fn push(&mut self, s: Stmt) {
+        // Only track source lines when lowering located (explain-opt / debug info). Kept tiny and the
+        // line work in a separate `#[inline(never)]` helper: `push` is inlined into `lower_expr`, a
+        // very large, deeply recursive function, so any locals here would grow its per-level frame
+        // ×depth and overflow the test thread on machine-generated deep expressions (`expr_depth`).
+        // A normal build leaves `stmt_lines` empty — codegen reads it defensively (`.get(i)`) and the
+        // fusion pass guards on its length.
+        if self.dbg.is_some() {
+            self.record_line();
+        }
         self.blocks[self.cur as usize].stmts.push(s);
+    }
+
+    /// Record the current statement's source (line, col), parallel to the just/soon-pushed stmt.
+    /// Out-of-line so `push` (hence `lower_expr`) stays frame-lean.
+    #[inline(never)]
+    fn record_line(&mut self) {
+        let lc = self.cur_line();
+        self.blocks[self.cur as usize].stmt_lines.push(lc);
     }
 
     fn terminate(&mut self, t: Term) {
@@ -1325,7 +1459,12 @@ impl Builder {
     }
 }
 
-fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -> Function {
+fn lower_fn(
+    f: &hir::Fn,
+    tuples: &[hir::TupleDef],
+    structs: &[hir::StructDef],
+    lines: Option<&Rc<SourceLines>>,
+) -> Function {
     let mut b = Builder {
         slots: f.locals.iter().map(|l| l.ty).collect(),
         slot_align: f.locals.iter().map(|l| l.align).collect(),
@@ -1340,6 +1479,7 @@ fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -
         structs: structs.to_vec(),
         alias_scope: 0,
         loops: Vec::new(),
+        dbg: lines.map(|l| Box::new(LineCtx { lines: Rc::clone(l), cur_span: None })),
     };
     let entry = b.new_block();
     b.cur = entry;
@@ -1383,6 +1523,7 @@ fn lower_fn(f: &hir::Fn, tuples: &[hir::TupleDef], structs: &[hir::StructDef]) -
         .map(|(id, bb)| Block {
             id: id as BlockId,
             stmts: bb.stmts,
+            stmt_lines: bb.stmt_lines,
             term: bb.term.unwrap_or(Term::Unreachable),
         })
         .collect();
@@ -1509,10 +1650,42 @@ fn lower_block(b: &mut Builder, block: &hir::Block) -> Option<Operand> {
             return None;
         }
     }
-    block.value.as_ref().map(|e| lower_expr(b, e))
+    block.value.as_ref().map(|e| {
+        // Anchor the block's trailing value to its own line — this is where a single-expression
+        // function body's pipeline lives (`fn run() -> T = xs.map(f).sum()`), so it carries the
+        // pipeline's source line into every instruction the value lowers.
+        b.set_span(e.span);
+        lower_expr(b, e)
+    })
+}
+
+/// A representative source span for a statement — the span of its primary expression, used to
+/// anchor the statement's lowered instructions to a source line (debug info).
+fn stmt_span(s: &hir::Stmt) -> Option<Span> {
+    match s {
+        hir::Stmt::Let { init, .. } => Some(init.span),
+        hir::Stmt::LetTuple { init, .. } => Some(init.span),
+        hir::Stmt::Assign { value, .. } => Some(value.span),
+        hir::Stmt::AssignIndex { value, .. } => Some(value.span),
+        hir::Stmt::AssignVecLane { value, .. } => Some(value.span),
+        hir::Stmt::AssignField { value, .. } => Some(value.span),
+        hir::Stmt::AssignElemField { value, .. } => Some(value.span),
+        hir::Stmt::AssignElem { value, .. } => Some(value.span),
+        hir::Stmt::Return(e) => e.as_ref().map(|e| e.span),
+        hir::Stmt::Break(e) => e.as_ref().map(|e| e.span),
+        hir::Stmt::Expr(e) => Some(e.span),
+    }
 }
 
 fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
+    // Anchor this statement's instructions to its primary expression's line (debug info). Set inline
+    // — no save/restore wrapper — because `lower_stmt` sits at the base of `lower_expr`'s deep
+    // per-sub-expression recursion; an extra wrapper frame there overflows the test thread on
+    // machine-generated deep expressions (`expr_depth`). `lower_stmt` itself only nests as deep as
+    // blocks (shallow), so a following statement resets the span before it emits.
+    if let Some(sp) = stmt_span(s) {
+        b.set_span(sp);
+    }
     match s {
         hir::Stmt::Let { local, init } => match &init.kind {
             // A struct literal initializes its slot field by field; there is no scalar value to
@@ -1782,6 +1955,13 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
 }
 
 fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
+    // NOTE: `cur_span` is deliberately NOT set here. `lower_expr` is a very large, deeply recursive
+    // function; touching its frame (even one field write) grows it enough to overflow the test
+    // thread on machine-generated deep expressions (`expr_depth`). Instead the enclosing `lower_stmt`
+    // and `lower_block` (shallow, not per-sub-expression) set the span, which anchors every pipeline
+    // / loop / call site — a function body's pipeline lowers from one block-value expression, a
+    // statement's from its primary expression. Sub-expressions inherit the enclosing span; that
+    // statement-level granularity is what the debug-info anchoring needs (`09-explain-opt.md`).
     match &e.kind {
         hir::ExprKind::Unit => Operand::Const(Const::Unit),
         hir::ExprKind::Int(v) => Operand::Const(Const::Int(*v, e.ty)),

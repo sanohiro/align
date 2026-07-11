@@ -83,6 +83,12 @@ impl SourceMap {
     pub fn get(&self, id: FileId) -> &SourceFile {
         &self.files[id as usize]
     }
+
+    /// All files, in `FileId` order (index == id). Used by MIR lowering to build a byte-offset →
+    /// (line, col) table for debug locations (`docs/impl/09-explain-opt.md`, Slice 3b).
+    pub fn files(&self) -> &[SourceFile] {
+        &self.files
+    }
 }
 
 #[cfg(test)]

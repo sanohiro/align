@@ -5,6 +5,7 @@
 //!   alignc emit-mir  <file>   Print MIR as text
 //!   alignc emit-llvm <file>   Print LLVM IR as text (--stage raw|optimized; default raw)
 //!   alignc emit-obj  <file>   Write an object file (no link, no `main` required)
+//!   alignc explain-opt <file> Report the -O2 optimizer's data-path decisions (--verbose)
 //!   alignc build     <file>   Build an executable (<stem> in cwd)
 //!   alignc run       <file>   Build, run, and return its exit code
 
@@ -32,6 +33,12 @@ fn main() -> ExitCode {
         // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
         // (a library / benchmark kernel). Default output is `<stem>.o`.
         (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target),
+        // `explain-opt <file> [--verbose]` — report what the `-O2` middle-end did to the data path
+        // (vectorized / not, with the reason), translated into the compiler's diagnostic voice.
+        (Some("explain-opt"), Some(p)) => {
+            let verbose = args.get(3..).unwrap_or(&[]).iter().any(|a| a == "--verbose" || a == "-v");
+            align_driver::explain::run_explain_opt(p, verbose, target)
+        }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
         (Some("build"), Some(p)) => run_build(p, target),
@@ -85,6 +92,7 @@ fn usage() {
            emit-mir   print MIR as text\n  \
            emit-llvm  print LLVM IR as text (--stage raw|optimized; default raw)\n  \
            emit-obj   write an object file (<file> [out.o]; no link, no `main` needed)\n  \
+           explain-opt report what the -O2 optimizer did to the data path (--verbose for detail)\n  \
            fmt        format source (prints to stdout; --write rewrites in place)\n  \
            build      build an executable\n  \
            run        build and run (returns the exit code)\n  \

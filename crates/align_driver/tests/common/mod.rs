@@ -98,7 +98,18 @@ pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::pro
         "unexpected errors:\n{}",
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
+    // Lower with only `sm`/`checked` live in this frame, then hand off — the path/emit/link locals
+    // live in `emit_link_run`'s frame, not this one. MIR lowering recurses per expression nesting
+    // level, so keeping this frame lean is what lets a within-limit deep expression (`expr_depth`,
+    // ~40-deep) lower on the 2 MB test thread with margin.
     let mir = lower_to_mir(&checked.hir);
+    emit_link_run(&mir, name, prog_args)
+}
+
+/// Object-emit + link + run for an already-lowered program — its own stack frame, so the
+/// (potentially deep) MIR lowering in the caller does not compete with these locals.
+#[inline(never)]
+fn emit_link_run(mir: &align_driver::MirProgram, name: &str, prog_args: &[&str]) -> std::process::Output {
     let dir = std::env::temp_dir();
     // Include the process id so two concurrent test-suite runs on one machine (e.g. parallel CI)
     // don't collide on these temp paths.
@@ -106,7 +117,7 @@ pub fn build_and_run_args(name: &str, src: &str, prog_args: &[&str]) -> std::pro
     let obj = dir.join(format!("align-test-{pid}-{name}.o"));
     let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
     let _artifacts = TempArtifacts { obj: obj.clone(), exe: exe.clone() };
-    emit_object_file(&mir, &obj, BuildTarget::Baseline).expect("codegen");
+    emit_object_file(mir, &obj, BuildTarget::Baseline).expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs).expect("link");
     std::process::Command::new(&exe).args(prog_args).output().expect("run")
 }
