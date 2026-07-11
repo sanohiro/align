@@ -5,7 +5,21 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, third wave (**M12 Slice A7 MERGED as #415** — streaming line reads:
+_Last updated: 2026-07-11, fourth wave (**the roadmap beyond M12 is now PLANNED, 8a47cc0**: the
+owner's out-of-repo GPT-5.6 optimization consultation was read in full by Fable, three claimed
+gaps empirically confirmed (zero linkage settings in codegen; `emit-llvm` is pre-opt only; the
+unconditional `-lz -lzstd -lcrypto -lssl …` link), and the whole thing triaged into an
+open-questions adoption record (adopted / verify / consumer-gated / post-upgrade /
+rejected-with-reasons). **New roadmap M13 = the pre-LLVM-upgrade codegen-quality wave**
+(internalization + unnamed_addr; capability-based linking + runtime split; optimized-IR emission
++ remarks→Align translation; build profiles over stock `default<O*>`; internal ABI flatten +
+argument attributes incl. broad `noundef`; verification bundle incl. the Cpu-feature test and
+measured cold metadata). **The LLVM/inkwell upgrade checkpoint is sequenced AFTER M13** (M13's
+shape/size/bench net is the upgrade gate); **ThinLTO → runtime bitcode → PGO → BOLT go after the
+upgrade** (bitcode compat dictates the order). A8 closed earlier today as measured-below-gate
+(#416, 1.06× < 1.15×; the 13.5× no-re-zero upper bound is the recorded follow-up). Owner
+reaffirmed: pre-release breaking changes stay OK indefinitely. Earlier: third wave (**M12 Slice
+A7 MERGED as #415** — streaming line reads:
 `r.buffered()` (the read dual of the buffered writer; drain-before-fd interleaving contract) +
 `r.read_line(mut buffer)` (body-with-`\r?\n`-stripped, consumed-incl-terminator, 0=EOF, 64 MiB
 cap, split-CRLF-across-refill verified) + the generic validating view `bytes.as_str()`. Gate SHIP
