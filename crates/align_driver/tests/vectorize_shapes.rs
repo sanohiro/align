@@ -348,10 +348,14 @@ fn mutation_k7_raw_is_not_vectorized() {
 /// The textual body of the first `define ... @{name}(` function in `ir` (up to the closing `}` at
 /// column 0), so an assertion can be scoped to one function instead of the whole module.
 fn fn_body(ir: &str, name: &str) -> String {
-    let start = ir
-        .find(&format!("@{name}("))
-        .and_then(|p| ir[..p].rfind("\ndefine").map(|d| d + 1))
+    // Match the `define` line itself, not the first `@name(` occurrence — a declare or a call
+    // site earlier in the module would otherwise anchor the extraction to the wrong function.
+    let needle = format!("@{name}(");
+    let line = ir
+        .lines()
+        .find(|l| l.starts_with("define ") && l.contains(&needle))
         .unwrap_or_else(|| panic!("no `define ... @{name}(` in:\n{ir}"));
+    let start = line.as_ptr() as usize - ir.as_ptr() as usize;
     let rest = &ir[start..];
     let end = rest.find("\n}\n").map(|e| start + e + 3).unwrap_or(ir.len());
     ir[start..end].to_string()

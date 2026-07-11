@@ -3017,11 +3017,12 @@ fn rt_contract(sym: &str) -> Option<RtContract> {
 /// left untouched (the fail-safe default).
 fn apply_rt_contract_attrs<'c>(ctx: &'c Context, module: &Module<'c>) {
     for f in module.get_functions() {
-        let name = f.get_name().to_string_lossy().into_owned();
+        let name = f.get_name();
+        let Ok(name) = name.to_str() else { continue };
         if !name.starts_with("align_rt_") || f.count_basic_blocks() != 0 {
             continue;
         }
-        let Some(c) = rt_contract(&name) else { continue };
+        let Some(c) = rt_contract(name) else { continue };
         for a in c.fn_attrs {
             add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, a);
         }
