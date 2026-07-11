@@ -5,7 +5,29 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, eleventh wave (**M13 Slice 5 MERGED as #423** — runtime-declare
+_Last updated: 2026-07-11, twelfth wave (**M13 COMPLETE — Slice V MERGED as #424**, the last
+slice; the milestone is formally closed in the roadmap). Slice V outcomes: (a) `--target-cpu`
+empty-feature-string VERIFIED CORRECT (LLVM derives the ISA set from the CPU name; objdump: v2 →
+SSE `paddq` zero `ymm`, v3/skylake → AVX2 `vpaddq`/`ymm`) and pinned by `target_cpu_isa.rs`
+(3 tool-gated tests, gate-mutation-verified BOTH directions); (b) cold-edge `!prof` closed
+**MOOT** — bounds/div/abort branches end in `unreachable` + the Slice-5 `noreturn` attrs already
+make BranchProbabilityInfo treat them as cold (objdump: fail calls sunk past the hot `ret`); a
+real `!prof` prototype produced byte-identical machine code and was reverted; correction
+recorded: `?`-edges are NOT cold (an `Err` is an ordinary value); (c) the Clang-IR comparison
+harness `bench/clang_ir_compare/` — **all 5 kernel pairs MATCH idiomatic C** through the same
+LLVM 19 at both v2 and v3 (semantic signals: reduce intrinsics + `<N x>` widths, not block-name
+strings which don't transfer cross-toolchain); divergences recorded as future leads (clang
+interleaves ~11 vs ~4 vector ops/body; Align's `out dst` = no-memcheck for free where C needs
+`restrict`). Gate SHIP; gemini's one high qualified-then-hardened (the shipped invocation shape
+survives — errexit suppressed in the `$(facts ...)` substitution, full run exits 0 — but all
+four greps now carry `|| true`). `cargo test --workspace` **1878 green** (1874 + 4), clippy
+clean. **M13 total: 7 PRs #418–#424, tests 1813 → 1878, the shape/size/bench regression net is
+built and green — it IS the LLVM-upgrade gate. Next: the LLVM/inkwell upgrade checkpoint**
+(roadmap: inkwell `llvm19-1` → newest; re-verify the shared-only Debian linkage stance
+(`LLVM_SYS_*_PREFER_DYNAMIC`); rerun the full net; re-measure Slice-V shapes; the deferred
+follow-ups — ThinLTO → runtime bitcode → PGO → BOLT — go AFTER the upgrade, and the Slice-5
+deferrals (ABI flattening, fn-arg attrs, nsw) wait for post-M14 ThinLTO boundaries). Earlier:
+eleventh wave (**M13 Slice 5 MERGED as #423** — runtime-declare
 contract attributes + regression net, after the slice was **RE-SCOPED by a two-lens design
 review** the same day: the original flatten-ABI + per-arg-attribute plan was contradicted by
 the whole-program reality — LLVM FunctionAttrs already infers program-fn attrs for the

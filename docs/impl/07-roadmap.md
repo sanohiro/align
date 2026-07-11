@@ -1894,7 +1894,16 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   1.0-raw / truncation / poison driver suite in `m12_http_stream.rs`).
 
 
-## M13: Codegen quality & link hygiene — the pre-LLVM-upgrade wave (IN PROGRESS)
+## M13: Codegen quality & link hygiene — the pre-LLVM-upgrade wave (COMPLETE 2026-07-11)
+
+**Formally closed 2026-07-11** — all slices merged with the standing slice-flow (#418 Slice 1
+internalization, #419 Slice 2 capability linking, #420 Slice 3a optimized-IR + vectorize_shapes,
+#421 Slice 3b explain-opt, #422 Slice 4 profiles + `alignc size`, #423 Slice 5 re-scoped
+runtime-contract attrs, #424 Slice V verification bundle). The completion condition is met: the
+shape/size/bench regression net (link_hygiene + capability_linking + vectorize_shapes incl. the
+canonical-loop skeletons + target_cpu_isa + the storage-form audits + bench/binary_size +
+bench/clang_ir_compare) is green — **it is now the LLVM-upgrade gate**. `cargo test --workspace`
+1878 green at close. Next: the LLVM/inkwell upgrade checkpoint below.
 
 Source: the 2026-07-11 external optimization consultation (adoption record in
 `open-questions.md` Open → "External optimization consultation"). Three gaps were empirically
@@ -2091,7 +2100,11 @@ regression net that validates the upgrade.
   exists; generated and user-wrap arithmetic are the same `Rvalue::Bin` — a sound version is a
   large new pass for a benefit SCEV largely recovers post-inline, at the highest miscompile
   risk in the slice).
-- **Slice V — verification bundle — DONE 2026-07-11.** (a) `BuildTarget::Cpu(name)` passes an
+- **Slice V — verification bundle — DONE (#424, 2026-07-11; gate SHIP — ISA tests
+  mutation-verified both directions, moot premise independently reproduced, harness honesty
+  verified at both tiers; gemini's one high qualified-then-hardened: the shipped invocation
+  shape survives — errexit is suppressed in the `$(facts ...)` substitution — but all four
+  greps now carry `|| true` for invocation-shape safety; 1878 green).** (a) `BuildTarget::Cpu(name)` passes an
   empty feature string — objdump-verify the CPU name alone selects the right ISA per target, or
   fix; (b) cold-edge `!prof` weights on `?`/bounds/abort edges — MEASURE first, ship iff it wins
   (the A8 gate precedent); (c) the Clang-IR comparison harness (compile semantically-equal C with
