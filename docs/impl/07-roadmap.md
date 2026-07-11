@@ -2030,16 +2030,43 @@ regression net that validates the upgrade.
     ≈ 4,290,816 B → 336,784 B. The strip win dominates (the runtime staticlib's symbol/debug info);
     the O-level difference is negligible on these runtime-dominated programs. LLVM does NOT guarantee
     `Oz ≤ Os ≤ O2` byte-for-byte, so the table reports reality, asserts no fragile ordering.
-- **Slice 5 — internal ABI + argument attributes (the big one; may split at implementation
-  time).** Flatten slice/str/Option/Result/closure-env into scalar SSA components inside the
-  internal ABI (aggregates only at external boundaries); derive per-argument attributes from
-  types/regions/effects (`noundef` broadly — the no-uninitialized-values guarantee;
-  `nonnull`/`nocapture`/`readonly`/`writeonly`/`noalias`/`dereferenceable(N)`/`align N` where
-  proven); effect summaries → `memory(...)`/`nofree`/`nosync`/`willreturn` (+`mustprogress` only
-  for provably-finite functions); `noreturn`+`unreachable` on abort paths; bool-storage-is-i8 and
-  alloca-in-entry audits; proven-range `nsw`/`nuw` via a new MIR arithmetic distinction
-  (`AddProvenNoOverflow` class — user wrap arithmetic NEVER gets flags). Canonical-loop shape
-  snapshot tests (Indexed/Reduction/Masked templates).
+- **Slice 5 — RE-SCOPED 2026-07-11 by a two-lens design review** (mechanics/soundness lens +
+  payoff/sequencing lens, independently convergent). The original "big one" premise —
+  per-argument attribute derivation + internal-ABI flattening — is **contradicted by the
+  whole-program reality**: since Slice 1 every fn is internal, LLVM inlines hard at O2, and for
+  the survivors (recursion, par thunks) **LLVM's FunctionAttrs already infers**
+  `memory(none)`/`nocapture readonly`/`nonnull` etc. with zero codegen help (IR-verified:
+  `fib` got `nofree nosync nounwind memory(none)` + fastcc; the `$parthunk` params got
+  `nocapture readonly/writeonly` — all inferred). Aggregates are already passed as first-class
+  by-value LLVM values that SROA/mem2reg scalarize immediately — hand-flattening measured a
+  no-op. The k7 finding (fn-level `noalias` not the map_into unlock) generalizes. **What ships
+  as Slice 5:**
+  - **5A — runtime-declare contract attributes.** The one non-inline-redundant lever: LLVM
+    cannot see the Rust bodies behind the ~250 opaque `align_rt_*` declares and those calls
+    never inline. A hand-curated per-function attribute table (each entry reviewed against the
+    actual runtime body — wrong = miscompile, that review IS the cost): `memory(...)`/`nofree`/
+    `nosync`/`willreturn` on provably-pure-finite fns (`hash64/128`, `utf8_valid`, codec fns —
+    the align-LLM hot path: a loop-invariant call becomes LICM-hoistable); `noreturn` on the
+    abort-family decls (free hygiene — MIR already places `unreachable`); `nocapture`/
+    `readonly`/`writeonly`/`nonnull` only where the contract is unambiguous. Fail-safe default =
+    no attribute. NEVER `willreturn`/`mustprogress` on anything abortable. **A8-style gate: the
+    effect-attr batch ships iff a probe shows a real LICM hoist / DCE / shape improvement;
+    else record below-gate.**
+  - **5B — regression-net additions.** Bool-storage (today: SSA `i1`) + alloca-in-entry audits
+    as pinning tests, and ~3 canonical-loop-skeleton assertions folded INTO `vectorize_shapes`
+    (single bounds check in the indexed body, one canonical induction phi) — a second suite
+    would be duplicate coverage, so fold, don't add.
+  - **Measurements to record while there:** the nsw/nuw scratch probe (hack `nsw` onto index
+    adds locally, diff the shape suite; kernels already vectorize → expected below-gate).
+  **DEFERRED with reasons (revisit post-M14 ThinLTO/runtime-bitcode — the wave that creates
+  real non-inlined boundaries where argument attributes stop evaporating):** internal-ABI
+  signature flattening (SROA already achieves it; FFI boundary correctly kept aggregate in the
+  separate extern pass); type-derived per-program-fn param attributes (`readonly`/`nocapture`/
+  `noalias`/`memory` — all need new analysis, all miscompile-if-wrong, all redundant with
+  FunctionAttrs today); `AddProvenNoOverflow` nsw/nuw MIR distinction (no range analysis
+  exists; generated and user-wrap arithmetic are the same `Rvalue::Bin` — a sound version is a
+  large new pass for a benefit SCEV largely recovers post-inline, at the highest miscompile
+  risk in the slice).
 - **Slice V — verification bundle.** (a) `BuildTarget::Cpu(name)` passes an empty feature string —
   objdump-verify the CPU name alone selects the right ISA per target, or fix; (b) cold-edge
   `!prof` weights on `?`/bounds/abort edges — MEASURE first, ship iff it wins (the A8 gate
