@@ -199,7 +199,13 @@ fn dynamic_deps(exe: &Path) -> Option<Vec<String>> {
 /// (not installed) — the caller degrades that section to a note. A nonzero exit that still produced
 /// stdout (e.g. `nm` on a stripped file) is returned as-is; a nonzero exit with no stdout is `None`.
 fn run_tool(tool: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(tool).args(args).output().ok()?;
+    // LC_ALL=C pins binutils output to the untranslated form; the relocation-count parse keys
+    // on the English "contains", which a localized binutils would otherwise break.
+    let output = Command::new(tool)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     if text.trim().is_empty() && !output.status.success() {
         return None;
