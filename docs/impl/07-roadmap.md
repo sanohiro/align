@@ -1918,13 +1918,37 @@ regression net that validates the upgrade.
   decision site: Align has no separate compilation — one `Program` → one object, `pub` resolves
   at sema — so `emit-obj` output is a whole-program object, not a separately-linkable unit.
   Adversarial gate: SHIP, zero CONFIRMED findings.
-- **Slice 2 — capability-based linking + runtime split.** Collect `UsedCapability`
-  (Threads/Zlib/Zstd/Crypto/Tls/Dl/Math/…) from builtin usage into the existing
-  `Program.link_libs` mechanism; the driver links ONLY what is used. Function/data sections +
-  `--gc-sections` + `--as-needed` in release profiles. Split (or verify member granularity of)
-  the runtime staticlib by feature area (`core/alloc/io/parallel/json/compress/crypto/http`).
-  Completion: `fn main() -> i32 = 0` links none of z/zstd/crypto/ssl, and `empty`/`hello`
-  binary-size benchmarks exist and are recorded.
+- **Slice 2 — capability-based linking + link hygiene. DONE (2026-07-11).** The unconditional
+  `-lz -lzstd -lcrypto -lssl` link is gone; those four are now GATED. MIR collects an
+  `align_mir::Capability` (`Zlib`/`Zstd`/`Crypto`/`Tls`) from the builtin `Rvalue`s a program uses
+  (`rvalue_capability` — a focused match; `CompressCompress/Decompress{kind}` → Zlib/Zstd,
+  `CryptoHash/Hmac/Hkdf/Aead/Argon2` → Crypto, the four `HttpClient*` ops → Tls; `CryptoCtEqual`
+  (const-time compare) and `CryptoRandom` (OS getrandom) map to nothing) and appends the required
+  `-l<name>`s to `Program.link_libs` in `lower_program`, so the driver's existing per-lib loop links
+  only what is used. **Collection point = MIR** (deliberate): MIR is the last stage before codegen
+  where every builtin is a distinct total `Rvalue`, and `link_libs` already rides on the `Program`;
+  the walk is a flat CFG scan (no recursion → no frame inflation). Fail-closed net: the driver links
+  ONLY the collected libs, so an external-lib op added but not classified drops its lib and its
+  `build_and_run` test fails to link — the `m11_compress`/`m11_crypto`/`m11_http` + new
+  `capability_linking` suites are that net. **Runtime NOT split** — verified the ideal call: the
+  runtime is one crate → one archive member (alloc + compress + crypto + http all in one `*.rcgu.o`),
+  so member granularity does NOT isolate a feature; what does is `--gc-sections` over Rust's default
+  per-function sections. Driver now passes `-Wl,--gc-sections -Wl,--as-needed` unconditionally
+  (safe, no profile) and keeps `-lpthread -ldl -lm` always (Rust-std support the runtime *core*
+  references independent of any Align feature; merged into libc on modern glibc so `--as-needed`
+  makes them free; portable on older). **Capability collection and gc-sections are COUPLED**: a
+  GNU ld quirk means once a candidate library on the link line resolves *some* of the single member's
+  symbols, ld stops garbage-collecting the member's *other* external references — so `Crypto`/`Tls`
+  transitively retain the compress libs (`Capability::link_libs` is a monotonic SUPERSET,
+  `Tls ⊇ Crypto ⊇ {compress}`; always correct — `--as-needed` drops any truly-unused lib from
+  `DT_NEEDED`). Completion conditions BOTH met: `capability_linking.rs` asserts (via `readelf -d`)
+  that `fn main() -> i32 = 0` AND `hello` link none of z/zstd/crypto/ssl while `gzip` keeps only
+  `libz`; `bench/binary_size/` records before/after. Release numbers: `hello` 5.52 MB / 4 gated deps
+  → 4.27 MB / **0** gated deps (−22.6 %), `gzip` → libz only, `https` → all four (correct). Full
+  suite green (1828, +9). **Deferred (not blocking):** fine-grained per-C-library isolation for
+  crypto/tls (→ `libcrypto` alone) needs a runtime-crate split by feature area — see
+  `open-questions.md` Open → "Runtime staticlib feature-split". This entry supersedes the
+  "always-linked" linking notes in `std-design/{compress,crypto,http}.md`.
 - **Slice 3 — optimized-IR emission + remarks translation.** `emit-llvm --stage raw|optimized`
   (today only pre-`run_passes` IR exists); capture LLVM `-Rpass*`-class remarks and translate
   them to Align-language diagnostics (`alignc explain-opt`: "the pipeline at app.align:42 was not

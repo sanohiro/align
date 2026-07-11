@@ -1,0 +1,7 @@
+// Uses hashing → links libcrypto (+ the co-located compress libs in the current single-member runtime).
+import std.crypto
+fn main() -> Result<(), Error> {
+  h := crypto.sha256("the quick brown fox")
+  print(h.len() as i64)
+  return Ok(())
+}
