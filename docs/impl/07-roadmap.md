@@ -1973,20 +1973,24 @@ regression net that validates the upgrade.
     literal-constructible — DX note). Follow-up applied from review: one `TargetMachine` per
     compile (`build_module`/`write_object` take `&TargetMachine`). Gate: SHIP zero blocking
     defects; gemini's 2 mediums verified and applied. 1844 green (+15).
-  - **Slice 3b — debug-loc anchoring + remarks capture + `alignc explain-opt`.** Empirically
-    confirmed prerequisites: codegen emits zero DILocations and MIR is span-free → remarks
-    anchor at `<unknown>:0:0` today; fix = per-block `stmt_lines` MIR plumbing + opt-in inkwell
-    DI emission (only under explain-opt; normal builds byte-identical). Capture = the only
+  - **Slice 3b — debug-loc anchoring + remarks capture + `alignc explain-opt` — DONE
+    (`m13-slice3b-explain-opt`).** Per-block `stmt_lines` MIR plumbing (populated only in located
+    lowering — `lower_program_located`; a normal build is byte-identical) + opt-in inkwell DI
+    emission (one `DIFile`/CU, one `DISubprogram` per fn, per-statement `set_current_debug_location`;
+    the "Debug Info Version" module flag stamped manually — inkwell does NOT). Capture = the only
     C-API path: process-global `LLVMParseCommandLineOptions(-pass-remarks*)` behind `Once` +
-    `LLVMContextSetDiagnosticHandler` (flat `file:line:col: message` strings — no structured
-    RemarkName without a C++ shim, deferred with record). Surface: new verb `explain-opt`
-    (report not build; exit 0 regardless of miss count), missed/actionable by default +
-    one-line success summary + bucket count, `--verbose` for passed/raw/internal; v1
-    translation scope = loop-vectorize (full) + pipeline-critical inline misses + slp passed;
-    honesty rule (never upgrade a cost-model decline into a cause; no fabricated suggestions);
-    internal locations suppressed, never fabricated. Build `Vec<OptRecord>` first, render
-    second — `--format json` / score / CI gates stay pure extensions (deferral list in the
-    design doc).
+    `LLVMContextSetDiagnosticHandler` (flat `file:line:col: message` strings; structured RemarkName
+    needs a C++ shim, deferred). New verb `explain-opt` (report not build; exit 0 regardless of miss
+    count; 1 on compile error / bad args), missed/actionable by default + one-line success summary +
+    bucket count, `--verbose` for passed/raw `[llvm …]`/compiler-internal. Translation (keyed on the
+    REAL LLVM-19 strings, `09-explain-opt.md`): loop-vectorize passed + missed (reason codes incl. a
+    new `FpReorder`), slp passed → summary, inline passed → summary; inline MISSES → bucket (no
+    lambda-inline-miss string exists to key on — every pipeline lambda inlines — so the actionable
+    inline path is deferred, honest scoping). Honesty rule enforced (cost-model decline says only
+    that). `Vec<OptRecord>` built first, rendered second — `--format json` / score / CI gates stay
+    pure extensions. 1858 green (+14: 5 subprocess driver tests + 9 translation-table unit tests
+    incl. the mutation-check); clippy `-D warnings` clean; the 3a `vectorize_shapes` sentinel and
+    `emit-llvm` output byte-identical. Full outcome + deviations in `09-explain-opt.md`.
 - **Slice 4 — build profiles.** `--profile dev/release/fast/small/tiny` →
   `default<O0|O2|O3|Os|Oz>` (deliberately the STOCK pipelines — no custom pass order until
   remarks+benchmarks justify one) + per-profile linker flags (gc-sections/as-needed/strip) +

@@ -22,6 +22,10 @@ use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
+use inkwell::debug_info::{
+    AsDIScope, DIFlags, DIFlagsConstants, DIFile, DISubprogram, DWARFEmissionKind,
+    DWARFSourceLanguage, DebugInfoBuilder,
+};
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
@@ -115,7 +119,7 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget) -> Resul
     let ctx = Context::create();
     let module = ctx.create_module("align");
     let tm = create_target_machine(target)?;
-    build_module(&ctx, &module, program, &tm)?;
+    build_module(&ctx, &module, program, &tm, None)?;
     write_object(&module, out, &tm)
 }
 
@@ -132,11 +136,145 @@ pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool) ->
     let ctx = Context::create();
     let module = ctx.create_module("align");
     let tm = create_target_machine(target)?;
-    build_module(&ctx, &module, program, &tm)?;
+    build_module(&ctx, &module, program, &tm, None)?;
     if optimized {
         run_opt_pipeline(&module, &tm, "default<O2>")?;
     }
     Ok(module.print_to_string().to_string())
+}
+
+/// Source identity for opt-in debug-info emission (`explain-opt`): the filename and directory that
+/// name the module's single `DIFile`, so LLVM's optimization remarks anchor to
+/// `<file>:<line>:<col>` (`docs/impl/09-explain-opt.md`, Slice 3b).
+pub struct DebugInfo {
+    pub file: String,
+    pub directory: String,
+}
+
+/// Compile `program` with opt-in debug locations, run the `-O2` pipeline, and return LLVM's raw
+/// optimization-remark strings (each `"<file>:<line>:<col>: <message>"`) captured via the
+/// diagnostic handler (`docs/impl/09-explain-opt.md`, Slice 3b, Mechanism A). The driver's
+/// `explain-opt` translates these into `OptRecord`s.
+///
+/// **Process-global side effect**: the first call enables `-pass-remarks*` via
+/// `LLVMParseCommandLineOptions` (behind a `Once`) — it stays on for the process. Keep this strictly
+/// on the `explain-opt` path; a normal build / the IR-shape suite must never call it.
+pub fn collect_opt_remarks(
+    program: &Program,
+    target: &BuildTarget,
+    debug: &DebugInfo,
+) -> Result<Vec<String>, CodegenError> {
+    ensure_remark_cl_opts();
+    let ctx = Context::create();
+    let module = ctx.create_module("align");
+    let tm = create_target_machine(target)?;
+
+    // Heap-box the sink so its address is stable while it is registered as the handler userdata.
+    let mut sink: Box<Vec<String>> = Box::default();
+    let sink_ptr = (&mut *sink as *mut Vec<String>).cast::<std::ffi::c_void>();
+    // SAFETY: `diag_handler` only reads the remark severity + description (disposing the C string)
+    // and pushes into the `Vec<String>` behind `sink_ptr`. `sink` outlives the handler: the guard
+    // below detaches the handler before `sink` is dropped, so no callback can fire after it is freed.
+    unsafe {
+        llvm_sys::core::LLVMContextSetDiagnosticHandler(ctx.raw(), Some(diag_handler), sink_ptr);
+    }
+    // RAII guard: detaches the handler on every exit path, including unwind (a panic inside
+    // `build_module` / `run_opt_pipeline`), so a panic can never leave the handler dangling while
+    // `sink` is freed.
+    let _detach_guard = DiagnosticHandlerGuard { ctx: ctx.raw() };
+
+    let built = build_module(&ctx, &module, program, &tm, Some(debug));
+    let ran = built.and_then(|()| run_opt_pipeline(&module, &tm, "default<O2>"));
+
+    drop(_detach_guard);
+    ran?;
+    Ok(*sink)
+}
+
+/// Detaches the context diagnostic handler on drop. Ensures the handler is cleared before its
+/// userdata (the remarks sink) can be freed on any exit path, including unwind.
+struct DiagnosticHandlerGuard {
+    ctx: llvm_sys::prelude::LLVMContextRef,
+}
+
+impl Drop for DiagnosticHandlerGuard {
+    fn drop(&mut self) {
+        // SAFETY: clears the handler registered on this same context in `collect_opt_remarks`.
+        unsafe {
+            llvm_sys::core::LLVMContextSetDiagnosticHandler(self.ctx, None, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Enable LLVM's optimization-remark emission once per process. `-pass-remarks*` are `cl::opt`
+/// globals that `OptimizationRemarkEmitter` reads; setting them makes the passes emit remarks
+/// through the context diagnostic handler. Behind a `Once` because command-line options can only be
+/// parsed once and the state is process-global.
+fn ensure_remark_cl_opts() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // These outlive the synchronous `LLVMParseCommandLineOptions` call, which copies the option
+        // values into the `cl::opt` globals; freeing them afterward is fine.
+        let prog = std::ffi::CString::new("alignc").unwrap();
+        let opts = [
+            std::ffi::CString::new("-pass-remarks=.*").unwrap(),
+            std::ffi::CString::new("-pass-remarks-missed=.*").unwrap(),
+            std::ffi::CString::new("-pass-remarks-analysis=.*").unwrap(),
+        ];
+        let mut argv: Vec<*const std::ffi::c_char> = vec![prog.as_ptr()];
+        argv.extend(opts.iter().map(|o| o.as_ptr()));
+        let overview = std::ffi::CString::new("").unwrap();
+        // SAFETY: `argv` holds `argc` valid, NUL-terminated C strings that live across the call.
+        unsafe {
+            llvm_sys::support::LLVMParseCommandLineOptions(
+                argv.len() as std::ffi::c_int,
+                argv.as_ptr(),
+                overview.as_ptr(),
+            );
+        }
+    });
+}
+
+/// Context diagnostic handler: collect each remark's flat `"<file>:<line>:<col>: <message>"`
+/// description into the `Vec<String>` behind `userdata`. Must not panic across the FFI boundary and
+/// must dispose the LLVM-owned description string.
+extern "C" fn diag_handler(
+    di: llvm_sys::prelude::LLVMDiagnosticInfoRef,
+    userdata: *mut std::ffi::c_void,
+) {
+    // SAFETY: called by LLVM during `run_passes` with a valid `di`; `userdata` is the `*mut
+    // Vec<String>` registered in `collect_opt_remarks`, valid until the handler is detached.
+    unsafe {
+        if di.is_null() || userdata.is_null() {
+            return;
+        }
+        // Keep only remarks (severity 2); ignore errors/warnings/notes here.
+        if llvm_sys::core::LLVMGetDiagInfoSeverity(di) as i32
+            != llvm_sys::LLVMDiagnosticSeverity::LLVMDSRemark as i32
+        {
+            return;
+        }
+        let desc = llvm_sys::core::LLVMGetDiagInfoDescription(di);
+        if desc.is_null() {
+            return;
+        }
+        let s = std::ffi::CStr::from_ptr(desc).to_string_lossy().into_owned();
+        llvm_sys::core::LLVMDisposeMessage(desc);
+        let sink = &mut *(userdata.cast::<Vec<String>>());
+        sink.push(s);
+    }
+}
+
+/// Debug-info context for one module (opt-in): the `DebugInfoBuilder`, the shared `DIFile`, and a
+/// shared `void()` subroutine type used for every function's `DISubprogram`. We describe only enough
+/// to anchor remarks (file + line/col), not parameter/local types — the honest minimum for
+/// `explain-opt` (real DWARF type info is out of scope, `docs/impl/09-explain-opt.md`).
+struct DebugCtx<'c> {
+    dib: DebugInfoBuilder<'c>,
+    file: DIFile<'c>,
+    subty: inkwell::debug_info::DISubroutineType<'c>,
+    scope: inkwell::debug_info::DIScope<'c>,
 }
 
 fn build_module<'c>(
@@ -144,6 +282,7 @@ fn build_module<'c>(
     module: &Module<'c>,
     program: &Program,
     tm: &TargetMachine,
+    debug: Option<&DebugInfo>,
 ) -> Result<(), CodegenError> {
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -154,6 +293,40 @@ fn build_module<'c>(
     // instead of falling back to a generic one. The driver's own object emission is unaffected (it
     // always drives `write_object` with the same TargetMachine).
     module.set_triple(&tm.get_triple());
+
+    // Opt-in debug info (explain-opt / a future `-g`). Emitting DILocations anchors LLVM's
+    // optimization remarks to real source lines; off by default so normal builds and the IR-shape
+    // baseline stay byte-identical. The verifier drops all debug metadata (with a warning) unless
+    // the module declares the debug-info version, so stamp it first (inkwell's DI builder does not).
+    let debug_ctx: Option<DebugCtx<'c>> = debug.map(|dbg| {
+        let ver = ctx.i32_type().const_int(3, false);
+        module.add_basic_value_flag(
+            "Debug Info Version",
+            inkwell::module::FlagBehavior::Warning,
+            ver,
+        );
+        let (dib, cu) = module.create_debug_info_builder(
+            true,
+            DWARFSourceLanguage::C,
+            &dbg.file,
+            &dbg.directory,
+            "alignc",
+            /* is_optimized */ true,
+            "",
+            0,
+            "",
+            DWARFEmissionKind::Full,
+            0,
+            false,
+            false,
+            "",
+            "",
+        );
+        let file = cu.get_file();
+        let subty = dib.create_subroutine_type(file, None, &[], DIFlags::ZERO);
+        let scope = cu.as_debug_info_scope();
+        DebugCtx { dib, file, subty, scope }
+    });
 
     // Struct layouts → LLVM struct types, indexed by struct id. Two phases so a **nested** struct
     // field (`Struct(id)`) can reference another struct's type: first create every struct as a named
@@ -1776,6 +1949,26 @@ fn build_module<'c>(
     // Pass 2: define bodies.
     for f in &program.fns {
         let builder = ctx.create_builder();
+        // Under debug info, give each function a DISubprogram (anchored to its first source line)
+        // and attach it to the LLVM function, so its instructions can carry DILocations.
+        let fn_line = debug_ctx.as_ref().map_or(0, |_| first_fn_line(f));
+        let subprogram = debug_ctx.as_ref().map(|dc| {
+            let sp = dc.dib.create_function(
+                dc.scope,
+                symbol_name(f),
+                None,
+                dc.file,
+                fn_line,
+                dc.subty,
+                /* is_local_to_unit */ false,
+                /* is_definition */ true,
+                fn_line,
+                DIFlags::ZERO,
+                /* is_optimized */ true,
+            );
+            funcs[&f.name].set_subprogram(sp);
+            sp
+        });
         FnGen {
             ctx,
             module,
@@ -1796,8 +1989,16 @@ fn build_module<'c>(
             values: HashMap::new(),
             blocks: Vec::new(),
             alias_scopes: HashMap::new(),
+            dibuilder: debug_ctx.as_ref().map(|dc| &dc.dib),
+            subprogram,
+            fn_line,
         }
         .emit_fn()?;
+    }
+    // Resolve debug metadata before it is read (verify / opt pipeline / print). `Drop` also
+    // finalizes, but doing it explicitly keeps the ordering obvious.
+    if let Some(dc) = &debug_ctx {
+        dc.dib.finalize();
     }
     // A Result-returning main needs a C `main` wrapper that maps Ok/Err to an exit code (and, when
     // `main(args: array<str>)`, marshals argv into the `array<str>` argument).
@@ -1805,6 +2006,17 @@ fn build_module<'c>(
         emit_main_wrapper(ctx, module, funcs["main"], f.ret, !f.params.is_empty())?;
     }
     Ok(())
+}
+
+/// The function's fallback source line for debug info: the first non-zero statement line in program
+/// order, or 1 if none was recorded (a synthetic function). Never 0 — a `DISubprogram` line of 0 is
+/// legal but a nonzero fallback keeps every anchored location inside the function's line range.
+fn first_fn_line(f: &Function) -> u32 {
+    f.blocks
+        .iter()
+        .flat_map(|b| b.stmt_lines.iter())
+        .find_map(|&(line, _)| (line != 0).then_some(line))
+        .unwrap_or(1)
 }
 
 /// The LLVM symbol for a function: a `Result`-returning `main` is emitted as
@@ -2659,6 +2871,15 @@ struct FnGen<'c, 'a> {
     /// (`!alias.scope in`, `!noalias out`) and `dst` store (`!alias.scope out`, `!noalias in`) are
     /// proven not to overlap. Globally unique per (function, id) so distinct loops never collide.
     alias_scopes: HashMap<u32, (inkwell::values::MetadataValue<'c>, inkwell::values::MetadataValue<'c>)>,
+    /// Opt-in debug info (`explain-opt`): the module's `DebugInfoBuilder` and this function's
+    /// `DISubprogram`, plus a fallback line. `None` in a normal build → [`FnGen::set_line`] is a
+    /// no-op and no `DILocation`s are emitted.
+    dibuilder: Option<&'a DebugInfoBuilder<'c>>,
+    subprogram: Option<DISubprogram<'c>>,
+    /// The function's fallback source line (first non-zero statement line, else 1) — set on every
+    /// body instruction so a statement with no recorded line still carries a `DILocation` (LLVM's
+    /// verifier requires one on inlinable calls in a function that has debug info).
+    fn_line: u32,
 }
 
 impl<'c, 'a> FnGen<'c, 'a> {
@@ -2869,6 +3090,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
         mark_nounwind(self.ctx, thunk);
         mark_private_helper(thunk);
         let saved = self.builder.get_insert_block();
+        // This thunk has no DISubprogram; emitting into it while the outer function's debug location
+        // is active would attach a wrong-scope `!dbg` (a verifier error). Clear it while building
+        // the thunk, then restore the outer function's fallback location afterward (a no-op without
+        // debug info). The thunk needs no locations — the verifier's rule applies only to functions
+        // that carry debug info.
+        if self.dibuilder.is_some() {
+            self.builder.unset_current_debug_location();
+        }
         let entry = self.ctx.append_basic_block(thunk, "entry");
         self.builder.position_at_end(entry);
         let in_p = thunk.get_nth_param(0).unwrap().into_pointer_value();
@@ -2888,7 +3117,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // No prior block: clear the position so later codegen doesn't append into the thunk.
             None => self.builder.clear_insertion_position(),
         }
+        // Restore an active debug location for the outer function's subsequent instructions.
+        self.set_line(self.fn_line, 0);
         Ok(thunk.as_global_value().as_pointer_value())
+    }
+
+    /// Set the builder's current debug location (opt-in). A no-op without debug info. `line == 0`
+    /// (a statement with no recorded source line) falls back to the function line, so every body
+    /// instruction carries a location — LLVM's verifier requires one on inlinable calls in a
+    /// function that has debug info.
+    fn set_line(&self, line: u32, col: u32) {
+        if let (Some(dib), Some(sp)) = (self.dibuilder, self.subprogram) {
+            let (l, c) = if line == 0 { (self.fn_line.max(1), 0) } else { (line, col) };
+            let loc = dib.create_debug_location(self.ctx, l, c, sp.as_debug_info_scope(), None);
+            self.builder.set_current_debug_location(loc);
+        }
     }
 
     fn emit_fn(&mut self) -> Result<(), CodegenError> {
@@ -2923,6 +3166,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             self.slots.insert(i as Slot, ptr);
         }
 
+        // Establish a fallback debug location (a no-op without debug info) so every body
+        // instruction — including ones from statements with no recorded line — carries one.
+        self.set_line(self.fn_line, 0);
+
         // Emit each block.
         for b in &self.f.blocks {
             let bb = self.blocks[b.id as usize];
@@ -2933,7 +3180,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
     }
 
     fn gen_block(&mut self, b: &Block) -> Result<(), CodegenError> {
-        for s in &b.stmts {
+        for (i, s) in b.stmts.iter().enumerate() {
+            // Anchor this statement's instructions to its source line (opt-in debug info). Keep the
+            // previous location for a statement with no recorded line (`(0, 0)`).
+            if let Some(&(line, col)) = b.stmt_lines.get(i)
+                && line != 0
+            {
+                self.set_line(line, col);
+            }
             match s {
                 Stmt::Let(v, rv) => {
                     let result_ty = self.f.value_tys[*v as usize];
