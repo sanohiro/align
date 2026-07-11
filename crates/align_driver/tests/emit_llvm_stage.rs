@@ -5,9 +5,9 @@
 
 use std::process::Command;
 
-fn write_src() -> std::path::PathBuf {
+fn write_src(test_name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("align-stage-{}.align", std::process::id()));
+    let path = dir.join(format!("align-stage-{}-{}.align", std::process::id(), test_name));
     std::fs::write(
         &path,
         "fn dbl(x: i64) -> i64 = x * 2\n\
@@ -32,7 +32,7 @@ fn stage_optimized_runs_the_pipeline() {
     if !align_driver::backend_available() || !cfg!(target_arch = "x86_64") {
         return;
     }
-    let src = write_src();
+    let src = write_src("stage_optimized_runs_the_pipeline");
     let out = alignc()
         .args(["emit-llvm"])
         .arg(&src)
@@ -51,7 +51,7 @@ fn stage_raw_is_the_default_and_unoptimized() {
     if !align_driver::backend_available() {
         return;
     }
-    let src = write_src();
+    let src = write_src("stage_raw_is_the_default_and_unoptimized");
     // No `--stage` flag → default `raw`.
     let out = alignc().args(["emit-llvm"]).arg(&src).output().expect("run alignc");
     let _ = std::fs::remove_file(&src);
@@ -63,7 +63,7 @@ fn stage_raw_is_the_default_and_unoptimized() {
 
 #[test]
 fn stage_unknown_value_is_a_diagnostic_not_a_panic() {
-    let src = write_src();
+    let src = write_src("stage_unknown_value_is_a_diagnostic_not_a_panic");
     let out = alignc()
         .args(["emit-llvm"])
         .arg(&src)

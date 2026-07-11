@@ -234,12 +234,16 @@ fn k6_float_sum_does_not_vectorize_without_fast_math() {
 //
 // Divergence from the design table: it predicted a scalar loop or a `vector.memcheck` runtime
 // overlap guard "today (no `noalias`)", flipping to clean vectorization only when Slice 5 adds
-// function-parameter `noalias`. Reality: `map_into` already emits scoped `!alias.scope`/`!noalias`
+// function-parameter `noalias`. Reality: the outcome is clean vectorization with NO
+// `vector.memcheck`, confirmed below. `map_into` does emit scoped `!alias.scope`/`!noalias`
 // metadata on the fused loop's source load and `dst` store (see `map_into.rs`
-// `map_into_emits_scoped_noalias_metadata`), which is exactly what lets the vectorizer drop its
-// runtime overlap check — so the loop vectorizes cleanly today, with NO `vector.memcheck`. Slice 5's
-// function-level `noalias` is therefore about cases this scoped metadata does not already cover
-// (e.g. cross-function provenance), not this loop.
+// `map_into_emits_scoped_noalias_metadata`), and that metadata is present in the raw IR and
+// plausibly contributes — but the mechanism isn't isolated: at O2 `scale` fully inlines into
+// `main`, where `s`/`d` trace back to distinct local allocas (`a`/`b`), and BasicAA can prove
+// non-alias from that provenance alone, independent of the scoped metadata. The non-inlined case
+// (metadata's contribution without the inlined-alloca shortcut) is untested. Either way, Slice 5's
+// function-level `noalias` is not the unlock for this pattern — this loop already vectorizes
+// cleanly without it.
 
 #[test]
 fn k7_map_into_vectorizes_without_memcheck() {
