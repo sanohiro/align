@@ -2312,6 +2312,51 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
+### External optimization consultation (GPT-5.6, 2026-07-11) — adoption record
+
+The owner's out-of-repo optimization consultation (8 long responses: LLVM Performance Tips for
+Frontend Authors digest, constants/binary-size, core/std review, cache locality, execution-plan
+engine, performance philosophy, codegen deep-dive, and a repo-read review) was fully read and
+triaged by Fable on 2026-07-11. Three claimed gaps were **empirically confirmed** against the code:
+zero linkage/`unnamed_addr` settings in codegen, `emit-llvm` emits only pre-`run_passes` IR, and the
+driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Disposition:
+
+- **ADOPTED → roadmap M13** (the pre-LLVM-upgrade codegen-quality wave; actionable detail lives
+  there): symbol internalization + `private unnamed_addr` constants; capability-based linking +
+  runtime split (+ `--gc-sections`/`--as-needed`); optimized-IR emission + LLVM-remarks→Align
+  translation (`explain-opt`); build profiles (`dev/release/fast/small/tiny` over `default<O*>` —
+  deliberately NOT a custom pass pipeline); internal-ABI flattening of slice/str/Option/Result +
+  argument attributes (`noundef`/`nonnull`/`nocapture`/`readonly`/`writeonly`/`noalias`/
+  `dereferenceable`) + effect-summary `memory(...)` attrs + proven-range `nsw`/`nuw` (a new
+  `AddProvenNoOverflow`-class MIR distinction; user wrap arithmetic NEVER gets them).
+- **ADOPTED as verification tasks → M13 Slice V**: `BuildTarget::Cpu(name)` empty-feature-string
+  objdump test; cold-edge `!prof` metadata (measure before shipping); canonical-loop shape
+  snapshot tests + the Vectorizers.html-catalog IR-shape suite (these become the LLVM-upgrade
+  regression net).
+- **ADOPTED direction, consumer-gated (no milestone yet; recorded at their homes):** decode fusion
+  (decode+filter+reduce without materialization — the align-LLM trace-aggregation consumer);
+  filter/projection pushdown + dense/sparse execution (selection vector / bitset / index list);
+  algorithm portfolio + `Exact/AtMost` cardinality in MIR (→ auto `array_builder` capacity);
+  Sink/Source as MIR vocabulary (template/encode → writer without intermediate strings — the
+  streaming×pipeline backlog's concrete shape); `for_each_line` scoped zero-copy callback (the
+  safe form of A7's rejected lookahead view — noted in the A7 record); cache-locality lints
+  (useful-byte ratio, pointer-indirection, false-sharing — the M8 frequency-lints family);
+  string blob + offset tables / error-message tables / relative-offset metadata (binary-size,
+  alignpack-adjacent); performance contracts spelled in draft.md as Guaranteed /
+  Target-dependent / Profile-dependent tiers; `f.len()`-in-loop syscall lint.
+- **Post-LLVM-upgrade (order matters — bitcode compat):** ThinLTO → runtime-as-bitcode (LLVM
+  version alignment is the known wall) → instrument PGO → sample PGO / BOLT.
+- **REJECTED (do not re-litigate; reasons):** NaN boxing / general SSO / runtime string interning
+  (representation branches + hidden state vs the settled type splits); automatic AoS↔SoA
+  conversion (hidden bulk data movement); deterministic map iteration as a default contract
+  (map/ordered_map split instead); `llvm.assume` / early intrinsic emission / loop-metadata
+  overrides as a general policy (the consultation itself counsels restraint — attributes and
+  flags first); custom pass pipelines from day one (measure `default<O*>` first); linked lists as
+  std-central collections.
+- **Standing context reaffirmed by the owner (2026-07-11):** pre-release breaking changes stay OK
+  for the foreseeable future — public repo but sole user; interface/spec changes need no compat
+  shims (the CLAUDE.md rule extends indefinitely until stated otherwise).
+
 ### Bare array literal in a value position (general lowering gap)
 
 Surfaced by the `loop` adversarial review (2026-07-10). A bare array literal `[…]` is lowerable only

@@ -36,9 +36,12 @@ Denied/Code/Invalid taxonomy. With std.http done, **all M11 std-module work is c
 formal M11 close is the orchestrator's call (verify against `open-questions.md` before flipping the
 milestone header).
 
-**Next (in order):** M12 (the align-LLM runway remainder — see the M12 section: A4 offset file
-I/O, then A6 `array_builder<T>`, then A7 streaming line reads / A8 arena checkpoint / the A5 SSE
-remainder).
+**Next (in order):** finish M12 (only the A5-SSE slice remains in flight) → **M13 codegen
+quality & link hygiene** (the pre-LLVM-upgrade wave — see its section) → the **LLVM/inkwell
+upgrade checkpoint** → the post-upgrade wave (ThinLTO → runtime bitcode → PGO → BOLT). The
+consumer-gated execution-plan items (decode fusion, pushdown, algorithm portfolio, Sink/Source
+MIR) stay recorded in the consultation digest + runway records until their align-LLM consumers
+arrive.
 
 **Historical build sequence (2026-06 snapshot — kept for the build-order and decision record;
 every item below has since completed as recorded in the per-milestone sections, except
@@ -1765,7 +1768,10 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
   (memchr-scanned, refill across boundaries, one `\r?\n` stripped, grows to a 64 MiB cap →
   `Error.Invalid`, `0` = EOF), the interleaving contract (a buffered `read` drains the lookahead
   first; unbuffered path byte-identical), and the generic `bytes.as_str()` validating region-bound
-  view. New runtime FFI: `align_rt_io_reader_buffered` / `_read_line` / `align_rt_bytes_as_str`; new
+  view. **Recorded future form (2026-07-11 consultation):** a scoped zero-copy variant —
+  `r.for_each_line(fn(line: str) { … })`, the line view valid only inside the callback (escape
+  forbidden) — is the SAFE version of the rejected lookahead view; deferred until the copy cost is
+  measured to matter. New runtime FFI: `align_rt_io_reader_buffered` / `_read_line` / `align_rt_bytes_as_str`; new
   HIR/Rvalues `ReaderBuffered`/`ReaderReadLine`/`BytesAsStr` registered through every sema pass +
   the MIR/codegen `#[inline(never)]` dispatchers (the #296 expr-depth budget held at 5/5). Consumer
   = the multi-GB `expert_trace.jsonl` per-line decode loop (align-LLM Phase 2); *(general — any
@@ -1876,6 +1882,79 @@ Move types inherit the standing v1 bind-to-local rule (unbound Move temporaries 
   info) + **`finish()` as the sole clean terminator** (Drop = close-only — amends the original
   Drop-terminates commitment; poisoned flag on failed sends). Implement after A7.
 
+
+## M13: Codegen quality & link hygiene — the pre-LLVM-upgrade wave (PLANNED)
+
+Source: the 2026-07-11 external optimization consultation (adoption record in
+`open-questions.md` Open → "External optimization consultation"). Three gaps were empirically
+confirmed before planning (zero linkage settings in codegen; `emit-llvm` is pre-optimization only;
+the unconditional `-lz -lzstd -lcrypto -lssl -lpthread -ldl -lm` link). Pre-release rules apply in
+full: breaking interface changes are fine, no compat shims. **This wave deliberately lands BEFORE
+the LLVM/inkwell upgrade** — its IR-shape tests, size benchmarks, and remarks tooling are the
+regression net that validates the upgrade.
+
+- **Slice 1 — symbol internalization + constant hygiene.** Non-exported functions → `internal`;
+  compiler-generated helpers → `private`; string/descriptor constants → `private unnamed_addr`.
+  Unlocks LLVM IPO/DCE/inlining/`constmerge`. Completion: an IR-shape test pins the linkage map
+  (main/pub/extern = external, everything else internal/private) and a before/after size+perf
+  smoke shows no regression.
+- **Slice 2 — capability-based linking + runtime split.** Collect `UsedCapability`
+  (Threads/Zlib/Zstd/Crypto/Tls/Dl/Math/…) from builtin usage into the existing
+  `Program.link_libs` mechanism; the driver links ONLY what is used. Function/data sections +
+  `--gc-sections` + `--as-needed` in release profiles. Split (or verify member granularity of)
+  the runtime staticlib by feature area (`core/alloc/io/parallel/json/compress/crypto/http`).
+  Completion: `fn main() -> i32 = 0` links none of z/zstd/crypto/ssl, and `empty`/`hello`
+  binary-size benchmarks exist and are recorded.
+- **Slice 3 — optimized-IR emission + remarks translation.** `emit-llvm --stage raw|optimized`
+  (today only pre-`run_passes` IR exists); capture LLVM `-Rpass*`-class remarks and translate
+  them to Align-language diagnostics (`alignc explain-opt`: "the pipeline at app.align:42 was not
+  vectorized — source and destination may overlap; use an `out` parameter"). Build the
+  **vectorization IR-shape suite** from the Vectorizers.html catalog (unknown-trip-count /
+  reduction / if-conversion / noalias-two-slices / masked-filter / pointer-induction …) — the
+  LLVM-upgrade gate.
+- **Slice 4 — build profiles.** `--profile dev/release/fast/small/tiny` →
+  `default<O0|O2|O3|Os|Oz>` (deliberately the STOCK pipelines — no custom pass order until
+  remarks+benchmarks justify one) + per-profile linker flags (gc-sections/as-needed/strip) +
+  `alignc size` report (per-section, largest symbols, relocation and dynamic-dep counts).
+- **Slice 5 — internal ABI + argument attributes (the big one; may split at implementation
+  time).** Flatten slice/str/Option/Result/closure-env into scalar SSA components inside the
+  internal ABI (aggregates only at external boundaries); derive per-argument attributes from
+  types/regions/effects (`noundef` broadly — the no-uninitialized-values guarantee;
+  `nonnull`/`nocapture`/`readonly`/`writeonly`/`noalias`/`dereferenceable(N)`/`align N` where
+  proven); effect summaries → `memory(...)`/`nofree`/`nosync`/`willreturn` (+`mustprogress` only
+  for provably-finite functions); `noreturn`+`unreachable` on abort paths; bool-storage-is-i8 and
+  alloca-in-entry audits; proven-range `nsw`/`nuw` via a new MIR arithmetic distinction
+  (`AddProvenNoOverflow` class — user wrap arithmetic NEVER gets flags). Canonical-loop shape
+  snapshot tests (Indexed/Reduction/Masked templates).
+- **Slice V — verification bundle.** (a) `BuildTarget::Cpu(name)` passes an empty feature string —
+  objdump-verify the CPU name alone selects the right ISA per target, or fix; (b) cold-edge
+  `!prof` weights on `?`/bounds/abort edges — MEASURE first, ship iff it wins (the A8 gate
+  precedent); (c) the Clang-IR comparison harness (compile semantically-equal C with the same
+  LLVM, diff optimized IR/assembly) for 3–5 core kernels.
+
+**Completion condition:** all slices merged with the standing slice-flow; the shape/size/bench
+regression net is green and becomes the LLVM-upgrade gate.
+
+## LLVM/inkwell upgrade checkpoint (AFTER M13)
+
+The standing mid-term note (recorded with the SVE/sme2 lean) says to schedule this before
+targeting newer ISAs. Sequencing settled 2026-07-11: **M13 first** — its IR-shape suite,
+vectorization shapes, size benchmarks, and ~1800-test corpus are exactly the net that makes the
+version jump safe; **ThinLTO/bitcode work waits until AFTER** the upgrade (doing bitcode plumbing
+on LLVM 19 and then jumping versions would redo the compatibility work). Scope: inkwell
+`llvm19-1` → newest supported; re-verify the shared-only Debian linkage stance
+(`LLVM_SYS_*_PREFER_DYNAMIC`); rerun the full net; re-measure the Slice-V cold-metadata and
+vectorization shapes (pass-pipeline changes across versions are expected).
+
+## Post-upgrade wave (M14 candidates, in order — bitcode compatibility dictates the sequence)
+
+1. **ThinLTO** across Align modules (internalization from M13 Slice 1 is the prerequisite).
+2. **Runtime as bitcode** — the known wall is Rust-vs-Align LLVM version alignment; options
+   recorded in the consultation digest (same-toolchain build / C or Align core / stable-ABI
+   boundary for the rest). Unlocks cross-runtime inlining of trivial wrappers.
+3. **Instrument PGO** (`alignc profile build` → run → `--profile-use`); hot-kernel
+   multiversioning gated on PGO hotness.
+4. **Sample PGO / BOLT** — evaluate, driver-managed external pipeline, not compiler-integrated.
 
 ## Design Issues to Settle in Parallel
 
