@@ -161,6 +161,11 @@ pub enum Scalar {
     /// [`Scalar::HttpResponse`] — owned, never region-tracked. (There is no `Scalar::ResponseBuilder`: a
     /// `response_builder` is returned directly by `http.response`, never inside an aggregate.)
     HttpRequestCtx,
+    /// A `http_stream` payload (`Result<http_stream, Error>` from `ctx.respond_stream(rb)`). An owned
+    /// **Move** handle (the streaming-response socket fd, lifted out of the ctx); the enclosing
+    /// `Result`'s `Drop` closes it (close-only — no terminal chunk). Opaque pointer, like
+    /// [`Scalar::HttpRequestCtx`] — owned, never region-tracked.
+    HttpStream,
 }
 
 impl Scalar {
@@ -169,7 +174,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, and a `udp_socket`.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx)
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream)
     }
 }
 
@@ -460,6 +465,14 @@ pub enum Ty {
     /// Pure (no I/O — the write is at `respond`). Opaque pointer; never rides an aggregate (no
     /// `Scalar::ResponseBuilder`).
     ResponseBuilder,
+    /// A `http_stream` (`std.http`) — the streaming-response handle from `ctx.respond_stream(status)`,
+    /// the `Ok` payload of its `Result<http_stream, Error>`. An owned **Move** handle owning the
+    /// accepted socket fd (lifted out of the `http_request_ctx`; it borrows nothing else — free-standing,
+    /// no region binding), `Drop`-closed (close-only — no terminal chunk). `s.send(chunk)` writes one
+    /// chunk frame (borrows `s`); `s.finish()` **consumes** `s` (writes `0\r\n\r\n` + closes). Standard
+    /// Move-handle exclusions (never an array/slice/box element; bound to a local). **Impure** (network).
+    /// Opaque pointer.
+    HttpStream,
     /// A struct type; the id indexes `Program::structs`.
     Struct(u32),
     /// An anonymous tuple type `(T, U, ...)`; the id indexes `Program::tuples`. PR1 elements
@@ -541,6 +554,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // / `srv.accept()`. (A `response_builder` is never a payload — it has no `Scalar`, `None` here.)
         Ty::HttpServer => Some(Scalar::HttpServer),
         Ty::HttpRequestCtx => Some(Scalar::HttpRequestCtx),
+        // A `http_stream` owned handle as the `Result` Ok payload of `ctx.respond_stream()`.
+        Ty::HttpStream => Some(Scalar::HttpStream),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -595,6 +610,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::HttpResponse => Ty::HttpResponse,
         Scalar::HttpServer => Ty::HttpServer,
         Scalar::HttpRequestCtx => Ty::HttpRequestCtx,
+        Scalar::HttpStream => Ty::HttpStream,
     }
 }
 
@@ -666,7 +682,7 @@ fn parse_int_arith(method: &str) -> Option<(BinOp, Option<hir::ArithMode>)> {
 /// (slice ③ supports copy-value captures only; an owned capture needs move/region handling).
 fn ty_capture_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — Move, like `box<T>`.
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Box(_) | Ty::Task(_) | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -698,7 +714,7 @@ fn struct_is_move_rec(id: u32, structs: &[StructDef], visiting: &mut Vec<u32>) -
 /// they are not considered here; `str` is a borrow, not owned.) `visiting` carries the struct ids on
 /// the current recursion path so a cyclic struct graph terminates instead of overflowing the stack.
 fn ty_owns_buffer_rec(ty: Ty, structs: &[StructDef], visiting: &mut Vec<u32>) -> bool {
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder)
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream)
         || payload_is_move(ty)
         || matches!(ty, Ty::Struct(id) if struct_is_move_rec(id, structs, visiting))
 }
@@ -847,7 +863,7 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
 }
 
 fn ty_is_move(ty: Ty, structs: &[StructDef], tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::Box(_) | Ty::Task(_) | Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         || ty_tuple_is_move(ty, tuples)
         || matches!(ty, Ty::Struct(id) if struct_is_move(id, structs))
@@ -919,7 +935,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(ty: Ty, structs: &[StructDef]) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
-    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
         || payload_is_move(ty)
         // A Move struct (owns a `string`/owned field, transitively) — its `Drop` recursively frees
         // each owned field (Slice 3).
@@ -2818,6 +2834,20 @@ impl EffectScan {
                 self.expr(ctx);
                 self.expr(rb);
             }
+            ExprKind::HttpRespondStream { ctx, rb } => {
+                self.impure_direct = true;
+                self.expr(ctx);
+                self.expr(rb);
+            }
+            ExprKind::HttpStreamSend { stream, chunk } => {
+                self.impure_direct = true;
+                self.expr(stream);
+                self.expr(chunk);
+            }
+            ExprKind::HttpStreamFinish { stream } => {
+                self.impure_direct = true;
+                self.expr(stream);
+            }
             ExprKind::HttpResponseBuilder { status } => self.expr(status),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.expr(rb);
@@ -4283,6 +4313,15 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(ctx, depth);
                 self.walk(rb, depth);
             }
+            ExprKind::HttpRespondStream { ctx, rb } => {
+                self.walk(ctx, depth);
+                self.walk(rb, depth);
+            }
+            ExprKind::HttpStreamSend { stream, chunk } => {
+                self.walk(stream, depth);
+                self.walk(chunk, depth);
+            }
+            ExprKind::HttpStreamFinish { stream } => self.walk(stream, depth),
             ExprKind::HttpResponseBuilder { status } => self.walk(status, depth),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.walk(rb, depth);
@@ -4855,6 +4894,15 @@ impl UnnecessaryHeapScan {
                 self.visit(ctx);
                 self.visit(rb);
             }
+            ExprKind::HttpRespondStream { ctx, rb } => {
+                self.visit(ctx);
+                self.visit(rb);
+            }
+            ExprKind::HttpStreamSend { stream, chunk } => {
+                self.visit(stream);
+                self.visit(chunk);
+            }
+            ExprKind::HttpStreamFinish { stream } => self.visit(stream),
             ExprKind::HttpResponseBuilder { status } => self.visit(status),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.visit(rb);
@@ -5852,6 +5900,18 @@ impl<'a> MoveCheck<'a> {
                 self.expr(ctx, moved, true, true);
                 self.expr(rb, moved, true, true);
             }
+            // `respond_stream` consumes BOTH `ctx` and `rb` (like `respond`); `send` borrows the
+            // stream (mutated in place — not consumed) and reads the chunk; `finish` consumes the
+            // stream.
+            ExprKind::HttpRespondStream { ctx, rb } => {
+                self.expr(ctx, moved, true, true);
+                self.expr(rb, moved, true, true);
+            }
+            ExprKind::HttpStreamSend { stream, chunk } => {
+                self.expr(stream, moved, false, false);
+                self.expr(chunk, moved, false, false);
+            }
+            ExprKind::HttpStreamFinish { stream } => self.expr(stream, moved, true, true),
             ExprKind::HttpResponseBuilder { status } => self.expr(status, moved, false, false),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.expr(rb, moved, false, false);
@@ -9516,13 +9576,19 @@ impl<'a, 't> Checker<'a, 't> {
             // intercept above, alongside `tcp_listener`'s accept — the name is shared.)
             // Request-context getters + `respond` on an `http_request_ctx`: `ctx.method()` / `ctx.path()`
             // / `ctx.header(name)` / `ctx.body()` (views) and `ctx.respond(rb)` (consumes ctx + rb).
-            "method" | "path" | "header" | "body" | "respond" if recv_ty == Ty::HttpRequestCtx => {
+            "method" | "path" | "header" | "body" | "respond" | "respond_stream" if recv_ty == Ty::HttpRequestCtx => {
                 self.check_http_ctx_method(recv_expr, method, args, span)
             }
             // Response-builder methods on a `response_builder`: `rb.header(name, value)` / `rb.body(data)`
             // mutate the builder in place. Type-guarded, same as the `http request` builder methods.
             "header" | "body" if recv_ty == Ty::ResponseBuilder => {
                 self.check_http_response_builder_method(recv_expr, method, args, span)
+            }
+            // Streaming-response methods on a `http_stream` (from `ctx.respond_stream(rb)`): `s.send(chunk)`
+            // writes one chunk (borrows `s`), `s.finish()` terminates + closes (consumes `s`). Both yield
+            // `Result<(), Error>`. Type-guarded, same as above.
+            "send" | "finish" if recv_ty == Ty::HttpStream => {
+                self.check_http_stream_method(recv_expr, method, args, span)
             }
             _ => {
                 if recv_ty != Ty::Error {
@@ -9876,7 +9942,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A `reader`/`writer`/`buffer`/cli handle element is rejected at construction (like a struct
         // field / tuple element): the array read copies the handle by value, so collecting handles
         // would alias one fd/buffer across copies → double close/free (UB). Bind the handle to a local.
-        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
+        if matches!(self.resolve(elem_ty), Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
                 span,
@@ -14226,8 +14292,73 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "respond_stream" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.respond_stream()' takes 1 argument (a header-only response_builder), got {}", args.len()), span);
+                    return err;
+                }
+                let rb = self.check_expr(&args[0], None);
+                if rb.ty == Ty::Error {
+                    return err;
+                }
+                if self.resolve(rb.ty) != Ty::ResponseBuilder {
+                    self.diags.error(
+                        format!("'.respond_stream()' expects a response_builder (from `http.response(...)`), got {}", ty_name(rb.ty)),
+                        args[0].span,
+                    );
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::HttpRespondStream { ctx: Box::new(recv_expr), rb: Box::new(rb) },
+                    ty: Ty::Result(Scalar::HttpStream, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / header / body / respond)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / header / body / respond / respond_stream)"), span);
+                err
+            }
+        }
+    }
+
+    /// `s.send(chunk)` / `s.finish()` on a `http_stream` ([`Ty::HttpStream`]), the receiver already
+    /// evaluated. The receiver must be a **bound local** (the v1 Move-temporary gate). `send(chunk)`
+    /// writes one streamed chunk (`chunk` is a byte view — `str` / owned `string` auto-borrowed /
+    /// `slice<u8>` / a `builder`'s bytes), **borrowing** `s` (not consumed); `finish()` **consumes** `s`
+    /// (writes the terminator + closes). Both yield `Result<(), Error>` (Impure).
+    fn check_http_stream_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the http stream to a local first, then use it (`s := ctx.respond_stream(rb)?` then `s.send(...)` / `s.finish()`) — a temporary owned stream handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
+        match method {
+            "send" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.send()' takes 1 argument (the chunk bytes), got {}", args.len()), span);
+                    return err;
+                }
+                let chunk = self.check_bytes_init(&args[0], "'.send()'");
+                if chunk.ty == Ty::Error {
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpStreamSend { stream: Box::new(recv_expr), chunk: Box::new(chunk) }, ty: result_ty, span }
+            }
+            "finish" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.finish()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpStreamFinish { stream: Box::new(recv_expr) }, ty: result_ty, span }
+            }
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on an http stream (try send / finish)"), span);
                 err
             }
         }
@@ -16014,6 +16145,15 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(ctx);
                 self.finalize_expr(rb);
             }
+            ExprKind::HttpRespondStream { ctx, rb } => {
+                self.finalize_expr(ctx);
+                self.finalize_expr(rb);
+            }
+            ExprKind::HttpStreamSend { stream, chunk } => {
+                self.finalize_expr(stream);
+                self.finalize_expr(chunk);
+            }
+            ExprKind::HttpStreamFinish { stream } => self.finalize_expr(stream),
             ExprKind::HttpResponseBuilder { status } => self.finalize_expr(status),
             ExprKind::HttpRbHeader { rb, name, value } => {
                 self.finalize_expr(rb);
@@ -16556,6 +16696,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::HttpServer => "http_server".to_string(),
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
+        Ty::HttpStream => "http_stream".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),
@@ -16734,7 +16875,7 @@ fn scalar_arg(ty: Ty, what: &str, allow_param: bool, span: Span, diags: &mut Dia
     // `http.response`). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::ResponseBuilder) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::ResponseBuilder) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,

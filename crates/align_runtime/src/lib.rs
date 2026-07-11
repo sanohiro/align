@@ -11271,6 +11271,10 @@ pub struct HttpRequestCtx {
     headers: Vec<HttpHeaderSpan>,
     body_start: usize,
     body_len: usize,
+    /// The request's HTTP version (`true` = 1.1, `false` = 1.0), threaded from
+    /// [`http_parse_request_head`]. Consumed by `respond_stream` to choose chunked (1.1) vs.
+    /// close-delimited raw (1.0) framing; unused by the non-streaming `respond`.
+    http11: bool,
 }
 
 impl Drop for HttpRequestCtx {
@@ -11345,6 +11349,12 @@ struct HttpRequestHead {
     /// The declared `Content-Length`, or `None` (framed as no body — a request without CL/TE has no
     /// body in v1).
     content_length: Option<usize>,
+    /// The request's HTTP version: `true` for `HTTP/1.1`, `false` for `HTTP/1.0`. Parsed here (both
+    /// are accepted) and **threaded** to the `http_request_ctx` and the streaming response — a 1.0
+    /// request cannot receive a chunked (`Transfer-Encoding: chunked`) body, so `respond_stream`
+    /// falls back to close-delimited raw framing for it (http.md item 7). The non-streaming `respond`
+    /// ignores it (it always closes the conn and frames by Content-Length).
+    http11: bool,
 }
 
 /// Parse one **strict-CRLF**-terminated line starting at `pos` in `src`, returning
@@ -11412,6 +11422,7 @@ fn http_parse_request_head(src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> 
     if version != b"HTTP/1.1" && version != b"HTTP/1.0" {
         return Err(HttpParseErr::Invalid);
     }
+    let http11 = version == b"HTTP/1.1";
     let method_start = rl_start;
     let method_len = method.len();
     let target_start = rl_start + sp1 + 1;
@@ -11486,7 +11497,7 @@ fn http_parse_request_head(src: &[u8]) -> Result<HttpRequestHead, HttpParseErr> 
         headers.push(HttpHeaderSpan { name_start, name_len, value_start, value_len });
         pos = next;
     }
-    Ok(HttpRequestHead { method_start, method_len, target_start, target_len, headers, body_start, content_length })
+    Ok(HttpRequestHead { method_start, method_len, target_start, target_len, headers, body_start, content_length, http11 })
 }
 
 /// Read + parse one inbound request over the accepted socket `fd`: stream 32 KiB reads (never per-line —
@@ -11552,6 +11563,7 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
                 headers: h.headers,
                 body_start: h.body_start,
                 body_len,
+                http11: h.http11,
             });
         }
         // Read more (retries EINTR).
@@ -11840,7 +11852,16 @@ fn http_reason_phrase(status: i64) -> &'static str {
 /// `Content-Length` is emitted iff a body was set; `Connection: close` is always emitted (v1 closes the
 /// conn after every response — the RFC 9112 §9.6 mandated signal for a non-persistent server). NO auto
 /// `Date`/`Server` (editorial headers are the caller's — framework territory).
-fn http_serialize_response(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
+/// Serialize the **head** of a response — the status line, the caller headers, and the auto
+/// `Connection: close` line — into a fresh buffer, WITHOUT the terminating blank line or any framing
+/// header. **Single source** shared by [`http_serialize_response`] (which appends `Content-Length` +
+/// the blank line + body) and [`align_rt_http_respond_stream`] (which appends the transfer-framing
+/// header — `Transfer-Encoding: chunked` for a 1.1 client — + the blank line). Rejects the same
+/// caller-supplied framing / connection-management headers (`Content-Length` / `Transfer-Encoding` /
+/// `Connection` — all auto-generated; a duplicate is a response-smuggling vector) and validates the
+/// status (`100..=599`), returning `Err(AL_INVALID)` on either. The returned buffer ends exactly at
+/// `Connection: close\r\n` (no trailing `\r\n`).
+fn http_serialize_head(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
     // A valid HTTP status code is `100..=599`.
     if !(100..=599).contains(&rb.status) {
         return Err(AL_INVALID);
@@ -11872,6 +11893,14 @@ fn http_serialize_response(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
     // v1 closes the conn after each response → signal it (RFC 9112 §9.6). Server-side keepalive later
     // drops this and pools the conn, invisibly behind the same surface.
     buf.extend_from_slice(b"Connection: close\r\n");
+    Ok(buf)
+}
+
+/// Render a response builder into ONE contiguous buffer (http.md R4): the shared head
+/// ([`http_serialize_head`]) plus `Content-Length` (iff a body was set) + the blank line + the body.
+/// `Err(AL_INVALID)` on a bad status / caller framing header (delegated to the head serializer).
+fn http_serialize_response(rb: &ResponseBuilder) -> Result<Vec<u8>, i32> {
+    let mut buf = http_serialize_head(rb)?;
     if let Some(body) = &rb.body {
         buf.extend_from_slice(b"Content-Length: ");
         buf.extend_from_slice(body.len().to_string().as_bytes());
@@ -11909,6 +11938,197 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
     // One SIGPIPE-safe write of the whole response; then `c` (and its fd) drops at scope end → the
     // accepted conn is closed (v1: one request per conn). `r`'s buffers likewise drop here.
     unsafe { http_send_all(c.fd, &bytes) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// std.http — SSE / chunked streaming response (http.md item 7). `ctx.respond_stream(rb)` writes the
+// response head (with `Transfer-Encoding: chunked` for a 1.1 client, or close-delimited raw framing
+// for a 1.0 client), lifts the accepted fd out of the ctx, and hands back an owned `http_stream`. The
+// caller then `s.send(chunk)`s each token (one chunk frame, one write) and `s.finish()`es (the sole
+// clean terminator: `0\r\n\r\n` in framed mode, then close). Drop is **close-only** — no terminal
+// write ever (abrupt close is chunked's own truncation signal, and with no write deadline a terminal
+// write to a stalled peer would block the single accept loop). **All ops Impure** (network syscalls).
+// ---------------------------------------------------------------------------------------------
+
+/// A `http_stream` (`std.http`) — the streaming-response handle from `ctx.respond_stream(rb)`. An
+/// owned **Move** handle owning the accepted socket fd (lifted out of the `http_request_ctx`; it
+/// borrows nothing else from the ctx — free-standing). `framed` selects one chunk frame per `send`
+/// (HTTP/1.1, `Transfer-Encoding: chunked`) vs. raw payload bytes (HTTP/1.0, close-delimited);
+/// `poisoned` is latched by any failed `send` so `finish` skips the terminal write. `Drop` closes the
+/// fd with **no** terminal write (http.md item 7's settled amendment).
+pub struct HttpStream {
+    fd: i32,
+    /// `true` → chunked framing (1.1); `false` → raw close-delimited bytes (1.0).
+    framed: bool,
+    /// Latched by any failed `send`; makes `finish` skip the `0\r\n\r\n` terminator and return `Err`.
+    poisoned: bool,
+}
+
+impl Drop for HttpStream {
+    fn drop(&mut self) {
+        // Close-only: never a terminal chunk (see the module banner). Null-safe (`finish` sets `fd`
+        // to `-1` after it owns the close).
+        if self.fd >= 0 {
+            unsafe { close(self.fd) };
+        }
+    }
+}
+
+/// Append `n` as a lowercase, `0x`-free, minimal-width hex chunk-size to `buf` (RFC 9112 §7.1
+/// `chunk-size`). Allocation-free (a 16-byte stack scratch covers a 64-bit length). `n == 0` is never
+/// framed by `send` (a zero-length chunk is the terminator), but the encoder still renders `"0"`
+/// defensively so the table is total.
+fn http_push_chunk_size_hex(buf: &mut Vec<u8>, mut n: usize) {
+    if n == 0 {
+        buf.push(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 16]; // a usize is at most 16 hex digits
+    let mut i = tmp.len();
+    while n > 0 {
+        i -= 1;
+        let d = (n & 0xf) as u8;
+        tmp[i] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        n >>= 4;
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+/// `ctx.respond_stream(rb)` — begin a streaming response: serialize `rb`'s head (shared with
+/// `respond` via [`http_serialize_head`]) plus the transfer-framing header, write it in one write,
+/// lift the accepted fd out of `ctx`, and write the owned `http_stream` handle to `*out` (returning
+/// `0`); else a mapped status leaving `*out` null. **Consumes BOTH** `ctx` and `rb` (the language
+/// moved them in, nulling both caller slots — the runtime frees them). `rb` must be **header-only**: a
+/// body already set is a programmer contract bug → **abort** (`respond` is the bodied path). A 1.1
+/// request gets `Transfer-Encoding: chunked`; a 1.0 request cannot be chunked, so the stream is
+/// close-delimited raw (no TE header). Errors: `AL_INVALID` for a bad status / caller framing header,
+/// or the head-write `send` errno; the fd is closed on **every** failure path (via the ctx `Drop`).
+///
+/// # Safety
+/// `ctx` a pointer from [`align_rt_http_accept`] (moved in — freed here), or null; `rb` a pointer from
+/// [`align_rt_http_response_new`] (moved in — freed here), or null; `out` must point to a writable
+/// `*mut HttpStream` slot (or be null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_respond_stream(
+    ctx: *mut HttpRequestCtx,
+    rb: *mut ResponseBuilder,
+    out: *mut *mut HttpStream,
+) -> i32 {
+    // Take ownership of BOTH moved-in handles FIRST, so every early return frees them (mirror
+    // `respond`): the ctx's `Drop` closes its fd; the builder's `Drop` frees its buffers.
+    let ctx_owned = if ctx.is_null() { None } else { Some(unsafe { Box::from_raw(ctx) }) };
+    let rb_owned = if rb.is_null() { None } else { Some(unsafe { Box::from_raw(rb) }) };
+    if out.is_null() {
+        return AL_INVALID; // both `Drop` here (fd closed, buffers freed)
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    let (Some(mut c), Some(r)) = (ctx_owned, rb_owned) else {
+        return AL_INVALID; // a null handle — both `Drop` here
+    };
+    // `rb` must be header-only. A set body is `respond`'s job, not a streamed response — a
+    // code-structure bug (the `respond`/`rand.range` abort class, not client data). Abort.
+    if r.body.is_some() {
+        panic_abort("http.respond_stream: the response_builder must be header-only (a streamed body is written with s.send(...), not rb.body(...)); use ctx.respond(rb) for a bodied response");
+    }
+    // Shared head serialize (status line + caller headers + `Connection: close`), then the framing
+    // header + the terminating blank line. A 1.1 request → chunked; a 1.0 request → raw (no TE).
+    let mut head = match http_serialize_head(&r) {
+        Ok(b) => b,
+        Err(s) => return s, // `c` drops → the accepted fd is closed
+    };
+    let framed = c.http11;
+    if framed {
+        head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    // One SIGPIPE-safe write of the head.
+    let rc = unsafe { http_send_all(c.fd, &head) };
+    if rc != 0 {
+        return rc; // `c` drops → the accepted fd is closed
+    }
+    // Lift the fd out of the ctx (so the ctx's `Drop` does NOT close it — the stream owns it now),
+    // then drop the ctx (freeing its request buffer).
+    let fd = c.fd;
+    c.fd = -1;
+    drop(c);
+    unsafe { *out = Box::into_raw(Box::new(HttpStream { fd, framed, poisoned: false })) };
+    0
+}
+
+/// `s.send(chunk)` — write one streamed chunk. **Framed** (1.1): one chunk frame (lowercase-hex
+/// length, CRLF, payload, CRLF) assembled in ONE buffer and sent in ONE `http_send_all` write.
+/// **Raw** (1.0): the payload bytes unframed, one write. **`send("")` (an empty chunk) is a no-op
+/// returning `0`** — a zero-length chunk is the protocol TERMINATOR, and an empty output step is
+/// foreseeable gateway data (a multi-byte codepoint split across tokens detokenizes to zero bytes),
+/// not a bug. On a write error the stream is **poisoned** (so `finish` skips the terminator) and the
+/// errno returned. Borrows `s` (mutated in place — the poison latch); never consumed.
+///
+/// # Safety
+/// `s` must be a valid `HttpStream` (or null); `ptr`/`len` a valid byte range (or `{null,<=0}`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_stream_send(s: *mut HttpStream, ptr: *const u8, len: i64) -> i32 {
+    if s.is_null() {
+        return AL_INVALID;
+    }
+    let st = unsafe { &mut *s };
+    let chunk = unsafe { bytes_view(ptr, len) };
+    // A zero-length chunk is the chunked terminator — never frame it; an empty output step is honest
+    // "no bytes this step" data, so writing nothing and returning Ok is the correct semantics.
+    if chunk.is_empty() {
+        return 0;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    if st.framed {
+        http_push_chunk_size_hex(&mut buf, chunk.len());
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(chunk);
+        buf.extend_from_slice(b"\r\n");
+    } else {
+        buf.extend_from_slice(chunk);
+    }
+    let rc = unsafe { http_send_all(st.fd, &buf) };
+    if rc != 0 {
+        st.poisoned = true; // a broken stream — `finish` will skip the terminator and return Err
+    }
+    rc
+}
+
+/// `s.finish()` — the SOLE clean terminator. **Consumes** `s` (the language moved it in, nulling the
+/// caller slot — the runtime frees it). **Framed + not poisoned:** write `0\r\n\r\n` (trailers omitted,
+/// conformant per RFC 9112 §7.1), close the fd (via `Drop`), surface any write errno. **Raw + not
+/// poisoned:** just close (close IS the 1.0 terminator), return `0`. **Poisoned:** skip the terminal
+/// write, close, return `AL_INVALID` (the stream did not terminate cleanly). A null handle → `AL_INVALID`.
+///
+/// # Safety
+/// `s` a pointer from [`align_rt_http_respond_stream`] (moved in — freed here), or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_stream_finish(s: *mut HttpStream) -> i32 {
+    if s.is_null() {
+        return AL_INVALID;
+    }
+    let st = unsafe { Box::from_raw(s) }; // consumed — `Drop` closes the fd at scope end
+    if st.poisoned {
+        return AL_INVALID; // a failed `send` already broke the stream — skip the terminator, close, Err
+    }
+    if st.framed {
+        // The terminal zero-length chunk. `Drop` closes the fd right after (RAII), so surface the errno.
+        unsafe { http_send_all(st.fd, b"0\r\n\r\n") }
+    } else {
+        0 // raw mode: close (via `Drop`) IS the terminator
+    }
+}
+
+/// Free a `http_stream`, closing its socket fd (via `Drop`, close-only — NO terminal write). Null-safe.
+/// This is the `Drop` path for a stream that was **never** `finish`ed — the client then sees an abrupt
+/// close, which is chunked's own truncation signal (http.md item 7).
+///
+/// # Safety
+/// `s` must be null or a pointer from [`align_rt_http_respond_stream`], not yet freed / finished.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_stream_free(s: *mut HttpStream) {
+    if !s.is_null() {
+        drop(unsafe { Box::from_raw(s) }); // `Drop` closes the fd (close-only)
+    }
 }
 
 #[cfg(test)]
@@ -17877,6 +18097,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         assert_eq!(&raw[head.method_start..head.method_start + head.method_len], b"POST");
         assert_eq!(&raw[head.target_start..head.target_start + head.target_len], b"/submit");
         assert_eq!(head.content_length, Some(3));
+        assert!(head.http11, "HTTP/1.1 request threads http11 = true");
         // The Host header span points into the same buffer (no copy).
         let hosts: Vec<_> = head
             .headers
@@ -17890,6 +18111,109 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let gh = http_parse_request_head(g).expect("HTTP/1.0 GET parses");
         assert_eq!(gh.content_length, None);
         assert_eq!(&g[gh.target_start..gh.target_start + gh.target_len], b"/");
+        assert!(!gh.http11, "HTTP/1.0 request threads http11 = false");
+    }
+
+    /// The chunk-size hex encoder (`http_push_chunk_size_hex`): lowercase, `0x`-free, minimal-width,
+    /// across the byte-count boundaries a chunk length crosses (15/16, 255/256), 1 byte, and a large
+    /// length. A zero renders `"0"` defensively (never used — `send("")` is a no-op that frames nothing).
+    #[test]
+    fn http_chunk_size_hex_table() {
+        let enc = |n: usize| -> String {
+            let mut b = Vec::new();
+            http_push_chunk_size_hex(&mut b, n);
+            String::from_utf8(b).unwrap()
+        };
+        assert_eq!(enc(0), "0");
+        assert_eq!(enc(1), "1");
+        assert_eq!(enc(15), "f");
+        assert_eq!(enc(16), "10");
+        assert_eq!(enc(255), "ff");
+        assert_eq!(enc(256), "100");
+        assert_eq!(enc(4096), "1000");
+        assert_eq!(enc(0xdead_beef), "deadbeef");
+    }
+
+    /// The shared head serializer (`http_serialize_head`) is single-sourced: `http_serialize_response`
+    /// must be byte-identical to the pre-refactor inline serialize. Pins the exact wire bytes so the
+    /// refactor cannot silently drift the output (the header order `Connection: close` before
+    /// `Content-Length`, the blank-line terminator, the body append).
+    #[test]
+    fn http_serialize_response_shared_head_parity() {
+        let mut rb = ResponseBuilder { status: 200, headers: Vec::new(), body: None };
+        rb.headers.push(("X-Tag".to_string(), "v".to_string()));
+        rb.body = Some(b"hello".to_vec());
+        let out = String::from_utf8(http_serialize_response(&rb).unwrap()).unwrap();
+        assert_eq!(out, "HTTP/1.1 200 OK\r\nX-Tag: v\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello");
+        // Header-only: no Content-Length line at all.
+        let hdr_only = ResponseBuilder { status: 204, headers: Vec::new(), body: None };
+        let out2 = String::from_utf8(http_serialize_response(&hdr_only).unwrap()).unwrap();
+        assert_eq!(out2, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+    }
+
+    /// The streaming head is the shared head plus the framing header: a 1.1 stream gets
+    /// `Transfer-Encoding: chunked`; a bodied builder aborts; a bad status / caller framing header is
+    /// rejected by the shared serializer. (The head-write + fd lift are exercised end-to-end by the
+    /// driver test; here we pin the head-serialize contract only.)
+    #[test]
+    fn http_stream_head_serialize_contract() {
+        // A 1.1 streaming head appends `Transfer-Encoding: chunked` after `Connection: close`.
+        let rb = ResponseBuilder { status: 200, headers: Vec::new(), body: None };
+        let mut head = http_serialize_head(&rb).unwrap();
+        head.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+        assert_eq!(
+            String::from_utf8(head).unwrap(),
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
+        // A caller framing header is rejected by the shared serializer (same as `respond`).
+        let mut bad = ResponseBuilder { status: 200, headers: Vec::new(), body: None };
+        bad.headers.push(("Content-Length".to_string(), "5".to_string()));
+        assert_eq!(http_serialize_head(&bad), Err(AL_INVALID));
+        // A bad status is rejected too.
+        let badstatus = ResponseBuilder { status: 999, headers: Vec::new(), body: None };
+        assert_eq!(http_serialize_head(&badstatus), Err(AL_INVALID));
+    }
+
+    /// A poisoned stream's `finish` skips the terminal write and returns `Err`, and closes the fd (no
+    /// leak). The framing-vs-poison decision is unit-level; the mid-stream kill is also covered
+    /// end-to-end in the driver test.
+    #[test]
+    fn http_stream_finish_poisoned_returns_err() {
+        use std::os::unix::io::IntoRawFd;
+        // A stream whose `poisoned` flag is set returns Err from finish and does not write `0\r\n\r\n`.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let fd = a.into_raw_fd();
+        let s = Box::into_raw(Box::new(HttpStream { fd, framed: true, poisoned: true }));
+        assert_eq!(unsafe { align_rt_http_stream_finish(s) }, AL_INVALID, "poisoned finish returns Err");
+        // `fd` was closed by finish's Drop; a second close must fail (already closed → no leak).
+        assert_eq!(unsafe { close(fd) }, -1, "the stream's fd was closed by finish");
+    }
+
+    /// `send("")` (an empty chunk) is a no-op that frames NOTHING — it returns Ok without touching the
+    /// socket (a zero-length chunk is the terminator; empty output steps are normal gateway data).
+    #[test]
+    fn http_stream_send_empty_is_noop_ok() {
+        use std::os::unix::io::IntoRawFd;
+        // Drop the peer so a real framed write EPIPEs and poisons the stream. An empty send must instead
+        // be a clean Ok that never writes, leaving the stream un-poisoned.
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        drop(b); // peer gone → a write on `a` eventually errors (EPIPE / ECONNRESET)
+        let fd = a.into_raw_fd();
+        let s = Box::into_raw(Box::new(HttpStream { fd, framed: true, poisoned: false }));
+        assert_eq!(unsafe { align_rt_http_stream_send(s, b"".as_ptr(), 0) }, 0, "empty send is Ok");
+        assert!(!unsafe { &*s }.poisoned, "empty send never wrote, so never poisoned");
+        // A real non-empty send now DOES write; against a dropped peer it errors and poisons. (A single
+        // buffered write may succeed before the peer-gone error surfaces, so drive until it errors.)
+        let mut errored = false;
+        for _ in 0..100_000 {
+            if unsafe { align_rt_http_stream_send(s, b"xxxxxxxx".as_ptr(), 8) } != 0 {
+                errored = true;
+                break;
+            }
+        }
+        assert!(errored, "a send to a dead peer eventually errors");
+        assert!(unsafe { &*s }.poisoned, "a failed send poisons the stream");
+        unsafe { align_rt_http_stream_free(s) };
     }
 
     /// The five inbound smuggling guards each reject with `Invalid`.

@@ -852,6 +852,21 @@ pub enum Rvalue {
     /// both source slots). Returns an `i32` status (0 = ok; else `AL_INVALID` / errno → `Error`); the
     /// caller branches `Ok(())` / `Err`. Impure.
     HttpRespond { ctx: Operand, rb: Operand },
+    /// `ctx.respond_stream(rb)` — serialize `rb`'s head + the transfer framing, write it, lift the fd
+    /// out of `ctx`, and write an owned `http_stream` handle (opaque pointer) to `out`. **Both** `ctx`
+    /// and `rb` are opaque pointers **moved in** (the runtime frees both, so the MIR nulls both source
+    /// slots). Returns an `i32` status (0 = ok; else `AL_INVALID` / errno → `Error`); the caller branches
+    /// `Ok(http_stream)` / `Err`. Impure.
+    HttpRespondStream { ctx: Operand, rb: Operand, out: Slot },
+    /// `s.send(chunk)` — write one streamed chunk to the stream `s` (opaque pointer, **borrowed** —
+    /// mutated in place, not consumed); `chunk` is a byte view `{ptr,len}`. Returns an `i32` status
+    /// (0 = ok, incl. an empty-chunk no-op; else errno → `Error`); the caller branches `Ok(())` / `Err`.
+    /// Impure.
+    HttpStreamSend { stream: Operand, chunk: Operand },
+    /// `s.finish()` — write the terminator (framed mode) + close the fd. `s` is an opaque pointer
+    /// **moved in** (the runtime frees it, so the MIR nulls its source slot). Returns an `i32` status
+    /// (0 = ok; else `AL_INVALID` → `Error`); the caller branches `Ok(())` / `Err`. Impure.
+    HttpStreamFinish { stream: Operand },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -1296,7 +1311,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 Some(&ty) => {
-                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::DictEncoded(..))
+                    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(..) | Ty::DynResponseArray | Ty::String | Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::DictEncoded(..))
                         || payload_is_move(ty)
                         // A Move tuple (holds an owned element) moved away must be nulled so its
                         // exit `Drop` frees nulls, not the buffers the new owner took.
@@ -2127,7 +2142,10 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpResponseBuilder { .. }
         | hir::ExprKind::HttpRbHeader { .. }
         | hir::ExprKind::HttpRbBody { .. }
-        | hir::ExprKind::HttpRespond { .. } => lower_http(b, e),
+        | hir::ExprKind::HttpRespond { .. }
+        | hir::ExprKind::HttpRespondStream { .. }
+        | hir::ExprKind::HttpStreamSend { .. }
+        | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
         hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
         hir::ExprKind::Local(id) => {
             let v = b.fresh_value(e.ty);
@@ -6169,6 +6187,36 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(code, Rvalue::HttpRespond { ctx: cx, rb: r }));
             lower_status_result(b, code, e.ty)
         }
+        // `ctx.respond_stream(rb)` → `Result<http_stream, Error>`. BOTH `ctx` and `rb` are **consumed**
+        // (the runtime frees both, and lifts the fd into the returned stream): null both source slots so
+        // the exit `Drop` doesn't double-free. The result rides the shared out-slot + i32-status
+        // lowering (`ok_ty = HttpStream`), like `srv.accept()`.
+        hir::ExprKind::HttpRespondStream { ctx, rb } => {
+            let out = b.new_slot(Ty::HttpStream);
+            let cx = lower_expr(b, ctx);
+            let r = lower_expr(b, rb);
+            null_moved_source(b, ctx);
+            null_moved_source(b, rb);
+            lower_http_response_result(b, Rvalue::HttpRespondStream { ctx: cx, rb: r, out }, out, Ty::HttpStream, e.ty)
+        }
+        // `s.send(chunk)` → `Result<(), Error>`. `s` is **borrowed** (mutated in place — not consumed);
+        // `chunk` is a byte view.
+        hir::ExprKind::HttpStreamSend { stream, chunk } => {
+            let s = lower_expr(b, stream);
+            let ch = lower_expr(b, chunk);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpStreamSend { stream: s, chunk: ch }));
+            lower_status_result(b, code, e.ty)
+        }
+        // `s.finish()` → `Result<(), Error>`. `s` is **consumed** (the runtime frees it): null its source
+        // slot so the exit `Drop` doesn't double-free (a new `null_moved_source` arm — the easy-to-miss one).
+        hir::ExprKind::HttpStreamFinish { stream } => {
+            let s = lower_expr(b, stream);
+            null_moved_source(b, stream);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpStreamFinish { stream: s }));
+            lower_status_result(b, code, e.ty)
+        }
         _ => unreachable!("lower_http on a non-http expr"),
     }
 }
@@ -6954,6 +7002,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::HttpServer => "http_server".to_string(),
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),
+        Ty::HttpStream => "http_stream".to_string(),
         Ty::Struct(id) => format!("struct#{id}"),
         Ty::Tuple(id) => format!("tuple#{id}"),
         Ty::Fn(id) => format!("fn#{id}"),

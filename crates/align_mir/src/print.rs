@@ -562,6 +562,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::HttpRbHeader { rb, name, value } => format!("http_rb_header({}, {}, {})", operand_str(rb), operand_str(name), operand_str(value)),
         Rvalue::HttpRbBody { rb, data } => format!("http_rb_body({}, {})", operand_str(rb), operand_str(data)),
         Rvalue::HttpRespond { ctx, rb } => format!("http_respond({}, {})", operand_str(ctx), operand_str(rb)),
+        Rvalue::HttpRespondStream { ctx, rb, out } => format!("http_respond_stream({}, {}, -> _{out})", operand_str(ctx), operand_str(rb)),
+        Rvalue::HttpStreamSend { stream, chunk } => format!("http_stream_send({}, {})", operand_str(stream), operand_str(chunk)),
+        Rvalue::HttpStreamFinish { stream } => format!("http_stream_finish({})", operand_str(stream)),
     }
 }
 

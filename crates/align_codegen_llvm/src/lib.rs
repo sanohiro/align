@@ -1470,6 +1470,25 @@ fn build_module<'c>(
         "http_respond".to_string(),
         module.add_function("align_rt_http_respond", ctx.i32_type().fn_type(&[ptr.into(), ptr.into()], false), None),
     );
+    // Streaming response (SSE/chunked): `respond_stream(ctx, rb, out) -> i32` (writes the head + framing,
+    // lifts the fd into an owned `http_stream` at `out`); `stream_send(s, ptr, len) -> i32`;
+    // `stream_finish(s) -> i32` (consumes `s`); `stream_free(s)` (Drop: close-only).
+    funcs.insert(
+        "http_respond_stream".to_string(),
+        module.add_function("align_rt_http_respond_stream", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), ptr.into()], false), None),
+    );
+    funcs.insert(
+        "http_stream_send".to_string(),
+        module.add_function("align_rt_http_stream_send", ctx.i32_type().fn_type(&[ptr.into(), ptr.into(), i64t2.into()], false), None),
+    );
+    funcs.insert(
+        "http_stream_finish".to_string(),
+        module.add_function("align_rt_http_stream_finish", ctx.i32_type().fn_type(&[ptr.into()], false), None),
+    );
+    funcs.insert(
+        "http_stream_free".to_string(),
+        module.add_function("align_rt_http_stream_free", ctx.void_type().fn_type(&[ptr.into()], false), None),
+    );
     // `core.string` trims → a borrowed sub-`str` `{ptr,len}` of the receiver (no allocation).
     for (key, sym) in [
         ("str_trim", "align_rt_str_trim"),
@@ -1916,7 +1935,7 @@ fn scalar_type<'c>(ctx: &'c Context, ty: Ty, sx: &[StructType<'c>], ex: &[Struct
         // `Task<R>` (④b) is a box in the task_group region — a pointer, like `box<T>`.
         Ty::Task(_) => ctx.ptr_type(AddressSpace::default()).into(),
         // A `reader`/`writer`/`buffer` / cli handle / `tcp_conn` payload is an opaque pointer.
-        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Reader | Ty::Writer | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
         // A comparison `mask` (M6) → `<N x i1>` (one bool lane per vector lane; element-independent).
@@ -2380,6 +2399,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::HttpResponse => unreachable!("an http response handle is not a box/array payload"),
         Scalar::HttpServer => unreachable!("an http_server handle is not a box/array payload"),
         Scalar::HttpRequestCtx => unreachable!("an http_request_ctx handle is not a box/array payload"),
+        Scalar::HttpStream => unreachable!("an http_stream handle is not a box/array payload"),
         Scalar::TcpConn => unreachable!("a tcp_conn handle is not a box/array payload"),
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
@@ -3032,7 +3052,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
+                    let z: BasicValueEnum = if matches!(ty, Ty::Builder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::ArrayBuilder(_) | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
                         // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
                         self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                     } else if matches!(ty, Ty::StructArray(..)) {
@@ -3108,7 +3128,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.builder
                             .build_call(self.funcs[free_fn], &[p.into()], "")
                             .map_err(|e| self.err(e))?;
-                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder) {
+                    } else if matches!(ty, Ty::Writer | Ty::Reader | Ty::Buffer | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream) {
                         // A writer flushes + closes; a reader closes; a buffer / cli / http handle
                         // frees; a tcp_conn / tcp_listener / udp_socket closes its socket fd. Each
                         // runtime `*_free` is null-safe (a moved-out / never-initialised slot drops
@@ -3130,6 +3150,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             Ty::HttpServer => "http_server_free",
                             Ty::HttpRequestCtx => "http_ctx_free",
                             Ty::ResponseBuilder => "http_response_free",
+                            Ty::HttpStream => "http_stream_free",
                             _ => "cli_parsed_free",
                         };
                         let p = self
@@ -3157,7 +3178,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .build_extract_value(agg, idx, "droppl")
                                 .map_err(|e| self.err(e))?;
                             match payload_field_scalar(ty, idx) {
-                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) => {
+                                Some(Scalar::Reader) | Some(Scalar::Writer) | Some(Scalar::Buffer) | Some(Scalar::File) | Some(Scalar::CliParsed) | Some(Scalar::TcpConn) | Some(Scalar::TcpListener) | Some(Scalar::UdpSocket) | Some(Scalar::Child) | Some(Scalar::HttpResponse) | Some(Scalar::HttpServer) | Some(Scalar::HttpRequestCtx) | Some(Scalar::HttpStream) => {
                                     // The field is the handle pointer itself; each `*_free` is null-safe
                                     // (the inactive arm / a moved-out aggregate reads a null handle).
                                     let free_fn = match payload_field_scalar(ty, idx) {
@@ -3172,6 +3193,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         Some(Scalar::HttpResponse) => "http_resp_free",
                                         Some(Scalar::HttpServer) => "http_server_free",
                                         Some(Scalar::HttpRequestCtx) => "http_ctx_free",
+                                        Some(Scalar::HttpStream) => "http_stream_free",
                                         _ => "cli_parsed_free",
                                     };
                                     self.builder
@@ -5629,6 +5651,31 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.funcs["http_respond"], &[c.into(), r.into()], "httprespond")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_respond returns i32 status")
+            }
+            Rvalue::HttpRespondStream { ctx, rb, out } => {
+                let c = self.operand(ctx).into_pointer_value();
+                let r = self.operand(rb).into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null()).map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.funcs["http_respond_stream"], &[c.into(), r.into(), out_ptr.into()], "httprespondstream")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_respond_stream returns i32 status")
+            }
+            Rvalue::HttpStreamSend { stream, chunk } => {
+                let s = self.operand(stream).into_pointer_value();
+                let (dp, dl) = self.split_str(chunk)?;
+                self.builder
+                    .build_call(self.funcs["http_stream_send"], &[s.into(), dp.into(), dl.into()], "httpstreamsend")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_stream_send returns i32 status")
+            }
+            Rvalue::HttpStreamFinish { stream } => {
+                let s = self.operand(stream).into_pointer_value();
+                self.builder
+                    .build_call(self.funcs["http_stream_finish"], &[s.into()], "httpstreamfinish")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().expect("http_stream_finish returns i32 status")
             }
             // env.get — write the owned value {ptr,len} into `out`, return an i32 present flag.
             Rvalue::EnvGet { name, out } => {

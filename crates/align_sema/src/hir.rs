@@ -1082,6 +1082,25 @@ pub enum ExprKind {
     /// runtime frees both (like [`HttpClientRequest`]'s `req`). A caller-supplied Content-Length / a bad
     /// status is `Error.Invalid`. **Impure** (network I/O).
     HttpRespond { ctx: Box<Expr>, rb: Box<Expr> },
+    /// `ctx.respond_stream(rb)` — begin a chunked/streaming response: serialize `rb`'s head (header-only)
+    /// plus the transfer framing, write it, and yield `Result<http_stream, Error>` (the `ty`). **Consumes
+    /// BOTH** `ctx` ([`crate::Ty::HttpRequestCtx`]) and `rb` ([`crate::Ty::ResponseBuilder`]) — the
+    /// runtime frees both (like [`HttpRespond`]) and lifts the accepted fd into the returned
+    /// [`crate::Ty::HttpStream`]. A `rb` with a body set **aborts** (a header-only builder is required —
+    /// the streamed body is written with `s.send`); a bad status is `Error.Invalid`. A 1.0 request gets
+    /// close-delimited raw framing (no chunked). **Impure** (network I/O).
+    HttpRespondStream { ctx: Box<Expr>, rb: Box<Expr> },
+    /// `s.send(chunk)` — write one streamed chunk (one chunk frame in framed/1.1 mode, or raw payload
+    /// bytes in 1.0 mode) to the stream `s` ([`crate::Ty::HttpStream`]), yielding `Result<(), Error>`
+    /// (the `ty`). `send("")` is a no-op returning `Ok` (an empty chunk is the terminator). `s` is a
+    /// bound local, **borrowed** (mutated in place — the poison latch), not consumed; `chunk` is a byte
+    /// view. **Impure** (network I/O).
+    HttpStreamSend { stream: Box<Expr>, chunk: Box<Expr> },
+    /// `s.finish()` — the sole clean terminator: write `0\r\n\r\n` (framed mode) + close, yielding
+    /// `Result<(), Error>` (the `ty`). **Consumes** `s` ([`crate::Ty::HttpStream`]) — the runtime frees
+    /// it. A poisoned stream (a prior failed `send`) skips the terminal write and returns `Err`.
+    /// **Impure** (network I/O).
+    HttpStreamFinish { stream: Box<Expr> },
     /// `crypto.constant_time_equal(a, b)` — a constant-time byte-equality test over two byte views
     /// `a` / `b` (`str` / owned `string` auto-borrowed / `slice<u8>`); the `ty` is
     /// [`crate::Ty::Bool`]. The input *length* is **public** (crypto.md P1): differing lengths return
