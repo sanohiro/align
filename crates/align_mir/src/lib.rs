@@ -924,20 +924,139 @@ pub enum Term {
     Unreachable,
 }
 
+/// A native C library the runtime only references when a program uses a std feature that needs it
+/// (M13 Slice 2 — capability-based linking). `libpthread`/`libdl`/`libm` are linked unconditionally
+/// by the driver (Rust-std support the runtime core needs, portable across glibc versions — a no-op
+/// under merged-libc). The four libraries below are *gated*: linked only when a program reaches the
+/// runtime code that references them.
+///
+/// The mapping is a **superset** of the symbols each op's runtime code references, on purpose. The
+/// runtime is one crate compiled to a single archive member (verified: all of alloc + compress +
+/// crypto + http land in one `*.rcgu.o`), so archive-member granularity does NOT isolate a feature.
+/// What isolates it is the final link's `--gc-sections`: for a program that uses *no* gated feature
+/// the dead compress/crypto/tls code (and its external references) is garbage-collected, so none of
+/// z/zstd/crypto/ssl is needed. But once a gated feature IS used, a GNU ld quirk kicks in — as soon
+/// as a candidate library on the command line resolves *some* of the member's undefined symbols, ld
+/// stops garbage-collecting the member's *other* library references — so `Crypto`/`Tls` transitively
+/// retain the compress libraries. Hence the monotonic sets below (`Tls ⊇ Crypto ⊇ {compress}`). A
+/// superset is always correct: any passed library the final image does not actually reference is
+/// dropped from `DT_NEEDED` by `--as-needed`. Fine-grained isolation (crypto → `-lcrypto` alone)
+/// would require splitting the runtime crate by feature area — recorded as a follow-up, not done here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Capability {
+    /// gzip compression/decompression — `libz`.
+    Zlib,
+    /// zstd compression/decompression — `libzstd`.
+    Zstd,
+    /// hashing / HMAC / HKDF / AEAD / argon2 — `libcrypto` (OpenSSL EVP). Transitively retains the
+    /// compress libraries in the current single-member runtime (see the type doc).
+    Crypto,
+    /// the HTTP client (plaintext or TLS — the scheme is a runtime decision, so any client use may
+    /// hit the TLS path) — `libssl` + `libcrypto`, transitively the compress libraries.
+    Tls,
+}
+
+impl Capability {
+    /// The `-l<name>` libraries this capability requires (a superset — see the type doc).
+    pub fn link_libs(self) -> &'static [&'static str] {
+        match self {
+            Capability::Zlib => &["z"],
+            Capability::Zstd => &["zstd"],
+            Capability::Crypto => &["crypto", "z", "zstd"],
+            Capability::Tls => &["ssl", "crypto", "z", "zstd"],
+        }
+    }
+}
+
+/// The capability a single `Rvalue` requires, if any. Only ops whose runtime implementation calls
+/// into a gated C library map to a capability; everything else — including `CryptoCtEqual`
+/// (a constant-time byte compare) and `CryptoRandom` (OS getrandom), which touch no library —
+/// returns `None`.
+///
+/// FAIL-CLOSED: this is a focused match with a `_ => None` fallthrough (the `Rvalue` enum has ~200
+/// variants; an exhaustive list would be unmaintainable). The safety net is that the driver links
+/// ONLY the collected libraries, so an external-library op added but not classified here has its
+/// library dropped and any *build-and-run* test using it fails to link — the per-module `m11_*`
+/// (compress/crypto/http) and `capability_linking` suites are exactly that net. Keep this in sync
+/// with the runtime's `#[link(name = ...)]` blocks (currently z / zstd / crypto / ssl).
+#[inline(never)]
+fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
+    match rv {
+        Rvalue::CompressCompress { kind, .. } | Rvalue::CompressDecompress { kind, .. } => {
+            Some(match kind {
+                hir::CompressKind::Gzip => Capability::Zlib,
+                hir::CompressKind::Zstd => Capability::Zstd,
+            })
+        }
+        Rvalue::CryptoHash { .. }
+        | Rvalue::CryptoHmac { .. }
+        | Rvalue::CryptoHkdf { .. }
+        | Rvalue::CryptoAead { .. }
+        | Rvalue::CryptoArgon2(_) => Some(Capability::Crypto),
+        Rvalue::HttpClientGet { .. }
+        | Rvalue::HttpClientPost { .. }
+        | Rvalue::HttpClientRequest { .. }
+        | Rvalue::HttpGetMany { .. } => Some(Capability::Tls),
+        _ => None,
+    }
+}
+
+/// The `-l<name>` libraries required by the capability-bearing builtins used anywhere in `fns`,
+/// deduplicated, in a deterministic order. Appended to `Program.link_libs` by [`lower_program`] so
+/// the driver links only what is used. A pure program (no gated feature) yields an empty list.
+#[inline(never)]
+fn collect_capability_libs(fns: &[Function]) -> Vec<String> {
+    let mut caps: Vec<Capability> = Vec::new();
+    for f in fns {
+        for blk in &f.blocks {
+            for s in &blk.stmts {
+                let Stmt::Let(_, rv) = s else { continue };
+                if let Some(cap) = rvalue_capability(rv)
+                    && !caps.contains(&cap)
+                {
+                    caps.push(cap);
+                }
+            }
+        }
+    }
+    // Emit in a fixed canonical order (dependent-first: ssl -> crypto -> zstd -> z),
+    // independent of MIR discovery order. With shared libraries the order is not
+    // load-bearing (each lib's own DT_NEEDED resolves its dependencies — verified
+    // empirically: a crypto-before-http program links fine either way), but a fixed
+    // order keeps the link line deterministic across code motion and stays correct
+    // if these libs are ever linked as static archives.
+    let mut libs: Vec<String> = Vec::new();
+    for l in ["ssl", "crypto", "zstd", "z"] {
+        if caps.iter().any(|cap| cap.link_libs().contains(&l)) {
+            libs.push(l.to_string());
+        }
+    }
+    libs
+}
+
 /// typed HIR -> MIR.
 pub fn lower_program(program: &hir::Program) -> Program {
+    let fns: Vec<Function> = program
+        .fns
+        .iter()
+        .map(|f| {
+            let mut mf = lower_fn(f, &program.tuples, &program.structs);
+            fuse_builder_writes(&mut mf);
+            mf
+        })
+        .collect();
+    // User-declared `extern "C" link("name")` libraries come first (validated in sema); then the
+    // libraries the used builtins require. Both feed the driver's single `-l<name>` loop.
+    let mut link_libs = program.link_libs.clone();
+    for l in collect_capability_libs(&fns) {
+        if !link_libs.contains(&l) {
+            link_libs.push(l);
+        }
+    }
     Program {
-        fns: program
-            .fns
-            .iter()
-            .map(|f| {
-                let mut mf = lower_fn(f, &program.tuples, &program.structs);
-                fuse_builder_writes(&mut mf);
-                mf
-            })
-            .collect(),
+        fns,
         externs: program.externs.clone(),
-        link_libs: program.link_libs.clone(),
+        link_libs,
         structs: program.structs.clone(),
         enums: program.enums.clone(),
         tuples: program.tuples.clone(),

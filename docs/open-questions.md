@@ -2374,6 +2374,26 @@ driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Dis
   for the foreseeable future — public repo but sole user; interface/spec changes need no compat
   shims (the CLAUDE.md rule extends indefinitely until stated otherwise).
 
+### Runtime staticlib feature-split — deferred from M13 Slice 2 (OPEN, not blocking)
+
+M13 Slice 2 (capability-based linking, DONE 2026-07-11) landed the coarse win: a program using no
+gated feature links none of z/zstd/crypto/ssl, and per-capability gating is precise for the *clean*
+cases (`gzip` → `libz`, `zstd` → `libzstd`). What it could NOT make precise is `Crypto`/`Tls`:
+`Capability::link_libs` is a monotonic SUPERSET (`Tls ⊇ Crypto ⊇ {compress}`) because the runtime is
+one crate → one archive member, and once a candidate library on the link line resolves *some* of
+that member's symbols GNU ld stops garbage-collecting the member's *other* external references (so a
+crypto-only program still retains `libz`/`libzstd` in its `DT_NEEDED`). The **ideal** fix — a
+crypto/tls binary that links `libcrypto`/`libssl` **alone** — needs the runtime **split by feature
+area** so each C-library's code lives in its own object/member (then `--gc-sections` + member
+granularity isolate cleanly). Options weighed and deferred (none blocking; the superset is always
+correct): (a) separate `align_runtime_{core,compress,crypto,http}` crates/staticlibs — the clean
+form, but restructures the 18.5k-line single `lib.rs` and the driver's single-archive link; (b)
+cargo features producing per-capability builds — the roadmap already flags this "probably too
+slow/complex"; (c) forcing the compress/crypto/http modules into distinct codegen units. Revisit
+when a crypto/tls binary's extra compress `DT_NEEDED` actually matters (deployment-size or
+supply-chain-surface pressure), or fold into a build-profile/packaging slice. Recorded at the M13
+Slice 2 roadmap entry.
+
 ### Side-effecting iteration & pipeline sinks — `each`/Sink terminal + `range(n)` source
 
 Direction SETTLED + owner-ratified 2026-07-11 (grew out of the map-vs-loop discussion; also the

@@ -1,0 +1,4 @@
+// Pulls the runtime core (print) but no gated feature — must link none of z/zstd/crypto/ssl.
+fn main() {
+  print("hello")
+}

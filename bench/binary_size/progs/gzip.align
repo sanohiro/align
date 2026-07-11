@@ -1,0 +1,7 @@
+// Uses gzip only → links libz alone.
+import std.compress
+fn main() -> Result<(), Error> {
+  c := compress.gzip_compress("the quick brown fox jumps over the lazy dog", 6)?
+  print(c.len() as i64)
+  return Ok(())
+}

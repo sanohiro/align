@@ -144,20 +144,26 @@ pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs:
     cmd.arg(&runtime)
         .arg("-o")
         .arg(exe)
-        // `-lz` (zlib), `-lzstd` (libzstd), `-lcrypto` (OpenSSL libcrypto) and `-lssl` (OpenSSL
-        // libssl) are always linked, alongside the Rust-std support libs: the runtime staticlib
-        // unconditionally contains the `std.compress` gzip + zstd wrappers (which reference libz's
-        // `deflate`/`inflate` and libzstd's `ZSTD_*`), the `std.crypto` hash wrappers (which
-        // reference libcrypto's `EVP_Q_digest`), and the `std.http` HTTPS client (which references
-        // libssl's `SSL_*` — the TLS engine, mirroring crypto's libcrypto settlement, ≥3.2 shared
-        // floor). All are universal system libraries like libm. Linking each only when a program
-        // uses the module would need a magic per-module flag threaded from sema to the driver — the
-        // baseline set stays simple and unconditional (`docs/impl/std-design/compress.md`,
-        // `docs/impl/std-design/crypto.md`, `docs/impl/std-design/http.md` Slice 5).
-        .args(["-lpthread", "-ldl", "-lm", "-lz", "-lzstd", "-lcrypto", "-lssl"]);
-    // User-declared external libraries (`extern "C" link("name")`) go after the objects that
-    // reference them (`-l` resolves left-to-right against preceding objects). Each name is validated
-    // in sema and passed as a single `-l<name>` argument (no shell/flag injection).
+        // Link hygiene (M13 Slice 2). `--gc-sections` drops every unreferenced input section from the
+        // final image; combined with the runtime's per-function sections (Rust's default) this
+        // garbage-collects the `std.compress`/`std.crypto`/`std.http` code a program does not use,
+        // eliminating its `libz`/`libzstd`/`libcrypto`/`libssl` references so those libraries are not
+        // needed at all. `--as-needed` then records `DT_NEEDED` only for libraries that actually
+        // satisfy a surviving reference (a no-op for the merged-libc support libs below on modern
+        // glibc, a portable win on older systems). Both are safe unconditionally — no build profile.
+        .args(["-Wl,--gc-sections", "-Wl,--as-needed"])
+        // `libpthread`/`libdl`/`libm` are linked unconditionally: they are Rust-std support libraries
+        // the runtime *core* may reference (threads, dlopen, math) independent of any Align feature,
+        // and modern glibc merges them into libc so they cost nothing (`--as-needed` drops any that
+        // resolve nothing). They are NOT capability-gated — the runtime core, not an opt-in feature,
+        // is what needs them.
+        .args(["-lpthread", "-ldl", "-lm"]);
+    // Capability + user libraries. `libz`/`libzstd`/`libcrypto`/`libssl` are NO LONGER linked
+    // unconditionally: they now arrive through `link_libs`, which MIR populates from the builtins a
+    // program actually uses (`align_mir::Capability`) plus any `extern "C" link("name")` the user
+    // declared (validated in sema). All go AFTER the objects/archive that reference them (`-l`
+    // resolves left-to-right against preceding inputs). Each name is a single `-l<name>` argv (no
+    // shell/flag injection). A program using no gated feature links none of z/zstd/crypto/ssl.
     for lib in link_libs {
         cmd.arg(format!("-l{lib}"));
     }

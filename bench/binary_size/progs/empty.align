@@ -1,0 +1,2 @@
+// The smallest possible program: no runtime, no gated library.
+fn main() -> i32 = 0

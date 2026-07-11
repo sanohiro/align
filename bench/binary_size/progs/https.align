@@ -1,0 +1,8 @@
+// Uses the HTTP client → links the full TLS set (ssl + crypto + compress libs). Built, not run.
+import std.http
+fn main() -> Result<(), Error> {
+  client := http.client()
+  resp := client.get("https://example.com")?
+  print(resp.status())
+  return Ok(())
+}
