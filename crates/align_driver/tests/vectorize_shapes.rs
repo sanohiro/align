@@ -338,3 +338,87 @@ fn mutation_k7_raw_is_not_vectorized() {
     assert!(!ir.contains("vector.body"), "raw IR must have no vectorized loop:\n{ir}");
     assert!(!ir.contains("store <4 x i64>"), "raw IR must have no vectorized store:\n{ir}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// M13 Slice 5 — canonical-loop-skeleton pins + the A8 runtime-call-hoist win. Folded into this
+// suite (a separate file would duplicate the harness); these pin the shape codegen emits and the
+// optimizer's use of the new `align_rt_*` contract attributes, both part of the LLVM-upgrade gate.
+// ---------------------------------------------------------------------------------------------
+
+/// The textual body of the first `define ... @{name}(` function in `ir` (up to the closing `}` at
+/// column 0), so an assertion can be scoped to one function instead of the whole module.
+fn fn_body(ir: &str, name: &str) -> String {
+    // Match the `define` line itself, not the first `@name(` occurrence — a declare or a call
+    // site earlier in the module would otherwise anchor the extraction to the wrong function.
+    let needle = format!("@{name}(");
+    let line = ir
+        .lines()
+        .find(|l| l.starts_with("define ") && l.contains(&needle))
+        .unwrap_or_else(|| panic!("no `define ... @{name}(` in:\n{ir}"));
+    let start = line.as_ptr() as usize - ir.as_ptr() as usize;
+    let rest = &ir[start..];
+    let end = rest.find("\n}\n").map(|e| start + e + 3).unwrap_or(ir.len());
+    ir[start..end].to_string()
+}
+
+/// The canonical indexed loop a pipeline lowers to (RAW IR, pre-opt) — the shape codegen owns. Pins:
+/// a single loop-governing bounds check (the `0..len` guard, NOT a per-element check), no per-element
+/// `bounds_fail`, and exactly one counted-loop back-edge (one induction variable).
+#[test]
+fn canonical_indexed_loop_skeleton_raw() {
+    if !x86_backend() {
+        return;
+    }
+    let src = reduction_kernel("map(dbl).sum()", "fn dbl(x: i64) -> i64 = x * 2");
+    let ir = raw_ir("skel", &src, V3);
+    let run = fn_body(&ir, "run");
+    // (1) Single bounds check: the map iterates `0..len`, so the ONLY loop-governing comparison is
+    // the header's `idx < len` guard — exactly one `icmp slt` in the whole `run` loop.
+    assert_eq!(run.matches("icmp slt").count(), 1, "want exactly one loop-guard compare:\n{run}");
+    // (2) No per-element bounds fault: the slice map is proven in-bounds, so codegen emits NO
+    // `align_rt_bounds_fail` inside the body (the header guard is the single check).
+    assert!(!run.contains("align_rt_bounds_fail"), "map body must carry no per-element bounds check:\n{run}");
+    // (3) One canonical induction variable: exactly one index step (`add i64 %iv, 1`) — the single
+    // counted-loop advance. (The header is reached by two edges — the pre-loop entry and the
+    // back-edge — the normal counted-loop shape, so the step count is the induction pin.)
+    let index_steps = run.lines().filter(|l| l.contains("add i64") && l.trim_end().ends_with(", 1")).count();
+    assert_eq!(index_steps, 1, "want exactly one `add i64 %iv, 1` induction step:\n{run}");
+}
+
+/// After `-O2`, the counted loop carries a canonical induction: an `i64` phi whose step is the
+/// IndVarSimplify-canonical `add nuw nsw i64 %iv, 1`. Pins that codegen's memory-form loop lowers to
+/// the shape the vectorizer/SCEV expect (a drift here would silently cost vectorization).
+#[test]
+fn canonical_induction_phi_opt() {
+    if !x86_backend() {
+        return;
+    }
+    let src = reduction_kernel("map(dbl).sum()", "fn dbl(x: i64) -> i64 = x * 2");
+    let ir = opt_ir("indvar", &src, V3);
+    assert!(ir.contains("phi i64"), "want an i64 induction phi:\n{ir}");
+    assert!(ir.contains("add nuw nsw i64"), "want the canonical +1 nuw/nsw induction step:\n{ir}");
+}
+
+/// A8 gate (M13 Slice 5A) — the runtime-contract-attribute win, pinned. A loop-invariant
+/// `hash64("literal")` call inside a `map` mapper: with `memory(argmem: read)` + the pure-finite
+/// flags on `align_rt_hash64`, LLVM hoists the opaque call out of the loop (computed once in the
+/// pre-header), which in turn lets the `+hash` map loop VECTORIZE. Without those attributes the
+/// opaque in-loop call blocks both the hoist and vectorization. So `<4 x i64>` + `vector.body`
+/// co-occurring with a surviving `@align_rt_hash64` call is the observable, attribute-dependent win.
+#[test]
+fn a8_hash64_loop_invariant_hoist_enables_vectorization() {
+    if !x86_backend() {
+        return;
+    }
+    let src = reduction_kernel(
+        "map(hkey).sum()",
+        "fn hkey(x: i64) -> i64 = x + (hash64(\"align\") as i64)",
+    );
+    let ir = opt_ir("a8", &src, V3);
+    assert!(ir.contains("call i64 @align_rt_hash64"), "the opaque hash64 call must survive:\n{ir}");
+    // The hoist let the map vectorize — impossible with the call still in the loop body.
+    assert!(ir.contains("<4 x i64>"), "hoist should let the +hash map vectorize (want <4 x i64>):\n{ir}");
+    assert!(ir.contains("vector.body"), "want a vectorized loop body after the hoist:\n{ir}");
+    // The invariant call is hoisted (and CSE'd) to a single site, not re-run per iteration.
+    assert_eq!(ir.matches("call i64 @align_rt_hash64").count(), 1, "hash64 must be hoisted to one call:\n{ir}");
+}

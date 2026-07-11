@@ -1833,6 +1833,10 @@ fn build_module<'c>(
             None,
         ),
     );
+    // M13 Slice 5A — every `align_rt_*` declare now exists; hand-annotate the audited subset whose
+    // contract is provable from the runtime body (LLVM can't see those Rust bodies and never inlines
+    // the calls, so it infers nothing without this). Fail-safe: an unlisted symbol gets no attribute.
+    apply_rt_contract_attrs(ctx, module);
     // Pass 1b: emit a thunk for each function used as a value (`FnValue`/`FnAddr`). A closure
     // value has the env-ABI `fn(env, args)`; a non-capturing / named function is wrapped by
     // `name$fnval(env, args) = name(args)` so all closure callees share that ABI (the env pointer
@@ -2910,6 +2914,130 @@ fn mark_alloc_like<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
 /// buffers the pointer aliases into are never moved, only the chunk-*index* vector is).
 fn mark_bump_alloc<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
     mark_alloc_common(ctx, f);
+}
+
+// ---------------------------------------------------------------------------------------------
+// M13 Slice 5A — contract attributes for the opaque `align_rt_*` runtime declarations.
+//
+// LLVM cannot see the Rust bodies behind the `align_rt_*` declares in `align_runtime`, and these
+// calls never inline, so its FunctionAttrs pass infers nothing for them: every runtime call is an
+// opaque "reads+writes all memory, may not return, may unwind" barrier. `RT_CONTRACT_ATTRS`
+// hand-annotates the small, individually-audited set whose contract is *provable from the runtime
+// body* (each entry cites `crates/align_runtime/src/lib.rs` and its verified reasoning). A wrong
+// attribute here is a silent miscompile, so the fail-safe default is NO attribute: any symbol
+// absent from the table gets nothing. Applied once by `apply_rt_contract_attrs`, after every
+// runtime declare exists (all `align_rt_*` are external declares — never Align definitions).
+// ---------------------------------------------------------------------------------------------
+
+/// LLVM 19's packed `MemoryEffects` bitmask (`llvm/IR/ModRef.h`): 2 bits per location —
+/// `ArgMem = 0`, `InaccessibleMem = 1`, `Other = 2` — holding a `ModRefInfo` (`Ref = 1` reads,
+/// `Mod = 2` writes). `memory(argmem: read)` = ArgMem:Ref only = `1 << (0 * 2)` = `1`, every other
+/// location `NoModRef`. This encoding is version-sensitive (a location was added after LLVM 19), so
+/// `rt_contract_memory_argmem_read_prints_canonically` pins the emitted attribute's textual form —
+/// an LLVM upgrade that shifts the bits fails that test loudly instead of silently miscompiling.
+const MEM_ARGMEM_READ: u64 = 1;
+
+/// The contract of one runtime declaration: which function-level valueless enum attributes it
+/// carries, its LLVM `memory(...)` effect bitmask (if any), and which pointer parameters are
+/// `readonly` + `nocapture` (the function only reads through them and never stores/returns them).
+struct RtContract {
+    fn_attrs: &'static [&'static str],
+    memory: Option<u64>,
+    read_ptr_params: &'static [u32],
+}
+
+/// Function-level attributes shared by the provably pure-finite reader fns: they always return
+/// (a loop bounded by the input length — never abort, never spin), never free reachable memory, and
+/// never synchronize with other threads (any internal atomic is `monotonic`-or-weaker, permitted
+/// under `nosync`). Paired with `memory(argmem: read)` where the body touches ONLY argument memory.
+const PURE_READ: &[&str] = &["willreturn", "nofree", "nosync"];
+
+/// The contract for `sym` (a full `align_rt_*` symbol), or `None` (fail-safe: no attributes). Every
+/// entry was read against the runtime body; the justification cites the function and why each
+/// attribute holds. Curated conservatively — when a fn touched non-argument memory (a feature-detect
+/// cache) `memory(...)` is deliberately withheld even though the fn is otherwise pure.
+fn rt_contract(sym: &str) -> Option<RtContract> {
+    // `hash64`/`hash128` (align_runtime `align_rt_hash64`/`_hash128`): `wyhash` over `safe_slice`d
+    // argument bytes — pure arithmetic, no allocation, no global reads/writes (`WY_SEED`/`WY_SECRET`
+    // are `const`, baked into code, not memory), always terminates, returns a scalar/`{u64,u64}` and
+    // never stores the pointer. → `memory(argmem: read)` + pure-finite + `readonly nocapture` on ptr.
+    // `str_eq`/`str_cmp`/`eq_ignore_case`/`starts_with`/`ends_with`: slice compare (`==`/`.cmp()`/
+    // `eq_ignore_ascii_case`) over `safe_slice`d argument bytes → `memcmp`-class, argument memory
+    // only, no globals, no feature-detect, returns an `i32`/`i64`. Same treatment; both ptr params
+    // (`0` and `2`) are `readonly nocapture`.
+    let memcmp_class = |params: &'static [u32]| RtContract {
+        fn_attrs: PURE_READ,
+        memory: Some(MEM_ARGMEM_READ),
+        read_ptr_params: params,
+    };
+    // `utf8_valid` (`align_rt_utf8_valid` → `validate_utf8`) and the `memchr::memmem`-backed
+    // `str_contains`/`str_find`/`str_rfind`: pure-finite readers, BUT their dispatch runs
+    // `is_x86_feature_detected!` / memchr's runtime CPU-feature detection, which reads (and, on the
+    // first call, writes) a process-global cache — non-argument memory. So `memory(...)` is WITHHELD
+    // (an `argmem: read` / `read` claim would be a lie the first time). They keep the pure-finite
+    // flags and `readonly nocapture` params (all still true), just no memory-effects attribute.
+    let feature_detect_reader = |params: &'static [u32]| RtContract {
+        fn_attrs: PURE_READ,
+        memory: None,
+        read_ptr_params: params,
+    };
+    match sym {
+        "align_rt_hash64" | "align_rt_hash128" => Some(memcmp_class(&[0])),
+        "align_rt_str_eq"
+        | "align_rt_str_cmp"
+        | "align_rt_str_eq_ignore_case"
+        | "align_rt_str_starts_with"
+        | "align_rt_str_ends_with" => Some(memcmp_class(&[0, 2])),
+        "align_rt_utf8_valid" => Some(feature_detect_reader(&[0])),
+        "align_rt_str_contains" | "align_rt_str_find" | "align_rt_str_rfind" => {
+            Some(feature_detect_reader(&[0, 2]))
+        }
+        // The abort family (`align_rt_bounds_fail`/`len_mismatch_fail`/`range_fail`/`div_fail`/
+        // `process_exit`/`process_abort`): each is `-> !` in the runtime — it prints then calls
+        // `std::process::abort()` / `_exit` / `std::process::exit`, none of which return. MIR already
+        // emits `unreachable` after the call, so `noreturn` is free hygiene (it lets LLVM drop the
+        // fall-through and mark the path cold). No pointer params; no memory claim needed.
+        "align_rt_bounds_fail"
+        | "align_rt_len_mismatch_fail"
+        | "align_rt_range_fail"
+        | "align_rt_div_fail"
+        | "align_rt_process_exit"
+        | "align_rt_process_abort" => Some(RtContract {
+            fn_attrs: &["noreturn"],
+            memory: None,
+            read_ptr_params: &[],
+        }),
+        _ => None,
+    }
+}
+
+/// Apply `RT_CONTRACT_ATTRS` to every runtime declaration in the module. Runs once, after all
+/// `align_rt_*` declares are created. Filters to `align_rt_`-prefixed *declarations* (zero basic
+/// blocks) so it can never touch an Align-generated definition; a symbol without a contract entry is
+/// left untouched (the fail-safe default).
+fn apply_rt_contract_attrs<'c>(ctx: &'c Context, module: &Module<'c>) {
+    for f in module.get_functions() {
+        let name = f.get_name();
+        let Ok(name) = name.to_str() else { continue };
+        if !name.starts_with("align_rt_") || f.count_basic_blocks() != 0 {
+            continue;
+        }
+        let Some(c) = rt_contract(name) else { continue };
+        for a in c.fn_attrs {
+            add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, a);
+        }
+        if let Some(mem) = c.memory {
+            let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("memory");
+            f.add_attribute(
+                inkwell::attributes::AttributeLoc::Function,
+                ctx.create_enum_attribute(kind, mem),
+            );
+        }
+        for &p in c.read_ptr_params {
+            add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Param(p), "readonly");
+            add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Param(p), "nocapture");
+        }
+    }
 }
 
 struct FnGen<'c, 'a> {
@@ -7657,29 +7785,174 @@ mod tests {
         ] {
             assert!(out.contains(&format!("declare noalias ptr @{sym}")), "want noalias on {sym}:\n{out}");
         }
-        // Single-shot allocators also get `nofree` + `nounwind` — but deliberately NOT `willreturn`
-        // (they `abort` on OOM, so asserting they always return would be a miscompile).
-        assert!(out.contains("nofree"), "want nofree on the single-shot alloc family:\n{out}");
-        assert!(!out.contains("willreturn"), "must NOT claim willreturn (alloc can abort):\n{out}");
-
-        // The **bump** allocators must NOT carry `nofree`: growing the region `Vec::push`es the
-        // chunk list, which can reallocate (free) memory allocated before the call. Resolve each
-        // one's attribute-group number and assert that group has no `nofree`.
-        let group_has_nofree = |sym: &str| -> bool {
+        // Resolve a runtime declare's attribute group and test it for a substring. (Scoped to the
+        // named symbol — a module-wide `out.contains` would now also catch the M13 Slice 5A pure-fn
+        // attributes like `willreturn` on `align_rt_hash64`.)
+        let group_has = |sym: &str, needle: &str| -> bool {
             let decl = out.lines().find(|l| l.contains(&format!("@{sym}("))).expect("decl present");
             let n = decl.rsplit('#').next().and_then(|s| s.trim().parse::<u32>().ok());
             match n {
-                None => false, // no attribute group at all → certainly no nofree
+                None => false, // no attribute group at all
                 Some(n) => out
                     .lines()
                     .find(|l| l.starts_with(&format!("attributes #{n} = ")))
-                    .is_some_and(|l| l.contains("nofree")),
+                    .is_some_and(|l| l.contains(needle)),
             }
         };
-        assert!(!group_has_nofree("align_rt_arena_alloc"), "bump alloc must not be nofree:\n{out}");
-        assert!(!group_has_nofree("align_rt_tg_alloc"), "bump alloc must not be nofree:\n{out}");
-        // ...while a single-shot one does.
-        assert!(group_has_nofree("align_rt_alloc"), "single-shot alloc should be nofree:\n{out}");
+        // Single-shot allocators get `nofree` + `nounwind` — but deliberately NOT `willreturn` (they
+        // `abort` on OOM, so asserting they always return would be a miscompile).
+        assert!(group_has("align_rt_alloc", "nofree"), "want nofree on the single-shot alloc:\n{out}");
+        for sym in ["align_rt_alloc", "align_rt_arena_alloc", "align_rt_tg_alloc", "align_rt_builder_new"] {
+            assert!(!group_has(sym, "willreturn"), "{sym} can abort — must NOT claim willreturn:\n{out}");
+        }
+        // The **bump** allocators must NOT carry `nofree`: growing the region `Vec::push`es the
+        // chunk list, which can reallocate (free) memory allocated before the call.
+        assert!(!group_has("align_rt_arena_alloc", "nofree"), "bump alloc must not be nofree:\n{out}");
+        assert!(!group_has("align_rt_tg_alloc", "nofree"), "bump alloc must not be nofree:\n{out}");
+    }
+
+    #[test]
+    fn rt_contract_attrs_pin_encoding_and_curation() {
+        // Every runtime builtin is declared unconditionally, so a trivial program emits them all.
+        let out = ir("fn main() -> i32 = 0\n");
+
+        // (1) The `memory(...)` encoding pin. `MEM_ARGMEM_READ` (raw value 1) is an LLVM-19
+        // `MemoryEffects` bitmask; a version bump can shift the bits. Assert it prints in canonical
+        // textual form so an LLVM upgrade that changes the encoding fails HERE (loud), not silently.
+        // hash64 is the clean pure-finite reader: `memory(argmem: read)` + the pure-finite flags +
+        // `ptr nocapture readonly` on its byte-pointer param.
+        assert!(
+            out.contains("declare i64 @align_rt_hash64(ptr nocapture readonly, i64)"),
+            "want nocapture readonly on hash64's ptr param:\n{out}"
+        );
+        let hash_attrs = attr_group_of(&out, "align_rt_hash64");
+        assert!(hash_attrs.contains("memory(argmem: read)"), "hash64 memory encoding drifted:\n{hash_attrs}");
+        for a in ["willreturn", "nofree", "nosync"] {
+            assert!(hash_attrs.contains(a), "hash64 must carry {a}:\n{hash_attrs}");
+        }
+        // hash128 shares the treatment.
+        assert!(attr_group_of(&out, "align_rt_hash128").contains("memory(argmem: read)"));
+
+        // (2) The str compare/order family: same `memory(argmem: read)` + `nocapture readonly` on
+        // BOTH pointer operands (params 0 and 2).
+        assert!(
+            out.contains("declare i32 @align_rt_str_cmp(ptr nocapture readonly, i64, ptr nocapture readonly, i64)"),
+            "want nocapture readonly on both str_cmp operands:\n{out}"
+        );
+        assert!(attr_group_of(&out, "align_rt_str_cmp").contains("memory(argmem: read)"));
+
+        // (3) The feature-detect readers (utf8_valid, memchr-backed str_find): pure-finite flags +
+        // `nocapture readonly` params, but memory is WITHHELD (their dispatch reads/writes a global
+        // CPU-feature cache — non-argument memory).
+        let u = attr_group_of(&out, "align_rt_utf8_valid");
+        assert!(u.contains("willreturn") && u.contains("nofree"), "utf8_valid keeps pure-finite flags:\n{u}");
+        assert!(!u.contains("memory("), "utf8_valid must NOT claim a memory effect (feature-detect cache):\n{u}");
+        assert!(
+            out.contains("declare i32 @align_rt_utf8_valid(ptr nocapture readonly, i64)"),
+            "want nocapture readonly on utf8_valid's ptr:\n{out}"
+        );
+        let sf = attr_group_of(&out, "align_rt_str_find");
+        assert!(!sf.contains("memory("), "str_find (memchr dispatch cache) must not claim a memory effect:\n{sf}");
+
+        // (4) The abort family: `noreturn`, nothing else. Never `willreturn` (they diverge).
+        for sym in [
+            "align_rt_bounds_fail",
+            "align_rt_range_fail",
+            "align_rt_div_fail",
+            "align_rt_process_exit",
+            "align_rt_process_abort",
+        ] {
+            let g = attr_group_of(&out, sym);
+            assert!(g.contains("noreturn"), "{sym} must be noreturn:\n{g}");
+            assert!(!g.contains("willreturn"), "{sym} diverges — must NOT be willreturn:\n{g}");
+        }
+
+        // (5) Fail-safe default: a runtime symbol with no contract entry gets NO added attribute.
+        // `align_rt_print_i64` is impure (writes stdout) and unlisted → a bare declare.
+        assert!(
+            out.contains("declare void @align_rt_print_i64(i64)\n"),
+            "an unlisted runtime declare must stay attribute-free:\n{out}"
+        );
+    }
+
+    #[test]
+    fn allocas_live_only_in_entry_blocks() {
+        // M13 Slice 5B pin. Every `alloca` codegen emits must sit in its function's ENTRY block
+        // (via `alloca_at_entry` / the entry-positioned SysV slot path) — a mid-function alloca in a
+        // loop would be a stack leak and defeats mem2reg. This program has multiple non-entry blocks
+        // (a counted loop + a bounds-fail branch) and stack slots, so it exercises the invariant.
+        let src = "fn run(xs: slice<i64>) -> i64 = xs.map(dbl).sum()\n\
+             fn dbl(x: i64) -> i64 = x * 2\n\
+             fn main(args: array<str>) -> Result<(), Error> {\n  \
+               a := [1, 2, 3, 4, 5, 6, 7, 8]\n  \
+               s : slice<i64> := a[0..args.len()]\n  \
+               print(run(s))\n  \
+               return Ok(())\n\
+             }\n";
+        let out = ir(src);
+        // Walk each `define`; within it, the entry block is everything before the SECOND label line
+        // (`name:`). Assert no `alloca` appears at or after that second label.
+        for func in out.split("\ndefine ").skip(1) {
+            let body = func.split("\n}\n").next().unwrap_or(func);
+            let mut labels = 0usize;
+            let mut past_entry = false;
+            for line in body.lines() {
+                let t = line.trim_end();
+                // A basic-block label line looks like `bb1:` / `entry:` — a single token ending in `:`.
+                if t.ends_with(':') && !t.contains(' ') && !t.contains('=') {
+                    labels += 1;
+                    if labels >= 2 {
+                        past_entry = true;
+                    }
+                }
+                if past_entry {
+                    assert!(
+                        !line.contains(" = alloca "),
+                        "alloca outside the entry block:\n{line}\nin:\n{body}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bool_and_tag_storage_forms_are_pinned() {
+        // M13 Slice 5B pin — the canonical storage widths (verified 2026-07-11, this codegen):
+        //   * `bool` is `i1` in BOTH SSA and its stack slot (never widened to `i8`).
+        //   * `Result<T,E>` / `Option<T>` lower to a tagged struct with an `i8` discriminant.
+        //   * a general user sum type lowers to a tagged struct with an `i32` discriminant.
+        // A future codegen change to any of these fails here (they are load-bearing for ABI + layout).
+        let bool_ir = ir("fn main() -> i32 {\n  b : bool := true\n  if b { return 1 }\n  return 0\n}\n");
+        assert!(bool_ir.contains("alloca i1"), "bool slot must be i1:\n{bool_ir}");
+        assert!(bool_ir.contains("store i1"), "bool store must be i1:\n{bool_ir}");
+        assert!(bool_ir.contains("br i1"), "bool branch must be on i1:\n{bool_ir}");
+        assert!(!bool_ir.contains("alloca i8"), "bool must not be widened to an i8 slot:\n{bool_ir}");
+
+        // `main() -> Result<(), Error>` returns the tagged Result struct — its tag is `i8`.
+        let res_ir = ir("fn main() -> Result<(), Error> {\n  return Ok(())\n}\n");
+        assert!(
+            res_ir.contains("{ i8,") || res_ir.contains("{ i8 }"),
+            "Result must carry an i8 tag:\n{res_ir}"
+        );
+
+        // A user sum type lowers to a non-union tagged struct with an i32 tag.
+        let sum_ir = ir("Shape { Circle(i64), Square(i64) }\n\
+             fn area(s: Shape) -> i64 = match s {\n    Circle(r) => r,\n    Square(w) => w,\n  }\n\
+             fn main() -> i64 = area(Shape.Circle(3))\n");
+        assert!(sum_ir.contains("{ i32,"), "a user sum type must carry an i32 tag:\n{sum_ir}");
+    }
+
+    /// The textual attribute group `{ ... }` attached to the declaration of `@sym`, resolved through
+    /// its `#N` reference. Empty string if the declare carries no attribute group.
+    fn attr_group_of(ir: &str, sym: &str) -> String {
+        let decl = ir.lines().find(|l| l.contains(&format!("@{sym}("))).unwrap_or_else(|| panic!("declare for {sym} not found:\n{ir}"));
+        let Some(n) = decl.rsplit('#').next().and_then(|s| s.trim().parse::<u32>().ok()) else {
+            return String::new();
+        };
+        ir.lines()
+            .find(|l| l.starts_with(&format!("attributes #{n} = ")))
+            .unwrap_or("")
+            .to_string()
     }
 
     #[test]

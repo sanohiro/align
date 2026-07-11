@@ -2058,6 +2058,27 @@ regression net that validates the upgrade.
     would be duplicate coverage, so fold, don't add.
   - **Measurements to record while there:** the nsw/nuw scratch probe (hack `nsw` onto index
     adds locally, diff the shape suite; kernels already vectorize → expected below-gate).
+  - **LANDED 2026-07-11.** 5A shipped as one table-driven mechanism (`rt_contract` +
+    `apply_rt_contract_attrs` in `align_codegen_llvm`, applied to every `align_rt_*` declare;
+    fail-safe = no attribute). Curated set: `memory(argmem: read)` + `willreturn`/`nofree`/`nosync`
+    + `ptr nocapture readonly` on `hash64`/`hash128` and the `str_eq`/`str_cmp`/`eq_ignore_case`/
+    `starts_with`/`ends_with` compare family (provably argument-memory-only). `utf8_valid` and the
+    memchr-backed `str_contains`/`find`/`rfind` keep the pure-finite flags + `nocapture readonly`
+    but **`memory(...)` WITHHELD** — their `is_x86_feature_detected!` / memchr dispatch reads+writes
+    a process-global CPU-feature cache (non-argument memory), so any `argmem`/`read` claim would be
+    unsound on the first call. `noreturn` on the six abort-family decls. **A8 gate: ABOVE-gate** —
+    a loop-invariant `hash64("literal")` in a `map` mapper is hoisted out of the loop into the
+    pre-header (computed once), which then lets the `+hash` map VECTORIZE (`<4 x i64>`); without the
+    attributes the opaque in-loop call blocks both the hoist and vectorization. Pinned by
+    `a8_hash64_loop_invariant_hoist_enables_vectorization` (`vectorize_shapes`) +
+    `rt_contract_attrs_pin_encoding_and_curation` (which also pins the version-sensitive
+    `MemoryEffects` bitmask via its textual form). 5B: `allocas_live_only_in_entry_blocks` +
+    `bool_and_tag_storage_forms_are_pinned` (bool = `i1` in SSA and slot; `Result`/`Option` tag =
+    `i8`; general user sum tag = `i32`) as codegen unit tests, and 3 canonical-loop-skeleton
+    assertions + a canonical-induction-phi assertion folded into `vectorize_shapes`. nsw scratch
+    probe: **below-gate confirmed** — hacking `nsw` onto the synthesized index add changes only the
+    raw spelling (`add nsw i64`); the whole optimized shape suite (widths, `vector.body`,
+    reductions, guards) is byte-for-byte unchanged (kernels already vectorize). Reverted.
   **DEFERRED with reasons (revisit post-M14 ThinLTO/runtime-bitcode — the wave that creates
   real non-inlined boundaries where argument attributes stop evaporating):** internal-ABI
   signature flattening (SROA already achieves it; FFI boundary correctly kept aggregate in the
