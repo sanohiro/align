@@ -23,7 +23,7 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::intrinsics::Intrinsic;
-use inkwell::module::Module;
+use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
@@ -1596,6 +1596,7 @@ fn build_module<'c>(
         };
         let thunk = module.add_function(&format!("{name}$fnval"), thunk_ty, None);
         mark_nounwind(ctx, thunk);
+        mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
@@ -1644,6 +1645,7 @@ fn build_module<'c>(
         };
         let thunk = module.add_function(&format!("{lifted}$clos"), thunk_ty, None);
         mark_nounwind(ctx, thunk);
+        mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
@@ -1698,6 +1700,7 @@ fn build_module<'c>(
         let fn_ty = i32t.fn_type(&[ptr.into(), ptr.into(), ptr.into(), ptr.into()], false);
         let tramp = module.add_function(&format!("tramp${key}"), fn_ty, None);
         mark_nounwind(ctx, tramp);
+        mark_private_helper(tramp);
         let bb = ctx.append_basic_block(tramp, "entry");
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
@@ -2507,6 +2510,13 @@ fn declare_fn<'c>(
     };
     let fv = module.add_function(symbol, fn_ty, None);
     mark_nounwind(ctx, fv);
+    // Every Align program function is module-private (internal) EXCEPT the C entry: a `()`-returning
+    // `main` keeps the symbol name `main` and IS the C entry (`crt0` resolves it by name), so it must
+    // stay external. A `Result`-returning `main` is emitted as `align_main` here (internal) and its
+    // external C `main` wrapper is generated separately. No other function is named `main`.
+    if symbol != "main" {
+        mark_internal(fv);
+    }
     fv
 }
 
@@ -2518,6 +2528,39 @@ fn declare_fn<'c>(
 /// declarations, which are ordinary Rust functions and not promised `nounwind` here.
 fn mark_nounwind<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
     add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, "nounwind");
+}
+
+/// M13 Slice 1 — link hygiene. Align compiles the whole program (entry file + every transitively
+/// imported user module) into ONE LLVM module and ONE object file: `pub` is a sema-level *module*
+/// visibility that is fully resolved by name-mangling before codegen, and there is no separate
+/// compilation or C-ABI export of Align function bodies (see `align_sema` note near the `map_into`
+/// `noalias` derivation). Therefore the only definition the linker/runtime must resolve by name is
+/// the C entry `main`; every other emitted definition is module-private, so we give it the tightest
+/// linkage that still lets its address escape to the runtime when needed. This unlocks LLVM
+/// IPO/DCE/inlining and `constmerge`. `external` is kept ONLY for `main` and for the undefined
+/// `declare`s (runtime `align_rt_*` + `extern "C"` FFI) — an undefined symbol cannot be internal.
+///
+/// `internal`: an Align *program* function body — module-local, but the name is kept (harmless).
+fn mark_internal<'c>(f: FunctionValue<'c>) {
+    f.set_linkage(Linkage::Internal);
+}
+
+/// `private`: a compiler-generated helper (fn-value / closure / spawn-trampoline / par_map thunk).
+/// Stronger than `internal` — the symbol name itself is dropped. These are only ever reached
+/// through a function pointer (handed to the runtime or an indirect call), never by symbol name, so
+/// dropping the name is safe and maximizes what the optimizer may fold away.
+fn mark_private_helper<'c>(f: FunctionValue<'c>) {
+    f.set_linkage(Linkage::Private);
+}
+
+/// `private unnamed_addr`: a codegen-emitted constant global (string bytes, JSON field-descriptor
+/// table, perfect-hash table). `private` hides the symbol — nothing references these by name, only
+/// by the pointer we return. `unnamed_addr` declares the *address* is not significant (only the
+/// contents are), which lets LLVM's `constmerge` fold byte-identical constants (e.g. two equal
+/// string literals) into one. The caller sets `constant` where the data is immutable.
+fn mark_private_unnamed_addr(g: inkwell::values::GlobalValue) {
+    g.set_linkage(Linkage::Private);
+    g.set_unnamed_address(inkwell::values::UnnamedAddress::Global);
 }
 
 /// Add a named zero-valued enum attribute at `loc`.
@@ -2808,6 +2851,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let ptr_t = self.ctx.ptr_type(AddressSpace::default());
         let thunk = self.module.add_function(&name, self.ctx.void_type().fn_type(&[ptr_t.into(), ptr_t.into()], false), None);
         mark_nounwind(self.ctx, thunk);
+        mark_private_helper(thunk);
         let saved = self.builder.get_insert_block();
         let entry = self.ctx.append_basic_block(thunk, "entry");
         self.builder.position_at_end(entry);
@@ -6341,6 +6385,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let g = self.module.add_global(arr.get_type(), None, "str");
         g.set_initializer(&arr);
         g.set_constant(true);
+        mark_private_unnamed_addr(g);
         (g.as_pointer_value(), self.ctx.i64_type().const_int(s.len() as u64, false))
     }
 
@@ -6394,6 +6439,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let table = self.module.add_global(table_val.get_type(), None, "jfields");
         table.set_initializer(&table_val);
         table.set_constant(true);
+        mark_private_unnamed_addr(table);
 
         // Compile-time perfect-hash table for the field names: O(1) key → index lookup at runtime
         // instead of a linear scan over `descs` (the win on wide schemas). If no collision-free
@@ -6407,6 +6453,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let g = self.module.add_global(arr.get_type(), None, "jphf");
                 g.set_initializer(&arr);
                 g.set_constant(true);
+                mark_private_unnamed_addr(g);
                 (g.as_pointer_value(), slots.len() as u64, seed)
             }
             None => (ptr_ty.const_null(), 0, 0),
@@ -7222,7 +7269,9 @@ mod tests {
         // Align functions never unwind, so codegen marks them `nounwind` (drops exception edges /
         // unwind tables, enables more inlining). Every Align-defined function carries it...
         let out = ir("fn sq(x: i64) -> i64 = x * x\nfn main() -> i32 = sq(7) as i32\n");
-        assert!(out.contains("define i64 @sq(i64 %0) #0"));
+        // `sq` is a non-exported program fn → `internal` (M13 Slice 1); `main` is the C entry →
+        // external (no linkage word). Both still carry the `#0` nounwind attribute group.
+        assert!(out.contains("define internal i64 @sq(i64 %0) #0"));
         assert!(out.contains("define i32 @main() #0"));
         assert!(out.contains("attributes #0 = { nounwind }"));
         // ...but the external runtime declarations (ordinary Rust fns) are NOT promised nounwind.
@@ -7318,7 +7367,7 @@ mod tests {
     fn fib_emits_calls_and_branch() {
         let src = "fn fib(n: i64) -> i64 {\n  if n < 2 { return n }\n  return fib(n - 1) + fib(n - 2)\n}\n";
         let text = ir(src);
-        assert!(text.contains("define i64 @fib(i64"), "got:\n{text}");
+        assert!(text.contains("define internal i64 @fib(i64"), "got:\n{text}");
         assert!(text.contains("call i64 @fib"), "expected recursive calls:\n{text}");
         assert!(text.contains("icmp slt"), "expected signed comparison:\n{text}");
     }
