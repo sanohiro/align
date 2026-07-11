@@ -78,3 +78,8 @@ vectorizes into constant `store <4 x i64> <i64 ...>` groups. That is a one-time 
 the harness filters it out by requiring an **SSA** store operand for the `vec` verdict, so k4/k5
 correctly read `no` despite those constant stores. The C twins take a pointer parameter and have no
 such init.
+
+One residual caveat on the `width` column: it reports the widest `<N x i64>` seen anywhere in the
+function, including the constant literal-init store groups. For the current kernels the loop width
+equals the init width at both tiers, so it reads correctly; a future kernel whose init is wider
+than its loop body would misreport — key on the reduction intrinsic's width in that case.
