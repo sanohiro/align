@@ -11983,7 +11983,7 @@ fn http_push_chunk_size_hex(buf: &mut Vec<u8>, mut n: usize) {
         buf.push(b'0');
         return;
     }
-    let mut tmp = [0u8; 16]; // a usize is at most 16 hex digits
+    let mut tmp = [0u8; 2 * core::mem::size_of::<usize>()]; // max hex digits for a usize, target-independent
     let mut i = tmp.len();
     while n > 0 {
         i -= 1;
@@ -12077,7 +12077,12 @@ pub unsafe extern "C" fn align_rt_http_stream_send(s: *mut HttpStream, ptr: *con
     if chunk.is_empty() {
         return 0;
     }
-    let mut buf: Vec<u8> = Vec::new();
+    // A poisoned stream (an earlier write failed) short-circuits a real send — no point writing to a
+    // broken fd. Placed AFTER the empty-noop check so `send("")` stays an unconditional Ok(0).
+    if st.poisoned {
+        return AL_INVALID;
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(chunk.len() + 20);
     if st.framed {
         http_push_chunk_size_hex(&mut buf, chunk.len());
         buf.extend_from_slice(b"\r\n");
