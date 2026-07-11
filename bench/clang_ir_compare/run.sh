@@ -50,10 +50,13 @@ trap 'rm -rf "$tmp"' EXIT
 #            without the string. Trust MEM for Align; read it as a lower bound for clang.
 facts() {
   local f="$1" reduce width loopstore memcheck vec
-  reduce=$(grep -oE 'llvm\.vector\.reduce\.[a-z]+' "$f" | sed 's/llvm.vector.reduce.//' | sort -u | paste -sd, -)
+  # `|| true` on every grep: a scalar kernel legitimately matches nothing, and while the
+  # $(facts ...) command-substitution context happens to suppress errexit today, the function
+  # must stay safe under ANY invocation shape.
+  reduce=$(grep -oE 'llvm\.vector\.reduce\.[a-z]+' "$f" | sed 's/llvm.vector.reduce.//' | sort -u | paste -sd, - || true)
   loopstore=$(grep -cE 'store <[0-9]+ x i(32|64)> %' "$f" || true)
   memcheck=$(grep -c 'vector.memcheck' "$f" || true)
-  width=$(grep -oE '<[0-9]+ x i(32|64)>' "$f" | sed -E 's/<([0-9]+) x.*/\1/' | sort -rn | head -1)
+  width=$(grep -oE '<[0-9]+ x i(32|64)>' "$f" | sed -E 's/<([0-9]+) x.*/\1/' | sort -rn | head -1 || true)
   if [ -n "$reduce" ] || [ "${loopstore:-0}" -gt 0 ]; then vec=yes; else vec=no; width="-"; fi
   echo "${vec}|${width:--}|${reduce:--}|${memcheck:-0}"
 }
