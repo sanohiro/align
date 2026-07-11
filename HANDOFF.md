@@ -5,7 +5,28 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, eighth wave (**M13 Slice 3 design SETTLED + Slice 3a MERGED as #420**).
+_Last updated: 2026-07-11, ninth wave (**M13 Slice 3b MERGED as #421 — Slice 3 COMPLETE**:
+`alignc explain-opt` ships). Per-block `stmt_lines` MIR plumbing (populated only by
+`lower_program_located`; single push site keeps the parallel invariant by construction) + opt-in
+inkwell DI emission (`"Debug Info Version"` module flag stamped MANUALLY — the design doc's
+inkwell claim was wrong, recorded) + Mechanism-A remarks capture (`-pass-remarks*` cl::opts
+behind `Once` strictly inside explain-opt; `LLVMContextSetDiagnosticHandler`; RAII detach guard
+so unwind can't leave a dangling handler) + the new verb `explain-opt <file> [--verbose]`
+(missed/actionable one-liners in the diagnostic voice + one-line success summary + bucket count;
+exit 0 regardless of miss count; `Vec<OptRecord>` built first, rendered second — json/score/CI
+gates stay pure extensions). Translation keyed on REAL captured LLVM-19 strings: loop-vectorize
+passed+missed (reason codes incl. the new honest `FpReorder`), slp/inline passed → summary;
+inline misses → bucket (no lambda-inline-miss string exists — every pipeline lambda inlines;
+actionable-inline deferred). Honesty rule enforced; `<unknown>`/line-0 never renders as a user
+diagnostic; `align_rt_*` remarks → library/runtime bucket. Adversarial gate SHIP zero confirmed
+defects (byte-identity vs main proven across 10 programs raw/optimized/obj — normal builds carry
+zero debug metadata; handler lifetime traced incl. probed double-invocation; anchoring honesty
+probed live); its RAII-guard note applied pre-merge. gemini zero findings. `cargo test
+--workspace` **1858 green** (1844 + 14), clippy clean. **Next: M13 Slice 4** (build profiles —
+`--profile dev/release/fast/small/tiny` → stock `default<O*>` + per-profile linker flags +
+`alignc size`), then Slice 5 (internal ABI + argument attributes — NOTE its `noalias` motivation
+was re-scoped by the 3a k7 finding) and Slice V. Earlier: eighth wave (**M13 Slice 3 design
+SETTLED + Slice 3a MERGED as #420**).
 The Slice 3 design was settled by a two-lens review and recorded in the new
 **`docs/impl/09-explain-opt.md`** (the implementation source of truth for 3a/3b): split into
 3a (optimized-IR emission + the vectorization IR-shape suite = the LLVM-upgrade gate) and 3b

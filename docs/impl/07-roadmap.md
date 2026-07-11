@@ -1974,7 +1974,7 @@ regression net that validates the upgrade.
     compile (`build_module`/`write_object` take `&TargetMachine`). Gate: SHIP zero blocking
     defects; gemini's 2 mediums verified and applied. 1844 green (+15).
   - **Slice 3b — debug-loc anchoring + remarks capture + `alignc explain-opt` — DONE
-    (`m13-slice3b-explain-opt`).** Per-block `stmt_lines` MIR plumbing (populated only in located
+    (#421, 2026-07-11).** Per-block `stmt_lines` MIR plumbing (populated only in located
     lowering — `lower_program_located`; a normal build is byte-identical) + opt-in inkwell DI
     emission (one `DIFile`/CU, one `DISubprogram` per fn, per-statement `set_current_debug_location`;
     the "Debug Info Version" module flag stamped manually — inkwell does NOT). Capture = the only
@@ -1990,7 +1990,12 @@ regression net that validates the upgrade.
     that). `Vec<OptRecord>` built first, rendered second — `--format json` / score / CI gates stay
     pure extensions. 1858 green (+14: 5 subprocess driver tests + 9 translation-table unit tests
     incl. the mutation-check); clippy `-D warnings` clean; the 3a `vectorize_shapes` sentinel and
-    `emit-llvm` output byte-identical. Full outcome + deviations in `09-explain-opt.md`.
+    `emit-llvm` output byte-identical. Adversarial gate: SHIP zero confirmed defects
+    (byte-identity proven vs main across 10 programs raw/optimized/obj; the `stmt_lines` parallel
+    invariant structurally verified — single push site; handler lifetime traced incl. a probed
+    double-invocation); its one robustness note (RAII detach guard for the diagnostic handler —
+    unwind-safe by construction) applied pre-merge. gemini: zero findings. Full outcome +
+    deviations in `09-explain-opt.md`.
 - **Slice 4 — build profiles.** `--profile dev/release/fast/small/tiny` →
   `default<O0|O2|O3|Os|Oz>` (deliberately the STOCK pipelines — no custom pass order until
   remarks+benchmarks justify one) + per-profile linker flags (gc-sections/as-needed/strip) +
