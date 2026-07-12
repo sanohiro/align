@@ -81,6 +81,11 @@ Stage responsibilities and IR-boundary details in `01-pipeline.md`.
 05-backend-llvm.md    MIR → LLVM lowering / SIMD / arena codegen
 06-runtime-std.md     minimal runtime and core/std bootstrap
 07-roadmap.md         milestones M0..Mn
+08-memory-model-v2.md owned heap/drop + inferred borrow-region implementation design
+08-nested-structs.md  nested aggregate ownership/lowering implementation record
+09-explain-opt.md     optimized-IR / optimization-remark implementation record
+10-cache-first-optimization.md  cache identity, incremental-build, and CPU-locality audit
+11-parallel-execution-optimization.md  parallel correctness, low-lock runtime, and range-IR audit
 ```
 
 ## Invariants (upheld in the implementation too)

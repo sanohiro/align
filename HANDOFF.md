@@ -5,7 +5,29 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-12, fourteenth wave (**Codex-audit item 2 — the macOS link/size
+_Last updated: 2026-07-12, **cache-first compilation/output-code audit RECORDED** in
+`docs/impl/10-cache-first-optimization.md` (implementation not started). New CONFIRMED P0: the
+production driver derives temporary object plus `run`/`size` executable names from basename only;
+concurrent different `main.align` builds were corrupted in 40/40 paired probes. The record makes
+private staging + content-key identity + atomic publication the pre-M15 correctness slice, defines
+the staged CAS/interface-vs-implementation/runtime-link key contract and validation matrix, records
+diagnostic nondeterminism (`HashMap::keys()` const evaluation: 17 stderr orders across 24 fresh
+processes), and keeps four CPU-cache ideas explicitly MEASURE-FIRST (owned-temp buffer donation,
+wide AoS→SoA blocked construction, `task_group` batching, stack lifetime markers after MIR
+liveness). Existing valid objects/executables were byte-identical across repeated/relocated builds,
+so the CAS substrate is promising but not yet regression-pinned. **Parallel execution/generated-IR
+companion audit RECORDED** in `docs/impl/11-parallel-execution-optimization.md` (implementation not
+started): two new CONFIRMED P0s — a lifted capturing closure can omit its call-graph effect edge and
+run `print` inside an accepted Pure, real multi-worker `par_map`; and on an eight-worker host,
+`task_group` with nine tasks that each enter multi-range `par_map` deadlocks on the shared pool (eight
+tasks complete). Required first fixes are the missing closure edge and caller-draining work-first
+range claims. The already-planned per-element-thunk removal remains the main IR lever; new gated
+candidates are read-only parallel capture context, wrapping-integer `par_map(...).sum()` fusion to
+eliminate the full intermediate write/read, length-preserving staged kernels, low-lock task
+claim/completion + queue batching, packed task records, body/byte-aware grain, and only later a
+generic application of the already-recorded CPU-vs-blocking pool direction. No new source syntax
+is recommended. Earlier this date: fourteenth wave
+(**Codex-audit item 2 — the macOS link/size
 portability slice COMPLETE, MERGED as #426**; independent adversarial gate: SHIP, zero
 branch-caused confirmed defects, all three mutations caught. `ObjectFormat` +
 `target_object_format()` in codegen (apple/darwin → Mach-O, windows fail-closed, else ELF; the
@@ -378,9 +400,10 @@ owed-delta wave; staleness sweep #395)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state (session close 2026-07-12, macOS arm64 machine):** `main` clean at **#426**
-(fourteenth wave — the Codex-audit item-2 macOS link/size portability slice; full record in the
-_Last updated_ paragraph above), no open PRs. **This machine needs two env vars for every
+**Repo baseline for the cache-first audit (2026-07-12, macOS arm64 machine):** **#426**
+(fourteenth code wave — the Codex-audit item-2 macOS link/size portability slice; full record in the
+_Last updated_ paragraph above). The new cache-first and parallel records are docs-only and their
+implementation has not started. **This machine needs two env vars for every
 `cargo build`/`cargo test`/driver-link run** — this was the undocumented blocker at session
 start: `LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm` (Homebrew LLVM 22.1.8 is keg-only) and
 `LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib` (zstd + keg-only openssl@3 sit
@@ -392,13 +415,19 @@ remaining macOS full-suite failures are cataloged out-of-scope at adoption-recor
 (ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
 expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
 is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
-one is next available. **Next, pick one:** (a) the Codex wave-1 remainder — CONFIRMED bug 1
-(bench export roots: `emit-obj --export` mechanism, `bench/run.sh` re-verified) and bug 3
-(profiles never reach the TargetMachine: `optsize`/`minsize` fn attrs, per-profile runtime
-variant + cache key); (b) the deferred `bench/binary_size` script port (small PR, adoption-record
-item 2 sub-item); (c) the M14 LTO ceiling probe rerun (procedure in the roadmap M14 section);
-(d) Codex wave-2 quick wins (O(n²) sort, tiny-`par_map` cold start, zero-size arena,
-attr-kind fail-loud + `captures(none)`). Reminder: gemini-code-assist reviews cease **2026-07-17**
+one is next available. **Next, pick one:** (a) cache-first C0 — fix the confirmed basename-temp
+race with private staging + atomic publication and add determinism/concurrency gates (source of
+truth `docs/impl/10-cache-first-optimization.md`; MUST precede M15 parallel compilation); (b)
+parallel P0 correctness — close the capturing-closure effect edge and saturated
+`task_group -> par_map` deadlock before any scheduler/IR widening (source of truth
+`docs/impl/11-parallel-execution-optimization.md`); (c) the Codex wave-1 remainder — CONFIRMED bug
+1 (bench export roots: `emit-obj --export` mechanism,
+`bench/run.sh` re-verified) and bug 3 (profiles never reach the TargetMachine:
+`optsize`/`minsize` fn attrs, per-profile runtime variant + cache key); (d) the deferred
+`bench/binary_size` script port (small PR, adoption-record item 2 sub-item); (e) the M14 LTO ceiling
+probe rerun (procedure in the roadmap M14 section); (f) Codex wave-2 quick wins (O(n²) sort,
+tiny-`par_map` cold start, zero-size arena, attr-kind fail-loud + `captures(none)`). Reminder:
+gemini-code-assist reviews cease **2026-07-17**
 — after that, `/code-review` on the branch replaces the reflect-before-merge step.
 
 **Earlier repo state (re-verified 2026-07-10):** `main` clean, no open PRs. Newest commit is the

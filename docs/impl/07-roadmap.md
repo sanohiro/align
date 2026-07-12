@@ -954,10 +954,11 @@ already lives in `docs/open-questions.md`.
   skeleton. A direct (no prior stages) `{ptr,len}` / scalar-array / `chunks` source lowers to
   `Rvalue::ParMapParallel`: codegen emits a per-function `void(in, out)` thunk (load element → call
   `f` → store result) and the runtime `align_rt_par_map` splits `[0, count)` into disjoint output
-  ranges across `available_parallelism()` threads (`std::thread::scope`). Race-free **by
-  construction** — `f` is Pure (no shared mutable state) and the output ranges never overlap. A
-  *staged* `par_map` (`where(p).par_map(f)`) still uses the sequential collect loop (a flat split
-  can't see through a filter). Results are identical to the sequential lowering.
+  ranges on a process-lifetime `ParPool`; the caller runs chunk 0 and waits for submitted helper
+  chunks. Intended race-freedom comes from inferred Pure `f` plus disjoint output ranges, but the
+  2026-07-12 audit confirmed a P0 lifted-capturing-closure effect edge is missing. A *staged*
+  `par_map` (`where(p).par_map(f)`) and a capturing `par_map` still use the sequential collect loop.
+  Results are identical to the sequential lowering when the Pure premise holds.
 - [done] **first-class closures (escape-driven)** — slices ①–③ (PRs #104–108): non-capturing
   function values + indirect call (①), a lambda as a first-class value with typed parameters (②a),
   the fat-pointer closure ABI (②b-1), capturing closures with a **frame-local** environment (②b-2),
@@ -967,16 +968,25 @@ already lives in `docs/open-questions.md`.
 - [done] **`task_group` / `spawn` / `wait` (I/O concurrency)** — slices ④a–④c (PRs #110–117; #117
   "closures arc COMPLETE"). A structured scope like `arena {}`: `spawn(fn { … })` takes a lambda
   (captures snapshotted into a fresh per-spawn **region env**), returns `Task<R>` (a region-tied
-  result slot); `wait()?` joins all on **real threads** (fork-join via `align_rt_tg_*` +
-  `std::thread::scope`) and propagates a failing task's `Err`; `t.get()` reads a result after the
-  join (a `get`-before-`wait` use is a compile-time flow error). Tasks may be impure (I/O); safety
-  from by-value capture. Runtime: `align_rt_tg_begin/alloc/register/wait/end`.
+  result slot); `wait()?` joins all through caller-participating atomic claims on the persistent
+  `ParPool` and propagates a failing task's `Err`; `t.get()` reads a result after the join (a
+  `get`-before-`wait` use is a compile-time flow error). Tasks may be impure (I/O); safety from
+  by-value capture. Runtime: `align_rt_tg_begin/alloc/register/wait/end`.
 - [deferred] **fully-escaping function values** — returning a fn value from a function, or storing
   one in a struct field / array element, is **not** supported: it needs a **heap-owned** closure
   environment with its own drop (the "escapes every region" model), whose design is not yet settled
   and which has no consumer today (`task_group` uses the region env). Deliberately deferred — see
   `open-questions.md` "First-class closures + task_group" (the escape-every-region note).
 - async/await is not included (`non-goals.md`).
+
+**Parallel correctness/output-IR companion record (2026-07-12):**
+`11-parallel-execution-optimization.md` confirmed two previously unrecorded P0s: an Impure lifted
+capturing closure can be laundered through a function value into `par_map`, and a saturated
+`task_group -> par_map` re-entry deadlocks because only `task_group` drains work on its caller.
+The record requires caller-draining range claims before scheduler optimization, makes the existing
+whole-chunk specialization plan concrete, and gates new capture-context, integer
+transform-reduce, staged-pipeline, low-lock latch/batching, work-aware grain, and split execution
+domain candidates. It proposes no new source syntax.
 
 ## M8 — Tooling and Quality — DONE (2026-07-03)
 
@@ -2272,6 +2282,15 @@ real codebase — align-LLM included — recompiles everything on every edit tod
 distribution for the future pkg ecosystem, and CI/agent iteration latency (four-way alignment:
 the Compiler axis includes fast feedback).
 
+**Cache-first companion record (2026-07-12):** `10-cache-first-optimization.md` is the detailed
+source for artifact identity, publication, invalidation, and the newly found output/runtime cache
+candidates. It confirmed a P0 prerequisite not previously in this roadmap: `build`/`run`/`size`
+derive shared temporary object/executable paths from the source basename, so two unrelated
+`main.align` builds can overwrite and link/execute each other's artifacts. Private staging + atomic
+publication under a complete content key must land before M15 compiles units in parallel. The same
+record pins the already-promising reproducibility baseline and the cache validation matrix; do not
+build a throwaway mtime cache that M15 immediately replaces.
+
 **Design questions to settle FIRST (a two-lens design review before any code; record the
 settlement here + `open-questions.md`):**
 1. **Unit boundary** — module, module subtree, or package? What is the stable build artifact
@@ -2293,11 +2312,15 @@ settlement here + `open-questions.md`):**
    cross-unit optimizer; the runtime-bitcode plumbing from the M14 probe/Slice-2 is the same
    substrate. Sequence ThinLTO *after* unit boundaries exist.
 6. **Incremental driver** — per-unit staleness/caching, parallel unit compilation, and how
-   `alignc build/size/explain-opt` surfaces multi-unit builds.
+   `alignc build/size/explain-opt` surfaces multi-unit builds. Settle content/action identity,
+   interface-vs-implementation hashes, exact compiler/LLVM/target/profile keys, runtime/link
+   digests, atomic publication, corruption recovery, and hit/miss reasons per
+   `10-cache-first-optimization.md`; "mtime is older/newer" is not a sufficient cache contract.
 
 **Sequencing:** design review can start right after the M14 Slice 1 probe verdict; M14's
 remaining items (PGO/BOLT evaluation) are independent and may be reordered around it at the
-owner's discretion.
+owner's discretion. The cache record's C0 artifact-correctness slice is independent of that verdict
+and may land immediately; it is mandatory before M15 parallel compilation.
 
 ## Design Issues to Settle in Parallel
 

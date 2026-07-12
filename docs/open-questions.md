@@ -2326,6 +2326,29 @@ driver) lives in the roadmap **M15** section — settle by a two-lens design rev
 code. Soundness note: every escape/effect gate audited to date assumes whole-program
 visibility; unit interfaces must carry summaries or be conservative, never fail-open.
 
+**Cache-first companion audit (2026-07-12):** `impl/10-cache-first-optimization.md` is the durable
+detail for this item's artifact identity and invalidation questions. It adds a confirmed pre-M15
+correctness prerequisite (basename-derived shared temporary artifacts corrupt concurrent builds),
+the proposed staged CAS + interface/implementation/link-summary hashes, exact toolchain/runtime
+keys, deterministic-output validation, and separately labeled measure-first CPU-cache candidates.
+Only the confirmed defect and cache correctness constraints are commitments today; the locality
+candidates remain probes until their written gates pass.
+
+**Parallel execution/output-IR companion audit (2026-07-12):**
+`impl/11-parallel-execution-optimization.md` is the durable implementation record. It confirmed two
+P0s absent from the prior queue: `EffectScan` omits a lifted capturing closure's call edge, allowing
+observable I/O inside an accepted Pure `par_map`; and `task_group -> par_map` deadlocks at shared
+pool saturation because `par_map` waits after one caller chunk instead of draining its ranges.
+Required order: close both correctness defects, then implement the already-recorded whole-chunk
+specialization. The guide already calls capturing-`par_map` parallelization “implementation in
+progress”; this audit pins its read-only context ABI. New measure-first work is wrapping-integer
+`par_map(...).sum()` fusion (remove the full intermediate write/read), length-preserving staged
+parallel lowering, task claim/completion + queue batching, packed task records, and body/byte-aware
+grain. Applying the already-recorded blocking-worker direction to generic `task_group` stays a
+later mixed-load gate, not a newly invented idea. No new language syntax is proposed. The same
+record catalogs task-error, pool, MIR, and generic parallel-reduce documentation drift; none of
+those unsettled descriptions authorizes implicit parallelization of ordinary `reduce`.
+
 ### External binary-optimization audit (Codex, 2026-07-12) — adoption record
 
 The owner's out-of-repo Codex audit (`~/winhome/Downloads/align-binary-optimization-report-2026-07-12.md`,
