@@ -4066,6 +4066,7 @@ fn lower_array_reduce(
     for stage in stages {
         if seen_where && matches!(&stage.kind, hir::StageKind::Map { .. } | hir::StageKind::Where { .. }) {
             guard_rejected = true;
+            break;
         }
         if matches!(&stage.kind, hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. }) {
             seen_where = true;
