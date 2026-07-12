@@ -2932,7 +2932,8 @@ fn mark_bump_alloc<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
 /// LLVM 19's packed `MemoryEffects` bitmask (`llvm/IR/ModRef.h`): 2 bits per location —
 /// `ArgMem = 0`, `InaccessibleMem = 1`, `Other = 2` — holding a `ModRefInfo` (`Ref = 1` reads,
 /// `Mod = 2` writes). `memory(argmem: read)` = ArgMem:Ref only = `1 << (0 * 2)` = `1`, every other
-/// location `NoModRef`. This encoding is version-sensitive (a location was added after LLVM 19), so
+/// location `NoModRef`. This encoding is version-sensitive (a location was added after LLVM 19;
+/// re-verified to print canonically on LLVM 22 at the 2026-07-12 upgrade), so
 /// `rt_contract_memory_argmem_read_prints_canonically` pins the emitted attribute's textual form —
 /// an LLVM upgrade that shifts the bits fails that test loudly instead of silently miscompiling.
 const MEM_ARGMEM_READ: u64 = 1;
