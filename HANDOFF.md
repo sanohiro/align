@@ -6,7 +6,7 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
 _Last updated: 2026-07-12, fourteenth wave (**Codex-audit item 2 — the macOS link/size
-portability slice COMPLETE, PR pending**; independent adversarial gate: SHIP, zero
+portability slice COMPLETE, MERGED as #426**; independent adversarial gate: SHIP, zero
 branch-caused confirmed defects, all three mutations caught. `ObjectFormat` +
 `target_object_format()` in codegen (apple/darwin → Mach-O, windows fail-closed, else ELF; the
 one triple-classification site, M15 cross-compile seam noted); `link_objects` selects its flag
