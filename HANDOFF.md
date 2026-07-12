@@ -49,7 +49,15 @@ whole-program-only must not remain; roadmap M15 section holds the design-questio
 (unit boundary/artifact, cross-unit inference summaries, generics, M13 internalization +
 capability-linking interactions, ThinLTO un-mooting, incremental driver); two-lens design review
 FIRST, sequenced after the M14 probe verdict; the deferred ABI-flattening/fn-arg-attr/nsw items
-still wait for the M14+ boundaries. Earlier: twelfth wave (**M13 COMPLETE — Slice V MERGED as #424**, the last
+still wait for the M14+ boundaries. **Also recorded 2026-07-12: the owner's Codex
+binary-optimization audit** (out-of-repo, pre-#425 HEAD) triaged into `open-questions.md` →
+"External binary-optimization audit (Codex, 2026-07-12) — adoption record" + a roadmap work-queue
+note: wave 1 = 3 CONFIRMED bugs (bench export roots broken by the #418 internalization; ELF-only
+linker/size tooling breaks macOS builds; profiles never reach the TargetMachine/`optsize`/runtime
+variant), wave 2 = quick wins (O(n²) sort — 547× at 100k, tiny-`par_map` cold start, zero-size
+arena, attr-kind fail-loud + `captures(none)` emission which likely fixes the llvm-as round-trip
+follow-up), wave 3 = measure-first (JSON double-alloc, I/O zero-fill); rejected claims recorded
+with reasons (the "nocapture dangerous" one is disproven by the A8 gate). Earlier: twelfth wave (**M13 COMPLETE — Slice V MERGED as #424**, the last
 slice; the milestone is formally closed in the roadmap). **Upgrade-target decision (owner,
 2026-07-11, end of session): LLVM 22 from apt.llvm.org** (`llvm-toolchain-trixie-22`; the owner
 installs `llvm-22 llvm-22-dev clang-22` themselves) — NOT Debian backports' 21: inkwell 0.9

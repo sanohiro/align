@@ -2241,6 +2241,17 @@ stage + `PGOOptions` likely via raw llvm-sys — inkwell 0.9 does not expose it)
 lever, hotness-gated multiversioning, is a separate unimplemented feature. Sample PGO / BOLT
 unchanged (evaluate later, driver-managed external pipeline).
 
+**Codex binary-optimization audit (2026-07-12) — adopted work queue.** The owner's external
+audit (pre-#425 HEAD; full triage = `open-questions.md` → "External binary-optimization audit
+(Codex, 2026-07-12) — adoption record") queues code waves that are independent of the LTO probe
+and M15: **wave 1, measurement portability** (three CONFIRMED bugs — bench export roots broken
+by the #418 internalization, ELF-only linker/size tooling breaks macOS builds, build profiles
+never reach the TargetMachine/`optsize`/runtime variant); **wave 2, quick wins** (O(n²)
+`sort`/`sort_by_key`, tiny-`par_map` pool-before-threshold cold start, zero-size arena 64 KiB
+chunk, attribute-kind fail-loud + modern `captures(none)` emission — the latter likely also
+fixes the `llvm-as-22` textual round-trip follow-up above); **wave 3, measure-first** (JSON
+decode double-allocation, I/O buffer zero-fill). Doc-debt items ride along with their slices.
+
 ## M15 — Separate compilation (multi-module compilation units) — OWNER-MANDATED 2026-07-12
 
 **Directive.** On reading the M14 re-scope note "Align has no separate compilation — one

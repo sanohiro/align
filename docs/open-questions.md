@@ -2326,6 +2326,95 @@ driver) lives in the roadmap **M15** section — settle by a two-lens design rev
 code. Soundness note: every escape/effect gate audited to date assumes whole-program
 visibility; unit interfaces must carry summaries or be conservative, never fail-open.
 
+### External binary-optimization audit (Codex, 2026-07-12) — adoption record
+
+The owner's out-of-repo Codex audit (`~/winhome/Downloads/align-binary-optimization-report-2026-07-12.md`,
+audited HEAD `4a8e76c` = **pre-#425**, on arm64 macOS with rustc 1.96.1 / LLVM 22.1.8). Fable
+verified the key claims against the code on 2026-07-12. High-quality report; the owner wants
+every valid finding addressed. Disposition:
+
+- **Already resolved by #425 (no action):** the LLVM-22 `nocapture` compatibility item (the
+  named attr auto-upgrades to `captures(none)`; the A8 gate proves the in-memory attribute is
+  honored — the report's "dangerous as-is" is DISPROVEN, though its hardening suggestion is
+  adopted below), opaque benchmark seeding (Shape shift A), clang-22 harness unification.
+- **CONFIRMED bugs → adopt as the next code wave ("measurement portability", the report's PR1):**
+  1. **bench export contract broken by M13 internalization** — `bench/README.md` promises
+     no-`main` `pub fn`s are exported from `emit-obj`; #418 internalizes ALL program fns, so
+     `bench/run.sh`'s Rust harness link fails (undefined `_sum_sq_pos` etc.). Fix per the
+     report: keep default whole-program internalization; add explicit export roots
+     (`emit-obj --export foo` driver mechanism); DCE roots + linkage from the same export set;
+     re-verify `bench/run.sh baseline/native` runs.
+  2. **ELF-only link/size tooling breaks macOS builds** — the driver passes
+     `--gc-sections/--as-needed/--strip-all` unconditionally (`align_driver/src/lib.rs:182`);
+     `alignc size` assumes `readelf`/GNU `nm`; `bench/binary_size` assumes `stat -c`/`mapfile`.
+     Fix: linker policy selected by target triple/object format (ELF vs Mach-O `-dead_strip`,
+     no `-ldl` on macOS), migrate size inspection to version-matched `llvm-readobj`/`llvm-nm`/
+     `llvm-size`. Also adopt: derive runtime native-lib deps from Rust's `native-static-libs`
+     instead of hand-written flags.
+  3. **Build profiles don't reach the backend** — TargetMachine is always
+     `OptimizationLevel::Default` (`align_codegen_llvm/src/lib.rs:181`); `small`/`tiny` never
+     set `optsize`/`minsize` fn attrs; the runtime archive is one variant for all profiles.
+     Adopt the report's mapping table as the starting point (dev=None … fast=Aggressive,
+     small=`optsize`, tiny=`minsize`+`optsize`); runtime cache key gains profile/panic/LLVM-major.
+- **Quick-win fixes (all verified in code; independent small slices):**
+  4. **`sort`/`sort_by_key` O(n²)** insertion sort (`align_mir` ~5161, self-documented "first
+     cut") — report measured 547× vs Rust stable sort at 100k. Adopt: stable O(n log n) core +
+     tiny-N insertion base case + `sort_by_key` decorate-sort-undecorate (keys computed N times,
+     not per-comparison — inner comparisons currently recompute `key(arr[j])`).
+  5. **tiny `par_map` cold start** — `par_pool()` is called BEFORE the single-chunk threshold
+     check (`align_runtime` ~1469), so an 8-element map spawns the worker pool (~69 µs cold vs
+     125 ns warm). Adopt: hoist the `count <= PAR_MIN_CHUNK` check above `par_pool()`; same for
+     `task_group` n=1.
+  6. **zero-size arena alloc** can take a fresh 64 KiB zeroed chunk (`CHUNK = 64*1024`,
+     `align_runtime` ~7095). Adopt: size-0 fast path returning a canonical dangling pointer,
+     allocation-counter test. Distinct from the REJECTED arena pool+re-zero — do not conflate.
+- **Measure-first adoptions (direction yes, gated on numbers):**
+  7. **JSON decode double allocation** (Rust `Vec` → `align_rt_alloc` → memcpy, runtime
+     ~2317/~2624). Direction adopted (C-owned growable buffer / exact-count direct decode) but
+     the recorded fact stands that decode wins are parse-bound/modest — measure first; the
+     bigger lever stays decode-fusion (consumer-gated, GPT-5.6 record).
+  8. **I/O buffer zero-fill** (`Vec::resize(64KiB, 0)` before `read` overwrite, runtime ~4558/
+     ~4995). Adopt `spare_capacity_mut`+`set_len` — but correctness tests (short read/EINTR/
+     EOF) FIRST; throughput-only.
+- **Hardening (adopt):**
+  9. **attribute kind-ID fail-loud** — `add_enum_attr` doesn't check
+     `get_named_enum_kind_id() == 0` (silent no-op on a renamed/typo'd attr); make it a codegen
+     error. Emit `captures(none)` via the modern `captures` kind (raw CaptureInfo value pinned
+     against the LLVM 22 headers) instead of relying on auto-upgrade — this likely also FIXES
+     the recorded `emit-llvm | llvm-as-22` textual round-trip follow-up (the printer would emit
+     `captures(none)`, not the unparseable `ptr none`). Prefer semantic attr assertions over
+     full-declaration string pins where practical.
+- **Already recorded elsewhere (report converges independently — pointers only):** runtime
+  staticlib feature-split (existing Open item; the report adds a Mach-O upper-bound observation:
+  hello 409,248 B → 33,984 B when a print-only member resolves first — evidence FOR the split;
+  probe numbers, not baselines); discarded-Move drop leak (recorded M9 v1 limit);
+  structured remarks via libRemarks (09-explain-opt C++-shim deferral — short-term stays
+  re-captured LLVM-22 strings, DONE in #425); ThinLTO-limited/runtime-bitcode-is-the-prize +
+  same-major opportunity (= the M14 re-scope, independently derived); PGO needs a merged
+  multi-workload profile, BOLT is Linux/ELF-only (fold into the M14 PGO/BOLT items when they
+  come up). The report's "do not re-propose" list fully matches our rejected/settled records.
+- **Doc debt (fix with the adopting slices):** `bench/README.md` export contract vs M13
+  internalization (rewrite with the `--export` mechanism); `docs/impl/05-backend-llvm.md` says
+  bool is "i8 when stored" while Slice 5B deliberately pinned SSA+stack `i1` (align the doc with
+  the pinned reality; the i8-stored-bool idea stays a bounded experiment per the report's own
+  P3 restraint); `docs/guide/ja/16-toolchain.md` missing profiles/`size`/`explain-opt`;
+  VERIFY-then-fix the claimed `draft.md`/`open-questions.md` `str + str` prohibition vs
+  arena-backed concat in sema/guide (unverified claim); the untracked
+  `analysis-report-2026-07-02.md` at root is superseded by this report — delete or archive.
+- **Rejected report claims (with reasons):** "`nocapture` is dangerous as-is" (disproven — the
+  A8 gate proves auto-upgrade preserves the semantic attribute; adopted only as hardening);
+  macOS size/speed numbers as baselines (the report itself marks them manual-link probes;
+  baselines wait for the portability fix); "second `default<O2>` run" (the report itself
+  rejects it — keep the stock pipeline; the trigger was literal-folded non-opaque input, which
+  #425 already fixed).
+
+**Sequencing (owner-tunable):** wave 1 = the three CONFIRMED bugs (measurement portability —
+also unblocks trustworthy cross-platform numbers for everything later); wave 2 = quick wins
+4–6 (+ 9 hardening); wave 3 = 7–8 measured. The M14 LTO ceiling probe is independent and cheap
+— run it whenever. M15 separate compilation proceeds on its own track.
+
+### External optimization consultation (GPT-5.6, 2026-07-11) — adoption record
+
 The owner's out-of-repo optimization consultation (8 long responses: LLVM Performance Tips for
 Frontend Authors digest, constants/binary-size, core/std review, cache locality, execution-plan
 engine, performance philosophy, codegen deep-dive, and a repo-read review) was fully read and
