@@ -4008,7 +4008,7 @@ fn validate_utf8(bytes: &[u8]) -> bool {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { validate_utf8_neon(bytes) };
+        unsafe { validate_utf8_neon(bytes) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     validate_utf8_scalar(bytes)
@@ -14779,14 +14779,17 @@ mod tests {
     }
 
     // `fcntl(F_GETFD)` — read the file-descriptor flags to prove `FD_CLOEXEC` is set (the runtime
-    // declares `fcntl` only on the non-Linux path, so the test declares its own).
+    // declares `fcntl` only on the non-Linux path, so the test declares its own). The signature
+    // matches the runtime's fixed-arity declaration exactly — on a non-Linux target both are in
+    // scope, and two `extern` declarations of one symbol must agree (`clashing_extern_declarations`).
+    // `F_GETFD` ignores the third argument.
     unsafe extern "C" {
-        fn fcntl(fd: i32, cmd: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
     }
     const T_F_GETFD: i32 = 1;
     const T_FD_CLOEXEC: i32 = 1;
     fn fd_is_cloexec(fd: i32) -> bool {
-        let flags = unsafe { fcntl(fd, T_F_GETFD) };
+        let flags = unsafe { fcntl(fd, T_F_GETFD, 0) };
         flags >= 0 && (flags & T_FD_CLOEXEC) != 0
     }
 
@@ -17392,7 +17395,7 @@ mod tests {
         // Had `SSL_free` closed the fd (BIO_CLOSE — the review's claim), `F_GETFD` would now report
         // EBADF (-1). It stays open (BIO_NOCLOSE), so `close_tls`'s explicit `close` is REQUIRED, not
         // a double-close.
-        let flags = unsafe { fcntl(fd, T_F_GETFD) };
+        let flags = unsafe { fcntl(fd, T_F_GETFD, 0) };
         assert!(
             flags >= 0,
             "SSL_free must NOT close the fd (BIO_NOCLOSE); fcntl F_GETFD returned {flags} \

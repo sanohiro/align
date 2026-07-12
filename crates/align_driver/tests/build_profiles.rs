@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use align_driver::{check, emit_object_file, lower_to_mir, BuildTarget, Profile};
+use align_driver::{check, emit_object_file, lower_to_mir, BuildTarget, ObjectFormat, Profile};
 
 // ---------------------------------------------------------------------------
 // 1. Profile enum — the mapping is the mechanism.
@@ -121,6 +121,7 @@ fn size_report_release_has_expected_shape() {
     if !align_driver::backend_available() {
         return;
     }
+    let format = align_driver::target_object_format().expect("classifiable build target");
     let src = write_src("release", HELLO);
     let out = alignc().arg("size").arg(src.path()).output().expect("run alignc size");
     assert_eq!(out.status.code(), Some(0), "size exits 0:\n{}", String::from_utf8_lossy(&out.stderr));
@@ -128,16 +129,31 @@ fn size_report_release_has_expected_shape() {
     // Header names the profile + its pipeline.
     assert!(s.contains("profile:    release (default<O2>)"), "profile header:\n{s}");
     assert!(s.contains("total size:"), "total size line:\n{s}");
-    // Section report includes the code section and the (unstripped) symbol table.
-    assert!(s.contains(".text"), "expected a .text section:\n{s}");
-    assert!(s.contains(".symtab"), "release keeps the symbol table:\n{s}");
     // The other three report blocks are present and populated.
     assert!(s.contains("largest symbols"), "symbol block:\n{s}");
     assert!(s.contains("relocations:"), "relocation count:\n{s}");
-    assert!(s.contains("dynamic dependencies"), "DT_NEEDED block:\n{s}");
-    assert!(s.contains("libc.so.6"), "libc is a DT_NEEDED:\n{s}");
+    assert!(s.contains("dynamic dependencies"), "dependency block:\n{s}");
     // A release binary is NOT stripped, so the "no symbols" note must be absent.
     assert!(!s.contains("the symbol table is absent"), "release must list symbols:\n{s}");
+    // The format-specific expectations: section naming, libc spelling, and the Mach-O
+    // derived-symbol-size annotation.
+    match format {
+        ObjectFormat::Elf => {
+            assert!(s.contains(".text"), "expected a .text section:\n{s}");
+            assert!(s.contains(".symtab"), "release keeps the symbol table:\n{s}");
+            assert!(s.contains("(DT_NEEDED)"), "ELF dependency heading:\n{s}");
+            assert!(s.contains("libc.so.6"), "libc is a DT_NEEDED:\n{s}");
+        }
+        ObjectFormat::MachO => {
+            assert!(s.contains("__TEXT,__text"), "expected the __TEXT,__text section:\n{s}");
+            assert!(s.contains("(LC_LOAD_DYLIB)"), "Mach-O dependency heading:\n{s}");
+            assert!(s.contains("libSystem"), "libSystem is an LC_LOAD_DYLIB:\n{s}");
+            assert!(
+                s.contains("derived from symbol address deltas"),
+                "Mach-O sizes are annotated as derived:\n{s}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -145,14 +161,19 @@ fn size_report_tiny_is_stripped() {
     if !align_driver::backend_available() {
         return;
     }
+    let format = align_driver::target_object_format().expect("classifiable build target");
     let src = write_src("tiny", HELLO);
     let out = alignc().args(["size"]).arg(src.path()).args(["--profile", "tiny"]).output().expect("run alignc size");
     assert_eq!(out.status.code(), Some(0), "size exits 0:\n{}", String::from_utf8_lossy(&out.stderr));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("profile:    tiny (default<Oz>)"), "tiny profile header:\n{s}");
-    // Stripped: no symtab section, and the symbol block shows the absent-table note.
-    assert!(!s.contains(".symtab"), "tiny strips the symbol table:\n{s}");
+    // Stripped: the symbol block shows the absent-table note; on ELF the .symtab section is gone
+    // too (a Mach-O symbol table lives in load commands, not a section, so there is no section to
+    // check there).
     assert!(s.contains("the symbol table is absent"), "tiny shows the stripped note:\n{s}");
+    if format == ObjectFormat::Elf {
+        assert!(!s.contains(".symtab"), "tiny strips the symbol table:\n{s}");
+    }
 }
 
 #[test]

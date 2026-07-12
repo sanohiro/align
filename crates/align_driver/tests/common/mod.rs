@@ -7,7 +7,7 @@
 
 pub use align_driver::{
     backend_available, check, emit_llvm_ir, emit_object_file, link_executable, link_objects,
-    lower_to_mir, BuildTarget, Profile,
+    lower_to_mir, BuildTarget, ObjectFormat, Profile,
 };
 pub use align_span::SourceMap;
 
@@ -24,6 +24,45 @@ pub fn cc_available() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// `llvm-readobj`, if discoverable — the gate for binary-inspection assertions (the version-matched
+/// LLVM tool the driver's `llvm_tool` locates; reads both ELF and Mach-O, unlike GNU `readelf`).
+pub fn llvm_readobj() -> Option<PathBuf> {
+    align_driver::llvm_tool("llvm-readobj")
+}
+
+/// The dynamic-dependency names of the binary at `path` (via `llvm-readobj --needed-libs`):
+/// `DT_NEEDED` sonames on ELF, `LC_LOAD_DYLIB` install names (full paths) on Mach-O.
+pub fn needed_libs(tool: &std::path::Path, path: &std::path::Path) -> Vec<String> {
+    let out = std::process::Command::new(tool)
+        .arg("--needed-libs")
+        .arg(path)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run llvm-readobj");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut libs = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l == "NeededLibraries [" {
+            inside = true;
+        } else if inside && l == "]" {
+            break;
+        } else if inside && !l.is_empty() {
+            libs.push(l.to_string());
+        }
+    }
+    libs
+}
+
+/// Whether a dependency entry names the library `lib` (`is_lib(entry, "z")` ⇔ libz). Matches on the
+/// path base name, so a Mach-O full install name (`/usr/lib/libz.1.dylib`) and an ELF soname
+/// (`libz.so.1`) both classify.
+pub fn is_lib(entry: &str, lib: &str) -> bool {
+    let base = entry.rsplit('/').next().unwrap_or(entry);
+    base.starts_with(&format!("lib{lib}."))
 }
 
 /// Compile `align_src` and `c_src` (a C helper defining the `extern "C"` callee), link them
