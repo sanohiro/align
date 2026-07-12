@@ -2,11 +2,21 @@
 
 A living continuity note so a fresh Claude Code session — e.g. on a faster machine — can pick the
 work up immediately. **If you are a new session: read this, then `CLAUDE.md`, then
+`docs/impl/13-string-array-allocation-short-input-audit.md`, then
 `docs/impl/12-pipeline-closure-memory-io-simd-audit.md`, then `docs/impl/08-nested-structs.md`.**
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **pipeline/closure/memory/I/O/SIMD audit RECORDED** in
+_Last updated: 2026-07-13, **string/array allocation-copy and short-input audit RECORDED** in
+`docs/impl/13-string-array-allocation-short-input-audit.md` (implementation not started). It adds
+confirmed correctness/resource prerequisites for UTF-8 slice boundaries, settled `str + str`
+enforcement, arena-free template lifetime, unbound owned-temporary drops, and known-null destructor
+calls. New mechanical allocation/copy work covers borrowed path ABI views, compatible zero-copy
+builder freeze, direct `read_dir`/DNS/path/group outputs, tiny builder headers, and virtual direct-
+consumer chunks. UTF-8 short crossover, repeated-needle plans, JSON escape SIMD, and large constant
+arrays stay measure-first with explicit `0..64` gates. Language-surface ideas are questions for
+Claude Code only, not decisions. Previous update: 2026-07-13,
+**pipeline/closure/memory/I/O/SIMD audit RECORDED** in
 `docs/impl/12-pipeline-closure-memory-io-simd-audit.md` (implementation not started). The normal
 fused sequential loop, `map_into` alias metadata, capture inlining, JSON/UTF-8/string SIMD, direct
 file read/mmap, and buffered small/direct large writer paths are strong. New correctness-first work:
