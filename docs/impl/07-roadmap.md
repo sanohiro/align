@@ -2187,13 +2187,58 @@ interchange; consider emitting the modern `captures(none)` form or `-o .bc` dire
 
 ## Post-upgrade wave (M14 candidates, in order — bitcode compatibility dictates the sequence)
 
-1. **ThinLTO** across Align modules (internalization from M13 Slice 1 is the prerequisite).
-2. **Runtime as bitcode** — the known wall is Rust-vs-Align LLVM version alignment; options
-   recorded in the consultation digest (same-toolchain build / C or Align core / stable-ABI
-   boundary for the rest). Unlocks cross-runtime inlining of trivial wrappers.
-3. **Instrument PGO** (`alignc profile build` → run → `--profile-use`); hot-kernel
-   multiversioning gated on PGO hotness.
-4. **Sample PGO / BOLT** — evaluate, driver-managed external pipeline, not compiler-integrated.
+Original candidate order: ThinLTO → runtime-as-bitcode → instrument PGO → sample PGO / BOLT.
+**RE-SCOPED 2026-07-12 by a two-lens design review** (architecture/feasibility + payoff/measurement),
+run right after the LLVM 22 upgrade landed (#425). Three findings changed the shape:
+
+- **"ThinLTO across Align modules" is MOOT today.** Align has no separate compilation — one
+  `Program` → one whole-program module (the M13 Slice 1 record) — so the only cross-module
+  boundary in any Align binary is Align ↔ runtime-staticlib. ThinLTO's summary/lazy-import
+  machinery is unjustified at two modules; the right shape is full (monolithic) **in-process**
+  LTO. Revisit ThinLTO only if multi-module separate compilation ever exists.
+- **The "Rust-vs-Align LLVM version alignment" wall dissolved with the 22 upgrade.** rustc 1.96
+  emits LLVM **22.1.2** bitcode; the alignc toolchain is 22.1.8 — same major. Verified
+  end-to-end: rustc `.bc` parses under `llvm-dis-22`, `llvm-link-22` merges it into Align IR,
+  internalize + `default<O2/O3>` produces real cross-boundary constant-fold + DCE, and Rust std
+  does NOT leak into the IR (only the `align_rt_*` wrapper defines + external declares such as
+  `__rust_alloc`; std stays opaque machine code). The consultation's option (a) same-toolchain
+  build is simply TRUE now; options (b) rewrite-core-in-C/Align and (c) stable-ABI boundary
+  demote to fallbacks. Future skew guard: if rustc jumps to a newer LLVM major than inkwell's,
+  the driver must fail LOUDLY back to the machine-code `.a` path, never silently miscompile.
+- **The payoff surface is narrow (measured on optimized IR at v3).** The numeric data-oriented
+  core already vectorizes with ZERO in-loop `align_rt_*` calls — LTO wins nothing there. The win
+  surface is per-element string/hash primitives left as opaque calls inside hot loops
+  (`str_eq`/`str_cmp`/`hash64` confirmed live in loop bodies; the trivial-wrapper set ≈
+  {`str_eq`, `str_cmp`, `hash64/128`, `starts/ends_with`, `utf8_valid`, `bytes_as_str`}). The
+  memchr-backed `find`/`contains` family and the group/compress/crypto/syscall families would
+  NOT benefit (their loops live inside the runtime; inlining is pure bloat). Expected shape of
+  the win: scalar constant-factor (call overhead + fast-path exposure), NOT vectorization.
+
+**M14 Slice 1 (re-scoped): the LTO ceiling probe — measurement-first, A8-style.** Manually link
+the runtime bitcode into the three confirmed kernels (str_eq-filter / str_cmp-filter /
+hash64-map over ~1M short strings): `llvm-link-22` + internalize-to-main + one `default<O2>`,
+bench against the shipped `.a` path, with a numeric `sum_sq_pos` kernel as the non-regression
+control; also record the compile-time cost of link+reoptimize over the full runtime `.bc`.
+**Gate = wall-clock ≥ 1.15× on at least one kernel.** Below gate → record-and-close items 1+2
+together (mechanism + numbers recorded here; no driver infrastructure built — the #416
+precedent). Above gate → **Slice 2 builds the real thing:** a small bitcode artifact for the
+trivial-primitive set (built `codegen-units=1`), driver in-process `Module::link_in_module` +
+internalize to the Slice-1 entry set + a single `default<O*>` run, behind an opt-in
+flag/profile (never linker-plugin LTO — the driver-knows-everything structure stays);
+`rt_contract` split — merged symbols SHED their curated attributes (FunctionAttrs infers from
+the real bodies; a stale hand-curated attr shadowing a visible body is a latent miscompile),
+opaque symbols keep them, strict per-symbol xor; `.bc` staleness folded into the existing
+runtime staleness check; fail-loud fallback to the `.a` path on unparseable bitcode; gates =
+in-loop call-absence IR shape (mutation-checked both directions) + `bench/binary_size` guard +
+an explicit compile-time-regression bound.
+
+**PGO stays sequenced after — do NOT reorder it ahead on "LTO is thin" grounds:** its
+block-layout/hot-cold-split win is already MOOT per M13 Slice V (`noreturn` attrs make fail
+edges cold; a real `!prof` prototype was byte-identical and reverted); instrument PGO is
+mid-size infrastructure (InstrProfiling pass + profile runtime hook + an `llvm-profdata` merge
+stage + `PGOOptions` likely via raw llvm-sys — inkwell 0.9 does not expose it); its unique
+lever, hotness-gated multiversioning, is a separate unimplemented feature. Sample PGO / BOLT
+unchanged (evaluate later, driver-managed external pipeline).
 
 ## Design Issues to Settle in Parallel
 

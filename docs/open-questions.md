@@ -2365,6 +2365,13 @@ driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Dis
   the count-gates piggyback on the M13 IR-shape suite).
 - **Post-LLVM-upgrade (order matters — bitcode compat):** ThinLTO → runtime-as-bitcode (LLVM
   version alignment is the known wall) → instrument PGO → sample PGO / BOLT.
+  **Amended 2026-07-12 (post-#425 two-lens review; full record = roadmap "Post-upgrade wave"):**
+  ThinLTO-across-Align-modules is MOOT (one `Program` → one module; the only boundary is the
+  runtime FFI), the version wall DISSOLVED (rustc 1.96 = LLVM 22.1.2, same major as the 22.1.8
+  toolchain; rustc bitcode verified to merge + LTO cleanly, std does not leak into IR), and the
+  measured win surface is narrow (per-element string/hash wrappers only; the numeric core
+  already vectorizes with zero in-loop FFI). M14 Slice 1 = a wall-clock ceiling probe
+  (≥ 1.15× or record-and-close both items); PGO keeps its place in the order.
 - **REJECTED (do not re-litigate; reasons):** NaN boxing / general SSO / runtime string interning
   (representation branches + hidden state vs the settled type splits); automatic AoS↔SoA
   conversion (hidden bulk data movement); deterministic map iteration as a default contract
