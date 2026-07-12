@@ -400,7 +400,7 @@ ordinary call-graph edges; `parmaps` records only the terminal function. Consequ
 `xs.map(impure).par_map(pure)` can be accepted and is safe only because the staged path is currently
 sequential. Before any stage executes inside a parallel range, require every prior callable stage
 of that `ArrayParMap` to be Pure (including lifted/capturing forms), with named and capturing
-negative tests. Alternatively keep an Impure prefix materialized and sequential; never widen it
+negative tests. Alternatively, keep an Impure prefix materialized and sequential; never widen it
 silently.
 
 `where(...).par_map(...)` is a separate gate because output length is unknown. Two viable stable
