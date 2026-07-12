@@ -59,16 +59,18 @@ fn main() -> i32 {
 
 (There is no `path[i]` single-byte access — a byte index is for slicing, not for walking.) A `split` does not exist yet (implementation in progress); today `find`/`rfind` + `[a..b]` compose the manual split, or you write a real parser.
 
-## Concatenation: allowed where the allocation has a home
+## Concatenation: builder is the one way
 
-`a + b` on strings allocates — so Align insists the allocation have a visible lifetime. Inside an `arena`, concatenation is the natural way to build a temporary:
+`a + b` on strings is a compile error everywhere. Concatenation allocates, so Align makes both the
+allocation and its owner explicit through one construction path:
 
 ```align
 fn shout(name: str) -> string {
-    arena {
-        s := "hey, " + name + "!"   // arena-backed temporaries
-        return s.clone()            // copy the survivor out
-    }
+    b := builder()
+    b.write("hey, ")
+    b.write(name)
+    b.write("!")
+    return b.to_string()
 }
 
 fn main() -> i32 {
@@ -77,7 +79,10 @@ fn main() -> i32 {
 }
 ```
 
-But `+` inside a **pipeline lambda** is a compile error: `xs.reduce("", fn acc, x { acc + x })` would allocate per element with no owner — a hidden quadratic leak in one innocent line. The compiler rejects it and the fix is the builder, which is the next section. This is "nothing hidden" applied to text: every string allocation belongs to an arena, an owner, or a builder — never to the middle of a fused loop.
+This is "nothing hidden" and "one way" applied to text. A spelling such as
+`xs.reduce("", fn acc, x { acc + x })` would hide an allocation and repeatedly copy a growing
+intermediate; it is rejected rather than receiving a special arena exception. Use the builder for
+both one-shot concatenation and incremental assembly.
 
 ## The builder
 
@@ -121,6 +126,6 @@ Templates cover the `print`-a-composed-line case; the builder covers the build-a
 |---|---|
 | pass text around, inspect it | `str` (views, free) |
 | keep text beyond its source's lifetime | `.clone()` → `string` |
-| glue a few pieces once, in a scope | `+` inside an `arena` |
+| glue a few pieces once | `builder` |
 | assemble text incrementally / in bulk | `builder` |
 | one formatted line | `template "..."` |
