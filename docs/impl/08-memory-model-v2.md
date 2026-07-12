@@ -118,7 +118,7 @@ free-standing **owned** `array`/`string` is heap-owned and `Static`-lived *until
 frame-local array literal, or a view into a by-value parameter's interior), never for a
 view *parameter* (which borrows the caller → `Static`, returnable).
 
-\** Prose about making an in-arena clone a bump allocation has drifted from the current heap-owned
+\*\* Prose about making an in-arena clone a bump allocation has drifted from the current heap-owned
 implementation. Audit 13 leaves that contract as a Claude Code question rather than deciding it.
 
 Regions are never written by the user and never appear in a type. They live only in the
