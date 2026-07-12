@@ -63,7 +63,7 @@ b := a
 ```align
 fn shout(name: str) -> string {
     arena {
-        s := "hey, " + name + "!"
+        s := template "hey, {name}!"
         return s.clone()
     }
 }
@@ -71,7 +71,7 @@ fn shout(name: str) -> string {
 print(shout("align"))
 ```
 
-**A8.** `hey, align!`。`arena { }` の中では、`+` の連結が自由に確保します — arena の中へ。`}` で、arena まるごとがひとつの動作で解放されます。`.clone()` が、その前に生き残りを外へコピーしておきました。
+**A8.** `hey, align!`。`arena { }` の中では、template が arena 内に確保します。`}` で、arena まるごとがひとつの動作で解放されます。`.clone()` が、その前に生き残りを外へコピーしておきました。文字列の `+` はコンパイルエラーであり、連結方法は builder ひとつです。
 
 ---
 
