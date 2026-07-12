@@ -39,6 +39,44 @@ pub fn is_available() -> bool {
     true
 }
 
+/// The major version of the LLVM this compiler is built against (the `inkwell` `llvm22-1` feature /
+/// llvm-sys 221). Toolchain discovery uses it to find version-suffixed LLVM tools (`llvm-readobj-22`,
+/// apt.llvm.org naming). **Update on every LLVM upgrade**, together with the `inkwell` feature in
+/// `Cargo.toml` and the `LLVM_SYS_*_PREFIX` env-var name in `align_driver::llvm_tool`.
+pub const LLVM_TOOL_VERSION: &str = "22";
+
+/// The object-file format the build targets — the classification every format-dependent toolchain
+/// step shares (linker-flag spelling in the driver, `alignc size` inspection). Lives here, next to
+/// the other triple sniffing (the baseline-CPU floor in [`create_target_machine`], the SysV check in
+/// `build_module`), so triple classification stays in one place: codegen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectFormat {
+    /// ELF (Linux and the other System-V platforms): GNU-style linker flags, `DT_NEEDED` deps.
+    Elf,
+    /// Mach-O (macOS / Darwin): ld64 linker flags, `LC_LOAD_DYLIB` deps.
+    MachO,
+}
+
+/// Classify the build target's object format from the default (host) triple.
+///
+/// Windows is fail-closed: an explicit error, never a guess — the driver must not invoke the
+/// linker with the wrong flag dialect there. Any other unrecognized triple is presumed ELF (the
+/// System-V default shared by Linux and the BSDs, where the GNU-style flag set applies).
+///
+/// Cross-compilation seam (M15+): when builds take an explicit target triple, this widens to take
+/// the `BuildTarget` as an argument instead of reading the host default triple.
+pub fn target_object_format() -> Result<ObjectFormat, String> {
+    let triple = TargetMachine::get_default_triple();
+    let ts = triple.as_str().to_string_lossy().to_ascii_lowercase();
+    if ts.contains("apple") || ts.contains("darwin") {
+        Ok(ObjectFormat::MachO)
+    } else if ts.contains("windows") {
+        Err(format!("linking for target '{ts}' is not supported yet"))
+    } else {
+        Ok(ObjectFormat::Elf)
+    }
+}
+
 #[derive(Debug)]
 pub enum CodegenError {
     Lowering(String),
@@ -112,7 +150,8 @@ impl Profile {
         }
     }
 
-    /// Whether the linker should strip all symbols (`-Wl,--strip-all`) from the final image. The
+    /// Whether all symbols should be stripped from the final image (spelled per object format by
+    /// the driver: ELF links with `-Wl,--strip-all`, Mach-O runs `strip` post-link). The
     /// size profiles (`small`/`tiny`) strip — the symbol table is pure size a size build does not
     /// want; the speed profiles (`dev`/`release`/`fast`) keep symbols so a crash backtrace / `perf`
     /// stays useful. (Pre-release, changeable — documented at the decision site.)

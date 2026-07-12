@@ -5,7 +5,29 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-12, thirteenth wave (**LLVM/inkwell upgrade checkpoint COMPLETE — LLVM
+_Last updated: 2026-07-12, fourteenth wave (**Codex-audit item 2 — the macOS link/size
+portability slice COMPLETE, MERGED as #426**; independent adversarial gate: SHIP, zero
+branch-caused confirmed defects, all three mutations caught. `ObjectFormat` +
+`target_object_format()` in codegen (apple/darwin → Mach-O, windows fail-closed, else ELF; the
+one triple-classification site, M15 cross-compile seam noted); `link_objects` selects its flag
+dialect per format via `hygiene_flags`/`support_libs` data tables — ELF unchanged, Mach-O
+`-dead_strip`/`-dead_strip_dylibs`, no support libs (libSystem re-exports), post-link external
+`strip` (re-signs ad hoc; `Profile::strip` stays the sole strip decision) — plus a
+`LIBRARY_PATH` hint on gated-library link failures; `llvm_tool()` discovery (build prefix →
+`<name>-22` → bare name); `alignc size` fully migrated to version-matched
+`llvm-readobj`/`llvm-nm` for BOTH formats (readelf/GNU-nm removed outright; Mach-O symbol sizes
+derived from address deltas capped at section ends, dyld chained-fixups note,
+`LC_LOAD_DYLIB` listing). macOS arm64 verification: `align_attr` (its 3 link failures resolved),
+`capability_linking` (now `--needed-libs` + basename matching + a `can_link` probe),
+`build_profiles` (format-branched expectations), and the new `macho_link.rs` net (hello =
+libSystem-only + runs; tiny strips every symbol and stays runnable) all green — previously every
+macOS link failed on ld64. Remaining macOS failures are cataloged out-of-scope in the adoption
+record (ffi_byval = SysV-Linux-only by design, std.net/TLS/cloexec runtime items, APFS non-UTF-8
+setup, expr_depth test-thread stack); rode along: the m11_process `/bin/true` → `coreutil()`
+existence-probe portability fix and two macOS-only compile errors in the `align_runtime` test
+target (clashing test `fcntl` declaration, aarch64 `needless_return`). Deferred sub-items
+recorded at adoption-record item 2 — `bench/binary_size` port is the next small PR.) Earlier
+this date: thirteenth wave (**LLVM/inkwell upgrade checkpoint COMPLETE — LLVM
 19 → 22 MERGED as #425**, the checkpoint sequenced after M13; the M13 shape/size/bench net served
 as the gate and caught exactly three behavior shifts, all re-pinned only after IR/objdump
 verification). Toolchain: inkwell `llvm19-1` → `llvm22-1` (0.9.0), llvm-sys 191 → 221 (221.0.1),

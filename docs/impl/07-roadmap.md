@@ -1950,7 +1950,9 @@ regression net that validates the upgrade.
   symbols, ld stops garbage-collecting the member's *other* external references — so `Crypto`/`Tls`
   transitively retain the compress libs (`Capability::link_libs` is a monotonic SUPERSET,
   `Tls ⊇ Crypto ⊇ {compress}`; always correct — `--as-needed` drops any truly-unused lib from
-  `DT_NEEDED`). Completion conditions BOTH met: `capability_linking.rs` asserts (via `readelf -d`)
+  `DT_NEEDED`). Completion conditions BOTH met: `capability_linking.rs` asserts (via `readelf -d`
+  then; via `llvm-readobj --needed-libs` since the 2026-07-12 portability slice, which also made
+  the ELF-only flag set format-selected — see the Codex work queue below)
   that `fn main() -> i32 = 0` AND `hello` link none of z/zstd/crypto/ssl while `gzip` keeps only
   `libz`; `bench/binary_size/` records before/after (fail-loud on build errors). Release numbers:
   `hello` 5.52 MB / 4 gated deps → 4.27 MB / **0** gated deps (−22.6 %), `gzip` → libz only,
@@ -2026,7 +2028,9 @@ regression net that validates the upgrade.
     the produced executable: total size, per-section sizes (largest first), the top-10 largest
     symbols, the relocation count, and the `DT_NEEDED` list. Input = an Align source (builds it), not
     a pre-built binary — `size` tracks the profile that made the artifact. Implemented by shelling to
-    **binutils** (`readelf`/`nm` — already implicit toolchain deps via `cc`/`ld`); no new crate dep;
+    **binutils** (`readelf`/`nm` — already implicit toolchain deps via `cc`/`ld`) then; migrated to
+    version-matched **`llvm-readobj`/`llvm-nm`** (both ELF and Mach-O) by the 2026-07-12 portability
+    slice — see the Codex work queue below. No new crate dep;
     every tool call is failure-tolerant (a missing/erroring tool degrades one report block to a note).
   - **Tests** (`build_profiles.rs`, +9; +1 `group_digits` unit): the enum mapping pinned exactly
     (pipeline strings / strip set / exact-name parse / default = release); an in-process
@@ -2245,8 +2249,10 @@ unchanged (evaluate later, driver-managed external pipeline).
 audit (pre-#425 HEAD; full triage = `open-questions.md` → "External binary-optimization audit
 (Codex, 2026-07-12) — adoption record") queues code waves that are independent of the LTO probe
 and M15: **wave 1, measurement portability** (three CONFIRMED bugs — bench export roots broken
-by the #418 internalization, ELF-only linker/size tooling breaks macOS builds, build profiles
-never reach the TargetMachine/`optsize`/runtime variant); **wave 2, quick wins** (O(n²)
+by the #418 internalization, ELF-only linker/size tooling breaks macOS builds **[compiler slice
+DONE 2026-07-12: `ObjectFormat`-selected linker policy + `llvm-readobj`/`llvm-nm` size report +
+macOS regression net; the `bench/binary_size` script port is the remaining sub-item]**, build
+profiles never reach the TargetMachine/`optsize`/runtime variant); **wave 2, quick wins** (O(n²)
 `sort`/`sort_by_key`, tiny-`par_map` pool-before-threshold cold start, zero-size arena 64 KiB
 chunk, attribute-kind fail-loud + modern `captures(none)` emission — the latter likely also
 fixes the `llvm-as-22` textual round-trip follow-up above); **wave 3, measure-first** (JSON

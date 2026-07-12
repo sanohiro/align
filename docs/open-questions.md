@@ -2351,6 +2351,23 @@ every valid finding addressed. Disposition:
      no `-ldl` on macOS), migrate size inspection to version-matched `llvm-readobj`/`llvm-nm`/
      `llvm-size`. Also adopt: derive runtime native-lib deps from Rust's `native-static-libs`
      instead of hand-written flags.
+     **DONE (compiler slice, 2026-07-12):** `ObjectFormat` + `target_object_format()` in
+     `align_codegen_llvm` (triple classification stays in codegen; Windows fail-closed);
+     format-selected linker policy in `link_objects` via `hygiene_flags`/`support_libs` data
+     tables (ELF `--gc-sections`/`--as-needed`/`--strip-all` unchanged; Mach-O `-dead_strip`/
+     `-dead_strip_dylibs`, no support libs, post-link external `strip` — `Profile::strip` stays
+     the only strip decision point); a `LIBRARY_PATH` hint on gated-library link failures;
+     `llvm_tool()` discovery (build prefix → `-22` suffix → bare name); `alignc size` fully on
+     `llvm-readobj`/`llvm-nm` for both formats (readelf/GNU-nm removed outright — Mach-O symbol
+     sizes derived from address deltas, chained-fixups note, `LC_LOAD_DYLIB` listing); the
+     macOS regression net (`macho_link.rs`, format-branched `build_profiles`/`capability_linking`
+     with a `can_link` probe for gated libs). **Deferred out of the slice:** (a) the
+     `bench/binary_size` script port (next small PR); (b) `native-static-libs` derivation — the
+     `support_libs(format)` table is the seam it replaces; (c) x86_64-apple-darwin SysV
+     acceptance (today fail-closed over-rejects that target for by-value FFI structs — not a bug;
+     relax when hardware/CI exists); (d) `-L`/sysroot CLI flags (M15 cross-compilation
+     discussion); (e) a Mach-O chained-fixups count in `alignc size` (llvm-readobj 22 exposes
+     no way to print it).
   3. **Build profiles don't reach the backend** — TargetMachine is always
      `OptimizationLevel::Default` (`align_codegen_llvm/src/lib.rs:181`); `small`/`tiny` never
      set `optsize`/`minsize` fn attrs; the runtime archive is one variant for all profiles.
