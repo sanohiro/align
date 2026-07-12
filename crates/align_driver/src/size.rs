@@ -302,7 +302,10 @@ fn macho_symbols(tool: &Path, exe: &Path, secs: &[Section]) -> Option<Vec<Symbol
             .iter()
             .find(|s| s.addr <= *addr && *addr < s.addr.saturating_add(s.size))
             .map(|s| s.addr.saturating_add(s.size));
-        let next_addr = entries.get(i + 1).map(|e| e.0);
+        // Strictly greater: aliases share an address, and the first of a same-address run
+        // must be credited with the run's real extent, not a zero delta (ELF's st_size path
+        // gives every alias its full size — keep the formats consistent).
+        let next_addr = entries[i + 1..].iter().find(|e| e.0 > *addr).map(|e| e.0);
         let end = match (next_addr, section_end) {
             (Some(n), Some(se)) => n.min(se),
             (Some(n), None) => n,
