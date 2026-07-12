@@ -44,7 +44,7 @@ When a *phase* of work allocates many things that all die together — parse a f
 ```align
 fn join(a: str, b: str) -> string {
     arena {
-        c := a + b          // arena-backed temporary
+        c := template "{a}{b}" // arena-backed temporary
         return c.clone()    // copy the result out — visible escape
     }                       // everything else freed here, O(1)
 }
