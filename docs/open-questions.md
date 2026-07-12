@@ -2314,7 +2314,17 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
-### External optimization consultation (GPT-5.6, 2026-07-11) — adoption record
+### Separate compilation (multi-module compilation units) — OWNER-MANDATED → M15
+
+Recorded 2026-07-12. The owner ruled that "one `Program` → one whole-program object" must not
+remain Align's only compilation model: separate compilation is REQUIRED, near-term.
+Language-level modules already exist; the missing piece is per-unit compilation +
+incremental builds. The full design-question list (unit boundary + artifact format, cross-unit
+inference summaries for escape/region/effect/MoveCheck, generics monomorphization strategy,
+the M13 internalization/capability-linking interactions, ThinLTO un-mooting, incremental
+driver) lives in the roadmap **M15** section — settle by a two-lens design review before any
+code. Soundness note: every escape/effect gate audited to date assumes whole-program
+visibility; unit interfaces must carry summaries or be conservative, never fail-open.
 
 The owner's out-of-repo optimization consultation (8 long responses: LLVM Performance Tips for
 Frontend Authors digest, constants/binary-size, core/std review, cache locality, execution-plan

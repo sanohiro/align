@@ -2195,7 +2195,8 @@ run right after the LLVM 22 upgrade landed (#425). Three findings changed the sh
   `Program` → one whole-program module (the M13 Slice 1 record) — so the only cross-module
   boundary in any Align binary is Align ↔ runtime-staticlib. ThinLTO's summary/lazy-import
   machinery is unjustified at two modules; the right shape is full (monolithic) **in-process**
-  LTO. Revisit ThinLTO only if multi-module separate compilation ever exists.
+  LTO. Revisit ThinLTO once multi-module separate compilation exists — which is now PLANNED:
+  see **M15** below (owner-mandated 2026-07-12).
 - **The "Rust-vs-Align LLVM version alignment" wall dissolved with the 22 upgrade.** rustc 1.96
   emits LLVM **22.1.2** bitcode; the alignc toolchain is 22.1.8 — same major. Verified
   end-to-end: rustc `.bc` parses under `llvm-dis-22`, `llvm-link-22` merges it into Align IR,
@@ -2239,6 +2240,47 @@ mid-size infrastructure (InstrProfiling pass + profile runtime hook + an `llvm-p
 stage + `PGOOptions` likely via raw llvm-sys — inkwell 0.9 does not expose it); its unique
 lever, hotness-gated multiversioning, is a separate unimplemented feature. Sample PGO / BOLT
 unchanged (evaluate later, driver-managed external pipeline).
+
+## M15 — Separate compilation (multi-module compilation units) — OWNER-MANDATED 2026-07-12
+
+**Directive.** On reading the M14 re-scope note "Align has no separate compilation — one
+`Program` → one whole-program module", the owner ruled this must not remain true: multi-module
+compilation is REQUIRED and belongs on the near-term roadmap. To be precise about today's state:
+*language-level* modules already exist (`import`, `pub`, module files, the `std.*` tree) — what
+is single is the **compilation unit**: the driver compiles the whole program as one `Program`
+and emits one object; every build is a full rebuild.
+
+**Why it matters** (beyond the directive): build scalability and incremental compilation (any
+real codebase — align-LLM included — recompiles everything on every edit today), compiled-library
+distribution for the future pkg ecosystem, and CI/agent iteration latency (four-way alignment:
+the Compiler axis includes fast feedback).
+
+**Design questions to settle FIRST (a two-lens design review before any code; record the
+settlement here + `open-questions.md`):**
+1. **Unit boundary** — module, module subtree, or package? What is the stable build artifact
+   (object + interface summary? bitcode, anticipating ThinLTO)? Where does the unit graph live
+   (driver-discovered vs manifest)?
+2. **Cross-unit inference boundaries** — escape/region inference, purity/effect inference, and
+   MoveCheck are whole-program analyses today. Unit interfaces must carry summaries (effect
+   bits, region-bearing signatures, Move/Copy classification) or make conservative assumptions;
+   this must not silently weaken soundness (the fail-open-wildcard bug class — every gate the
+   audits closed assumed whole-program visibility).
+3. **Generics across units** — monomorphization strategy: instantiate-in-consumer (needs body
+   availability → IR/bitcode in the artifact) vs pre-instantiated exports (closed instantiation
+   sets). Interacts with the "generic fn over generic struct unsupported" gap.
+4. **M13 interactions** — Slice 1 internalization is "safe by construction" ONLY under
+   one-object whole-program; separate compilation needs a real symbol-visibility model
+   (`pub`-driven export sets). Capability-based linking must collect per-unit capability sets
+   and union them at final link. `emit-obj`'s "whole-program object" contract changes.
+5. **ThinLTO un-moots** — with N Align units, the M14 item-1 machinery becomes the natural
+   cross-unit optimizer; the runtime-bitcode plumbing from the M14 probe/Slice-2 is the same
+   substrate. Sequence ThinLTO *after* unit boundaries exist.
+6. **Incremental driver** — per-unit staleness/caching, parallel unit compilation, and how
+   `alignc build/size/explain-opt` surfaces multi-unit builds.
+
+**Sequencing:** design review can start right after the M14 Slice 1 probe verdict; M14's
+remaining items (PGO/BOLT evaluation) are independent and may be reordered around it at the
+owner's discretion.
 
 ## Design Issues to Settle in Parallel
 

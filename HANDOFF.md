@@ -32,9 +32,19 @@ SHIP, all 8 implementation claims re-verified against real LLVM 22.1.8 incl. kil
 gemini zero findings. NEW recorded follow-up (roadmap): inkwell 0.9's `ptr none` shorthand is not
 re-parseable by `llvm-as-22` — the textual `emit-llvm | llvm-as` dev path is broken (object
 codegen and grep-based consumers unaffected); resolve at the M14 bitcode/ThinLTO boundary (emit
-`captures(none)` or a `.bc` path). **Next: M14, the post-upgrade wave** (roadmap order: ThinLTO →
-runtime bitcode → PGO → BOLT; the deferred ABI-flattening/fn-arg-attr/nsw items wait for those
-boundaries). Earlier: twelfth wave (**M13 COMPLETE — Slice V MERGED as #424**, the last
+`captures(none)` or a `.bc` path). **M14 was RE-SCOPED the same day by a two-lens design review**
+(roadmap "Post-upgrade wave": ThinLTO-across-Align-modules is moot today — one `Program` → one
+module; the rustc-vs-alignc LLVM version wall DISSOLVED with the 22 jump — rustc 1.96 emits LLVM
+22.1.2 bitcode, verified to merge+LTO cleanly, std does not leak into IR; the measured win surface
+is per-element string/hash wrappers only, the numeric core is already saturated). **M14 Slice 1 =
+the LTO ceiling probe** (wall-clock ≥ 1.15× on a str_eq/str_cmp/hash64 kernel or record-and-close
+items 1+2, the #416 precedent); PGO keeps its place with written reasons. **M15 separate
+compilation (multi-module compilation units) is OWNER-MANDATED (2026-07-12)** — the owner ruled
+whole-program-only must not remain; roadmap M15 section holds the design-question list
+(unit boundary/artifact, cross-unit inference summaries, generics, M13 internalization +
+capability-linking interactions, ThinLTO un-mooting, incremental driver); two-lens design review
+FIRST, sequenced after the M14 probe verdict; the deferred ABI-flattening/fn-arg-attr/nsw items
+still wait for the M14+ boundaries. Earlier: twelfth wave (**M13 COMPLETE — Slice V MERGED as #424**, the last
 slice; the milestone is formally closed in the roadmap). **Upgrade-target decision (owner,
 2026-07-11, end of session): LLVM 22 from apt.llvm.org** (`llvm-toolchain-trixie-22`; the owner
 installs `llvm-22 llvm-22-dev clang-22` themselves) — NOT Debian backports' 21: inkwell 0.9
