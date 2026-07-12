@@ -4000,19 +4000,29 @@ impl<'a> EscapeCheck<'a> {
                     }
             }
             ExprKind::Spawn { closure, .. } => {
-                if let (Some(group), ExprKind::Closure { captures, .. }) =
-                    (self.task_group_regions.last().copied(), &closure.kind)
-                {
-                    for capture in captures {
-                        if self.region_bearing(capture.ty)
-                            && !self.region_of(capture, depth).outlives(group)
-                        {
-                            self.diags.error(
-                                "a spawned task cannot capture a value that is freed before its task_group is joined"
-                                    .to_string(),
-                                capture.span,
-                            );
+                if let Some(group) = self.task_group_regions.last().copied() {
+                    if let ExprKind::Closure { captures, .. } = &closure.kind {
+                        for capture in captures {
+                            if self.region_bearing(capture.ty)
+                                && !self.region_of(capture, depth).outlives(group)
+                            {
+                                self.diags.error(
+                                    "a spawned task cannot capture a value that is freed before its task_group is joined"
+                                        .to_string(),
+                                    capture.span,
+                                );
+                            }
                         }
+                    } else if self.region_bearing(closure.ty)
+                        && !self.region_of(closure, depth).outlives(group)
+                    {
+                        // `check_spawn` currently constructs only `FnValue` or `Closure`, but keep
+                        // the escape pass fail-closed if the surface later accepts a local/block fn.
+                        self.diags.error(
+                            "a spawned task cannot capture a value that is freed before its task_group is joined"
+                                .to_string(),
+                            closure.span,
+                        );
                     }
                 }
                 self.walk(closure, depth);

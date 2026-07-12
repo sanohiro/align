@@ -244,12 +244,16 @@ fn main() -> Result<(), Error> {
 The task environment snapshots only the view's `{ptr,len}`; it does not own the arena backing.
 `EscapeCheck` now keeps the active task-group regions as an innermost-last stack. At each `spawn`,
 every region-bearing capture must outlive the innermost group. Static, frame, and outer-arena
-captures remain accepted; a capture tied to any inner arena is rejected before MIR lowering.
+captures remain accepted; a capture tied to any inner arena is rejected before MIR lowering. The
+checked HIR currently permits only a direct `FnValue` or `Closure`, but a whole-expression fallback
+keeps this pass fail-closed if `spawn` later accepts a local or block function expression.
 
 `task_group.rs` pins the direct reproduction and captures wrapped in a struct, tuple, `Option`,
-`Result`, and another closure. Positive gates cover frame/static and outer-arena captures. Removing
-the outlives check makes the negative matrix pass checking again, so the regression net exercises
-the lifetime gate rather than an adjacent restriction.
+`Result`, and another closure; a parenthesized lambda reaches the same gate because grouping is
+erased by the parser. Positive gates cover frame/static and outer-arena captures. Separate tests pin
+the current literal-only surface for local and block function expressions. Removing the outlives
+check makes the negative matrix pass checking again, so the regression net exercises the lifetime
+gate rather than an adjacent restriction.
 
 ### 3.4 FIXED 2026-07-13 — closure-call results include the closure environment's region
 

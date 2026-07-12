@@ -191,6 +191,10 @@ fn spawn_rejects_inner_arena_captures() {
             "fn main() -> Result<(), Error> {\n  task_group {\n    arena {\n      n := 7\n      v := template \"hello {n}\"\n      spawn(fn { print(v) })\n      0\n    }\n    wait()\n  }\n  return Ok(())\n}\n",
         ),
         (
+            "parenthesized",
+            "fn main() -> Result<(), Error> {\n  task_group {\n    arena {\n      n := 7\n      v := template \"hello {n}\"\n      spawn((fn { print(v) }))\n      0\n    }\n    wait()\n  }\n  return Ok(())\n}\n",
+        ),
+        (
             "struct",
             "Holder { value: str }\nfn use_holder(h: Holder) -> i64 = h.value.len()\nfn main() -> Result<(), Error> {\n  task_group {\n    arena {\n      n := 7\n      v := template \"hello {n}\"\n      h := Holder { value: v }\n      spawn(fn { use_holder(h) })\n      0\n    }\n    wait()\n  }\n  return Ok(())\n}\n",
         ),
@@ -231,6 +235,28 @@ fn spawn_accepts_captures_that_outlive_group() {
     for (name, src) in [("outer-arena", outer_arena), ("frame-static", frame_and_static)] {
         let diagnostics = check_diagnostics(&format!("tg-valid-capture-{name}"), src);
         assert!(diagnostics.is_empty(), "{name} capture should be accepted:\n{diagnostics}");
+    }
+}
+
+#[test]
+fn spawn_requires_a_literal_lambda() {
+    let cases = [
+        (
+            "local",
+            "fn main() -> Result<(), Error> {\n  task_group {\n    f := fn { 1 }\n    spawn(f)\n    wait()\n  }\n  return Ok(())\n}\n",
+        ),
+        (
+            "block",
+            "fn main() -> Result<(), Error> {\n  task_group {\n    spawn({ fn { 1 } })\n    wait()\n  }\n  return Ok(())\n}\n",
+        ),
+    ];
+
+    for (name, src) in cases {
+        let diagnostics = check_diagnostics(&format!("tg-nonliteral-{name}"), src);
+        assert!(
+            diagnostics.contains("'spawn' takes a `fn { … }` literal"),
+            "{name} function expression should be rejected before HIR construction:\n{diagnostics}"
+        );
     }
 }
 
