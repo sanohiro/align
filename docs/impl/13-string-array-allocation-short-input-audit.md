@@ -1,0 +1,608 @@
+# String and array allocation, copying, and short-input audit
+
+> Status: audit record, 2026-07-13. No implementation in this document is shipped merely because
+> it is described here. Correctness/resource findings are **CONFIRMED**; performance changes remain
+> gated unless an existing roadmap item already says otherwise.
+
+## 1. Scope and classification
+
+This record answers a narrower question than documents 10–12:
+
+- do text and array operations allocate or copy more than their result ownership requires;
+- do paths tuned for large inputs impose disproportionate setup costs on empty and short inputs;
+- does generated IR preserve the allocation-free, fused shape that Align intends;
+- which implementation changes are new, and which are already planned elsewhere;
+- are there language-contract questions worth asking Claude Code to assess without treating them as
+  decisions.
+
+The audit read the runtime, sema, MIR, LLVM lowering, tests, current implementation plans, and the
+settled/open language records. A local Apple-Silicon release microprobe covered `0..4096` bytes or
+elements for UTF-8 validation, equality, substring search, `builder`, and `array_builder`. Its numbers
+are directional evidence, not a merge gate: the probe used the runtime dylib boundary and
+`black_box`, but not the repository's required balanced AB/BA harness or hardware counters.
+
+Classifications:
+
+- **CONFIRMED P0** — violates a settled invariant or leaks in a repeatable ordinary program;
+- **CONFIRMED P1** — unnecessary work is mechanically present and the correct shape is clear;
+- **ALREADY PLANNED** — do not count it as a new finding or build a parallel mechanism;
+- **MEASURE FIRST** — plausible, but keep the current implementation unless the stated gate wins;
+- **SHIPPED / GOOD** — retain it and use it as the oracle or negative control;
+- **CLAUDE QUESTION** — a non-binding language-design question, not a proposal adopted here.
+
+## 2. Executive result
+
+The large-input story is not generally crowding out small inputs. Fused numeric pipelines have no
+intermediate arrays, LLVM emits scalar fallbacks for mapped materializers, substring search uses a
+special path below 64 bytes, fixed arrays are stack values, and `array_builder.build()` freezes its
+payload without copying. The two-word `str`/`string`/slice/array view layout should remain simple;
+this audit does **not** reopen SSO or a hidden small-vector representation.
+
+The strongest problems are instead ownership and fixed-cost gaps:
+
+| Area | Current shape | Disposition |
+|---|---|---|
+| `s[a..b]` | checks range but not UTF-8 scalar boundaries | **CONFIRMED P0**; fix before more text fast paths |
+| `str + str` | settled hard error, but sema still accepts and MIR allocates | **CONFIRMED P0** contract drift |
+| arena-free `template` / `json.encode` | leaks its payload for process lifetime | **CONFIRMED P0/P1** resource bug |
+| unbound owned temporaries | `.len()`, scalar index, direct call use can omit `Drop` | **CONFIRMED P0**; leaks strings and arrays in loops |
+| moved slots | optimized IR still calls `free(null)` / handle-free(null) | **CONFIRMED P1** short-value fixed cost |
+| filesystem/path ABI views | common helper copies every short path into `String` | **CONFIRMED P1** avoidable allocation/copy |
+| UTF-8 validation | AVX2/NEON even for 0–15 bytes; no scalar crossover | **MEASURE FIRST**, short path is directionally slower |
+| `builder.to_string()` | header allocation + grow buffer + final allocation/copy | **CONFIRMED P1** copy count; M14 only solves call overhead |
+| `array_builder` | header allocation + payload allocation + per-push ABI call | **CONFIRMED P1** for tiny builders; zero-copy freeze is good |
+| `chunks(n)` | always materializes `array<slice<T>>` headers | **CONFIRMED P1** for direct consumers |
+| str-key group/dictionary | output buffers exist, but runtime stages in extra Vecs then copies | **CONFIRMED P1** for single aggregates/dictionary |
+| `path.normalize` | component Vec + output Vec + final malloc/copy | **CONFIRMED P1** direct-final-buffer opportunity |
+| large constant local arrays | entry alloca plus O(N) stores remains after O2 | **MEASURE FIRST** global constant/memcpy crossover |
+| Base64/hex and JSON final copies | Vec then final allocator copy | **ALREADY PLANNED** in document 12 / roadmap |
+| O(n²) sorting | insertion sort at every size | **ALREADY PLANNED** hybrid stable O(n log n), keep tiny base case |
+
+Correctness/resource work comes first. Several current leaks accidentally keep borrowed views alive;
+freeing them without owner/view liveness would convert a leak into a UAF.
+
+## 3. Correctness and ownership prerequisites
+
+### 3.1 CONFIRMED P0 — `str` range slicing can create invalid UTF-8
+
+The language contract says every `str` is valid UTF-8 and a byte-range slice aborts if either bound
+splits a scalar ([draft §12](../../draft.md#12-string),
+[language summary](../language-spec.md#strings)). MIR currently performs only
+`0 <= start <= end <= len`, then creates a byte-stride `SubSlice`
+([range lowering](../../crates/align_mir/src/lib.rs#L3496)). There is no continuation-byte test in
+MIR, codegen, or the runtime.
+
+For example, the current optimizer accepts and constant-folds the length of an invalid view:
+
+```align
+s := "é"          // c3 a9
+bad := s[1..2]     // a9, a UTF-8 continuation byte
+print(bad.len())   // 1
+```
+
+Checking a boundary is O(1): `0` and `len` are valid; otherwise the byte at the boundary must not
+match `10xxxxxx`. Check both endpoints after the range guard and branch to a cold abort. Add tests for
+every 1/2/3/4-byte scalar boundary, omitted endpoints, empty strings, and dynamic indices. Optimized
+ASCII slicing must remain two loads/masks plus the existing cold edge, not a full validation scan.
+
+The documented arbitrary-byte escape hatch `s.bytes() -> slice<u8>` is also absent: sema dispatches
+`buffer.bytes()` but not `str.bytes()`
+([method dispatch](../../crates/align_sema/src/lib.rs#L9261)). Implement the existing contract as a
+zero-cost `{ptr,len}` retype so callers never need to violate `str` to process arbitrary bytes.
+
+### 3.2 CONFIRMED P0 — the settled `str + str` hard error is not enforced
+
+`draft.md`, `language-spec.md`, and the settled ledger all say concatenation through `+` is a hard
+error and `builder` is the one construction path
+([settlement ledger](../open-questions.md)).
+The checker still explicitly accepts it
+([sema](../../crates/align_sema/src/lib.rs#L7941)), and MIR lowers every binary node to a fresh
+two-piece `Template` ([MIR](../../crates/align_mir/src/lib.rs#L2481)). Repository guides and
+implementation records had the same drift and are corrected alongside this audit.
+
+This is not a new language proposal. Enforce the settled error, change the stale tests, and use the
+same diagnostic the spec gives. Besides restoring One way / Nothing hidden, this prevents a chain
+such as `a + b + c + d` from building and recopying a growing intermediate at every syntax node.
+Inside an arena that is O(k²) copied bytes plus retained intermediates; outside an arena it joins the
+process-lifetime leak below.
+
+### 3.3 CONFIRMED P0/P1 — arena-free `template` and `json.encode` leak forever
+
+Sema assigns an allocating `Template` to `Region::arena(depth)`; at depth zero that becomes Static,
+described as safe because the result is leaked
+([region inference](../../crates/align_sema/src/lib.rs#L3341)). Codegen passes a null arena handle
+([template codegen](../../crates/align_codegen_llvm/src/lib.rs#L7228)), and
+`align_rt_builder_finish` turns the Vec into a leaked boxed slice
+([runtime](../../crates/align_runtime/src/lib.rs#L4398)). `json.encode` uses the same path and says
+“else leaked” in its implementation comment
+([sema](../../crates/align_sema/src/lib.rs#L12005)).
+
+The guard covers only a lifted lambda with no inner arena. An ordinary function or `loop` can execute
+`template`/`json.encode` repeatedly and grow RSS until OOM. The guides show arena-free encode as the
+normal spelling, so this is not an exotic unsafe path.
+
+Implementation work can already remove common cases without settling the value type:
+
+- fold a template with no holes to a pooled `StrLit` — no builder or allocation;
+- when the immediate consumer is a writer/file/response/print sink, keep the builder as the sink and
+  consume/free it without `builder_finish`;
+- retain the already-shipped `writer.write(builder)` / `fs.write_file(path, builder)` route as the
+  oracle for no-final-string I/O.
+
+The stored-value case is a **CLAUDE QUESTION** in section 10: arena-required `str`, owned `string`, or
+contextual sink lowering. Do not paper over it with another process-global owner.
+
+### 3.4 CONFIRMED P0 — unbound owned string/array temporaries miss `Drop`
+
+Bound Move locals receive null-on-move drop wiring, and a temporary owned array consumed as a later
+pipeline source may be returned through `SrcSetup.temp_free`. General expression temporaries do not.
+`Len` simply lowers its receiver and extracts the length
+([MIR](../../crates/align_mir/src/lib.rs#L2940)); scalar index and ordinary call-argument paths have
+the same ownership gap.
+
+Confirmed optimized-IR examples:
+
+```align
+"x".clone().len()          // calls align_rt_str_clone; no align_rt_free
+[n, n + 1].to_array().len() // calls align_rt_alloc; no free
+[n, n + 1].to_array()[0]    // same
+[1, 2, 3].chunks(2).len()   // chunks header allocation; no free
+b.build().len()              // frozen array payload; no free
+```
+
+The existing collect comment acknowledges that some free-standing `.to_array()` temporaries leak
+([known limitation](../../crates/align_mir/src/lib.rs#L4252)), while the memory-model status text
+overstates drop coverage.
+
+Introduce a real owned-temporary/synthetic-owner representation and derive destruction from MIR
+liveness. Separate two cases:
+
+- scalar consumers such as `.len()` and `[i]` may drop the owner after the scalar is produced;
+- view consumers such as `[a..b]`, `.trim()`, `path.base`, or a function returning a borrowed view
+  require the hidden owner to live through the last use of that view.
+
+Test every producer (`clone`, builder freeze, path/encoding results, `to_array`, `sort`, `partition`,
+`chunks`, `par_map`) through `.len`, index, subslice, method, call argument, `if`/`match`, `?`, return,
+and loops. Use an allocation counter/ASan-equivalent and require allocation count to equal destruction
+count on every normal path. Existing leaks may currently mask UAFs, so sanitizer/view-lifetime tests
+are mandatory.
+
+### 3.5 CONFIRMED P1 — definite-null destructor calls survive O2
+
+Move lowering nulls the source slot, but exit cleanup still loads it and calls a null-safe runtime
+destructor. Optimized IR retains calls such as:
+
+```llvm
+tail call void @align_rt_free(ptr null)
+call void @align_rt_array_builder_free(ptr null)
+```
+
+See source nulling ([MIR](../../crates/align_mir/src/lib.rs#L1563)) and generated drop dispatch
+([codegen](../../crates/align_codegen_llvm/src/lib.rs#L3658)). This is small in absolute time, but it
+is pure fixed overhead for a short returned string/array or a just-frozen builder.
+
+Prefer MIR definite-null/drop-state elimination after control-flow joins are correct. A separately
+audited LLVM free-family contract may help the ordinary `align_rt_free(null)` case, but it cannot
+model every handle-specific destructor. Gate on zero known-null destructor calls in optimized IR,
+with conditional moves, early returns, `?`, and exactly-once destruction as negative tests.
+
+## 4. Short-input measurements
+
+### 4.1 Directional probe
+
+Host: Apple Silicon arm64, macOS 26.3.1, rustc/cargo 1.96.1, release builds. Ratios below are the
+range from two consecutive runs; absolute operations are often only a few nanoseconds, so permanent
+acceptance benches must use balanced order and batches.
+
+| Operation | Short sizes | Observed current/reference ratio | Interpretation |
+|---|---:|---:|---|
+| `utf8_valid` runtime / `std::str::from_utf8` | 0 | 5.1–6.0x | empty SIMD dispatch is unnecessary |
+| same | 1 | 3.2–3.5x | strong short crossover signal |
+| same | 4 | 2.1–2.6x | strong short crossover signal |
+| same | 8–64 | mostly 1.1–1.6x | threshold must be measured per target |
+| same | 4096 | 1.07–1.08x | current SIMD remains the large-input oracle |
+| `str_eq` runtime / inline slice equality | 1–8 | 1.27–1.79x | opaque call dominates tiny compares |
+| same | 16–31 | about 2.0–2.23x | exact M14 runtime-bitcode target |
+| same | 4096 | 1.04x | byte scan dominates, wrapper is negligible |
+| `str_find` runtime / direct `memmem::find` | 1–16 | 1.06–1.32x | small extra ABI cost only |
+| same | 31–63 | about parity | memchr's `<64` one-shot path is already appropriate |
+| same | 4096 | 1.02x | do not replace the search algorithm |
+| one-write `builder.to_string` / Rust `String` | 0 | 24–25x | header allocation alone dominates |
+| same | 1–16 | 3.3–3.6x | header + final allocation/copy dominate |
+| same | 64–256 | 2.8–3.1x | still allocation/copy-bound in this probe |
+| `array_builder<i64>` / Rust Vec grow-freeze | 0 | about 35x | header Box with no payload |
+| same | 1–4 | 2.0–2.46x | header + first backing allocation + ABI calls |
+| same | 8–64 | 1.8–2.36x | per-push calls remain visible |
+
+These ratios do not authorize an optimization by themselves. They establish the missing regression
+matrix and refute the assumption that only large text/arrays matter.
+
+### 4.2 Permanent benchmark matrix
+
+Every relevant slice must include:
+
+```text
+length/count: 0 1 2 3 4 7 8 15 16 31 32 63 64 65 256 4K 1M
+element bytes: 1 4 8 16 and one wide Copy struct
+text: ASCII, mixed valid UTF-8, invalid-at-head/middle/tail, escape-dense, escape-free
+ownership: literal/view, bound owned, unbound owned temporary, arena result, returned result
+state: cold first dispatch/allocation and warm steady state
+target: arm64 baseline, x86-64 baseline and v3/native where available
+```
+
+Record allocator calls, allocated bytes, initialized/copied bytes, wall time, and optimized IR.
+Require the `0..64` geometric mean to regress no more than 3%, even when a large case passes. Use a
+15% positive gate for new infrastructure; smaller mechanical cleanups may use an allocation-count
+gate plus statistically stable wall-time improvement.
+
+## 5. String paths already shaped well
+
+- `str`/`string` remain a stable two-word `{ptr,len}` view/owner representation; auto-borrowing an
+  owned string to `str` does not move or copy it.
+- `str.clone()` uses exactly one final allocation and one copy, and empty clone allocates nothing
+  ([runtime](../../crates/align_runtime/src/lib.rs#L137)).
+- equality rejects length mismatch, same-pointer, and empty cases before reading memory
+  ([runtime](../../crates/align_runtime/src/lib.rs#L6145)).
+- contains/find/rfind handle empty and too-long needles before search. `memchr 2.8.2` explicitly uses
+  Rabin–Karp for haystacks below 64 bytes and a prepared/vector portfolio above it; retain it.
+- trim and `path.base`/`dir`/`ext` return borrowed subviews, not owned copies.
+- JSON decoded string fields borrow validated input; no per-field allocation. The long JSON structural
+  scans retain scalar prefixes/tails and SIMD oracles.
+- integer builder formatting uses a stack buffer, including a special `-999..=999` path, and MIR
+  already fuses the common `str + int + str` write triplet into one runtime call.
+- direct regular-file read allocates the final string once; `bytes.as_str()` validates then returns a
+  view rather than copying.
+
+SSO remains rejected for good reasons: it would branch every pointer access, complicate FFI pointer
+stability and Move/drop, and penalize all strings to help a subset. Remove excess allocation count
+around the existing representation first.
+
+## 6. String allocation and copy opportunities
+
+### 6.1 CONFIRMED P1 — borrow ABI path strings instead of copying them
+
+`path_from_view` validates bytes, then calls `to_string()`
+([runtime](../../crates/align_runtime/src/lib.rs#L4512)). It is used by file existence/removal,
+directory reads, mmap views, reader/writer/file open/create, multiple network host paths, and process
+launch. Thus even a five-byte path pays an owned allocation/copy before a filesystem API that only
+needs `&str`.
+
+Split the helper by the real boundary need:
+
+- filesystem/path consumers: `abi_str_view -> Option<&str>` with the same defensive UTF-8 check,
+  then pass the borrow directly to `std::fs`;
+- C-string consumers (`getaddrinfo`, exec): validate the view and construct one `CString` directly
+  from bytes, rather than `String` then `CString`;
+- language-only trusted callers may later avoid redundant UTF-8 validation only if the public C ABI
+  and its safety contract are split explicitly. Do not silently make malformed external calls UB.
+
+Gate the helper itself at 0/1/8/32/256 bytes and run end-to-end file/network controls so syscall or
+DNS latency does not hide whether the allocation actually disappeared.
+
+### 6.2 MEASURE FIRST — add a short scalar crossover to UTF-8 validation
+
+`validate_utf8` enters AVX2 whenever available and NEON unconditionally on aarch64
+([dispatch](../../crates/align_runtime/src/lib.rs#L4002)). A tail shorter than the vector width is
+copied into a zeroed 32/16-byte stack block after lookup vectors are loaded. This differs from the
+JSON quote scan's 16-byte scalar prefix and memmem's explicit `<64` strategy.
+
+Probe per-target thresholds using valid ASCII, multibyte boundary crossings, and invalid inputs.
+Keep `std::str::from_utf8` as the oracle/scalar path and existing AVX2/NEON as the large path. The
+threshold is an implementation constant, not a language feature; choose it from allocator-excluded
+latency and retain differential fuzzing across the crossover.
+
+### 6.3 CONFIRMED P1 — make owned builder freeze compatible with its backing allocation
+
+A surface builder currently owns a Rust `Vec<u8>` in a boxed header. `to_string()` allocates again
+through `align_rt_alloc`, copies the complete output, then drops the Vec
+([freeze](../../crates/align_runtime/src/lib.rs#L4427)). For a one-write tiny string that means a
+header allocation, a Vec allocation, a final allocation, and one full copy.
+
+The existing `array_builder` proves the compatible shape: C `malloc/realloc` storage can be handed to
+an Align owned value and freed by the existing size-less `align_rt_free`. Prototype a raw
+malloc/realloc-backed text builder so owned freeze transfers the pointer without copying. Preserve:
+
+- UTF-8-by-construction writes;
+- geometric growth and checked capacity arithmetic;
+- builder Move/drop and null-on-move behavior;
+- arena template behavior as a distinct case — an arena result still needs arena-owned storage;
+- direct builder-to-I/O paths, which should never freeze a string merely to write it.
+
+M14's already-planned runtime-bitcode ceiling probe addresses per-write ABI calls, not this final
+allocation/copy. Sequence the two measurements independently. A nonescaping stack header is another
+measure-first layer; do not combine both mechanisms in the first benchmark so the attribution stays
+clear.
+
+### 6.4 CONFIRMED P1 — remove staging copies in `read_dir` and DNS results
+
+`fs.read_dir` collects every UTF-8 name into `Vec<Vec<u8>>`, then allocates each final Align string
+and copies again ([runtime](../../crates/align_runtime/src/lib.rs#L324)). DNS resolution does the same
+for short numeric IP strings ([runtime](../../crates/align_runtime/src/lib.rs#L500)). Allocate each
+final payload once while enumerating and keep only `AlignStr` headers in the fallible staging list;
+on a later error, free already-created payloads before returning. Then publish one final header
+buffer. This removes one payload allocation/copy per entry while preserving generic
+`array<string>` deep-drop.
+
+Do not change `array<string>` representation or introduce a shared hidden slab here. Per-element
+ownership is observable through Move/drop and the generic deep-free path; a slab requires a distinct
+owner representation.
+
+### 6.5 CONFIRMED P1 — normalize directly into the final buffer
+
+`path.normalize` creates a component `Vec<&[u8]>`, constructs an output `Vec<u8>`, then allocates and
+copies into the Align-owned result
+([runtime](../../crates/align_runtime/src/lib.rs#L6555)). Normalized output fits
+`max(input_len, 1)`. A one-pass final-buffer implementation can append ordinary components and pop
+the last output component for `..`, scanning back to the preceding separator. Removed bytes are not
+rescanned indefinitely, so the operation remains linear without a second component allocation.
+
+Gate short paths, deep paths, repeated `..`, root clamping, repeated separators, and long UTF-8
+components. Require one payload allocation, zero final full-output copy, byte-identical output, and
+no more than 3% regression for already-normal short paths.
+
+### 6.6 MEASURE FIRST — repeated-needle plan hoisting and JSON escape scan
+
+For one search, keep `memchr::memmem`. For a pipeline applying the same loop-invariant needle to many
+strings, the one-shot API rebuilds a Finder/FinderRev each call. Probe preparing the same memchr
+finder once outside the loop, especially for many haystacks of 0/1/7/15/31/63/64/128 bytes and
+needles of 1/2/4/8/16/32 bytes. Implement this as MIR/runtime plan hoisting first; do not add a public
+Pattern type unless a real dynamic consumer cannot use compiler hoisting.
+
+`builder_write_json_str` still scans escape-free long content byte by byte. A scalar prefix followed
+by a block classifier for quote, backslash, or `<0x20` may help long strings, but per-write ABI and
+allocation dominate short records. Gate escape-free, sparse, and dense inputs; a short scalar path
+is mandatory, and the existing scalar encoder remains the differential oracle.
+
+### 6.7 ALREADY PLANNED — do not duplicate
+
+- exact-final Base64/hex allocation and the independent Base64/hex SIMD gates: document 12 §6.3/8.2;
+- JSON Vec-to-final allocator measurement: roadmap wave 3;
+- runtime bitcode for short `str_eq`/`str_cmp`/hash wrappers: M14 ceiling probe;
+- direct template/encode-to-writer Sink vocabulary: consumer-gated open design;
+- no general SSO, string interning, or automatic global allocator replacement.
+
+## 7. Array paths already shaped well
+
+- fixed arrays are Copy stack aggregates; dynamic arrays are Move `{ptr,len}` owners and slices are
+  Copy views. A subslice is pointer arithmetic plus a new header, with no allocation/copy.
+- reductions are one fused counted loop with no intermediate array.
+- `to_array`/`scan` allocate the source upper bound once and fill it in one loop; there is no growth
+  or final right-size copy. Lazy pages make low selectivity less costly than the virtual capacity
+  suggests.
+- `map_into` performs no allocation and carries scoped source/destination alias facts.
+- optimized mapped materializers have a scalar fallback (`min.iters.check`) rather than forcing SIMD
+  setup on short arrays. Identity materialization can become `llvm.memcpy`.
+- `array_builder` grows from capacity four by checked doubling and hands its realloc-compatible
+  payload to `array<T>` without copying.
+- two full-capacity `partition` outputs avoid a second predicate pass and preserve independent
+  ownership. Do not add a count pass or a shared allocation without a measured win and new owner
+  model.
+
+## 8. Array allocation, copying, and IR opportunities
+
+### 8.1 CONFIRMED P1 — make `array_builder` cheap when it is tiny
+
+`array_builder_new` always boxes the header; the first push separately reallocates backing storage
+([runtime](../../crates/align_runtime/src/lib.rs#L7652)). A dynamic push loop also retains one opaque
+`align_rt_array_builder_push` call per element, so LLVM cannot turn it into bulk/vector stores. Empty
+builders therefore allocate once, 1–4 elements allocate twice, and larger loops remain ABI-bound.
+
+Separate refinements:
+
+1. Mark `align_rt_array_builder_new` with the same audited allocator attributes as `builder_new`.
+   The declaration is currently registered without `mark_alloc_like`
+   ([codegen](../../crates/align_codegen_llvm/src/lib.rs#L1223)). This is hygiene, not the main speedup.
+2. Probe an entry-alloca/by-value header for a proven nonescaping local, retaining boxed headers for
+   escaping values. Payload allocation and pointer stability remain unchanged.
+3. Prefer existing bulk `append(slice)` whenever a source slice exists.
+4. Feed future internal `Exact/AtMost` cardinality into one reserve/direct-fill plan. Do not add a
+   user capacity parameter merely because the compiler lacks that summary today.
+
+Gate 0–4 elements on one fewer allocation and at least 15% allocator-inclusive improvement; 1K/1M
+append and push controls may not regress over 3%. Pin optimized IR for no per-element call only in
+the direct-fill/bulk case — header attributes alone cannot remove it.
+
+### 8.2 CONFIRMED P1 — virtualize `chunks` for direct consumers
+
+`align_rt_chunks` allocates `ceil(len/n) * 16` bytes and fills every `{ptr,len}` header
+([runtime](../../crates/align_runtime/src/lib.rs#L1348)). MIR materializes this before `.len`, index,
+or a following pipeline ([MIR](../../crates/align_mir/src/lib.rs#L2918)). Thus one short chunk pays a
+heap allocation, while `chunks(1)` on a large input writes an entire metadata array that the next
+loop immediately rereads.
+
+Represent a nonescaping chunk source as `(base, source_len, chunk_len, chunk_count)` and compute each
+view in SSA:
+
+```text
+start = i * chunk_len
+ptr   = base + start * element_size
+len   = min(chunk_len, source_len - start)
+```
+
+Fold `.len()` to `chunk_count`, direct index to one view, and feed pipeline/par_map consumers without
+headers. A bound `cs := xs.chunks(n)` may continue to materialize until the language question in
+section 10 is settled. Gate on allocation 1→0, no `N*16` header stores, source-region correctness,
+and byte-identical final partial chunks. Document 11's later explicit-parallel result elision is
+related but does not by itself remove these producer headers.
+
+### 8.3 CONFIRMED P1 — write str-group results directly into existing outputs
+
+Generated str-key group-by already allocates `out_keys` and `out_vals` at the row-count upper bound.
+The runtime nevertheless accumulates into `reprs: Vec<AlignStr>` and `acc: Vec<i64>`, then copies both
+into those outputs ([runtime](../../crates/align_runtime/src/lib.rs#L3105)). For a single aggregate,
+write a representative and seed directly at `out_[id]` on a vacant hash entry, then update
+`out_vals[id]` on hits. This removes two internal Vec allocations and two final copies without
+changing the hash table or output ownership.
+
+`dict_encode` similarly stages dictionary representatives in a Vec before copying to its already
+allocated dictionary buffer ([runtime](../../crates/align_runtime/src/lib.rs#L3449)); write them
+directly. Multi-aggregate group-by deliberately keeps a row-major accumulator for update locality,
+so do not scatter it into K output streams without measurement. It can still avoid allocating
+`ops`/`val_offs` Vecs from the call's already-present specs.
+
+Add a small-N strategy probe: for `n <= 8/16`, a linear scan over the caller output may beat a heap
+HashMap. This remains measure-first and must include duplicate-heavy and all-distinct inputs.
+
+### 8.4 MEASURE FIRST — pool large constant array literals
+
+A 256-element immutable local i64 literal read through a runtime index still produced a
+`[256 x i64]` entry alloca and 128 vector stores after O2. The literal lowering stores each element
+individually ([MIR](../../crates/align_mir/src/lib.rs#L3758)).
+
+Prefer the already-recorded top-level aggregate-constant feature first. Its backend mechanism can
+emit `private unnamed_addr constant` storage. Then measure an extension for local all-constant
+literals:
+
+- immutable/non-address-mutated local: read the pooled constant directly;
+- mutable large local: one memcpy from a constant template;
+- short local: retain inline stores when they are smaller/faster;
+- runtime-valued, Move-element, explicitly aligned, or address-sensitive cases remain on the
+  existing path.
+
+Sweep 1..4096 elements around L1/code-size/frame thresholds. Require at least 15% on the positive
+large case, no O(N) store sequence, and <=3% regression below the chosen cutoff.
+
+### 8.5 ALREADY PLANNED — keep one owner
+
+- replace O(n²) sort/sort_by_key with stable O(n log n), retaining insertion sort as the tiny base
+  case and decorating keys once;
+- donate a uniquely owned unbound temporary buffer to compatible map/where/scan materialization:
+  document 10 §8.1; extend to sort only through the same ownership proof;
+- SIMD stable compaction for selective materializers: document 12, measure first;
+- redundant `.to_array().sum()` lint/legality-aware elision: document 12;
+- whole-range `par_map` and explicit-parallel terminal elision: document 11;
+- exact/AtMost cardinality and `range(n)` are already consumer-gated design work.
+
+## 9. Allocation/copy matrix
+
+| Operation | Payload allocations today | Full payload copies after production | Target shape |
+|---|---:|---:|---|
+| empty `str.clone()` | 0 | 0 | keep |
+| nonempty `str.clone()` | 1 | 1 input→final | keep; ownership requires it |
+| `builder.to_string()` | header + Vec + final | 1 Vec→final | compatible grow buffer, zero-copy freeze |
+| template in arena | header + Vec + arena | 1 Vec→arena | direct arena/sink fill after ownership settlement |
+| template outside arena | header + Vec leaked | 0 after freeze, but never freed | remove process-lifetime leak |
+| `path.join` | 1 exact final | two input runs→final | keep; add checked total length with document-12 hardening |
+| `path.normalize` | components + output Vec + final | output Vec→final | one final allocation/direct fill |
+| `fs.read_dir` N names | Vec-of-Vec staging + N final + header | each name staging→final | N final + header, no payload staging |
+| Base64/hex encode | Vec + final | Vec→final | document 12 exact destination |
+| JSON decoded string field | 0 per field | 0 | keep zero-copy view |
+| JSON decoded array | parser Vec + final | Vec→final | already-planned measure-first |
+| `to_array` | 1 output | source→output fill | keep; donation only for proven unique temporary |
+| `partition` | 2 outputs | one store per source element | keep baseline |
+| `array_builder.build()` | header + grow payload | 0 | remove nonescaping header allocation; keep freeze |
+| `chunks` | 1 header array | header fill then consumer read | virtualize when not stored |
+| str-key single group | 2 result + HashMap + 2 staging Vecs | 2 staging→result | direct result accumulation |
+
+## 10. Questions for Claude Code — not decisions
+
+The user explicitly asked that language-spec changes remain optional. No syntax or semantic change is
+adopted by this audit. Ask Claude Code to compare the following against One way, Nothing hidden,
+predictable performance, and inferred regions:
+
+1. **Where does a template result live?** Should `template`/`json.encode` require an arena when their
+   result is `str`, produce an owned `string`, or become contextual Sink producers when immediately
+   consumed? Which option removes arena-free lifetime leaks without creating a second text-building
+   mechanism?
+2. **What does `.to_array()` promise?** Is it a guaranteed fresh physical allocation, or a visible
+   owned result whose backing may be donated from a provably unique, unobservable temporary? The
+   latter would legitimize document 10's planned donation without new syntax.
+3. **Is `chunks` a virtual pipeline stage or an eagerly owned array?** Prefer compiler elision for
+   direct consumers first. Only consider requiring `.to_array()` for storage if that makes the
+   source model materially clearer and the compatibility cost is acceptable.
+4. **Should `split` start virtual?** The already-specified but unimplemented ideal result is borrowed
+   `array<str>` views, never copied owned substrings. Could `split(...).where/map/reduce` be a virtual
+   source and materialize headers only at `.to_array()`?
+5. **Does `array_builder` need a capacity surface?** First evaluate internal Exact/AtMost inference,
+   bulk append, and nonescaping headers. Add `array_builder(capacity)` only if real consumers still
+   show realloc-bound behavior that inference cannot express.
+6. **Does repeated dynamic search need a visible compiled Pattern?** First try loop-invariant
+   memmem Finder hoisting with no language change. A new type is justified only if profiling shows a
+   common case the compiler cannot safely recognize.
+7. **Resolve existing clone text drift.** Some prose suggests arena-local clone allocation, while
+   implementation and escape examples require `str.clone()` to be heap-owned and returnable. Decide
+   and make the documents agree; this audit does not recommend changing the current heap behavior.
+
+The default answer should be “implementation-only” wherever ownership and result identity are not
+observable. Do not add SSO, hidden small-vector storage, a second concatenation operator, automatic
+AoS/SoA conversion, or a second substring-search algorithm.
+
+## 11. Implementation sequence
+
+### C0 — invariants and resource ownership
+
+1. Enforce UTF-8 range boundaries and ship the specified zero-cost `s.bytes()` view.
+2. Enforce the settled `str + str` hard error and correct stale tests/docs.
+3. Add owned expression temporaries/synthetic owners with view-aware liveness; close string, array,
+   chunks, and builder direct-consumer leaks.
+4. Remove definite-null destructor calls after the ownership dataflow is trustworthy.
+5. Settle arena-free template/json.encode ownership; immediately fold static-only templates and
+   direct obvious sinks where semantics already permit it.
+6. Complete document 12's checked dynamic allocation-size arithmetic.
+
+### P1 — short fixed costs
+
+1. Borrow filesystem/path ABI strings and construct C strings directly.
+2. Add the audited `array_builder_new` allocator attributes.
+3. Run M14's already-planned runtime-bitcode ceiling probe on short string equality/order/hash.
+4. Establish the UTF-8 scalar/SIMD crossover per target.
+5. Prototype nonescaping builder/array-builder headers separately from payload changes.
+
+### P2 — remove proven staging
+
+1. Make owned builder freeze allocator-compatible and zero-copy.
+2. Virtualize direct-consumer `chunks`.
+3. Write single str-group and dictionary outputs directly.
+4. Direct-fill `path.normalize`, `read_dir`, and DNS final payloads.
+5. Execute document 12's codec exact-destination slice and the roadmap JSON-copy probe.
+
+### P3 — larger portfolios after measurement
+
+1. Replace large sorting while retaining the tiny insertion base case.
+2. Pool large constant array literals after the top-level aggregate-constant surface exists.
+3. Run unique-buffer donation, repeated-needle plan, JSON escape scan, and short-N group strategy
+   gates independently.
+
+## 12. Regression and IR gates
+
+Correctness/resource mutations must fail when any of the following is removed:
+
+- UTF-8 start/end continuation-byte check;
+- hard error for `str + str`;
+- synthetic owner/drop for an unbound Move temporary;
+- owner lifetime extension for a borrowed result view;
+- arena-free template ownership/diagnostic rule once settled.
+
+IR gates:
+
+- no allocation for static-only template, string subview, slice, trim, or direct chunk `.len()`;
+- no `*_free(null)` for definitely moved slots;
+- direct-consumer chunks contain no header allocation or `N*16` header-store loop;
+- bulk/direct array builder contains no per-element push call;
+- str-group single aggregate contains no accumulator/representative staging copies;
+- mapped materializers retain `min.iters.check` and a scalar short path;
+- large constant-array positive case uses a private constant and direct read/one memcpy, while the
+  short control retains the winning inline shape.
+
+Benchmark adoption requires the matrix in §4.2, balanced AB/BA, allocation/copy counters, optimized
+IR, and a negative workload. Large-input throughput never excuses a short-input regression, and a
+short microbenchmark never justifies code-size or memory-traffic loss at scale.
+
+## 13. Relationship to existing records
+
+- document 10 owns artifact caching, unique temporary donation, AoS→SoA blocking, and cache-sensitive
+  benchmark methodology;
+- document 11 owns parallel correctness, range kernels, scheduler contention, and explicit-parallel
+  terminal elision;
+- document 12 owns allocation arithmetic, arena initialized-before-read classes, exact codecs,
+  stream compaction, I/O syscall paths, and SIMD portfolio rules;
+- the roadmap owns M14 runtime bitcode, hybrid sort replacement, tiny par-map startup, and the JSON
+  double-allocation probe;
+- `open-questions.md` remains the sole decision ledger. Section 10 above must be copied there only
+  after a real decision, not because this audit asked the question.
+
+The new contribution of document 13 is the short-input evidence and the confirmed ownership/copy
+gaps: UTF-8 slicing, settled concat enforcement, arena-free template lifetime, unbound temporary
+drop, known-null drops, borrowed ABI paths, builder/array-builder headers and freeze, virtual chunks,
+direct str-group outputs, direct path normalization, staged name/IP payloads, and large constant-local
+initialization.

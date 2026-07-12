@@ -63,7 +63,7 @@ How many owned strings exist now?
 ```align
 fn shout(name: str) -> string {
     arena {
-        s := "hey, " + name + "!"
+        s := template "hey, {name}!"
         return s.clone()
     }
 }
@@ -71,7 +71,7 @@ fn shout(name: str) -> string {
 print(shout("align"))
 ```
 
-**A8.** `hey, align!`. Inside `arena { }`, the `+` concatenations allocate freely — into the arena. At `}`, the whole arena frees in one motion. The `.clone()` copied the survivor out first.
+**A8.** `hey, align!`. Inside `arena { }`, the template allocates into the arena. At `}`, the whole arena frees in one motion. The `.clone()` copied the survivor out first. String `+` is a compile error; a builder is the one concatenation path.
 
 ---
 
