@@ -87,6 +87,7 @@ Stage responsibilities and IR-boundary details in `01-pipeline.md`.
 10-cache-first-optimization.md  cache identity, incremental-build, and CPU-locality audit
 11-parallel-execution-optimization.md  parallel correctness, low-lock runtime, and range-IR audit
 12-pipeline-closure-memory-io-simd-audit.md  pipeline legality, closure ABI/lifetime, allocation, I/O, and SIMD audit
+13-string-array-allocation-short-input-audit.md  text/array ownership, copy counts, and short-input audit
 ```
 
 ## Invariants (upheld in the implementation too)
