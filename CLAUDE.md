@@ -55,7 +55,8 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 
 > **2026-07-13 audit correction:** M6's masked vector *shape* remains shipped, but post-`where`
 > callable legality is a P0 and the ordinary sequential effect contract is unsettled. M9's portable
-> `io.copy` is memory-bounded but skips buffered-reader lookahead, another P0. Read
+> `io.copy` lookahead P0, the closure-result region gap, and the Unit indirect-call ABI mismatch are
+> fixed and regression-pinned in `docs/impl/source-correctness-fixes-2026-07-13.md`. Read
 > `docs/impl/12-pipeline-closure-memory-io-simd-audit.md` before touching either optimization path.
 
 - **Where things are:** spec = `draft.md` (authoritative). Design rationale + decisions = `docs/*.md` (`open-questions.md` Settled is locked). Implementation plan + milestone truth = `docs/impl/00–07`; std module design specs = `docs/impl/std-design/*.md`; core library surface docs (shipped signatures + drift vs §18.1) = `docs/impl/core-design/*.md`. The Rust workspace under `crates/` (all 10 crates per `docs/impl/00-overview.md`) flows end-to-end `lexer → parser → sema → MIR → LLVM → executable`; `cargo build` / `cargo test` are green.

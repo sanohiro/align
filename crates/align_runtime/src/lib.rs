@@ -4991,39 +4991,42 @@ pub unsafe extern "C" fn align_rt_io_copy(r: *mut Reader, w: *mut Writer) -> i64
     if r.is_null() || w.is_null() {
         return -(AL_INVALID as i64);
     }
-    let rfd = unsafe { (*r).fd };
     // A fixed 64 KiB transfer buffer (matches `BUF_WRITER_CAP`) — the point is O(buffer) memory,
     // independent of the file size. `try_reserve` so a hostile/OOM environment fails softly
     // (EINVAL) instead of aborting the process.
-    let mut buf: Vec<u8> = Vec::new();
-    if buf.try_reserve_exact(BUF_WRITER_CAP).is_err() {
+    let mut data: Vec<u8> = Vec::new();
+    if data.try_reserve_exact(BUF_WRITER_CAP).is_err() {
         return -(AL_INVALID as i64);
     }
-    buf.resize(BUF_WRITER_CAP, 0);
+    let mut buf = Buffer { data, cap: BUF_WRITER_CAP, len: 0 };
 
     // Fast-path dispatch site (post-M9): on Linux, if `rfd` is a regular file and `w`'s fd is a
     // pipe/socket, a `sendfile`/`splice` loop would replace the read+write below — same result,
     // same O(buffer) bound, no signature change. v1 always takes the portable loop.
     let mut total: i64 = 0;
     loop {
-        let n = unsafe { read(rfd, buf.as_mut_ptr() as *mut core::ffi::c_void, BUF_WRITER_CAP) };
+        // `reader_read` appends into the supplied Buffer. Reuse this allocation as a fresh transfer
+        // chunk each time; otherwise later reads grow the buffer and `writer_write` keeps sending
+        // bytes from its beginning instead of the newly appended chunk.
+        buf.len = 0;
+        // Go through the reader's one read path rather than reading its fd directly. In particular,
+        // a buffered reader may hold bytes that a preceding `read_line` fetched past its terminator;
+        // those lookahead bytes are logically next in the stream and must be copied before fd-fresh
+        // bytes (or before reporting EOF).
+        let n = unsafe { align_rt_io_reader_read(r, &mut buf) };
         if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue; // interrupted before reading: retry
-            }
-            return -(io_error_to_status(&e) as i64);
+            return n; // already encoded as `-(status)` by the shared reader path
         }
         if n == 0 {
             break; // EOF
         }
         // Route the chunk through the writer so buffering + partial-write + EINTR handling is the
         // one shared implementation.
-        let s = unsafe { align_rt_io_writer_write(w, buf.as_ptr(), n as i64) };
+        let s = unsafe { align_rt_io_writer_write(w, buf.data.as_ptr(), n) };
         if s != 0 {
             return -(s as i64);
         }
-        total = total.saturating_add(n as i64);
+        total = total.saturating_add(n);
     }
     total
 }
@@ -5329,13 +5332,35 @@ pub unsafe extern "C" fn align_rt_buffer_append(b: *mut Buffer, ptr: *const u8, 
         return;
     }
     let b = unsafe { &mut *b };
-    b.data.truncate(b.len);
-    if let Ok(n) = usize::try_from(len)
+    if let Ok(n) = safe_len(len)
         && n > 0
         && !ptr.is_null()
     {
-        let src = unsafe { core::slice::from_raw_parts(ptr, n) };
-        b.data.extend_from_slice(src);
+        // `b.append(b.bytes())` is a valid copy operation. Its source pointer aliases `b.data`, and
+        // `extend_from_slice` may reallocate that Vec before copying, which would otherwise leave the
+        // source slice dangling (a use-after-free). Detect any overlap with the current allocation
+        // by address and snapshot it before truncate/growth. The ordinary non-aliasing path remains
+        // allocation-free apart from the Vec's own required growth.
+        let src_start = ptr as usize;
+        let src_end = src_start.checked_add(n);
+        let buf_start = b.data.as_ptr() as usize;
+        let buf_end = buf_start.checked_add(b.data.capacity());
+        let aliases_buffer = matches!(
+            (src_end, buf_end),
+            (Some(se), Some(be)) if src_start < be && buf_start < se
+        );
+        let snapshot =
+            aliases_buffer.then(|| unsafe { core::slice::from_raw_parts(ptr, n) }.to_vec());
+
+        b.data.truncate(b.len);
+        if let Some(src) = snapshot {
+            b.data.extend_from_slice(&src);
+        } else {
+            let src = unsafe { core::slice::from_raw_parts(ptr, n) };
+            b.data.extend_from_slice(src);
+        }
+    } else {
+        b.data.truncate(b.len);
     }
     b.len = b.data.len();
     b.cap = b.cap.max(b.len);
@@ -6733,6 +6758,15 @@ pub extern "C" fn align_rt_len_mismatch_fail(dst_len: i64, src_len: i64) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_range_fail(start: i64, end: i64, len: i64) -> ! {
     eprintln!("align: panic: slice range out of bounds: {start}..{end} is not within length {len}");
+    std::process::abort();
+}
+
+/// A `str` range endpoint split a UTF-8 scalar value. Every safe `str` operation relies on the
+/// invariant that its view contains valid UTF-8, so this is a hard bounds-like failure rather than
+/// constructing an invalid sub-view.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_utf8_boundary_fail(index: i64, len: i64) -> ! {
+    eprintln!("align: panic: string slice index {index} is not a UTF-8 boundary within length {len}");
     std::process::abort();
 }
 

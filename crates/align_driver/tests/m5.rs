@@ -1324,6 +1324,35 @@ fn str_range_slice_out_of_bounds_aborts() {
 }
 
 #[test]
+fn str_range_slice_accepts_utf8_scalar_boundaries() {
+    if !backend_available() {
+        return;
+    }
+    // Byte indices at every scalar boundary remain valid for 1/2/3/4-byte UTF-8 scalars.
+    let src = "fn main() -> i32 {\n  s := \"aé日🦀z\"\n  print(s[0..1])\n  print(s[1..3])\n  print(s[3..6])\n  print(s[6..10])\n  print(s[10..])\n  print(s[..])\n  return 0\n}\n";
+    let out = build_and_run("str-range-utf8-boundaries", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\né\n日\n🦀\nz\naé日🦀z\n");
+}
+
+#[test]
+fn str_range_slice_rejects_split_utf8_scalar() {
+    if !backend_available() {
+        return;
+    }
+    for (name, range) in [("start", "2..3"), ("end", "1..2")] {
+        let src = format!("fn main() -> i32 {{\n  s := \"aéz\"\n  print(s[{range}])\n  return 0\n}}\n");
+        let out = build_and_run(&format!("str-range-utf8-{name}"), &src);
+        assert_ne!(out.status.code(), Some(0), "a range that splits a UTF-8 scalar must abort");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not a UTF-8 boundary"),
+            "expected a UTF-8-boundary panic, got: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn array_range_slice_inverted_bounds_aborts() {
     if !backend_available() {
         return;

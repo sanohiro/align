@@ -30,6 +30,23 @@ fn reassign_fn_value_same_signature() {
 }
 
 #[test]
+fn dynamically_selected_unit_fn_value_uses_the_selected_target() {
+    if !backend_available() {
+        return;
+    }
+    // Keep both targets live through optimization: the selected function depends on runtime argv.
+    // Unit-returning fn-value thunks use LLVM `void`, so the indirect call must use the same ABI.
+    let src = "fn first() { print(1) }\nfn second() { print(2) }\n\nfn main(args: array<str>) -> Result<(), Error> {\n  mut f := first\n  if args.len() > 1 { f = second }\n  f()\n  return Ok(())\n}\n";
+    let first = build_and_run_args("fv-unit-dynamic-first", src, &[]);
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&first.stdout), "1\n");
+
+    let second = build_and_run_args("fv-unit-dynamic-second", src, &["choose-second"]);
+    assert_eq!(second.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&second.stdout), "2\n");
+}
+
+#[test]
 fn higher_order_named_fn() {
     if !backend_available() {
         return;

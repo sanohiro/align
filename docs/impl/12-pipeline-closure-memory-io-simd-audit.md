@@ -1,8 +1,13 @@
 # Pipeline, closure, memory, I/O, and SIMD audit
 
-Status: **RECORDED 2026-07-13; implementation not started.** This is the durable follow-up to
+Status: **RECORDED 2026-07-13; partially implemented 2026-07-13.** The closure-result environment
+region gap (§3.4), Unit indirect-call ABI defect (§3.5), and buffered `io.copy` data loss (§3.6) are
+fixed and regression-pinned; the other
+correctness and performance items remain open. This is the durable follow-up to
 [`10-cache-first-optimization.md`](10-cache-first-optimization.md) and
-[`11-parallel-execution-optimization.md`](11-parallel-execution-optimization.md). It answers five
+[`11-parallel-execution-optimization.md`](11-parallel-execution-optimization.md); the corrective
+wave is summarized in [`source-correctness-fixes-2026-07-13.md`](source-correctness-fixes-2026-07-13.md).
+It answers five
 questions together because the profitable changes cross their boundaries: pipeline legality decides
 whether LLVM may vectorize; closure representation decides whether the loop stays visible; allocation
 policy decides how much memory is touched; and blocking I/O decides whether parallel workers make
@@ -42,10 +47,13 @@ come before further SIMD or parallel widening:
 2. The implementation documents say ordinary pipeline callables are Pure, while the normative spec
    constrains only `par_map` and the compiler accepts Impure sequential stages. Optimizations cannot
    assume a premise the language has not settled.
-3. `spawn` can retain a view backed by an inner arena until after that arena is freed; a first-class
-   closure call can likewise return its captured arena view past the arena boundary.
-4. An indirect `() -> ()` call is emitted with an `i32` return type while its thunk is `void`.
-5. `io.copy` reads the fd directly and skips bytes already held in a buffered reader's lookahead.
+3. `spawn` can retain a view backed by an inner arena until after that arena is freed. The related
+   first-class closure-result escape is **FIXED 2026-07-13** by including the callee environment's
+   region in an indirect call result.
+4. ~~An indirect `() -> ()` call was emitted with an `i32` return type while its thunk was `void`.~~
+   **FIXED 2026-07-13.**
+5. ~~`io.copy` read the fd directly and skipped bytes already held in a buffered reader's
+   lookahead.~~ **FIXED 2026-07-13.**
 
 Separately, generated dynamic allocation byte counts use unchecked signed multiply/add. A concrete
 safe-source exploit was not established, so this is **REQUIRED hardening**, not a confirmed P0.
@@ -242,9 +250,9 @@ region-bearing captured value to outlive that group. Snapshotting a view is not 
 positive coverage for frame/static/outer-arena captures and negative coverage for every inner arena,
 including captures wrapped in structs, tuples, Option/Result, and another closure.
 
-### 3.4 CONFIRMED P0 — closure-call results ignore the closure environment's region
+### 3.4 FIXED 2026-07-13 — closure-call results include the closure environment's region
 
-This shape also passes `check` and uses `v` after `arena_end`:
+At the audit baseline this shape passed `check` and used `v` after `arena_end`:
 
 ```align
 fn main() -> i32 {
@@ -258,21 +266,21 @@ fn main() -> i32 {
 }
 ```
 
-`region_of(CallFnValue)` folds only the explicit arguments
-([lines 3585-3590](../../crates/align_sema/src/lib.rs#L3585)); a zero-argument call is consequently
-`Static`, even though its result borrows the captured environment. Conservatively fold the callee's
-region into the result as well. A future function-type return-borrow summary can recover precision;
-the safe default must not be `Static`.
+`region_of(CallFnValue)` used to fold only the explicit arguments; a zero-argument call was
+consequently `Static`, even though its result could borrow the captured environment. It now seeds
+that fold with the callee's region, then shortens it with every argument. A regression test rejects
+the zero-argument arena-capture reproduction above. A future function-type return-borrow summary can
+recover precision; the safe default is no longer `Static`.
 
 This is distinct from the existing test that prevents the closure value itself from escaping an
 arena: here the closure is called inside the arena and only its returned view escapes.
 
-### 3.5 CONFIRMED P0 — Unit-returning indirect-call ABI mismatch
+### 3.5 FIXED 2026-07-13 — Unit-returning indirect-call ABI mismatch
 
-A Unit-returning function and its function-value thunk are declared as LLVM `void`, but
-`Rvalue::CallIndirect` asks `scalar_type(Unit)` for a value type and constructs an `i32`-returning call.
-This complete source emits the mismatch in raw IR (a two-target runtime selection keeps it in
-optimized IR as the negative/devirtualization control):
+At the audit baseline a Unit-returning function and its function-value thunk were declared as LLVM
+`void`, but `Rvalue::CallIndirect` asked `scalar_type(Unit)` for a value type and constructed an
+`i32`-returning call. This complete source emitted the mismatch in raw IR (a two-target runtime
+selection kept it in optimized IR as the negative/devirtualization control):
 
 ```align
 fn noop() {}
@@ -284,7 +292,7 @@ fn main() -> i32 {
 }
 ```
 
-Raw IR contains the incompatible pair:
+At the audit baseline, raw IR contained the incompatible pair:
 
 ```llvm
 define private void @"noop$fnval"(ptr %env)
@@ -292,23 +300,23 @@ define private void @"noop$fnval"(ptr %env)
 %r = call i32 %selected(ptr %env)
 ```
 
-Opaque pointers prevent the verifier from rejecting the mismatch. A dynamically selected target keeps
-the bad call after optimization. The relevant sites are the Unit-aware function declaration
+Opaque pointers prevented the verifier from rejecting the mismatch. A dynamically selected target kept
+the bad call after optimization. The relevant sites were the Unit-aware function declaration
 ([`declare_fn`](../../crates/align_codegen_llvm/src/lib.rs#L2852)), the closure thunk
 ([around line 1900](../../crates/align_codegen_llvm/src/lib.rs#L1900)), and the non-Unit-aware indirect
 call ([around line 6501](../../crates/align_codegen_llvm/src/lib.rs#L6501)).
 
-The spawn trampoline already has the correct precedent: call a Unit thunk as `void`, then synthesize
-the internal dummy value only where storage requires it
-([around line 2046](../../crates/align_codegen_llvm/src/lib.rs#L2046)). Apply that rule to ordinary
-indirect calls and add raw/optimized IR plus runtime tests with a target selected at runtime.
+The fix follows the spawn-trampoline precedent: ordinary Unit `CallIndirect` now constructs a
+`void(env, args...)` function type, emits a void call, and returns no MIR value to store. The raw-IR
+test pins `call void` and rejects `call i32`; an integration test selects between two Unit targets
+from runtime argv and executes both paths.
 
-### 3.6 CONFIRMED P0 — `io.copy` skips buffered-reader lookahead
+### 3.6 FIXED 2026-07-13 — `io.copy` preserves buffered-reader lookahead
 
-`Reader` may hold unread bytes in `buf[start..filled]` after `read_line`. Ordinary `reader.read`
-drains that lookahead before reading the fd, but `align_rt_io_copy` reads `Reader.fd` directly
-([copy loop around lines 4990-5022](../../crates/align_runtime/src/lib.rs#L4990)). The fd offset has
-already advanced past the lookahead, so this sequence loses data:
+`Reader` may hold unread bytes in `buf[start..filled]` after `read_line`. At the audit baseline,
+ordinary `reader.read` drained that lookahead before reading the fd, but `align_rt_io_copy` read
+`Reader.fd` directly. The fd offset had already advanced past the lookahead, so this sequence lost
+data:
 
 ```align
 import std.fs
@@ -325,11 +333,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }
 ```
 
-Drain `buf[start..filled]` through the writer first, update `start` and the returned byte count, and
-only then enter the fd loop or any future sendfile/splice path. A fast path is legal only when the
-lookahead is empty. Add a byte-exact test whose first `read_line` causes payload beyond the newline to
-be prefetched, then assert `io.copy` emits every remaining byte exactly once; cover empty lookahead,
-final short data, buffered/unbuffered writers, errors, and totals.
+`align_rt_io_copy` now goes through the shared `align_rt_io_reader_read` path for every chunk. That
+path drains `buf[start..filled]` first, advances `start`, and only then reads fresh fd bytes; the
+shared writer path and returned byte total are unchanged. The regression test uses `AB\nCDEFG`,
+consumes the first line, then proves that copy returns `5` and writes exactly `CDEFG`. Any future
+sendfile/splice path must retain the same precondition: it may start only after lookahead is empty.
 
 ### 3.7 REQUIRED HARDENING — check allocation byte arithmetic before allocator work
 
@@ -650,7 +658,7 @@ whose chunk-vector growth may free old metadata.
 | `fs.read_file_view` / bytes view | any nonzero regular file may mmap; zero/special/failure falls back to arena copy | same arena-scoped mmap path; no payload copy | **GOOD** copy avoidance, not nonblocking I/O: string view immediately UTF-8-scans/faults pages; bytes view may fault later |
 | buffered `writer` | accumulates into 64 KiB, amortizing syscalls | flushes then writes a chunk >=64 KiB directly, avoiding double copy | **GOOD** for both sizes; `print` remains the deliberately slow debug rail |
 | buffered `reader.read_line` | `memchr` finds newline; one payload append per lookahead span | 64 KiB lookahead; long lines may append several spans and reallocate while growing | **GOOD** baseline; scoped zero-copy line callback is already planned if copying dominates |
-| `io.copy` | one 64 KiB allocation per call; final short write may enter writer buffer | portable fixed 64 KiB read/write loop | Memory-bounded, but **incorrect after buffered lookahead** (P0 §3.6); fix before syscall fast paths |
+| `io.copy` | one 64 KiB allocation per call; final short write may enter writer buffer | portable fixed 64 KiB shared-reader/shared-writer loop | Memory-bounded and **byte-correct after buffered lookahead** (fixed §3.6) |
 | `file.pread/pwrite` | one synchronous positional syscall/loop | caller-selected buffer size; pwrite handles partial writes | Correct, but blocks the calling OS thread; no batch/vectored surface today |
 | `http.get_many` | per-request allocations matter | bounded dedicated blocking threads overlap latency; input-order slots | Correct concurrency shape; request construction has one removable copy |
 
@@ -685,7 +693,7 @@ blocking calls, CPU helper starvation, p50/p99, and file/network throughput unde
 
 ### 7.3 Already-planned large-transfer work
 
-After section 3.6 makes buffered lookahead byte-exact, keep the portable `io.copy` loop as the oracle,
+Now that section 3.6 makes buffered lookahead byte-exact, keep the portable `io.copy` loop as the oracle,
 then dispatch by descriptor kind:
 
 - Linux file->socket/pipe: `sendfile`/`splice`; file->file where valid: `copy_file_range`;
@@ -838,7 +846,7 @@ Do not count the following as new findings from this audit:
 - Base64 SIMD as an encoding backlog item.
 
 New here are the `where` speculation reproduction and legality split, the ordinary-stage normative
-effect conflict, two closure-region UAFs, Unit indirect-call ABI mismatch, buffered-`io.copy` data loss,
+effect conflict, two closure-region UAFs (the closure-result half now fixed), Unit indirect-call ABI mismatch, buffered-`io.copy` data loss,
 allocation byte-overflow hardening requirement, per-callsite initialized-before-read arena proof/gate,
 exact-final-destination codec fill, hex SIMD and macOS copy-path probes, HTTP request-copy removal, and
 sequential SIMD stream compaction.
@@ -867,8 +875,8 @@ match the settled contract; safe primitive positive cases retain vectorization.
 ### Slice P0b — closure lifetime and ABI
 
 - require spawn captures to outlive the task-group region;
-- include callee/environment region in an indirect call's result;
-- emit Unit indirect calls as `void`;
+- [x] include callee/environment region in an indirect call's result (2026-07-13);
+- [x] emit Unit indirect calls as `void` (2026-07-13);
 - wire the documented fallible spawn-lambda expected `Result` type;
 - retain document 11's closure-effect and scheduler-progress P0s in the same release gate.
 
@@ -877,8 +885,8 @@ mutation tests prove every new gate.
 
 ### Slice P0c — buffered copy correctness
 
-- drain `Reader` lookahead before the fd loop and before every syscall fast path;
-- add `read_line -> io.copy` byte/count/error regression tests.
+- [x] drain `Reader` lookahead before the fd loop (2026-07-13; future syscall fast paths retain the gate);
+- [x] add a `read_line -> io.copy` byte/count regression test (2026-07-13; injected-error expansion remains useful).
 
 **Completion:** the portable implementation is a byte-exact oracle from every reader state.
 

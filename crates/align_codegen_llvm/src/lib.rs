@@ -646,6 +646,15 @@ fn build_module<'c>(
             None,
         ),
     );
+    // A `str` range endpoint that splits a UTF-8 scalar: report `(index, len)` and abort (`-> !`).
+    funcs.insert(
+        "utf8_boundary_fail".to_string(),
+        module.add_function(
+            "align_rt_utf8_boundary_fail",
+            ctx.void_type().fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false),
+            None,
+        ),
+    );
     // Integer division/remainder by zero: report and abort (`-> !`). Codegen emits the
     // `divisor == 0` guard inline (see MIR `lower_int_div`) and calls this on the failing path.
     funcs.insert(
@@ -3040,6 +3049,7 @@ fn rt_contract(sym: &str) -> Option<RtContract> {
         "align_rt_bounds_fail"
         | "align_rt_len_mismatch_fail"
         | "align_rt_range_fail"
+        | "align_rt_utf8_boundary_fail"
         | "align_rt_div_fail"
         | "align_rt_process_exit"
         | "align_rt_process_abort" => Some(RtContract {
@@ -6506,9 +6516,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let mut param_meta: Vec<BasicMetadataTypeEnum> =
                     vec![self.ctx.ptr_type(AddressSpace::default()).into()];
                 param_meta.extend(param_tys.iter().map(|t| BasicMetadataTypeEnum::from(self.llvm_type(*t))));
-                let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
                 let mut argv: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env.into()];
                 argv.extend(args.iter().map(|o| inkwell::values::BasicMetadataValueEnum::from(self.operand(o))));
+                if *ret_ty == Ty::Unit {
+                    // Align `()` functions use LLVM `void`, including their env-ABI fn-value
+                    // thunks. Calling such a thunk through an `i32` signature is an ABI mismatch
+                    // that opaque pointers cannot verify, so keep the indirect call Unit-aware just
+                    // like the spawn trampoline above.
+                    let fn_ty = self.ctx.void_type().fn_type(&param_meta, false);
+                    self.builder
+                        .build_indirect_call(fn_ty, fn_ptr, &argv, "")
+                        .map_err(|e| self.err(e))?;
+                    return Ok(None);
+                }
+                let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
                 let cs = self
                     .builder
                     .build_indirect_call(fn_ty, fn_ptr, &argv, "icall")
@@ -7907,6 +7928,7 @@ mod tests {
         for sym in [
             "align_rt_bounds_fail",
             "align_rt_range_fail",
+            "align_rt_utf8_boundary_fail",
             "align_rt_div_fail",
             "align_rt_process_exit",
             "align_rt_process_abort",
@@ -8036,6 +8058,23 @@ mod tests {
     fn m0_emits_main_returning_i32() {
         let text = ir("fn main() -> i32 {\n  x := 1\n  return x\n}\n");
         assert!(text.contains("define i32 @main()"), "got:\n{text}");
+    }
+
+    #[test]
+    fn unit_fn_value_uses_void_indirect_call_abi() {
+        let text = ir("fn noop() {}\nfn main() -> i32 {\n  f := noop\n  f()\n  return 0\n}\n");
+        assert!(
+            text.contains("define private void @\"noop$fnval\"(ptr"),
+            "Unit thunk must return void:\n{text}"
+        );
+        assert!(
+            text.contains("call void %cf(ptr %ce)"),
+            "Unit fn value must be called through a void signature:\n{text}"
+        );
+        assert!(
+            !text.contains("call i32 %cf(ptr %ce)"),
+            "Unit fn value must not be called through an i32 signature:\n{text}"
+        );
     }
 
     #[test]

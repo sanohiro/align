@@ -19,6 +19,24 @@ fn par_map_pure_function() {
 }
 
 #[test]
+fn par_map_borrowed_call_source_is_not_freed() {
+    if !backend_available() {
+        return;
+    }
+    // A function call returning `slice<T>` lends the caller's storage. The parallel path must not
+    // classify every call expression as an owned temporary and free the stack-array pointer.
+    let src = "fn whole(xs: slice<i64>) -> slice<i64> = xs\nfn twice(x: i64) -> i64 = x * 2\nfn main() -> Result<(), Error> {\n  a := [1, 2, 3]\n  out := whole(a).par_map(twice)\n  print(out.sum())\n  return Ok(())\n}\n";
+    let out = build_and_run("pm-borrowed-call", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n");
+
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(!text.contains("drop_value"), "the borrowed par_map source must not be freed:\n{text}");
+}
+
+#[test]
 fn par_map_after_where() {
     if !backend_available() {
         return;

@@ -45,6 +45,25 @@ fn main() -> i32 {
     assert!(check_errs("callfnvalue-escape", src), "arena str escaping via an indirect call must be rejected");
 }
 
+#[test]
+fn arena_capture_returned_by_zero_arg_closure_is_rejected() {
+    let src = "\
+fn main() -> i32 {
+  v := arena {
+    n := 7
+    s := template \"hello {n}\"
+    f := fn { s }
+    f()
+  }
+  return v.len() as i32
+}
+";
+    assert!(
+        check_errs("callfnvalue-capture-result-escape", src),
+        "an indirect call result must not outlive the closure environment it can borrow"
+    );
+}
+
 // A direct call of the same borrow-returning function is (and stays) rejected — the control that
 // proves the indirect path was the only gap.
 #[test]

@@ -105,7 +105,8 @@ The lexer generates a statement-terminator token `END`. Rules:
 - If the last token on a line is of a kind that "can end a statement" (ident / literal / ) / ] / } / ? etc.),
   an implicit END is inserted at the newline.
 - However, if the next line starts with . or a binary operator, it is treated as a continuation and no END
-  is inserted (multi-line method chains).
+  is inserted (multi-line method chains). This includes `!=`; the lexer distinguishes it from a bare
+  unary `!`, which does start a new statement after a completed previous line.
 - An explicit ; is always an END. Used to cram multiple statements onto one line.
 - If a line ends with a binary operator / , / ( / { / -> etc., it is also a continuation (no END inserted).
 ```
@@ -174,6 +175,9 @@ variant    = ident ( "(" type ("," type)* ")" )?
 ```
 
 Disambiguation rule (parser): if the first element inside the block is `ident ":" type` it is a **struct**; if it is `ident` or `ident "(" ... ")"` it is a **sum type**. Mixing the two is not allowed (error). An empty block `Name {}` is an empty struct.
+
+Field names within one struct must be unique. Sema diagnoses the second occurrence before building
+the field lookup/layout table; the rule applies equally to concrete and generic structs.
 
 ```align
 User {

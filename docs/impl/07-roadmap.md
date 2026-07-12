@@ -1232,10 +1232,10 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   (peak `VmHWM` bounded via a stdout/stdin handshake), `tests/m9_io.rs` + `examples/io_copy.align` +
   runtime unit tests. Fast paths (`sendfile`/`splice`/mmap/`io_uring`) are explicitly **post-M9** —
   see that Future entry, unchanged in shape by this slice (the runtime marks the dispatch site).
-  **Audit correction (2026-07-13):** the original byte-exact tests start from an empty reader buffer.
-  `io.copy` reads the fd directly and skips unread lookahead retained by a prior `read_line`; fix and
-  test `read_line -> io.copy` before treating the portable loop as the fast-path oracle (`impl/12`
-  §3.6). The O(buffer) result remains valid.
+  **Audit correction (2026-07-13, FIXED):** the original byte-exact tests started from an empty
+  reader buffer. `io.copy` used to skip unread lookahead retained by a prior `read_line`; it now uses
+  the shared reader path, and a byte/count regression pins `read_line -> io.copy` before any future
+  fast path (`impl/12` §3.6). The O(buffer) result remains valid.
 - **Slice 3 — std.fs complete — DONE.** `write_file` (`str`/`bytes`/`builder`, the same three
   forms as `writer.write`), `exists` (a plain `bool` — every `stat` failure folds to `false`, never
   a `Result`), `remove`, `read_dir` (an **owned `array<string>`** — a new `PrimScalar::String` lets

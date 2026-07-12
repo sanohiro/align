@@ -2,13 +2,20 @@
 
 A living continuity note so a fresh Claude Code session — e.g. on a faster machine — can pick the
 work up immediately. **If you are a new session: read this, then `CLAUDE.md`, then
+`docs/impl/source-correctness-fixes-2026-07-13.md`, then
 `docs/impl/13-string-array-allocation-short-input-audit.md`, then
 `docs/impl/12-pipeline-closure-memory-io-simd-audit.md`, then `docs/impl/08-nested-structs.md`.**
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **string/array allocation-copy and short-input audit RECORDED** in
-`docs/impl/13-string-array-allocation-short-input-audit.md` (implementation not started). It adds
+_Last updated: 2026-07-13, **focused source-correctness fix wave IMPLEMENTED** and recorded in
+`docs/impl/source-correctness-fixes-2026-07-13.md`: UTF-8-safe `str` range boundaries, closure-result
+environment regions, Unit function-value ABI parity, buffered-reader-correct `io.copy`, borrowed
+pipeline-source ownership, self-aliasing `buffer.append`, line-head `!=`, and duplicate struct fields
+are regression-pinned.
+Previous update: 2026-07-13, **string/array allocation-copy and short-input audit RECORDED** in
+`docs/impl/13-string-array-allocation-short-input-audit.md` (UTF-8 range boundaries now fixed; other
+items not started). It adds
 confirmed correctness/resource prerequisites for UTF-8 slice boundaries, settled `str + str`
 enforcement, arena-free template lifetime, unbound owned-temporary drops, and known-null destructor
 calls. New mechanical allocation/copy work covers borrowed path ABI views, compatible zero-copy
@@ -17,13 +24,16 @@ consumer chunks. UTF-8 short crossover, repeated-needle plans, JSON escape SIMD,
 arrays stay measure-first with explicit `0..64` gates. Language-surface ideas are questions for
 Claude Code only, not decisions. Previous update: 2026-07-13,
 **pipeline/closure/memory/I/O/SIMD audit RECORDED** in
-`docs/impl/12-pipeline-closure-memory-io-simd-audit.md` (implementation not started). The normal
+`docs/impl/12-pipeline-closure-memory-io-simd-audit.md` (Unit indirect-call ABI and buffered
+`io.copy` fixed; other items not started). The normal
 fused sequential loop, `map_into` alias metadata, capture inlining, JSON/UTF-8/string SIMD, direct
 file read/mmap, and buffered small/direct large writer paths are strong. New correctness-first work:
 post-`where` callables are speculatively executed on rejected elements (confirmed division-by-zero
-abort); the ordinary sequential effect contract conflicts across spec/implementation docs; `spawn`
-and indirect closure-result region gaps permit arena-backed view UAF; Unit indirect calls use an
-incompatible LLVM return ABI; and `io.copy` skips buffered-reader lookahead. Dynamic allocation size
+abort); the ordinary sequential effect contract conflicts across spec/implementation docs; the
+`spawn` capture region gap still permits arena-backed view UAF, while the related indirect
+closure-result gap is fixed; Unit indirect calls used an incompatible LLVM return ABI, and
+`io.copy` skipped buffered-reader lookahead (both fixed in the
+source-correctness wave). Dynamic allocation size
 arithmetic separately needs required overflow hardening. Highest-value new measured/gated work is an
 initialized-before-read arena split, exact-final-allocation Base64/hex fill paired with the existing
 Base64 SIMD backlog plus a new hex probe, macOS copy-path validation, HTTP batch request-copy removal,
@@ -440,8 +450,8 @@ remaining macOS full-suite failures are cataloged out-of-scope at adoption-recor
 (ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
 expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
 is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
-one is next available. **Next, pick one:** (a) document-12 P0 — fix Unit indirect-call ABI, the two
-closure-region UAF paths, buffered-`io.copy` lookahead loss, post-`where` inactive-lane-unsafe
+one is next available. **Next, pick one:** (a) document-12 P0 — fix the remaining spawn-capture
+closure-region UAF, post-`where` inactive-lane-unsafe
 execution, and parallel/higher-order effect holes; settle ordinary sequential effects rather than
 silently adding a rejection; complete required allocation-size hardening before widening (source of truth
 `docs/impl/12-pipeline-closure-memory-io-simd-audit.md`); (b) cache-first C0 — fix the confirmed basename-temp

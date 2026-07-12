@@ -59,8 +59,8 @@ arena is a hard error ("would silently leak" — `lambda.rs`). The current check
 
 No `Result` in this area. `s[a..b]` out of bounds aborts. Non-UTF-8 *input* is a `std` boundary
 concern (`fs.read_file` → `Error.Invalid`); core string ops assume the invariant and stay
-byte-oriented. Audit 13 records that the current range lowering still needs the promised
-UTF-8-scalar-boundary abort.
+byte-oriented. Range lowering now enforces the promised O(1) UTF-8-scalar-boundary abort at both
+endpoints (audit 13 §3.1; fixed 2026-07-13).
 
 ## Regions
 

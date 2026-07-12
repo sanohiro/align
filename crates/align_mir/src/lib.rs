@@ -2893,15 +2893,9 @@ fn lower_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                             Operand::Value(sv)
                         }
                     };
-                    // Free the source buffer if it is an owned temporary the runtime just consumed
-                    // (same rule as `setup_source`: `chunks`/call results are always heap; the
-                    // materializing terminals arena-allocate inside an arena and are bulk-freed).
-                    let free_src = matches!(source.kind, hir::ExprKind::ArrayChunks { .. } | hir::ExprKind::Call { .. })
-                        || (matches!(
-                            source.kind,
-                            hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. }
-                                | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. } | hir::ExprKind::ArraySortBy { .. }
-                        ) && b.arenas.is_empty());
+                    // Free the source buffer if it is an owned temporary the runtime just consumed.
+                    // A call returning `slice<T>` is a borrow and must never be classified as one.
+                    let free_src = pipeline_source_needs_drop(source, b.arenas.is_empty());
                     let v = b.fresh_value(e.ty);
                     b.push(Stmt::Let(v, Rvalue::ParMapParallel { src: src.clone(), func: func.clone(), elem_in, elem_out: *elem }));
                     if free_src {
@@ -3489,6 +3483,63 @@ fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len:
     b.cur = ok;
 }
 
+/// A byte index is a valid UTF-8 boundary when it is either edge of the string, or the byte at
+/// that index is not a continuation byte (`10xxxxxx`). Range bounds have already been checked by
+/// the caller, so the load is performed only for `0 < index < len`.
+fn emit_utf8_boundary_check(b: &mut Builder, base: &Operand, index: &Operand, len: &Operand) {
+    let at_start = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        at_start,
+        Rvalue::Bin(BinOp::Eq, index.clone(), Operand::Const(Const::Int(0, i64_ty()))),
+    ));
+    let at_end = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(at_end, Rvalue::Bin(BinOp::Eq, index.clone(), len.clone())));
+    let at_edge = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        at_edge,
+        Rvalue::Bin(BinOp::Or, Operand::Value(at_start), Operand::Value(at_end)),
+    ));
+
+    let check = b.new_block();
+    let fail = b.new_block();
+    let ok = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(at_edge), ok, check));
+
+    b.cur = check;
+    let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
+    let byte = b.fresh_value(u8_ty);
+    b.push(Stmt::Let(byte, Rvalue::SliceIndex(base.clone(), index.clone())));
+    let prefix = b.fresh_value(u8_ty);
+    b.push(Stmt::Let(
+        prefix,
+        Rvalue::Bin(
+            BinOp::BitAnd,
+            Operand::Value(byte),
+            Operand::Const(Const::Int(0xc0, u8_ty)),
+        ),
+    ));
+    let continuation = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        continuation,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(prefix),
+            Operand::Const(Const::Int(0x80, u8_ty)),
+        ),
+    ));
+    b.terminate(Term::Branch(Operand::Value(continuation), fail, ok));
+
+    b.cur = fail;
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        t,
+        Rvalue::Call("utf8_boundary_fail".to_string(), vec![index.clone(), len.clone()]),
+    ));
+    b.terminate(Term::Unreachable);
+
+    b.cur = ok;
+}
+
 /// `recv[start..end]` → a borrowed sub-view `{ ptr + start, end - start }` with a range bounds
 /// check. The base `{ptr,len}` comes from the receiver (a fixed `array<T>` borrows to a slice
 /// first; `str`/`slice`/owned-array are already `{ptr,len}`). `result_ty` is the view type — `str`
@@ -3521,6 +3572,11 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
         None => Operand::Value(base_len),
     };
     emit_range_bounds_check(b, &start_op, &end_op, Operand::Value(base_len));
+    if result_ty == Ty::Str {
+        let len = Operand::Value(base_len);
+        emit_utf8_boundary_check(b, &base, &start_op, &len);
+        emit_utf8_boundary_check(b, &base, &end_op, &len);
+    }
     let new_len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(new_len, Rvalue::Bin(BinOp::Sub, end_op, start_op.clone())));
     let v = b.fresh_value(result_ty);
@@ -3825,6 +3881,25 @@ fn stage_call_args(b: &mut Builder, arg: Operand, captures: &[hir::Expr]) -> Vec
     args
 }
 
+/// Whether an unbound pipeline source owns a buffer that its consumer must release. In particular,
+/// classify a call by its return type: `make() -> array<T>` transfers ownership, while
+/// `identity(xs) -> slice<T>` merely returns a borrowed view. Treating both as owned attempts to
+/// `free` stack/borrowed storage after the pipeline finishes.
+fn pipeline_source_needs_drop(source: &hir::Expr, outside_arena: bool) -> bool {
+    let always_heap = matches!(source.kind, hir::ExprKind::ArrayChunks { .. })
+        || (matches!(source.kind, hir::ExprKind::Call { .. })
+            && matches!(source.ty, Ty::DynArray(_) | Ty::DynSliceArray(_)));
+    let arena_if_in_arena = matches!(
+        source.kind,
+        hir::ExprKind::ArrayToArray { .. }
+            | hir::ExprKind::ArrayScan { .. }
+            | hir::ExprKind::ArrayParMap { .. }
+            | hir::ExprKind::ArraySort { .. }
+            | hir::ExprKind::ArraySortBy { .. }
+    );
+    always_heap || (arena_if_in_arena && outside_arena)
+}
+
 fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
     match source.ty {
         // `slice<T>`, owned `array<T>`, and `array<slice<T>>` (a `chunks` result, element =
@@ -3841,21 +3916,12 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> SrcSetup {
             // temporaries are bulk-freed, so none of those are freed here. `Block`/`If` sources
             // may *borrow* a bound local in a branch (e.g. `(if c { ys } else { zs }).sum()`), so
             // blanket-freeing them would double-free — they are left as a sound, bounded leak.
-            // `chunks` (runtime `align_rt_chunks`) and a function's owned-array return are *always*
+            // `chunks` (runtime `align_rt_chunks`) and a function's *owned-array* return are always
             // heap-allocated, so they must be freed even inside an `arena {}` (the arena's bulk-free
-            // doesn't cover them). The materializing terminals instead arena-allocate when inside an
-            // arena (bulk-freed there), so the loop frees them only outside one.
-            let always_heap = matches!(
-                source.kind,
-                hir::ExprKind::ArrayChunks { .. } | hir::ExprKind::Call { .. }
-            );
-            let arena_if_in_arena = matches!(
-                source.kind,
-                hir::ExprKind::ArrayToArray { .. } | hir::ExprKind::ArrayScan { .. }
-                    | hir::ExprKind::ArrayParMap { .. } | hir::ExprKind::ArraySort { .. } | hir::ExprKind::ArraySortBy { .. }
-            );
-            let temp_free =
-                (always_heap || (arena_if_in_arena && b.arenas.is_empty())).then(|| sv.clone());
+            // doesn't cover them). A function returning `slice<T>` only lends a view and is never
+            // freed here. Materializing terminals instead arena-allocate inside an arena, so the loop
+            // frees those only outside one.
+            let temp_free = pipeline_source_needs_drop(source, b.arenas.is_empty()).then(|| sv.clone());
             SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: None, temp_free }
         }
         // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field

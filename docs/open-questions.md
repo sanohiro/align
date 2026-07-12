@@ -2392,9 +2392,10 @@ those unsettled descriptions authorizes implicit parallelization of ordinary `re
 is the durable implementation record. It confirms that normal fused loops, `map_into` alias
 metadata, non-escaping capture inlining, JSON/UTF-8/string SIMD, direct regular-file reads, mmap
 views, and small/large writer paths already have the intended shape. It also records new P0s:
-post-`where` callable speculation changes semantics; two closure-region paths permit arena-backed
-view UAF; Unit indirect calls have an LLVM ABI mismatch; and `io.copy` skips buffered-reader
-lookahead. It separately records the ordinary-stage normative effect conflict and required dynamic
+post-`where` callable speculation changes semantics and the spawn-capture closure path permits an
+arena-backed view UAF. The second closure-result region gap, Unit indirect-call ABI mismatch, and
+buffered-reader `io.copy` lookahead loss are fixed and regression-pinned in
+`impl/source-correctness-fixes-2026-07-13.md`. It separately records the ordinary-stage normative effect conflict and required dynamic
 allocation-size hardening. New measure-first work is the per-callsite initialized-before-read
 `arena_alloc_uninit` / conservative-zeroed split, exact-final Base64/hex fill paired with the existing
 Base64 SIMD backlog plus a new hex SIMD probe, HTTP batch request-copy removal, and scalar vs SIMD
@@ -2402,8 +2403,8 @@ stable compaction. Existing work from documents 10/11 remains attributed there.
 
 **String/array allocation-copy and short-input companion audit (2026-07-13):**
 [`impl/13-string-array-allocation-short-input-audit.md`](impl/13-string-array-allocation-short-input-audit.md)
-is the durable implementation record. It confirms UTF-8 range-boundary and owned-expression-
-temporary lifetime gaps, settled `str + str` enforcement drift, arena-free template lifetime leaks,
+is the durable implementation record. Its UTF-8 range-boundary gap is fixed and regression-pinned;
+it confirms the remaining owned-expression-temporary lifetime gaps, settled `str + str` enforcement drift, arena-free template lifetime leaks,
 known-null destructor calls, and avoidable path/builder/chunks/group staging. It also records the
 good existing zero-copy view, fused pipeline, scalar fallback, and array-builder freeze shapes so
 later work does not replace them accidentally. UTF-8 short crossover, repeated-needle preparation,
@@ -3229,10 +3230,11 @@ around the string/JSON milestone (M5) and std build-out.
 The fast paths above (`sendfile`/`splice`/`io_uring`/Direct I/O) stay **post-M9**, added later
 without an `io.copy` signature change.
 
-**Correctness correction (audit 2026-07-13):** the v1 loop is memory-bounded but is not yet a
-byte-exact oracle from every valid reader state. After `read_line`, a buffered reader may hold unread
-lookahead while its fd offset is already ahead; `io.copy` reads the fd directly and skips those bytes.
-Drain lookahead before the loop and before any syscall fast path. Reproduction/gate: `impl/12` §3.6.
+**Correctness correction (audit 2026-07-13, FIXED):** the v1 loop was memory-bounded but not a
+byte-exact oracle from every valid reader state. After `read_line`, a buffered reader could hold unread
+lookahead while its fd offset was already ahead; `io.copy` read the fd directly and skipped those
+bytes. It now drains through the shared reader path before fresh fd reads. The permanent byte/count
+gate is in `impl/12` §3.6; every future syscall fast path must retain the empty-lookahead precondition.
 
 **Status update (2026-07-03, M9 Slice 3 DONE):** the **`mmap` scan path** landed as `fs.read_file_view`
 (`draft.md` §18.2), the one place a view's backing is bound to a region (the enclosing arena;

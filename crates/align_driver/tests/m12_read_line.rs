@@ -117,6 +117,49 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     );
 }
 
+/// `io.copy` is another reader consumer and must obey the same interleaving contract as `read`:
+/// after `read_line` has filled the reader's lookahead past the newline, copy drains that retained
+/// surplus before reading the fd (which is already at EOF for this short input).
+#[test]
+fn io_copy_after_read_line_drains_lookahead_surplus() {
+    if !backend_available() {
+        return;
+    }
+    let src = TempFile::new("copy-lookahead-src", b"AB\nCDEFG");
+    let dst = TempFile::new("copy-lookahead-dst", b"");
+    let prog = "\
+import std.fs
+import std.io
+pub fn main(args: array<str>) -> Result<(), Error> {
+  base := fs.open(args[1])?
+  r := base.buffered()
+  buf := buffer(64)
+  n := r.read_line(buf)?
+  print(n)
+  w := fs.create(args[2])?
+  copied := io.copy(r, w)?
+  print(copied)
+    return Ok(())
+}
+";
+    let out = build_and_run_args("a7-copy-lookahead", prog, &[&src.str(), &dst.str()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3\n5\n",
+        "line count then copied surplus count"
+    );
+    assert_eq!(
+        std::fs::read(&dst.path).expect("read copied surplus"),
+        b"CDEFG"
+    );
+}
+
 /// A line longer than the internal 64 KiB refill chunk forces several refills across the boundary;
 /// its body must come back whole. Prints the recovered body length (via `line.len()`) and the
 /// consumed count (`n`, incl. the terminator).
