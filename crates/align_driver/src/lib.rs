@@ -6,7 +6,9 @@
 
 use align_diag::{Diagnostics, Severity};
 use align_span::SourceMap;
-pub use align_codegen_llvm::{BuildTarget, DebugInfo, Profile};
+pub use align_codegen_llvm::{
+    target_object_format, BuildTarget, DebugInfo, ObjectFormat, Profile,
+};
 /// The lowered MIR program type (re-exported so callers can name it without depending on
 /// `align_mir` directly).
 pub use align_mir::Program as MirProgram;
@@ -150,8 +152,9 @@ pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, optimized: bo
 /// Link an object into an executable. Uses the system C compiler (`cc`); crt0 calls
 /// the generated `main` as the entry point (`docs/impl/01-pipeline.md`: driver links).
 ///
-/// The thin runtime (`libalign_runtime.a`, e.g. the builtin `print`) is linked in too.
-/// Being a Rust staticlib, it needs the usual std support libraries (`pthread`/`dl`/`m`).
+/// The thin runtime (`libalign_runtime.a`, e.g. the builtin `print`) is linked in too. Being a
+/// Rust staticlib, it needs the usual std support libraries (`pthread`/`dl`/`m` on ELF; on Mach-O
+/// they are libSystem re-exports — see [`support_libs`]).
 pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
     link_objects(&[obj], exe, link_libs, profile)
 }
@@ -161,6 +164,7 @@ pub fn link_executable(obj: &std::path::Path, exe: &std::path::Path, link_libs: 
 /// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
 /// callee), and by any future multi-translation-unit build.
 pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
+    let format = target_object_format()?;
     let runtime = runtime_archive()?;
     let mut cmd = std::process::Command::new("cc");
     for obj in objs {
@@ -169,30 +173,32 @@ pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs:
     cmd.arg(&runtime)
         .arg("-o")
         .arg(exe)
-        // Link hygiene (M13 Slice 2). `--gc-sections` drops every unreferenced input section from the
-        // final image; combined with the runtime's per-function sections (Rust's default) this
-        // garbage-collects the `std.compress`/`std.crypto`/`std.http` code a program does not use,
-        // eliminating its `libz`/`libzstd`/`libcrypto`/`libssl` references so those libraries are not
-        // needed at all. `--as-needed` then records `DT_NEEDED` only for libraries that actually
-        // satisfy a surviving reference (a no-op for the merged-libc support libs below on modern
-        // glibc, a portable win on older systems). Both are correctness-neutral hygiene, kept for
-        // EVERY profile (M13 Slice 4) — even `dev`: the potential link-speed saving of dropping
-        // `--gc-sections` is not worth a second link-flag path, and a `dev` binary that silently
-        // links dead `libssl` etc. would be a surprising difference from `release`.
-        .args(["-Wl,--gc-sections", "-Wl,--as-needed"]);
+        // Link hygiene (M13 Slice 2), spelled per object format by `hygiene_flags`. Dead-code
+        // removal (ELF `--gc-sections` / Mach-O `-dead_strip`) drops every unreferenced input
+        // section from the final image; combined with the runtime's per-function sections (Rust's
+        // default) this garbage-collects the `std.compress`/`std.crypto`/`std.http` code a program
+        // does not use, eliminating its `libz`/`libzstd`/`libcrypto`/`libssl` references so those
+        // libraries are not needed at all. Unused-dylib removal (ELF `--as-needed` / Mach-O
+        // `-dead_strip_dylibs`) then records a dependency (`DT_NEEDED` / `LC_LOAD_DYLIB`) only for
+        // libraries that actually satisfy a surviving reference. Both are correctness-neutral
+        // hygiene, kept for EVERY profile (M13 Slice 4) — even `dev`: the potential link-speed
+        // saving of dropping dead-code removal is not worth a second link-flag path, and a `dev`
+        // binary that silently links dead `libssl` etc. would be a surprising difference from
+        // `release`.
+        .args(hygiene_flags(format));
     // Per-profile strip (M13 Slice 4). The size profiles (`small`/`tiny`) drop the whole symbol
-    // table via `-Wl,--strip-all`; the speed profiles (`dev`/`release`/`fast`) keep symbols so a
-    // crash backtrace / `perf` stays useful. One decision, owned by `Profile::strip`.
-    if profile.strip() {
+    // table; the speed profiles (`dev`/`release`/`fast`) keep symbols so a crash backtrace / `perf`
+    // stays useful. The strip *decision* is owned by `Profile::strip` alone; only the *spelling*
+    // is per-format: ELF strips in the link (`-Wl,--strip-all`), Mach-O has no ld64 equivalent and
+    // runs the external `strip` after a successful link (below).
+    if profile.strip() && format == ObjectFormat::Elf {
         cmd.arg("-Wl,--strip-all");
     }
-    cmd
-        // `libpthread`/`libdl`/`libm` are linked unconditionally: they are Rust-std support libraries
-        // the runtime *core* may reference (threads, dlopen, math) independent of any Align feature,
-        // and modern glibc merges them into libc so they cost nothing (`--as-needed` drops any that
-        // resolve nothing). They are NOT capability-gated — the runtime core, not an opt-in feature,
-        // is what needs them.
-        .args(["-lpthread", "-ldl", "-lm"]);
+    // The always-linked support libraries, per format (`support_libs`): on ELF,
+    // `libpthread`/`libdl`/`libm` are Rust-std support libraries the runtime *core* may reference
+    // (threads, dlopen, math) independent of any Align feature — NOT capability-gated. On Mach-O
+    // all three are libSystem re-exports, so the list is empty.
+    cmd.args(support_libs(format));
     // Capability + user libraries. `libz`/`libzstd`/`libcrypto`/`libssl` are NO LONGER linked
     // unconditionally: they now arrive through `link_libs`, which MIR populates from the builtins a
     // program actually uses (`align_mir::Capability`) plus any `extern "C" link("name")` the user
@@ -205,11 +211,107 @@ pub fn link_objects(objs: &[&std::path::Path], exe: &std::path::Path, link_libs:
     let status = cmd
         .status()
         .map_err(|e| format!("cannot launch cc: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("link failed (cc exit code {:?})", status.code()))
+    if !status.success() {
+        return Err(link_failure_message(status.code(), link_libs));
     }
+    // Mach-O strip: ld64 has no `--strip-all`, so the size profiles run the external `strip` on the
+    // linked image. `strip` ships with the same Xcode CLT as the `cc`/`ld` above (the existing
+    // implicit toolchain dependency), and it re-signs the stripped binary ad hoc, so the result
+    // stays runnable. A launch failure or nonzero exit is a hard error, same as a failed link — the
+    // profile's contract (all symbols removed) must never be broken silently.
+    if profile.strip() && format == ObjectFormat::MachO {
+        let strip_status = std::process::Command::new("strip")
+            .arg(exe)
+            .status()
+            .map_err(|e| format!("cannot launch strip: {e}"))?;
+        if !strip_status.success() {
+            return Err(format!("strip failed (exit code {:?})", strip_status.code()));
+        }
+    }
+    Ok(())
+}
+
+/// The link-hygiene flags for `format` (see the call site in [`link_objects`] for what they do).
+/// A data table, same shape as `Profile::pipeline` — the *meaning* is format-independent, only the
+/// spelling differs.
+fn hygiene_flags(format: ObjectFormat) -> &'static [&'static str] {
+    match format {
+        // Dead-section removal + record only the shared libraries that resolve a reference.
+        ObjectFormat::Elf => &["-Wl,--gc-sections", "-Wl,--as-needed"],
+        ObjectFormat::MachO => &["-Wl,-dead_strip", "-Wl,-dead_strip_dylibs"],
+    }
+}
+
+/// The always-linked support libraries for `format` (see the call site in [`link_objects`]).
+/// Mach-O has none: `pthread`/`dl`/`m` are all libSystem re-exports there, so naming them is noise.
+fn support_libs(format: ObjectFormat) -> &'static [&'static str] {
+    match format {
+        ObjectFormat::Elf => &["-lpthread", "-ldl", "-lm"],
+        ObjectFormat::MachO => &[],
+    }
+}
+
+/// The gated capability libraries (`align_mir::Capability`): the ones a system commonly does NOT
+/// ship in the default linker search path, so a link failure involving them gets a `LIBRARY_PATH`
+/// hint appended ([`link_failure_message`]).
+const GATED_LIBS: [&str; 4] = ["z", "zstd", "crypto", "ssl"];
+
+/// The link-failure error. When the failed link involved a gated capability library, append a note
+/// about non-default library prefixes: those libraries often live outside the default search path
+/// (e.g. Homebrew keg-only OpenSSL on macOS), and the fix is the standard `LIBRARY_PATH` mechanism.
+/// The driver never injects search paths itself — what is linked, and from where, stays visible
+/// (Nothing hidden).
+fn link_failure_message(code: Option<i32>, link_libs: &[String]) -> String {
+    let mut msg = format!("link failed (cc exit code {code:?})");
+    if link_libs.iter().any(|l| GATED_LIBS.contains(&l.as_str())) {
+        msg.push_str(
+            "\nnote: libraries in a non-default prefix (e.g. Homebrew keg-only) are found via \
+             LIBRARY_PATH, e.g. LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib",
+        );
+    }
+    msg
+}
+
+/// Locate the LLVM binutils replacement `name` (`llvm-readobj`, `llvm-nm`) with the version
+/// matching the LLVM this compiler is built against. Used by `alignc size` and the link-inspection
+/// tests. Search order:
+///
+///  1. `$LLVM_SYS_221_PREFIX/bin/<name>` — the build-time LLVM prefix (compile-time env, the same
+///     variable llvm-sys builds from), so the tool version always matches the linked LLVM. A stale
+///     baked-in path (prefix moved since the build) falls through.
+///  2. `<name>-22` on `PATH` (apt.llvm.org naming; the suffix is
+///     [`align_codegen_llvm::LLVM_TOOL_VERSION`]).
+///  3. Plain `<name>` on `PATH`.
+///
+/// `None` when nothing is found — callers degrade the affected report section to a note.
+pub fn llvm_tool(name: &str) -> Option<std::path::PathBuf> {
+    llvm_tool_in(option_env!("LLVM_SYS_221_PREFIX"), name)
+}
+
+/// [`llvm_tool`] with the LLVM prefix as a parameter (unit-testable without rebaking the
+/// compile-time env).
+fn llvm_tool_in(prefix: Option<&str>, name: &str) -> Option<std::path::PathBuf> {
+    if let Some(prefix) = prefix {
+        let p = std::path::Path::new(prefix).join("bin").join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let versioned = format!("{name}-{}", align_codegen_llvm::LLVM_TOOL_VERSION);
+    for cand in [versioned.as_str(), name] {
+        // Minimal PATH probe: does `<cand> --version` launch and exit 0?
+        let found = std::process::Command::new(cand)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if found {
+            return Some(std::path::PathBuf::from(cand));
+        }
+    }
+    None
 }
 
 /// The in-tree `align_runtime` source directory, baked in at build time (relative to this
@@ -353,6 +455,58 @@ mod tests {
 
         // A missing directory yields None (read_dir fails, skipped, not a panic).
         assert_eq!(newest_rs_mtime(&root.join("does-not-exist")), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn hygiene_flags_are_pinned_per_format() {
+        // The flag tables ARE the linker policy — pin the exact spellings so a drive-by edit
+        // cannot silently change what every `alignc build` passes to the linker.
+        assert_eq!(hygiene_flags(ObjectFormat::Elf), ["-Wl,--gc-sections", "-Wl,--as-needed"]);
+        assert_eq!(hygiene_flags(ObjectFormat::MachO), ["-Wl,-dead_strip", "-Wl,-dead_strip_dylibs"]);
+    }
+
+    #[test]
+    fn support_libs_are_pinned_per_format() {
+        assert_eq!(support_libs(ObjectFormat::Elf), ["-lpthread", "-ldl", "-lm"]);
+        assert_eq!(support_libs(ObjectFormat::MachO), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn link_failure_message_hints_library_path_only_for_gated_libs() {
+        // No gated library involved → the plain error, no note.
+        let plain = link_failure_message(Some(1), &["m".to_string()]);
+        assert!(plain.starts_with("link failed"));
+        assert!(!plain.contains("LIBRARY_PATH"), "no hint without a gated lib:\n{plain}");
+        // A gated library (Homebrew keg-only class) → the LIBRARY_PATH hint is appended.
+        let hinted = link_failure_message(Some(1), &["z".to_string(), "ssl".to_string()]);
+        assert!(hinted.contains("LIBRARY_PATH"), "gated libs get the hint:\n{hinted}");
+        assert!(hinted.contains("/opt/homebrew/opt/openssl@3/lib"), "hint shows an example path:\n{hinted}");
+    }
+
+    #[test]
+    fn llvm_tool_discovery_order() {
+        // 1. A prefix that contains `bin/<name>` wins outright (mere existence, no launch).
+        let root = std::env::temp_dir().join(format!(
+            "align-driver-llvmtool-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const _
+        ));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("create temp prefix");
+        std::fs::write(bin.join("llvm-sometool"), b"").unwrap();
+        let prefix = root.to_string_lossy().into_owned();
+        assert_eq!(
+            llvm_tool_in(Some(&prefix), "llvm-sometool"),
+            Some(bin.join("llvm-sometool")),
+            "the build-time prefix hit is taken first"
+        );
+
+        // 2. A stale prefix (no such file) falls through to the PATH probe; a name that exists
+        //    nowhere yields None (the caller degrades to a note).
+        assert_eq!(llvm_tool_in(Some(&prefix), "llvm-definitely-not-a-tool"), None);
+        assert_eq!(llvm_tool_in(None, "llvm-definitely-not-a-tool"), None);
 
         std::fs::remove_dir_all(&root).ok();
     }
