@@ -5005,6 +5005,10 @@ pub unsafe extern "C" fn align_rt_io_copy(r: *mut Reader, w: *mut Writer) -> i64
     // same O(buffer) bound, no signature change. v1 always takes the portable loop.
     let mut total: i64 = 0;
     loop {
+        // `reader_read` appends into the supplied Buffer. Reuse this allocation as a fresh transfer
+        // chunk each time; otherwise later reads grow the buffer and `writer_write` keeps sending
+        // bytes from its beginning instead of the newly appended chunk.
+        buf.len = 0;
         // Go through the reader's one read path rather than reading its fd directly. In particular,
         // a buffered reader may hold bytes that a preceding `read_line` fetched past its terminator;
         // those lookahead bytes are logically next in the stream and must be copied before fd-fresh
