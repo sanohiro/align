@@ -8,11 +8,14 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **focused source-correctness fix wave IMPLEMENTED** and recorded in
-`docs/impl/source-correctness-fixes-2026-07-13.md`: UTF-8-safe `str` range boundaries, closure-result
-environment regions, Unit function-value ABI parity, buffered-reader-correct `io.copy`, borrowed
-pipeline-source ownership, self-aliasing `buffer.append`, line-head `!=`, and duplicate struct fields
-are regression-pinned.
+_Last updated: 2026-07-13, **spawn-capture lifetime P0 FIXED**: `EscapeCheck` now tracks active
+task-group regions and rejects direct or wrapped captures that can be freed before the group's
+`wait`; frame/static/outer-arena captures remain valid, with the full matrix pinned in
+`task_group.rs`. The focused source-correctness wave is recorded in
+`docs/impl/source-correctness-fixes-2026-07-13.md`: UTF-8-safe `str` range boundaries,
+spawn-capture and closure-result environment regions, Unit function-value ABI parity,
+buffered-reader-correct `io.copy`, borrowed pipeline-source ownership, self-aliasing
+`buffer.append`, line-head `!=`, and duplicate struct fields are regression-pinned.
 Previous update: 2026-07-13, **string/array allocation-copy and short-input audit RECORDED** in
 `docs/impl/13-string-array-allocation-short-input-audit.md` (UTF-8 range boundaries now fixed; other
 items not started). It adds
@@ -24,14 +27,14 @@ consumer chunks. UTF-8 short crossover, repeated-needle plans, JSON escape SIMD,
 arrays stay measure-first with explicit `0..64` gates. Language-surface ideas are questions for
 Claude Code only, not decisions. Previous update: 2026-07-13,
 **pipeline/closure/memory/I/O/SIMD audit RECORDED** in
-`docs/impl/12-pipeline-closure-memory-io-simd-audit.md` (Unit indirect-call ABI and buffered
-`io.copy` fixed; other items not started). The normal
+`docs/impl/12-pipeline-closure-memory-io-simd-audit.md` (spawn-capture and closure-result regions,
+Unit indirect-call ABI, and buffered `io.copy` fixed; other items not started). The normal
 fused sequential loop, `map_into` alias metadata, capture inlining, JSON/UTF-8/string SIMD, direct
 file read/mmap, and buffered small/direct large writer paths are strong. New correctness-first work:
 post-`where` callables are speculatively executed on rejected elements (confirmed division-by-zero
 abort); the ordinary sequential effect contract conflicts across spec/implementation docs; the
-`spawn` capture region gap still permits arena-backed view UAF, while the related indirect
-closure-result gap is fixed; Unit indirect calls used an incompatible LLVM return ABI, and
+`spawn` capture region gap and the related indirect closure-result gap are now fixed; Unit indirect
+calls used an incompatible LLVM return ABI, and
 `io.copy` skipped buffered-reader lookahead (both fixed in the
 source-correctness wave). Dynamic allocation size
 arithmetic separately needs required overflow hardening. Highest-value new measured/gated work is an
@@ -434,11 +437,10 @@ owed-delta wave; staleness sweep #395)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo baseline for the audits (2026-07-13, macOS arm64 machine):** **#427**
-(docs-only cache/parallel merge; last code wave is #426, the Codex-audit item-2 macOS link/size
-portability slice; full record in the _Last updated_ paragraph above). The new cache-first, parallel,
-and pipeline/closure/memory/I/O/SIMD records are docs-only and their
-implementation has not started. **This machine needs two env vars for every
+**Repo baseline for the audits (2026-07-13, macOS arm64 machine):** **#430** plus the spawn-capture
+lifetime fix described in the _Last updated_ paragraph above. The cache-first and parallel records
+remain unimplemented; the pipeline/closure/memory/I/O/SIMD record is partially implemented.
+**This machine needs two env vars for every
 `cargo build`/`cargo test`/driver-link run** — this was the undocumented blocker at session
 start: `LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm` (Homebrew LLVM 22.1.8 is keg-only) and
 `LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib` (zstd + keg-only openssl@3 sit
@@ -450,11 +452,11 @@ remaining macOS full-suite failures are cataloged out-of-scope at adoption-recor
 (ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
 expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
 is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
-one is next available. **Next, pick one:** (a) document-12 P0 — fix the remaining spawn-capture
-closure-region UAF, post-`where` inactive-lane-unsafe
-execution, and parallel/higher-order effect holes; settle ordinary sequential effects rather than
-silently adding a rejection; complete required allocation-size hardening before widening (source of truth
-`docs/impl/12-pipeline-closure-memory-io-simd-audit.md`); (b) cache-first C0 — fix the confirmed basename-temp
+one is next available. **Next, pick one:** (a) document-12 P0 — fix post-`where`
+inactive-lane-unsafe execution and parallel/higher-order effect holes; settle ordinary sequential
+effects rather than silently adding a rejection; complete required allocation-size hardening before
+widening (source of truth `docs/impl/12-pipeline-closure-memory-io-simd-audit.md`); (b) cache-first C0
+— fix the confirmed basename-temp
 race with private staging + atomic publication and add determinism/concurrency gates (source of
 truth `docs/impl/10-cache-first-optimization.md`; MUST precede M15 parallel compilation); (c)
 parallel P0 correctness — close the capturing-closure effect edge and saturated

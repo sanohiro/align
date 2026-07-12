@@ -12,6 +12,7 @@ below.
 | Unit function-value ABI | A `void` thunk was called through an `i32` indirect-call signature | Unit `CallIndirect` now uses LLVM `void(env,args...)` and yields no stored value. Raw IR rejects `call i32`; `fn_values.rs` executes both sides of a runtime-selected Unit target. |
 | Buffered `io.copy` | A preceding `read_line` could leave unread lookahead that copy skipped by reading the fd directly | Copy uses the shared reader path, which drains lookahead before fresh fd bytes. The `AB\nCDEFG` gate copies exactly `CDEFG` and reports 5. |
 | Closure-call result region | A zero-argument closure could return an arena-backed captured view as `Static`, then use it after `arena_end` | `region_of(CallFnValue)` now includes the callee/environment region before folding argument regions. `analysis_coverage.rs` rejects the zero-argument capture reproduction. |
+| Spawn capture region | A task spawned inside an inner arena could retain a view until the enclosing task group's later `wait`, after the arena had freed its backing | `EscapeCheck` tracks active task-group regions and requires every region-bearing capture to outlive the innermost group, with a whole-expression fail-closed fallback for future HIR widening. `task_group.rs` rejects direct/parenthesized, struct, tuple, `Option`, `Result`, and nested-closure cases while accepting frame/static/outer-arena captures; local/block function expressions remain rejected at the literal-only surface. |
 | Borrowed call result as pipeline source | `whole(xs) -> slice<T>` was classified as an owned call temporary; `sum` and parallel `par_map` called `free` on the caller's stack/borrowed pointer | The shared source-drop predicate now classifies calls by return ownership: `array<T>` transfers ownership, `slice<T>` never does. MIR and runtime tests cover `sum` and `par_map`, while existing owned-array call tests retain their drops. **New finding.** |
 | `buffer.append` self-alias | `b.append(b.bytes())` could reallocate `b.data` before copying from its old pointer, causing a UAF | The runtime detects overlap with the current allocation and snapshots the source before truncate/growth. A forced-growth doubling test pins byte identity. **New finding.** |
 | Line-head `!=` | The lexer inserted `END` before a next-line `!=`, although line-head binary operators continue the expression | `!` suppresses `END` only when followed by `=`; a bare unary `!` still starts a new statement. Lexer tests pin both sides. **New finding.** |
@@ -42,9 +43,10 @@ The permanent gates live in:
 - `crates/align_driver/tests/m5.rs` (UTF-8 slicing);
 - `crates/align_driver/tests/mmv2.rs` and `par_map.rs` (borrowed vs owned pipeline sources);
 - `crates/align_driver/tests/m12_read_line.rs` (buffered copy);
+- `crates/align_driver/tests/task_group.rs` (spawn-capture lifetime);
 - `crates/align_driver/tests/runway_a2_binary_codec.rs` (self-append);
 - `crates/align_lexer/src/lib.rs` and `crates/align_sema/src/lib.rs` (front-end diagnostics).
 
 The audit intentionally did not mark unrelated broader findings complete. Pipeline speculation after
-`where`, remaining closure-region escape holes, allocation-size overflow,
+`where`, parallel/higher-order effect holes, allocation-size overflow,
 arena-free owned-temporary leaks, and the remaining short-input work retain their recorded status.

@@ -2343,6 +2343,7 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 region: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
                 local_backed_slice: std::collections::HashSet::new(),
+                task_group_regions: Vec::new(),
             };
             ec.check();
             ec.region
@@ -3206,6 +3207,10 @@ struct EscapeCheck<'a> {
     /// local array materialized in this frame). Such a slice borrows the stack frame and so
     /// must not be returned. A slice *parameter* borrows the caller and is never in this set.
     local_backed_slice: std::collections::HashSet<LocalId>,
+    /// Region of each active `task_group`, innermost last. A spawned closure may execute as late as
+    /// the group's `wait`, so every capture must outlive the innermost group even when `spawn`
+    /// appears inside a shorter-lived nested arena.
+    task_group_regions: Vec<Region>,
 }
 
 impl<'a> EscapeCheck<'a> {
@@ -3983,7 +3988,9 @@ impl<'a> EscapeCheck<'a> {
             // region value (e.g. a `Task` handle) cannot escape as the block's value.
             ExprKind::TaskGroup(b) => {
                 let inner = depth + 1;
+                self.task_group_regions.push(Region::arena(inner));
                 self.block(b, inner);
+                self.task_group_regions.pop();
                 if let Some(v) = &b.value
                     && self.region_bearing(v.ty) && !self.region_of(v, inner).outlives(Region::arena(depth)) {
                         self.diags.error(
@@ -3992,7 +3999,34 @@ impl<'a> EscapeCheck<'a> {
                         );
                     }
             }
-            ExprKind::Spawn { closure, .. } => self.walk(closure, depth),
+            ExprKind::Spawn { closure, .. } => {
+                if let Some(group) = self.task_group_regions.last().copied() {
+                    if let ExprKind::Closure { captures, .. } = &closure.kind {
+                        for capture in captures {
+                            if self.region_bearing(capture.ty)
+                                && !self.region_of(capture, depth).outlives(group)
+                            {
+                                self.diags.error(
+                                    "a spawned task cannot capture a value that is freed before its task_group is joined"
+                                        .to_string(),
+                                    capture.span,
+                                );
+                            }
+                        }
+                    } else if self.region_bearing(closure.ty)
+                        && !self.region_of(closure, depth).outlives(group)
+                    {
+                        // `check_spawn` currently constructs only `FnValue` or `Closure`, but keep
+                        // the escape pass fail-closed if the surface later accepts a local/block fn.
+                        self.diags.error(
+                            "a spawned task cannot capture a value that is freed before its task_group is joined"
+                                .to_string(),
+                            closure.span,
+                        );
+                    }
+                }
+                self.walk(closure, depth);
+            }
             ExprKind::EnumValue { payload, .. } => {
                 for p in payload {
                     self.walk(p, depth);
