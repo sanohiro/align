@@ -690,8 +690,20 @@ Provenance: surfaced by an external idea review (2026-07-02); adopted + implemen
 Record: `draft.md` §9 (memory layout) + §15 (`layout(C)`), `docs/language-spec.md`,
 `docs/design-notes.md`, `impl/05-backend-llvm.md` §2, `tests/struct_field_reorder.rs`.
 
-### Branchless `where` (all reducing terminals) — DONE (sum/count 2026-06-27; extended to min/max/any/all/reduce 2026-07-02)
-**Decision: a `where`/`where(.field)` feeding *any* reducing terminal lowers branchless** — AND the
+### Masked reducing `where` — vector code shipped; callable-speculation correctness fix OPEN (audit 2026-07-13)
+
+**Audit correction:** the 2026-07-02 implementation result below established a valuable
+identity-select vector shape, but overextended it to user callables and post-`where` stages. A Pure
+callable can still divide by zero, fail a bounds check, allocate/OOM, or fail to terminate. The
+current `where(false).map(divide_by_zero).sum()` therefore aborts, and ordinary Impure pipeline
+stages are accepted today. The implementation plan says they require Pure, but the normative draft
+constrains only `par_map`; settle that conflict before adding a rejection. Required now: keep
+identity/accumulator select only for operations separately proven safe on inactive lanes and
+branch-guard every other rejected-lane computation, preserving accepted sequential effects. Full
+reproduction, legality split, and regression gate:
+[`impl/12-pipeline-closure-memory-io-simd-audit.md` §3.1](impl/12-pipeline-closure-memory-io-simd-audit.md#31-confirmed-p0--where-does-not-guard-later-stages-or-the-reducer).
+
+**Historical shipped shape:** a `where`/`where(.field)` feeding a reducing terminal lowers by ANDing the
 predicates into a `mask`, then `select` each masked-out lane to the reducer's identity instead of a
 per-element branch (`Rvalue::Select` + `accumulate_mask` in `align_mir`). Fixed identities:
 `sum`/`count` → `0` (`acc += mask ? value : 0`, `count += mask ? 1 : 0`), `min` → `+∞` / `max` → `−∞`
@@ -699,13 +711,13 @@ per-element branch (`Rvalue::Select` + `accumulate_mask` in `align_mir`). Fixed 
 its user `f`, so it uses the **accumulator-select** form `acc = mask ? f(acc,v) : acc` (a masked-out
 lane leaves the accumulator unchanged). `min`/`max` also moved from a compare-and-branch update to
 the `select(cur `cmp` acc, cur, acc)` idiom, so the plain (no-`where`) path is branch-free too — one
-lowering, no dual mechanism. Semantics are byte-identical to the branch form: same ordered comparison
+lowering, no dual mechanism. For the builtin identity operation itself, results are byte-identical to
+the branch form: same ordered comparison
 (NaN elements still skipped by `min`/`max`), same empty-selection result (`min`/`max` → the extreme
 seed, `reduce` → `init`, `any` → `false`, `all` → `true`). `dot` is out of scope — `a.dot(b)` is a
-two-array kernel with no `where`, already branch-free. NB: the branchless form runs a reducer's own
-`f`/predicate (and any post-`where` stage) on masked-out elements too, its contribution discarded —
-the deliberate cost of a vectorizable, predication-ready loop (pipeline functions are pure, so this
-cannot differ observably); this already held for `sum`/`count`. **Why it matters (deferred before):**
+two-array kernel with no `where`, already branch-free. The current implementation also runs a
+reducer's own `f`/predicate and every post-`where` stage on rejected elements; that is the confirmed
+P0 above, not an acceptable cost of vectorization. **Why the safe identity-select shape matters:**
 the single-column `s.where(p).sum()` over `slice<i64>` already vectorized via LLVM if-conversion — no
 gain. But the **soa filtered aggregate** `rs.where(.active).pay.sum()` (bool mask column + i64 value
 column) did NOT auto-vectorize — scalar, 20 branches, branch-bound, **0.93× vs Rust AoS** (parity).
@@ -2117,9 +2129,13 @@ the same convention as the external audit: **CONFIRMED** = read against the code
 - **Low priority, deliberate design: `print` does a flushing `write(2)` per call.** An option is
   process-lifetime buffered stdout flushed via `align_rt_start` — the runtime's existing
   `BufferedWriter` already does this shape elsewhere, so it would be reuse, not new machinery. Noted
-  in passing so it isn't "fixed" by accident: the arena chunk's 64KiB zero-fill looks like waste but
-  is **load-bearing** — `json.decode` depends on the zeroed-out contract — don't remove it
-  independently of touching that contract.
+  in passing so it isn't "fixed" by accident. **Arena-zeroing correction (audit 2026-07-13):** the
+  earlier claim that JSON missing fields make the full 64 KiB zero-fill load-bearing is stale; the
+  current known-schema decoder rejects missing declared fields and writes every semantic field on
+  success. Blanket zeroing still must not simply be deleted: move a callsite to uninitialized storage
+  only after proving every semantically readable/copied/FFI/drop byte or field is initialized first,
+  while unwritten capacity/padding is never covered by an initialized bulk view. Full gate in
+  `impl/12-pipeline-closure-memory-io-simd-audit.md` §6.2.
 
 Record: none yet (all open); this session's design-facing conclusions (MIR width-agnostic invariant,
 two-tier SIMD positioning, the string-concatenation/literal-default/short-circuit spec gaps) are
@@ -2314,6 +2330,23 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
+### Ordinary sequential pipeline callable effects — SETTLE BEFORE P0 OPTIMIZER FIX
+
+Recorded 2026-07-13 by the pipeline audit. The implementation plan says closure arguments to
+`map`/`where`/`reduce` are Pure; the normative `draft.md` side-effect rule constrains only
+`par_map`, `language-spec.md` is silent, and the compiler currently accepts Impure sequential
+callables. The mismatch became observable because reducing `where` speculates post-filter calls on
+rejected elements. Rejecting those programs now would be a source-language change, not merely a
+checker fix.
+
+Preferred compatibility settlement: ordinary sequential stages may be Impure, must retain exact
+guarded source order, and their inferred effect restricts fusion/reordering/vectorization;
+every stage moved into explicit `par_map` remains Pure-required. Alternative: make all data-processing
+callables Pure normatively, update both specs and diagnostics, then enforce consistently. Also settle
+`sort_by_key`: its planned decorate-sort-undecorate changes an Impure key's call count from O(n^2) to
+exactly N, so either key functions are Pure or exactly-once evaluation becomes the contract. Full
+reproduction and interaction with `CanExecuteOnInactiveLane`: `impl/12` §3.1-3.2.
+
 ### Separate compilation (multi-module compilation units) — OWNER-MANDATED → M15
 
 Recorded 2026-07-12. The owner ruled that "one `Program` → one whole-program object" must not
@@ -2348,6 +2381,19 @@ grain. Applying the already-recorded blocking-worker direction to generic `task_
 later mixed-load gate, not a newly invented idea. No new language syntax is proposed. The same
 record catalogs task-error, pool, MIR, and generic parallel-reduce documentation drift; none of
 those unsettled descriptions authorizes implicit parallelization of ordinary `reduce`.
+
+**Pipeline/closure/memory/I/O/SIMD companion audit (2026-07-13):**
+[`impl/12-pipeline-closure-memory-io-simd-audit.md`](impl/12-pipeline-closure-memory-io-simd-audit.md)
+is the durable implementation record. It confirms that normal fused loops, `map_into` alias
+metadata, non-escaping capture inlining, JSON/UTF-8/string SIMD, direct regular-file reads, mmap
+views, and small/large writer paths already have the intended shape. It also records new P0s:
+post-`where` callable speculation changes semantics; two closure-region paths permit arena-backed
+view UAF; Unit indirect calls have an LLVM ABI mismatch; and `io.copy` skips buffered-reader
+lookahead. It separately records the ordinary-stage normative effect conflict and required dynamic
+allocation-size hardening. New measure-first work is the per-callsite initialized-before-read
+`arena_alloc_uninit` / conservative-zeroed split, exact-final Base64/hex fill paired with the existing
+Base64 SIMD backlog plus a new hex SIMD probe, HTTP batch request-copy removal, and scalar vs SIMD
+stable compaction. Existing work from documents 10/11 remains attributed there.
 
 ### External binary-optimization audit (Codex, 2026-07-12) — adoption record
 
@@ -3166,6 +3212,11 @@ around the string/JSON milestone (M5) and std build-out.
 `io.copy` is scheduled as `impl/07-roadmap.md` M9 Slice 2 (memory-bounded, `O(buffer)`, tested).
 The fast paths above (`sendfile`/`splice`/`io_uring`/Direct I/O) stay **post-M9**, added later
 without an `io.copy` signature change.
+
+**Correctness correction (audit 2026-07-13):** the v1 loop is memory-bounded but is not yet a
+byte-exact oracle from every valid reader state. After `read_line`, a buffered reader may hold unread
+lookahead while its fd offset is already ahead; `io.copy` reads the fd directly and skips those bytes.
+Drain lookahead before the loop and before any syscall fast path. Reproduction/gate: `impl/12` §3.6.
 
 **Status update (2026-07-03, M9 Slice 3 DONE):** the **`mmap` scan path** landed as `fs.read_file_view`
 (`draft.md` §18.2), the one place a view's backing is bound to a region (the enclosing arena;

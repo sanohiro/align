@@ -211,26 +211,25 @@ a scalable ISA is handled by predicated scalable codegen instead, which is why M
 > `select(cur `cmp` acc, cur, acc)` idiom (`llvm.{s,u}{min,max}` / `llvm.{min,max}imum`) so the whole
 > loop is branch-free and vectorizes: e.g. `xs.where(p).min()` over a `slice<i32>` emits `pminsd`
 > over a `pcmpgtd` mask on x86-64-v2 (verified via `objdump`; before, the per-element branch blocked
-> it entirely). The materializing terminals (`to_array`/`scan`) still use a real skip-branch — they
-> must not *append* a masked-out element, which is not an identity operation. The design is fixed:
-> **`where` is branchless** for the reducing shapes; no per-element `if` is part of the intended
-> source semantics. (`maskN<T>` is the explicit hand-written form of the same.) NB: with the
-> branchless form a reducer's own `f`/predicate (and any post-`where` stage) runs on masked-out
-> elements too, its contribution discarded — the deliberate, long-standing cost of a vectorizable
-> loop (pipeline functions are pure, so a masked-out element cannot differ observably). `dot` has no
-> masked pipeline form (`a.dot(b)` is a two-array kernel with no `where`), so it is already a
-> branch-free `acc += a[i]*b[i]` loop.
+> it entirely). The materializing terminals (`to_array`/`scan`) use a real skip-branch because they
+> must not append a rejected element.
+>
+> **Correctness audit correction (2026-07-13):** the current reducing lowering also speculates a
+> reducer's callable and every stage after `where` on rejected elements. This is a CONFIRMED P0:
+> Pure does not imply total/non-trapping, so `where(false).map(divide_by_zero).sum()` aborts. The
+> intended form is now: identity/accumulator `select` may stay branchless for operations separately
+> proven safe on inactive lanes; every other post-`where` stage/reducer must be guarded so it is not executed.
+> See [`12-pipeline-closure-memory-io-simd-audit.md` §3.1](12-pipeline-closure-memory-io-simd-audit.md#31-confirmed-p0--where-does-not-guard-later-stages-or-the-reducer).
+> `maskN<T>` remains the explicit hand-written value mask, and `dot` has no masked pipeline form.
 
 > **Why the identity-select shape matters beyond perf.** Selecting each reducer's identity for a
 > masked-out lane (`min` → `+∞`, `max` → `−∞`, `any` → `false`, `all` → `true`, `dot` → `0`, matching
 > `sum`/`count` → `0`) makes *every* reduction **predication-ready**: a masked-out lane contributes the
 > identity and cannot change the result. Generic `reduce` is the one exception — its user-supplied
 > function has no known identity (`init` is the starting accumulator, not an identity), so it uses the
-> equally branchless accumulator-select form `acc = mask ? f(acc, v) : acc`: a masked-out lane leaves
-> the accumulator unchanged. That is exactly how a scalable ISA predicates a partial tail
-> vector (`04 §4`), so extending the identity-select form across all reducers keeps them
-> scalable-tail-ready for free — the branchless form is the forward-compatible one, not just the fast
-> one.
+> accumulator-select result `acc = mask ? candidate : acc`. The candidate itself may be computed
+> speculatively only when proven safe; otherwise its computation is guarded. That distinction is what
+> makes the form semantics-correct and still predication-ready for scalable tails (`04 §4`).
 
 ---
 

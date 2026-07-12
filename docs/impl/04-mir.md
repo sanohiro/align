@@ -119,7 +119,12 @@ Project(field)      extract an element's field (no intermediate array)
 reduce/sum/min/max/count/dot/any/all  terminal. fold into an accumulator
 ```
 
-Consecutive map/where/project are **producer-consumer fused** into a single loop body, and the terminal reduction closes the loop. `Effect=Pure` (`03 §8`) is a prerequisite for fusion.
+Consecutive map/where/project are **producer-consumer fused** into a single loop body, and the
+terminal reduction closes the loop. `Effect=Pure` (`03 §8`) is a prerequisite for transformations
+that reorder, speculate, erase, or parallelize calls. **Audit note (2026-07-13):** whether ordinary
+sequential pipeline callables are normatively Pure is unsettled across the draft and implementation
+documents; accepted Impure calls may still share one loop only when their guarded source order and
+evaluation count are preserved. See `12-pipeline-closure-memory-io-simd-audit.md` §3.2.
 
 ```text
 total := users.where(.active).score.sum();
@@ -155,14 +160,14 @@ don't fuse sort / group_by / partition (involve whole-collection rearrangement),
 
 Carry vec/mask in MIR as **first-class** (`draft.md` §9), in a form that codegen can deterministically lower to vector instructions.
 
-### masks are branchless
-`where`/comparisons are lowered not to a per-element branch but to a `mask` + predicated ops
-(suited to SIMD/GPU) — **settled** (`open-questions.md` "SIMD exposure"; `05` §5): `where(p).sum()`
-→ masked reduce, materialization → stream-compaction. No per-element `if` is part of the source
-semantics. *(Done for the `sum`/`count` reducers: `where(p).sum()` lowers branchless via a mask +
-`Rvalue::Select` (`acc += mask ? value : 0`) — it vectorizes and makes the soa filtered aggregate
-beat Rust (`bench/` `total_pay`). `reduce`/`any`/`all`/`min`/`max` and materializing terminals still
-use `Term::Branch`.)*
+### masks and guarded inactive lanes
+Safe primitive `where` reductions can lower to a mask + predicated identity operation
+(suited to SIMD/GPU); materialization uses stream compaction. The shipped reducing lowering extended
+that mask to every reducer, but the 2026-07-13 audit found it also executes general callables and
+post-`where` stages on rejected elements. That is a P0, not source semantics. MIR must guard every
+inactive-lane-unsafe computation; mask + `select` remains legal only under the local conjunction in
+`12-pipeline-closure-memory-io-simd-audit.md` §3.1. Materializing terminals continue to skip rejected
+elements.
 
 ```align
 m := scores > 80;

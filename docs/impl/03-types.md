@@ -266,6 +266,16 @@ total := users.reduce(0, fn acc, u { acc + u.score });  // OK: Pure
 
 The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked even through a function value.
 
+> **Implementation audit note (2026-07-13):** the intended function-type effect bit is not yet
+> implemented end to end. The current name-based effect graph validates only `par_map` targets and
+> has lifted/higher-order closure holes. There is also a normative conflict: this implementation
+> plan says ordinary `map`/`where`/reducer callables require Pure, while `draft.md` constrains only
+> `par_map`, the language summary is silent, and the compiler accepts Impure sequential stages. Do
+> not turn that accepted behavior into an error until the language contract is settled; effects may
+> instead serve as optimization legality while exact guarded sequential order is preserved. Treat the
+> function-type effect representation as required, but the ordinary-stage rejection policy as open;
+> see [`12-pipeline-closure-memory-io-simd-audit.md` §3.2](12-pipeline-closure-memory-io-simd-audit.md).
+
 ---
 
 ## 9. Generics (minimal) — 4c-1 built
