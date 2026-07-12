@@ -95,7 +95,8 @@ its sources** — a borrow can never outlive what it borrows.
 ```text
 literal / leaked / owned-from-scalars     → Static
 view parameter (slice/str/… param)        → Static within this fn  (borrows the caller; returnable)
-heap.new / clone / template / str-concat  → region of the enclosing arena (Static if none*)
+heap.new / template                        → region of the enclosing arena (Static if none*)
+clone                                      → owned `string` in the current implementation**
 slice of a frame-local array literal      → Frame
 slice/view into a by-value param interior → Frame
 slice of an arena-allocated array         → that Arena(k)
@@ -109,12 +110,16 @@ struct literal { … }                      → max region over its fields  (Sta
 decoded str/array field                   → region of the decode input  (§9)
 ```
 
-\* `heap.new`/`clone`/`template`/concat outside any arena: the result is leaked /
-process-lifetime today, so `Static`. The owned-collection case is different — see §6: a
+\* An arena-free `template` is leaked/process-lifetime today, so `Static`; audit 13 records this as
+a confirmed ownership gap, not a performance contract. String `+` is a settled hard error, although
+the stale checker/MIR path still needs removal. The owned-collection case is different — see §6: a
 free-standing **owned** `array`/`string` is heap-owned and `Static`-lived *until its `Drop`*
 (not `Frame`). `Frame` is only for **borrows** of frame-local storage (a slice of a
 frame-local array literal, or a view into a by-value parameter's interior), never for a
 view *parameter* (which borrows the caller → `Static`, returnable).
+
+\** Prose about making an in-arena clone a bump allocation has drifted from the current heap-owned
+implementation. Audit 13 leaves that contract as a Claude Code question rather than deciding it.
 
 Regions are never written by the user and never appear in a type. They live only in the
 checker (an inferred property of each binding), exactly like today's `region` map — just
@@ -377,9 +382,10 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      function that does *not* return a borrow of its args is over-restricted (precise per-fn
      "returns a borrow of arg i" inference is a later slice) — but sound. Non-tracked args
      (ints/literals) are `Static` and don't shorten, so `dup("hi")` stays returnable.
-     - **`reduce` accumulator region (same fix).** A sibling gap: `region_of(ArrayReduce)` was
-       `Static`, so a `reduce` whose accumulator is region-tracked (a `str` built by concatenation
-       in the fold) could escape the arena it was folded in → use-after-free. `reduce` now joins
+     - **`reduce` accumulator region (same fix, historical trigger).** A sibling gap:
+       `region_of(ArrayReduce)` was `Static`, so a region-tracked accumulator could escape the arena
+       it was folded in → use-after-free. The original trigger used the now-forbidden string `+`;
+       the propagation rule remains necessary for any permitted region-tracked accumulator. `reduce` now joins
        `to_array`/`scan`/`sort` at `Region::arena(depth)` (the accumulator is folded in the
        enclosing arena). Scalar accumulators are unaffected (no region). (Note: the precise region
        is `arena(depth)`, not `shorter(init, source)` — an empty/all-`Static`-arg reduce still
