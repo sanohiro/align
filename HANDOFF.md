@@ -5,7 +5,36 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 `docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-11, twelfth wave (**M13 COMPLETE — Slice V MERGED as #424**, the last
+_Last updated: 2026-07-12, thirteenth wave (**LLVM/inkwell upgrade checkpoint COMPLETE — LLVM
+19 → 22 MERGED as #425**, the checkpoint sequenced after M13; the M13 shape/size/bench net served
+as the gate and caught exactly three behavior shifts, all re-pinned only after IR/objdump
+verification). Toolchain: inkwell `llvm19-1` → `llvm22-1` (0.9.0), llvm-sys 191 → 221 (221.0.1),
+`.cargo/config.toml` → `LLVM_SYS_221_PREFER_DYNAMIC=1`; the shared-only stance was re-verified and
+its rationale UPDATED — apt.llvm.org llvm-22 ships static archives and Polly is no longer a
+`--libs` component, so static would now work; dynamic kept as smaller + rustc-matching. clang-IR
+harness → clang-22 (same-LLVM requirement); LLVM 19 stays installed (rollback/shape-diff triage).
+The three shifts: (a) LLVM 22 SCEV constant-folds constant-array reductions to closed form (zero
+vector-reduce emitted) → kernels re-seeded opaque from `args.len()`; under opaque data 22
+vectorizes to the SAME widths/intrinsics as 19 (`reduce.add.v4i64` at v3 / `.v2i64` at v2; objdump
+re-verified v2 `paddq`-no-`ymm`, v3/skylake `vpaddq`+`ymm`); clang-compare k4/k5 negative controls
+deliberately stay constant-form (opaque seeding would false-positive the harness vec-detector on
+SSA init stores). (b) the `vector.body` block name is unreliable for inlined reduction loops on 22
+→ reduction detection re-keyed on the mangled reduce intrinsic (`llvm.vector.reduce.<op>.v<N>i64`,
+which also pins width) + `vector.ph`; mutation teeth re-verified BOTH directions (emptying
+`rt_contract` collapses the A8 kernel and fails its test). (c) `nocapture` auto-upgrades to
+`captures(none)`, which inkwell 0.9 prints as `ptr none` → rt_contract textual pin updated;
+`memory(argmem: read)` bitmask unchanged; the A8 gate (loop-invariant `hash64` hoists AND
+vectorizes) alive on 22. Verification: `cargo test --workspace` **1878 green** (byte-for-byte the
+M13-close baseline), clippy clean; `bench/binary_size` **byte-identical** to the 19 baseline (the
+rustc-built runtime staticlib dominates; section rounding absorbs the codegen delta);
+`bench/clang_ir_compare` all 5 kernels **MATCH** on 22/clang-22. Independent adversarial gate:
+SHIP, all 8 implementation claims re-verified against real LLVM 22.1.8 incl. kill-mutations;
+gemini zero findings. NEW recorded follow-up (roadmap): inkwell 0.9's `ptr none` shorthand is not
+re-parseable by `llvm-as-22` — the textual `emit-llvm | llvm-as` dev path is broken (object
+codegen and grep-based consumers unaffected); resolve at the M14 bitcode/ThinLTO boundary (emit
+`captures(none)` or a `.bc` path). **Next: M14, the post-upgrade wave** (roadmap order: ThinLTO →
+runtime bitcode → PGO → BOLT; the deferred ABI-flattening/fn-arg-attr/nsw items wait for those
+boundaries). Earlier: twelfth wave (**M13 COMPLETE — Slice V MERGED as #424**, the last
 slice; the milestone is formally closed in the roadmap). **Upgrade-target decision (owner,
 2026-07-11, end of session): LLVM 22 from apt.llvm.org** (`llvm-toolchain-trixie-22`; the owner
 installs `llvm-22 llvm-22-dev clang-22` themselves) — NOT Debian backports' 21: inkwell 0.9
