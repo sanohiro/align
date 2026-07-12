@@ -601,13 +601,14 @@ copies into Align-owned storage
 ([encoding implementation](../../crates/align_runtime/src/lib.rs#L5375)). Their output sizes are known:
 
 ```text
-base64 padded   4 * ceil(input_len / 3)
-base64url       floor((4 * input_len + 2) / 3)
+base64 padded   4 * ((input_len + 2) / 3)
+base64url       (4 * input_len + 2) / 3
 hex             2 * input_len
 ```
 
-After checked length arithmetic, allocate the final Align string once and fill it directly. This
-removes one allocation and one full-output copy before any SIMD work. Then implement the
+All additions and multiplications in these integer formulas must use checked arithmetic. Then
+allocate the final Align string once and fill it directly. This removes one allocation and one
+full-output copy before any SIMD work. Then implement the
 **ALREADY PLANNED** Lemire-class Base64 runtime dispatch behind the same ABI. Hex SIMD is a separate
 new **MEASURE-FIRST** extension and must beat the simple scalar exact-destination loop:
 
