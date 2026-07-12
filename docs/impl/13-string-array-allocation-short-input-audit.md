@@ -1,8 +1,11 @@
 # String and array allocation, copying, and short-input audit
 
-> Status: audit record, 2026-07-13. No implementation in this document is shipped merely because
-> it is described here. Correctness/resource findings are **CONFIRMED**; performance changes remain
-> gated unless an existing roadmap item already says otherwise.
+> Status: audit record, 2026-07-13. **Partial corrective implementation shipped in the working
+> tree on 2026-07-13:** the UTF-8 range-boundary part of §3.1 is fixed and regression-pinned;
+> `s.bytes()` and the other findings remain open. No other implementation in this document is
+> shipped merely because it is described here. Performance changes remain gated unless an existing
+> roadmap item already says otherwise. The complete corrective wave is summarized in
+> [`source-correctness-fixes-2026-07-13.md`](source-correctness-fixes-2026-07-13.md).
 
 ## 1. Scope and classification
 
@@ -42,7 +45,7 @@ The strongest problems are instead ownership and fixed-cost gaps:
 
 | Area | Current shape | Disposition |
 |---|---|---|
-| `s[a..b]` | checks range but not UTF-8 scalar boundaries | **CONFIRMED P0**; fix before more text fast paths |
+| `s[a..b]` | O(1) range + UTF-8 scalar-boundary checks | **FIXED 2026-07-13**; `str` validity is preserved |
 | `str + str` | settled hard error, but sema still accepts and MIR allocates | **CONFIRMED P0** contract drift |
 | arena-free `template` / `json.encode` | leaks its payload for process lifetime | **CONFIRMED P0/P1** resource bug |
 | unbound owned temporaries | `.len()`, scalar index, direct call use can omit `Drop` | **CONFIRMED P0**; leaks strings and arrays in loops |
@@ -63,16 +66,15 @@ freeing them without owner/view liveness would convert a leak into a UAF.
 
 ## 3. Correctness and ownership prerequisites
 
-### 3.1 CONFIRMED P0 — `str` range slicing can create invalid UTF-8
+### 3.1 FIXED 2026-07-13 — `str` range slicing cannot create invalid UTF-8
 
 The language contract says every `str` is valid UTF-8 and a byte-range slice aborts if either bound
 splits a scalar ([draft §12](../../draft.md#12-string),
-[language summary](../language-spec.md#strings)). MIR currently performs only
-`0 <= start <= end <= len`, then creates a byte-stride `SubSlice`
-([range lowering](../../crates/align_mir/src/lib.rs#L3496)). There is no continuation-byte test in
-MIR, codegen, or the runtime.
+[language summary](../language-spec.md#strings)). At the audit baseline MIR performed only
+`0 <= start <= end <= len`, then created a byte-stride `SubSlice`; there was no
+continuation-byte test in MIR, codegen, or the runtime.
 
-For example, the current optimizer accepts and constant-folds the length of an invalid view:
+For example, the audit-baseline optimizer accepted and constant-folded the length of an invalid view:
 
 ```align
 s := "é"          // c3 a9
@@ -80,10 +82,11 @@ bad := s[1..2]     // a9, a UTF-8 continuation byte
 print(bad.len())   // 1
 ```
 
-Checking a boundary is O(1): `0` and `len` are valid; otherwise the byte at the boundary must not
-match `10xxxxxx`. Check both endpoints after the range guard and branch to a cold abort. Add tests for
-every 1/2/3/4-byte scalar boundary, omitted endpoints, empty strings, and dynamic indices. Optimized
-ASCII slicing must remain two loads/masks plus the existing cold edge, not a full validation scan.
+The fix is O(1): `0` and `len` are valid; otherwise the byte at the boundary must not match
+`10xxxxxx`. MIR now checks both endpoints after the ordinary range guard and calls the noreturn
+`align_rt_utf8_boundary_fail` cold path on a split scalar. Integration tests cover accepted
+1/2/3/4-byte boundaries, omitted endpoints, and both a split start and split end. This preserves the
+two loads/masks shape instead of rescanning the sub-string.
 
 The documented arbitrary-byte escape hatch `s.bytes() -> slice<u8>` is also absent: sema dispatches
 `buffer.bytes()` but not `str.bytes()`
@@ -531,7 +534,8 @@ AoS/SoA conversion, or a second substring-search algorithm.
 
 ### C0 — invariants and resource ownership
 
-1. Enforce UTF-8 range boundaries and ship the specified zero-cost `s.bytes()` view.
+1. ~~Enforce UTF-8 range boundaries~~ **DONE 2026-07-13**; separately ship the specified zero-cost
+   `s.bytes()` view.
 2. Enforce the settled `str + str` hard error and correct stale tests/docs.
 3. Add owned expression temporaries/synthetic owners with view-aware liveness; close string, array,
    chunks, and builder direct-consumer leaks.
@@ -567,7 +571,7 @@ AoS/SoA conversion, or a second substring-search algorithm.
 
 Correctness/resource mutations must fail when any of the following is removed:
 
-- UTF-8 start/end continuation-byte check;
+- UTF-8 start/end continuation-byte check (**shipped and regression-pinned 2026-07-13**);
 - hard error for `str + str`;
 - synthetic owner/drop for an unbound Move temporary;
 - owner lifetime extension for a borrowed result view;
@@ -602,7 +606,7 @@ short microbenchmark never justifies code-size or memory-traffic loss at scale.
   after a real decision, not because this audit asked the question.
 
 The new contribution of document 13 is the short-input evidence and the confirmed ownership/copy
-gaps: UTF-8 slicing, settled concat enforcement, arena-free template lifetime, unbound temporary
+gaps: the now-fixed UTF-8 slicing defect, settled concat enforcement, arena-free template lifetime, unbound temporary
 drop, known-null drops, borrowed ABI paths, builder/array-builder headers and freeze, virtual chunks,
 direct str-group outputs, direct path normalization, staged name/IP payloads, and large constant-local
 initialization.

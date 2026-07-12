@@ -95,6 +95,23 @@ fn call_returned_owned_array_consumed_in_place() {
 }
 
 #[test]
+fn call_returned_borrowed_slice_consumed_in_place_is_not_freed() {
+    if !backend_available() {
+        return;
+    }
+    // `whole` returns a borrowed view into the caller's fixed stack array. The pipeline may read
+    // that view, but must not mistake the call expression for an owned array temporary and free it.
+    let src = "fn whole(xs: slice<i64>) -> slice<i64> = xs\nfn main() -> i32 {\n  a := [1, 2, 3]\n  return whole(a).sum() as i32\n}\n";
+    let out = build_and_run("call-borrowed-slice-sum", src);
+    assert_eq!(out.status.code(), Some(6));
+
+    let mut sm = SourceMap::new();
+    let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
+    let text = align_mir::print::program_to_string(&mir);
+    assert!(!text.contains("drop_value"), "a borrowed call result must not be freed:\n{text}");
+}
+
+#[test]
 fn call_returned_owned_array_as_collect_source() {
     if !backend_available() {
         return;

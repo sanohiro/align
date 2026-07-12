@@ -116,6 +116,37 @@ pub fn main() -> Result<(), Error> {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "48692121\n");
 }
 
+/// Appending a buffer's own bytes is a copy, even when doubling the payload forces the backing Vec
+/// to reallocate. The source view must be snapshotted before that growth so it cannot dangle.
+#[test]
+fn append_own_bytes_survives_reallocation() {
+    if !backend_available() {
+        return;
+    }
+    const PAYLOAD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let prog = "\
+pub fn main() -> Result<(), Error> {
+  mut b := buffer(0)
+  b.append(\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\")
+  own := b.bytes()
+  b.append(own)
+  print(b.bytes().as_str()?)
+  return Ok(())
+}
+";
+    let out = build_and_run("a2-append-self", prog);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{PAYLOAD}{PAYLOAD}\n")
+    );
+}
+
 /// An out-of-range read aborts (the offset+width exceeds the view length) — the same fail-closed
 /// policy as `slice[i]`, so a parser must check `.len()` first. The process exits non-zero.
 #[test]

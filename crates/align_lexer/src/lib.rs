@@ -204,6 +204,8 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b'.') | Some(b'+') | Some(b'*') | Some(b'/') | Some(b'%') => return true,
                 Some(b'<') | Some(b'>') | Some(b'=') | Some(b'&') | Some(b'|') | Some(b'^') => return true,
+                // `!=` is binary, while a bare `!` is unary and starts a new statement.
+                Some(b'!') => return self.src.get(i + 1).copied() == Some(b'='),
                 // '-' is also unary, but at line start treat it as a binary continuation.
                 Some(b'-') => return self.src.get(i + 1).copied() != Some(b'>'),
                 _ => return false,
@@ -893,6 +895,31 @@ mod tests {
             vec![
                 TokKind::Ident("a".into()),
                 TokKind::Dot,
+                TokKind::Ident("b".into()),
+                TokKind::End,
+                TokKind::Eof,
+            ]
+        );
+
+        // `!=` is a binary operator, so it continues the previous line just like `==`.
+        assert_eq!(
+            kinds("a\n  != b\n"),
+            vec![
+                TokKind::Ident("a".into()),
+                TokKind::NotEq,
+                TokKind::Ident("b".into()),
+                TokKind::End,
+                TokKind::Eof,
+            ]
+        );
+
+        // A bare `!` remains unary and must not glue the next statement to the previous one.
+        assert_eq!(
+            kinds("a\n  !b\n"),
+            vec![
+                TokKind::Ident("a".into()),
+                TokKind::End,
+                TokKind::Bang,
                 TokKind::Ident("b".into()),
                 TokKind::End,
                 TokKind::Eof,

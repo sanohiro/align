@@ -1597,6 +1597,25 @@ pub fn check_program(modules: &[Module], diags: &mut Diagnostics) -> Program {
                 diags.error(format!("duplicate type declaration: '{bare}' in module '{}'", m.path), span);
                 continue;
             }
+            // Field names define the struct's source-level layout and lookup table. Keeping two
+            // fields with the same name would make the later field unreachable (`field_index`
+            // finds the first) and make the type impossible to construct without a spurious
+            // "missing field" error. Validate here so concrete and generic structs share the same
+            // declaration rule.
+            if let ast::Item::Struct(s) = item {
+                let mut seen_fields = std::collections::HashSet::new();
+                for field in &s.fields {
+                    if !seen_fields.insert(field.name.name.as_str()) {
+                        diags.error(
+                            format!(
+                                "duplicate field '{}' in struct '{}'",
+                                field.name.name, s.name.name
+                            ),
+                            field.span,
+                        );
+                    }
+                }
+            }
             let canonical = mangle_fn(&m.path, m.is_entry, bare);
             tt.insert(bare.clone(), TypeEntry { canonical: canonical.clone(), is_pub: matches!(vis, ast::Vis::Pub) });
             match item {
@@ -3582,12 +3601,14 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Match { arms, .. } => arms
                 .iter()
                 .fold(Region::Static, |acc, a| acc.shorter(self.region_of(&a.body, depth))),
-            // An indirect call's result may borrow one of its arguments (`g := id; g(s)`), so it
-            // lives no longer than the shortest-lived argument — exactly like a direct `Call`.
-            // Without this, returning `g(arena_str)` out of an arena slips the escape check.
-            ExprKind::CallFnValue { args, .. } => args
-                .iter()
-                .fold(Region::Static, |acc, a| acc.shorter(self.region_of(a, depth))),
+            // An indirect call's result may borrow one of its arguments (`g := id; g(s)`) or its
+            // closure environment (`f := fn { captured_view }; f()`). It therefore lives no longer
+            // than either the callee or the shortest-lived argument. Without the callee fold, a
+            // zero-argument closure can return an arena capture after that arena is freed.
+            ExprKind::CallFnValue { callee, args } => args.iter().fold(
+                self.region_of(callee, depth),
+                |acc, a| acc.shorter(self.region_of(a, depth)),
+            ),
             // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
             // into the array's storage, so it inherits the array's region (like `ElemField`).
             ExprKind::IndexField { base, .. } => self.region.get(base).copied().unwrap_or(Region::Static),
@@ -17614,6 +17635,26 @@ mod tests {
     fn bool_condition_required() {
         let (_p, d) = check("fn f(n: i32) -> i32 {\n  if n { return 1 }\n  return 0\n}\n");
         assert!(d.has_errors(), "if condition must be bool");
+    }
+
+    #[test]
+    fn duplicate_struct_fields_are_rejected() {
+        let (_p, d) = check("P { x: i32, x: i32 }\nPair<T> { value: T, value: T }\n");
+        let duplicates: Vec<_> = d
+            .iter()
+            .filter(|diag| diag.message.contains("duplicate field"))
+            .collect();
+        assert_eq!(
+            duplicates.len(),
+            2,
+            "both concrete and generic structs must reject duplicate fields: {duplicates:?}"
+        );
+        assert!(duplicates
+            .iter()
+            .any(|diag| diag.message.contains("struct 'P'")));
+        assert!(duplicates
+            .iter()
+            .any(|diag| diag.message.contains("struct 'Pair'")));
     }
 
     #[test]

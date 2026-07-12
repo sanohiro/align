@@ -60,7 +60,8 @@ audit 13 が P0 の実装/settlement drift として記録している。
 
 この領域に `Result` は無い。`s[a..b]` の out of bounds は abort する。非 UTF-8 の *入力* は `std` 境界の
 関心事である(`fs.read_file` → `Error.Invalid`)。core の文字列操作は不変条件を前提としてバイト指向を
-保つ。現在の range lowering に仕様どおりの UTF-8 scalar-boundary abort がまだ必要なことも audit 13 に記録した。
+保つ。range lowering は両端で仕様どおりの O(1) UTF-8 scalar-boundary abort を行う
+(audit 13 §3.1、2026-07-13 修正済み)。
 
 ## Regions
 
