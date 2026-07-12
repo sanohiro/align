@@ -38,7 +38,12 @@ module; the rustc-vs-alignc LLVM version wall DISSOLVED with the 22 jump — rus
 22.1.2 bitcode, verified to merge+LTO cleanly, std does not leak into IR; the measured win surface
 is per-element string/hash wrappers only, the numeric core is already saturated). **M14 Slice 1 =
 the LTO ceiling probe** (wall-clock ≥ 1.15× on a str_eq/str_cmp/hash64 kernel or record-and-close
-items 1+2, the #416 precedent); PGO keeps its place with written reasons. **M15 separate
+items 1+2, the #416 precedent); PGO keeps its place with written reasons. **Probe status: launched
+2026-07-12 then STOPPED mid-run on session token budget — rerun next session** (procedure fully
+specified in the roadmap M14 section; one practical hint from the aborted run: the probe pipeline
+must NOT round-trip alignc IR through standalone `opt-22`/`llvm-as-22` — the known `ptr none`
+textual-print issue rejects it; either `sed 's/ptr none/ptr captures(none)/'` the emitted text or
+keep the Align side in-memory). **M15 separate
 compilation (multi-module compilation units) is OWNER-MANDATED (2026-07-12)** — the owner ruled
 whole-program-only must not remain; roadmap M15 section holds the design-question list
 (unit boundary/artifact, cross-unit inference summaries, generics, M13 internalization +
