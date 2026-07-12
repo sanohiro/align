@@ -987,7 +987,8 @@ pub enum Term {
 /// The mapping is a **superset** of the symbols each op's runtime code references, on purpose. The
 /// runtime is one crate compiled to a single archive member (verified: all of alloc + compress +
 /// crypto + http land in one `*.rcgu.o`), so archive-member granularity does NOT isolate a feature.
-/// What isolates it is the final link's `--gc-sections`: for a program that uses *no* gated feature
+/// What isolates it is the final link's dead-code removal (`--gc-sections` on ELF, `-dead_strip`
+/// on Mach-O): for a program that uses *no* gated feature
 /// the dead compress/crypto/tls code (and its external references) is garbage-collected, so none of
 /// z/zstd/crypto/ssl is needed. But once a gated feature IS used, a GNU ld quirk kicks in — as soon
 /// as a candidate library on the command line resolves *some* of the member's undefined symbols, ld

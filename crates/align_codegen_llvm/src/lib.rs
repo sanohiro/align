@@ -149,7 +149,8 @@ impl Profile {
         }
     }
 
-    /// Whether the linker should strip all symbols (`-Wl,--strip-all`) from the final image. The
+    /// Whether all symbols should be stripped from the final image (spelled per object format by
+    /// the driver: ELF links with `-Wl,--strip-all`, Mach-O runs `strip` post-link). The
     /// size profiles (`small`/`tiny`) strip — the symbol table is pure size a size build does not
     /// want; the speed profiles (`dev`/`release`/`fast`) keep symbols so a crash backtrace / `perf`
     /// stays useful. (Pre-release, changeable — documented at the decision site.)
