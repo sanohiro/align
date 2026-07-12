@@ -184,6 +184,57 @@ fn task_cannot_escape_scope() {
 }
 
 #[test]
+fn spawn_rejects_inner_arena_captures() {
+    let cases = [
+        (
+            "direct",
+            "fn main() -> Result<(), Error> {\n  task_group {\n    arena {\n      n := 7\n      v := template \"hello {n}\"\n      spawn(fn { print(v) })\n      0\n    }\n    wait()\n  }\n  return Ok(())\n}\n",
+        ),
+        (
+            "struct",
+            "Holder { value: str }\nfn use_holder(h: Holder) -> i64 = h.value.len()\nfn main() -> Result<(), Error> {\n  task_group {\n    arena {\n      n := 7\n      v := template \"hello {n}\"\n      h := Holder { value: v }\n      spawn(fn { use_holder(h) })\n      0\n    }\n    wait()\n  }\n  return Ok(())\n}\n",
+        ),
+        (
+            "tuple",
+            "fn use_pair(pair: (str, i64)) -> i64 = pair.0.len()\nfn main() -> Result<(), Error> {\n  task_group {\n    arena {\n      n := 7\n      v := template \"hello {n}\"\n      pair := (v, 1)\n      spawn(fn { use_pair(pair) })\n      0\n    }\n    wait()\n  }\n  return Ok(())\n}\n",
+        ),
+        (
+            "option",
+            "fn use_option(wrapped: Option<str>) -> i64 = (wrapped else { \"fallback\" }).len()\nfn main() -> Result<(), Error> {\n  task_group {\n    arena {\n      n := 7\n      v := template \"hello {n}\"\n      wrapped := Some(v)\n      spawn(fn { use_option(wrapped) })\n      0\n    }\n    wait()\n  }\n  return Ok(())\n}\n",
+        ),
+        (
+            "result",
+            "fn use_result(wrapped: Result<str, Error>) -> Result<i64, Error> = Ok(wrapped?.len())\nfn main() -> Result<(), Error> {\n  task_group {\n    arena {\n      n := 7\n      v := template \"hello {n}\"\n      wrapped: Result<str, Error> := Ok(v)\n      spawn(fn { use_result(wrapped) })\n      0\n    }\n    wait()?\n  }\n  return Ok(())\n}\n",
+        ),
+        (
+            "closure",
+            "fn call(f: fn(i64) -> i64) -> i64 = f(0)\nfn main() -> Result<(), Error> {\n  task_group {\n    arena {\n      n := 7\n      v := template \"hello {n}\"\n      inner := fn x: i64 { v.len() + x }\n      spawn(fn { call(inner) })\n      0\n    }\n    wait()\n  }\n  return Ok(())\n}\n",
+        ),
+    ];
+
+    for (name, src) in cases {
+        let diagnostics = check_diagnostics(&format!("tg-inner-arena-{name}"), src);
+        assert!(
+            diagnostics.contains(
+                "a spawned task cannot capture a value that is freed before its task_group is joined"
+            ),
+            "{name} capture should be rejected by the task-group lifetime check:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn spawn_accepts_captures_that_outlive_group() {
+    let outer_arena = "fn main() -> Result<(), Error> {\n  arena {\n    n := 7\n    v := template \"hello {n}\"\n    task_group {\n      spawn(fn { print(v) })\n      wait()\n    }\n  }\n  return Ok(())\n}\n";
+    let frame_and_static = "fn main() -> Result<(), Error> {\n  owned := \"frame\".clone()\n  view: str := owned\n  literal := \"static\"\n  task_group {\n    spawn(fn { print(view) })\n    spawn(fn { print(literal) })\n    wait()\n  }\n  return Ok(())\n}\n";
+
+    for (name, src) in [("outer-arena", outer_arena), ("frame-static", frame_and_static)] {
+        let diagnostics = check_diagnostics(&format!("tg-valid-capture-{name}"), src);
+        assert!(diagnostics.is_empty(), "{name} capture should be accepted:\n{diagnostics}");
+    }
+}
+
+#[test]
 fn spawn_outside_task_group_rejected() {
     assert!(check_errs(
         "tg-outside",

@@ -1,8 +1,8 @@
 # Pipeline, closure, memory, I/O, and SIMD audit
 
-Status: **RECORDED 2026-07-13; partially implemented 2026-07-13.** The closure-result environment
-region gap (§3.4), Unit indirect-call ABI defect (§3.5), and buffered `io.copy` data loss (§3.6) are
-fixed and regression-pinned; the other
+Status: **RECORDED 2026-07-13; partially implemented 2026-07-13.** The spawn-capture lifetime gap
+(§3.3), closure-result environment region gap (§3.4), Unit indirect-call ABI defect (§3.5), and
+buffered `io.copy` data loss (§3.6) are fixed and regression-pinned; the other
 correctness and performance items remain open. This is the durable follow-up to
 [`10-cache-first-optimization.md`](10-cache-first-optimization.md) and
 [`11-parallel-execution-optimization.md`](11-parallel-execution-optimization.md); the corrective
@@ -47,9 +47,10 @@ come before further SIMD or parallel widening:
 2. The implementation documents say ordinary pipeline callables are Pure, while the normative spec
    constrains only `par_map` and the compiler accepts Impure sequential stages. Optimizations cannot
    assume a premise the language has not settled.
-3. `spawn` can retain a view backed by an inner arena until after that arena is freed. The related
-   first-class closure-result escape is **FIXED 2026-07-13** by including the callee environment's
-   region in an indirect call result.
+3. ~~`spawn` could retain a view backed by an inner arena until after that arena was freed.~~
+   **FIXED 2026-07-13**, including wrapped and nested-closure captures. The related first-class
+   closure-result escape is also fixed by including the callee environment's region in an indirect
+   call result.
 4. ~~An indirect `() -> ()` call was emitted with an `i32` return type while its thunk was `void`.~~
    **FIXED 2026-07-13.**
 5. ~~`io.copy` read the fd directly and skipped bytes already held in a buffered reader's
@@ -220,9 +221,10 @@ effect bit on function types is therefore a prerequisite for parallel capture co
 optimization legality. Until that lands, unknown function values must be conservatively Impure at a
 Pure/parallel boundary; this does not require rejecting a guarded sequential call.
 
-### 3.3 CONFIRMED P0 — `spawn` can outlive a captured inner-arena view
+### 3.3 FIXED 2026-07-13 — `spawn` captures outlive the task-group region
 
-This shape passes `check`; emitted MIR orders `spawn_task`, `arena_end`, then `tg_wait`:
+At the audit baseline this shape passed `check`; emitted MIR ordered `spawn_task`, `arena_end`, then
+`tg_wait`:
 
 ```align
 fn main() -> Result<(), Error> {
@@ -239,16 +241,15 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-The task environment snapshots only the view's `{ptr,len}`. It does not own the arena backing. The
-escape checker currently handles `Spawn` by recursively walking its closure and never checks that each
-capture outlives the enclosing task-group region
-([`EscapeCheck` around line 3974](../../crates/align_sema/src/lib.rs#L3974)). Because tasks execute at
-`wait`, this is a use-after-free.
+The task environment snapshots only the view's `{ptr,len}`; it does not own the arena backing.
+`EscapeCheck` now keeps the active task-group regions as an innermost-last stack. At each `spawn`,
+every region-bearing capture must outlive the innermost group. Static, frame, and outer-arena
+captures remain accepted; a capture tied to any inner arena is rejected before MIR lowering.
 
-Required correction: track the active task-group region in `EscapeCheck`; at each spawn, require every
-region-bearing captured value to outlive that group. Snapshotting a view is not deep cloning. Add
-positive coverage for frame/static/outer-arena captures and negative coverage for every inner arena,
-including captures wrapped in structs, tuples, Option/Result, and another closure.
+`task_group.rs` pins the direct reproduction and captures wrapped in a struct, tuple, `Option`,
+`Result`, and another closure. Positive gates cover frame/static and outer-arena captures. Removing
+the outlives check makes the negative matrix pass checking again, so the regression net exercises
+the lifetime gate rather than an adjacent restriction.
 
 ### 3.4 FIXED 2026-07-13 — closure-call results include the closure environment's region
 
@@ -846,10 +847,10 @@ Do not count the following as new findings from this audit:
 - Base64 SIMD as an encoding backlog item.
 
 New here are the `where` speculation reproduction and legality split, the ordinary-stage normative
-effect conflict, two closure-region UAFs (the closure-result half now fixed), Unit indirect-call ABI mismatch, buffered-`io.copy` data loss,
-allocation byte-overflow hardening requirement, per-callsite initialized-before-read arena proof/gate,
-exact-final-destination codec fill, hex SIMD and macOS copy-path probes, HTTP request-copy removal, and
-sequential SIMD stream compaction.
+effect conflict, two now-fixed closure-region UAFs, Unit indirect-call ABI mismatch,
+buffered-`io.copy` data loss, allocation byte-overflow hardening requirement, per-callsite
+initialized-before-read arena proof/gate, exact-final-destination codec fill, hex SIMD and macOS
+copy-path probes, HTTP request-copy removal, and sequential SIMD stream compaction.
 
 The document-11 lifted-closure effect hole and nested scheduler deadlock remain P0 and must be solved in
 the same correctness wave. The new higher-order effect finding strengthens its planned function-type
@@ -874,7 +875,7 @@ match the settled contract; safe primitive positive cases retain vectorization.
 
 ### Slice P0b — closure lifetime and ABI
 
-- require spawn captures to outlive the task-group region;
+- [x] require spawn captures to outlive the task-group region (2026-07-13);
 - [x] include callee/environment region in an indirect call's result (2026-07-13);
 - [x] emit Unit indirect calls as `void` (2026-07-13);
 - wire the documented fallible spawn-lambda expected `Result` type;
