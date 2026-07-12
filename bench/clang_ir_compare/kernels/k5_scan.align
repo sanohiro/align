@@ -1,5 +1,7 @@
 // K5 — prefix scan (NEGATIVE CONTROL). Loop-carried (element i depends on i-1): must NOT
 // vectorize. Confirms the harness reports a scalar loop where one is expected, on both sides.
+// Keeps a CONSTANT array (unlike k1/k2/k3): the "neither vectorizes" verdict is reported correctly;
+// opaque seeding would make the array-INIT store SSA and trip the vec-detector. See ../README.md.
 fn add(a: i64, x: i64) -> i64 = a + x
 fn run(xs: slice<i64>) -> i64 {
   ps := xs.scan(0, add)

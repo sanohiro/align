@@ -4,22 +4,22 @@
 #   bench/clang_ir_compare/run.sh
 #
 # For each kernel pair under kernels/ (kNN_name.align + kNN_name.c — semantically equal), this
-# compiles BOTH through the SAME LLVM 19: Align via `alignc emit-llvm --stage optimized`, C via
-# `clang-19 -O2`, both pinned to the same `--target-cpu` / `-march`. It then diffs the load-bearing
+# compiles BOTH through the SAME LLVM 22: Align via `alignc emit-llvm --stage optimized`, C via
+# `clang-22 -O2`, both pinned to the same `--target-cpu` / `-march`. It then diffs the load-bearing
 # optimized-IR SHAPE (not bytes): did the pipeline vectorize, at what width, with which horizontal
 # reduction intrinsic, and did a runtime overlap guard (`vector.memcheck`) appear.
 #
 # This is a HARNESS + a recorded baseline, not a pass/fail gate — divergences are FINDINGS (see
 # README.md "Recorded baseline"), i.e. future optimization leads, not failures. It exits 0 whether
-# shapes match or diverge; it exits 0 (skips) when clang-19 is absent.
+# shapes match or diverge; it exits 0 (skips) when clang-22 is absent.
 #
-# Env knobs: ALIGNC (path to a prebuilt alignc; else `cargo build`), CLANG (default clang-19),
+# Env knobs: ALIGNC (path to a prebuilt alignc; else `cargo build`), CLANG (default clang-22),
 # CPU (default x86-64-v3 — an AVX2 tier that gives stable 256-bit widths).
 set -euo pipefail
 cd "$(dirname "$0")"
 
 CPU="${CPU:-x86-64-v3}"
-CLANG="${CLANG:-clang-19}"
+CLANG="${CLANG:-clang-22}"
 
 if ! command -v "$CLANG" >/dev/null 2>&1; then
   echo "clang-IR compare: '$CLANG' not found — skipping (this harness needs the same-version clang)."

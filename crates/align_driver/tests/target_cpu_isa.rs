@@ -5,9 +5,10 @@
 //! that CPU's ISA extensions (AVX2 etc.) — leaving the vectorizer's `<4 x i64>` to be scalarized or
 //! narrowed at the backend. This suite settles it **empirically** at the machine-code level.
 //!
-//! Verdict (probed 2026-07-11, LLVM 19): the empty feature string is CORRECT. LLVM derives the ISA
-//! feature set from the CPU name itself (`getFeaturesForCPU`), so `x86-64-v3` enables AVX2 and the
-//! backend selects `ymm` / `vpaddq`; `x86-64-v2` stays on SSE (`xmm` / `paddq`, no `ymm`). No fix
+//! Verdict (probed 2026-07-11, LLVM 19; re-verified 2026-07-12, LLVM 22): the empty feature string
+//! is CORRECT. LLVM derives the ISA feature set from the CPU name itself (`getFeaturesForCPU`), so
+//! `x86-64-v3` enables AVX2 and the backend selects `ymm` / `vpaddq`; `x86-64-v2` stays on SSE
+//! (`xmm` / `paddq`, no `ymm`). No fix
 //! needed. This pins the residual that `vectorize_shapes.rs` does not: that suite pins the *IR*
 //! widths (`<4 x i64>` at v3, `<2 x i64>` at v2); this one pins actual **instruction selection** —
 //! the last link in the chain the empty-feature-string concern was about.
@@ -38,14 +39,18 @@ fn ready() -> bool {
     cfg!(target_arch = "x86_64") && backend_available() && objdump_available()
 }
 
-/// A vectorizable int reduction over a runtime-length prefix (unknown trip count → the loop
-/// survives to vectorize; a fixed literal length would constant-fold away). Mirrors the
-/// `vectorize_shapes` reduction kernel so the two suites pin the same lowering from two lenses.
+/// A vectorizable int reduction over a runtime-length prefix whose element *values* are also seeded
+/// from a runtime value (`n := args.len()`), so both the trip count and the data are opaque. On
+/// LLVM 22 a runtime length alone is not enough — SCEV constant-folds a reduction over a
+/// compile-time-constant array to a closed form, so no `vpaddq` reduction would be emitted (see
+/// `vectorize_shapes.rs` module header, finding 1). Mirrors the `vectorize_shapes` reduction kernel
+/// so the two suites pin the same lowering from two lenses.
 const KERNEL: &str = "\
 fn dbl(x: i64) -> i64 = x * 2\n\
 fn run(xs: slice<i64>) -> i64 = xs.map(dbl).sum()\n\
 fn main(args: array<str>) -> Result<(), Error> {\n  \
-  a := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]\n  \
+  n := args.len() as i64\n  \
+  a := [n, n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12, n+13, n+14, n+15]\n  \
   s : slice<i64> := a[0..args.len()]\n  \
   print(run(s))\n  \
   return Ok(())\n\

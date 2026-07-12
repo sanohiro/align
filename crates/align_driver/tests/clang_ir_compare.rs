@@ -3,10 +3,10 @@
 //! This does NOT assert Align == clang (shape differences are *findings*, recorded in that dir's
 //! README, not failures). It only proves the harness itself RUNS end to end when its tools are
 //! present: it invokes `run.sh` with the freshly-built `alignc` (so no nested `cargo build`) and
-//! `clang-19`, and checks it produced the comparison table and its own MATCH/DIVERGE summary.
+//! `clang-22`, and checks it produced the comparison table and its own MATCH/DIVERGE summary.
 //!
-//! Gating: x86-64 host (the pinned CPU tiers are x86) + LLVM backend + `clang-19` present. Anywhere
-//! one is missing the test skips cleanly — a machine without clang-19 is not a failure.
+//! Gating: x86-64 host (the pinned CPU tiers are x86) + LLVM backend + `clang-22` present. Anywhere
+//! one is missing the test skips cleanly — a machine without clang-22 is not a failure.
 
 mod common;
 use common::*;
@@ -14,8 +14,8 @@ use common::*;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn clang19_available() -> bool {
-    Command::new("clang-19")
+fn clang22_available() -> bool {
+    Command::new("clang-22")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -35,7 +35,7 @@ fn harness_dir() -> PathBuf {
 
 #[test]
 fn harness_runs_and_emits_the_comparison_table() {
-    if !(cfg!(target_arch = "x86_64") && backend_available() && clang19_available()) {
+    if !(cfg!(target_arch = "x86_64") && backend_available() && clang22_available()) {
         return;
     }
     let dir = harness_dir();

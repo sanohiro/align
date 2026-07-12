@@ -2147,7 +2147,7 @@ regression net that validates the upgrade.
 **Completion condition:** all slices merged with the standing slice-flow; the shape/size/bench
 regression net is green and becomes the LLVM-upgrade gate.
 
-## LLVM/inkwell upgrade checkpoint (AFTER M13)
+## LLVM/inkwell upgrade checkpoint (AFTER M13) — DONE 2026-07-12 (LLVM 19 → 22)
 
 The standing mid-term note (recorded with the SVE/sme2 lean) says to schedule this before
 targeting newer ISAs. Sequencing settled 2026-07-11: **M13 first** — its IR-shape suite,
@@ -2157,6 +2157,33 @@ on LLVM 19 and then jumping versions would redo the compatibility work). Scope: 
 `llvm19-1` → newest supported; re-verify the shared-only Debian linkage stance
 (`LLVM_SYS_*_PREFER_DYNAMIC`); rerun the full net; re-measure the Slice-V cold-metadata and
 vectorization shapes (pass-pipeline changes across versions are expected).
+
+**Outcome (2026-07-12).** Upgraded to **LLVM 22** (inkwell `llvm22-1`, llvm-sys 221) from
+apt.llvm.org. `cargo test --workspace` **1878 green** (unchanged from the M13-close baseline),
+clippy clean, binary sizes byte-identical to LLVM 19. Linkage: kept `prefer-dynamic`
+(`LLVM_SYS_221_PREFER_DYNAMIC=1`) — the shared-only-Debian rationale is obsolete (apt.llvm.org
+llvm-22 ships static archives; Polly is no longer a `--libs` component) but dynamic is retained as
+the smaller/rustc-matching choice. The M13 net caught exactly three shifts, all re-pinned to
+IR-verified-equivalent shapes (no Align codegen regression):
+1. **SCEV constant-folds reductions over constant arrays.** LLVM 22 folds a reduction over a
+   compile-time-constant array indexed by a runtime-length prefix into a closed form (a `select`
+   over boundary partial-sums) — strictly better, but the old `vectorize_shapes` / `target_cpu_isa`
+   / clang-compare reduction kernels stopped exercising the vectorizer. Fix: seed the array *values*
+   from `args.len()` so the data is genuinely opaque; under opaque data LLVM 22 vectorizes to the
+   same width and same reduce intrinsic as LLVM 19.
+2. **`vector.body` block name is unreliable** for an inlined reduction loop (renamed at v3, present
+   at v2 and for materialize loops). The suite now keys reductions on the block-name- and
+   init-noise-independent signals: the mangled reduce intrinsic (`llvm.vector.reduce.<op>.v<N>i64`)
+   + `vector.ph`.
+3. **`nocapture` → `captures(none)` param attribute.** LLVM 22 auto-upgrades `nocapture`; inkwell
+   0.9's text printer renders it as the shorthand `none`. The in-memory attribute is honored (the
+   A8 hoist+vectorize gate depends on it and passes), so object codegen is correct; the
+   `rt_contract` textual pin was re-pinned to `ptr none readonly`.
+
+Known follow-up (not a blocker): the `none` shorthand does **not** round-trip through `llvm-as-22`
+(`alignc emit-llvm` output can't be re-parsed by the LLVM 22 text tools on runtime declares) — this
+was a valid round-trip on LLVM 19. Revisit when the M14 bitcode/ThinLTO boundary needs textual IR
+interchange; consider emitting the modern `captures(none)` form or `-o .bc` directly.
 
 ## Post-upgrade wave (M14 candidates, in order — bitcode compatibility dictates the sequence)
 

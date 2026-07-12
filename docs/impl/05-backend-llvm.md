@@ -282,13 +282,17 @@ The `body` is the fused body from MIR, **carved out as a separate function**, an
 
 ## 10. Open items (to be settled)
 
-### Settled (M0): inkwell / LLVM version and linking method
-Use LLVM 19 via `inkwell 0.9` (feature `llvm19-1`). Debian's llvm-19 is in shared mode
-(`llvm-config --shared-mode` = shared, not bundling static components such as `libPolly.a`), so
-`llvm-sys` is pinned to **dynamic linking**: `llvm-sys`'s `prefer-dynamic` feature +
-`LLVM_SYS_191_PREFER_DYNAMIC=1` in `.cargo/config.toml`. In M0 the generated `main` is the C entry
-(called by crt0), and the driver links the object with `cc`. The upgrade strategy (tracking future LLVM versions)
-remains to be examined.
+### Settled (M0; upgraded to LLVM 22 post-M13): inkwell / LLVM version and linking method
+Use LLVM 22 via `inkwell 0.9` (feature `llvm22-1`), with `llvm-sys` 221. `llvm-sys` is pinned to
+**dynamic linking** (`prefer-dynamic` feature + `LLVM_SYS_221_PREFER_DYNAMIC=1` in
+`.cargo/config.toml`); `llvm-config-22 --shared-mode` still reports `shared`. Unlike the Debian
+llvm-19 era (shared-only — no static components such as `libPolly.a`, so dynamic linking was
+mandatory), the apt.llvm.org llvm-22 packages ship the static archives and Polly is no longer a
+separate `--libs` component, so a static build would work; dynamic linking is kept deliberately (it
+links smaller and matches the rustc-side LLVM). In M0 the generated `main` is the C entry (called by
+crt0), and the driver links the object with `cc`. (History: M0 shipped on LLVM 19 / `llvm19-1` /
+`LLVM_SYS_191_PREFER_DYNAMIC`; the LLVM 19 → 22 upgrade checkpoint landed after M13 — see
+`07-roadmap.md`.)
 
 ```text
 - finalize the LLVM representation of Option/Result (null-ization vs. tagged, niche optimization)

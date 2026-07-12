@@ -6,10 +6,10 @@ Align is pre-release: there are no binary downloads yet, so you build the compil
 
 ## Building the compiler
 
-You need **Rust 1.96+** and **LLVM 19**. On Debian/Ubuntu:
+You need **Rust 1.96+** and **LLVM 22**. On Debian/Ubuntu (via apt.llvm.org):
 
 ```text
-apt install llvm-19 llvm-19-dev
+apt install llvm-22 llvm-22-dev
 git clone https://github.com/sanohiro/align
 cd align
 cargo build

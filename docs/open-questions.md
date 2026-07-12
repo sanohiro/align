@@ -1638,15 +1638,17 @@ idea from scratch; do not vendor their code; keep compression/codec choices plug
         fewer runtime calls (a `write_many` internal ABI) is the lever. Probe:
         `work/string_processing_probe.rs`; advice `work/string-processing-findings-2026-06-28.md`.
       - **LLVM-version gap + upgrade as a perf-roadmap item (codex modern-CPU advice 2026-06-28).**
-        Align is pinned to **LLVM 19** (inkwell 0.9, `llvm19-1`); rustc 1.96 already rides **LLVM 22**,
-        so current Rust *sees* newer target features than Align's backend (x86 `avx10.1/.2`, `apxf`,
+        Align rode **LLVM 19** (inkwell 0.9, `llvm19-1`) through M13; the post-M13 upgrade checkpoint
+        moved it to **LLVM 22** (inkwell `llvm22-1`, llvm-sys 221) — now matching rustc 1.96's LLVM,
+        so the backend sees the newer target features (x86 `avx10.1/.2`, `apxf`,
         `amx-*`; aarch64 `sve2`, `sme2`, `i8mm`, `bf16`, `fp8`). Division of labor: **LLVM** does
         instruction selection / new ISA legalization / vectorizer + cost model (so APX is "free" once
         the backend targets it — just keep emitting clean optimizable IR); **the runtime** does
         feature-detect + function-multiversioning like Rust crates. Plan: short-term AVX2+NEON runtime
-        dispatch on LLVM 19; **mid-term schedule an LLVM/inkwell upgrade checkpoint** before targeting
-        AVX10/APX/SME2 seriously (guarded by the existing bench + IR/behavior tests, since an LLVM
-        bump can shift codegen); long-term treat LLVM upgrade as part of the *performance* roadmap,
+        dispatch; **the LLVM/inkwell upgrade checkpoint is DONE** (LLVM 19 → 22, post-M13, 2026-07-12
+        — guarded by the M13 bench + IR/behavior tests, which caught two vectorizer-behavior shifts and
+        one attribute-spelling change; all re-pinned to verified-equivalent shapes) so the backend can
+        now target AVX10/APX/SME2 seriously; long-term treat LLVM upgrade as part of the *performance* roadmap,
         not just maintenance. Model **capabilities, not feature-names**, in the dispatch table (vector
         width / mask / byte-permute / VNNI-int8) so fixed-width SIMD, scalable vectors (SVE/RVV), and
         matrix engines (AMX/SME2, which stay behind the LLM/tensor backend, never core syntax) all

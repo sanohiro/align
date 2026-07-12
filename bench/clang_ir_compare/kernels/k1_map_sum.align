@@ -1,8 +1,12 @@
 // K1 — map + sum reduction. Expected: vectorized reduction, `llvm.vector.reduce.add`.
+// The array VALUES are seeded from a runtime `n` (not a constant literal): LLVM 22's SCEV folds a
+// reduction over a compile-time-constant array to a closed form (no vectorization), so opaque data
+// is required to mirror the C twin's opaque pointer parameter. See ../README.md.
 fn dbl(x: i64) -> i64 = x * 2
 fn run(xs: slice<i64>) -> i64 = xs.map(dbl).sum()
 fn main(args: array<str>) -> Result<(), Error> {
-  a := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  n := args.len() as i64
+  a := [n, n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12, n+13, n+14, n+15]
   s : slice<i64> := a[0..args.len()]
   print(run(s))
   return Ok(())
