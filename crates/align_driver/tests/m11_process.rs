@@ -169,24 +169,36 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   return Ok(())
 }";
 
-/// `/bin/true` exits 0 → `wait()` returns 0. The child argv is a single element (`argv[0]` only).
+/// The absolute path of the coreutils binary `name`: `/bin/<name>` on Linux, `/usr/bin/<name>` on
+/// macOS (which ships no `/bin/true`/`/bin/false`). `None` skips the test — the same style as the
+/// `/bin/sh` / `/bin/sleep` `.exists()` guards below.
+fn coreutil(name: &str) -> Option<String> {
+    ["/bin", "/usr/bin"]
+        .iter()
+        .map(|d| format!("{d}/{name}"))
+        .find(|p| std::path::Path::new(p).exists())
+}
+
+/// `true` exits 0 → `wait()` returns 0. The child argv is a single element (`argv[0]` only).
 #[test]
 fn spawn_true_waits_zero() {
     if !backend_available() {
         return;
     }
-    let out = build_and_run_args("m11proc-true", SPAWN_WAIT_PRINT, &["/bin/true"]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0", "spawn /bin/true → wait 0");
+    let Some(tru) = coreutil("true") else { return };
+    let out = build_and_run_args("m11proc-true", SPAWN_WAIT_PRINT, &[&tru]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0", "spawn true → wait 0");
 }
 
-/// `/bin/false` exits 1 → `wait()` returns 1.
+/// `false` exits 1 → `wait()` returns 1.
 #[test]
 fn spawn_false_waits_one() {
     if !backend_available() {
         return;
     }
-    let out = build_and_run_args("m11proc-false", SPAWN_WAIT_PRINT, &["/bin/false"]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1", "spawn /bin/false → wait 1");
+    let Some(fls) = coreutil("false") else { return };
+    let out = build_and_run_args("m11proc-false", SPAWN_WAIT_PRINT, &[&fls]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1", "spawn false → wait 1");
 }
 
 /// An exec-not-found cannot be reported synchronously (the fork already happened): the forked child
@@ -200,24 +212,27 @@ fn spawn_nonexistent_waits_127() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "127", "exec-not-found → wait 127");
 }
 
-/// The natural call form: the argv is a **fixed-size array literal** (`["/bin/true"]`, typed
+/// The natural call form: the argv is a **fixed-size array literal** (`["…/true"]`, typed
 /// `array<str, 1>`), not a dynamic array or a slice-range of one. It is borrowed to a `slice<str>`
-/// via the existing `ArrayToSlice` coercion, so no `[..]` / `[0..n]` dance is needed. `/bin/true`
+/// via the existing `ArrayToSlice` coercion, so no `[..]` / `[0..n]` dance is needed. `true`
 /// exits 0 → `wait()` returns 0.
 #[test]
 fn spawn_with_fixed_array_literal_argv() {
     if !backend_available() {
         return;
     }
-    let src = "\
+    let Some(tru) = coreutil("true") else { return };
+    let src = format!(
+        "\
 import std.process
-pub fn main() -> Result<(), Error> {
-  ch := process.spawn(\"/bin/true\", [\"/bin/true\"])?
+pub fn main() -> Result<(), Error> {{
+  ch := process.spawn(\"{tru}\", [\"{tru}\"])?
   code := ch.wait()?
   print(code)
   return Ok(())
-}";
-    let out = build_and_run("m11proc-fixed-argv", src);
+}}"
+    );
+    let out = build_and_run("m11proc-fixed-argv", &src);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         "0",
@@ -282,7 +297,8 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   }
   return Ok(())
 }";
-    let out = build_and_run_args("m11proc-double-wait", prog, &["/bin/true"]);
+    let Some(tru) = coreutil("true") else { return };
+    let out = build_and_run_args("m11proc-double-wait", prog, &[&tru]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0\nsecond-err", "double-wait → clean Err");
 }
 
@@ -362,7 +378,8 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   print(code)
   return Ok(())
 }";
-    let out = build_and_run_args("m11proc-move-fn", prog, &["/bin/true"]);
+    let Some(tru) = coreutil("true") else { return };
+    let out = build_and_run_args("m11proc-move-fn", prog, &[&tru]);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0", "child moved into run(), waited once");
 }

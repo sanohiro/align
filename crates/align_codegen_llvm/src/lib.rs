@@ -59,8 +59,9 @@ pub enum ObjectFormat {
 
 /// Classify the build target's object format from the default (host) triple.
 ///
-/// Fail-closed: an unrecognized platform (e.g. Windows) is an explicit error, never a guess — the
-/// driver must not invoke the linker with the wrong flag dialect.
+/// Windows is fail-closed: an explicit error, never a guess — the driver must not invoke the
+/// linker with the wrong flag dialect there. Any other unrecognized triple is presumed ELF (the
+/// System-V default shared by Linux and the BSDs, where the GNU-style flag set applies).
 ///
 /// Cross-compilation seam (M15+): when builds take an explicit target triple, this widens to take
 /// the `BuildTarget` as an argument instead of reading the host default triple.
