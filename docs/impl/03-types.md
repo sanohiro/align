@@ -246,7 +246,9 @@ Region propagation is inferred by flow analysis; users write nothing. Only on vi
 
 ## 8. Effect checking (purity of par_map, pass 3)
 
-Functions passed to parallel / data processing cannot have side effects (`draft.md` §11). Effects are **inferred** (not annotated; the purity in open-questions is settled to be an inference policy).
+Functions passed to parallel processing cannot have side effects (`draft.md` §11). Effects are
+**inferred** (not annotated); ordinary sequential data-processing callables may be Impure and retain
+exact guarded source order (`draft.md` §8).
 
 ```text
 Effect = Pure | Impure(reason)
@@ -256,7 +258,9 @@ A function/lambda has its effect inferred from its body:
   if none of the above             → Pure
 ```
 
-The closure arguments to `par_map` / `map` / `where` / `reduce` require `Pure`. A violation is an error, with guidance toward `reduce`.
+Every callable moved into `par_map` requires `Pure`. Ordinary sequential `map` / `where` / `reduce`
+/ `scan` / `partition` / `any` / `all` accepts Impure callables; effect and inactive-lane legality
+restrict fusion/vectorization without changing evaluation order or count.
 
 ```align
 mut total := 0;
@@ -268,13 +272,10 @@ The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked e
 
 > **Implementation audit note (2026-07-13):** the intended function-type effect bit is not yet
 > implemented end to end. The current name-based effect graph validates only `par_map` targets and
-> has lifted/higher-order closure holes. There is also a normative conflict: this implementation
-> plan says ordinary `map`/`where`/reducer callables require Pure, while `draft.md` constrains only
-> `par_map`, the language summary is silent, and the compiler accepts Impure sequential stages. Do
-> not turn that accepted behavior into an error until the language contract is settled; effects may
-> instead serve as optimization legality while exact guarded sequential order is preserved. Treat the
-> function-type effect representation as required, but the ordinary-stage rejection policy as open;
-> see [`12-pipeline-closure-memory-io-simd-audit.md` §3.2](12-pipeline-closure-memory-io-simd-audit.md).
+> has lifted/higher-order closure holes. Ordinary sequential effects are now settled as allowed with
+> exact guarded source order; the function-type effect representation remains required for sound
+> parallel and optimization boundaries. See
+> [`12-pipeline-closure-memory-io-simd-audit.md` §3.2](12-pipeline-closure-memory-io-simd-audit.md).
 
 ---
 

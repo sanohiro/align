@@ -248,6 +248,13 @@ inferred). A lambda may capture enclosing variables by value — with no hidden 
 environment (it compiles like a named function, captures passed as arguments). `where(.active)`
 is shorthand for a one-field lambda.
 
+Sequential `map` / `where` / `reduce` / `scan` / `partition` / `any` / `all` callables may be
+Impure. They run in input-index and stage order, exactly once for each element that reaches them; a
+false `where` suppresses every later stage and reducer for that element. `any` / `all` do not
+short-circuit. Effects restrict optimization legality, while explicit `par_map` still requires
+Pure callables. Pure alone does not make a trapping or nonterminating call safe to speculate.
+`sort_by_key` key evaluation remains a separate open contract.
+
 A pipeline **materializes** either into a fresh owned `array<T>` (`.to_array()`) or into a
 caller-provided `out`/`mut` slice (`.map_into(dst)` — the caller-storage counterpart). `map_into` is
 length-preserving (`map` / field-projection stages; `dst.len() == src.len()`, a mismatch aborts) and

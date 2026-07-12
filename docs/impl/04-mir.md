@@ -121,10 +121,10 @@ reduce/sum/min/max/count/dot/any/all  terminal. fold into an accumulator
 
 Consecutive map/where/project are **producer-consumer fused** into a single loop body, and the
 terminal reduction closes the loop. `Effect=Pure` (`03 §8`) is a prerequisite for transformations
-that reorder, speculate, erase, or parallelize calls. **Audit note (2026-07-13):** whether ordinary
-sequential pipeline callables are normatively Pure is unsettled across the draft and implementation
-documents; accepted Impure calls may still share one loop only when their guarded source order and
-evaluation count are preserved. See `12-pipeline-closure-memory-io-simd-audit.md` §3.2.
+that reorder, speculate, erase, or parallelize calls. Ordinary sequential callables may be Impure;
+they may share one loop only when guarded source order and exactly-once evaluation are preserved.
+Pure is necessary but not sufficient for inactive-lane execution because a Pure call can trap,
+allocate, or fail to terminate. See `12-pipeline-closure-memory-io-simd-audit.md` §3.2.
 
 ```text
 total := users.where(.active).score.sum();
@@ -149,8 +149,8 @@ With an `out` argument (no-alias, `03 §6`), the input and output are guaranteed
 
 ### Fusion boundaries (`// OPEN:` details)
 ```text
-fuse       consecutive map/where/project + terminal reduction, element-independent, Pure
-don't fuse sort / group_by / partition (involve whole-collection rearrangement), side effects, inter-element dependence (part of scan)
+fuse       consecutive map/where/project + terminal reduction when source order/count is preserved
+don't fuse sort / group_by / partition (involve whole-collection rearrangement), reordered side effects, inter-element dependence (part of scan)
 ```
 `sort` etc. cut the fusion point, with separate loops before and after.
 
@@ -163,10 +163,9 @@ Carry vec/mask in MIR as **first-class** (`draft.md` §9), in a form that codege
 ### masks and guarded inactive lanes
 Safe primitive `where` reductions can lower to a mask + predicated identity operation
 (suited to SIMD/GPU); materialization uses stream compaction. The shipped reducing lowering extended
-that mask to every reducer, but the 2026-07-13 audit found it also executes general callables and
-post-`where` stages on rejected elements. That is a P0, not source semantics. MIR must guard every
-inactive-lane-unsafe computation; mask + `select` remains legal only under the local conjunction in
-`12-pipeline-closure-memory-io-simd-audit.md` §3.1. Materializing terminals continue to skip rejected
+that mask too far, but the 2026-07-13 correction now guards every general callable and
+post-`where` inactive-lane-unsafe computation. Field operations plus builtin
+`sum`/`count`/`min`/`max` retain mask + `select`; materializing terminals continue to skip rejected
 elements.
 
 ```align

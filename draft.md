@@ -843,6 +843,21 @@ beyond the frame, or handed to `spawn` (§11) — needs a region-owned environme
 enclosing `arena {}` / `task_group {}` scope (never a hidden `malloc`); escape analysis chooses the
 representation.
 
+### Sequential Effects and Evaluation Order
+
+Ordinary sequential `map` / `where` / `reduce` / `scan` / `partition` / `any` / `all` callables may
+be Impure. They execute in input-index order and stage order. A callable runs exactly once for each
+element that reaches it; when a `where` predicate is false, no later stage or reducer runs for that
+element. `any` and `all` evaluate their predicate for every surviving element rather than
+short-circuiting, so observable call counts stay deterministic.
+
+Fusion may preserve this order, but effect inference restricts transformations: a call may be
+reordered, erased, duplicated, speculated, or parallelized only when its inferred effect and the
+specific operation make that transformation legal. Pure alone does not mean non-trapping or total.
+`par_map` remains different: every callable moved into its parallel range must be Pure (§11).
+`sort_by_key` is not covered by this rule because comparison sorting has a separate key-evaluation
+contract, still open.
+
 ### Core Array Functions
 
 ```text
@@ -948,8 +963,9 @@ total := scores.sum_where(m)   // masked reduction
 A mask has the type `maskN<T>` — spelled like `vecN<T>`, with the same width and element as the
 vectors it compares (the type is usually inferred; name it to thread a mask through a function). A
 mask is a first-class concept for SIMD / branchless / GPU. The pipeline's `where` is the implicit
-form: `xs.where(p).sum()` lowers **branchless** (mask + `select`, a masked reduction), not a
-per-element `if` — so a filtered hot loop stays vectorizable and does not fight the branch predictor.
+form when its suffix is safe on rejected lanes: `xs.where(p).sum()` lowers **branchless** (mask +
+`select`, a masked reduction), not a per-element `if`. A general callable after `where` is guarded
+instead; rejected elements never execute it.
 
 ### Memory Layout (`soa<T>`)
 

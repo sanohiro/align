@@ -203,6 +203,25 @@ One narrow expression. The pipeline owns the data path; `loop` owns the control 
 
 ---
 
+## Sequential pipeline effects
+
+The implementation accepted Impure sequential callables while early implementation notes described
+all data-processing callables as Pure. The conflict became observable when branchless `where`
+speculated a later callable on a rejected element.
+
+The direction chosen (2026-07-13):
+
+```text
+sequential pipeline  -> Impure allowed, exact guarded input/stage order
+par_map              -> Pure required
+```
+
+Effect inference controls optimization legality. It does not reject ordinary sequential effects,
+and Pure alone does not make a trapping or nonterminating call safe to speculate. `sort_by_key` key
+evaluation remains separate because comparison sorting has a data-dependent call count.
+
+---
+
 ## Naming
 
 Several names were considered.

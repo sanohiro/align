@@ -1,11 +1,8 @@
-//! Branchless `where` reductions. `where(p).<reducer>()` lowers without a per-element branch: the
-//! predicates are AND-folded into a mask and the reducer `select`s each masked-out lane to its
-//! identity — `sum`/`count` → 0, `min` → +∞, `max` → −∞, `any` → false, `all` → true — or, for
-//! generic `reduce` (no identity for a user `f`), leaves the accumulator unchanged
-//! (`acc = mask ? f(acc,v) : acc`). The loop stays branch-free so it vectorizes (and, for a `soa`
-//! filtered aggregate, beats Rust — see `bench/`) and maps 1:1 onto a scalable-ISA predicated tail.
-//! These tests pin the *results* (equal to the branch form they replaced, incl. empty-selection and
-//! NaN); the speedup / actual SIMD is in `bench/` and `optimizer.rs`.
+//! Guarded and branchless `where` reductions. A suffix of field operations plus a builtin
+//! `sum`/`count`/`min`/`max` uses a mask and identity-select so it stays vectorizable. A general
+//! callable after `where` is control-flow guarded because Pure does not imply total/non-trapping.
+//! These tests pin results, trapping behavior, and sequential effect order; the positive SIMD shape
+//! is pinned in `vectorize_shapes.rs`.
 
 mod common;
 use common::*;
@@ -38,6 +35,49 @@ fn where_then_map_sum_is_correct() {
     // odds → 1,3,5; squared → 1,9,25; sum = 35.
     let out = build_and_run("blw-mapsum", "fn main() -> i32 {\n  return [1,2,3,4,5].where(odd).map(sq).sum() as i32\n}\nfn odd(x: i64) -> bool = x % 2 == 1\nfn sq(x: i64) -> i64 = x * x\n");
     assert_eq!(out.status.code(), Some(35));
+}
+
+#[test]
+fn rejected_element_does_not_run_trapping_map() {
+    if !backend_available() {
+        return;
+    }
+    let divide = "fn nonzero(x: i64) -> bool = x != 0\nfn reciprocal(x: i64) -> i64 = 10 / x\nfn main() -> i32 {\n  return [0, 2].where(nonzero).map(reciprocal).sum() as i32\n}\n";
+    assert_eq!(build_and_run("where-guard-div", divide).status.code(), Some(5));
+
+    let index = "fn valid(x: i64) -> bool = x < 2\nfn lookup(x: i64) -> i64 {\n  values := [10, 20]\n  return values[x]\n}\nfn main() -> i32 {\n  return [0, 2].where(valid).map(lookup).sum() as i32\n}\n";
+    assert_eq!(build_and_run("where-guard-index", index).status.code(), Some(10));
+}
+
+#[test]
+fn rejected_element_does_not_run_later_predicate_or_callable_reducer() {
+    if !backend_available() {
+        return;
+    }
+    let later_where = "fn nonzero(x: i64) -> bool = x != 0\nfn reciprocal_positive(x: i64) -> bool = 10 / x > 0\nfn main() -> i32 {\n  return [0, 2].where(nonzero).where(reciprocal_positive).sum() as i32\n}\n";
+    assert_eq!(build_and_run("where-guard-predicate", later_where).status.code(), Some(2));
+
+    let reduce = "fn nonzero(x: i64) -> bool = x != 0\nfn add_reciprocal(acc: i64, x: i64) -> i64 = acc + 10 / x\nfn main() -> i32 {\n  return [0, 2].where(nonzero).reduce(0, add_reciprocal) as i32\n}\n";
+    assert_eq!(build_and_run("where-guard-reduce", reduce).status.code(), Some(5));
+
+    let any_all = "fn nonzero(x: i64) -> bool = x != 0\nfn reciprocal_positive(x: i64) -> bool = 10 / x > 0\nfn main() -> i32 {\n  a := [0, 2].where(nonzero).any(reciprocal_positive)\n  b := [0, 2].where(nonzero).all(reciprocal_positive)\n  return if a && b { 1 } else { 0 }\n}\n";
+    assert_eq!(build_and_run("where-guard-any-all", any_all).status.code(), Some(1));
+}
+
+#[test]
+fn impure_sequential_stage_keeps_guarded_source_order() {
+    if !backend_available() {
+        return;
+    }
+    let after = "fn nonzero(x: i64) -> bool = x != 0\nfn noisy(x: i64) -> i64 {\n  print(x)\n  return x\n}\nfn main() -> Result<(), Error> {\n  total := [0, 2].where(nonzero).map(noisy).sum()\n  print(total)\n  return Ok(())\n}\n";
+    let out = build_and_run("where-guard-impure-after", after);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n2\n");
+
+    let before = "fn nonzero(x: i64) -> bool = x != 0\nfn noisy(x: i64) -> i64 {\n  print(x)\n  return x\n}\nfn main() -> Result<(), Error> {\n  total := [0, 2].map(noisy).where(nonzero).sum()\n  print(total)\n  return Ok(())\n}\n";
+    let out = build_and_run("where-guard-impure-before", before);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n2\n2\n");
 }
 
 #[test]
