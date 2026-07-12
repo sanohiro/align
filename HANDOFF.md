@@ -378,7 +378,30 @@ owed-delta wave; staleness sweep #395)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo state (re-verified 2026-07-10):** `main` clean, no open PRs. Newest commit is the
+**Repo state (session close 2026-07-12, macOS arm64 machine):** `main` clean at **#426**
+(fourteenth wave — the Codex-audit item-2 macOS link/size portability slice; full record in the
+_Last updated_ paragraph above), no open PRs. **This machine needs two env vars for every
+`cargo build`/`cargo test`/driver-link run** — this was the undocumented blocker at session
+start: `LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm` (Homebrew LLVM 22.1.8 is keg-only) and
+`LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib` (zstd + keg-only openssl@3 sit
+outside cc's default search path; the same applies to running Align programs that link gated
+libs — the driver now prints this hint on such link failures). On this Mac the driver suites are
+green (align_attr 8/8, capability_linking 10/10 executed-not-skipped, build_profiles 9/9,
+macho_link 2/2, m11_process 35/35) and `alignc build`/`size` work natively on Mach-O; the
+remaining macOS full-suite failures are cataloged out-of-scope at adoption-record item 2
+(ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
+expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
+is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
+one is next available. **Next, pick one:** (a) the Codex wave-1 remainder — CONFIRMED bug 1
+(bench export roots: `emit-obj --export` mechanism, `bench/run.sh` re-verified) and bug 3
+(profiles never reach the TargetMachine: `optsize`/`minsize` fn attrs, per-profile runtime
+variant + cache key); (b) the deferred `bench/binary_size` script port (small PR, adoption-record
+item 2 sub-item); (c) the M14 LTO ceiling probe rerun (procedure in the roadmap M14 section);
+(d) Codex wave-2 quick wins (O(n²) sort, tiny-`par_map` cold start, zero-size arena,
+attr-kind fail-loud + `captures(none)`). Reminder: gemini-code-assist reviews cease **2026-07-17**
+— after that, `/code-review` on the branch replaces the reflect-before-merge step.
+
+**Earlier repo state (re-verified 2026-07-10):** `main` clean, no open PRs. Newest commit is the
 **docs-only design wave committed directly to main on 2026-07-09** (see the three 2026-07-09
 paragraphs below: `loop` settled, spec-vacuum sweep + 7 settlements total, align-LLM runway).
 Two code merges landed between #392 and that wave, easy to miss: **#393** (editor support —
