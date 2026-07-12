@@ -907,6 +907,14 @@ predication-ready, the forward-compatible shape for scalable-ISA tails (`05 §5`
   Materializing terminals (`to_array`/`scan`) keep a real skip-branch (they must not *append* a
   masked-out element — not an identity op). The completion condition is met.
 
+  **Correctness correction (audit 2026-07-13):** the vector-shape completion remains valid only for
+  operations safe to speculate. The implementation also evaluates a general reducer/`any`/`all`
+  predicate and every stage after `where` on rejected elements. Pure does not imply non-trapping;
+  this is now a confirmed P0. The implementation plan's ordinary-Pure requirement also conflicts
+  with the normative draft and accepted Impure sequential stages; settle it before adding a new
+  rejection. Restore a real guard for every inactive-lane-unsafe suffix/reducer, then recover masked
+  SIMD only under conservative legality. See `12-pipeline-closure-memory-io-simd-audit.md` §3.1-3.2.
+
 ### Post-M6 backlog (not M6 blockers — M6 is closed; these are future perf/feature slices)
 
 None of the below gated M6's completion conditions (vector IR + branchless `where`, both met above).
@@ -987,6 +995,14 @@ The record requires caller-draining range claims before scheduler optimization, 
 whole-chunk specialization plan concrete, and gates new capture-context, integer
 transform-reduce, staged-pipeline, low-lock latch/batching, work-aware grain, and split execution
 domain candidates. It proposes no new source syntax.
+
+**Pipeline/closure/memory/I/O/SIMD companion record (2026-07-13):**
+`12-pipeline-closure-memory-io-simd-audit.md` is the durable follow-up. It preserves the positive
+fusion/vectorization/capture/I/O findings, corrects the post-`where` speculation premise, records
+closure lifetime + Unit-indirect-ABI + buffered-`io.copy` blockers, the ordinary-effect contract
+conflict, and required allocation-size hardening. It gates per-callsite arena initialization,
+exact-destination codec/hex-SIMD, macOS copy-path, HTTP-copy, and sequential compaction candidates.
+Its P0 slices precede any SIMD or parallel widening; it adds no source syntax.
 
 ## M8 — Tooling and Quality — DONE (2026-07-03)
 
@@ -1203,6 +1219,10 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   (peak `VmHWM` bounded via a stdout/stdin handshake), `tests/m9_io.rs` + `examples/io_copy.align` +
   runtime unit tests. Fast paths (`sendfile`/`splice`/mmap/`io_uring`) are explicitly **post-M9** —
   see that Future entry, unchanged in shape by this slice (the runtime marks the dispatch site).
+  **Audit correction (2026-07-13):** the original byte-exact tests start from an empty reader buffer.
+  `io.copy` reads the fd directly and skips unread lookahead retained by a prior `read_line`; fix and
+  test `read_line -> io.copy` before treating the portable loop as the fast-path oracle (`impl/12`
+  §3.6). The O(buffer) result remains valid.
 - **Slice 3 — std.fs complete — DONE.** `write_file` (`str`/`bytes`/`builder`, the same three
   forms as `writer.write`), `exists` (a plain `bool` — every `stat` failure folds to `false`, never
   a `Result`), `remove`, `read_dir` (an **owned `array<string>`** — a new `PrimScalar::String` lets

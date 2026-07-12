@@ -320,15 +320,18 @@ mask
 ```
 
 These should lower naturally to vectorized code. The point is *structural*: contiguous arrays mean a
-pipeline walks memory sequentially (no random jumps), and `where` / conditional reductions lower
-branchless (mask + `select`, not a per-element `if`) — so the predictable shape, not hand-tuning, is
-what keeps hot loops vectorizable.
+pipeline walks memory sequentially (no random jumps), and safe primitive conditional reductions can
+lower to a mask + `select` — so the predictable shape, not hand-tuning, is what keeps hot loops
+vectorizable. A callable after `where` **must be guarded** unless it is separately proven safe on an
+inactive lane; the current reducing lowering does not yet do this. Pure alone is insufficient because
+a Pure function may trap (audit: `impl/12` §3.1).
 
 **Branchless is for vectorization, not because branches are slow (recorded 2026-07-04, external
 design-note review adoption).** Modern branch predictors (TAGE-class) make well-predicted branches
 near-free, and scalar CMOV chains create data dependencies that can be *slower* than branching.
-Align's branchless `where` exists because the select-form enables SIMD (a lane-masked reduction), not
-as a scalar-branch-avoidance dogma — don't cargo-cult branchless into scalar std code. The one
+Align's masked `where` form exists because select/predication enables SIMD for operations that are safe
+on inactive lanes, not as a scalar-branch-avoidance dogma — don't cargo-cult branchless into scalar
+std code or speculate trapping callables. The one
 exception where branchless is mandatory is `std.crypto`'s constant-time requirement (see
 `open-questions.md`).
 

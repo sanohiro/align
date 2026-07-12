@@ -2,10 +2,24 @@
 
 A living continuity note so a fresh Claude Code session — e.g. on a faster machine — can pick the
 work up immediately. **If you are a new session: read this, then `CLAUDE.md`, then
-`docs/impl/08-nested-structs.md`.** Everything durable is in this repo; the conversation history and
+`docs/impl/12-pipeline-closure-memory-io-simd-audit.md`, then `docs/impl/08-nested-structs.md`.**
+Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-12, **cache-first compilation/output-code audit RECORDED** in
+_Last updated: 2026-07-13, **pipeline/closure/memory/I/O/SIMD audit RECORDED** in
+`docs/impl/12-pipeline-closure-memory-io-simd-audit.md` (implementation not started). The normal
+fused sequential loop, `map_into` alias metadata, capture inlining, JSON/UTF-8/string SIMD, direct
+file read/mmap, and buffered small/direct large writer paths are strong. New correctness-first work:
+post-`where` callables are speculatively executed on rejected elements (confirmed division-by-zero
+abort); the ordinary sequential effect contract conflicts across spec/implementation docs; `spawn`
+and indirect closure-result region gaps permit arena-backed view UAF; Unit indirect calls use an
+incompatible LLVM return ABI; and `io.copy` skips buffered-reader lookahead. Dynamic allocation size
+arithmetic separately needs required overflow hardening. Highest-value new measured/gated work is an
+initialized-before-read arena split, exact-final-allocation Base64/hex fill paired with the existing
+Base64 SIMD backlog plus a new hex probe, macOS copy-path validation, HTTP batch request-copy removal,
+and sequential SIMD compaction only if its selectivity matrix wins. No new syntax. Previous update:
+2026-07-12,
+**cache-first compilation/output-code audit RECORDED** in
 `docs/impl/10-cache-first-optimization.md` (implementation not started). New CONFIRMED P0: the
 production driver derives temporary object plus `run`/`size` executable names from basename only;
 concurrent different `main.align` builds were corrupted in 40/40 paired probes. The record makes
@@ -400,9 +414,10 @@ owed-delta wave; staleness sweep #395)._
 
 ## ▶ NEXT SESSION — start here
 
-**Repo baseline for the cache-first audit (2026-07-12, macOS arm64 machine):** **#426**
-(fourteenth code wave — the Codex-audit item-2 macOS link/size portability slice; full record in the
-_Last updated_ paragraph above). The new cache-first and parallel records are docs-only and their
+**Repo baseline for the audits (2026-07-13, macOS arm64 machine):** **#427**
+(docs-only cache/parallel merge; last code wave is #426, the Codex-audit item-2 macOS link/size
+portability slice; full record in the _Last updated_ paragraph above). The new cache-first, parallel,
+and pipeline/closure/memory/I/O/SIMD records are docs-only and their
 implementation has not started. **This machine needs two env vars for every
 `cargo build`/`cargo test`/driver-link run** — this was the undocumented blocker at session
 start: `LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm` (Homebrew LLVM 22.1.8 is keg-only) and
@@ -415,17 +430,21 @@ remaining macOS full-suite failures are cataloged out-of-scope at adoption-recor
 (ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
 expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
 is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
-one is next available. **Next, pick one:** (a) cache-first C0 — fix the confirmed basename-temp
+one is next available. **Next, pick one:** (a) document-12 P0 — fix Unit indirect-call ABI, the two
+closure-region UAF paths, buffered-`io.copy` lookahead loss, post-`where` inactive-lane-unsafe
+execution, and parallel/higher-order effect holes; settle ordinary sequential effects rather than
+silently adding a rejection; complete required allocation-size hardening before widening (source of truth
+`docs/impl/12-pipeline-closure-memory-io-simd-audit.md`); (b) cache-first C0 — fix the confirmed basename-temp
 race with private staging + atomic publication and add determinism/concurrency gates (source of
-truth `docs/impl/10-cache-first-optimization.md`; MUST precede M15 parallel compilation); (b)
+truth `docs/impl/10-cache-first-optimization.md`; MUST precede M15 parallel compilation); (c)
 parallel P0 correctness — close the capturing-closure effect edge and saturated
 `task_group -> par_map` deadlock before any scheduler/IR widening (source of truth
-`docs/impl/11-parallel-execution-optimization.md`); (c) the Codex wave-1 remainder — CONFIRMED bug
+`docs/impl/11-parallel-execution-optimization.md`); (d) the Codex wave-1 remainder — CONFIRMED bug
 1 (bench export roots: `emit-obj --export` mechanism,
 `bench/run.sh` re-verified) and bug 3 (profiles never reach the TargetMachine:
-`optsize`/`minsize` fn attrs, per-profile runtime variant + cache key); (d) the deferred
-`bench/binary_size` script port (small PR, adoption-record item 2 sub-item); (e) the M14 LTO ceiling
-probe rerun (procedure in the roadmap M14 section); (f) Codex wave-2 quick wins (O(n²) sort,
+`optsize`/`minsize` fn attrs, per-profile runtime variant + cache key); (e) the deferred
+`bench/binary_size` script port (small PR, adoption-record item 2 sub-item); (f) the M14 LTO ceiling
+probe rerun (procedure in the roadmap M14 section); (g) Codex wave-2 quick wins (O(n²) sort,
 tiny-`par_map` cold start, zero-size arena, attr-kind fail-loud + `captures(none)`). Reminder:
 gemini-code-assist reviews cease **2026-07-17**
 — after that, `/code-review` on the branch replaces the reflect-before-merge step.
