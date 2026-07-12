@@ -546,13 +546,16 @@ later slices (struct arrays, M5 strings/JSON).
   `print(str)` via `align_rt_print_str` (M5-A).
 - [done] `str` equality (`==`/`!=`); the runtime string `builder`
   (`align_rt_builder_*`); `template "...{ident}..."` desugaring (static parts +
-  int/str holes → builder writes → `str`); `str + str` concatenation.
-- [done] arena-backed builder: when a `template`/concat runs inside an `arena {}`,
+  int/str holes → builder writes → `str`). **Historical milestone note:** `str + str`
+  concatenation shipped here, but the 2026-07-02 settlement removed that surface; the checker/MIR
+  drift is audit-13 C0 work.
+- [done] arena-backed builder: when a `template` runs inside an `arena {}`,
   the result is allocated in the arena (bulk-freed, no leak); outside, it is leaked
   (process-lifetime).
 - [done] `str` escape checking: an arena-backed `str` cannot escape its arena (return /
   arena-block value / assign-to-outer) — `EscapeCheck` now tracks `str` regions like
-  `box`. A non-arena `str` (literal / leaked concat) is region-0 and freely returnable.
+  `box`. A literal `str` is region-0 and freely returnable. Arena-free template ownership is a
+  confirmed gap in audit 13; do not treat its current process-lifetime leak as the desired model.
 - [done] `slice<T>` escape checking. Slices borrow function-local array storage (a
   different lifetime model from arena regions: the backing array lives in the *frame*,
   not an arena), so `EscapeCheck` tracks a separate set of "local-backed" slice locals.
@@ -1003,6 +1006,16 @@ closure lifetime + Unit-indirect-ABI + buffered-`io.copy` blockers, the ordinary
 conflict, and required allocation-size hardening. It gates per-callsite arena initialization,
 exact-destination codec/hex-SIMD, macOS copy-path, HTTP-copy, and sequential compaction candidates.
 Its P0 slices precede any SIMD or parallel widening; it adds no source syntax.
+
+**String/array allocation-copy and short-input companion record (2026-07-13):**
+`13-string-array-allocation-short-input-audit.md` is the durable follow-up for text and array
+ownership, allocation count, copy count, and `0..64` behavior. C0 first restores UTF-8 slice
+boundaries and settled concat rejection, then gives unbound owned expression temporaries
+view-aware lifetime/drop handling and removes the arena-free template lifetime leak. Confirmed
+implementation work then removes borrowed-path copies, builder freeze copies, staged directory/DNS/
+path/group outputs, and direct-consumer chunk headers. UTF-8 crossovers, repeated-needle plans, JSON
+escape SIMD, and large constant arrays remain measure-first. Its language-surface section contains
+questions for Claude Code, not adopted syntax or semantics; `open-questions.md` remains authoritative.
 
 ## M8 — Tooling and Quality — DONE (2026-07-03)
 
