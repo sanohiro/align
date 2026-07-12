@@ -1,0 +1,574 @@
+# Cache-first compilation and output-code optimization
+
+Status: **RECORDED 2026-07-12; implementation not started.** This is the durable source for the
+cache-first audit requested after the LLVM 22 / macOS portability wave. It records confirmed
+correctness defects, the required artifact-cache architecture, and new measure-first CPU-cache
+candidates that are not already in the roadmap. Audit baseline: commit `ad7e4c8b57ad`, arm64 macOS,
+LLVM 22.1.8, rustc 1.96.1.
+
+The status labels in this document are deliberate:
+
+- **CONFIRMED** — reproduced against the baseline, or directly proven from the implementation.
+- **REQUIRED** — an architectural constraint for a sound cache, not an optional optimization.
+- **PROPOSED** — the preferred design direction; settle its remaining details in the M15 review.
+- **MEASURE-FIRST** — a plausible output/runtime optimization, not approved to ship until a written
+  gate is met.
+- **ALREADY PLANNED** — recorded only to draw the boundary; do not count it as a new finding here.
+
+No language semantics or user-facing syntax are changed by this note.
+
+---
+
+## 1. Decision summary
+
+The cache-first priority is sound, in both meanings of "cache":
+
+1. **Build artifact reuse.** Make repeated builds skip work safely and make independent builds of
+   the same input converge on one immutable artifact.
+2. **CPU cache locality.** Reduce working-set size, memory traffic, active write streams, and
+   cache-coherence traffic before pursuing instruction-level tricks.
+
+The immediate order is:
+
+1. Fix the predictable temporary-artifact collision. It is a correctness prerequisite for any
+   parallel or cached build.
+2. Pin reproducible artifacts and deterministic diagnostics with regression tests.
+3. Add a whole-program content-addressed object cache without waiting for M15 unit boundaries.
+4. In M15, split interface and implementation fingerprints so private edits do not invalidate
+   consumers.
+5. Repair the cache-sensitive benchmark methodology, then probe buffer donation, blocked AoS→SoA
+   construction, and `task_group` batching. Add stack lifetime markers only after sound MIR liveness
+   exists.
+
+The existing M14 LTO ceiling probe and the existing Codex work queue remain independent. This note
+does not reorder them except that the temporary-artifact race must be fixed before M15 parallel unit
+compilation can be correct.
+
+---
+
+## 2. Boundary with already-planned work
+
+The following are **ALREADY PLANNED** and are intentionally not presented as new findings:
+
+- M14's runtime-bitcode / in-process-LTO ceiling probe, followed later by PGO and BOLT evaluation.
+- M15 separate compilation, per-unit staleness/caching, parallel unit compilation, and ThinLTO once
+  multiple Align units exist.
+- Build-profile propagation into the `TargetMachine`, `optsize` / `minsize`, and a profile-aware
+  runtime variant/cache key.
+- Explicit benchmark export roots, the macOS binary-size script port, O(n²) sort replacement, the
+  tiny-`par_map` pool-start fix, zero-size arena allocation, and attribute hardening.
+- Measure-first JSON decode double-allocation and I/O zero-fill removal.
+- Owned SoA columns, `soa_slice<T>`, packed-bool columns, hot/cold and useful-byte-ratio lints,
+  non-temporal stores, cache-aware shaped operations, string blob/offset layouts, runtime SIMD,
+  zero-copy I/O, and runtime static-library feature splitting.
+
+Sources: the M14/M15 sections of `07-roadmap.md`, and the external binary-optimization / optimization
+consultation adoption records in `open-questions.md`.
+
+---
+
+## 3. P0 confirmed defect: predictable temporary artifacts collide
+
+### Current behavior
+
+`alignc build` and `alignc run` compile through a temporary object named only from the source
+basename:
+
+```text
+<temp>/align-<stem>.o
+```
+
+`run` similarly uses `<temp>/align-<stem>` for the executable, while `size` uses
+`<temp>/align-size-<stem>`. The relevant code is:
+
+- [`build_to` and `run`](../../crates/align_driver/src/main.rs#L307-L346)
+- [`size`](../../crates/align_driver/src/size.rs#L27-L39)
+
+Two unrelated `/a/main.align` and `/b/main.align` therefore write the same object even when their
+contents, target CPUs, profiles, or capability sets differ. One invocation can overwrite the object
+between another invocation's codegen and link. `run` / `size` add a second collision on the
+executable, and `size` may remove an executable another process is inspecting or about to execute.
+
+The integration-test helper already includes the process id because it recognizes cross-process
+temporary collisions, but the production driver does not apply that protection
+([test helper](../../crates/align_driver/tests/common/mod.rs#L148-L161)). A process id alone would
+still be insufficient for two concurrent builds inside one long-lived driver and would provide no
+artifact identity.
+
+### Reproduction
+
+Two different programs were copied to separate directories under the same name `main.align` and
+built concurrently for 40 pairs:
+
+```text
+build failures                                      0 / 40 pairs
+the module-derived program linked the wrong object  6 / 40
+the min-derived program linked the wrong object    34 / 40
+pairs with at least one wrong executable            40 / 40
+```
+
+Concurrent `run` probes also produced wrong programs, signals, `ENOENT`, and "cannot execute binary
+file" failures as the shared executable was replaced or removed. This is **CONFIRMED** and is not a
+performance-only issue.
+
+### Required fix
+
+Use the same artifact-identity mechanism for collision safety and caching:
+
+```text
+cache root / namespace / content key / artifact
+                           ^
+                           immutable after publication
+```
+
+For a missing key:
+
+1. Create a private, unique staging directory under the cache root (`create_new`; never a predictable
+   shared pathname).
+2. Generate the artifact completely in staging.
+3. Verify success and, where stored as CAS, verify the artifact digest.
+4. Atomically rename/publish it at the content-key path. A per-key lock may suppress duplicate work;
+   alternatively, racing producers may build independently and the losing publisher discards its
+   byte-identical result.
+5. Materialize the requested cwd output through its own temporary name + atomic rename. Never link or
+   execute a partially written cache entry.
+6. Remove staging data on failure; an interrupted build must not create a cache hit.
+
+The first implementation may use a unique non-cache staging directory to close the correctness bug,
+but it should use the final key/path abstraction so it is not throwaway work.
+
+### Regression requirements
+
+- Two different same-basename programs build/run concurrently for many rounds; both always execute
+  their own program.
+- Same basename with different profile / target CPU never shares an object key.
+- Many producers of one identical key all receive a complete byte-identical artifact.
+- Kill the producer between codegen and publish; the next build reports a miss and rebuilds.
+- A `size` process cannot remove or inspect another process's executable.
+
+---
+
+## 4. Reproducibility baseline: promising but unpinned
+
+Normal location-free builds are already a good content-addressing substrate. Across three fresh
+processes on the audit host, each of the following was byte-identical across all repetitions:
+
+- `min.align`: raw LLVM IR, optimized LLVM IR, object, release executable, and tiny executable.
+- `json_decode.align`: object.
+- Executables built from different working directories.
+- An object built through a differently named path/symlink to identical source.
+- An object after a comment-only source change.
+
+The audit also independently repeated `vec_sum.align` object and executable builds; each pair had
+identical SHA-256 digests. No source path enters an ordinary build's MIR/codegen path. `explain-opt`
+is intentionally different: its located MIR and debug metadata include file/line identity and must
+live in another cache namespace.
+
+This is empirical, not contractual. Existing profile tests prove that O0 and O3 objects differ, but
+there is no test that identical inputs stay identical. Add a reproducibility suite before relying on
+CAS:
+
+- same process and fresh processes;
+- relocated source trees and cwd;
+- comment/format-only changes (canonical MIR/object identity, even if frontend diagnostics rerun);
+- import graph ordering that is semantically equivalent;
+- release / tiny and baseline / native namespaces;
+- object and linked executable, on ELF and Mach-O;
+- cold build output vs cache-hit output (bytes and execution result).
+
+Do not promise cross-toolchain byte identity. A toolchain fingerprint deliberately creates a new
+namespace.
+
+---
+
+## 5. Confirmed deterministic-diagnostic gap
+
+Top-level constants are collected into a `HashMap`, then every independent constant is evaluated in
+`decls.keys()` order ([constant evaluation](../../crates/align_sema/src/lib.rs#L1993-L2041)). Rust's
+per-process randomized hash seed makes that order unstable.
+
+One source containing four independent constant division-by-zero errors was checked in 24 fresh
+processes. Its stderr produced **17 distinct SHA-256 digests**; observed line orders included
+`2,4,3,1` and `3,1,2,4`.
+
+This does not alter a valid machine artifact, but it breaks diagnostic/action caching, creates noisy
+CI diffs, and makes the AI repair loop see a different problem order on identical input. It is
+**CONFIRMED**.
+
+Required correction:
+
+- Evaluate independent roots in stable source-span order (dependency recursion remains memoized and
+  naturally evaluates prerequisites first), or retain collection order explicitly.
+- Render diagnostics in a stable final order as a defense-in-depth boundary.
+- Add a subprocess test that repeats the same failing source and compares stderr bytes.
+
+Do not cache failed frontend results until this is fixed and diagnostic cache identity includes the
+compiler/frontend schema plus source-location identity.
+
+---
+
+## 6. Cache architecture
+
+M15 currently says "per-unit staleness/caching" but does not define identity, invalidation, or
+publication. The design review should settle those as first-class correctness rules, not driver
+details.
+
+### 6.1 Stage-separated action cache + CAS
+
+Use action keys to map declared inputs to immutable result digests, and CAS to store the immutable
+bytes:
+
+| Stage | Action identity | Result |
+|---|---|---|
+| Frontend | source/import graph digests + frontend schema/options | checked HIR/MIR digest + diagnostics |
+| Codegen | canonical location-free MIR digest + exact codegen/toolchain identity | object or bitcode digest |
+| Link | ordered input-object digests + runtime/link environment identity | executable digest |
+
+This separation matters:
+
+- A no-op build can hit before parsing.
+- A comment/format-only edit may rerun the frontend, produce the same canonical MIR digest, and hit
+  codegen.
+- Reverting source can recover an older CAS object without rebuilding it.
+- `check`, normal build, and located `explain-opt` do not accidentally share incompatible results.
+- Object caching remains useful even where non-hermetic system linking makes executable caching
+  unsafe.
+
+Do not use the formatter's current "significant token texts" helper directly as a semantic cache
+key: it deliberately drops statement terminators and relies on reparsing as a second safety check.
+Canonical checked HIR/MIR is the safer codegen identity. If a token-level frontend key is added, it
+must retain normalized statement boundaries and every semantic token value.
+
+### 6.2 Object/codegen key
+
+At minimum, hash a canonical encoding of:
+
+```text
+cache-format/schema version
+compiler build or codegen-schema identity
+canonical location-free MIR
+explicit export/root set
+target triple + object format
+resolved CPU + full feature set
+profile + pass pipeline + TargetMachine optimization level
+relocation/code model and codegen-affecting flags
+exact LLVM build/version identity
+LTO/runtime-bitcode mode and merged bitcode digest (when applicable)
+```
+
+"LLVM major" is not a sufficient cache boundary. Minor/patch changes can alter pass pipelines,
+instruction selection, textual attributes, or object bytes. Prefer an exact LLVM version/build id,
+and include a compiler build/schema id so a codegen change cannot reuse an old object.
+
+The key must use the **resolved** CPU/features. `native` as a string is not identity: two machines
+resolve it differently.
+
+### 6.3 Runtime and link key
+
+The current runtime freshness check compares `libalign_runtime.a` mtime only with
+`align_runtime/src/**/*.rs` ([implementation](../../crates/align_driver/src/lib.rs#L317-L396)). It
+misses, among other inputs:
+
+- `align_hash` changes (the runtime depends on it);
+- `align_runtime/Cargo.toml` and `Cargo.lock`;
+- rustc/toolchain and codegen flags;
+- panic strategy, runtime profile, target, and native dependencies.
+
+It can also false-miss on a content-preserving `touch` and false-hit when timestamps are restored.
+Replace it with a runtime build manifest keyed by content/configuration. Independently, hash the
+actual runtime archive bytes into every link action. If M14 merges runtime bitcode into the Align
+module, its bitcode digest belongs in the object/codegen key instead.
+
+A link key needs:
+
+```text
+ordered object/bitcode digests
+runtime archive digest
+object format + link flags + dead-strip policy
+capability/user libraries in emitted order
+profile strip decision
+linker executable/version and target/sysroot identity
+resolved search paths and other link-affecting environment
+```
+
+System `cc` + mutable system-library search paths are not hermetic today. Start the executable cache
+as host-local. Object CAS is the portable/high-value layer; do not weaken its key in pursuit of a
+cross-host link hit.
+
+### 6.4 M15 interface vs implementation identity
+
+Per-unit caching only has a high hit rate if a private implementation edit does not force every
+consumer to rebuild. Each stable unit artifact should carry at least three independently hashed
+parts:
+
+1. **Public interface summary** — exported names/signatures, type layouts, generic body/instantiation
+   information required by the chosen monomorphization model, and the conservative escape/region,
+   effect/purity, and Move/Copy summaries required for sound cross-unit checking.
+2. **Implementation body** — private + exported bodies needed to build this unit's object/bitcode.
+3. **Link summary** — capability/native-library requirements and exported symbol/root information.
+
+Consumers depend on the public-interface hash, not the implementation hash. Final link depends on
+all implementation artifacts and the union of link summaries. Canonical encodings must not contain
+process-local numeric ids or hash-map iteration order.
+
+Soundness is fail-closed: an absent/unknown summary forces a conservative assumption or rebuild. It
+must never recover the whole-program optimizer's former optimistic fact by guessing across a unit
+boundary.
+
+### 6.5 Observability
+
+A cache that cannot explain misses will decay. Record, in a human and eventually machine-readable
+form:
+
+- hit/miss per frontend, unit, codegen, runtime, and link stage;
+- the first differing key component / miss reason;
+- stage wall time, bytes read/written, and peak RSS;
+- cache corruption and forced-rebuild events.
+
+The exact CLI surface is an M15 decision. The data model is required from the first slice so tests
+can assert invalidation rather than infer it from elapsed time.
+
+---
+
+## 7. Cache validation matrix
+
+The cache implementation is incomplete until this matrix is automated:
+
+| Change/event | Expected result |
+|---|---|
+| no-op rebuild | frontend/unit/object/link hit |
+| comment/format-only edit | diagnostics/frontend work as needed; canonical codegen hit |
+| private function body edit | edited unit object miss; dependent-unit codegen hit; relink |
+| public signature/layout/summary edit | reverse dependents miss |
+| unused, unimported file edit | all existing build actions hit |
+| profile/target/CPU/LLVM/compiler change | only the correct namespace misses |
+| runtime source/dependency/flags change | runtime/link miss; no stale archive accepted |
+| source edit then exact revert | old CAS artifact hit |
+| many identical concurrent builds | one immutable result; no partial readers |
+| different same-basename concurrent builds | distinct keys and correct executables |
+| producer killed before publish | no cache entry; next build safely rebuilds |
+| corrupted cache bytes | digest failure, eviction, automatic rebuild |
+| cache hit vs cold build | byte-identical output and identical execution |
+
+Add bounded cache eviction only after correctness and hit telemetry exist. Eviction policy is not an
+artifact-identity concern and must not complicate the first slice.
+
+---
+
+## 8. CPU-cache candidates not already scheduled
+
+These are **MEASURE-FIRST** candidates. Each changes implementation only; none creates a language
+surface. Write the gate before prototyping and pin both a positive workload and a non-regression
+control.
+
+### 8.1 Donate a uniquely owned temporary buffer to a materializing pipeline
+
+Current MIR explicitly recognizes a fresh unbound owned-array source as uniquely owned by the
+consumer. For `make().map(f).to_array()`, `setup_source` returns `temp_free`; `lower_array_collect`
+allocates a fresh output buffer, copies/filters into it, then frees the source
+([collect lowering](../../crates/align_mir/src/lib.rs#L4234-L4418)).
+
+For a heap-owned scalar source with compatible element size/alignment, the source buffer can become
+the result buffer:
+
+- `map`: load element `i`, compute, store element `i` back.
+- `where`: stable compaction is safe because `out_index <= source_index`; the current element is
+  loaded before its slot can be overwritten.
+- `scan`: safe under the same compatible-layout rule; each source element is consumed before the
+  running result is stored at or behind it.
+
+Start with the mechanically safe subset:
+
+```text
+temp_free is present (fresh unbound heap ownership)
+source and result scalar layouts are identical
+no struct/string/Move payloads
+no arena reuse in the first slice
+no exposed alias/view of the source
+```
+
+The output remains a visible `.to_array()` materialization whose storage comes from a visible owned
+input allocation; the optimization only removes redundant storage. A design review must still
+confirm that this allocation elision is consistent with Nothing-hidden and the explicit
+`map_into(out)` surface. Do not silently generalize donation to a bound local without real last-use
+and borrow-liveness analysis.
+
+Gate signals:
+
+- one fewer allocator call and no source `DropValue` free/reallocate pair;
+- lower peak RSS / resident bytes on a large owned temporary;
+- lower wall time or cache/write-traffic counters on map and selective-where workloads;
+- byte-for-byte result parity, drop/allocation-counter tests, and no regression for borrowed inputs.
+
+### 8.2 Cache-block the AoS→SoA construction loop for wide structs
+
+`transpose_to_soa` currently walks one row at a time and stores every field into a far-separated
+column before advancing to the next row
+([implementation](../../crates/align_mir/src/lib.rs#L4563-L4639)). Each column is individually
+sequential, which is ideal for narrow structs, but a wide struct creates many simultaneous write
+streams. Once the field count exceeds the store-buffer/cache-line working set, stores can thrash
+active lines and page translations.
+
+Probe a two-dimensional construction tile:
+
+```text
+for each small row block whose AoS bytes fit a chosen cache budget
+  for each small field block
+    transpose those rows × fields into the final plain-SoA columns
+```
+
+This is **not** the rejected automatic AoSoA/chunked-SoA representation. The final memory layout and
+all later column scans remain ordinary SoA; only the one-time transpose loop order changes. A field
+block may reread the row tile, so the row tile must fit cache and the threshold must be earned on
+wide structs. Narrow structs are the non-regression control and should keep the current single loop
+unless the probe proves otherwise.
+
+Measure at multiple row sizes and field counts (for example 4/8/16/32 scalar fields), recording
+wall time, stores, cache/TLB misses, and final column-scan parity. Ship only with a clear crossover
+and a simple target-independent threshold or a settled target-data query.
+
+### 8.3 Batch `task_group` claiming and completion
+
+The parallel-runtime shape, newly confirmed nested-pool deadlock, and wider generated-IR audit are
+recorded in [`11-parallel-execution-optimization.md`](11-parallel-execution-optimization.md). This
+subsection remains the cache-locality gate; document 11 is the parallel correctness source.
+
+`align_rt_tg_wait` performs one shared atomic `fetch_add` per task and, after every task, locks one
+shared `TgBarrier`, updates it, and calls `notify_all`
+([implementation](../../crates/align_runtime/src/lib.rs#L7318-L7395)). For many tiny tasks, the
+task body can be cheaper than the cache-coherence and mutex traffic.
+
+Probe runners claiming a small contiguous batch of indices at once and accumulating completion
+locally. Merge one local result per batch/runner; lock only for a real error/panic or the final
+completion transition. Preserve all existing semantics:
+
+- caller participation and nested-group deadlock freedom;
+- every task claimed exactly once;
+- deterministic lowest-index error and panic selection;
+- all tasks joined before region release.
+
+This is distinct from the already-planned `n == 1` fast path. Gate across task count and body-cost
+sweeps; heavy-task performance must stay flat while tiny-task throughput improves materially.
+
+### 8.4 Emit stack lifetime markers after sound liveness exists
+
+Codegen allocates every MIR slot in the function entry block and emits no
+`llvm.lifetime.start/end` markers
+([slot allocation](../../crates/align_codegen_llvm/src/lib.rs#L3380-L3410)). Entry allocation is
+correct and prevents loop-growing stacks, but without lifetime intervals LLVM has less information
+for stack coloring/reuse of large non-overlapping slots.
+
+Do not derive markers from lexical scope alone while borrow liveness is incomplete. Sequence this
+after the planned MIR-dataflow / borrow-liveness work and derive markers from proven last use,
+including every branch, early return, `?`, cleanup, captured environment, and FFI escape. An early
+`lifetime.end` is optimizer UB and can miscompile.
+
+Gate on functions with disjoint large fixed arrays/struct temporaries: optimized frame size, stack
+slot reuse, cache/TLB counters, and full behavior tests. Scalar allocas promoted by mem2reg are the
+negative control; they should show no benefit.
+
+---
+
+## 9. Cache-sensitive benchmark methodology
+
+Before accepting any CPU-cache optimization, fix two measurement gaps.
+
+### 9.1 Balance execution order
+
+Several head-to-head harnesses say they alternate implementations, but every measured round is
+fixed `Align → Rust`:
+
+- [`bench/harness.rs`](../../bench/harness.rs#L72-L86)
+- [`bench/group_by`](../../bench/group_by/src/main.rs#L75-L88)
+- [`bench/json_decode`](../../bench/json_decode/src/main.rs#L106-L123)
+
+With shared input, the second implementation may inherit cache warmth or settled frequency from the
+first. Replace fixed AB rounds with balanced AB/BA (or a fixed-seed balanced order), keep separate
+minima/distributions, and retain the existing correctness equality check. The sequence itself must
+be reproducible.
+
+### 9.2 Sweep cache hierarchy boundaries
+
+Current sizes (`100k`, `1M`, `50M`, etc.) cover broad regimes but do not identify where performance
+changes as the working set leaves L1, L2, LLC, and DRAM. For locality claims, record sizes around
+`0.5× / 1× / 2×` each relevant cache capacity, expressed in bytes actually read/written rather than
+only element count.
+
+Record at least:
+
+```text
+ns/element and absolute wall time
+useful bytes vs total bytes moved
+allocations/materializations and peak RSS
+cycles/instructions where available
+L1/LLC/TLB misses where available
+```
+
+Hardware counters and cold/warm separation are already in the external audit checklist. The new
+requirement here is balanced ordering plus the hierarchy-boundary working-set sweep. Cross-platform
+tests must still run without counters; counters enrich a benchmark, never gate functional CI.
+
+---
+
+## 10. Implementation sequence and stop conditions
+
+### Slice C0 — artifact correctness and determinism
+
+- Replace predictable shared temporary paths with private staging + atomic publication.
+- Add the concurrent same-basename and interrupted-publish regression tests.
+- Sort independent constant evaluation/diagnostic output deterministically.
+- Add the byte-reproducibility suite for normal object/executable output.
+
+**Completion:** no shared partial path exists; the race mutation is caught; identical cold builds
+are byte-identical on the supported object formats.
+
+### Slice C1 — whole-program object CAS
+
+- Define cache schema and exact object key.
+- Cache the current one-Program object before M15 changes the unit boundary.
+- Hash the real runtime archive into link identity; replace the incomplete mtime freshness premise
+  with a content/configuration manifest.
+- Emit structured hit/miss reasons.
+
+**Completion:** no-op and source-revert builds hit; comment-only changes can hit codegen; every key
+mutation in the validation matrix causes the intended miss; cache-hit and cold outputs match.
+
+### Slice C2 — M15 unit summaries and incremental invalidation
+
+- Settle the unit boundary/artifact format and generic strategy.
+- Canonicalize interface, implementation, and link summaries.
+- Rebuild only reverse dependencies whose interface inputs changed.
+- Compile independent misses in parallel using the C0 publication mechanism.
+
+**Completion:** a private-body edit recompiles one unit plus relink; public soundness-summary changes
+invalidate the right reverse dependencies; no missing summary is treated optimistically.
+
+### CPU-cache probes
+
+After benchmark export roots and balanced measurement work:
+
+1. uniquely owned buffer donation;
+2. wide AoS→SoA blocked construction;
+3. `task_group` batch claiming/completion;
+4. stack lifetimes only after MIR liveness.
+
+Record below-gate results and close them, following the arena-reuse and cold-edge precedents. Do not
+keep an unearned second mechanism.
+
+---
+
+## 11. Claude Code handoff checklist
+
+When resuming this work in a later session:
+
+1. Read `HANDOFF.md`, `CLAUDE.md`, the M14/M15 sections of `07-roadmap.md`, then this document and
+   the parallel companion `11-parallel-execution-optimization.md`.
+2. Check whether C0 has landed; never begin parallel M15 compilation while basename-shared artifacts
+   remain.
+3. Re-run the confirmed reproductions on the current HEAD before editing; line numbers may have
+   moved, but the linked functions are the authoritative sites.
+4. Keep confirmed fixes separate from measure-first CPU candidates.
+5. For code changes, follow the repository's self-review and adversarial gate workflow; cache-key
+   omissions are correctness defects, not minor performance findings.
+6. Update this document's status ledger and the short roadmap/handoff pointers as slices land. Do not
+   duplicate the full design into `HANDOFF.md` or `open-questions.md`.
