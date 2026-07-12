@@ -450,9 +450,11 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCo
 mod tests {
     use super::*;
 
-    // Real LLVM-19 remark strings captured from the probe kernels (`docs/impl/09-explain-opt.md`).
+    // Real LLVM remark strings captured from the probe kernels (`docs/impl/09-explain-opt.md`).
     // The translation table is keyed on these; breaking a pattern must drop the actionable line
-    // (the mutation-check below).
+    // (the mutation-check below). Re-verified at the LLVM 19 → 22 upgrade (2026-07-12): the
+    // vectorize/reduction/inline/SLP message patterns are unchanged, and the `explain_opt.rs`
+    // integration tests (which drive the REAL LLVM 22 remark stream) pass.
 
     #[test]
     fn parses_location_and_message() {

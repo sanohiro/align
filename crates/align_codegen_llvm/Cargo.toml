@@ -9,10 +9,13 @@ align_mir = { path = "../align_mir" }
 align_sema = { path = "../align_sema" }
 align_ast = { path = "../align_ast" }
 align_hash = { path = "../align_hash" }
-inkwell = { version = "0.9", features = ["llvm19-1"] }
-# Add prefer-dynamic to the llvm-sys (191.x) that inkwell uses, forcing dynamic
-# linking against libLLVM-19.so (Debian llvm-19 lacks static components like libPolly.a).
-llvm-sys = { version = "191", features = ["prefer-dynamic"] }
+inkwell = { version = "0.9", features = ["llvm22-1"] }
+# Add prefer-dynamic to the llvm-sys (221.x) that inkwell uses, forcing dynamic
+# linking against libLLVM-22.so. The apt.llvm.org llvm-22 packages DO ship the static
+# archives (Polly is no longer a separate `--libs` component in LLVM 22), so a static
+# build is now possible — but we keep dynamic linking: it is smaller to link, matches the
+# rustc-side toolchain, and avoids re-litigating the archive set. See .cargo/config.toml.
+llvm-sys = { version = "221", features = ["prefer-dynamic"] }
 
 [dev-dependencies]
 align_diag = { path = "../align_diag" }

@@ -9,20 +9,42 @@
 //! also run at `x86-64-v2` (SSE → 128-bit → `<2 x i64>`) to pin that widths track the target. All
 //! tests are gated to x86-64 hosts (the pinned CPU names are x86 tiers) and to backend availability.
 //!
-//! The `<N x ...>` widths, `vector.body`, and `llvm.vector.reduce.*` names are LLVM-19 IR spellings;
-//! re-verify them at the LLVM upgrade — that re-verification is exactly what this gate exists for.
+//! The `<N x ...>` widths and `llvm.vector.reduce.*` names are LLVM IR spellings; re-verify them at
+//! each LLVM upgrade — that re-verification is exactly what this gate exists for.
 //!
-//! Empirical verdicts (probed 2026-07-11, LLVM 19, this codegen) are recorded per-test below.
+//! Re-verified at the **LLVM 19 → 22 upgrade** (2026-07-12). Two vectorizer-behavior changes forced
+//! a re-pin of the *reduction* kernels (k1/k2/k4/k5), both verified in IR to be equivalent-or-better,
+//! not a codegen regression:
+//!   1. **Constant-fold, not de-vectorize.** LLVM 22's SCEV now sees through a compile-time-constant
+//!      array reduced over a runtime-length prefix and folds the reduction to a closed form
+//!      (a `select` over the boundary partial-sums) — no vector reduce at all, which is *better*
+//!      codegen but means the kernel stopped exercising the vectorizer. The old kernels leaned on
+//!      "constant values + unknown length = opaque enough"; that no longer holds. Fix: the reduction
+//!      kernels now seed their array from a runtime value (`args.len()`), so the element *values* are
+//!      opaque. Under opaque data LLVM 22 vectorizes to the SAME width and SAME reduction intrinsic
+//!      as LLVM 19 did (verified below).
+//!   2. **`vector.body` block name is unreliable.** When a reduction `run` inlines into `main`, LLVM
+//!      22 renames/merges the vector loop body block, so the literal `vector.body` string is gone at
+//!      v3 (it survives at v2 and for the materialize kernels k7/k8). The stable, block-name- and
+//!      init-noise-independent signals are the **mangled reduce intrinsic** (`llvm.vector.reduce.
+//!      <op>.v<N>i64` — the `.vNi64` suffix pins the width precisely, unpolluted by the constant
+//!      array-init store groups that can read `<4 x i64>` even at v2) and the **`vector.ph`** vector
+//!      preheader. The reduction kernels key on those; the materialize kernels (k7/k8) keep the
+//!      `vector.body` + `store <N x i64>` shape, which is still emitted for them.
+//!
+//! Empirical verdicts (re-probed 2026-07-12, LLVM 22, this codegen) are recorded per-test below.
 //! Divergences from the design table in `09-explain-opt.md` (kernels 4, 7) are noted in place — the
 //! suite pins **reality**, not the table's pre-implementation guesses (the design's own rule).
 
 mod common;
 use common::*;
 
-/// The kernels feed on a runtime-length prefix of a fixed array (`a[0..args.len()]`) so the trip
-/// count is unknown and the data is opaque to the optimizer — otherwise a fixed literal is
-/// constant-folded away and no loop survives to vectorize. `main(args)` must return
-/// `Result<(), Error>`, and the pipeline result is kept live with `print`.
+/// The kernels feed on a runtime-length prefix of an array whose *element values* are also seeded
+/// from a runtime value (`n := args.len()`), so both the trip count AND the data are opaque to the
+/// optimizer. A runtime length alone is not enough on LLVM 22: its SCEV constant-folds a reduction
+/// over a compile-time-constant array (see the module header, finding 1), so the loop never
+/// vectorizes. Seeding the values from `n` keeps the reduction genuinely data-dependent. `main(args)`
+/// must return `Result<(), Error>`, and the pipeline result is kept live with `print`.
 fn compile_ir(name: &str, src: &str, cpu: &str, optimized: bool) -> String {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, name, src);
@@ -59,7 +81,8 @@ fn reduction_kernel(stage_and_terminal: &str, helpers: &str) -> String {
     format!(
         "{helpers}\nfn run(xs: slice<i64>) -> i64 = xs.{stage_and_terminal}\n\
          fn main(args: array<str>) -> Result<(), Error> {{\n  \
-           a := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]\n  \
+           n := args.len() as i64\n  \
+           a := [n, n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12, n+13, n+14, n+15]\n  \
            s : slice<i64> := a[0..args.len()]\n  \
            print(run(s))\n  \
            return Ok(())\n\
@@ -76,10 +99,15 @@ fn k1_map_sum_vectorizes_v3() {
     }
     let src = reduction_kernel("map(dbl).sum()", "fn dbl(x: i64) -> i64 = x * 2");
     let ir = opt_ir("k1", &src, V3);
-    // AVX2: 256-bit int vectors = 4 lanes; a vectorized reduction loop with a horizontal add.
+    // AVX2: 256-bit int vectors = 4 lanes; a vectorized reduction loop with a horizontal add. The
+    // width is pinned by the reduce intrinsic's mangled `.v4i64` suffix (block-name- and
+    // init-store-noise-independent — see the module header).
     assert!(ir.contains("<4 x i64>"), "want <4 x i64>:\n{ir}");
-    assert!(ir.contains("vector.body"), "want a vectorized loop:\n{ir}");
-    assert!(ir.contains("llvm.vector.reduce.add"), "want a horizontal add reduction:\n{ir}");
+    assert!(ir.contains("vector.ph"), "want a vectorized loop (vector preheader):\n{ir}");
+    assert!(
+        ir.contains("llvm.vector.reduce.add.v4i64"),
+        "want a 4-lane horizontal add reduction:\n{ir}"
+    );
 }
 
 #[test]
@@ -88,12 +116,22 @@ fn k1_map_sum_width_tracks_target_v2() {
         return;
     }
     // Same kernel at the SSE tier: 128-bit int vectors = 2 lanes. Pins that the vector width is the
-    // target's, not a constant baked into the suite.
+    // target's, not a constant baked into the suite. The width is read off the reduce intrinsic's
+    // mangled suffix: it must be `.v2i64` and must NOT be `.v4i64`. (A whole-module `!contains("<4 x
+    // i64>")` is unusable here — the constant array-init store groups can be `<4 x i64>` even at v2;
+    // the intrinsic width is the loop's, unpolluted by init.)
     let src = reduction_kernel("map(dbl).sum()", "fn dbl(x: i64) -> i64 = x * 2");
     let ir = opt_ir("k1v2", &src, V2);
     assert!(ir.contains("<2 x i64>"), "want <2 x i64> at v2:\n{ir}");
-    assert!(!ir.contains("<4 x i64>"), "v2 must not use 4-lane vectors:\n{ir}");
-    assert!(ir.contains("vector.body"), "want a vectorized loop:\n{ir}");
+    assert!(ir.contains("vector.ph"), "want a vectorized loop (vector preheader):\n{ir}");
+    assert!(
+        ir.contains("llvm.vector.reduce.add.v2i64"),
+        "want a 2-lane horizontal add reduction at v2:\n{ir}"
+    );
+    assert!(
+        !ir.contains("llvm.vector.reduce.add.v4i64"),
+        "v2 must not use a 4-lane reduction:\n{ir}"
+    );
 }
 
 // --- Kernel 2: where(big).sum() — if-conversion, masked. VECTORIZES. ★ locked ---
@@ -109,8 +147,11 @@ fn k2_where_sum_vectorizes_masked_v3() {
     // masked into the vectorized reduction.
     assert!(ir.contains("<4 x i1>"), "want a <4 x i1> predicate mask:\n{ir}");
     assert!(ir.contains("<4 x i64>"), "want <4 x i64>:\n{ir}");
-    assert!(ir.contains("vector.body"), "want a vectorized loop:\n{ir}");
-    assert!(ir.contains("llvm.vector.reduce.add"), "want a horizontal add reduction:\n{ir}");
+    assert!(ir.contains("vector.ph"), "want a vectorized loop (vector preheader):\n{ir}");
+    assert!(
+        ir.contains("llvm.vector.reduce.add.v4i64"),
+        "want a 4-lane horizontal add reduction:\n{ir}"
+    );
 }
 
 #[test]
@@ -122,7 +163,15 @@ fn k2_where_sum_mask_width_tracks_target_v2() {
     let ir = opt_ir("k2v2", &src, V2);
     assert!(ir.contains("<2 x i1>"), "want a <2 x i1> mask at v2:\n{ir}");
     assert!(ir.contains("<2 x i64>"), "want <2 x i64> at v2:\n{ir}");
-    assert!(ir.contains("vector.body"), "want a vectorized loop:\n{ir}");
+    assert!(ir.contains("vector.ph"), "want a vectorized loop (vector preheader):\n{ir}");
+    assert!(
+        ir.contains("llvm.vector.reduce.add.v2i64"),
+        "want a 2-lane horizontal add reduction at v2:\n{ir}"
+    );
+    assert!(
+        !ir.contains("llvm.vector.reduce.add.v4i64"),
+        "v2 must not use a 4-lane reduction:\n{ir}"
+    );
 }
 
 // --- Kernel 3: scan(0, add) — loop-carried dependency. NEGATIVE CONTROL. ★ locked ---
@@ -176,10 +225,10 @@ fn k4_where_min_vectorizes() {
     let ir = opt_ir("k4", &src, V3);
     assert!(ir.contains("<4 x i1>"), "want a <4 x i1> predicate mask:\n{ir}");
     assert!(ir.contains("<4 x i64>"), "want <4 x i64>:\n{ir}");
-    assert!(ir.contains("vector.body"), "want a vectorized loop:\n{ir}");
+    assert!(ir.contains("vector.ph"), "want a vectorized loop (vector preheader):\n{ir}");
     assert!(
-        ir.contains("llvm.vector.reduce.smin"),
-        "want a horizontal signed-min reduction:\n{ir}"
+        ir.contains("llvm.vector.reduce.smin.v4i64"),
+        "want a 4-lane horizontal signed-min reduction:\n{ir}"
     );
 }
 
@@ -196,8 +245,11 @@ fn k5_map_reduce_mul_vectorizes() {
     );
     let ir = opt_ir("k5", &src, V3);
     assert!(ir.contains("<4 x i64>"), "want <4 x i64>:\n{ir}");
-    assert!(ir.contains("vector.body"), "want a vectorized loop:\n{ir}");
-    assert!(ir.contains("llvm.vector.reduce.mul"), "want a horizontal product reduction:\n{ir}");
+    assert!(ir.contains("vector.ph"), "want a vectorized loop (vector preheader):\n{ir}");
+    assert!(
+        ir.contains("llvm.vector.reduce.mul.v4i64"),
+        "want a 4-lane horizontal product reduction:\n{ir}"
+    );
 }
 
 // --- Kernel 6: float map(f).sum() — FP reassociation control. NEGATIVE CONTROL. ---

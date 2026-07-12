@@ -1,13 +1,15 @@
 // K3 — two-slice materialize (map_into). Expected: vectorized store loop, NO runtime overlap
 // guard (`vector.memcheck`) — `out dst` is a distinct region by the type system.
+// Input values seeded from a runtime `n` (opaque data) — see k1_map_sum.align / ../README.md.
 fn dbl(x: i64) -> i64 = x * 2
 fn scale(src: slice<i64>, out dst: slice<i64>) { src.map(dbl).map_into(dst) }
 fn main(args: array<str>) -> Result<(), Error> {
-  a := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  n := args.len() as i64
+  a := [n, n+1, n+2, n+3, n+4, n+5, n+6, n+7, n+8, n+9, n+10, n+11, n+12, n+13, n+14, n+15]
   mut b := [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-  n := args.len()
-  s : slice<i64> := a[0..n]
-  d : slice<i64> := b[0..n]
+  m := args.len()
+  s : slice<i64> := a[0..m]
+  d : slice<i64> := b[0..m]
   scale(s, d)
   print(b[0])
   return Ok(())

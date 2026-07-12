@@ -1,6 +1,9 @@
-# Pin llvm-sys to dynamic linking against libLLVM-19.so.
-# Debian's llvm-19 is shared-mode (does not ship static components like libPolly.a),
-# so the default static linking fails with "could not find native static library `Polly`".
-# llvm-config also reports --shared-mode = shared.
+# Pin llvm-sys to dynamic linking against libLLVM-22.so.
+# Unlike the Debian llvm-19 era (shared-only — it shipped no static components such as
+# libPolly.a, so dynamic linking was mandatory), the apt.llvm.org llvm-22 packages DO
+# ship the static archives and Polly is no longer a separate `--libs` component, so a
+# static build would work. We deliberately keep dynamic linking anyway: it links smaller,
+# matches the rustc-side LLVM, and avoids re-deriving the archive set on every host.
+# (llvm-config-22 --shared-mode still reports `shared`.)
 [env]
-LLVM_SYS_191_PREFER_DYNAMIC = "1"
+LLVM_SYS_221_PREFER_DYNAMIC = "1"

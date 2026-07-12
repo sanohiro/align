@@ -2932,7 +2932,8 @@ fn mark_bump_alloc<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
 /// LLVM 19's packed `MemoryEffects` bitmask (`llvm/IR/ModRef.h`): 2 bits per location —
 /// `ArgMem = 0`, `InaccessibleMem = 1`, `Other = 2` — holding a `ModRefInfo` (`Ref = 1` reads,
 /// `Mod = 2` writes). `memory(argmem: read)` = ArgMem:Ref only = `1 << (0 * 2)` = `1`, every other
-/// location `NoModRef`. This encoding is version-sensitive (a location was added after LLVM 19), so
+/// location `NoModRef`. This encoding is version-sensitive (a location was added after LLVM 19;
+/// re-verified to print canonically on LLVM 22 at the 2026-07-12 upgrade), so
 /// `rt_contract_memory_argmem_read_prints_canonically` pins the emitted attribute's textual form —
 /// an LLVM upgrade that shifts the bits fails that test loudly instead of silently miscompiling.
 const MEM_ARGMEM_READ: u64 = 1;
@@ -7816,14 +7817,23 @@ mod tests {
         // Every runtime builtin is declared unconditionally, so a trivial program emits them all.
         let out = ir("fn main() -> i32 = 0\n");
 
-        // (1) The `memory(...)` encoding pin. `MEM_ARGMEM_READ` (raw value 1) is an LLVM-19
-        // `MemoryEffects` bitmask; a version bump can shift the bits. Assert it prints in canonical
-        // textual form so an LLVM upgrade that changes the encoding fails HERE (loud), not silently.
-        // hash64 is the clean pure-finite reader: `memory(argmem: read)` + the pure-finite flags +
-        // `ptr nocapture readonly` on its byte-pointer param.
+        // (1) The `memory(...)` encoding pin. `MEM_ARGMEM_READ` (raw value 1) is the `MemoryEffects`
+        // bitmask; a version bump can shift the bits. Assert it prints in canonical textual form so
+        // an LLVM upgrade that changes the encoding fails HERE (loud), not silently. hash64 is the
+        // clean pure-finite reader: `memory(argmem: read)` + the pure-finite flags + `readonly` +
+        // the no-capture attribute on its byte-pointer param.
+        //
+        // NOTE (LLVM 19 → 22 re-pin, 2026-07-12): LLVM 22 replaced the `nocapture` parameter
+        // attribute with `captures(...)` (an auto-upgrade of `nocapture` → `captures(none)`). The
+        // in-memory attribute is honored — the A8 optimization gate (`vectorize_shapes.rs`
+        // `a8_hash64_loop_invariant_hoist_enables_vectorization`) depends on exactly these
+        // contract attributes and passes — so object codegen is correct. inkwell 0.9's LLVM 22 text
+        // printer renders it as the shorthand `none` (which, oddly, does NOT round-trip through
+        // `llvm-as-22` — see the recorded follow-up); we pin that printed reality here. The `memory`
+        // and pure-finite spellings are unchanged from LLVM 19.
         assert!(
-            out.contains("declare i64 @align_rt_hash64(ptr nocapture readonly, i64)"),
-            "want nocapture readonly on hash64's ptr param:\n{out}"
+            out.contains("declare i64 @align_rt_hash64(ptr none readonly, i64)"),
+            "want the no-capture readonly attribute on hash64's ptr param:\n{out}"
         );
         let hash_attrs = attr_group_of(&out, "align_rt_hash64");
         assert!(hash_attrs.contains("memory(argmem: read)"), "hash64 memory encoding drifted:\n{hash_attrs}");
@@ -7833,23 +7843,23 @@ mod tests {
         // hash128 shares the treatment.
         assert!(attr_group_of(&out, "align_rt_hash128").contains("memory(argmem: read)"));
 
-        // (2) The str compare/order family: same `memory(argmem: read)` + `nocapture readonly` on
-        // BOTH pointer operands (params 0 and 2).
+        // (2) The str compare/order family: same `memory(argmem: read)` + no-capture `readonly` on
+        // BOTH pointer operands (params 0 and 2). (`nocapture` prints as `none` on LLVM 22 — see (1).)
         assert!(
-            out.contains("declare i32 @align_rt_str_cmp(ptr nocapture readonly, i64, ptr nocapture readonly, i64)"),
-            "want nocapture readonly on both str_cmp operands:\n{out}"
+            out.contains("declare i32 @align_rt_str_cmp(ptr none readonly, i64, ptr none readonly, i64)"),
+            "want the no-capture readonly attribute on both str_cmp operands:\n{out}"
         );
         assert!(attr_group_of(&out, "align_rt_str_cmp").contains("memory(argmem: read)"));
 
         // (3) The feature-detect readers (utf8_valid, memchr-backed str_find): pure-finite flags +
-        // `nocapture readonly` params, but memory is WITHHELD (their dispatch reads/writes a global
-        // CPU-feature cache — non-argument memory).
+        // no-capture `readonly` params, but memory is WITHHELD (their dispatch reads/writes a global
+        // CPU-feature cache — non-argument memory). (`nocapture` prints as `none` on LLVM 22 — see (1).)
         let u = attr_group_of(&out, "align_rt_utf8_valid");
         assert!(u.contains("willreturn") && u.contains("nofree"), "utf8_valid keeps pure-finite flags:\n{u}");
         assert!(!u.contains("memory("), "utf8_valid must NOT claim a memory effect (feature-detect cache):\n{u}");
         assert!(
-            out.contains("declare i32 @align_rt_utf8_valid(ptr nocapture readonly, i64)"),
-            "want nocapture readonly on utf8_valid's ptr:\n{out}"
+            out.contains("declare i32 @align_rt_utf8_valid(ptr none readonly, i64)"),
+            "want the no-capture readonly attribute on utf8_valid's ptr:\n{out}"
         );
         let sf = attr_group_of(&out, "align_rt_str_find");
         assert!(!sf.contains("memory("), "str_find (memchr dispatch cache) must not claim a memory effect:\n{sf}");

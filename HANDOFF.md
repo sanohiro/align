@@ -803,8 +803,8 @@ purity-as-effect-bit) tracked **open** in `docs/open-questions.md`. See memory
 ```bash
 git clone https://github.com/sanohiro/align            # ideally into /home/<user>/prj/align
 cd align
-# Toolchain: Rust 1.96 + LLVM 19 (inkwell llvm19-1). Debian: apt install llvm-19 llvm-19-dev
-# .cargo/config.toml already sets LLVM_SYS_191_PREFER_DYNAMIC=1 (Debian llvm-19 is shared-only).
+# Toolchain: Rust 1.96 + LLVM 22 (inkwell llvm22-1). apt.llvm.org: apt install llvm-22 llvm-22-dev clang-22
+# .cargo/config.toml already sets LLVM_SYS_221_PREFER_DYNAMIC=1 (kept dynamic; static would now work too).
 cargo build && cargo test       # expect all green (1600+ tests)
 ```
 

@@ -1,5 +1,9 @@
 // K4 — hash-style fold (linear recurrence `h = h*31 + x`). Loop-carried: expected NOT to
 // vectorize on either toolchain. A control for "same non-vectorization verdict".
+// Keeps a CONSTANT array (unlike the positive controls k1/k2/k3): the verdict is "neither side
+// vectorizes", which a constant array reports correctly. Seeding opaque values here would make the
+// array-INIT store SSA (`store <N x> %..`), which the harness's vec-detector reads as a vectorized
+// store — a false positive on a loop-carried control. See ../README.md.
 fn mix(h: i64, x: i64) -> i64 = h * 31 + x
 fn run(xs: slice<i64>) -> i64 = xs.reduce(0, mix)
 fn main(args: array<str>) -> Result<(), Error> {
