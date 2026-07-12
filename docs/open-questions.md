@@ -939,6 +939,11 @@ Gemini ran a 3-workload bench on Apple Silicon (arm64) and filed a gap report. C
 arm64 *numbers* here (linux x86), but every *code* claim was verified against the source. Not urgent
 (shared for awareness); recorded so the gaps are tracked.
 
+**Historical scope note (superseded 2026-07-02):** Gap A below records the earlier lambda-only guard,
+not the current language contract. The later settled rule rejects string `+` everywhere and uses
+`builder.to_string()` as the one construction path. Audit 13 confirms that sema/MIR and stale tests
+still need to enforce that settlement.
+
 - **Math pipeline (`map→where→sum`): Align 1.15–1.27× FASTER than Rust on M2 — a positive confirm.**
   The branchless-`select` fusion wins on arm64 (on x86 it was parity — Rust's slice `filter` evidently
   doesn't vectorize as cleanly on arm here). Nothing to do; good signal that the flagship lowering
@@ -1837,7 +1842,7 @@ favor of the hard error: a lint is opt-out-able and a silent per-call hidden all
 what "Nothing hidden" + "One way" rule out (concatenation already leaked when reached through a
 lifted lambda with no arena — see "External benchmark report — Gemini on M2/arm64" Gap A above, fixed
 2026-06-27 for that specific path; this decision generalizes the fix into the actual rule rather than
-a lambda-only guard). `builder` (`.write`/`.finish()`) is the one way to build a string incrementally.
+a lambda-only guard). `builder` (`.write`/`.to_string()`) is the one way to build a string incrementally.
 Record: `draft.md` §12 (doc update landed), `impl/06-runtime-std.md`.
 
 ### Unconstrained literal defaults + `&&`/`||` evaluation order — now explicit in the spec (2026-07-02)
@@ -2395,6 +2400,17 @@ allocation-size hardening. New measure-first work is the per-callsite initialize
 Base64 SIMD backlog plus a new hex SIMD probe, HTTP batch request-copy removal, and scalar vs SIMD
 stable compaction. Existing work from documents 10/11 remains attributed there.
 
+**String/array allocation-copy and short-input companion audit (2026-07-13):**
+[`impl/13-string-array-allocation-short-input-audit.md`](impl/13-string-array-allocation-short-input-audit.md)
+is the durable implementation record. It confirms UTF-8 range-boundary and owned-expression-
+temporary lifetime gaps, settled `str + str` enforcement drift, arena-free template lifetime leaks,
+known-null destructor calls, and avoidable path/builder/chunks/group staging. It also records the
+good existing zero-copy view, fused pipeline, scalar fallback, and array-builder freeze shapes so
+later work does not replace them accidentally. UTF-8 short crossover, repeated-needle preparation,
+JSON escape SIMD, and large constant-local pooling are measurement-gated. The document's language-
+surface items are deliberately **questions for Claude Code only**: this ledger adopts no new syntax,
+type, capacity argument, eager/lazy guarantee, or template ownership rule from the audit.
+
 ### External binary-optimization audit (Codex, 2026-07-12) — adoption record
 
 The owner's out-of-repo Codex audit (`~/winhome/Downloads/align-binary-optimization-report-2026-07-12.md`,
@@ -2484,8 +2500,8 @@ every valid finding addressed. Disposition:
   bool is "i8 when stored" while Slice 5B deliberately pinned SSA+stack `i1` (align the doc with
   the pinned reality; the i8-stored-bool idea stays a bounded experiment per the report's own
   P3 restraint); `docs/guide/ja/16-toolchain.md` missing profiles/`size`/`explain-opt`;
-  VERIFY-then-fix the claimed `draft.md`/`open-questions.md` `str + str` prohibition vs
-  arena-backed concat in sema/guide (unverified claim); the untracked
+  `draft.md`/`open-questions.md` `str + str` prohibition is now verified: audit 13 corrected the
+  guides and records sema/MIR enforcement as C0 implementation drift; the untracked
   `analysis-report-2026-07-02.md` at root is superseded by this report — delete or archive.
 - **Rejected report claims (with reasons):** "`nocapture` is dangerous as-is" (disproven — the
   A8 gate proves auto-upgrade preserves the semantic attribute; adopted only as hardening);
