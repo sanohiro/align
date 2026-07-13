@@ -2374,12 +2374,12 @@ candidates remain probes until their written gates pass.
 
 **Parallel execution/output-IR companion audit (2026-07-12):**
 `impl/11-parallel-execution-optimization.md` is the durable implementation record. It confirmed two
-P0s absent from the prior queue: `EffectScan` omits a lifted capturing closure's call edge, allowing
-observable I/O inside an accepted Pure `par_map`; and `task_group -> par_map` deadlocks at shared
-pool saturation because `par_map` waits after one caller chunk instead of draining its ranges.
-The lifted/higher-order effect P0 is fixed 2026-07-13 with a closure edge plus unknown-target
-fail-closed propagation; the scheduler deadlock remains. Required order: close that progress defect,
-then implement the already-recorded whole-chunk
+P0s absent from the prior queue: `EffectScan` omitted a lifted capturing closure's call edge, allowing
+observable I/O inside an accepted Pure `par_map`; and `task_group -> par_map` deadlocked at shared
+pool saturation because `par_map` waited after one caller chunk instead of draining its ranges.
+Both P0s are fixed 2026-07-13: closure edges plus unknown-target fail-closed propagation close the
+effect path, while a shared cursor, caller drain loop, total-range barrier, and forced-worker
+watchdog close the progress path. Next implement the already-recorded whole-chunk
 specialization. The guide already calls capturing-`par_map` parallelization “implementation in
 progress”; this audit pins its read-only context ABI. New measure-first work is wrapping-integer
 `par_map(...).sum()` fusion (remove the full intermediate write/read), length-preserving staged

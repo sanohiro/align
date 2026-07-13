@@ -673,14 +673,14 @@ The I/O APIs are synchronous and therefore block an OS thread. This is consisten
 no-async-runtime decision. `task_group` is the explicit way to overlap independent blocking calls, and
 `http.get_many` already uses a bounded blocking-specific claim loop with strong measured scaling.
 
-Generic task-group I/O still shares the CPU-sized `ParPool` with `par_map`. Document 11 already records
-the saturated nested deadlock and the required caller-draining work-first scheduler, followed by a
+Generic task-group I/O still shares the CPU-sized `ParPool` with `par_map`. Document 11 records the
+now-fixed saturated nested deadlock and caller-draining work-first scheduler, followed by a
 measure-first CPU/blocking execution-domain split. That is the answer to “are callers forced to wait?”:
 
 - a single synchronous dependency must wait;
 - independent calls can be overlapped explicitly;
-- current generic overlap can occupy every CPU worker and must not be widened until the document-11
-  progress invariant is fixed;
+- current generic overlap can occupy every CPU worker, but the document-11 caller-draining
+  invariant guarantees structured forward progress;
 - no source-level async/await is required to use Linux io_uring, kqueue for readiness-capable
   descriptors, or bounded blocking workers/platform file APIs under the same explicit operation.
 
@@ -852,8 +852,8 @@ buffered-`io.copy` data loss, allocation byte-overflow hardening requirement, pe
 initialized-before-read arena proof/gate, exact-final-destination codec fill, hex SIMD and macOS
 copy-path probes, HTTP request-copy removal, and sequential SIMD stream compaction.
 
-The document-11 nested scheduler deadlock remains P0. The lifted/higher-order effect holes are fixed;
-the function-type effect bit remains the precision path, not a second source mechanism.
+The document-11 nested scheduler deadlock and lifted/higher-order effect holes are fixed. The
+function-type effect bit remains the precision path, not a second source mechanism.
 
 ---
 
@@ -877,7 +877,7 @@ match the settled contract; safe primitive positive cases retain vectorization.
 - [x] include callee/environment region in an indirect call's result (2026-07-13);
 - [x] emit Unit indirect calls as `void` (2026-07-13);
 - wire the documented fallible spawn-lambda expected `Result` type;
-- retain document 11's closure-effect and scheduler-progress P0s in the same release gate.
+- [x] retain document 11's closure-effect and scheduler-progress P0s in the same release gate (2026-07-13).
 
 **Completion:** all UAF repros are rejected, dynamic Unit targets have matching LLVM signatures, and
 mutation tests prove every new gate.

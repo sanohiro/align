@@ -127,7 +127,8 @@ void align_rt_par_reduce(
   void* acc)
 ```
 
-Combine partial results tree-wise/serially. `// OPEN:` ordering guarantee of the combine (floating-point reproducibility), thread pool lifetime (process-resident vs. per-block).
+Combine partial results tree-wise/serially. Reuse the process-resident `ParPool`; `// OPEN:` ordering
+guarantee of the combine (floating-point reproducibility).
 
 ---
 
@@ -218,7 +219,7 @@ M8+    std expansion (path/env/time/net/...). pkg is out of scope (draft.md §18
 
 ```text
 - static linking / scope of libc dependence / whether direct syscalls are allowed (common with 05 §10)
-- thread pool lifetime (resident vs. per-block) and floating-point reproducibility of par reduce
+- floating-point reproducibility of parallel reduce
 - whether to provide a panic catch boundary (current: immediate abort)
 - Error type display and exit-code correspondence (M2 error type design)
 - the boundary for writing core in Align (how far to drop to intrinsics)

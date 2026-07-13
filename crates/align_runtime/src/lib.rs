@@ -1393,7 +1393,14 @@ impl ParPool {
 fn par_pool() -> (&'static ParPool, usize) {
     static POOL: std::sync::OnceLock<(&'static ParPool, usize)> = std::sync::OnceLock::new();
     *POOL.get_or_init(|| {
+        #[cfg(not(test))]
         let n = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+        #[cfg(test)]
+        let n = std::env::var("ALIGN_TEST_PAR_WORKERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1));
         let p: &'static ParPool = Box::leak(Box::new(ParPool {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             available: std::sync::Condvar::new(),
@@ -1414,6 +1421,61 @@ fn par_pool() -> (&'static ParPool, usize) {
         }
         (p, n)
     })
+}
+
+type ParPanic = Box<dyn std::any::Any + Send + 'static>;
+
+struct ParMapBarrier {
+    remaining: usize,
+    panic: Option<(usize, ParPanic)>,
+}
+
+/// Call-scoped scheduler state for one `par_map`. Raw buffer addresses are inert after the range
+/// cursor is exhausted, so late pool helpers may safely retain this descriptor without extending
+/// the input, output, or capture-context lifetimes.
+struct ParMapWork {
+    next_range: std::sync::atomic::AtomicUsize,
+    ranges: usize,
+    per: usize,
+    count: usize,
+    in_addr: usize,
+    out_addr: usize,
+    in_stride: usize,
+    out_stride: usize,
+    thunk: extern "C" fn(*const u8, *mut u8),
+    barrier: std::sync::Mutex<ParMapBarrier>,
+    complete: std::sync::Condvar,
+}
+
+/// Claim and execute ranges until this `par_map` is drained. The exhausted-cursor check precedes
+/// every access to call-scoped buffer addresses, which is required because a queued helper may
+/// start after the external caller has joined all ranges and returned.
+fn drain_par_map(work: &ParMapWork) {
+    use std::sync::atomic::Ordering;
+
+    loop {
+        let range = work.next_range.fetch_add(1, Ordering::Relaxed);
+        if range >= work.ranges {
+            break;
+        }
+        let start = range * work.per;
+        let end = (start + work.per).min(work.count);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for i in start..end {
+                let ip = work.in_addr.checked_add(i.checked_mul(work.in_stride).unwrap()).unwrap() as *const u8;
+                let op = work.out_addr.checked_add(i.checked_mul(work.out_stride).unwrap()).unwrap() as *mut u8;
+                (work.thunk)(ip, op);
+            }
+        }));
+
+        let mut state = work.barrier.lock().unwrap();
+        state.remaining -= 1;
+        if let Err(panic) = result
+            && state.panic.as_ref().is_none_or(|(first, _)| range < *first) {
+                state.panic = Some((range, panic));
+            }
+        work.complete.notify_all();
+    }
 }
 
 /// `par_map`: allocate an output buffer of `count` elements (`out_stride` bytes each) and apply
@@ -1454,18 +1516,6 @@ pub unsafe extern "C" fn align_rt_par_map(
         .unwrap_or_else(|| panic_abort("par_map input size overflow"));
 
     let out_buf = align_rt_alloc(bytes);
-    let in_addr = in_buf as usize;
-    let out_addr = out_buf as usize;
-    // Run `[start, end)` of the map on this thread (buffers passed as `usize` so the closures are
-    // `Send` — raw pointers are not; the ranges are disjoint, so this is race-free).
-    let run = move |start: usize, end: usize| {
-        for i in start..end {
-            let ip = in_addr.checked_add(i.checked_mul(in_stride).unwrap()).unwrap() as *const u8;
-            let op = out_addr.checked_add(i.checked_mul(out_stride).unwrap()).unwrap() as *mut u8;
-            thunk(ip, op);
-        }
-    };
-
     let (pool, workers) = par_pool();
     // Don't parallelize trivially-small work: a chunk must be at least `PAR_MIN_CHUNK` elements, so
     // tiny maps (where the pool round-trip would dwarf the work) fall to the single-chunk caller
@@ -1475,43 +1525,42 @@ pub unsafe extern "C" fn align_rt_par_map(
     let nchunks = count.div_ceil(per); // ≤ workers, every chunk non-empty
     // Single-chunk fast path: run on the caller, no pool round-trip.
     if nchunks <= 1 {
-        run(0, count);
+        for i in 0..count {
+            let ip = (in_buf as usize).checked_add(i.checked_mul(in_stride).unwrap()).unwrap() as *const u8;
+            let op = (out_buf as usize).checked_add(i.checked_mul(out_stride).unwrap()).unwrap() as *mut u8;
+            thunk(ip, op);
+        }
         return out_buf;
     }
-    // Submit chunks 1.. to the pool and run chunk 0 on the caller, then wait for the submitted ones.
-    // The barrier is `(remaining count, first panic payload)`: each worker decrements + signals; the
-    // caller waits to 0. A worker job is wrapped in `catch_unwind` so a panic in it can't kill the
-    // pool worker or leave the barrier stuck (a deadlock) — it's recorded and re-raised on the caller
-    // (Align thunks abort rather than unwind, so this is defensive, but a stuck pool is unacceptable).
-    type PanicBox = Box<dyn std::any::Any + Send + 'static>;
-    // (remaining chunk count, first panic payload) guarded by a mutex, signaled via the condvar.
-    type Barrier = std::sync::Arc<(std::sync::Mutex<(usize, Option<PanicBox>)>, std::sync::Condvar)>;
-    let remaining: Barrier =
-        std::sync::Arc::new((std::sync::Mutex::new((nchunks - 1, None)), std::sync::Condvar::new()));
-    for t in 1..nchunks {
-        let start = t * per;
-        let end = (start + per).min(count);
-        let remaining = remaining.clone();
-        pool.submit(Box::new(move || {
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(start, end)));
-            let (m, cv) = &*remaining;
-            let mut st = m.lock().unwrap();
-            st.0 -= 1;
-            if let Err(p) = res
-                && st.1.is_none() {
-                    st.1 = Some(p);
-                }
-            cv.notify_all();
-        }));
+
+    // Helpers and the caller share one claim loop. The caller therefore drains all of its own
+    // ranges even when every pool worker is blocked in another nested structured operation.
+    let work = std::sync::Arc::new(ParMapWork {
+        next_range: std::sync::atomic::AtomicUsize::new(0),
+        ranges: nchunks,
+        per,
+        count,
+        in_addr: in_buf as usize,
+        out_addr: out_buf as usize,
+        in_stride,
+        out_stride,
+        thunk,
+        barrier: std::sync::Mutex::new(ParMapBarrier { remaining: nchunks, panic: None }),
+        complete: std::sync::Condvar::new(),
+    });
+    for _ in 0..nchunks - 1 {
+        let work = work.clone();
+        pool.submit(Box::new(move || drain_par_map(&work)));
     }
-    run(0, per.min(count));
-    let (m, cv) = &*remaining;
-    let mut st = m.lock().unwrap();
-    while st.0 > 0 {
-        st = cv.wait(st).unwrap();
+    drain_par_map(&work);
+
+    let mut state = work.barrier.lock().unwrap();
+    while state.remaining > 0 {
+        state = work.complete.wait(state).unwrap();
     }
-    if let Some(p) = st.1.take() {
-        std::panic::resume_unwind(p);
+    if let Some((_, panic)) = state.panic.take() {
+        drop(state);
+        std::panic::resume_unwind(panic);
     }
     out_buf
 }
@@ -14361,6 +14410,103 @@ mod tests {
             assert_eq!(unsafe { *(*s as *const i64) }, 32 * base as i64 + 240, "outer base={base}");
         }
         unsafe { align_rt_tg_end(tg) };
+    }
+
+    extern "C" fn par_map_double(input: *const u8, output: *mut u8) {
+        unsafe { *(output as *mut i64) = *(input as *const i64) * 2 };
+    }
+
+    /// Run a two-range `par_map` from a task-group task. This is deliberately large enough to cross
+    /// `PAR_MIN_CHUNK` on every pool with at least two workers.
+    extern "C" fn nested_par_map_tramp(
+        _thunk: *const u8,
+        env: *mut u8,
+        slot: *mut u8,
+        _err: *mut u8,
+    ) -> i32 {
+        const COUNT: i64 = 32_769;
+        let base = unsafe { *(env as *const i64) };
+        let input: Vec<i64> = (0..COUNT).map(|i| base + i).collect();
+        let output = unsafe {
+            align_rt_par_map(
+                input.as_ptr() as *const u8,
+                COUNT,
+                size_of::<i64>() as i64,
+                size_of::<i64>() as i64,
+                par_map_double,
+            )
+        };
+        let values = unsafe { std::slice::from_raw_parts(output as *const i64, COUNT as usize) };
+        let sum: i64 = values.iter().sum();
+        unsafe {
+            *(slot as *mut i64) = sum;
+            align_rt_free(output);
+        }
+        0
+    }
+
+    fn run_saturated_nested_par_map() {
+        const COUNT: i64 = 32_769;
+        let (_, workers) = par_pool();
+        let tasks = workers + 1;
+        let tg = align_rt_tg_begin();
+        let mut slots = Vec::with_capacity(tasks);
+        for base in 0..tasks {
+            let env = unsafe { align_rt_tg_alloc(tg, 8, 8) };
+            unsafe { *(env as *mut i64) = base as i64 };
+            let slot = unsafe { align_rt_tg_alloc(tg, 8, 8) };
+            unsafe {
+                align_rt_tg_register(
+                    tg,
+                    nested_par_map_tramp,
+                    std::ptr::null(),
+                    env,
+                    slot,
+                    std::ptr::null_mut(),
+                )
+            };
+            slots.push(slot);
+        }
+        assert!(unsafe { align_rt_tg_wait(tg) }.is_null());
+        let base_sum = COUNT * (COUNT - 1);
+        for (base, slot) in slots.into_iter().enumerate() {
+            assert_eq!(unsafe { *(slot as *const i64) }, base_sum + 2 * base as i64 * COUNT);
+        }
+        unsafe { align_rt_tg_end(tg) };
+    }
+
+    #[test]
+    fn tg_wait_nested_par_map_does_not_deadlock() {
+        const CHILD: &str = "ALIGN_NESTED_PAR_MAP_CHILD";
+        const WORKERS: &str = "ALIGN_TEST_PAR_WORKERS";
+        if std::env::var_os(CHILD).is_some() {
+            run_saturated_nested_par_map();
+            return;
+        }
+
+        // Run the deadlock reproduction out of process so the watchdog can terminate a regressed
+        // scheduler instead of leaving the entire test binary blocked forever.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::tg_wait_nested_par_map_does_not_deadlock", "--nocapture"])
+            .env(CHILD, "1")
+            .env(WORKERS, "2")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "nested par_map child failed with {status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("task_group -> par_map did not complete before the watchdog deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     // --- std.fs Slice 3 -----------------------------------------------------------------------

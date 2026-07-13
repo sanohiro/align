@@ -1,8 +1,8 @@
 # Parallel execution and generated-IR optimization audit
 
-Status: **RECORDED 2026-07-12; partially implemented 2026-07-13.** The lifted-closure effect edge
-and higher-order unknown-target fail-closed gate (§4) are fixed and regression-pinned. The scheduler
-deadlock (§5) and performance work remain open. This is the durable parallel-runtime
+Status: **RECORDED 2026-07-12; correctness P0s implemented 2026-07-13.** The lifted-closure effect
+edge and higher-order unknown-target fail-closed gate (§4), plus caller-draining nested scheduler
+progress (§5), are fixed and regression-pinned. Performance work remains open. This is the durable parallel-runtime
 and generated-IR companion to [`10-cache-first-optimization.md`](10-cache-first-optimization.md).
 It separates already-recorded work from new findings, records two confirmed correctness blockers,
 and gives a cache-coherence-first implementation order. Audit baseline: commit
@@ -30,8 +30,8 @@ Do the work in this order:
 
 1. ~~Close the capturing-closure effect hole.~~ **FIXED 2026-07-13**, including a conservative
    higher-order unknown-target gate until `FnTy` carries effects.
-2. Make `par_map` work-first and caller-draining. `task_group -> par_map` can currently deadlock
-   when the shared pool is saturated.
+2. ~~Make `par_map` work-first and caller-draining.~~ **FIXED 2026-07-13** with a shared range
+   cursor, caller drain loop, total-range completion barrier, and watchdog gate.
 3. Implement the **already-planned** whole-range kernel so LLVM sees the loop body and the
    per-element indirect thunk disappears.
 4. Extend that kernel with a read-only capture context, removing the current sequential fallback
@@ -50,9 +50,9 @@ The cache-first principle applies directly: the important resource is often not 
 count but ownership of shared cache lines. One atomic range claim per coarse block is acceptable;
 one atomic plus one mutex acquisition plus one wake attempt per tiny task is not.
 
-The cache/artifact C0 sequence in document 10 remains the build-system priority. The two P0 items
-here are parallel correctness prerequisites: any change touching purity or the shared scheduler
-must close them before attempting performance widening.
+The cache/artifact C0 sequence in document 10 remains the build-system priority. Both parallel P0
+prerequisites are now closed; later purity or scheduler changes must retain their mutation and
+watchdog gates before performance widening.
 
 ---
 
@@ -135,14 +135,14 @@ does not compensate for hiding the counted loop behind the runtime ABI.
 ([pool](../../crates/align_runtime/src/lib.rs#L1376-L1418)). Every submit locks the global queue;
 every worker locks it again to pop a job.
 
-`align_rt_par_map` currently:
+`align_rt_par_map` now:
 
 1. allocates the complete output;
 2. initializes the pool;
 3. partitions into at most `workers` contiguous chunks, with `PAR_MIN_CHUNK = 32768` **elements**;
-4. submits chunks `1..` as independent jobs;
-5. runs only chunk 0 on the caller;
-6. waits on a mutex/condvar barrier for every submitted chunk.
+4. creates one shared range cursor and total-range completion barrier;
+5. submits helper drain loops and runs the same drain loop on the caller;
+6. waits until every claimed range publishes completion, then re-raises any recorded panic.
 
 The already-planned tiny-call fix moves step 2 after the single-chunk decision. It does not address
 nested progress, per-element IR, or warm steady-state contention.
@@ -218,7 +218,7 @@ must not reach observable side effects through a representation corner.
 
 ---
 
-## 5. CONFIRMED P0: `task_group -> par_map` can deadlock
+## 5. FIXED 2026-07-13: `task_group -> par_map` caller-draining progress
 
 ### Reproduction
 
@@ -233,7 +233,7 @@ On the eight-worker audit host, each spawned task ran a 40,000-element `par_map`
 | top-level `par_map -> par_map` control | completes in about 0.5 s |
 
 The result was independently reproduced through the public runtime ABI and through an Align
-program. There is no existing `task_group -> par_map` regression test. The current “parallel path”
+program. At the audit baseline there was no `task_group -> par_map` regression test. The current “parallel path”
 driver test uses only 12 elements, below the runtime threshold, so it proves the MIR call shape but
 not multi-worker execution.
 
@@ -259,7 +259,7 @@ is not a correctness guarantee.
 > A thread waiting for a structured parallel operation must be able to make that operation finish
 > without requiring an idle pool worker.
 
-Change `par_map` to a shared range descriptor:
+The fix changes `par_map` to a shared range descriptor:
 
 ```text
 next_range       AtomicUsize
@@ -291,8 +291,16 @@ continue draining/joining, then resume it on the external caller after no valid 
 touch the output/context. A caller unwind that escapes immediately would invalidate a stack capture
 context while queued helpers still hold raw addresses.
 
-This fix is separate from the already-planned `n == 1`/tiny-call fast path. It is a forward-progress
-requirement for all multi-worker calls.
+The implementation uses an `Arc<ParMapWork>` with an atomic range cursor and a mutex/condvar state
+initialized to the total range count. Pool helpers and the caller both run `drain_par_map`; each
+range is caught independently, decrements completion exactly once, and the lowest-index panic is
+re-raised only after the join. Late helpers check the exhausted cursor before reading inert raw
+addresses from the scheduler descriptor. A child-process unit test forces two workers, launches
+`workers + 1` task-group tasks whose maps each have two ranges, and completes under a ten-second
+watchdog. Breaking the drain loop after one range reproduces the timeout and fails the gate.
+
+This fix is separate from the already-planned `n == 1`/tiny-call fast path. It establishes the
+forward-progress requirement for all multi-worker calls.
 
 ---
 
@@ -305,6 +313,7 @@ requirement for all multi-worker calls.
 | Capturing `par_map` parallelization | **ALREADY INDICATED** as “implementation in progress”; this audit pins the context ABI |
 | Pool initialization after the tiny/single-chunk decision; `task_group n == 1` fast path | **ALREADY PLANNED** |
 | Persistent `ParPool` for `task_group` and caller-draining nested `task_group` | **IMPLEMENTED** |
+| Caller-draining shared range claims for nested `par_map` | **IMPLEMENTED 2026-07-13** |
 | `task_group` + blocking workers / a dedicated HTTP blocking pool | **ALREADY RECORDED/IMPLEMENTED FOR I/O CONSUMERS**; generic `task_group` application is new |
 | Deterministic parallel-reduction candidates and generic associativity question | **ALREADY RECORDED; UNSETTLED** |
 | Profile-guided performance diagnostics | **ALREADY RECORDED** |
@@ -616,8 +625,8 @@ selection would make reruns nondeterministic for negligible normal-path benefit.
 
 Parts of `07-roadmap.md` still describe `std::thread::scope`/one OS thread per task, and
 `06-runtime-std.md` still calls pool lifetime open. The current implementation uses the persistent
-shared `ParPool` with caller-participating `task_group` runners. Update those descriptions when the
-P0 scheduler slice lands so the progress invariant is documented once in its final form.
+shared `ParPool` with caller-participating `task_group` and `par_map` runners. The P0 scheduler
+slice updated both descriptions on 2026-07-13; retain this invariant in later scheduler edits.
 
 ### MIR and reduction
 
@@ -693,8 +702,8 @@ order-warmed cache to the scheduler change.
 ### Slice P0 — soundness and forward progress
 
 - [x] Add the missing lifted-closure effect edge, higher-order fail-closed gate, and negative tests (2026-07-13).
-- Replace fixed `par_map` chunk waiting with caller-draining shared range claims.
-- Add cross-construct watchdog tests and a real multi-worker runtime-path test.
+- [x] Replace fixed `par_map` chunk waiting with caller-draining shared range claims (2026-07-13).
+- [x] Add a forced-multi-worker `task_group -> par_map` child-process watchdog gate (2026-07-13).
 
 **Completion:** no Impure closure reaches a Pure map, and every structured operation can complete
 with zero idle pool workers.
