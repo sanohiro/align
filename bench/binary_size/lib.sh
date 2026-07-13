@@ -47,12 +47,14 @@ llvm_tool() {
 # so the line is basename'd before matching (an ELF soname is already bare; a Mach-O install name is
 # a full path).
 gated() {
-  local readobj="$1" bin="$2" g
+  local readobj="$1" bin="$2" g rc
   [ -n "$readobj" ] || { echo "?"; return; }
-  # `|| true`: under `set -o pipefail` a nonzero exit anywhere in the pipeline (e.g. `--needed-libs`
-  # failing on an unexpected input) would otherwise trip the script's `set -e` here, since this
-  # assignment is not itself inside a tested condition.
-  g=$("$readobj" --needed-libs "$bin" 2>/dev/null | awk '
+  # Capture the pipeline's own exit status (via the `if`, so `set -e` never trips here regardless
+  # of outcome — `set -o pipefail` in the caller makes that status reflect `--needed-libs` itself,
+  # not just the downstream awk/sort/tr, which will happily emit empty output for empty/garbage
+  # input). A nonzero status (bad file, unsupported format, tool crash) reports "?" — empty output
+  # from a *successful* run (no gated deps at all) must not be conflated with a failed run.
+  if g=$("$readobj" --needed-libs "$bin" 2>/dev/null | awk '
     /^NeededLibraries \[/ { inside=1; next }
     inside && /^\]/ { inside=0; next }
     inside {
@@ -62,7 +64,12 @@ gated() {
       base = parts[n]
       if (base ~ /^lib(z|zstd|crypto|ssl)([._-]|$)/) print base
     }
-  ' | sort -u | tr '\n' ' ') || true
+  ' | sort -u | tr '\n' ' '); then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 0 ] || { echo "?"; return; }
   # Trailing space kept (not trimmed): matches the old `readelf | grep -oE ... | tr '\n' ' '`
   # byte-for-byte, which the printf column-width formatting in run.sh/profiles.sh was tuned against.
   [ -n "$g" ] && echo "$g" || echo "-"
@@ -73,9 +80,18 @@ gated() {
 # stdout and a "no symbols" note to stderr for a stripped file, on both ELF and Mach-O, so
 # stdout-emptiness is the format-independent stripped signal -- no need to grep for `.symtab`, which
 # is ELF-only vocabulary (Mach-O's symbol table is a load command, not a section, so `readelf
-# -SW | grep '\.symtab'` never even applied there).
+# -SW | grep '\.symtab'` never even applied there). Emptiness is only a valid "stripped" signal on a
+# *successful* run, though: llvm-nm also prints nothing to stdout (with an error to stderr) when it
+# fails outright (bad file, unsupported format), so the exit status is checked first — that failure
+# must report "?", not be silently read as "stripped".
 stripped() {
-  local nm="$1" bin="$2"
+  local nm="$1" bin="$2" out rc
   [ -n "$nm" ] || { echo "?"; return; }
-  if [ -n "$("$nm" "$bin" 2>/dev/null)" ]; then echo symbols; else echo stripped; fi
+  if out=$("$nm" "$bin" 2>/dev/null); then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 0 ] || { echo "?"; return; }
+  if [ -n "$out" ]; then echo symbols; else echo stripped; fi
 }
