@@ -76,15 +76,14 @@ fn dev_and_fast_produce_different_objects() {
     assert!(!checked.diags.has_errors(), "kernel compiles");
     let mir = lower_to_mir(&checked.hir);
 
-    let dir = std::env::temp_dir();
-    let o0 = dir.join(format!("align-prof-o0-{}.o", std::process::id()));
-    let o3 = dir.join(format!("align-prof-o3-{}.o", std::process::id()));
-    emit_object_file(&mir, &o0, BuildTarget::Baseline, Profile::Dev).expect("emit O0");
-    emit_object_file(&mir, &o3, BuildTarget::Baseline, Profile::Fast).expect("emit O3");
-    let b0 = std::fs::read(&o0).expect("read O0");
-    let b3 = std::fs::read(&o3).expect("read O3");
-    let _ = std::fs::remove_file(&o0);
-    let _ = std::fs::remove_file(&o3);
+    // RAII temp paths so a panic mid-test still cleans up the objects (per-test tag keeps the two
+    // filenames distinct under parallel test threads).
+    let o0 = temp_obj("o0");
+    let o3 = temp_obj("o3");
+    emit_object_file(&mir, o0.path(), BuildTarget::Baseline, Profile::Dev).expect("emit O0");
+    emit_object_file(&mir, o3.path(), BuildTarget::Baseline, Profile::Fast).expect("emit O3");
+    let b0 = std::fs::read(o0.path()).expect("read O0");
+    let b3 = std::fs::read(o3.path()).expect("read O3");
     assert_ne!(b0, b3, "O0 and O3 objects must differ — the profile pipeline must reach LLVM");
 }
 
@@ -101,15 +100,14 @@ fn small_and_release_objects_differ() {
     assert!(!checked.diags.has_errors(), "kernel compiles");
     let mir = lower_to_mir(&checked.hir);
 
-    let dir = std::env::temp_dir();
-    let os = dir.join(format!("align-prof-os-{}.o", std::process::id()));
-    let o2 = dir.join(format!("align-prof-o2-{}.o", std::process::id()));
-    emit_object_file(&mir, &os, BuildTarget::Baseline, Profile::Small).expect("emit small");
-    emit_object_file(&mir, &o2, BuildTarget::Baseline, Profile::Release).expect("emit release");
-    let bs = std::fs::read(&os).expect("read small");
-    let b2 = std::fs::read(&o2).expect("read release");
-    let _ = std::fs::remove_file(&os);
-    let _ = std::fs::remove_file(&o2);
+    // RAII temp paths so a panic mid-test still cleans up the objects (per-test tag keeps the two
+    // filenames distinct under parallel test threads).
+    let os = temp_obj("os");
+    let o2 = temp_obj("o2");
+    emit_object_file(&mir, os.path(), BuildTarget::Baseline, Profile::Small).expect("emit small");
+    emit_object_file(&mir, o2.path(), BuildTarget::Baseline, Profile::Release).expect("emit release");
+    let bs = std::fs::read(os.path()).expect("read small");
+    let b2 = std::fs::read(o2.path()).expect("read release");
     assert_ne!(bs, b2, "small and release objects must differ — the size dimension must reach LLVM");
 }
 
@@ -127,6 +125,12 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// An RAII path for an object file emitted by a test (created by `emit_object_file`, not here); the
+/// `tag` keeps sibling objects in the same test distinct, and `Drop` removes it even on panic.
+fn temp_obj(tag: &str) -> TempFile {
+    TempFile(std::env::temp_dir().join(format!("align-prof-{}-{}.o", tag, std::process::id())))
 }
 
 fn write_src(tag: &str, body: &str) -> TempFile {
