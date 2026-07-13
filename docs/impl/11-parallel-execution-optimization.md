@@ -1,6 +1,8 @@
 # Parallel execution and generated-IR optimization audit
 
-Status: **RECORDED 2026-07-12; implementation not started.** This is the durable parallel-runtime
+Status: **RECORDED 2026-07-12; partially implemented 2026-07-13.** The lifted-closure effect edge
+and higher-order unknown-target fail-closed gate (§4) are fixed and regression-pinned. The scheduler
+deadlock (§5) and performance work remain open. This is the durable parallel-runtime
 and generated-IR companion to [`10-cache-first-optimization.md`](10-cache-first-optimization.md).
 It separates already-recorded work from new findings, records two confirmed correctness blockers,
 and gives a cache-coherence-first implementation order. Audit baseline: commit
@@ -26,8 +28,8 @@ parallel-performance wave.** Align's Pure `par_map`, value capture, ordered resu
 
 Do the work in this order:
 
-1. Close the capturing-closure effect hole. A `par_map` accepted as Pure can currently execute
-   observable I/O.
+1. ~~Close the capturing-closure effect hole.~~ **FIXED 2026-07-13**, including a conservative
+   higher-order unknown-target gate until `FnTy` carries effects.
 2. Make `par_map` work-first and caller-draining. `task_group -> par_map` can currently deadlock
    when the shared pool is saturated.
 3. Implement the **already-planned** whole-range kernel so LLVM sees the loop body and the
@@ -160,11 +162,11 @@ line.
 
 ---
 
-## 4. CONFIRMED P0: capturing closure bypasses `par_map` purity
+## 4. FIXED 2026-07-13: capturing and higher-order calls fail closed at `par_map`
 
 ### Reproduction
 
-This program is accepted as Pure at `par_map(worker)`, although the capturing closure performs
+At the audit baseline this program was accepted as Pure at `par_map(worker)`, although the capturing closure performs
 observable output:
 
 ```align
@@ -191,21 +193,24 @@ captured closure's output 1,905 times. This is not only a small-input sequential
 
 ### Cause
 
-`EffectScan` adds a call-graph edge for `ExprKind::FnValue(name)`, closing the previously fixed
+At the audit baseline `EffectScan` added a call-graph edge for `ExprKind::FnValue(name)`, closing the previously fixed
 non-capturing function-value laundering hole. For
 `ExprKind::Closure { lifted, captures }`, however, it visits only capture expressions and discards
 the `lifted` function name ([effect scan](../../crates/align_sema/src/lib.rs#L2529-L2544)). A later
 indirect call through a local does not recover that target. `worker` is therefore marked Pure even
 though its lifted closure is Impure.
 
-### Required fix and gate
+### Shipped correction and gate
 
-- Add the lifted closure function as an `EffectScan` call edge, while continuing to visit captures.
+- [x] Add the lifted closure function as an `EffectScan` call edge while continuing to visit captures.
   The conservative behavior matches the existing `FnValue` rule.
-- Add the capturing counterpart beside
+- [x] Add the capturing counterpart beside
   `impure_fn_via_fn_value_rejected_in_par_map` in `analysis_coverage.rs`.
-- Retain direct, transitive, inline-lambda, and non-capturing function-value purity tests.
-- Mutation gate: removing the closure edge must make the new test fail.
+- [x] Treat an indirect target whose effect is absent from `FnTy` as unknown and propagate that fact
+  separately from observable I/O; reject it only at a later Pure/`par_map` boundary. Sequential HOF
+  calls remain legal. A future function-type effect bit recovers pure-HOF precision.
+- [x] Retain direct, transitive, inline-lambda, and non-capturing function-value purity tests.
+- [x] Mutation gates: removing either the closure edge or unknown-indirect mark fails its dedicated test.
 
 No scheduler or IR optimization should widen parallel execution until this soundness hole is
 closed. The language promise is stronger than “usually race-free”: accepted Pure parallel bodies
@@ -687,7 +692,7 @@ order-warmed cache to the scheduler change.
 
 ### Slice P0 — soundness and forward progress
 
-- Add the missing lifted-closure effect edge and negative test.
+- [x] Add the missing lifted-closure effect edge, higher-order fail-closed gate, and negative tests (2026-07-13).
 - Replace fixed `par_map` chunk waiting with caller-draining shared range claims.
 - Add cross-construct watchdog tests and a real multi-worker runtime-path test.
 

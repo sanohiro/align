@@ -188,14 +188,14 @@ short-circuit. Inferred effects restrict transformations rather than source acce
 `par_map` remains Pure-required.
 
 `sort_by_key` is separated into its own Open item: the current comparison sort calls its key O(n²)
-times, while decoration would call exactly N times. No partial Pure rejection lands before the
-function-type effect path is sound.
+times, while decoration would call exactly N times. The effect graph can now fail closed at Pure
+boundaries, but no rejection lands before the key-evaluation contract itself settles.
 
 Section 3.1 is independent: even after choosing Pure-only, a Pure callable may abort and cannot be
 speculated without the stronger inactive-lane proof.
 
-The already-recorded missing lifted-closure effect edge in document 11 remains a P0. Adding only that
-edge is insufficient for a higher-order function:
+The document-11 lifted-closure edge and the higher-order unknown-target case are fixed. The latter
+reproduction was:
 
 ```align
 fn loud(x: i64) -> i64 {
@@ -212,10 +212,10 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`apply` contains an indirect target that the name-only effect graph cannot recover. The already-planned
-effect bit on function types is therefore a prerequisite for parallel capture contexts and sound
-optimization legality. Until that lands, unknown function values must be conservatively Impure at a
-Pure/parallel boundary; this does not require rejecting a guarded sequential call.
+`apply` contains an indirect target that the name-only effect graph cannot recover. `EffectScan` now
+propagates unknown-indirect separately from observable I/O and rejects it at a Pure/parallel boundary;
+ordinary sequential HOF calls remain legal. The already-planned effect bit on function types now
+recovers precision for known-Pure HOFs rather than blocking soundness.
 
 ### 3.3 FIXED 2026-07-13 — `spawn` captures outlive the task-group region
 
@@ -852,9 +852,8 @@ buffered-`io.copy` data loss, allocation byte-overflow hardening requirement, pe
 initialized-before-read arena proof/gate, exact-final-destination codec fill, hex SIMD and macOS
 copy-path probes, HTTP request-copy removal, and sequential SIMD stream compaction.
 
-The document-11 lifted-closure effect hole and nested scheduler deadlock remain P0 and must be solved in
-the same correctness wave. The new higher-order effect finding strengthens its planned function-type
-effect solution; it does not replace it with a second mechanism.
+The document-11 nested scheduler deadlock remains P0. The lifted/higher-order effect holes are fixed;
+the function-type effect bit remains the precision path, not a second source mechanism.
 
 ---
 
@@ -864,7 +863,7 @@ effect solution; it does not replace it with a second mechanism.
 
 - [x] branch-guard all post-`where` work not proven safe on inactive lanes (2026-07-13);
 - [x] settle ordinary sequential effects normatively with exact guarded order (2026-07-13);
-- close lifted/higher-order effect holes and require Pure for every stage moved into `par_map`;
+- [x] close lifted/higher-order effect holes at current Pure boundaries (2026-07-13);
 - introduce conservative inactive-lane legality only after the correct branch baseline;
 - [x] update backend/design text that equated Pure with safe speculation (2026-07-13).
 

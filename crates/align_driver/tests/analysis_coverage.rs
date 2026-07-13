@@ -136,6 +136,67 @@ fn main() -> Result<(), Error> {
     assert!(check_errs("parmap-fnvalue-purity", src), "an impure fn laundered through a fn value must be rejected by par_map");
 }
 
+#[test]
+fn impure_capturing_closure_edge_rejected_in_par_map() {
+    let src = "\
+fn worker(x: i64) -> i64 {
+  k := 100
+  f := fn y: i64 {
+    print(y + k)
+    y
+  }
+  return x
+}
+fn main() -> Result<(), Error> {
+  ys := [1, 2, 3].par_map(worker)
+  print(ys.sum())
+  return Ok(())
+}
+";
+    assert!(
+        check_errs("parmap-capturing-closure-purity", src),
+        "an Impure lifted closure must contribute an effect edge even before an indirect call"
+    );
+}
+
+#[test]
+fn unknown_higher_order_effect_rejected_in_par_map() {
+    let src = "\
+fn loud(x: i64) -> i64 {
+  print(x)
+  return x
+}
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 = f(x)
+fn main() -> Result<(), Error> {
+  f := loud
+  ys := [1, 2, 3].par_map(fn x { apply(f, x) })
+  print(ys.sum())
+  return Ok(())
+}
+";
+    let diagnostics = check_diagnostics("parmap-hof-unknown-effect", src);
+    assert!(
+        diagnostics.contains("calls a function value whose effect is not statically known"),
+        "a higher-order target with no function-type effect must fail closed at par_map:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn pure_higher_order_call_remains_legal_sequentially() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+fn inc(x: i64) -> i64 = x + 1
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 = f(x)
+fn main() -> i32 {
+  return apply(inc, 4) as i32
+}
+";
+    assert!(!check_errs("sequential-hof-unknown-effect", src), "sequential higher-order calls remain legal");
+    assert_eq!(build_and_run("sequential-hof-unknown-effect", src).status.code(), Some(5));
+}
+
 // --- NEW-3: the MoveCheck false positive — the same move value consumed in mutually-exclusive
 //            match arms must be accepted (arms now clone+join like if/else). ---
 #[test]

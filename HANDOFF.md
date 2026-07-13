@@ -8,7 +8,12 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **post-`where` callable P0 FIXED + sequential effects SETTLED**:
+_Last updated: 2026-07-13, **parallel lifted/higher-order effect P0 FIXED**: capturing closures now
+contribute their lifted call edge, and function-value calls whose effect is absent from `FnTy`
+propagate a separate unknown effect that is rejected at Pure/`par_map` boundaries. Sequential HOF
+calls remain legal; a future function-type effect bit recovers precision. Named/capturing/higher-order
+negative gates and a sequential positive control live in `analysis_coverage.rs`. Also this date,
+**post-`where` callable P0 FIXED + sequential effects SETTLED**:
 reducing MIR guards every general callable suffix/reducer on rejected elements, while safe field +
 builtin `sum`/`count`/`min`/`max` suffixes retain the vectorized mask/select path. Sequential
 `map`/`where`/`reduce`/`scan`/`partition`/`any`/`all` may be Impure with exact input/stage order;
@@ -59,12 +64,10 @@ processes), and keeps four CPU-cache ideas explicitly MEASURE-FIRST (owned-temp 
 wide AoS→SoA blocked construction, `task_group` batching, stack lifetime markers after MIR
 liveness). Existing valid objects/executables were byte-identical across repeated/relocated builds,
 so the CAS substrate is promising but not yet regression-pinned. **Parallel execution/generated-IR
-companion audit RECORDED** in `docs/impl/11-parallel-execution-optimization.md` (implementation not
-started): two new CONFIRMED P0s — a lifted capturing closure can omit its call-graph effect edge and
-run `print` inside an accepted Pure, real multi-worker `par_map`; and on an eight-worker host,
+companion audit RECORDED** in `docs/impl/11-parallel-execution-optimization.md` (effect P0 fixed;
+scheduler work not started): the lifted/higher-order effect holes are now closed. On an eight-worker host,
 `task_group` with nine tasks that each enter multi-range `par_map` deadlocks on the shared pool (eight
-tasks complete). Required first fixes are the missing closure edge and caller-draining work-first
-range claims. The already-planned per-element-thunk removal remains the main IR lever; new gated
+tasks complete). The required next fix is caller-draining work-first range claims. The already-planned per-element-thunk removal remains the main IR lever; new gated
 candidates are read-only parallel capture context, wrapping-integer `par_map(...).sum()` fusion to
 eliminate the full intermediate write/read, length-preserving staged kernels, low-lock task
 claim/completion + queue batching, packed task records, body/byte-aware grain, and only later a
@@ -458,14 +461,12 @@ remaining macOS full-suite failures are cataloged out-of-scope at adoption-recor
 (ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
 expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
 is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
-one is next available. **Next, pick one:** (a) document-12 P0 — fix parallel/higher-order effect
-holes and complete required allocation-size hardening before
+one is next available. **Next, pick one:** (a) document-12 P0 — complete required allocation-size hardening before
 widening (source of truth `docs/impl/12-pipeline-closure-memory-io-simd-audit.md`); (b) cache-first C0
 — fix the confirmed basename-temp
 race with private staging + atomic publication and add determinism/concurrency gates (source of
 truth `docs/impl/10-cache-first-optimization.md`; MUST precede M15 parallel compilation); (c)
-parallel P0 correctness — close the capturing-closure effect edge and saturated
-`task_group -> par_map` deadlock before any scheduler/IR widening (source of truth
+parallel P0 correctness — close the saturated `task_group -> par_map` deadlock before any scheduler/IR widening (source of truth
 `docs/impl/11-parallel-execution-optimization.md`); (d) the Codex wave-1 remainder — CONFIRMED bug
 1 (bench export roots: `emit-obj --export` mechanism,
 `bench/run.sh` re-verified) and bug 3 (profiles never reach the TargetMachine:

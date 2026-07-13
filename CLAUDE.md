@@ -56,6 +56,8 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 > **2026-07-13 audit correction:** M6's masked vector shape remains shipped; post-`where` general
 > callables are now guarded, while safe builtin suffixes retain mask/select. Ordinary sequential
 > callables may be Impure with exact guarded source order; explicit `par_map` remains Pure-required.
+> Lifted-closure effects now propagate, and unknown higher-order targets fail closed at Pure/parallel
+> boundaries while remaining legal sequentially.
 > M9's portable `io.copy` lookahead P0, the spawn-capture and closure-result region gaps, and the Unit
 > indirect-call ABI mismatch are fixed and regression-pinned in
 > `docs/impl/source-correctness-fixes-2026-07-13.md`. Read
