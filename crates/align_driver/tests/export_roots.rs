@@ -86,6 +86,36 @@ fn unexported_still_internal() {
     assert_internal(&ir, "helper");
 }
 
+/// A `Result`-returning `main`: lowers to TWO LLVM definitions — the body under the renamed symbol
+/// `align_main` (`Function::name` is still the source name `"main"`), and a separately generated C
+/// `main` wrapper (always external, unconditionally, so `crt0` finds it).
+const RESULT_MAIN: &str = concat!(
+    "fn helper(x: i64) -> i64 = x + 1\n",
+    "fn main() -> Result<(), Error> {\n",
+    "  print(helper(41))\n",
+    "  return Ok(())\n",
+    "}\n",
+);
+
+#[test]
+fn export_main_is_a_harmless_noop_for_result_main() {
+    if !backend_available() {
+        return;
+    }
+    // `--export main` names the SOURCE function `main` — but for a `Result`-returning `main`,
+    // `Function::name == "main"` while the LLVM symbol is `align_main`. A regression here (caught in
+    // PR review): if the internalization guard compared `exports` against `Function::name` instead
+    // of the LLVM symbol, `--export main` would spuriously match the `align_main` body too (since
+    // its `Function::name` is also `"main"`) and leave it wrongly external — silently breaking the
+    // `link_hygiene.rs` invariant that `main` is the only externally-resolved definition. The C
+    // `main` wrapper is already external unconditionally (first half of the guard), so `--export
+    // main` must be a genuine no-op: `align_main` stays internal either way.
+    let ir = emit_llvm_with_exports(RESULT_MAIN, &["main"]);
+    assert_external(&ir, "main");
+    assert_internal(&ir, "align_main");
+    assert_internal(&ir, "helper");
+}
+
 #[test]
 fn unknown_export_rejected() {
     // The fail-closed seam `align_driver::unknown_exports` (the driver's `--export` validation):

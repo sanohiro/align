@@ -2914,16 +2914,24 @@ fn declare_fn<'c>(
     //  - the C entry: a `()`-returning `main` keeps the symbol name `main` and IS the C entry
     //    (`crt0` resolves it by name), so it must stay external. A `Result`-returning `main` is
     //    emitted as `align_main` here (internal) and its external C `main` wrapper is generated
-    //    separately. No other function is named `main`. This check is keyed on `symbol` (the
-    //    LLVM name), not `f.name` — `--export main` must not accidentally make `align_main`
-    //    external.
+    //    separately. No other function is named `main`.
     //  - an explicit export root (`emit-obj`/`emit-llvm --export <name>`, M13 Codex-audit item
-    //    1): keyed on `f.name` (the source-level function name), so the caller names what it
-    //    wrote, not an internal codegen symbol. Exporting a function makes it BOTH a linker-
-    //    visible external symbol AND a DCE root in the same step (`external` linkage keeps LLVM's
-    //    `globaldce`/`internalize`-style passes from ever considering it dead), so linkage and
-    //    "what stays reachable" always agree.
-    if symbol != "main" && !exports.contains(&f.name) {
+    //    1). Exporting a function makes it BOTH a linker-visible external symbol AND a DCE root in
+    //    the same step (`external` linkage keeps LLVM's `globaldce`/`internalize`-style passes from
+    //    ever considering it dead), so linkage and "what stays reachable" always agree.
+    //
+    // BOTH checks are keyed on `symbol` (the LLVM name), never `f.name` (the source name): for a
+    // `Result`-returning `main`, `f.name == "main"` but `symbol == "align_main"` — if the export
+    // check compared `f.name`, `--export main` would match it and skip internalizing `align_main`,
+    // leaving it wrongly external (a real, one-line-fix regression caught in review). Keying on
+    // `symbol` makes `--export main` compare against `"align_main"`, which never matches, so
+    // `align_main` still internalizes and `--export main` stays the harmless no-op the CLI promises
+    // (the C `main` wrapper was already external via the first check, unconditionally). Every
+    // *other* function has `symbol == f.name` (only `main` is ever renamed), so this is
+    // observationally identical to keying on `f.name` for the entire non-`main` case — the export
+    // roots the driver validates (`align_driver::unknown_exports`, matched against `Function::name`)
+    // still name exactly what the caller wrote.
+    if symbol != "main" && !exports.iter().any(|e| e == symbol) {
         mark_internal(fv);
     }
     fv
