@@ -2433,6 +2433,20 @@ every valid finding addressed. Disposition:
      report: keep default whole-program internalization; add explicit export roots
      (`emit-obj --export foo` driver mechanism); DCE roots + linkage from the same export set;
      re-verify `bench/run.sh baseline/native` runs.
+     **DONE (2026-07-13):** a repeatable `--export <name>`/`--export=<name>` flag on
+     `emit-obj`/`emit-llvm` only (rejected with a diagnostic elsewhere); pulled out before
+     positional-argument parsing so a following value can never be misread as the output-object
+     path; fail-closed against the lowered MIR (`align_driver::unknown_exports`, unit-tested) —
+     an unknown name is a listed hard error, never a silent no-op. `align_codegen_llvm::declare_fn`
+     keeps `external` linkage for a named export root exactly like it already does for `main`
+     (keyed on the *source* `Function::name`, independent of the `main`/`align_main` symbol
+     split), so linkage and the LLVM DCE-root set come from the same list by construction.
+     `bench/run.sh` + every sub-bench (`group_by`, `group_by_reuse`, `json_decode`, `json_soa`,
+     `par_map`, `string_builder`) now pass the exact `--export` list their Rust harness's
+     `extern "C"` block calls; `bench/binary_size` links no harness and needed no change.
+     `bench/README.md` rewritten: `--export` is an object-level C-ABI boundary independent of
+     `pub`. Regression test `crates/align_driver/tests/export_roots.rs` (mutation-tight: reverting
+     the linkage guard fails it).
   2. **ELF-only link/size tooling breaks macOS builds** — the driver passes
      `--gc-sections/--as-needed/--strip-all` unconditionally (`align_driver/src/lib.rs:182`);
      `alignc size` assumes `readelf`/GNU `nm`; `bench/binary_size` assumes `stat -c`/`mapfile`.
@@ -2515,7 +2529,8 @@ every valid finding addressed. Disposition:
   multi-workload profile, BOLT is Linux/ELF-only (fold into the M14 PGO/BOLT items when they
   come up). The report's "do not re-propose" list fully matches our rejected/settled records.
 - **Doc debt (fix with the adopting slices):** `bench/README.md` export contract vs M13
-  internalization (rewrite with the `--export` mechanism); `docs/impl/05-backend-llvm.md` says
+  internalization (rewrite with the `--export` mechanism) **[DONE 2026-07-13, with item 1]**;
+  `docs/impl/05-backend-llvm.md` says
   bool is "i8 when stored" while Slice 5B deliberately pinned SSA+stack `i1` (align the doc with
   the pinned reality; the i8-stored-bool idea stays a bounded experiment per the report's own
   P3 restraint); `docs/guide/ja/16-toolchain.md` missing profiles/`size`/`explain-opt`;

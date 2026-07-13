@@ -44,7 +44,7 @@ fn float_ne_lowers_to_une() {
     let src = "fn main() -> i32 {\n  a := 1.0\n  b := 2.0\n  if a != b { return 1 }\n  return 0\n}\n";
     let checked = check(&mut sm, "fne.align", src);
     assert!(!checked.diags.has_errors());
-    let ir = emit_llvm_ir(&lower_to_mir(&checked.hir), BuildTarget::Baseline, false).expect("llvm ir");
+    let ir = emit_llvm_ir(&lower_to_mir(&checked.hir), BuildTarget::Baseline, false, &[]).expect("llvm ir");
     assert!(
         ir.contains("fcmp une"),
         "float != must lower to `fcmp une` (IEEE 754 NaN-correct), got:\n{ir}"

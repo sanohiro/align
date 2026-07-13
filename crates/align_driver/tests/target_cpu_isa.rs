@@ -76,7 +76,7 @@ fn disasm_at(cpu: &str, tag: &str) -> String {
     let mir = lower_to_mir(&checked.hir);
     let obj = std::env::temp_dir().join(format!("align-isa-{}-{tag}.o", std::process::id()));
     let _guard = TempObj(obj.clone());
-    emit_object_file(&mir, &obj, BuildTarget::Cpu(cpu.to_string()), Profile::Release)
+    emit_object_file(&mir, &obj, BuildTarget::Cpu(cpu.to_string()), Profile::Release, &[])
         .expect("codegen");
     let out = std::process::Command::new("objdump")
         .arg("-d")

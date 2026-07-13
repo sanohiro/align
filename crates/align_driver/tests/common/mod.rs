@@ -94,7 +94,7 @@ pub fn build_and_run_with_c(name: &str, align_src: &str, c_src: &str) -> std::pr
         }
     }
     let _guard = Cleanup(vec![a_obj.clone(), c_src_path.clone(), c_obj.clone(), exe.clone()]);
-    emit_object_file(&mir, &a_obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
+    emit_object_file(&mir, &a_obj, BuildTarget::Baseline, Profile::Release, &[]).expect("codegen");
     std::fs::write(&c_src_path, c_src).expect("write c helper");
     let cc_status = std::process::Command::new("cc")
         .args(["-c", "-O0"])
@@ -156,7 +156,7 @@ fn emit_link_run(mir: &align_driver::MirProgram, name: &str, prog_args: &[&str])
     let obj = dir.join(format!("align-test-{pid}-{name}.o"));
     let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
     let _artifacts = TempArtifacts { obj: obj.clone(), exe: exe.clone() };
-    emit_object_file(mir, &obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
+    emit_object_file(mir, &obj, BuildTarget::Baseline, Profile::Release, &[]).expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     std::process::Command::new(&exe).args(prog_args).output().expect("run")
 }
@@ -186,13 +186,20 @@ pub fn build_exe(name: &str, src: &str) -> BuiltExe {
     let pid = std::process::id();
     let obj = dir.join(format!("align-test-{pid}-{name}.o"));
     let exe = dir.join(format!("align-test-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
+    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[]).expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     BuiltExe { exe: exe.clone(), _artifacts: TempArtifacts { obj, exe } }
 }
 
 /// The LLVM IR text for `src` (for asserting on the generated instructions).
 pub fn emit_llvm(src: &str) -> String {
+    emit_llvm_with_exports(src, &[])
+}
+
+/// [`emit_llvm`] with explicit export roots (`--export`) — the names in `exports` keep external
+/// linkage instead of the default whole-program `internal` (M13 Slice 1 / the export-roots
+/// mechanism, `docs/impl/07-roadmap.md` M13 Codex-audit item 1).
+pub fn emit_llvm_with_exports(src: &str, exports: &[&str]) -> String {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "ir", src);
     assert!(
@@ -201,7 +208,8 @@ pub fn emit_llvm(src: &str) -> String {
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
-    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, false).expect("emit llvm ir")
+    let exports: Vec<String> = exports.iter().map(|s| s.to_string()).collect();
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, false, &exports).expect("emit llvm ir")
 }
 
 /// Whether checking `src` produces any error (for negative tests).
@@ -269,7 +277,7 @@ pub fn build_and_run_multi(name: &str, files: &[(&str, &str)], entry: &str) -> s
     let pid = std::process::id();
     let obj = proj.dir.join(format!("align-mtest-{pid}-{name}.o"));
     let exe = proj.dir.join(format!("align-mtest-{pid}-{name}{}", std::env::consts::EXE_SUFFIX));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
+    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[]).expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     std::process::Command::new(&exe).output().expect("run")
 }

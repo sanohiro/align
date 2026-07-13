@@ -12,6 +12,12 @@
 //!
 //! A `--profile dev|release|fast|small|tiny` flag selects the optimization/size trade-off for the
 //! build-producing subcommands (`build`/`run`/`emit-obj`/`size`); default `release`.
+//!
+//! A repeatable `--export <name>` flag (`emit-obj`/`emit-llvm` only) names an entry-file top-level
+//! function that keeps external linkage instead of the default whole-program `internal` (M13 Slice
+//! 1 internalized every program function) — the explicit export-roots mechanism restoring a linkable
+//! C-ABI surface for a no-`main` library/benchmark object (`docs/impl/07-roadmap.md` M13 Codex-audit
+//! item 1).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
     check, emit_llvm_ir, emit_object_file, format_diagnostics, link_executable, lower_to_mir,
-    BuildTarget, Profile,
+    unknown_exports, BuildTarget, Profile,
 };
 use align_span::SourceMap;
 
@@ -39,16 +45,38 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Pull every `--export <name>` out next, still before positional parsing — otherwise
+    // `emit-obj kernels.align --export foo` would leave `foo` sitting where the output-object
+    // positional argument is read from. A bare `--export` with no following value is a hard error.
+    let (exports, args) = match parse_exports(&args) {
+        Ok(v) => v,
+        Err(()) => {
+            eprintln!("alignc: --export requires a value (e.g. `--export foo`)");
+            return ExitCode::FAILURE;
+        }
+    };
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
+
+    // `--export` only means something where codegen produces a standalone object/IR with linker-
+    // visible symbols (`emit-obj`/`emit-llvm`); anywhere else a nonempty export set would either be
+    // silently ignored or silently change linkage no one asked for — neither is acceptable
+    // (Nothing hidden), so reject it outright instead.
+    if !exports.is_empty() && !matches!(cmd, Some("emit-obj") | Some("emit-llvm")) {
+        eprintln!(
+            "alignc: --export is only valid for `emit-obj`/`emit-llvm` (got `{}`)",
+            cmd.unwrap_or("<none>")
+        );
+        return ExitCode::FAILURE;
+    }
 
     match (cmd, path) {
         (Some("check"), Some(p)) => run_check(p),
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
-        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target),
+        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target, &exports),
         // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
         // (a library / benchmark kernel). Default output is `<stem>.o`.
-        (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile),
+        (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile, &exports),
         // `size <file>` — build with the profile, then report the executable's size breakdown.
         (Some("size"), Some(p)) => size::run_size(p, target, profile),
         // `explain-opt <file> [--verbose]` — report what the `-O2` middle-end did to the data path
@@ -67,6 +95,47 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Pull every `--export <name>` / `--export=<name>` out of `args` (repeatable — each occurrence
+/// adds one name; no comma-separated lists), returning the collected export roots in order and the
+/// remaining (positional) arguments. A bare `--export` with no following value is `Err(())` — a hard
+/// error, never a silently-ignored flag or a guessed name.
+fn parse_exports(args: &[String]) -> Result<(Vec<String>, Vec<String>), ()> {
+    let mut exports = Vec::new();
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(v) = a.strip_prefix("--export=") {
+            exports.push(v.to_string());
+        } else if a == "--export" {
+            match args.get(i + 1) {
+                Some(v) => {
+                    exports.push(v.clone());
+                    i += 1;
+                }
+                None => return Err(()),
+            }
+        } else {
+            rest.push(a.clone());
+        }
+        i += 1;
+    }
+    Ok((exports, rest))
+}
+
+/// Validate `exports` against the lowered `mir`: every name must match a `Function::name` in the
+/// program, or this is a hard failure listing every unknown name (never a silent no-op — a typo'd
+/// export name must not compile a wrong object with no diagnostic). Returns the failure `ExitCode`
+/// on rejection, `None` when every export resolves.
+fn check_exports(mir: &align_mir::Program, exports: &[String], path: &str) -> Option<ExitCode> {
+    let unknown = unknown_exports(mir, exports);
+    if unknown.is_empty() {
+        return None;
+    }
+    eprintln!("alignc: unknown export(s): {} (not defined in {path})", unknown.join(", "));
+    Some(ExitCode::FAILURE)
 }
 
 /// Pull `--target-cpu <baseline|native>` (or `--target-cpu=…`) out of `args`, returning the chosen
@@ -147,7 +216,10 @@ fn usage() {
          \n\
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
                        or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \
-         --profile     dev (O0), release (O2, default), fast (O3), small (Os), tiny (Oz)"
+         --profile     dev (O0), release (O2, default), fast (O3), small (Os), tiny (Oz)\n  \
+         --export      (emit-obj/emit-llvm only; repeatable) keep an entry-file top-level function\n  \
+                       name's linkage external instead of the default internal, so a no-`main`\n  \
+                       library/benchmark object exposes it to the linker"
     );
 }
 
@@ -224,7 +296,7 @@ fn run_emit_mir(path: &str) -> ExitCode {
     }
 }
 
-fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget) -> ExitCode {
+fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, exports: &[String]) -> ExitCode {
     // `--stage raw|optimized` picks the lens (default `raw` = today's semantics, the pre-opt IR
     // codegen emitted). `optimized` runs the `-O2` pipeline first (what LLVM did: inlined, fused,
     // vectorized). Any other value is a hard argument error, not a panic.
@@ -238,7 +310,10 @@ fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
-    match emit_llvm_ir(&mir, target, optimized) {
+    if let Some(code) = check_exports(&mir, exports, path) {
+        return code;
+    }
+    match emit_llvm_ir(&mir, target, optimized, exports) {
         Ok(ir) => {
             print!("{ir}");
             ExitCode::SUCCESS
@@ -280,12 +355,15 @@ fn parse_stage(rest: &[String]) -> Result<bool, String> {
     Ok(optimized)
 }
 
-fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget, profile: Profile) -> ExitCode {
+fn run_emit_obj(path: &str, out: Option<&str>, target: BuildTarget, profile: Profile, exports: &[String]) -> ExitCode {
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
+    if let Some(code) = check_exports(&mir, exports, path) {
+        return code;
+    }
     let obj = PathBuf::from(out.map(String::from).unwrap_or_else(|| format!("{}.o", stem(path))));
-    match emit_object_file(&mir, &obj, target, profile) {
+    match emit_object_file(&mir, &obj, target, profile, exports) {
         Ok(()) => {
             println!("alignc: wrote object: {}", obj.display());
             ExitCode::SUCCESS
@@ -358,7 +436,9 @@ fn build_to(_path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarg
         ExitCode::FAILURE
     })?;
     let obj = object_stage.path().join("program.o");
-    if let Err(e) = emit_object_file(mir, &obj, target, profile) {
+    // `build`/`run`/`size` never take `--export` — they always produce a linked executable whose
+    // only linker-visible symbol is `main`, so no export roots apply here.
+    if let Err(e) = emit_object_file(mir, &obj, target, profile, &[]) {
         eprintln!("alignc: codegen failed: {e}");
         return Err(ExitCode::FAILURE);
     }

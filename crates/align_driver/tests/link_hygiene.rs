@@ -16,9 +16,14 @@
 //!
 //! Align compiles the entry file + every imported user module into ONE module and ONE object; `pub`
 //! is a sema-level module visibility fully resolved before codegen, and no Align function body is
-//! C-exported. So the ONLY definition the linker must resolve by name is `main`; everything else is
-//! module-private. A thunk reached only through a function pointer handed to the runtime keeps
+//! C-exported by default. So the ONLY definition the linker must resolve by name is `main`; everything
+//! else is module-private. A thunk reached only through a function pointer handed to the runtime keeps
 //! `private` (its symbol name is never used). An undefined `declare` cannot be made internal.
+//!
+//! **Exception:** `emit-obj`/`emit-llvm --export <name>` (M13 Codex-audit item 1, see
+//! `export_roots.rs`) names additional program functions that keep `external` linkage instead —
+//! a no-`main` library/benchmark object's C-ABI surface. This table describes the DEFAULT (no
+//! `--export`) linkage map; every row above is unaffected by an empty export set.
 
 mod common;
 use common::*;

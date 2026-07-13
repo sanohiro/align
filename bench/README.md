@@ -12,10 +12,17 @@ ALIGN_BENCH_PROFILE=1 bench/json_soa/run.sh native  # optional decomposition out
 
 ## How it works
 
-- `kernels.align` is a **no-`main` library**; `alignc emit-obj` compiles it to an object (its `pub fn`s
-  exported, no linking).
-- `harness.rs` links that object and calls each kernel with the **same runtime-generated data** as an
-  idiomatic Rust equivalent, then prints the ratio.
+- `kernels.align` is a **no-`main` library**; `alignc emit-obj` compiles it to an object (no linking).
+- Every Align program function is `internal` by default (M13 Slice 1) — a whole-program build has no
+  separate compilation, so nothing needs external linkage except the C entry `main`. A no-`main`
+  object like this one names its C-ABI surface explicitly with **`emit-obj --export <name>`**
+  (repeatable), one flag per kernel the harness calls: `--export` is an object-level C-ABI boundary,
+  **separate from Align's `pub` visibility** — `pub` is a *source-level module* visibility resolved
+  entirely inside the compiler, while `--export` controls *linker* visibility; a non-`pub` function
+  can be exported too. Un-exported functions (even `pub` ones) may be inlined or dead-code-eliminated
+  entirely, since `external` linkage doubles as the DCE root set.
+- `harness.rs` links that object and calls each exported kernel with the **same runtime-generated
+  data** as an idiomatic Rust equivalent, then prints the ratio.
 - Both `alignc` and `rustc` are pinned to the **same `--target-cpu`**, so the comparison is fair.
 
 ## Methodology (don't skip)

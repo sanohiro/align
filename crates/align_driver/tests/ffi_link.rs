@@ -43,7 +43,7 @@ fn bogus_library_fails_to_link() {
     let dir = std::env::temp_dir();
     let obj = dir.join(format!("align-link-{pid}.o"));
     let exe = dir.join(format!("align-link-{pid}"));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
+    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[]).expect("codegen");
     let linked = link_executable(&obj, &exe, &mir.link_libs, Profile::Release);
     let _ = std::fs::remove_file(&obj);
     let _ = std::fs::remove_file(&exe);
