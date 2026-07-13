@@ -5234,29 +5234,131 @@ fn lower_array_partition(
     Operand::Value(tup)
 }
 
-/// `source.….sort()` — materialize the surviving elements into an owned `array<T>` (the
-/// `to_array` collect loop), then sort that buffer ascending in place with insertion sort.
-/// Reads use `SliceIndex` over the `{ptr,len}` value; writes use `PtrStore` through its buffer
-/// pointer (`SlicePtr`). Returns the same owned array. O(n²) — fine for the small arrays this
-/// first cut targets; a faster sort is a follow-up.
-/// A `sort_by_key` key: the per-element key function, its captures, and the key type. The
-/// insertion sort compares `key(a) > key(b)` instead of `a > b`.
+/// A `sort_by_key` key: the per-element key function, its captures, and the key type. The sort
+/// compares `key(a)` against `key(b)` instead of `a` against `b` — see [`lower_array_sort`], where
+/// the keys are precomputed once (decorate) rather than recomputed per comparison.
 struct SortKey {
     func: String,
     captures: Vec<hir::Expr>,
     key_ty: Ty,
 }
 
+/// Insertion-sort base-case cutoff for the merge sort in [`lower_array_sort`]. Runs no longer than
+/// this are sorted in place with insertion sort — for tiny N that beats merging (no scratch
+/// traffic, predictable branches) — after which the bottom-up merge passes take over. 32 sits in
+/// the 16–32 band the binary-optimization audit recommended.
+const SORT_INSERTION_THRESHOLD: usize = 32;
+
+/// `let v = x <op> y` on `i64`, returning `v` as an operand.
+fn sort_int(b: &mut Builder, op: BinOp, x: Operand, y: Operand) -> Operand {
+    let v = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(v, Rvalue::Bin(op, x, y)));
+    Operand::Value(v)
+}
+
+/// `let v = x <op> y` yielding a `bool` (a comparison / logical op).
+fn sort_cmp(b: &mut Builder, op: BinOp, x: Operand, y: Operand) -> Operand {
+    let v = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(v, Rvalue::Bin(op, x, y)));
+    Operand::Value(v)
+}
+
+/// Branchless `min(x, y)` on `i64` (`select(x < y, x, y)`).
+fn sort_min(b: &mut Builder, x: Operand, y: Operand) -> Operand {
+    let lt = sort_cmp(b, BinOp::Lt, x.clone(), y.clone());
+    let v = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(v, Rvalue::Select { cond: lt, a: x, b: y }));
+    Operand::Value(v)
+}
+
+/// Load the `i64` slot `s`.
+fn sort_load(b: &mut Builder, s: Slot) -> Operand {
+    let v = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(v, Rvalue::Load(s)));
+    Operand::Value(v)
+}
+
+/// Read `buf[idx]` (a `{ptr,len}` value) as an element of type `ty`.
+fn sort_read(b: &mut Builder, buf: &Operand, idx: Operand, ty: Ty) -> Operand {
+    let v = b.fresh_value(ty);
+    b.push(Stmt::Let(v, Rvalue::SliceIndex(buf.clone(), idx)));
+    Operand::Value(v)
+}
+
+/// Heap-allocate a transient `count`-element scratch buffer of `ty`, returning its raw buffer
+/// pointer (for `PtrStore`) and a `{ptr,len}` value (for `SliceIndex`). Always a free-standing heap
+/// allocation (arena-independent), balanced by a shallow-spine `DropValue` before the sort returns —
+/// the same transient-scratch discipline `group_by` uses.
+fn sort_alloc_buf(b: &mut Builder, ty: Ty, len: &Operand) -> (Operand, Operand) {
+    let ptr = b.fresh_value(Ty::Box(scalar_of(ty)));
+    b.push(Stmt::Let(ptr, Rvalue::HeapAllocBuf { count: len.clone(), elem: ty }));
+    let val = b.fresh_value(Ty::DynArray(scalar_of(ty)));
+    b.push(Stmt::Let(val, Rvalue::MakeDynArray { ptr: Operand::Value(ptr), len: len.clone() }));
+    (Operand::Value(ptr), Operand::Value(val))
+}
+
+/// One merge/drain step: `dst_arr[k] = src_arr[s]` (and, when sorting by key, `dst_keys[k] =
+/// src_keys[s]`), then advance both the source cursor `s_slot` and the destination cursor `k_slot`.
+/// `src_*` are `{ptr,len}` values (read via `SliceIndex`); `dst_*_ptr` are raw buffer pointers
+/// (written via `PtrStore`). Element and key move together so a later comparison stays O(1).
+#[allow(clippy::too_many_arguments)]
+fn sort_copy_step(
+    b: &mut Builder,
+    has_keys: bool,
+    elem: Ty,
+    kty: Ty,
+    src_arr: &Operand,
+    src_keys: &Operand,
+    dst_arr_ptr: &Operand,
+    dst_keys_ptr: &Operand,
+    s_slot: Slot,
+    k_slot: Slot,
+) {
+    let si = sort_load(b, s_slot);
+    let ki = sort_load(b, k_slot);
+    let e = sort_read(b, src_arr, si.clone(), elem);
+    b.push(Stmt::PtrStore(dst_arr_ptr.clone(), ki.clone(), e));
+    if has_keys {
+        let kv = sort_read(b, src_keys, si.clone(), kty);
+        b.push(Stmt::PtrStore(dst_keys_ptr.clone(), ki.clone(), kv));
+    }
+    let s_next = sort_int(b, BinOp::Add, si, index_const(1));
+    b.push(Stmt::Store(s_slot, s_next));
+    let k_next = sort_int(b, BinOp::Add, ki, index_const(1));
+    b.push(Stmt::Store(k_slot, k_next));
+}
+
+/// `source.….sort()` / `.sort_by_key(f)` — materialize the surviving elements into an owned
+/// `array<T>` (the `to_array` collect loop), then sort that buffer ascending and return it.
+///
+/// The sort is a **stable, bottom-up merge sort** (O(n log n)) with an insertion-sort base case for
+/// short runs ([`SORT_INSERTION_THRESHOLD`]). It runs in place over the collected buffer `arr`,
+/// using one heap scratch buffer `tmp` of the same size (each merge pass merges `arr` into `tmp`,
+/// then copies back, so the result always lands in `arr`). Stability comes from taking the left run
+/// first on equal keys (insertion shifts only on a strict `>`; merge takes the right run only on a
+/// strict `<`).
+///
+/// For `sort_by_key`, the key of each element is computed **exactly once** into a parallel `keys`
+/// buffer (decorate), carried alongside the elements through every move (so comparisons read a
+/// precomputed key, never re-call `f`), and freed at the end — the fix for the old per-comparison
+/// `key(arr[j])` recomputation. A `str` key is a borrowed `{ptr,len}` view (Copy), so freeing the
+/// key buffers is a shallow spine `DropValue` that never touches the pointed-to bytes.
+///
+/// Elements are always Copy scalars (sema restricts `sort` to numeric scalars and `sort_by_key` to
+/// primitive scalars), so no element ever needs a deep move/drop. Reads use `SliceIndex`; writes use
+/// `PtrStore` through a buffer pointer (`SlicePtr`).
 fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty, sort_key: Option<SortKey>) -> Operand {
     let arr = lower_array_collect(b, source, stages, elem, CollectKind::Collect);
-    // Lower the key function's captures ONCE before the loop — they are loop-invariant, so
-    // re-lowering them inside the per-comparison block would emit redundant loads on the hot path
-    // (and LICM is not run). `key_of` reuses these pre-lowered operands.
+    let has_keys = sort_key.is_some();
+    // The comparison-key type: the key type for `sort_by_key`, else the element type itself.
+    let kty = sort_key.as_ref().map(|sk| sk.key_ty).unwrap_or(elem);
+
+    // Lower the key function's captures ONCE (loop-invariant); `key_of` reuses them, so a
+    // `sort_by_key` key is computed exactly N times (decorate), never per comparison.
     let lowered_captures: Vec<Operand> = match &sort_key {
         Some(sk) => sk.captures.iter().map(|c| lower_expr(b, c)).collect(),
         None => Vec::new(),
     };
-    // Compute the sort key of an element value (`key(elem)` for `sort_by_key`, else the element).
     let key_of = |b: &mut Builder, v: Operand| -> Operand {
         match &sort_key {
             Some(sk) => {
@@ -5270,88 +5372,309 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
             None => v,
         }
     };
-    let ptr = b.fresh_value(Ty::Box(scalar_of(elem)));
-    b.push(Stmt::Let(ptr, Rvalue::SlicePtr(arr.clone())));
-    let len = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(len, Rvalue::SliceLen(arr.clone())));
 
-    // i = 1; while i < len { key = arr[i]; j = i-1; while j >= 0 && arr[j] > key { arr[j+1] =
-    // arr[j]; j-- }; arr[j+1] = key; i++ }.
-    let iv = b.new_slot(i64_ty());
-    b.push(Stmt::Store(iv, Operand::Const(Const::Int(1, i64_ty()))));
-    let jv = b.new_slot(i64_ty());
+    let arr_ptr = {
+        let p = b.fresh_value(Ty::Box(scalar_of(elem)));
+        b.push(Stmt::Let(p, Rvalue::SlicePtr(arr.clone())));
+        Operand::Value(p)
+    };
+    let len = {
+        let l = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(l, Rvalue::SliceLen(arr.clone())));
+        Operand::Value(l)
+    };
 
-    let outer = b.new_block();
-    let outer_body = b.new_block();
-    let inner = b.new_block();
-    let cmp_bb = b.new_block();
-    let shift = b.new_block();
-    let place = b.new_block();
-    let exit = b.new_block();
-    b.terminate(Term::Goto(outer));
+    // Fewer than 2 elements → already sorted; return the collected buffer untouched (this also
+    // avoids the zero-length scratch allocation the sort path would otherwise make).
+    let sort_start = b.new_block();
+    let done = b.new_block();
+    let ge2 = sort_cmp(b, BinOp::Ge, len.clone(), index_const(2));
+    b.terminate(Term::Branch(ge2, sort_start, done));
 
-    // outer: while i < len
-    b.cur = outer;
-    let i_val = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
-    let ocond = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(ocond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), Operand::Value(len))));
-    b.terminate(Term::Branch(Operand::Value(ocond), outer_body, exit));
+    b.cur = sort_start;
 
-    // outer_body: key = arr[i]; j = i - 1.
-    b.cur = outer_body;
-    let i_cur = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(i_cur, Rvalue::Load(iv)));
-    let key = b.fresh_value(elem);
-    b.push(Stmt::Let(key, Rvalue::SliceIndex(arr.clone(), Operand::Value(i_cur))));
-    // The sort key of the element being inserted (invariant across the inner loop).
-    let key_cmp = key_of(b, Operand::Value(key));
-    let j0 = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(j0, Rvalue::Bin(BinOp::Sub, Operand::Value(i_cur), index_const(1))));
-    b.push(Stmt::Store(jv, Operand::Value(j0)));
-    b.terminate(Term::Goto(inner));
+    // Scratch: `keys` (decorate target, `sort_by_key` only), the element ping buffer `tmp`, and —
+    // sorting by key — the key ping buffer `ktmp`. All are transient heap allocations freed before
+    // `done`. When `!has_keys`, the key buffers are unused dummies (`arr`) that no code path reads.
+    let (keys_ptr, keys_val) =
+        if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+    let (tmp_ptr, tmp_val) = sort_alloc_buf(b, elem, &len);
+    let (ktmp_ptr, ktmp_val) =
+        if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
 
-    // inner: while j >= 0 (then test arr[j] > key in cmp_bb).
-    b.cur = inner;
-    let j_val = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(j_val, Rvalue::Load(jv)));
-    let jge0 = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(jge0, Rvalue::Bin(BinOp::Ge, Operand::Value(j_val), index_const(0))));
-    b.terminate(Term::Branch(Operand::Value(jge0), cmp_bb, place));
+    // Decorate: keys[i] = key(arr[i]) for i in 0..len (each key computed exactly once).
+    if has_keys {
+        let di = b.new_slot(i64_ty());
+        b.push(Stmt::Store(di, index_const(0)));
+        let dh = b.new_block();
+        let dbody = b.new_block();
+        let dexit = b.new_block();
+        b.terminate(Term::Goto(dh));
 
-    // cmp_bb: if arr[j] > key, shift; else place.
-    b.cur = cmp_bb;
-    let aj = b.fresh_value(elem);
-    b.push(Stmt::Let(aj, Rvalue::SliceIndex(arr.clone(), Operand::Value(j_val))));
-    // Compare keys: `key(arr[j]) > key(element)` (for a plain sort, the keys are the elements).
-    let aj_cmp = key_of(b, Operand::Value(aj));
-    let gt = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(gt, Rvalue::Bin(BinOp::Gt, aj_cmp, key_cmp.clone())));
-    b.terminate(Term::Branch(Operand::Value(gt), shift, place));
+        b.cur = dh;
+        let dv = sort_load(b, di);
+        let dc = sort_cmp(b, BinOp::Lt, dv, len.clone());
+        b.terminate(Term::Branch(dc, dbody, dexit));
 
-    // shift: arr[j+1] = arr[j]; j -= 1.
-    b.cur = shift;
-    let jp1 = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(jp1, Rvalue::Bin(BinOp::Add, Operand::Value(j_val), index_const(1))));
-    b.push(Stmt::PtrStore(Operand::Value(ptr), Operand::Value(jp1), Operand::Value(aj)));
-    let jdec = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(jdec, Rvalue::Bin(BinOp::Sub, Operand::Value(j_val), index_const(1))));
-    b.push(Stmt::Store(jv, Operand::Value(jdec)));
-    b.terminate(Term::Goto(inner));
+        b.cur = dbody;
+        let dvi = sort_load(b, di);
+        let e = sort_read(b, &arr, dvi.clone(), elem);
+        let k = key_of(b, e);
+        b.push(Stmt::PtrStore(keys_ptr.clone(), dvi.clone(), k));
+        let dn = sort_int(b, BinOp::Add, dvi, index_const(1));
+        b.push(Stmt::Store(di, dn));
+        b.terminate(Term::Goto(dh));
 
-    // place: arr[j+1] = key; i += 1. `jv` is unchanged between `inner` (which dominates `place`)
-    // and here — only `shift` writes it, and `shift` loops back to `inner` — so `j_val` from
-    // `inner` is still current; reuse it instead of re-loading.
-    b.cur = place;
-    let jf1 = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(jf1, Rvalue::Bin(BinOp::Add, Operand::Value(j_val), index_const(1))));
-    b.push(Stmt::PtrStore(Operand::Value(ptr), Operand::Value(jf1), Operand::Value(key)));
-    let i_inc = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(i_inc, Rvalue::Bin(BinOp::Add, Operand::Value(i_cur), index_const(1))));
-    b.push(Stmt::Store(iv, Operand::Value(i_inc)));
-    b.terminate(Term::Goto(outer));
+        b.cur = dexit;
+    }
 
-    b.cur = exit;
+    // Base case: insertion-sort each run of up to THRESHOLD elements in place (carrying `keys`).
+    let rs = b.new_slot(i64_ty());
+    b.push(Stmt::Store(rs, index_const(0)));
+    let base_head = b.new_block();
+    let base_run = b.new_block();
+    let merge_setup = b.new_block();
+    b.terminate(Term::Goto(base_head));
+
+    b.cur = base_head;
+    let rsv = sort_load(b, rs);
+    let rcond = sort_cmp(b, BinOp::Lt, rsv, len.clone());
+    b.terminate(Term::Branch(rcond, base_run, merge_setup));
+
+    b.cur = base_run;
+    let run_start = sort_load(b, rs);
+    let run_end = {
+        let e = sort_int(b, BinOp::Add, run_start.clone(), index_const(SORT_INSERTION_THRESHOLD));
+        sort_min(b, e, len.clone())
+    };
+    // insertion sort arr[run_start .. run_end): i from run_start+1, shift down to run_start.
+    let ii = b.new_slot(i64_ty());
+    let i0 = sort_int(b, BinOp::Add, run_start.clone(), index_const(1));
+    b.push(Stmt::Store(ii, i0));
+    let ins_head = b.new_block();
+    let ins_body = b.new_block();
+    let base_next = b.new_block();
+    b.terminate(Term::Goto(ins_head));
+
+    b.cur = ins_head;
+    let iv = sort_load(b, ii);
+    let icond = sort_cmp(b, BinOp::Lt, iv, run_end.clone());
+    b.terminate(Term::Branch(icond, ins_body, base_next));
+
+    b.cur = ins_body;
+    let ivb = sort_load(b, ii);
+    // Save the element (and its key) being inserted before any shifting overwrites arr[i].
+    let cur_elem = sort_read(b, &arr, ivb.clone(), elem);
+    let cur_key = if has_keys { sort_read(b, &keys_val, ivb.clone(), kty) } else { cur_elem.clone() };
+    let jj = b.new_slot(i64_ty());
+    let j0 = sort_int(b, BinOp::Sub, ivb.clone(), index_const(1));
+    b.push(Stmt::Store(jj, j0));
+    let ins_jhead = b.new_block();
+    let ins_jcmp = b.new_block();
+    let ins_shift = b.new_block();
+    let ins_place = b.new_block();
+    b.terminate(Term::Goto(ins_jhead));
+
+    // ins_jhead: while j >= run_start (then test key[j] > cur_key in ins_jcmp).
+    b.cur = ins_jhead;
+    let jv = sort_load(b, jj);
+    let jge = sort_cmp(b, BinOp::Ge, jv, run_start.clone());
+    b.terminate(Term::Branch(jge, ins_jcmp, ins_place));
+
+    // ins_jcmp: strict `>` → stop on equal keys (stable).
+    b.cur = ins_jcmp;
+    let jvc = sort_load(b, jj);
+    let kj = if has_keys {
+        sort_read(b, &keys_val, jvc.clone(), kty)
+    } else {
+        sort_read(b, &arr, jvc.clone(), elem)
+    };
+    let gt = sort_cmp(b, BinOp::Gt, kj, cur_key.clone());
+    b.terminate(Term::Branch(gt, ins_shift, ins_place));
+
+    // ins_shift: arr[j+1] = arr[j] (and keys); j -= 1.
+    b.cur = ins_shift;
+    let jvs = sort_load(b, jj);
+    let jp1 = sort_int(b, BinOp::Add, jvs.clone(), index_const(1));
+    let ej = sort_read(b, &arr, jvs.clone(), elem);
+    b.push(Stmt::PtrStore(arr_ptr.clone(), jp1.clone(), ej));
+    if has_keys {
+        let kjv = sort_read(b, &keys_val, jvs.clone(), kty);
+        b.push(Stmt::PtrStore(keys_ptr.clone(), jp1, kjv));
+    }
+    let jdec = sort_int(b, BinOp::Sub, jvs, index_const(1));
+    b.push(Stmt::Store(jj, jdec));
+    b.terminate(Term::Goto(ins_jhead));
+
+    // ins_place: arr[j+1] = cur_elem (and cur_key); i += 1.
+    b.cur = ins_place;
+    let jvp = sort_load(b, jj);
+    let jf1 = sort_int(b, BinOp::Add, jvp, index_const(1));
+    b.push(Stmt::PtrStore(arr_ptr.clone(), jf1.clone(), cur_elem.clone()));
+    if has_keys {
+        b.push(Stmt::PtrStore(keys_ptr.clone(), jf1, cur_key.clone()));
+    }
+    let inext = sort_int(b, BinOp::Add, ivb, index_const(1));
+    b.push(Stmt::Store(ii, inext));
+    b.terminate(Term::Goto(ins_head));
+
+    // base_next: advance to the next run.
+    b.cur = base_next;
+    let rsn = sort_int(b, BinOp::Add, run_start, index_const(SORT_INSERTION_THRESHOLD));
+    b.push(Stmt::Store(rs, rsn));
+    b.terminate(Term::Goto(base_head));
+
+    // Merge passes: while width < len, merge adjacent run pairs of `width` into `tmp`, copy back.
+    b.cur = merge_setup;
+    let ww = b.new_slot(i64_ty());
+    b.push(Stmt::Store(ww, index_const(SORT_INSERTION_THRESHOLD)));
+    let pass_head = b.new_block();
+    let pass_body = b.new_block();
+    let free_scratch = b.new_block();
+    b.terminate(Term::Goto(pass_head));
+
+    b.cur = pass_head;
+    let wv = sort_load(b, ww);
+    let pcond = sort_cmp(b, BinOp::Lt, wv, len.clone());
+    b.terminate(Term::Branch(pcond, pass_body, free_scratch));
+
+    b.cur = pass_body;
+    let width = sort_load(b, ww);
+    let lo = b.new_slot(i64_ty());
+    b.push(Stmt::Store(lo, index_const(0)));
+    let lo_head = b.new_block();
+    let lo_body = b.new_block();
+    let copyback = b.new_block();
+    b.terminate(Term::Goto(lo_head));
+
+    b.cur = lo_head;
+    let lov = sort_load(b, lo);
+    let lcond = sort_cmp(b, BinOp::Lt, lov, len.clone());
+    b.terminate(Term::Branch(lcond, lo_body, copyback));
+
+    b.cur = lo_body;
+    let lo_start = sort_load(b, lo);
+    let mid = {
+        let m = sort_int(b, BinOp::Add, lo_start.clone(), width.clone());
+        sort_min(b, m, len.clone())
+    };
+    let two_w = sort_int(b, BinOp::Mul, width.clone(), index_const(2));
+    let hi = {
+        let h = sort_int(b, BinOp::Add, lo_start.clone(), two_w.clone());
+        sort_min(b, h, len.clone())
+    };
+    // Merge arr[lo_start..mid] and arr[mid..hi] into tmp[lo_start..hi] (stable).
+    let mi = b.new_slot(i64_ty());
+    b.push(Stmt::Store(mi, lo_start.clone()));
+    let mj = b.new_slot(i64_ty());
+    b.push(Stmt::Store(mj, mid.clone()));
+    let mk = b.new_slot(i64_ty());
+    b.push(Stmt::Store(mk, lo_start.clone()));
+    let m_head = b.new_block();
+    let m_cmp = b.new_block();
+    let take_r = b.new_block();
+    let take_l = b.new_block();
+    let drain_l_head = b.new_block();
+    let drain_l_body = b.new_block();
+    let drain_r_head = b.new_block();
+    let drain_r_body = b.new_block();
+    let merge_done = b.new_block();
+    b.terminate(Term::Goto(m_head));
+
+    // m_head: while i < mid && j < hi.
+    b.cur = m_head;
+    let miv = sort_load(b, mi);
+    let mjv = sort_load(b, mj);
+    let ilt = sort_cmp(b, BinOp::Lt, miv, mid.clone());
+    let jlt = sort_cmp(b, BinOp::Lt, mjv, hi.clone());
+    let both = sort_cmp(b, BinOp::And, ilt, jlt);
+    b.terminate(Term::Branch(both, m_cmp, drain_l_head));
+
+    // m_cmp: take the right run only when key[j] < key[i] (strict → left-first on equal → stable).
+    b.cur = m_cmp;
+    let ci = sort_load(b, mi);
+    let cj = sort_load(b, mj);
+    let key_i = if has_keys { sort_read(b, &keys_val, ci.clone(), kty) } else { sort_read(b, &arr, ci.clone(), elem) };
+    let key_j = if has_keys { sort_read(b, &keys_val, cj.clone(), kty) } else { sort_read(b, &arr, cj.clone(), elem) };
+    let take_right = sort_cmp(b, BinOp::Lt, key_j, key_i);
+    b.terminate(Term::Branch(take_right, take_r, take_l));
+
+    b.cur = take_r;
+    sort_copy_step(b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mj, mk);
+    b.terminate(Term::Goto(m_head));
+
+    b.cur = take_l;
+    sort_copy_step(b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mi, mk);
+    b.terminate(Term::Goto(m_head));
+
+    // drain_l: copy the rest of the left run.
+    b.cur = drain_l_head;
+    let dli = sort_load(b, mi);
+    let dlc = sort_cmp(b, BinOp::Lt, dli, mid.clone());
+    b.terminate(Term::Branch(dlc, drain_l_body, drain_r_head));
+
+    b.cur = drain_l_body;
+    sort_copy_step(b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mi, mk);
+    b.terminate(Term::Goto(drain_l_head));
+
+    // drain_r: copy the rest of the right run.
+    b.cur = drain_r_head;
+    let drj = sort_load(b, mj);
+    let drc = sort_cmp(b, BinOp::Lt, drj, hi.clone());
+    b.terminate(Term::Branch(drc, drain_r_body, merge_done));
+
+    b.cur = drain_r_body;
+    sort_copy_step(b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mj, mk);
+    b.terminate(Term::Goto(drain_r_head));
+
+    // merge_done: advance to the next run pair (lo += 2*width).
+    b.cur = merge_done;
+    let lonext = sort_int(b, BinOp::Add, lo_start, two_w);
+    b.push(Stmt::Store(lo, lonext));
+    b.terminate(Term::Goto(lo_head));
+
+    // copyback: arr[k] = tmp[k] (and keys[k] = ktmp[k]) for k in 0..len — the pass result lands in
+    // arr so the next pass reads a fully-written source.
+    b.cur = copyback;
+    let cb = b.new_slot(i64_ty());
+    b.push(Stmt::Store(cb, index_const(0)));
+    let cb_head = b.new_block();
+    let cb_body = b.new_block();
+    let pass_next = b.new_block();
+    b.terminate(Term::Goto(cb_head));
+
+    b.cur = cb_head;
+    let cbv = sort_load(b, cb);
+    let cbc = sort_cmp(b, BinOp::Lt, cbv, len.clone());
+    b.terminate(Term::Branch(cbc, cb_body, pass_next));
+
+    b.cur = cb_body;
+    let cbi = sort_load(b, cb);
+    let te = sort_read(b, &tmp_val, cbi.clone(), elem);
+    b.push(Stmt::PtrStore(arr_ptr.clone(), cbi.clone(), te));
+    if has_keys {
+        let tk = sort_read(b, &ktmp_val, cbi.clone(), kty);
+        b.push(Stmt::PtrStore(keys_ptr.clone(), cbi.clone(), tk));
+    }
+    let cbn = sort_int(b, BinOp::Add, cbi, index_const(1));
+    b.push(Stmt::Store(cb, cbn));
+    b.terminate(Term::Goto(cb_head));
+
+    b.cur = pass_next;
+    let wn = sort_int(b, BinOp::Mul, width, index_const(2));
+    b.push(Stmt::Store(ww, wn));
+    b.terminate(Term::Goto(pass_head));
+
+    // free_scratch: shallow-spine free of the transient buffers (never `arr`, which is returned).
+    b.cur = free_scratch;
+    b.push(Stmt::DropValue(tmp_val));
+    if has_keys {
+        b.push(Stmt::DropValue(keys_val));
+        b.push(Stmt::DropValue(ktmp_val));
+    }
+    b.terminate(Term::Goto(done));
+
+    b.cur = done;
     arr
 }
 

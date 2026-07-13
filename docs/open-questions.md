@@ -2496,6 +2496,26 @@ every valid finding addressed. Disposition:
      cut") — report measured 547× vs Rust stable sort at 100k. Adopt: stable O(n log n) core +
      tiny-N insertion base case + `sort_by_key` decorate-sort-undecorate (keys computed N times,
      not per-comparison — inner comparisons currently recompute `key(arr[j])`).
+     **DONE (2026-07-13):** `lower_array_sort` rewritten as a **stable bottom-up merge sort**
+     (O(n log n)) with an insertion-sort base case for runs ≤ `SORT_INSERTION_THRESHOLD` (32).
+     Kept as **MIR expansion** rather than a runtime function on purpose: the comparison is already
+     polymorphic over every scalar *and* `str` key via `BinOp` lowering (`Lt`/`Gt` → `align_rt_str_cmp`),
+     so no per-type `align_rt_sort_*` matrix and — critically — **zero `align_runtime` changes**. It
+     runs in place over the collected buffer using one same-size heap scratch buffer `tmp` (each pass
+     merges `arr`→`tmp` then copies back, so the result always lands in `arr` and the caller's
+     drop/arena semantics are unchanged); scratch is transient `HeapAllocBuf` freed by shallow-spine
+     `DropValue` (the same discipline `group_by` uses, and correct for `str`-view keys, which are
+     Copy `{ptr,len}` borrows — the free never touches the pointed-to bytes). `sort_by_key` is now
+     true **decorate-sort-undecorate**: each key is computed exactly once into a parallel `keys`
+     buffer (carried alongside the elements through every move), replacing the old per-comparison
+     `key(arr[j])` recomputation. Stability comes from taking the left run first on equal keys
+     (insertion shifts only on strict `>`; merge takes the right run only on strict `<`).
+     Correctness net = `crates/align_driver/tests/sort_merge.rs` (random/sorted/reverse/duplicate/
+     all-equal/empty/single, the N = 31/32/33 base-case⇄merge boundaries, and stability in both the
+     insertion base case and through several merge passes; i64/f64/char/`str`-key). **Measured**
+     (100k pseudo-random i64, `--profile release`, this host): O(n²) main **≈ 1.08 s** →
+     merge-sort branch **≈ 9.7 ms** whole-program (identical generation) = **~111×**; isolating the
+     sort (subtracting the ~4.8 ms generation) ≈ **220×**.
   5. **tiny `par_map` cold start** — `par_pool()` is called BEFORE the single-chunk threshold
      check (`align_runtime` ~1469), so an 8-element map spawns the worker pool (~69 µs cold vs
      125 ns warm). Adopt: hoist the `count <= PAR_MIN_CHUNK` check above `par_pool()`; same for
