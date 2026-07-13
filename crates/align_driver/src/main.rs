@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
     check, emit_llvm_ir, emit_object_file, format_diagnostics, link_executable, lower_to_mir,
@@ -304,16 +305,74 @@ fn stem(path: &str) -> String {
         .unwrap_or_else(|| "a".to_string())
 }
 
+static ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// A process-private staging directory. `create_dir` is the atomic claim: a stale or racing path is
+/// skipped, and Drop removes only the directory this invocation successfully created.
+struct ArtifactStage {
+    dir: PathBuf,
+}
+
+impl ArtifactStage {
+    fn in_dir(parent: &Path, label: &str) -> std::io::Result<Self> {
+        for _ in 0..1024 {
+            let nonce = ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let dir = parent.join(format!(".{label}-{}-{stamp}-{nonce}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(Self { dir }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique artifact staging directory",
+        ))
+    }
+
+    fn temp(label: &str) -> std::io::Result<Self> {
+        Self::in_dir(&std::env::temp_dir(), label)
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for ArtifactStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Turn MIR into an object and link it into an executable. Returns the `exe` path. `profile` selects
 /// both the codegen pipeline and the link-time strip choice (one mechanism, `Profile`).
-fn build_to(path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarget, profile: Profile) -> Result<(), ExitCode> {
-    let obj = std::env::temp_dir().join(format!("align-{}.o", stem(path)));
+fn build_to(_path: &str, mir: &align_mir::Program, exe: &Path, target: BuildTarget, profile: Profile) -> Result<(), ExitCode> {
+    let object_stage = ArtifactStage::temp("align-object").map_err(|e| {
+        eprintln!("alignc: cannot create object staging directory: {e}");
+        ExitCode::FAILURE
+    })?;
+    let obj = object_stage.path().join("program.o");
     if let Err(e) = emit_object_file(mir, &obj, target, profile) {
         eprintln!("alignc: codegen failed: {e}");
         return Err(ExitCode::FAILURE);
     }
-    if let Err(e) = link_executable(&obj, exe, &mir.link_libs, profile) {
+    let parent = exe.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let output_stage = ArtifactStage::in_dir(parent, "align-publish").map_err(|e| {
+        eprintln!("alignc: cannot create executable staging directory: {e}");
+        ExitCode::FAILURE
+    })?;
+    let staged_exe = output_stage.path().join(exe.file_name().unwrap_or_else(|| std::ffi::OsStr::new("program")));
+    if let Err(e) = link_executable(&obj, &staged_exe, &mir.link_libs, profile) {
         eprintln!("alignc: {e}");
+        return Err(ExitCode::FAILURE);
+    }
+    if let Err(e) = std::fs::rename(&staged_exe, exe) {
+        eprintln!("alignc: cannot publish executable {}: {e}", exe.display());
         return Err(ExitCode::FAILURE);
     }
     Ok(())
@@ -337,7 +396,14 @@ fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profi
     let Some(mir) = front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
-    let exe = std::env::temp_dir().join(format!("align-{}", stem(path)));
+    let stage = match ArtifactStage::temp("align-run") {
+        Ok(stage) => stage,
+        Err(e) => {
+            eprintln!("alignc: cannot create run staging directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let exe = stage.path().join("program");
     if let Err(code) = build_to(path, &mir, &exe, target, profile) {
         return code;
     }

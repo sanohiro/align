@@ -8,7 +8,13 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **dynamic allocation-size C0 HARDENED**: `ArenaAlloc`, `HeapAllocBuf`,
+_Last updated: 2026-07-13, **artifact collision C0 FIXED**: production codegen objects live in
+per-invocation private temp directories, linked executables are staged beside their final path and
+atomically renamed only after success, and `run`/`size` retain private directories through use.
+Twelve concurrent same-basename run/build pairs plus eight size pairs pass; reverting either object
+or run staging to a shared name independently executes the wrong program. Deterministic diagnostics,
+reproducibility, and whole-program CAS remain open in document 10. Also this date,
+**dynamic allocation-size C0 HARDENED**: `ArenaAlloc`, `HeapAllocBuf`,
 and `SoaAlloc` now reject negative counts, checked multiply/add overflow, and byte results above the
 signed `i64` allocator ABI before allocator work. SoA uses an allocation-only checked offset walk,
 leaving ordinary column access unchanged. Raw/O2 gates pin negative/zero/largest-fitting/one-over,
@@ -64,9 +70,9 @@ Base64 SIMD backlog plus a new hex probe, macOS copy-path validation, HTTP batch
 and sequential SIMD compaction only if its selectivity matrix wins. No new syntax. Previous update:
 2026-07-12,
 **cache-first compilation/output-code audit RECORDED** in
-`docs/impl/10-cache-first-optimization.md` (implementation not started). New CONFIRMED P0: the
-production driver derives temporary object plus `run`/`size` executable names from basename only;
-concurrent different `main.align` builds were corrupted in 40/40 paired probes. The record makes
+`docs/impl/10-cache-first-optimization.md` (artifact collision fixed; determinism/CAS not started).
+At the audit baseline, basename-only temporary object plus `run`/`size` executable names corrupted
+concurrent different `main.align` builds in 40/40 paired probes; private staging now closes that defect. The record makes
 private staging + content-key identity + atomic publication the pre-M15 correctness slice, defines
 the staged CAS/interface-vs-implementation/runtime-link key contract and validation matrix, records
 diagnostic nondeterminism (`HashMap::keys()` const evaluation: 17 stderr orders across 24 fresh
@@ -472,10 +478,9 @@ remaining macOS full-suite failures are cataloged out-of-scope at adoption-recor
 (ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
 expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
 is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
-one is next available. **Next, pick one:** (a) cache-first C0
-— fix the confirmed basename-temp
-race with private staging + atomic publication and add determinism/concurrency gates (source of
-truth `docs/impl/10-cache-first-optimization.md`; MUST precede M15 parallel compilation); (b)
+one is next available. **Next, pick one:** (a) cache-first C0 continuation — stabilize independent
+constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth
+`docs/impl/10-cache-first-optimization.md`; MUST precede caching failed results); (b)
 parallel P1 — replace the per-element runtime thunk with the recorded whole-range kernel, then add
 the read-only capture context (source of truth `docs/impl/11-parallel-execution-optimization.md`); (c) the Codex wave-1 remainder — CONFIRMED bug
 1 (bench export roots: `emit-obj --export` mechanism,
