@@ -1,6 +1,7 @@
 //! `sort_by_key(f)` — materialize the surviving scalar elements and sort ascending by `f(element)`
-//! (`draft.md` §8). The key function may be named or a lambda (which may capture). Reuses the MIR
-//! insertion sort, comparing keys instead of elements.
+//! (`draft.md` §8). The key function may be named or a lambda (which may capture). Shares the MIR
+//! stable merge sort with `sort()`, precomputing each key once (decorate) and comparing keys instead
+//! of elements. The larger correctness/stability net lives in `sort_merge.rs`.
 
 
 mod common;

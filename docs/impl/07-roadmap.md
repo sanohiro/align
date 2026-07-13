@@ -2312,7 +2312,9 @@ TargetMachine + small/tiny `optsize`/`minsize` definition-only fn-attr sweep, di
 pinned to codegen=Default/no-attrs so the IR-shape suite stays byte-identical, release object
 bit-for-bit unchanged; the per-profile runtime variant + cache key is deferred to the M14
 runtime-bitcode slice + doc-10 §2 cache layer]**); **wave 2, quick wins** (O(n²)
-`sort`/`sort_by_key`, tiny-`par_map` pool-before-threshold cold start, zero-size arena 64 KiB
+`sort`/`sort_by_key` **[DONE 2026-07-13: stable bottom-up merge sort + insertion base case +
+decorate-sort-undecorate `sort_by_key` (keys computed once), all in MIR — record in
+`open-questions.md` item 4]**, tiny-`par_map` pool-before-threshold cold start, zero-size arena 64 KiB
 chunk, attribute-kind fail-loud + modern `captures(none)` emission **[DONE 2026-07-13: fail-loud
 `enum_kind_id` panic + `captures(none)` via the `captures` kind; the `llvm-as-22` textual
 round-trip follow-up above is RESOLVED — tool-gated gate added]**); **wave 3, measure-first** (JSON
