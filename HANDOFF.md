@@ -8,7 +8,30 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **Codex-audit wave-1 COMPLETE — the two remaining CONFIRMED bugs
+_Last updated: 2026-07-13, **Codex-audit wave-2 (quick wins) COMPLETE — #439 + #440 + #441
+MERGED** (three parallel worktree slices, gemini reflected before each merge; workspace
+**1931 green** + clippy clean on merged main). **#441 sort:** `lower_array_sort` rewritten as a
+stable bottom-up merge sort with an insertion base case (threshold 32), deliberately kept as MIR
+expansion — the comparison is already polymorphic over every scalar and `str` key via `BinOp` →
+`align_rt_str_cmp`, so no runtime type matrix; `sort_by_key` is true decorate-sort-undecorate
+(each key computed exactly once); measured **~220× on a 100k-element sort** (~1075 ms → ~4.9 ms
+sort-only); 11 new tests incl. stability and base-case⇄merge boundaries. **#440 attr hardening:**
+shared `enum_kind_id` fail-loud gate (panic — every attr name is a compiler-internal literal) +
+first-class `captures(none)` emission (raw CaptureInfo value 0, pinned to the LLVM 22.1.8
+`ModRef.h` encoding); **root cause of the recorded `emit-llvm | llvm-as-22` round-trip failure
+found and FIXED** — the removed `nocapture` name resolves to kind id 0 on LLVM 22 and prints as
+the un-reparseable `ptr none`; emitting `captures` directly restores the textual round-trip,
+pinned by a tool-gated `llvm-as` gate, so the roadmap M14 follow-up is resolved early. **#439
+runtime quick wins:** tiny `par_map` (≤ PAR_MIN_CHUNK) now runs on the caller before `par_pool()`
+ever spins up (pool non-initialization pinned via a test-only introspection hook), the identical
+shape fixed in `task_group` n=1, and zero-size arena allocs return an aligned dangling pointer
+with no chunk fetch (allocation-counter pinned). Operational note: after a merge that touches
+`align_runtime` sources, `cargo test` alone trips the deliberate `libalign_runtime.a` staleness
+guard (the `.a` refreshes only on `cargo build`) — run `cargo build --workspace` first; the 4
+apparent size/staging failures right after the wave-2 merges were exactly this, not regressions.
+Codex wave-2 is closed; remaining Codex items = wave-3 measure-first (JSON decode double-alloc,
+I/O buffer zero-fill) + the `bench/binary_size` port. Previous update: 2026-07-13,
+**Codex-audit wave-1 COMPLETE — the two remaining CONFIRMED bugs
 fixed, #437 + #438 MERGED** (both two-lens designed; gemini reviews reflected before merge;
 workspace **1914 green** + clippy clean on merged main, verified on the Linux/WSL2 host).
 **#437 profiles-reach-the-backend:** `Profile::codegen_opt_level()` (dev=None / release=Default /
@@ -504,16 +527,16 @@ is pinned unchanged by construction; the owed Linux full-suite re-verification i
 manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targets --
 -D warnings` clean** — the #427–#436 audit+fix wave (authored outside Claude Code; those PRs
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
-Linux. **Next, pick one** (Codex wave-1 is DONE 2026-07-13 — #426/#437/#438, see the _Last
-updated_ paragraph): (a) cache-first C0 continuation — stabilize independent
+Linux. **Next, pick one** (Codex waves 1+2 are DONE 2026-07-13 — #426/#437/#438 + #439/#440/#441, see
+the _Last updated_ paragraph): (a) cache-first C0 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth
 `docs/impl/10-cache-first-optimization.md`; MUST precede caching failed results); (b)
 parallel P1 — replace the per-element runtime thunk with the recorded whole-range kernel, then add
 the read-only capture context (source of truth `docs/impl/11-parallel-execution-optimization.md`);
 (c) the deferred
 `bench/binary_size` script port (small PR, adoption-record item 2 sub-item); (d) the M14 LTO ceiling
-probe rerun (procedure in the roadmap M14 section); (e) Codex wave-2 quick wins (O(n²) sort,
-tiny-`par_map` cold start, zero-size arena, attr-kind fail-loud + `captures(none)`). Reminder:
+probe rerun (procedure in the roadmap M14 section); (e) Codex wave-3 measure-first (JSON decode
+double-allocation, I/O buffer zero-fill — correctness tests first, throughput-gated). Reminder:
 gemini-code-assist reviews cease **2026-07-17**
 — after that, `/code-review` on the branch replaces the reflect-before-merge step.
 
