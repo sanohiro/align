@@ -2983,16 +2983,72 @@ fn mark_private_unnamed_addr<'c>(g: inkwell::values::GlobalValue<'c>) {
     g.set_unnamed_address(inkwell::values::UnnamedAddress::Global);
 }
 
-/// Add a named zero-valued enum attribute at `loc`.
+/// Resolve a named enum attribute to its LLVM kind id, **failing loudly** if this LLVM version does
+/// not recognize the name.
+///
+/// `Attribute::get_named_enum_kind_id` returns `0` for any name the linked LLVM does not know — a
+/// renamed, removed, or mistyped attribute (LLVM 22, for instance, removed the `nocapture`
+/// parameter attribute in favour of `captures(...)`, so `"nocapture"` now resolves to `0`). Kind
+/// `0` is not a usable attribute: `create_enum_attribute(0, _)` silently emits the wrong thing
+/// (inkwell's LLVM-22 printer renders it as the bare, un-reparseable `none` shorthand), which
+/// *drops* the optimization contract the attribute was meant to carry (`noalias` / `readonly` /
+/// `memory` / `captures`) — a silent miscompile.
+///
+/// Every `name` reaching here is a compiler-internal string literal (never user input), so an
+/// unknown name is a compiler build defect against the linked LLVM: input-independent — it would
+/// fail on *every* compilation, not for one particular program. That is an internal invariant
+/// violation, handled the way the rest of codegen handles them (`unreachable!` / `expect`): a loud
+/// panic naming the offending attribute, **not** a per-program [`CodegenError`] (which would falsely
+/// blame the user's source).
+fn enum_kind_id(name: &str) -> u32 {
+    let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
+    assert!(
+        kind != 0,
+        "codegen: LLVM does not recognize the enum attribute {name:?} (kind id 0) — it was renamed \
+         or removed in this LLVM version; emitting it would silently drop the attribute's \
+         optimization contract"
+    );
+    kind
+}
+
+/// Add a named zero-valued enum attribute at `loc`. Fails loudly (see [`enum_kind_id`]) if the
+/// attribute name is unknown to the linked LLVM.
 fn add_enum_attr<'c>(
     ctx: &'c Context,
     f: FunctionValue<'c>,
     loc: inkwell::attributes::AttributeLoc,
     name: &str,
 ) {
-    let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
-    f.add_attribute(loc, ctx.create_enum_attribute(kind, 0));
+    f.add_attribute(loc, ctx.create_enum_attribute(enum_kind_id(name), 0));
 }
+
+/// Add a named enum attribute carrying an integer `value` at `loc` — the valued form for attributes
+/// whose payload is a packed encoding (`memory(...)`, `captures(...)`). Same fail-loud kind-id
+/// resolution as [`add_enum_attr`].
+fn add_valued_enum_attr<'c>(
+    ctx: &'c Context,
+    f: FunctionValue<'c>,
+    loc: inkwell::attributes::AttributeLoc,
+    name: &str,
+    value: u64,
+) {
+    f.add_attribute(loc, ctx.create_enum_attribute(enum_kind_id(name), value));
+}
+
+/// The `captures(none)` parameter-attribute payload. LLVM 22 replaced the old `nocapture` parameter
+/// attribute with the richer `captures(...)` attribute (`llvm/Support/ModRef.h`): a `CaptureInfo` is
+/// a pair of `CaptureComponents` (Other, Ret) encoded as `(u32(Other) << 4) | u32(Ret)`
+/// (`CaptureInfo::toIntValue`). `captures(none)` = `CaptureInfo::none()` = both components
+/// `CaptureComponents::None` (`== 0`), so its encoded value is `(0 << 4) | 0` = `0`. Verified against
+/// the LLVM 22.1.8 headers (`/usr/lib/llvm-22/include/llvm/Support/ModRef.h`:
+/// `enum class CaptureComponents { None = 0, ... }` and `uint32_t CaptureInfo::toIntValue()`), and
+/// empirically: `LLVMCreateEnumAttribute(ctx, kind("captures"), 0)` prints `captures(none)`.
+///
+/// Emitting the modern attribute directly — rather than the removed `nocapture` name, which resolves
+/// to kind id `0` and only *looked* correct because inkwell's LLVM-22 printer renders it as the
+/// un-reparseable `none` shorthand — keeps the textual `emit-llvm | llvm-as-22` round-trip valid
+/// (the printer now emits the canonical `captures(none)` spelling `llvm-as-22` accepts).
+const CAPTURES_NONE: u64 = 0;
 
 /// Attributes shared by every allocator-family runtime declaration, verified per function:
 ///
@@ -3047,13 +3103,14 @@ fn mark_bump_alloc<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
 /// `Mod = 2` writes). `memory(argmem: read)` = ArgMem:Ref only = `1 << (0 * 2)` = `1`, every other
 /// location `NoModRef`. This encoding is version-sensitive (a location was added after LLVM 19;
 /// re-verified to print canonically on LLVM 22 at the 2026-07-12 upgrade), so
-/// `rt_contract_memory_argmem_read_prints_canonically` pins the emitted attribute's textual form —
+/// `rt_contract_attrs_pin_encoding_and_curation` pins the emitted attribute's textual form —
 /// an LLVM upgrade that shifts the bits fails that test loudly instead of silently miscompiling.
 const MEM_ARGMEM_READ: u64 = 1;
 
 /// The contract of one runtime declaration: which function-level valueless enum attributes it
 /// carries, its LLVM `memory(...)` effect bitmask (if any), and which pointer parameters are
-/// `readonly` + `nocapture` (the function only reads through them and never stores/returns them).
+/// `readonly` + `captures(none)` (the function only reads through them and never stores/returns
+/// them).
 struct RtContract {
     fn_attrs: &'static [&'static str],
     memory: Option<u64>,
@@ -3074,11 +3131,11 @@ fn rt_contract(sym: &str) -> Option<RtContract> {
     // `hash64`/`hash128` (align_runtime `align_rt_hash64`/`_hash128`): `wyhash` over `safe_slice`d
     // argument bytes — pure arithmetic, no allocation, no global reads/writes (`WY_SEED`/`WY_SECRET`
     // are `const`, baked into code, not memory), always terminates, returns a scalar/`{u64,u64}` and
-    // never stores the pointer. → `memory(argmem: read)` + pure-finite + `readonly nocapture` on ptr.
+    // never stores the pointer. → `memory(argmem: read)` + pure-finite + `readonly captures(none)` on ptr.
     // `str_eq`/`str_cmp`/`eq_ignore_case`/`starts_with`/`ends_with`: slice compare (`==`/`.cmp()`/
     // `eq_ignore_ascii_case`) over `safe_slice`d argument bytes → `memcmp`-class, argument memory
     // only, no globals, no feature-detect, returns an `i32`/`i64`. Same treatment; both ptr params
-    // (`0` and `2`) are `readonly nocapture`.
+    // (`0` and `2`) are `readonly captures(none)`.
     let memcmp_class = |params: &'static [u32]| RtContract {
         fn_attrs: PURE_READ,
         memory: Some(MEM_ARGMEM_READ),
@@ -3089,7 +3146,7 @@ fn rt_contract(sym: &str) -> Option<RtContract> {
     // `is_x86_feature_detected!` / memchr's runtime CPU-feature detection, which reads (and, on the
     // first call, writes) a process-global cache — non-argument memory. So `memory(...)` is WITHHELD
     // (an `argmem: read` / `read` claim would be a lie the first time). They keep the pure-finite
-    // flags and `readonly nocapture` params (all still true), just no memory-effects attribute.
+    // flags and `readonly captures(none)` params (all still true), just no memory-effects attribute.
     let feature_detect_reader = |params: &'static [u32]| RtContract {
         fn_attrs: PURE_READ,
         memory: None,
@@ -3143,15 +3200,20 @@ fn apply_rt_contract_attrs<'c>(ctx: &'c Context, module: &Module<'c>) {
             add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, a);
         }
         if let Some(mem) = c.memory {
-            let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("memory");
-            f.add_attribute(
-                inkwell::attributes::AttributeLoc::Function,
-                ctx.create_enum_attribute(kind, mem),
-            );
+            add_valued_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, "memory", mem);
         }
         for &p in c.read_ptr_params {
             add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Param(p), "readonly");
-            add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Param(p), "nocapture");
+            // `captures(none)`: the pointer's address/provenance never escapes (LLVM 22's `captures`
+            // replaces the removed `nocapture` — see `CAPTURES_NONE`). Emitting the modern attribute
+            // directly (value 0) keeps the `emit-llvm | llvm-as-22` textual round-trip valid.
+            add_valued_enum_attr(
+                ctx,
+                f,
+                inkwell::attributes::AttributeLoc::Param(p),
+                "captures",
+                CAPTURES_NONE,
+            );
         }
     }
 }
@@ -8346,19 +8408,21 @@ mod tests {
         // bitmask; a version bump can shift the bits. Assert it prints in canonical textual form so
         // an LLVM upgrade that changes the encoding fails HERE (loud), not silently. hash64 is the
         // clean pure-finite reader: `memory(argmem: read)` + the pure-finite flags + `readonly` +
-        // the no-capture attribute on its byte-pointer param.
+        // `captures(none)` on its byte-pointer param.
         //
-        // NOTE (LLVM 19 → 22 re-pin, 2026-07-12): LLVM 22 replaced the `nocapture` parameter
-        // attribute with `captures(...)` (an auto-upgrade of `nocapture` → `captures(none)`). The
-        // in-memory attribute is honored — the A8 optimization gate (`vectorize_shapes.rs`
-        // `a8_hash64_loop_invariant_hoist_enables_vectorization`) depends on exactly these
-        // contract attributes and passes — so object codegen is correct. inkwell 0.9's LLVM 22 text
-        // printer renders it as the shorthand `none` (which, oddly, does NOT round-trip through
-        // `llvm-as-22` — see the recorded follow-up); we pin that printed reality here. The `memory`
-        // and pure-finite spellings are unchanged from LLVM 19.
+        // NOTE (Codex audit item 9, 2026-07-13): the no-capture contract is now emitted as the modern
+        // `captures(none)` attribute (LLVM 22's replacement for the removed `nocapture`), via the
+        // `captures` kind id + value 0 (`CAPTURES_NONE`) — NOT the old `nocapture` name (which
+        // resolves to kind id 0 on LLVM 22 and only printed as the bare, un-reparseable `none`
+        // shorthand). This both fixes the `emit-llvm | llvm-as-22` textual round-trip (proven by the
+        // `emitted_ir_round_trips_through_llvm_as` gate in `align_driver`) and keeps the same
+        // optimization contract the A8 gate (`vectorize_shapes.rs`
+        // `a8_hash64_loop_invariant_hoist_enables_vectorization`) depends on. The canonical printed
+        // order is `ptr readonly captures(none)` (LLVM sorts param attrs by kind id: readonly=53 <
+        // captures=92). The `memory` and pure-finite spellings are unchanged.
         assert!(
-            out.contains("declare i64 @align_rt_hash64(ptr none readonly, i64)"),
-            "want the no-capture readonly attribute on hash64's ptr param:\n{out}"
+            out.contains("declare i64 @align_rt_hash64(ptr readonly captures(none), i64)"),
+            "want readonly + captures(none) on hash64's ptr param:\n{out}"
         );
         let hash_attrs = attr_group_of(&out, "align_rt_hash64");
         assert!(hash_attrs.contains("memory(argmem: read)"), "hash64 memory encoding drifted:\n{hash_attrs}");
@@ -8368,23 +8432,25 @@ mod tests {
         // hash128 shares the treatment.
         assert!(attr_group_of(&out, "align_rt_hash128").contains("memory(argmem: read)"));
 
-        // (2) The str compare/order family: same `memory(argmem: read)` + no-capture `readonly` on
-        // BOTH pointer operands (params 0 and 2). (`nocapture` prints as `none` on LLVM 22 — see (1).)
+        // (2) The str compare/order family: same `memory(argmem: read)` + `readonly captures(none)` on
+        // BOTH pointer operands (params 0 and 2).
         assert!(
-            out.contains("declare i32 @align_rt_str_cmp(ptr none readonly, i64, ptr none readonly, i64)"),
-            "want the no-capture readonly attribute on both str_cmp operands:\n{out}"
+            out.contains(
+                "declare i32 @align_rt_str_cmp(ptr readonly captures(none), i64, ptr readonly captures(none), i64)"
+            ),
+            "want readonly + captures(none) on both str_cmp operands:\n{out}"
         );
         assert!(attr_group_of(&out, "align_rt_str_cmp").contains("memory(argmem: read)"));
 
         // (3) The feature-detect readers (utf8_valid, memchr-backed str_find): pure-finite flags +
-        // no-capture `readonly` params, but memory is WITHHELD (their dispatch reads/writes a global
-        // CPU-feature cache — non-argument memory). (`nocapture` prints as `none` on LLVM 22 — see (1).)
+        // `readonly captures(none)` params, but memory is WITHHELD (their dispatch reads/writes a
+        // global CPU-feature cache — non-argument memory).
         let u = attr_group_of(&out, "align_rt_utf8_valid");
         assert!(u.contains("willreturn") && u.contains("nofree"), "utf8_valid keeps pure-finite flags:\n{u}");
         assert!(!u.contains("memory("), "utf8_valid must NOT claim a memory effect (feature-detect cache):\n{u}");
         assert!(
-            out.contains("declare i32 @align_rt_utf8_valid(ptr none readonly, i64)"),
-            "want the no-capture readonly attribute on utf8_valid's ptr:\n{out}"
+            out.contains("declare i32 @align_rt_utf8_valid(ptr readonly captures(none), i64)"),
+            "want readonly + captures(none) on utf8_valid's ptr:\n{out}"
         );
         let sf = attr_group_of(&out, "align_rt_str_find");
         assert!(!sf.contains("memory("), "str_find (memchr dispatch cache) must not claim a memory effect:\n{sf}");
@@ -8410,6 +8476,58 @@ mod tests {
             out.contains("declare void @align_rt_print_i64(i64)\n"),
             "an unlisted runtime declare must stay attribute-free:\n{out}"
         );
+    }
+
+    /// Semantic pin (Codex audit item 9): assert the no-capture contract as an *attribute-kind
+    /// query*, not a textual string match — the adoption record's "prefer semantic attr assertions
+    /// over full-declaration string pins where practical". The pointer param of a memcmp-class reader
+    /// must carry BOTH `readonly` and the modern `captures` attribute, and the `captures` payload must
+    /// be exactly `captures(none)` (encoded value 0 = `CAPTURES_NONE` = `CaptureInfo::none()`), so the
+    /// attribute is proven present and correct regardless of how LLVM chooses to *print* it.
+    #[test]
+    fn rt_contract_captures_none_is_present_by_kind_id() {
+        let mut d = Diagnostics::new();
+        let toks = tokenize(0, "fn main() -> i32 = 0\n", &mut d);
+        let f = parse_file(toks, &mut d);
+        let hir = check_file(&f, &mut d);
+        assert!(!d.has_errors());
+        let program = lower_program(&hir);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("align");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+        build_module(&ctx, &module, &program, &tm, None, &[]).unwrap();
+
+        let captures = inkwell::attributes::Attribute::get_named_enum_kind_id("captures");
+        let readonly = inkwell::attributes::Attribute::get_named_enum_kind_id("readonly");
+        assert_ne!(captures, 0, "LLVM must recognize the `captures` attribute");
+        // Document the exact LLVM-22 regression this hardening fixes: the removed `nocapture` name
+        // resolves to kind id 0 (an unusable no-op), which is why we emit `captures` instead.
+        assert_eq!(
+            inkwell::attributes::Attribute::get_named_enum_kind_id("nocapture"),
+            0,
+            "LLVM 22 removed `nocapture` (kind id 0) — the reason item 9 emits `captures` directly"
+        );
+
+        let hash64 = module.get_function("align_rt_hash64").expect("hash64 declared");
+        let p0 = inkwell::attributes::AttributeLoc::Param(0);
+        assert!(hash64.get_enum_attribute(p0, readonly).is_some(), "hash64 ptr param must be readonly");
+        let cap = hash64.get_enum_attribute(p0, captures).expect("hash64 ptr param must carry captures");
+        assert_eq!(
+            cap.get_enum_value(),
+            CAPTURES_NONE,
+            "the captures payload must be captures(none) (encoded value 0)"
+        );
+    }
+
+    /// Fail-loud pin (Codex audit item 9): resolving an attribute name LLVM does not recognize must
+    /// panic, never silently no-op. A bogus name is version-robust — it resolves to kind id 0 on
+    /// every LLVM — so this proves `enum_kind_id` (the shared gate under `add_enum_attr` /
+    /// `add_valued_enum_attr`) rejects the whole class of renamed/removed/typo'd attributes.
+    #[test]
+    #[should_panic(expected = "does not recognize the enum attribute")]
+    fn enum_kind_id_panics_on_unknown_attribute() {
+        let _ = enum_kind_id("definitely_not_a_real_llvm_attribute");
     }
 
     #[test]

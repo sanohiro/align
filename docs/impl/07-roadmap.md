@@ -2225,15 +2225,21 @@ IR-verified-equivalent shapes (no Align codegen regression):
    at v2 and for materialize loops). The suite now keys reductions on the block-name- and
    init-noise-independent signals: the mangled reduce intrinsic (`llvm.vector.reduce.<op>.v<N>i64`)
    + `vector.ph`.
-3. **`nocapture` → `captures(none)` param attribute.** LLVM 22 auto-upgrades `nocapture`; inkwell
-   0.9's text printer renders it as the shorthand `none`. The in-memory attribute is honored (the
-   A8 hoist+vectorize gate depends on it and passes), so object codegen is correct; the
-   `rt_contract` textual pin was re-pinned to `ptr none readonly`.
+3. **`nocapture` → `captures(none)` param attribute.** LLVM 22 removed the `nocapture` parameter
+   attribute in favour of `captures(...)`. The no-capture contract is now emitted **directly** as
+   `captures(none)` (the `captures` kind id 92 + value 0, pinned against `llvm/Support/ModRef.h`) —
+   see Codex audit item 9 (`docs/open-questions.md`). The A8 hoist+vectorize gate depends on the
+   contract and passes; the `rt_contract` pin is the canonical `ptr readonly captures(none)`.
 
-Known follow-up (not a blocker): the `none` shorthand does **not** round-trip through `llvm-as-22`
-(`alignc emit-llvm` output can't be re-parsed by the LLVM 22 text tools on runtime declares) — this
-was a valid round-trip on LLVM 19. Revisit when the M14 bitcode/ThinLTO boundary needs textual IR
-interchange; consider emitting the modern `captures(none)` form or `-o .bc` directly.
+Known follow-up: ~~the `none` shorthand does not round-trip through `llvm-as-22`~~ **RESOLVED
+(2026-07-13, Codex audit item 9).** The broken round-trip had a concrete cause: the pre-fix code
+emitted the *removed* `nocapture` name, which `get_named_enum_kind_id` resolves to kind id `0` on
+LLVM 22, so `create_enum_attribute(0, 0)` produced the bare, un-reparseable `ptr none` shorthand.
+Emitting the modern `captures(none)` attribute directly makes the printer emit
+`ptr readonly captures(none)`, which `llvm-as-22` accepts — proven by the tool-gated gate
+`align_driver::tests/llvm_as_roundtrip::emitted_ir_round_trips_through_llvm_as` (feeds `alignc
+emit-llvm` output to `llvm-as` and asserts it assembles). The textual `emit-llvm | llvm-as-22` dev
+path is no longer broken; the M14 bitcode/ThinLTO boundary no longer inherits this as a caveat.
 
 ## Post-upgrade wave (M14 candidates, in order — bitcode compatibility dictates the sequence)
 
@@ -2307,8 +2313,9 @@ pinned to codegen=Default/no-attrs so the IR-shape suite stays byte-identical, r
 bit-for-bit unchanged; the per-profile runtime variant + cache key is deferred to the M14
 runtime-bitcode slice + doc-10 §2 cache layer]**); **wave 2, quick wins** (O(n²)
 `sort`/`sort_by_key`, tiny-`par_map` pool-before-threshold cold start, zero-size arena 64 KiB
-chunk, attribute-kind fail-loud + modern `captures(none)` emission — the latter likely also
-fixes the `llvm-as-22` textual round-trip follow-up above); **wave 3, measure-first** (JSON
+chunk, attribute-kind fail-loud + modern `captures(none)` emission **[DONE 2026-07-13: fail-loud
+`enum_kind_id` panic + `captures(none)` via the `captures` kind; the `llvm-as-22` textual
+round-trip follow-up above is RESOLVED — tool-gated gate added]**); **wave 3, measure-first** (JSON
 decode double-allocation, I/O buffer zero-fill). Doc-debt items ride along with their slices.
 
 ## M15 — Separate compilation (multi-module compilation units) — OWNER-MANDATED 2026-07-12
