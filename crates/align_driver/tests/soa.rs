@@ -125,7 +125,7 @@ fn the_compiled_object_exports_the_kernel() {
     let mir = lower_to_mir(&checked.hir);
     let dir = std::env::temp_dir();
     let obj = dir.join(format!("align-soa-{}.o", std::process::id()));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release).expect("codegen");
+    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[]).expect("codegen");
     assert!(obj.exists());
     let _ = std::fs::remove_file(&obj);
 }

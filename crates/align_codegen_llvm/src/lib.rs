@@ -245,14 +245,20 @@ fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result
 
 /// Write the program as an object file.
 ///
+/// `exports` names the program functions (matched against `Function::name`, NOT the LLVM-symbol
+/// `main`/`align_main` split) that keep `external` linkage instead of the default whole-program
+/// `internal` (M13 Slice 1) — the explicit export-roots mechanism (`emit-obj --export`,
+/// `docs/impl/07-roadmap.md` M13 Codex-audit item 1). Empty = every program function stays
+/// internal, today's default behavior.
+///
 /// Creates exactly one `TargetMachine` for the whole compile and threads it through both
 /// `build_module` (data layout / triple / ABI classification) and `write_object` (optimization +
 /// object emission), so the two stages always agree on the same target settings.
-pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile: Profile) -> Result<(), CodegenError> {
+pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile: Profile, exports: &[String]) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
     let tm = create_target_machine(target, profile.codegen_opt_level())?;
-    build_module(&ctx, &module, program, &tm, None)?;
+    build_module(&ctx, &module, program, &tm, None, exports)?;
     // Size profiles get their `optsize`/`minsize` sweep here — object path only, so the diagnostic
     // lenses (`emit_llvm_ir` / `collect_opt_remarks`) see a byte-identical module structure.
     apply_size_attrs(&ctx, &module, profile);
@@ -266,15 +272,18 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile:
 /// `-O2` middle-end pipeline `write_object` uses (via [`run_opt_pipeline`]) before printing, so the
 /// output is "what LLVM did" — inlined lambdas, fused loops, vectorized `<N x T>` bodies.
 ///
+/// `exports` is the same export-roots list as [`emit_object`] (external linkage instead of
+/// `internal`); empty = every program function stays internal.
+///
 /// Creates exactly one `TargetMachine` for the whole call and reuses it for both `build_module`
 /// and (when `optimized`) the opt pipeline.
-pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool) -> Result<String, CodegenError> {
+pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, exports: &[String]) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
     // Diagnostic lens: codegen opt pinned to `Default` (no size attrs, pipeline `O2` below) so the
     // IR-shape suite stays profile-independent and byte-identical.
     let tm = create_target_machine(target, OptimizationLevel::Default)?;
-    build_module(&ctx, &module, program, &tm, None)?;
+    build_module(&ctx, &module, program, &tm, None, exports)?;
     if optimized {
         run_opt_pipeline(&module, &tm, "default<O2>")?;
     }
@@ -323,7 +332,7 @@ pub fn collect_opt_remarks(
     // `sink` is freed.
     let _detach_guard = DiagnosticHandlerGuard { ctx: ctx.raw() };
 
-    let built = build_module(&ctx, &module, program, &tm, Some(debug));
+    let built = build_module(&ctx, &module, program, &tm, Some(debug), &[]);
     let ran = built.and_then(|()| run_opt_pipeline(&module, &tm, "default<O2>"));
 
     drop(_detach_guard);
@@ -423,6 +432,7 @@ fn build_module<'c>(
     program: &Program,
     tm: &TargetMachine,
     debug: Option<&DebugInfo>,
+    exports: &[String],
 ) -> Result<(), CodegenError> {
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -519,7 +529,7 @@ fn build_module<'c>(
     // generated after the bodies (see below).
     let mut funcs: HashMap<String, FunctionValue<'c>> = HashMap::new();
     for f in &program.fns {
-        let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types, &enum_types, &tuple_types);
+        let fv = declare_fn(ctx, module, f, symbol_name(f), &struct_types, &enum_types, &tuple_types, exports);
         funcs.insert(f.name.clone(), fv);
     }
     // A by-value struct in an `extern "C"` signature uses the SysV AMD64 register ABI, which we
@@ -2863,6 +2873,10 @@ fn int_bits(ty: Ty) -> u32 {
     }
 }
 
+// The type-table + `exports` parameters are each independently threaded through from `build_module`
+// (no natural grouping struct exists yet for "the type tables"); splitting them into a bag-of-fields
+// struct would obscure more than it clarifies for a single call site.
+#[allow(clippy::too_many_arguments)]
 fn declare_fn<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
@@ -2871,6 +2885,7 @@ fn declare_fn<'c>(
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
     tuple_types: &[StructType<'c>],
+    exports: &[String],
 ) -> FunctionValue<'c> {
     // Structs / struct-arrays / tuples pass and return by value as their aggregate LLVM type
     // (`abi_type` covers scalars + Option/Result/slice/str).
@@ -2895,11 +2910,20 @@ fn declare_fn<'c>(
     };
     let fv = module.add_function(symbol, fn_ty, None);
     mark_nounwind(ctx, fv);
-    // Every Align program function is module-private (internal) EXCEPT the C entry: a `()`-returning
-    // `main` keeps the symbol name `main` and IS the C entry (`crt0` resolves it by name), so it must
-    // stay external. A `Result`-returning `main` is emitted as `align_main` here (internal) and its
-    // external C `main` wrapper is generated separately. No other function is named `main`.
-    if symbol != "main" {
+    // Every Align program function is module-private (internal) EXCEPT:
+    //  - the C entry: a `()`-returning `main` keeps the symbol name `main` and IS the C entry
+    //    (`crt0` resolves it by name), so it must stay external. A `Result`-returning `main` is
+    //    emitted as `align_main` here (internal) and its external C `main` wrapper is generated
+    //    separately. No other function is named `main`. This check is keyed on `symbol` (the
+    //    LLVM name), not `f.name` — `--export main` must not accidentally make `align_main`
+    //    external.
+    //  - an explicit export root (`emit-obj`/`emit-llvm --export <name>`, M13 Codex-audit item
+    //    1): keyed on `f.name` (the source-level function name), so the caller names what it
+    //    wrote, not an internal codegen symbol. Exporting a function makes it BOTH a linker-
+    //    visible external symbol AND a DCE root in the same step (`external` linkage keeps LLVM's
+    //    `globaldce`/`internalize`-style passes from ever considering it dead), so linkage and
+    //    "what stays reachable" always agree.
+    if symbol != "main" && !exports.contains(&f.name) {
         mark_internal(fv);
     }
     fv
@@ -2919,11 +2943,14 @@ fn mark_nounwind<'c>(ctx: &'c Context, f: FunctionValue<'c>) {
 /// imported user module) into ONE LLVM module and ONE object file: `pub` is a sema-level *module*
 /// visibility that is fully resolved by name-mangling before codegen, and there is no separate
 /// compilation or C-ABI export of Align function bodies (see `align_sema` note near the `map_into`
-/// `noalias` derivation). Therefore the only definition the linker/runtime must resolve by name is
-/// the C entry `main`; every other emitted definition is module-private, so we give it the tightest
-/// linkage that still lets its address escape to the runtime when needed. This unlocks LLVM
-/// IPO/DCE/inlining and `constmerge`. `external` is kept ONLY for `main` and for the undefined
-/// `declare`s (runtime `align_rt_*` + `extern "C"` FFI) — an undefined symbol cannot be internal.
+/// `noalias` derivation). Therefore the only *program* definition the linker/runtime must resolve
+/// by name is the C entry `main`, plus whatever the caller names as an explicit export root
+/// (`emit-obj`/`emit-llvm --export`, M13 Codex-audit item 1) — e.g. a benchmark kernel or FFI
+/// library with no `main`. Every other emitted definition is module-private, so we give it the
+/// tightest linkage that still lets its address escape to the runtime when needed. This unlocks
+/// LLVM IPO/DCE/inlining and `constmerge`. `external` is kept ONLY for `main`, export roots, and
+/// the undefined `declare`s (runtime `align_rt_*` + `extern "C"` FFI) — an undefined symbol cannot
+/// be internal.
 ///
 /// `internal`: an Align *program* function body — module-local, but the name is kept (harmless).
 fn mark_internal<'c>(f: FunctionValue<'c>) {
@@ -7851,7 +7878,7 @@ mod tests {
         let f = parse_file(toks, &mut d);
         let hir = check_file(&f, &mut d);
         assert!(!d.has_errors());
-        emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false).unwrap()
+        emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false, &[]).unwrap()
     }
 
     // -- Build profiles reach the backend (Codex audit item 3) ------------------------------------
@@ -7882,7 +7909,7 @@ mod tests {
         let ctx = Context::create();
         let module = ctx.create_module("align");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
-        build_module(&ctx, &module, &program, &tm, None).unwrap();
+        build_module(&ctx, &module, &program, &tm, None, &[]).unwrap();
         apply_size_attrs(&ctx, &module, profile);
 
         let optsize = inkwell::attributes::Attribute::get_named_enum_kind_id("optsize");
@@ -7974,7 +8001,7 @@ mod tests {
             enums: vec![],
             tuples: vec![],
         };
-        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized).unwrap()
+        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[]).unwrap()
     }
 
     fn function_body<'a>(ir: &'a str, name: &str) -> &'a str {
@@ -8018,7 +8045,7 @@ mod tests {
             enums: vec![],
             tuples: vec![],
         };
-        emit_llvm_ir(&program, &BuildTarget::Baseline, false).unwrap()
+        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[]).unwrap()
     }
 
     fn soa_allocation_case_ir(len: Operand, row: StructDef, optimized: bool) -> String {
@@ -8059,7 +8086,7 @@ mod tests {
             enums: vec![],
             tuples: vec![],
         };
-        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized).unwrap()
+        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[]).unwrap()
     }
 
     #[test]

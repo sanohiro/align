@@ -54,7 +54,7 @@ fn tiny_profile_strips_and_stays_runnable() {
     let pid = std::process::id();
     let obj = dir.join(format!("align-macho-tiny-{pid}.o"));
     let exe = dir.join(format!("align-macho-tiny-{pid}"));
-    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Tiny).expect("codegen");
+    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Tiny, &[]).expect("codegen");
     link_executable(&obj, &exe, &mir.link_libs, Profile::Tiny).expect("link + strip");
     let out = std::process::Command::new(&exe).output().expect("run stripped binary");
     let _ = std::fs::remove_file(&obj);

@@ -138,15 +138,32 @@ pub fn collect_opt_remarks(
 
 /// Write MIR out to an object file (codegen). `target` selects the CPU baseline (portable default
 /// vs. host-`native`); `profile` selects the middle-end pipeline (`default<O0|O2|O3|Os|Oz>`).
-pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile) -> Result<(), String> {
-    align_codegen_llvm::emit_object(mir, obj, &target, profile).map_err(|e| e.to_string())
+/// `exports` are the explicit export roots (`emit-obj --export`, M13 Codex-audit item 1): the
+/// program-function names (matched against source-level `Function::name`, validate with
+/// [`unknown_exports`] first) that keep `external` linkage instead of the default whole-program
+/// `internal`. Empty for every caller except `emit-obj`/`emit-llvm`.
+pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile, exports: &[String]) -> Result<(), String> {
+    align_codegen_llvm::emit_object(mir, obj, &target, profile, exports).map_err(|e| e.to_string())
 }
 
 /// MIR to LLVM IR text (`alignc emit-llvm`). `optimized` picks the lens: `false` (`--stage raw`)
 /// prints what codegen emitted; `true` (`--stage optimized`) runs the `-O2` pipeline first, so the
-/// output shows what LLVM actually did (inlined, fused, vectorized).
-pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, optimized: bool) -> Result<String, String> {
-    align_codegen_llvm::emit_llvm_ir(mir, &target, optimized).map_err(|e| e.to_string())
+/// output shows what LLVM actually did (inlined, fused, vectorized). `exports` is the same
+/// export-roots list as [`emit_object_file`].
+pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, optimized: bool, exports: &[String]) -> Result<String, String> {
+    align_codegen_llvm::emit_llvm_ir(mir, &target, optimized, exports).map_err(|e| e.to_string())
+}
+
+/// The names in `exports` that do not match any function in `mir` (by [`align_mir::Function::name`]).
+/// Empty ⇒ every requested export root resolves. The fail-closed seam for `--export <name>`: an
+/// unknown name must be a hard, listed error (`alignc: unknown export(s): …`), never a silent no-op
+/// (a typo'd export name would otherwise compile a wrong object with no diagnostic at all).
+pub fn unknown_exports<'a>(mir: &align_mir::Program, exports: &'a [String]) -> Vec<&'a str> {
+    exports
+        .iter()
+        .filter(|name| !mir.fns.iter().any(|f| &f.name == *name))
+        .map(String::as_str)
+        .collect()
 }
 
 /// Link an object into an executable. Uses the system C compiler (`cc`); crt0 calls
