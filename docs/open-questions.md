@@ -2500,9 +2500,31 @@ every valid finding addressed. Disposition:
      check (`align_runtime` ~1469), so an 8-element map spawns the worker pool (~69 µs cold vs
      125 ns warm). Adopt: hoist the `count <= PAR_MIN_CHUNK` check above `par_pool()`; same for
      `task_group` n=1.
+     **DONE (2026-07-13):** `align_rt_par_map` now checks `count <= PAR_MIN_CHUNK` and runs the
+     whole map on the caller *before* calling `par_pool()`, so a tiny map never touches the global
+     pool (the pre-existing `nchunks <= 1` fallback stays, reached only when a degenerate worker
+     count still collapses a bigger-than-threshold `count` to one chunk). `align_rt_tg_wait` gets
+     the same treatment: `par_pool()` is now called only when `n > 1` (`workers.min(n - 1)` is
+     always 0 for `n == 1`, so a single-task group never needed the pool either — confirmed by
+     reading the code, not just the report). Regression-pinned by a same-process correctness sweep
+     across the threshold boundary (`par_map_correct_across_threshold_boundary`) plus a
+     process-isolated integration test (`tests/par_map_cold_start.rs`) that checks a new test-only
+     introspection hook (`align_rt_test_par_pool_initialized`, not part of the FFI surface) stays
+     `false` through both the tiny `par_map` and the single-task `task_group`, then confirms it
+     flips `true` once a workload actually crosses the threshold (so the assertions above are not
+     vacuous).
   6. **zero-size arena alloc** can take a fresh 64 KiB zeroed chunk (`CHUNK = 64*1024`,
      `align_runtime` ~7095). Adopt: size-0 fast path returning a canonical dangling pointer,
      allocation-counter test. Distinct from the REJECTED arena pool+re-zero — do not conflate.
+     **DONE (2026-07-13):** `Arena::alloc` now takes a `size == 0` fast path that returns `align`
+     itself (already normalized to a nonzero power of two) cast to a pointer — non-null, trivially
+     aligned, and read/written through only in the sense that it never is (a 0-byte allocation
+     carries no bytes) — without fetching a chunk or advancing the bump cursor. Distinct from the
+     rejected "arena pool + re-zero" idea: no chunk memory is ever reused or pooled, none is
+     allocated at all for a 0-byte request. Regression-pinned by
+     `arena_alloc_zero_size_never_grows_chunk_count` (many size-0 allocations at several alignments
+     keep the chunk count at zero, interleaved with a real allocation to confirm the fast path
+     doesn't corrupt subsequent bump-allocator state).
 - **Measure-first adoptions (direction yes, gated on numbers):**
   7. **JSON decode double allocation** (Rust `Vec` → `align_rt_alloc` → memcpy, runtime
      ~2317/~2624). Direction adopted (C-owned growable buffer / exact-count direct decode) but
