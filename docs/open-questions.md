@@ -2676,6 +2676,13 @@ driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Dis
   measured win surface is narrow (per-element string/hash wrappers only; the numeric core
   already vectorizes with zero in-loop FFI). M14 Slice 1 = a wall-clock ceiling probe
   (≥ 1.15× or record-and-close both items); PGO keeps its place in the order.
+  **Probe RESULT 2026-07-13 (full record + tables = roadmap "M14 Slice 1 probe RESULT"): ABOVE
+  GATE → proceed to Slice 2.** Median-of-7 over ~1M short strings (znver3, LLVM 22.1.8): `str_eq`
+  2.12× (a genuine LTO-visibility win — inlined + constant-target length fast-path fold; holds at
+  generic codegen 2.35×), `hash64` 1.63× native but 1.02× generic (win is native-runtime-tuning
+  only, cheaper via a per-target-cpu runtime `.a`), `str_cmp` 0.72× (LTO REGRESSES it — the
+  per-symbol `rt_contract` guard is mandatory), numeric control 1.00×; link+reopt ≈ 0.25 s. Slice 2
+  re-scoped to the inlinable fast-path string primitives, per-symbol guarded.
 - **REJECTED (do not re-litigate; reasons):** NaN boxing / general SSO / runtime string interning
   (representation branches + hidden state vs the settled type splits); automatic AoS↔SoA
   conversion (hidden bulk data movement); deterministic map iteration as a default contract

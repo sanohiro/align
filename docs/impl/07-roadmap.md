@@ -2289,6 +2289,51 @@ runtime staleness check; fail-loud fallback to the `.a` path on unparseable bitc
 in-loop call-absence IR shape (mutation-checked both directions) + `bench/binary_size` guard +
 an explicit compile-time-regression bound.
 
+**M14 Slice 1 probe RESULT — ABOVE GATE (2026-07-13; proceed to Slice 2, re-scoped below).**
+Ran on WSL2 / AMD Zen 3 (znver3), LLVM 22.1.8 (`opt-22`/`llc-22`/`llvm-link-22`/`llvm-as-22`),
+rustc 1.96 runtime bitcode (LLVM 22.1.x). **Round-trip repair confirmed:** `alignc emit-llvm
+--stage optimized | llvm-as-22` round-trips cleanly (the #440 `captures(none)` fix), so the
+straightforward pipeline was used with NO `ptr none` sed workaround. Kernels (no-`main` object,
+`--export`ed, driven by a Rust harness over ~1M short strings, alternating-min timing, ratio =
+shipped-`.a` / LTO, >1 = LTO faster): `eq_count` = `s.where(x == "hello").count`, `lt_count` =
+`s.where(x < "mmmmmmmm").count` (`Ord(str)`/`str_cmp`), `hash64_sum` = `s.map(hash64).sum`, plus the
+numeric `sum_sq_pos` non-regression control. Pipeline: `emit-llvm --stage optimized` (native) →
+`llvm-as` → `llvm-link-22` with the release `align_runtime.bc` **and** `align_hash.bc` (so `wyhash`
+is inlinable, giving `hash64` its best shot) → `opt-22 -passes="internalize,default<O2>"` keeping the
+export set → `llc-22 -O2`. **Baseline = the shipped path** (native `emit-obj` kernels + the generic
+release `libalign_runtime.a` — there is no `-Ctarget-cpu` anywhere, so the shipped runtime is generic
+x86-64; the driver links exactly this `.a`). Compile-time cost of link+reoptimize+`llc` over the full
+runtime `.bc` ≈ **0.25 s** (small). Median of 7 runs, N=1M, 300 rounds each:
+
+```text
+                LTO native (= real Slice-2)      LTO generic codegen (isolates pure
+kernel          median  best   worst             LTO-visibility, no native tuning)
+str_eq           2.119  2.140  2.095             2.353   ← ABOVE gate, robust
+str_cmp          0.717  0.723  0.708             0.757   ← LTO REGRESSES it
+hash64           1.631  1.642  1.624             1.017   ← win is native-tuning ONLY
+sum_sq_pos       1.000  1.012  0.997             (n/a — generic de-vectorizes control)
+```
+
+**Verdict: gate cleared** (`str_eq` ≥ 1.15× robustly, 2.1×). Decomposition (the generic column
+splits the two effects the LTO mechanism bundles — cross-module inlining vs native-recompiling the
+runtime primitive): (a) **`str_eq` is a genuine LTO-visibility win** — IR-confirmed: `align_rt_str_eq`
+inlines into the loop and the compile-time-constant target's length (5) folds into an inline `icmp
+len, 5` fast path, so the majority (length≠5) elements are rejected with zero call/`bcmp`; it holds
+even at generic codegen (2.35×). *Caveat: it leans on a constant-length target (the idiomatic `x ==
+"literal"` filter); a runtime target keeps only call-overhead removal.* (b) **`hash64`'s win is purely
+native-runtime-tuning** (1.63× native vs 1.02× generic) — `wyhash` stays real per-element work, so LTO
+visibility buys nothing; this win is equally (and more cheaply) captured by shipping a per-target-cpu
+runtime `.a`, no bitcode plumbing. (c) **`str_cmp` REGRESSES under the post-link `default<O2>`
+(~0.72×)** — hard evidence that Slice 2's `rt_contract` per-symbol xor split + `binary_size`/IR-shape
+gates are NOT optional: a blanket merge would ship this regression. (d) control `sum_sq_pos` = 1.000×
+confirms the pipeline is non-regressing on the already-saturated numeric core (zero in-loop runtime
+calls — nothing for LTO to do). **Consequent (Slice 2, re-scoped by this probe):** build it, but
+scope the trivial-primitive bitcode set to the **inlinable fast-path string primitives** (`str_eq`
+and its kin — `starts/ends_with`, `eq_ignore_case`, `utf8_valid`), **per-symbol guarded** so
+`str_cmp`'s regression is excluded; do NOT chase `hash64` through LTO — pursue its native-tuning win
+via the deferred **per-target-cpu runtime variant + cache key** (already parked on this slice), the
+cheaper lever. PGO/BOLT sequencing unchanged.
+
 **PGO stays sequenced after — do NOT reorder it ahead on "LTO is thin" grounds:** its
 block-layout/hot-cold-split win is already MOOT per M13 Slice V (`noreturn` attrs make fail
 edges cold; a real `!prof` prototype was byte-identical and reverted); instrument PGO is
