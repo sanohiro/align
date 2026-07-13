@@ -3,7 +3,8 @@
 Status: **RECORDED 2026-07-13; partially implemented 2026-07-13.** Post-`where` callable execution
 (§3.1) is corrected and ordinary sequential effects are settled (§3.2). The spawn-capture lifetime
 gap (§3.3), closure-result environment region gap (§3.4), Unit indirect-call ABI defect (§3.5), and
-buffered `io.copy` data loss (§3.6) are also fixed and regression-pinned; the other
+buffered `io.copy` data loss (§3.6), and dynamic allocation byte arithmetic (§3.7) are also fixed
+and regression-pinned; the other
 correctness and performance items remain open. This is the durable follow-up to
 [`10-cache-first-optimization.md`](10-cache-first-optimization.md) and
 [`11-parallel-execution-optimization.md`](11-parallel-execution-optimization.md); the corrective
@@ -57,8 +58,9 @@ come before further SIMD or parallel widening:
 5. ~~`io.copy` read the fd directly and skipped bytes already held in a buffered reader's
    lookahead.~~ **FIXED 2026-07-13.**
 
-Separately, generated dynamic allocation byte counts use unchecked signed multiply/add. A concrete
-safe-source exploit was not established, so this is **REQUIRED hardening**, not a confirmed P0.
+6. ~~Generated dynamic allocation byte counts used unchecked signed multiply/add.~~ **HARDENED
+   2026-07-13:** heap, arena, and SoA allocation paths reject negative counts, checked-operation
+   overflow, and results above the signed allocator ABI maximum before allocator work.
 
 After those are closed, the highest-value performance refinements from this audit are:
 
@@ -340,7 +342,7 @@ shared writer path and returned byte total are unchanged. The regression test us
 consumes the first line, then proves that copy returns `5` and writes exactly `CDEFG`. Any future
 sendfile/splice path must retain the same precondition: it may start only after lookahead is empty.
 
-### 3.7 REQUIRED HARDENING — check allocation byte arithmetic before allocator work
+### 3.7 HARDENED 2026-07-13 — checked allocation byte arithmetic before allocator work
 
 Codegen currently forms byte sizes with ordinary signed LLVM multiply/add for `ArenaAlloc`,
 `HeapAllocBuf`, and `SoaAlloc` before passing the result to the runtime
@@ -350,11 +352,19 @@ assumes the returned buffer covers the original count. Most safe producers are b
 source allocation, but unsafe/FFI lengths and widening output types make that an observation, not a
 proof.
 
-Reject a negative signed count first, then use checked unsigned `count * stride` and checked
-aligned-add, with a cold abort before allocation on overflow. The runtime parallel-map allocation
-already demonstrates checked multiplication. Pin the
-largest fitting count, one-over-limit, widening element size, SoA padding overflow, and zero-count
-cases before changing arena initialization policy.
+Codegen now rejects a negative signed count, uses `llvm.umul.with.overflow` /
+`llvm.uadd.with.overflow`, and separately rejects a negative result. The last check is required
+because allocator calls take signed `i64`: a mathematically valid unsigned result in
+`2^63..=2^64-1` would otherwise arrive as a non-positive byte count. `ArenaAlloc` and
+`HeapAllocBuf` share the checked multiply; `SoaAlloc` uses an allocation-only checked offset walk
+covering every column product, column end, alignment bump, and final total. Normal post-allocation
+column reads/writes retain the existing offset helper and do not acquire duplicate guards. Every
+failure calls the noreturn `align_rt_alloc_size_fail` before allocator work.
+
+Raw and O2-folded MIR gates pin the largest fitting 16-byte count, one-over-limit, negative and
+zero counts, widening `str` elements, and SoA padding overflow. Removing the signed-result check
+reproduces `align_rt_alloc(i64 -9223372036854775808)` and fails the boundary gate; replacing the SoA
+alignment checked-add with ordinary add fails the exact intrinsic-count gate.
 
 ---
 
@@ -891,8 +901,9 @@ mutation tests prove every new gate.
 
 ### Slice C0 — allocation arithmetic hardening
 
-- checked count/stride multiplication and SoA aligned-add before allocation;
-- huge/zero/widening tests at heap, arena, and parallel allocation sites.
+- [x] checked count/stride multiplication and SoA aligned-add before allocation (2026-07-13);
+- [x] huge/zero/widening tests at heap, arena, and SoA allocation sites (2026-07-13; parallel-map's
+  independent runtime check remains pinned).
 
 **Completion:** no generated output loop can observe a buffer smaller than its logical extent because
 of integer wrap.
@@ -951,7 +962,7 @@ result here and close it, as was done for arena pooling with mandatory re-zero.
    entries.
 2. Re-run every P0 reproduction at current HEAD before editing; line numbers may move, function names
    and semantic gates are authoritative.
-3. Fix pipeline/closure/I/O correctness and allocation-size hardening before widening SIMD or parallel execution.
+3. Preserve the completed pipeline/closure/I/O and allocation-size gates before widening SIMD or parallel execution.
 4. Keep `Pure`, `CanExecuteOnInactiveLane`, and ownership/region facts distinct. Never infer one from another.
 5. Preserve the pipeline's direct, width-independent loop; do not introduce iterator/closure runtime
    allocation on the hot path.

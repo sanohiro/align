@@ -8,7 +8,12 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **nested parallel scheduler P0 FIXED**: `par_map` now uses a shared
+_Last updated: 2026-07-13, **dynamic allocation-size C0 HARDENED**: `ArenaAlloc`, `HeapAllocBuf`,
+and `SoaAlloc` now reject negative counts, checked multiply/add overflow, and byte results above the
+signed `i64` allocator ABI before allocator work. SoA uses an allocation-only checked offset walk,
+leaving ordinary column access unchanged. Raw/O2 gates pin negative/zero/largest-fitting/one-over,
+widening, and padding cases; removing the signed-result or alignment-add guard fails independently.
+Also this date, **nested parallel scheduler P0 FIXED**: `par_map` now uses a shared
 atomic range cursor, caller/helper drain loop, and total-range completion barrier. Saturated
 `task_group -> par_map` therefore makes progress with zero idle pool workers; a forced-two-worker,
 `workers + 1` task child-process gate is watchdog-bounded, and stopping each runner after one range
@@ -30,7 +35,8 @@ task-group regions and rejects direct or wrapped captures that can be freed befo
 `docs/impl/source-correctness-fixes-2026-07-13.md`: UTF-8-safe `str` range boundaries,
 spawn-capture and closure-result environment regions, Unit function-value ABI parity,
 buffered-reader-correct `io.copy`, borrowed pipeline-source ownership, self-aliasing
-`buffer.append`, line-head `!=`, and duplicate struct fields are regression-pinned.
+`buffer.append`, line-head `!=`, duplicate struct fields, and checked dynamic allocation sizes are
+regression-pinned.
 Previous update: 2026-07-13, **string/array allocation-copy and short-input audit RECORDED** in
 `docs/impl/13-string-array-allocation-short-input-audit.md` (UTF-8 range boundaries now fixed; other
 items not started). It adds
@@ -51,8 +57,8 @@ fixed/settled as described above; the
 `spawn` capture region gap and the related indirect closure-result gap are now fixed; Unit indirect
 calls used an incompatible LLVM return ABI, and
 `io.copy` skipped buffered-reader lookahead (both fixed in the
-source-correctness wave). Dynamic allocation size
-arithmetic separately needs required overflow hardening. Highest-value new measured/gated work is an
+source-correctness wave). Dynamic allocation size arithmetic is now hardened as described above.
+Highest-value new measured/gated work is an
 initialized-before-read arena split, exact-final-allocation Base64/hex fill paired with the existing
 Base64 SIMD backlog plus a new hex probe, macOS copy-path validation, HTTP batch request-copy removal,
 and sequential SIMD compaction only if its selectivity matrix wins. No new syntax. Previous update:
@@ -466,18 +472,17 @@ remaining macOS full-suite failures are cataloged out-of-scope at adoption-recor
 (ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
 expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
 is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
-one is next available. **Next, pick one:** (a) document-12 P0 — complete required allocation-size hardening before
-widening (source of truth `docs/impl/12-pipeline-closure-memory-io-simd-audit.md`); (b) cache-first C0
+one is next available. **Next, pick one:** (a) cache-first C0
 — fix the confirmed basename-temp
 race with private staging + atomic publication and add determinism/concurrency gates (source of
-truth `docs/impl/10-cache-first-optimization.md`; MUST precede M15 parallel compilation); (c)
+truth `docs/impl/10-cache-first-optimization.md`; MUST precede M15 parallel compilation); (b)
 parallel P1 — replace the per-element runtime thunk with the recorded whole-range kernel, then add
-the read-only capture context (source of truth `docs/impl/11-parallel-execution-optimization.md`); (d) the Codex wave-1 remainder — CONFIRMED bug
+the read-only capture context (source of truth `docs/impl/11-parallel-execution-optimization.md`); (c) the Codex wave-1 remainder — CONFIRMED bug
 1 (bench export roots: `emit-obj --export` mechanism,
 `bench/run.sh` re-verified) and bug 3 (profiles never reach the TargetMachine:
-`optsize`/`minsize` fn attrs, per-profile runtime variant + cache key); (e) the deferred
-`bench/binary_size` script port (small PR, adoption-record item 2 sub-item); (f) the M14 LTO ceiling
-probe rerun (procedure in the roadmap M14 section); (g) Codex wave-2 quick wins (O(n²) sort,
+`optsize`/`minsize` fn attrs, per-profile runtime variant + cache key); (d) the deferred
+`bench/binary_size` script port (small PR, adoption-record item 2 sub-item); (e) the M14 LTO ceiling
+probe rerun (procedure in the roadmap M14 section); (f) Codex wave-2 quick wins (O(n²) sort,
 tiny-`par_map` cold start, zero-size arena, attr-kind fail-loud + `captures(none)`). Reminder:
 gemini-code-assist reviews cease **2026-07-17**
 — after that, `/code-review` on the branch replaces the reflect-before-merge step.

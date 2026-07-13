@@ -6832,6 +6832,15 @@ pub extern "C" fn align_rt_div_fail() -> ! {
     std::process::abort();
 }
 
+/// A dynamic collection's logical element count cannot be represented as the allocator's signed
+/// byte-size ABI after multiplication and alignment padding. Codegen checks before calling an
+/// allocator so a wrapped small/null buffer can never be paired with the original loop bound.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_alloc_size_fail() -> ! {
+    eprintln!("align: panic: allocation size overflow");
+    std::process::abort();
+}
+
 /// `process.exit(code)` (`std.process`, `docs/impl/std-design/process.md`) — terminate the process
 /// with `code`. The settled cleanup-then-exit semantics: the CALLER (codegen, via MIR
 /// `emit_exit_cleanup`) has already run the current function's pending cleanup — dropping every live

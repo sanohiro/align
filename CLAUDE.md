@@ -60,6 +60,8 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 > boundaries while remaining legal sequentially.
 > Saturated `task_group -> par_map` now shares caller-drained range claims; a forced-worker
 > child-process watchdog pins progress with zero idle pool workers.
+> Dynamic heap/arena/SoA byte sizes now use checked LLVM arithmetic and abort before allocation on
+> negative counts, overflow, or results outside the signed allocator ABI.
 > M9's portable `io.copy` lookahead P0, the spawn-capture and closure-result region gaps, and the Unit
 > indirect-call ABI mismatch are fixed and regression-pinned in
 > `docs/impl/source-correctness-fixes-2026-07-13.md`. Read

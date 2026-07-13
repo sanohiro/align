@@ -2397,7 +2397,8 @@ views, and small/large writer paths already have the intended shape. Its post-`w
 spawn-capture, closure-result region, Unit indirect-call ABI, and buffered-reader `io.copy` P0s are
 fixed and regression-pinned in `impl/source-correctness-fixes-2026-07-13.md`; ordinary sequential
 effects are settled as Impure-allowed with exact guarded order. Dynamic allocation-size hardening
-remains required. New measure-first work is the per-callsite initialized-before-read
+is complete with checked heap/arena/SoA byte arithmetic and boundary/mutation gates. New
+measure-first work is the per-callsite initialized-before-read
 `arena_alloc_uninit` / conservative-zeroed split, exact-final Base64/hex fill paired with the existing
 Base64 SIMD backlog plus a new hex SIMD probe, HTTP batch request-copy removal, and scalar vs SIMD
 stable compaction. Existing work from documents 10/11 remains attributed there.
