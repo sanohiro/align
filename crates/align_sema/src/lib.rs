@@ -2390,12 +2390,14 @@ fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
     // Per function: directly observable effect + the set of functions it calls (incl. pipeline
     // stage/reducer functions) + the `par_map` callees to verify.
     let mut direct: HashMap<&str, bool> = HashMap::new();
+    let mut direct_unknown: HashMap<&str, bool> = HashMap::new();
     let mut calls: HashMap<&str, Vec<String>> = HashMap::new();
     let mut parmaps: Vec<(String, Span)> = Vec::new();
     for f in &program.fns {
-        let mut scan = EffectScan { impure_direct: false, calls: Vec::new(), parmaps: Vec::new() };
+        let mut scan = EffectScan { impure_direct: false, unknown_indirect: false, calls: Vec::new(), parmaps: Vec::new() };
         scan.block(&f.body);
         direct.insert(f.name.as_str(), scan.impure_direct);
+        direct_unknown.insert(f.name.as_str(), scan.unknown_indirect);
         calls.insert(f.name.as_str(), scan.calls);
         parmaps.extend(scan.parmaps);
     }
@@ -2410,29 +2412,37 @@ fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
         }
     }
 
-    let mut impure = std::collections::HashSet::new();
-    let mut worklist = Vec::new();
-
-    for (name, &is_direct_impure) in &direct {
-        if is_direct_impure {
-            let n = name.to_string();
-            impure.insert(n.clone());
-            worklist.push(n);
+    let propagate = |seeds: &HashMap<&str, bool>| {
+        let mut affected = std::collections::HashSet::new();
+        let mut worklist = Vec::new();
+        for (name, &active) in seeds {
+            if active {
+                let n = name.to_string();
+                affected.insert(n.clone());
+                worklist.push(n);
+            }
         }
-    }
-
-    while let Some(callee) = worklist.pop() {
-        if let Some(callers) = reverse_calls.get(callee.as_str()) {
-            for caller in callers {
-                if impure.insert(caller.to_string()) {
-                    worklist.push(caller.to_string());
+        while let Some(callee) = worklist.pop() {
+            if let Some(callers) = reverse_calls.get(callee.as_str()) {
+                for caller in callers {
+                    if affected.insert(caller.to_string()) {
+                        worklist.push(caller.to_string());
+                    }
                 }
             }
         }
-    }
+        affected
+    };
+    let impure = propagate(&direct);
+    let unknown = propagate(&direct_unknown);
     // The `par_map` function must be Pure.
     for (func, span) in parmaps {
-        if impure.contains(&func) {
+        if unknown.contains(&func) {
+            diags.error(
+                format!("'par_map' requires a Pure function, but '{func}' calls a function value whose effect is not statically known"),
+                span,
+            );
+        } else if impure.contains(&func) {
             diags.error(
                 format!("'par_map' requires a Pure function, but '{func}' has a side effect (it reads/writes I/O); use `reduce` for an accumulation"),
                 span,
@@ -2446,6 +2456,10 @@ fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
 /// call edge or effect node can be silently missed.
 struct EffectScan {
     impure_direct: bool,
+    /// An indirect call whose function-value target/effect is not encoded in `FnTy`. Sequential
+    /// code may execute it, but a Pure/parallel boundary must reject it until function types carry
+    /// an inferred effect bit.
+    unknown_indirect: bool,
     calls: Vec<String>,
     parmaps: Vec<(String, Span)>,
 }
@@ -2552,12 +2566,19 @@ impl EffectScan {
             // referenced function here: its impurity then propagates through the call graph, closing
             // the `par_map`-purity bypass where an impure function is laundered through a fn value.
             ExprKind::FnValue(name) => self.calls.push(name.clone()),
-            ExprKind::Closure { captures, .. } => {
+            ExprKind::Closure { lifted, captures } => {
+                // A capturing closure exposes its lifted body just like `FnValue(name)` exposes a
+                // named body. Dropping this edge launders an Impure lifted function through a local.
+                self.calls.push(lifted.clone());
                 for c in captures {
                     self.expr(c);
                 }
             }
             ExprKind::CallFnValue { callee, args } => {
+                // `FnTy` does not carry an effect yet, so a call through a local/parameter cannot
+                // prove Pure even when construction sites contribute known call edges. Fail closed
+                // only at a later `par_map` boundary; ordinary sequential HOF calls remain legal.
+                self.unknown_indirect = true;
                 self.expr(callee);
                 for a in args {
                     self.expr(a);

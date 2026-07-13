@@ -967,7 +967,8 @@ already lives in `docs/open-questions.md`.
   `f` → store result) and the runtime `align_rt_par_map` splits `[0, count)` into disjoint output
   ranges on a process-lifetime `ParPool`; the caller runs chunk 0 and waits for submitted helper
   chunks. Intended race-freedom comes from inferred Pure `f` plus disjoint output ranges, but the
-  2026-07-12 audit confirmed a P0 lifted-capturing-closure effect edge is missing. A *staged*
+  2026-07-12 audit found a P0 lifted-capturing-closure effect edge; **fixed 2026-07-13**, together
+  with a fail-closed higher-order unknown-target gate. A *staged*
   `par_map` (`where(p).par_map(f)`) and a capturing `par_map` still use the sequential collect loop.
   Results are identical to the sequential lowering when the Pure premise holds.
 - [done] **first-class closures (escape-driven)** — slices ①–③ (PRs #104–108): non-capturing

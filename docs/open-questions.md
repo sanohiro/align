@@ -2348,9 +2348,9 @@ Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`
 Ordinary sequential stage/reducer effects are settled above, but comparison sorting is a distinct
 contract. The current insertion sort calls a key function O(n²) times in comparison-dependent order;
 the planned decorate-sort-undecorate rewrite would call it exactly once per surviving element. Settle
-either Pure-only keys or exactly-once input-order key evaluation before that rewrite. The current
-effect graph is not sound enough to enforce Pure through every lifted/higher-order path, so do not add
-a partial rejection. Full context: `impl/12` §3.2.
+either Pure-only keys or exactly-once input-order key evaluation before that rewrite. The effect graph
+now fails closed for unknown higher-order targets, but that mechanism does not choose the language
+contract; do not add a rejection until this item settles. Full context: `impl/12` §3.2.
 
 ### Separate compilation (multi-module compilation units) — OWNER-MANDATED → M15
 
@@ -2377,7 +2377,9 @@ candidates remain probes until their written gates pass.
 P0s absent from the prior queue: `EffectScan` omits a lifted capturing closure's call edge, allowing
 observable I/O inside an accepted Pure `par_map`; and `task_group -> par_map` deadlocks at shared
 pool saturation because `par_map` waits after one caller chunk instead of draining its ranges.
-Required order: close both correctness defects, then implement the already-recorded whole-chunk
+The lifted/higher-order effect P0 is fixed 2026-07-13 with a closure edge plus unknown-target
+fail-closed propagation; the scheduler deadlock remains. Required order: close that progress defect,
+then implement the already-recorded whole-chunk
 specialization. The guide already calls capturing-`par_map` parallelization “implementation in
 progress”; this audit pins its read-only context ABI. New measure-first work is wrapping-integer
 `par_map(...).sum()` fusion (remove the full intermediate write/read), length-preserving staged
@@ -2391,12 +2393,11 @@ those unsettled descriptions authorizes implicit parallelization of ordinary `re
 [`impl/12-pipeline-closure-memory-io-simd-audit.md`](impl/12-pipeline-closure-memory-io-simd-audit.md)
 is the durable implementation record. It confirms that normal fused loops, `map_into` alias
 metadata, non-escaping capture inlining, JSON/UTF-8/string SIMD, direct regular-file reads, mmap
-views, and small/large writer paths already have the intended shape. It also records new P0s:
-post-`where` callable speculation changes semantics and the spawn-capture closure path permits an
-arena-backed view UAF. The second closure-result region gap, Unit indirect-call ABI mismatch, and
-buffered-reader `io.copy` lookahead loss are fixed and regression-pinned in
-`impl/source-correctness-fixes-2026-07-13.md`. It separately records the ordinary-stage normative effect conflict and required dynamic
-allocation-size hardening. New measure-first work is the per-callsite initialized-before-read
+views, and small/large writer paths already have the intended shape. Its post-`where` callable,
+spawn-capture, closure-result region, Unit indirect-call ABI, and buffered-reader `io.copy` P0s are
+fixed and regression-pinned in `impl/source-correctness-fixes-2026-07-13.md`; ordinary sequential
+effects are settled as Impure-allowed with exact guarded order. Dynamic allocation-size hardening
+remains required. New measure-first work is the per-callsite initialized-before-read
 `arena_alloc_uninit` / conservative-zeroed split, exact-final Base64/hex fill paired with the existing
 Base64 SIMD backlog plus a new hex SIMD probe, HTTP batch request-copy removal, and scalar vs SIMD
 stable compaction. Existing work from documents 10/11 remains attributed there.

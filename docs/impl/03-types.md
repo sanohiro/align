@@ -271,10 +271,10 @@ total := users.reduce(0, fn acc, u { acc + u.score });  // OK: Pure
 The `Fn` type carries an effect (`Fn([Ty], Ty, Effect)`), so it can be checked even through a function value.
 
 > **Implementation audit note (2026-07-13):** the intended function-type effect bit is not yet
-> implemented end to end. The current name-based effect graph validates only `par_map` targets and
-> has lifted/higher-order closure holes. Ordinary sequential effects are now settled as allowed with
-> exact guarded source order; the function-type effect representation remains required for sound
-> parallel and optimization boundaries. See
+> implemented end to end. Lifted closures now contribute their call edge, and an indirect target
+> whose effect is absent from `FnTy` fails closed at a Pure/`par_map` boundary while remaining legal
+> sequentially. Ordinary sequential effects are allowed with exact guarded source order. The
+> function-type effect representation remains the path to recover known-Pure HOF precision. See
 > [`12-pipeline-closure-memory-io-simd-audit.md` §3.2](12-pipeline-closure-memory-io-simd-audit.md).
 
 ---
