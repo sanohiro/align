@@ -1389,10 +1389,13 @@ impl ParPool {
     }
 }
 
+/// The global pool's storage, hoisted out of `par_pool()` so [`align_rt_test_par_pool_initialized`]
+/// can check whether it has been created yet without forcing creation itself.
+static PAR_POOL: std::sync::OnceLock<(&'static ParPool, usize)> = std::sync::OnceLock::new();
+
 /// The global pool (lazily created). Returns its worker count too (= the parallelism degree).
 fn par_pool() -> (&'static ParPool, usize) {
-    static POOL: std::sync::OnceLock<(&'static ParPool, usize)> = std::sync::OnceLock::new();
-    *POOL.get_or_init(|| {
+    *PAR_POOL.get_or_init(|| {
         #[cfg(not(test))]
         let n = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
         #[cfg(test)]
@@ -1421,6 +1424,17 @@ fn par_pool() -> (&'static ParPool, usize) {
         }
         (p, n)
     })
+}
+
+/// Test-only introspection: has the global `par_map`/`task_group` worker pool been spun up yet in
+/// this process? Deliberately **not** part of the runtime's FFI surface (no `extern "C"`/
+/// `no_mangle`, so it is never callable from Align-generated code) — it exists only so regression
+/// tests can pin that a tiny `par_map`/single-task `task_group` never pays the pool's cold-start
+/// cost (Codex audit item 5). Checking `PAR_POOL.get()` rather than calling [`par_pool`] is the
+/// point: the latter would force creation, defeating the check.
+#[doc(hidden)]
+pub fn align_rt_test_par_pool_initialized() -> bool {
+    PAR_POOL.get().is_some()
 }
 
 type ParPanic = Box<dyn std::any::Any + Send + 'static>;
@@ -1518,20 +1532,36 @@ pub unsafe extern "C" fn align_rt_par_map(
         .unwrap_or_else(|| panic_abort("par_map input size overflow"));
 
     let out_buf = align_rt_alloc(bytes);
-    let (pool, workers) = par_pool();
     // Don't parallelize trivially-small work: a chunk must be at least `PAR_MIN_CHUNK` elements, so
     // tiny maps (where the pool round-trip would dwarf the work) fall to the single-chunk caller
     // path. Keep chunks coarse because each element still crosses the indirect thunk boundary.
     const PAR_MIN_CHUNK: usize = 32768;
-    let per = count.div_ceil(workers).max(PAR_MIN_CHUNK);
-    let nchunks = count.div_ceil(per); // ≤ workers, every chunk non-empty
-    // Single-chunk fast path: run on the caller, no pool round-trip.
-    if nchunks <= 1 {
+    // Run every element on the calling thread, no pool involved.
+    let run_all_on_caller = || {
         for i in 0..count {
             let ip = (in_buf as usize).checked_add(i.checked_mul(in_stride).unwrap()).unwrap() as *const u8;
             let op = (out_buf as usize).checked_add(i.checked_mul(out_stride).unwrap()).unwrap() as *mut u8;
             thunk(ip, op);
         }
+    };
+    // Threshold check hoisted above `par_pool()`: `count <= PAR_MIN_CHUNK` guarantees a single
+    // chunk regardless of the worker count (below, `per` would end up `>= PAR_MIN_CHUNK >= count`),
+    // so this skips touching the global worker pool entirely — a tiny `par_map` (e.g. 8 elements)
+    // must not pay the pool's cold-start cost (~69µs measured, vs ~125ns warm) just to immediately
+    // fall back to the caller-only path anyway (Codex audit item 5).
+    if count <= PAR_MIN_CHUNK {
+        run_all_on_caller();
+        return out_buf;
+    }
+
+    let (pool, workers) = par_pool();
+    let per = count.div_ceil(workers).max(PAR_MIN_CHUNK);
+    let nchunks = count.div_ceil(per); // ≤ workers, every chunk non-empty
+    // Single-chunk fast path: run on the caller, no pool round-trip. Reached only when `workers ==
+    // 1` (or another degenerate worker count) still pushes `per` up to `count` even though `count
+    // > PAR_MIN_CHUNK` above; the pool is already initialized by this point regardless.
+    if nchunks <= 1 {
+        run_all_on_caller();
         return out_buf;
     }
 
@@ -7193,7 +7223,21 @@ impl Arena {
         // The bit-trick below requires a power-of-two alignment; normalize so a future
         // ABI passing odd alignments stays correct.
         let align = align.max(1).next_power_of_two();
-        let need = size.max(1);
+        if size == 0 {
+            // Zero-size fast path: return a canonical dangling pointer without touching chunk
+            // storage at all -- no chunk is fetched (a size-0 request must never trigger a fresh
+            // 64 KiB zeroed `CHUNK` allocation) and the bump cursor (`self.off`) is not advanced,
+            // so it can never collide with a real allocation that follows. `align` itself (a
+            // nonzero power of two after normalization above) is used as the pointer value: it is
+            // trivially non-null and trivially aligned to `align` (a number is always a multiple
+            // of itself). This is safe precisely because a 0-byte allocation carries no bytes --
+            // codegen never emits a load/store through it (mirrors Rust's own
+            // `NonNull::dangling()` convention for zero-sized types). Distinct from the rejected
+            // "arena pool + re-zero" idea: this path never reuses or pools chunk memory, it simply
+            // never allocates any for a request that needs zero bytes.
+            return align as *mut u8;
+        }
+        let need = size;
         // Align against the chunk's *absolute* base address, not the chunk-relative
         // offset: a `Vec<u8>` buffer is only guaranteed 1-byte aligned, so a multiple of
         // `align` measured from the chunk start need not be an aligned address. Returning
@@ -7466,12 +7510,18 @@ pub unsafe extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
         }
     };
 
-    let (pool, workers) = par_pool();
-    // Dispatch helper runners onto the pool (bounded by the pool size and by `n-1` — the caller is
-    // itself a runner), then run the claim loop on the caller. See the deadlock analysis above:
-    // even if every submitted helper is starved by busy workers, the caller drains the group.
-    for _ in 0..workers.min(n - 1) {
-        pool.submit(Box::new(run_all.clone()));
+    // A single task never needs a helper (`workers.min(n - 1)` is always 0 when `n == 1`), so skip
+    // `par_pool()` entirely rather than paying its cold-start cost just to submit zero jobs
+    // (Codex audit item 5, the `task_group` analog of the tiny-`par_map` fix above).
+    if n > 1 {
+        let (pool, workers) = par_pool();
+        // Dispatch helper runners onto the pool (bounded by the pool size and by `n-1` — the caller
+        // is itself a runner), then run the claim loop on the caller. See the deadlock analysis
+        // above: even if every submitted helper is starved by busy workers, the caller drains the
+        // group.
+        for _ in 0..workers.min(n - 1) {
+            pool.submit(Box::new(run_all.clone()));
+        }
     }
     run_all();
 
@@ -13860,6 +13910,47 @@ mod tests {
     }
 
     #[test]
+    fn arena_alloc_zero_size_never_grows_chunk_count() {
+        // Codex audit item 6: a size-0 arena allocation must not fetch a fresh 64 KiB `CHUNK`
+        // buffer -- it takes a fast path that returns a canonical dangling pointer and leaves
+        // `chunks`/`off` untouched. Pin this with an allocation-counter test: many size-0 allocs,
+        // at several alignments, must never change the chunk count.
+        let a = align_rt_arena_begin();
+        assert_eq!(unsafe { &*a }.chunks.len(), 0, "a fresh arena starts with no chunks");
+        for _ in 0..10_000 {
+            for &align in &[1i64, 2, 8, 16, 64] {
+                let p = unsafe { align_rt_arena_alloc(a, 0, align) };
+                // Non-null: the runtime's "null == absent" convention still holds for a size-0
+                // request. Never dereferenced here (or anywhere): a 0-byte allocation carries no
+                // bytes, so there is nothing to safely read or write through this pointer.
+                assert!(!p.is_null(), "a size-0 allocation must still be non-null");
+                assert_eq!(
+                    (p as usize) % (align as usize),
+                    0,
+                    "the dangling pointer must be aligned to the requested alignment {align}"
+                );
+            }
+        }
+        assert_eq!(unsafe { &*a }.chunks.len(), 0, "size-0 allocations must never grow the chunk list");
+        assert_eq!(unsafe { &*a }.off, 0, "size-0 allocations must never advance the bump cursor");
+
+        // Mixed with real allocations: the fast path must not corrupt arena state for allocations
+        // that follow, and a real allocation must still fetch a chunk as normal.
+        let real = unsafe { align_rt_arena_alloc(a, 8, 8) } as *mut i64;
+        assert!(!real.is_null());
+        unsafe { *real = 99 };
+        assert_eq!(unsafe { *real }, 99, "a real allocation after size-0 ones must be writable");
+        assert_eq!(unsafe { &*a }.chunks.len(), 1, "the first real allocation fetches exactly one chunk");
+
+        // Zero-size allocations interleaved with a real one still never grow the chunk count.
+        for _ in 0..1_000 {
+            assert!(!unsafe { align_rt_arena_alloc(a, 0, 8) }.is_null());
+        }
+        assert_eq!(unsafe { &*a }.chunks.len(), 1, "zero-size allocations after a real one still add no chunks");
+        unsafe { align_rt_arena_end(a) };
+    }
+
+    #[test]
     fn soa_layout_matches_codegen_formula() {
         // start_0 = 0; start_j = align_up(start_{j-1} + n*size_{j-1}, size_j); total = end of last.
         // widths [1, 8] (bool, i64), n = 2: col0 @0, align_up(0+2,8)=8 → col1 @8, total = 8+16 = 24.
@@ -14425,6 +14516,32 @@ mod tests {
 
     extern "C" fn par_map_double(input: *const u8, output: *mut u8) {
         unsafe { *(output as *mut i64) = *(input as *const i64) * 2 };
+    }
+
+    #[test]
+    fn par_map_correct_across_threshold_boundary() {
+        // Codex audit item 5: `PAR_MIN_CHUNK` (32_768) is the caller-only/pool-split boundary. A
+        // count at or below it must run the tiny-map fast path added above `par_pool()`; one above
+        // it crosses into the pool-backed path. Both must produce identical, correct output --
+        // this only checks correctness (see the `par_map_cold_start` integration test for the
+        // pool-untouched pin, which needs a fresh process to observe reliably).
+        for &count in &[1i64, 7, 32_767, 32_768, 32_769, 65_537] {
+            let input: Vec<i64> = (0..count).collect();
+            let output = unsafe {
+                align_rt_par_map(
+                    input.as_ptr() as *const u8,
+                    count,
+                    size_of::<i64>() as i64,
+                    size_of::<i64>() as i64,
+                    par_map_double,
+                )
+            };
+            let values = unsafe { std::slice::from_raw_parts(output as *const i64, count as usize) };
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(v, (i as i64) * 2, "count={count} index={i}");
+            }
+            unsafe { align_rt_free(output) };
+        }
     }
 
     /// Run a two-range `par_map` from a task-group task. This is deliberately large enough to cross
