@@ -477,8 +477,13 @@ macho_link 2/2, m11_process 35/35) and `alignc build`/`size` work natively on Ma
 remaining macOS full-suite failures are cataloged out-of-scope at adoption-record item 2
 (ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
 expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
-is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
-one is next available. **Next, pick one:** (a) cache-first C0 continuation — stabilize independent
+is pinned unchanged by construction; the owed Linux full-suite re-verification is **DONE
+2026-07-13 (Linux/WSL2, apt.llvm.org LLVM 22.1.8 dynamic, rustc 1.96, post-#436 main):
+`cargo test --workspace` = 1907 passed / 0 failed / 1 ignored** (the by-design `#[ignore]`
+manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targets --
+-D warnings` clean** — the #427–#436 audit+fix wave (authored outside Claude Code; those PRs
+carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
+Linux. **Next, pick one:** (a) cache-first C0 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth
 `docs/impl/10-cache-first-optimization.md`; MUST precede caching failed results); (b)
 parallel P1 — replace the per-element runtime thunk with the recorded whole-range kernel, then add
