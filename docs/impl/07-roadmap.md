@@ -2306,7 +2306,9 @@ roots mechanism, fail-closed against the lowered MIR; `bench/run.sh` + every sub
 and re-verified — full record in `open-questions.md` item 1]**, ELF-only linker/size tooling
 breaks macOS builds **[compiler slice DONE 2026-07-12: `ObjectFormat`-selected linker policy +
 `llvm-readobj`/`llvm-nm` size report + macOS regression net; the `bench/binary_size` script port
-is the remaining sub-item]**, build profiles never reach the TargetMachine/`optsize`/runtime
+DONE 2026-07-13: shared `lib.sh` (`filesize`/`llvm_tool`/`gated`/`stripped`), no more `stat -c`/
+`mapfile`/`readelf` — full record in `open-questions.md` item 2 sub-item (a)]**, build profiles
+never reach the TargetMachine/`optsize`/runtime
 variant **[code slice DONE 2026-07-13: `Profile::codegen_opt_level` threaded into the
 TargetMachine + small/tiny `optsize`/`minsize` definition-only fn-attr sweep, diagnostic lenses
 pinned to codegen=Default/no-attrs so the IR-shape suite stays byte-identical, release object

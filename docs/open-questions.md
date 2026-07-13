@@ -2464,8 +2464,18 @@ every valid finding addressed. Disposition:
      `llvm-readobj`/`llvm-nm` for both formats (readelf/GNU-nm removed outright — Mach-O symbol
      sizes derived from address deltas, chained-fixups note, `LC_LOAD_DYLIB` listing); the
      macOS regression net (`macho_link.rs`, format-branched `build_profiles`/`capability_linking`
-     with a `can_link` probe for gated libs). **Deferred out of the slice:** (a) the
-     `bench/binary_size` script port (next small PR); (b) `native-static-libs` derivation — the
+     with a `can_link` probe for gated libs). **Deferred out of the slice:** (a) **DONE
+     (2026-07-13):** `bench/binary_size` script port — `run.sh`/`profiles.sh` now source a shared
+     `bench/binary_size/lib.sh` for `filesize` (GNU `stat -c%s` / BSD `stat -f%z` / `wc -c`
+     fallback), `llvm_tool` (the PATH half of `align_driver::llvm_tool`'s `<name>-22` → `<name>`
+     search), `gated` (`llvm-readobj --needed-libs`, format-general: ELF `DT_NEEDED` sonames /
+     Mach-O `LC_LOAD_DYLIB` install names, basename'd before matching), and `stripped` (`llvm-nm`
+     empty-stdout signal, not ELF-only `.symtab` grepping); `profiles.sh`'s `mapfile` (bash >= 4)
+     replaced with a plain-loop array build for bash 3.2 compatibility. Verified end-to-end on this
+     Linux box: both scripts' before/after output is byte-identical to the pre-port readelf/GNU-nm
+     version; the Mach-O branch is structurally exercised by the same code path as the compiler-side
+     `size.rs` but unverified on real Mach-O hardware, same caveat as the compiler slice above; (b)
+     `native-static-libs` derivation — the
      `support_libs(format)` table is the seam it replaces; (c) x86_64-apple-darwin SysV
      acceptance (today fail-closed over-rejects that target for by-value FFI structs — not a bug;
      relax when hardware/CI exists); (d) `-L`/sysroot CLI flags (M15 cross-compilation
