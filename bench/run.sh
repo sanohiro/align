@@ -32,7 +32,8 @@ esac
 ( cd .. && cargo build -q --release --bin alignc )
 ALIGNC="../target/release/alignc"
 
-"$ALIGNC" emit-obj kernels.align kernels.o --target-cpu "$align_tgt"
+"$ALIGNC" emit-obj kernels.align kernels.o --target-cpu "$align_tgt" \
+  --export sum_sq_pos --export col_sum --export total_pay
 rustc -O -C target-cpu="$rust_tgt" -C link-arg="$PWD/kernels.o" harness.rs -o harness
 echo "target: $mode"
 ./harness

@@ -22,7 +22,7 @@ RT_DIR="$(cd ../.. && pwd)/target/release"
 
 KOBJ="$PWD/kernel.o"
 trap 'rm -f "$KOBJ"' EXIT
-"$ALIGNC" emit-obj kernel.align "$KOBJ" --target-cpu "$align_tgt"
+"$ALIGNC" emit-obj kernel.align "$KOBJ" --target-cpu "$align_tgt" --export pmap --export smap
 
 echo "target: $mode"
 ALIGN_KERNEL_OBJ="$KOBJ" ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release

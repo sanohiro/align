@@ -28,7 +28,8 @@ RT_DIR="$(cd ../.. && pwd)/target/release"
 
 KOBJ="$PWD/kernel.o"
 trap 'rm -f "$KOBJ"' EXIT  # always clean up the temp object, even on failure/interrupt
-"$ALIGNC" emit-obj kernel.align "$KOBJ" --target-cpu "$align_tgt"
+"$ALIGNC" emit-obj kernel.align "$KOBJ" --target-cpu "$align_tgt" \
+  --export a1 --export a2 --export a3 --export a2_encode --export a2_one --export a2_two --export a2_three
 
 echo "target: $mode"
 ALIGN_KERNEL_OBJ="$KOBJ" ALIGN_RUNTIME_DIR="$RT_DIR" cargo run -q --release
