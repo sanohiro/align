@@ -8,7 +8,26 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **Codex-audit wave-2 (quick wins) COMPLETE — #439 + #440 + #441
+_Last updated: 2026-07-13, **M14 Slice 1 (LTO ceiling probe) DONE — ABOVE GATE, proceed to
+Slice 2** (full record + tables in the roadmap M14 section, commit `52ecfb1`) **and the
+`bench/binary_size` portability port MERGED as #442** — Codex-audit item 2 is now closed in
+full. Probe verdict (median of 7, 1M short strings, znver3): **`str_eq` 2.12× native / 2.35×
+generic = a genuine LTO win** (the runtime `str_eq` inlines and a constant target length folds
+into an inline length-check fast path — zero call/`bcmp` for non-matching lengths);
+**`str_cmp` REGRESSES to ~0.72×** under a blanket post-link `default<O2>` — hard evidence that
+Slice 2's per-symbol guard is mandatory; `hash64` 1.63× native but 1.02× generic = a
+native-tuning effect, better captured by the deferred per-target-cpu runtime variant, not
+bitcode; numeric control 1.00×. Link+reopt+llc over the full runtime `.bc` ≈ 0.25 s. **Slice 2
+re-scoped accordingly:** ship LTO visibility only for the inlinable fast-path string primitives
+(`str_eq` and kin), per-symbol guarded, excluding `str_cmp`. Also confirmed: the #440
+`captures(none)` fix makes `emit-llvm --stage optimized | llvm-as-22` round-trip cleanly — the
+2026-07-12 `ptr none` sed hint is obsolete, the probe ran the straightforward pipeline. #442:
+`bench/binary_size/{run,profiles}.sh` GNU/ELF assumptions (`stat -c`, bash-4 `mapfile`,
+`readelf -d`, `.symtab` checks) replaced by a shared `lib.sh` (portable `filesize`, `llvm_tool`
+discovery mirroring the driver, format-general `llvm-readobj --needed-libs`/`llvm-nm` helpers
+with tool-failure degrading to `?` — gemini's one valid finding, fixed); Linux before/after
+byte-identical; Mach-O branch honestly marked unexercised on real hardware. Previous update:
+2026-07-13, **Codex-audit wave-2 (quick wins) COMPLETE — #439 + #440 + #441
 MERGED** (three parallel worktree slices, gemini reflected before each merge; workspace
 **1931 green** + clippy clean on merged main). **#441 sort:** `lower_array_sort` rewritten as a
 stable bottom-up merge sort with an insertion base case (threshold 32), deliberately kept as MIR
@@ -527,15 +546,18 @@ is pinned unchanged by construction; the owed Linux full-suite re-verification i
 manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targets --
 -D warnings` clean** — the #427–#436 audit+fix wave (authored outside Claude Code; those PRs
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
-Linux. **Next, pick one** (Codex waves 1+2 are DONE 2026-07-13 — #426/#437/#438 + #439/#440/#441, see
-the _Last updated_ paragraph): (a) cache-first C0 continuation — stabilize independent
+Linux. **Next, pick one** (Codex waves 1+2, the `bench/binary_size` port, and the M14 LTO probe are all
+DONE 2026-07-13 — see the _Last updated_ paragraph): (a) **M14 Slice 2** — runtime-bitcode LTO
+for the inlinable string primitives, per-symbol guarded per the probe verdict (source of truth =
+the roadmap M14 section incl. the probe record; probe scaffolding was left in the 2026-07-13
+session scratchpad, rebuild it if gone); (b) **M15 separate-compilation two-lens design review**
+(owner-mandated; sequenced after the probe verdict, which is now in); (c) cache-first C0
+continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth
-`docs/impl/10-cache-first-optimization.md`; MUST precede caching failed results); (b)
+`docs/impl/10-cache-first-optimization.md`; MUST precede caching failed results); (d)
 parallel P1 — replace the per-element runtime thunk with the recorded whole-range kernel, then add
 the read-only capture context (source of truth `docs/impl/11-parallel-execution-optimization.md`);
-(c) the deferred
-`bench/binary_size` script port (small PR, adoption-record item 2 sub-item); (d) the M14 LTO ceiling
-probe rerun (procedure in the roadmap M14 section); (e) Codex wave-3 measure-first (JSON decode
+(e) Codex wave-3 measure-first (JSON decode
 double-allocation, I/O buffer zero-fill — correctness tests first, throughput-gated). Reminder:
 gemini-code-assist reviews cease **2026-07-17**
 — after that, `/code-review` on the branch replaces the reflect-before-merge step.
