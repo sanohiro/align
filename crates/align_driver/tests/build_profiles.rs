@@ -88,6 +88,31 @@ fn dev_and_fast_produce_different_objects() {
     assert_ne!(b0, b3, "O0 and O3 objects must differ — the profile pipeline must reach LLVM");
 }
 
+#[test]
+fn small_and_release_objects_differ() {
+    // Sister to the O0/O3 check: `small` adds `optsize` fn attrs + a `default<Os>` pipeline on top
+    // of `release`'s `default<O2>`, so the two objects must differ byte-for-byte. Proves the size
+    // dimension of the profile actually reaches the backend, not just the speed dimension.
+    if !align_driver::backend_available() {
+        return;
+    }
+    let mut sm = align_span::SourceMap::new();
+    let checked = check(&mut sm, "prof-kernel", KERNEL);
+    assert!(!checked.diags.has_errors(), "kernel compiles");
+    let mir = lower_to_mir(&checked.hir);
+
+    let dir = std::env::temp_dir();
+    let os = dir.join(format!("align-prof-os-{}.o", std::process::id()));
+    let o2 = dir.join(format!("align-prof-o2-{}.o", std::process::id()));
+    emit_object_file(&mir, &os, BuildTarget::Baseline, Profile::Small).expect("emit small");
+    emit_object_file(&mir, &o2, BuildTarget::Baseline, Profile::Release).expect("emit release");
+    let bs = std::fs::read(&os).expect("read small");
+    let b2 = std::fs::read(&o2).expect("read release");
+    let _ = std::fs::remove_file(&os);
+    let _ = std::fs::remove_file(&o2);
+    assert_ne!(bs, b2, "small and release objects must differ — the size dimension must reach LLVM");
+}
+
 // ---------------------------------------------------------------------------
 // 3. `alignc size` CLI + the bad-profile diagnostic (subprocess, real binary).
 // ---------------------------------------------------------------------------

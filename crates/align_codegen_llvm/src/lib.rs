@@ -150,6 +150,20 @@ impl Profile {
         }
     }
 
+    /// The codegen (machine-code) opt level for the `TargetMachine` — a separate dimension from the
+    /// IR pass `pipeline()`. `small`/`tiny` stay at `Default` on purpose, same as clang: size
+    /// reduction is carried by the `optsize`/`minsize` fn attrs plus the `default<Os|Oz>` pipeline;
+    /// lowering the codegen level does not shrink size, it only slows the code down.
+    pub fn codegen_opt_level(self) -> OptimizationLevel {
+        match self {
+            Profile::Dev => OptimizationLevel::None,
+            Profile::Release => OptimizationLevel::Default,
+            Profile::Fast => OptimizationLevel::Aggressive,
+            Profile::Small => OptimizationLevel::Default,
+            Profile::Tiny => OptimizationLevel::Default,
+        }
+    }
+
     /// Whether all symbols should be stripped from the final image (spelled per object format by
     /// the driver: ELF links with `-Wl,--strip-all`, Mach-O runs `strip` post-link). The
     /// size profiles (`small`/`tiny`) strip — the symbol table is pure size a size build does not
@@ -189,7 +203,12 @@ impl Profile {
 
 /// Build the `TargetMachine` for `target` — the one place that picks the CPU / feature string, so
 /// the data-layout machine (`build_module`) and the emission machine (`write_object`) always agree.
-fn create_target_machine(target: &BuildTarget) -> Result<TargetMachine, CodegenError> {
+///
+/// `opt` is the codegen (machine-code) opt level — a separate dimension from the IR pass pipeline
+/// (`Profile::pipeline()`). Object emission threads the profile's [`Profile::codegen_opt_level`];
+/// the diagnostic lenses (`emit_llvm_ir` / `collect_opt_remarks`) pin `Default` so their IR shape
+/// stays profile-independent.
+fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result<TargetMachine, CodegenError> {
     Target::initialize_native(&InitializationConfig::default())
         .map_err(|e| CodegenError::Target(format!("native target init: {e}")))?;
     let triple = TargetMachine::get_default_triple();
@@ -217,7 +236,7 @@ fn create_target_machine(target: &BuildTarget) -> Result<TargetMachine, CodegenE
         &triple,
         &cpu,
         &features,
-        OptimizationLevel::Default,
+        opt,
         RelocMode::PIC,
         CodeModel::Default,
     )
@@ -232,8 +251,11 @@ fn create_target_machine(target: &BuildTarget) -> Result<TargetMachine, CodegenE
 pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile: Profile) -> Result<(), CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    let tm = create_target_machine(target)?;
+    let tm = create_target_machine(target, profile.codegen_opt_level())?;
     build_module(&ctx, &module, program, &tm, None)?;
+    // Size profiles get their `optsize`/`minsize` sweep here — object path only, so the diagnostic
+    // lenses (`emit_llvm_ir` / `collect_opt_remarks`) see a byte-identical module structure.
+    apply_size_attrs(&ctx, &module, profile);
     write_object(&module, out, &tm, profile.pipeline())
 }
 
@@ -249,7 +271,9 @@ pub fn emit_object(program: &Program, out: &Path, target: &BuildTarget, profile:
 pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool) -> Result<String, CodegenError> {
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    let tm = create_target_machine(target)?;
+    // Diagnostic lens: codegen opt pinned to `Default` (no size attrs, pipeline `O2` below) so the
+    // IR-shape suite stays profile-independent and byte-identical.
+    let tm = create_target_machine(target, OptimizationLevel::Default)?;
     build_module(&ctx, &module, program, &tm, None)?;
     if optimized {
         run_opt_pipeline(&module, &tm, "default<O2>")?;
@@ -281,7 +305,9 @@ pub fn collect_opt_remarks(
     ensure_remark_cl_opts();
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    let tm = create_target_machine(target)?;
+    // Diagnostic lens: codegen opt pinned to `Default` (see `emit_llvm_ir`), so remark output does
+    // not vary with the build profile.
+    let tm = create_target_machine(target, OptimizationLevel::Default)?;
 
     // Heap-box the sink so its address is stable while it is registered as the handler userdata.
     let mut sink: Box<Vec<String>> = Box::default();
@@ -3091,6 +3117,31 @@ fn apply_rt_contract_attrs<'c>(ctx: &'c Context, module: &Module<'c>) {
         for &p in c.read_ptr_params {
             add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Param(p), "readonly");
             add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Param(p), "nocapture");
+        }
+    }
+}
+
+/// Apply the size-optimization function attributes for the build `profile` to every Align-generated
+/// *definition* in the module. `small` gets `optsize`; `tiny` gets `optsize` + `minsize` (`minsize`
+/// implies `optsize`, but clang `-Oz` emits both explicitly, so we do too). All other profiles are a
+/// no-op — the speed profiles carry no size attrs.
+///
+/// Filters to definitions (`count_basic_blocks() > 0`), so it never touches an `align_rt_*`
+/// declaration: the target set is completely disjoint from [`apply_rt_contract_attrs`], which only
+/// touches declarations. Called on the object path (after `build_module`, before the opt pipeline);
+/// the diagnostic lenses never run it, keeping their IR shape profile-independent.
+fn apply_size_attrs<'c>(ctx: &'c Context, module: &Module<'c>, profile: Profile) {
+    let names: &[&str] = match profile {
+        Profile::Small => &["optsize"],
+        Profile::Tiny => &["optsize", "minsize"],
+        _ => return,
+    };
+    for f in module.get_functions() {
+        if f.count_basic_blocks() == 0 {
+            continue; // a declaration (`align_rt_*`, an extern) — never a size-attr target
+        }
+        for &name in names {
+            add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, name);
         }
     }
 }
@@ -7803,6 +7854,94 @@ mod tests {
         emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false).unwrap()
     }
 
+    // -- Build profiles reach the backend (Codex audit item 3) ------------------------------------
+
+    #[test]
+    fn codegen_opt_level_maps_each_profile() {
+        // The codegen (machine-code) opt level — a separate dimension from `pipeline()`. Swapping
+        // any single entry fails. `small`/`tiny` stay at `Default` on purpose (clang parity: size
+        // lives in the `optsize`/`minsize` attrs + `default<Os|Oz>` pipeline, not the codegen level).
+        assert_eq!(Profile::Dev.codegen_opt_level(), OptimizationLevel::None);
+        assert_eq!(Profile::Release.codegen_opt_level(), OptimizationLevel::Default);
+        assert_eq!(Profile::Fast.codegen_opt_level(), OptimizationLevel::Aggressive);
+        assert_eq!(Profile::Small.codegen_opt_level(), OptimizationLevel::Default);
+        assert_eq!(Profile::Tiny.codegen_opt_level(), OptimizationLevel::Default);
+    }
+
+    /// Build a module for `profile`, run the size-attr sweep, and report `(name, is_decl, optsize,
+    /// minsize)` for every function — enough to pin the sweep exactly (definitions vs declarations,
+    /// optsize vs minsize).
+    fn size_attr_probe(src: &str, profile: Profile) -> Vec<(String, bool, bool, bool)> {
+        let mut d = Diagnostics::new();
+        let toks = tokenize(0, src, &mut d);
+        let f = parse_file(toks, &mut d);
+        let hir = check_file(&f, &mut d);
+        assert!(!d.has_errors());
+        let program = lower_program(&hir);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("align");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+        build_module(&ctx, &module, &program, &tm, None).unwrap();
+        apply_size_attrs(&ctx, &module, profile);
+
+        let optsize = inkwell::attributes::Attribute::get_named_enum_kind_id("optsize");
+        let minsize = inkwell::attributes::Attribute::get_named_enum_kind_id("minsize");
+        let loc = inkwell::attributes::AttributeLoc::Function;
+        module
+            .get_functions()
+            .map(|f| {
+                let name = f.get_name().to_str().unwrap().to_string();
+                let is_decl = f.count_basic_blocks() == 0;
+                let has_optsize = f.get_enum_attribute(loc, optsize).is_some();
+                let has_minsize = f.get_enum_attribute(loc, minsize).is_some();
+                (name, is_decl, has_optsize, has_minsize)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn size_attrs_sweep_hits_definitions_only_per_profile() {
+        // A definition (`helper`, `main`) plus the always-declared `align_rt_*` prelude — so both
+        // sides of the definition/declaration split are present in the module.
+        let src = "fn helper(x: i64) -> i64 = x + 1\n\
+                   fn main() -> i32 {\n  print(helper(41))\n  return 0\n}\n";
+
+        // Tiny: every definition carries BOTH optsize and minsize; every declaration stays bare.
+        let tiny = size_attr_probe(src, Profile::Tiny);
+        let mut saw_def = false;
+        let mut saw_rt_decl = false;
+        for (name, is_decl, optsize, minsize) in &tiny {
+            if *is_decl {
+                if name.starts_with("align_rt_") {
+                    saw_rt_decl = true;
+                }
+                assert!(!optsize && !minsize, "tiny: declaration {name} must stay attr-free");
+            } else {
+                assert!(*optsize && *minsize, "tiny: definition {name} must carry optsize+minsize");
+                saw_def = true;
+            }
+        }
+        assert!(saw_def, "test needs at least one definition to be meaningful");
+        assert!(saw_rt_decl, "test needs at least one align_rt_ declaration to be meaningful");
+
+        // Small: definitions get optsize only, never minsize; declarations stay bare.
+        for (name, is_decl, optsize, minsize) in size_attr_probe(src, Profile::Small) {
+            if is_decl {
+                assert!(!optsize && !minsize, "small: declaration {name} must stay attr-free");
+            } else {
+                assert!(optsize && !minsize, "small: definition {name} must carry optsize only");
+            }
+        }
+
+        // The speed profiles are a no-op sweep — nothing gains a size attr anywhere.
+        for profile in [Profile::Dev, Profile::Release, Profile::Fast] {
+            for (name, _is_decl, optsize, minsize) in size_attr_probe(src, profile) {
+                assert!(!optsize && !minsize, "{}: {name} must have no size attrs", profile.name());
+            }
+        }
+    }
+
     fn allocation_case_ir(
         rv: Rvalue,
         value_ty: Ty,
@@ -8078,7 +8217,7 @@ mod tests {
         ];
 
         let ctx = Context::create();
-        let tm = create_target_machine(&BuildTarget::Baseline).expect("target machine");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).expect("target machine");
         let td = tm.get_target_data();
 
         // Build the LLVM struct types exactly as `codegen` does (opaque, then body via the shared
