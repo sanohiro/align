@@ -1471,9 +1471,11 @@ fn drain_par_map(work: &ParMapWork) {
         let mut state = work.barrier.lock().unwrap();
         state.remaining -= 1;
         if let Err(panic) = result
-            && state.panic.as_ref().is_none_or(|(first, _)| range < *first) {
-                state.panic = Some((range, panic));
-            }
+            && state.panic.as_ref().is_none_or(|(first, _)| range < *first)
+        {
+            state.panic = Some((range, panic));
+        }
+        drop(state);
         work.complete.notify_all();
     }
 }
