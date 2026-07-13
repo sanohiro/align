@@ -252,7 +252,10 @@ The **Side Effect Rule** completes the picture: a `par_map` lambda must be Pure 
 captured values but not mutate external state), which is what makes data-parallel execution safe
 without locks. A `task_group` task, by contrast, *may* be impure — it performs I/O — and its
 safety comes from capture being by value (no shared mutable state) rather than from purity.
-Purity is inferred, never annotated.
+Ordinary sequential pipeline callables may also be Impure: deterministic input/stage order and
+`where` guards preserve their observable behavior. Their inferred effect is optimization evidence,
+not a rejection rule. Purity is inferred, never annotated, and is still weaker than
+non-trapping/total execution.
 
 ---
 

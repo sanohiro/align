@@ -8,7 +8,13 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **spawn-capture lifetime P0 FIXED**: `EscapeCheck` now tracks active
+_Last updated: 2026-07-13, **post-`where` callable P0 FIXED + sequential effects SETTLED**:
+reducing MIR guards every general callable suffix/reducer on rejected elements, while safe field +
+builtin `sum`/`count`/`min`/`max` suffixes retain the vectorized mask/select path. Sequential
+`map`/`where`/`reduce`/`scan`/`partition`/`any`/`all` may be Impure with exact input/stage order;
+`par_map` remains Pure-required and `sort_by_key` key evaluation stays separately Open. Trap,
+ordering, callable-reducer, and vector-shape gates are pinned. Also this date, **spawn-capture
+lifetime P0 FIXED**: `EscapeCheck` now tracks active
 task-group regions and rejects direct or wrapped captures that can be freed before the group's
 `wait`; frame/static/outer-arena captures remain valid, with the full matrix pinned in
 `task_group.rs`. The focused source-correctness wave is recorded in
@@ -31,8 +37,8 @@ Claude Code only, not decisions. Previous update: 2026-07-13,
 Unit indirect-call ABI, and buffered `io.copy` fixed; other items not started). The normal
 fused sequential loop, `map_into` alias metadata, capture inlining, JSON/UTF-8/string SIMD, direct
 file read/mmap, and buffered small/direct large writer paths are strong. New correctness-first work:
-post-`where` callables are speculatively executed on rejected elements (confirmed division-by-zero
-abort); the ordinary sequential effect contract conflicts across spec/implementation docs; the
+post-`where` callable speculation and the ordinary sequential effect-contract conflict are now
+fixed/settled as described above; the
 `spawn` capture region gap and the related indirect closure-result gap are now fixed; Unit indirect
 calls used an incompatible LLVM return ABI, and
 `io.copy` skipped buffered-reader lookahead (both fixed in the
@@ -452,9 +458,8 @@ remaining macOS full-suite failures are cataloged out-of-scope at adoption-recor
 (ffi_byval SysV-Linux-by-design, std.net/TLS/cloexec runtime items, APFS non-UTF-8 setup,
 expr_depth test-thread stack — all reproduce identically on pre-#426 main). The Linux flag path
 is pinned unchanged by construction; re-verify the full **1878 + 7** total on a Linux host when
-one is next available. **Next, pick one:** (a) document-12 P0 — fix post-`where`
-inactive-lane-unsafe execution and parallel/higher-order effect holes; settle ordinary sequential
-effects rather than silently adding a rejection; complete required allocation-size hardening before
+one is next available. **Next, pick one:** (a) document-12 P0 — fix parallel/higher-order effect
+holes and complete required allocation-size hardening before
 widening (source of truth `docs/impl/12-pipeline-closure-memory-io-simd-audit.md`); (b) cache-first C0
 — fix the confirmed basename-temp
 race with private staging + atomic publication and add determinism/concurrency gates (source of

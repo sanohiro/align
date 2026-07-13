@@ -203,32 +203,29 @@ a scalable ISA is handled by predicated scalable codegen instead, which is why M
 > Status note: the default build now targets the **portable per-arch baseline** (`x86-64-v2` on
 > amd64, `generic`/`armv8-a` on arm64) via `BuildTarget` in `align_codegen_llvm`; `--target-cpu
 > native` opts into the host CPU. The backend still builds **scalar** IR and leans on the LLVM `-O2`
-> pipeline (SLP / loop vectorizer) for the actual SIMD. Branchless `where` is implemented for **every
-> reducing terminal**: MIR folds the predicates into a mask and each reducer emits `Rvalue::Select` —
-> identity-select where a fixed identity exists (`sum`/`count` → `0`, `min` → `+∞`, `max` → `−∞`,
-> `any` → `false`, `all` → `true`) and accumulator-select for generic `reduce`
-> (`acc = mask ? f(acc,v) : acc`, no identity for a user `f`). `min`/`max` further lower to the
+> pipeline (SLP / loop vectorizer) for the actual SIMD. Branchless `where` is implemented for the
+> inactive-lane-safe reducing suffix: MIR folds predicates into a mask and emits identity-select for
+> `sum`/`count` (`0`) and `min`/`max` (`+∞`/`−∞`). `min`/`max` further lower to the
 > `select(cur `cmp` acc, cur, acc)` idiom (`llvm.{s,u}{min,max}` / `llvm.{min,max}imum`) so the whole
 > loop is branch-free and vectorizes: e.g. `xs.where(p).min()` over a `slice<i32>` emits `pminsd`
 > over a `pcmpgtd` mask on x86-64-v2 (verified via `objdump`; before, the per-element branch blocked
-> it entirely). The materializing terminals (`to_array`/`scan`) use a real skip-branch because they
-> must not append a rejected element.
+> it entirely). General callable suffixes/reducers and materializing terminals use real skip-branches:
+> the former may trap or have effects, and the latter must not append a rejected element.
 >
-> **Correctness audit correction (2026-07-13):** the current reducing lowering also speculates a
-> reducer's callable and every stage after `where` on rejected elements. This is a CONFIRMED P0:
-> Pure does not imply total/non-trapping, so `where(false).map(divide_by_zero).sum()` aborts. The
-> intended form is now: identity/accumulator `select` may stay branchless for operations separately
-> proven safe on inactive lanes; every other post-`where` stage/reducer must be guarded so it is not executed.
-> See [`12-pipeline-closure-memory-io-simd-audit.md` §3.1](12-pipeline-closure-memory-io-simd-audit.md#31-confirmed-p0--where-does-not-guard-later-stages-or-the-reducer).
+> **Correctness fix (2026-07-13):** reducing lowering used to speculate a reducer's callable and
+> every stage after `where` on rejected elements. Pure does not imply total/non-trapping, so
+> `where(false).map(divide_by_zero).sum()` aborted. Identity `select` now stays branchless only for
+> field operations plus builtin `sum`/`count`/`min`/`max`; every general post-`where` callable is
+> guarded and never executes on a rejected element.
+> See [`12-pipeline-closure-memory-io-simd-audit.md` §3.1](12-pipeline-closure-memory-io-simd-audit.md#31-fixed-2026-07-13--where-guards-later-callables-and-callable-reducers).
 > `maskN<T>` remains the explicit hand-written value mask, and `dot` has no masked pipeline form.
 
 > **Why the identity-select shape matters beyond perf.** Selecting each reducer's identity for a
-> masked-out lane (`min` → `+∞`, `max` → `−∞`, `any` → `false`, `all` → `true`, `dot` → `0`, matching
+> masked-out lane (`min` → `+∞`, `max` → `−∞`, `dot` → `0`, matching
 > `sum`/`count` → `0`) makes *every* reduction **predication-ready**: a masked-out lane contributes the
 > identity and cannot change the result. Generic `reduce` is the one exception — its user-supplied
-> function has no known identity (`init` is the starting accumulator, not an identity), so it uses the
-> accumulator-select result `acc = mask ? candidate : acc`. The candidate itself may be computed
-> speculatively only when proven safe; otherwise its computation is guarded. That distinction is what
+> function has no known identity (`init` is the starting accumulator, not an identity), so its
+> computation is guarded. `any`/`all` predicates are likewise guarded. That distinction is what
 > makes the form semantics-correct and still predication-ready for scalable tails (`04 §4`).
 
 ---

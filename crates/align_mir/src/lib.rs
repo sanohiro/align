@@ -4057,6 +4057,25 @@ fn lower_array_reduce(
     let exit = b.new_block();
     b.terminate(Term::Goto(header));
 
+    // A callable after the first `where`, or a callable reducer, cannot be speculated on a rejected
+    // element: Pure does not imply total/non-trapping. Guard those suffixes with control flow. A
+    // suffix made only of field projection/predicates plus a builtin scalar reducer is safe to mask
+    // and retains the vectorizable identity-select shape.
+    let mut seen_where = false;
+    let mut guard_rejected = false;
+    for stage in stages {
+        if seen_where && matches!(&stage.kind, hir::StageKind::Map { .. } | hir::StageKind::Where { .. }) {
+            guard_rejected = true;
+            break;
+        }
+        if matches!(&stage.kind, hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. }) {
+            seen_where = true;
+        }
+    }
+    if seen_where && matches!(&reducer, Reducer::Fold { .. } | Reducer::AnyAll { .. }) {
+        guard_rejected = true;
+    }
+
     // header: while i < len
     b.cur = header;
     let i_val = b.fresh_value(i64_ty());
@@ -4096,10 +4115,9 @@ fn lower_array_reduce(
         None
     };
 
-    // Branchless `where` for *every* reducer: rather than a per-element branch that skips the
-    // accumulate (it doesn't auto-vectorize, and defeats a scalable-ISA predicated tail), AND the
-    // predicates into a `mask` and let the reducer `select` each masked-out lane to its identity.
-    // The mask is `None` when the pipeline has no `where`.
+    // Safe builtin suffixes keep `where` branchless: AND predicates into a mask and let the reducer
+    // select each rejected lane to its identity. A general callable suffix instead branches at each
+    // predicate, so `mask` stays `None` and rejected elements jump directly to `cont`.
     let mut mask: Option<Operand> = None;
 
     for stage in stages {
@@ -4143,29 +4161,35 @@ fn lower_array_reduce(
                 let call_args = stage_call_args(b, arg, captures);
                 let pred = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(pred, Rvalue::Call(func.clone(), call_args)));
-                mask = Some(accumulate_mask(b, mask, Operand::Value(pred)));
+                if guard_rejected {
+                    let accepted = b.new_block();
+                    b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
+                    b.cur = accepted;
+                } else {
+                    mask = Some(accumulate_mask(b, mask, Operand::Value(pred)));
+                }
             }
             hir::StageKind::WhereField { field } => {
                 // Predicate on a struct element's (bool) field; the element is unchanged.
                 let pred = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
-                mask = Some(accumulate_mask(b, mask, Operand::Value(pred)));
+                if guard_rejected {
+                    let accepted = b.new_block();
+                    b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
+                    b.cur = accepted;
+                } else {
+                    mask = Some(accumulate_mask(b, mask, Operand::Value(pred)));
+                }
             }
         }
     }
     let a = b.fresh_value(acc_ty);
     b.push(Stmt::Let(a, Rvalue::Load(acc)));
-    // Every reducer is branchless. When there is a `where` (`mask` is `Some`), each masked-out lane
+    // A safe builtin suffix is branchless. When there is a masked `where`, each rejected lane
     // contributes the reducer's identity so it cannot change the result — additive `0` (`sum`/
-    // `count`), `+∞`/`−∞` (`min`/`max`, exactly the fold seed), `false`/`true` (`any`/`all`) — or, for
-    // generic `reduce`, the accumulator is left unchanged (`acc = mask ? f(acc,v) : acc`), since a
-    // user-supplied `f` has no identity (`init` is the starting accumulator, not an identity).
+    // `count`) or `+∞`/`−∞` (`min`/`max`, exactly the fold seed).
     //
-    // NB: a `where` mask no longer *guards* the reducer's own function. With the branchless form the
-    // reducer's `f`/predicate `p` (and any stage after the `where`) runs on masked-out elements too,
-    // its contribution then discarded. That matches the shipped `sum`/`count` branchless form (a
-    // post-`where` `map` already ran on every element) and is the deliberate cost of a vectorizable,
-    // predication-ready loop (pipeline functions are pure — a masked-out element cannot differ
-    // observably). See `05 §5`.
+    // General callables never reach this masked path after a `where`; their predicates branch to
+    // `cont`, so later stages and the reducer run only for accepted elements.
     let next: Operand = match &reducer {
         // `count`: acc + (mask ? 1 : 0).
         Reducer::Count => {
@@ -4197,10 +4221,10 @@ fn lower_array_reduce(
             b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), contribution)));
             Operand::Value(n)
         }
-        // `reduce`: acc = mask ? f(acc, cur) : acc — accumulator-select (a masked-out lane leaves
-        // the accumulator unchanged, so the result is the fold over the surviving elements, seeded
-        // with `init`). No `where` → the fold result is the accumulator directly.
+        // A callable reducer is control-flow guarded after `where`, so only surviving elements call
+        // it. Without `where`, every element reaches it directly.
         Reducer::Fold { func, captures } => {
+            debug_assert!(mask.is_none(), "a callable reducer after where must use control flow");
             let cur = cur.expect("reduce needs a scalar element");
             let mut args = vec![Operand::Value(a), cur];
             for c in captures {
@@ -4208,34 +4232,19 @@ fn lower_array_reduce(
             }
             let folded = b.fresh_value(acc_ty);
             b.push(Stmt::Let(folded, Rvalue::Call(func.clone(), args)));
-            match &mask {
-                Some(m) => {
-                    let n = b.fresh_value(acc_ty);
-                    b.push(Stmt::Let(n, Rvalue::Select { cond: m.clone(), a: Operand::Value(folded), b: Operand::Value(a) }));
-                    Operand::Value(n)
-                }
-                None => Operand::Value(folded),
-            }
+            Operand::Value(folded)
         }
-        // `any`/`all`: t = p(cur); acc = acc || (mask ? t : false)  /  acc && (mask ? t : true).
-        // A full ||/&&-fold (no early exit) — the branchless, vectorizable shape.
+        // `any`/`all` are likewise guarded after `where`. They deliberately remain a full fold (no
+        // early exit), preserving exactly-once predicate calls for every surviving element.
         Reducer::AnyAll { func, captures, all } => {
+            debug_assert!(mask.is_none(), "a callable predicate after where must use control flow");
             let cur = cur.expect("any/all needs a scalar element");
             let t = b.fresh_value(Ty::Bool);
             let args = stage_call_args(b, cur, captures);
             b.push(Stmt::Let(t, Rvalue::Call(func.clone(), args)));
-            let contribution = match &mask {
-                // masked-out contributes the fold identity: `any` (||) → false, `all` (&&) → true.
-                Some(m) => {
-                    let s = b.fresh_value(Ty::Bool);
-                    b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: Operand::Value(t), b: Operand::Const(Const::Bool(*all)) }));
-                    Operand::Value(s)
-                }
-                None => Operand::Value(t),
-            };
             let op = if *all { BinOp::And } else { BinOp::Or };
             let n = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(n, Rvalue::Bin(op, Operand::Value(a), contribution)));
+            b.push(Stmt::Let(n, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
             Operand::Value(n)
         }
         // `min`/`max`: acc = (cur `op` acc) ? cur : acc — the branchless min/max reduction idiom

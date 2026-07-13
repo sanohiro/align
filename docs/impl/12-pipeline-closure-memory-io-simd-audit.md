@@ -1,8 +1,9 @@
 # Pipeline, closure, memory, I/O, and SIMD audit
 
-Status: **RECORDED 2026-07-13; partially implemented 2026-07-13.** The spawn-capture lifetime gap
-(§3.3), closure-result environment region gap (§3.4), Unit indirect-call ABI defect (§3.5), and
-buffered `io.copy` data loss (§3.6) are fixed and regression-pinned; the other
+Status: **RECORDED 2026-07-13; partially implemented 2026-07-13.** Post-`where` callable execution
+(§3.1) is corrected and ordinary sequential effects are settled (§3.2). The spawn-capture lifetime
+gap (§3.3), closure-result environment region gap (§3.4), Unit indirect-call ABI defect (§3.5), and
+buffered `io.copy` data loss (§3.6) are also fixed and regression-pinned; the other
 correctness and performance items remain open. This is the durable follow-up to
 [`10-cache-first-optimization.md`](10-cache-first-optimization.md) and
 [`11-parallel-execution-optimization.md`](11-parallel-execution-optimization.md); the corrective
@@ -41,12 +42,12 @@ or heap closure.
 The audit nevertheless found correctness blockers and one normative effect-contract conflict that
 come before further SIMD or parallel widening:
 
-1. A reducing pipeline speculatively executes every stage after `where`, and the reducer itself, on
-   rejected elements. Pure does not mean non-trapping or guaranteed to terminate. Division by zero
-   after a false predicate aborts today.
-2. The implementation documents say ordinary pipeline callables are Pure, while the normative spec
-   constrains only `par_map` and the compiler accepts Impure sequential stages. Optimizations cannot
-   assume a premise the language has not settled.
+1. ~~A reducing pipeline speculatively executed every stage after `where`, and the reducer itself,
+   on rejected elements.~~ **FIXED 2026-07-13:** general callable suffixes are guarded; safe field +
+   builtin reducer suffixes retain mask/select.
+2. ~~The ordinary sequential effect contract conflicted across normative and implementation docs.~~
+   **SETTLED 2026-07-13:** Impure is allowed with exact guarded input/stage order; `par_map` remains
+   Pure-required. `sort_by_key` key evaluation stays separately open.
 3. ~~`spawn` could retain a view backed by an inner arena until after that arena was freed.~~
    **FIXED 2026-07-13**, including wrapped and nested-closure captures. The related first-class
    closure-result escape is also fixed by including the callee environment's region in an indirect
@@ -104,9 +105,9 @@ with `E0658 portable_simd`. Consequently the current repository's `std::arch` + 
 
 ## 3. Correctness blockers and required hardening found while auditing performance
 
-### 3.1 CONFIRMED P0 — `where` does not guard later stages or the reducer
+### 3.1 FIXED 2026-07-13 — `where` guards later callables and callable reducers
 
-`lower_array_reduce` accumulates predicates into a Boolean mask, but keeps evaluating subsequent
+At the audit baseline `lower_array_reduce` accumulated predicates into a Boolean mask but kept evaluating subsequent
 `map`/`where` functions and a user reducer/predicate for every source element. Only the contribution
 to the accumulator is discarded with `select` ([lowering around lines 4033-4102](../../crates/align_mir/src/lib.rs#L4033)).
 At the audit baseline the backend guide explicitly described this as deliberate because pipeline
@@ -125,25 +126,20 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-The false predicate rejects `0`, but `reciprocal(0)` still runs and reaches the division-by-zero abort.
+The false predicate rejected `0`, but `reciprocal(0)` still ran and reached the division-by-zero abort.
 The same class includes checked indexing, explicit fatal operations, allocation/OOM, and
 nontermination. **Pure means no observable I/O/shared mutation; it does not imply total,
 non-trapping, non-allocating, or speculatable.** LLVM's own legality rules make the same distinction.
 
-Required immediate correction:
+The correction is deliberately split by local legality:
 
-1. Once a `where` mask is false, branch around every later stage and the reducer call for that
-   element. Stages before the first `where` still execute, preserving source order.
-2. Retain branchless identity/select only where every operation executed on an inactive lane is
-   locally proven safe. Use a summary such as `CanExecuteOnInactiveLane`; do not mechanically map a
-   broad function effect bit to LLVM's `speculatable` attribute.
-3. The proof is a conjunction: Pure/no observable side effect, no trap/abort, will return, no
-   allocation whose OOM is observable, and valid provenance/bounds for every inactive-lane memory
-   access. Initially infer it only for a small whitelist such as wrapping integer arithmetic,
-   bitwise operations, comparisons, and loads whose address is independently proven in bounds.
-   Division, checked indexing, allocation, opaque calls, and loops fail closed.
-4. A later backend may use target masks or LLVM VP operations, but masked execution must suppress the
-   unsafe operation, not merely discard its result.
+1. If a callable stage follows the first `where`, or the terminal is generic `reduce`/`any`/`all`,
+   each predicate branches rejected elements directly to the loop continuation. Stages before the
+   first `where` still execute in source order.
+2. Field projection/predicates and builtin `sum`/`count`/`min`/`max` are locally safe for the loaded
+   source element, so they keep the identity-select mask path and its vector shape.
+3. Future widening requires a stronger `CanExecuteOnInactiveLane` proof; it must not mechanically
+   map the broad Pure effect bit to LLVM `speculatable`.
 
 Regression gate:
 
@@ -154,16 +150,18 @@ Regression gate:
 - a whitelisted, total arithmetic `where(...).sum()` retains the vectorized positive shape;
 - mutation that changes the guard back to a result-only `select` fails the trap tests.
 
-### 3.2 CONFIRMED DOC/LEGALITY CONFLICT — ordinary pipeline effects are unsettled
+All gates are implemented in `branchless_where.rs`; `vectorize_shapes.rs` retains the v2/v3 masked
+sum and masked-min positive shapes.
+
+### 3.2 SETTLED 2026-07-13 — ordinary sequential callables may be Impure
 
 The effect pass walks ordinary stage call edges, but `check_parallelism` validates only the terminal
-`par_map` function ([lines 2413-2420](../../crates/align_sema/src/lib.rs#L2413)). The implementation
-type/MIR documents say ordinary `map`/`where`/reducer callables require Pure, but `draft.md`'s
-normative side-effect rule constrains `par_map` only, the language summary does not forbid sequential
-effects, and the compiler accepts them. Rejecting all existing Impure sequential pipelines would
-therefore be a language change, not a performance bug fix.
+`par_map` function ([lines 2413-2420](../../crates/align_sema/src/lib.rs#L2413)). At the audit
+baseline the implementation type/MIR documents said ordinary `map`/`where`/reducer callables require
+Pure, while `draft.md` constrained `par_map` only and the compiler accepted Impure sequential calls.
+The settled specification now matches that implementation behavior and defines its exact order.
 
-The following checks and runs successfully, printing `1`, `2`, then `0`:
+At the audit baseline the following printed `1`, `2`, then `0`:
 
 ```align
 fn never(x: i64) -> bool = false
@@ -180,20 +178,18 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-The output is `1`, `2`, then `0`: direct evidence for section 3.1's speculation bug. It is not by
-itself authority to ban `noisy` from an ordinary sequential pipeline.
+It now prints only `0`: `noisy` is after a predicate that rejects every element. The old output was
+direct evidence for section 3.1's speculation bug, not authority to ban sequential effects.
 
-Required settlement before optimization widening:
+The compatibility default is now normative: sequential `map`/`where`/`reduce`/`scan`/`partition`/
+`any`/`all` callables may be Impure. They execute in input-index and stage order, exactly once for
+each element that reaches them; a false `where` suppresses the suffix. `any`/`all` do not
+short-circuit. Inferred effects restrict transformations rather than source acceptance. Explicit
+`par_map` remains Pure-required.
 
-1. **Recommended compatibility default:** allow Impure sequential callables, preserve exact source
-   order/evaluation with real guards, and use inferred effects only as fusion/vectorization legality.
-   Require Pure for every stage moved into an explicit `par_map` range.
-2. Alternatively, if Align deliberately wants all data-processing callables Pure, first change
-   `draft.md` and `language-spec`, define diagnostics/migration, then enforce it consistently for
-   `map`, `where`, `reduce`, `scan`, `partition`, `any`/`all`, and `sort_by_key`.
-3. Settle `sort_by_key` before its planned decorate-sort-undecorate rewrite: an Impure key function's
-   call count is currently O(n^2), while decoration calls it once per element. Either require Pure or
-   normatively define exactly-once key evaluation.
+`sort_by_key` is separated into its own Open item: the current comparison sort calls its key O(n²)
+times, while decoration would call exactly N times. No partial Pure rejection lands before the
+function-type effect path is sound.
 
 Section 3.1 is independent: even after choosing Pure-only, a Pure callable may abort and cannot be
 speculated without the stronger inactive-lane proof.
@@ -368,7 +364,7 @@ cases before changing arena initialization policy.
 
 | Terminal/shape | Current lowering | Assessment |
 |---|---|---|
-| `map/where/.../sum`, `count`, `min/max`, `reduce`, `any/all` | One counted loop; scalar accumulator; no intermediate allocation | Correct high-level shape; section 3.1 must fix unsafe speculation |
+| `map/where/.../sum`, `count`, `min/max`, `reduce`, `any/all` | One counted loop; scalar accumulator; no intermediate allocation | Correct high-level shape; section 3.1 callable speculation fixed |
 | `to_array` / `scan` | One output allocation sized to the source upper bound, one fused fill loop | Good single-allocation shape; `where` uses a real skip branch |
 | `map_into(out)` | No output allocation; one length-preserving loop into caller storage | Best materializing path; scoped input/output alias metadata removes overlap checks |
 | `to_soa` | One contiguous aligned arena buffer, one fused transpose | Good representation; wide schemas may benefit from already-planned blocking |
@@ -866,12 +862,11 @@ effect solution; it does not replace it with a second mechanism.
 
 ### Slice P0a — pipeline semantic legality
 
-- branch-guard all post-`where` work not proven safe on inactive lanes;
-- settle ordinary sequential effects normatively; preserve accepted Impure call order unless/until the
-  language spec changes;
+- [x] branch-guard all post-`where` work not proven safe on inactive lanes (2026-07-13);
+- [x] settle ordinary sequential effects normatively with exact guarded order (2026-07-13);
 - close lifted/higher-order effect holes and require Pure for every stage moved into `par_map`;
 - introduce conservative inactive-lane legality only after the correct branch baseline;
-- update the backend/design text that currently equates Pure with safe speculation.
+- [x] update backend/design text that equated Pure with safe speculation (2026-07-13).
 
 **Completion:** false predicates suppress every later potentially trapping operation; named,
 capturing, and higher-order Impure functions cannot enter a parallel body; guarded sequential effects

@@ -174,6 +174,18 @@ Record: `draft.md` §5 (Sum Type), `impl/07-roadmap.md`.
 **Decision: compiler inference (no explicit marks).** Effects (Pure/Impure) are inferred from the body, and `par_map` etc. require Pure closures. **Implemented** (`align_sema` Pass 4, `check_parallelism`): a function is Impure iff it transitively performs an observable side effect — calling `print` / `io.stdout.write` / `fs.read_file`, or calling an Impure function (fixpoint over the call graph). Everything else (arithmetic, reads, builder/arena/heap, owned-value moves) is Pure. `par_map(f)` rejects an Impure `f`. (Sound for the language as it stands: a `par_map` function is `(T) -> R` with no `out` parameter, so reaching an I/O builtin is the only route to impurity.)
 Record: `impl/03-types.md` §8
 
+### Ordinary sequential pipeline effects and evaluation order
+**Decision (2026-07-13): Impure is allowed; guarded source order is normative.** Sequential
+`map`/`where`/`reduce`/`scan`/`partition`/`any`/`all` callables run in input-index order and stage
+order, exactly once for each element that reaches them. A false `where` suppresses every later
+stage/reducer for that element; `any`/`all` do not short-circuit. Inferred effects constrain
+reordering, speculation, erasure, duplication, and parallelization instead of rejecting ordinary
+sequential code. Pure is not a proof of total/non-trapping execution. Explicit `par_map` remains
+Pure-required. `sort_by_key` is excluded pending its separate key-evaluation settlement below.
+**Implemented:** reducing MIR branches around every general callable after `where`, while safe field
+operations plus builtin `sum`/`count`/`min`/`max` retain the mask/identity-select vector shape.
+Record: `draft.md` §8, `docs/language-spec.md`, `impl/12-pipeline-closure-memory-io-simd-audit.md` §3
+
 ### Lambdas / closures — IMPLEMENTED (map/where/all reducers + capture)
 **Decision: lambdas exist and are the way to pass behavior to stages/reducers; capture by value, no hidden closure environment.** Always part of the design (`draft.md` §8/§11 use `fn x { ... }`); the early implementation accepted only named functions, now lifted. **Implemented**: an inline lambda `fn params { body }` (parameter types inferred) in `map`/`where`/`reduce`/`par_map`/`scan`/`partition`/`any`/`all`/`sort_by_key` is **lifted** to a synthetic top-level function (`align_sema` `lift_lambda`), so it flows through the same `Rvalue::Call` + fused-loop lowering as a named function — optimized identically. **Capture** of enclosing locals is by value: each captured local becomes a trailing parameter passed at the call site (a loop-invariant argument the backend hoists), so there is no closure environment / allocation. Capture is wired into **every** stage and reducer (`map`/`where` + `reduce`/`scan`/`partition`/`any`/`all`/`par_map`/`sort_by_key`) for copy values; a capturing `par_map` falls back to the sequential path (the parallel thunk has no capture context). All three flow analyses (`MoveCheck`/`EscapeCheck`/`EffectScan`) walk stage and node captures. Deferred: owned-value capture, and first-class function values (see next entry).
 Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-notes.md` (lambda philosophy), `impl/07-roadmap.md`.
@@ -690,18 +702,15 @@ Provenance: surfaced by an external idea review (2026-07-02); adopted + implemen
 Record: `draft.md` §9 (memory layout) + §15 (`layout(C)`), `docs/language-spec.md`,
 `docs/design-notes.md`, `impl/05-backend-llvm.md` §2, `tests/struct_field_reorder.rs`.
 
-### Masked reducing `where` — vector code shipped; callable-speculation correctness fix OPEN (audit 2026-07-13)
+### Masked reducing `where` — vector shape + callable correctness SHIPPED (2026-07-13)
 
-**Audit correction:** the 2026-07-02 implementation result below established a valuable
-identity-select vector shape, but overextended it to user callables and post-`where` stages. A Pure
-callable can still divide by zero, fail a bounds check, allocate/OOM, or fail to terminate. The
-current `where(false).map(divide_by_zero).sum()` therefore aborts, and ordinary Impure pipeline
-stages are accepted today. The implementation plan says they require Pure, but the normative draft
-constrains only `par_map`; settle that conflict before adding a rejection. Required now: keep
-identity/accumulator select only for operations separately proven safe on inactive lanes and
-branch-guard every other rejected-lane computation, preserving accepted sequential effects. Full
-reproduction, legality split, and regression gate:
-[`impl/12-pipeline-closure-memory-io-simd-audit.md` §3.1](impl/12-pipeline-closure-memory-io-simd-audit.md#31-confirmed-p0--where-does-not-guard-later-stages-or-the-reducer).
+**Audit correction shipped:** the 2026-07-02 implementation established a valuable identity-select
+vector shape, but overextended it to user callables and post-`where` stages. A Pure callable can
+still divide by zero, fail a bounds check, allocate/OOM, or fail to terminate. Reducing MIR now keeps
+mask/select only for safe field operations plus builtin `sum`/`count`/`min`/`max`; a general
+post-`where` callable is control-flow guarded. Sequential Impure callables are normatively allowed
+with exact guarded source order. Full reproduction, legality split, and regression gate:
+[`impl/12-pipeline-closure-memory-io-simd-audit.md` §3.1](impl/12-pipeline-closure-memory-io-simd-audit.md#31-fixed-2026-07-13--where-guards-later-callables-and-callable-reducers).
 
 **Historical shipped shape:** a `where`/`where(.field)` feeding a reducing terminal lowers by ANDing the
 predicates into a `mask`, then `select` each masked-out lane to the reducer's identity instead of a
@@ -715,9 +724,8 @@ lowering, no dual mechanism. For the builtin identity operation itself, results 
 the branch form: same ordered comparison
 (NaN elements still skipped by `min`/`max`), same empty-selection result (`min`/`max` → the extreme
 seed, `reduce` → `init`, `any` → `false`, `all` → `true`). `dot` is out of scope — `a.dot(b)` is a
-two-array kernel with no `where`, already branch-free. The current implementation also runs a
-reducer's own `f`/predicate and every post-`where` stage on rejected elements; that is the confirmed
-P0 above, not an acceptable cost of vectorization. **Why the safe identity-select shape matters:**
+two-array kernel with no `where`, already branch-free. Generic reducers and `any`/`all` now execute
+only on surviving elements. **Why the safe identity-select shape matters:**
 the single-column `s.where(p).sum()` over `slice<i64>` already vectorized via LLVM if-conversion — no
 gain. But the **soa filtered aggregate** `rs.where(.active).pay.sum()` (bool mask column + i64 value
 column) did NOT auto-vectorize — scalar, 20 branches, branch-bound, **0.93× vs Rust AoS** (parity).
@@ -2335,22 +2343,14 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
 
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
-### Ordinary sequential pipeline callable effects — SETTLE BEFORE P0 OPTIMIZER FIX
+### `sort_by_key` key effects and evaluation count — OPEN
 
-Recorded 2026-07-13 by the pipeline audit. The implementation plan says closure arguments to
-`map`/`where`/`reduce` are Pure; the normative `draft.md` side-effect rule constrains only
-`par_map`, `language-spec.md` is silent, and the compiler currently accepts Impure sequential
-callables. The mismatch became observable because reducing `where` speculates post-filter calls on
-rejected elements. Rejecting those programs now would be a source-language change, not merely a
-checker fix.
-
-Preferred compatibility settlement: ordinary sequential stages may be Impure, must retain exact
-guarded source order, and their inferred effect restricts fusion/reordering/vectorization;
-every stage moved into explicit `par_map` remains Pure-required. Alternative: make all data-processing
-callables Pure normatively, update both specs and diagnostics, then enforce consistently. Also settle
-`sort_by_key`: its planned decorate-sort-undecorate changes an Impure key's call count from O(n^2) to
-exactly N, so either key functions are Pure or exactly-once evaluation becomes the contract. Full
-reproduction and interaction with `CanExecuteOnInactiveLane`: `impl/12` §3.1-3.2.
+Ordinary sequential stage/reducer effects are settled above, but comparison sorting is a distinct
+contract. The current insertion sort calls a key function O(n²) times in comparison-dependent order;
+the planned decorate-sort-undecorate rewrite would call it exactly once per surviving element. Settle
+either Pure-only keys or exactly-once input-order key evaluation before that rewrite. The current
+effect graph is not sound enough to enforce Pure through every lifted/higher-order path, so do not add
+a partial rejection. Full context: `impl/12` §3.2.
 
 ### Separate compilation (multi-module compilation units) — OWNER-MANDATED → M15
 
