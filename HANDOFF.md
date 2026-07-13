@@ -8,7 +8,28 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **artifact collision C0 FIXED**: production codegen objects live in
+_Last updated: 2026-07-13, **Codex-audit wave-1 COMPLETE — the two remaining CONFIRMED bugs
+fixed, #437 + #438 MERGED** (both two-lens designed; gemini reviews reflected before merge;
+workspace **1914 green** + clippy clean on merged main, verified on the Linux/WSL2 host).
+**#437 profiles-reach-the-backend:** `Profile::codegen_opt_level()` (dev=None / release=Default /
+fast=Aggressive / small,tiny=Default — size comes from attrs, clang-style) threaded into
+`create_target_machine`; `optsize` (+`minsize` on tiny) swept over module **definitions only**
+(disjoint from the #423 rt_contract declare table by the `count_basic_blocks` split); the
+diagnostic lenses (`emit-llvm`/`explain-opt`) stay pinned at Default/Release so every IR-shape
+suite is byte-identical; the release (no-flag) object proven **sha256-identical** to pre-change
+main. The per-profile **runtime variant + cache key is DEFERRED with a recorded key spec**
+(profile / panic-strategy / LLVM-major / rustc / runtime-source-hash / target) to the M14
+runtime-bitcode work + the doc-10 §2 cache layer — no cache substrate exists to key today.
+**#438 `--export` roots:** repeatable `--export <name>` on `emit-obj`/`emit-llvm` only
+(diagnosed, not ignored, on other verbs), fail-closed against MIR fn names, and `declare_fn`'s
+internalization guard keyed on the **symbol** — gemini's one high finding was REAL
+(`--export main` left `align_main` external; reproduced, fixed, regression-pinned as a harmless
+no-op); export = linkage + DCE root from the same set; the bench export contract is restored
+(`bench/run.sh baseline/native` + all six kernel-linking sub-benches run end-to-end again;
+`bench/README.md` rewritten — `--export` is the object's C-ABI surface, independent of `pub`).
+Codex wave-1 is now fully closed (item 2 shipped earlier as #426); remaining Codex work =
+wave-2 quick wins, wave-3 measure-first, and the `bench/binary_size` script port. Previous
+update: 2026-07-13, **artifact collision C0 FIXED**: production codegen objects live in
 per-invocation private temp directories, linked executables are staged beside their final path and
 atomically renamed only after success, and `run`/`size` retain private directories through use.
 Twelve concurrent same-basename run/build pairs plus eight size pairs pass; reverting either object
@@ -483,16 +504,15 @@ is pinned unchanged by construction; the owed Linux full-suite re-verification i
 manual probe `utf8_validate_throughput`), **`cargo clippy --workspace --all-targets --
 -D warnings` clean** — the #427–#436 audit+fix wave (authored outside Claude Code; those PRs
 carry no Claude-Code marker) added ~22 tests over the #426 baseline and is fully green on
-Linux. **Next, pick one:** (a) cache-first C0 continuation — stabilize independent
+Linux. **Next, pick one** (Codex wave-1 is DONE 2026-07-13 — #426/#437/#438, see the _Last
+updated_ paragraph): (a) cache-first C0 continuation — stabilize independent
 constant diagnostics and add byte-reproducibility gates before whole-program CAS (source of truth
 `docs/impl/10-cache-first-optimization.md`; MUST precede caching failed results); (b)
 parallel P1 — replace the per-element runtime thunk with the recorded whole-range kernel, then add
-the read-only capture context (source of truth `docs/impl/11-parallel-execution-optimization.md`); (c) the Codex wave-1 remainder — CONFIRMED bug
-1 (bench export roots: `emit-obj --export` mechanism,
-`bench/run.sh` re-verified) and bug 3 (profiles never reach the TargetMachine:
-`optsize`/`minsize` fn attrs, per-profile runtime variant + cache key); (d) the deferred
-`bench/binary_size` script port (small PR, adoption-record item 2 sub-item); (e) the M14 LTO ceiling
-probe rerun (procedure in the roadmap M14 section); (f) Codex wave-2 quick wins (O(n²) sort,
+the read-only capture context (source of truth `docs/impl/11-parallel-execution-optimization.md`);
+(c) the deferred
+`bench/binary_size` script port (small PR, adoption-record item 2 sub-item); (d) the M14 LTO ceiling
+probe rerun (procedure in the roadmap M14 section); (e) Codex wave-2 quick wins (O(n²) sort,
 tiny-`par_map` cold start, zero-size arena, attr-kind fail-loud + `captures(none)`). Reminder:
 gemini-code-assist reviews cease **2026-07-17**
 — after that, `/code-review` on the branch replaces the reflect-before-merge step.
