@@ -1,6 +1,8 @@
 # Cache-first compilation and output-code optimization
 
-Status: **RECORDED 2026-07-12; implementation not started.** This is the durable source for the
+Status: **RECORDED 2026-07-12; artifact-collision C0 implemented 2026-07-13.** Private object/run/size
+staging plus atomic executable publication closes §3; deterministic diagnostics, reproducibility,
+and CAS work remain open. This is the durable source for the
 cache-first audit requested after the LLVM 22 / macOS portability wave. It records confirmed
 correctness defects, the required artifact-cache architecture, and new measure-first CPU-cache
 candidates that are not already in the roadmap. Audit baseline: commit `ad7e4c8b57ad`, arm64 macOS,
@@ -67,9 +69,9 @@ consultation adoption records in `open-questions.md`.
 
 ---
 
-## 3. P0 confirmed defect: predictable temporary artifacts collide
+## 3. FIXED 2026-07-13: predictable temporary artifacts collided
 
-### Current behavior
+### Audit-baseline behavior
 
 `alignc build` and `alignc run` compile through a temporary object named only from the source
 basename:
@@ -111,7 +113,7 @@ Concurrent `run` probes also produced wrong programs, signals, `ENOENT`, and "ca
 file" failures as the shared executable was replaced or removed. This is **CONFIRMED** and is not a
 performance-only issue.
 
-### Required fix
+### Implemented first slice
 
 Use the same artifact-identity mechanism for collision safety and caching:
 
@@ -134,17 +136,27 @@ For a missing key:
    execute a partially written cache entry.
 6. Remove staging data on failure; an interrupted build must not create a cache hit.
 
-The first implementation may use a unique non-cache staging directory to close the correctness bug,
-but it should use the final key/path abstraction so it is not throwaway work.
+The first implementation uses atomically claimed private directories containing PID, time, and a
+process-local nonce. Objects never leave private system-temp staging. Link output is created in a
+private directory beside the requested executable and renamed atomically only after a complete
+successful link, avoiding cross-filesystem publication. `run` and `size` each hold a separate
+private directory through execution/reporting; Drop removes only the directory that invocation
+claimed. This closes the race without pretending the later content-key CAS exists.
 
 ### Regression requirements
 
-- Two different same-basename programs build/run concurrently for many rounds; both always execute
-  their own program.
+- [x] Two different same-basename programs build/run concurrently for many rounds; both always
+  execute their own program (12 run pairs + 12 build pairs per gate).
 - Same basename with different profile / target CPU never shares an object key.
 - Many producers of one identical key all receive a complete byte-identical artifact.
 - Kill the producer between codegen and publish; the next build reports a miss and rebuilds.
-- A `size` process cannot remove or inspect another process's executable.
+- [x] A `size` process cannot remove or inspect another process's executable (8 concurrent pairs).
+
+The regression mutates object staging and run-executable staging independently back to shared
+paths. The object mutation fails in round 0 with the wrong program; the run mutation fails with the
+wrong program by round 6. Interrupted-publish fault injection and same-key CAS producer tests remain
+for the content-key slice; private Drop cleanup and publish-after-link structure prevent failed
+ordinary invocations from creating a partial final executable.
 
 ---
 
@@ -514,8 +526,9 @@ tests must still run without counters; counters enrich a benchmark, never gate f
 
 ### Slice C0 — artifact correctness and determinism
 
-- Replace predictable shared temporary paths with private staging + atomic publication.
-- Add the concurrent same-basename and interrupted-publish regression tests.
+- [x] Replace predictable shared temporary paths with private staging + atomic publication (2026-07-13).
+- [x] Add concurrent same-basename build/run/size regression tests (2026-07-13); retain explicit
+  interrupted-publish fault injection for the content-key publication slice.
 - Sort independent constant evaluation/diagnostic output deterministically.
 - Add the byte-reproducibility suite for normal object/executable output.
 
@@ -563,8 +576,8 @@ When resuming this work in a later session:
 
 1. Read `HANDOFF.md`, `CLAUDE.md`, the M14/M15 sections of `07-roadmap.md`, then this document and
    the parallel companion `11-parallel-execution-optimization.md`.
-2. Check whether C0 has landed; never begin parallel M15 compilation while basename-shared artifacts
-   remain.
+2. Preserve the landed private-staging/atomic-publication C0 gate; never reintroduce a shared partial
+   artifact path when adding content keys or parallel M15 compilation.
 3. Re-run the confirmed reproductions on the current HEAD before editing; line numbers may have
    moved, but the linked functions are the authoritative sites.
 4. Keep confirmed fixes separate from measure-first CPU candidates.

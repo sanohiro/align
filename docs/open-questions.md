@@ -2365,11 +2365,12 @@ code. Soundness note: every escape/effect gate audited to date assumes whole-pro
 visibility; unit interfaces must carry summaries or be conservative, never fail-open.
 
 **Cache-first companion audit (2026-07-12):** `impl/10-cache-first-optimization.md` is the durable
-detail for this item's artifact identity and invalidation questions. It adds a confirmed pre-M15
-correctness prerequisite (basename-derived shared temporary artifacts corrupt concurrent builds),
+detail for this item's artifact identity and invalidation questions. Its confirmed pre-M15
+basename-derived shared temporary artifact defect is fixed 2026-07-13 with private staging, atomic
+publication, and concurrent build/run/size gates. It also records
 the proposed staged CAS + interface/implementation/link-summary hashes, exact toolchain/runtime
 keys, deterministic-output validation, and separately labeled measure-first CPU-cache candidates.
-Only the confirmed defect and cache correctness constraints are commitments today; the locality
+The remaining cache correctness constraints are commitments today; the locality
 candidates remain probes until their written gates pass.
 
 **Parallel execution/output-IR companion audit (2026-07-12):**

@@ -29,14 +29,20 @@ pub fn run_size(path: &str, target: BuildTarget, profile: Profile) -> ExitCode {
     let Some(mir) = crate::front_to_mir(path) else {
         return ExitCode::FAILURE;
     };
-    // Build into a private temp path (like `run`), never the cwd — `size` is a report, not `build`.
-    let exe = std::env::temp_dir().join(format!("align-size-{}", crate::stem(path)));
+    // Keep the complete executable private through the report. Another `size` process cannot
+    // replace or remove it while llvm-readobj/llvm-nm are inspecting it.
+    let stage = match crate::ArtifactStage::temp("align-size") {
+        Ok(stage) => stage,
+        Err(e) => {
+            eprintln!("alignc: cannot create size staging directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let exe = stage.path().join("program");
     if let Err(code) = crate::build_to(path, &mir, &exe, target, profile) {
         return code;
     }
     let res = report(&exe, profile);
-    // The exe is purely transient (the report is the product) — don't accumulate in temp_dir.
-    let _ = std::fs::remove_file(&exe);
     match res {
         Ok(text) => {
             print!("{text}");

@@ -2320,10 +2320,10 @@ the Compiler axis includes fast feedback).
 
 **Cache-first companion record (2026-07-12):** `10-cache-first-optimization.md` is the detailed
 source for artifact identity, publication, invalidation, and the newly found output/runtime cache
-candidates. It confirmed a P0 prerequisite not previously in this roadmap: `build`/`run`/`size`
-derive shared temporary object/executable paths from the source basename, so two unrelated
-`main.align` builds can overwrite and link/execute each other's artifacts. Private staging + atomic
-publication under a complete content key must land before M15 compiles units in parallel. The same
+candidates. Its P0 basename-derived shared temporary artifact defect is fixed as of 2026-07-13:
+objects and transient executables use private staging, and requested executables publish by atomic
+same-directory rename. The future complete content key and CAS must build on that invariant before
+M15 compiles units in parallel. The same
 record pins the already-promising reproducibility baseline and the cache validation matrix; do not
 build a throwaway mtime cache that M15 immediately replaces.
 
