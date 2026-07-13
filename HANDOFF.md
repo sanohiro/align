@@ -8,7 +8,11 @@ work up immediately. **If you are a new session: read this, then `CLAUDE.md`, th
 Everything durable is in this repo; the conversation history and
 Claude's per-machine memory do not travel with `git clone` (see "Memory" below).
 
-_Last updated: 2026-07-13, **parallel lifted/higher-order effect P0 FIXED**: capturing closures now
+_Last updated: 2026-07-13, **nested parallel scheduler P0 FIXED**: `par_map` now uses a shared
+atomic range cursor, caller/helper drain loop, and total-range completion barrier. Saturated
+`task_group -> par_map` therefore makes progress with zero idle pool workers; a forced-two-worker,
+`workers + 1` task child-process gate is watchdog-bounded, and stopping each runner after one range
+reproduces the old timeout. Also this date, **parallel lifted/higher-order effect P0 FIXED**: capturing closures now
 contribute their lifted call edge, and function-value calls whose effect is absent from `FnTy`
 propagate a separate unknown effect that is rejected at Pure/`par_map` boundaries. Sequential HOF
 calls remain legal; a future function-type effect bit recovers precision. Named/capturing/higher-order
@@ -64,10 +68,10 @@ processes), and keeps four CPU-cache ideas explicitly MEASURE-FIRST (owned-temp 
 wide AoS→SoA blocked construction, `task_group` batching, stack lifetime markers after MIR
 liveness). Existing valid objects/executables were byte-identical across repeated/relocated builds,
 so the CAS substrate is promising but not yet regression-pinned. **Parallel execution/generated-IR
-companion audit RECORDED** in `docs/impl/11-parallel-execution-optimization.md` (effect P0 fixed;
-scheduler work not started): the lifted/higher-order effect holes are now closed. On an eight-worker host,
-`task_group` with nine tasks that each enter multi-range `par_map` deadlocks on the shared pool (eight
-tasks complete). The required next fix is caller-draining work-first range claims. The already-planned per-element-thunk removal remains the main IR lever; new gated
+companion audit RECORDED** in `docs/impl/11-parallel-execution-optimization.md` (both correctness
+P0s fixed; performance work not started): the lifted/higher-order effect holes and saturated nested
+scheduler deadlock are now closed. `par_map` callers and helpers drain shared coarse ranges, so a
+structured caller never depends on an idle pool worker. The already-planned per-element-thunk removal remains the main IR lever; new gated
 candidates are read-only parallel capture context, wrapping-integer `par_map(...).sum()` fusion to
 eliminate the full intermediate write/read, length-preserving staged kernels, low-lock task
 claim/completion + queue batching, packed task records, body/byte-aware grain, and only later a
@@ -448,7 +452,8 @@ owed-delta wave; staleness sweep #395)._
 
 **Repo baseline for the audits (2026-07-13, macOS arm64 machine):** **#430** plus the spawn-capture
 lifetime fix described in the _Last updated_ paragraph above. The cache-first and parallel records
-remain unimplemented; the pipeline/closure/memory/I/O/SIMD record is partially implemented.
+are respectively unimplemented and correctness-complete/performance-open; the
+pipeline/closure/memory/I/O/SIMD record is partially implemented.
 **This machine needs two env vars for every
 `cargo build`/`cargo test`/driver-link run** — this was the undocumented blocker at session
 start: `LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm` (Homebrew LLVM 22.1.8 is keg-only) and
@@ -466,8 +471,8 @@ widening (source of truth `docs/impl/12-pipeline-closure-memory-io-simd-audit.md
 — fix the confirmed basename-temp
 race with private staging + atomic publication and add determinism/concurrency gates (source of
 truth `docs/impl/10-cache-first-optimization.md`; MUST precede M15 parallel compilation); (c)
-parallel P0 correctness — close the saturated `task_group -> par_map` deadlock before any scheduler/IR widening (source of truth
-`docs/impl/11-parallel-execution-optimization.md`); (d) the Codex wave-1 remainder — CONFIRMED bug
+parallel P1 — replace the per-element runtime thunk with the recorded whole-range kernel, then add
+the read-only capture context (source of truth `docs/impl/11-parallel-execution-optimization.md`); (d) the Codex wave-1 remainder — CONFIRMED bug
 1 (bench export roots: `emit-obj --export` mechanism,
 `bench/run.sh` re-verified) and bug 3 (profiles never reach the TargetMachine:
 `optsize`/`minsize` fn attrs, per-profile runtime variant + cache key); (e) the deferred

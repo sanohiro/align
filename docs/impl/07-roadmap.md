@@ -965,10 +965,11 @@ already lives in `docs/open-questions.md`.
   skeleton. A direct (no prior stages) `{ptr,len}` / scalar-array / `chunks` source lowers to
   `Rvalue::ParMapParallel`: codegen emits a per-function `void(in, out)` thunk (load element → call
   `f` → store result) and the runtime `align_rt_par_map` splits `[0, count)` into disjoint output
-  ranges on a process-lifetime `ParPool`; the caller runs chunk 0 and waits for submitted helper
-  chunks. Intended race-freedom comes from inferred Pure `f` plus disjoint output ranges, but the
+  ranges on a process-lifetime `ParPool`; helpers and the caller drain one shared range cursor and
+  join a total-range completion barrier. Intended race-freedom comes from inferred Pure `f` plus disjoint output ranges, but the
   2026-07-12 audit found a P0 lifted-capturing-closure effect edge; **fixed 2026-07-13**, together
-  with a fail-closed higher-order unknown-target gate. A *staged*
+  with a fail-closed higher-order unknown-target gate. The saturated `task_group -> par_map`
+  forward-progress P0 is also fixed by the shared caller-draining cursor and a watchdog gate. A *staged*
   `par_map` (`where(p).par_map(f)`) and a capturing `par_map` still use the sequential collect loop.
   Results are identical to the sequential lowering when the Pure premise holds.
 - [done] **first-class closures (escape-driven)** — slices ①–③ (PRs #104–108): non-capturing
@@ -993,9 +994,10 @@ already lives in `docs/open-questions.md`.
 
 **Parallel correctness/output-IR companion record (2026-07-12):**
 `11-parallel-execution-optimization.md` confirmed two previously unrecorded P0s: an Impure lifted
-capturing closure can be laundered through a function value into `par_map`, and a saturated
-`task_group -> par_map` re-entry deadlocks because only `task_group` drains work on its caller.
-The record requires caller-draining range claims before scheduler optimization, makes the existing
+capturing closure could be laundered through a function value into `par_map`, and a saturated
+`task_group -> par_map` re-entry deadlocked because only `task_group` drained work on its caller.
+Both are fixed and regression-pinned as of 2026-07-13: effects fail closed at the Pure boundary,
+and `par_map` helpers plus callers drain one shared range cursor under a child-process watchdog. The record makes the existing
 whole-chunk specialization plan concrete, and gates new capture-context, integer
 transform-reduce, staged-pipeline, low-lock latch/batching, work-aware grain, and split execution
 domain candidates. It proposes no new source syntax.

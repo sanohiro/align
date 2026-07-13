@@ -58,6 +58,8 @@ These are locked. Full rationale + record locations in `docs/open-questions.md` 
 > callables may be Impure with exact guarded source order; explicit `par_map` remains Pure-required.
 > Lifted-closure effects now propagate, and unknown higher-order targets fail closed at Pure/parallel
 > boundaries while remaining legal sequentially.
+> Saturated `task_group -> par_map` now shares caller-drained range claims; a forced-worker
+> child-process watchdog pins progress with zero idle pool workers.
 > M9's portable `io.copy` lookahead P0, the spawn-capture and closure-result region gaps, and the Unit
 > indirect-call ABI mismatch are fixed and regression-pinned in
 > `docs/impl/source-correctness-fixes-2026-07-13.md`. Read
