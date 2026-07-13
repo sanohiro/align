@@ -63,12 +63,10 @@ fn emitted_ir_round_trips_through_llvm_as() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn llvm-as");
-    child
-        .stdin
-        .take()
-        .expect("llvm-as stdin")
-        .write_all(ir.as_bytes())
-        .expect("write IR to llvm-as");
+    // Ignore the write result: if `llvm-as` rejects the IR and exits before draining stdin, the
+    // pipe closes and `write_all` returns BrokenPipe. Panicking here would mask the real failure —
+    // the verdict and diagnostics come from the exit status + stderr captured below, not the write.
+    let _ = child.stdin.take().expect("llvm-as stdin").write_all(ir.as_bytes());
     let out = child.wait_with_output().expect("await llvm-as");
     assert!(
         out.status.success(),
