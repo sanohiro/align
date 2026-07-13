@@ -2425,8 +2425,10 @@ fn check_parallelism(program: &Program, diags: &mut Diagnostics) {
         while let Some(callee) = worklist.pop() {
             if let Some(callers) = reverse_calls.get(callee.as_str()) {
                 for caller in callers {
-                    if affected.insert(caller.to_string()) {
-                        worklist.push(caller.to_string());
+                    if !affected.contains(*caller) {
+                        let caller = caller.to_string();
+                        affected.insert(caller.clone());
+                        worklist.push(caller);
                     }
                 }
             }
