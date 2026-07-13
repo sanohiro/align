@@ -82,6 +82,8 @@ construction) is `Stmt::StoreColumn` — both share one `soa_column_offset` code
 Construction is `.to_soa()`: `Rvalue::SoaAlloc` arena-bump-allocates the buffer (total size = the
 offset walk to the last column + its `len*size`, aligned to the widest field), then a fused loop
 scatters each AoS element's fields into their columns (`StoreColumn`), yielding the `{ptr,len}` view.
+The allocation uses a checked mirror of the offset walk: negative counts, product/addition wrap,
+and byte totals above the signed `i64` allocator ABI abort before allocation.
 `s: soa<T> := json.decode(d)?` reuses this: decode to a temporary AoS (the array length is unknown
 until parsed), `transpose_to_soa`, then free the AoS temp. `str`/owned columns are a later slice.
 

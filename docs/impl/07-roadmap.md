@@ -1006,7 +1006,7 @@ domain candidates. It proposes no new source syntax.
 `12-pipeline-closure-memory-io-simd-audit.md` is the durable follow-up. It preserves the positive
 fusion/vectorization/capture/I/O findings, corrects the post-`where` speculation premise, records
 closure lifetime + Unit-indirect-ABI + buffered-`io.copy` blockers, the ordinary-effect contract
-conflict, and required allocation-size hardening. It gates per-callsite arena initialization,
+conflict, and the now-complete allocation-size hardening. It gates per-callsite arena initialization,
 exact-destination codec/hex-SIMD, macOS copy-path, HTTP-copy, and sequential compaction candidates.
 Its P0 slices precede any SIMD or parallel widening; it adds no source syntax.
 

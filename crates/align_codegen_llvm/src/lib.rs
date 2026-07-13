@@ -661,6 +661,10 @@ fn build_module<'c>(
         "div_fail".to_string(),
         module.add_function("align_rt_div_fail", ctx.void_type().fn_type(&[], false), None),
     );
+    funcs.insert(
+        "alloc_size_fail".to_string(),
+        module.add_function("align_rt_alloc_size_fail", ctx.void_type().fn_type(&[], false), None),
+    );
     // `std.process` (M11) — `process.exit(code)` (cleanup runs first, in MIR) and `process.abort()`.
     // Both are diverging (`-> !`); MIR emits `Unreachable` after the call (like `bounds_fail`), so no
     // `noreturn` attribute is required for correctness.
@@ -3051,6 +3055,7 @@ fn rt_contract(sym: &str) -> Option<RtContract> {
         | "align_rt_range_fail"
         | "align_rt_utf8_boundary_fail"
         | "align_rt_div_fail"
+        | "align_rt_alloc_size_fail"
         | "align_rt_process_exit"
         | "align_rt_process_abort" => Some(RtContract {
             fn_attrs: &["noreturn"],
@@ -3217,11 +3222,99 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .collect()
     }
 
-    /// Byte offset of column `field` within a `soa<Struct>` column-major buffer of `len` rows:
+    /// Branch to the cold allocation-overflow abort when `invalid` is true, then continue codegen
+    /// in a fresh success block. The runtime allocator ABI takes a signed i64 byte count, so every
+    /// checked size operation must fit `0..=i64::MAX`, not merely the full unsigned i64 domain.
+    fn guard_allocation_size(&self, invalid: inkwell::values::IntValue<'c>) -> Result<(), CodegenError> {
+        let fail = self.ctx.append_basic_block(self.func, "alloc.size.fail");
+        let ok = self.ctx.append_basic_block(self.func, "alloc.size.ok");
+        self.builder.build_conditional_branch(invalid, fail, ok).map_err(|e| self.err(e))?;
+        self.builder.position_at_end(fail);
+        self.builder
+            .build_call(self.funcs["alloc_size_fail"], &[], "")
+            .map_err(|e| self.err(e))?;
+        self.builder.build_unreachable().map_err(|e| self.err(e))?;
+        self.builder.position_at_end(ok);
+        Ok(())
+    }
+
+    /// Checked non-negative `a * b` for an allocator byte count. `umul.with.overflow` catches the
+    /// full-width wrap; the signed-negative checks reject a negative logical count and a product
+    /// above `i64::MAX`, which the signed allocator ABI would otherwise interpret as non-positive.
+    fn checked_allocation_mul(
+        &self,
+        a: inkwell::values::IntValue<'c>,
+        b: inkwell::values::IntValue<'c>,
+        name: &str,
+    ) -> Result<inkwell::values::IntValue<'c>, CodegenError> {
+        let ty = a.get_type();
+        let agg = self
+            .call_overflow_intrinsic("llvm.umul.with.overflow", ty, a, b)?
+            .into_struct_value();
+        let product = self.builder.build_extract_value(agg, 0, name).map_err(|e| self.err(e))?.into_int_value();
+        let overflow = self.builder.build_extract_value(agg, 1, "alloc.mul.overflow").map_err(|e| self.err(e))?.into_int_value();
+        let a_negative = self.builder.build_int_compare(IntPredicate::SLT, a, ty.const_zero(), "alloc.count.negative").map_err(|e| self.err(e))?;
+        let product_negative = self.builder.build_int_compare(IntPredicate::SLT, product, ty.const_zero(), "alloc.product.negative").map_err(|e| self.err(e))?;
+        let invalid = self.builder.build_or(overflow, a_negative, "alloc.mul.invalid").map_err(|e| self.err(e))?;
+        let invalid = self.builder.build_or(invalid, product_negative, "alloc.mul.invalid").map_err(|e| self.err(e))?;
+        self.guard_allocation_size(invalid)?;
+        Ok(product)
+    }
+
+    /// Checked addition for an allocator byte count, including the alignment bump. Inputs are
+    /// already non-negative; reject both unsigned wrap and a result above the signed ABI maximum.
+    fn checked_allocation_add(
+        &self,
+        a: inkwell::values::IntValue<'c>,
+        b: inkwell::values::IntValue<'c>,
+        name: &str,
+    ) -> Result<inkwell::values::IntValue<'c>, CodegenError> {
+        let ty = a.get_type();
+        let agg = self
+            .call_overflow_intrinsic("llvm.uadd.with.overflow", ty, a, b)?
+            .into_struct_value();
+        let sum = self.builder.build_extract_value(agg, 0, name).map_err(|e| self.err(e))?.into_int_value();
+        let overflow = self.builder.build_extract_value(agg, 1, "alloc.add.overflow").map_err(|e| self.err(e))?.into_int_value();
+        let sum_negative = self.builder.build_int_compare(IntPredicate::SLT, sum, ty.const_zero(), "alloc.sum.negative").map_err(|e| self.err(e))?;
+        let invalid = self.builder.build_or(overflow, sum_negative, "alloc.add.invalid").map_err(|e| self.err(e))?;
+        self.guard_allocation_size(invalid)?;
+        Ok(sum)
+    }
+
+    /// Checked byte offset of column `field` while allocating a `soa<Struct>` buffer. This is the
+    /// allocation-only counterpart of [`Self::soa_column_offset`]: every product, column end, and
+    /// alignment bump must fit the signed allocator byte-size ABI before the buffer is created.
+    fn soa_allocation_column_offset(
+        &self,
+        len: inkwell::values::IntValue<'c>,
+        sizes: &[u64],
+        field: usize,
+    ) -> Result<inkwell::values::IntValue<'c>, CodegenError> {
+        if field >= sizes.len() {
+            return Err(self.err("soa allocation column index out of bounds"));
+        }
+        let ty = len.get_type();
+        let mut off = ty.const_zero();
+        for j in 1..=field {
+            let adv = self.checked_allocation_mul(len, ty.const_int(sizes[j - 1], false), "coladv")?;
+            let sum = self.checked_allocation_add(off, adv, "colend")?;
+            let align = sizes[j];
+            off = if align > 1 {
+                let bumped = self.checked_allocation_add(sum, ty.const_int(align - 1, false), "colbump")?;
+                self.builder.build_and(bumped, ty.const_int(!(align - 1), false), "colalign").map_err(|e| self.err(e))?
+            } else {
+                sum
+            };
+        }
+        Ok(off)
+    }
+
+    /// Byte offset of column `field` within an already allocated `soa<Struct>` column-major buffer of `len` rows:
     /// `start_0 = 0`, `start_j = align_up(start_{j-1} + len*size_{j-1}, size_j)`. Each column is
     /// padded to the field's alignment (= its size for a primitive), so mixed-width columns stay
-    /// naturally aligned for any `len`. Shared by [`Rvalue::IndexColumn`], [`Stmt::StoreColumn`],
-    /// and the [`Rvalue::SoaAlloc`] total-size walk.
+    /// naturally aligned for any `len`. Shared by [`Rvalue::IndexColumn`] and
+    /// [`Stmt::StoreColumn`]; [`Self::soa_allocation_column_offset`] mirrors it with overflow checks
+    /// for the allocation-size walk.
     fn soa_column_offset(
         &self,
         len: inkwell::values::IntValue<'c>,
@@ -4695,7 +4788,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let elem_bytes = i64t.const_int(scalar_bytes(scalar), false);
                 let count_v = self.operand(count).into_int_value();
-                let bytes = self.builder.build_int_mul(count_v, elem_bytes, "bytes").map_err(|e| self.err(e))?;
+                let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
                     .build_call(self.funcs["arena_alloc"], &[self.operand(handle).into(), bytes.into(), elem_bytes.into()], "buf")
                     .map_err(|e| self.err(e))?
@@ -4709,7 +4802,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let i64t = self.ctx.i64_type();
                 let elem_bytes = i64t.const_int(scalar_bytes(scalar), false);
                 let count_v = self.operand(count).into_int_value();
-                let bytes = self.builder.build_int_mul(count_v, elem_bytes, "bytes").map_err(|e| self.err(e))?;
+                let bytes = self.checked_allocation_mul(count_v, elem_bytes, "bytes")?;
                 self.builder
                     .build_call(self.funcs["alloc"], &[bytes.into()], "buf")
                     .map_err(|e| self.err(e))?
@@ -4727,9 +4820,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // A soa struct always has ≥1 field (sema-enforced); guard the underflow anyway.
                 let last = sizes.len().checked_sub(1).ok_or_else(|| self.err("empty soa struct"))?;
                 let i64t = self.ctx.i64_type();
-                let last_off = self.soa_column_offset(len_v, &sizes, last)?;
-                let last_bytes = self.builder.build_int_mul(len_v, i64t.const_int(sizes[last], false), "lastcol").map_err(|e| self.err(e))?;
-                let total = self.builder.build_int_add(last_off, last_bytes, "soabytes").map_err(|e| self.err(e))?;
+                let last_off = self.soa_allocation_column_offset(len_v, &sizes, last)?;
+                let last_bytes = self.checked_allocation_mul(len_v, i64t.const_int(sizes[last], false), "lastcol")?;
+                let total = self.checked_allocation_add(last_off, last_bytes, "soabytes")?;
                 let max_align = sizes.iter().copied().max().unwrap_or(1);
                 self.builder
                     .build_call(self.funcs["arena_alloc"], &[self.operand(handle).into(), total.into(), i64t.const_int(max_align, false).into()], "soabuf")
@@ -7710,6 +7803,204 @@ mod tests {
         emit_llvm_ir(&lower_program(&hir), &BuildTarget::Baseline, false).unwrap()
     }
 
+    fn allocation_case_ir(
+        rv: Rvalue,
+        value_ty: Ty,
+        structs: Vec<StructDef>,
+        optimized: bool,
+        count_arg: bool,
+    ) -> String {
+        let program = Program {
+            fns: vec![Function {
+                name: if count_arg { "allocation_probe" } else { "main" }.to_string(),
+                params: if count_arg { vec![0] } else { vec![] },
+                ret: Ty::Int(IntTy { bits: 32, signed: true }),
+                slots: if count_arg { vec![Ty::Int(IntTy { bits: 64, signed: true })] } else { vec![] },
+                slot_align: if count_arg { vec![None] } else { vec![] },
+                value_tys: vec![value_ty],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(0, rv)],
+                    stmt_lines: vec![(0, 0)],
+                    term: Term::Return(Some(Operand::Const(Const::Int(
+                        0,
+                        Ty::Int(IntTy { bits: 32, signed: true }),
+                    )))),
+                }],
+                entry: 0,
+            }],
+            externs: vec![],
+            link_libs: vec![],
+            structs,
+            enums: vec![],
+            tuples: vec![],
+        };
+        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized).unwrap()
+    }
+
+    fn function_body<'a>(ir: &'a str, name: &str) -> &'a str {
+        ir.find(&format!(" @{name}("))
+            .map(|start| &ir[start..])
+            .and_then(|tail| tail.split_once("{\n").map(|(_, body)| body))
+            .and_then(|body| body.split("\n}").next())
+            .unwrap_or_else(|| panic!("{name} body not found"))
+    }
+
+    fn arena_allocation_case_ir() -> String {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let program = Program {
+            fns: vec![Function {
+                name: "arena_allocation_probe".to_string(),
+                params: vec![0],
+                ret: Ty::Int(IntTy { bits: 32, signed: true }),
+                slots: vec![i64_ty],
+                slot_align: vec![None],
+                value_tys: vec![Ty::ArenaHandle, Ty::Box(Scalar::Str)],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![
+                        Stmt::Let(0, Rvalue::ArenaBegin),
+                        Stmt::Let(
+                            1,
+                            Rvalue::ArenaAlloc { handle: Operand::Value(0), count: Operand::Arg(0), elem: Ty::Str },
+                        ),
+                    ],
+                    stmt_lines: vec![(0, 0), (0, 0)],
+                    term: Term::Return(Some(Operand::Const(Const::Int(
+                        0,
+                        Ty::Int(IntTy { bits: 32, signed: true }),
+                    )))),
+                }],
+                entry: 0,
+            }],
+            externs: vec![],
+            link_libs: vec![],
+            structs: vec![],
+            enums: vec![],
+            tuples: vec![],
+        };
+        emit_llvm_ir(&program, &BuildTarget::Baseline, false).unwrap()
+    }
+
+    fn soa_allocation_case_ir(len: Operand, row: StructDef, optimized: bool) -> String {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let dynamic = matches!(len, Operand::Arg(0));
+        let program = Program {
+            fns: vec![Function {
+                name: if dynamic { "soa_allocation_probe" } else { "main" }.to_string(),
+                params: if dynamic { vec![0] } else { vec![] },
+                ret: Ty::Int(IntTy { bits: 32, signed: true }),
+                slots: if dynamic { vec![i64_ty] } else { vec![] },
+                slot_align: if dynamic { vec![None] } else { vec![] },
+                value_tys: vec![Ty::ArenaHandle, Ty::Box(Scalar::Int(IntTy { bits: 8, signed: false }))],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![
+                        Stmt::Let(0, Rvalue::ArenaBegin),
+                        Stmt::Let(
+                            1,
+                            Rvalue::SoaAlloc {
+                                handle: Operand::Value(0),
+                                len,
+                                struct_id: 0,
+                            },
+                        ),
+                    ],
+                    stmt_lines: vec![(0, 0), (0, 0)],
+                    term: Term::Return(Some(Operand::Const(Const::Int(
+                        0,
+                        Ty::Int(IntTy { bits: 32, signed: true }),
+                    )))),
+                }],
+                entry: 0,
+            }],
+            externs: vec![],
+            link_libs: vec![],
+            structs: vec![row],
+            enums: vec![],
+            tuples: vec![],
+        };
+        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized).unwrap()
+    }
+
+    #[test]
+    fn dynamic_allocation_sizes_are_checked_before_allocator_calls() {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let dynamic = allocation_case_ir(
+            Rvalue::HeapAllocBuf { count: Operand::Arg(0), elem: Ty::Str },
+            Ty::Box(Scalar::Str),
+            vec![],
+            false,
+            true,
+        );
+        assert!(dynamic.contains("@llvm.umul.with.overflow.i64"), "missing checked multiply:\n{dynamic}");
+        assert!(dynamic.contains("icmp slt i64 %0, 0"), "missing negative-count guard:\n{dynamic}");
+        assert!(dynamic.contains("@align_rt_alloc_size_fail"), "missing cold allocation failure:\n{dynamic}");
+
+        let arena = arena_allocation_case_ir();
+        let arena_body = function_body(&arena, "arena_allocation_probe");
+        assert!(arena_body.contains("@llvm.umul.with.overflow.i64"), "arena allocation lacks checked multiply:\n{arena_body}");
+        assert!(arena_body.contains("@align_rt_alloc_size_fail"), "arena allocation lacks overflow failure:\n{arena_body}");
+
+        let fit = i64::MAX as i128 / 16;
+        let fit_ir = allocation_case_ir(
+            Rvalue::HeapAllocBuf { count: Operand::Const(Const::Int(fit, i64_ty)), elem: Ty::Str },
+            Ty::Box(Scalar::Str),
+            vec![],
+            true,
+            false,
+        );
+        let fit_body = function_body(&fit_ir, "main");
+        assert!(fit_body.contains("@align_rt_alloc(i64 9223372036854775792)"), "largest fitting str allocation changed:\n{fit_body}");
+        assert!(!fit_body.contains("@align_rt_alloc_size_fail"), "largest fitting count must not fail:\n{fit_body}");
+
+        let over_ir = allocation_case_ir(
+            Rvalue::HeapAllocBuf { count: Operand::Const(Const::Int(fit + 1, i64_ty)), elem: Ty::Str },
+            Ty::Box(Scalar::Str),
+            vec![],
+            true,
+            false,
+        );
+        assert!(function_body(&over_ir, "main").contains("@align_rt_alloc_size_fail"), "one-over-limit must fail:\n{over_ir}");
+
+        for count in [-1i128, 0] {
+            let out = allocation_case_ir(
+                Rvalue::HeapAllocBuf { count: Operand::Const(Const::Int(count, i64_ty)), elem: i64_ty },
+                Ty::Box(Scalar::Int(IntTy { bits: 64, signed: true })),
+                vec![],
+                true,
+                false,
+            );
+            let body = function_body(&out, "main");
+            if count < 0 {
+                assert!(body.contains("@align_rt_alloc_size_fail"), "negative count must fail:\n{body}");
+            } else {
+                assert!(!body.contains("@align_rt_alloc_size_fail"), "zero count must remain legal:\n{body}");
+            }
+        }
+
+        let row = StructDef {
+            name: "Row".to_string(),
+            fields: vec![
+                align_sema::hir::FieldDef { name: "tiny".to_string(), ty: Ty::Int(IntTy { bits: 8, signed: false }) },
+                align_sema::hir::FieldDef { name: "wide".to_string(), ty: i64_ty },
+            ],
+            align: None,
+            c_repr: false,
+        };
+        let soa_dynamic = soa_allocation_case_ir(Operand::Arg(0), row.clone(), false);
+        let soa_dynamic_body = function_body(&soa_dynamic, "soa_allocation_probe");
+        assert_eq!(soa_dynamic_body.matches("@llvm.umul.with.overflow.i64").count(), 2, "SoA allocation must check both column products:\n{soa_dynamic_body}");
+        assert_eq!(soa_dynamic_body.matches("@llvm.uadd.with.overflow.i64").count(), 3, "SoA allocation must check column end, alignment bump, and total size:\n{soa_dynamic_body}");
+
+        let soa = soa_allocation_case_ir(
+            Operand::Const(Const::Int(i64::MAX as i128, i64_ty)),
+            row,
+            true,
+        );
+        assert!(function_body(&soa, "main").contains("@align_rt_alloc_size_fail"), "SoA alignment bump overflow must fail:\n{soa}");
+    }
+
     /// Layout parity: the sema `(size, align)` computation (`align_sema::ty_size_align` /
     /// `struct_size_align`, which the huge-struct-copy lint trusts) must equal the **real** LLVM ABI
     /// size/alignment of the struct as codegen lays it out (descending-alignment field order via
@@ -7930,6 +8221,7 @@ mod tests {
             "align_rt_range_fail",
             "align_rt_utf8_boundary_fail",
             "align_rt_div_fail",
+            "align_rt_alloc_size_fail",
             "align_rt_process_exit",
             "align_rt_process_abort",
         ] {

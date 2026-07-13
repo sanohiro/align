@@ -542,7 +542,7 @@ AoS/SoA conversion, or a second substring-search algorithm.
 4. Remove definite-null destructor calls after the ownership dataflow is trustworthy.
 5. Settle arena-free template/json.encode ownership; immediately fold static-only templates and
    direct obvious sinks where semantics already permit it.
-6. Complete document 12's checked dynamic allocation-size arithmetic.
+6. ~~Complete document 12's checked dynamic allocation-size arithmetic.~~ **DONE 2026-07-13.**
 
 ### P1 — short fixed costs
 
