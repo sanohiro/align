@@ -2298,7 +2298,11 @@ and M15: **wave 1, measurement portability** (three CONFIRMED bugs — bench exp
 by the #418 internalization, ELF-only linker/size tooling breaks macOS builds **[compiler slice
 DONE 2026-07-12: `ObjectFormat`-selected linker policy + `llvm-readobj`/`llvm-nm` size report +
 macOS regression net; the `bench/binary_size` script port is the remaining sub-item]**, build
-profiles never reach the TargetMachine/`optsize`/runtime variant); **wave 2, quick wins** (O(n²)
+profiles never reach the TargetMachine/`optsize`/runtime variant **[code slice DONE 2026-07-13:
+`Profile::codegen_opt_level` threaded into the TargetMachine + small/tiny `optsize`/`minsize`
+definition-only fn-attr sweep, diagnostic lenses pinned to codegen=Default/no-attrs so the IR-shape
+suite stays byte-identical, release object bit-for-bit unchanged; the per-profile runtime variant +
+cache key is deferred to the M14 runtime-bitcode slice + doc-10 §2 cache layer]**); **wave 2, quick wins** (O(n²)
 `sort`/`sort_by_key`, tiny-`par_map` pool-before-threshold cold start, zero-size arena 64 KiB
 chunk, attribute-kind fail-loud + modern `captures(none)` emission — the latter likely also
 fixes the `llvm-as-22` textual round-trip follow-up above); **wave 3, measure-first** (JSON

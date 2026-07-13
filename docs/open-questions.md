@@ -2462,6 +2462,21 @@ every valid finding addressed. Disposition:
      set `optsize`/`minsize` fn attrs; the runtime archive is one variant for all profiles.
      Adopt the report's mapping table as the starting point (dev=None … fast=Aggressive,
      small=`optsize`, tiny=`minsize`+`optsize`); runtime cache key gains profile/panic/LLVM-major.
+     **DONE (code slice, 2026-07-13):** `Profile::codegen_opt_level` (dev=`None`, release=`Default`,
+     fast=`Aggressive`, small/tiny=`Default`) threaded into `create_target_machine`, so the object
+     path's TargetMachine follows the profile; the diagnostic lenses (`emit_llvm_ir` /
+     `collect_opt_remarks`) pin codegen=`Default`, no size attrs, pipeline `O2` — the IR-shape suite
+     stays byte-identical. `small`/`tiny` gain a single `optsize` / `optsize`+`minsize` fn-attr
+     sweep over module *definitions* only (`apply_size_attrs`, `count_basic_blocks() > 0`), a set
+     completely disjoint from `apply_rt_contract_attrs`'s declaration-only sweep. small/tiny stay at
+     codegen `Default` on purpose (clang parity: lowering the codegen level does not shrink size, it
+     only slows code — size is the attrs + `default<Os|Oz>` pipeline). Release object output is
+     bit-for-bit unchanged (verified). **Deferred:** the per-profile runtime variant + cache key
+     (`(profile, panic-strategy, LLVM-major, rustc-version, runtime-source-hash, target-triple/cpu)`)
+     goes to the M14 runtime-bitcode slice + the doc-10 §2 cache layer — there is no clean partial:
+     the runtime `.a` is a single cargo-side prebuilt, variants need `alignc` to drive cargo through
+     a keyed cache subsystem that does not exist yet, and the `panic=abort` lever is already a Future
+     backlog item, the bitcode LLVM-major match belongs to M14.
 - **Quick-win fixes (all verified in code; independent small slices):**
   4. **`sort`/`sort_by_key` O(n²)** insertion sort (`align_mir` ~5161, self-documented "first
      cut") — report measured 547× vs Rust stable sort at 100k. Adopt: stable O(n log n) core +
