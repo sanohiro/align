@@ -2519,6 +2519,33 @@ every valid finding addressed. Disposition:
      the recorded `emit-llvm | llvm-as-22` textual round-trip follow-up (the printer would emit
      `captures(none)`, not the unparseable `ptr none`). Prefer semantic attr assertions over
      full-declaration string pins where practical.
+     **DONE (2026-07-13):** the two changes were coupled — investigating the fail-loud check
+     revealed the *current* code was already going through the silent-no-op path: on LLVM 22
+     `get_named_enum_kind_id("nocapture")` returns `0` (the attribute was removed in favour of
+     `captures(...)`), so `create_enum_attribute(0, 0)` emitted the bare, un-reparseable `ptr none`
+     shorthand — the very shape that broke the round-trip. Fix: a shared `enum_kind_id(name)` gate
+     under `add_enum_attr` / the new valued `add_valued_enum_attr` that **panics** if the name
+     resolves to kind id 0. Chosen a panic, not a `CodegenError`: every attribute name is a
+     compiler-internal string literal (never user input), so an unknown name is an input-independent
+     compiler build defect against the linked LLVM — it fails on *every* compilation, not one
+     program — which is the internal-invariant class codegen already handles with `unreachable!` /
+     `expect`; a per-program `CodegenError` would falsely blame the user's source, and threading
+     `Result` through the ~6 valueless call sites (`mark_nounwind`, `apply_size_attrs`,
+     `apply_rt_contract_attrs`, …) buys nothing. The no-capture contract is now emitted as
+     `captures(none)` via the `captures` kind (id 92) + value `0` (`CAPTURES_NONE`), pinned against
+     LLVM 22.1.8 `llvm/Support/ModRef.h` (`CaptureComponents::None == 0`;
+     `CaptureInfo::toIntValue() == (Other<<4)|Ret == 0` for `none()`) and verified empirically via
+     `LLVMCreateEnumAttribute`. **Round-trip follow-up: RESOLVED (hypothesis CONFIRMED).** With
+     `captures(none)` emitted directly the printer now prints `ptr readonly captures(none)`, which
+     `llvm-as-22` accepts — a new tool-gated gate `align_driver::llvm_as_roundtrip`
+     (`emitted_ir_round_trips_through_llvm_as`) feeds `alignc emit-llvm` output to `llvm-as` and
+     proves it assembles. Semantic pin added (`rt_contract_captures_none_is_present_by_kind_id`):
+     queries the param attribute by kind id and asserts the `captures` payload is exactly `0`, per
+     "prefer semantic attr assertions"; the remaining declaration string pins were updated to the
+     new `ptr readonly captures(none)` spelling. The A8 optimization gate and the full IR-shape
+     suite stay green (the contract is semantically preserved — `captures(none)` is a strictly more
+     precise no-capture claim than the old kind-0 emission). Fail-loud pinned by a
+     `#[should_panic]` test on a bogus attribute name.
 - **Already recorded elsewhere (report converges independently — pointers only):** runtime
   staticlib feature-split (existing Open item; the report adds a Mach-O upper-bound observation:
   hello 409,248 B → 33,984 B when a print-only member resolves first — evidence FOR the split;
