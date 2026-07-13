@@ -315,6 +315,7 @@ struct ArtifactStage {
 
 impl ArtifactStage {
     fn in_dir(parent: &Path, label: &str) -> std::io::Result<Self> {
+        let parent = std::fs::canonicalize(parent)?;
         for _ in 0..1024 {
             let nonce = ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
             let stamp = std::time::SystemTime::now()
